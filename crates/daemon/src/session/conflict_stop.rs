@@ -1,17 +1,20 @@
-//! `session stop` of a session whose runtime is unavailable.
+//! Stopping and removing a session whose runtime is unavailable.
 //!
 //! A runtime that is `lost`, `reconnecting` or `incompatible` has no worker
 //! connection to stop through, and a stop refuses it before anything is
-//! written. A `conflict` is the one state with an exit: when the journal of
-//! the recorded generation names the recorded worker and the supervisor's job
-//! is that worker's, the job is stopped by that recorded identity, its
-//! workers and marked processes are proven gone, and the session ends
-//! `stopped`. A stop interrupted after the job was retired is finished by
-//! reconciliation from the persisted stop intent.
+//! written. Before anything a stop or a removal uses is retired, the
+//! journal of the recorded generation must name the recorded worker and the
+//! supervisor's job must be that worker's — this submodule only supports a
+//! `conflict`, the one state that can prove its recorded generation this
+//! way. A stop ends the session `stopped`; a removal persists its Remove
+//! intent before retirement and releases the session with the caller's
+//! cleanup choice. A stop interrupted after the job was retired is finished
+//! by reconciliation from the persisted stop intent, and a removal
+//! interrupted the same way by the persisted Remove intent.
 
 // Rust guideline compliant 2026-06-26
 
-use protocol::{RuntimeState, SessionId, SessionStopResult};
+use protocol::{RuntimeState, SessionId, SessionRemoveResult, SessionStopResult};
 use tracing::warn;
 
 use super::supervision::UNREADABLE_CANDIDATES_RECOVER;
@@ -29,6 +32,21 @@ use std::sync::atomic::Ordering;
 /// Recovery hint of a stop refused because of unreadable-marker processes.
 const UNREADABLE_CANDIDATES_STOP_RECOVER: &str =
     "inspect the listed processes and end the ones that belong to this session, then retry the stop";
+
+/// Transaction phase of a Remove intent whose recorded identity
+/// [`SessionRegistry::prove_conflicted_runtime`] already judged once, so
+/// every replay ([`SessionRegistry::finish_removal_intent`]) re-proves it
+/// before any retirement instead of trusting the job under the service ID.
+pub(super) const PROVEN_CONFLICT_REMOVAL_PHASE: &str = "proven-conflict";
+
+/// Whether `record` removes through a Remove intent whose recorded identity
+/// was already proven once and must be re-proven on replay.
+pub(super) fn is_conflict_proven_removal(record: &SessionRecord) -> bool {
+    record.transaction.as_ref().is_some_and(|transaction| {
+        transaction.kind == TransactionKind::Remove
+            && transaction.phase == PROVEN_CONFLICT_REMOVAL_PHASE
+    })
+}
 
 /// What a conflicted entry records about the runtime a stop would end.
 struct ConflictedRuntime {
@@ -290,6 +308,150 @@ impl SessionRegistry {
                 error
             }
         }
+    }
+
+    /// Removes a conflicted session when its runtime is available only for a
+    /// proven removal.
+    ///
+    /// The caller has already established that the entry shows a
+    /// `conflict` runtime with a recorded generation whose identity loss is
+    /// not the supervisor's own ambiguity, so
+    /// [`Self::prove_conflicted_runtime`] has the last word on the identity:
+    /// a refusal leaves the durable record and every foreign job untouched.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::remove_conflicted_runtime`].
+    pub(super) async fn remove_conflict_unavailable_runtime(
+        &self,
+        id: &SessionId,
+        cleanup: UnconfirmedCleanup,
+    ) -> Result<SessionRemoveResult, ProtocolError> {
+        let target = {
+            let sessions = self.inner.sessions.lock().await;
+            let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
+            ConflictedRuntime::of(id, entry)?
+        };
+        Box::pin(self.remove_conflicted_runtime(id, target, cleanup)).await
+    }
+
+    /// Removes a proven conflicted session by its recorded identity.
+    ///
+    /// Identity proof comes first ([`Self::prove_conflicted_runtime`]), so a
+    /// refusal writes nothing. The Remove intent is then committed
+    /// conditionally over the durable record (the exact `conflict` runtime is
+    /// re-checked under the sessions lock first), the exact recorded
+    /// generation is retired ([`Self::retire_generation_for_removal`]), and
+    /// [`Self::release_removed_session`] sweeps the session's runtimes with
+    /// the caller's `cleanup` choice, deletes everything the session owns,
+    /// and the durable record last. A failed or stale intent commit restores
+    /// the in-memory desired state and retires nothing; a retirement or
+    /// release failure keeps the Remove intent durable, so startup
+    /// reconciliation finishes the removal.
+    ///
+    /// # Errors
+    ///
+    /// Returns `runtime_identity_mismatch` or `session_runtime_transition_busy`
+    /// when the runtime cannot be proven the recorded one with nothing
+    /// written, `runtime_supervision_ambiguous` when the proof scan or the
+    /// marker sweep of an accepting cleanup cannot prove the runtimes, and
+    /// `runtime_supervision_unavailable` when the job cannot be inspected or
+    /// retired.
+    async fn remove_conflicted_runtime(
+        &self,
+        id: &SessionId,
+        target: ConflictedRuntime,
+        cleanup: UnconfirmedCleanup,
+    ) -> Result<SessionRemoveResult, ProtocolError> {
+        let lifecycle = self
+            .lifecycle()
+            .map_err(|_unsupervised| refusal(id, "no worker supervisor is configured"))?;
+        Box::pin(self.prove_conflicted_runtime(
+            id,
+            &target.generation,
+            &target.worker_id,
+            target.worker_instance_id.as_deref(),
+            &lifecycle,
+        ))
+        .await?;
+
+        let sequence = self.inner.next_write_id.fetch_add(1, Ordering::Relaxed);
+        let (intent, previous_desired_state) = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let entry = sessions
+                .get_mut(id)
+                .ok_or_else(|| session_not_found(&id.0))?;
+            // The exact state the identity proof judged: a concurrent
+            // classification or a changed runtime never accepts this intent.
+            if !target.expected.matches(entry)
+                || !matches!(
+                    entry.runtime,
+                    RuntimeHandle::Unavailable(RuntimeState::Conflict)
+                )
+            {
+                return Err(runtime_error(
+                    "session_runtime_transition_busy",
+                    format!(
+                        "session {} changed while its removal was being proven",
+                        id.0
+                    ),
+                ));
+            }
+            let previous_desired_state = entry.desired_state;
+            entry.desired_state = DesiredState::Removed;
+            (
+                Self::session_record(
+                    id,
+                    entry,
+                    DesiredState::Removed,
+                    Some(SessionTransaction {
+                        id: format!("remove-{sequence}"),
+                        kind: TransactionKind::Remove,
+                        phase: PROVEN_CONFLICT_REMOVAL_PHASE.to_owned(),
+                        previous_worker_id: None,
+                        previous_worker_instance_id: None,
+                        daemon_instance_id: None,
+                    }),
+                ),
+                previous_desired_state,
+            )
+        };
+        // Conditionally over the durable record, so a classification another
+        // writer committed meanwhile is never silently overwritten.
+        if let Err(error) = Box::pin(self.commit_removal_intent(id, intent)).await {
+            self.rollback_removal_intent(id, previous_desired_state, Some(&target.expected))
+                .await;
+            return Err(error);
+        }
+
+        if let Err(error) =
+            Box::pin(self.retire_generation_for_removal(id, &target.generation, &lifecycle)).await
+        {
+            // The Remove intent stays durable and the entry keeps showing its
+            // conflict, so startup reconciliation and a retried
+            // `session.remove` both finish the removal from fresh evidence.
+            warn!(
+                session_id = %id.0,
+                service_id = %target.generation.service_id(),
+                error = %error,
+                "removal intent of a conflicted session waits for its generation to be retired"
+            );
+            return Err(error);
+        }
+        let released = Box::pin(self.release_removed_session(
+            id,
+            Some(&target.generation),
+            target.worker_instance_id.as_deref(),
+            cleanup,
+        ))
+        .await?;
+        Ok(SessionRemoveResult {
+            removed: released.evicted,
+            stopped: true,
+            worktrees_removed: u32::try_from(released.worktrees.removed).unwrap_or(u32::MAX),
+            worktrees_failed: u32::try_from(released.worktrees.failed).unwrap_or(u32::MAX),
+            accepted_unconfirmed_processes: released.accepted_unconfirmed,
+        })
     }
 
     /// Retires the job of `target`'s generation, proves its workers gone, and

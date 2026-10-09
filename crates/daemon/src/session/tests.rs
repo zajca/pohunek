@@ -13566,6 +13566,14 @@ fn build_retention_registry(
 /// none names a real process that could be signalled.
 const UNREADABLE_CANDIDATE_PID: Pid = Pid::MAX;
 
+/// Start identity of an opted-in live candidate of
+/// [`UnreadableCandidateHost`].
+///
+/// Above every real start identity, so a journaled sweep always orders the
+/// candidate at or after its worker and cannot dismiss it as a pre-worker
+/// process.
+const UNREADABLE_CANDIDATE_LIVE_START: StartIdentity = StartIdentity::new(u64::MAX);
+
 /// The [`ReadableHost`] view plus a scripted number of same-user processes
 /// whose ownership markers cannot be read, and an optional process-table
 /// failure.
@@ -13574,6 +13582,10 @@ struct UnreadableCandidateHost {
     readable: ReadableHost,
     candidates: AtomicUsize,
     listing_fails: AtomicBool,
+    /// When set, every scripted candidate also reports a live synthetic
+    /// identity ([`UNREADABLE_CANDIDATE_LIVE_START`]), so a journaled sweep
+    /// keeps it as an unreadable survivor instead of dismissing it.
+    live_candidates: AtomicBool,
 }
 
 impl UnreadableCandidateHost {
@@ -13583,6 +13595,11 @@ impl UnreadableCandidateHost {
 
     fn set_candidates(&self, count: usize) {
         self.candidates.store(count, Ordering::Release);
+    }
+
+    /// Opts the scripted candidates in as live unreadable survivors.
+    fn set_live_candidates(&self, live: bool) {
+        self.live_candidates.store(live, Ordering::Release);
     }
 
     fn set_listing_fails(&self, fails: bool) {
@@ -13628,12 +13645,21 @@ impl ProcessInspector for UnreadableCandidateHost {
         // The candidate's start is never proven older than a worker, so only a
         // sweep without a worker bound still counts it as possibly marked.
         if self.scripts_candidate(pid) {
-            return Ok(None);
+            return Ok(self
+                .live_candidates
+                .load(Ordering::Acquire)
+                .then_some(ProcessIdentity {
+                    pid,
+                    start_identity: UNREADABLE_CANDIDATE_LIVE_START,
+                }));
         }
         self.readable.identity(pid)
     }
 
     fn is_running(&self, identity: ProcessIdentity) -> Result<bool, crate::procwatch::Error> {
+        if self.scripts_candidate(identity.pid) && self.live_candidates.load(Ordering::Acquire) {
+            return Ok(true);
+        }
         self.readable.is_running(identity)
     }
 

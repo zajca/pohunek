@@ -3516,10 +3516,17 @@ impl SessionRegistry {
     }
 
     /// Persists `intent` and returns it with the durable record it replaced.
-    async fn commit_stop_intent(
+    /// Commits an intent record over the durable record conditionally,
+    /// retrying while another writer keeps changing the record under it.
+    ///
+    /// `busy_code` is the error code of the exhaustion after the retry bound:
+    /// the stop keeps its historical `session_stop_intent_busy`.
+    async fn commit_intent(
         &self,
         id: &SessionId,
         intent: SessionRecord,
+        what: &str,
+        busy_code: &str,
     ) -> Result<(SessionRecord, SessionRecord), ProtocolError> {
         for _ in 0..MAX_RUNTIME_TRANSITION_COMMIT_ATTEMPTS {
             let durable_base = self
@@ -3545,12 +3552,32 @@ impl SessionRegistry {
             }
         }
         Err(runtime_error(
-            "session_stop_intent_busy",
-            format!(
-                "session {} kept changing while committing its stop intent",
-                id.0
-            ),
+            busy_code,
+            format!("session {} kept changing while committing {what}", id.0),
         ))
+    }
+
+    async fn commit_stop_intent(
+        &self,
+        id: &SessionId,
+        intent: SessionRecord,
+    ) -> Result<(SessionRecord, SessionRecord), ProtocolError> {
+        self.commit_intent(id, intent, "its stop intent", "session_stop_intent_busy")
+            .await
+    }
+
+    async fn commit_removal_intent(
+        &self,
+        id: &SessionId,
+        intent: SessionRecord,
+    ) -> Result<(SessionRecord, SessionRecord), ProtocolError> {
+        self.commit_intent(
+            id,
+            intent,
+            "its removal intent",
+            "session_removal_intent_busy",
+        )
+        .await
     }
 
     async fn commit_user_stop_exit(
@@ -3621,9 +3648,12 @@ impl SessionRegistry {
     /// runtime-state code (`session_runtime_conflict`, `session_runtime_reconnecting`, or
     /// `worker_protocol_incompatible`). A conflict whose recorded identity
     /// cannot be proven fails with `runtime_identity_mismatch` or
-    /// `runtime_supervision_ambiguous`; a generation the supervisor cannot
-    /// retire fails with `runtime_supervision_unavailable`. The record is kept
-    /// in every case. A
+    /// `runtime_supervision_ambiguous` before anything is written; the
+    /// record is kept byte-identical and no foreign job is retired. A
+    /// conflict that is proven keeps the removal intent durable from before
+    /// its generation's retirement, so a retired-but-unproven generation
+    /// (`runtime_supervision_unavailable`) leaves a retryable session listed
+    /// with its intent, which daemon startup reconciliation also finishes. A
     /// marker sweep that cannot confirm every marked process exited fails
     /// with `runtime_supervision_ambiguous` after the removal intent was
     /// recorded; like any cleanup that fails then, it keeps the session
@@ -3637,9 +3667,10 @@ impl SessionRegistry {
     ///
     /// With [`UnconfirmedCleanup::Accept`], a runtime whose marker sweep is
     /// unconfirmed solely because of unreadable-marker processes does not
-    /// refuse the removal: those processes are never signalled and are
-    /// returned in [`SessionRemoveResult::accepted_unconfirmed_processes`]
-    /// and logged at `warn` before any cleanup step. Every other unconfirmed outcome (a signalled
+    /// refuse the removal on every removal path, a proven conflicted runtime
+    /// included: those processes are never signalled and are returned in
+    /// [`SessionRemoveResult::accepted_unconfirmed_processes`] and logged at
+    /// `warn` before any cleanup step. Every other unconfirmed outcome (a signalled
     /// process still running, a sweep error, a missing supervision
     /// configuration) refuses exactly as under [`UnconfirmedCleanup::Refuse`].
     ///
@@ -3653,13 +3684,15 @@ impl SessionRegistry {
     ) -> Result<SessionRemoveResult, ProtocolError> {
         self.ensure_not_external_session(id).await?;
         let _guard = self.lock_lifecycle(id).await;
-        let prove_and_stop_conflict = {
+        let prove_and_remove_conflict = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
-            matches!(
-                entry.runtime,
-                RuntimeHandle::Unavailable(RuntimeState::Conflict)
-            ) && entry.job.is_some()
+            !is_terminal(entry.info.state)
+                && matches!(
+                    entry.runtime,
+                    RuntimeHandle::Unavailable(RuntimeState::Conflict)
+                )
+                && entry.job.is_some()
                 && entry
                     .info
                     .runtime
@@ -3667,16 +3700,13 @@ impl SessionRegistry {
                     .and_then(|runtime| runtime.loss_reason.as_deref())
                     != Some(crate::runtime::lifecycle::SUPERVISION_AMBIGUOUS)
         };
-        let stopped_conflict = if prove_and_stop_conflict {
+        if prove_and_remove_conflict {
             // The conflict's old reason alone cannot prove what `remove` may
-            // retire. Stop first: its journal, job and process checks prove
-            // the recorded generation and commit the terminal transition.
-            self.stop_unavailable_runtime(id)
-                .await?
-                .is_some_and(|result| result.stopped)
-        } else {
-            false
-        };
+            // retire: removal owns the whole conflict flow, so the removal
+            // intent is persisted before the retirement and never stranded
+            // behind a stop.
+            return Box::pin(self.remove_conflict_unavailable_runtime(id, cleanup)).await;
+        }
         let should_stop = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
@@ -3695,11 +3725,8 @@ impl SessionRegistry {
             stopped
         } else {
             // Retiring first means a refused or failed retirement leaves no
-            // removal intent behind; the record keeps its runtime state. A
-            // proven conflict's job was already retired by its stop.
-            if !stopped_conflict {
-                self.retire_unstopped_job(id).await?;
-            }
+            // removal intent behind; the record keeps its runtime state.
+            self.retire_unstopped_job(id).await?;
             let removal_intent = {
                 let mut sessions = self.inner.sessions.lock().await;
                 let entry = sessions
@@ -3724,7 +3751,7 @@ impl SessionRegistry {
                 )
             };
             self.write_session_record(removal_intent).await?;
-            stopped_conflict
+            false
         };
 
         let (job, worker_instance_id) = {
@@ -4594,6 +4621,35 @@ impl SessionRegistry {
                 entry.stopping = false;
                 entry.stop_transaction_id = None;
             }
+        }
+    }
+
+    /// Restores the in-memory desired state of the intent-only removal write
+    /// of [`Self::remove_conflicted_runtime`].
+    ///
+    /// Only the exact intent that writer set is undone: the entry must still
+    /// show the proved runtime, and only a `Removed` desired state can belong
+    /// to it (the lifecycle lock serializes removals, and no watcher writes a
+    /// desired state).
+    async fn rollback_removal_intent(
+        &self,
+        id: &SessionId,
+        previous_desired_state: DesiredState,
+        expected_runtime: Option<&RuntimeWatchIdentity>,
+    ) {
+        let mut sessions = self.inner.sessions.lock().await;
+        let Some(entry) = sessions.get_mut(id) else {
+            return;
+        };
+        let runtime_matches = expected_runtime.map_or_else(
+            || RuntimeWatchIdentity::from_info(&entry.info).is_none(),
+            |expected| expected.matches(entry),
+        );
+        if runtime_matches
+            && !is_terminal(entry.info.state)
+            && entry.desired_state == DesiredState::Removed
+        {
+            entry.desired_state = previous_desired_state;
         }
     }
 

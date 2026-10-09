@@ -22,6 +22,7 @@ use protocol::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use super::conflict_stop::is_conflict_proven_removal;
 use super::supervision::{
     classify_unreachable, describe_unreadable_candidates, job_identity_mismatch, observe,
     record_accepted_process, Cleanup, JobEvidence, JournalWorker, Unreachable,
@@ -2435,6 +2436,13 @@ impl SessionRegistry {
     /// cleanup keeps it `runtime_supervision_unavailable`; each re-check
     /// reaches this finalizer again from fresh evidence. A worker of another
     /// generation that still runs is an identity conflict and is not retried.
+    ///
+    /// A Remove intent with the conflict-proven transaction phase
+    /// (`PROVEN_CONFLICT_REMOVAL_PHASE`, a conflict removal whose identity
+    /// was proven once, then interrupted) is re-proven
+    /// ([`Self::prove_conflicted_runtime`]) before any retirement: the job
+    /// under the service ID may have changed while the daemon was down, and a
+    /// foreign or replaced job is never retired.
     async fn finish_removal_intent(
         &self,
         record: SessionRecord,
@@ -2445,32 +2453,10 @@ impl SessionRegistry {
         let id = SessionId(record.session_id.clone());
         if let (Some(generation), Some(lifecycle)) = (generation, lifecycle) {
             if let Err(error) = self
-                .retire_generation_for_removal(&id, generation, lifecycle)
+                .retire_removal_intent(&id, &record, generation, lifecycle)
                 .await
             {
-                tracing::warn!(
-                    session_id = %id.0,
-                    service_id = %generation.service_id(),
-                    error = %error,
-                    "removal intent waits for its generation to be retired"
-                );
-                let (state, reason) = match error.code.as_str() {
-                    SUPERVISION_UNAVAILABLE => {
-                        (RuntimeState::Reconnecting, SUPERVISION_UNAVAILABLE)
-                    }
-                    SUPERVISION_AMBIGUOUS => (RuntimeState::Conflict, SUPERVISION_AMBIGUOUS),
-                    _ => {
-                        return !self
-                            .insert_unavailable_record(
-                                record,
-                                RuntimeState::Conflict,
-                                IDENTITY_MISMATCH,
-                            )
-                            .await;
-                    }
-                };
-                self.mark_pending(record, state, reason, retry).await;
-                return true;
+                return self.settle_failed_removal(record, &error, retry).await;
             }
         }
         let worker_instance_id = record.runtime.worker_instance_id.clone();
@@ -2495,6 +2481,116 @@ impl SessionRegistry {
                 true
             }
         }
+    }
+
+    /// Re-proves a conflict-proven Remove intent's recorded identity before
+    /// its retirement, then retires its recorded generation.
+    ///
+    /// The re-proof ([`Self::prove_conflicted_runtime`]) judges the recorded
+    /// worker ID and runtime against a fresh journal scan and the job the
+    /// supervisor currently shows under the service ID, as a live removal
+    /// does, so a foreign or replaced job is never retired.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::prove_conflicted_runtime`] and
+    /// [`Self::retire_generation_for_removal`], and
+    /// `runtime_identity_mismatch` when the intent names no complete worker
+    /// identity.
+    async fn retire_removal_intent(
+        &self,
+        id: &SessionId,
+        record: &SessionRecord,
+        generation: &super::Generation,
+        lifecycle: &Lifecycle<'_>,
+    ) -> Result<(), ProtocolError> {
+        if is_conflict_proven_removal(record) {
+            Box::pin(self.reprove_conflict_removal_intent(id, record, generation, lifecycle))
+                .await?;
+        }
+        if let Err(error) =
+            Box::pin(self.retire_generation_for_removal(id, generation, lifecycle)).await
+        {
+            tracing::warn!(
+                session_id = %id.0,
+                service_id = %generation.service_id(),
+                error = %error,
+                "removal intent waits for its generation to be retired"
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Re-proves a conflict-proven Remove intent's recorded identity before
+    /// its retirement.
+    ///
+    /// The recorded worker ID and runtime are judged against a fresh journal
+    /// scan and the job the supervisor currently shows under the service ID,
+    /// as [`Self::prove_conflicted_runtime`] does for a live removal.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::prove_conflicted_runtime`], and
+    /// `runtime_identity_mismatch` when the record names no worker.
+    async fn reprove_conflict_removal_intent(
+        &self,
+        id: &SessionId,
+        record: &SessionRecord,
+        generation: &super::Generation,
+        lifecycle: &Lifecycle<'_>,
+    ) -> Result<(), ProtocolError> {
+        let worker_id = record.runtime.worker_id.as_deref();
+        let worker_instance_id = record.runtime.worker_instance_id.as_deref();
+        Box::pin(async {
+            match (worker_id, worker_instance_id) {
+                (Some(worker_id), Some(worker_instance_id)) => {
+                    self.prove_conflicted_runtime(
+                        id,
+                        generation,
+                        worker_id,
+                        Some(worker_instance_id),
+                        lifecycle,
+                    )
+                    .await
+                }
+                // The proof pinned a recorded worker; a record without one can no
+                // longer be proven.
+                _ => Err(ProtocolError::new(
+                    protocol::ErrorClass::Runtime,
+                    IDENTITY_MISMATCH,
+                    format!(
+                        "session {} cannot be removed: its removal intent names no complete worker identity",
+                        id.0
+                    ),
+                    None,
+                )),
+            }
+        })
+        .await
+    }
+
+    /// Shows `record` after a failed removal retirement or identity proof.
+    ///
+    /// Identity conflicts are not retried; everything else waits for a
+    /// re-check that reaches the finalizer again from fresh evidence.
+    async fn settle_failed_removal(
+        &self,
+        record: SessionRecord,
+        error: &ProtocolError,
+        retry: bool,
+    ) -> bool {
+        let (state, reason) = match error.code.as_str() {
+            SUPERVISION_UNAVAILABLE => (RuntimeState::Reconnecting, SUPERVISION_UNAVAILABLE),
+            SUPERVISION_AMBIGUOUS => (RuntimeState::Conflict, SUPERVISION_AMBIGUOUS),
+            _ => {
+                return !self
+                    .insert_unavailable_record(record, RuntimeState::Conflict, IDENTITY_MISMATCH)
+                    .await;
+            }
+        };
+        self.mark_pending(record, state, reason, retry).await;
+        true
     }
 
     /// Reads the journal of exactly `key`'s generation from a fresh scan.
@@ -3693,7 +3789,7 @@ impl SessionRegistry {
             .ok()
             .flatten();
         let lifecycle = self.lifecycle().ok();
-        self.finish_removal_intent(record, generation.as_ref(), lifecycle.as_ref(), retry)
+        Box::pin(self.finish_removal_intent(record, generation.as_ref(), lifecycle.as_ref(), retry))
             .await
     }
 }
