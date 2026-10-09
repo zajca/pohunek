@@ -126,16 +126,20 @@ struct Daemon {
     socket: TestSocket,
     shutdown: oneshot::Sender<()>,
     handle: tokio::task::JoinHandle<()>,
+    /// This daemon process instance's opaque controller id, the value an
+    /// inherited origin pair uses to identify its own daemon.
+    instance_id: String,
 }
 
 impl Daemon {
     async fn start(tag: &str) -> Self {
         let socket = TestSocket::new(tag);
-        let (shutdown, handle) = spawn_server(&socket).await;
+        let (shutdown, handle, daemon_instance_id) = spawn_server(&socket).await;
         Self {
             socket,
             shutdown,
             handle,
+            instance_id: daemon_instance_id,
         }
     }
 
@@ -150,7 +154,7 @@ impl Daemon {
 }
 
 /// Spawns the control server over a registry backed by a real worker binary.
-async fn spawn_server(socket: &Path) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+async fn spawn_server(socket: &Path) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>, String) {
     // Short, because the worker nests its control socket below it.
     let worker_home_dir =
         pohunek_test_support::tempdir_with_prefix("pw-h-").expect("create the worker home");
@@ -178,6 +182,7 @@ async fn spawn_server(socket: &Path) -> (oneshot::Sender<()>, tokio::task::JoinH
         Arc::new(SubprocessWorkerLauncher::new()),
         Arc::new(readable_host::ReadableHost::new()),
     );
+    let daemon_instance_id = registry.daemon_instance_id().to_owned();
     let state_root = socket
         .parent()
         .expect("test socket has an isolated parent")
@@ -225,7 +230,7 @@ async fn spawn_server(socket: &Path) -> (oneshot::Sender<()>, tokio::task::JoinH
             })
             .await;
     });
-    (tx, handle)
+    (tx, handle, daemon_instance_id)
 }
 
 async fn connect(socket: &Path) -> Client {
@@ -266,6 +271,29 @@ fn previous_request(id: &str, method: &str, params: Value) -> Value {
         "id": id,
         "method": method,
         "params": params,
+    })
+}
+
+/// A hand-built request line of the previous protocol version that carries an
+/// inherited origin pair.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "test helper takes the json! literal by value to keep call sites terse"
+)]
+fn previous_origin_request(
+    id: &str,
+    method: &str,
+    params: Value,
+    origin_session: &str,
+    origin_daemon: &str,
+) -> Value {
+    json!({
+        "v": {"minimum": PREVIOUS_VERSION, "maximum": PREVIOUS_VERSION},
+        "id": id,
+        "method": method,
+        "params": params,
+        "origin_session_id": origin_session,
+        "origin_daemon_id": origin_daemon,
     })
 }
 
@@ -401,6 +429,9 @@ async fn previous_version_client_drives_a_worker_backed_session_in_the_previous_
         &previous_request("inspect-1", method::SESSION_INSPECT, json!(live.session_id)),
     )
     .await;
+    // A real protocol 3 SDK correlates a response to its request by id; the
+    // daemon must echo it through the adapter untouched.
+    assert_eq!(inspected["id"], "inspect-1", "{inspected}");
     assert_eq!(
         previous_ok(&inspected)["runtime"]["runtime_id"],
         live.worker_instance_id
@@ -630,6 +661,24 @@ async fn invalid_input_on_a_previous_version_connection_is_answered_in_that_vers
         assert_eq!(reply["err"]["code"], "bad_request", "{line:?}: {reply}");
     }
 
+    // A well-formed envelope advertising a version outside the supported
+    // window is refused at the negotiation boundary; the adapter never runs.
+    for (id, outside) in [
+        ("below-window", PREVIOUS_VERSION - 1),
+        ("above-window", PREVIOUS_VERSION + 3),
+    ] {
+        let line = json!({
+            "v": {"minimum": outside, "maximum": outside},
+            "id": id,
+            "method": method::DAEMON_HEALTH,
+            "params": serde_json::Value::Null,
+        });
+        let reply = exchange(&mut client, &line).await;
+        assert_eq!(reply["v"], PREVIOUS_VERSION, "{line}: {reply}");
+        assert_eq!(reply["id"], id, "{line}: {reply}");
+        assert_eq!(reply["err"]["code"], "version_mismatch", "{line}: {reply}");
+    }
+
     // Before anything is negotiated the daemon's current version is stamped.
     let mut fresh = daemon.connect().await;
     fresh
@@ -638,6 +687,89 @@ async fn invalid_input_on_a_previous_version_connection_is_answered_in_that_vers
         .expect("send invalid input");
     let reply = next_line(&mut fresh).await;
     assert_eq!(reply["v"], PROTOCOL_VERSION.get(), "{reply}");
+    daemon.stop().await;
+}
+
+/// A well-formed protocol 3 request whose handler fails: the daemon's typed
+/// error reaches the protocol 3 client untranslated, stamped and correlated in
+/// the negotiated version. This is the boundary evidence for the
+/// downgrade-response typed-error pass-through: only success payloads are
+/// translated.
+#[tokio::test]
+async fn a_typed_error_on_a_previous_version_connection_is_answered_in_that_version() {
+    let daemon = Daemon::start("window-typed-error").await;
+    let mut client = daemon.connect().await;
+    let health = exchange(
+        &mut client,
+        &previous_request("health-1", method::DAEMON_HEALTH, Value::Null),
+    )
+    .await;
+    assert_eq!(previous_ok(&health)["protocol_version"], PREVIOUS_VERSION);
+
+    let response = exchange(
+        &mut client,
+        &previous_request(
+            "inspect-missing",
+            method::SESSION_INSPECT,
+            json!("ses_missing"),
+        ),
+    )
+    .await;
+    assert_eq!(response["v"], PREVIOUS_VERSION, "{response}");
+    assert_eq!(response["id"], "inspect-missing", "{response}");
+    assert_eq!(response["err"]["code"], "session_not_found", "{response}");
+    assert!(response.get("ok").is_none(), "{response}");
+
+    daemon.stop().await;
+}
+
+/// The origin markers survive the request upgrade path and are acted on: a
+/// protocol 3 request carrying its own session's origin pair is denied by the
+/// same-origin guard, while the same method with a different origin pairing
+/// proceeds — both answered in protocol 3.
+#[tokio::test]
+async fn an_inherited_origin_guards_a_protocol_3_mutation() {
+    let daemon = Daemon::start("window-origin").await;
+    let mut client = daemon.connect().await;
+    let (live, _) = create_previous_session(&mut client, &daemon).await;
+
+    let rename = json!({"session_id": live.session_id, "name": "renamed"});
+    let denied = exchange(
+        &mut client,
+        &previous_origin_request(
+            "origin-same",
+            method::SESSION_RENAME,
+            rename.clone(),
+            &live.session_id,
+            &daemon.instance_id,
+        ),
+    )
+    .await;
+    assert_eq!(denied["v"], PREVIOUS_VERSION, "{denied}");
+    assert_eq!(denied["id"], "origin-same", "{denied}");
+    assert_eq!(
+        denied["err"]["code"], "plugin_self_target_denied",
+        "{denied}"
+    );
+
+    // The same method pairing the markers with a different origin session is
+    // an inherited origin targeting the live session from elsewhere: the guard
+    // lets it through and the rename succeeds.
+    let control = exchange(
+        &mut client,
+        &previous_origin_request(
+            "origin-other",
+            method::SESSION_RENAME,
+            rename,
+            "s-other-origin",
+            &daemon.instance_id,
+        ),
+    )
+    .await;
+    assert_eq!(control["v"], PREVIOUS_VERSION, "{control}");
+    assert_eq!(control["id"], "origin-other", "{control}");
+    assert!(control.get("ok").is_some(), "{control}");
+
     daemon.stop().await;
 }
 
@@ -699,7 +831,7 @@ async fn recorded_previous_release_consumer_requests_are_accepted() {
             }
             let mut client = daemon.connect().await;
             let response = exchange(&mut client, &sent).await;
-            assert_accepted(file, label, &name, &response);
+            assert_accepted(file, label, &name, &sent, &response);
             accepted += 1;
         }
     }
@@ -711,16 +843,18 @@ async fn recorded_previous_release_consumer_requests_are_accepted() {
     for (label, sent) in stops {
         let mut client = daemon.connect().await;
         let response = exchange(&mut client, &sent).await;
-        assert_accepted("stop", &label, method::SESSION_STOP, &response);
+        assert_accepted("stop", &label, method::SESSION_STOP, &sent, &response);
     }
     daemon.stop().await;
 }
 
 /// A recorded request is accepted when it is answered in protocol 3 and is not
-/// refused for its shape; the listed methods must also succeed.
-fn assert_accepted(file: &str, label: &str, name: &str, response: &Value) {
+/// refused for its shape; the listed methods must also succeed. The response
+/// correlates to the request by id, so the envelope adapter keeps it.
+fn assert_accepted(file: &str, label: &str, name: &str, sent: &Value, response: &Value) {
     let context = format!("{file}: {label}: {response}");
     assert_eq!(response["v"], PREVIOUS_VERSION, "{context}");
+    assert_eq!(response["id"], sent["id"], "{context}");
     assert_previous_spelling(response);
     if let Some(error) = response.get("err") {
         let code = error["code"].as_str().expect("error code");
