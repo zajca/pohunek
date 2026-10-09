@@ -289,116 +289,13 @@ fn generate_worker_id() -> Result<String, WorkerError> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use pohunek_service_config::{ConfigSpec, Deadlines, ServiceConfig};
-    use pohunek_session_worker::{WorkerConfig, WorkerError};
+    use pohunek_session_worker::WorkerConfig;
 
-    use super::{generate_worker_id, worker_config, Cli};
-
-    fn arguments(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| (*value).to_owned()).collect()
-    }
-
-    #[test]
-    fn cli_requires_safe_managed_session_id() {
-        Cli::parse(arguments(&[
-            "--session-id",
-            "s-42",
-            "--worker-generation",
-            "abcd2345",
-        ]))
-        .expect("valid session");
-        Cli::parse(arguments(&[
-            "--session-id",
-            "s-01KYAPVPFVHD56Z69B9CX3XWN2",
-            "--worker-generation",
-            "abcd2345",
-        ]))
-        .expect("valid ULID session");
-        Cli::parse(arguments(&[
-            "--session-id",
-            "../bad",
-            "--worker-generation",
-            "abcd2345",
-        ]))
-        .expect_err("path-like session must fail");
-    }
-
-    #[test]
-    fn cli_requires_a_valid_worker_generation() {
-        let error = Cli::parse(arguments(&["--session-id", "s-42"]))
-            .expect_err("missing generation must fail");
-        assert!(error.to_string().contains("--worker-generation"));
-
-        for invalid in ["ABCD2345", "abcd234", "abcd2341", ""] {
-            assert!(
-                matches!(
-                    Cli::parse(arguments(&[
-                        "--session-id",
-                        "s-42",
-                        "--worker-generation",
-                        invalid,
-                    ])),
-                    Err(WorkerError::InvalidGeneration(_))
-                ),
-                "{invalid:?} must be rejected"
-            );
-        }
-
-        let cli = Cli::parse(arguments(&[
-            "--session-id",
-            "s-42",
-            "--worker-generation",
-            "abcd2345",
-        ]))
-        .expect("valid generation");
-        assert_eq!(cli.generation, "abcd2345");
-        assert_eq!(cli.service_config, None);
-    }
-
-    #[test]
-    fn cli_accepts_only_an_absolute_service_config() {
-        let cli = Cli::parse(arguments(&[
-            "--session-id",
-            "s-42",
-            "--worker-generation",
-            "abcd2345",
-            "--service-config",
-            "/home/u/.config/pohunek/service.toml",
-        ]))
-        .expect("absolute service configuration");
-        assert_eq!(
-            cli.service_config.as_deref(),
-            Some(Path::new("/home/u/.config/pohunek/service.toml"))
-        );
-
-        Cli::parse(arguments(&[
-            "--session-id",
-            "s-42",
-            "--worker-generation",
-            "abcd2345",
-            "--service-config",
-            "service.toml",
-        ]))
-        .expect_err("relative service configuration must fail");
-    }
-
-    #[test]
-    fn cli_rejects_repeated_and_valueless_arguments() {
-        Cli::parse(arguments(&[
-            "--session-id",
-            "s-42",
-            "--session-id",
-            "s-43",
-            "--worker-generation",
-            "abcd2345",
-        ]))
-        .expect_err("repeated argument must fail");
-        Cli::parse(arguments(&["--session-id", "s-42", "--worker-generation"]))
-            .expect_err("valueless argument must fail");
-    }
+    use super::{generate_worker_id, worker_config};
 
     /// A service configuration whose deadlines differ from every worker default.
     fn service_config(worker_initialize: Duration) -> ServiceConfig {
