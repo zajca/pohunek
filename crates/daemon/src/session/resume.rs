@@ -325,6 +325,13 @@ impl SessionRegistry {
                         .runtime
                         .as_ref()
                         .and_then(|runtime| runtime.worker_instance_id.clone()),
+                    previous_cleanup_unconfirmed: entry.info.runtime.as_ref().is_some_and(
+                        |runtime| {
+                            runtime.state == protocol::RuntimeState::Lost
+                                && runtime.loss_reason.as_deref()
+                                    == Some(super::supervision::RUNTIME_LOST_CLEANUP_UNCONFIRMED)
+                        },
+                    ),
                     previous_job: entry.job.clone(),
                     previous_runtime_generation: entry
                         .info
@@ -786,6 +793,11 @@ impl SessionRegistry {
                 previous_job: super::Generation::from_record(&id.0, &record.runtime)?,
                 previous_worker_id: record.runtime.worker_id,
                 previous_worker_instance_id: record.runtime.worker_instance_id,
+                previous_cleanup_unconfirmed: record.info.runtime.as_ref().is_some_and(|runtime| {
+                    runtime.state == protocol::RuntimeState::Lost
+                        && runtime.loss_reason.as_deref()
+                            == Some(super::supervision::RUNTIME_LOST_CLEANUP_UNCONFIRMED)
+                }),
                 previous_runtime_generation: record
                     .info
                     .runtime
