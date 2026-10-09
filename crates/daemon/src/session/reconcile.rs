@@ -2291,10 +2291,10 @@ impl SessionRegistry {
     /// descendant that left the worker's process group (launchd kills only
     /// the group) is reaped by nothing but the marker sweep. Every runtime
     /// the record names (`worker_instance_id`) or a journal of `generation` records,
-    /// terminal journals included, is swept ([`Self::sweep_lost_runtime`])
-    /// with the start identity of the worker that journaled it; a runtime no
-    /// journal records is swept without one, which counts every
-    /// unreadable-marker process as possibly its own. Callers sweep only
+    /// terminal journals included, is swept. A journaled runtime is bounded
+    /// by its worker's start identity. A runtime only the record names also
+    /// requires a matching session marker, because its runtime marker alone
+    /// could belong to another session. Callers sweep only
     /// once every worker of the generation is proven gone, so no live
     /// worker is still starting marked processes.
     ///
@@ -2325,7 +2325,8 @@ impl SessionRegistry {
                 None,
             )
         };
-        let mut runtimes: Vec<(String, Option<StartIdentity>)> = Vec::new();
+        // The marker requirement applies only to a runtime no journal names.
+        let mut runtimes: Vec<(String, Option<StartIdentity>, bool)> = Vec::new();
         if let Some(generation) = generation {
             let scan = self
                 .discover_worker_journals()
@@ -2354,30 +2355,34 @@ impl SessionRegistry {
                     .identity()
                     .ok()
                     .map(|identity| identity.start_identity);
-                match runtimes.iter_mut().find(|(known, _)| known == journaled) {
+                match runtimes.iter_mut().find(|(known, _, _)| known == journaled) {
                     // Several workers journaling one runtime cannot tell
                     // which one started it, so none of them bounds it.
-                    Some((_, known_start)) if *known_start != start => *known_start = None,
+                    Some((_, known_start, _)) if *known_start != start => *known_start = None,
                     Some(_) => {}
-                    None => runtimes.push((journaled.to_owned(), start)),
+                    None => runtimes.push((journaled.to_owned(), start, false)),
                 }
             }
         }
         if let Some(worker_instance_id) = worker_instance_id {
             if !runtimes
                 .iter()
-                .any(|(known, _)| known == worker_instance_id)
+                .any(|(known, _, _)| known == worker_instance_id)
             {
-                runtimes.push((worker_instance_id.to_owned(), None));
+                runtimes.push((worker_instance_id.to_owned(), None, true));
             }
         }
         // Each accepted process with the runtime that first listed it. The
         // caller logs them once the removal has completed.
         let mut accepted: Vec<(UnconfirmedProcess, String)> = Vec::new();
-        for (worker_instance_id, start) in runtimes {
-            let outcome = self
-                .sweep_lost_runtime_detailed(&id.0, &worker_instance_id, start)
-                .await;
+        for (worker_instance_id, start, requires_session_marker) in runtimes {
+            let outcome = if requires_session_marker {
+                self.sweep_unjournaled_removed_runtime_detailed(&id.0, &worker_instance_id, None)
+                    .await
+            } else {
+                self.sweep_lost_runtime_detailed(&id.0, &worker_instance_id, start)
+                    .await
+            };
             if outcome.cleanup != Cleanup::Unconfirmed {
                 continue;
             }

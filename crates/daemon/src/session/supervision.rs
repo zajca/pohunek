@@ -491,6 +491,33 @@ impl SessionRegistry {
         worker_instance_id: &str,
         worker_start_identity: Option<StartIdentity>,
     ) -> SweepOutcome {
+        self.sweep_runtime_detailed(session_id, worker_instance_id, worker_start_identity, None)
+            .await
+    }
+
+    /// Sweeps a runtime absent from the journal only when its marker names this session.
+    pub(super) async fn sweep_unjournaled_removed_runtime_detailed(
+        &self,
+        session_id: &str,
+        worker_instance_id: &str,
+        worker_start_identity: Option<StartIdentity>,
+    ) -> SweepOutcome {
+        self.sweep_runtime_detailed(
+            session_id,
+            worker_instance_id,
+            worker_start_identity,
+            Some(session_id),
+        )
+        .await
+    }
+
+    async fn sweep_runtime_detailed(
+        &self,
+        session_id: &str,
+        worker_instance_id: &str,
+        worker_start_identity: Option<StartIdentity>,
+        expected_session_id: Option<&str>,
+    ) -> SweepOutcome {
         let Some(grace) = self
             .inner
             .config
@@ -511,7 +538,13 @@ impl SessionRegistry {
             grace,
             SWEEP_POLL_INTERVAL.min(grace),
         ) {
-            Ok(request) => request.with_worker_start_identity(worker_start_identity),
+            Ok(request) => {
+                let request = request.with_worker_start_identity(worker_start_identity);
+                match expected_session_id {
+                    Some(id) => request.with_session_id(id),
+                    None => request,
+                }
+            }
             Err(error) => {
                 tracing::warn!(session_id, worker_instance_id, error = %error, "lost runtime cannot be swept");
                 return SweepOutcome::blocked_by_other();

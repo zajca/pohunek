@@ -13962,6 +13962,169 @@ async fn record_only_session_in(registry: &SessionRegistry, repo: Option<&PathBu
     session
 }
 
+/// Replaces a terminal session's recorded runtime while retaining its journal.
+///
+/// The store's normal write path rejects this stale metadata, so the fixture
+/// changes the persisted line directly to model an already damaged record.
+async fn record_runtime_for_removal(
+    registry: &SessionRegistry,
+    data_dir: &std::path::Path,
+    id: &SessionId,
+    worker_instance_id: &str,
+) {
+    let store_path = data_dir.join("metadata.jsonl");
+    let mut lines = Vec::new();
+    let mut changed = false;
+    for line in fs::read_to_string(&store_path)
+        .expect("read session store")
+        .lines()
+    {
+        let mut value: serde_json::Value = serde_json::from_str(line).expect("store line");
+        if value["kind"] == "session" && value["session_id"] == id.0 {
+            value["runtime"]["runtime_id"] = worker_instance_id.into();
+            value["info"]["runtime"]["worker_instance_id"] = worker_instance_id.into();
+            changed = true;
+        }
+        lines.push(serde_json::to_string(&value).expect("serialize store line"));
+    }
+    assert!(changed, "the target session has a durable record");
+    fs::write(&store_path, format!("{}\n", lines.join("\n"))).expect("write damaged store");
+
+    let mut sessions = registry.inner.sessions.lock().await;
+    sessions
+        .get_mut(id)
+        .expect("target session remains listed")
+        .info
+        .runtime
+        .as_mut()
+        .expect("runtime metadata")
+        .worker_instance_id = Some(worker_instance_id.to_owned());
+}
+
+/// An independent marked process that the removal sweep can observe.
+struct RemovalMarkedProcess(std::process::Child);
+
+impl RemovalMarkedProcess {
+    async fn spawn(worker_instance_id: &str, session_id: Option<&str>) -> Self {
+        let mut command = pohunek_test_support::process_env::command("/bin/cat");
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .env_remove("POHUNEK_RUNTIME_ID")
+            .env_remove("POHUNEK_SESSION_ID")
+            .env("POHUNEK_WORKER_INSTANCE_ID", worker_instance_id);
+        if let Some(session_id) = session_id {
+            command.env("POHUNEK_SESSION_ID", session_id);
+        }
+        let child = command.spawn().expect("spawn marked process");
+        let pid = child.id();
+        wait_until("removal process markers", || async {
+            pohunek_platform::process::HostInspector::new()
+                .ownership_markers(pid)
+                .ok()
+                .filter(|markers| {
+                    markers.worker_instance_id.as_deref() == Some(worker_instance_id)
+                        && markers.session_id.as_deref() == session_id
+                })
+        })
+        .await;
+        Self(child)
+    }
+
+    fn alive(&mut self) -> bool {
+        self.0.try_wait().expect("inspect marked process").is_none()
+    }
+}
+
+impl Drop for RemovalMarkedProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[tokio::test]
+async fn removal_keeps_a_foreign_session_process_named_by_a_damaged_record() {
+    let (registry, data_dir, _worktree_root) = retention_registry("remove-foreign-record");
+    let target = exited_session(&registry, None).await;
+    let foreign = exited_session(&registry, None).await;
+    let foreign_runtime = foreign
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.worker_instance_id.as_deref())
+        .expect("foreign runtime ID");
+    let mut process = RemovalMarkedProcess::spawn(foreign_runtime, Some(&foreign.id.0)).await;
+    record_runtime_for_removal(&registry, &data_dir, &target.id, foreign_runtime).await;
+
+    registry
+        .remove(&target.id)
+        .await
+        .expect("remove only the target session");
+    assert!(
+        process.alive(),
+        "removal must not signal the foreign runtime"
+    );
+    assert!(
+        registry.inspect(&foreign.id).await.is_ok(),
+        "the foreign logical session remains listed"
+    );
+    registry
+        .remove(&foreign.id)
+        .await
+        .expect("foreign owner can remove its own runtime");
+    assert!(!process.alive(), "the owning removal reaps its runtime");
+}
+
+#[tokio::test]
+async fn removal_sweeps_a_restarted_runtime_but_refuses_an_unverified_marker() {
+    let (registry, data_dir, _worktree_root) = retention_registry("remove-restarted-record");
+    let target = exited_session(&registry, None).await;
+    let restarted_runtime = format!("restarted-{}", target.id.0);
+    record_runtime_for_removal(&registry, &data_dir, &target.id, &restarted_runtime).await;
+    let mut unverified = RemovalMarkedProcess::spawn(&restarted_runtime, None).await;
+
+    let refusal = registry
+        .remove(&target.id)
+        .await
+        .expect_err("runtime marker alone does not prove session ownership");
+    assert_eq!(
+        refusal.code,
+        crate::runtime::lifecycle::SUPERVISION_AMBIGUOUS,
+        "{refusal:?}"
+    );
+    assert!(unverified.alive(), "an unverified process is not signalled");
+    registry
+        .inspect(&target.id)
+        .await
+        .expect("target remains listed after refusal");
+    let pending = crate::store::Store::new(data_dir.join("metadata.jsonl"))
+        .load_sessions()
+        .expect("read removal intent")
+        .into_iter()
+        .find(|record| record.session_id == target.id.0)
+        .expect("the removal intent remains durable");
+    assert_eq!(pending.desired_state, crate::store::DesiredState::Removed);
+    assert!(pending.transaction.is_some(), "removal stays retryable");
+    let consent = registry
+        .remove_with(&target.id, super::UnconfirmedCleanup::Accept)
+        .await
+        .expect_err("unreadable-process consent does not prove a session marker");
+    assert_eq!(
+        consent.code,
+        crate::runtime::lifecycle::SUPERVISION_AMBIGUOUS,
+        "{consent:?}"
+    );
+    assert!(unverified.alive(), "consent must not signal the process");
+    drop(unverified);
+
+    let mut own = RemovalMarkedProcess::spawn(&restarted_runtime, Some(&target.id.0)).await;
+    registry
+        .remove(&target.id)
+        .await
+        .expect("the restarted runtime carries the target session marker");
+    assert!(!own.alive(), "removal sweeps the restarted runtime");
+}
+
 /// Pins the removal of a runtime that only the record names (no worker
 /// journal, so no worker start bounds its sweep): an unreadable same-user
 /// process may carry its marker, so the removal stays refused, names the

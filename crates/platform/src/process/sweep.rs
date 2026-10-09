@@ -35,6 +35,7 @@ pub const MAX_SWEEP_GRACE: Duration = Duration::from_mins(10);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweepRequest {
     worker_instance_id: String,
+    session_id: Option<String>,
     owner_uid: u32,
     grace: Duration,
     poll: Duration,
@@ -75,6 +76,7 @@ impl SweepRequest {
         }
         Ok(Self {
             worker_instance_id,
+            session_id: None,
             owner_uid,
             grace,
             poll,
@@ -95,6 +97,16 @@ impl SweepRequest {
         worker_start_identity: Option<StartIdentity>,
     ) -> Self {
         self.worker_start_identity = worker_start_identity;
+        self
+    }
+
+    /// Requires a matching session marker before signalling a runtime process.
+    ///
+    /// A runtime marker with no session marker remains unconfirmed. This
+    /// protects removal when a stored runtime ID lacks journal evidence.
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
         self
     }
 
@@ -155,6 +167,8 @@ pub enum SkipReason {
     /// `POHUNEK_WORKER_INSTANCE_ID` and `POHUNEK_RUNTIME_ID` carry different
     /// values, so the process cannot be proven to belong to the runtime or not.
     MarkersConflicting,
+    /// The target runtime marker has no matching session marker.
+    SessionUnverified,
     /// The sweep aborted before signalling the selected process.
     Aborted,
 }
@@ -461,6 +475,13 @@ fn classify(
         | WorkerInstanceMarker::Absent
         | WorkerInstanceMarker::Instance(_) => {
             return Ok(Selection::Foreign);
+        }
+    }
+    if let Some(session_id) = request.session_id.as_deref() {
+        match markers.session_id.as_deref() {
+            Some(marked) if marked == session_id => {}
+            Some(_) => return Ok(Selection::Foreign),
+            None => return Ok(Selection::Skip(SkipReason::SessionUnverified)),
         }
     }
     Ok(match verify(inspector, identity)? {
