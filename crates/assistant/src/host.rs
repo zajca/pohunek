@@ -50,10 +50,14 @@ impl Default for ConnectionOptions {
 
 impl ConnectionOptions {
     fn client(self) -> ClientOptions {
-        ClientOptions::default()
+        let options = ClientOptions::default()
             .with_connect_timeout(self.connect_timeout)
-            .with_request_timeout(self.request_timeout)
-            .with_origin_source(self.origin_source)
+            .with_origin_source(self.origin_source);
+        if self.request_timeout == DEFAULT_REQUEST_TIMEOUT {
+            options
+        } else {
+            options.with_request_timeout(self.request_timeout)
+        }
     }
 }
 

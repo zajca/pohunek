@@ -38,6 +38,12 @@ impl ScreenTracker {
         self.parser.process(bytes);
     }
 
+    /// Whether the parsed terminal has bracketed paste enabled.
+    #[must_use]
+    pub fn bracketed_paste(&self) -> bool {
+        self.parser.screen().bracketed_paste()
+    }
+
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.parser.screen_mut().set_size(rows, cols);
     }

@@ -192,11 +192,7 @@ pub struct Detector {
     latest_cwd_hint: Option<String>,
     process_activity: ProcessActivityScanner,
     needs_visible_recheck: bool,
-    input_reader_prefix: usize,
-    input_reader_enabled: bool,
 }
-
-const BRACKETED_PASTE_MODE: &[u8] = b"\x1b[?2004";
 
 impl Detector {
     #[must_use]
@@ -211,26 +207,10 @@ impl Detector {
             latest_cwd_hint: None,
             process_activity: ProcessActivityScanner::default(),
             needs_visible_recheck: false,
-            input_reader_prefix: 0,
-            input_reader_enabled: false,
         }
     }
 
     pub fn feed(&mut self, now: Instant, bytes: &[u8]) -> Vec<ActivityTransition> {
-        for byte in bytes {
-            if self.input_reader_prefix == BRACKETED_PASTE_MODE.len() {
-                if *byte == b'h' {
-                    self.input_reader_enabled = true;
-                } else if *byte == b'l' {
-                    self.input_reader_enabled = false;
-                }
-                self.input_reader_prefix = usize::from(*byte == BRACKETED_PASTE_MODE[0]);
-            } else if *byte == BRACKETED_PASTE_MODE[self.input_reader_prefix] {
-                self.input_reader_prefix += 1;
-            } else {
-                self.input_reader_prefix = usize::from(*byte == BRACKETED_PASTE_MODE[0]);
-            }
-        }
         let has_process_activity = self.process_activity.observe(bytes);
         let recent_before = self.screen.recent_text();
         let osc_items = self.osc.advance(bytes);
@@ -281,7 +261,7 @@ impl Detector {
     /// Whether terminal output identifies an editable agent input reader.
     #[must_use]
     pub fn input_ready(&self) -> bool {
-        self.input_reader_enabled
+        self.screen.bracketed_paste()
             || self
                 .manifest_evidence(ContextFreshness::all())
                 .is_some_and(|evidence| {
@@ -318,8 +298,6 @@ impl Detector {
         self.latest_progress = None;
         self.latest_cwd_hint = None;
         self.screen.reset();
-        self.input_reader_prefix = 0;
-        self.input_reader_enabled = false;
         self.needs_visible_recheck = false;
     }
 
@@ -846,6 +824,28 @@ mod tests {
         detector.resync_after_lag();
 
         assert_eq!(detector.take_cwd_hint(), None);
+    }
+
+    #[test]
+    fn input_readiness_tracks_combined_and_fragmented_bracketed_paste_modes() {
+        let started_at = instant();
+        let mut detector = Detector::new(3, 80, started_at, config());
+        assert!(!detector.input_ready());
+
+        detector.feed(started_at, b"\x1b[?1;20");
+        assert!(!detector.input_ready());
+        detector.feed(started_at, b"04h");
+        assert!(detector.input_ready());
+
+        detector.feed(started_at, b"\x1b[?1;2004");
+        assert!(detector.input_ready());
+        detector.feed(started_at, b"l");
+        assert!(!detector.input_ready());
+
+        detector.feed(started_at, b"\x1b[?2004h");
+        assert!(detector.input_ready());
+        detector.resync_after_lag();
+        assert!(!detector.input_ready());
     }
 
     #[test]

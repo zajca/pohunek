@@ -2412,6 +2412,96 @@ async fn session_new_initial_input_waits_for_silent_reader() {
     initial_input_waits_for_reader(false).await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn default_sdk_client_waits_for_initial_input_without_reader_signal() {
+    let socket = temp_socket("initial-input-default-client");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let received = socket.dir.join("received.bin");
+    let fake = agents_dir.join("silent-reader.py");
+    write_executable(
+        &fake,
+        &format!(
+            r#"#!/usr/bin/python3
+import os
+import tty
+
+tty.setraw(0)
+body = bytearray()
+while len(body) < len(b"hello reader\r"):
+    body.extend(os.read(0, len(b"hello reader\r") - len(body)))
+with open({received:?}, "wb") as capture:
+    capture.write(body)
+while True:
+    os.read(0, 1)
+"#,
+            received = received.display().to_string(),
+        ),
+    );
+    std::fs::write(
+        agents_dir.join("silentreader.toml"),
+        format!(
+            "base = \"claude\"\nprogram = {}\n",
+            toml::Value::String(fake.display().to_string())
+        ),
+    )
+    .expect("write silent reader profile");
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let mut client = pohunek_client::Client::connect_local(&socket.path)
+        .await
+        .expect("connect default SDK client");
+    let mut params = session_params(&socket);
+    params.agent = "silentreader".to_owned();
+    params.input = Some("hello reader".to_owned());
+
+    let created = client
+        .call::<protocol::method::SessionNew>(params)
+        .await
+        .expect("default client waits through reader grace");
+    assert_eq!(created.applied_input, Some(true));
+    wait_until("silent reader received the initial input", || async {
+        received.exists().then_some(())
+    })
+    .await;
+    assert_eq!(
+        std::fs::read(&received).expect("captured input"),
+        b"hello reader\r"
+    );
+
+    let mut observer = connect(&socket).await;
+    let list = Request::make(
+        "default-client-session-list",
+        method::SESSION_LIST,
+        Value::Null,
+    );
+    let sessions: Vec<SessionInfo> =
+        serde_json::from_value(ok_payload(exchange(&mut observer, &list).await))
+            .expect("list sessions");
+    assert_eq!(
+        sessions
+            .iter()
+            .filter(|session| session.agent == "silentreader")
+            .count(),
+        1,
+        "a request timeout must not leave a detached session for a retry"
+    );
+    let stop = Request::make(
+        "stop-silent-reader",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.session.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut observer, &stop).await))
+            .expect("stop result");
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
 #[tokio::test]
 async fn codex_stub_session_publishes_blocked_and_receives_bracketed_input() {
     let bin_dir = temp_dir("codex-stub-bin");
