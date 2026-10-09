@@ -74,13 +74,27 @@ pub async fn gate(
     accept_runtime_loss: bool,
 ) -> Result<Gated, Error> {
     let daemon = daemon_dir.join(DAEMON_EXECUTABLE_NAME);
-    match std::fs::metadata(&daemon) {
-        Ok(metadata) if metadata.is_file() => {}
-        _ => return Err(Error::StagedBinary { path: daemon }),
-    }
-    layout::probe(&daemon, DAEMON_EXECUTABLE_NAME, version).await?;
+    probe_daemon(&daemon, version).await?;
     let report = preflight.judge(context, &daemon).await?;
     decide(report, accept_runtime_loss)
+}
+
+/// Verifies the daemon binary before using it as compatibility evidence.
+///
+/// # Errors
+///
+/// Returns the staged-binary or version-probe failure.
+pub(super) async fn probe_daemon(daemon: &Path, version: &str) -> Result<(), Error> {
+    match std::fs::metadata(daemon) {
+        Ok(metadata) if metadata.is_file() => {}
+        _ => {
+            return Err(Error::StagedBinary {
+                path: daemon.to_path_buf(),
+            })
+        }
+    }
+    layout::probe(daemon, DAEMON_EXECUTABLE_NAME, version).await?;
+    Ok(())
 }
 
 /// Applies the operator's choice to `report`.

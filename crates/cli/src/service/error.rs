@@ -349,6 +349,24 @@ pub enum Error {
         last: Option<String>,
     },
 
+    /// The supervised daemon job serves a version the command may not use.
+    ///
+    /// A removal reaches only the daemon a pending transaction or the
+    /// configuration proves belongs to it; anything else running the job —
+    /// for example another installation's daemon swapped in — must not be
+    /// stopped or asked for its sessions here. The refusal happens before
+    /// any session mutation.
+    #[error(
+        "the supervised daemon job reports version {served}; only {} is accepted here",
+        accepted.join(" or ")
+    )]
+    SupervisedVersion {
+        /// The version the serving process reports.
+        served: String,
+        /// The versions the command proves belong to this installation.
+        accepted: Vec<String>,
+    },
+
     /// A control request to the local daemon failed.
     #[error("daemon request `{operation}` failed: {source}")]
     Control {
@@ -402,7 +420,7 @@ pub enum Error {
 
     /// The new daemon would not adopt, or would adopt without native
     /// recovery, live sessions of the running daemon.
-    #[error("{}", at_risk_summary(sessions))]
+    #[error("{}", at_risk_summary("upgrade", sessions))]
     UpgradeAtRisk {
         /// The sessions the preflight judged at risk, ordered by id.
         sessions: Vec<SessionVerdict>,
@@ -428,6 +446,37 @@ pub enum Error {
         /// The daemon executable that was asked.
         binary: PathBuf,
         /// Why no report came back.
+        detail: String,
+    },
+
+    /// The previous daemon cannot safely read the store after an upgrade.
+    #[error("rollback to {version} refused: metadata store {} is unreadable ({code}): {detail}", path.display())]
+    RollbackStoreUnusable {
+        /// Version that would be restored.
+        version: String,
+        /// The store file.
+        path: PathBuf,
+        /// Stable reason code.
+        code: String,
+        /// Reason the previous reader cannot use the store.
+        detail: String,
+    },
+
+    /// The previous daemon may lose live runtime or recovery on rollback.
+    #[error("{}", at_risk_summary(&format!("rollback to {version}"), sessions))]
+    RollbackAtRisk {
+        /// Version that would be restored.
+        version: String,
+        /// Sessions requiring explicit acceptance.
+        sessions: Vec<SessionVerdict>,
+    },
+
+    /// The previous daemon gave no trustworthy rollback verdict.
+    #[error("rollback to {version} refused: previous daemon preflight failed: {detail}")]
+    RollbackPreflightFailed {
+        /// Version that would be restored.
+        version: String,
+        /// The failed preflight.
         detail: String,
     },
 
@@ -525,6 +574,7 @@ impl Error {
             Self::VerifierMissing => "service_verifier_missing",
             Self::UnitVerification { .. } => "service_unit_invalid",
             Self::DaemonNotReady { .. } => "service_daemon_not_ready",
+            Self::SupervisedVersion { .. } => "service_daemon_version_unexpected",
             Self::Control { .. } => "service_daemon_request_failed",
             Self::LiveSessions { .. } => "service_live_sessions",
             Self::StopTimeout { .. } => "service_stop_timeout",
@@ -533,6 +583,9 @@ impl Error {
             Self::UpgradeAtRisk { .. } => "service_upgrade_sessions_at_risk",
             Self::UpgradeStoreUnusable { .. } => "service_upgrade_store_unusable",
             Self::UpgradePreflightFailed { .. } => "service_upgrade_preflight_failed",
+            Self::RollbackStoreUnusable { .. } => "service_rollback_store_unusable",
+            Self::RollbackAtRisk { .. } => "service_rollback_sessions_at_risk",
+            Self::RollbackPreflightFailed { .. } => "service_rollback_preflight_failed",
             Self::OrphanWorkers { .. } => "service_orphan_workers",
             Self::Record { .. } => "service_record_invalid",
             Self::TransactionInProgress { .. } => "service_transaction_in_progress",
@@ -582,6 +635,15 @@ impl Error {
             Self::UpgradePreflightFailed { .. } => Some(
                 "run `<staged>/pohunekd upgrade-preflight` by hand with the same XDG environment to see its error, then retry",
             ),
+            Self::RollbackStoreUnusable { .. } => Some(
+                "--accept-runtime-loss cannot make the previous daemon read this store; restore its .pre-schema-<n> backup or keep the newer release installed",
+            ),
+            Self::RollbackAtRisk { .. } => Some(
+                "end the listed sessions, or rerun the upgrade with --accept-runtime-loss to accept their loss during rollback",
+            ),
+            Self::RollbackPreflightFailed { .. } => Some(
+                "keep the transaction and restore the previous daemon only after its store and runtime compatibility can be proven",
+            ),
             Self::VerifierMissing => Some("install systemd's `systemd-analyze` and retry"),
             Self::Config(pohunek_service_config::ConfigError::NamespaceMismatch { .. }) => Some(
                 "run the command as the user and with the XDG_STATE_HOME and XDG_RUNTIME_DIR the installation was made with",
@@ -613,6 +675,9 @@ impl Error {
             Self::DaemonNotReady { .. } => {
                 Some("inspect the daemon logs, then rerun the command to resume or roll back")
             }
+            Self::SupervisedVersion { .. } => Some(
+                "inspect which daemon the service job now runs (for example through `systemctl cat` or `launchctl print`), and decide through which pohunek installation's commands it should be stopped or replaced before this command continues",
+            ),
             Self::RollbackFailed { .. } => {
                 Some("rerun the same command; the transaction record resumes the rollback")
             }
@@ -631,9 +696,9 @@ impl Error {
 }
 
 /// The refusal text: one line per session with its verdict, code and evidence.
-fn at_risk_summary(sessions: &[SessionVerdict]) -> String {
+fn at_risk_summary(action: &str, sessions: &[SessionVerdict]) -> String {
     let mut text = format!(
-        "upgrade refused: {} live session(s) would not survive the new daemon intact",
+        "{action} refused: {} live session(s) have unverified runtime or recovery",
         sessions.len()
     );
     for session in sessions {

@@ -107,12 +107,16 @@
 //! rerun of `uninstall` still finds the installation and finishes the
 //! cleanup.
 //!
-//! A pending install that already reached the registration step takes this
-//! same flow instead of a rollback: its daemon may already run it with live
-//! workers, and only the session-checked removal above may stop them. Such a
-//! record found without `service.toml` describes its installation through
+//! A pending install or upgrade that already reached the registration step
+//! takes this same flow instead of a rollback: its daemon may already run it
+//! with live workers, and only the session-checked removal above may stop
+//! them. For an upgrade this also means the previous daemon is never
+//! restored: its reader may already be incompatible with the migrated store
+//! (or with the live workers), and only the removal itself, blessed by
+//! `--stop-sessions`, decides what happens to the runtimes. Such a record
+//! found without `service.toml` describes its installation through
 //! its version and prefix, and the uninstall runs the same flow with the
-//! configuration the install wrote.
+//! configuration the transaction wrote.
 //!
 //! Worker journals an older pohunek wrote under an earlier schema block the
 //! uninstall while their worker may still run. The daemon of this version
@@ -146,6 +150,7 @@ use super::report::{
     state_name, InstallReport, JobReport, KeptVersion, PendingReport, SearchPathReport,
     StatusReport, UninstallReport, UpgradeReport, VersionReport, WorkerReport,
 };
+use super::rollback;
 use super::settings;
 use super::usage::{Journals, Usage};
 #[cfg(target_os = "linux")]
@@ -349,6 +354,19 @@ impl<'a> Engine<'a> {
         version
     }
 
+    /// Returns whether `daemon_version` is a version `serving` accepts.
+    ///
+    /// Every comparison runs through [`Engine::reported`], so a reported
+    /// build name judges the same for the expectation and for the daemon.
+    fn serving_matches(&self, daemon_version: &str, serving: &Serving<'_>) -> bool {
+        match serving {
+            Serving::Strict(version) => daemon_version == self.reported(version),
+            Serving::Allowed(allowed) => allowed
+                .iter()
+                .any(|version| daemon_version == self.reported(version)),
+        }
+    }
+
     /// Installs `version` from the binaries in `from` below `prefix`.
     ///
     /// # Errors
@@ -382,15 +400,7 @@ impl<'a> Engine<'a> {
             self.ensure_not_installed(&config_path).await?;
         }
         let discovered = discover_for_plan(self.context, &plan)?;
-        let (resume, rolled_back) = match plan {
-            Plan::Fresh => (None, None),
-            Plan::Resume(record) => (Some(record), None),
-            Plan::RollBack(record) => {
-                let report = pending_report(&record);
-                self.rollback_pending(&record).await?;
-                (None, Some(report))
-            }
-        };
+        let (resume, rolled_back) = self.resolve_plan(plan).await?;
         // The rollback removed the foreign transaction's files; what is left
         // must not be an installation.
         if rolled_back.is_some() {
@@ -487,6 +497,25 @@ impl<'a> Engine<'a> {
         ensure_no_daemon_job(self.backend).await
     }
 
+    /// Applies a pending transaction decision and reports its rollback.
+    async fn resolve_plan(
+        &self,
+        plan: Plan,
+    ) -> Result<(Option<Record>, Option<PendingReport>), Error> {
+        match plan {
+            Plan::Fresh => Ok((None, None)),
+            Plan::Resume(record) => Ok((Some(record), None)),
+            Plan::RollBack(record) => {
+                let mut report = pending_report(&record);
+                if let Some(gated) = self.rollback_pending(&record).await? {
+                    report.accepted_runtime_loss = gated.accepted;
+                    report.preflight = Some(gated.report);
+                }
+                Ok((None, Some(report)))
+            }
+        }
+    }
+
     /// Upgrades the installation to `version` from the binaries in `from`.
     ///
     /// # Errors
@@ -505,15 +534,7 @@ impl<'a> Engine<'a> {
         let config_path = self.context.config_path();
         let plan = upgrade_plan(self.store.load()?, version)?;
         let gated = self.adoption_gate(&plan, from, version).await?;
-        let (resume, rolled_back) = match plan {
-            Plan::Fresh => (None, None),
-            Plan::Resume(record) => (Some(record), None),
-            Plan::RollBack(record) => {
-                let report = pending_report(&record);
-                self.rollback_pending(&record).await?;
-                (None, Some(report))
-            }
-        };
+        let (resume, rolled_back) = self.resolve_plan(plan).await?;
         let config = load_config(&config_path)?.ok_or(Error::NotInstalled {
             path: config_path.clone(),
         })?;
@@ -537,12 +558,16 @@ impl<'a> Engine<'a> {
                 to_version: version.to_owned(),
                 unchanged: true,
                 resumed: false,
-                rolled_back,
                 removed_versions,
                 kept_versions,
                 gc_error,
-                preflight: None,
-                accepted_runtime_loss: false,
+                preflight: rolled_back
+                    .as_ref()
+                    .and_then(|report| report.preflight.clone()),
+                accepted_runtime_loss: rolled_back
+                    .as_ref()
+                    .is_some_and(|report| report.accepted_runtime_loss),
+                rolled_back,
             });
         }
         let mut record = if let Some(record) = resume {
@@ -585,12 +610,19 @@ impl<'a> Engine<'a> {
             to_version: version.to_owned(),
             unchanged: false,
             resumed,
-            rolled_back,
             removed_versions,
             kept_versions,
             gc_error,
-            accepted_runtime_loss: gated.as_ref().is_some_and(|gated| gated.accepted),
-            preflight: gated.map(|Gated { report, .. }| report),
+            accepted_runtime_loss: gated.as_ref().is_some_and(|gated| gated.accepted)
+                || rolled_back
+                    .as_ref()
+                    .is_some_and(|report| report.accepted_runtime_loss),
+            preflight: gated.map(|Gated { report, .. }| report).or_else(|| {
+                rolled_back
+                    .as_ref()
+                    .and_then(|report| report.preflight.clone())
+            }),
+            rolled_back,
         })
     }
 
@@ -645,21 +677,35 @@ impl<'a> Engine<'a> {
         let mut registered = None;
         if let Some(pending) = self.store.load()? {
             // A transaction that may already have registered its daemon
-            // cannot be rolled back here: the daemon may run it with live
-            // workers, and removing both is the session-checked decision of
-            // the uninstall below, which also consumes the record together
-            // with the installation.
-            if pending.operation == Operation::Install && pending.step >= Step::Registering {
+            // cannot be rolled back here, whichever operation it is: at or
+            // after `registering` the previous daemon may be gone and the
+            // new one may own live workers, and the rollback instead would
+            // restore the previous daemon behind its compatibility gate. An
+            // upgrade whose previous reader the gate refuses — because the
+            // new daemon migrated the store or a worker changed meanwhile —
+            // would block even `--stop-sessions --purge` there, while
+            // uninstall exposes no runtime-loss acceptance; so the record is
+            // consumed by the session-checked removal below together with
+            // the installation, without restoring anything.
+            if pending.step >= Step::Registering {
                 registered = Some(pending);
             } else if options.purge && pending.operation == Operation::Install {
                 // The rollback removes `service.toml`, so only the record lets
                 // a rerun after a failed purge find this installation; it is
                 // cleared once the purge below finished.
-                report.rolled_back = Some(pending_report(&pending));
-                self.rollback(&pending).await?;
+                let mut rolled_back = pending_report(&pending);
+                if let Some(gated) = self.rollback(&pending).await? {
+                    rolled_back.accepted_runtime_loss = gated.accepted;
+                    rolled_back.preflight = Some(gated.report);
+                }
+                report.rolled_back = Some(rolled_back);
             } else {
-                report.rolled_back = Some(pending_report(&pending));
-                self.rollback_pending(&pending).await?;
+                let mut rolled_back = pending_report(&pending);
+                if let Some(gated) = self.rollback_pending(&pending).await? {
+                    rolled_back.accepted_runtime_loss = gated.accepted;
+                    rolled_back.preflight = Some(gated.report);
+                }
+                report.rolled_back = Some(rolled_back);
             }
         }
         let config_path = self.context.config_path();
@@ -690,9 +736,22 @@ impl<'a> Engine<'a> {
         layout::claim_existing_prefix(&layout, &config.namespace())?;
         let definition = daemon_definition(self.context, &config)?;
 
-        let reachable = self
-            .ensure_daemon(&definition, config.active_version(), &mut report)
-            .await;
+        let reachable = match self
+            .ensure_daemon(
+                &definition,
+                config.active_version(),
+                &allowed_removal_versions(config.active_version(), registered.as_ref()),
+                &mut report,
+            )
+            .await
+        {
+            // A supervised version outside the removal's set is a proven
+            // property of the job, not an unreachable daemon: it refuses the
+            // uninstall before any destructive call, whatever the sessions
+            // and workers then report — even with none live.
+            Err(error @ Error::SupervisedVersion { .. }) => return Err(error),
+            reachable => reachable,
+        };
         let sessions = match &reachable {
             Ok(()) => self
                 .backend
@@ -703,6 +762,9 @@ impl<'a> Engine<'a> {
                     operation: "session.list",
                     source,
                 })?,
+            // An unreachable daemon proves no session of this installation
+            // can be listed or stopped; without live sessions or workers the
+            // removal below reaches the job (or its absence) directly.
             Err(_unreachable) => Vec::new(),
         };
         let (live, workers) = self.blocking(&sessions).await?;
@@ -933,7 +995,7 @@ impl<'a> Engine<'a> {
             return Err(error);
         }
         match self.rollback(record).await {
-            Ok(()) => {
+            Ok(_gated) => {
                 self.store.clear()?;
                 Err(error)
             }
@@ -945,9 +1007,10 @@ impl<'a> Engine<'a> {
     }
 
     /// Rolls back an interrupted transaction found at startup.
-    async fn rollback_pending(&self, record: &Record) -> Result<(), Error> {
-        self.rollback(record).await?;
-        self.store.clear()
+    async fn rollback_pending(&self, record: &Record) -> Result<Option<Gated>, Error> {
+        let gated = self.rollback(record).await?;
+        self.store.clear()?;
+        Ok(gated)
     }
 
     /// Undoes every effect `record`'s transaction may have had.
@@ -965,9 +1028,10 @@ impl<'a> Engine<'a> {
     /// session check; `settle`, `install`, `upgrade`, and `uninstall` all
     /// route those records elsewhere, so reaching this is a broken invariant
     /// that must fail loudly rather than stop sessions.
-    async fn rollback(&self, record: &Record) -> Result<(), Error> {
+    async fn rollback(&self, record: &Record) -> Result<Option<Gated>, Error> {
         let layout = install_layout(&record.prefix)?;
         let config_path = self.context.config_path();
+        let mut gated = None;
         match record.operation {
             Operation::Install => {
                 if record.step >= Step::Registering {
@@ -994,7 +1058,21 @@ impl<'a> Engine<'a> {
                         path: self.store.path(),
                         detail: "an upgrade record names no previous version".to_owned(),
                     })?;
+                if record.step >= Step::Registering {
+                    gated = Some(self.rollback_gate(&layout, previous).await?);
+                }
                 self.mark_rolling_back(record)?;
+                if record.step >= Step::Registering {
+                    // Stopping the new daemon closes the store-write race.
+                    // A refused second judgment leaves the transaction and
+                    // the daemon stopped, without starting an unsafe reader.
+                    self.backend
+                        .daemon()
+                        .uninstall()
+                        .await
+                        .map_err(|source| supervisor_error("stop daemon for rollback", source))?;
+                    gated = Some(self.rollback_gate(&layout, previous).await?);
+                }
                 let current = load_config(&config_path)?.ok_or(Error::NotInstalled {
                     path: config_path.clone(),
                 })?;
@@ -1004,7 +1082,7 @@ impl<'a> Engine<'a> {
                     let definition = daemon_definition(self.context, &restored)?;
                     self.backend
                         .daemon()
-                        .replace(&definition)
+                        .install(&definition)
                         .await
                         .map_err(|source| supervisor_error("restore daemon", source))?;
                     self.wait_ready(previous).await?;
@@ -1015,7 +1093,7 @@ impl<'a> Engine<'a> {
         layout::claim_existing_prefix(&layout, &namespace)?;
         let install = record.operation == Operation::Install;
         if record.version_dir_preexisted && !install {
-            return Ok(());
+            return Ok(gated);
         }
         let usage = self.usage(&layout).await?;
         if !record.version_dir_preexisted && usage.keep_reason(&record.version, None).is_none() {
@@ -1031,7 +1109,32 @@ impl<'a> Engine<'a> {
         {
             layout::release_prefix(&layout, &namespace)?;
         }
-        Ok(())
+        Ok(gated)
+    }
+
+    /// Judges a rollback using the previous version's daemon reader.
+    async fn rollback_gate(&self, layout: &InstallLayout, previous: &str) -> Result<Gated, Error> {
+        let daemon_dir =
+            layout
+                .version_dir(previous)
+                .ok_or_else(|| Error::RollbackPreflightFailed {
+                    version: previous.to_owned(),
+                    detail: "previous version has no valid installation directory".to_owned(),
+                })?;
+        rollback::gate(
+            rollback::Inputs {
+                preflight: &*self.preflight,
+                context: self.context,
+                backend: Some(self.backend),
+                layout,
+                inspector: &*self.inspector,
+            },
+            &daemon_dir,
+            previous,
+            self.reported(previous),
+            self.accept_runtime_loss,
+        )
+        .await
     }
 
     /// Journals that `record`'s rollback has begun.
@@ -1128,19 +1231,42 @@ impl<'a> Engine<'a> {
     /// such as a manually started daemon, can hold the socket while the
     /// supervised job crash-loops, and must never make a transaction ready.
     async fn wait_ready(&self, version: &str) -> Result<(), Error> {
+        self.wait_served(&Serving::Strict(version), version).await
+    }
+
+    /// Waits until the supervised daemon answers `daemon.health`.
+    ///
+    /// [`Serving::Strict`] compares the answer against [`Engine::reported`]
+    /// of that one version; [`Serving::Allowed`] accepts any version in the
+    /// set, applied through [`Engine::reported`] as well. The answer counts
+    /// only when the process serving the socket is the daemon job's running
+    /// main process, and a job that serves a version outside its expectation
+    /// is refused immediately instead of being waited for.
+    async fn wait_served(&self, serving: &Serving<'_>, version: &str) -> Result<(), Error> {
         let deadline = Instant::now() + self.ready_timeout;
         loop {
             let mut last = match self.backend.control().health().await {
-                Ok(health) if health.result.daemon_version == self.reported(version) => {
+                Ok(health) if self.serving_matches(&health.result.daemon_version, serving) => {
                     match self.served_by_job(health.pid).await {
                         Ok(()) => return Ok(()),
                         Err(mismatch) => Some(mismatch),
                     }
                 }
-                Ok(health) => Some(format!(
-                    "daemon reports version {}",
-                    health.result.daemon_version
-                )),
+                Ok(health) => match serving {
+                    Serving::Strict(_) => Some(format!(
+                        "daemon reports version {}",
+                        health.result.daemon_version
+                    )),
+                    Serving::Allowed(allowed) => match self.served_by_job(health.pid).await {
+                        Ok(()) => {
+                            return Err(Error::SupervisedVersion {
+                                served: health.result.daemon_version.clone(),
+                                accepted: allowed.to_vec(),
+                            });
+                        }
+                        Err(mismatch) => Some(mismatch),
+                    },
+                },
                 Err(error) => Some(error.to_string()),
             };
             if Instant::now() >= deadline {
@@ -1189,21 +1315,29 @@ impl<'a> Engine<'a> {
     }
 
     /// Starts an installed daemon that is not running, then waits for it.
+    ///
+    /// A daemon that already runs is left alone and answered by the version
+    /// it actually serves, which a removal may reach only within `allowed`
+    /// ([`allowed_removal_versions`]; see [`Error::SupervisedVersion`]).
+    /// A daemon started here is the configured one and must report `version`
+    /// exactly.
     async fn ensure_daemon(
         &self,
         definition: &JobDefinition,
         version: &str,
+        allowed: &[String],
         report: &mut UninstallReport,
     ) -> Result<(), Error> {
         let daemon = self.backend.daemon();
-        match daemon.inspect().await {
-            Ok(observation) if observation.state == ServiceState::Running => {}
+        let running = match daemon.inspect().await {
+            Ok(observation) if observation.state == ServiceState::Running => true,
             Ok(_stopped) => {
                 daemon
                     .replace(definition)
                     .await
                     .map_err(|source| supervisor_error("start daemon", source))?;
                 report.started_daemon = true;
+                false
             }
             Err(supervisor::Error::NotFound(_)) => {
                 daemon
@@ -1211,10 +1345,15 @@ impl<'a> Engine<'a> {
                     .await
                     .map_err(|source| supervisor_error("start daemon", source))?;
                 report.started_daemon = true;
+                false
             }
             Err(source) => return Err(supervisor_error("inspect daemon", source)),
+        };
+        if running {
+            self.wait_served(&Serving::Allowed(allowed), version).await
+        } else {
+            self.wait_ready(version).await
         }
-        self.wait_ready(version).await
     }
 
     /// Returns live sessions and live worker runtimes not covered by them.
@@ -1523,6 +1662,34 @@ fn layout_log_dir(context: &Context) -> Result<(), Error> {
     .map_err(|source| super::error::fs_error("create launchd log directory", source))
 }
 
+/// The reported version a supervised readiness check accepts.
+enum Serving<'a> {
+    /// Only this version makes the daemon ready: a transaction observes its
+    /// one replacement, so readiness is the proof it happened.
+    Strict(&'a str),
+    /// Every named version is accepted: the supervised job may have been
+    /// replaced before the job registration landed, and serving through that
+    /// daemon is the removal's job.
+    Allowed(&'a [String]),
+}
+
+/// The versions a removal may serve through: the configured one, plus — for
+/// a pending upgrade at or after `registering` — the version whose daemon the
+/// interrupted transaction may have left running while `service.toml` already
+/// names the new one. Any other supervised version is refused before the
+/// removal touches a session.
+fn allowed_removal_versions(active: &str, pending: Option<&Record>) -> Vec<String> {
+    let mut allowed = vec![active.to_owned()];
+    if let Some(pending) = pending {
+        if pending.operation == Operation::Upgrade && pending.step >= Step::Registering {
+            if let Some(previous) = pending.previous_version.as_deref().filter(|p| *p != active) {
+                allowed.push(previous.to_owned());
+            }
+        }
+    }
+    allowed
+}
+
 /// Returns whether a session may still own a live PTY.
 fn is_live(session: &SessionInfo) -> bool {
     session.may_own_runtime()
@@ -1536,7 +1703,7 @@ fn is_live(session: &SessionInfo) -> bool {
 /// job may still be waiting to spawn. Only `Stopped` and `Failed` prove the
 /// end without further evidence; a caller that needs more proof reads the
 /// worker journal.
-fn job_alive(observation: &ServiceObservation) -> bool {
+pub(super) fn job_alive(observation: &ServiceObservation) -> bool {
     observation.process.is_some()
         || matches!(
             observation.state,
@@ -1552,6 +1719,8 @@ pub(crate) fn pending_report(record: &Record) -> PendingReport {
         operation: record.operation.as_str(),
         version: record.version.clone(),
         step: record.step.as_str(),
+        preflight: None,
+        accepted_runtime_loss: false,
     }
 }
 
@@ -1818,7 +1987,7 @@ pub(crate) fn upgrade_plan(pending: Option<Record>, version: &str) -> Result<Pla
 /// Install and rollback check the prefix before any effect, so a prefix the
 /// configuration would reject never lets a pending transaction be rolled
 /// back first.
-fn install_layout(prefix: &Path) -> Result<InstallLayout, Error> {
+pub(crate) fn install_layout(prefix: &Path) -> Result<InstallLayout, Error> {
     pohunek_service_config::validate_prefix(prefix).map_err(|_invalid| Error::InvalidPath {
         flag: "--prefix",
         path: prefix.to_path_buf(),

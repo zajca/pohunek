@@ -90,11 +90,12 @@ pub struct UpgradeReport {
     pub kept_versions: Vec<KeptVersion>,
     /// Why garbage collection did not run, when it failed.
     pub gc_error: Option<String>,
-    /// What the new daemon's adoption preflight found; `null` when the upgrade
-    /// resumed an interrupted one or the version was already active.
+    /// The requested daemon's adoption preflight, or the previous daemon's
+    /// rollback verdict when the operation only undid an interrupted upgrade.
+    /// `null` when no daemon replacement needed a verdict.
     pub preflight: Option<PreflightReport>,
-    /// Whether `--accept-runtime-loss` let the upgrade proceed over sessions
-    /// the preflight listed as at risk.
+    /// Whether `--accept-runtime-loss` accepted at-risk sessions in the
+    /// upgrade or a preceding rollback.
     pub accepted_runtime_loss: bool,
 }
 
@@ -140,11 +141,12 @@ pub struct CheckReport {
     /// Whether the check ran under a transaction lock a `pohunek service
     /// lock` ancestor holds, so no other transaction can change the result.
     pub locked: bool,
-    /// What the new daemon's adoption preflight found; `null` for an install,
-    /// a resumed upgrade, and a version that is already active.
+    /// The requested daemon's adoption preflight, or the previous daemon's
+    /// rollback verdict when the check only covers an interrupted upgrade.
+    /// `null` when no daemon replacement needs a verdict.
     pub preflight: Option<PreflightReport>,
-    /// Whether `--accept-runtime-loss` would let the upgrade proceed over
-    /// sessions the preflight listed as at risk.
+    /// Whether `--accept-runtime-loss` would accept at-risk sessions in the
+    /// upgrade or a preceding rollback.
     pub accepted_runtime_loss: bool,
 }
 
@@ -166,6 +168,10 @@ pub struct PendingReport {
     pub version: String,
     /// The last completed step.
     pub step: &'static str,
+    /// The previous daemon's read-only verdict when rollback replaced it.
+    pub preflight: Option<PreflightReport>,
+    /// Whether the operator accepted the rollback's at-risk sessions.
+    pub accepted_runtime_loss: bool,
 }
 
 /// Result of `pohunek service status`.

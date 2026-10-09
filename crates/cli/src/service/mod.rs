@@ -36,9 +36,11 @@ pub mod engine;
 pub mod error;
 pub mod inherited;
 pub mod layout;
+mod legacy_store;
 pub mod preflight;
 pub mod record;
 pub mod report;
+mod rollback;
 pub mod settings;
 pub mod usage;
 #[cfg(target_os = "linux")]
@@ -159,10 +161,17 @@ pub async fn check(
         context.install_search_path()?;
     }
     let daemon_dir = staged_dir(&context, None)?;
+    let rollback_backend = if checked.rollback.is_some() {
+        let namespace = context.namespace()?;
+        Some(Backend::connect(&context, &namespace, settings::LAUNCHCTL_COMMAND).await?)
+    } else {
+        None
+    };
     finish_check(
         checked,
         &preflight::DaemonPreflight,
         &context,
+        rollback_backend.as_ref(),
         &daemon_dir,
         VERSION,
         accept_runtime_loss,
@@ -180,14 +189,52 @@ async fn finish_check(
     mut checked: Checked,
     preflight: &dyn preflight::AdoptionPreflight,
     context: &Context,
+    backend: Option<&Backend>,
     daemon_dir: &Path,
     version: &str,
     accept_runtime_loss: bool,
 ) -> Result<report::CheckReport, Error> {
+    if let Some(record) = &checked.rollback {
+        let layout = engine::install_layout(&record.prefix)?;
+        let previous = record
+            .previous_version
+            .as_deref()
+            .ok_or_else(|| Error::Record {
+                path: context.paths().state_dir.join(record::FILE_NAME),
+                detail: "an upgrade record names no previous version".to_owned(),
+            })?;
+        let daemon_dir =
+            layout
+                .version_dir(previous)
+                .ok_or_else(|| Error::RollbackPreflightFailed {
+                    version: previous.to_owned(),
+                    detail: "previous version has no valid installation directory".to_owned(),
+                })?;
+        let gated = rollback::gate(
+            rollback::Inputs {
+                preflight,
+                context,
+                backend,
+                layout: &layout,
+                inspector: &pohunek_platform::process::HostInspector::new(),
+            },
+            &daemon_dir,
+            previous,
+            previous,
+            accept_runtime_loss,
+        )
+        .await?;
+        checked.report.accepted_runtime_loss = gated.accepted;
+        checked.report.preflight = Some(gated.report.clone());
+        if let Some(pending) = &mut checked.report.pending_transaction {
+            pending.accepted_runtime_loss = gated.accepted;
+            pending.preflight = Some(gated.report);
+        }
+    }
     if checked.adoption == Adoption::Required {
         let gated =
             preflight::gate(preflight, context, daemon_dir, version, accept_runtime_loss).await?;
-        checked.report.accepted_runtime_loss = gated.accepted;
+        checked.report.accepted_runtime_loss |= gated.accepted;
         checked.report.preflight = Some(gated.report);
     }
     Ok(checked.report)
@@ -568,6 +615,8 @@ pub(crate) struct Checked {
     pub(crate) discovery_first: bool,
     /// Whether the adoption preflight applies.
     pub(crate) adoption: Adoption,
+    /// Pending upgrade whose rollback needs the previous reader's verdict.
+    pub(crate) rollback: Option<record::Record>,
 }
 
 /// Whether a check asks the new daemon's adoption preflight
@@ -656,6 +705,15 @@ pub(crate) fn check_local(
     };
     let fresh_install =
         operation == record::Operation::Install && !matches!(plan, engine::Plan::Resume(_));
+    let rollback = match &plan {
+        engine::Plan::RollBack(record)
+            if record.operation == record::Operation::Upgrade
+                && record.step >= record::Step::Registering =>
+        {
+            Some(record.clone())
+        }
+        _ => None,
+    };
     let report = report::CheckReport {
         operation: operation.as_str(),
         version: version.to_owned(),
@@ -678,6 +736,7 @@ pub(crate) fn check_local(
         needs_discovery: operation == record::Operation::Install && engine::plan_discovers(&plan),
         discovery_first: matches!(plan, engine::Plan::RollBack(_)),
         adoption,
+        rollback,
     })
 }
 
@@ -726,6 +785,7 @@ pub(crate) async fn check_with_preflight(
         checked,
         preflight,
         context,
+        None,
         daemon_dir,
         version,
         accept_runtime_loss,
@@ -780,6 +840,8 @@ async fn status_of(context: &Context) -> Result<report::StatusReport, Error> {
                 operation: pending.operation.as_str(),
                 version: pending.version,
                 step: pending.step.as_str(),
+                preflight: None,
+                accepted_runtime_loss: false,
             }),
         });
     }
