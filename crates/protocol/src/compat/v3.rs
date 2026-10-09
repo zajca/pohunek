@@ -403,33 +403,6 @@ mod tests {
     }
 
     #[test]
-    fn request_with_the_current_spelling_is_not_a_protocol_3_request() {
-        let error = request_params(
-            method::SESSION_REPORT_NATIVE_ID,
-            json!({"session_id": "s-1", "worker_instance_id": "w-1"}),
-        )
-        .expect_err("the protocol 4 key does not exist in protocol 3");
-        assert_eq!(
-            error,
-            CompatError::Conflict {
-                site: "params",
-                key: "worker_instance_id"
-            }
-        );
-    }
-
-    #[test]
-    fn request_rename_never_walks_free_form_values() {
-        let params = json!({
-            "session_id": "s-1",
-            "metadata": {"runtime_id": "user-value"}
-        });
-        let upgraded =
-            request_params(method::SESSION_SET_METADATA, params.clone()).expect("adapter");
-        assert_eq!(upgraded, params);
-    }
-
-    #[test]
     fn request_without_a_runtime_is_untouched() {
         let params = json!({"session_id": "s-1"});
         assert_eq!(
@@ -508,13 +481,14 @@ mod tests {
         assert_eq!(input["runtime"]["runtime_id"], "w-1");
     }
 
+    /// The free-form half of this contract — user metadata survives the
+    /// downgrade of a session-bearing result untouched — is asserted at the
+    /// real daemon boundary by `metadata_user_keys_named_like_worker_identity_
+    /// are_never_rewritten` (`crates/daemon/tests/protocol_window.rs`), where a
+    /// user entry named like each renamed key rides a protocol 3 response
+    /// verbatim.
     #[test]
-    fn result_never_walks_free_form_values_or_other_methods() {
-        let free_form = json!({"session": {"metadata": {"worker_instance_id": "user-value"}}});
-        assert_eq!(
-            result(method::SESSION_NEW, free_form.clone()).expect("adapter"),
-            free_form
-        );
+    fn results_of_methods_without_a_translation_site_are_never_walked() {
         let other = json!({"worker_instance_id": "kept"});
         assert_eq!(
             result(method::NOTIFICATION_LIST, other.clone()).expect("adapter"),
@@ -625,17 +599,6 @@ mod tests {
     }
 
     #[test]
-    fn methods_introduced_after_protocol_3_are_refused_in_both_directions() {
-        for name in INTRODUCED_METHODS {
-            let expected = CompatError::MethodNotDefined {
-                method: (*name).to_owned(),
-            };
-            assert_eq!(request_params(name, json!({})), Err(expected.clone()));
-            assert_eq!(result(name, json!({})), Err(expected));
-        }
-    }
-
-    #[test]
     fn known_events_are_a_subset_of_the_current_events() {
         for name in KNOWN_EVENTS {
             assert!(
@@ -678,32 +641,6 @@ mod tests {
             )
             .expect("adapter"),
             json!({"session_id": "s-1", "runtime_id": "w-1", "agent": "claude"})
-        );
-    }
-
-    #[test]
-    fn request_downgrade_never_walks_free_form_values() {
-        let params = json!({"session_id": "s-1", "metadata": {"worker_instance_id": "user-value"}});
-        assert_eq!(
-            downgrade_request_params(method::SESSION_SET_METADATA, params.clone())
-                .expect("adapter"),
-            params
-        );
-    }
-
-    #[test]
-    fn request_downgrade_refuses_a_request_that_already_has_the_protocol_3_spelling() {
-        let error = downgrade_request_params(
-            method::SESSION_REPORT_NATIVE_ID,
-            json!({"worker_instance_id": "w-1", "runtime_id": "w-0"}),
-        )
-        .expect_err("two identities in one request");
-        assert_eq!(
-            error,
-            CompatError::Conflict {
-                site: "params",
-                key: "runtime_id"
-            }
         );
     }
 
