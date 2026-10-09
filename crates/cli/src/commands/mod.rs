@@ -4,7 +4,7 @@
 //! command supports `--json` where the plan calls for machine-readable output
 //! (see `docs/plan-phase-1.md` "CLI Grammar").
 
-use protocol::{ProtocolError, Request, CURRENT_PROTOCOL_VERSIONS};
+use protocol::{method, ProtocolError, Request, CLIENT_PROTOCOL_VERSIONS};
 use serde::Serialize;
 
 use crate::error::CliError;
@@ -39,17 +39,88 @@ pub(crate) mod setup;
 pub(crate) fn render_json<T: Serialize + ?Sized>(value: &T) -> Result<String, CliError> {
     render_json_document(&JsonEnvelope {
         cli_version: env!("CARGO_PKG_VERSION"),
-        protocol: CURRENT_PROTOCOL_VERSIONS,
+        protocol: CLIENT_PROTOCOL_VERSIONS,
         ok: Some(value),
         err: None,
     })
+}
+
+/// Keep the v0.33.0 Hermes CLI consumer's session-summary identity spelling
+/// available while public protocol 3 remains in the client window. The old
+/// plugin reads `SessionInfo.runtime.runtime_id` during start recovery. Other
+/// result types, including strict `SessionRuntimeIdentity` decoders, retain
+/// their current typed `--json` shape.
+pub(crate) fn render_json_with_v3_identity<T: Serialize + ?Sized>(
+    method: &str,
+    value: &T,
+) -> Result<String, CliError> {
+    if protocol::MIN_PROTOCOL_VERSION.get() != 3
+        || !matches!(
+            method,
+            method::SESSION_NEW
+                | method::SESSION_INSPECT
+                | method::SESSION_FORK
+                | method::SESSION_LIST
+                | method::SESSION_WAIT
+                | method::SESSION_RESUME
+                | method::SESSION_RESIZE
+                | method::SESSION_SET_METADATA
+                | method::SESSION_RENAME
+        )
+    {
+        return render_json(value);
+    }
+    let mut current = serde_json::to_value(value)?;
+    let legacy = protocol::compat::result(protocol::MIN_PROTOCOL_VERSION, method, current.clone())?;
+    merge_v3_session_runtime(method, &mut current, &legacy);
+    render_json(&current)
+}
+
+fn merge_v3_session_runtime(
+    method: &str,
+    current: &mut serde_json::Value,
+    legacy: &serde_json::Value,
+) {
+    match method {
+        method::SESSION_LIST => {
+            if let (Some(current), Some(legacy)) = (current.as_array_mut(), legacy.as_array()) {
+                for (session, previous) in current.iter_mut().zip(legacy) {
+                    merge_v3_runtime_id(session, previous);
+                }
+            }
+        }
+        method::SESSION_NEW | method::SESSION_INSPECT | method::SESSION_FORK => {
+            merge_v3_runtime_id(current, legacy);
+        }
+        method::SESSION_WAIT
+        | method::SESSION_RESUME
+        | method::SESSION_RESIZE
+        | method::SESSION_SET_METADATA
+        | method::SESSION_RENAME => {
+            merge_v3_runtime_id(&mut current["session"], &legacy["session"]);
+        }
+        _ => {}
+    }
+}
+
+fn merge_v3_runtime_id(current: &mut serde_json::Value, legacy: &serde_json::Value) {
+    if let (Some(runtime), Some(runtime_id)) = (
+        current
+            .get_mut("runtime")
+            .and_then(serde_json::Value::as_object_mut),
+        legacy
+            .get("runtime")
+            .and_then(|runtime| runtime.get("runtime_id")),
+    ) {
+        runtime.insert("runtime_id".to_owned(), runtime_id.clone());
+    }
 }
 
 /// Render a typed error in the same versioned process envelope as successes.
 pub(crate) fn render_json_error(error: &ProtocolError) -> Result<String, CliError> {
     render_json_document(&JsonEnvelope::<()> {
         cli_version: env!("CARGO_PKG_VERSION"),
-        protocol: CURRENT_PROTOCOL_VERSIONS,
+        protocol: CLIENT_PROTOCOL_VERSIONS,
         ok: None,
         err: Some(error),
     })

@@ -53,8 +53,10 @@ pub const CLIENT_PROTOCOL_VERSIONS: ProtocolVersionRange = SUPPORTED_PROTOCOL_VE
 /// The exact current version as a range.
 ///
 /// Describes the shape a client hands to its callers: client adapters
-/// translate every older daemon payload to the current shape, so the CLI
-/// `--json` envelope and the Hermes policy range name exactly this version.
+/// translate every older daemon payload to the current shape. New Hermes
+/// policies name exactly this version; the CLI JSON envelope advertises its
+/// full supported window while retaining the previous identity spelling at
+/// typed session sites for an installed previous-release plugin.
 pub const CURRENT_PROTOCOL_VERSIONS: ProtocolVersionRange = ProtocolVersionRange {
     minimum: PROTOCOL_VERSION,
     maximum: PROTOCOL_VERSION,

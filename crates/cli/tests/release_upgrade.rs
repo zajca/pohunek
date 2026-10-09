@@ -315,14 +315,16 @@ struct Runtime {
 
 /// Reads the runtime identity of a `session inspect` payload. The previous
 /// release (v0.33.0, protocol 3) spells the worker instance `runtime_id`; v0.33.1
-/// and this build spell it `worker_instance_id`. Exactly one spelling must be
-/// present: both at once is a malformed payload.
+/// and this build spell it `worker_instance_id`. While protocol 3 is in the
+/// CLI window, this build includes both names for an older Hermes plugin;
+/// their values must agree.
 fn runtime(info: &Value) -> Option<Runtime> {
     let runtime = info.get("runtime")?;
     let spelled = |name: &str| runtime.get(name).and_then(Value::as_str);
     let worker_instance_id = match (spelled("worker_instance_id"), spelled("runtime_id")) {
+        (Some(worker), Some(legacy)) if worker == legacy => worker.to_owned(),
         (Some(_), Some(_)) => {
-            panic!("runtime carries both worker_instance_id and runtime_id: {runtime}")
+            panic!("runtime carries conflicting worker_instance_id and runtime_id: {runtime}")
         }
         (Some(id), None) | (None, Some(id)) => id.to_owned(),
         (None, None) => return None,
@@ -935,11 +937,24 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "both worker_instance_id and runtime_id")]
-    fn both_spellings_at_once_are_refused() {
+    fn matching_spellings_at_once_are_normalized() {
         let info = serde_json::json!({"runtime": {
             "state": "live", "runtime_generation": "1",
             "worker_instance_id": "a", "runtime_id": "a"}});
+        assert_eq!(
+            runtime(&info)
+                .expect("matching identity")
+                .worker_instance_id,
+            "a"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "conflicting worker_instance_id and runtime_id")]
+    fn conflicting_spellings_at_once_are_refused() {
+        let info = serde_json::json!({"runtime": {
+            "state": "live", "runtime_generation": "1",
+            "worker_instance_id": "a", "runtime_id": "b"}});
         let _ = runtime(&info);
     }
 

@@ -520,7 +520,10 @@ pub(crate) async fn run_new(
     }
 
     if json {
-        print!("{}", crate::commands::render_json(info)?);
+        print!(
+            "{}",
+            crate::commands::render_json_with_v3_identity(method::SESSION_NEW, info)?
+        );
     } else {
         print!("{}", render_new_human(info));
     }
@@ -588,7 +591,10 @@ pub(crate) async fn run_inspect(
         .await?;
 
     if json {
-        print!("{}", crate::commands::render_json(&info)?);
+        print!(
+            "{}",
+            crate::commands::render_json_with_v3_identity(method::SESSION_INSPECT, &info)?
+        );
     } else {
         print!("{}", render_inspect_human(&info));
     }
@@ -650,7 +656,10 @@ pub(crate) async fn run_fork(
     let info = &forked.session;
 
     if json {
-        print!("{}", crate::commands::render_json(info)?);
+        print!(
+            "{}",
+            crate::commands::render_json_with_v3_identity(method::SESSION_FORK, info)?
+        );
     } else {
         print!("{}", render_fork_human(info));
     }
@@ -1011,7 +1020,10 @@ pub(crate) async fn run_wait(
     let client = Client::connect(host, paths).await?;
     let result = cancellable(client.into_sdk().session_wait(params)).await?;
     if json {
-        print!("{}", crate::commands::render_json(&result)?);
+        print!(
+            "{}",
+            crate::commands::render_json_with_v3_identity(method::SESSION_WAIT, &result)?
+        );
     } else {
         println!(
             "{:?}\t{}\t{}\t{}",
@@ -1040,7 +1052,10 @@ pub(crate) async fn run_resume(
         .session_resume_with(resume_params(target, accept_profile_change))
         .await?;
     if json {
-        print!("{}", crate::commands::render_json(&result)?);
+        print!(
+            "{}",
+            crate::commands::render_json_with_v3_identity(method::SESSION_RESUME, &result)?
+        );
     } else {
         println!("resumed {}", result.session.id.0);
     }
@@ -1065,7 +1080,10 @@ pub(crate) async fn run_resize(
         })
         .await?;
     if json {
-        print!("{}", crate::commands::render_json(&result)?);
+        print!(
+            "{}",
+            crate::commands::render_json_with_v3_identity(method::SESSION_RESIZE, &result)?
+        );
     } else {
         println!("resized {} to {cols}x{rows}", target.session_id);
     }
@@ -1088,7 +1106,10 @@ pub(crate) async fn run_metadata(
         })
         .await?;
     if json {
-        print!("{}", crate::commands::render_json(&result)?);
+        print!(
+            "{}",
+            crate::commands::render_json_with_v3_identity(method::SESSION_SET_METADATA, &result)?
+        );
     } else {
         println!("updated metadata for {}", target.session_id);
     }
@@ -1126,7 +1147,10 @@ pub(crate) async fn run_rename(
         .await?;
 
     if json {
-        print!("{}", crate::commands::render_json(&renamed)?);
+        print!(
+            "{}",
+            crate::commands::render_json_with_v3_identity(method::SESSION_RENAME, &renamed)?
+        );
     } else {
         print!("{}", render_rename_human(&renamed.session));
     }
@@ -1697,7 +1721,9 @@ fn render_list_output(
 
     match output_mode {
         ListOutputMode::Human => Ok(render_list_human(&filtered)),
-        ListOutputMode::Json => crate::commands::render_json(&filtered),
+        ListOutputMode::Json => {
+            crate::commands::render_json_with_v3_identity(method::SESSION_LIST, &filtered)
+        }
         ListOutputMode::Quiet => Ok(render_list_quiet(&filtered)),
     }
 }

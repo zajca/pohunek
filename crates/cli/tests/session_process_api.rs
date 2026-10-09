@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use pohunek_test_support::env::TestEnv;
-use protocol::{Request, Response, PROTOCOL_VERSION};
+use protocol::{Request, Response, CLIENT_PROTOCOL_VERSIONS, PROTOCOL_VERSION};
 use serde_json::{json, Value};
 
 const SESSION_ID: &str = "s-fixture-1";
@@ -655,6 +655,9 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
     }
     let ok = match request.method() {
         protocol::method::SESSION_LIST => session_list(scenario),
+        protocol::method::SESSION_INSPECT | protocol::method::SESSION_FORK => {
+            session(SESSION_ID, Some(SESSION_NAME))
+        }
         protocol::method::SESSION_SCREEN => json!({
             "session_id": SESSION_ID,
             "worker_id": "worker-fixture-1",
@@ -667,38 +670,17 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
             "title": "fixture terminal",
             "visible_lines": ["pohunek fixture"]
         }),
-        protocol::method::SESSION_OUTPUT => {
-            if matches!(scenario, Scenario::OutputLogSafety) {
-                let output = format!("{OUTPUT_LOG_LINE_ONE}\n{OUTPUT_LOG_LINE_TWO}");
-                let end = output.len().to_string();
-                json!({
-                    "session_id": SESSION_ID,
-                    "worker_instance_id": "runtime-fixture-1",
-                    "runtime_generation": "3",
-                    "history_start_offset": "0",
-                    "start_offset": "0",
-                    "next_offset": end,
-                    "runtime_end_offset": end,
-                    "data_base64": base64::engine::general_purpose::STANDARD.encode(output),
-                    "has_more": false,
-                    "timed_out": false
-                })
-            } else {
-                json!({
-                    "session_id": SESSION_ID,
-                    "worker_instance_id": "runtime-fixture-1",
-                    "runtime_generation": "3",
-                    "history_start_offset": "4",
-                    "start_offset": "4",
-                    "next_offset": "6",
-                    "runtime_end_offset": "6",
-                    "data_base64": "AJ8=",
-                    "gap": {"start_offset": "2", "end_offset": "4"},
-                    "has_more": false,
-                    "timed_out": false
-                })
-            }
-        }
+        protocol::method::SESSION_READ => json!({
+            "text": "pohunek fixture",
+            "source_used": "visible",
+            "worker_instance_id": "runtime-fixture-1",
+            "runtime_generation": "3",
+            "revision": "7",
+            "alternate_screen": false,
+            "lines_requested": 1,
+            "truncated": false
+        }),
+        protocol::method::SESSION_OUTPUT => output_response(scenario),
         protocol::method::SESSION_WAIT => json!({
             "reason": if matches!(scenario, Scenario::WaitTimeout) {
                 "timeout"
@@ -711,7 +693,8 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
         }),
         protocol::method::SESSION_RESUME
         | protocol::method::SESSION_RESIZE
-        | protocol::method::SESSION_SET_METADATA => {
+        | protocol::method::SESSION_SET_METADATA
+        | protocol::method::SESSION_RENAME => {
             json!({"session": session(SESSION_ID, Some(SESSION_NAME))})
         }
         protocol::method::SESSION_RUNTIME_INVENTORY => json!({
@@ -733,6 +716,39 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
         method => panic!("unexpected fixture method: {method}"),
     };
     Response::ok(PROTOCOL_VERSION, request.id(), ok).expect("valid success response")
+}
+
+fn output_response(scenario: Scenario) -> Value {
+    if matches!(scenario, Scenario::OutputLogSafety) {
+        let output = format!("{OUTPUT_LOG_LINE_ONE}\n{OUTPUT_LOG_LINE_TWO}");
+        let end = output.len().to_string();
+        json!({
+            "session_id": SESSION_ID,
+            "worker_instance_id": "runtime-fixture-1",
+            "runtime_generation": "3",
+            "history_start_offset": "0",
+            "start_offset": "0",
+            "next_offset": end,
+            "runtime_end_offset": end,
+            "data_base64": base64::engine::general_purpose::STANDARD.encode(output),
+            "has_more": false,
+            "timed_out": false
+        })
+    } else {
+        json!({
+            "session_id": SESSION_ID,
+            "worker_instance_id": "runtime-fixture-1",
+            "runtime_generation": "3",
+            "history_start_offset": "4",
+            "start_offset": "4",
+            "next_offset": "6",
+            "runtime_end_offset": "6",
+            "data_base64": "AJ8=",
+            "gap": {"start_offset": "2", "end_offset": "4"},
+            "has_more": false,
+            "timed_out": false
+        })
+    }
 }
 
 /// A sweep result whose only difference between scenarios is whether it reports a
@@ -824,7 +840,13 @@ fn session(id: &str, name: Option<&str>) -> Value {
         "cols": 80,
         "rows": 24,
         "created_at": "2026-07-08T00:00:00Z",
-        "updated_at": "2026-07-08T00:01:00Z"
+        "updated_at": "2026-07-08T00:01:00Z",
+        "runtime": {
+            "state": "live",
+            "runtime_generation": "3",
+            "worker_id": "worker-fixture-1",
+            "worker_instance_id": "runtime-fixture-1"
+        }
     });
     if let Some(name) = name {
         value["name"] = json!(name);
@@ -918,8 +940,14 @@ fn assert_json_success(output: &Output) -> Value {
     assert!(output.stderr.is_empty(), "stderr must stay clean");
     let document = parse_single_json(&output.stdout);
     assert!(document["cli_version"].is_string());
-    assert_eq!(document["protocol"]["minimum"], PROTOCOL_VERSION.get());
-    assert_eq!(document["protocol"]["maximum"], PROTOCOL_VERSION.get());
+    assert_eq!(
+        document["protocol"]["minimum"],
+        CLIENT_PROTOCOL_VERSIONS.minimum().get()
+    );
+    assert_eq!(
+        document["protocol"]["maximum"],
+        CLIENT_PROTOCOL_VERSIONS.maximum().get()
+    );
     assert!(document.get("err").is_none());
     document["ok"].clone()
 }
@@ -936,8 +964,14 @@ fn assert_json_error(output: &Output, expected_code: &str) -> Value {
     );
     let document = parse_single_json(&output.stdout);
     assert!(document["cli_version"].is_string());
-    assert_eq!(document["protocol"]["minimum"], PROTOCOL_VERSION.get());
-    assert_eq!(document["protocol"]["maximum"], PROTOCOL_VERSION.get());
+    assert_eq!(
+        document["protocol"]["minimum"],
+        CLIENT_PROTOCOL_VERSIONS.minimum().get()
+    );
+    assert_eq!(
+        document["protocol"]["maximum"],
+        CLIENT_PROTOCOL_VERSIONS.maximum().get()
+    );
     assert_eq!(document["err"]["code"], expected_code);
     assert!(document.get("ok").is_none());
     document
@@ -1071,88 +1105,192 @@ fn utf8(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+const PLUGIN_COMMAND_CASES: &[(&[&str], &str)] = &[
+    (
+        &["session", "new", "--agent", "shell", "--json"],
+        protocol::method::SESSION_NEW,
+    ),
+    (
+        &["session", "list", "--json"],
+        protocol::method::SESSION_LIST,
+    ),
+    (
+        &["session", "inspect", SESSION_ID, "--json"],
+        protocol::method::SESSION_INSPECT,
+    ),
+    (
+        &["session", "fork", SESSION_ID, "--json"],
+        protocol::method::SESSION_FORK,
+    ),
+    (
+        &["session", "screen", SESSION_ID, "--json"],
+        protocol::method::SESSION_SCREEN,
+    ),
+    (
+        &["session", "read", SESSION_ID, "--json"],
+        protocol::method::SESSION_READ,
+    ),
+    (
+        &["session", "input", SESSION_ID, "hello", "--json"],
+        protocol::method::SESSION_INPUT,
+    ),
+    (
+        &[
+            "session",
+            "output",
+            SESSION_ID,
+            "--worker-instance-id",
+            "runtime-fixture-1",
+            "--runtime-generation",
+            "3",
+            "--after-offset",
+            "2",
+            "--json",
+        ],
+        protocol::method::SESSION_OUTPUT,
+    ),
+    (
+        &[
+            "session",
+            "wait",
+            SESSION_ID,
+            "--state",
+            "done",
+            "--timeout-ms",
+            "50",
+            "--json",
+        ],
+        protocol::method::SESSION_WAIT,
+    ),
+    (
+        &["session", "resume", SESSION_ID, "--json"],
+        protocol::method::SESSION_RESUME,
+    ),
+    (
+        &[
+            "session", "resize", SESSION_ID, "--cols", "100", "--rows", "40", "--json",
+        ],
+        protocol::method::SESSION_RESIZE,
+    ),
+    (
+        &[
+            "session",
+            "metadata",
+            SESSION_ID,
+            "--set",
+            "owner=test",
+            "--clear",
+            "stale",
+            "--json",
+        ],
+        protocol::method::SESSION_SET_METADATA,
+    ),
+    (
+        &["session", "rename", SESSION_ID, "renamed", "--json"],
+        protocol::method::SESSION_RENAME,
+    ),
+    (
+        &["session", "runtime-inventory", "--json"],
+        protocol::method::SESSION_RUNTIME_INVENTORY,
+    ),
+];
+
 #[test]
 fn plugin_commands_have_binary_level_json_and_wire_parity() {
-    let cases: &[(&[&str], &str)] = &[
-        (
-            &["session", "screen", SESSION_ID, "--json"],
-            protocol::method::SESSION_SCREEN,
-        ),
-        (
-            &[
-                "session",
-                "output",
-                SESSION_ID,
-                "--worker-instance-id",
-                "runtime-fixture-1",
-                "--runtime-generation",
-                "3",
-                "--after-offset",
-                "2",
-                "--json",
-            ],
-            protocol::method::SESSION_OUTPUT,
-        ),
-        (
-            &[
-                "session",
-                "wait",
-                SESSION_ID,
-                "--state",
-                "done",
-                "--timeout-ms",
-                "50",
-                "--json",
-            ],
-            protocol::method::SESSION_WAIT,
-        ),
-        (
-            &["session", "resume", SESSION_ID, "--json"],
-            protocol::method::SESSION_RESUME,
-        ),
-        (
-            &[
-                "session", "resize", SESSION_ID, "--cols", "100", "--rows", "40", "--json",
-            ],
-            protocol::method::SESSION_RESIZE,
-        ),
-        (
-            &[
-                "session",
-                "metadata",
-                SESSION_ID,
-                "--set",
-                "owner=test",
-                "--clear",
-                "stale",
-                "--json",
-            ],
-            protocol::method::SESSION_SET_METADATA,
-        ),
-        (
-            &["session", "runtime-inventory", "--json"],
-            protocol::method::SESSION_RUNTIME_INVENTORY,
-        ),
-    ];
-
-    for (args, expected_method) in cases {
+    for (args, expected_method) in PLUGIN_COMMAND_CASES {
         let home = TestHome::new();
         let fixture = FixtureDaemon::start(&home.socket(), Scenario::Success);
         let (output, requests) = run(&home, fixture, args);
         let ok = assert_json_success(&output);
         assert!(!ok.is_null(), "success payload for {expected_method}");
+        assert_typed_session_json(expected_method, &ok);
         assert_eq!(
             requests.last().expect("captured command request").method(),
             *expected_method
         );
-        if *expected_method == protocol::method::SESSION_RUNTIME_INVENTORY {
-            assert_eq!(requests.len(), 1, "inventory needs no name resolution");
+        if matches!(
+            *expected_method,
+            protocol::method::SESSION_NEW | protocol::method::SESSION_RUNTIME_INVENTORY
+        ) {
+            assert_eq!(requests.len(), 1, "command needs no name resolution");
         } else {
             assert_eq!(
                 requests.first().expect("captured list request").method(),
                 protocol::method::SESSION_LIST
             );
         }
+    }
+}
+
+fn assert_typed_session_json(method: &str, ok: &Value) {
+    match method {
+        protocol::method::SESSION_NEW
+        | protocol::method::SESSION_INSPECT
+        | protocol::method::SESSION_FORK => {
+            let _: protocol::SessionInfo = serde_json::from_value(ok.clone())
+                .unwrap_or_else(|error| panic!("{method} typed JSON: {error}"));
+            assert_eq!(ok["runtime"]["runtime_id"], "runtime-fixture-1");
+        }
+        protocol::method::SESSION_LIST => {
+            let _: Vec<protocol::SessionInfo> =
+                serde_json::from_value(ok.clone()).expect("typed session list JSON");
+            assert_eq!(ok[0]["runtime"]["runtime_id"], "runtime-fixture-1");
+        }
+        protocol::method::SESSION_WAIT => {
+            let _: protocol::SessionWaitResult =
+                serde_json::from_value(ok.clone()).expect("typed session wait JSON");
+            assert_eq!(ok["session"]["runtime"]["runtime_id"], "runtime-fixture-1");
+        }
+        protocol::method::SESSION_RESUME
+        | protocol::method::SESSION_RESIZE
+        | protocol::method::SESSION_SET_METADATA
+        | protocol::method::SESSION_RENAME => {
+            match method {
+                protocol::method::SESSION_RESUME => {
+                    let _: protocol::SessionResumeResult =
+                        serde_json::from_value(ok.clone()).expect("typed session resume JSON");
+                }
+                protocol::method::SESSION_RESIZE => {
+                    let _: protocol::SessionResizeResult =
+                        serde_json::from_value(ok.clone()).expect("typed session resize JSON");
+                }
+                protocol::method::SESSION_SET_METADATA => {
+                    let _: protocol::SessionSetMetadataResult =
+                        serde_json::from_value(ok.clone()).expect("typed session metadata JSON");
+                }
+                protocol::method::SESSION_RENAME => {
+                    let _: protocol::SessionRenameResult =
+                        serde_json::from_value(ok.clone()).expect("typed session rename JSON");
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(ok["session"]["runtime"]["runtime_id"], "runtime-fixture-1");
+        }
+        protocol::method::SESSION_SCREEN => {
+            let _: protocol::SessionScreenResult =
+                serde_json::from_value(ok.clone()).expect("strict typed session screen JSON");
+            assert!(ok.get("runtime_id").is_none());
+        }
+        protocol::method::SESSION_READ => {
+            let _: protocol::SessionReadResult =
+                serde_json::from_value(ok.clone()).expect("strict typed session read JSON");
+            assert!(ok.get("runtime_id").is_none());
+        }
+        protocol::method::SESSION_OUTPUT => {
+            let _: protocol::SessionOutputResult =
+                serde_json::from_value(ok.clone()).expect("strict typed session output JSON");
+            assert!(ok.get("runtime_id").is_none());
+        }
+        protocol::method::SESSION_INPUT => {
+            let _: protocol::SessionInputResult =
+                serde_json::from_value(ok.clone()).expect("strict typed session input JSON");
+            assert!(ok["runtime"].get("runtime_id").is_none());
+        }
+        protocol::method::SESSION_RUNTIME_INVENTORY => {
+            let _: protocol::RuntimeInventoryResult =
+                serde_json::from_value(ok.clone()).expect("typed runtime inventory JSON");
+        }
+        method => panic!("unexpected tested method: {method}"),
     }
 }
 

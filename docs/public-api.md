@@ -249,11 +249,16 @@ kinds and events v3 never defined (a v3 connection never receives a
 `native_recovery` session warning; v4 connections do). A client whose range does not overlap the window
 receives `daemon/version_mismatch` before any method runs; a client of this build
 negotiates v3 and translates as described above. The window covers
-the public daemon protocol only: the CLI's `--json` envelope reports `protocol`
-`4..=4` and its `--runtime-id` flags are now `--worker-instance-id`, so an
-installed v3 Hermes plugin whose policy pins `3..=3` is refused with
-`pohunek_cli_incompatible` until `pohunek integration install hermes` renews it,
-while its hook requests to the daemon keep working. A client and a
+the public daemon protocol and the Hermes CLI tool path: the CLI's `--json`
+envelope reports its actual `3..=4` window and its session summaries carry
+both `worker_instance_id` and the v3 `runtime_id` spelling. Other typed CLI
+results retain their current shape. Its observation
+commands accept the old `--runtime-id` spelling as a hidden alias while v3
+remains in the window. A v0.33.0 Hermes plugin whose policy pins `3..=3` can
+therefore keep using tools, including timed-out start recovery, without
+rewriting its owner policy. A policy outside the window fails closed with
+`pohunek_cli_incompatible`; `integration update --agent hermes` refreshes
+the plugin assets and policy explicitly. A client and a
 daemon more than one release apart are refused.
 Notification hooks deliver through the worker socket when
 `POHUNEK_WORKER_SOCKET_PATH` is set and fall back to the daemon socket otherwise;

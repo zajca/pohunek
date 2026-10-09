@@ -70,6 +70,13 @@ assets with the ones the new daemon embeds:
    release even though no file was edited; `integration status` shows
    `outdated=true`. Run `pohunek integration update --agent hermes --hermes-profile work`
    with the same target; it needs `--confirm-modified` only when `modified=true`.
+   A v0.33.0 Hermes plugin with a `3..=3` policy can continue using its tools
+   through the current CLI's `3..=4` protocol window, including its old
+   `--runtime-id` flag and timed-out start recovery. The update refreshes the
+   plugin assets and policy to the current shape; it is not required solely to
+   restore tool access during that window. A policy outside the window is
+   rejected as `pohunek_cli_incompatible` and needs an explicit update. An
+   upgrade never rewrites a user-modified Hermes plugin or policy.
 
 The installer wrapper prints these commands after a successful install or
 upgrade. A new, resumed or forked session whose agent has outdated Claude or
@@ -85,7 +92,9 @@ daemon of the previous release on another host over NetBird. Nothing has to be
 upgraded in one pass for that pair. The CLI and Rust client advertise the protocol
 window `3..=4`; the older daemon answers in protocol 3 and the client translates
 requests, results and subscription events through the same shape-only adapter the
-daemon uses, so `--json` output keeps the current shape. The command
+daemon uses. The CLI's `--json` output uses the current shape plus the old
+runtime-identity spelling at typed session sites while v3 remains supported.
+The command
 `pohunek host inspect <host> --json` reports `protocol_version` `3` for such a host, `pohunek host list`
 shows it as `reachable`, and multi-host commands include it.
 

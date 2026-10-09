@@ -1,11 +1,21 @@
 ---
-type: Guide
-id: guide/hermes-operator
-title: Hermes operator
-description: Install and use the owner-private Hermes operator plugin without bypassing Pohunek lifecycle, target, or terminal safety rules.
-source_kind: manual
-intents: [setup, project, update, debug, help]
+name: pohunek
+description: Safely observe and operate Pohunek sessions through registered tools.
+metadata:
+  hermes:
+    requires_tools:
+      - pohunek_hosts
+      - pohunek_sessions
+      - pohunek_session_get
+      - pohunek_session_screen
+      - pohunek_session_output
+      - pohunek_session_wait
+      - pohunek_session_diff
 ---
+
+<!-- @generated: do not edit; run `cargo xtask hermes generate-skill` -->
+<!-- Source: docs/knowledge/guides/hermes-operator.md -->
+
 
 # Hermes Operator
 
@@ -141,17 +151,6 @@ stored range no longer overlaps the installed CLI. It otherwise preserves the
 installed CLI path, access mode, host allowlist, and bounds unless their
 replacement flags are supplied.
 
-A plugin installed by v0.33.0 keeps its `3..=3` policy and CLI tools working
-while protocol 3 remains in the CLI's `3..=4` window. The CLI accepts its old
-`--runtime-id` observation flag and returns the old `runtime_id` spelling
-alongside `worker_instance_id` in session summaries, including the list result
-used to recover a timed-out start. Other typed CLI results keep their current
-shape. This does not change the
-policy's access mode, host allowlist, or file permissions. A policy entirely
-outside the CLI window fails closed as `pohunek_cli_incompatible`; update the
-plugin and policy with `pohunek integration update --agent hermes` using its
-installed target. The bridge is removed when protocol 3 leaves the window.
-
 The plugin preserves the daemon's exact origin-session protection. It must deny
 these eight methods when they target the session hosting Hermes:
 
@@ -247,12 +246,6 @@ Outside Pohunek-managed sessions they report nothing. Doctor performs the
 corresponding payload-free hook dry run and returns typed findings for missing
 files, policy, permissions, version compatibility, registration, host policy,
 or stale ownership state.
-
-After upgrading Pohunek, run `integration doctor` for the selected Hermes home:
-the `asset_current` check fails (and status shows `outdated=true`) when the
-installed plugin was written by an older release, even though no file was edited.
-`integration update` with the same target flags replaces it and needs
-`--confirm-modified` only when `modified=true`.
 
 When troubleshooting, start with `integration status` and `integration doctor`
 for the selected Hermes home. Use `integration update` only after reviewing the

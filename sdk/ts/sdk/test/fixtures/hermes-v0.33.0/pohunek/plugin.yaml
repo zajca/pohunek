@@ -1,0 +1,28 @@
+name: pohunek
+version: "1"
+description: Safe, policy-bounded Pohunek session tools and lifecycle reporting.
+provides_tools:
+  - pohunek_hosts
+  - pohunek_sessions
+  - pohunek_session_get
+  - pohunek_session_screen
+  - pohunek_session_output
+  - pohunek_session_wait
+  - pohunek_session_diff
+  - pohunek_session_start
+  - pohunek_session_send
+  - pohunek_session_resume
+  - pohunek_session_fork
+  - pohunek_session_resize
+  - pohunek_session_rename
+  - pohunek_session_set_metadata
+  - pohunek_session_stop
+  - pohunek_session_remove
+provides_hooks:
+  - on_session_start
+  - pre_llm_call
+  - pre_approval_request
+  - post_approval_response
+  - post_llm_call
+  - on_session_end
+  - on_session_finalize

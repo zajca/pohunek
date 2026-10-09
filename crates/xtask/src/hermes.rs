@@ -82,8 +82,6 @@ const PLUGIN_FIXTURE_SKILL_BODY: &str = "Model-free Pohunek compatibility skill.
 const PLUGIN_RUNTIME_CHECKS: usize = 1;
 /// Four CLI states plus one real production-plugin registration check.
 const PRODUCTION_PLUGIN_CHECKS: usize = 5;
-/// The current Pohunek CLI protocol required by the generated plugin policy.
-const EXPECTED_POHUNEK_PROTOCOL: u32 = protocol::PROTOCOL_VERSION.get();
 /// A normal executable search remains well below this abuse-resistant bound.
 const MAX_EXECUTABLE_PATH_ENTRIES: usize = 64;
 const PLUGIN_RUNTIME_MARKERS: [&str; 3] = [
@@ -2022,8 +2020,8 @@ fn validate_pohunek_envelope(
 ) -> Result<(), XtaskError> {
     let result = &envelope.ok;
     if envelope.cli_version.is_empty()
-        || envelope.protocol.minimum != EXPECTED_POHUNEK_PROTOCOL
-        || envelope.protocol.maximum != EXPECTED_POHUNEK_PROTOCOL
+        || envelope.protocol.minimum != protocol::CLIENT_PROTOCOL_VERSIONS.minimum().get()
+        || envelope.protocol.maximum != protocol::CLIENT_PROTOCOL_VERSIONS.maximum().get()
         || result.action != integration_action_name(step.action)
         || result.target_kind != "profile"
         || result.target_label != EXPECTED_NAMED_PROFILE
@@ -5202,8 +5200,8 @@ PY
             serde_json::json!({
                 "cli_version": "controlled",
                 "protocol": {
-                    "minimum": protocol::PROTOCOL_VERSION.get(),
-                    "maximum": protocol::PROTOCOL_VERSION.get()
+                    "minimum": protocol::CLIENT_PROTOCOL_VERSIONS.minimum().get(),
+                    "maximum": protocol::CLIENT_PROTOCOL_VERSIONS.maximum().get()
                 },
                 "ok": {
                     "action": action,
@@ -5355,8 +5353,8 @@ PY
         serde_json::json!({
             "cli_version": "controlled",
             "protocol": {
-                "minimum": super::EXPECTED_POHUNEK_PROTOCOL,
-                "maximum": super::EXPECTED_POHUNEK_PROTOCOL,
+                "minimum": protocol::CLIENT_PROTOCOL_VERSIONS.minimum().get(),
+                "maximum": protocol::CLIENT_PROTOCOL_VERSIONS.maximum().get(),
             },
             "ok": result,
         })
@@ -5374,6 +5372,13 @@ PY
         let current: super::PohunekEnvelope =
             serde_json::from_value(status_envelope(&serde_json::json!({}))).expect("parse");
         super::validate_pohunek_envelope(&status_step(), &current).expect("current install");
+
+        let mut narrowed = status_envelope(&serde_json::json!({}));
+        narrowed["protocol"]["minimum"] = protocol::PROTOCOL_VERSION.get().into();
+        let narrowed: super::PohunekEnvelope = serde_json::from_value(narrowed).expect("parse");
+        let error = super::validate_pohunek_envelope(&status_step(), &narrowed)
+            .expect_err("the CLI must advertise its complete supported window");
+        assert!(error.to_string().contains("invalid envelope"), "{error}");
 
         let outdated: super::PohunekEnvelope =
             serde_json::from_value(status_envelope(&serde_json::json!({"outdated": true})))

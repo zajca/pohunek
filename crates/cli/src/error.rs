@@ -190,6 +190,11 @@ pub(crate) enum CliError {
     /// JSON (de)serialization error at the client edge.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// A typed CLI result could not be represented at the previous protocol's
+    /// identity spelling.
+    #[error("CLI JSON compatibility rendering failed: {0}")]
+    JsonCompatibility(#[from] protocol::compat::CompatError),
 }
 
 impl CliError {
@@ -375,6 +380,12 @@ impl CliError {
                 format!("json error: {err}"),
                 None,
             ),
+            CliError::JsonCompatibility(error) => ProtocolError::new(
+                ErrorClass::Daemon,
+                "cli_json_compatibility_failed",
+                format!("CLI JSON compatibility rendering failed: {error}"),
+                None,
+            ),
         }
     }
 
@@ -517,7 +528,7 @@ fn print_json_error(err: &ProtocolError) {
             "{}",
             serde_json::json!({
                 "cli_version": env!("CARGO_PKG_VERSION"),
-                "protocol": protocol::CURRENT_PROTOCOL_VERSIONS,
+                "protocol": protocol::CLIENT_PROTOCOL_VERSIONS,
                 "err": {
                     "class": "daemon",
                     "code": "serialize_failed",
