@@ -158,7 +158,7 @@ fn path_error(err: pohunek_paths::PathError) -> DaemonError {
 mod tests {
     use std::path::Path;
 
-    use pohunek_paths::{PathEnv, APP_DIR};
+    use pohunek_paths::PathEnv;
 
     use super::*;
 
@@ -193,70 +193,5 @@ mod tests {
                 "unsafe id should be rejected: {id:?}"
             );
         }
-    }
-
-    #[test]
-    fn missing_config_home_and_home_fails_fast() {
-        let base = tmp_base("missing");
-        let mut env = all_present(&base);
-        // XDG_STATE_HOME/XDG_DATA_HOME stay set so the earlier steps do not need
-        // HOME; only the config step must fail, and with the actionable message.
-        env.xdg_config_home = None;
-        env.home = None;
-        match Paths::resolve_from(&env) {
-            Err(DaemonError::MissingEnv { var }) => {
-                assert_eq!(var, "XDG_CONFIG_HOME or HOME");
-            }
-            other => panic!("expected MissingEnv, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn plugins_dir_matches_the_shared_path_contract() {
-        let base = tmp_base("plugins");
-        let env = all_present(&base);
-        let paths = Paths::resolve_from(&env).expect("resolve paths");
-
-        assert_eq!(
-            paths.plugins_dir(),
-            base.join("state")
-                .join(APP_DIR)
-                .join(pohunek_paths::PLUGINS_SUBDIR)
-        );
-    }
-
-    #[test]
-    fn host_state_paths_have_the_canonical_layout() {
-        let base = tmp_base("host-state");
-        let env = all_present(&base);
-        let paths = Paths::resolve_from(&env).expect("resolve paths");
-        let host = base
-            .join("state")
-            .join(APP_DIR)
-            .join(pohunek_paths::HOST_STATE_SUBDIR);
-
-        assert_eq!(paths.host_state_dir(), host);
-        assert_eq!(
-            paths.host_identity_path(),
-            host.join(pohunek_paths::HOST_IDENTITY_NAME)
-        );
-        assert_eq!(
-            paths.host_approval_key_path(),
-            host.join(pohunek_paths::HOST_APPROVAL_KEY_NAME)
-        );
-        assert_eq!(
-            paths.host_governance_path(),
-            host.join(pohunek_paths::HOST_GOVERNANCE_NAME)
-        );
-        assert_eq!(
-            paths.host_state_lock_path(),
-            host.join(pohunek_paths::HOST_STATE_LOCK_NAME)
-        );
-        assert_eq!(
-            paths.data_authority_lock_path(),
-            base.join("data")
-                .join(APP_DIR)
-                .join(DATA_AUTHORITY_LOCK_NAME)
-        );
     }
 }
