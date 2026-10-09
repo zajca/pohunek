@@ -1,25 +1,30 @@
-//! Frozen typed mirror of the v0.33.0/1 legacy metadata-store reader.
+//! Frozen typed mirrors of the v0.33 releases' legacy metadata-store readers.
 //!
 //! The two v0.33 releases have no upgrade preflight, so the rollback gate
 //! (`super::rollback`) must prove on its own that a schema-1 store survives
-//! the legacy reader. That reader parses every line as a `serde` `Record` and
-//! **silently skips** a line it cannot deserialize or whose agent kinds are
-//! not runtime ids, and every mutation later rewrites the whole file from
-//! what it loaded — so one skipped line permanently loses a session's
-//! recovery, a worktree binding, or a known project. A syntax check alone
-//! cannot prove this: a record with a known `kind` but a missing or ill-typed
-//! field is accepted there and yet dropped by the reader.
+//! the reader of the exact previous release. Each reader parses every line as
+//! a `serde` `Record` and **silently skips** a line it cannot deserialize or
+//! whose agent kinds it does not support, and every mutation later rewrites
+//! the whole file from what it loaded — so one skipped line permanently loses
+//! a session's recovery, a worktree binding, or a known project. A syntax
+//! check alone cannot prove this: a record with a known `kind` but a missing
+//! or ill-typed field is accepted there and yet dropped by the reader.
 //!
-//! This module freezes the deserialization semantics of the v0.33.1 reader in
-//! this crate, independent of the legacy daemon binary. It mirrors the
-//! v0.33.1 source tree attribute for attribute (`git show
-//! v0.33.1:crates/daemon/src/store/mod.rs`, plus the `protocol` and daemon
-//! `agent` wire types it embeds): required fields, `serde` defaults and
-//! renames, the `deny_unknown_fields` sets, enum spellings, the validated
-//! wire types (runtime-id grammar, canonical decimal strings, `sha256:`
+//! The two releases disagree, so each one is frozen separately in this crate,
+//! independent of the legacy daemon binary, and a rollback validates against
+//! the reader of the exact previous version. Each mirror mirrors its tag
+//! attribute for attribute (the `store/mod.rs` of `v0.33.0` / `v0.33.1`, plus
+//! the `protocol` and daemon `agent` wire types it embeds): required fields,
+//! `serde` defaults and renames, the `deny_unknown_fields` sets, enum
+//! spellings, the validated wire types (canonical decimal strings, `sha256:`
 //! digests, native launch argv invariants), and the post-parse
-//! persistability checks. A line the legacy reader would drop refuses the
-//! rollback here, and a line it would keep passes.
+//! persistability checks. The agent-kind rules differ the widest: v0.33.0's
+//! `AgentKind` recognizes only the reserved built-in spellings, while
+//! v0.33.1's `RuntimeRef` keeps a grammar-valid custom id, and v0.33.1's
+//! native launch snapshot (`NativeSessionLaunch`, `LaunchBinding`) v0.33.0
+//! ignores in favor of its own mode/`fork` enum fields. A line that the
+//! selected reader would drop refuses the rollback, and a line it would keep
+//! passes — one release's acceptance never covers another's.
 //!
 //! Wire shapes here are consume-only: nothing in this module serializes.
 //! When a schema-1 store is ever re-read for another release, re-verify every
@@ -33,12 +38,13 @@ use std::path::PathBuf;
 use serde::de;
 use serde_json::Value;
 
-/// Wire names of the reserved built-in runtime ids
-/// (`agent/host/registry.rs` of the legacy tree).
+/// Wire spellings that reserve their own base in both legacy readers —
+/// v0.33.1's `RESERVED_RUNTIME_IDS` (`agent/host/registry.rs`) and the
+/// `legacy_agent_base_from_agent` match in the v0.33.0 `store/mod.rs`.
 ///
 /// A resume binding written without `agent_base` derives it from its `agent`
 /// only when the agent is one of these names.
-const RESERVED_RUNTIME_IDS: [&str; 4] = ["shell", "codex", "claude", "hermes"];
+const RESERVED_AGENT_KINDS: [&str; 4] = ["shell", "codex", "claude", "hermes"];
 
 /// Maximum UTF-8 bytes of a runtime id (`protocol/runtime_id.rs`).
 const MAX_RUNTIME_ID_BYTES: usize = 64;
@@ -52,20 +58,76 @@ const DIGEST_HEX_CHARS: usize = 64;
 /// The schema the legacy readers stamp and read.
 const LEGACY_SCHEMA: u32 = 1;
 
-/// Validates one schema-1 store body against the frozen legacy reader.
+/// The released legacy reader a rollback must prove a schema-1 store
+/// against, selected by the previous release's version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LegacyReader {
+    /// The v0.33.0 reader: `AgentKind` bases and the mode/`fork` snapshot
+    /// fields of `ResumeBinding`.
+    V0_33_0,
+    /// The v0.33.1 reader: `RuntimeRef` id bases and the native launch
+    /// snapshot of `ResumeBinding`.
+    V0_33_1,
+}
+
+/// The released version of the v0.33.0 reader; its daemon has no upgrade
+/// preflight and writes schema 1.
+pub(super) const V0_33_0_RELEASE: &str = "0.33.0";
+/// The released version of the v0.33.1 reader; same gate.
+pub(super) const V0_33_1_RELEASE: &str = "0.33.1";
+
+impl LegacyReader {
+    /// Selects the frozen reader of a released legacy daemon version.
+    pub(super) fn from_version(version: &str) -> Option<Self> {
+        match version {
+            V0_33_0_RELEASE => Some(Self::V0_33_0),
+            V0_33_1_RELEASE => Some(Self::V0_33_1),
+            _ => None,
+        }
+    }
+}
+
+/// The post-parse skip rule of one frozen reader, over its record type.
+///
+/// Both readers fail a line whose deserialization closes; some lines that
+/// deserialize carry agent kinds the reader still drops at load, and the
+/// trait carries that per-version rule so one validation loop proves both.
+trait ReaderSkip {
+    /// Why the reader would skip a record that deserialized, or `None` when
+    /// it keeps it.
+    fn skip_reason(record: &Self) -> Option<&'static str>;
+}
+
+/// Validates one schema-1 store body against the reader that `reader`
+/// freezes.
 ///
 /// Besides the syntax, schema, and kind checks the store scan already makes,
 /// this proves what they cannot: that every line deserializes through the
-/// frozen legacy reader and passes its post-parse persistability rules, so
-/// the reader keeps, rather than silently skips, every record on its next
-/// whole-store rewrite. Returns the number of records the reader would keep.
+/// frozen reader of the previous release and passes its post-parse
+/// persistability rules, so that reader keeps, rather than silently skips,
+/// every record on its next whole-store rewrite. Returns the number of
+/// records the reader would keep.
 ///
 /// # Errors
 ///
-/// Returns `("legacy_store_invalid", detail)` for a line the legacy reader
-/// would drop and `("legacy_store_schema_unsupported", detail)` for a schema
-/// it would never write.
-pub(super) fn validate_records(bytes: &[u8]) -> Result<usize, (&'static str, String)> {
+/// Returns `("legacy_store_invalid", detail)` for a line the reader would
+/// drop and `("legacy_store_schema_unsupported", detail)` for a schema it
+/// would never write.
+pub(super) fn validate_records(
+    bytes: &[u8],
+    reader: LegacyReader,
+) -> Result<usize, (&'static str, String)> {
+    match reader {
+        LegacyReader::V0_33_0 => validate_through::<Record330>(bytes),
+        LegacyReader::V0_33_1 => validate_through::<Record>(bytes),
+    }
+}
+
+/// Validates a store body against one frozen reader's typed record shape.
+fn validate_through<T>(bytes: &[u8]) -> Result<usize, (&'static str, String)>
+where
+    T: serde::de::DeserializeOwned + ReaderSkip,
+{
     let body = std::str::from_utf8(bytes).map_err(|error| {
         (
             "legacy_store_invalid",
@@ -74,6 +136,11 @@ pub(super) fn validate_records(bytes: &[u8]) -> Result<usize, (&'static str, Str
     })?;
     let mut records = 0;
     for (index, line) in body.lines().enumerate() {
+        // The reader filters blank lines before parsing; skip them too, but
+        // keep numbering the lines by their real position.
+        if line.trim().is_empty() {
+            continue;
+        }
         let number = index + 1;
         let parsed: Value = serde_json::from_str(line).map_err(|error| {
             (
@@ -108,15 +175,16 @@ pub(super) fn validate_records(bytes: &[u8]) -> Result<usize, (&'static str, Str
                 format!("line {number} has an unknown record kind"),
             ));
         }
-        let checked = serde_json::from_str::<Record>(line);
+        let checked = serde_json::from_str::<T>(line);
         match checked {
-            Ok(Record::Session(session)) if !session_persistable(&session) => {
-                return Err((
-                    "legacy_store_invalid",
-                    format!("line {number} would be skipped: the agent kind is not a runtime id"),
-                ));
+            Ok(record) => {
+                if let Some(reason) = T::skip_reason(&record) {
+                    return Err((
+                        "legacy_store_invalid",
+                        format!("line {number} would be skipped: {reason}"),
+                    ));
+                }
             }
-            Ok(_) => {}
             Err(error) => {
                 return Err((
                     "legacy_store_invalid",
@@ -146,6 +214,17 @@ fn session_persistable(record: &SessionRecord) -> bool {
             .recovery
             .as_ref()
             .is_none_or(|binding| persistable(&binding.agent_base))
+}
+
+impl ReaderSkip for Record {
+    fn skip_reason(record: &Self) -> Option<&'static str> {
+        match record {
+            Record::Session(session) if !session_persistable(session) => {
+                Some("the agent kind is not a runtime id")
+            }
+            _ => None,
+        }
+    }
 }
 
 /// One line of the legacy store: internally tagged by `kind`, `snake_case`.
@@ -378,7 +457,7 @@ impl TryFrom<RawResumeBinding> for ResumeBinding {
         let agent_base = if let Some(base) = raw.agent_base {
             Some(base)
         } else {
-            RESERVED_RUNTIME_IDS
+            RESERVED_AGENT_KINDS
                 .contains(&raw.agent.as_str())
                 .then(|| RuntimeRef::from_wire(raw.agent.clone()))
         };
@@ -1050,4 +1129,474 @@ pub(super) enum ProjectSource {
     Auto,
     /// Added explicitly by the operator.
     Manual,
+}
+
+// --- the v0.33.0 reader (suffix `330`, mirroring `git show v0.33.0:...`) ----
+
+/// An agent kind as the v0.33.0 reader classifies it: any wire string, with
+/// the reserved built-in spellings the known kinds.
+///
+/// Mirrors the v0.33.0 `protocol` `AgentKind`, whose `Deserialize` maps the
+/// reserved spellings and keeps any other value as an unrecognized one. The
+/// reader persists only known kinds, so a grammar-valid custom runtime id
+/// such as `claude-sonnet` skips a store line here that the v0.33.1 reader
+/// keeps. The string itself is dropped after classification; validation only
+/// decides keep-or-skip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AgentKind330 {
+    /// Whether the value is one of the reserved built-in spellings.
+    is_known_kind: bool,
+}
+
+impl AgentKind330 {
+    /// Classifies a wire agent kind the v0.33.0 `AgentKind` does.
+    fn from_wire(wire: &str) -> Self {
+        Self {
+            is_known_kind: RESERVED_AGENT_KINDS.contains(&wire),
+        }
+    }
+
+    /// Whether the kind is one of the reserved built-in spellings, so a
+    /// v0.33.0 record carrying it persists.
+    fn is_known(self) -> bool {
+        self.is_known_kind
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AgentKind330 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = String::deserialize(deserializer)?;
+        Ok(Self::from_wire(&wire))
+    }
+}
+
+/// How a v0.33.0 agent's resume invocation is shaped on the command line.
+///
+/// Mirrors the v0.33.0 daemon `agent::ResumeMode` (`snake_case` wire): a
+/// `--resume` flag or a `resume` subcommand. A record with an unrecognized
+/// spelling fails the reader's deserialization and is skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ResumeMode330 {
+    /// `<program> --resume <ref>` (Claude).
+    Flag,
+    /// `<program> resume <ref>` (Codex).
+    Subcommand,
+}
+
+/// A compiled provider-native fork command shape of the v0.33.0 reader.
+///
+/// Mirrors the v0.33.0 daemon `agent::ForkMode` (`snake_case` wire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ForkMode330 {
+    /// Append `--fork-session` to a Claude Code resume operation.
+    ClaudeSession,
+}
+
+/// A single line of the v0.33.0 store, internally tagged by `kind`,
+/// `snake_case`.
+///
+/// Mirrors the v0.33.0 `Record` enum: the same variant set as the v0.33.1
+/// [`Record`], wrapping the v0.33.0 session and resume types. Unknown fields
+/// are ignored (the reader never denies them at this level); an unknown kind
+/// fails the deserialization the reader skips.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(super) enum Record330 {
+    /// A durable logical session.
+    Session(Box<SessionRecord330>),
+    /// A native recovery binding of one logical session.
+    Resume(ResumeBinding330),
+    /// A bound worktree.
+    Worktree(WorktreeBinding),
+    /// A known project.
+    Project(ProjectRecord),
+}
+
+impl ReaderSkip for Record330 {
+    fn skip_reason(record: &Self) -> Option<&'static str> {
+        match record {
+            Record330::Session(session) if !session_agents_are_known(session) => {
+                Some("the agent kind is not a known agent kind")
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Whether a v0.33.0 session record keeps its agent kinds.
+///
+/// Mirrors the v0.33.0 reader's `record_agents_are_known`: the summary's
+/// base, the active nested agent's base when present, and the recovery
+/// binding's base when present must all be known `AgentKind` spellings.
+fn session_agents_are_known(record: &SessionRecord330) -> bool {
+    record.info.agent_base.is_known()
+        && record
+            .info
+            .active_agent_base
+            .as_ref()
+            .is_none_or(|kind| kind.is_known())
+        && record
+            .recovery
+            .as_ref()
+            .is_none_or(|binding| binding.agent_base.is_known())
+}
+
+/// A v0.33.0 resume binding, whose `agent_base` is classified on load.
+///
+/// Mirrors the v0.33.0 `ResumeBinding`: the raw serde form below, plus the
+/// v0.33.0 load rules in [`TryFrom<RawResumeBinding330>`] — a recorded
+/// `agent_base` wins, otherwise only a reserved kind derives its own base,
+/// and a base the reader does not know fails its `validate_persistence`,
+/// which skips the line. Unlike the v0.33.1 reader, the relaunch shape is the
+/// mode/fork enums ([`ResumeMode330`], [`ForkMode330`], [`SessionRefKind`])
+/// rather than a native launch spec, and each spelled field must deserialize.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(try_from = "RawResumeBinding330")]
+pub(super) struct ResumeBinding330 {
+    /// The pohunek session id.
+    pub session_id: String,
+    /// Owner-set display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Agent name backing the session.
+    pub agent: String,
+    /// Recorded or derived agent base, whose known-ness decides persistence.
+    pub agent_base: AgentKind330,
+    /// Working directory to relaunch in.
+    pub cwd: PathBuf,
+    /// Terminal width at capture time.
+    pub cols: u16,
+    /// Terminal height at capture time.
+    pub rows: u16,
+    /// Captured native session id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_session_id: Option<String>,
+    /// Captured native session path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_session_path: Option<String>,
+    /// Project this session belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// Whether the session's cwd is a linked worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_linked_worktree: Option<bool>,
+    /// Owner-controlled session metadata.
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
+    /// Resolved launch program, frozen at creation.
+    #[serde(default)]
+    pub program: String,
+    /// Resolved launch args, frozen at creation.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Resolved input-framing rules, frozen at creation.
+    #[serde(default)]
+    pub input_rules: StoredInputRules,
+    /// Resume argv mode frozen at creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_mode: Option<ResumeMode330>,
+    /// Native-reference kind frozen at creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_kind: Option<SessionRefKind>,
+    /// Whether the session resumes at all, frozen at creation.
+    #[serde(default)]
+    pub resumable: bool,
+    /// Provider-native fork argv shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_mode: Option<ForkMode330>,
+    /// Resume argv operation used by fork.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_resume_mode: Option<ResumeMode330>,
+    /// Native-reference kind used by fork.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_ref_kind: Option<SessionRefKind>,
+    /// Whether the session retained a native fork capability at creation.
+    #[serde(default)]
+    pub forkable: bool,
+}
+
+impl TryFrom<RawResumeBinding330> for ResumeBinding330 {
+    type Error = String;
+
+    fn try_from(raw: RawResumeBinding330) -> Result<Self, Self::Error> {
+        // Derivation per the v0.33.0 reader: a recorded base wins; otherwise
+        // only a reserved kind derives its own base, anything else fails to
+        // load, skipping the line. A base the reader does not know fails its
+        // `validate_persistence`, which also skips the line.
+        let agent_base = if let Some(base) = raw.agent_base {
+            Some(base)
+        } else {
+            RESERVED_AGENT_KINDS
+                .contains(&raw.agent.as_str())
+                .then(|| AgentKind330::from_wire(&raw.agent))
+        };
+        let agent_base = agent_base.ok_or_else(|| "agent_name_has_no_base".to_owned())?;
+        if !agent_base.is_known() {
+            return Err("the agent kind is not supported for persistence at 0.33.0".to_owned());
+        }
+        Ok(Self {
+            session_id: raw.session_id,
+            name: raw.name,
+            agent: raw.agent,
+            agent_base,
+            cwd: raw.cwd,
+            cols: raw.cols,
+            rows: raw.rows,
+            native_session_id: raw.native_session_id,
+            native_session_path: raw.native_session_path,
+            project_id: raw.project_id,
+            is_linked_worktree: raw.is_linked_worktree,
+            metadata: raw.metadata,
+            program: raw.program,
+            args: raw.args,
+            input_rules: raw.input_rules,
+            resume_mode: raw.resume_mode,
+            ref_kind: raw.ref_kind,
+            resumable: raw.resumable,
+            fork_mode: raw.fork_mode,
+            fork_resume_mode: raw.fork_resume_mode,
+            fork_ref_kind: raw.fork_ref_kind,
+            forkable: raw.forkable,
+        })
+    }
+}
+
+/// The serde form of a v0.33.0 resume binding.
+///
+/// Field for field the v0.33.0 `RawResumeBinding`, with its `serde` defaults.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+struct RawResumeBinding330 {
+    session_id: String,
+    #[serde(default)]
+    name: Option<String>,
+    agent: String,
+    #[serde(default)]
+    agent_base: Option<AgentKind330>,
+    cwd: PathBuf,
+    cols: u16,
+    rows: u16,
+    #[serde(default)]
+    native_session_id: Option<String>,
+    #[serde(default)]
+    native_session_path: Option<String>,
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    is_linked_worktree: Option<bool>,
+    #[serde(default)]
+    metadata: BTreeMap<String, String>,
+    #[serde(default)]
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    input_rules: StoredInputRules,
+    #[serde(default)]
+    resume_mode: Option<ResumeMode330>,
+    #[serde(default)]
+    ref_kind: Option<SessionRefKind>,
+    #[serde(default)]
+    resumable: bool,
+    #[serde(default)]
+    fork_mode: Option<ForkMode330>,
+    #[serde(default)]
+    fork_resume_mode: Option<ResumeMode330>,
+    #[serde(default)]
+    fork_ref_kind: Option<SessionRefKind>,
+    #[serde(default)]
+    forkable: bool,
+}
+
+/// A v0.33.0 logical session record with its recovery snapshot and runtime.
+///
+/// Mirrors the v0.33.0 `SessionRecord`: the same field set as the v0.33.1
+/// [`SessionRecord`], with the summary and snapshot of the v0.33.0 reader.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub(super) struct SessionRecord330 {
+    /// On-disk record schema.
+    pub schema_version: u32,
+    /// Stable logical session identifier.
+    pub session_id: String,
+    /// Desired lifecycle outcome.
+    pub desired_state: DesiredState,
+    /// In-progress operation, when reconciliation has work to finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction: Option<SessionTransaction>,
+    /// Sanitized client-facing snapshot.
+    pub info: SessionInfo330,
+    /// Native-recovery snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<ResumeBinding330>,
+    /// Last accepted native identity ordering key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_identity_ordering: Option<NativeIdentityOrdering>,
+    /// Last durable worker binding.
+    pub runtime: RuntimeRecord,
+}
+
+/// Durable worker runtime information of a v0.33.0 session summary.
+///
+/// Mirrors the v0.33.0 `protocol` `SessionRuntime`: the persisted key for the
+/// PTY generation stays `runtime_id`; v0.33.1 renamed it
+/// `worker_instance_id`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub(super) struct SessionRuntime330 {
+    /// Availability of the runtime.
+    pub state: RuntimeState,
+    /// Monotonic generation, a canonical decimal wire string.
+    pub runtime_generation: DecimalWire,
+    /// Worker that owns the PTY, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    /// PTY generation identity, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
+    /// When this generation started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// Latest successful daemon connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_connected_at: Option<String>,
+    /// Reason when the runtime is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_reason: Option<String>,
+}
+
+/// One provider-managed subagent of a v0.33.0 session.
+///
+/// Mirrors the v0.33.0 `protocol` `SubagentInfo`, whose provider is an
+/// `AgentKind` rather than the v0.33.1 `RuntimeRef`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub(super) struct SubagentInfo330 {
+    /// Provider-native identifier.
+    pub id: String,
+    /// Parent provider-native identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    /// Provider that owns the subagent.
+    pub provider: AgentKind330,
+    /// Provider-defined subagent type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    /// Lifecycle state.
+    pub lifecycle: SubagentLifecycle,
+    /// Coarse activity while running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<AgentActivity>,
+    /// Worker-owned monotonic revision, a canonical decimal wire string.
+    pub revision: DecimalWire,
+    /// Unix-millisecond timestamp of the accepted start hook.
+    pub started_at_ms: u64,
+    /// Unix-millisecond timestamp of the latest transition.
+    pub updated_at_ms: u64,
+    /// Unix-millisecond timestamp of the terminal transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at_ms: Option<u64>,
+}
+
+/// Sanitized client-facing v0.33.0 session snapshot.
+///
+/// Mirrors the v0.33.0 `protocol` `SessionInfo`: the same required fields,
+/// defaults and `deny_unknown_fields` set as [`SessionInfo`], with the v0.33.0
+/// `AgentKind` bases, runtime and subagent types.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub(super) struct SessionInfo330 {
+    /// Stable session identifier.
+    pub id: String,
+    /// Whether the entry is an observe-only external process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external: Option<bool>,
+    /// Capabilities frozen at session start.
+    #[serde(default)]
+    pub capabilities: SessionCapabilities,
+    /// Owner-set display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Agent profile name backing the session.
+    pub agent: String,
+    /// Resolved base kind backing the session, whose known-ness decides
+    /// persistence.
+    pub agent_base: AgentKind330,
+    /// Current working directory.
+    pub cwd: PathBuf,
+    /// Source that last set the working directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd_source: Option<CwdSource>,
+    /// Process id of the session root process.
+    pub pid: u32,
+    /// Durable worker runtime information; `None` predates worker-backed
+    /// sessions or marks an observe-only entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<SessionRuntime330>,
+    /// Terminal width.
+    pub cols: u16,
+    /// Terminal height.
+    pub rows: u16,
+    /// Lifecycle state.
+    pub state: SessionState,
+    /// Source of the state signal.
+    pub state_source: StateSource,
+    /// Detected agent activity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<AgentActivity>,
+    /// Provider-managed subagents.
+    #[serde(default)]
+    pub subagents: Vec<SubagentInfo330>,
+    /// Active nested agent profile name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_agent: Option<String>,
+    /// Resolved base kind for the nested agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_agent_base: Option<AgentKind330>,
+    /// Process id of the nested agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_agent_pid: Option<u32>,
+    /// Native session id of the nested agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_agent_session_id: Option<String>,
+    /// Native session path of the nested agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_agent_session_path: Option<String>,
+    /// Captured native session id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_session_id: Option<String>,
+    /// Captured native session path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_session_path: Option<String>,
+    /// Project the session belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// Current display label of the project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_label: Option<String>,
+    /// Whether the checkout is a linked worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_linked_worktree: Option<bool>,
+    /// Source git repository, when bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<PathBuf>,
+    /// Branch checked out in the worktree, when bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Path to the bound worktree, when bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<PathBuf>,
+    /// Worktree-setup warnings.
+    #[serde(default)]
+    pub warnings: Vec<SessionWarning>,
+    /// Owner-controlled metadata.
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
+    /// Creation timestamp.
+    pub created_at: String,
+    /// Last update timestamp.
+    pub updated_at: String,
+    /// Process exit code, when the session exited with one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
 }

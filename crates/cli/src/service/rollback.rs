@@ -2,11 +2,14 @@
 //!
 //! Releases with `upgrade-preflight` judge their own reader and worker
 //! adoption. The two v0.33 releases have no preflight and can silently skip
-//! records they cannot deserialize, so only their own schema-1 store is
-//! admitted: every line is validated against the frozen typed legacy reader
-//! in [`super::legacy_store`], so a record the old reader would drop, and a
-//! whole-store rewrite would lose, refuses the rollback. Unproven live
-//! workers need explicit runtime-loss consent.
+//! records they cannot load, so only their own schema-1 store is admitted:
+//! every line is validated against the frozen typed reader of the exact
+//! previous release ([`super::legacy_store`], selected by
+//! [`super::legacy_store::LegacyReader`]), so a record that reader would
+//! drop, and a whole-store rewrite would lose, refuses the rollback. The two
+//! releases' readers differ, so their verdicts are frozen separately and a
+//! line one keeps never proves another's contract. Unproven live workers
+//! need explicit runtime-loss consent.
 
 // Rust guideline compliant 2026-10-09
 
@@ -26,12 +29,11 @@ use super::engine::job_alive;
 use super::error::Error;
 use super::layout;
 use super::legacy_store;
+use super::legacy_store::LegacyReader;
 use super::preflight::{self, AdoptionPreflight, Gated};
 use super::settings;
 use super::usage::Journals;
 
-/// Releases whose daemon has no upgrade preflight and writes schema 1.
-const LEGACY_READERS: [&str; 2] = ["0.33.0", "0.33.1"];
 /// The legacy metadata layout; the current daemon stamps later schemas.
 const LEGACY_STORE_SCHEMA: u32 = 1;
 /// Mode of the owner-private metadata store.
@@ -61,7 +63,7 @@ pub(super) async fn gate(
     reported_version: &str,
     accept_runtime_loss: bool,
 ) -> Result<Gated, Error> {
-    let judged = if LEGACY_READERS.contains(&previous) {
+    let judged = if let Some(reader) = LegacyReader::from_version(previous) {
         let daemon = daemon_dir.join(DAEMON_EXECUTABLE_NAME);
         preflight::probe_daemon(&daemon, reported_version)
             .await
@@ -69,7 +71,7 @@ pub(super) async fn gate(
                 version: previous.to_owned(),
                 detail: error.to_string(),
             })?;
-        let report = legacy_report(&inputs, previous).await?;
+        let report = legacy_report(&inputs, previous, reader).await?;
         preflight::decide(report, accept_runtime_loss)
     } else {
         preflight::gate(
@@ -99,8 +101,12 @@ pub(super) async fn gate(
     })
 }
 
-async fn legacy_report(inputs: &Inputs<'_>, previous: &str) -> Result<PreflightReport, Error> {
-    let store = legacy_store(inputs.context);
+async fn legacy_report(
+    inputs: &Inputs<'_>,
+    previous: &str,
+    reader: LegacyReader,
+) -> Result<PreflightReport, Error> {
+    let store = store_report(inputs.context, reader);
     let sessions = if store.state == StoreState::Refused {
         Vec::new()
     } else {
@@ -248,7 +254,7 @@ fn unverified(session_id: String, detail: String) -> SessionVerdict {
     }
 }
 
-fn legacy_store(context: &Context) -> StoreReport {
+fn store_report(context: &Context, reader: LegacyReader) -> StoreReport {
     let mut report = StoreReport {
         path: context.paths().data_dir.join(METADATA_STORE_NAME),
         state: StoreState::Missing,
@@ -263,7 +269,7 @@ fn legacy_store(context: &Context) -> StoreReport {
         Ok(Some(bytes)) => bytes,
         Err(detail) => return refused(report, "legacy_store_unreadable", detail),
     };
-    match legacy_store::validate_records(&bytes) {
+    match legacy_store::validate_records(&bytes, reader) {
         Ok(records) => {
             report.state = StoreState::UpToDate;
             report.records = records;
