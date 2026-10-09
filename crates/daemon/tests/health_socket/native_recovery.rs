@@ -38,6 +38,7 @@ struct ClaudeRig {
     ack_log: PathBuf,
     config_home: PathBuf,
     worker_state_root: PathBuf,
+    store_path: PathBuf,
     additional_sessions: Vec<SessionId>,
     _bin: TestDir,
     _state: TestDir,
@@ -58,6 +59,31 @@ impl ClaudeRig {
         journals.sort();
         assert_eq!(journals.len(), 1, "one worker generation: {journals:?}");
         journals.remove(0)
+    }
+
+    fn rewrite_durable_worker_id(&self, expected: &str, replacement: &str) {
+        let original = std::fs::read(&self.store_path).expect("read durable session store");
+        let mut changed = false;
+        let lines = original
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let mut record: serde_json::Value =
+                    serde_json::from_slice(line).expect("durable record decodes");
+                if record["kind"] == "session"
+                    && record["session_id"] == self.session.id.0.as_str()
+                    && record["runtime"]["worker_id"] == expected
+                {
+                    record["runtime"]["worker_id"] = serde_json::json!(replacement);
+                    changed = true;
+                }
+                serde_json::to_vec(&record).expect("durable record serializes")
+            })
+            .collect::<Vec<_>>();
+        assert!(changed, "the durable record names a worker to mismatch");
+        let mut rewritten = lines.join(&b'\n');
+        rewritten.push(b'\n');
+        std::fs::write(&self.store_path, rewritten).expect("rewrite durable session store");
     }
 
     async fn new(tag: &str) -> Self {
@@ -104,9 +130,10 @@ impl ClaudeRig {
         )
         .expect("write Claude host profile");
         let socket = temp_socket(tag);
+        let store_path = state.join("metadata.jsonl");
         let registry_config = SessionRegistryConfig {
             shell_command: support::hermetic_shell(),
-            store_path: Some(state.join("metadata.jsonl")),
+            store_path: Some(store_path.clone()),
             agents_dir: Some(agents.to_path_buf()),
             host_state_dir: Some(state.join("host-state")),
             ..SessionRegistryConfig::default()
@@ -135,6 +162,7 @@ impl ClaudeRig {
             ack_log,
             config_home,
             worker_state_root,
+            store_path,
             additional_sessions: Vec::new(),
             _bin: bin,
             _state: state,
@@ -383,6 +411,262 @@ async fn claude_list_reads_multiple_targets_in_one_large_store_without_following
     assert_eq!(activity_for(&clear_id, &listed_again), None);
     assert_eq!(activity_for(&symlink_id, &listed_again), None);
     rig.finish(None).await;
+}
+
+fn pi_descriptor(program: &std::path::Path) -> String {
+    format!(
+        "schema = 1\nid = \"acme.runtime.pi\"\nversion = \"1.0.0\"\nruntime_api = 1\n\
+         [runtime]\nid = \"pi\"\nname = \"Pi fixture\"\nprogram = {program:?}\nargs = []\n\
+         detect_manifest = \"detect.toml\"\nprompt_arg = true\n\
+         [input]\nbracketed_paste = false\nsubmit_delay_ms = 0\ntext_policy = \"unrestricted\"\n\
+         [resume]\nsupported = true\nreference_kind = \"id\"\nargs = [\"--session\", \"{{reference}}\"]\n\
+         [fork]\nsupported = true\nargs = [\"--fork\", \"{{reference}}\"]\n\
+         [native_reference]\nstrategy = \"assigned\"\nlaunch_args = [\"--session-id\", \"{{reference}}\"]\n\
+         [native_reference.existence]\ncheck = \"file\"\nroot_env = \"PI_CODING_AGENT_DIR\"\n\
+         dir = \"sessions\"\nfile_name = \"_{{reference}}.jsonl\"\nname_match = \"ends_with\"\nmax_depth = 1\n",
+        program = program.display().to_string(),
+    )
+}
+
+fn pi_archive_from_descriptor(descriptor: String) -> (Vec<u8>, package::PackageDigest) {
+    let archive = package::build_archive(
+        &[
+            package::ArchiveEntry {
+                path: "runtime.toml".to_owned(),
+                contents: descriptor.into_bytes(),
+                executable: false,
+            },
+            package::ArchiveEntry {
+                path: "detect.toml".to_owned(),
+                contents: b"[[rules]]\nid = \"ready\"\nstate = \"idle\"\npriority = 100\nregion = \"whole_recent\"\nany = [{ contains = \"ready\" }]\n".to_vec(),
+                executable: false,
+            },
+        ],
+        &package::Limits::DEFAULT,
+    )
+    .expect("build fixture Pi package");
+    let digest = package::read_archive(&archive, &package::Limits::DEFAULT)
+        .expect("read fixture Pi package")
+        .digest()
+        .clone();
+    (archive, digest)
+}
+
+fn pi_archive(program: &std::path::Path) -> (Vec<u8>, package::PackageDigest) {
+    pi_archive_from_descriptor(pi_descriptor(program))
+}
+
+async fn install_pi_archive(
+    control: &mut Framed<UnixStream, LinesCodec>,
+    archive_path: &std::path::Path,
+    digest: &package::PackageDigest,
+) {
+    let installed = exchange(
+        control,
+        &Request::make(
+            "install-pi-batch-package",
+            method::PACKAGE_INSTALL,
+            serde_json::json!({
+                "archive_path": archive_path,
+                "trust": { "kind": "explicit_digest", "digest": digest },
+                "enable": true,
+                "select": true,
+                "dry_run": false
+            }),
+        ),
+    )
+    .await;
+    ok_payload(installed);
+}
+
+async fn assert_invalid_pi_descriptors_are_refused(
+    control: &mut Framed<UnixStream, LinesCodec>,
+    state: &std::path::Path,
+    program: &std::path::Path,
+) {
+    let baseline: protocol::PackageListResult = serde_json::from_value(ok_payload(
+        exchange(
+            control,
+            &Request::make("list-before-invalid-pi", method::PACKAGE_LIST, Value::Null),
+        )
+        .await,
+    ))
+    .expect("list installed package");
+    let valid = pi_descriptor(program);
+    let path_hook = valid
+        .replace("reference_kind = \"id\"", "reference_kind = \"path\"")
+        .replace(
+            "strategy = \"assigned\"\nlaunch_args = [\"--session-id\", \"{reference}\"]",
+            "strategy = \"hook\"",
+        );
+    assert_ne!(path_hook, valid, "path-kind hook descriptor differs");
+    assert!(path_hook.contains("strategy = \"hook\""));
+    assert!(!path_hook.contains("launch_args"));
+    let deep_scan = valid.replace("max_depth = 1", "max_depth = 9");
+    assert_ne!(deep_scan, valid, "invalid scan depth differs");
+    for (name, descriptor) in [("path-hook", path_hook), ("deep-scan", deep_scan)] {
+        let (archive, digest) = pi_archive_from_descriptor(descriptor);
+        let archive_path = state.join(format!("invalid-{name}.tar.zst"));
+        std::fs::write(&archive_path, archive).expect("write invalid fixture package");
+        let response = exchange(
+            control,
+            &Request::make(
+                name,
+                method::PACKAGE_INSTALL,
+                serde_json::json!({
+                    "archive_path": archive_path,
+                    "trust": { "kind": "explicit_digest", "digest": digest },
+                    "enable": true,
+                    "select": true,
+                    "dry_run": false
+                }),
+            ),
+        )
+        .await;
+        let Err(error) = response.into_result() else {
+            panic!("invalid {name} descriptor must be rejected");
+        };
+        assert_eq!(error.code, "package_descriptor_invalid", "{name}");
+    }
+    let after: protocol::PackageListResult = serde_json::from_value(ok_payload(
+        exchange(
+            control,
+            &Request::make("list-after-invalid-pi", method::PACKAGE_LIST, Value::Null),
+        )
+        .await,
+    ))
+    .expect("list packages after refused installs");
+    assert_eq!(
+        after, baseline,
+        "refused installs cannot mutate the registry"
+    );
+}
+
+fn write_pi_transcripts(config_home: &std::path::Path, sessions: &[SessionInfo]) -> PathBuf {
+    let project = config_home.join("sessions/project");
+    std::fs::create_dir_all(&project).expect("create Pi session store");
+    for (index, seconds) in [(0, 1_700_000_000), (1, 1_700_000_100)] {
+        let reference = sessions[index]
+            .native_session_id
+            .as_deref()
+            .expect("Pi assigned ID");
+        let transcript = project.join(format!("2026-10-10T0{index}_{reference}.jsonl"));
+        std::fs::write(&transcript, "{}\n").expect("write Pi transcript");
+        std::fs::File::options()
+            .write(true)
+            .open(&transcript)
+            .expect("open Pi transcript")
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds)),
+            )
+            .expect("set Pi transcript activity");
+    }
+    let outside = config_home.join("outside.jsonl");
+    std::fs::write(&outside, "{}\n").expect("write outside transcript");
+    std::os::unix::fs::symlink(
+        &outside,
+        project.join(format!(
+            "2026-10-10T02_{}.jsonl",
+            sessions[2]
+                .native_session_id
+                .as_deref()
+                .expect("Pi assigned ID")
+        )),
+    )
+    .expect("link outside transcript");
+    project
+}
+
+#[tokio::test]
+async fn pi_package_list_batches_suffix_matches_and_ignores_symlinks() {
+    let bin = temp_dir("pi-batch-bin");
+    let state = temp_dir("pi-batch-state");
+    let cwd = temp_dir("pi-batch-cwd");
+    let agents = temp_dir("pi-batch-agents");
+    let config = temp_dir("pi-batch-config");
+    let program = bin.join("pi-fixture.sh");
+    write_executable(
+        &program,
+        "#!/bin/sh\nprintf '\\033[?2004h'\nwhile IFS= read -r line; do :; done\n",
+    );
+    let (archive, digest) = pi_archive(&program);
+    let archive_path = state.join("pi.tar.zst");
+    std::fs::write(&archive_path, archive).expect("write fixture Pi archive");
+    let config_home = config.join("pi");
+    std::fs::create_dir(&config_home).expect("create Pi config home");
+    std::fs::write(
+        agents.join("pi-fixture.toml"),
+        format!(
+            "base = \"pi\"\npackage = \"acme.runtime.pi\"\ndigest = \"{digest}\"\n\
+             [env]\nPI_CODING_AGENT_DIR = \"{}\"\n",
+            config_home.display()
+        ),
+    )
+    .expect("write pinned Pi profile");
+    let socket = temp_socket("pi-batch-activity");
+    let registry_config = SessionRegistryConfig {
+        shell_command: support::hermetic_shell(),
+        store_path: Some(state.join("metadata.jsonl")),
+        agents_dir: Some(agents.to_path_buf()),
+        plugins_dir: Some(state.join("plugins")),
+        host_state_dir: Some(state.join("host-state")),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, server, _worker_home) =
+        spawn_server_with_config(&socket, "0.0.0", registry_config).await;
+    let mut control = connect(&socket).await;
+    install_pi_archive(&mut control, &archive_path, &digest).await;
+    assert_invalid_pi_descriptors_are_refused(&mut control, &state, &program).await;
+    let mut sessions = Vec::new();
+    for _ in 0..3 {
+        let mut params = session_params_in(cwd.to_path_buf());
+        "pi-fixture".clone_into(&mut params.agent);
+        let session: SessionInfo = serde_json::from_value(ok_payload(
+            create_session_with_params(&mut control, params).await,
+        ))
+        .expect("create package-backed Pi session");
+        assert!(
+            session.native_session_id.is_some(),
+            "Pi gets an assigned ID"
+        );
+        sessions.push(session);
+    }
+    let project = write_pi_transcripts(&config_home, &sessions);
+    let listed = listed_sessions(&mut control).await;
+    let inspected = inspect_session(&mut control, &sessions[0].id).await;
+    let absent = sessions[1]
+        .native_session_id
+        .as_deref()
+        .expect("Pi assigned ID");
+    std::fs::remove_file(project.join(format!("2026-10-10T01_{absent}.jsonl")))
+        .expect("remove Pi transcript");
+    let listed_missing = listed_sessions(&mut control).await;
+    for session in &sessions {
+        let request = Request::make(
+            "remove-pi-batch-session",
+            method::SESSION_REMOVE,
+            serde_json::to_value(&session.id).expect("serialize session id"),
+        );
+        ok_payload(exchange(&mut control, &request).await);
+    }
+    let _ = shutdown.send(());
+    server.await.expect("Pi control server stops");
+
+    assert_eq!(
+        activity_for(&sessions[0].id, &listed),
+        Some("2023-11-14T22:13:20Z")
+    );
+    assert_eq!(
+        activity_for(&sessions[1].id, &listed),
+        Some("2023-11-14T22:15:00Z")
+    );
+    assert_eq!(activity_for(&sessions[2].id, &listed), None);
+    assert_eq!(
+        inspected.native_last_activity_at,
+        activity_for(&sessions[0].id, &listed).map(str::to_owned)
+    );
+    assert_eq!(activity_for(&sessions[1].id, &listed_missing), None);
 }
 
 #[tokio::test]
@@ -706,4 +990,64 @@ async fn claude_mismatched_generation_instance_refuses_resume_and_fork() {
         serde_json::to_vec(&journal).expect("mismatched journal serializes")
     })
     .await;
+}
+
+#[tokio::test]
+async fn claude_mismatched_durable_worker_refuses_resume_and_fork() {
+    let mut rig = ClaudeRig::new("claude-mismatched-durable-worker").await;
+    rig.transcript(LAUNCH);
+    rig.report("startup", LAUNCH).await;
+    let id = rig.session.id.clone();
+    let stopped = rig.stop(&id).await;
+    let original_worker = stopped
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.worker_id.as_deref())
+        .expect("stopped runtime names its worker")
+        .to_owned();
+    rig.rewrite_durable_worker_id(&original_worker, "different-worker");
+    let argv_before = std::fs::read(&rig.argv_log).expect("initial launch argv");
+
+    let resume = rig.resume().await;
+    let fork = exchange(
+        &mut rig.control,
+        &Request::make(
+            "fork-with-mismatched-durable-worker",
+            method::SESSION_FORK,
+            serde_json::json!({
+                "session_id": id,
+                "cwd_mode": "same",
+                "cols": 80,
+                "rows": 24
+            }),
+        ),
+    )
+    .await;
+    let after = inspect_session(&mut rig.control, &id).await;
+    let argv_after = std::fs::read(&rig.argv_log).expect("argv after refused recovery");
+    if !resume.is_ok() {
+        rig.rewrite_durable_worker_id("different-worker", &original_worker);
+    }
+    let sessions = listed_sessions(&mut rig.control).await;
+    let child = sessions
+        .iter()
+        .find(|session| session.id != id)
+        .map(|session| session.id.clone());
+    rig.finish(child).await;
+
+    for response in [resume, fork] {
+        let Err(error) = response.into_result() else {
+            panic!("mismatched durable worker must refuse resume and fork");
+        };
+        assert_eq!(error.code, "native_identity_evidence_unavailable");
+    }
+    assert_eq!(sessions.len(), 1, "refused fork cannot register a child");
+    assert_eq!(
+        after.runtime, stopped.runtime,
+        "resume cannot mint a generation"
+    );
+    assert_eq!(
+        argv_after, argv_before,
+        "neither request can launch an agent"
+    );
 }

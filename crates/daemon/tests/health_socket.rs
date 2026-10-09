@@ -513,11 +513,13 @@ fn worker_backed_registry(
             .with_environment_source(support::hermetic_environment_source()),
     );
     let launcher = Arc::new(SubprocessWorkerLauncher::new());
-    let registry = SessionRegistry::new_with_launcher_and_inspector(
-        config,
-        launcher,
-        Arc::new(readable_host::ReadableHost::new()),
-    );
+    let inspector = Arc::new(readable_host::ReadableHost::new());
+    let registry = if config.plugins_dir.is_some() {
+        SessionRegistry::new_production_with_inspector(config, launcher, inspector)
+            .expect("package-backed registry opens the plugin root")
+    } else {
+        SessionRegistry::new_with_launcher_and_inspector(config, launcher, inspector)
+    };
     (registry, worker_home_dir)
 }
 

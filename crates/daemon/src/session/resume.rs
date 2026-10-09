@@ -625,6 +625,12 @@ impl SessionRegistry {
             }
             return Ok(());
         };
+        if Some(snapshot.worker_id.as_str()) != durable.runtime.worker_id.as_deref() {
+            return Err(native_evidence_unavailable(
+                binding,
+                "the worker journal names another worker",
+            ));
+        }
         let instance = snapshot
             .worker_instance_id
             .as_ref()

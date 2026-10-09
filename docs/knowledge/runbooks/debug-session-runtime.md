@@ -131,7 +131,7 @@ means its own generation journal has no native claim;
 `runtime/native_identity_unverified` means it has a claim but no verified
 launch-process binding. `runtime/native_identity_evidence_unavailable` means
 the durable session record or exact generation journal cannot be read, the
-journal is absent or ambiguous, or its worker instance does not match the
+journal is absent or ambiguous, or its worker id or instance does not match the
 record. Preserve both records for diagnosis. A foreign process claim keeps the
 existing typed process-identity reason and cannot replace the stored native
 reference.
