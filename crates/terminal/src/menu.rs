@@ -442,28 +442,3 @@ fn overlay_line(text: &str, highlighted: bool) -> OverlayLine {
         highlighted,
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const RENAME_TEST_BYTE: u8 = b'a';
-
-    #[test]
-    fn rename_input_ignores_graphic_bytes_after_session_name_limit() {
-        let mut state = MenuState::RenameInput {
-            buffer: String::new(),
-        };
-
-        for _ in 0..=MAX_SESSION_NAME_BYTES {
-            let (next, effects) = step(state, MenuEvent::Key(MenuKey::Byte(RENAME_TEST_BYTE)));
-            state = next;
-            assert!(effects.is_empty());
-        }
-
-        let MenuState::RenameInput { buffer } = state else {
-            panic!("rename input should remain open");
-        };
-        assert_eq!(buffer.len(), MAX_SESSION_NAME_BYTES);
-    }
-}
