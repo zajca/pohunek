@@ -51,7 +51,6 @@ Current CLI and command surface:
 - `crates/cli/src/target.rs`
 - `crates/cli/src/paths.rs`
 - `crates/cli/src/error.rs`
-- `crates/cli/tests/notifications_clap.rs`
 - `crates/cli/tests/agent_skill.rs`
 - `crates/cli/tests/prompt_link.rs`
 - `crates/cli/tests/standalone_discovery.rs`

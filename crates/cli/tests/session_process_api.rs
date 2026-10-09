@@ -1,9 +1,9 @@
 //! Binary-level contract tests for the session process API.
 //!
 //! These tests deliberately invoke the built CLI and speak the public wire
-//! protocol over a Unix socket. They cover behavior that parser and command
-//! unit tests cannot prove: stdout/stderr separation, the versioned process
-//! envelope, dedicated wait connections, and origin propagation.
+//! protocol over a Unix socket. They cover stdout/stderr separation, the
+//! versioned process envelope, dedicated wait connections, origin
+//! propagation, and argument validation before a daemon connection.
 
 #![cfg(unix)]
 
@@ -1915,4 +1915,56 @@ fn session_retention_sweep_exits_nonzero_on_a_partial_failure() {
     let stdout = utf8(&output.stdout);
     assert!(stdout.contains("failed=1"), "{stdout}");
     assert!(stdout.contains("worktrees_failed=1"), "{stdout}");
+}
+
+fn assert_cli_usage_error(args: &[&str], message: &str) {
+    let home = TestHome::new();
+    let output = home.command().args(args).output().expect("run pohunek");
+    assert_eq!(output.status.code(), Some(2), "{}", utf8(&output.stderr));
+    assert!(output.stdout.is_empty(), "a usage error has no stdout");
+    assert!(
+        utf8(&output.stderr).contains(message),
+        "{}",
+        utf8(&output.stderr)
+    );
+    assert!(
+        !home.socket().exists(),
+        "argument validation must not start or contact a daemon"
+    );
+}
+
+#[test]
+fn session_policy_set_requires_a_field_on_the_cli() {
+    assert_cli_usage_error(
+        &["session", "policy", "set"],
+        "required arguments were not provided",
+    );
+}
+
+#[test]
+fn session_policy_set_rejects_conflicting_flags_on_the_cli() {
+    assert_cli_usage_error(
+        &["session", "policy", "set", "--enabled", "--disabled"],
+        "cannot be used with",
+    );
+}
+
+#[test]
+fn session_retention_sweep_requires_an_explicit_mode_on_the_cli() {
+    assert_cli_usage_error(
+        &["session", "retention", "sweep"],
+        "required arguments were not provided",
+    );
+    assert_cli_usage_error(
+        &["session", "retention", "sweep", "--dry-run", "--apply"],
+        "cannot be used with",
+    );
+}
+
+#[test]
+fn notification_retention_prune_requires_an_explicit_mode_on_the_cli() {
+    assert_cli_usage_error(
+        &["notifications", "retention", "prune"],
+        "required arguments were not provided",
+    );
 }
