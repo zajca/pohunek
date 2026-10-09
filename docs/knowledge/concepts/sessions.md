@@ -337,24 +337,24 @@ retains its final output, so removal retires its job. A `reconnecting` or
 so removal first retires that worker's job through the service manager by the
 exact generation the record names, which stops the worker and its child, then
 requires every worker the session's journals record for that generation to be
-gone, and only then deletes the record. Removal is refused, and the record kept so it can be retried, when:
-the record names no worker generation, or the runtime is a `conflict` for any
-other reason (such as `runtime_identity_mismatch`, a job or worker that is not
-the recorded generation's, which is never touched), both with the runtime code
-(`session_runtime_conflict`, `session_runtime_reconnecting`, or
-`worker_protocol_incompatible`); the service manager cannot complete the
-retirement (`runtime_supervision_unavailable`); a worker journaled under another
-generation still runs (`runtime_identity_mismatch`); or the session's journals
-cannot be read, or a journaled worker of the generation still runs or cannot be
-inspected after the retirement (`runtime_supervision_ambiguous`). Every
-removal, whatever the runtime state, then sweeps the processes carrying a
-journal-proven runtime marker. A recorded runtime absent from its worker journal
-is swept only when its process also carries the removed session's ID. A process
-with that runtime marker but another session ID is left alone; one with no
-session ID is not signalled and keeps cleanup unconfirmed. A descendant that
-left the worker's process group (macOS kills
-only the group) can outlive the stop and job retirement. A sweep that cannot
-confirm every marked process exited fails
+gone, and only then deletes the record. For another `conflict` reason, removal
+first applies the same journal, job, and process identity proof as `session stop`.
+A proven generation is stopped, then its logical record is removed. Removal is
+refused, and the record kept so it can be retried, when the record names no
+worker generation (`session_runtime_conflict`), a conflicted worker cannot be
+proven to be the recorded generation (`runtime_identity_mismatch` or
+`runtime_supervision_ambiguous`), the service manager cannot complete retirement
+(`runtime_supervision_unavailable`), a worker journaled under another generation
+still runs (`runtime_identity_mismatch`), or the session's journals cannot be
+read or a journaled worker still runs or cannot be inspected after retirement
+(`runtime_supervision_ambiguous`). Every removal, whatever the runtime state,
+then sweeps processes carrying a journal-proven runtime marker. A recorded
+runtime absent from its worker journal is swept only when its process also
+carries the removed session's ID. A process with that runtime marker but
+another session ID is left alone; one with no session ID is not signalled and
+keeps cleanup unconfirmed. A descendant that left the worker's process group
+(macOS kills only the group) can outlive the stop and job retirement. A sweep
+that cannot confirm every marked process exited fails
 the removal with `runtime_supervision_ambiguous` and keeps the session listed
 with its removal intent; `session rm` again, or the next daemon start,
 finishes it once the leftover process is gone. When the only obstacle is

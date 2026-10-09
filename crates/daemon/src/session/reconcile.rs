@@ -12252,7 +12252,7 @@ handler = "codex-hook-v1"
             let runtime = runtime_of(&fixture.registry, "s-358").await;
             assert_eq!(runtime.loss_reason.as_deref(), Some(IDENTITY_MISMATCH));
 
-            assert_removal_refused(&fixture, "s-358", "session_runtime_conflict").await;
+            assert_removal_refused(&fixture, "s-358", IDENTITY_MISMATCH).await;
             assert!(
                 fixture.supervisor.retired().is_empty(),
                 "a job reconciliation classified foreign is never retired"

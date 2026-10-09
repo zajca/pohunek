@@ -52,6 +52,7 @@ use super::{
     MAX_SESSION_NAME_BYTES, MAX_WORKER_METADATA_RETRY_DELAY, WORKER_METADATA_RETRY_WARN_INTERVAL,
 };
 
+mod conflict_cleanup;
 mod native_supersede;
 
 /// Bounds retries around intentional same-runtime snapshot races in transition tests.
@@ -4627,6 +4628,7 @@ async fn remove_refuses_a_conflicted_runtime_not_proven_to_be_its_own() {
     entry.runtime = super::RuntimeHandle::Unavailable(RuntimeState::Conflict);
     let runtime = entry.info.runtime.as_mut().expect("runtime");
     runtime.state = RuntimeState::Conflict;
+    runtime.worker_instance_id = Some("foreign-runtime".to_owned());
     runtime.loss_reason = Some(crate::runtime::lifecycle::IDENTITY_MISMATCH.to_owned());
     drop(sessions);
 
@@ -4635,7 +4637,7 @@ async fn remove_refuses_a_conflicted_runtime_not_proven_to_be_its_own() {
         .await
         .expect_err("a conflict over a foreign job or worker is never retired");
 
-    assert_eq!(error.code, "session_runtime_conflict");
+    assert_eq!(error.code, "runtime_identity_mismatch");
     let kept = registry
         .inspect(&created.id)
         .await

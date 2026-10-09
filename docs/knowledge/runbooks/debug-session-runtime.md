@@ -212,10 +212,13 @@ Interpret runtime states as follows:
   `runtime_supervision_ambiguous` session: it retires the worker job of the
   exact generation the record names through the service manager, which stops
   that worker and its child, requires every worker the session's journals
-  record for that generation to be gone, and then deletes the logical record. It refuses, keeping the record, a
-  `runtime_identity_mismatch` conflict or a record that names no worker
-  generation (`session_runtime_conflict`), a retirement the service manager
-  cannot complete (`runtime_supervision_unavailable`), a still-running worker
+  record for that generation to be gone, and then deletes the logical record.
+  For another conflict reason, it first applies the same journal, job, and
+  process identity proof as `session stop`; a proven worker is stopped before
+  its record is removed. It refuses, keeping the record, an unproven worker
+  (`runtime_identity_mismatch` or `runtime_supervision_ambiguous`), a record
+  that names no worker generation (`session_runtime_conflict`), a retirement
+  the service manager cannot complete (`runtime_supervision_unavailable`), a still-running worker
   journaled under another generation (`runtime_identity_mismatch`), and
   unreadable session journals or a journaled worker that still runs after the
   retirement, for example outside its job (`runtime_supervision_ambiguous`). Stop such a worker by hand after

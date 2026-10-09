@@ -3617,13 +3617,13 @@ impl SessionRegistry {
     ///
     /// Returns `session_not_found` when no session has the given id, and
     /// surfaces any PTY shutdown error from the implied stop of a live session.
-    /// An unreachable runtime that cannot be retired (no recorded generation,
-    /// or a non-ambiguous conflict) fails with its runtime-state code
-    /// (`session_runtime_conflict`, `session_runtime_reconnecting`, or
-    /// `worker_protocol_incompatible`); a generation the supervisor cannot
-    /// retire fails with `runtime_supervision_unavailable`; a worker not
-    /// proven gone afterwards fails with `runtime_supervision_ambiguous` or
-    /// `runtime_identity_mismatch`. The record is kept in every case. A
+    /// An unreachable runtime without a recorded generation fails with its
+    /// runtime-state code (`session_runtime_conflict`, `session_runtime_reconnecting`, or
+    /// `worker_protocol_incompatible`). A conflict whose recorded identity
+    /// cannot be proven fails with `runtime_identity_mismatch` or
+    /// `runtime_supervision_ambiguous`; a generation the supervisor cannot
+    /// retire fails with `runtime_supervision_unavailable`. The record is kept
+    /// in every case. A
     /// marker sweep that cannot confirm every marked process exited fails
     /// with `runtime_supervision_ambiguous` after the removal intent was
     /// recorded; like any cleanup that fails then, it keeps the session
@@ -3653,6 +3653,30 @@ impl SessionRegistry {
     ) -> Result<SessionRemoveResult, ProtocolError> {
         self.ensure_not_external_session(id).await?;
         let _guard = self.lock_lifecycle(id).await;
+        let prove_and_stop_conflict = {
+            let sessions = self.inner.sessions.lock().await;
+            let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
+            matches!(
+                entry.runtime,
+                RuntimeHandle::Unavailable(RuntimeState::Conflict)
+            ) && entry.job.is_some()
+                && entry
+                    .info
+                    .runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.loss_reason.as_deref())
+                    != Some(crate::runtime::lifecycle::SUPERVISION_AMBIGUOUS)
+        };
+        let stopped_conflict = if prove_and_stop_conflict {
+            // The conflict's old reason alone cannot prove what `remove` may
+            // retire. Stop first: its journal, job and process checks prove
+            // the recorded generation and commit the terminal transition.
+            self.stop_unavailable_runtime(id)
+                .await?
+                .is_some_and(|result| result.stopped)
+        } else {
+            false
+        };
         let should_stop = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
@@ -3671,8 +3695,11 @@ impl SessionRegistry {
             stopped
         } else {
             // Retiring first means a refused or failed retirement leaves no
-            // removal intent behind; the record keeps its runtime state.
-            self.retire_unstopped_job(id).await?;
+            // removal intent behind; the record keeps its runtime state. A
+            // proven conflict's job was already retired by its stop.
+            if !stopped_conflict {
+                self.retire_unstopped_job(id).await?;
+            }
             let removal_intent = {
                 let mut sessions = self.inner.sessions.lock().await;
                 let entry = sessions
@@ -3697,7 +3724,7 @@ impl SessionRegistry {
                 )
             };
             self.write_session_record(removal_intent).await?;
-            false
+            stopped_conflict
         };
 
         let (job, worker_instance_id) = {
