@@ -77,6 +77,11 @@ const PACKAGES_DIR: &str = "runtime-packages";
 /// Lock location of a runtime relative to the repository root.
 const LOCK_FILE: &str = "compatibility-lock.json";
 
+/// Lock location of `runtime` under the repository `root`.
+pub(crate) fn lock_path(root: &Path, runtime: &str) -> PathBuf {
+    root.join("compat").join(runtime).join(LOCK_FILE)
+}
+
 /// Why a field was refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Fault {
@@ -150,13 +155,13 @@ fn refuse(field: impl Into<String>, fault: Fault) -> XtaskError {
 pub(crate) struct Attestation {
     binary_set_digest: String,
     commit: String,
-    package_digest: String,
+    pub(crate) package_digest: String,
     package_id: String,
     platform: String,
-    runtime: String,
+    pub(crate) runtime: String,
     schema: u32,
     suite_version: u32,
-    target: String,
+    pub(crate) target: String,
     upstream_lock_digest: String,
     upstream_version: String,
 }
@@ -184,9 +189,9 @@ struct Matrix {
 
 #[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
 #[serde(deny_unknown_fields)]
-struct Row {
-    runtime: String,
-    target: String,
+pub(crate) struct Row {
+    pub(crate) runtime: String,
+    pub(crate) target: String,
 }
 
 /// The fields of `compat/<runtime>/compatibility-lock.json` the attestation
@@ -217,22 +222,22 @@ pub(crate) struct RecomputeArgs {
     /// Directory holding the `pohunek`, `pohunekd` and `pohunek-sessiond`
     /// executables that will be bundled.
     #[arg(long, value_name = "DIR")]
-    bin_dir: PathBuf,
+    pub(crate) bin_dir: PathBuf,
     /// Runtime package archive (`package build` output).
     #[arg(long, value_name = "FILE")]
-    package: PathBuf,
+    pub(crate) package: PathBuf,
     /// The runtime's `compat/<runtime>/compatibility-lock.json`.
     #[arg(long, value_name = "FILE")]
-    lock: PathBuf,
+    pub(crate) lock: PathBuf,
     /// The checked-in `compat/matrix.json`.
     #[arg(long, value_name = "FILE")]
-    matrix: PathBuf,
+    pub(crate) matrix: PathBuf,
     /// Full 40-character lowercase hex commit the artifacts were built from.
     #[arg(long, value_name = "SHA")]
-    commit: String,
+    pub(crate) commit: String,
     /// Core target triple the executables were built for.
     #[arg(long, value_name = "TRIPLE")]
-    target: String,
+    pub(crate) target: String,
 }
 
 /// `cargo xtask compat` actions.
@@ -521,7 +526,7 @@ fn read_package(path: &Path) -> Result<(String, String, String), XtaskError> {
     ))
 }
 
-fn is_commit(text: &str) -> bool {
+pub(crate) fn is_commit(text: &str) -> bool {
     text.len() == COMMIT_HEX_LEN
         && text
             .bytes()
@@ -755,11 +760,26 @@ pub(crate) fn verify_attestation(
     Ok(expected)
 }
 
+/// A matrix that passed [`checked_matrix`], with the official runtimes it covers.
+pub(crate) struct CheckedMatrix {
+    /// Official runtime ids (the package directory names), ascending.
+    pub(crate) runtimes: Vec<String>,
+    /// The matrix rows, ascending.
+    pub(crate) rows: Vec<Row>,
+}
+
 /// Requires `compat/matrix.json` under `root` to hold exactly one row per
 /// official package directory and declared target, and every package to have
 /// a lock for its runtime. Returns the row count.
 fn matrix_check(root: &Path) -> Result<usize, XtaskError> {
-    let matrix = read_matrix(&root.join(MATRIX_PATH))?;
+    Ok(checked_matrix(root, &root.join(MATRIX_PATH))?.rows.len())
+}
+
+/// Requires the matrix file `matrix_path` to hold exactly one row per official
+/// package directory under `root` and declared target, and every package to
+/// have a lock for its runtime.
+pub(crate) fn checked_matrix(root: &Path, matrix_path: &Path) -> Result<CheckedMatrix, XtaskError> {
+    let matrix = read_matrix(matrix_path)?;
     let packages = root.join(PACKAGES_DIR);
     let mut runtimes = Vec::new();
     for entry in std::fs::read_dir(&packages).map_err(io_error(&packages))? {
@@ -777,7 +797,7 @@ fn matrix_check(root: &Path) -> Result<usize, XtaskError> {
     }
     runtimes.sort_unstable();
     for runtime in &runtimes {
-        let lock_path = root.join("compat").join(runtime).join(LOCK_FILE);
+        let lock_path = lock_path(root, runtime);
         let (lock, _digest) = match read_lock(&lock_path) {
             Ok(read) => read,
             Err(XtaskError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -808,7 +828,10 @@ fn matrix_check(root: &Path) -> Result<usize, XtaskError> {
             ));
         }
     }
-    Ok(matrix.rows.len())
+    Ok(CheckedMatrix {
+        runtimes,
+        rows: matrix.rows,
+    })
 }
 
 #[cfg(test)]

@@ -579,6 +579,11 @@ Signed runtime catalog:
 - `crates/cli/tests/plugin_catalog_install.rs` — clean-environment official install through a real daemon with a test key.
 - `crates/xtask/src/attestation.rs` — `cargo xtask compat attest|verify|matrix-check`, the binary-set digest and the compatibility attestation.
 - `compat/matrix.json` — the required runtime x target rows and the suite version of the release compatibility matrix.
+- `crates/xtask/src/release.rs` — `cargo xtask release assemble|verify-inventory`: input checks, catalog signing and bundle assembly.
+- `crates/xtask/src/release_policy.rs` — the release policy file parser.
+- `crates/xtask/src/release_tree.rs` — safe archive extraction and the rebuilt daemon archive trees.
+- `crates/xtask/src/release_inventory.rs` — the release inventory and its verification.
+- `packaging/release-policy.json` — the expected archives, SDK packages and catalog validity of a release.
 - `crates/cli/tests/release_consumer.rs` — out-of-process consumer suite on the exact release binaries (inputs, layout, drivers, report).
 - `crates/xtask/src/attestation.rs` — `cargo xtask compat attest|verify|matrix-check`, the binary-set digest and the compatibility attestation.
 - `compat/matrix.json` — the required runtime x target rows and the suite version of the release compatibility matrix.

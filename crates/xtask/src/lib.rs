@@ -11,6 +11,12 @@ mod generators;
 mod hermes;
 mod hermes_mock;
 mod hermes_skill;
+mod release;
+mod release_inventory;
+mod release_policy;
+#[cfg(test)]
+mod release_tests;
+mod release_tree;
 mod runtime_package;
 mod site;
 pub mod test_code;
@@ -83,6 +89,8 @@ pub enum XtaskError {
     Package(::package::ArchiveError),
     /// A compatibility attestation input was refused.
     Attestation(attestation::AttestationError),
+    /// A release input was refused by the assembler or the inventory check.
+    Release(release::ReleaseError),
     /// A catalog could not be built, signed or verified.
     Catalog(::package::CatalogError),
     /// A trust anchor could not be built or read.
@@ -142,6 +150,7 @@ impl fmt::Display for XtaskError {
             Self::Yaml(error) => write!(f, "failed to serialize yaml: {error}"),
             Self::Package(error) => write!(f, "package archive: {error}"),
             Self::Attestation(error) => write!(f, "attestation: {error}"),
+            Self::Release(error) => write!(f, "release: {error}"),
             Self::Catalog(error) => write!(f, "catalog: {error}"),
             Self::Anchor(error) => write!(f, "trust anchor: {error}"),
             Self::KeyFile { path, fault } => {
@@ -174,6 +183,7 @@ impl Error for XtaskError {
             Self::Yaml(error) => Some(error),
             Self::Package(error) => Some(error),
             Self::Attestation(error) => Some(error),
+            Self::Release(error) => Some(error),
             Self::Catalog(error) => Some(error),
             Self::Anchor(error) => Some(error),
             Self::Usage(_)
@@ -380,6 +390,7 @@ where
         TopCommand::Package { action } => run_package(action),
         TopCommand::Catalog { action } => run_catalog(action),
         TopCommand::Compat { action } => attestation::run(action, &root),
+        TopCommand::Release { action } => release::run(action, &root),
         TopCommand::AgentSkill { action } => match action {
             AgentSkillAction::Generate => {
                 agent_skill::generate(&root)?;
@@ -489,6 +500,17 @@ enum TopCommand {
     Compat {
         #[command(subcommand)]
         action: attestation::CompatAction,
+    },
+    /// Assemble and verify the release bundle.
+    ///
+    /// `assemble` recomputes every digest from the producer artifacts and
+    /// writes the signed catalog, the final daemon archives and the
+    /// inventory only when everything verified; `verify-inventory` checks a
+    /// bundle directory against its inventory and catalog. A signing key is
+    /// read only from the file named by `--key-file`.
+    Release {
+        #[command(subcommand)]
+        action: release::ReleaseAction,
     },
     /// Build and check canonical runtime package archives.
     Package {
@@ -700,6 +722,18 @@ fn run_catalog(action: CatalogAction) -> Result<(), XtaskError> {
     Ok(())
 }
 
+/// Root of the checkout the tool runs in.
+///
+/// Under test the root comes from the runtime environment, because the test
+/// archive of CI runs from a relocated checkout while the compile-time path
+/// names the checkout that built it.
+#[cfg(test)]
+fn repo_root() -> PathBuf {
+    pohunek_test_support::workspace_root()
+}
+
+/// Root of the checkout the tool runs in.
+#[cfg(not(test))]
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

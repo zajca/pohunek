@@ -2,6 +2,13 @@
 
 ## Unreleased (2026-10-08, digest-bound release evidence, #150)
 
+- `cargo xtask release assemble|verify-inventory` builds and checks the release
+  bundle from the producer artifacts: it recomputes every digest, verifies the
+  attestation of each matrix row, signs the schema 2 catalog and rebuilds the
+  daemon archives with a `runtime/` directory. `packaging/release-policy.json`
+  is the single source of the expected inventory; the concept page
+  `release-bundle` describes the layout, the macOS-without-packages rule and
+  the inventory the publisher verifies.
 - Runtime catalog schema 2: a signed `release` block (version, commit, binary
   sets per target) and, per entry, `runtime_api` and per-platform attestation
   digests; the signing domain separator is v2, schema 1 documents are refused.

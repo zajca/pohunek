@@ -18,7 +18,11 @@ Daemon archives contain `pohunekd`, `pohunek-sessiond`, `pohunek`, and the
 `packaging/install-daemon.sh` wrapper around `pohunek service install`, plus
 `runtime-catalog-anchor.json`, the runtime-catalog trust anchor that the daemon
 reads from the directory of its executable. CLI and relay archives do not
-contain it.
+contain it. A release daemon archive also carries a `runtime/` directory with
+the signed `runtime-catalog.json` and, for the targets with attested official
+runtime packages, `runtime/packages/<runtime>.tar.zst` and
+`runtime/attestations/<runtime>-<target>.json` (the Apple Silicon archive carries the
+catalog and no package). The `MANIFEST` covers these files.
 Every CLI, daemon, and relay archive is packed deterministically
 (members sorted, root-owned, stamped with the tagged commit time) and carries a
 `MANIFEST` with the SHA-256 of every member; the daemon installer verifies
