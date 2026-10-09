@@ -53,6 +53,7 @@ use super::{
 };
 
 mod conflict_cleanup;
+mod native_recovery;
 mod native_supersede;
 
 /// Bounds retries around intentional same-runtime snapshot races in transition tests.

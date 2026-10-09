@@ -124,6 +124,16 @@ Interpret runtime states as follows:
   `lost` / `runtime_lost_cleanup_unconfirmed` and requires process inspection
   before recovery. Inspect the session state and service status together rather
   than treating the socket pathname or inventory reason as proof by itself.
+
+A terminal or lost hook runtime without a trusted native reference refuses
+`session.resume` before launching anything. `runtime/native_identity_missing`
+means its own generation journal has no native claim;
+`runtime/native_identity_unverified` means it has a claim but no verified
+launch-process binding. `runtime/native_identity_evidence_unavailable` means
+the generation journal cannot be read or selected unambiguously. Preserve the
+journal for diagnosis. A foreign process claim keeps the existing typed
+process-identity reason and cannot replace the stored native reference.
+
 - `conflict`: multiple or mismatched identities claim the session. Never stop,
   unlink, or kill either candidate by hand, and the daemon never kills one
   automatically. Preserve the job, journal, and socket evidence for diagnosis;

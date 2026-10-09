@@ -2629,6 +2629,30 @@ impl SessionRegistry {
             .ok()
     }
 
+    /// Whether this generation journal carries an unpromoted native claim.
+    /// An unreadable or ambiguous journal is never classified as absent.
+    pub(super) async fn generation_has_native_claim(
+        &self,
+        record: &SessionRecord,
+    ) -> Result<bool, String> {
+        let Some(generation) = record.runtime.generation.as_deref() else {
+            return Ok(false);
+        };
+        let journals = self.discover_worker_journals().await?;
+        let Some(scan) = journals.get(record.session_id.as_str()) else {
+            return Ok(false);
+        };
+        let Some(journal) = scan.journal_of_generation(generation)? else {
+            return Ok(false);
+        };
+        let snapshot = journal.snapshot().map_err(str::to_owned)?;
+        Ok(snapshot
+            .active_identity
+            .as_ref()
+            .is_some_and(|identity| identity.native_reference.is_some())
+            || snapshot.native_reference.is_some())
+    }
+
     /// Scans every session's worker journals.
     /// Scans every session's worker journals.
     ///
@@ -4342,11 +4366,12 @@ fn apply_worker_identities_with(
         .as_ref()
         .map(ToString::to_string);
     let journaled = snapshot.native_reference.as_ref();
+    let journaled_reference_accepted = journaled_reference_matches_ordering(record, snapshot);
     apply_worker_launch_identity(
         record,
         snapshot.launch_identity.as_ref(),
         instance.as_deref(),
-        journaled.is_some(),
+        journaled_reference_accepted,
     )?;
 
     let Some(identity) = &snapshot.active_identity else {
@@ -4427,6 +4452,42 @@ fn apply_worker_identities_with(
     })
 }
 
+fn journaled_reference_matches_ordering(
+    record: &SessionRecord,
+    snapshot: &pohunek_worker_protocol::InspectSnapshot,
+) -> bool {
+    let Some(reference) = snapshot.native_reference.as_ref() else {
+        return false;
+    };
+    let instance = snapshot
+        .worker_instance_id
+        .as_ref()
+        .map(ToString::to_string);
+    record.runtime.worker_instance_id.as_deref() == instance.as_deref()
+        && snapshot
+            .launch_identity
+            .as_ref()
+            .is_some_and(|launch| launch.process == reference.process)
+        && reference.provider == super::agent_kind_label(&record.info.agent_base)
+        && record.recovery.as_ref().is_some_and(|binding| {
+            binding.reference_kind() == parse_reference_kind(&reference.reference_kind)
+        })
+        && record
+            .native_identity_ordering
+            .as_ref()
+            .is_some_and(|ordering| {
+                Some(ordering.worker_instance_id.as_str()) == instance.as_deref()
+                    && ordering.worker_sequence == Some(reference.sequence)
+                    && ordering.pid == reference.process.pid
+                    && ordering.pid_start_identity == reference.process.start_identity
+                    && match reference.reference_kind.as_str() {
+                        "id" => record.info.native_session_id.as_deref(),
+                        "path" => record.info.native_session_path.as_deref(),
+                        _ => None,
+                    } == Some(reference.native_reference.as_str())
+            })
+}
+
 fn apply_worker_launch_identity(
     record: &mut SessionRecord,
     identity: Option<&pohunek_worker_protocol::ReportedLaunchIdentity>,
@@ -4441,6 +4502,7 @@ fn apply_worker_launch_identity(
         &identity.provider,
         &identity.reference_kind,
         &identity.native_reference,
+        &identity.process,
         worker_instance_id,
         journaled_reference,
     )?;
@@ -4478,6 +4540,7 @@ pub(super) fn apply_launch_identity(
     provider: &str,
     reference_kind: &str,
     native_reference: &str,
+    process: &pohunek_worker_protocol::ProcessIdentity,
     worker_instance_id: Option<&str>,
     journaled_reference: bool,
 ) -> Result<bool, &'static str> {
@@ -4513,32 +4576,29 @@ pub(super) fn apply_launch_identity(
         SessionRefKind::Path => record.info.native_session_path.as_deref(),
     };
     let differs = existing.is_some_and(|existing| existing != native);
-    // The worker's journaled native reference of an assigned runtime is the
-    // ordered record of every report of the launch process, the launch claim
-    // included, so the claim alone decides nothing.
-    if journaled_reference && is_assigned_runtime(binding) {
+    // A current journaled report of the verified launch process supersedes
+    // the immutable first launch claim, including after an in-agent switch.
+    if journaled_reference {
         return Ok(false);
     }
-    // A reported reference always supersedes an assigned one, whether or not
-    // the values agree: the claim is bound to the launch process, the assigned
-    // value never was.
+    // A report from the verified launch process in this generation has
+    // already superseded its first claim. An assigned runtime keeps its
+    // existing generation-ordering behavior.
     if binding.native_reference_provenance != NativeReferenceProvenance::Assigned && differs {
-        if !is_assigned_runtime(binding) {
-            return Err("launch_identity_reference_mismatch");
-        }
-        // The worker keeps its first launch claim for good. A report this
-        // generation already accepted (a switch after the claim) makes the
-        // claim superseded history; a stored reference that predates the
-        // generation (a recovered conversation, a switch before the first
-        // report) is what the claim supersedes.
         if record
             .native_identity_ordering
             .as_ref()
             .is_some_and(|ordering| {
                 Some(ordering.worker_instance_id.as_str()) == worker_instance_id
+                    && (is_assigned_runtime(binding)
+                        || (ordering.pid == process.pid
+                            && ordering.pid_start_identity == process.start_identity))
             })
         {
             return Ok(false);
+        }
+        if !is_assigned_runtime(binding) {
+            return Err("launch_identity_reference_mismatch");
         }
     }
     binding.native_reference_provenance = NativeReferenceProvenance::Reported;
@@ -4596,8 +4656,7 @@ pub(super) fn import_native_reference(
 ///
 /// It is the ordered record of every report of the launch process and has no
 /// lease, so a switch made while the daemon was absent is still read. Runtimes
-/// that report their reference through a hook keep their existing import
-/// rules.
+/// that report their reference through a hook use the same proof.
 fn apply_journaled_native_reference(
     record: &mut SessionRecord,
     snapshot: &pohunek_worker_protocol::InspectSnapshot,
@@ -4643,8 +4702,8 @@ fn apply_active_native_reference(
     );
 }
 
-/// Supersedes the stored reference of an assigned runtime with one the launch
-/// process reported through the worker.
+/// Supersedes the stored reference with one the launch process reported
+/// through the worker.
 ///
 /// It applies when the report names the launch runtime, is bound to the
 /// verified launch process (never a nested agent), carries the frozen
@@ -4662,19 +4721,7 @@ fn adopt_worker_reference(
     let Some(binding) = record.recovery.as_mut() else {
         return;
     };
-    if !is_assigned_runtime(binding)
-        || binding.reference_kind() != Some(kind)
-        || provider != super::agent_kind_label(&record.info.agent_base)
-        || snapshot
-            .launch_identity
-            .as_ref()
-            .map_or(snapshot.child_process.as_ref(), |launch| {
-                Some(&launch.process)
-            })
-            != Some(process)
-    {
-        return;
-    }
+    let assigned = is_assigned_runtime(binding);
     let Some(worker_instance_id) = snapshot
         .worker_instance_id
         .as_ref()
@@ -4682,6 +4729,49 @@ fn adopt_worker_reference(
     else {
         return;
     };
+    if record.runtime.worker_instance_id.as_deref() != Some(worker_instance_id.as_str()) {
+        return;
+    }
+    // A hook launch in a new generation must first confirm the reference it
+    // was asked to resume. Its later reports may then switch conversations.
+    if !assigned
+        && record
+            .native_identity_ordering
+            .as_ref()
+            .is_none_or(|ordering| ordering.worker_instance_id != worker_instance_id)
+        && match kind {
+            SessionRefKind::Id => record.info.native_session_id.as_deref(),
+            SessionRefKind::Path => record.info.native_session_path.as_deref(),
+        }
+        .is_some_and(|existing| {
+            snapshot
+                .launch_identity
+                .as_ref()
+                .is_none_or(|launch| launch.native_reference != existing)
+        })
+    {
+        return;
+    }
+    if binding.reference_kind() != Some(kind)
+        || provider != super::agent_kind_label(&record.info.agent_base)
+        || (if assigned {
+            snapshot
+                .launch_identity
+                .as_ref()
+                .map_or(snapshot.child_process.as_ref(), |launch| {
+                    Some(&launch.process)
+                })
+                != Some(process)
+        } else {
+            snapshot
+                .launch_identity
+                .as_ref()
+                .map(|launch| &launch.process)
+                != Some(process)
+        })
+    {
+        return;
+    }
     if !super::native_report_is_current(
         record.native_identity_ordering.as_ref(),
         &worker_instance_id,
@@ -8695,7 +8785,8 @@ while os.getppid() == parent:
             .expect("a superseded launch claim is history");
         assert_eq!(reported.info.native_session_id.as_deref(), Some("first"));
 
-        // A hook runtime keeps its immutable launch claim.
+        // An already accepted report of this hook runtime makes its launch
+        // claim history too.
         let mut hooked = identity_record();
         hooked.info.native_session_id = Some("first".to_owned());
         hooked
@@ -8704,11 +8795,48 @@ while os.getppid() == parent:
             .expect("recovery binding")
             .native_session_id = Some("first".to_owned());
         hooked.native_identity_ordering = Some(ordered_in("runtime-identity"));
+        import_worker_identities(&mut hooked, &switch_snapshot(Some("other"), None))
+            .expect("the accepted hook report supersedes the launch claim");
+        assert_eq!(hooked.info.native_session_id.as_deref(), Some("first"));
+
+        // A same-generation key for another process cannot overrule the
+        // verified launch process's first claim of a hook runtime.
+        let mut foreign = hooked;
+        let ordering = foreign
+            .native_identity_ordering
+            .as_mut()
+            .expect("same-generation ordering");
+        ordering.pid = 51;
+        ordering.pid_start_identity = 510;
         assert_eq!(
-            import_worker_identities(&mut hooked, &switch_snapshot(Some("other"), None))
-                .expect_err("a hook runtime keeps its immutable launch claim"),
+            import_worker_identities(&mut foreign, &switch_snapshot(Some("other"), None))
+                .expect_err("foreign ordering cannot supersede the hook launch claim"),
             "launch_identity_reference_mismatch"
         );
+        assert_eq!(foreign.info.native_session_id.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn a_hook_active_claim_without_a_journaled_reference_needs_launch_proof_and_order() {
+        let mut record = identity_record();
+        let current = switch_snapshot(Some("first"), Some((50, 5, "switched")));
+        import_worker_identities(&mut record, &current).expect("verified hook switch");
+        assert_eq!(record.info.native_session_id.as_deref(), Some("switched"));
+        assert_eq!(
+            record
+                .native_identity_ordering
+                .as_ref()
+                .and_then(|ordering| ordering.worker_sequence),
+            Some(5)
+        );
+
+        let stale = switch_snapshot(Some("first"), Some((50, 4, "stale")));
+        import_worker_identities(&mut record, &stale).expect("stale claim is ignored");
+        assert_eq!(record.info.native_session_id.as_deref(), Some("switched"));
+
+        let nested = switch_snapshot(Some("first"), Some((51, 6, "nested")));
+        import_worker_identities(&mut record, &nested).expect("nested claim is not a native ref");
+        assert_eq!(record.info.native_session_id.as_deref(), Some("switched"));
     }
 
     #[test]
