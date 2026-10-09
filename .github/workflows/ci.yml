@@ -778,6 +778,7 @@ jobs:
               - 'crates/terminal/**'
               - 'crates/platform/**'
               - 'crates/paths/**'
+              - '.github/workflows/ci.yml'
             # Official Codex runtime package: same inputs as the Pi package
             # with its own lock and captured screens. The real-Codex tests also
             # drive the daemon's integration install and the hook reporters.
