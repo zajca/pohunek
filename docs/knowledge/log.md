@@ -2,6 +2,12 @@
 
 ## Unreleased (2026-10-08, digest-bound release evidence, #150)
 
+- The Release workflow is rewired: producers upload workflow artifacts only,
+  the reusable `release-build.yml` and `release-evidence.yml` build the
+  packages and run the compatibility rows, provenance, catalog signing and the
+  archive smoke, and a single `publish` job creates a draft release, uploads
+  and verifies the complete inventory and then publishes it. `ci.yml` rehearses
+  the same flow on pull requests with a throwaway key.
 - `packaging/smoke-archive` runs a finished daemon archive in a network- and
   PID-isolated namespace: it verifies the staged upstreams, installs every
   shipped package from the archive's own signed catalog and anchor, and runs

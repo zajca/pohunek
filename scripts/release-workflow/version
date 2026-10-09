@@ -1,0 +1,46 @@
+#!/bin/sh
+# Print the release version of the checkout in the current directory.
+#
+# usage: version <release|rehearsal> <ref-name>
+#
+# The version is `[workspace.package] version` of Cargo.toml: it is what
+# `pohunekd --version` reports, and the signed catalog pins its entries to
+# `=<version>`. A release run requires the tag (<ref-name>) to be exactly
+# `v<version>`; a rehearsal ignores <ref-name> and never names a tag.
+
+set -eu
+
+fail() {
+    printf 'version: %s\n' "$*" >&2
+    exit 1
+}
+
+[ "$#" -eq 2 ] || fail "usage: version <release|rehearsal> <ref-name>"
+mode=$1
+ref_name=$2
+
+version=$(awk '
+    /^\[/ { in_section = ($0 == "[workspace.package]") }
+    in_section && /^version[ ]*=/ {
+        gsub(/^version[ ]*=[ ]*"/, "")
+        gsub(/".*$/, "")
+        print
+        exit
+    }
+' Cargo.toml)
+
+case $version in
+    '' | *[!0-9.]* | .* | *. | *..*) fail "Cargo.toml has no plain X.Y.Z workspace version" ;;
+esac
+dots=$(printf '%s' "$version" | tr -cd . | wc -c)
+[ "$dots" -eq 2 ] || fail "the workspace version is not X.Y.Z: $version"
+
+case $mode in
+    release)
+        [ "$ref_name" = "v$version" ] || fail "the tag $ref_name does not match the workspace version v$version"
+        ;;
+    rehearsal) ;;
+    *) fail "mode must be release or rehearsal" ;;
+esac
+
+printf '%s\n' "$version"

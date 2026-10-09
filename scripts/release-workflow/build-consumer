@@ -1,0 +1,29 @@
+#!/bin/sh
+# Build the release consumer test executable and copy it to <output-dir>.
+#
+# usage: build-consumer <output-dir>               (run from the repository root)
+#
+# The executable is the prebuilt `release_consumer` integration test of
+# pohunek-cli. It is built once per workflow run; row jobs and the archive
+# smoke run the same bytes against the released binaries.
+
+set -eu
+
+fail() {
+    printf 'build-consumer: %s\n' "$*" >&2
+    exit 1
+}
+
+[ "$#" -eq 1 ] || fail "usage: build-consumer <output-dir>"
+output=$1
+mkdir -p "$output"
+
+executable=$(cargo test --locked --no-run -p pohunek-cli --test release_consumer --message-format=json \
+    | jq -r 'select(.reason == "compiler-artifact" and .target.name == "release_consumer" and .executable != null) | .executable')
+case $executable in
+    '' | *'
+'*) fail "cargo did not report exactly one release_consumer executable" ;;
+esac
+[ -f "$executable" ] || fail "the reported executable does not exist: $executable"
+cp -- "$executable" "$output/release_consumer"
+chmod 0755 "$output/release_consumer"

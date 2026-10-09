@@ -2,7 +2,7 @@
 type: Concept
 id: concept/release-bundle
 title: Release bundle
-description: The release bundle that cargo xtask release assemble produces from the producer artifacts - its layout, the release policy file, the catalog sequence and expiry rules, the inventory the publisher uploads and verifies, and the fail-closed input checks.
+description: The release bundle that cargo xtask release assemble produces from the producer artifacts - its layout, the release policy file, the catalog sequence and expiry rules, the inventory the publisher uploads and verifies, the fail-closed input checks, and the release workflows that build, sign and publish it with their trust and permission model.
 source_kind: manual
 intents: [debug, help, project]
 ---
@@ -118,3 +118,81 @@ are the `runtime/packages/*.tar.zst` the archive carries; a shipped package
 without a staged upstream fails. Each consumer report must name the catalog
 entry's package digest and the SHA-256 of the archive's own binaries. The
 procedure and its limits are in `docs/development.md` ("Archive smoke").
+
+## Release workflows
+
+Three workflow files build and publish a release; the structure below is pinned
+by `scripts/tests/test_release_workflow.py`.
+
+| File | Role |
+| --- | --- |
+| `release.yml` | Tag trigger, the quality gate, the macOS jobs, two calls and the single `publish` job. |
+| `release-build.yml` | Reusable producers: Linux archives, one job over `runtime-packages/*`, SDK tarballs. |
+| `release-evidence.yml` | Reusable evidence: rows, provenance, assembly and signing, bundle provenance, archive smoke, verdict. |
+
+`ci.yml` calls the two reusable files with `mode: rehearsal` (jobs
+`release-rehearsal-build`, `release-rehearsal`); `release.yml` calls them with
+`mode: release`.
+
+### Flow
+
+Producers upload workflow artifacts only: `build-<component>-<target>`,
+`package-archives`, `sdk-release-assets` and the macOS `macos-signed-<component>`.
+The evidence workflow plans the rows from `compat/matrix.json` with `jq`; every
+row extracts the binaries from the daemon ARCHIVE of its target, stages the pinned
+upstream and runs the consumer suite, then `compat attest` writes
+`attestation-<runtime>-<target>.json`. `attest` attests every producer artifact;
+`assemble` verifies every input with `gh attestation verify` (signer workflow
+`release-evidence.yml`, signer and source digest equal to the release commit,
+source ref equal to the tag, GitHub-hosted runners only), collects the flat input
+directory and runs `cargo xtask release assemble` with the commit time from
+`git log`, then `verify-inventory`. `attest-bundle` attests every file of the
+bundle, `smoke` runs `packaging/smoke-archive` on every Linux daemon archive
+with the isolation strategy a probe step proved available, and `verdict` fails
+unless exactly the jobs of the mode succeeded (a skipped job counts as success
+to a caller). The bundle is the artifact `release-bundle`.
+
+`publish` is the only job with `contents: write`. It needs every producer and
+the evidence call, downloads only `release-bundle`, and uses `gh` and coreutils
+only: it checks the bundle against `release-inventory.sha256` (exactly the listed
+files plus the inventory, every versioned name carrying the tag's version),
+verifies each file's provenance, requires the tag to resolve to the run's commit
+and no release of the tag to exist (the releases listing includes drafts), creates
+a draft with `gh release create --draft --verify-tag`, uploads the bundle, compares
+asset names, digests and sizes read back from the API with the bundle, publishes
+with `gh release edit --draft=false`, re-checks the tag binding before and the
+assets after, and deletes the draft it created if any step fails. No other job
+creates, edits or attaches to a release, so a visible release is complete or absent.
+
+### Trust and permissions
+
+- Every workflow default token is `permissions: {}`; each job widens it to
+  `contents: read`, except `publish` (`contents: write`) and the two attest jobs.
+- The OIDC scopes (write access to `id-token` and `attestations`) exist only on
+  `attest` and `attest-bundle`, which download artifacts, check checksums and attest; they
+  check out nothing and run no repository code, and are skipped in a rehearsal.
+  The caller jobs (`evidence` in `release.yml`, `release-rehearsal` in `ci.yml`)
+  grant the same scopes because a called workflow cannot hold a scope its caller
+  lacks.
+- The signing seed is the secret `CATALOG_SIGNING_KEY_CI` of the environment
+  `release` (deployment policy: tags `v*`), read only by the signing step of
+  the `assemble` job, which exists only in release mode and restores no cache.
+  `scripts/release-workflow/assemble` writes it to a 0700 tmpfs directory with
+  mode 0600, removes it from the environment before the first program starts
+  and shreds it on exit. The key id handed to xtask is the root of
+  `packaging/runtime-catalog-anchor.json` that carries `packaging/catalog-trust/ci.pub`,
+  so a seed of any other root (the offline primary) is refused, and the catalog
+  must verify against the anchor.
+- A rehearsal has no secret, no environment and no provenance. The daemon
+  archives are staged with a throwaway anchor written over
+  `packaging/runtime-catalog-anchor.json` in the build job's own checkout, and
+  `assemble-rehearsal` signs with the key derived from
+  `sha256("rehearsal <run id> <commit>")`; it refuses a tag, so a rehearsal key
+  never signs anything a release trusts and nothing is published. It runs the
+  full policy minus the targets it does not build (the macOS archives).
+- Every action is pinned to a commit; untrusted values reach scripts through
+  `env:`, never through expression interpolation.
+
+What a rehearsal cannot show, and only a tag run does: signing with the production
+key against the production anchor, `gh attestation verify` against real
+attestations, the macOS jobs, and the draft/publish steps of `publish`.

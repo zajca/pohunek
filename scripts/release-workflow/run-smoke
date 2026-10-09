@@ -1,0 +1,51 @@
+#!/bin/sh
+# Stage the pinned upstreams and run the network-isolated smoke on every Linux
+# daemon archive of a release bundle.
+#
+# usage: run-smoke <bundle-dir>                   (run from the repository root)
+# env:   VERSION    release version
+#        CONSUMER   the prebuilt release_consumer executable
+#        ISOLATION  userns or sudo (from probe-isolation)
+#        XTASK      path of the built xtask binary
+#        RUNNER_TEMP
+#
+# Every runtime of the compatibility matrix is staged once (network), then
+# packaging/smoke-archive runs each Linux daemon archive of the bundle in a
+# network namespace. The stage, the temp tree and the consumer copy lie outside
+# the checkout, as smoke-archive requires.
+
+set -eu
+
+fail() {
+    printf 'run-smoke: %s\n' "$*" >&2
+    exit 1
+}
+
+[ "$#" -eq 1 ] || fail "usage: run-smoke <bundle-dir>"
+bundle=$1
+for name in VERSION CONSUMER ISOLATION XTASK RUNNER_TEMP; do
+    eval "value=\${$name:-}"
+    [ -n "$value" ] || fail "$name is required"
+done
+case $ISOLATION in userns | sudo) ;; *) fail "ISOLATION must be userns or sudo" ;; esac
+[ -d "$bundle" ] || fail "not a directory: $bundle"
+
+# Artifact upload drops the executable bit; the copy gets it back.
+consumer_copy=$RUNNER_TEMP/smoke-consumer
+cp -- "$CONSUMER" "$consumer_copy"
+chmod 0755 "$consumer_copy"
+
+stage=$RUNNER_TEMP/smoke-stage
+[ ! -e "$stage" ] || fail "stage exists: $stage"
+mkdir -p "$stage"
+jq -r '[.rows[].runtime] | unique | .[]' compat/matrix.json | while IFS= read -r runtime; do
+    "$XTASK" compat stage-upstream --runtime "$runtime" --out "$stage"
+done
+
+found=0
+for archive in "$bundle"/pohunek-daemon-"$VERSION"-*-linux-*.tar.gz; do
+    [ -f "$archive" ] || continue
+    packaging/smoke-archive --archive "$archive" --stage "$stage" --consumer "$consumer_copy" --isolation "$ISOLATION"
+    found=$((found + 1))
+done
+[ "$found" -gt 0 ] || fail "the bundle holds no Linux daemon archive"

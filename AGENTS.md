@@ -339,7 +339,8 @@ The TypeScript SDK is released as three npm-pack tarballs
 (`pohunek-ts-protocol-X.Y.Z.tgz`, `pohunek-ts-sdk-X.Y.Z.tgz`,
 `pohunek-ts-testkit-X.Y.Z.tgz`, each with a `.sha256`) built by
 `sdk/ts/scripts/pack-release.ts` in the Release workflow's read-only `sdk-pack`
-job, which needs `sdk-gate`; the separate `sdk-publish` job attaches them. `bun test sdk/ts/scripts` is the pack contract: it
+job, which needs `sdk-gate`; the single `publish` job of the Release workflow uploads them
+with the rest of the verified release inventory. `bun test sdk/ts/scripts` is the pack contract: it
 packs, serves the tarballs from a local HTTP server and runs a real
 `bun install` of a consumer that pins them by URL against an unreachable
 registry. Run it after touching an SDK package manifest, export map or file

@@ -1,0 +1,98 @@
+#!/bin/sh
+# Run one compatibility row (runtime x target) and write its attestation.
+#
+# usage: run-row            (run from the repository root; everything via env)
+# env:   VERSION      release version X.Y.Z
+#        COMMIT       full commit the artifacts were built from
+#        RUNTIME      runtime id (a runtime-packages/ directory)
+#        TARGET       core target triple of the row
+#        DAEMON_DIR   directory holding the daemon archive of TARGET and its .sha256
+#        PACKAGES_DIR directory holding the package archives and their .sha256
+#        CONSUMER     the prebuilt release_consumer executable
+#        OUT_DIR      directory that receives attestation-<runtime>-<target>.json
+#        XTASK        path of the built xtask binary
+#
+# The binaries under test are extracted from the daemon ARCHIVE of the target,
+# never rebuilt: the attestation binds exactly the bytes that will be bundled.
+# The pinned upstream is staged from its lockfile (network), the consumer runs
+# once out of process with a scrubbed environment, and `compat attest`
+# recomputes every digest from the files.
+
+set -eu
+
+# The single out-of-process test of crates/cli/tests/release_consumer.rs; the
+# archive smoke (packaging/smoke-archive) selects the same one.
+consumer_test=the_release_binaries_serve_the_runtime_out_of_process
+
+fail() {
+    printf 'run-row: %s\n' "$*" >&2
+    exit 1
+}
+
+need() {
+    eval "value=\${$1:-}"
+    [ -n "$value" ] || fail "$1 is required"
+}
+for name in VERSION COMMIT RUNTIME TARGET DAEMON_DIR PACKAGES_DIR CONSUMER OUT_DIR XTASK; do
+    need "$name"
+done
+case $RUNTIME in *[!a-z0-9_-]*) fail "invalid runtime id" ;; esac
+case $TARGET in *[!a-z0-9_-]*) fail "invalid target" ;; esac
+[ -x "$XTASK" ] || fail "XTASK is not executable"
+[ -f "$CONSUMER" ] || fail "CONSUMER is not a file"
+[ -d runtime-packages/"$RUNTIME" ] || fail "no package directory for runtime $RUNTIME"
+lock=compat/$RUNTIME/compatibility-lock.json
+[ -f "$lock" ] || fail "no compatibility lock for runtime $RUNTIME"
+
+stem=pohunek-daemon-$VERSION-$TARGET
+archive=$DAEMON_DIR/$stem.tar.gz
+package=$PACKAGES_DIR/pohunek-runtime-$RUNTIME-$VERSION.tar.zst
+(cd "$DAEMON_DIR" && sha256sum -c "$stem.tar.gz.sha256") || fail "daemon archive checksum mismatch"
+(cd "$PACKAGES_DIR" && sha256sum -c "pohunek-runtime-$RUNTIME-$VERSION.tar.zst.sha256") || fail "package archive checksum mismatch"
+
+# A short root keeps the suite's socket paths inside the AF_UNIX limit.
+work=$(mktemp -d /tmp/pkrow.XXXXXX)
+trap 'rm -rf -- "$work"' EXIT
+mkdir -p "$work/extract" "$work/stage" "$work/cwd" "$work/home" "$work/t" "$OUT_DIR"
+
+tar -xzf "$archive" -C "$work/extract" --no-same-owner
+bin_dir=$work/extract/$stem
+for binary in pohunek pohunekd pohunek-sessiond; do
+    [ -f "$bin_dir/$binary" ] && [ ! -L "$bin_dir/$binary" ] || fail "the archive lacks $binary"
+done
+
+"$XTASK" compat stage-upstream --runtime "$RUNTIME" --out "$work/stage"
+node_bin=$(command -v node) || fail "node is required on PATH"
+node_dir=$(cd "$(dirname -- "$node_bin")" && pwd -P)
+
+cp -- "$CONSUMER" "$work/consumer"
+chmod 0755 "$work/consumer"
+report=$work/report.json
+(
+    cd "$work/cwd"
+    exec env -i \
+        PATH="$work/stage/$RUNTIME/bin:$node_dir:/usr/bin:/bin" \
+        HOME="$work/home" \
+        XDG_CONFIG_HOME="$work/home/.config" \
+        XDG_DATA_HOME="$work/home/.local/share" \
+        XDG_STATE_HOME="$work/home/.local/state" \
+        XDG_CACHE_HOME="$work/home/.cache" \
+        TMPDIR="$work/t" \
+        LANG=C.UTF-8 \
+        POHUNEK_CONSUMER_BIN_DIR="$bin_dir" \
+        POHUNEK_CONSUMER_RUNTIME="$RUNTIME" \
+        POHUNEK_CONSUMER_PACKAGE="$package" \
+        POHUNEK_CONSUMER_REPORT="$report" \
+        "$work/consumer" --exact "$consumer_test" --nocapture
+) || fail "the consumer run failed for $RUNTIME on $TARGET"
+[ -f "$report" ] || fail "the consumer wrote no report"
+
+"$XTASK" compat attest \
+    --report "$report" \
+    --bin-dir "$bin_dir" \
+    --package "$package" \
+    --lock "$lock" \
+    --matrix compat/matrix.json \
+    --commit "$COMMIT" \
+    --target "$TARGET" \
+    --output "$OUT_DIR/attestation-$RUNTIME-$TARGET.json"

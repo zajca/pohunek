@@ -889,6 +889,53 @@ check = "none"
         );
     }
 
+    #[test]
+    fn archive_smoke_accepts_a_staged_link_to_its_native_binary() {
+        let dir = pohunek_test_support::tempdir().expect("tempdir");
+        let stage = dir.path().join("stage/claude");
+        let stage_bin = stage.join("bin");
+        let host_bin = dir.path().join("host/bin");
+        let native = stage.join("lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe");
+        fs::create_dir_all(&stage_bin).expect("stage bin");
+        fs::create_dir_all(&host_bin).expect("host bin");
+        fs::create_dir_all(native.parent().expect("native parent")).expect("native parent");
+        write_executable(&native, "#!/bin/sh\nexit 0\n").expect("native executable");
+        symlink(
+            "../lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+            stage_bin.join("claude"),
+        )
+        .expect("staged entry");
+        let path = std::env::join_paths([stage_bin.as_path(), host_bin.as_path()]).expect("PATH");
+
+        assert_eq!(
+            locate_smoke_upstream("claude", Some(&path), Some(stage_bin.as_os_str()))
+                .expect("valid staged link"),
+            stage_bin.join("claude"),
+            "the launcher must keep the staged entry path"
+        );
+        assert_eq!(
+            stage_bin
+                .join("claude")
+                .canonicalize()
+                .expect("resolved staged entry"),
+            native
+        );
+
+        symlink(&native, host_bin.join("claude")).expect("later PATH alias");
+        fs::set_permissions(&stage_bin, fs::Permissions::from_mode(0o777))
+            .expect("untrusted staged bin directory");
+        let fallback_path =
+            std::env::join_paths([stage_bin.as_path(), host_bin.as_path()]).expect("fallback PATH");
+        assert_eq!(
+            locate_upstream("claude", Some(&fallback_path)).expect("later alias is usable"),
+            host_bin.join("claude")
+        );
+        let refused =
+            locate_smoke_upstream("claude", Some(&fallback_path), Some(stage_bin.as_os_str()))
+                .expect_err("later PATH alias must not substitute for the staged entry");
+        assert!(refused.contains("verified stage"), "{refused}");
+    }
+
     /// `target` relative to `base`, both absolute.
     fn pathdiff(target: &Path, base: &Path) -> PathBuf {
         let mut up = PathBuf::new();

@@ -310,14 +310,49 @@ unavailable).
 ## Release
 
 `scripts/release` bumps the workspace version, tags `vX.Y.Z`, and pushes; the
-Release workflow re-runs the gates on the tag, then builds and publishes glibc
-and MUSL x86_64 CLI and daemon archives, and ad-hoc signed `aarch64-apple-darwin`
-CLI and daemon archives. No macOS job uses secrets or a protected environment.
-A download-only `attest` job, the only job holding `id-token: write` and
-`attestations: write`, creates a build-provenance attestation for every
-published asset (Linux, macOS, SDK, and the `.sha256` checksum files); the publish jobs depend on it, so an
-unattested asset is never published. Developer ID signing and notarization are
-not part of the pipeline. The offline docs, the README, and the reference
+Release workflow (`.github/workflows/release.yml`) re-runs the gates on the tag
+and then builds, assembles and publishes the release in one fixed flow:
+
+1. **Producers** upload workflow artifacts only: `release-build.yml` (reusable)
+   builds the glibc and MUSL x86_64 CLI and daemon archives, the glibc relay
+   archive, the official runtime package archives (every `runtime-packages/*`
+   directory: `package verify`, then `package build`, named
+   `pohunek-runtime-<runtime>-<version>.tar.zst` with a `.sha256`) and the SDK
+   tarballs; the macOS jobs build, ad-hoc sign and verify the Apple Silicon
+   archives. No macOS job uses secrets or a protected environment.
+2. **Evidence** (`release-evidence.yml`, reusable): one job per
+   (runtime x target) row of `compat/matrix.json` extracts the binaries from the
+   daemon ARCHIVE, stages the pinned upstream, runs the out-of-process consumer
+   suite and emits `attestation-<runtime>-<target>.json`; the download-only
+   `attest` job creates build provenance for every producer artifact;
+   `assemble` (environment `release`) verifies that provenance with `gh
+   attestation verify`, then `cargo xtask release assemble` signs the catalog
+   with the CI root key and writes the bundle; `attest-bundle` attests the
+   bundle; `smoke` runs `packaging/smoke-archive` on every Linux daemon archive
+   in a network namespace; `verdict` requires all of them.
+3. **Publish**: the single job with `contents: write`. It checks out nothing and
+   runs no repository or downloaded code. It downloads the `release-bundle`
+   artifact, checks it against `release-inventory.sha256` (the only list of
+   files), verifies provenance, refuses a moved tag or any existing release of
+   the tag (drafts included), creates a DRAFT with `gh release create --draft
+   --verify-tag`, uploads exactly the inventory, compares the draft's asset
+   names, digests and sizes with it, and only then publishes
+   (`gh release edit --draft=false`) and reads the result back. A failed run
+   deletes the draft it created. A visible release is therefore complete or
+   absent; if a draft is ever left behind (the runner was killed), delete it in
+   the GitHub UI or with `gh release delete vX.Y.Z --yes`, then rerun the
+   failed workflow.
+
+Every asset (Linux, macOS, SDK, package archives, the signed catalog, the
+attestation documents, the rebuilt daemon archives, and the `.sha256` files)
+has a build-provenance attestation from `release-evidence.yml`; the two jobs
+that hold `id-token: write` and `attestations: write` (`attest`,
+`attest-bundle`) download and attest only. Only the signing step of `assemble`
+reads the secret `CATALOG_SIGNING_KEY_CI` of the environment `release`
+(deployment policy: tags `v*`); it writes the seed to a 0700 tmpfs directory
+with mode 0600, removes it from the environment before any program starts, and
+shreds it afterwards. Developer ID signing and notarization are not part of the
+pipeline. The offline docs, the README, and the reference
 pages under `docs/` are bundled into every native component archive. CLI archives also contain
 `packaging/smoke-hermes-plugin-release`. Release automation provisions the
 source-locked Hermes runtime without provider credentials, runs the model-free
@@ -327,6 +362,41 @@ script with an explicitly supplied, preinstalled pinned Hermes executable. It
 creates an isolated temporary profile/state, requires that executable rather
 than downloading it, and fails if install, status, doctor, or uninstall cannot
 prove the embedded plugin and generated skill.
+
+### Release rehearsal
+
+`ci.yml` runs the same two reusable workflows with `mode: rehearsal`
+(`release-rehearsal-build`, `release-rehearsal`) on push to main, the weekly
+schedule, manual dispatch, and pull requests that change the release workflows,
+`packaging/**`, `scripts/release-workflow/**`, `crates/xtask/**`, `compat/**`,
+`runtime-packages/**`, the consumer suite or the release workflow tests. It
+builds the Linux archives, packages and SDK tarballs from the PR commit, runs
+every matrix row, assembles a bundle and runs the archive smoke. It uses no
+secret and no environment: the daemon archives are staged with a throwaway trust
+anchor and the bundle is signed with a key derived from
+`sha256("rehearsal <run id> <commit>")`, so the key signs only a bundle that is
+never published, and no provenance is created. It does not run for fork or
+Dependabot pull requests. The rehearsal cannot prove what needs the real tag:
+signing with the production key against `packaging/runtime-catalog-anchor.json`,
+`gh attestation verify` against real attestations, the macOS archives, and the
+draft/publish semantics of the `publish` job.
+
+### Adding a runtime package or row
+
+Add `runtime-packages/<runtime>/`, `compat/<runtime>/` (lock and npm project) and
+the rows to `compat/matrix.json` (`cargo xtask compat matrix-check`), and a driver
+entry for the consumer suite. Nothing in `release.yml`, `release-build.yml` or
+`release-evidence.yml` names a runtime: the package job, the row matrix and the
+smoke derive them from those directories and files. A new target needs a runner
+mapping in `scripts/release-workflow/row-matrix`, a build leg in
+`release-build.yml` and the policy entries in `packaging/release-policy.json`.
+
+The structure of the workflows (one writer, the OIDC jobs, the secret, pinned
+actions, asset names against the policy) is pinned by
+`scripts/tests/test_release_workflow.py`; the helper scripts under
+`scripts/release-workflow/` by `scripts/tests/test_release_workflow_scripts.py`.
+Check workflow edits with `actionlint` (with `shellcheck` on `PATH`) before
+pushing.
 
 Runtime package compatibility is attested per package and target:
 `cargo xtask compat attest` turns a consumer-suite report into an attestation

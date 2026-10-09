@@ -2,7 +2,9 @@
 
 # Cut a new release: bump the workspace version, refresh the lockfile, commit,
 # tag `vX.Y.Z`, and push. Pushing the tag triggers .github/workflows/release.yml,
-# which builds the binaries and publishes the GitHub Release.
+# which builds the binaries, runs the compatibility rows, signs the runtime
+# catalog and publishes the GitHub Release as a draft that becomes visible only
+# after its assets were verified.
 #
 # Usage:
 #   scripts/release patch        # 0.1.0 -> 0.1.1

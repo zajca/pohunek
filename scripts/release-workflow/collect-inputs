@@ -1,0 +1,44 @@
+#!/bin/sh
+# Merge downloaded producer artifacts into the flat input directory of
+# `cargo xtask release assemble`.
+#
+# usage: collect-inputs <output-dir> <download-dir>...
+#
+# Every regular file below the download directories is copied by its base name.
+# A link, a special file or a repeated name fails. The checksum files of the
+# runtime package archives are checked here and not copied, because the
+# assembler's input set holds the package archives without them.
+
+set -eu
+
+fail() {
+    printf 'collect-inputs: %s\n' "$*" >&2
+    exit 1
+}
+
+[ "$#" -ge 2 ] || fail "usage: collect-inputs <output-dir> <download-dir>..."
+output=$1
+shift
+[ ! -e "$output" ] || fail "output exists: $output"
+mkdir -p "$output"
+
+for dir in "$@"; do
+    [ -d "$dir" ] || fail "not a directory: $dir"
+    odd=$(find "$dir" ! -type f ! -type d -print | head -n 1)
+    [ -z "$odd" ] || fail "not a regular file or directory: $odd"
+    find "$dir" -type f -print | while IFS= read -r file; do
+        name=$(basename -- "$file")
+        case $name in
+            '' | .* | *[!A-Za-z0-9._-]*) fail "unsafe file name: $name" ;;
+        esac
+        case $name in
+            pohunek-runtime-*.tar.zst.sha256)
+                (cd "$(dirname -- "$file")" && sha256sum -c "$name" >/dev/null) \
+                    || fail "checksum mismatch: $name"
+                continue
+                ;;
+        esac
+        [ ! -e "$output/$name" ] || fail "repeated input: $name"
+        cp -- "$file" "$output/$name"
+    done
+done

@@ -252,6 +252,11 @@ const RULES: &[Rule] = &[
         "release workflow asserted by pohunek-cli's daemon_packaging test",
     ),
     rule(
+        Pattern::File(".github/workflows/release-build.yml"),
+        Effect::Packages(&["pohunek-cli"]),
+        "release build workflow asserted by pohunek-cli's daemon_packaging test",
+    ),
+    rule(
         Pattern::File("crates/relay/src/lib.rs"),
         Effect::Packages(&["xtask"]),
         "relay sources scanned by xtask's dependency_policy test",
@@ -998,7 +1003,7 @@ mod tests {
 
     #[test]
     fn embedded_paths_map_to_their_embedding_packages() {
-        let cases: [(&str, &[&str]); 15] = [
+        let cases: [(&str, &[&str]); 16] = [
             (
                 "docs/knowledge/guides/agent-skill.md",
                 &["pohunek-knowledge", "xtask"],
@@ -1031,6 +1036,7 @@ mod tests {
             ("packaging/install-daemon.sh", &["pohunek-cli", "xtask"]),
             ("packaging/stage-archive", &["pohunek-cli", "xtask"]),
             (".github/workflows/release.yml", &["pohunek-cli"]),
+            (".github/workflows/release-build.yml", &["pohunek-cli"]),
             ("crates/relay/src/lib.rs", &["pohunek-relay", "xtask"]),
         ];
         for (path, expected) in cases {

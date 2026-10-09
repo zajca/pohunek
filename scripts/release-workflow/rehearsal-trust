@@ -1,0 +1,53 @@
+#!/bin/sh
+# Derive the throwaway signing key and trust anchor of a release rehearsal.
+#
+# usage: rehearsal-trust <output-dir> <run-id> <commit>
+# env:   XTASK  path of the built xtask binary
+#
+# The seed is SHA-256 of "rehearsal <run-id> <commit>": public values, so
+# every job of one rehearsal run derives the same key and the same anchor
+# bytes without any secret. The key signs only the catalog of a rehearsal
+# bundle that is never published, and the anchor trusts only that key. The
+# script refuses to run for a tag, so it cannot influence a release.
+#
+# Writes <output-dir>/seed (mode 0600), <output-dir>/anchor.json and
+# <output-dir>/key-id, and creates <output-dir> with mode 0700.
+
+set -eu
+
+# Window of the throwaway root: from the epoch to the year 2100, so it covers
+# every commit time and every verification time of a rehearsal.
+not_before=0
+not_after=4102444800
+
+fail() {
+    printf 'rehearsal-trust: %s\n' "$*" >&2
+    exit 1
+}
+
+[ "$#" -eq 3 ] || fail "usage: rehearsal-trust <output-dir> <run-id> <commit>"
+output=$1
+run_id=$2
+commit=$3
+[ -n "${XTASK:-}" ] && [ -x "$XTASK" ] || fail "XTASK must name the built xtask binary"
+[ "${GITHUB_REF_TYPE:-}" != tag ] || fail "a rehearsal key is never derived for a tag"
+case $run_id in
+    '' | *[!0-9]*) fail "run id must be digits" ;;
+esac
+case $commit in
+    '' | *[!0-9a-f]*) fail "commit must be lowercase hex" ;;
+esac
+[ ! -e "$output" ] || fail "output exists: $output"
+
+umask 077
+mkdir -p "$output"
+chmod 700 "$output"
+printf 'rehearsal %s %s' "$run_id" "$commit" | sha256sum | cut -c1-64 > "$output/seed"
+chmod 600 "$output/seed"
+"$XTASK" catalog public-key --key-file "$output/seed" > "$output/public-key.txt"
+sed -n 's/^key_id: //p' "$output/public-key.txt" > "$output/key-id"
+sed -n 's/^public_key: //p' "$output/public-key.txt" > "$output/public-key"
+rm -- "$output/public-key.txt"
+[ -s "$output/key-id" ] && [ -s "$output/public-key" ] || fail "cannot read the derived public key"
+"$XTASK" catalog anchor --root "$output/public-key:$not_before:$not_after" --output "$output/anchor.json" >/dev/null
+chmod 644 "$output/anchor.json"

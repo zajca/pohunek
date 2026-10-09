@@ -2072,10 +2072,10 @@ fn an_unknown_argument_fails_without_side_effects() {
 
 #[test]
 fn release_workflow_packages_the_wrapper_and_binaries_only() {
-    let workflow = read(&repo_root().join(".github/workflows/release.yml"));
+    let workflow = read(&repo_root().join(".github/workflows/release-build.yml"));
     assert!(
         workflow.contains("packaging/stage-archive"),
-        "the release workflow stages archives with packaging/stage-archive"
+        "the release build workflow stages archives with packaging/stage-archive"
     );
     let stage = read(&repo_root().join("packaging/stage-archive"));
     for expected in [

@@ -1,38 +1,42 @@
 name: Release
 
-# Triggered by pushing a `vX.Y.Z` tag (created by `scripts/release`). First runs
-# the full quality gate (fmt/clippy/test) on the tagged commit, and only if that
-# passes builds the native component binaries and packages them with sha256
-# checksums. Every build job holds a read-only token; the `publish*` jobs are
-# the only ones with a write token, and they only download an artifact, check
-# its checksum, and attach it to the GitHub Release for that tag, without
-# checking out the repository or running any code from it.
+# Triggered by pushing a `vX.Y.Z` tag (created by `scripts/release`). The flow
+# has one producer half, one evidence half and ONE writer:
 #
-# The TypeScript SDK ships as three npm-pack tarballs (`pohunek-ts-protocol`,
-# `pohunek-ts-sdk`, `pohunek-ts-testkit`, each with a `.sha256`), built by
-# `sdk-pack` after `sdk-gate` and attached by `sdk-publish`. Inner
-# `@pohunek/*` dependencies inside the tarballs are rewritten to this release's
-# asset URLs, so a consumer pins one URL and never resolves the `@pohunek`
-# scope from a registry.
+#   gate, docs-gate, sdk-gate, upgrade-test   the quality gate on the tagged
+#       commit (a tag push does not run the CI workflow, so the gate is
+#       duplicated here);
+#   build            release-build.yml: the Linux CLI/daemon/relay archives, the
+#                    official runtime package archives and the SDK tarballs;
+#   stage-macos, package-macos, verify-macos   the ad-hoc signed Apple Silicon
+#                    archives (see the macOS comment below);
+#   evidence         release-evidence.yml: per-row compatibility attestations,
+#                    provenance, the signed catalog and final bundle, and the
+#                    network-isolated archive smoke on that bundle;
+#   publish          the only job with `contents: write`.
 #
-# A tag push does NOT run the CI workflow (CI runs on branch pushes and PRs), so
-# the gate is duplicated here: no binary is published from a commit that fails
-# fmt, clippy, tests, or the upgrade test (a session started on the previous
-# release must survive `pohunek service upgrade` to the tagged commit; see
-# upgrade.yml).
+# Every producer and evidence job holds a read-only token and uploads workflow
+# artifacts only; none of them can create or edit a GitHub Release. `publish`
+# checks out nothing and runs no repository or downloaded code: it takes the
+# `release-bundle` artifact, whose `release-inventory.sha256` is the only list
+# of files, verifies it, refuses an existing release for the tag, creates a
+# DRAFT, uploads exactly the inventory, verifies the draft's assets by name,
+# size and digest, and only then publishes it. A visible release is therefore
+# either complete or absent. `.github/workflows/notify-tap.yml` runs after this
+# workflow and requires the release to be published.
 #
-# The native Apple Silicon archives are built on macOS runners and ad-hoc signed
-# (no Developer ID, no notarization, no secret); see the macOS job comment. Every
-# published asset (Linux, macOS, SDK) gets a build-provenance attestation from
-# the `attest` job, the only job that holds `id-token: write`, and the publish
-# jobs wait for it.
+# Provenance: the `attest` and `attest-bundle` jobs of release-evidence.yml are
+# the only jobs with `id-token: write` and `attestations: write`; the caller
+# job `evidence` must grant them because a called workflow cannot hold a scope
+# its caller lacks. They run no repository or downloaded code. The signing key
+# (the secret CATALOG_SIGNING_KEY_CI of the environment `release`) is read only
+# by the signing step of the `assemble` job there.
 on:
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
 
-permissions:
-  contents: read
+permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -50,6 +54,8 @@ jobs:
   gate:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     env:
       # Bound concurrent isolated PostgreSQL fixture pools.
       RUST_TEST_THREADS: 4
@@ -70,21 +76,22 @@ jobs:
           --health-timeout 5s
           --health-retries 12
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install mold linker
         run: sudo apt-get update && sudo apt-get install -y mold
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Enable sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: ci-
 
@@ -109,10 +116,12 @@ jobs:
         env:
           # Resolved at step level: the `job` context is not available in
           # job-level `env`, where it makes the whole workflow invalid.
-          POHUNEK_RELAY_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}/pohunek_test
+          POHUNEK_RELAY_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/pohunek_test
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@cargo-audit
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-audit
 
       - name: Audit release dependencies
         run: cargo audit
@@ -130,24 +139,28 @@ jobs:
   docs-gate:
     name: docs check (deterministic build + secret scan)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install mold linker
         run: sudo apt-get update && sudo apt-get install -y mold
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
 
       - name: Enable sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: ci-
 
@@ -163,20 +176,22 @@ jobs:
   sdk-gate:
     name: SDK typecheck + lint + test + pack contract + e2e
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.3.11
 
       - name: Cache Bun packages
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.bun/install/cache
           key: bun-${{ runner.os }}-1.3.11-${{ hashFiles('bun.lock') }}
@@ -184,16 +199,18 @@ jobs:
             bun-${{ runner.os }}-1.3.11-
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
 
       - name: Install mold linker
         run: sudo apt-get update && sudo apt-get install -y mold
 
       - name: Enable sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: ci-
 
@@ -217,7 +234,7 @@ jobs:
       # named by POHUNEK_TEST_NODE_BIN (skipped when unset), so each step below
       # runs the whole contract once per Node major.
       - name: Install Node 20 for the SDK Node contract
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
 
@@ -225,7 +242,7 @@ jobs:
         run: POHUNEK_TEST_NODE_BIN="$(command -v node)" bun test sdk/ts/scripts
 
       - name: Install Node 22 for the SDK Node contract
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
 
@@ -251,315 +268,16 @@ jobs:
           POHUNEK_CLI_BIN: ${{ github.workspace }}/target/debug/pohunek
           POHUNEK_PYTHON_BIN: /usr/bin/python3
 
-  # The SDK tarballs are built with a read-only token and no persisted git
-  # credentials, because packing installs and runs npm dependencies. Only
-  # `sdk-publish`, which runs no repository or dependency code, can write.
-  sdk-pack:
-    name: Pack TypeScript SDK release assets
-    needs: [gate, docs-gate, sdk-gate]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    env:
-      SDK_ASSET_DIR: sdk-dist
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Install Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.3.11
-
-      # The pack script compiles each package with the workspace's locked
-      # TypeScript and `@types/*`, so the lockfile is installed first.
-      - name: Install workspace dependencies
-        run: bun install --frozen-lockfile
-
-      # The asset base URL is where this very release serves its files.
-      - name: Pack SDK tarballs
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-          RELEASE_BASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
-          export SOURCE_DATE_EPOCH
-          bun sdk/ts/scripts/pack-release.ts \
-            --version "${RELEASE_TAG#v}" \
-            --base-url "$RELEASE_BASE_URL" \
-            --out "$SDK_ASSET_DIR"
-          ( cd "$SDK_ASSET_DIR" && sha256sum -c ./*.sha256 )
-
-      - name: Upload SDK tarballs
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: sdk-release-assets
-          path: ${{ env.SDK_ASSET_DIR }}
-          if-no-files-found: error
-
-  sdk-publish:
-    name: Publish TypeScript SDK release assets
-    needs: [sdk-pack, attest]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download SDK tarballs
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: sdk-release-assets
-          path: ${{ runner.temp }}/sdk-download
-
-      # One tarball per SDK package, each matching its checksum sidecar.
-      - name: Check the SDK tarball checksums
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP/sdk-download"
-          sha256sum -c ./*.tgz.sha256
-          for package in protocol sdk testkit; do
-            test "$(ls ./pohunek-ts-"$package"-*.tgz | wc -l)" = 1
-          done
-
-      - name: Attach to release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          fail_on_unmatched_files: true
-          files: |
-            ${{ runner.temp }}/sdk-download/pohunek-ts-protocol-*.tgz
-            ${{ runner.temp }}/sdk-download/pohunek-ts-protocol-*.tgz.sha256
-            ${{ runner.temp }}/sdk-download/pohunek-ts-sdk-*.tgz
-            ${{ runner.temp }}/sdk-download/pohunek-ts-sdk-*.tgz.sha256
-            ${{ runner.temp }}/sdk-download/pohunek-ts-testkit-*.tgz
-            ${{ runner.temp }}/sdk-download/pohunek-ts-testkit-*.tgz.sha256
-
   build:
-    name: Build ${{ matrix.component }} for ${{ matrix.target }}
+    name: Build the release artifacts
     needs: [gate, docs-gate, sdk-gate, upgrade-test]
-    runs-on: ${{ matrix.runner }}
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
-      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
+    uses: ./.github/workflows/release-build.yml
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Dynamically linked glibc build (primary target).
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-            component: cli
-            archive_prefix: pohunek-cli
-            binary: pohunek
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-            component: daemon
-            archive_prefix: pohunek-daemon
-            binary: pohunekd
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-            component: relay
-            archive_prefix: pohunek-relay
-            binary: pohunek-relayd
-          # Fully static musl CLI and daemon builds: self-contained binaries
-          # that run on x86_64 Linux regardless of the host glibc version.
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
-            component: cli
-            archive_prefix: pohunek-cli
-            binary: pohunek
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
-            component: daemon
-            archive_prefix: pohunek-daemon
-            binary: pohunekd
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
+    with:
+      mode: release
 
-      - name: Install Python for Hermes release verification
-        if: matrix.component == 'cli'
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install uv for Hermes release verification
-        if: matrix.component == 'cli'
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
-        with:
-          version: "0.9.28"
-          enable-cache: true
-
-      - name: Install musl toolchain
-        if: endsWith(matrix.target, '-musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      # Every leg links host binaries (build scripts, `cargo xtask docs site`)
-      # with the job-level mold RUSTFLAGS; only the musl target link itself
-      # drops mold, in the "Build release binaries" step.
-      - name: Install mold linker
-        run: sudo apt-get update && sudo apt-get install -y mold
-
-      - name: Enable sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
-
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-
-
-      - name: Build release binaries
-        shell: bash
-        env:
-          # musl targets link statically via the musl toolchain wrapper, which
-          # does not accept GNU ld replacement flags: keep mold GNU-only.
-          RUSTFLAGS: ${{ endsWith(matrix.target, '-musl') && '-D warnings' || '-D warnings -C link-arg=-fuse-ld=mold' }}
-        run: |
-          set -euo pipefail
-          build_args=(--release --locked --target "${{ matrix.target }}")
-          case "${{ matrix.component }}" in
-            cli)
-              cargo build "${build_args[@]}" -p pohunek-cli --bin pohunek
-              ;;
-            daemon)
-              cargo build "${build_args[@]}" \
-                -p pohunek-cli \
-                -p pohunek-daemon \
-                -p pohunek-session-worker \
-                --bin pohunek \
-                --bin pohunekd \
-                --bin pohunek-sessiond
-              ;;
-            relay)
-              cargo build "${build_args[@]}" -p pohunek-relay --bin pohunek-relayd
-              ;;
-            *)
-              echo "::error::unsupported release component: ${{ matrix.component }}"
-              exit 1
-              ;;
-          esac
-
-      - name: Build docs artifacts
-        run: cargo xtask docs site
-
-      - name: Package
-        id: package
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          target="${{ matrix.target }}"
-          component="${{ matrix.component }}"
-          # Archives are stamped with the tagged commit's time, so rebuilding
-          # the same tag yields the same archive bytes.
-          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
-          export SOURCE_DATE_EPOCH
-          name="$(packaging/stage-archive "${component}" "${version}" "${target}" \
-            "target/${target}/release" target/pohunek-docs dist)"
-          if [ "${name}" != "${{ matrix.archive_prefix }}-${version}-${target}" ]; then
-            echo "::error::staged archive ${name} does not match the matrix archive prefix"
-            exit 1
-          fi
-          sh packaging/write-manifest "dist/${name}" "${component}" "${version}" "${target}" none
-          sh packaging/archive dist "${name}" dist
-          echo "archive=dist/${name}.tar.gz" >> "${GITHUB_OUTPUT}"
-          echo "checksum=dist/${name}.tar.gz.sha256" >> "${GITHUB_OUTPUT}"
-
-      - name: Provision locked Hermes runtime
-        if: matrix.component == 'cli'
-        id: hermes
-        shell: bash
-        run: |
-          set -euo pipefail
-          hermes_bin="$(scripts/provision-hermes-compat "$RUNNER_TEMP/hermes-compat")"
-          printf 'bin=%s\n' "$hermes_bin" >> "$GITHUB_OUTPUT"
-
-      - name: Verify packaged CLI against pinned Hermes
-        if: matrix.component == 'cli'
-        shell: bash
-        run: |
-          set -euo pipefail
-          archive="${{ steps.package.outputs.archive }}"
-          extract_dir="$(mktemp -d)"
-          trap 'rm -rf "$extract_dir"' EXIT
-          tar -xzf "$archive" -C "$extract_dir"
-          release_root="$extract_dir/${{ matrix.archive_prefix }}-${GITHUB_REF_NAME#v}-${{ matrix.target }}"
-          release_pohunek="$(realpath "$release_root/${{ matrix.binary }}")"
-          packaged_smoke="$release_root/packaging/smoke-hermes-plugin-release"
-          test -x "$release_pohunek"
-          test -x "$packaged_smoke"
-          cargo xtask hermes compatibility \
-            --hermes-bin "${{ steps.hermes.outputs.bin }}" \
-            --pohunek-bin "$release_pohunek"
-          "$packaged_smoke" "$release_pohunek" "${{ steps.hermes.outputs.bin }}"
-
-      # Only the archive and its checksum leave this job. Publishing happens in
-      # `publish`, which holds the write token and runs none of this code.
-      - name: Upload release archive
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: release-${{ matrix.component }}-${{ matrix.target }}
-          path: |
-            ${{ steps.package.outputs.archive }}
-            ${{ steps.package.outputs.checksum }}
-          if-no-files-found: error
-
-  publish:
-    name: Publish ${{ matrix.component }} for ${{ matrix.target }}
-    needs: [build, attest]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            component: cli
-          - target: x86_64-unknown-linux-gnu
-            component: daemon
-          - target: x86_64-unknown-linux-gnu
-            component: relay
-          - target: x86_64-unknown-linux-musl
-            component: cli
-          - target: x86_64-unknown-linux-musl
-            component: daemon
-    steps:
-      - name: Download the release archive
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: release-${{ matrix.component }}-${{ matrix.target }}
-          path: ${{ runner.temp }}/release-download
-
-      # The checksum file names the archive relative to its own directory.
-      - name: Check the archive checksum
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP/release-download"
-          sha256sum -c ./*.tar.gz.sha256
-          test "$(ls ./*.tar.gz | wc -l)" = 1
-
-      - name: Attach to release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          fail_on_unmatched_files: true
-          files: |
-            ${{ runner.temp }}/release-download/*.tar.gz
-            ${{ runner.temp }}/release-download/*.tar.gz.sha256
-
-  # Ad-hoc signed native Apple Silicon archives (issues #104, #481), in four
+  # Ad-hoc signed native Apple Silicon archives (issues #104, #481), in three
   # jobs so that no built program runs after the final bytes are produced:
   #
   #   stage-macos    builds against the macOS 14.0 deployment target on the
@@ -574,14 +292,13 @@ jobs:
   #                  with the signing step that produces the final bytes.
   #   verify-macos   extracts the archive outside the checkout, verifies its
   #                  signatures, and runs the packaged smokes.
-  #   publish-macos  downloads the archive again on a fresh runner, checks its
-  #                  checksum, and attaches it without running anything from it.
-  #                  The only macOS job with a write token, and it waits for
-  #                  `attest`.
   #
-  # No macOS job uses an environment, a secret, or a repository variable: an
-  # ad-hoc signature needs no credential. The archive's provenance comes from
-  # the `attest` job, not from a signer identity.
+  # The signed archives (artifacts `macos-signed-<component>`) enter the release
+  # through the `evidence` job like every other producer artifact; no macOS job
+  # can write to the repository. No macOS job uses an environment, a secret, or
+  # a repository variable: an ad-hoc signature needs no credential. The
+  # archive's provenance comes from the evidence workflow's attest job, not
+  # from a signer identity.
   #
   # Running the archives on macOS 14 itself is a separate acceptance gate.
   stage-macos:
@@ -589,6 +306,8 @@ jobs:
     needs: [gate, docs-gate, sdk-gate, upgrade-test]
     runs-on: macos-15
     timeout-minutes: 120
+    permissions:
+      contents: read
     env:
       RUSTFLAGS: -D warnings
     strategy:
@@ -832,90 +551,146 @@ jobs:
             --pohunek-bin "$release_pohunek"
           PATH="/bin:$PATH" "$packaged_smoke" "$release_pohunek" "${{ steps.hermes.outputs.bin }}"
 
-  # Build-provenance attestations for every published archive, tarball, and
-  # checksum file. The
-  # only job with `id-token: write` and `attestations: write`: it checks out
-  # nothing, only downloads the already built and verified assets, checks their
-  # checksum files, and attests them, so no code from this repository or from an
-  # asset runs while the OIDC token is available. Every publish job waits for
-  # it, so an unattested asset is never attached to the release.
-  attest:
-    name: Attest release assets
-    needs: [build, verify-macos, sdk-pack]
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+  # Per-row compatibility attestations, provenance, the signed catalog and
+  # bundle, and the archive smoke. The called workflow downloads the artifacts
+  # of `build` and of the macOS jobs by name. The OIDC scopes are the ceiling
+  # for its attest jobs; every other job there holds `contents: read`.
+  evidence:
+    name: Evidence, signed bundle and archive smoke
+    needs: [build, verify-macos]
+    uses: ./.github/workflows/release-evidence.yml
     permissions:
       contents: read
       id-token: write
       attestations: write
-    steps:
-      - name: Download the Linux archives
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          pattern: release-*
-          merge-multiple: true
-          path: ${{ runner.temp }}/attest-assets
+    with:
+      version: ${{ needs.build.outputs.version }}
+      commit: ${{ github.sha }}
+      mode: release
 
-      - name: Download the macOS archives
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          pattern: macos-signed-*
-          merge-multiple: true
-          path: ${{ runner.temp }}/attest-assets
-
-      - name: Download the SDK tarballs
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: sdk-release-assets
-          path: ${{ runner.temp }}/attest-assets
-
-      # Every asset has exactly one checksum file, and each one matches.
-      - name: Check the asset checksums
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP/attest-assets"
-          sha256sum -c ./*.sha256
-          test "$(ls ./*.tar.gz ./*.tgz | wc -l)" = "$(ls ./*.sha256 | wc -l)"
-
-      - name: Attest the release assets
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: |
-            ${{ runner.temp }}/attest-assets/*.tar.gz
-            ${{ runner.temp }}/attest-assets/*.tgz
-            ${{ runner.temp }}/attest-assets/*.sha256
-
-  publish-macos:
-    name: Publish ${{ matrix.component }} for aarch64-apple-darwin
-    needs: [verify-macos, attest]
-    runs-on: macos-15
+  # The one writer. It needs every producer and the evidence workflow (whose
+  # `verdict` job requires assemble, attest-bundle and smoke to have
+  # succeeded). It runs no repository code and no downloaded data: only `gh`
+  # and coreutils on the `release-bundle` artifact. A failed run deletes the
+  # draft it created, so no partial release stays behind.
+  publish:
+    name: Publish the release
+    needs: [gate, docs-gate, sdk-gate, upgrade-test, build, stage-macos, package-macos, verify-macos, evidence]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        component: [cli, daemon]
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      COMMIT: ${{ github.sha }}
     steps:
-      - name: Download the signed archive
+      - name: Download the release bundle
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: macos-signed-${{ matrix.component }}
-          path: ${{ runner.temp }}/signed-download
+          name: release-bundle
+          path: ${{ runner.temp }}/bundle
 
-      - name: Check the archive checksum
+      # The inventory is the only list of files: the directory must hold
+      # exactly the listed regular files plus the inventory itself, with the
+      # listed digests, and every versioned name must carry this tag's version.
+      - name: Check the bundle against its inventory
         shell: bash
         run: |
           set -euo pipefail
-          cd "$RUNNER_TEMP/signed-download"
-          shasum -a 256 -c ./*.tar.gz.sha256
-          test "$(ls ./*.tar.gz | wc -l | tr -d ' ')" = 1
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          version="${TAG#v}"
+          cd "$RUNNER_TEMP/bundle"
+          test -z "$(find . -mindepth 1 ! -type f -print)"
+          test -z "$(find . -mindepth 2 -print)"
+          test -z "$(grep -Ev '^[0-9a-f]{64}  [A-Za-z0-9][A-Za-z0-9._-]*$' release-inventory.sha256 || true)"
+          sha256sum -c release-inventory.sha256
+          { cut -c67- release-inventory.sha256; echo release-inventory.sha256; } | LC_ALL=C sort > "$RUNNER_TEMP/listed.txt"
+          find . -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort > "$RUNNER_TEMP/present.txt"
+          diff "$RUNNER_TEMP/listed.txt" "$RUNNER_TEMP/present.txt"
+          while IFS= read -r name; do
+            case "$name" in
+              runtime-catalog.json | release-inventory.sha256 | attestation-*.json) ;;
+              *"-$version-"* | *"-$version."*) ;;
+              *) echo "::error::$name does not belong to release $version"; exit 1 ;;
+            esac
+          done < "$RUNNER_TEMP/present.txt"
 
-      - name: Attach to release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          fail_on_unmatched_files: true
-          files: |
-            ${{ runner.temp }}/signed-download/*.tar.gz
-            ${{ runner.temp }}/signed-download/*.tar.gz.sha256
+      # Every published file has provenance from this repository's evidence
+      # workflow for this very tag and commit.
+      - name: Verify the provenance of every file
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/bundle"
+          for file in *; do
+            gh attestation verify "$file" --repo "$GH_REPO" \
+              --signer-workflow "$GH_REPO/.github/workflows/release-evidence.yml" \
+              --signer-digest "$COMMIT" --source-ref "$GITHUB_REF" --source-digest "$COMMIT" \
+              --deny-self-hosted-runners > /dev/null
+          done
+
+      # `releases` lists drafts too, unlike the tag endpoint; a leftover draft
+      # of this tag blocks the run (delete it, then rerun).
+      - name: Refuse a moved tag or an existing release
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GH_REPO/commits/$TAG" --jq .sha)" = "$COMMIT"
+          existing="$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.tag_name == env.TAG) | .id')"
+          test -z "$existing"
+
+      - name: Create the draft release
+        id: draft
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes ""
+
+      - name: Upload exactly the inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/bundle"
+          gh release upload "$TAG" ./*
+
+      # The draft must hold exactly the bundle: same names, digests and sizes,
+      # read back through the releases API.
+      - name: Verify the draft against the inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/bundle"
+          want="$(for file in *; do printf '%s sha256:%s %s\n' "$file" "$(sha256sum "$file" | cut -d' ' -f1)" "$(stat -c %s "$file")"; done | LC_ALL=C sort)"
+          have="$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.tag_name == env.TAG and .draft) | .assets[] | select(.state == "uploaded") | "\(.name) \(.digest) \(.size)"' | LC_ALL=C sort)"
+          test -n "$have"
+          test "$want" = "$have"
+
+      - name: Publish the draft
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GH_REPO/commits/$TAG" --jq .sha)" = "$COMMIT"
+          gh release edit "$TAG" --draft=false
+
+      - name: Verify the published release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/bundle"
+          want="$(for file in *; do printf '%s sha256:%s %s\n' "$file" "$(sha256sum "$file" | cut -d' ' -f1)" "$(stat -c %s "$file")"; done | LC_ALL=C sort)"
+          have="$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.tag_name == env.TAG and (.draft | not)) | .assets[] | select(.state == "uploaded") | "\(.name) \(.digest) \(.size)"' | LC_ALL=C sort)"
+          test -n "$have"
+          test "$want" = "$have"
+
+      # Only a draft this run created and left unpublished is removed; a
+      # published release is never touched.
+      - name: Remove an unpublished draft after a failure
+        if: ${{ failure() && steps.draft.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for id in $(gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.tag_name == env.TAG and .draft) | .id'); do
+            gh api --method DELETE "repos/$GH_REPO/releases/$id"
+          done
