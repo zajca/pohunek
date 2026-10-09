@@ -425,7 +425,8 @@ async fn stale_refused_socket_without_job_recovers_but_silent_job_stays_conflict
         .expect("private silent worker directory");
     let silent_socket = silent_dir.join(pohunek_paths::WORKER_SOCKET_NAME);
     drop(UnixListener::bind(&silent_socket).expect("bind a stale silent socket"));
-    let silent_process = start_running(&fixture, &*fixture.workers, None, &key).await;
+    let logs = backend::worker_logs(&fixture.paths, &fixture.namespace(), &key);
+    let silent_process = start_running(&fixture, &*fixture.workers, logs, &key).await;
 
     fixture.start_daemon().await;
     fixture
