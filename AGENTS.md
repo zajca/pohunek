@@ -825,7 +825,7 @@ PoC or imply that current direct-host execution is a hostile-workload sandbox.
   `docs/design/` stays for accepted long-lived technical design. The shared
   rules — issue resolution, deduplication, body/comment structure, project
   status semantics, and safe persistence — live in the **`github-workflow`
-  skill** (`.claude/skills/github-workflow/`) with configuration in
+  skill** (`.agents/skills/github-workflow/`) with configuration in
   `.github/agent-workflow.json`; every agent must follow it for any GitHub
   issue/comment/project write.
 - **Gate meaningful work on an issue first.** Before meaningful work starts,
@@ -915,8 +915,10 @@ do not re-report them as review findings:
 - `.lh-harness/workflows/` — milestone-build harness instructions
   (issue-driven; `.github/agent-workflow.json` holds the work-tracking
   config).
-- `.claude/skills/` — milestone-loop skills, including the shared
-  `github-workflow` tracking rules.
+- `.agents/skills/` — canonical home of the milestone-loop skills, including
+  the shared `github-workflow` tracking rules. `.claude/skills/<name>` is a
+  relative symlink to `../../.agents/skills/<name>` so Claude Code discovers
+  the same skills; edit only the canonical tree under `.agents/skills/`.
 - `README.md` — what pohunek is, the agent install prompt, the pohunek-work
   experiments, and the roadmap sketch. Reference material lives in
   `docs/features.md`, `docs/install.md`, `docs/cli.md`, `docs/sdk.md`, and

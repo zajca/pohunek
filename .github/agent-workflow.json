@@ -1,7 +1,7 @@
 {
   "comment": [
     "Configuration for the repository's agent work-tracking workflow (GitHub Issues + GitHub Projects), introduced by issue #177.",
-    "Skills under .claude/skills/ reference this file instead of hardcoding project or field identifiers.",
+    "Skills under .agents/skills/ (canonical location; .claude/skills/<name> are relative symlinks to ../../.agents/skills/<name> for Claude Code) reference this file instead of hardcoding project or field identifiers.",
     "Opaque identifiers (project item/field/status IDs, view IDs) are never stored here or in skills; agents resolve them at runtime with `gh` from the names below."
   ],
   "repository": "zajca/pohunek",
