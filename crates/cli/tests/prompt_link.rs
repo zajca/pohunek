@@ -1,5 +1,5 @@
 use std::io::Write as _;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 /// The built `pohunek` binary with an empty environment: `prompt link` renders
 /// from stdin and arguments and reads none of it.
@@ -10,6 +10,22 @@ fn pohunek() -> Command {
 }
 
 fn run_prompt_link(provider: &str, item_id: &str, url: &str, context_json: &str) -> String {
+    let out = run_prompt_link_process(provider, item_id, url, context_json);
+
+    assert!(
+        out.status.success(),
+        "prompt link failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "successful link render must not write stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("utf8 stdout")
+}
+
+fn run_prompt_link_process(provider: &str, item_id: &str, url: &str, context_json: &str) -> Output {
     let mut child = pohunek()
         .args([
             "prompt",
@@ -33,19 +49,7 @@ fn run_prompt_link(provider: &str, item_id: &str, url: &str, context_json: &str)
         .write_all(context_json.as_bytes())
         .expect("write stdin");
 
-    let out = child.wait_with_output().expect("wait pohunek");
-
-    assert!(
-        out.status.success(),
-        "prompt link failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        out.stderr.is_empty(),
-        "successful link render must not write stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).expect("utf8 stdout")
+    child.wait_with_output().expect("wait pohunek")
 }
 
 #[test]
@@ -114,10 +118,10 @@ fn prompt_link_invalid_json_honors_json_error_output() {
 
     let out = child.wait_with_output().expect("wait pohunek");
 
-    assert!(
-        !out.status.success(),
-        "invalid JSON must fail: {}",
-        String::from_utf8_lossy(&out.stdout)
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "invalid JSON must exit with the CLI failure code: {out:?}"
     );
     assert!(
         out.stderr.is_empty(),
@@ -148,39 +152,134 @@ fn prompt_link_rejects_unsafe_provider_branch_values() {
             "{\"title\":\"Title\",\"branchName\":\"feature/line\\nbreak\"}",
             "provider link metadata `link.branch` contains an ASCII control character",
         ),
+        (
+            r#"{"title":"Title","branchName":"feature/ta\tb"}"#,
+            "provider link metadata `link.branch` contains an ASCII control character",
+        ),
+        (
+            r#"{"title":"Title","branchName":"feature/\u007fdelete"}"#,
+            "provider link metadata `link.branch` contains an ASCII control character",
+        ),
     ] {
-        let mut child = pohunek()
-            .args([
-                "prompt",
-                "link",
-                "--provider",
-                "linear_issue",
-                "--item-id",
-                "LIN-1",
-                "--url",
-                "https://linear.test/LIN-1",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn pohunek");
-        child
-            .stdin
-            .as_mut()
-            .expect("stdin")
-            .write_all(context.as_bytes())
-            .expect("write stdin");
-
-        let out = child.wait_with_output().expect("wait pohunek");
-        assert!(!out.status.success(), "unsafe branch must fail");
-        assert!(out.stdout.is_empty());
+        let out = run_prompt_link_process(
+            "linear_issue",
+            "LIN-1",
+            "https://linear.test/LIN-1",
+            context,
+        );
+        assert!(!out.status.success(), "unsafe branch must fail: {out:?}");
+        assert!(
+            out.stdout.is_empty(),
+            "failed link render must not write stdout: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
         assert!(
             String::from_utf8_lossy(&out.stderr).contains(expected),
             "stderr: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     }
+}
+
+/// `prompt link` validates the CLI-provided identifier and URL the same way as
+/// the provider-derived branch: empty or whitespace-only values are reported as
+/// missing, values with ASCII control characters are rejected outright.
+#[test]
+fn prompt_link_rejects_unsafe_item_id_and_url_values() {
+    for (row, item_id, url, expected) in [
+        (
+            "whitespace-only id",
+            " ",
+            "https://linear.test/LIN-1",
+            "provider link metadata is missing `link.id`",
+        ),
+        (
+            "newlines in id",
+            "LIN-1\nLIN-2",
+            "https://linear.test/LIN-1",
+            "provider link metadata `link.id` contains an ASCII control character",
+        ),
+        (
+            "whitespace-only url",
+            "LIN-1",
+            " \t ",
+            "provider link metadata is missing `link.url`",
+        ),
+        (
+            "vertical tab in url",
+            "LIN-1",
+            "https://linear.test/LIN-1\u{0b}bad",
+            "provider link metadata `link.url` contains an ASCII control character",
+        ),
+    ] {
+        let out = run_prompt_link_process(
+            "linear_issue",
+            item_id,
+            url,
+            r#"{"title":"Fix launcher","branchName":"lin-1-fix-launcher"}"#,
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{row} must exit with the CLI failure code: {out:?}"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "{row} must not write stdout: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(expected),
+            "{row} must name the invalid link field on stderr: {stderr}"
+        );
+    }
+}
+
+/// GitHub picks `headRefName` first, so a provider that supplies several branch
+/// fields still resolves the canonical head branch.
+#[test]
+fn prompt_link_uses_github_head_ref_name_precedence() {
+    let stdout = run_prompt_link(
+        "github_pr",
+        "7",
+        "https://example.test/pr/7",
+        r#"{"title":"Fix filters","headRefName":"feature/head","branch":"feature/branch","branchName":"feature/branch-name"}"#,
+    );
+    assert!(
+        stdout.contains("link.branch=feature/head\n"),
+        "headRefName must win over the fallback fields: {stdout}"
+    );
+}
+
+/// With no `headRefName` or `branch`, the last GitHub fallback field is used.
+#[test]
+fn prompt_link_uses_github_branch_name_final_fallback() {
+    let stdout = run_prompt_link(
+        "github_pr",
+        "7",
+        "https://example.test/pr/7",
+        r#"{"title":"Fix filters","branchName":"feature/branch-name"}"#,
+    );
+    assert!(
+        stdout.contains("link.branch=feature/branch-name\n"),
+        "branchName must be accepted as the final GitHub fallback: {stdout}"
+    );
+}
+
+/// Linear prefers `branchName`, unlike GitHub's `headRefName`-first order.
+#[test]
+fn prompt_link_uses_linear_branch_name_precedence() {
+    let stdout = run_prompt_link(
+        "linear_issue",
+        "LIN-1",
+        "https://linear.test/LIN-1",
+        r#"{"title":"Fix launcher","branchName":"lin-1-fix-launcher","branch":"feature/branch"}"#,
+    );
+    assert!(
+        stdout.contains("link.branch=lin-1-fix-launcher\n"),
+        "branchName must win over the fallback field for Linear: {stdout}"
+    );
 }
 
 #[test]
