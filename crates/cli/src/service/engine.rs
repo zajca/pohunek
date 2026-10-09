@@ -107,12 +107,16 @@
 //! rerun of `uninstall` still finds the installation and finishes the
 //! cleanup.
 //!
-//! A pending install that already reached the registration step takes this
-//! same flow instead of a rollback: its daemon may already run it with live
-//! workers, and only the session-checked removal above may stop them. Such a
-//! record found without `service.toml` describes its installation through
+//! A pending install or upgrade that already reached the registration step
+//! takes this same flow instead of a rollback: its daemon may already run it
+//! with live workers, and only the session-checked removal above may stop
+//! them. For an upgrade this also means the previous daemon is never
+//! restored: its reader may already be incompatible with the migrated store
+//! (or with the live workers), and only the removal itself, blessed by
+//! `--stop-sessions`, decides what happens to the runtimes. Such a record
+//! found without `service.toml` describes its installation through
 //! its version and prefix, and the uninstall runs the same flow with the
-//! configuration the install wrote.
+//! configuration the transaction wrote.
 //!
 //! Worker journals an older pohunek wrote under an earlier schema block the
 //! uninstall while their worker may still run. The daemon of this version
@@ -660,11 +664,17 @@ impl<'a> Engine<'a> {
         let mut registered = None;
         if let Some(pending) = self.store.load()? {
             // A transaction that may already have registered its daemon
-            // cannot be rolled back here: the daemon may run it with live
-            // workers, and removing both is the session-checked decision of
-            // the uninstall below, which also consumes the record together
-            // with the installation.
-            if pending.operation == Operation::Install && pending.step >= Step::Registering {
+            // cannot be rolled back here, whichever operation it is: at or
+            // after `registering` the previous daemon may be gone and the
+            // new one may own live workers, and the rollback instead would
+            // restore the previous daemon behind its compatibility gate. An
+            // upgrade whose previous reader the gate refuses — because the
+            // new daemon migrated the store or a worker changed meanwhile —
+            // would block even `--stop-sessions --purge` there, while
+            // uninstall exposes no runtime-loss acceptance; so the record is
+            // consumed by the session-checked removal below together with
+            // the installation, without restoring anything.
+            if pending.step >= Step::Registering {
                 registered = Some(pending);
             } else if options.purge && pending.operation == Operation::Install {
                 // The rollback removes `service.toml`, so only the record lets

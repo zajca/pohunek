@@ -36,6 +36,7 @@ pub mod engine;
 pub mod error;
 pub mod inherited;
 pub mod layout;
+mod legacy_store;
 pub mod preflight;
 pub mod record;
 pub mod report;

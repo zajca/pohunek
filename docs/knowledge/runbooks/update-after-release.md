@@ -337,8 +337,10 @@ nothing have been registered. `pohunek service status --json` reports it as
 run its daemon with live workers, so it is never rolled back directly: an
 interrupted install met by `pohunek service upgrade`, or by `service install`
 with another version or prefix, fails with `service_install_pending` and
-changes nothing, and `pohunek service uninstall` removes it through the full
-session-checked uninstall instead (`--stop-sessions` stops the live sessions).
+changes nothing, and `pohunek service uninstall` removes an interrupted
+install — or an interrupted upgrade whose daemon was already replaced — through
+the full session-checked uninstall instead (`--stop-sessions` stops the live
+sessions), without restoring the previous daemon.
 Rerun `pohunek service install` (or `packaging/install-daemon.sh`) to finish
 it: the same version and prefix resume. The same rule covers an install whose
 step fails at or after `registering` without an interruption: a service-manager
@@ -413,9 +415,16 @@ CLI copy (it stays while a version is kept for a worker journal or job of this
 installation). The transaction record (`service-install.json`) is cleared just before
 `service.toml`, which is removed last, so if an uninstall fails partway or is
 interrupted, rerunning `pohunek service uninstall` finishes the cleanup. A
-pending install that reached its `registering` step is uninstalled through the
-same live-session check even when its `service.toml` is already gone: the
-record's version and prefix identify the installation.
+pending install or upgrade that reached its `registering` step is uninstalled
+through the same live-session check even when its `service.toml` is already
+gone: the record's version and prefix identify the installation. For a pending
+upgrade this restores no previous daemon and runs no rollback: the previous
+reader may already be incompatible with the migrated store and `uninstall`
+exposes no `--accept-runtime-loss`, so `uninstall --stop-sessions --purge`
+removes the pending upgrade and the installation even when
+`pohunek service upgrade` to the previous version would be refused with
+`service_rollback_store_unusable`; without `--stop-sessions` it still refuses
+with `service_live_sessions` while any session is live.
 A pending install that stopped before `registering` never started its daemon,
 so `uninstall` rolls it back; with `--purge` it then purges the durable
 metadata too (refusing with `service_daemon_job_present` while any daemon job
@@ -513,8 +522,12 @@ the previous daemon in place. At or after registration, rollback judges the
 previous daemon against the current store and live workers before changing the
 service. A previous daemon with `upgrade-preflight` judges its own reader and
 adoption; v0.33.0 and v0.33.1 have no such command, so only their schema-1
-store is admitted, and live worker recovery needs `--accept-runtime-loss`. A
-newer, corrupt, or unreadable store refuses rollback even with that flag. The
+store is admitted, and each record must deserialize the way those releases
+read it: a line their reader would silently skip on its next whole-store
+rewrite — a known record kind with a missing or ill-typed field, or an agent
+kind that is not a runtime id — refuses the rollback before anything changes.
+Live worker recovery needs `--accept-runtime-loss`. A newer, corrupt, or
+unreadable store refuses rollback even with that flag. The
 installer stops the new daemon and judges again before starting the old one,
 so a write during the first check cannot become an unsafe downgrade. If that
 second check refuses, the daemon remains stopped and the transaction remains
@@ -526,7 +539,9 @@ unreadable store. Worker journals that cannot be read are never treated as
 "no live workers": a journal root that cannot be scanned yields an
 `evidence_unavailable` entry, and while a store line that names no session
 cannot be read, an unreadable or unsupported journal of an unknown session is
-listed as at risk. `service uninstall` keeps its own `--stop-sessions` rule.
+listed as at risk. `service uninstall` keeps its own `--stop-sessions` rule
+and removes a pending upgrade at or after `registering` without restoring the
+previous daemon, as described above.
 
 The report has two parts. The store part is the dry-run startup migration:
 `missing`, `up_to_date`, `would_migrate` (with the schema it migrates from and

@@ -3,12 +3,12 @@
 //! Releases with `upgrade-preflight` judge their own reader and worker
 //! adoption. The two v0.33 releases have no preflight and can silently skip
 //! records they cannot deserialize, so only their own schema-1 store is
-//! admitted. Unproven live workers need explicit runtime-loss consent.
+//! admitted: every line is validated against the frozen typed legacy reader
+//! in [`super::legacy_store`], so a record the old reader would drop, and a
+//! whole-store rewrite would lose, refuses the rollback. Unproven live
+//! workers need explicit runtime-loss consent.
 
 // Rust guideline compliant 2026-10-09
-
-use std::collections::BTreeSet;
-use std::path::Path;
 
 use pohunek_paths::{InstallLayout, DAEMON_EXECUTABLE_NAME, METADATA_STORE_NAME};
 use pohunek_platform::filesystem::{EntryKind, TrustedDir};
@@ -17,13 +17,15 @@ use pohunek_platform::supervisor::WorkerKey;
 use pohunek_service_config::preflight::{
     PreflightReport, SessionVerdict, StoreReport, StoreState, Verdict, REPORT_VERSION,
 };
-use serde_json::Value;
+use std::collections::BTreeSet;
+use std::path::Path;
 
 use super::backend::Backend;
 use super::context::Context;
 use super::engine::job_alive;
 use super::error::Error;
 use super::layout;
+use super::legacy_store;
 use super::preflight::{self, AdoptionPreflight, Gated};
 use super::settings;
 use super::usage::Journals;
@@ -261,7 +263,7 @@ fn legacy_store(context: &Context) -> StoreReport {
         Ok(Some(bytes)) => bytes,
         Err(detail) => return refused(report, "legacy_store_unreadable", detail),
     };
-    match count_legacy_records(&bytes) {
+    match legacy_store::validate_records(&bytes) {
         Ok(records) => {
             report.state = StoreState::UpToDate;
             report.records = records;
@@ -300,53 +302,4 @@ fn read_legacy_store(context: &Context) -> Result<Option<Vec<u8>>, String> {
     )
     .map(Some)
     .map_err(|error| format!("cannot read metadata store: {error}"))
-}
-
-fn count_legacy_records(bytes: &[u8]) -> Result<usize, (&'static str, String)> {
-    let body = std::str::from_utf8(bytes).map_err(|error| {
-        (
-            "legacy_store_invalid",
-            format!("metadata store is not UTF-8: {error}"),
-        )
-    })?;
-    let mut records = 0;
-    for (index, line) in body.lines().enumerate() {
-        let parsed: Value = serde_json::from_str(line).map_err(|error| {
-            (
-                "legacy_store_invalid",
-                format!("line {} is not JSON: {error}", index + 1),
-            )
-        })?;
-        let record = parsed.as_object().ok_or_else(|| {
-            (
-                "legacy_store_invalid",
-                format!("line {} is not a record", index + 1),
-            )
-        })?;
-        let schema = record
-            .get("schema_version")
-            .map_or(Some(u64::from(LEGACY_STORE_SCHEMA)), Value::as_u64);
-        if schema != Some(u64::from(LEGACY_STORE_SCHEMA)) {
-            return Err((
-                "legacy_store_schema_unsupported",
-                format!(
-                    "line {} has schema {:?}; the previous daemon reads schema {}",
-                    index + 1,
-                    schema,
-                    LEGACY_STORE_SCHEMA
-                ),
-            ));
-        }
-        if !matches!(
-            record.get("kind").and_then(Value::as_str),
-            Some("session" | "resume" | "worktree" | "project")
-        ) {
-            return Err((
-                "legacy_store_invalid",
-                format!("line {} has an unknown record kind", index + 1),
-            ));
-        }
-        records += 1;
-    }
-    Ok(records)
 }

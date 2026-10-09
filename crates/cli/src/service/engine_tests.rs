@@ -4683,6 +4683,293 @@ async fn downgrade_refuses_malformed_or_unknown_store_records_before_any_effect(
     }
 }
 
+/// A whole schema-1 store the v0.33.1 reader keeps: one record of every kind.
+const LEGACY_STORE_ALL_KINDS: &str = concat!(
+    r#"{"kind":"session","schema_version":1,"session_id":"s-leg","desired_state":"running","#,
+    r#""info":{"id":"s-leg","external":false,"agent":"shell","agent_base":"shell","cwd":"/work","#,
+    r#""pid":412,"cols":80,"rows":24,"state":"running","state_source":"process","#,
+    r#""created_at":"2026-06-19T00:00:00Z","updated_at":"2026-06-19T00:00:00Z"},"#,
+    r#""runtime":{"state":"live","worker_id":"w-1","service_id":"s-leg.abcd2345"}}"#,
+    "\n",
+    r#"{"kind":"resume","session_id":"s-leg","agent":"shell","cwd":"/work","cols":80,"rows":24,"#,
+    r#""native_session_id":"native-1"}"#,
+    "\n",
+    r#"{"kind":"worktree","session_id":"s-leg","repository":"/repo/main","branch":"main","#,
+    r#""base_branch":"trunk","branch_slug":"main","path":"/repo/wt","agent":"shell","#,
+    r#""status":"active","created_at":"2026-06-19T00:00:00Z","updated_at":"2026-06-19T00:00:00Z"}"#,
+    "\n",
+    r#"{"kind":"project","git_common_dir":"/workspace/project/.git","repo_root":"/workspace/project","#,
+    r#""custom_name":"Fixture Project","origin_url":"https://github.com/example/repo.git","#,
+    r#""is_bare":false,"source":"auto","added_at":"2026-06-19T00:00:00Z","#,
+    r#""last_used_at":"2026-06-19T00:00:00Z"}"#,
+    "\n",
+);
+
+/// Leaves the service pending at `registered` (the daemon already runs the
+/// new version), with the store migrated past schema 1, so the previous
+/// release's reader refuses the store and any rollback to it.
+///
+/// Nothing rewrites the store during a pending transaction, so the test
+/// simulates the new daemon's startup migration by writing it through the
+/// daemon's own current-schema writer.
+async fn pending_registered_upgrade_with_migrated_store(harness: &Harness) -> Record {
+    const PREVIOUS: &str = "0.33.1";
+    harness
+        .install(PREVIOUS)
+        .await
+        .expect("install previous release");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registered);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted after replacement");
+    write_new_store(&store_path(harness));
+    harness.pending().expect("pending upgrade")
+}
+
+#[tokio::test]
+async fn an_upgrade_accepts_a_whole_schema1_store_with_a_record_of_every_kind() {
+    // Previously covered only a project record; this also pins the valid
+    // session, resume, and worktree shapes the rollback gate's frozen legacy
+    // reader admits.
+    const PREVIOUS: &str = "0.33.1";
+    let harness = Harness::new();
+    harness
+        .install(PREVIOUS)
+        .await
+        .expect("install previous release");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registered);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted after replacement");
+    write_legacy_store_bytes(&store_path(&harness), LEGACY_STORE_ALL_KINDS.as_bytes());
+
+    let report = harness
+        .upgrade(PREVIOUS)
+        .await
+        .expect("previous reader keeps every schema-1 record");
+    let preflight = report.preflight.expect("rollback preflight");
+    assert_eq!(preflight.store.state, StoreState::UpToDate);
+    assert_eq!(preflight.store.schema_from, Some(1));
+    assert_eq!(preflight.store.records, 4);
+    harness.assert_installed(PREVIOUS);
+}
+
+/// A schema-1 record with a known kind that the v0.33.1 reader deserializes
+/// past the syntax checks, then silently skips.
+const TYPED_MALFORMED_STORES: &[(&str, &str)] = &[
+    // A session record without its required runtime binding.
+    (
+        "session without runtime",
+        concat!(
+            r#"{"kind":"session","schema_version":1,"session_id":"s-leg","desired_state":"running","#,
+            r#""info":{"id":"s-leg","agent":"shell","agent_base":"shell","cwd":"/work","pid":412,"cols":80,"rows":24,"state":"running","state_source":"process","created_at":"2026-06-19T00:00:00Z","updated_at":"2026-06-19T00:00:00Z"}}"#,
+        ),
+    ),
+    // A session whose summary agent kind is not a runtime id: the reader
+    // drops even a fully typed record over this semantic rule.
+    (
+        "session with a historical agent kind",
+        concat!(
+            r#"{"kind":"session","schema_version":1,"session_id":"s-leg","desired_state":"running","#,
+            r#""info":{"id":"s-leg","agent":"mystery","agent_base":"Legacy Agent Friend","cwd":"/work","pid":412,"cols":80,"rows":24,"state":"running","state_source":"process","created_at":"2026-06-19T00:00:00Z","updated_at":"2026-06-19T00:00:00Z"},"#,
+            r#""runtime":{"state":"live"}}"#,
+        ),
+    ),
+    // A resume record whose agent base cannot be recorded nor derived.
+    (
+        "resume without a recordable agent base",
+        r#"{"kind":"resume","session_id":"s-leg","agent":"mystery","cwd":"/work","cols":80,"rows":24}"#,
+    ),
+    // A worktree record with an unrecognized status.
+    (
+        "worktree with an unknown status",
+        concat!(
+            r#"{"kind":"worktree","session_id":"s-leg","repository":"/repo/main","branch":"main","#,
+            r#""base_branch":"trunk","branch_slug":"main","path":"/repo/wt","status":"merged-forever","#,
+            r#""created_at":"2026-06-19T00:00:00Z","updated_at":"2026-06-19T00:00:00Z"}"#,
+        ),
+    ),
+    // A project record whose identity fields are all missing.
+    ("project without identity fields", r#"{"kind":"project"}"#),
+];
+
+#[tokio::test]
+async fn a_downgrade_refuses_typed_malformed_records_of_every_kind() {
+    const PREVIOUS: &str = "0.33.1";
+    for (name, line) in TYPED_MALFORMED_STORES {
+        let harness = Harness::new();
+        harness
+            .install(PREVIOUS)
+            .await
+            .expect("install previous release");
+        let mut engine = harness.engine();
+        engine.interrupt_after = Some(Step::Registered);
+        engine
+            .upgrade(&harness.staged(V2), V2)
+            .await
+            .expect_err("interrupted after replacement");
+        write_legacy_store_bytes(&store_path(&harness), format!("{line}\n").as_bytes());
+        let before = harness.pending().expect("pending upgrade");
+        let (installs, replaces) = {
+            let world = harness.fake.world();
+            (world.installs, world.replaces)
+        };
+        let store_before = std::fs::read(store_path(&harness)).expect("read store");
+
+        let checked = crate::service::check_with_preflight(
+            &harness.context,
+            &harness.staged(PREVIOUS),
+            &InProcessPreflight::default(),
+            PREVIOUS,
+            true,
+        )
+        .await
+        .expect_err("read-only check refuses what the reader would skip");
+        assert_eq!(checked.code(), "service_rollback_store_unusable", "{name}");
+        assert!(
+            matches!(
+                &checked,
+                Error::RollbackStoreUnusable { code, .. } if code == "legacy_store_invalid"
+            ),
+            "{name}: {checked:?}"
+        );
+
+        let error = harness
+            .upgrade_accepting_loss(PREVIOUS)
+            .await
+            .expect_err("rollback refuses what the reader would skip");
+        assert_eq!(error.code(), "service_rollback_store_unusable", "{name}");
+        assert!(
+            matches!(
+                &error,
+                Error::RollbackStoreUnusable { code, .. } if code == "legacy_store_invalid"
+            ),
+            "{name}: {error:?}"
+        );
+        // Nothing changed: the record survives for the operator, the new
+        // daemon still runs, and the store is untouched.
+        assert_eq!(harness.pending(), Some(before), "{name}");
+        let after = {
+            let world = harness.fake.world();
+            (world.installs, world.replaces, world.running)
+        };
+        assert_eq!(after.0, installs, "{name}");
+        assert_eq!(after.1, replaces, "{name}");
+        assert!(after.2, "{name}: the new daemon still runs");
+        assert_eq!(harness.fake.daemon_version().as_deref(), Some(V2));
+        assert_eq!(
+            std::fs::read(store_path(&harness)).expect("read store"),
+            store_before,
+            "{name}: the store is untouched"
+        );
+        assert_eq!(
+            harness.config().expect("config").active_version(),
+            V2,
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn uninstall_of_a_pending_schema_changing_upgrade_never_restores_the_previous_daemon() {
+    // With session consent the removal proceeds through the session-checked
+    // path, even though the rollback gate of this pending upgrade refuses the
+    // migrated store: the previous release's reader reads nothing the new
+    // daemon migrated, and restoring it would lose anything the migration
+    // wrote. The uninstall therefore consumes the record without ever
+    // contacting the previous reader or restarting the previous daemon.
+    let harness = Harness::new();
+    harness.fake.seed(
+        vec![session(SESSION, Some("review"))],
+        vec![worker(worker_id(SESSION), ServiceState::Running)],
+    );
+    pending_registered_upgrade_with_migrated_store(&harness).await;
+    let (installs, replaces) = {
+        let world = harness.fake.world();
+        (world.installs, world.replaces)
+    };
+
+    let report = harness
+        .engine()
+        .uninstall(UninstallOptions {
+            stop_sessions: true,
+            purge: true,
+        })
+        .await
+        .expect("uninstall removes the pending upgrade and the installation");
+    assert_eq!(report.stopped_sessions, [SESSION]);
+    assert!(report.purged);
+    assert!(report.rolled_back.is_none(), "no rollback ran");
+    harness.assert_clean();
+    assert!(
+        !harness
+            .context
+            .paths()
+            .data_dir
+            .join("metadata.jsonl")
+            .exists(),
+        "--purge removes the migrated store"
+    );
+    let after = {
+        let world = harness.fake.world();
+        (world.installs, world.replaces)
+    };
+    assert_eq!(after.0, installs, "the previous daemon was never restored");
+    assert_eq!(after.1, replaces, "no replacement beyond the pending one");
+    assert_eq!(harness.pending(), None, "the record is consumed");
+}
+
+#[tokio::test]
+async fn uninstall_without_session_consent_still_refuses_a_live_pending_upgrade() {
+    // Without consent the uninstall fails closed before touching anything.
+    let harness = Harness::new();
+    harness.fake.seed(
+        vec![session(SESSION, Some("review"))],
+        vec![worker(worker_id(SESSION), ServiceState::Running)],
+    );
+    let before = pending_registered_upgrade_with_migrated_store(&harness).await;
+
+    let error = harness
+        .engine()
+        .uninstall(UninstallOptions {
+            stop_sessions: false,
+            purge: true,
+        })
+        .await
+        .expect_err("live sessions refuse the uninstall");
+    let Error::LiveSessions { sessions, .. } = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, SESSION);
+    assert_eq!(error.code(), "service_live_sessions");
+    // The pending upgrade and the installation are untouched.
+    assert_eq!(
+        harness.pending(),
+        Some(before),
+        "the record survives for a consented rerun"
+    );
+    assert_eq!(harness.fake.daemon_version().as_deref(), Some(V2));
+    assert_eq!(
+        harness.config().expect("config").active_version(),
+        V2,
+        "the pending upgrade is not rolled back"
+    );
+    assert!(
+        harness
+            .context
+            .paths()
+            .data_dir
+            .join("metadata.jsonl")
+            .exists(),
+        "the purged store is untouched"
+    );
+}
+
 #[tokio::test]
 async fn downgrade_refuses_an_untrusted_store_even_with_runtime_loss_consent() {
     const PREVIOUS: &str = "0.33.1";
