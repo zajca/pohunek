@@ -295,7 +295,7 @@ mod tests {
     use pohunek_service_config::{ConfigSpec, Deadlines, ServiceConfig};
     use pohunek_session_worker::WorkerConfig;
 
-    use super::{generate_worker_id, worker_config};
+    use super::worker_config;
 
     /// A service configuration whose deadlines differ from every worker default.
     fn service_config(worker_initialize: Duration) -> ServiceConfig {
@@ -344,11 +344,5 @@ mod tests {
     #[test]
     fn a_dev_worker_keeps_the_default_initialize_deadline() {
         assert_eq!(worker_config(None), WorkerConfig::new());
-    }
-
-    #[test]
-    fn generated_worker_id_is_safe() {
-        let id = generate_worker_id().expect("operating-system entropy");
-        assert!(pohunek_paths::valid_worker_id(&id).is_some());
     }
 }

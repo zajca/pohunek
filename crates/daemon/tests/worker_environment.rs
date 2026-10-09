@@ -267,6 +267,7 @@ async fn version_six_child_gets_only_base_term_profile_and_identity() {
     let mut fixture = Fixture::start();
     let worker = fixture.connect(BASE_ENVIRONMENT_VERSION).await;
     let worker_id = worker.worker_id().await;
+    assert!(pohunek_paths::valid_worker_id(worker_id.as_str()).is_some());
     let initialize = fixture.initialize(worker_id.clone());
 
     let environment = child_environment(&worker, initialize).await;
