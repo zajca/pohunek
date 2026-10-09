@@ -28,6 +28,7 @@ semver = { workspace = true }
 clap = { workspace = true }
 pulldown-cmark = { workspace = true }
 nix = { workspace = true, features = ["process", "signal"] }
+rustix = { workspace = true, features = ["process"] }
 portable-pty = { workspace = true }
 tempfile = { workspace = true }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

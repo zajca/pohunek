@@ -1,0 +1,12 @@
+{
+  "name": "pohunek-upstream-claude",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pinned npm install set of the locked claude release; staged by `cargo xtask compat stage-upstream`.",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.289"
+  },
+  "allowScripts": {
+    "@anthropic-ai/claude-code@2.1.289": true
+  }
+}

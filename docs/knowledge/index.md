@@ -26,6 +26,9 @@ Start here:
   `compat/matrix.json`. The [release bundle](concepts/release-bundle.md)
   defines the assembled release layout, the release policy file, the catalog
   sequence and expiry rules and the inventory the publisher verifies.
+  The [upstream staging](concepts/upstream-staging.md) page covers how the
+  pinned upstream runtime releases are installed and verified from the
+  compatibility locks and committed npm lockfiles.
 - [Setup](guides/setup.md), [project setup](guides/project-setup.md),
   and [remote hosts](guides/remote-hosts.md)
   cover common configuration paths. The

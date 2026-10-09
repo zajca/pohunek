@@ -1,0 +1,9 @@
+{
+  "name": "pohunek-upstream-pi",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pinned npm install set of the locked pi release; staged by `cargo xtask compat stage-upstream`.",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "1.0.2"
+  }
+}

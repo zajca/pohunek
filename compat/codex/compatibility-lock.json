@@ -6,7 +6,9 @@
     "name": "OpenAI Codex CLI",
     "npm": "@openai/codex",
     "release": "0.160.0",
-    "binary": "codex"
+    "integrity": "sha512-kEtVGzjRAYAMOwJxN39bGcna7LT3IDQgq64NNJ/dDTfu4OzZaocJcyNb5/gGJ/IVF/Vj7oK7E2m3nmTan7lpjg==",
+    "binary": "codex",
+    "version_output": "codex-cli {release}"
   },
   "supported": {
     "min": "0.160.0",

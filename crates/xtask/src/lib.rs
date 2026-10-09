@@ -21,6 +21,9 @@ mod runtime_package;
 mod site;
 pub mod test_code;
 mod ts;
+mod upstream_stage;
+#[cfg(test)]
+mod upstream_stage_tests;
 
 use std::error::Error;
 use std::ffi::OsString;
@@ -89,6 +92,8 @@ pub enum XtaskError {
     Package(::package::ArchiveError),
     /// A compatibility attestation input was refused.
     Attestation(attestation::AttestationError),
+    /// An upstream stage input or staged tree was refused.
+    UpstreamStage(upstream_stage::StageError),
     /// A release input was refused by the assembler or the inventory check.
     Release(release::ReleaseError),
     /// A catalog could not be built, signed or verified.
@@ -150,6 +155,7 @@ impl fmt::Display for XtaskError {
             Self::Yaml(error) => write!(f, "failed to serialize yaml: {error}"),
             Self::Package(error) => write!(f, "package archive: {error}"),
             Self::Attestation(error) => write!(f, "attestation: {error}"),
+            Self::UpstreamStage(error) => write!(f, "upstream stage: {error}"),
             Self::Release(error) => write!(f, "release: {error}"),
             Self::Catalog(error) => write!(f, "catalog: {error}"),
             Self::Anchor(error) => write!(f, "trust anchor: {error}"),
@@ -183,6 +189,7 @@ impl Error for XtaskError {
             Self::Yaml(error) => Some(error),
             Self::Package(error) => Some(error),
             Self::Attestation(error) => Some(error),
+            Self::UpstreamStage(error) => Some(error),
             Self::Release(error) => Some(error),
             Self::Catalog(error) => Some(error),
             Self::Anchor(error) => Some(error),

@@ -584,6 +584,8 @@ Signed runtime catalog:
 - `crates/xtask/src/release_tree.rs` — safe archive extraction and the rebuilt daemon archive trees.
 - `crates/xtask/src/release_inventory.rs` — the release inventory and its verification.
 - `packaging/release-policy.json` — the expected archives, SDK packages and catalog validity of a release.
+- `crates/xtask/src/upstream_stage.rs` — `cargo xtask compat stage-upstream|verify-stage`: npm staging of the pinned upstream runtimes and the stage verifier.
+- `compat/pi/npm/package-lock.json` — the pinned npm dependency tree of the Pi upstream (with the codex and claude counterparts under `compat/`).
 - `crates/cli/tests/release_consumer.rs` — out-of-process consumer suite on the exact release binaries (inputs, layout, drivers, report).
 - `crates/xtask/src/attestation.rs` — `cargo xtask compat attest|verify|matrix-check`, the binary-set digest and the compatibility attestation.
 - `compat/matrix.json` — the required runtime x target rows and the suite version of the release compatibility matrix.

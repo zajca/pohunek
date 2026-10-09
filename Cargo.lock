@@ -5772,6 +5772,7 @@ dependencies = [
  "portable-pty",
  "pulldown-cmark",
  "regex",
+ "rustix",
  "semver",
  "serde",
  "serde_json",

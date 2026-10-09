@@ -2,6 +2,11 @@
 
 ## Unreleased (2026-10-08, digest-bound release evidence, #150)
 
+- `cargo xtask compat stage-upstream|verify-stage` install and verify the pinned
+  upstream runtime releases from `compat/<rt>/npm` lockfiles with an integrity
+  per package; the locks gain `integrity`, `scripts` and `version_output`. The
+  concept page `upstream-staging` describes the stage layout and its POSIX
+  verifier.
 - `cargo xtask release assemble|verify-inventory` builds and checks the release
   bundle from the producer artifacts: it recomputes every digest, verifies the
   attestation of each matrix row, signs the schema 2 catalog and rebuilds the
