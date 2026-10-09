@@ -2495,20 +2495,64 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_connection_rejects_selected_version_changes() {
-        let selected = protocol::PROTOCOL_VERSION;
-        let mut state = None;
-        validate_selected_version(protocol::CLIENT_PROTOCOL_VERSIONS, selected, &mut state)
-            .expect("first response selects the version");
-        let changed = ProtocolVersion::new(selected.get() + 1).expect("nonzero changed version");
-        assert!(matches!(
-            validate_selected_version(
-                ProtocolVersionRange::new(selected, changed).expect("valid test range"),
-                changed,
-                &mut state,
-            ),
-            Err(ClientError::ProtocolVersionMismatch { .. })
-        ));
+    #[tokio::test]
+    async fn a_connection_rejects_a_daemon_that_changes_protocol_version() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind fixture daemon");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let mut stream = BufReader::new(stream);
+            let mut requests = Vec::new();
+            for version in [protocol::PROTOCOL_VERSION, protocol::MIN_PROTOCOL_VERSION] {
+                let mut line = String::new();
+                stream.read_line(&mut line).await.expect("read request");
+                let request: Request = serde_json::from_str(&line).expect("decode request");
+                let response =
+                    Response::ok(version, request.id().to_owned(), serde_json::json!({}))
+                        .expect("response");
+                let mut encoded = serde_json::to_vec(&response).expect("encode response");
+                encoded.push(b'\n');
+                stream
+                    .get_mut()
+                    .write_all(&encoded)
+                    .await
+                    .expect("write response");
+                requests.push(request);
+            }
+            requests
+        });
+
+        let mut client = Client::connect_trusted_tcp_addr_with_options(
+            "fixture-remote",
+            address,
+            no_origin_options(),
+        )
+        .await
+        .expect("connect remote");
+        let first = Request::new("request-1", protocol::method::HOST_DISCOVER, Value::Null)
+            .expect("first request");
+        client
+            .request(&first)
+            .await
+            .expect("first version accepted");
+        assert_eq!(client.selected_version(), Some(protocol::PROTOCOL_VERSION));
+
+        let second = Request::new("request-2", protocol::method::HOST_DISCOVER, Value::Null)
+            .expect("second request");
+        let error = client
+            .request(&second)
+            .await
+            .expect_err("connection must retain its selected version");
+        assert_eq!(error.to_protocol_error().code, "version_mismatch");
+        assert_eq!(client.selected_version(), Some(protocol::PROTOCOL_VERSION));
+
+        let requests = server.await.expect("fixture task");
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert_eq!(request.method(), protocol::method::HOST_DISCOVER);
+            assert_eq!(request.version_range(), protocol::CLIENT_PROTOCOL_VERSIONS);
+        }
     }
 }
