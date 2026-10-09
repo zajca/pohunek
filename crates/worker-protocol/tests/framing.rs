@@ -5,11 +5,14 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use pohunek_worker_protocol::{
-    CloseReason, ControlCodecError, ControlMessage, ControlReader, ControlWriter, DataFrame,
-    FrameError, FrameHeader, FrameKind, StreamId, Version, WorkerInstanceId, WriteId,
-    CURRENT_VERSION, MAX_DATA_HEADER_BYTES, MAX_DATA_PAYLOAD_BYTES,
+    Capability, CloseReason, ControlCode, ControlCodecError, ControlError, ControlEvent,
+    ControlMessage, ControlReader, ControlRequest, ControlResponse, ControlWriter, DaemonId,
+    DataFrame, EventKind, FrameError, FrameHeader, FrameKind, LeaseChallenge, LeaseId,
+    ProcessIdentity, RequestId, RequestKind, ResponseKind, RuntimePhase, SessionId, StreamId,
+    VersionRange, WorkerId, WorkerInstanceId, WriteId, CURRENT_VERSION, MAX_DATA_HEADER_BYTES,
+    MAX_DATA_PAYLOAD_BYTES, PREVIOUS_VERSION,
 };
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 #[derive(Debug)]
 struct ChunkReader {
@@ -198,6 +201,15 @@ async fn malformed_unknown_and_mismatched_frames_are_rejected() {
         },
     })
     .expect("serialize close header");
+    let mut zero_version: serde_json::Value =
+        serde_json::from_slice(&close_header).expect("decode valid header");
+    zero_version["version"] = serde_json::json!(0);
+    let zero_version_header = serde_json::to_vec(&zero_version).expect("encode invalid header");
+    let mut invalid_frame = ChunkReader::new(raw_frame(&zero_version_header, &[]), 2);
+    assert!(matches!(
+        pohunek_worker_protocol::read_frame(&mut invalid_frame).await,
+        Err(FrameError::InvalidHeader(_))
+    ));
     let mut mismatched_reader = ChunkReader::new(raw_frame(&close_header, b"unexpected"), 2);
     assert!(matches!(
         pohunek_worker_protocol::read_frame(&mut mismatched_reader).await,
@@ -289,8 +301,406 @@ async fn control_reader_enforces_the_configured_bound() {
     ));
 }
 
-#[test]
-fn version_zero_is_rejected_before_it_enters_a_frame_header() {
-    let error = Version::new(0).expect_err("version zero must fail");
-    assert!(error.to_string().contains("nonzero"));
+/// Builds the daemon's first handshake request.
+fn negotiation_request() -> ControlRequest {
+    ControlRequest {
+        request_id: RequestId::new("request-1").expect("valid request"),
+        kind: RequestKind::Negotiate {
+            daemon_instance_id: DaemonId::new("daemon-1").expect("valid daemon"),
+            minimum_version: PREVIOUS_VERSION,
+            maximum_version: CURRENT_VERSION,
+        },
+    }
+}
+
+/// Builds the worker's handshake acknowledgement.
+///
+/// The same value is serialized by production code paths and re-decoded, so
+/// the expected result never derives from the change under test.
+fn negotiated_response() -> ResponseKind {
+    ResponseKind::Negotiated {
+        selected_version: CURRENT_VERSION,
+        supported_range: VersionRange::new(PREVIOUS_VERSION, CURRENT_VERSION)
+            .expect("ordered range"),
+        session_id: SessionId::new("session-1").expect("valid session"),
+        worker_id: WorkerId::new("worker-1").expect("valid worker"),
+        worker_instance_id: Some(WorkerInstanceId::new("runtime-1").expect("valid runtime")),
+        worker_process: ProcessIdentity {
+            pid: 42,
+            start_identity: 7,
+        },
+        phase: RuntimePhase::Uninitialized,
+        capabilities: vec![Capability::AtomicReplay],
+        challenge: LeaseChallenge::new("connection-bound-challenge").expect("valid challenge"),
+    }
+}
+
+/// Builds the event with the smallest realistic serialized form, so
+/// cancellation and bound scenarios keep every piece inside one duplex buffer.
+fn compact_identity_event() -> ControlEvent {
+    ControlEvent {
+        event_sequence: 1,
+        kind: EventKind::IdentityChanged {
+            worker_instance_id: WorkerInstanceId::new("runtime-1").expect("valid runtime"),
+        },
+    }
+}
+
+#[tokio::test]
+async fn control_writer_and_reader_relay_a_full_handshake_in_both_directions() {
+    let negotiation = negotiation_request();
+    let negotiated = negotiated_response();
+    let acquired = ResponseKind::ControllerAcquired {
+        lease_id: LeaseId::new("lease-1").expect("valid lease"),
+        capabilities: vec![Capability::DeduplicatedInput],
+    };
+    let acquisition = ControlRequest {
+        request_id: RequestId::new("request-2").expect("valid request"),
+        kind: RequestKind::AcquireController {
+            daemon_instance_id: DaemonId::new("daemon-1").expect("valid daemon"),
+            challenge: LeaseChallenge::new("connection-bound-challenge").expect("valid challenge"),
+            requested_capabilities: vec![Capability::DeduplicatedInput],
+        },
+    };
+
+    // 512 bytes buffer both directions of the handshake, so neither side ever
+    // waits on the other's backpressure in this flow.
+    let (daemon_side, worker_side) = tokio::io::duplex(512);
+    let expected_negotiation = negotiation.clone();
+    let expected_negotiated = negotiated.clone();
+    let expected_acquisition = acquisition.clone();
+    let expected_acquired = acquired.clone();
+    let worker = tokio::spawn(async move {
+        let (read_half, write_half) = tokio::io::split(worker_side);
+        let mut reader = ControlReader::new(read_half);
+        let mut writer = ControlWriter::new(write_half);
+
+        let request = reader
+            .read::<ControlMessage>()
+            .await
+            .expect("negotiation read")
+            .expect("one negotiation request");
+        assert_eq!(
+            request,
+            ControlMessage::Request(expected_negotiation.clone())
+        );
+        writer
+            .write(&ControlMessage::Response(ControlResponse {
+                request_id: RequestId::new("request-1").expect("valid request"),
+                kind: expected_negotiated.clone(),
+            }))
+            .await
+            .expect("write negotiated response");
+
+        let request = reader
+            .read::<ControlMessage>()
+            .await
+            .expect("acquisition read")
+            .expect("one acquisition request");
+        assert_eq!(
+            request,
+            ControlMessage::Request(expected_acquisition.clone())
+        );
+        writer
+            .write(&ControlMessage::Response(ControlResponse {
+                request_id: RequestId::new("request-2").expect("valid request"),
+                kind: expected_acquired.clone(),
+            }))
+            .await
+            .expect("write acquisition response");
+    });
+
+    let (read_half, write_half) = tokio::io::split(daemon_side);
+    let mut writer = ControlWriter::new(write_half);
+    let mut reader = ControlReader::new(read_half);
+    writer
+        .write(&ControlMessage::Request(negotiation.clone()))
+        .await
+        .expect("write negotiation request");
+    let response = reader
+        .read::<ControlMessage>()
+        .await
+        .expect("negotiated read")
+        .expect("one negotiated response");
+    assert_eq!(
+        response,
+        ControlMessage::Response(ControlResponse {
+            request_id: RequestId::new("request-1").expect("valid request"),
+            kind: negotiated.clone(),
+        })
+    );
+    writer
+        .write(&ControlMessage::Request(acquisition.clone()))
+        .await
+        .expect("write acquisition request");
+    let response = reader
+        .read::<ControlMessage>()
+        .await
+        .expect("acquired read")
+        .expect("one acquired response");
+    assert_eq!(
+        response,
+        ControlMessage::Response(ControlResponse {
+            request_id: RequestId::new("request-2").expect("valid request"),
+            kind: acquired.clone(),
+        })
+    );
+
+    worker.await.expect("worker task");
+    assert_eq!(
+        reader.read::<ControlMessage>().await.expect("clean EOF"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn control_reader_accepts_fragmented_crlf_lines_and_a_final_unterminated_line() {
+    let negotiated = ControlResponse {
+        request_id: RequestId::new("request-1").expect("valid request"),
+        kind: negotiated_response(),
+    };
+    let advanced = ControlEvent {
+        event_sequence: 1,
+        kind: EventKind::OutputAdvanced {
+            worker_instance_id: WorkerInstanceId::new("runtime-1").expect("valid runtime"),
+            next_offset: 42,
+        },
+    };
+
+    // One byte of pipe capacity forces every read boundary, including the
+    // boundary between CR and LF, while the producer and reader run together.
+    let (codec_side, counterpart_side) = tokio::io::duplex(1);
+    let expected_negotiated = negotiated.clone();
+    let expected_advanced = advanced.clone();
+    let counterpart = tokio::spawn(async move {
+        // Every production peer serializes through the codec, so the exchange
+        // opens with its newline-terminated line.
+        let mut writer = ControlWriter::new(counterpart_side);
+        writer
+            .write(&ControlMessage::Request(negotiation_request()))
+            .await
+            .expect("write negotiate line");
+        let mut raw = writer.into_inner();
+
+        let mut crlf_line =
+            serde_json::to_vec(&ControlMessage::Response(expected_negotiated.clone()))
+                .expect("serialize negotiated response");
+        crlf_line.extend_from_slice(b"\r\n");
+        let crlf_beginning = crlf_line.len() - 1;
+        // The one-byte pipe delivers CR before LF on separate reads.
+        raw.write_all(&crlf_line[..crlf_beginning])
+            .await
+            .expect("write response body with CR");
+
+        let mut unterminated_line = vec![b'\n'];
+        unterminated_line.extend_from_slice(
+            &serde_json::to_vec(&ControlMessage::Event(expected_advanced.clone()))
+                .expect("serialize advanced event"),
+        );
+        raw.write_all(&unterminated_line)
+            .await
+            .expect("write newline and final unterminated line");
+    });
+
+    let mut reader = ControlReader::new(codec_side);
+    assert_eq!(
+        reader
+            .read::<ControlMessage>()
+            .await
+            .expect("request decode"),
+        Some(ControlMessage::Request(negotiation_request()))
+    );
+    assert_eq!(
+        reader
+            .read::<ControlMessage>()
+            .await
+            .expect("response decode"),
+        Some(ControlMessage::Response(negotiated))
+    );
+    assert_eq!(
+        reader.read::<ControlMessage>().await.expect("event decode"),
+        Some(ControlMessage::Event(advanced))
+    );
+    assert_eq!(
+        reader.read::<ControlMessage>().await.expect("clean EOF"),
+        None
+    );
+    counterpart.await.expect("counterpart task");
+}
+
+/// Polls one `read` exactly once, returning `None` when it was still pending
+/// and its future was dropped.
+async fn poll_read_once<R>(
+    reader: &mut ControlReader<R>,
+) -> Option<Result<Option<ControlMessage>, ControlCodecError>>
+where
+    R: AsyncRead + Unpin + Send,
+{
+    tokio::select! {
+        biased;
+        result = reader.read::<ControlMessage>() => Some(result),
+        () = std::future::ready(()) => None,
+    }
+}
+
+#[tokio::test]
+async fn a_dropped_pending_call_resumes_the_interrupted_line() {
+    // The 64-byte duplex buffer holds every piece because the polls between
+    // the writes drain it, so no write ever waits on a concurrent reader.
+    let (mut sender, receiver) = tokio::io::duplex(64);
+    let expected = compact_identity_event();
+    let mut line = serde_json::to_vec(&ControlMessage::Event(expected.clone()))
+        .expect("serialize identity event");
+    line.push(b'\n');
+    let mut reader = ControlReader::new(receiver);
+
+    // The 8-byte prefix keeps a JSON object unterminated, so the two dropped
+    // calls below each poll an interrupted line and lose only their future.
+    sender.write_all(&line[..8]).await.expect("write prefix");
+    assert!(
+        poll_read_once(&mut reader).await.is_none(),
+        "an unterminated line must leave the read pending"
+    );
+    sender.write_all(&line[8..56]).await.expect("write body");
+    assert!(
+        poll_read_once(&mut reader).await.is_none(),
+        "a longer unterminated line must still leave the read pending"
+    );
+    sender
+        .write_all(&line[56..])
+        .await
+        .expect("write terminator");
+
+    // The decoded full line is the only external evidence that the prefix
+    // survived the dropped calls: codec scrubbing stays an internal detail.
+    assert_eq!(
+        reader.read::<ControlMessage>().await.expect("resumed line"),
+        Some(ControlMessage::Event(expected))
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_prefix_stays_bound_by_the_configured_limit() {
+    // Each leftover piece plus the prefix fits in the 64-byte duplex buffer,
+    // while the reader limit sits just below the rendered line so the
+    // accumulated prefix is what trips the bound.
+    let (mut sender, receiver) = tokio::io::duplex(64);
+    let expected = compact_identity_event();
+    let mut line = serde_json::to_vec(&ControlMessage::Event(expected.clone()))
+        .expect("serialize identity event");
+    line.push(b'\n');
+    let mut reader = ControlReader::with_maximum(receiver, line.len() - 3).expect("valid limit");
+
+    sender.write_all(&line[..8]).await.expect("write prefix");
+    assert!(
+        poll_read_once(&mut reader).await.is_none(),
+        "an unterminated line must leave the read pending"
+    );
+    // Everything between the prefix and the newline overflows the limit
+    // without the line ever terminating.
+    sender
+        .write_all(&line[8..line.len() - 1])
+        .await
+        .expect("write body");
+    let result = poll_read_once(&mut reader)
+        .await
+        .expect("an overlong resumed line must fail without waiting");
+
+    match result {
+        Err(ControlCodecError::LineTooLong { actual, maximum }) => {
+            assert_eq!(actual, line.len() - 1);
+            assert_eq!(maximum, line.len() - 3);
+        }
+        other => panic!("expected a LineTooLong error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_oversized_serialized_line_is_rejected_with_a_clean_stream() {
+    // 128 bytes of duplex and a 96-byte writer bound let the realistic identity
+    // event through, while any realistic runtime fault would overflow it.
+    let (codec_side, write_side) = tokio::io::duplex(128);
+    let mut writer = ControlWriter::with_maximum(write_side, 96).expect("valid limit");
+    let fault = ControlMessage::Event(ControlEvent {
+        event_sequence: 2,
+        kind: EventKind::RuntimeFault {
+            worker_instance_id: None,
+            error: ControlError {
+                code: ControlCode::RuntimeFault,
+                message: "sanitized failure repeated to overflow the bound certainly ".repeat(8),
+                retryable: false,
+            },
+        },
+    });
+
+    let error = writer
+        .write(&fault)
+        .await
+        .expect_err("oversized line must fail");
+    assert!(matches!(error, ControlCodecError::LineTooLong { .. }));
+
+    // Whatever the failed attempt kept had to leave the stream untouched: the
+    // compact event that follows decodes standalone and no byte is missing.
+    let compact = compact_identity_event();
+    writer
+        .write(&ControlMessage::Event(compact.clone()))
+        .await
+        .expect("write compact event after the rejected one");
+
+    drop(writer);
+    let mut reader = ControlReader::new(codec_side);
+    assert_eq!(
+        reader
+            .read::<ControlMessage>()
+            .await
+            .expect("compact event"),
+        Some(ControlMessage::Event(compact))
+    );
+    assert_eq!(
+        reader.read::<ControlMessage>().await.expect("clean EOF"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn invalid_worker_identifiers_are_rejected_before_a_handshake_is_accepted() {
+    let response = ControlMessage::Response(ControlResponse {
+        request_id: RequestId::new("request-1").expect("valid request"),
+        kind: negotiated_response(),
+    });
+    let valid_wire = serde_json::to_value(&response).expect("encode valid handshake");
+    let (reader_side, mut peer) = tokio::io::duplex(1024);
+    let mut reader = ControlReader::new(reader_side);
+    let overlong = "a".repeat(256);
+
+    for invalid in [".", "..", "../../worker", overlong.as_str()] {
+        let mut wire = valid_wire.clone();
+        wire["worker_id"] = serde_json::Value::String(invalid.to_owned());
+        peer.write_all(&serde_json::to_vec(&wire).expect("encode malformed handshake"))
+            .await
+            .expect("send malformed handshake");
+        peer.write_all(b"\n").await.expect("finish control line");
+        assert!(
+            matches!(
+                reader.read::<ControlMessage>().await,
+                Err(ControlCodecError::Json(_))
+            ),
+            "identifier {invalid:?} must be rejected on the control stream"
+        );
+    }
+
+    let mut writer = ControlWriter::new(peer);
+    writer.write(&response).await.expect("send valid handshake");
+    drop(writer);
+    assert_eq!(
+        reader
+            .read::<ControlMessage>()
+            .await
+            .expect("valid handshake"),
+        Some(response)
+    );
+    assert_eq!(
+        reader.read::<ControlMessage>().await.expect("clean EOF"),
+        None
+    );
 }
