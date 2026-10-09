@@ -1,9 +1,10 @@
 """Regression checks for the worktree-new helper (stdlib only).
 
-No test reaches a real git, cargo, or cp subprocess and none needs btrfs:
-the executor is injected everywhere and emulates those commands inside a
-temporary directory. Cargo and repository lock contention is exercised with
-real `flock` calls on temporary files.
+Most tests inject an executor that emulates git, cargo, and cp in a temporary
+directory. The CLI tests run the real script against a private Git repository;
+seed-source validation also runs real cargo metadata with a private CARGO_HOME.
+No test needs btrfs: seed-copy scenarios use emulated cp or fail before copying.
+Cargo and repository lock contention uses real flock on temporary files.
 """
 
 import contextlib
@@ -352,6 +353,28 @@ def set_build_time(target, epoch):
         os.utime(target / worktree_new.PROFILE / name, (epoch, epoch))
 
 
+# Minimal Cargo source for the real-CLI seed-source fixtures: a virtual
+# workspace manifest with no members, enough for `cargo metadata` to
+# succeed offline and report the repo's default `<root>/target` layout.
+CLI_FIXTURE_MANIFEST = """\
+[workspace]
+"""
+
+
+def make_cli_seed_source(repo):
+    """Write a `Cargo.toml` and build the `make_main_target` seed shape.
+
+    The commit is the caller's: it writes only the virtual-workspace
+    manifest, whose `cargo metadata` succeeds offline with the default
+    `<root>/target` layout, and a `make_main_target`-shaped target dir
+    that gives `check_seed_source` everything it validates. Everything
+    lives inside the caller's temporary root, so no operator Cargo state
+    is read or written.
+    """
+    (repo / "Cargo.toml").write_text(CLI_FIXTURE_MANIFEST)
+    return make_main_target(repo)
+
+
 class Harness:
     """A temporary main checkout plus a fake executor bound to it."""
 
@@ -386,8 +409,14 @@ class HarnessCase(unittest.TestCase):
         self.assertFalse((self.h.worktrees / "issue-1").exists())
 
 
-class WorktreeCliTests(unittest.TestCase):
-    """Exercise argument validation through the real script and a private Git repo."""
+class WorktreeCliFixture:
+    """Private real Git repository and script runner for `worktree-new`.
+
+    Non-TestCase fixture base shared by the CLI test classes: the repo, a
+    hermetic environment, and the helpers that run real `git` and the real
+    script. It defines no test methods, so inheriting it never duplicates
+    another class's scenarios.
+    """
 
     def setUp(self):
         temp = tempfile.TemporaryDirectory(prefix="worktree-new-cli-")
@@ -429,6 +458,10 @@ class WorktreeCliTests(unittest.TestCase):
             capture_output=True, text=True, check=False,
             timeout=CLI_TIMEOUT_SECONDS,
         )
+
+
+class WorktreeCliTests(WorktreeCliFixture, unittest.TestCase):
+    """Exercise argument validation through the real script and a private Git repo."""
 
     def test_valid_slugs_create_branches_and_registered_worktrees(self):
         for slug in ("issue-168", "pr112-review", "a_b.c", "X9", "a" * 100):
@@ -653,6 +686,79 @@ class WorktreeCliTests(unittest.TestCase):
         return Path(path), branch
 
 
+class SeedSourceValidationCliTests(WorktreeCliFixture, unittest.TestCase):
+    """The fail-closed seed-source checks through the real script.
+
+    Each case runs the real `scripts/worktree-new` against the private
+    real Git repository with real `cargo metadata`, breaks exactly one
+    condition in the main checkout's target dir, and must fail before any
+    cp, worktree, or branch exists — so the scenarios never need reflink
+    support, and no rollback or destination cleanup is ever involved.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # Real `cargo metadata` must run hermetic: a private CARGO_HOME so
+        # no operator config is read, offline mode, and no environment
+        # override that would move the reported target/build directories
+        # away from `<repo>/target`.
+        self.cargo_home = self.root / "cargo-home"
+        self.cargo_home.mkdir()
+        self.env["CARGO_HOME"] = str(self.cargo_home)
+        self.env["CARGO_NET_OFFLINE"] = "true"
+        for name in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR",
+                     "CARGO_BUILD_BUILD_DIR"):
+            self.env.pop(name, None)
+
+    def prepare_seedable_repo(self):
+        """A committed minimal Cargo manifest plus the seed shape, so the
+        default seeding run reaches source validation with real cargo."""
+        target = make_cli_seed_source(self.repo)
+        self.git("add", "Cargo.toml")
+        self.git("commit", "-q", "-m", "cargo fixture")
+        return target
+
+    def assert_refused_at_source_validation(self, result, *error_texts):
+        """Exit 1 with the expected error and recovery hint, and nothing
+        created: no destination, no branch under the prefix, and the
+        worktrees root, which the script makes before the checks, empty —
+        probe, staging, and worktree names all come only after them."""
+        self.assertEqual(result.returncode, 1, result.stderr)
+        for text in error_texts:
+            self.assertIn(text, result.stderr)
+        self.assertTrue(self.worktrees.is_dir())
+        self.assertEqual(
+            sorted(p.name for p in self.worktrees.iterdir()), [])
+        self.assertEqual(self.git("branch", "--list", "zajca/*").stdout, "")
+
+    def test_missing_source_profile_fails(self):
+        target = self.prepare_seedable_repo()
+        shutil.rmtree(target / worktree_new.PROFILE)
+
+        result = self.run_script("issue-1", "HEAD")
+
+        self.assert_refused_at_source_validation(
+            result, "no seed source", "--no-seed")
+
+    def test_source_without_fingerprints_fails(self):
+        target = self.prepare_seedable_repo()
+        shutil.rmtree(target / worktree_new.PROFILE / ".fingerprint")
+
+        result = self.run_script("issue-1", "HEAD")
+
+        self.assert_refused_at_source_validation(
+            result, "no seed source", "not a Cargo profile dir", "--no-seed")
+
+    def test_source_without_cachedir_tag_fails(self):
+        target = self.prepare_seedable_repo()
+        (target / worktree_new.CACHEDIR_TAG).unlink()
+
+        result = self.run_script("issue-1", "HEAD")
+
+        self.assert_refused_at_source_validation(
+            result, "no seed source", "not a Cargo target dir", "--no-seed")
+
+
 class SeededCreateTests(HarnessCase):
     def test_default_run_fetches_and_seeds_the_worktree_target(self):
         code, out, err = self.h.run("issue-1")
@@ -748,28 +854,6 @@ class FailClosedTests(HarnessCase):
         copies = [c for c in self.h.executor.commands if c[0] == "cp"]
         self.assertEqual(len(copies), 1, "only the probe may run")
         self.assertEqual(list(self.h.worktrees.iterdir()), [])
-
-    def test_missing_source_profile_fails(self):
-        shutil.rmtree(self.h.target / "debug")
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 1)
-        self.assertIn("no seed source", err)
-        self.assertIn("--no-seed", err)
-        self.assert_no_worktree_created()
-
-    def test_source_without_fingerprints_fails(self):
-        shutil.rmtree(self.h.target / "debug" / ".fingerprint")
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 1)
-        self.assertIn("not a Cargo profile dir", err)
-        self.assert_no_worktree_created()
-
-    def test_source_without_cachedir_tag_fails(self):
-        (self.h.target / "CACHEDIR.TAG").unlink()
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 1)
-        self.assertIn("not a Cargo target dir", err)
-        self.assert_no_worktree_created()
 
     def test_non_default_source_layout_fails(self):
         self.h.executor.layouts[self.h.repo] = (
