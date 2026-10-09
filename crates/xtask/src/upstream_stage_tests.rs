@@ -14,12 +14,21 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{symlink, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+
+#[cfg(target_os = "linux")]
+use nix::sys::signal::{kill, Signal};
+#[cfg(target_os = "linux")]
+use nix::unistd::Pid;
 
 use pohunek_test_support::fs::{write_executable, write_file};
 use pohunek_test_support::process_env::ProcessEnv;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
+#[cfg(target_os = "linux")]
+use crate::upstream_stage::run_bounded;
 use crate::upstream_stage::{
     host_key, read_lock, read_project, stage_upstream, verify_stage, Fault, Outcome, StageError,
     Tools, POSIX_VERIFY,
@@ -658,6 +667,128 @@ fn a_link_outside_the_stage_is_refused_by_both_verifiers() {
 }
 
 #[test]
+fn a_link_escaping_through_another_link_is_refused_by_both_verifiers() {
+    let fixture = Fixture::new();
+    let stage = fixture.staged();
+    write_file(fixture.out().join("outside"), "external data").expect("external file");
+    symlink("..", stage.join("bin/alias")).expect("alias to stage root");
+    symlink("alias/../outside", stage.join("bin/escape")).expect("chained escape");
+    let manifest = stage.join("STAGE.links");
+    let mut links = fs::read_to_string(&manifest).expect("links manifest");
+    links.push_str("link\tbin/alias\t..\nlink\tbin/escape\talias/../outside\n");
+    write_file(manifest, links).expect("record links");
+
+    refused(fixture.verify(), "bin/escape", Fault::EscapingLink);
+    assert!(
+        !fixture.posix_verify(),
+        "POSIX verifier followed a chained link outside the stage"
+    );
+}
+
+#[test]
+fn a_link_that_leaves_and_reenters_the_stage_is_refused() {
+    let fixture = Fixture::new();
+    let stage = fixture.staged();
+    let external = fixture.out().join("external");
+    fs::create_dir(&external).expect("external directory");
+    symlink("../fakert/lib/package.json", external.join("return")).expect("external return link");
+    symlink(".", stage.join("bin/alias")).expect("alias to bin");
+    symlink("alias/../../external/return", stage.join("bin/escape"))
+        .expect("link that leaves and reenters");
+    let manifest = stage.join("STAGE.links");
+    let mut links = fs::read_to_string(&manifest).expect("links manifest");
+    links.push_str("link\tbin/alias\t.\nlink\tbin/escape\talias/../../external/return\n");
+    write_file(manifest, links).expect("record links");
+
+    refused(fixture.verify(), "bin/escape", Fault::EscapingLink);
+    assert!(
+        !fixture.posix_verify(),
+        "POSIX verifier accepted an external intermediate target"
+    );
+}
+
+#[test]
+fn a_link_with_a_missing_final_target_is_refused_by_both_verifiers() {
+    let fixture = Fixture::new();
+    let stage = fixture.staged();
+    let link = stage.join("bin/up");
+    fs::remove_file(&link).expect("remove staged link");
+    symlink("missing", &link).expect("dangling link");
+    let manifest = stage.join("STAGE.links");
+    let links = fs::read_to_string(&manifest).expect("links manifest");
+    write_file(
+        manifest,
+        links.replace(
+            "link\tbin/up\t../lib/node_modules/@fake/up/bin/up.sh\n",
+            "link\tbin/up\tmissing\n",
+        ),
+    )
+    .expect("record dangling link");
+
+    refused(fixture.verify(), "bin/up", Fault::EscapingLink);
+    assert!(
+        !fixture.posix_verify(),
+        "POSIX verifier accepted a dangling link"
+    );
+}
+
+#[test]
+fn a_symlink_cycle_is_refused_by_both_verifiers() {
+    let fixture = Fixture::new();
+    let stage = fixture.staged();
+    symlink("b", stage.join("bin/a")).expect("first cycle link");
+    symlink("a", stage.join("bin/b")).expect("second cycle link");
+    let manifest = stage.join("STAGE.links");
+    let mut links = fs::read_to_string(&manifest).expect("links manifest");
+    links.push_str("link\tbin/a\tb\nlink\tbin/b\ta\n");
+    write_file(manifest, links).expect("record links");
+
+    let (_subject, fault, _more) = refusal(fixture.verify());
+    assert_eq!(fault, Fault::EscapingLink);
+    assert!(
+        !fixture.posix_verify(),
+        "POSIX verifier accepted a link cycle"
+    );
+}
+
+#[test]
+fn a_trailing_newline_in_the_link_target_is_refused_by_the_posix_verifier() {
+    let fixture = Fixture::new();
+    let stage = fixture.staged();
+    let link = stage.join("bin/up");
+    fs::remove_file(&link).expect("remove staged link");
+    symlink("../lib/node_modules/@fake/up/bin/up.sh\n", &link).expect("newline link");
+
+    assert!(
+        fixture.verify().is_err(),
+        "Rust verifier accepted a retargeted link"
+    );
+    assert!(
+        !fixture.posix_verify(),
+        "POSIX verifier discarded the target's trailing newline"
+    );
+}
+
+#[test]
+fn a_stage_below_a_directory_with_a_trailing_newline_still_verifies() {
+    let fixture = Fixture::new();
+    let stage = fixture.staged();
+    let parent = fixture.out().join("parent\n");
+    fs::create_dir(&parent).expect("unusual stage parent");
+    let moved = parent.join(RUNTIME);
+    fs::rename(stage, &moved).expect("move stage");
+
+    let status = Command::new("/bin/sh")
+        .args(["-c", POSIX_VERIFY, "sh"])
+        .arg(moved)
+        .env_clear()
+        .env("PATH", TOOL_PATH)
+        .status()
+        .expect("run verifier below a newline parent");
+    assert!(status.success(), "the path's trailing newline was lost");
+}
+
+#[test]
 fn a_symlinked_stage_root_is_refused_by_both_verifiers() {
     let fixture = Fixture::new();
     let stage = fixture.staged();
@@ -897,6 +1028,88 @@ fn a_runtime_that_writes_into_its_install_during_the_probe_is_refused() {
     ));
     refused(fixture.run_stage(), "bin/touched", Fault::Added);
     assert!(!fixture.stage().exists());
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_running(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    stat.rsplit_once(") ")
+        .and_then(|(_identity, fields)| fields.chars().next())
+        .is_some_and(|state| state != 'Z' && state != 'X')
+}
+
+#[cfg(target_os = "linux")]
+fn assert_background_process_stopped(pid_file: &Path) {
+    let pid: u32 = fs::read_to_string(pid_file)
+        .expect("background process PID")
+        .trim()
+        .parse()
+        .expect("numeric PID");
+    pohunek_test_support::wait::poll_until("background process group cleanup", || {
+        (!process_is_running(pid)).then_some(())
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_successful_install_kills_background_processes_in_its_group() {
+    let fixture = Fixture::new();
+    fixture.write_shim(&format!(
+        "sleep 120 & printf '%s\\n' \"$!\" > '{}'",
+        fixture.log("npm-child").display()
+    ));
+    fixture.staged();
+    assert_background_process_stopped(&fixture.log("npm-child"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_successful_probe_kills_background_stdout_holders() {
+    let fixture = Fixture::new();
+    fixture.write_runtime(&format!(
+        "#!/bin/sh\nsleep 120 & printf '%s\\n' \"$!\" > '{}'\necho '{BANNER}'\n",
+        fixture.log("probe-child").display()
+    ));
+    fixture.staged();
+    assert_background_process_stopped(&fixture.log("probe-child"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_escaped_stdout_holder_cannot_extend_the_probe_deadline() {
+    let fixture = Fixture::new();
+    let pid_file = fixture.log("escaped-probe-child");
+    fs::create_dir_all(pid_file.parent().expect("log parent")).expect("log directory");
+    let mut command = Command::new("/bin/sh");
+    command.arg("-c").arg(format!(
+        "/usr/bin/setsid /bin/sh -c 'printf \"%s\\n\" \"$$\" > \"{pid}\"; exec /bin/sleep 5' & \
+         while [ ! -f '{pid}' ]; do :; done; printf 'banner\\n'",
+        pid = pid_file.display()
+    ));
+    // timing-allowed: #150 a real subprocess deadline cannot use virtual time.
+    let result = run_bounded(
+        &mut command,
+        Duration::from_secs(1),
+        true,
+        4096,
+        "test probe",
+    );
+    let pid: i32 = fs::read_to_string(&pid_file)
+        .expect("escaped process PID")
+        .trim()
+        .parse()
+        .expect("numeric PID");
+    let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+    assert_background_process_stopped(&pid_file);
+
+    match result {
+        Err(XtaskError::UpstreamStage(StageError::Command { step, outcome })) => {
+            assert_eq!((step, outcome), ("test probe", Outcome::TimedOut));
+        }
+        other => panic!("expected a bounded probe timeout, got {other:?}"),
+    }
 }
 
 #[test]

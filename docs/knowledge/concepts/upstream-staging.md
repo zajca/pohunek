@@ -81,7 +81,7 @@ project remain the root of trust.
 
 Where no Rust tooling exists (the isolated namespace) run this POSIX `sh`
 verifier with the stage directory as its argument. It needs `sha256sum`,
-`find`, `sed`, `sort`, `grep`, `readlink`, `iconv`, `tr` and `wc` and fails on
+`find`, `sed`, `sort`, `grep`, `readlink` (with `-e`), `iconv`, `tr` and `wc` and fails on
 every drift `verify-stage` refuses, except the checks against the committed
 project and the lock. Keep the script in the repository or the runner, not in
 the stage, which could otherwise only verify itself:
@@ -90,6 +90,10 @@ the stage, which could otherwise only verify itself:
 set -eu
 [ -d "$1" ] && [ ! -h "$1" ] || exit 1
 cd "$1"
+root=$(pwd -P && printf x) || exit 1
+nl='
+'
+root=${root%"$nl"x}
 for manifest in STAGE.sha256 STAGE.links; do
   [ -f "$manifest" ] && [ ! -h "$manifest" ] || exit 1
   # Shell read can discard NUL, so validate raw bytes before parsing.
@@ -97,8 +101,6 @@ for manifest in STAGE.sha256 STAGE.links; do
   [ "$(LC_ALL=C tr -cd '\000' < "$manifest" | wc -c)" -eq 0 ] || exit 1
 done
 tab=$(printf '\t')
-nl='
-'
 # UTF-8 C1 controls are C2 80..9F; grep's C locale recognizes only ASCII controls.
 c1_prefix=$(printf '\302')
 c1_first=$(printf '\200')
@@ -134,6 +136,20 @@ stays_inside() (
       ''|.) ;;
       *) depth=$((depth + 1)) ;;
     esac
+  done
+)
+resolved_inside() (
+  path=$1
+  target=$2
+  case $path in */*) candidate=${path%/*} ;; *) candidate=. ;; esac
+  set -f
+  IFS=/
+  set -- $target
+  for component do
+    [ -n "$component" ] || continue
+    candidate=$candidate/$component
+    resolved=$(readlink -e "$candidate" && printf x) || exit 1
+    case $resolved in "$root$nl"x|"$root"/*"$nl"x) ;; *) exit 1 ;; esac
   done
 )
 contains_line() {
@@ -211,7 +227,10 @@ printf '%s\n' "$files" | while IFS= read -r path; do
 done
 while IFS="$tab" read -r kind path target; do
   if [ "$kind" = link ]; then
-    [ -h "$path" ] && [ "$(readlink "$path")" = "$target" ] || exit 1
+    [ -h "$path" ] || exit 1
+    actual=$(readlink "$path" && printf x) || exit 1
+    [ "$actual" = "$target$nl"x ] || exit 1
+    resolved_inside "$path" "$target" || exit 1
   fi
 done < STAGE.links
 sha256sum -c STAGE.sha256 >/dev/null

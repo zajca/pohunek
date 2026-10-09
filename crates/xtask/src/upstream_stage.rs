@@ -25,15 +25,16 @@ use std::os::unix::fs::{symlink, OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{mpsc, Arc, LazyLock, Mutex};
+use std::sync::{mpsc, LazyLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Subcommand;
 use nix::fcntl::OFlag;
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
 use regex::Regex;
+use rustix::process::{waitid, Pid as RustixPid, WaitId, WaitIdOptions};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -91,7 +92,7 @@ const RELEASE_PLACEHOLDER: &str = "{release}";
 
 /// POSIX `sh` verifier of a staged tree, run as `sh -c "$SCRIPT" sh <stage>`.
 ///
-/// It needs only `sha256sum`, `find`, `sed`, `sort`, `grep`, `readlink`,
+/// It needs only `sha256sum`, `find`, `sed`, `sort`, `grep`, `readlink -e`,
 /// `iconv`, `tr` and `wc`, so the network-isolated namespace can run it with
 /// no Rust tooling. It refuses a modified, added or removed file, a file
 /// replaced by a link, a retargeted link and a changed executable bit.
@@ -101,6 +102,10 @@ const RELEASE_PLACEHOLDER: &str = "{release}";
 pub(crate) const POSIX_VERIFY: &str = r#"set -eu
 [ -d "$1" ] && [ ! -h "$1" ] || exit 1
 cd "$1"
+root=$(pwd -P && printf x) || exit 1
+nl='
+'
+root=${root%"$nl"x}
 for manifest in STAGE.sha256 STAGE.links; do
   [ -f "$manifest" ] && [ ! -h "$manifest" ] || exit 1
   # Shell read can discard NUL, so validate raw bytes before parsing.
@@ -108,8 +113,6 @@ for manifest in STAGE.sha256 STAGE.links; do
   [ "$(LC_ALL=C tr -cd '\000' < "$manifest" | wc -c)" -eq 0 ] || exit 1
 done
 tab=$(printf '\t')
-nl='
-'
 # UTF-8 C1 controls are C2 80..9F; grep's C locale recognizes only ASCII controls.
 c1_prefix=$(printf '\302')
 c1_first=$(printf '\200')
@@ -145,6 +148,20 @@ stays_inside() (
       ''|.) ;;
       *) depth=$((depth + 1)) ;;
     esac
+  done
+)
+resolved_inside() (
+  path=$1
+  target=$2
+  case $path in */*) candidate=${path%/*} ;; *) candidate=. ;; esac
+  set -f
+  IFS=/
+  set -- $target
+  for component do
+    [ -n "$component" ] || continue
+    candidate=$candidate/$component
+    resolved=$(readlink -e "$candidate" && printf x) || exit 1
+    case $resolved in "$root$nl"x|"$root"/*"$nl"x) ;; *) exit 1 ;; esac
   done
 )
 contains_line() {
@@ -222,7 +239,10 @@ printf '%s\n' "$files" | while IFS= read -r path; do
 done
 while IFS="$tab" read -r kind path target; do
   if [ "$kind" = link ]; then
-    [ -h "$path" ] && [ "$(readlink "$path")" = "$target" ] || exit 1
+    [ -h "$path" ] || exit 1
+    actual=$(readlink "$path" && printf x) || exit 1
+    [ "$actual" = "$target$nl"x ] || exit 1
+    resolved_inside "$path" "$target" || exit 1
   fi
 done < STAGE.links
 sha256sum -c STAGE.sha256 >/dev/null
@@ -813,6 +833,24 @@ fn stays_inside(target: &Path, depth: usize) -> bool {
     true
 }
 
+/// Resolves each path prefix, including symlinks and `..`, before advancing.
+/// A final path that leaves and then re-enters the stage is still unsafe.
+fn resolved_inside(stage_root: &Path, path: &Path, target: &Path) -> bool {
+    let Some(mut prefix) = path.parent().map(Path::to_path_buf) else {
+        return false;
+    };
+    for component in target.components() {
+        prefix.push(component.as_os_str());
+        let Ok(resolved) = fs::canonicalize(&prefix) else {
+            return false;
+        };
+        if !resolved.starts_with(stage_root) {
+            return false;
+        }
+    }
+    true
+}
+
 /// A path rendered with control characters escaped, for error messages.
 fn escaped(path: &Path) -> String {
     path.display().to_string().escape_debug().to_string()
@@ -836,6 +874,7 @@ fn hash_file(path: &Path) -> Result<String, XtaskError> {
 /// manifests at its root.
 fn scan_tree(stage: &Path) -> Result<Tree, XtaskError> {
     let mut tree = Tree::new();
+    let stage_root = fs::canonicalize(stage).map_err(io_error(stage))?;
     let mut pending = vec![(stage.to_path_buf(), String::new(), 0_usize)];
     while let Some((dir, prefix, depth)) = pending.pop() {
         let entries = fs::read_dir(&dir).map_err(io_error(&dir))?;
@@ -867,6 +906,9 @@ fn scan_tree(stage: &Path) -> Result<Tree, XtaskError> {
             } else if kind.is_symlink() {
                 let target = fs::read_link(&path).map_err(io_error(&path))?;
                 if !stays_inside(&target, depth) {
+                    return Err(refuse(relative, Fault::EscapingLink));
+                }
+                if !resolved_inside(&stage_root, &path, &target) {
                     return Err(refuse(relative, Fault::EscapingLink));
                 }
                 let target = target
@@ -1188,11 +1230,30 @@ impl Drop for Scratch {
     }
 }
 
-/// How a bounded child ended and what it printed.
-/// Runs `command` in its own process group and kills the group after
-/// `limit`. With `capture`, standard output is kept up to `output_limit`
-/// bytes and the rest is discarded.
-fn run_bounded(
+/// Waits without reaping, preserving the group ID until cleanup.
+fn observe_child_exit(pid: RustixPid) -> io::Result<()> {
+    loop {
+        match waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+        ) {
+            Ok(Some(_status)) => return Ok(()),
+            Ok(None) => return Err(io::Error::other("child observation returned no status")),
+            Err(rustix::io::Errno::INTR) => {}
+            Err(source) => return Err(io::Error::from(source)),
+        }
+    }
+}
+
+enum ChildEvent {
+    Exited(io::Result<()>),
+    Output(io::Result<Vec<u8>>),
+}
+
+/// Runs `command` in its own process group with a single deadline for exit
+/// and output collection. All members of the group are killed before the
+/// direct child is reaped, including after a successful command.
+pub(crate) fn run_bounded(
     command: &mut Command,
     limit: Duration,
     capture: bool,
@@ -1211,53 +1272,76 @@ fn run_bounded(
         path: PathBuf::from(command.get_program()),
         source,
     })?;
-    let reader = child.stdout.take().map(|mut stdout| {
+    let pid = match i32::try_from(child.id()) {
+        Ok(pid) => pid,
+        Err(_cause) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(refuse(step, Fault::Malformed));
+        }
+    };
+    let Some(rustix_pid) = RustixPid::from_raw(pid) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(refuse(step, Fault::Malformed));
+    };
+    let group = Pid::from_raw(pid);
+    let deadline = Instant::now() + limit;
+    let (sender, receiver) = mpsc::channel();
+    if let Some(mut stdout) = child.stdout.take() {
+        let sender = sender.clone();
         thread::spawn(move || {
             let mut kept = Vec::new();
             let read = (&mut stdout).take(output_limit).read_to_end(&mut kept);
             // Keep draining so the child never blocks on a full pipe.
             let drained = io::copy(&mut stdout, &mut io::sink());
-            read.and(drained).map(|_| kept)
-        })
+            let _ = sender.send(ChildEvent::Output(read.and(drained).map(|_| kept)));
+        });
+    }
+    thread::spawn(move || {
+        let _ = sender.send(ChildEvent::Exited(observe_child_exit(rustix_pid)));
     });
 
-    let pid = i32::try_from(child.id()).map_err(|_cause| refuse(step, Fault::Malformed))?;
-    let finished = Arc::new(Mutex::new(false));
-    let (stop_tx, stop_rx) = mpsc::channel::<()>();
-    let watchdog = {
-        let finished = Arc::clone(&finished);
-        thread::spawn(move || {
-            if stop_rx.recv_timeout(limit) == Err(mpsc::RecvTimeoutError::Timeout) {
-                let done = finished.lock().map_or(true, |done| *done);
-                if !done {
-                    // The group may already be gone; the result is irrelevant.
-                    killpg(Pid::from_raw(pid), Signal::SIGKILL).unwrap_or(());
-                    return true;
-                }
+    let mut exited = false;
+    let mut output = (!capture).then(Vec::new);
+    let mut timed_out = false;
+    let observed = loop {
+        if exited {
+            if let Some(bytes) = output.take() {
+                break Ok(bytes);
             }
-            false
-        })
+        }
+        match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(ChildEvent::Exited(Ok(()))) => {
+                exited = true;
+                let _ = killpg(group, Signal::SIGKILL);
+            }
+            Ok(ChildEvent::Exited(Err(source)) | ChildEvent::Output(Err(source))) => {
+                break Err(XtaskError::Io {
+                    path: PathBuf::from(step),
+                    source,
+                });
+            }
+            Ok(ChildEvent::Output(Ok(bytes))) => output = Some(bytes),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                timed_out = true;
+                break Ok(Vec::new());
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(refuse(step, Fault::Malformed));
+            }
+        }
     };
-    let status = child.wait();
-    if let Ok(mut done) = finished.lock() {
-        *done = true;
+    if !exited {
+        let _ = killpg(group, Signal::SIGKILL);
+        // The direct child may have created a new session after spawn.
+        let _ = child.kill();
     }
-    drop(stop_tx);
-    let timed_out = watchdog.join().unwrap_or(false);
-    let stdout = match reader {
-        Some(reader) => reader
-            .join()
-            .map_err(|_cause| refuse(step, Fault::Malformed))?
-            .map_err(|source| XtaskError::Io {
-                path: PathBuf::from(step),
-                source,
-            })?,
-        None => Vec::new(),
-    };
-    let status = status.map_err(|source| XtaskError::Io {
+    let status = child.wait().map_err(|source| XtaskError::Io {
         path: PathBuf::from(step),
         source,
     })?;
+    let stdout = observed?;
     let outcome = if timed_out {
         Outcome::TimedOut
     } else {
