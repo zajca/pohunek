@@ -58,15 +58,41 @@ bottom-up. For each slice, from the bottom:
 - A review fix to a lower slice is committed on that slice's branch; restack
   the branches above it with `git rebase --update-refs` from the top branch,
   re-run the applicable gates on every rebased slice (its inputs changed with
-  its base), and push them all
-  (`--force-with-lease`).
+  its base), and keep those higher branches local. Push the changed lower
+  branch first, wait for its current head's CI and review, then publish higher
+  branches one at a time, bottom-up, using `--force-with-lease` for rewritten
+  remote heads. Do not batch-push the restacked branches.
+
+## GitHub Actions capacity
+
+The repository has limited concurrent Actions capacity. Coordinate with other
+agents publishing independent PRs: check active PR runs before a head push and
+avoid starting another expensive run while capacity is saturated. Never cancel
+another agent's run just to make room. For a stack, commit and verify every
+slice locally first, then push and open only the bottom ready PR. Publish the
+next slice after the previous PR's current-head CI and review finish; a local
+rebase of a higher slice does not need a push yet. Record unpublished slices as
+pending in issue tracking, then add each PR link when that slice is published.
+
+Before replacing a published PR head, record its active `pull_request` run IDs
+(`gh run list --branch <slice-branch> --event pull_request --json
+databaseId,headBranch,status,url`) and confirm each belongs to that PR. If a
+run has not completed, cancel it with `gh run cancel <run-id>` before the new
+push or immediately afterward. Read its status again with `gh run view
+<run-id> --json status,conclusion`; a cancel request alone is not confirmation.
+Confirm it completed with `cancelled` (or had completed before cancellation).
+The CI workflow's same-ref `cancel-in-progress` is a fallback, not a reason to
+leave an obsolete run consuming capacity. Watch only the new head after the
+push.
 
 A milestone that is one small concern is a stack of one: a single PR on
 `main` with `Closes #N`.
 
 ## Steps
 
-Run steps 1–5 for each slice, bottom-up, then step 6 once for the stack.
+Run steps 1–5 for each slice, bottom-up, observing the capacity rule above;
+repeat step 6 after each publication to record its PR link and the remaining
+unpublished slices as pending.
 
 1. **Stage explicitly.** Add files by path — never `git add -A`. Exclude
    transient files the user does not want committed (historically `idea.md`,
@@ -76,7 +102,8 @@ Run steps 1–5 for each slice, bottom-up, then step 6 once for the stack.
    machines whose global git config forces a signer. Message: concise,
    imperative, English. Never add a `Co-Authored-By` trailer or any
    "generated with" footer.
-3. **Push.** `git push -u origin <slice-branch>`.
+3. **Push.** `git push -u origin <slice-branch>` only when that slice is next
+   to receive CI and review. Keep the other slices local until their turn.
 4. **Build the PR description from evidence, not memory.** English body,
    before/after structure:
    - *Summary* — what changed and why, one paragraph; link the tracked issue

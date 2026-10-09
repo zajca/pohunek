@@ -862,6 +862,16 @@ PoC or imply that current direct-host execution is a hostile-workload sandbox.
   the full DoD, so slicing is not a PoC shortcut. The slice plan is recorded on
   the issue first. Size cue and mechanics: `pullRequests` in
   `.github/agent-workflow.json` and the `pr-handoff` skill.
+- **Budget GitHub Actions capacity across PRs.** For independent PRs, coordinate
+  head pushes so their CI runs do not start together when the shared runner
+  capacity is saturated. For a stack, rebase and verify higher branches locally,
+  but push only the lowest PR that currently needs CI or review. Wait for its
+  current head to finish CI and review before publishing the next branch; do
+  not batch-push a restacked train. If a new push supersedes an unfinished PR
+  run, cancel that run or verify GitHub's same-ref concurrency already canceled
+  it, and stop watching the obsolete head. Cancel only runs belonging to the
+  PR being updated. Every published head still needs its own required checks
+  and review before merge; see `pr-handoff` and `deliver-issue` for the steps.
 - **Commits are never signed.** Use clean, concise, English messages. Do not add
   a `Co-Authored-By` trailer or any "generated with" footer.
 - Keep changes scoped. If you touch the wire protocol (`crates/protocol`), expect
