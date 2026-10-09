@@ -42,9 +42,12 @@ use protocol::{
     AgentActivity, BindingProvenance, PackageId, PackageVersion, RuntimeId, StateSource,
 };
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
 #[path = "support/catalog_fixture.rs"]
 mod catalog_fixture;
+#[path = "support/native_reference_diagnostics.rs"]
+mod native_reference_diagnostics;
 #[path = "support/plugin_harness.rs"]
 mod plugin_harness;
 #[path = "support/responses_stub.rs"]
@@ -54,6 +57,7 @@ use catalog_fixture::{
     attestations_for, catalog_of, host_platform, root_of, signed, test_key, ANY_CORE, RUNTIME_API,
     WINDOW_END, WINDOW_START,
 };
+use native_reference_diagnostics::{NativeReferenceDiagnostics, MAX_EVENTS};
 use plugin_harness::{path_str, Harness};
 use responses_stub::ResponsesStub;
 
@@ -1557,16 +1561,32 @@ async fn a_real_codex_session_launches_and_is_detected_through_package_facts() {
         .await;
     assert_package_agrees(&fixture, &package, &id, AgentActivity::Idle).await;
 
-    // The SessionStart hook reported the conversation id; it names Codex's own
-    // rollout file, and it is what the daemon resumes with.
-    let reference = wait_until("the hook-reported conversation id", || async {
+    // The SessionStart hook reported the launch conversation id used for
+    // resume. Active-agent metadata is optional and belongs to another view.
+    let diagnostics = NativeReferenceDiagnostics::new(
+        fixture
+            .harness
+            .env
+            .root()
+            .join("worker/state/pohunek/workers"),
+        fixture.harness.env.root().join("worker/state/pohunek/logs"),
+        None,
+        &id,
+    );
+    let reference = wait_until("the hook-reported native reference", || async {
         let (code, inspected) = fixture.harness.json(&["session", "inspect", &id]).await;
         assert_eq!(code, 0, "{inspected}");
-        inspected["ok"]["active_agent_session_id"]
+        diagnostics.observe(&inspected["ok"]);
+        inspected["ok"]["native_session_id"]
             .as_str()
             .map(str::to_owned)
     })
     .await;
+    let evidence = diagnostics.describe();
+    assert!(evidence.contains("journal: phase="), "{evidence}");
+    assert!(evidence.contains("worker admission events:"), "{evidence}");
+    assert!(!evidence.contains(&reference), "native reference leaked");
+    drop(diagnostics);
     assert!(
         fixture.rollout_file(&reference).is_some(),
         "Codex wrote a rollout file for the reported conversation {reference}"
@@ -1632,6 +1652,77 @@ fn describe_chain(chain: &[u64]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Exercise the real worker's rejection log with payload that must stay out of
+/// the bounded timeout diagnostics.
+async fn assert_private_hook_diagnostics(fixture: &Fixture, id: &str, pid: u64, reference: &str) {
+    let socket = fixture
+        .harness
+        .env
+        .root()
+        .join("worker/runtime/pohunek/workers")
+        .join(id)
+        .join("control.sock");
+    let poisoned_reference = format!("{reference} {PROMPT}");
+    let expires_at = (time::OffsetDateTime::now_utc() + time::Duration::seconds(30))
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("RFC 3339 expiry");
+    for sequence in 0..=MAX_EVENTS {
+        let request = serde_json::json!({
+            "type": "identity_report",
+            "runtime_id": "foreign-runtime",
+            "provider": "codex",
+            "pid": pid,
+            "start_identity": 1,
+            "sequence": sequence,
+            "expires_at": expires_at,
+            "reference_kind": "id",
+            "native_reference": poisoned_reference,
+        });
+        let stream = tokio::net::UnixStream::connect(&socket)
+            .await
+            .expect("connect to the private worker hook endpoint");
+        let (read, mut write) = stream.into_split();
+        let mut frame = serde_json::to_vec(&request).expect("serialize hook claim");
+        frame.push(b'\n');
+        write.write_all(&frame).await.expect("send hook claim");
+        let mut reply = String::new();
+        tokio::io::BufReader::new(read)
+            .read_line(&mut reply)
+            .await
+            .expect("read hook refusal");
+        let reply: Value = serde_json::from_str(&reply).expect("hook response JSON");
+        assert_eq!(reply["ok"], false, "foreign runtime claim refused");
+    }
+    let diagnostics = NativeReferenceDiagnostics::new(
+        fixture
+            .harness
+            .env
+            .root()
+            .join("worker/state/pohunek/workers"),
+        fixture.harness.env.root().join("worker/state/pohunek/logs"),
+        None,
+        id,
+    );
+    let expected = format!("worker admission events: {MAX_EVENTS} shown, ");
+    let evidence = wait_until("bounded redacted hook diagnostics", || async {
+        let evidence = diagnostics.describe();
+        let omitted = evidence.lines().find_map(|line| {
+            line.strip_prefix(&expected)?
+                .strip_suffix(" earlier omitted")?
+                .parse::<usize>()
+                .ok()
+        });
+        omitted.is_some_and(|count| count >= 1).then_some(evidence)
+    })
+    .await;
+    assert!(!evidence.contains(reference), "native reference leaked");
+    assert!(!evidence.contains(PROMPT), "prompt leaked");
+    assert!(
+        evidence.contains("reason=runtime_mismatch"),
+        "the worker logged the rejection reason: {evidence}"
+    );
 }
 
 /// Codex 0.160.0 runs its hooks from a `codex app-server` process below the one
@@ -1703,6 +1794,8 @@ async fn a_real_codex_reports_hooks_from_a_descendant_of_the_launched_process_an
         fixture.rollout_file(&reference).is_some(),
         "Codex wrote a rollout file for the reported conversation {reference}"
     );
+
+    assert_private_hook_diagnostics(&fixture, &id, reporter_pid, &reference).await;
 
     fixture.stop(&id).await;
     let (code, resumed) = fixture.harness.json(&["session", "resume", &id]).await;

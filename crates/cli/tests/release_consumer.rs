@@ -29,6 +29,8 @@ mod catalog_fixture;
 mod messages_stub;
 #[path = "support/model_stub.rs"]
 mod model_stub;
+#[path = "support/native_reference_diagnostics.rs"]
+mod native_reference_diagnostics;
 #[path = "support/process_guard.rs"]
 mod process_guard;
 #[path = "support/release_bounded.rs"]

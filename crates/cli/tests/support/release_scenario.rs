@@ -14,6 +14,7 @@ use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::wait::poll_until;
 use serde_json::Value;
 
+use crate::native_reference_diagnostics::NativeReferenceDiagnostics;
 use crate::release_bounded::{run as run_bounded, PROBE_TIMEOUT};
 use crate::release_catalog::PackageFacts;
 use crate::release_drivers::{write_profile, Driver, Prepared, Stub};
@@ -410,14 +411,23 @@ pub(crate) fn run_scenario(
     host.wait_activity(&id, "idle");
 
     // The conversation id the daemon will resume with.
+    let diagnostics = NativeReferenceDiagnostics::new(
+        host.env.state_home().join("pohunek/workers"),
+        host.env.state_home().join("pohunek/logs"),
+        Some(host.env.state_home().join("pohunek/logs/pohunekd.jsonl")),
+        &id,
+    );
     let reference = poll_until("the session's native reference", || {
         let record = host.inspect(&id);
-        let reported = !driver.hooks || record["active_agent_session_id"].is_string();
-        record["native_session_id"]
-            .as_str()
-            .filter(|_| reported)
-            .map(str::to_owned)
+        diagnostics.observe(&record);
+        record["native_session_id"].as_str().map(str::to_owned)
     });
+    let evidence = diagnostics.describe();
+    assert!(evidence.contains("journal: phase="), "{evidence}");
+    assert!(evidence.contains("worker admission events:"), "{evidence}");
+    assert!(evidence.contains("daemon identity events:"), "{evidence}");
+    assert!(!evidence.contains(&reference), "native reference leaked");
+    drop(diagnostics);
 
     stop_resume_and_check_history(host, driver, prepared, &id, &reference);
 
