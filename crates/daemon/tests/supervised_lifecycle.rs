@@ -24,7 +24,8 @@
 mod supervised;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -335,6 +336,141 @@ async fn crashed_worker_is_lost_swept_and_never_restarted() {
     .await;
     fixture.assert_same_runtime(&survivor_before).await;
     assert!(fixture.is_running(survivor_descendant));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the outage evidence and recovery assertions must stay in chronological order"
+)]
+async fn stale_refused_socket_without_job_recovers_but_silent_job_stays_conflict() {
+    let fixture = Installation::new(Settings::default()).await;
+    fixture.start_daemon().await;
+    let lost = fixture.new_session("lost-after-manager-outage").await.id.0;
+    let lost_before = fixture.snapshot(&lost).await;
+    let lost_descendant = fixture.descendant(&lost).await;
+    fixture.stop_daemon().await;
+
+    // A live journal and the record's exact generation must survive the
+    // outage. Give that real session a native binding so this test can prove
+    // that reconciliation leaves `session.resume` usable.
+    let runtime = fixture.record(&lost).expect("durable session").runtime;
+    fixture.seed_record(&lost, runtime);
+    assert!(fixture
+        .journal_path(&lost, &lost_before.worker_id)
+        .is_file());
+
+    signal(lost_before.worker.pid, Signal::SIGKILL);
+    fixture.wait_gone(lost_before.worker, "dead worker").await;
+    fixture
+        .workers
+        .retire(&lost_before.service_id())
+        .await
+        .expect("remove the dead generation's native job");
+    eventually("dead worker job absent", || async {
+        fixture
+            .job_absent(&lost_before.service_id())
+            .await
+            .then_some(())
+    })
+    .await;
+    let lost_socket = fixture
+        .paths
+        .runtime_dir
+        .join(pohunek_paths::WORKERS_SUBDIR)
+        .join(&lost)
+        .join(pohunek_paths::WORKER_SOCKET_NAME);
+    assert!(
+        std::fs::symlink_metadata(&lost_socket)
+            .expect("dead worker left its socket")
+            .file_type()
+            .is_socket(),
+        "the dead worker left a stale control.sock"
+    );
+    assert_eq!(
+        UnixStream::connect(&lost_socket)
+            .expect_err("stale socket has no listener")
+            .raw_os_error(),
+        Some(nix::libc::ECONNREFUSED)
+    );
+
+    // A separate record names a real native job with the right generation,
+    // but the same refused socket condition. This job may still become a
+    // worker, so reconciliation must preserve conflict and must not sweep it.
+    let silent = "s-4200";
+    let key = WorkerKey::new(silent, "siln2345").expect("silent generation");
+    fixture.seed_record(
+        silent,
+        pohunek_daemon::store::RuntimeRecord {
+            state: RuntimeState::Live,
+            worker_id: None,
+            worker_instance_id: None,
+            service_id: Some(key.service_id().to_string()),
+            generation: Some(key.generation().to_owned()),
+            executable: Some(PathBuf::from("/bin/bash")),
+            reason: None,
+        },
+    );
+    let silent_dir = fixture
+        .paths
+        .runtime_dir
+        .join(pohunek_paths::WORKERS_SUBDIR)
+        .join(silent);
+    std::fs::create_dir_all(&silent_dir).expect("silent worker directory");
+    std::fs::set_permissions(&silent_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("private silent worker directory");
+    let silent_socket = silent_dir.join(pohunek_paths::WORKER_SOCKET_NAME);
+    drop(UnixListener::bind(&silent_socket).expect("bind a stale silent socket"));
+    let logs = backend::worker_logs(&fixture.paths, &fixture.namespace(), &key);
+    let silent_process = start_running(&fixture, &*fixture.workers, logs, &key).await;
+
+    fixture.start_daemon().await;
+    fixture
+        .wait_reason(&lost, RuntimeState::Lost, RUNTIME_LOST)
+        .await;
+    fixture
+        .wait_reason(
+            silent,
+            RuntimeState::Conflict,
+            "runtime_supervision_ambiguous",
+        )
+        .await;
+    assert!(
+        !fixture.is_running(lost_descendant),
+        "lost runtime was swept"
+    );
+    assert!(
+        fixture.is_running(silent_process),
+        "silent job was preserved"
+    );
+
+    let contradictory = fixture.inventory().await.entries.into_iter().any(|entry| {
+        entry.runtime_slot == lost
+            && entry.status == RuntimeInventoryStatus::IdentityMismatch
+            && entry.reason.as_deref() == Some("worker_unavailable")
+    });
+    let resumed = fixture
+        .client()
+        .await
+        .call::<method::SessionResume>(SessionId(lost.clone()).into())
+        .await
+        .expect("resume the proven-lost runtime")
+        .session;
+    assert_eq!(resumed.id.0, lost);
+    let resumed = fixture.snapshot(&lost).await;
+    assert_ne!(resumed.generation, lost_before.generation);
+    assert!(
+        fixture.is_running(silent_process),
+        "resume left the silent job alone"
+    );
+    assert!(
+        !contradictory,
+        "the inventory must not call a refused, jobless socket identity_mismatch/worker_unavailable"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

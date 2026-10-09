@@ -386,7 +386,10 @@ Reconciliation joins the service manager's jobs with worker sockets and
 journals for each worker generation. It reports `runtime_lost` when a worker's
 job ended while its journal still said live, after sweeping that generation's
 leftover processes (`runtime_lost_cleanup_unconfirmed` when that cleanup could
-not be confirmed). It reports `runtime_supervision_ambiguous` (`conflict`) for
+not be confirmed). A stale socket that refuses connections supplies no worker
+identity: an absent job and a confirmed marker sweep yield `lost`, while a
+present but silent job remains `conflict`. It reports
+`runtime_supervision_ambiguous` (`conflict`) for
 a present job whose worker does not answer, `runtime_identity_mismatch`
 (`conflict`) for a job whose definition or process does not match the record,
 and `runtime_supervision_unavailable` (`reconnecting`) while the service manager

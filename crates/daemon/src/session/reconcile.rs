@@ -2915,7 +2915,16 @@ impl SessionRegistry {
                     snapshot,
                 }),
                 Err(ProbeFailure::Failed(error)) => {
-                    inventory.push(discovery_failure_entry(slot, &error));
+                    // A refused or vanished endpoint is no identity evidence:
+                    // supervisor and journal proof decide the session, so no
+                    // contradictory inventory entry exists. Other failures
+                    // (unreadable or unowned path, real protocol/identity
+                    // mismatch) still quarantine.
+                    if no_listener_on_socket(&error) {
+                        tracing::debug!(slot = %slot, error = %error, "no durable worker listens");
+                    } else {
+                        inventory.push(discovery_failure_entry(slot, &error));
+                    }
                 }
                 // Nothing proves who answers there, so the slot is not
                 // inventoried; the session it names stays pending.
@@ -5302,6 +5311,21 @@ fn effective_uid() -> u32 {
     // SAFETY: `geteuid` has no preconditions and only reads process identity.
     unsafe {
         libc::geteuid()
+    }
+}
+
+/// Whether a socket-operation failure proves that nothing listens on the
+/// discovered endpoint: the connect was refused or the endpoint vanished.
+/// Any other failure — an unreadable or unowned path (`PermissionDenied`) or
+/// an answered but incompatible or mismatched worker — stays quarantined in
+/// the inventory.
+fn no_listener_on_socket(error: &WorkerError) -> bool {
+    match error {
+        WorkerError::Socket { source, .. } => matches!(
+            source.kind(),
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+        ),
+        _ => false,
     }
 }
 
