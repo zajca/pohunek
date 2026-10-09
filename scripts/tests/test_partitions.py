@@ -39,7 +39,7 @@ LOADER.exec_module(partitions)
 # The CLI's shard arguments, as the operations they name are documented (the
 # per-package fast shards, the relay-PostgreSQL shard, and the heavy
 # complement): the inventory every check run must split exactly once.
-SHARD_NAMES = ("unit", "daemon", "relay", "cli", "relay-db", "heavy")
+SHARD_NAMES = ("core", "daemon", "relay", "cli", "relay-db", "heavy")
 
 # How long one scenario lets the script + its fake run before the scenario
 # fails instead of hanging CI; a scenario finishes well under a second.
@@ -63,7 +63,7 @@ def shard_expressions(fast):
         "daemon": f"({fast}) and ({daemon})",
         "relay": f"({fast}) and ({relay})",
         "cli": f"({fast}) and (package(=pohunek-cli))",
-        "unit": f"({fast}) and (not (({daemon}) or ({relay}) or (package(=pohunek-cli))))",
+        "core": f"({fast}) and (not (({daemon}) or ({relay}) or (package(=pohunek-cli))))",
         "relay-db": f"(not ({fast})) and ({relay})",
         "heavy": f"(not ({fast})) and not ({relay})",
     }
@@ -95,7 +95,7 @@ def shard_of(expression, fast):
 
     The expression must be the fast filter with the wrap the script composes
     it in: `(fast) and (owner)` for the owned shards, `not ((owners))` for
-    unit, and the fast complement split by the conjunction that follows it:
+    core, and the fast complement split by the conjunction that follows it:
     relay-db takes the relay owners, heavy rejects them.
     """
     if expression.startswith("(not ("):
@@ -108,7 +108,7 @@ def shard_of(expression, fast):
         # starting with `not (` makes that expression start `(not (` too.
         rest = expression.removeprefix(f"({fast}) and (")
         if rest.startswith("not ((package(=pohunek-daemon"):
-            return "unit"
+            return "core"
     else:
         rest = expression.removeprefix(f"({fast}) and (")
     for name in ("daemon", "relay", "cli"):
@@ -253,7 +253,7 @@ def nextest_inventory():
             "service::upgrade": {"matches": ["cli"], "ignored": False},
         }},
         {"id": "pohunek-knowledge-444444", "tests": {
-            "bundle::materialize": {"matches": ["unit"], "ignored": False},
+            "bundle::materialize": {"matches": ["core"], "ignored": False},
             "source_map::drift": {"matches": ["heavy"], "ignored": False},
         }},
     ]
@@ -367,7 +367,7 @@ class CheckActionTests(ScriptScenario):
         self.set_inventory(nextest_inventory())
         result = self.run_script("check")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("unit: 1 tests", result.stdout)
+        self.assertIn("core: 1 tests", result.stdout)
         self.assertIn("daemon: 1 tests", result.stdout)
         self.assertIn("relay: 1 tests", result.stdout)
         self.assertIn("cli: 1 tests", result.stdout)
@@ -511,16 +511,16 @@ class ArchiveActionTests(ScriptScenario):
         self.assertEqual(len(self.nextest_calls()), 7)
 
     def test_an_archive_built_at_any_path_is_accepted_without_calling_nextest(self):
-        result = self.run_script("filter", "unit", "--archive-file", str(self.archive))
+        result = self.run_script("filter", "core", "--archive-file", str(self.archive))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             result.stdout.strip(),
-            shard_expressions(self.config_fast_filter())["unit"])
+            shard_expressions(self.config_fast_filter())["core"])
         self.assertEqual(self.nextest_calls(), [])
 
     def test_a_missing_archive_is_refused_without_calling_nextest(self):
         result = self.run_script(
-            "filter", "unit", "--archive-file", str(self.root / "absent.tar.zst"))
+            "filter", "core", "--archive-file", str(self.root / "absent.tar.zst"))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("nextest archive not found", result.stderr)
         self.assertEqual(self.nextest_calls(), [])
@@ -540,7 +540,7 @@ class EntrypointTests(ScriptScenario):
         self.assertEqual(len(set(printed.values())), len(printed))
 
     def test_an_invalid_shard_or_action_fails(self):
-        for arguments in (("filter", "bogus"), ("bogus", "unit"), ("run",), ()):
+        for arguments in (("filter", "bogus"), ("bogus", "core"), ("run",), ()):
             with self.subTest(arguments=arguments):
                 self.assertNotEqual(self.run_script(*arguments).returncode, 0)
 
@@ -574,7 +574,7 @@ class WorkerRunActionTests(ScriptScenario):
     def test_a_leaked_worker_fails_a_successful_run_and_is_reaped(self):
         pid_file = self.root / "worker.pid"
         result = self.run_script(
-            "run", "unit",
+            "run", "core",
             extra_env={
                 "PARTITIONS_SPAWN_WORKER_PID_FILE": str(pid_file),
                 "PARTITIONS_WORKER_SUBDIR": "worker with spaces",
@@ -599,7 +599,7 @@ class WorkerRunActionTests(ScriptScenario):
         pids = None
         try:
             result = self.run_script(
-                "run", "unit", extra_env={
+                "run", "core", extra_env={
                     "PARTITIONS_SPAWN_WORKER_PID_FILE": str(pid_file),
                     "PARTITIONS_DELETED_WORKER_EXE": "1",
                 },
@@ -626,7 +626,7 @@ class WorkerRunActionTests(ScriptScenario):
         pids = None
         try:
             result = self.run_script(
-                "run", "unit", extra_env={
+                "run", "core", extra_env={
                     "PARTITIONS_SPAWN_WORKER_PID_FILE": str(pid_file),
                     "PARTITIONS_WEIRD_STAT_NAME": "1",
                 },
@@ -646,7 +646,7 @@ class WorkerRunActionTests(ScriptScenario):
 
     def test_a_clean_failing_run_keeps_its_status_and_removes_its_base(self):
         result = self.run_script(
-            "run", "unit", extra_env={"PARTITIONS_FAKE_RUN_STATUS": "3"}
+            "run", "core", extra_env={"PARTITIONS_FAKE_RUN_STATUS": "3"}
         )
         self.assertEqual(result.returncode, 3, result.stderr)
         self.assertNotIn("leaked pohunek-sessiond worker", result.stderr)
@@ -656,7 +656,7 @@ class WorkerRunActionTests(ScriptScenario):
 
     def test_run_removes_a_fixture_tree_with_unreadable_directories(self):
         result = self.run_script(
-            "run", "unit", extra_env={"PARTITIONS_LOCKED_TREE": "1"}
+            "run", "core", extra_env={"PARTITIONS_LOCKED_TREE": "1"}
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         base = Path(self.nextest_calls()[-1]["tmpdir"])
@@ -676,7 +676,7 @@ class WorkerRunActionTests(ScriptScenario):
         try:
             self.assertEqual(worker.stdout.readline().strip(), b"ready")
             worker.stdout.close()
-            result = self.run_script("run", "unit")
+            result = self.run_script("run", "core")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertNotIn("leaked pohunek-sessiond worker", result.stderr)
             self.assertIsNone(worker.poll(), "another run's worker remains live")
@@ -692,7 +692,7 @@ class WorkerRunActionTests(ScriptScenario):
         pids = None
         try:
             result = self.run_script(
-                "run", "unit", extra_env={
+                "run", "core", extra_env={
                     "PARTITIONS_SPAWN_WORKER_PID_FILE": str(pid_file),
                     "PARTITIONS_WORKER_NO_SOCKET": "1",
                 },
@@ -712,7 +712,7 @@ class WorkerRunActionTests(ScriptScenario):
 
     def test_cancellation_stops_the_runner_and_cleans_the_worker(self):
         pid_file = self.root / "worker.pid"
-        command = [sys.executable, str(self.script), "run", "unit"]
+        command = [sys.executable, str(self.script), "run", "core"]
         process = subprocess.Popen(
             command, cwd=self.root,
             env=self.script_environment({
@@ -930,7 +930,7 @@ class JunitReportActionTests(ScriptScenario):
         return report
 
     def test_run_removes_the_effective_profiles_report_before_nextest(self):
-        profiles = (("unit", "ci"), ("heavy", "heavy"), ("relay-db", "relay-db"))
+        profiles = (("core", "ci"), ("heavy", "heavy"), ("relay-db", "relay-db"))
         for shard, profile in profiles:
             with self.subTest(shard=shard):
                 stale = self.stale_report(profile)
@@ -956,7 +956,7 @@ class JunitReportActionTests(ScriptScenario):
             config.write('\n[store]\ndir = "out/nx"\n')
         stale = self.stale_report("ci", store="out/nx")
         result = self.run_script(
-            "run", "unit", extra_env={"PARTITIONS_STALE_REPORT": str(stale)})
+            "run", "core", extra_env={"PARTITIONS_STALE_REPORT": str(stale)})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(stale.exists())
         self.assertFalse(self.nextest_calls()[-1]["stale_report_exists"])

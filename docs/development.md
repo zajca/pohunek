@@ -52,7 +52,7 @@ cargo ti                       # fast daemon/client/session-worker surface
 cargo tw                       # unfiltered full suite, four test processes
 bun test sdk/ts/sdk/test/config.test.ts -t "one case"  # one TypeScript test file, name pattern
 bacon                          # watcher: profile-fast nextest loop (bacon.toml)
-python3 scripts/test-partitions run cli    # exact CI shard (unit/daemon/relay/cli/relay-db/heavy)
+python3 scripts/test-partitions run cli    # exact CI shard (core/daemon/relay/cli/relay-db/heavy)
 python3 scripts/test-partitions check      # verify all tests belong to exactly one shard
 scripts/ci-timings compare --baseline 2026-09-14..2026-09-16 --current 2026-09-20..2026-09-21 \
     --event pull_request --conclusion success   # reproduce CI timing evidence

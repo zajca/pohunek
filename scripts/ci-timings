@@ -918,8 +918,8 @@ Reproducing the numbers in docs/design/test-performance-report.md:
   scripts/ci-timings compare \\
       --baseline 2026-09-14..2026-09-16 --current 2026-09-20..2026-09-21 \\
       --event pull_request --conclusion success --runs
-  scripts/ci-timings junit --label "tests (unit, fast)" --run RUN_ID \
-      junit-unit.xml
+  scripts/ci-timings junit --label "tests (core, fast)" --run RUN_ID \
+      junit-core.xml
   scripts/ci-timings cache --run 35564038269
 
 Fetched run metadata accumulates in target/ci-timings/ci-runs.json. Without
