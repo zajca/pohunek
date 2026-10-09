@@ -1079,6 +1079,10 @@ fn plugin_commands_have_binary_level_json_and_wire_parity() {
             protocol::method::SESSION_SCREEN,
         ),
         (
+            &["session", "screen", "local/s-fixture-1", "--json"],
+            protocol::method::SESSION_SCREEN,
+        ),
+        (
             &[
                 "session",
                 "output",
@@ -1502,7 +1506,7 @@ fn fake_netbird_resolution_reaches_tcp_fixture_with_origin_pair() {
     pohunek_test_support::fs::write_file(
         &netbird,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' '{{\"peers\":{{\"details\":[{{\"fqdn\":\"fixture-remote.netbird.test\",\"netbirdIp\":\"{netbird_ip}\",\"status\":\"Connected\"}}]}}}}'\n"
+            "#!/bin/sh\nprintf '%s\\n' '{{\"peers\":{{\"details\":[{{\"fqdn\":\"fixture-remote.netbird.test\",\"netbirdIp\":\"{netbird_ip}\",\"publicKey\":\"a/real+netbird@key==\",\"status\":\"Connected\"}}]}}}}'\n"
         ),
     )
     .expect("write fake netbird");
@@ -1532,9 +1536,29 @@ fn fake_netbird_resolution_reaches_tcp_fixture_with_origin_pair() {
         let ok = assert_json_success(&output);
         assert_eq!(ok["session_id"], SESSION_ID, "selector {selector}");
     }
+    let peer = pohunek_client::ExternalIdentity::peer_id("a/real+netbird@key==")
+        .expect("stable peer identity")
+        .selector();
+    let route = pohunek_client::remote_host_with_port(&format!("netbird:{peer}"), remote_port)
+        .expect("canonical remote route");
+    let target = format!("{route}/{SESSION_ID}");
+    let output = home
+        .command()
+        .env("PATH", &path)
+        .env("LD_PRELOAD", &connect_redirect)
+        .env("POHUNEK_TEST_CONNECT_CAPTURE", &connect_capture)
+        .env("POHUNEK_REMOTE_PORT", remote_port.to_string())
+        .env(protocol::ENV_SESSION_ID, private_session)
+        .env(protocol::ENV_DAEMON_ID, private_daemon)
+        .args(["session", "screen", &target, "--json"])
+        .output()
+        .expect("run CLI with a provider-qualified target");
+    let ok = assert_json_success(&output);
+    assert_eq!(ok["session_id"], SESSION_ID);
+
     let requests = tcp_fixture.finish();
     let local_requests = local_fixture.finish();
-    assert!(requests.len() >= 6, "every selector reaches TCP fixture");
+    assert!(requests.len() >= 8, "every selector reaches TCP fixture");
     for request in requests {
         assert_eq!(
             request.origin_session_id().map(|id| id.0.as_str()),
@@ -1553,7 +1577,7 @@ fn fake_netbird_resolution_reaches_tcp_fixture_with_origin_pair() {
             .lines()
             .filter(|line| *line == expected_target)
             .count()
-            >= 6,
+            >= 8,
         "every CLI connection must target the fake NetBird address before the test-only redirect"
     );
 }

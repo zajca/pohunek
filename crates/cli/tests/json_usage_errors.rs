@@ -156,6 +156,19 @@ fn missing_required_arg_under_json_is_structured_and_nonzero() {
 }
 
 #[test]
+fn malformed_session_targets_fail_at_the_cli_process_boundary() {
+    for (target, message) in [
+        ("", "empty target"),
+        ("   ", "empty target"),
+        ("host/", "missing session id"),
+        ("/s-42", "missing host"),
+        ("a/b/c", "expected at most one '/'"),
+    ] {
+        assert_json_usage_error(&["session", "inspect", target, "--json"], message);
+    }
+}
+
+#[test]
 fn invalid_enum_value_under_json_is_structured() {
     // A clap invalid-value error under --json. `session new --agent` is a free
     // string (resolved daemon-side), so use `integration install --agent`, whose
