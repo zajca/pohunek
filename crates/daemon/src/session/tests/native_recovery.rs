@@ -388,6 +388,52 @@ async fn a_codex_journal_identity_without_a_verified_launch_stays_unbound() {
 }
 
 #[tokio::test]
+async fn an_expired_unverified_codex_claim_is_diagnosed_as_unverified_not_missing() {
+    let rig = Rig::new("codex-expired-native", false).await;
+    let _snapshot = rig.report(NATIVE_ID).await;
+    rig.finish().await;
+    // The worker keeps the report in its journal while the snapshot filters
+    // the claim once its lease has lapsed. The daemon down for longer than the
+    // lease must still diagnose the existing report as unverified.
+    let journal = rig
+        .config
+        .worker_state_root
+        .as_ref()
+        .expect("worker state root")
+        .join(&rig.session.id.0)
+        .join(format!(
+            "{}.json",
+            rig.durable_record()
+                .runtime
+                .worker_id
+                .expect("recorded worker")
+        ));
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&journal).expect("worker journal")).expect("decode");
+    let expired = (OffsetDateTime::now_utc() - time::Duration::seconds(5))
+        .format(&Rfc3339)
+        .expect("format expired claim expiry");
+    value["active_identity"]["expires_at"] = expired.into();
+    fs::write(
+        &journal,
+        serde_json::to_vec(&value).expect("encode journal"),
+    )
+    .expect("expire the journaled claim");
+    let lapsed = serde_json::from_slice::<serde_json::Value>(&fs::read(&journal).expect("re-read"))
+        .expect("decode lapsed journal");
+    assert_eq!(
+        lapsed["active_identity"]["native_reference"], NATIVE_ID,
+        "the report stays journaled"
+    );
+
+    assert_eq!(
+        rig.refused_resume_code().await,
+        "native_identity_unverified",
+        "an expired report is still evidence, never absence"
+    );
+}
+
+#[tokio::test]
 async fn a_verified_codex_launch_identity_survives_daemon_restart_and_resume() {
     let mut rig = Rig::new("codex-verified-native", true).await;
     let snapshot = rig.report(NATIVE_ID).await;

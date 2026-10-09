@@ -427,6 +427,27 @@ impl SessionRegistry {
             .map(|schema| schema.id.to_owned())
     }
 
+    /// The hook schema a snapshot a worker of `record` carries is validated
+    /// with: the schema id the journal names must resolve, and a worker that
+    /// journaled none is validated with the schema of the record's own
+    /// runtime.
+    fn record_hook_schema(
+        &self,
+        record: &SessionRecord,
+        journaled: Option<&str>,
+    ) -> Result<Option<&'static pohunek_worker_protocol::HookSchema>, &'static str> {
+        reported_hook_schema(journaled).map(|reported| {
+            reported.or_else(|| {
+                let pin = record
+                    .recovery
+                    .as_ref()
+                    .map(|binding| binding.launch_binding.clone())
+                    .unwrap_or_default();
+                self.session_hook_schema(&record.info.agent_base, &pin)
+            })
+        })
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "one locked projection keeps identity and subagent snapshot updates atomic"
@@ -1251,8 +1272,11 @@ impl SessionRegistry {
         }
         // A worker that cannot be reached may still have journaled a switch the
         // daemon never imported; its own generation's journal is the evidence.
+        // A previous-release worker keeps that switch only as its active claim,
+        // which the terminal import applies when no reference is journaled.
         if let Some(snapshot) = journal.and_then(|journal| journal.snapshot().ok()) {
-            import_native_reference(&mut record, &snapshot);
+            let schema = self.record_hook_schema(&record, snapshot.hook_schema.as_deref());
+            import_terminal_native_reference(&mut record, &snapshot, schema);
         }
         let worker = journal.map(JournalEvidence::worker);
         match classify_unreachable(
@@ -2631,6 +2655,14 @@ impl SessionRegistry {
 
     /// Whether this generation journal carries an unpromoted native claim.
     /// An unreadable or ambiguous journal is never classified as absent.
+    ///
+    /// The claim is read from the durable journal itself, not from the
+    /// snapshot it builds: the snapshot filters an active claim whose lease
+    /// has expired, while the report the agent made stays in the journal. A
+    /// diagnostic must not turn the verification failure it expired from into
+    /// a claim of absence, so an expired unpromoted claim still reads as
+    /// present. The snapshot is still built first, so malformed evidence
+    /// remains an error instead of a false absence.
     pub(super) async fn generation_has_native_claim(
         &self,
         record: &SessionRecord,
@@ -2645,12 +2677,12 @@ impl SessionRegistry {
         let Some(journal) = scan.journal_of_generation(generation)? else {
             return Ok(false);
         };
-        let snapshot = journal.snapshot().map_err(str::to_owned)?;
-        Ok(snapshot
+        journal.snapshot().map_err(str::to_owned)?;
+        Ok(journal
             .active_identity
             .as_ref()
-            .is_some_and(|identity| identity.native_reference.is_some())
-            || snapshot.native_reference.is_some())
+            .is_some_and(|claim| claim.native_reference.is_some())
+            || journal.native_reference_claim.is_some())
     }
 
     /// Scans every session's worker journals.
@@ -2766,17 +2798,8 @@ impl SessionRegistry {
                 runtime.runtime_generation
             });
         record.transaction = None;
-        let schema = reported_hook_schema(evidence.hook_schema.as_deref())
-            .map(|reported| {
-                reported.or_else(|| {
-                    let pin = record
-                        .recovery
-                        .as_ref()
-                        .map(|binding| binding.launch_binding.clone())
-                        .unwrap_or_default();
-                    self.session_hook_schema(&record.info.agent_base, &pin)
-                })
-            })
+        let schema = self
+            .record_hook_schema(&record, evidence.hook_schema.as_deref())
             .and_then(|schema| map_worker_subagents(&evidence.subagents, schema));
         match schema {
             Ok(subagents) => record.info.subagents = subagents,
@@ -2785,7 +2808,10 @@ impl SessionRegistry {
             }
         }
         match evidence.snapshot() {
-            Ok(snapshot) => import_native_reference(&mut record, &snapshot),
+            Ok(snapshot) => {
+                let schema = self.record_hook_schema(&record, snapshot.hook_schema.as_deref());
+                import_terminal_native_reference(&mut record, &snapshot, schema);
+            }
             Err(reason) => {
                 tracing::warn!(session_id = %record.session_id, reason, "unreadable terminal worker journal; its native reference is not imported");
             }
@@ -2984,7 +3010,11 @@ impl SessionRegistry {
             }
         }
         terminalize_running_subagents(&mut record.info.subagents, current_time_millis());
-        import_native_reference(&mut record, snapshot);
+        import_terminal_native_reference(
+            &mut record,
+            snapshot,
+            reported_hook_schema(snapshot.hook_schema.as_deref()),
+        );
         if let Some(exit) = &snapshot.exit {
             record.info.exit_code = exit.code;
             record.info.state = if exit.stopped_by_user {
@@ -3708,7 +3738,15 @@ impl SessionRegistry {
             Ok(Some(exit)) => {
                 let mut terminal = record;
                 if let Ok(final_snapshot) = worker.inspect().await {
-                    import_native_reference(&mut terminal, &final_snapshot);
+                    let snapshot = InspectSnapshot {
+                        hook_schema: self.effective_hook_schema_id(&terminal, &final_snapshot),
+                        ..final_snapshot
+                    };
+                    import_terminal_native_reference(
+                        &mut terminal,
+                        &snapshot,
+                        reported_hook_schema(snapshot.hook_schema.as_deref()),
+                    );
                 }
                 terminal.transaction = None;
                 terminal.info.state = SessionState::Stopped;
@@ -4397,30 +4435,10 @@ fn apply_worker_identities_with(
             privately_reported: true,
         });
     };
-    if !identity_claim_expiry_is_valid(&identity.expires_at) {
-        return Err("active_identity_expired_or_overlong");
-    }
-    let schema = schema?
-        .filter(|schema| schema.allows(pohunek_worker_protocol::HookAction::IdentityReport))
-        .filter(|schema| {
-            schema.admits_identity_provider(
-                &identity.provider,
-                Some(super::agent_kind_label(&record.info.agent_base)),
-            )
-        })
-        .ok_or("active_identity_provider_invalid")?;
     let agent_base = RuntimeRef::from_wire(&identity.provider);
-    let (active_id, active_path) = match (
-        identity.reference_kind.as_deref(),
-        identity.native_reference.as_deref(),
-    ) {
-        (Some(kind), Some(reference)) => {
-            let kind = Some(kind)
-                .filter(|kind| schema.admits_reference_kind(kind))
-                .and_then(parse_reference_kind)
-                .ok_or("active_identity_reference_kind_invalid")?;
-            let native = validate_native_reference(kind, reference)
-                .ok_or("active_identity_reference_invalid")?;
+    let reference = verify_active_identity_reference(record, schema, identity)?;
+    let (active_id, active_path) = match reference {
+        Some((kind, native)) => {
             if journaled.is_none() {
                 apply_active_native_reference(record, snapshot, identity, kind, &native);
             }
@@ -4429,8 +4447,7 @@ fn apply_worker_identities_with(
                 SessionRefKind::Path => (None, Some(native)),
             }
         }
-        (None, None) => (None, None),
-        _ => return Err("active_identity_reference_incomplete"),
+        None => (None, None),
     };
     record.info.active_agent = Some(identity.provider.clone());
     record.info.active_agent_base = Some(agent_base);
@@ -4450,6 +4467,48 @@ fn apply_worker_identities_with(
         release: None,
         privately_reported: true,
     })
+}
+
+/// Validates the reference part of a worker's active identity claim exactly as
+/// the live identity import does: the claim must still be leased, the hook
+/// schema must admit the provider for the launch runtime, and the claim's
+/// frozen reference kind must carry a value.
+///
+/// Returns the validated reference, or `None` when the claim reports no
+/// reference at all (a provider-activity report).
+fn verify_active_identity_reference(
+    record: &SessionRecord,
+    schema: Result<Option<&'static pohunek_worker_protocol::HookSchema>, &'static str>,
+    identity: &pohunek_worker_protocol::ActiveIdentityClaim,
+) -> Result<Option<(SessionRefKind, String)>, &'static str> {
+    if !identity_claim_expiry_is_valid(&identity.expires_at) {
+        return Err("active_identity_expired_or_overlong");
+    }
+    let schema = schema?
+        .filter(|schema| schema.allows(pohunek_worker_protocol::HookAction::IdentityReport))
+        .filter(|schema| {
+            schema.admits_identity_provider(
+                &identity.provider,
+                Some(super::agent_kind_label(&record.info.agent_base)),
+            )
+        })
+        .ok_or("active_identity_provider_invalid")?;
+    match (
+        identity.reference_kind.as_deref(),
+        identity.native_reference.as_deref(),
+    ) {
+        (Some(kind), Some(reference)) => {
+            let kind = Some(kind)
+                .filter(|kind| schema.admits_reference_kind(kind))
+                .and_then(parse_reference_kind)
+                .ok_or("active_identity_reference_kind_invalid")?;
+            let native = validate_native_reference(kind, reference)
+                .ok_or("active_identity_reference_invalid")?;
+            Ok(Some((kind, native)))
+        }
+        (None, None) => Ok(None),
+        _ => Err("active_identity_reference_incomplete"),
+    }
 }
 
 fn journaled_reference_matches_ordering(
@@ -4648,6 +4707,50 @@ pub(super) fn import_native_reference(
         .is_some_and(|launch| launch.process == reference.process);
     if same_generation && bound_to_launch {
         let _ = apply_journaled_native_reference(record, snapshot, reference);
+    }
+}
+
+/// Imports a terminal snapshot's native reference, keeping the launch
+/// process's active claim when the durable field is absent.
+///
+/// The journaled reference is the ordered record and always wins when the
+/// worker reports it. A worker that predates that field keeps a conversation
+/// switch only as its leased active identity claim, so a switch committed
+/// between the last metadata import and the terminal transition would be lost
+/// on recovery. When the durable field is absent, the fallback imports the
+/// verified active claim's reference with the same proofs the live identity
+/// import applies — the snapshot's worker instance, the verified launch
+/// process and the ordering of the generation — and never imports a claim the
+/// live import would refuse. Every terminal or final import of a worker
+/// snapshot calls it in place of [`import_native_reference`].
+pub(super) fn import_terminal_native_reference(
+    record: &mut SessionRecord,
+    snapshot: &pohunek_worker_protocol::InspectSnapshot,
+    schema: Result<Option<&'static pohunek_worker_protocol::HookSchema>, &'static str>,
+) {
+    import_native_reference(record, snapshot);
+    if snapshot.native_reference.is_some() {
+        // The worker journaled the ordered record the live metadata import
+        // would have applied; the active claim never outranks it here.
+        return;
+    }
+    let Some(identity) = snapshot.active_identity.as_ref() else {
+        return;
+    };
+    match verify_active_identity_reference(record, schema, identity) {
+        Ok(Some((kind, native))) => {
+            apply_active_native_reference(record, snapshot, identity, kind, &native);
+        }
+        // A claim without a reference, or one the live import would refuse,
+        // imports nothing.
+        Ok(None) => {}
+        Err(reason) => {
+            tracing::warn!(
+                session_id = %record.session_id,
+                reason,
+                "rejected terminal worker active identity claim; its native reference is not imported"
+            );
+        }
     }
 }
 
@@ -6461,6 +6564,114 @@ while os.getppid() == parent:
             .await
             .expect("inspect the ended session");
         assert_eq!(info.native_session_id.as_deref(), Some("journaled-ref"));
+    }
+
+    /// The terminal journal of a previous-release worker: it keeps the
+    /// conversation switch only as its leased active identity claim and
+    /// journals no separate native reference.
+    fn legacy_evidence(record: &SessionRecord) -> super::JournalEvidence {
+        let mut legacy = ended_evidence(record);
+        legacy.native_reference_claim = None;
+        legacy.active_identity = Some(
+            serde_json::from_value(serde_json::json!({
+                "provider": "codex", "sequence": 8, "reference_kind": "id",
+                "native_reference": "switched-before-the-stop",
+                "expires_at": (OffsetDateTime::now_utc() + time::Duration::seconds(30))
+                    .format(&Rfc3339)
+                    .expect("format identity expiry"),
+                "process": {"pid": 50, "start_identity": "500"}
+            }))
+            .expect("active identity"),
+        );
+        legacy
+    }
+
+    /// A previous-release journal holds the switch as the active claim, so
+    /// the terminal import keeps it the way the live identity import would.
+    #[tokio::test]
+    async fn a_terminal_legacy_journal_keeps_the_switched_conversation() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: crate::session::ShellCommand::new("/bin/sh", ["-c", "sleep 1"]),
+            ..SessionRegistryConfig::default()
+        });
+        let record = ended_assigned_record();
+        let id = SessionId(record.session_id.clone());
+        assert!(
+            registry
+                .import_terminal_journal(record.clone(), legacy_evidence(&record))
+                .await
+        );
+        let info = registry
+            .inspect(&id)
+            .await
+            .expect("inspect the ended session");
+        assert_eq!(
+            info.native_session_id.as_deref(),
+            Some("switched-before-the-stop")
+        );
+    }
+
+    /// The active-claim fallback is as strict as the journaled reference: a
+    /// foreign process and a sequence older than the accepted report never
+    /// promote the recovery target, and the same shape with a current
+    /// sequence does.
+    #[test]
+    fn a_terminal_legacy_journal_never_imports_a_claim_that_fails_its_proofs() {
+        let schema = Ok(pohunek_worker_protocol::hook_schema("identity-subagent-v1"));
+        let claim_at = |pid: u32, sequence: u64| {
+            let mut snapshot = legacy_evidence(&ended_assigned_record())
+                .snapshot()
+                .expect("a readable journal");
+            snapshot.active_identity = Some(pohunek_worker_protocol::ActiveIdentityClaim {
+                provider: "codex".to_owned(),
+                process: ProcessIdentity {
+                    pid,
+                    start_identity: u64::from(pid) * 10,
+                },
+                sequence,
+                expires_at: snapshot
+                    .active_identity
+                    .as_ref()
+                    .map(|claim| claim.expires_at.clone())
+                    .expect("an expiry"),
+                reference_kind: Some("id".to_owned()),
+                native_reference: Some("switched-before-the-stop".to_owned()),
+            });
+            snapshot
+        };
+
+        // A claim of another process than the verified launch never imports.
+        let mut foreign = ended_assigned_record();
+        super::import_terminal_native_reference(&mut foreign, &claim_at(999, 8), schema);
+        assert_eq!(
+            foreign.info.native_session_id.as_deref(),
+            Some("assigned-ref"),
+            "a foreign process claim never promotes the recovery target"
+        );
+
+        // A record the launch process already reported at sequence 8 rejects
+        // a delayed claim of sequence 3 and adopts sequence 9.
+        let mut stale = ended_assigned_record();
+        stale.native_identity_ordering = Some(crate::store::NativeIdentityOrdering::accepting(
+            None,
+            "runtime-identity",
+            50,
+            500,
+            crate::store::ReportTransport::Worker,
+            8,
+        ));
+        super::import_terminal_native_reference(&mut stale, &claim_at(50, 3), schema);
+        assert_eq!(
+            stale.info.native_session_id.as_deref(),
+            Some("assigned-ref"),
+            "a delayed claim never replaces the accepted report"
+        );
+        super::import_terminal_native_reference(&mut stale, &claim_at(50, 9), schema);
+        assert_eq!(
+            stale.info.native_session_id.as_deref(),
+            Some("switched-before-the-stop"),
+            "a newer claim of the verified launch process promotes the target"
+        );
     }
 
     #[test]
@@ -10887,6 +11098,8 @@ handler = "codex-hook-v1"
         };
         use crate::session::{SessionRegistry, SessionRegistryConfig};
         use crate::store::{DesiredState, SessionRecord, Store};
+        use time::format_description::well_known::Rfc3339;
+        use time::OffsetDateTime;
 
         /// Sweep grace of the fixtures; short so a `SIGKILL` fallback stays fast.
         const SWEEP_GRACE: Duration = Duration::from_millis(300);
@@ -14783,6 +14996,125 @@ handler = "codex-hook-v1"
             let durable = durable_record(&fixture.root, session);
             assert_eq!(
                 durable.info.native_session_id.as_deref(),
+                Some("switched-before-the-stop")
+            );
+        }
+
+        /// A stop interrupted after its job was retired keeps the conversation
+        /// a previous-release worker journaled: it keeps a switch only as its
+        /// leased active identity claim, with no separate native reference,
+        /// so the startup replay reads that claim.
+        #[tokio::test]
+        #[expect(
+            clippy::too_many_lines,
+            reason = "the legacy restart scenario constructs and verifies durable worker evidence"
+        )]
+        async fn a_stop_replayed_at_startup_keeps_the_switch_the_legacy_worker_journaled() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let session = "s-5242";
+            interrupted_stop(&fixture, session).await;
+            let mut record = durable_record(&fixture.root, session);
+            let instance = record
+                .runtime
+                .worker_instance_id
+                .clone()
+                .expect("the record names its worker instance");
+            record.info.native_session_id = Some("assigned-ref".to_owned());
+            let binding = record.recovery.as_mut().expect("recovery binding");
+            binding.native_session_id = Some("assigned-ref".to_owned());
+            binding.native_reference_provenance = crate::agent::NativeReferenceProvenance::Assigned;
+            binding.native_launch = Some(
+                crate::agent::NativeSessionLaunch::from_templates(
+                    crate::agent::SessionRefKind::Id,
+                    &["--session", "{reference}"],
+                    None,
+                )
+                .expect("resume template")
+                .with_assigned(crate::agent::AssignedReference::new(
+                    crate::agent::NativeArgs::from_template(&["--session-id", "{reference}"])
+                        .expect("launch template"),
+                    crate::agent::ReferenceExistence::Unchecked,
+                ))
+                .expect("an id spec accepts an assignment"),
+            );
+            Store::new(fixture.root.join("data/metadata.jsonl"))
+                .record_session(&record)
+                .expect("persist the assigned record");
+            let existing: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(
+                    fixture
+                        .root
+                        .join("state/workers")
+                        .join(session)
+                        .join(format!("worker-{session}.json")),
+                )
+                .expect("read the worker journal"),
+            )
+            .expect("decode the worker journal");
+            let worker = (
+                u32::try_from(existing["worker_pid"].as_u64().expect("worker pid"))
+                    .expect("pid fits"),
+                existing["worker_start_identity"]
+                    .as_str()
+                    .expect("worker start identity")
+                    .parse::<u64>()
+                    .expect("start identity number"),
+            );
+            let provider = crate::session::agent_kind_label(&record.info.agent_base).to_owned();
+            let process = pohunek_session_worker::ChildIdentity {
+                pid: 50,
+                process_group: 50,
+                start_identity: "500".to_owned(),
+            };
+            let expires_at = (OffsetDateTime::now_utc() + std::time::Duration::from_secs(30))
+                .format(&Rfc3339)
+                .expect("format identity expiry");
+            write_journal_record(
+                &fixture.root,
+                session,
+                &format!("worker-{session}"),
+                TEST_GENERATION,
+                worker,
+                Some(&instance),
+                |journal| {
+                    journal.child = Some(process.clone());
+                    journal.launch_identity = Some(pohunek_session_worker::LaunchIdentity {
+                        provider: provider.clone(),
+                        process: process.clone(),
+                        reference_kind: "id".to_owned(),
+                        native_reference: "assigned-ref".to_owned(),
+                    });
+                    // A v0.33.1 worker journals a conversation switch only as
+                    // the active identity claim, never as a separate native
+                    // reference, so the durable claim is the switch.
+                    journal.active_identity = Some(pohunek_session_worker::ActiveIdentity {
+                        provider,
+                        process,
+                        sequence: 7,
+                        expires_at,
+                        reference_kind: Some("id".to_owned()),
+                        native_reference: Some("switched-before-the-stop".to_owned()),
+                    });
+                },
+            );
+            // The restart starts from an empty registry.
+            fixture.registry.inner.sessions.lock().await.clear();
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile after the restart");
+
+            assert_stopped(&fixture, session).await;
+            let durable = durable_record(&fixture.root, session);
+            assert_eq!(
+                durable.info.native_session_id.as_deref(),
+                Some("switched-before-the-stop")
+            );
+            assert_eq!(
+                durable
+                    .recovery
+                    .as_ref()
+                    .and_then(|binding| binding.native_session_id.as_deref()),
                 Some("switched-before-the-stop")
             );
         }
