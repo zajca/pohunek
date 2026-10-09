@@ -1367,7 +1367,7 @@ jobs:
             ${{ hashFiles('.github/workflows/ci.yml') }}
 
   # Official Pi runtime package against the real, locked Pi release. The job
-  # installs exactly `compat/pi/compatibility-lock.json`'s release from npm,
+  # installs the npm tree pinned by `compat/pi/npm/package-lock.json`,
   # builds the package with `cargo xtask package build`, installs it into a real
   # daemon with explicit-digest trust and drives a real `pi` through launch,
   # detection, resume and fork. The model is a loopback stub: no provider, no
@@ -1395,7 +1395,6 @@ jobs:
           set -euo pipefail
           lock=compat/pi/compatibility-lock.json
           {
-            echo "npm=$(jq -er '.upstream.npm' "$lock")"
             echo "release=$(jq -er '.upstream.release' "$lock")"
             echo "node=$(jq -er '.upstream.node_min' "$lock")"
           } >> "$GITHUB_OUTPUT"
@@ -1409,11 +1408,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          prefix="$RUNNER_TEMP/pi"
-          npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund \
-            "${{ steps.lock.outputs.npm }}@${{ steps.lock.outputs.release }}"
-          echo "$prefix/bin" >> "$GITHUB_PATH"
-          installed="$(env -i PATH="$prefix/bin:$PATH" HOME="$RUNNER_TEMP" pi --version)"
+          project="$GITHUB_WORKSPACE/compat/pi/npm"
+          if ! npm ci --prefix "$project" --ignore-scripts --no-audit --no-fund; then
+            echo "Failed to install the pinned Pi npm tree from $project/package-lock.json" >&2
+            exit 1
+          fi
+          bin="$project/node_modules/.bin"
+          echo "$bin" >> "$GITHUB_PATH"
+          installed="$(env -i PATH="$bin:$PATH" HOME="$RUNNER_TEMP" pi --version)"
           test "$installed" = "${{ steps.lock.outputs.release }}" \
             || { echo "installed Pi $installed is not the locked ${{ steps.lock.outputs.release }}" >&2; exit 1; }
 
@@ -1449,8 +1451,8 @@ jobs:
         run: cargo test --locked -p pohunek-cli --test pi_package -- --include-ignored --test-threads 1
 
   # Official Codex runtime package against the real, locked Codex release. The
-  # job installs exactly `compat/codex/compatibility-lock.json`'s release from
-  # npm, builds the package with `cargo xtask package build`, and runs the
+  # job installs the npm tree pinned by `compat/codex/npm/package-lock.json`,
+  # builds the package with `cargo xtask package build`, and runs the
   # always-on parity tests plus the real-Codex tests: a real `codex` with a
   # fresh CODEX_HOME, a loopback Responses stub, hook trust written by pohunek's
   # own integration install, and every live screen and title read through the
@@ -1479,20 +1481,20 @@ jobs:
         run: |
           set -euo pipefail
           lock=compat/codex/compatibility-lock.json
-          {
-            echo "npm=$(jq -er '.upstream.npm' "$lock")"
-            echo "release=$(jq -er '.upstream.release' "$lock")"
-          } >> "$GITHUB_OUTPUT"
+          echo "release=$(jq -er '.upstream.release' "$lock")" >> "$GITHUB_OUTPUT"
 
       - name: Install the locked Codex release
         shell: bash
         run: |
           set -euo pipefail
-          prefix="$RUNNER_TEMP/codex"
-          npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund \
-            "${{ steps.lock.outputs.npm }}@${{ steps.lock.outputs.release }}"
-          echo "$prefix/bin" >> "$GITHUB_PATH"
-          installed="$(env -i PATH="$prefix/bin:$PATH" HOME="$RUNNER_TEMP" CODEX_HOME="$RUNNER_TEMP/codex-version-home" codex --version)"
+          project="$GITHUB_WORKSPACE/compat/codex/npm"
+          if ! npm ci --prefix "$project" --ignore-scripts --no-audit --no-fund; then
+            echo "Failed to install the pinned Codex npm tree from $project/package-lock.json" >&2
+            exit 1
+          fi
+          bin="$project/node_modules/.bin"
+          echo "$bin" >> "$GITHUB_PATH"
+          installed="$(env -i PATH="$bin:$PATH" HOME="$RUNNER_TEMP" CODEX_HOME="$RUNNER_TEMP/codex-version-home" codex --version)"
           test "$installed" = "codex-cli ${{ steps.lock.outputs.release }}" \
             || { echo "installed Codex '$installed' is not the locked ${{ steps.lock.outputs.release }}" >&2; exit 1; }
 
@@ -1528,9 +1530,9 @@ jobs:
         run: cargo test --locked -p pohunek-cli --test codex_package -- --include-ignored --test-threads 1
 
   # Official Claude Code runtime package against the real, locked Claude Code
-  # release. The job installs exactly `compat/claude/compatibility-lock.json`'s
-  # release from npm (the package's postinstall links the native binary, so
-  # scripts stay enabled), checks the native binary against the lock's SHA-256,
+  # release. The job installs the npm tree pinned by
+  # `compat/claude/npm/package-lock.json` (the package's postinstall links the
+  # native binary, so scripts stay enabled), checks the binary's locked SHA-256,
   # builds the package with `cargo xtask package build`, and runs the always-on
   # parity tests plus the real-Claude tests: a real `claude` with a throwaway
   # CLAUDE_CONFIG_DIR, a dummy API key, a loopback Messages stub, hooks
@@ -1563,7 +1565,6 @@ jobs:
           set -euo pipefail
           lock=compat/claude/compatibility-lock.json
           {
-            echo "npm=$(jq -er '.upstream.npm' "$lock")"
             echo "release=$(jq -er '.upstream.release' "$lock")"
             echo "sha256=$(jq -er '.upstream.sha256["linux-x64"]' "$lock")"
           } >> "$GITHUB_OUTPUT"
@@ -1572,15 +1573,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          prefix="$RUNNER_TEMP/claude"
-          npm install --global --prefix "$prefix" --ignore-scripts=false --no-audit --no-fund \
-            "${{ steps.lock.outputs.npm }}@${{ steps.lock.outputs.release }}"
-          echo "$prefix/bin" >> "$GITHUB_PATH"
-          binary="$(readlink -f "$prefix/bin/claude")"
+          project="$GITHUB_WORKSPACE/compat/claude/npm"
+          if ! npm ci --prefix "$project" --ignore-scripts=false --no-audit --no-fund; then
+            echo "Failed to install the pinned Claude Code npm tree from $project/package-lock.json" >&2
+            exit 1
+          fi
+          bin="$project/node_modules/.bin"
+          echo "$bin" >> "$GITHUB_PATH"
+          binary="$(readlink -f "$bin/claude")"
           actual="$(sha256sum "$binary" | cut -d' ' -f1)"
           test "$actual" = "${{ steps.lock.outputs.sha256 }}" \
             || { echo "installed Claude Code binary $actual is not the locked ${{ steps.lock.outputs.sha256 }}" >&2; exit 1; }
-          installed="$(env -i PATH="$prefix/bin:$PATH" HOME="$RUNNER_TEMP" CLAUDE_CONFIG_DIR="$RUNNER_TEMP/claude-version-home" claude --version)"
+          installed="$(env -i PATH="$bin:$PATH" HOME="$RUNNER_TEMP" CLAUDE_CONFIG_DIR="$RUNNER_TEMP/claude-version-home" claude --version)"
           test "$installed" = "${{ steps.lock.outputs.release }} (Claude Code)" \
             || { echo "installed Claude Code '$installed' is not the locked ${{ steps.lock.outputs.release }}" >&2; exit 1; }
 
