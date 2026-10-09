@@ -292,6 +292,19 @@ fn help_exits_zero_even_with_json_present() {
 }
 
 #[test]
+fn positional_json_text_does_not_enable_structured_output() {
+    let output = pohunek()
+        .args(["session", "input", "s-1", "--", "--json"])
+        .output()
+        .expect("spawn pohunek");
+
+    assert!(!output.status.success(), "the private home has no daemon");
+    assert!(output.stdout.is_empty(), "a human error has no JSON stdout");
+    let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
+    assert!(stderr.contains("cannot reach the daemon"), "{stderr}");
+}
+
+#[test]
 fn mixed_input_sources_are_a_versioned_usage_error() {
     let out = pohunek()
         .args([

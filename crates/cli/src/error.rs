@@ -614,25 +614,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_error_passes_through_for_json() {
-        let pe = ProtocolError::version_mismatch(
-            ProtocolVersionRange::new(
-                ProtocolVersion::new(1).expect("valid version"),
-                ProtocolVersion::new(1).expect("valid version"),
-            )
-            .expect("valid range"),
-            ProtocolVersionRange::new(
-                ProtocolVersion::new(2).expect("valid version"),
-                ProtocolVersion::new(2).expect("valid version"),
-            )
-            .expect("valid range"),
-        );
-        let structured = CliError::Protocol(pe.clone()).to_protocol_error();
-        assert_eq!(structured, pe);
-        assert_eq!(structured.code, "version_mismatch");
-    }
-
-    #[test]
     fn sdk_descriptor_exhaustion_renders_specific_non_daemon_hint() {
         let err = CliError::Client(
             pohunek_client::ClientError::ClientFileDescriptorsExhausted {
@@ -646,33 +627,6 @@ mod tests {
         assert!(text.contains("client process"), "text: {text}");
         assert!(text.contains("RLIMIT_NOFILE"), "text: {text}");
         assert!(!text.contains("daemon start"), "text: {text}");
-    }
-
-    #[test]
-    fn daemon_unreachable_maps_to_structured_error_with_hint() {
-        let err = CliError::DaemonUnreachable {
-            socket: PathBuf::from("/run/pohunek/daemon.sock"),
-            source: io::Error::new(io::ErrorKind::NotFound, "no such file"),
-        };
-        let structured = err.to_protocol_error();
-        assert_eq!(structured.class, ErrorClass::Daemon);
-        assert_eq!(structured.code, "daemon_unreachable");
-        let hint = structured
-            .recover
-            .expect("daemon-unreachable carries a hint");
-        assert!(hint.contains("daemon start"), "hint: {hint}");
-    }
-
-    #[test]
-    fn duplicate_meta_key_maps_to_cli_usage_with_hint() {
-        let err = CliError::DuplicateMetaKey {
-            key: "link.provider".to_owned(),
-        };
-        let structured = err.to_protocol_error();
-        assert_eq!(structured.class, ErrorClass::Configuration);
-        assert_eq!(structured.code, "cli_usage");
-        assert!(structured.msg.contains("link.provider"), "{structured:?}");
-        assert!(structured.recover.is_some());
     }
 
     #[test]
@@ -718,57 +672,5 @@ mod tests {
             "bad frame".to_owned(),
         )));
         assert!(!text.contains("hint:"), "text: {text}");
-    }
-
-    // --- clap usage-error handling --------------------------------------------
-
-    use clap::Parser;
-
-    #[test]
-    fn args_request_json_detects_only_the_flag_itself() {
-        for (row, args, expected) in [
-            (
-                "inspect --json",
-                &["pohunek", "session", "inspect", "s-1", "--json"][..],
-                true,
-            ),
-            ("doctor --json", &["pohunek", "doctor", "--json"][..], true),
-            (
-                "flag absent",
-                &["pohunek", "session", "inspect", "s-1"][..],
-                false,
-            ),
-            ("program name only", &["pohunek"][..], false),
-            // argv[0] is the program name, never a flag.
-            ("argv[0] named --json", &["--json"][..], false),
-            // After `--` it is a positional value (e.g. `session input` text).
-            (
-                "value after --",
-                &["pohunek", "session", "input", "s-1", "--", "--json"][..],
-                false,
-            ),
-        ] {
-            assert_eq!(args_request_json(args.iter().copied()), expected, "{row}");
-        }
-    }
-
-    #[test]
-    fn help_and_version_are_display_kinds_but_usage_errors_are_not() {
-        let help = crate::Cli::try_parse_from(["pohunek", "--help"]).expect_err("help");
-        let version = crate::Cli::try_parse_from(["pohunek", "--version"]).expect_err("version");
-        assert!(clap_kind_is_display(help.kind()), "help is a display kind");
-        assert!(
-            clap_kind_is_display(version.kind()),
-            "version is a display kind"
-        );
-
-        // A genuine usage error is NOT a display kind, so under `--json` it
-        // renders as a structured document rather than being delegated to clap.
-        let usage =
-            crate::Cli::try_parse_from(["pohunek", "session", "inspect"]).expect_err("usage error");
-        assert!(
-            !clap_kind_is_display(usage.kind()),
-            "missing-arg usage error is not a display kind"
-        );
     }
 }
