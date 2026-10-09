@@ -46,6 +46,10 @@ use crate::service::usage::tests::{
 
 const V1: &str = "1.0.0";
 const V2: &str = "2.0.0";
+/// A supervised version older than and unrelated to the installed one.
+const OLDER: &str = "0.9.0";
+/// A supervised version newer than and unrelated to the installed one.
+const V3: &str = "3.0.0";
 const GENERATION: &str = "abcd2345";
 /// Main process of the fake supervised daemon job while it runs.
 const DAEMON_PID: Pid = 4_242;
@@ -2296,6 +2300,185 @@ async fn uninstall_refuses_live_sessions_while_a_pending_install_has_registered_
         .expect("uninstall with --stop-sessions");
     assert_eq!(report.stopped_sessions, [SESSION]);
     harness.assert_clean();
+}
+
+#[tokio::test]
+async fn uninstall_of_an_upgrade_interrupted_immediately_before_replacement_stops_sessions_through_the_previous_daemon(
+) {
+    // The interruption lands after `service.toml` already names the new
+    // version but before the service-manager register call: the previous
+    // daemon still runs and owns the store readership, and doing nothing to
+    // it is the only safe removal.
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registering);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted before the service-manager call");
+    assert_eq!(harness.fake.daemon_version().as_deref(), Some(V1));
+    assert!(harness.fake.world().running);
+    assert_eq!(harness.fake.world().replaces, 0, "no replacement call");
+    let config = harness.config().expect("service.toml exists");
+    assert_eq!(
+        config.active_version(),
+        V2,
+        "service.toml names the new version"
+    );
+    assert_eq!(
+        harness.pending().expect("record stays pending").step,
+        Step::Registering
+    );
+    harness.fake.seed(
+        vec![session(SESSION, Some("review"))],
+        vec![worker(worker_id(SESSION), ServiceState::Running)],
+    );
+
+    let error = harness
+        .engine()
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect_err("refused");
+    let Error::LiveSessions { sessions, .. } = &error else {
+        panic!("unexpected error {error:?}");
+    };
+    assert_eq!(sessions.len(), 1);
+    // Nothing was replaced or unlocked: the previous daemon keeps running,
+    // `service.toml`, and the record all survive for the rerun.
+    assert_eq!(harness.fake.world().replaces, 0);
+    assert_eq!(harness.fake.daemon_version().as_deref(), Some(V1));
+    assert_eq!(
+        harness
+            .config()
+            .expect("service.toml survives")
+            .active_version(),
+        V2
+    );
+    assert_eq!(
+        harness.pending().expect("record stays pending").step,
+        Step::Registering
+    );
+
+    let report = harness
+        .engine()
+        .uninstall(UninstallOptions {
+            stop_sessions: true,
+            purge: false,
+        })
+        .await
+        .expect("uninstall with --stop-sessions");
+    assert_eq!(report.stopped_sessions, [SESSION]);
+    assert_eq!(
+        harness.fake.world().replaces,
+        0,
+        "the previous daemon is never replaced"
+    );
+    harness.assert_clean();
+}
+
+#[tokio::test]
+async fn uninstall_refuses_a_supervised_daemon_of_a_foreign_or_older_version_before_any_change() {
+    // The job runs a daemon neither the configuration nor a pending
+    // transaction proves belongs to this installation: the removal must
+    // refuse before it asks for or stops a session. A completed install has
+    // the daemon job registered and running its version.
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let config = harness.config().expect("service.toml exists");
+    let definition = harness.fake.world().registered.clone().expect("definition");
+    harness.fake.seed(
+        vec![session(SESSION, Some("review"))],
+        vec![worker(worker_id(SESSION), ServiceState::Running)],
+    );
+    for foreign in [OLDER, V3] {
+        let foreign_config = with_version(&config, foreign).expect("with_version");
+        harness.fake.world().registered =
+            Some(daemon_definition(&harness.context, &foreign_config).expect("definition"));
+
+        let error = harness
+            .engine()
+            .uninstall(UninstallOptions {
+                stop_sessions: true,
+                purge: false,
+            })
+            .await
+            .expect_err("refused");
+        let Error::SupervisedVersion { served, accepted } = &error else {
+            panic!("unexpected error {error:?}");
+        };
+        assert_eq!(served, foreign);
+        assert_eq!(*accepted, [V1]);
+        assert_eq!(error.code(), "service_daemon_version_unexpected");
+        // The refusal happened without touching a session: nothing stopped
+        // and nothing was removed.
+        assert_eq!(harness.fake.world().sessions.len(), 1);
+        assert!(harness.fake.world().running);
+        assert!(harness.config().is_some());
+        assert_eq!(harness.fake.world().workers.len(), 1);
+    }
+    // The original supervised daemon still serves, and the uninstall
+    // proceeds through it unchanged.
+    harness.fake.world().registered = Some(definition);
+    let report = harness
+        .engine()
+        .uninstall(UninstallOptions {
+            stop_sessions: true,
+            purge: false,
+        })
+        .await
+        .expect("uninstall");
+    assert_eq!(report.stopped_sessions, [SESSION]);
+    harness.assert_clean();
+}
+
+#[tokio::test]
+async fn uninstall_refuses_an_unexpected_supervised_version_even_without_live_sessions() {
+    // No session and no worker may make the mismatch harmless: nothing here
+    // proves the unexpected daemon belongs to this installation, so the
+    // uninstall refuses before its first destructive call.
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let config = harness.config().expect("service.toml exists");
+    let foreign = daemon_definition(
+        &harness.context,
+        &with_version(&config, V3).expect("with_version"),
+    )
+    .expect("definition");
+    harness.fake.world().registered = Some(foreign);
+
+    let error = harness
+        .engine()
+        .uninstall(UninstallOptions {
+            stop_sessions: true,
+            purge: true,
+        })
+        .await
+        .expect_err("refused");
+    let Error::SupervisedVersion { served, accepted } = &error else {
+        panic!("unexpected error {error:?}");
+    };
+    assert_eq!(served, V3);
+    assert_eq!(*accepted, [V1]);
+    // Nothing was removed: the supervised job, the daemon it runs (through
+    // `--purge` the durable metadata must also have survived), `service.toml`,
+    // and the version directory all stay.
+    assert!(harness.fake.world().running);
+    assert!(harness.fake.world().registered.is_some());
+    assert!(harness.fake.world().workers.is_empty());
+    assert!(harness.fake.world().sessions.is_empty());
+    assert!(harness.config().is_some());
+    assert_eq!(
+        layout::installed_versions(&harness.layout())
+            .expect("versions")
+            .len(),
+        1
+    );
+    assert_eq!(
+        harness.engine().store.load().expect("load record"),
+        None,
+        "the purge ran nowhere: the daemon job alone still serves the store"
+    );
 }
 
 #[tokio::test]

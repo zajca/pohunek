@@ -349,6 +349,24 @@ pub enum Error {
         last: Option<String>,
     },
 
+    /// The supervised daemon job serves a version the command may not use.
+    ///
+    /// A removal reaches only the daemon a pending transaction or the
+    /// configuration proves belongs to it; anything else running the job —
+    /// for example another installation's daemon swapped in — must not be
+    /// stopped or asked for its sessions here. The refusal happens before
+    /// any session mutation.
+    #[error(
+        "the supervised daemon job reports version {served}; only {} is accepted here",
+        accepted.join(" or ")
+    )]
+    SupervisedVersion {
+        /// The version the serving process reports.
+        served: String,
+        /// The versions the command proves belong to this installation.
+        accepted: Vec<String>,
+    },
+
     /// A control request to the local daemon failed.
     #[error("daemon request `{operation}` failed: {source}")]
     Control {
@@ -556,6 +574,7 @@ impl Error {
             Self::VerifierMissing => "service_verifier_missing",
             Self::UnitVerification { .. } => "service_unit_invalid",
             Self::DaemonNotReady { .. } => "service_daemon_not_ready",
+            Self::SupervisedVersion { .. } => "service_daemon_version_unexpected",
             Self::Control { .. } => "service_daemon_request_failed",
             Self::LiveSessions { .. } => "service_live_sessions",
             Self::StopTimeout { .. } => "service_stop_timeout",
@@ -656,6 +675,9 @@ impl Error {
             Self::DaemonNotReady { .. } => {
                 Some("inspect the daemon logs, then rerun the command to resume or roll back")
             }
+            Self::SupervisedVersion { .. } => Some(
+                "inspect which daemon the service job now runs (for example through `systemctl cat` or `launchctl print`), and decide through which pohunek installation's commands it should be stopped or replaced before this command continues",
+            ),
             Self::RollbackFailed { .. } => {
                 Some("rerun the same command; the transaction record resumes the rollback")
             }

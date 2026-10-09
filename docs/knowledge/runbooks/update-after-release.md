@@ -338,9 +338,17 @@ run its daemon with live workers, so it is never rolled back directly: an
 interrupted install met by `pohunek service upgrade`, or by `service install`
 with another version or prefix, fails with `service_install_pending` and
 changes nothing, and `pohunek service uninstall` removes an interrupted
-install — or an interrupted upgrade whose daemon was already replaced — through
+install — or an interrupted upgrade — through
 the full session-checked uninstall instead (`--stop-sessions` stops the live
-sessions), without restoring the previous daemon.
+sessions), without restoring the previous daemon. Whether the upgrade's daemon
+was replaced or the replacement was interrupted before its service-manager
+call makes no difference: the uninstall reaches the daemon that actually
+serves the supervised job, as long as its version is one the configuration or
+the pending transaction proves belongs to the installation — the active one,
+or the previous version of a pending upgrade at or after `registering`. A job
+actually serving anything else fails at once with
+`service_daemon_version_unexpected`, before the uninstall touches a session —
+even when no session or worker is live at all.
 Rerun `pohunek service install` (or `packaging/install-daemon.sh`) to finish
 it: the same version and prefix resume. The same rule covers an install whose
 step fails at or after `registering` without an interruption: a service-manager

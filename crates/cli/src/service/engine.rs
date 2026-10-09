@@ -354,6 +354,19 @@ impl<'a> Engine<'a> {
         version
     }
 
+    /// Returns whether `daemon_version` is a version `serving` accepts.
+    ///
+    /// Every comparison runs through [`Engine::reported`], so a reported
+    /// build name judges the same for the expectation and for the daemon.
+    fn serving_matches(&self, daemon_version: &str, serving: &Serving<'_>) -> bool {
+        match serving {
+            Serving::Strict(version) => daemon_version == self.reported(version),
+            Serving::Allowed(allowed) => allowed
+                .iter()
+                .any(|version| daemon_version == self.reported(version)),
+        }
+    }
+
     /// Installs `version` from the binaries in `from` below `prefix`.
     ///
     /// # Errors
@@ -723,9 +736,22 @@ impl<'a> Engine<'a> {
         layout::claim_existing_prefix(&layout, &config.namespace())?;
         let definition = daemon_definition(self.context, &config)?;
 
-        let reachable = self
-            .ensure_daemon(&definition, config.active_version(), &mut report)
-            .await;
+        let reachable = match self
+            .ensure_daemon(
+                &definition,
+                config.active_version(),
+                &allowed_removal_versions(config.active_version(), registered.as_ref()),
+                &mut report,
+            )
+            .await
+        {
+            // A supervised version outside the removal's set is a proven
+            // property of the job, not an unreachable daemon: it refuses the
+            // uninstall before any destructive call, whatever the sessions
+            // and workers then report — even with none live.
+            Err(error @ Error::SupervisedVersion { .. }) => return Err(error),
+            reachable => reachable,
+        };
         let sessions = match &reachable {
             Ok(()) => self
                 .backend
@@ -736,6 +762,9 @@ impl<'a> Engine<'a> {
                     operation: "session.list",
                     source,
                 })?,
+            // An unreachable daemon proves no session of this installation
+            // can be listed or stopped; without live sessions or workers the
+            // removal below reaches the job (or its absence) directly.
             Err(_unreachable) => Vec::new(),
         };
         let (live, workers) = self.blocking(&sessions).await?;
@@ -1202,19 +1231,39 @@ impl<'a> Engine<'a> {
     /// such as a manually started daemon, can hold the socket while the
     /// supervised job crash-loops, and must never make a transaction ready.
     async fn wait_ready(&self, version: &str) -> Result<(), Error> {
+        self.wait_served(&Serving::Strict(version), version).await
+    }
+
+    /// Waits until the supervised daemon answers `daemon.health`.
+    ///
+    /// [`Serving::Strict`] compares the answer against [`Engine::reported`]
+    /// of that one version; [`Serving::Allowed`] accepts any version in the
+    /// set, applied through [`Engine::reported`] as well. The answer counts
+    /// only when the process serving the socket is the daemon job's running
+    /// main process, and a job that serves a version outside its expectation
+    /// is refused immediately instead of being waited for.
+    async fn wait_served(&self, serving: &Serving<'_>, version: &str) -> Result<(), Error> {
         let deadline = Instant::now() + self.ready_timeout;
         loop {
             let mut last = match self.backend.control().health().await {
-                Ok(health) if health.result.daemon_version == self.reported(version) => {
+                Ok(health) if self.serving_matches(&health.result.daemon_version, serving) => {
                     match self.served_by_job(health.pid).await {
                         Ok(()) => return Ok(()),
                         Err(mismatch) => Some(mismatch),
                     }
                 }
-                Ok(health) => Some(format!(
-                    "daemon reports version {}",
-                    health.result.daemon_version
-                )),
+                Ok(health) => match serving {
+                    Serving::Strict(_) => Some(format!(
+                        "daemon reports version {}",
+                        health.result.daemon_version
+                    )),
+                    Serving::Allowed(allowed) => {
+                        return Err(Error::SupervisedVersion {
+                            served: health.result.daemon_version.clone(),
+                            accepted: allowed.to_vec(),
+                        });
+                    }
+                },
                 Err(error) => Some(error.to_string()),
             };
             if Instant::now() >= deadline {
@@ -1263,21 +1312,29 @@ impl<'a> Engine<'a> {
     }
 
     /// Starts an installed daemon that is not running, then waits for it.
+    ///
+    /// A daemon that already runs is left alone and answered by the version
+    /// it actually serves, which a removal may reach only within `allowed`
+    /// ([`allowed_removal_versions`]; see [`Error::SupervisedVersion`]).
+    /// A daemon started here is the configured one and must report `version`
+    /// exactly.
     async fn ensure_daemon(
         &self,
         definition: &JobDefinition,
         version: &str,
+        allowed: &[String],
         report: &mut UninstallReport,
     ) -> Result<(), Error> {
         let daemon = self.backend.daemon();
-        match daemon.inspect().await {
-            Ok(observation) if observation.state == ServiceState::Running => {}
+        let running = match daemon.inspect().await {
+            Ok(observation) if observation.state == ServiceState::Running => true,
             Ok(_stopped) => {
                 daemon
                     .replace(definition)
                     .await
                     .map_err(|source| supervisor_error("start daemon", source))?;
                 report.started_daemon = true;
+                false
             }
             Err(supervisor::Error::NotFound(_)) => {
                 daemon
@@ -1285,10 +1342,15 @@ impl<'a> Engine<'a> {
                     .await
                     .map_err(|source| supervisor_error("start daemon", source))?;
                 report.started_daemon = true;
+                false
             }
             Err(source) => return Err(supervisor_error("inspect daemon", source)),
+        };
+        if running {
+            self.wait_served(&Serving::Allowed(allowed), version).await
+        } else {
+            self.wait_ready(version).await
         }
-        self.wait_ready(version).await
     }
 
     /// Returns live sessions and live worker runtimes not covered by them.
@@ -1595,6 +1657,34 @@ fn layout_log_dir(context: &Context) -> Result<(), Error> {
     )
     .map(drop)
     .map_err(|source| super::error::fs_error("create launchd log directory", source))
+}
+
+/// The reported version a supervised readiness check accepts.
+enum Serving<'a> {
+    /// Only this version makes the daemon ready: a transaction observes its
+    /// one replacement, so readiness is the proof it happened.
+    Strict(&'a str),
+    /// Every named version is accepted: the supervised job may have been
+    /// replaced before the job registration landed, and serving through that
+    /// daemon is the removal's job.
+    Allowed(&'a [String]),
+}
+
+/// The versions a removal may serve through: the configured one, plus — for
+/// a pending upgrade at or after `registering` — the version whose daemon the
+/// interrupted transaction may have left running while `service.toml` already
+/// names the new one. Any other supervised version is refused before the
+/// removal touches a session.
+fn allowed_removal_versions(active: &str, pending: Option<&Record>) -> Vec<String> {
+    let mut allowed = vec![active.to_owned()];
+    if let Some(pending) = pending {
+        if pending.operation == Operation::Upgrade && pending.step >= Step::Registering {
+            if let Some(previous) = pending.previous_version.as_deref().filter(|p| *p != active) {
+                allowed.push(previous.to_owned());
+            }
+        }
+    }
+    allowed
 }
 
 /// Returns whether a session may still own a live PTY.
