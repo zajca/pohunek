@@ -887,9 +887,23 @@ async fn a_terminal_stop_never_imports_a_foreign_switch_process() {
     let (rig, _value, exit) =
         switched_legacy_session("codex-legacy-switch-foreign-stop", true, |value| {
             value["active_identity"]["process"]["pid"] = 999.into();
-            value["active_identity"]["process"]["start_identity"] = 9990.into();
+            value["active_identity"]["process"]["start_identity"] = "9990".into();
         })
         .await;
+
+    let snapshot = rig
+        .registry
+        .generation_journal_snapshot(&rig.durable_record())
+        .await
+        .expect("patched foreign-process journal remains readable");
+    assert_eq!(
+        snapshot
+            .active_identity
+            .expect("foreign claim remains in the journal")
+            .process
+            .pid,
+        999,
+    );
 
     assert!(
         rig.registry.stop(&rig.session.id).await.is_err(),
