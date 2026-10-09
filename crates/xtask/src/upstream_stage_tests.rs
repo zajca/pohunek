@@ -8,7 +8,9 @@
 
 // Rust guideline compliant 2026-10-08
 
+use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{symlink, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -31,7 +33,7 @@ const BINARY: &str = "up";
 const BANNER: &str = "fake-cli 1.2.3";
 const REGISTRY: &str = "https://registry.example.test/";
 
-/// Tool search path of the shim and the probe: coreutils only.
+/// Tool search path of the shim and the POSIX verifier.
 const TOOL_PATH: &str = "/usr/bin:/bin";
 
 fn sri(fill: char) -> String {
@@ -568,6 +570,69 @@ fn malformed_links_manifest_is_refused_by_both_verifiers() {
 }
 
 #[test]
+fn raw_invalid_bytes_in_manifests_are_refused_by_both_verifiers() {
+    use sha2::{Digest as _, Sha256};
+
+    let fixture = Fixture::new();
+    let stage = fixture.staged();
+    let sha_path = stage.join("STAGE.sha256");
+    let sha_original = fs::read(&sha_path).expect("sha256 manifest");
+    let raw_name = b"lib/node_modules/dep/bad\xffname";
+    let content = b"invalid UTF-8 path\n";
+    write_file(stage.join(OsStr::from_bytes(raw_name)), content).expect("raw named file");
+    let mut sha = sha_original.clone();
+    sha.extend_from_slice(format!("{:x}  ", Sha256::digest(content)).as_bytes());
+    sha.extend_from_slice(raw_name);
+    sha.push(b'\n');
+    write_file(&sha_path, sha).expect("raw sha256 manifest");
+    refused(fixture.verify(), "STAGE.sha256", Fault::Malformed);
+    assert!(
+        !fixture.posix_verify(),
+        "POSIX verifier accepted invalid UTF-8 in a file path"
+    );
+
+    fs::remove_file(stage.join(OsStr::from_bytes(raw_name))).expect("remove raw named file");
+    write_file(&sha_path, sha_original).expect("restore sha256 manifest");
+    let link_path = stage.join("bin/up");
+    fs::remove_file(&link_path).expect("remove staged link");
+    let raw_target = b"../lib/node_modules/@fake/up/bin/up.sh\xff";
+    symlink(OsStr::from_bytes(raw_target), &link_path).expect("raw target link");
+    let links_path = stage.join("STAGE.links");
+    let original = fs::read_to_string(&links_path).expect("links manifest");
+    let mut links = original
+        .replace("link\tbin/up\t../lib/node_modules/@fake/up/bin/up.sh\n", "")
+        .into_bytes();
+    links.extend_from_slice(b"link\tbin/up\t");
+    links.extend_from_slice(raw_target);
+    links.push(b'\n');
+    write_file(&links_path, links).expect("raw links manifest");
+    refused(fixture.verify(), "STAGE.links", Fault::Malformed);
+    assert!(
+        !fixture.posix_verify(),
+        "POSIX verifier accepted invalid UTF-8 in a link target"
+    );
+}
+
+#[test]
+fn a_nul_in_links_manifest_is_refused_by_both_verifiers() {
+    let fixture = Fixture::new();
+    let stage = fixture.staged();
+    let links_path = stage.join("STAGE.links");
+    let original = fs::read_to_string(&links_path).expect("links manifest");
+    let mut links = original
+        .replace("exec\tlib/node_modules/@fake/up/bin/up.sh\n", "")
+        .into_bytes();
+    links.extend_from_slice(b"exec\tlib/node_modules/@fake/up/bin/up.sh\0\n");
+    write_file(&links_path, links).expect("links manifest with NUL");
+
+    refused(fixture.verify(), "STAGE.links", Fault::Malformed);
+    assert!(
+        !fixture.posix_verify(),
+        "POSIX verifier accepted a NUL byte"
+    );
+}
+
+#[test]
 fn a_link_outside_the_stage_is_refused_by_both_verifiers() {
     let fixture = Fixture::new();
     let stage = fixture.staged();
@@ -590,6 +655,42 @@ fn a_link_outside_the_stage_is_refused_by_both_verifiers() {
         !fixture.posix_verify(),
         "POSIX verifier accepted an escaping link target"
     );
+}
+
+#[test]
+fn a_symlinked_stage_root_is_refused_by_both_verifiers() {
+    let fixture = Fixture::new();
+    let stage = fixture.staged();
+    let real = fixture.out().join("real-stage");
+    fs::rename(&stage, &real).expect("move the stage directory");
+    symlink("real-stage", &stage).expect("link the stage root");
+
+    refused(fixture.verify(), RUNTIME, Fault::TypeChanged);
+    assert!(
+        !fixture.posix_verify(),
+        "POSIX verifier followed a symlinked stage root"
+    );
+}
+
+#[test]
+fn unsafe_empty_directory_names_are_refused_by_both_verifiers() {
+    for name in [
+        OsStr::new("bad\\name"),
+        OsStr::new("bad\nname"),
+        OsStr::new("bad\u{85}name"),
+        OsStr::from_bytes(b"bad\xffname"),
+    ] {
+        let fixture = Fixture::new();
+        let stage = fixture.staged();
+        fs::create_dir(stage.join(name)).expect("create unsafe empty directory");
+
+        let (_subject, fault, _more) = refusal(fixture.verify());
+        assert_eq!(fault, Fault::UnsafeName);
+        assert!(
+            !fixture.posix_verify(),
+            "POSIX verifier accepted an unsafe empty directory: {name:?}"
+        );
+    }
 }
 
 #[test]
@@ -637,6 +738,22 @@ fn malformed_sha256_manifest_is_refused_by_both_verifiers() {
             "{name}: POSIX verifier accepted it"
         );
     }
+}
+
+#[test]
+fn a_group_execute_bit_does_not_mean_owner_executable() {
+    let fixture = Fixture::new();
+    let stage = fixture.staged();
+    let file = stage.join("lib/node_modules/dep/index.js");
+    fs::set_permissions(file, fs::Permissions::from_mode(0o650)).expect("set group execute only");
+
+    fixture
+        .verify()
+        .expect("Rust verifier checks only the owner execute bit");
+    assert!(
+        fixture.posix_verify(),
+        "POSIX verifier treated group execute as owner execute"
+    );
 }
 
 #[cfg(target_os = "linux")]

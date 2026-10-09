@@ -81,16 +81,20 @@ project remain the root of trust.
 
 Where no Rust tooling exists (the isolated namespace) run this POSIX `sh`
 verifier with the stage directory as its argument. It needs `sha256sum`,
-`find`, `sed`, `sort`, `grep` and `readlink` (coreutils or busybox) and fails on
+`find`, `sed`, `sort`, `grep`, `readlink`, `iconv`, `tr` and `wc` and fails on
 every drift `verify-stage` refuses, except the checks against the committed
 project and the lock. Keep the script in the repository or the runner, not in
 the stage, which could otherwise only verify itself:
 
 ```sh
 set -eu
+[ -d "$1" ] && [ ! -h "$1" ] || exit 1
 cd "$1"
 for manifest in STAGE.sha256 STAGE.links; do
   [ -f "$manifest" ] && [ ! -h "$manifest" ] || exit 1
+  # Shell read can discard NUL, so validate raw bytes before parsing.
+  iconv -f UTF-8 -t UTF-8 "$manifest" >/dev/null 2>&1 || exit 1
+  [ "$(LC_ALL=C tr -cd '\000' < "$manifest" | wc -c)" -eq 0 ] || exit 1
 done
 tab=$(printf '\t')
 nl='
@@ -135,6 +139,19 @@ stays_inside() (
 contains_line() {
   [ -n "$1" ] && printf '%s\n' "$1" | grep -Fxq -- "$2"
 }
+# Pass each directory as an argument so a newline in its name stays visible.
+find . -type d -exec sh -c '
+  control=$1
+  newline=$2
+  shift 2
+  for dir do
+    [ "$dir" = . ] && continue
+    name=${dir##*/}
+    printf "%s" "$name" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 || exit 1
+    case $name in *\\*|*"$newline"*) exit 1 ;; esac
+    if printf "%s" "$name" | LC_ALL=C grep -q -e "[[:cntrl:]]" -e "$control"; then exit 1; fi
+  done
+' sh "$c1_prefix[$c1_first-$c1_last]" "$nl" {} + || exit 1
 files=
 while :; do
   line=
@@ -177,14 +194,19 @@ while :; do
   esac
 done < STAGE.links
 expected=$({ printf '%s\n' "$files"; printf '%s\n' "$links"; } | sed '/^$/d' | LC_ALL=C sort)
-actual=$(find . -path ./STAGE.sha256 -prune -o -path ./STAGE.links -prune -o ! -type d -print | sed 's|^\./||' | LC_ALL=C sort)
+actual=$(
+  found=$(find . -path ./STAGE.sha256 -prune -o -path ./STAGE.links -prune -o ! -type d -print) || exit 1
+  printf '%s\n' "$found" | sed 's|^\./||' | LC_ALL=C sort
+)
 [ "$expected" = "$actual" ]
 printf '%s\n' "$files" | while IFS= read -r path; do
   [ -f "$path" ] && [ ! -h "$path" ] || exit 1
-  if printf '%s\n' "$execs" | grep -Fxq -- "$path"; then
-    [ -x "$path" ] || exit 1
+  # -perm -100 tests the owner's execute bit, not this process's access.
+  owner_exec=$(find "./$path" -prune -perm -100 -print) || exit 1
+  if contains_line "$execs" "$path"; then
+    [ "$owner_exec" = "./$path" ] || exit 1
   else
-    [ ! -x "$path" ] || exit 1
+    [ -z "$owner_exec" ] || exit 1
   fi
 done
 while IFS="$tab" read -r kind path target; do
