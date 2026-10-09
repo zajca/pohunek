@@ -418,6 +418,20 @@ struct Fixture {
     worker_executable: PathBuf,
 }
 
+/// Creates a private Claude transcript for a seeded native reference.
+fn seed_transcript(home: &Path, reference: &str) {
+    let transcript_dir = home.join(".claude/projects/fixture");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&transcript_dir)
+        .expect("create private Claude transcript directory");
+    let transcript = transcript_dir.join(format!("{reference}.jsonl"));
+    std::fs::write(&transcript, "{}\n").expect("write fixture Claude transcript");
+    std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o600))
+        .expect("private Claude transcript");
+}
+
 impl Fixture {
     /// Lays out an isolated installation: XDG tree, versioned worker binary,
     /// and an explicit `service.toml` whose namespace names the fixture's
@@ -439,16 +453,7 @@ impl Fixture {
         for path in [&runtime_home, &config_home, &data_home, &state_home] {
             std::fs::create_dir_all(path).expect("create fixture XDG directory");
         }
-        let transcript_dir = root.join(".claude/projects/fixture");
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&transcript_dir)
-            .expect("create private Claude transcript directory");
-        let transcript = transcript_dir.join("native-systemd-recovery.jsonl");
-        std::fs::write(&transcript, "{}\n").expect("write fixture Claude transcript");
-        std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o600))
-            .expect("private Claude transcript");
+        seed_transcript(&root, "native-systemd-recovery");
         for path in [
             runtime_home.join("pohunek"),
             state_home.join("pohunek"),
