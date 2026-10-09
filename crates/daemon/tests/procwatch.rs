@@ -505,27 +505,29 @@ async fn assert_unreadable_bystander_liveness(
     session_id: &SessionId,
     cwd: &Path,
 ) {
-    let mut bystander = Command::new("/bin/sleep")
-        .arg(SHELL_LINGER_SECS.to_string())
-        .current_dir(cwd)
-        .env_clear()
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn unrelated process");
+    let mut bystander = ReapOnDrop(
+        Command::new("/bin/sleep")
+            .arg(SHELL_LINGER_SECS.to_string())
+            .current_dir(cwd)
+            .env_clear()
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn unrelated process"),
+    );
     let host = HostInspector::new();
     let identity = host
-        .identity(bystander.id())
+        .identity(bystander.0.id())
         .expect("inspect unrelated process")
         .expect("unrelated process is alive");
     assert!(host.is_running(identity).expect("inspect live bystander"));
-    inspector.make_markers_unreadable(bystander.id());
+    inspector.make_markers_unreadable(bystander.0.id());
     let blocked = registry.remove(session_id).await;
-    bystander.kill().expect("terminate unrelated process");
+    bystander.0.kill().expect("terminate unrelated process");
     let blocked = blocked.expect_err("a live unreadable process must keep cleanup unconfirmed");
     assert_eq!(blocked.code, "runtime_supervision_ambiguous");
     assert!(
-        blocked.msg.contains(&bystander.id().to_string()),
+        blocked.msg.contains(&bystander.0.id().to_string()),
         "{blocked:?}"
     );
 
@@ -540,7 +542,16 @@ async fn assert_unreadable_bystander_liveness(
         .remove(session_id)
         .await
         .expect("remove adopted session");
-    bystander.wait().expect("reap unrelated process");
+}
+
+/// A failed assertion must not leave the test's long-running bystander alive.
+struct ReapOnDrop(Child);
+
+impl Drop for ReapOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 #[tokio::test]
