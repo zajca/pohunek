@@ -130,9 +130,9 @@ release row and the archive smoke run, and it produces the consumer report that
 at `target/` or the source tree, so it runs as a prebuilt executable
 (`cargo test -p pohunek-cli --test release_consumer --no-run`).
 
-Inputs, all mandatory and absolute, with no fallback to `CARGO_BIN_EXE_*`; a
-missing, empty, relative or non-regular value (a link counts as non-regular)
-fails naming the variable:
+Four inputs are mandatory and absolute, with no fallback to `CARGO_BIN_EXE_*`;
+the smoke inputs are required only in smoke mode. A missing, empty, relative or
+non-regular value (a link counts as non-regular) fails naming the variable:
 
 | Variable | Meaning |
 | --- | --- |
@@ -141,6 +141,7 @@ fails naming the variable:
 | `POHUNEK_CONSUMER_PACKAGE` | package archive from `cargo xtask package build` |
 | `POHUNEK_CONSUMER_REPORT` | where the report is written after success |
 | `POHUNEK_CONSUMER_CATALOG` | optional; selects smoke mode |
+| `POHUNEK_CONSUMER_STAGE_BIN` | required in smoke mode; verified stage's `bin` directory, also first on `PATH` |
 
 With no `POHUNEK_CONSUMER_*` variable set the test skips, which keeps a plain
 `cargo test` green. Once any is set, every missing prerequisite (an input, the
@@ -257,7 +258,9 @@ the set). Steps, each fail-closed:
    `<stage>/<runtime>/bin` + the system node directory, a hermetic
    `HOME`/`XDG_*`, and only the `POHUNEK_CONSUMER_*` variables, pointing into
    the extracted archive (`POHUNEK_CONSUMER_CATALOG` is the archive's signed
-   catalog, so its own anchor is the trust).
+   catalog, so its own anchor is the trust). The consumer requires its resolved
+   upstream executable to be the entry from `POHUNEK_CONSUMER_STAGE_BIN` and
+   to remain inside that verified stage.
 5. Require each report's `package_digest` to equal the catalog entry's digest
    and its `executables` to equal the SHA-256 of the archive's binaries.
 

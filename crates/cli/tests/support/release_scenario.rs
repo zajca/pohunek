@@ -64,6 +64,41 @@ pub(crate) fn locate_upstream(
         .map_err(|error| format!("the upstream `{program}` is not usable on PATH: {error}"))
 }
 
+/// In archive smoke mode the first PATH entry is the verified stage's bin
+/// directory. Refuse a later PATH entry or a staged link that resolves outside
+/// that stage, even when the daemon's normal resolver considers it usable.
+pub(crate) fn locate_smoke_upstream(
+    program: &str,
+    path: Option<&std::ffi::OsStr>,
+    stage_bin: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, String> {
+    let stage_bin = stage_bin
+        .map(std::path::Path::new)
+        .filter(|entry| entry.is_absolute())
+        .ok_or("archive smoke requires an absolute POHUNEK_CONSUMER_STAGE_BIN")?;
+    let first = path
+        .and_then(|value| std::env::split_paths(value).next())
+        .ok_or("archive smoke requires the staged bin directory first on PATH")?;
+    if first != stage_bin {
+        return Err("archive smoke staged bin directory is not first on PATH".to_owned());
+    }
+    let stage_root = stage_bin
+        .parent()
+        .ok_or("archive smoke staged bin directory has no parent")?
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve archive smoke stage root: {error}"))?;
+    let expected = stage_bin.join(program).canonicalize().map_err(|error| {
+        format!("archive smoke staged upstream `{program}` is missing or unresolved: {error}")
+    })?;
+    let upstream = locate_upstream(program, path)?;
+    if !expected.starts_with(&stage_root) || upstream != expected {
+        return Err(format!(
+            "archive smoke upstream `{program}` did not resolve within the verified stage"
+        ));
+    }
+    Ok(upstream)
+}
+
 /// `plugin install <archive> --catalog <catalog> --yes`, returning the exit
 /// code and the JSON document so callers can assert a refusal.
 pub(crate) fn install_with_catalog(host: &Host, archive: &Path, catalog: &Path) -> (i32, Value) {

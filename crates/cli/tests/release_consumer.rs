@@ -56,7 +56,7 @@ use release_drivers::driver_for;
 use release_env::{Inputs, Mode, REPORT_VAR};
 use release_host::Host;
 use release_layout::{AnchorSource, Layout};
-use release_scenario::{install_official, locate_upstream, run_scenario};
+use release_scenario::{install_official, locate_smoke_upstream, locate_upstream, run_scenario};
 
 /// Prepares a run from `lookup`: refuses a report path that aliases an input,
 /// removes the stale report, then validates the inputs.
@@ -94,8 +94,16 @@ fn consume(inputs: &Inputs) {
         "the package archive serves another runtime than {}",
         release_env::RUNTIME_VAR
     );
-    let upstream = locate_upstream(&facts.program, std::env::var_os("PATH").as_deref())
-        .unwrap_or_else(|message| panic!("{message}"));
+    let path = std::env::var_os("PATH");
+    let upstream = match inputs.mode() {
+        Mode::Row => locate_upstream(&facts.program, path.as_deref()),
+        Mode::Smoke => locate_smoke_upstream(
+            &facts.program,
+            path.as_deref(),
+            std::env::var_os("POHUNEK_CONSUMER_STAGE_BIN").as_deref(),
+        ),
+    }
+    .unwrap_or_else(|message| panic!("{message}"));
 
     let env = TestEnv::new().expect("create the hermetic environment");
     let throwaway = ThrowawayRoot::new();
@@ -177,8 +185,8 @@ mod guards {
     use super::release_layout::{sha256_file, AnchorSource, Layout, LayoutError};
     use super::release_report;
     use super::release_scenario::{
-        history_restored, install_official, install_with_catalog, locate_upstream, probe_upstream,
-        probe_upstream_within,
+        history_restored, install_official, install_with_catalog, locate_smoke_upstream,
+        locate_upstream, probe_upstream, probe_upstream_within,
     };
 
     /// Longest a child test process may run: the child's own waits end at the
@@ -837,6 +845,48 @@ check = "none"
         let relative_only = std::env::join_paths([relative.as_path()]).expect("join");
         locate_upstream("pi", Some(&relative_only)).unwrap_err();
         locate_upstream("pi", None).unwrap_err();
+    }
+
+    #[test]
+    fn archive_smoke_refuses_host_fallback_and_external_staged_links() {
+        let dir = pohunek_test_support::tempdir().expect("tempdir");
+        let stage_bin = dir.path().join("stage/pi/bin");
+        let host_bin = dir.path().join("host/bin");
+        fs::create_dir_all(&stage_bin).expect("stage bin");
+        fs::create_dir_all(&host_bin).expect("host bin");
+        write_executable(host_bin.join("pi"), "#!/bin/sh\nexit 0\n").expect("host executable");
+        let path = std::env::join_paths([stage_bin.as_path(), host_bin.as_path()]).expect("PATH");
+        assert_eq!(
+            locate_upstream("pi", Some(&path)).expect("host fallback exists"),
+            host_bin.join("pi").canonicalize().expect("canonical host")
+        );
+        let refused = locate_smoke_upstream("pi", Some(&path), Some(stage_bin.as_os_str()))
+            .expect_err("missing staged entry must be refused");
+        assert!(refused.contains("staged upstream `pi`"), "{refused}");
+
+        fs::write(stage_bin.join("pi"), "#!/bin/sh\nexit 0\n").expect("staged entry");
+        fs::set_permissions(stage_bin.join("pi"), fs::Permissions::from_mode(0o644))
+            .expect("non-executable mode");
+        let refused = locate_smoke_upstream("pi", Some(&path), Some(stage_bin.as_os_str()))
+            .expect_err("unusable staged entry must not use host fallback");
+        assert!(refused.contains("verified stage"), "{refused}");
+
+        fs::remove_file(stage_bin.join("pi")).expect("remove staged entry");
+        symlink(host_bin.join("pi"), stage_bin.join("pi")).expect("external stage link");
+        let refused = locate_smoke_upstream("pi", Some(&path), Some(stage_bin.as_os_str()))
+            .expect_err("external staged link must be refused");
+        assert!(refused.contains("verified stage"), "{refused}");
+
+        fs::remove_file(stage_bin.join("pi")).expect("remove link");
+        write_executable(stage_bin.join("pi"), "#!/bin/sh\nexit 0\n").expect("staged executable");
+        assert_eq!(
+            locate_smoke_upstream("pi", Some(&path), Some(stage_bin.as_os_str()))
+                .expect("valid stage"),
+            stage_bin
+                .join("pi")
+                .canonicalize()
+                .expect("canonical staged entry")
+        );
     }
 
     /// `target` relative to `base`, both absolute.

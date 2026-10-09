@@ -331,6 +331,7 @@ inner_main() {
                 POHUNEK_CONSUMER_RUNTIME="$rt" \
                 POHUNEK_CONSUMER_PACKAGE="$root/runtime/packages/$rt.tar.zst" \
                 POHUNEK_CONSUMER_CATALOG="$root/runtime/runtime-catalog.json" \
+                POHUNEK_CONSUMER_STAGE_BIN="$stage/$rt/bin" \
                 POHUNEK_CONSUMER_REPORT="$run/report.json" \
                 "$consumer" --exact "$consumer_test" --nocapture
         ) || fail "the consumer run failed for runtime $rt"
@@ -339,9 +340,50 @@ inner_main() {
     done
 }
 
+sudo_supervisor() {
+    sudo_uid=$1
+    sudo_gid=$2
+    sudo_cancel=$3
+    shift 3
+    sudo_group=$(ps -o pgid= -p "$$" | tr -d ' ')
+    [ "$sudo_group" = "$$" ] || fail "sudo supervisor has no private process group"
+    [ -p "$sudo_cancel" ] && [ ! -L "$sudo_cancel" ] || fail "sudo cancellation pipe is not a FIFO"
+    /usr/bin/chmod 600 "$sudo_cancel"
+    /usr/bin/chown 0:0 "$sudo_cancel"
+    exec 3< "$sudo_cancel"
+    # The writer is held only by the outer shell. A root-owned FIFO keeps the
+    # unprivileged consumer from delaying EOF or requesting cancellation.
+    /usr/bin/unshare --net --pid --fork --kill-child --mount-proc \
+        /bin/sh -c 'ip link set lo up && u=$1 && g=$2 && shift 2 && exec setpriv --reuid="$u" --regid="$g" --clear-groups --inh-caps=-all --bounding-set=-all "$@"' \
+        sh "$sudo_uid" "$sudo_gid" /bin/sh "$0" __inner sudo "$@" &
+    sudo_child=$!
+    (
+        IFS= read -r _ <&3 || :
+        # The supervisor is the group leader until this signal arrives, so
+        # the group ID cannot have been reused for an unrelated process.
+        kill -KILL -- "-$sudo_group" 2>/dev/null || true
+    ) &
+    sudo_watchdog=$!
+    sudo_stop() {
+        kill -KILL -- "-$sudo_group" 2>/dev/null || true
+    }
+    trap sudo_stop HUP INT TERM
+    sudo_status=0
+    wait "$sudo_child" || sudo_status=$?
+    kill "$sudo_watchdog" 2>/dev/null || true
+    wait "$sudo_watchdog" 2>/dev/null || true
+    trap - HUP INT TERM
+    return "$sudo_status"
+}
+
 if [ "${1:-}" = __inner ]; then
     shift
     inner_main "$@"
+    exit 0
+fi
+if [ "${1:-}" = __sudo_supervisor ]; then
+    shift
+    sudo_supervisor "$@"
     exit 0
 fi
 
@@ -376,7 +418,7 @@ case $isolation in
     *) fail "--isolation must be auto, userns or sudo" ;;
 esac
 [ "$(uname -s)" = Linux ] || fail "the archive smoke needs Linux network namespaces"
-for tool in tar sha256sum jq unshare ip awk sed find readlink comm sort uniq tr wc cat head iconv mktemp; do
+for tool in tar sha256sum jq unshare setsid mkfifo ps ip awk sed find readlink comm sort uniq tr wc cat head iconv mktemp; do
     command -v "$tool" >/dev/null 2>&1 || fail "required tool is missing: $tool"
 done
 [ -f "$archive" ] && [ ! -L "$archive" ] || fail "archive is not a regular file: $archive"
@@ -396,8 +438,15 @@ ns_pid=
 cleanup() {
     status=$?
     trap '' EXIT
+    # The sudo supervisor's watchdog sees EOF even if sudo uses a PTY and
+    # moves its root-owned children out of the launcher's process group.
+    exec 3>&-
     if [ -n "$ns_pid" ]; then
-        kill "$ns_pid" 2>/dev/null || true
+        if [ "$chosen" != sudo ]; then
+            # Signal the private group before reaping its leader, so its ID
+            # cannot be reused for an unrelated process group.
+            kill -KILL -- "-$ns_pid" 2>/dev/null || kill -KILL "$ns_pid" 2>/dev/null || true
+        fi
         wait "$ns_pid" 2>/dev/null || true
     fi
     rm -rf -- "$work"
@@ -519,13 +568,12 @@ mkdir "$work/run"
 root_path=/usr/sbin:/usr/bin:/sbin:/bin
 
 run_userns() {
-    /usr/bin/env -i PATH="$root_path" /usr/bin/unshare --user --map-root-user --net --pid --fork --kill-child --mount-proc \
+    exec /usr/bin/setsid /usr/bin/env -i PATH="$root_path" /usr/bin/unshare --user --map-root-user --net --pid --fork --kill-child --mount-proc \
         /bin/sh "$self" __inner userns "$work" "$root" "$stage" "$work/consumer" "$node_dir" $runtimes
 }
 run_sudo() {
-    /usr/bin/sudo -n /usr/bin/env -i PATH="$root_path" /usr/bin/unshare --net --pid --fork --kill-child --mount-proc \
-        /bin/sh -c 'ip link set lo up && u=$1 && g=$2 && shift 2 && exec setpriv --reuid="$u" --regid="$g" --clear-groups --inh-caps=-all --bounding-set=-all "$@"' \
-        sh "$uid" "$gid" /bin/sh "$self" __inner sudo "$work" "$root" "$stage" "$work/consumer" "$node_dir" $runtimes
+    exec /usr/bin/setsid /usr/bin/sudo -n /usr/bin/env -i PATH="$root_path" \
+        /usr/bin/setsid --wait /bin/sh "$self" __sudo_supervisor "$uid" "$gid" "$work/sudo-cancel" "$work" "$root" "$stage" "$work/consumer" "$node_dir" $runtimes 3>&-
 }
 probe_userns() {
     /usr/bin/env -i PATH="$root_path" /usr/bin/unshare --user --map-root-user --net --pid --fork --kill-child --mount-proc /usr/bin/true >/dev/null 2>&1
@@ -551,6 +599,10 @@ case $chosen in
     userns) probe_userns || fail "isolation userns is not available on this host" ;;
     sudo) probe_sudo || fail "isolation sudo is not available on this host" ;;
 esac
+if [ "$chosen" = sudo ]; then
+    /usr/bin/mkfifo "$work/sudo-cancel"
+    exec 3<> "$work/sudo-cancel"
+fi
 
 # The namespace runs in the background so a signal reaches the trap at once.
 "run_$chosen" &

@@ -13,7 +13,9 @@ import io
 import json
 import os
 from pathlib import Path
+import selectors
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -76,6 +78,20 @@ def processes_with_marker():
             continue
         if cmdline[:2] == [b"sleep", MARKER_SLEEP.encode()]:
             found.append(entry.name)
+    return found
+
+
+def process_tree(root_pid):
+    pending = [root_pid]
+    found = []
+    while pending:
+        pid = pending.pop()
+        found.append(pid)
+        children = Path("/proc") / str(pid) / "task" / str(pid) / "children"
+        try:
+            pending.extend(int(child) for child in children.read_text().split())
+        except FileNotFoundError:
+            pass
     return found
 
 
@@ -164,6 +180,109 @@ class _SmokeArchiveFixture:
         self.assertEqual(processes_with_marker(), [], "a process was left behind")
 
 
+    def assert_termination_kills_namespace(self, isolation):
+        fifo_probe = (
+            'if (exec 8>"${TMPDIR%/t}/sudo-cancel") 2>/dev/null; '
+            'then echo FIFO-WRITABLE; else echo FIFO-REFUSED; fi\n'
+            if isolation == "sudo" else ""
+        )
+        self.write_consumer(
+            STUB_PREAMBLE
+            + f"sleep {MARKER_SLEEP} &\nchild=$!\n"
+            + 'while [ "$(cat "/proc/$child/comm")" != sleep ]; do :; done\n'
+            + fifo_probe
+            + "echo SMOKE-CONSUMER-READY\nwait\n"
+        )
+        env = dict(os.environ)
+        env["TMPDIR"] = str(self.tmpdir)
+        command = [
+            str(SCRIPT), "--archive", str(self.archive), "--stage", str(self.stage),
+            "--consumer", str(self.consumer), f"--isolation={isolation}", "--runtime", "pi",
+        ]
+        process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        launcher_group = None
+        child_fds = []
+        verified_cleanup = False
+        try:
+            output = b""
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while b"SMOKE-CONSUMER-READY\n" not in output:
+                    self.assertTrue(selector.select(timeout=10), "consumer did not become ready")
+                    chunk = os.read(process.stdout.fileno(), 4096)
+                    self.assertTrue(chunk, "consumer exited before becoming ready")
+                    output += chunk
+            if isolation == "sudo":
+                self.assertIn(b"FIFO-REFUSED\n", output, "consumer can hold the cancellation FIFO open")
+            markers = processes_with_marker()
+            self.assertEqual(len(markers), 1, "consumer workload did not start")
+            children = (Path("/proc") / str(process.pid) / "task" / str(process.pid) / "children").read_text().split()
+            self.assertEqual(len(children), 1, "expected one namespace launcher")
+            launcher_pid = int(children[0])
+            descendants = process_tree(launcher_pid)
+            self.assertIn(int(markers[0]), descendants, "background workload left the namespace tree")
+            for pid in descendants:
+                fd = os.pidfd_open(pid)
+                self.addCleanup(os.close, fd)
+                child_fds.append((pid, fd))
+            self.assertEqual(os.getpgid(launcher_pid), launcher_pid, "launcher does not own a private group")
+            self.assertNotEqual(launcher_pid, os.getpgrp(), "launcher shares the caller's group")
+            launcher_group = launcher_pid
+            if isolation == "userns":
+                for pid in descendants:
+                    self.assertEqual(os.getpgid(pid), launcher_pid, "namespace process left the launcher group")
+            else:
+                unshare = [pid for pid in descendants if (Path("/proc") / str(pid) / "comm").read_text().strip() == "unshare"]
+                self.assertEqual(len(unshare), 1, "expected one root namespace launcher")
+                root_group = os.getpgid(unshare[0])
+                self.assertIn(root_group, descendants, "root supervisor is not the group leader")
+                self.assertEqual(os.getpgid(int(markers[0])), root_group, "sudo workload left the root supervisor group")
+            with selectors.DefaultSelector() as exited:
+                for _, fd in child_fds:
+                    exited.register(fd, selectors.EVENT_READ)
+                os.kill(process.pid, signal.SIGTERM)
+                _, stderr = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 143, stderr.decode(errors="replace"))
+                while exited.get_map():
+                    ready = exited.select(timeout=10)
+                    self.assertTrue(ready, "namespace workload survived cancellation")
+                    for key, _ in ready:
+                        exited.unregister(key.fileobj)
+            self.assert_cleaned_up()
+            verified_cleanup = True
+        finally:
+            if process.poll() is None:
+                process.kill()
+            if not verified_cleanup and launcher_group is not None:
+                for pid, fd in child_fds:
+                    with selectors.DefaultSelector() as alive:
+                        alive.register(fd, selectors.EVENT_READ)
+                        if alive.select(timeout=0):
+                            continue
+                    try:
+                        group = os.getpgid(pid)
+                    except ProcessLookupError:
+                        continue
+                    if group == launcher_group:
+                        try:
+                            os.killpg(launcher_group, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        break
+            for _, fd in child_fds:
+                try:
+                    signal.pidfd_send_signal(fd, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            for pid in processes_with_marker():
+                os.kill(int(pid), signal.SIGKILL)
+            try:
+                process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.stdout.close()
+                process.stderr.close()
+                process.wait(timeout=10)
+
 @unittest.skipUnless(
     sys.platform.startswith("linux") and shutil.which("unshare") and shutil.which("jq") and userns_available(),
     "needs Linux with unprivileged user namespaces, unshare and jq",
@@ -196,8 +315,8 @@ echo "ENV-CATALOG=$POHUNEK_CONSUMER_CATALOG"; echo "ENV-ARGS=$*"
         self.assertIn(f"ENV-PATH={self.stage}/codex/bin:{node_dir}:/usr/bin:/bin", result.stdout)
         self.assertIn("/runtime/runtime-catalog.json", result.stdout)
         self.assertIn(f"--exact the_release_binaries_serve_the_runtime_out_of_process", result.stdout)
-        # Exactly the five consumer-contract variables reach the consumer.
-        self.assertIn("ENV-POHUNEK=5", result.stdout)
+        # Exactly the six consumer-contract variables reach the consumer.
+        self.assertIn("ENV-POHUNEK=6", result.stdout)
         for line in result.stdout.splitlines():
             if line.startswith(("ENV-HOME=", "ENV-PWD=")):
                 self.assertNotIn(str(ROOT), line)
@@ -514,6 +633,9 @@ PY
         self.assertIn("outlived the consumer run", result.stderr)
         self.assert_cleaned_up()
 
+    def test_termination_kills_the_userns_namespace_and_its_workload(self):
+        self.assert_termination_kills_namespace("userns")
+
     def test_the_userns_strategy_can_be_forced(self):
         result = self.smoke("--isolation=userns", "--runtime", "pi")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -550,6 +672,13 @@ PY
     "needs Linux with unshare, jq and node",
 )
 class SmokeArchivePreflightTest(_SmokeArchiveFixture, unittest.TestCase):
+    @unittest.skipUnless(
+        shutil.which("sudo") and shutil.which("setpriv") and sudo_available(),
+        "skipped: `sudo -n unshare` is unavailable here, so sudo cancellation is not exercised locally",
+    )
+    def test_termination_kills_the_sudo_namespace_and_its_workload(self):
+        self.assert_termination_kills_namespace("sudo")
+
     def test_sudo_strategy_does_not_run_shadow_tools_from_caller_path(self):
         shadow = self.base / "shadow"
         shadow.mkdir()
