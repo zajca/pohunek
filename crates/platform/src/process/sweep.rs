@@ -500,9 +500,12 @@ fn classify_unreadable_markers(
     request: &SweepRequest,
 ) -> Selection {
     // An exited process can keep its identity while its parent has not reaped
-    // it. Its environment is unreadable, but it cannot carry a live workload.
-    // An inspection error still fails closed below.
-    if matches!(inspector.is_running(identity), Ok(false)) {
+    // it. Dismiss it only when a fresh read confirms the enumerated identity
+    // and that exact process is no longer running. Missing or inconsistent
+    // identity evidence still fails closed below.
+    if matches!(inspector.identity(identity.pid), Ok(Some(current)) if current == identity)
+        && matches!(inspector.is_running(identity), Ok(false))
+    {
         return Selection::Foreign;
     }
     let Some(worker_start) = request.worker_start_identity() else {
