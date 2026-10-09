@@ -687,7 +687,7 @@ class WorktreeCliTests(WorktreeCliFixture, unittest.TestCase):
 
 
 class SeedSourceValidationCliTests(WorktreeCliFixture, unittest.TestCase):
-    """The fail-closed seed-source checks through the real script.
+    """Seed-source validation and stale-skip checks through the real script.
 
     Each case runs the real `scripts/worktree-new` against the private
     real Git repository with real `cargo metadata`, breaks exactly one
@@ -757,6 +757,55 @@ class SeedSourceValidationCliTests(WorktreeCliFixture, unittest.TestCase):
 
         self.assert_refused_at_source_validation(
             result, "no seed source", "not a Cargo target dir", "--no-seed")
+
+    def prepare_stale_seed(self):
+        target = self.prepare_seedable_repo()
+        (self.repo / "Cargo.lock").write_text("version = 3\n")
+        self.git("add", "Cargo.lock")
+        self.env["GIT_AUTHOR_DATE"] = f"@{NEW_EPOCH} +0000"
+        self.env["GIT_COMMITTER_DATE"] = f"@{NEW_EPOCH} +0000"
+        try:
+            self.git("commit", "-q", "-m", "lockfile fixture")
+        finally:
+            self.env.pop("GIT_AUTHOR_DATE")
+            self.env.pop("GIT_COMMITTER_DATE")
+        return target
+
+    def test_stale_seed_skips_copy_and_creates_no_cargo_lock_files(self):
+        target = self.prepare_stale_seed()
+        set_build_time(target, OLD_EPOCH)
+        for name in worktree_new.CARGO_LOCK_FILES:
+            (target / worktree_new.PROFILE / name).unlink()
+
+        result = self.run_script("issue-1", "HEAD")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("not seeded (stale seed", result.stdout)
+        self.assertIn(worktree_new.format_epoch(NEW_EPOCH), result.stdout)
+        self.assertIn(worktree_new.format_epoch(OLD_EPOCH), result.stdout)
+        self.assertIn("--force-seed", result.stdout)
+        destination = self.worktrees / "issue-1"
+        self.assertTrue(destination.is_dir())
+        self.assertFalse((destination / "target").exists())
+        self.assertIn(str(destination), self.git("worktree", "list", "--porcelain").stdout)
+        for name in worktree_new.CARGO_LOCK_FILES:
+            self.assertFalse((target / worktree_new.PROFILE / name).exists())
+        self.assertEqual(self.git("branch", "--list", "zajca/worktree-new-tmp-*").stdout, "")
+
+    def test_different_lockfile_blob_skips_a_time_fresh_seed(self):
+        target = self.prepare_stale_seed()
+        set_build_time(target, NEW_EPOCH + 100)
+        (self.repo / "Cargo.lock").write_text("version = 4\n")
+
+        result = self.run_script("issue-1", "HEAD")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("not seeded (stale seed: Cargo.lock on HEAD differs", result.stdout)
+        self.assertIn("--force-seed", result.stdout)
+        destination = self.worktrees / "issue-1"
+        self.assertTrue(destination.is_dir())
+        self.assertFalse((destination / "target").exists())
+        self.assertIn(str(destination), self.git("worktree", "list", "--porcelain").stdout)
 
 
 class SeededCreateTests(HarnessCase):
@@ -1406,41 +1455,6 @@ class StaleSeedTests(HarnessCase):
         os.utime(self.h.target / "debug/deps", (NEW_EPOCH + 5, NEW_EPOCH + 5))
         self.assert_seeded(*self.h.run("issue-1"))
 
-    def test_stale_seed_is_skipped_with_a_reason(self):
-        self.make_stale()
-        code, out, err = self.h.run("issue-1")
-        self.assertEqual(code, 0, err)
-        executor = self.h.executor
-        self.assertFalse(executor.ran("cp"))
-        # Only the layout check of the main checkout runs; the new worktree
-        # is never inspected for a seed destination.
-        self.assertEqual(
-            [c for c in executor.commands if c[0] == "cargo"],
-            [["cargo", "metadata", "--no-deps", "--format-version", "1"]])
-        self.assertTrue(executor.ran("git", "worktree", "add"))
-        self.assertFalse((self.h.worktrees / "issue-1/target").exists())
-        debug = self.h.target / "debug"
-        for name in worktree_new.CARGO_LOCK_FILES:
-            self.assertEqual((debug / name).read_bytes(), b"")
-        self.assertEqual(sorted(p.name for p in self.h.worktrees.iterdir()),
-                         ["issue-1"])
-        self.assertIn("not seeded (stale seed", out)
-        self.assertIn(worktree_new.format_epoch(NEW_EPOCH), out)
-        self.assertIn(worktree_new.format_epoch(OLD_EPOCH), out)
-        self.assertIn("--force-seed", out)
-        self.assertIn("next:", out)
-        self.assertEqual(executor.registered,
-                         {self.h.worktrees / "issue-1": "zajca/issue-1"})
-
-    def test_stale_skip_creates_no_lock_file_in_the_main_target(self):
-        self.make_stale()
-        for name in worktree_new.CARGO_LOCK_FILES:
-            (self.h.target / "debug" / name).unlink()
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 0, err)
-        for name in worktree_new.CARGO_LOCK_FILES:
-            self.assertFalse((self.h.target / "debug" / name).exists(), name)
-
     def test_unknown_staleness_still_seeds(self):
         self.make_stale()
         for output in ("", "not-a-number\n"):
@@ -1449,22 +1463,6 @@ class StaleSeedTests(HarnessCase):
                 self.make_stale()
                 self.h.executor.lockfile_log = output
                 self.assert_seeded(*self.h.run("issue-1"))
-
-    def test_different_lockfile_blob_skips_a_time_fresh_seed(self):
-        self.h.executor.base_blob = f"{'b' * 40}\n"
-        code, out, err = self.h.run("issue-1")
-        self.assertEqual(code, 0, err)
-        executor = self.h.executor
-        self.assertFalse(executor.ran("cp"))
-        self.assertIn("not seeded (stale seed: Cargo.lock on origin/main "
-                      "differs from the main checkout's", out)
-        self.assertIn("--force-seed", out)
-        self.assertFalse((self.h.worktrees / "issue-1/target").exists())
-        for name in worktree_new.CARGO_LOCK_FILES:
-            self.assertEqual((self.h.target / "debug" / name).read_bytes(),
-                             b"")
-        self.assertEqual(sorted(p.name for p in self.h.worktrees.iterdir()),
-                         ["issue-1"])
 
     def test_force_seed_overrides_a_different_lockfile_blob(self):
         self.h.executor.base_blob = f"{'b' * 40}\n"
