@@ -373,6 +373,16 @@ async fn integration_uninstall_and_doctor_run_at_daemon_boundary() {
         IntegrationInstallState::Current
     );
 
+    let all_doctor = Request::make(
+        "integration-doctor-all",
+        method::INTEGRATION_DOCTOR,
+        serde_json::json!({}),
+    );
+    let all_doctor: IntegrationDoctorResult =
+        serde_json::from_value(ok_payload(exchange(&mut framed, &all_doctor).await))
+            .expect("deserialize unfiltered doctor result");
+    assert_eq!(all_doctor.agents.len(), 2);
+
     let unknown = Request::make(
         "integration-doctor-unknown",
         method::INTEGRATION_DOCTOR,
@@ -388,9 +398,10 @@ async fn integration_uninstall_and_doctor_run_at_daemon_boundary() {
         method::INTEGRATION_UNINSTALL,
         serde_json::json!({ "agent": "claude" }),
     );
+    let removed_payload = ok_payload(exchange(&mut framed, &uninstall).await);
+    assert_eq!(removed_payload["uninstalled"][0]["state"], "removed");
     let removed: IntegrationUninstallResult =
-        serde_json::from_value(ok_payload(exchange(&mut framed, &uninstall).await))
-            .expect("deserialize uninstall result");
+        serde_json::from_value(removed_payload).expect("deserialize uninstall result");
     assert_eq!(removed.uninstalled.len(), 1);
     assert_eq!(
         removed.uninstalled[0].state,
@@ -404,9 +415,10 @@ async fn integration_uninstall_and_doctor_run_at_daemon_boundary() {
         method::INTEGRATION_UNINSTALL,
         serde_json::json!({ "agent": "claude" }),
     );
+    let again_payload = ok_payload(exchange(&mut framed, &again).await);
+    assert_eq!(again_payload["uninstalled"][0]["state"], "not_installed");
     let again: IntegrationUninstallResult =
-        serde_json::from_value(ok_payload(exchange(&mut framed, &again).await))
-            .expect("deserialize repeated uninstall result");
+        serde_json::from_value(again_payload).expect("deserialize repeated uninstall result");
     assert_eq!(
         again.uninstalled[0].state,
         IntegrationUninstallState::NotInstalled
@@ -415,12 +427,16 @@ async fn integration_uninstall_and_doctor_run_at_daemon_boundary() {
     for (id, params) in [
         ("integration-uninstall-null", serde_json::Value::Null),
         ("integration-uninstall-empty", serde_json::json!({})),
+        (
+            "integration-uninstall-unknown",
+            serde_json::json!({ "agent": "claude", "everything": true }),
+        ),
     ] {
-        let missing_agent = Request::make(id, method::INTEGRATION_UNINSTALL, params);
+        let invalid_request = Request::make(id, method::INTEGRATION_UNINSTALL, params);
         assert_eq!(
-            err_payload(exchange(&mut framed, &missing_agent).await).code,
+            err_payload(exchange(&mut framed, &invalid_request).await).code,
             "bad_request",
-            "{id}: an uninstall must name its agent"
+            "{id}: an invalid uninstall request must fail"
         );
     }
 
