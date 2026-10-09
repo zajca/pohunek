@@ -38,7 +38,7 @@ const PREVIOUS = MIN_PROTOCOL_VERSION;
 const HOST = "netbird:previous-release";
 
 interface Seen {
-  exchanges: Array<{ connection: number; method: string }>;
+  exchanges: Array<{ connection: number; method: string; params: unknown }>;
   violations: string[];
   connections: number;
   /** Version range each accepted request advertised. */
@@ -66,6 +66,7 @@ function startPreviousDaemon(
   resultOverrides: Record<string, unknown> = {},
   /** Also negotiates the current version, like a daemon of the current release. */
   servesCurrent = false,
+  extraRequests: Array<{ method: string; params: unknown }> = [],
 ): Promise<PreviousDaemon> {
   let ownMaximum = servesCurrent ? PROTOCOL_VERSION : PREVIOUS;
   const requests = recordedRequests();
@@ -108,7 +109,7 @@ function startPreviousDaemon(
       return;
     }
     const version = Math.min(range.maximum, ownMaximum);
-    seen.exchanges.push({ connection, method });
+    seen.exchanges.push({ connection, method, params: request["params"] ?? null });
     seen.ranges.push({ method, range });
     const recorded = requests.filter((entry) => entry.method === method);
     if (recorded.length === 0) {
@@ -116,7 +117,8 @@ function startPreviousDaemon(
       reply(socket, { v: version, id, err: { class: "daemon", code: "method_not_found", msg: method } });
       return;
     }
-    if (!recorded.some((entry) => canonical(entry.params) === canonical(request["params"] ?? null))) {
+    const accepted = [...recorded, ...extraRequests.filter((entry) => entry.method === method)];
+    if (!accepted.some((entry) => canonical(entry.params) === canonical(request["params"] ?? null))) {
       seen.violations.push(`${method} carried parameters protocol ${PREVIOUS} never recorded: ${JSON.stringify(request["params"])}`);
       reply(socket, { v: version, id, err: { class: "daemon", code: "bad_request", msg: "parameters are not valid for this protocol" } });
       return;
@@ -198,8 +200,10 @@ async function everyRecordedMethod(fresh: boolean): Promise<void> {
       continue;
     }
     const client = fresh ? await connect(daemon) : shared;
+    const originalParams = JSON.stringify(params);
     const value = await rawRequest(client, method, params);
     expect(value).toEqual(expected);
+    expect(JSON.stringify(params)).toBe(originalParams);
     for (const key of previousKeys()) {
       expect(containsKey(value, key)).toBe(false);
     }
@@ -339,6 +343,33 @@ describe("client against a daemon of the previous release", () => {
     const daemon = await startPreviousDaemon();
     const client = await connect(daemon);
     expect(await client.handshake()).toBe(PREVIOUS);
+  });
+
+  test("metadata keys remain caller data across a previous-version exchange", async () => {
+    const method = "session.set_metadata";
+    const params = {
+      session_id: "s-42",
+      metadata: { worker_instance_id: "user-value" },
+    };
+    const recorded = recordedResults().find((entry) => entry.method === method);
+    if (recorded === undefined) {
+      throw new Error(`no ${method} result recording`);
+    }
+    const session = (recorded.result as { session: Record<string, unknown> }).session;
+    const result = {
+      session: {
+        ...session,
+        metadata: { ...(session["metadata"] as Record<string, unknown>), runtime_id: "user-value" },
+      },
+    };
+    const daemon = await startPreviousDaemon({ [method]: result }, false, [{ method, params }]);
+    const client = await connect(daemon);
+
+    const response = await rawRequest(client, method, params) as { session: { metadata: Record<string, unknown> } };
+    expect(daemon.seen.exchanges.find((entry) => entry.method === method)?.params).toEqual(params);
+    expect(response.session.metadata["runtime_id"]).toBe("user-value");
+    expect(response.session.metadata["worker_instance_id"]).toBeUndefined();
+    expect(daemon.seen.violations).toEqual([]);
   });
 
   test("typed calls, including dedicated connections, decode the translated results", async () => {
