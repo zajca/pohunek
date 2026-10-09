@@ -123,6 +123,17 @@ enum Anchor {
     File { bytes: Vec<u8>, mode: u32 },
     /// A symbolic link to a valid anchor stored elsewhere.
     Link { bytes: Vec<u8> },
+    /// A valid file with another hard link.
+    HardLink { bytes: Vec<u8> },
+    /// A FIFO at the anchor path.
+    Fifo,
+    /// A directory at the anchor path.
+    Directory,
+    /// A valid anchor inside a directory writable by another account.
+    UnsafeDirectory { bytes: Vec<u8> },
+    /// A valid anchor with a native macOS ACL entry.
+    #[cfg(target_os = "macos")]
+    Acl { bytes: Vec<u8>, entry: &'static str },
 }
 
 /// A clean installation: a real daemon in a hermetic environment, with the
@@ -161,6 +172,38 @@ impl Install {
                 write_file(&real, bytes).expect("write the anchor target");
                 fs::set_permissions(&real, fs::Permissions::from_mode(0o644)).expect("anchor mode");
                 symlink(&real, &anchor_path).expect("link the anchor");
+            }
+            Anchor::HardLink { bytes } => {
+                write_file(&anchor_path, bytes).expect("write the anchor");
+                fs::hard_link(&anchor_path, release.join("second-anchor-link"))
+                    .expect("link the anchor again");
+            }
+            Anchor::Fifo => {
+                nix::unistd::mkfifo(
+                    &anchor_path,
+                    nix::sys::stat::Mode::from_bits_truncate(0o644),
+                )
+                .expect("create the anchor FIFO");
+            }
+            Anchor::Directory => {
+                fs::create_dir(&anchor_path).expect("create the anchor directory");
+            }
+            Anchor::UnsafeDirectory { bytes } => {
+                write_file(&anchor_path, bytes).expect("write the anchor");
+                fs::set_permissions(&release, fs::Permissions::from_mode(0o775))
+                    .expect("make the release directory group-writable");
+            }
+            #[cfg(target_os = "macos")]
+            Anchor::Acl { bytes, entry } => {
+                write_file(&anchor_path, bytes).expect("write the anchor");
+                let status = std::process::Command::new("/bin/chmod")
+                    .env_clear()
+                    .current_dir(&release)
+                    .args(["+a", entry])
+                    .arg(&anchor_path)
+                    .status()
+                    .expect("apply native ACL entry");
+                assert!(status.success(), "apply native ACL entry: {entry}");
             }
         }
         let mut command = env.tokio_command(&daemon);
@@ -377,6 +420,54 @@ async fn a_release_catalog_installs_the_package_as_official_in_a_clean_environme
 }
 
 #[tokio::test]
+async fn release_anchor_read_modes_still_authorize_official_packages() {
+    let key = test_key();
+    for mode in [0o600, 0o640, 0o444] {
+        let install = Install::start(&file_anchor(anchor_for(&key), mode)).await;
+        let built = install.archive("1.0.0");
+        let catalog = install.write(
+            "runtime-catalog.json",
+            &signed(
+                &key,
+                catalog_of(
+                    1,
+                    WINDOW_END,
+                    vec![entry_for(&built, "1.0.0", &host_platform(), ANY_CORE)],
+                ),
+            ),
+        );
+        let (code, document) = install.install_catalog(&built, &catalog).await;
+        assert_eq!(code, 0, "mode {mode:o}: {document}");
+        assert_eq!(document["ok"]["package"]["origin"], "official");
+        let check = install.trust_check().await;
+        assert_eq!(check["status"], "ok", "mode {mode:o}: {check}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn release_anchor_acl_entries_follow_the_native_file_safety_policy() {
+    let key = test_key();
+    for (entry, expected_status) in [
+        ("everyone allow write", "fail"),
+        (
+            "everyone allow read,write,append,delete,writeattr,writesecurity",
+            "fail",
+        ),
+        ("everyone deny delete", "ok"),
+        ("everyone allow read", "ok"),
+    ] {
+        let install = Install::start(&Anchor::Acl {
+            bytes: anchor_for(&key),
+            entry,
+        })
+        .await;
+        let check = install.trust_check().await;
+        assert_eq!(check["status"], expected_status, "{entry}: {check}");
+    }
+}
+
+#[tokio::test]
 async fn without_an_anchor_file_catalog_installs_stay_unavailable_and_explicit_digests_work() {
     let key = test_key();
     let install = Install::start(&Anchor::None).await;
@@ -505,6 +596,20 @@ async fn an_anchor_that_cannot_be_trusted_fails_closed_and_doctor_reports_it() {
         ("group-writable file", file_anchor(valid.clone(), 0o664)),
         ("world-writable file", file_anchor(valid.clone(), 0o666)),
         (
+            "group-writable release directory",
+            Anchor::UnsafeDirectory {
+                bytes: valid.clone(),
+            },
+        ),
+        (
+            "hard-linked file",
+            Anchor::HardLink {
+                bytes: valid.clone(),
+            },
+        ),
+        ("FIFO instead of a file", Anchor::Fifo),
+        ("directory instead of a file", Anchor::Directory),
+        (
             "symbolic link to a valid anchor",
             Anchor::Link {
                 bytes: valid.clone(),
@@ -544,6 +649,10 @@ async fn an_anchor_that_cannot_be_trusted_fails_closed_and_doctor_reports_it() {
         assert!(
             !detail.contains("secret-looking-text"),
             "{label}: the detail must not reveal anchor content: {detail}"
+        );
+        assert!(
+            !detail.contains(path_str(install.env.root())),
+            "{label}: the detail must not reveal installation paths: {detail}"
         );
         // The daemon keeps serving local trust while the anchor is refused.
         let (code, document) = install
