@@ -458,6 +458,33 @@ class WorktreeCliFixture:
 class WorktreeCliTests(WorktreeCliFixture, unittest.TestCase):
     """Exercise argument validation through the real script and a private Git repo."""
 
+    def test_failed_post_checkout_hook_rolls_back_and_allows_retry(self):
+        hook = self.repo / ".git/hooks/post-checkout"
+        marker = self.root / "hook-fired"
+        self.env["WORKTREE_TEST_HOOK_MARKER"] = str(marker)
+        hook.write_text(
+            "#!/bin/sh\nprintf 'rejected\\n' > \"$WORKTREE_TEST_HOOK_MARKER\"\nexit 1\n")
+        hook.chmod(0o700)
+
+        failed = self.run_script("--no-seed", "issue-1", "HEAD")
+
+        self.assertEqual(failed.returncode, 1, failed.stderr)
+        self.assertEqual(marker.read_text(), "rejected\n")
+        self.assertIn("git worktree add failed", failed.stderr)
+        self.assertIn("rolled back", failed.stderr)
+        self.assertEqual(list(self.worktrees.iterdir()), [])
+        self.assertEqual(self.git("branch", "--list", "zajca/*").stdout, "")
+        self.assertNotIn(str(self.worktrees),
+                         self.git("worktree", "list", "--porcelain").stdout)
+
+        hook.unlink()
+        retried = self.run_script("--no-seed", "issue-1", "HEAD")
+
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertTrue((self.worktrees / "issue-1").is_dir())
+        self.assertIn("branch refs/heads/zajca/issue-1",
+                      self.git("worktree", "list", "--porcelain").stdout)
+
     def test_bare_repository_is_rejected_before_creating_a_worktree(self):
         bare = self.root / "bare.git"
         self.git("init", "-q", "--bare", str(bare))
@@ -1256,15 +1283,6 @@ class WorktreeAddFailureTests(RollbackCase):
         self.assert_temp_branch_compare_and_deleted()
         self.assertFalse(self.h.executor.ran("git", "worktree", "remove"))
 
-    def test_worktree_left_by_failed_hook_is_removed(self):
-        err = self.run_failing_add("after-checkout")
-        self.assertIn("post-checkout hook failed", err)
-        removes = [c for c in self.h.executor.commands
-                   if c[1:3] == ["worktree", "remove"]]
-        self.assertEqual(len(removes), 1)
-        self.assertTrue(Path(removes[0][-1]).name.startswith(TEMP_PREFIX))
-        self.assert_temp_branch_compare_and_deleted()
-
     def test_failure_before_creation_rolls_back_nothing(self):
         self.h.executor.branch_fails = True
         err = self.run_failing_add(None, step="git branch")
@@ -1272,9 +1290,6 @@ class WorktreeAddFailureTests(RollbackCase):
         self.assertFalse(self.h.executor.ran("git", "update-ref"))
         self.assertFalse(self.h.executor.ran("git", "worktree", "remove"))
         self.assertFalse(self.h.executor.ran("git", "worktree", "add"))
-
-    def test_no_seed_failure_is_rolled_back_too(self):
-        self.run_failing_add("after-checkout", "--no-seed")
 
     def test_unregistered_leftover_dir_is_reported_not_deleted(self):
         worktree = self.h.worktrees / "issue-1"
@@ -1368,12 +1383,6 @@ class WorktreeAddFailureTests(RollbackCase):
         self.assertEqual(len(removes), 2)
         for command in self.h.executor.commands:
             self.assertNotIn("--force", command)
-
-    def test_retry_after_rollback_succeeds(self):
-        self.run_failing_add("after-checkout")
-        self.h.executor.add_fails = None
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 0, err)
 
 
 class PlainGitRaceTests(HarnessCase):
