@@ -96,6 +96,9 @@ fn rename_keys_everywhere(value: &Value) -> Value {
 struct Seen {
     /// `(connection number, method)` of every accepted request line, in order.
     exchanges: Vec<(usize, String)>,
+    /// `(method, params)` of every accepted request line, in order; a scenario
+    /// reads back exactly what the client wrote on the wire.
+    params: Vec<(String, Value)>,
     /// Requests the previous release would have rejected.
     violations: Vec<String>,
     connections: usize,
@@ -121,6 +124,10 @@ impl Seen {
 struct Script {
     /// Replaces the recorded result of a method.
     result_overrides: BTreeMap<String, Value>,
+    /// Additional parameter shapes the test accepts for a method, on top of the
+    /// recordings. A scenario that pins the accepted shape asserts the shape
+    /// itself; the recorded-version spelling is never loosened for anything.
+    extra_params: BTreeMap<String, Vec<Value>>,
     /// Also negotiates the current version, like a daemon of the current
     /// release; replies stay the recorded ones. Shared so a test can roll the
     /// daemon back while connections are open.
@@ -282,10 +289,18 @@ async fn serve(stream: TcpStream, connection: usize, seen: Arc<Mutex<Seen>>, scr
             write_line(&mut stream, &reply(response)).await;
             continue;
         }
-        if !recorded
+        let params_match_recording = recorded
             .iter()
             .any(|entry| entry["params"] == *request.params())
-        {
+            || script
+                .extra_params
+                .get(request.method())
+                .is_some_and(|accepted| {
+                    accepted
+                        .iter()
+                        .any(|accepted_shape| accepted_shape == request.params())
+                });
+        if !params_match_recording {
             violation(
                 &seen,
                 format!(
@@ -303,6 +318,10 @@ async fn serve(stream: TcpStream, connection: usize, seen: Arc<Mutex<Seen>>, scr
             write_line(&mut stream, &reply(response)).await;
             continue;
         }
+        seen.lock()
+            .expect("stub state")
+            .params
+            .push((request.method().to_owned(), request.params().clone()));
         let result = script
             .result_overrides
             .get(request.method())
@@ -850,6 +869,91 @@ async fn the_typed_error_names_the_host_the_versions_and_the_upgrade() {
             .request(&session_list_request())
             .await
             .expect("session.list still works");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_request_carrying_both_worker_identity_spellings_is_refused_before_it_is_sent() {
+    guard("the conflicting downgrade", async {
+        // A request cannot carry `runtime_id` next to `worker_instance_id` for a
+        // protocol 3 daemon: there is no protocol 3 expression of the params, so
+        // the client refuses them instead of writing them. This is the
+        // downgrade-side counterpart of the daemon's `bad_request` for a
+        // protocol 3 request that already carries the current spelling
+        // (`protocol_window.rs`, `previous_version_client_drives...`).
+        let daemon = PreviousDaemon::start().await;
+        let mut client = daemon.client().await;
+        let request = request_for(
+            method::SESSION_REPORT_NATIVE_ID,
+            json!({"session_id": "s-1", "worker_instance_id": "w-1", "runtime_id": "w-0"}),
+        );
+        let error = client
+            .request(&request)
+            .await
+            .expect_err("the conflicting request must not reach the previous daemon");
+        match &error {
+            ClientError::VersionTranslation {
+                host,
+                daemon_version,
+                ..
+            } => {
+                assert_eq!(host.as_deref(), Some(HOST));
+                assert_eq!(*daemon_version, previous());
+            }
+            other => panic!("expected VersionTranslation, got {other:?}"),
+        }
+        let structured = error.to_protocol_error();
+        assert_eq!(structured.code, "version_translation_failed");
+        assert!(structured.msg.contains(HOST), "{}", structured.msg);
+        assert_eq!(
+            daemon.methods(),
+            [method::DAEMON_HEALTH],
+            "only the version probe is sent; the request is refused before any write"
+        );
+        assert_eq!(daemon.violations(), Vec::<String>::new());
+    })
+    .await;
+}
+
+/// User metadata entries are free-form values the adapters never walk, even
+/// when they are named exactly like the keys the versions spell differently.
+/// The request downgrade must hand them to the peer verbatim.
+#[tokio::test]
+async fn user_metadata_named_like_the_renamed_keys_downgrades_untouched() {
+    guard("the free-form downgrade", async {
+        let params = json!({
+            "session_id": "s-42",
+            "metadata": {
+                "owner": "gui",
+                "previous_runtime_id": "user-previous",
+                "runtime_id": "user-runtime",
+                "worker_instance_id": "user-worker",
+            },
+        });
+        let script = Script {
+            extra_params: BTreeMap::from([(
+                method::SESSION_SET_METADATA.to_owned(),
+                vec![params.clone()],
+            )]),
+            ..Script::default()
+        };
+        let daemon = PreviousDaemon::start_with(script).await;
+        let mut client = daemon.client().await;
+        client
+            .request(&request_for(method::SESSION_SET_METADATA, params.clone()))
+            .await
+            .expect("the free-form params downgrade to themselves");
+        let seen = daemon.seen.lock().expect("stub state");
+        let received = seen
+            .params
+            .iter()
+            .find(|(name, _)| name == method::SESSION_SET_METADATA)
+            .map(|(_, params)| params)
+            .expect("the downgrade reached the stub");
+        assert_eq!(received, &params, "{received}");
+        drop(seen);
+        assert_eq!(daemon.violations(), Vec::<String>::new());
     })
     .await;
 }

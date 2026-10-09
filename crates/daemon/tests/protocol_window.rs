@@ -1069,6 +1069,99 @@ async fn prebump_state_hooks_report_through_the_daemon_socket() {
     daemon.stop().await;
 }
 
+/// User metadata keys are free-form values: both adapters leave them untouched
+/// even when a user entry is named exactly like the key the two versions spell
+/// differently (`runtime_id`, `previous_runtime_id`, `worker_instance_id`). A
+/// protocol 3 write must reach the store verbatim, a current read must return
+/// it verbatim, a current write must patch it verbatim, and a protocol 3
+/// read-back must return it verbatim in the downgraded result. The response
+/// here carries a user `worker_instance_id` entry, so the suite's blanket
+/// `assert_previous_spelling` would be wrong and is not used.
+#[tokio::test]
+async fn metadata_user_keys_named_like_worker_identity_are_never_rewritten() {
+    let daemon = Daemon::start("window-metadata").await;
+    let mut previous = daemon.connect().await;
+    let (live, _) = create_previous_session(&mut previous, &daemon).await;
+
+    // A protocol 3 client writes user entries named like the renamed keys: the
+    // request upgrade must not walk the metadata map.
+    let user = json!({
+        "owner": "gui",
+        "previous_runtime_id": "user-previous",
+        "runtime_id": "user-runtime",
+    });
+    let response = exchange(
+        &mut previous,
+        &previous_request(
+            "meta-previous-write",
+            method::SESSION_SET_METADATA,
+            json!({"session_id": live.session_id, "metadata": user.clone()}),
+        ),
+    )
+    .await;
+    let returned = previous_ok(&response)["session"].clone();
+    assert_eq!(returned["metadata"], user, "{response}");
+    assert_eq!(returned["runtime"]["runtime_id"], live.worker_instance_id);
+    assert_previous_spelling(&returned);
+
+    // The stored metadata is the user's own: a current reader sees the same
+    // entries verbatim, so the upgrade did not rewrite the user's keys.
+    let mut current = daemon.connect().await;
+    let read = Request::new(
+        "meta-current-read",
+        method::SESSION_INSPECT,
+        json!(live.session_id),
+    )
+    .expect("valid request");
+    let response = exchange(
+        &mut current,
+        &serde_json::to_value(&read).expect("serialize request"),
+    )
+    .await;
+    assert_eq!(response["v"], PROTOCOL_VERSION.get(), "{response}");
+    assert_eq!(response["ok"]["metadata"], user, "{response}");
+    assert_eq!(
+        response["ok"]["runtime"]["worker_instance_id"],
+        live.worker_instance_id
+    );
+
+    // A current client adds a user entry that itself resembles the current
+    // spelling of the worker identity.
+    let write = Request::new(
+        "meta-current-write",
+        method::SESSION_SET_METADATA,
+        json!({"session_id": live.session_id, "metadata": {"worker_instance_id": "user-worker"}}),
+    )
+    .expect("valid request");
+    let response = exchange(
+        &mut current,
+        &serde_json::to_value(&write).expect("serialize request"),
+    )
+    .await;
+    let mut patched = user.clone();
+    patched["worker_instance_id"] = json!("user-worker");
+    assert_eq!(response["ok"]["session"]["metadata"], patched, "{response}");
+
+    // The protocol 3 read-back: the result downgrade must not walk the
+    // metadata map either — both `runtime_id` spellings of the user entries
+    // survive, and the user `worker_instance_id` entry is not renamed or used
+    // to rewrite the carrier.
+    let read_back = exchange(
+        &mut previous,
+        &previous_request(
+            "meta-previous-read",
+            method::SESSION_INSPECT,
+            json!(live.session_id),
+        ),
+    )
+    .await;
+    let returned = previous_ok(&read_back).clone();
+    assert_eq!(returned["metadata"], patched, "{read_back}");
+    assert_eq!(returned["runtime"]["runtime_id"], live.worker_instance_id);
+
+    daemon.stop().await;
+}
+
 #[tokio::test]
 async fn prebump_notify_hooks_create_notifications_through_the_daemon_socket() {
     let daemon = Daemon::start("prebump-notify").await;
