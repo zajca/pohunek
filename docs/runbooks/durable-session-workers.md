@@ -88,7 +88,7 @@ Interpret the runtime independently from the agent lifecycle:
 | `live` | The daemon controls the current worker generation | Attach or continue normally |
 | `reconnecting` | Reconciliation knows the worker but has not finished adoption; `runtime_supervision_unavailable` means the service manager could not be inspected | Wait; reconciliation retries on its own. Do not recover or restart the worker |
 | `terminal` | The worker observed child exit | Inspect the terminal result; acknowledge or recover explicitly when eligible |
-| `lost` | The PTY generation no longer exists; `runtime_lost` after its leftover processes were swept, `runtime_lost_cleanup_unconfirmed` when the sweep could not confirm that | Preserve the logical record; use explicit native recovery only when available. After `runtime_lost_cleanup_unconfirmed`, check `ps` for that session's processes first |
+| `lost` | The PTY generation no longer exists; `runtime_lost` after its journaled worker ended and the ownership-marker sweep was confirmed, `runtime_lost_cleanup_unconfirmed` when that sweep could not be confirmed, or `worker_unavailable` when no worker journal exists for the generation | Preserve the logical record; use explicit native recovery only when available. After `runtime_lost_cleanup_unconfirmed`, check `ps` for that session's processes first |
 | `conflict` | More than one or mismatched runtime identity is present: `runtime_supervision_ambiguous` (job present, worker socket silent, journal not terminal) or `runtime_identity_mismatch` (job definition or process does not match the record) | Preserve evidence; the daemon never kills a worker automatically and re-checks the conflict in the background (1 s doubling to 60 s) until it adopts the worker `live` (only while no other socket claims the session) or the session becomes `lost`. `session stop` ends a conflict whose recorded identity the journal proves; `session rm` removes the logical record. |
 | `incompatible` | A live worker has no compatible private protocol | Run a compatible daemon; leave the worker alive |
 
@@ -104,6 +104,15 @@ cannot be read at all, the session is `conflict` with
 `runtime_supervision_ambiguous` and nothing is touched until a later check
 succeeds. While the service manager cannot be inspected, affected
 sessions are retried in the background after 1 s, doubling to at most 60 s.
+
+A stale `control.sock` that refuses connections is not proof of an identity
+conflict or of runtime loss. Reconciliation checks the recorded generation's
+job and worker journal before deciding: an absent job and a journaled worker
+proven gone lead to the marker sweep and `lost` after it is confirmed; a
+present job with a silent socket remains `conflict`. An unreadable journal or
+an unconfirmed sweep does not establish confirmed cleanup; inspect the
+remaining process evidence before native recovery. Check the session's
+`runtime.state` and `runtime.loss_reason` before `session resume`.
 
 `pohunek service status --json` lists every worker job of the installation
 with its `generation`, `state`, `pid`, and the executable and arguments the

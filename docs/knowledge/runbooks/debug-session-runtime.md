@@ -115,6 +115,15 @@ Interpret runtime states as follows:
   while its job still runs, `reconnecting` while the manager is unavailable).
   A socket that accepts but never answers counts as unreachable: each connect
   attempt ends at the same deadline.
+- A stale `control.sock` that refuses connections is only a failed endpoint
+  probe. If the recorded generation's native job is absent and its journaled
+  worker is proven gone, the daemon sweeps processes bearing that runtime's
+  ownership marker before reporting `lost` and allowing `session resume`.
+  A still-present job with a silent socket stays `conflict`; an unreadable
+  journal stays ambiguous, while an unconfirmed sweep reports
+  `lost` / `runtime_lost_cleanup_unconfirmed` and requires process inspection
+  before recovery. Inspect the session state and service status together rather
+  than treating the socket pathname or inventory reason as proof by itself.
 - `conflict`: multiple or mismatched identities claim the session. Never stop,
   unlink, or kill either candidate by hand, and the daemon never kills one
   automatically. Preserve the job, journal, and socket evidence for diagnosis;
