@@ -22,18 +22,19 @@
 //! selected runtime.
 
 use std::path::Path;
+use std::time::Duration;
 
 use pohunek_assistant::launch::{
     prepare_with_options, AssistantPaths, Intent, LaunchParams, PreparedLaunch,
 };
-use pohunek_assistant::{AssistantError, ConnectionOptions, HostConfig};
+use pohunek_assistant::{connect_client, AssistantError, ConnectionOptions, HostConfig};
 use pohunek_client::protocol::method;
 use pohunek_client::protocol::{
     self, AgentRuntime, ErrorClass, HostCapabilities, ProtocolError, Request, Response, RuntimeRef,
 };
-use pohunek_client::{Client, ClientOptions, OriginSource};
+use pohunek_client::{Client, ClientError, ClientOptions, OriginSource};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
 
@@ -385,6 +386,72 @@ async fn responder_serves_a_version_negotiation_before_the_capability_exchange()
     );
     assert_eq!(requests[0].method(), method::DAEMON_HEALTH);
     assert_eq!(requests[1].method(), method::HOST_INSPECT);
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_five_second_host_timeout_applies_to_initial_input_creation() {
+    let fixture = pohunek_test_support::tempdir().expect("create the hermetic fixture root");
+    let socket_path = fixture.path().join("assistant.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind the fixture host socket");
+    let responder = tokio::spawn(async move {
+        let (primary, _) = listener.accept().await.expect("accept primary connection");
+        let mut primary = BufReader::new(primary);
+        let mut line = String::new();
+        primary
+            .read_line(&mut line)
+            .await
+            .expect("read health probe");
+        let health: Request = serde_json::from_str(trim_line_end(&line)).expect("health request");
+        assert_eq!(health.method(), method::DAEMON_HEALTH);
+        reply_to(&mut primary, &health, &Value::Null).await;
+
+        let (dedicated, _) = listener.accept().await.expect("accept creation connection");
+        let mut dedicated = BufReader::new(dedicated);
+        line.clear();
+        dedicated
+            .read_line(&mut line)
+            .await
+            .expect("read initial-input creation");
+        let create: Request = serde_json::from_str(trim_line_end(&line)).expect("create request");
+        assert_eq!(create.method(), method::SESSION_NEW);
+        assert_eq!(create.params()["input"], "hello");
+        let mut eof = [0];
+        assert_eq!(
+            dedicated
+                .read(&mut eof)
+                .await
+                .expect("client closes after timeout"),
+            0
+        );
+    });
+
+    let options = ConnectionOptions {
+        request_timeout: Some(Duration::from_secs(5)),
+        origin_source: OriginSource::Omitted,
+        ..ConnectionOptions::default()
+    };
+    let mut client = connect_client(&local_host(&socket_path), options)
+        .await
+        .expect("connect fixture host");
+    client.handshake().await.expect("negotiate protocol");
+    let params = serde_json::from_value(json!({
+        "agent": "shell",
+        "cols": 80,
+        "rows": 24,
+        "input": "hello"
+    }))
+    .expect("valid initial-input params");
+    let error = client
+        .session_new(params)
+        .await
+        .expect_err("explicit timeout applies");
+    assert!(
+        matches!(error, ClientError::RequestTimeout { timeout, .. } if timeout == Duration::from_secs(5)),
+        "{error:?}"
+    );
+    pohunek_test_support::wait::guard("fixture creation responder", responder)
+        .await
+        .expect("responder completed");
 }
 
 /// The fixture responder's exchange loop: one line in, one reply out, until the

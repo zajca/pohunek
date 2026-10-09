@@ -2489,21 +2489,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn initial_input_uses_dedicated_default_but_honors_explicit_response_timeout() {
-        assert_eq!(
-            session_new_input_request_timeout(ClientOptions::default()),
-            Duration::from_millis(u64::from(SESSION_NEW_INPUT_REQUEST_BUDGET_MS))
-                + DEDICATED_WAIT_TRANSPORT_HEADROOM
-        );
-        assert_eq!(
-            session_new_input_request_timeout(
-                ClientOptions::default().with_request_timeout(Duration::from_millis(20))
-            ),
-            Duration::from_millis(20)
-        );
-    }
-
     #[tokio::test]
     async fn a_previous_only_request_on_a_current_connection_is_refused_before_sending() {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))

@@ -12,8 +12,6 @@ use crate::AssistantError;
 
 /// Default time allowed to establish a daemon connection.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-/// Default time allowed for one daemon request.
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default period of the full-state reconcile read of a host worker.
 const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 /// Default first reconnect delay of a host worker.
@@ -25,7 +23,10 @@ const DEFAULT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConnectionOptions {
     pub connect_timeout: Duration,
-    pub request_timeout: Duration,
+    /// An explicit request deadline. `None` keeps the SDK default, including
+    /// the dedicated initial-input creation budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout: Option<Duration>,
     pub reconcile_interval: Duration,
     pub backoff_initial: Duration,
     pub backoff_max: Duration,
@@ -39,7 +40,7 @@ impl Default for ConnectionOptions {
     fn default() -> Self {
         Self {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
-            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            request_timeout: None,
             reconcile_interval: DEFAULT_RECONCILE_INTERVAL,
             backoff_initial: DEFAULT_BACKOFF_INITIAL,
             backoff_max: DEFAULT_BACKOFF_MAX,
@@ -53,11 +54,8 @@ impl ConnectionOptions {
         let options = ClientOptions::default()
             .with_connect_timeout(self.connect_timeout)
             .with_origin_source(self.origin_source);
-        if self.request_timeout == DEFAULT_REQUEST_TIMEOUT {
-            options
-        } else {
-            options.with_request_timeout(self.request_timeout)
-        }
+        self.request_timeout
+            .map_or(options, |timeout| options.with_request_timeout(timeout))
     }
 }
 

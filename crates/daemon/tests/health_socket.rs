@@ -2212,7 +2212,7 @@ const INITIAL_READER_OBSERVATION_WINDOW: Duration = Duration::from_secs(3);
     clippy::too_many_lines,
     reason = "the real worker setup, public observation, and cleanup share one lifecycle fixture"
 )]
-async fn initial_input_waits_for_reader(warning_first: bool) {
+async fn initial_input_waits_for_reader(warning_first: bool, stale_mode_first: bool) {
     let socket = temp_socket(if warning_first {
         "initial-input-warning"
     } else {
@@ -2237,6 +2237,8 @@ gate.connect({reader_socket:?})
 tty.setraw(0)
 if {warning_first}:
     os.write(1, b"Startup warning: checking workspace\r\n")
+if {stale_mode_first}:
+    os.write(1, b"\x1b[?1;2004h\x1b[?1;2004l")
 gate.sendall(b"s")
 while True:
     ready, _, _ = select.select([gate, 0], [], [])
@@ -2246,7 +2248,13 @@ while True:
         os.read(0, 4096)
         gate.sendall(b"e")
 termios.tcflush(0, termios.TCIFLUSH)
-os.write(1, b"\x1b[?2004h\xe2\x9d\xaf ")
+if {stale_mode_first}:
+    os.write(1, b"\x1b[?1;20")
+    gate.sendall(b"p")
+    gate.recv(1)
+    os.write(1, b"04h\xe2\x9d\xaf ")
+else:
+    os.write(1, b"\x1b[?1;2004h\xe2\x9d\xaf ")
 body = bytearray()
 while len(body) < len(b"hello reader"):
     body.extend(os.read(0, len(b"hello reader") - len(body)))
@@ -2266,6 +2274,7 @@ while True:
         reader_socket = reader_socket.display().to_string(),
         received = received.display().to_string(),
         warning_first = if warning_first { "True" } else { "False" },
+        stale_mode_first = if stale_mode_first { "True" } else { "False" },
     );
     write_executable(&fake, &fake_source);
     std::fs::write(
@@ -2289,7 +2298,7 @@ while True:
         config_dir: Some(config_dir),
         ..support::hermetic_registry_config()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut client = connect(&socket).await;
     let mut params = session_params(&socket);
@@ -2363,6 +2372,36 @@ while True:
     gate.write_all(b"g")
         .await
         .expect("release fake input reader");
+    if stale_mode_first {
+        let mut partial_marker = [0];
+        gate.read_exact(&mut partial_marker)
+            .await
+            .expect("fake agent wrote the partial CSI");
+        assert_eq!(partial_marker, [b'p']);
+        wait::guard("partial CSI reaches public output", async {
+            loop {
+                let output = Request::make(
+                    "reader-partial-output",
+                    method::SESSION_OUTPUT,
+                    serde_json::json!({"session_id": id, "max_bytes": 1024}),
+                );
+                let value = ok_payload(exchange(&mut observer, &output).await);
+                let expected = b"\x1b[?1;2004h\x1b[?1;2004l\x1b[?1;20".len() as u64;
+                if value["next_offset"]
+                    .as_str()
+                    .and_then(|offset| offset.parse::<u64>().ok())
+                    .is_some_and(|offset| offset >= expected)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        gate.write_all(b"c")
+            .await
+            .expect("complete the fragmented CSI");
+    }
 
     let response = create.await.expect("session.new task");
     let created: SessionInfo = serde_json::from_value(ok_payload(response)).expect("session info");
@@ -2404,12 +2443,17 @@ while True:
 
 #[tokio::test(flavor = "current_thread")]
 async fn session_new_initial_input_waits_past_startup_warning() {
-    initial_input_waits_for_reader(true).await;
+    initial_input_waits_for_reader(true, false).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn session_new_initial_input_waits_for_silent_reader() {
-    initial_input_waits_for_reader(false).await;
+    initial_input_waits_for_reader(false, false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_new_initial_input_waits_after_combined_mode_disable_and_fragmented_enable() {
+    initial_input_waits_for_reader(false, true).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2451,7 +2495,7 @@ while True:
         host_state_dir: Some(socket.dir.join("host-state")),
         ..support::hermetic_registry_config()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
     let mut client = pohunek_client::Client::connect_local(&socket.path)
         .await
         .expect("connect default SDK client");

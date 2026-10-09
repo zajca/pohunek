@@ -827,28 +827,6 @@ mod tests {
     }
 
     #[test]
-    fn input_readiness_tracks_combined_and_fragmented_bracketed_paste_modes() {
-        let started_at = instant();
-        let mut detector = Detector::new(3, 80, started_at, config());
-        assert!(!detector.input_ready());
-
-        detector.feed(started_at, b"\x1b[?1;20");
-        assert!(!detector.input_ready());
-        detector.feed(started_at, b"04h");
-        assert!(detector.input_ready());
-
-        detector.feed(started_at, b"\x1b[?1;2004");
-        assert!(detector.input_ready());
-        detector.feed(started_at, b"l");
-        assert!(!detector.input_ready());
-
-        detector.feed(started_at, b"\x1b[?2004h");
-        assert!(detector.input_ready());
-        detector.resync_after_lag();
-        assert!(!detector.input_ready());
-    }
-
-    #[test]
     fn osc_progress_action_required_emits_blocked_progress_transition() {
         let started_at = instant();
         let mut detector = Detector::new(3, 80, started_at, config());

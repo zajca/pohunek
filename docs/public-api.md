@@ -2643,6 +2643,10 @@ Public exports:
   future ends the client's wait; it does not prove the daemon canceled a
   creation already in progress. `session.new` without initial input and raw
   envelope requests retain the ordinary timeout.
+- `ConnectionOptions.request_timeout` in the assistant host API is `None` by
+  default, preserving these SDK budgets. `Some(duration)` is an explicit
+  override even when `duration` equals the ordinary 5-second default. An
+  omitted serialized field also means `None`.
 - `OriginSource`: where a connection takes its request origin from.
   `Environment` (the default) reads `POHUNEK_SESSION_ID` and
   `POHUNEK_DAEMON_ID` from the calling process and rejects a partial or invalid
