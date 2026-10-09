@@ -3658,7 +3658,11 @@ impl SessionRegistry {
     /// with `runtime_supervision_ambiguous` after the removal intent was
     /// recorded; like any cleanup that fails then, it keeps the session
     /// listed with its intent, so the removal can be retried (daemon startup
-    /// reconciliation also finishes it).
+    /// reconciliation also finishes it). An explicit retry of a durable
+    /// proven-conflict intent whose classification no longer shows its
+    /// `conflict` (a failed reconciliation reproof or retirement) re-proves
+    /// the recorded identity with the errors of
+    /// [`Self::remove_conflicted_runtime`] and never retires a foreign job.
     pub async fn remove(&self, id: &SessionId) -> Result<SessionRemoveResult, ProtocolError> {
         self.remove_with(id, UnconfirmedCleanup::Refuse).await
     }
@@ -3706,6 +3710,13 @@ impl SessionRegistry {
             // intent is persisted before the retirement and never stranded
             // behind a stop.
             return Box::pin(self.remove_conflict_unavailable_runtime(id, cleanup)).await;
+        }
+        // A retry of an interrupted proven-conflict removal is the intent's
+        // replay, not a plain `retire_unstopped_job`: see
+        // [`SessionRegistry::is_retried_conflict_removal`] and
+        // [`SessionRegistry::remove_retried_conflict_intent`].
+        if self.is_retried_conflict_removal(id).await? {
+            return Box::pin(self.remove_retried_conflict_intent(id, cleanup)).await;
         }
         let should_stop = {
             let sessions = self.inner.sessions.lock().await;

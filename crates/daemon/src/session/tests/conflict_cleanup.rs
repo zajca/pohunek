@@ -13,7 +13,7 @@ use protocol::{RuntimeGeneration, RuntimeState, SessionId, SessionRuntime};
 
 use super::{hermetic_shell, temp_dir, UnreadableCandidateHost, UNREADABLE_CANDIDATE_PID};
 use crate::procwatch::{HostInspector, ProcessIdentity, ProcessInspector};
-use crate::runtime::lifecycle::tests::{JobScript, ScriptedSupervisor};
+use crate::runtime::lifecycle::tests::{InspectStep, JobScript, ScriptedSupervisor};
 use crate::runtime::WorkerLauncher;
 use crate::session::{test_supervision, SessionRegistry, SessionRegistryConfig};
 use crate::store::{migrate_at_startup, DesiredState, Store, TransactionKind};
@@ -648,4 +648,117 @@ async fn a_conflict_proven_remove_intent_reproves_before_retiring_a_replaced_job
         .inspect(&fixture.id)
         .await
         .expect_err("removed after the identity proof passed");
+}
+
+/// A reconciliation that cannot re-prove a proven-conflict Remove intent's
+/// identity (an unavailable manager at startup) classes the record
+/// `Reconnecting`, and a foreign job takes the service ID afterwards. An
+/// explicit `session.remove` retry is the intent's replay: it re-proves the
+/// recorded identity and refuses the foreign job before anything is retired,
+/// keeping the record and the intent in its proven phase, and it removes once
+/// the recorded identity is proven again.
+#[tokio::test]
+async fn an_explicit_retry_re_proves_a_conflict_intent_a_failed_reproof_left_reconnecting() {
+    let (fixture, _stand_in) = interrupted_conflict_removal().await;
+
+    // The ended worker journals a terminal record, so reconciliation reaches
+    // the removal finalizer and re-proves the intent; its manager cannot
+    // inspect the job, so the reproof fails closed on
+    // `runtime_supervision_unavailable` and reconciles the record as
+    // `Reconnecting` while the intent stays durable.
+    write_terminal_journal(&fixture.state_root, RUNTIME);
+    let unavailable = Arc::new(ScriptedSupervisor::scripted());
+    unavailable.script_inspects([InspectStep::Unavailable]);
+    let failed = fixture.restarted(Arc::clone(&unavailable) as Arc<dyn WorkerLauncher>);
+    failed
+        .reconcile_workers()
+        .await
+        .expect("startup reconciliation");
+    assert!(
+        unavailable.retired().is_empty(),
+        "nothing is retired while the manager is unavailable"
+    );
+    let listed = failed.inspect(&fixture.id).await.expect("listed");
+    let runtime = listed.runtime.expect("runtime");
+    assert_eq!(
+        runtime.state,
+        RuntimeState::Reconnecting,
+        "the failed reproof is classified as unavailable supervision"
+    );
+    assert_eq!(
+        runtime.loss_reason.as_deref(),
+        Some(crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE)
+    );
+    let pending = Store::new(fixture.store.clone())
+        .load_sessions()
+        .expect("read durable sessions")
+        .into_iter()
+        .find(|record| record.session_id == SESSION)
+        .expect("durable session");
+    assert_eq!(
+        pending.transaction.expect("removal intent").phase,
+        super::super::conflict_stop::PROVEN_CONFLICT_REMOVAL_PHASE,
+        "the failed reproof keeps the proven-conflict intent"
+    );
+
+    // A foreign job takes the recorded service ID, and the user retries the
+    // removal explicitly.
+    let foreign = foreign_definition();
+    unavailable.script_job(service_id(), job_script(Some(foreign.clone())));
+    let before = fs::read(&fixture.store).expect("read store before the retried removal");
+    let error = failed
+        .remove(&fixture.id)
+        .await
+        .expect_err("a foreign job under the service ID is never retired");
+    assert_eq!(error.code, "runtime_identity_mismatch", "{error:?}");
+    assert!(
+        unavailable.retired().is_empty(),
+        "the foreign job under the service ID is not retired"
+    );
+    assert_eq!(fixture.record_count(), 1);
+    assert_eq!(
+        fs::read(&fixture.store).expect("read store after refusal"),
+        before,
+        "the refused retry writes nothing"
+    );
+    let pending = Store::new(fixture.store.clone())
+        .load_sessions()
+        .expect("read durable sessions")
+        .into_iter()
+        .find(|record| record.session_id == SESSION)
+        .expect("durable session");
+    assert_eq!(pending.desired_state, DesiredState::Removed);
+    assert_eq!(
+        pending.transaction.expect("removal intent").phase,
+        super::super::conflict_stop::PROVEN_CONFLICT_REMOVAL_PHASE,
+        "the refused retry preserves the proven-conflict intent phase"
+    );
+
+    // The recorded generation's own job is a safe neighbor: the proof accepts
+    // it, so the retried removal finishes.
+    unavailable.script_job(service_id(), job_script(Some(own_job_definition())));
+    let removed = failed
+        .remove(&fixture.id)
+        .await
+        .expect("the retried removal finishes after the identity is proven");
+    assert!(removed.removed);
+    assert!(removed.stopped);
+    assert_eq!(fixture.record_count(), 0, "the removal finished");
+    assert!(
+        unavailable.retired() == vec![service_id()],
+        "only the recorded generation's retired job is the proven one"
+    );
+    failed
+        .inspect(&fixture.id)
+        .await
+        .expect_err("removed after the identity proof passed");
+}
+
+/// The job definition of a job that replaced the recorded worker's job under
+/// its service ID.
+fn foreign_definition() -> DefinitionFacts {
+    DefinitionFacts {
+        executable: PathBuf::from("/opt/other/pohunek-sessiond"),
+        arguments: Vec::new(),
+    }
 }
