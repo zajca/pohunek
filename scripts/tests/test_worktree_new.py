@@ -758,6 +758,9 @@ with open(os.environ["WORKTREE_TEST_CP_LOG"], "a") as log:
 if os.environ.get("WORKTREE_TEST_FAIL_PROBE") == "1":
     print("cp: failed to clone: Invalid cross-device link", file=sys.stderr)
     sys.exit(1)
+if os.environ.get("WORKTREE_TEST_FAIL_SOURCE") == source.name:
+    print("cp: No space left on device", file=sys.stderr)
+    sys.exit(1)
 real_cp = os.environ["WORKTREE_TEST_REAL_CP"]
 os.execv(real_cp, [real_cp, "-a", *args[2:]])
 """)
@@ -1073,6 +1076,35 @@ os.execv(real_cp, [real_cp, "-a", *args[2:]])
             "branch refs/heads/zajca/issue-1/review",
             self.git("worktree", "list", "--porcelain").stdout)
 
+    def test_failed_seed_copy_rolls_back_and_allows_retry(self):
+        target = self.prepare_seedable_repo()
+        # The real repository ignores target/, so Git permits plain rollback.
+        (self.repo / ".gitignore").write_text("/target/\n")
+        self.git("add", ".gitignore")
+        self.git("commit", "-q", "-m", "ignore build output")
+        self.install_cp_probe(target)
+        self.env["WORKTREE_TEST_FAIL_SOURCE"] = "deps"
+
+        failed = self.run_script("issue-1", "HEAD")
+
+        self.assertEqual(failed.returncode, 1, failed.stderr)
+        self.assertIn("seeding failed", failed.stderr)
+        self.assertIn("No space left on device", failed.stderr)
+        self.assertIn("rolled back", failed.stderr)
+        self.assertNotIn("manually", failed.stderr)
+        self.assertTrue(any(Path(entry["source"]).name == "deps"
+                            for entry in self.cp_observations()))
+        self.assertEqual(list(self.worktrees.iterdir()), [])
+        self.assertEqual(self.git("branch", "--list", "zajca/*").stdout, "")
+        self.assertNotIn(str(self.worktrees),
+                         self.git("worktree", "list", "--porcelain").stdout)
+
+        self.env.pop("WORKTREE_TEST_FAIL_SOURCE")
+        retried = self.run_script("issue-1", "HEAD")
+
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertTrue((self.worktrees / "issue-1/target/debug/deps/libdep-1.rlib").is_file())
+
     def prepare_stale_seed(self):
         target = self.prepare_seedable_repo()
         (self.repo / "Cargo.lock").write_text("version = 3\n")
@@ -1154,16 +1186,6 @@ class RollbackTests(RollbackCase):
         self.assertEqual(sorted(p.name for p in self.h.worktrees.iterdir()),
                          [])
         self.assertFalse(self.h.executor.ran("git", "branch", "-D"))
-
-    def test_copy_failure_removes_worktree_and_branch(self):
-        self.h.executor.copy_fails_for = "deps"
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 1)
-        self.assertIn("seeding failed", err)
-        self.assertIn("rolled back", err)
-        self.assertNotIn("manually", err)
-        self.assert_nothing_left()
-        self.assert_temp_branch_compare_and_deleted()
 
     def test_worktree_with_overridden_layout_is_rolled_back(self):
         self.h.executor.layouts["temporary"] = (
@@ -1454,18 +1476,6 @@ class PlainGitRaceTests(HarnessCase):
         self.assertFalse(self.h.executor.ran("git", "worktree", "remove"))
         self.assertEqual(self.h.executor.ref_deletions(), [])
         self.assertEqual(out, "")
-
-
-class TemporaryPathTests(HarnessCase):
-    def test_failure_leaves_no_temporary_worktree(self):
-        self.h.executor.copy_fails_for = "incremental"
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 1)
-        self.assertEqual(self.h.executor.temporary_worktrees(), [])
-        self.assertEqual(self.h.executor.temporary_branches(), [])
-        self.assertEqual(self.h.executor.registered, {})
-        self.assertEqual(list(self.h.worktrees.iterdir()), [])
-
 
 
 class StaleSeedTests(HarnessCase):
