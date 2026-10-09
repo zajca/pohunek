@@ -520,6 +520,41 @@ fn a_missing_or_corrupt_manifest_is_refused() {
 }
 
 #[test]
+fn a_manifest_symlink_outside_the_stage_is_refused_by_both_verifiers() {
+    for name in ["STAGE.sha256", "STAGE.links"] {
+        let fixture = Fixture::new();
+        let stage = fixture.staged();
+        let manifest = stage.join(name);
+        let outside = fixture.out().join(format!("outside-{name}"));
+        fs::rename(&manifest, &outside).expect("move manifest outside the stage");
+        symlink(&outside, &manifest).expect("link to the external manifest");
+
+        refused(fixture.verify(), name, Fault::TypeChanged);
+        assert!(
+            !fixture.posix_verify(),
+            "{name}: POSIX verifier accepted a link"
+        );
+    }
+}
+
+#[test]
+fn a_directory_in_place_of_a_manifest_is_refused_by_both_verifiers() {
+    for name in ["STAGE.sha256", "STAGE.links"] {
+        let fixture = Fixture::new();
+        let stage = fixture.staged();
+        let manifest = stage.join(name);
+        fs::remove_file(&manifest).expect("remove manifest");
+        fs::create_dir(&manifest).expect("replace manifest with directory");
+
+        refused(fixture.verify(), name, Fault::TypeChanged);
+        assert!(
+            !fixture.posix_verify(),
+            "{name}: POSIX verifier accepted a directory"
+        );
+    }
+}
+
+#[test]
 fn a_stage_built_from_another_npm_project_is_refused() {
     let fixture = Fixture::new();
     fixture.staged();

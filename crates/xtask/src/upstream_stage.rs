@@ -19,9 +19,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
-use std::os::unix::fs::{symlink, PermissionsExt as _};
+use std::os::unix::fs::{symlink, OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -30,6 +30,7 @@ use std::thread;
 use std::time::Duration;
 
 use clap::Subcommand;
+use nix::fcntl::OFlag;
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
 use regex::Regex;
@@ -99,6 +100,9 @@ const RELEASE_PLACEHOLDER: &str = "{release}";
 #[cfg(test)]
 pub(crate) const POSIX_VERIFY: &str = r#"set -eu
 cd "$1"
+for manifest in STAGE.sha256 STAGE.links; do
+  [ -f "$manifest" ] && [ ! -h "$manifest" ] || exit 1
+done
 sha256sum -c STAGE.sha256 >/dev/null
 tab=$(printf '\t')
 files=$(sed 's/^[0-9a-f]\{64\}  //' STAGE.sha256)
@@ -810,8 +814,23 @@ fn write_manifest(path: &Path, content: &str) -> Result<(), XtaskError> {
 }
 
 fn read_manifest(path: &Path, subject: &str) -> Result<String, XtaskError> {
-    match fs::read_to_string(path) {
-        Ok(text) => Ok(text),
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC).bits())
+        .open(path)
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::NotFound => refuse(subject, Fault::Missing),
+            _ if error.raw_os_error() == Some(nix::errno::Errno::ELOOP as i32) => {
+                refuse(subject, Fault::TypeChanged)
+            }
+            _ => io_error(path)(error),
+        })?;
+    if !file.metadata().map_err(io_error(path))?.is_file() {
+        return Err(refuse(subject, Fault::TypeChanged));
+    }
+    let mut text = String::new();
+    match file.read_to_string(&mut text) {
+        Ok(_) => Ok(text),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             Err(refuse(subject, Fault::Missing))
         }

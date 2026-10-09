@@ -89,6 +89,9 @@ the stage, which could otherwise only verify itself:
 ```sh
 set -eu
 cd "$1"
+for manifest in STAGE.sha256 STAGE.links; do
+  [ -f "$manifest" ] && [ ! -h "$manifest" ] || exit 1
+done
 sha256sum -c STAGE.sha256 >/dev/null
 tab=$(printf '\t')
 files=$(sed 's/^[0-9a-f]\{64\}  //' STAGE.sha256)
