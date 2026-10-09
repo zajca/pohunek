@@ -532,6 +532,126 @@ class WorktreeCliTests(unittest.TestCase):
         self.assertEqual(self.git("branch", "--list", "zajca/issue-1").stdout, "")
         self.assertFalse((self.worktrees / "issue-1").exists())
 
+    def test_conflicting_seed_flags_are_a_usage_error(self):
+        result = self.run_script("--force-seed", "--no-seed", "issue-1", "HEAD")
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("not allowed with", result.stderr)
+        # The argument check happens before any effect is made.
+        self.assertFalse(self.worktrees.exists())
+        self.assertEqual(self.git("branch", "--list", "zajca/*").stdout, "")
+
+    def install_shims(self, record):
+        """Record the script's git invocations through `PATH`.
+
+        The git shim logs the command words, then execs the real git, so
+        the run still operates on the private repository for real. The
+        cargo shim answers the layout question the script needs, so the
+        seed path short-circuits on its own lockfile probe without a real
+        Cargo toolchain.
+        """
+        shim = self.root / "shim"
+        shim.mkdir()
+        shim_git = shim / "git"
+        shim_git.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' \"$*\" >> \"{record}\"\n"
+            f"exec \"{shutil.which('git')}\" \"$@\"\n"
+        )
+        shim_git.chmod(0o755)
+        shim_cargo = shim / "cargo"
+        shim_cargo.write_text(
+            "#!/bin/sh\n"
+            "printf '{\"target_directory\": \"%s/target\"}\\n' \"$(pwd)\"\n"
+        )
+        shim_cargo.chmod(0o755)
+        self.env["PATH"] = f"{shim}{os.pathsep}{self.env['PATH']}"
+        return record
+
+    def test_no_seed_runs_no_lockfile_history_question(self):
+        """Against a stale seed setup, only the default seeding runs git log."""
+        (self.repo / "Cargo.lock").write_text("lockfile = \"only a mark\"\n")
+        self.git("add", "Cargo.lock")
+        self.git("commit", "-q", "-m", "lock")
+        target = self.repo / "target"
+        target.mkdir()
+        (target / worktree_new.CACHEDIR_TAG).write_text("cachedir\n")
+        for name in worktree_new.BUILD_ACTIVITY_DIRS:
+            (target / worktree_new.PROFILE / name).mkdir(parents=True)
+            os.utime(target / worktree_new.PROFILE / name,
+                     (NEW_EPOCH, NEW_EPOCH))
+        record = self.install_shims(self.root / "git-commands.log")
+
+        default = self.run_script("issue-1", "HEAD")
+
+        # The stale seed is refused before any copy, so the run completes
+        # without a seeding filesystem, and the probe is readable in the log.
+        self.assertEqual(default.returncode, 0, default.stderr)
+        self.assertIn("not seeded (stale seed", default.stdout)
+        self.assertNotIn("not seeded (--no-seed)", default.stdout)
+        entries = record.read_text().splitlines()
+        self.assertTrue(entries, "the shim must see at least one git call")
+        self.assertTrue(any(
+            command.split()[0] == "log" for command in entries), entries)
+
+        record.unlink()
+
+        unseeded = self.run_script("--no-seed", "issue-2", "HEAD")
+
+        self.assertEqual(unseeded.returncode, 0, unseeded.stderr)
+        self.assertIn("not seeded (--no-seed)", unseeded.stdout)
+        self.assertTrue((self.worktrees / "issue-2").is_dir())
+        entries = record.read_text().splitlines()
+        self.assertTrue(entries, "the shim must see every git call")
+        self.assertFalse(any(
+            command.split()[0] == "log" for command in entries), entries)
+
+    def test_two_runs_for_the_same_slug_get_distinct_temporary_names(self):
+        record = self.root / "post-checkout-record"
+        hook = self.repo / ".git" / "hooks" / "post-checkout"
+        hook.write_text(
+            "#!/bin/sh\n"
+            # `git worktree add` runs this in the new worktree: record the
+            # temporary path and the temporary branch it checks out.
+            "printf '%s\\t%s\\n' \"$(git rev-parse --show-toplevel)\""
+            " \"$(git symbolic-ref --short HEAD 2>/dev/null || true)\""
+            f" >> \"{record}\"\n"
+        )
+        hook.chmod(0o755)
+
+        first = self.run_script("--no-seed", "issue-1", "HEAD")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        first_temp, first_branch = self.recorded_temp_name(record, index=0)
+        self.git("worktree", "remove", str(self.worktrees / "issue-1"))
+        self.git("branch", "-D", "zajca/issue-1")
+
+        second = self.run_script("--no-seed", "issue-1", "HEAD")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        second_temp, second_branch = self.recorded_temp_name(record, index=1)
+
+        self.assertNotEqual(first_temp, second_temp)
+        self.assertNotEqual(first_branch, second_branch)
+        for temp, branch in ((first_temp, first_branch),
+                             (second_temp, second_branch)):
+            # One token names both the path and the branch.
+            self.assertEqual(
+                temp.name.removeprefix(worktree_new.TEMP_WORKTREE_PREFIX),
+                branch.removeprefix(
+                    worktree_new.BRANCH_PREFIX + worktree_new.TEMP_BRANCH_PREFIX),
+            )
+            self.assertTrue(temp.name.startswith(
+                f"{worktree_new.TEMP_WORKTREE_PREFIX}issue-1-"), temp)
+        # The second run ends with the destination state the first one had.
+        self.assertTrue((self.worktrees / "issue-1").is_dir())
+        self.assertEqual(
+            self.git("branch", "--list", "zajca/worktree-new-tmp-*").stdout, "")
+
+    def recorded_temp_name(self, record, index):
+        lines = record.read_text().splitlines()
+        self.assertEqual(len(lines), index + 1, lines)
+        path, branch = lines[index].split("\t", 1)
+        return Path(path), branch
+
 
 class SeededCreateTests(HarnessCase):
     def test_default_run_fetches_and_seeds_the_worktree_target(self):
@@ -1160,15 +1280,6 @@ class TemporaryPathTests(HarnessCase):
                   if any(p.name.startswith(temp_name) for p in d.parents)]
         self.assertTrue(seeded, "the seed must land in the temporary path")
 
-    def test_temporary_names_are_unique(self):
-        first = worktree_new.temporary_names(self.h.worktrees, "a")
-        second = worktree_new.temporary_names(self.h.worktrees, "a")
-        self.assertNotEqual(first[0], second[0])
-        self.assertNotEqual(first[1], second[1])
-        # One token names both the path and the branch.
-        self.assertEqual(first[0].name.removeprefix(TEMP_PREFIX),
-                         first[1].removeprefix("zajca/worktree-new-tmp-"))
-
     def test_failure_leaves_no_temporary_worktree(self):
         self.h.executor.copy_fails_for = "incremental"
         code, _, err = self.h.run("issue-1")
@@ -1319,22 +1430,6 @@ class StaleSeedTests(HarnessCase):
         code, out, err = self.h.run("--force-seed", "issue-1")
         self.assert_seeded(code, out, err)
         self.assertFalse(self.h.executor.ran("git", "log"))
-
-    def test_force_seed_with_no_seed_is_a_usage_error(self):
-        with contextlib.redirect_stderr(io.StringIO()) as err:
-            with self.assertRaises(SystemExit) as caught:
-                worktree_new.main(["--force-seed", "--no-seed", "issue-1"],
-                                  cwd=self.h.repo, executor=self.h.executor)
-        self.assertEqual(caught.exception.code, 2)
-        self.assertIn("not allowed with", err.getvalue())
-        self.assertEqual(self.h.executor.commands, [])
-
-    def test_no_seed_does_not_read_the_lockfile_history(self):
-        self.make_stale()
-        code, out, err = self.h.run("--no-seed", "issue-1")
-        self.assertEqual(code, 0, err)
-        self.assertFalse(self.h.executor.ran("git", "log"))
-        self.assertIn("not seeded (--no-seed)", out)
 
 
 class LockfileCommitTimeRealGitTests(unittest.TestCase):
