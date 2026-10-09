@@ -6,6 +6,7 @@ use regex::Regex;
 
 use crate::agent_skill;
 use crate::hermes_skill;
+use crate::upstream_stage;
 use crate::{
     collect_files, create_dir_all, remove_dir_all, repo_root, validate_docs, BuildOptions,
     XtaskError,
@@ -50,6 +51,7 @@ pub(crate) fn check_docs(
     all_pass &= check_schema_validation(source_dir);
     all_pass &= check_deterministic_build(source_dir, output_root)?;
     all_pass &= check_source_map_paths(source_dir, &repo);
+    all_pass &= check_upstream_verifier_docs(source_dir);
     all_pass &= hermes_skill::check(&repo)?;
     all_pass &= check_generated_skill_documentation(&repo)?;
     all_pass &= agent_skill::check(&repo)?;
@@ -158,6 +160,27 @@ fn check_source_map_paths(source_dir: &Path, repo: &Path) -> bool {
             println!(
                 "[FAIL] source-map-paths: could not read {}: {source}",
                 source_map_path.display()
+            );
+            false
+        }
+    }
+}
+
+fn check_upstream_verifier_docs(source_dir: &Path) -> bool {
+    let path = source_dir.join("concepts/upstream-staging.md");
+    match std::fs::read_to_string(&path) {
+        Ok(content) if content.contains(upstream_stage::POSIX_VERIFY) => {
+            println!("[PASS] upstream-verifier-docs: POSIX verifier matches the release tool");
+            true
+        }
+        Ok(_) => {
+            println!("[FAIL] upstream-verifier-docs: POSIX verifier differs from the release tool");
+            false
+        }
+        Err(source) => {
+            println!(
+                "[FAIL] upstream-verifier-docs: could not read {}: {source}",
+                path.display()
             );
             false
         }
