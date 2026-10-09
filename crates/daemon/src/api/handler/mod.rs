@@ -1201,6 +1201,41 @@ mod tests {
         let response = handle_request(&request, &state).await;
 
         let ok = ok_value(response, "assistant.materialize");
+        let concepts = ok["concepts"].as_array().expect("public concept list");
+        let architecture = concepts
+            .iter()
+            .find(|concept| concept["id"] == "concept/architecture")
+            .expect("architecture concept reaches public API");
+        assert_eq!(architecture["type"], "Concept");
+        assert_eq!(architecture["title"], "Universal assistant architecture");
+        assert!(architecture["intents"]
+            .as_array()
+            .expect("architecture intents")
+            .contains(&serde_json::json!("debug")));
+        let metadata = architecture.as_object().expect("public concept metadata");
+        for key in ["source_kind", "tags", "generated_from", "citations"] {
+            assert!(
+                !metadata.contains_key(key),
+                "private metadata leaked: {key}"
+            );
+        }
+        assert!(metadata.keys().all(|key| matches!(
+            key.as_str(),
+            "type"
+                | "id"
+                | "title"
+                | "description"
+                | "intents"
+                | "since"
+                | "changed_in"
+                | "deprecated"
+        )));
+        let runbook = concepts
+            .iter()
+            .find(|concept| concept["id"] == "runbook/update-after-release")
+            .expect("release runbook reaches public API");
+        assert_eq!(runbook["type"], "Runbook");
+        assert_eq!(runbook["since"], "0.3.3");
         let result: AssistantMaterializeResult =
             serde_json::from_value(ok).expect("result deserializes");
         assert!(std::path::Path::new(&result.bundle_path)
@@ -1212,6 +1247,34 @@ mod tests {
         );
         assert!(result.content_hash.starts_with("sha256:"));
         assert!(!result.concepts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn assistant_materialize_preserves_hook_safety_rules() {
+        let _env = EnvGuard::set_all("assistant-materialize-hook-rules");
+        let state = daemon_state(
+            HealthInfo::new("test"),
+            SessionRegistry::new(SessionRegistryConfig::default()),
+        );
+        let result = assistant_materialize_result(&state, "assistant-hook-rules", "{}").await;
+
+        for path in ["assistant/system.md", "safety/repo-pohunek.md"] {
+            let content =
+                std::fs::read_to_string(std::path::Path::new(&result.bundle_path).join(path))
+                    .expect("materialized safety document");
+            let normalized = content.split_whitespace().collect::<Vec<_>>().join(" ");
+            for required in [
+                "explicit per-file confirmation, independent of `--yes`",
+                "Non-interactive contexts must quarantine proposed hook content instead of enabling it.",
+                ".pohunek/quarantine/hooks/<event>.pending",
+                "~/.config/pohunek/quarantine/hooks/<event>.pending",
+            ] {
+                assert!(
+                    normalized.contains(required),
+                    "materialized {path} omits required hook rule: {required}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
