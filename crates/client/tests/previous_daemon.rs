@@ -749,8 +749,10 @@ async fn a_result_the_previous_release_could_not_have_sent_is_refused() {
             "{error:?}"
         );
         let structured = error.to_protocol_error();
+        assert_eq!(structured.class, ErrorClass::Daemon);
         assert_eq!(structured.code, "version_translation_failed");
         assert!(structured.msg.contains(HOST), "{}", structured.msg);
+        assert!(structured.recover.is_some());
     })
     .await;
 }
