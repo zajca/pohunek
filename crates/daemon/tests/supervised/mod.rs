@@ -695,6 +695,12 @@ impl Installation {
     /// Persists a logical record the daemon never created, for inputs a
     /// running daemon cannot produce (a resumable binding, a foreign peer).
     pub(crate) fn seed_record(&self, session_id: &str, runtime: RuntimeRecord) {
+        let transcript_dir = self.home().join(".claude/projects/fixture");
+        private_dir(&transcript_dir);
+        let transcript = transcript_dir.join(format!("native-{session_id}.jsonl"));
+        std::fs::write(&transcript, "{}\n").expect("write fixture Claude transcript");
+        std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o600))
+            .expect("private Claude transcript");
         let now = "2026-09-24T00:00:00Z".to_owned();
         let live = runtime.state == RuntimeState::Live;
         let info = SessionInfo {

@@ -5,7 +5,7 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::BTreeMap;
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -439,6 +439,16 @@ impl Fixture {
         for path in [&runtime_home, &config_home, &data_home, &state_home] {
             std::fs::create_dir_all(path).expect("create fixture XDG directory");
         }
+        let transcript_dir = root.join(".claude/projects/fixture");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&transcript_dir)
+            .expect("create private Claude transcript directory");
+        let transcript = transcript_dir.join("native-systemd-recovery.jsonl");
+        std::fs::write(&transcript, "{}\n").expect("write fixture Claude transcript");
+        std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o600))
+            .expect("private Claude transcript");
         for path in [
             runtime_home.join("pohunek"),
             state_home.join("pohunek"),
