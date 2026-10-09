@@ -212,6 +212,8 @@ struct World {
     registration: Registration,
     /// Process serving the socket instead of the supervised job's process.
     socket_pid: Option<Pid>,
+    /// Version served by another process holding the daemon socket.
+    socket_version: Option<String>,
     /// The running job reports no main process.
     processless: bool,
     /// State an inactive job is observed in; `Stopped` when unset. The launchd
@@ -435,12 +437,13 @@ impl Supervisor for Fake {
 impl Control for Fake {
     fn health(&self) -> Call<'_, Health> {
         Box::pin(async move {
-            let (running, silent, socket_pid) = {
+            let (running, silent, socket_pid, socket_version) = {
                 let world = self.world();
                 (
                     world.running,
                     world.silent_version.clone(),
                     world.socket_pid,
+                    world.socket_version.clone(),
                 )
             };
             match self
@@ -450,7 +453,7 @@ impl Control for Fake {
                 Some(version) => Ok(Health {
                     result: DaemonHealthResult {
                         status: "ok".to_owned(),
-                        daemon_version: version,
+                        daemon_version: socket_version.unwrap_or(version),
                         protocol_version: protocol::PROTOCOL_VERSION,
                     },
                     pid: socket_pid.unwrap_or(DAEMON_PID),
@@ -2479,6 +2482,58 @@ async fn uninstall_refuses_an_unexpected_supervised_version_even_without_live_se
         None,
         "the purge ran nowhere: the daemon job alone still serves the store"
     );
+}
+
+#[tokio::test]
+async fn uninstall_does_not_attribute_a_foreign_socket_version_to_the_supervised_job() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    harness.fake.seed(
+        vec![session(SESSION, Some("review"))],
+        vec![worker(worker_id(SESSION), ServiceState::Running)],
+    );
+    {
+        let mut world = harness.fake.world();
+        world.socket_pid = Some(FOREIGN_PID);
+        world.socket_version = Some(V3.to_owned());
+    };
+
+    let error = harness
+        .engine()
+        .uninstall(UninstallOptions {
+            stop_sessions: true,
+            purge: true,
+        })
+        .await
+        .expect_err("foreign process does not prove a supervised version");
+    let Error::DaemonNotReady { last, .. } = &error else {
+        panic!("unexpected error {error:?}");
+    };
+    assert!(
+        last.as_deref()
+            .is_some_and(|detail| detail.contains(&format!("daemon socket is served by pid {FOREIGN_PID}; the supervised job runs pid {DAEMON_PID}"))),
+        "{last:?}"
+    );
+    assert_eq!(harness.fake.world().sessions.len(), 1);
+    assert_eq!(harness.fake.world().workers.len(), 1);
+    assert!(harness.fake.world().running);
+    assert_eq!(harness.config().expect("config").active_version(), V1);
+
+    {
+        let mut world = harness.fake.world();
+        world.socket_pid = None;
+        world.socket_version = None;
+    };
+    let report = harness
+        .engine()
+        .uninstall(UninstallOptions {
+            stop_sessions: true,
+            purge: true,
+        })
+        .await
+        .expect("supervised daemon serves the socket");
+    assert_eq!(report.stopped_sessions, [SESSION]);
+    harness.assert_clean();
 }
 
 #[tokio::test]
@@ -5652,6 +5707,59 @@ async fn accepted_legacy_downgrade_reports_its_preflight_and_runtime_loss() {
         let rolled_back = report.rolled_back.expect("rollback summary");
         assert!(rolled_back.accepted_runtime_loss);
         assert_eq!(rolled_back.preflight, Some(preflight));
+        harness.assert_installed(previous);
+    }
+}
+
+#[tokio::test]
+async fn legacy_downgrade_refuses_an_incomplete_worker_inventory_before_stopping_the_daemon() {
+    for previous in ["0.33.0", "0.33.1"] {
+        let harness = Harness::new();
+        harness
+            .install(previous)
+            .await
+            .expect("install previous release");
+        let mut engine = harness.engine();
+        engine.interrupt_after = Some(Step::Registered);
+        engine
+            .upgrade(&harness.staged(V2), V2)
+            .await
+            .expect_err("interrupted after replacement");
+        let pending = harness.pending().expect("pending upgrade");
+        let worker_exe = harness.layout().worker_executable(V2).expect("worker");
+        harness.fake.world().raced_workers.push(pending_worker(
+            SESSION,
+            ServiceState::Starting,
+            worker_exe,
+        ));
+        let (installs, replaces) = {
+            let world = harness.fake.world();
+            (world.installs, world.replaces)
+        };
+
+        for accept_runtime_loss in [false, true] {
+            let error = if accept_runtime_loss {
+                harness.upgrade_accepting_loss(previous).await
+            } else {
+                harness.upgrade(previous).await
+            }
+            .expect_err("incomplete inventory refuses even with runtime-loss consent");
+            assert_eq!(error.code(), "service_rollback_preflight_failed");
+            assert!(error.to_string().contains("changed during"), "{error:?}");
+            assert_eq!(harness.pending(), Some(pending.clone()));
+            assert_eq!(harness.config().expect("config").active_version(), V2);
+            assert_eq!(harness.fake.daemon_version().as_deref(), Some(V2));
+            assert!(harness.fake.world().running);
+            assert_eq!(harness.fake.world().installs, installs);
+            assert_eq!(harness.fake.world().replaces, replaces);
+        }
+
+        harness.fake.world().raced_workers.clear();
+        let report = harness
+            .upgrade(previous)
+            .await
+            .expect("complete inventory permits rollback");
+        assert!(report.rolled_back.is_some());
         harness.assert_installed(previous);
     }
 }

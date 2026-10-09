@@ -1257,12 +1257,15 @@ impl<'a> Engine<'a> {
                         "daemon reports version {}",
                         health.result.daemon_version
                     )),
-                    Serving::Allowed(allowed) => {
-                        return Err(Error::SupervisedVersion {
-                            served: health.result.daemon_version.clone(),
-                            accepted: allowed.to_vec(),
-                        });
-                    }
+                    Serving::Allowed(allowed) => match self.served_by_job(health.pid).await {
+                        Ok(()) => {
+                            return Err(Error::SupervisedVersion {
+                                served: health.result.daemon_version.clone(),
+                                accepted: allowed.to_vec(),
+                            });
+                        }
+                        Err(mismatch) => Some(mismatch),
+                    },
                 },
                 Err(error) => Some(error.to_string()),
             };

@@ -129,15 +129,12 @@ async fn legacy_workers(inputs: &Inputs<'_>, previous: &str) -> Result<Vec<Sessi
             detail: "worker job inventory is unavailable".to_owned(),
         })?;
     let mut sessions = Vec::new();
-    let jobs =
-        backend
-            .workers()
-            .discover()
-            .await
-            .map_err(|error| Error::RollbackPreflightFailed {
-                version: previous.to_owned(),
-                detail: format!("cannot inspect worker jobs: {error}"),
-            })?;
+    let jobs = backend.workers().discover_strict().await.map_err(|error| {
+        Error::RollbackPreflightFailed {
+            version: previous.to_owned(),
+            detail: format!("cannot inspect worker jobs: {error}"),
+        }
+    })?;
     let mut covered = BTreeSet::new();
     let mut covered_pids = BTreeSet::new();
     for job in jobs {
