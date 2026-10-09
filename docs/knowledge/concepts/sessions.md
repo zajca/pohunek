@@ -677,9 +677,11 @@ hook schema may report, and the report replaces the stored value and its
 provenance (`reported`) in the session, its durable record and its resume
 binding, so `/clear` and in-session resume are followed and `session.resume` and
 `session.fork` launch with the reported conversation. The declared existence
-check runs for a still-assigned reference. Claude hook targets additionally
-require a regular transcript file under the effective declared config home;
-either recovery action refuses with `agent_native_reference_missing` before
+check runs for a still-assigned reference. A hook runtime may declare the same
+kind of check under `[native_reference.existence]` for its id-kind reference;
+the built-in `claude` declares one, so its recovery additionally requires a
+regular transcript file under its effective declared config home; either
+recovery action refuses with `agent_native_reference_missing` before
 launch when the file is absent or cannot be verified. A tested worker journal
 that carries a newer conversation switch the daemon cannot verify makes both
 recovery actions refuse with `native_identity_uncertain` instead of resuming

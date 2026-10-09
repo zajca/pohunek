@@ -16,16 +16,12 @@ use std::sync::Arc;
 
 use crate::agent::host::{ProfileRevision, RuntimeDefinition};
 use crate::agent::{
-    ExistenceCheckKind, ExistenceSpec, InputRules, LaunchEnv, NameMatch, NativeReferenceProvenance,
-    ReferenceExistence, ResolvedAgent,
+    InputRules, LaunchEnv, NativeReferenceProvenance, ReferenceExistence, ResolvedAgent,
 };
 use crate::detect::Manifest;
 use crate::runtime::environment::{base_environment, effective_variable};
 use pohunek_worker_protocol::BaseEnv;
 use protocol::ErrorClass;
-
-/// Claude stores each transcript one project directory below `projects`.
-const CLAUDE_PROJECT_DEPTH: u8 = 1;
 
 /// Frozen structural relaunch snapshot for a session (Part C, C.4).
 ///
@@ -190,9 +186,12 @@ fn profile_changed(binding: &ResumeBinding, was_frozen: bool) -> ProtocolError {
 }
 
 impl SessionRegistry {
-    /// Adds verified Claude transcript activity to public response copies.
+    /// Adds verified native-reference last activity to public response copies.
     ///
-    /// Store records keep this field unset: transcript activity changes outside
+    /// A runtime whose descriptor declares the conversation store reports the
+    /// verified modification time of the reference's transcript, so list and
+    /// inspect responses can lead with the freshest common knowledge. Store
+    /// records keep this field unset: transcript activity changes outside
     /// the daemon, so a cached value would give clients a stale recovery time.
     pub(crate) async fn enrich_native_activity(&self, sessions: &mut [SessionInfo]) {
         let bindings = {
@@ -200,11 +199,11 @@ impl SessionRegistry {
             sessions
                 .iter()
                 .map(|info| {
-                    (info.agent_base == protocol::RuntimeRef::claude()
-                        && info.native_session_id.is_some())
-                    .then(|| entries.get(&info.id))
-                    .flatten()
-                    .map(|entry| Self::resume_binding_from_entry(&info.id, entry))
+                    info.native_session_id
+                        .is_some()
+                        .then(|| entries.get(&info.id))
+                        .flatten()
+                        .map(|entry| Self::resume_binding_from_entry(&info.id, entry))
                 })
                 .collect::<Vec<_>>()
         };
@@ -221,13 +220,15 @@ impl SessionRegistry {
             let Ok(definition) = self.binding_definition(&binding) else {
                 continue;
             };
+            let launch = binding_native_launch(&binding, &definition);
+            let Some(existence) = reference_existence(&binding, launch.as_ref(), &definition)
+            else {
+                continue;
+            };
             let Ok(profile) = self.resolve_recovery_profile(&binding, ProfileChange::Refuse) else {
                 continue;
             };
             let Ok(reference) = SessionRef::id(target) else {
-                continue;
-            };
-            let Ok(existence) = claude_existence(&definition) else {
                 continue;
             };
             let profile_env = profile.env;
@@ -1196,8 +1197,10 @@ impl SessionRegistry {
 
 /// Confirms that the native reference still names an existing conversation.
 ///
-/// Assigned references use the runtime's declared check. A Claude hook target
-/// uses the transcript tree below the runtime's declared config home.
+/// An assigned reference verifies against the check its launch declares. A
+/// hook runtime's id-kind reference verifies against the
+/// `[native_reference.existence]` check its runtime descriptor declares; a hook
+/// runtime that leaves the check undeclared pointed the reference there itself.
 /// The check reads its config-home variable and `HOME` from the environment the
 /// agent is launched with (the filtered base environment, then the profile
 /// environment), and runs off the async runtime because it lists directories.
@@ -1210,20 +1213,9 @@ async fn verify_recovery_reference(
     binding: &ResumeBinding,
     relaunch: &RelaunchPlan,
 ) -> Result<(), ProtocolError> {
-    let existence = if binding.native_reference_provenance == NativeReferenceProvenance::Assigned {
-        let Some(assigned) = relaunch.launch.assigned() else {
-            return Ok(());
-        };
-        assigned.existence().clone()
-    } else if binding.agent_base == protocol::RuntimeRef::claude()
-        && binding.reference_kind() == Some(SessionRefKind::Id)
-    {
-        // A Claude conversation is named by its id and lives as a transcript
-        // file below the runtime's declared config home. A Claude-base profile
-        // that resumes a path reference keeps that reference as the agent's
-        // own transcript location; core cannot name a conversation for it.
-        claude_existence(&relaunch.definition)?
-    } else {
+    let Some(existence) =
+        reference_existence(binding, Some(&relaunch.launch), &relaunch.definition)
+    else {
         return Ok(());
     };
     let session_ref = relaunch.session_ref.clone();
@@ -1246,23 +1238,29 @@ async fn verify_recovery_reference(
     })
 }
 
-fn claude_existence(definition: &RuntimeDefinition) -> Result<ReferenceExistence, ProtocolError> {
-    let home = definition.config_home().ok_or_else(|| {
-        runtime_error(
-            "agent_native_reference_missing",
-            "Claude runtime has no declared config home".to_owned(),
-        )
-    })?;
-    ReferenceExistence::try_from(ExistenceSpec {
-        check: ExistenceCheckKind::File,
-        root_env: Some(home.env().to_owned()),
-        root_home: Some(home.default_relative().to_owned()),
-        dir: Some(crate::external::CLAUDE_TRANSCRIPT_SUBDIR.to_owned()),
-        file_name: Some("{reference}.jsonl".to_owned()),
-        name_match: Some(NameMatch::Exact),
-        max_depth: Some(CLAUDE_PROJECT_DEPTH),
-    })
-    .map_err(|error| runtime_error("agent_native_reference_missing", error.to_string()))
+/// The existence check the native-reference preflight and the last-activity
+/// enrichment run on `binding`, from the runtime descriptor alone.
+///
+/// An assigned reference carries its check frozen into the launch spec; a hook
+/// runtime's id-kind reference uses the `[native_reference.existence]`
+/// declaration of the descriptor. A hook reference of a runtime that leaves
+/// the check undeclared, and any path-kind reference, verifies nothing: the
+/// runtime pointed the reference into its own store.
+#[must_use]
+fn reference_existence(
+    binding: &ResumeBinding,
+    launch: Option<&NativeSessionLaunch>,
+    definition: &RuntimeDefinition,
+) -> Option<ReferenceExistence> {
+    if binding.reference_kind() != Some(SessionRefKind::Id) {
+        return None;
+    }
+    match binding.native_reference_provenance {
+        NativeReferenceProvenance::Assigned => launch
+            .and_then(NativeSessionLaunch::assigned)
+            .map(|assigned| assigned.existence().clone()),
+        NativeReferenceProvenance::Reported => definition.hook_existence().cloned(),
+    }
 }
 
 fn binding_program(binding: &ResumeBinding, definition: &RuntimeDefinition) -> String {

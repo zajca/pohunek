@@ -11338,7 +11338,6 @@ fn temp_agent_that_exits_then_resumes(
 /// Writes a fixture Claude transcript for `reference` below the declared
 /// fixture config home, so the transcript preflight of a later recovery
 /// verifies that conversation.
-#[cfg(unix)]
 fn write_claude_transcript(claude_home: &std::path::Path, reference: &str) {
     let project = claude_home.join("projects/fixture");
     std::fs::create_dir_all(&project).expect("create fixture Claude transcript directory");
@@ -12653,6 +12652,25 @@ async fn set_metadata_after_capture_updates_persisted_binding() {
 async fn resume_binding_restores_metadata_from_store() {
     let store_path = temp_store_path("resume-metadata");
     let expected = metadata(&[("owner", "daemon"), ("ticket", "DMD-1356")]);
+    // The legacy-style binding names a Claude transcript its recovery
+    // preflight verifies in the descriptor-declared config home, which the
+    // fixture provides through the registry's launch environment.
+    let claude_home = temp_dir("resume-metadata-claude");
+    write_claude_transcript(&claude_home, "native-metadata");
+    #[cfg(unix)]
+    let registry = claude_home_registry(
+        &claude_home,
+        temp_dir("resume-metadata-agents"),
+        Some(store_path.clone()),
+    );
+    #[cfg(not(unix))]
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path),
+        ..SessionRegistryConfig::default()
+    });
+    let _ = &claude_home;
     let store = crate::store::Store::new(store_path.clone());
     store
         .record_resume(&crate::store::ResumeBinding {
@@ -12684,12 +12702,6 @@ async fn resume_binding_restores_metadata_from_store() {
         .into_iter()
         .next()
         .expect("one binding");
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: hermetic_shell(),
-        stop_grace: Duration::from_millis(50),
-        store_path: Some(store_path),
-        ..SessionRegistryConfig::default()
-    });
 
     let resumed = registry
         .resume_binding(binding)
@@ -12747,6 +12759,10 @@ async fn resize_without_captured_native_id_persists_no_binding() {
 async fn resume_after_profile_edit_and_resize_uses_original_snapshot() {
     let store_path = temp_store_path("resume-edit-resize");
     let dir = temp_dir("resume-edit-resize-runtime");
+    // The recovery preflight verifies the reported transcript in the
+    // descriptor-declared config home the fixture profile declares.
+    let claude_home = dir.join("claude-home");
+    write_claude_transcript(&claude_home, "native-edit-resize");
     let script_v1 = dir.join("agent-v1");
     let script_v2 = dir.join("agent-v2");
     let marker_v1 = dir.join("v1-argv.txt");
@@ -12757,8 +12773,9 @@ async fn resume_after_profile_edit_and_resize_uses_original_snapshot() {
         "resume-edit-resize",
         "editable",
         &format!(
-            "base = \"claude\"\nprogram = \"{}\"\nargs = [\"--model\", \"sonnet\"]\n",
-            script_v1.display()
+            "base = \"claude\"\nprogram = \"{}\"\nargs = [\"--model\", \"sonnet\"]\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+            script_v1.display(),
+            claude_home.display()
         ),
     );
     let registry = SessionRegistry::new(SessionRegistryConfig {
@@ -12807,8 +12824,9 @@ async fn resume_after_profile_edit_and_resize_uses_original_snapshot() {
     fs::write(
         agents_dir.join("editable.toml"),
         format!(
-            "base = \"claude\"\nprogram = \"{}\"\nargs = [\"--model\", \"opus\"]\n",
-            script_v2.display()
+            "base = \"claude\"\nprogram = \"{}\"\nargs = [\"--model\", \"opus\"]\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+            script_v2.display(),
+            claude_home.display()
         ),
     )
     .expect("edit profile");

@@ -38,9 +38,19 @@ supported = true
 args = ["--resume", "{reference}", "--fork-session"]
 
 # Claude chooses the conversation id itself; the SessionStart hook of the
-# integration reports it.
+# integration reports it. Recovery verifies the transcript file the report
+# names exists before it launches: one project directory below `projects`.
 [native_reference]
 strategy = "hook"
+
+[native_reference.existence]
+check = "file"
+root_env = "CLAUDE_CONFIG_DIR"
+root_home = ".claude"
+dir = "projects"
+file_name = "{reference}.jsonl"
+name_match = "exact"
+max_depth = 1
 
 [integration]
 handler = "claude-hook-v1"

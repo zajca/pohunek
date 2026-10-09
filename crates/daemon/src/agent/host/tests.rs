@@ -1243,6 +1243,27 @@ fn builtin_runtimes_declare_their_native_reference_strategy() {
 }
 
 #[test]
+fn only_the_built_in_claude_declares_a_hook_existence_check() {
+    let registry = builtin_registry("/bin/sh");
+    for (runtime, declared) in [
+        ("shell", false),
+        ("codex", false),
+        ("claude", true),
+        ("hermes", false),
+    ] {
+        assert_eq!(
+            registry
+                .resolve(&id(runtime))
+                .expect("built in")
+                .hook_existence()
+                .is_some(),
+            declared,
+            "{runtime}"
+        );
+    }
+}
+
+#[test]
 fn the_three_strategies_resolve_to_their_launch_shape() {
     let none = parse(&document_with(
         "supported = false",
@@ -1388,7 +1409,7 @@ fn an_assigned_reference_must_be_an_id_with_a_template_and_an_explicit_check() {
 }
 
 #[test]
-fn only_an_assigned_strategy_accepts_a_template_or_a_check() {
+fn only_assigned_or_id_hook_strategies_accept_a_template_or_a_check() {
     for strategy in ["none", "hook"] {
         let resume = if strategy == "none" {
             "supported = false"
@@ -1405,17 +1426,52 @@ fn only_an_assigned_strategy_accepts_a_template_or_a_check() {
                 field: "launch_args"
             }
         );
-        assert_eq!(
-            native_reference_error(
-                resume,
-                "supported = false",
-                &format!(
-                    "strategy = \"{strategy}\"\n\n[native_reference.existence]\ncheck = \"none\""
-                )
-            ),
-            NativeReferenceError::UnexpectedField { field: "existence" }
-        );
     }
+    // A `none` runtime verifies nothing, so an existence check is stray data.
+    assert_eq!(
+        native_reference_error(
+            "supported = false",
+            "supported = false",
+            "strategy = \"none\"\n\n[native_reference.existence]\ncheck = \"none\""
+        ),
+        NativeReferenceError::UnexpectedField { field: "existence" }
+    );
+    // A path-kind hook reference keeps the reference as the agent's own
+    // location, so core cannot verify a conversation it could never name.
+    assert_eq!(
+        native_reference_error(
+            "supported = true\nreference_kind = \"path\"\nargs = [\"--file\", \"{reference}\"]",
+            "supported = false",
+            "strategy = \"hook\"\n\n[native_reference.existence]\ncheck = \"none\""
+        ),
+        NativeReferenceError::UnexpectedField { field: "existence" }
+    );
+}
+
+#[test]
+fn a_hook_runtime_declares_its_existence_check_for_an_id_reference() {
+    let existence = "strategy = \"hook\"\n\n[native_reference.existence]\ncheck = \"file\"\n\
+root_env = \"ACME_HOME\"\nroot_home = \".acme\"\ndir = \"sessions\"\n\
+file_name = \"{reference}.jsonl\"\nname_match = \"exact\"\nmax_depth = 1";
+    let declared = parse(&document_with(ID_RESUME, "supported = false", existence))
+        .expect("a hook runtime may declare the check");
+    assert!(
+        declared.hook_existence().is_some(),
+        "the declared check reaches the definition"
+    );
+    let undeclared = parse(&document_with(
+        ID_RESUME,
+        "supported = false",
+        "strategy = \"hook\"",
+    ))
+    .expect("the check stays optional");
+    assert!(undeclared.hook_existence().is_none());
+    let broken = existence.replace("max_depth = 1", "max_depth = 9");
+    let error = native_reference_error(ID_RESUME, "supported = false", &broken);
+    assert!(
+        matches!(error, NativeReferenceError::Existence(e) if e.field() == "max_depth"),
+        "{error}"
+    );
 }
 
 #[test]
