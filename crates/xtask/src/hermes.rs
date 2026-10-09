@@ -5200,8 +5200,8 @@ PY
             serde_json::json!({
                 "cli_version": "controlled",
                 "protocol": {
-                    "minimum": protocol::PROTOCOL_VERSION.get(),
-                    "maximum": protocol::PROTOCOL_VERSION.get()
+                    "minimum": protocol::CLIENT_PROTOCOL_VERSIONS.minimum().get(),
+                    "maximum": protocol::CLIENT_PROTOCOL_VERSIONS.maximum().get()
                 },
                 "ok": {
                     "action": action,
