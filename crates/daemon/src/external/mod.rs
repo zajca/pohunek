@@ -70,7 +70,7 @@ const TRANSCRIPT_SCAN_LINE_LIMIT: usize = 32;
 /// even if an initial transcript record has no newline.
 const TRANSCRIPT_SCAN_BYTE_LIMIT: usize = 64 * 1024;
 /// Claude transcript root below its config home.
-const CLAUDE_TRANSCRIPT_SUBDIR: &str = "projects";
+pub(crate) const CLAUDE_TRANSCRIPT_SUBDIR: &str = "projects";
 /// Codex transcript root below its config home.
 const CODEX_TRANSCRIPT_SUBDIR: &str = "sessions";
 /// JSONL transcript extension.

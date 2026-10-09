@@ -739,6 +739,7 @@ impl SessionRegistry {
             active_agent_session_path: None,
             native_session_id: native_session_id.clone(),
             native_session_path: native_session_path.clone(),
+            native_last_activity_at: None,
             project_id: project_id.clone(),
             project_label: None,
             is_linked_worktree,
@@ -883,6 +884,7 @@ impl SessionRegistry {
             active_agent_session_path: None,
             native_session_id,
             native_session_path,
+            native_last_activity_at: None,
             project_id,
             // Denormalized for display, resolved fresh at `session.list` time.
             project_label: None,

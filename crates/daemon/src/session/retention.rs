@@ -721,6 +721,7 @@ mod tests {
             active_agent_session_path: None,
             native_session_id: None,
             native_session_path: None,
+            native_last_activity_at: None,
             project_id: None,
             project_label: None,
             is_linked_worktree: None,

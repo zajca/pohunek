@@ -35,6 +35,7 @@ const SLOW_RESPONSE_DELAY: Duration = Duration::from_millis(300);
 #[derive(Debug, Clone, Copy)]
 enum Scenario {
     Success,
+    NativeRecovery,
     GovernanceInspectSuccess,
     GovernanceInspectError,
     Ambiguous,
@@ -655,9 +656,10 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
     }
     let ok = match request.method() {
         protocol::method::SESSION_LIST => session_list(scenario),
-        protocol::method::SESSION_INSPECT | protocol::method::SESSION_FORK => {
-            session(SESSION_ID, Some(SESSION_NAME))
+        protocol::method::SESSION_INSPECT => {
+            session_for_scenario(SESSION_ID, Some(SESSION_NAME), scenario)
         }
+        protocol::method::SESSION_FORK => session(SESSION_ID, Some(SESSION_NAME)),
         protocol::method::SESSION_SCREEN => json!({
             "session_id": SESSION_ID,
             "worker_id": "worker-fixture-1",
@@ -823,8 +825,23 @@ fn session_list(scenario: Scenario) -> Value {
             session("s-ambiguous-1", Some("ambiguous"))
         ])
     } else {
-        json!([session(SESSION_ID, Some(SESSION_NAME))])
+        json!([session_for_scenario(
+            SESSION_ID,
+            Some(SESSION_NAME),
+            scenario
+        )])
     }
+}
+
+fn session_for_scenario(id: &str, name: Option<&str>, scenario: Scenario) -> Value {
+    let mut value = session(id, name);
+    if matches!(scenario, Scenario::NativeRecovery) {
+        value["agent"] = json!("claude");
+        value["agent_base"] = json!("claude");
+        value["native_session_id"] = json!("native-fixture-conversation");
+        value["native_last_activity_at"] = json!("2023-11-14T22:13:20Z");
+    }
+    value
 }
 
 fn session(id: &str, name: Option<&str>) -> Value {
@@ -852,6 +869,37 @@ fn session(id: &str, name: Option<&str>) -> Value {
         value["name"] = json!(name);
     }
     value
+}
+
+#[test]
+fn human_session_views_show_the_exact_recovery_target_and_transcript_time() {
+    for (args, expected_method) in [
+        (
+            vec!["session", "inspect", SESSION_ID],
+            protocol::method::SESSION_INSPECT,
+        ),
+        (vec!["session", "list"], protocol::method::SESSION_LIST),
+    ] {
+        let home = TestHome::new();
+        let fixture = FixtureDaemon::start(&home.socket(), Scenario::NativeRecovery);
+        let (output, requests) = run(&home, fixture, &args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).expect("human output is UTF-8");
+        assert!(text.contains("native-fixture-conversation"), "{text}");
+        assert!(text.contains("2023-11-14T22:13:20Z"), "{text}");
+        if expected_method == protocol::method::SESSION_INSPECT {
+            assert!(text.contains("native_binding"), "{text}");
+            assert!(!text.contains("resumable"), "{text}");
+        }
+        assert_eq!(
+            requests.last().expect("view request").method(),
+            expected_method
+        );
+    }
 }
 
 fn run(home: &TestHome, fixture: FixtureDaemon, args: &[&str]) -> (Output, Vec<Request>) {

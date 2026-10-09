@@ -734,6 +734,7 @@ impl Installation {
             active_agent_pid: None,
             active_agent_session_id: None,
             active_agent_session_path: None,
+            native_last_activity_at: None,
             native_session_id: Some(format!("native-{session_id}")),
             native_session_path: None,
             project_id: None,

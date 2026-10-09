@@ -429,6 +429,27 @@ fn current_results_downgrade_to_the_protocol_3_golden() {
 }
 
 #[test]
+fn protocol_3_session_results_omit_native_file_activity() {
+    let previous = fixtures(RESULTS, "results.json")
+        .entries
+        .into_iter()
+        .find(|entry| entry["method"] == method::SESSION_INSPECT)
+        .expect("recorded session.inspect result")["result"]
+        .clone();
+    let mut current =
+        upgrade_result(v3(), method::SESSION_INSPECT, previous).expect("upgrade recorded result");
+    current["native_last_activity_at"] = json!("2026-01-01T00:00:00Z");
+    let legacy = result(v3(), method::SESSION_INSPECT, current).expect("downgrade result");
+    assert!(legacy.get("native_last_activity_at").is_none());
+
+    let upgraded = upgrade_result(v3(), method::SESSION_INSPECT, legacy)
+        .expect("upgrade previous-release result");
+    let session: protocol::SessionInfo =
+        serde_json::from_value(upgraded).expect("current type accepts old result");
+    assert_eq!(session.native_last_activity_at, None);
+}
+
+#[test]
 fn current_events_downgrade_to_the_protocol_3_golden() {
     let table = event_table();
     let mut renamed = 0;

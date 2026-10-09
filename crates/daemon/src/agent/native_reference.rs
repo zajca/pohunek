@@ -500,17 +500,41 @@ impl ReferenceExistence {
     ) -> Result<(), ReferenceCheckFailure> {
         match self {
             Self::Unchecked => Ok(()),
-            Self::File(file) => file.verify(reference.value(), env),
+            Self::File(file) => file.stat(reference.value(), env).map(|_| ()),
         }
+    }
+
+    /// Returns the verified file's modification time in Unix nanoseconds.
+    ///
+    /// The timestamp comes from the same no-follow file descriptor used for
+    /// existence verification. An unchecked reference has no verified file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReferenceCheckFailure`] when the file cannot be verified.
+    pub fn modified_at_unix_nanos(
+        &self,
+        reference: &SessionRef,
+        env: &dyn Fn(&str) -> Option<OsString>,
+    ) -> Result<Option<i128>, ReferenceCheckFailure> {
+        let Self::File(file) = self else {
+            return Ok(None);
+        };
+        let stat = file.stat(reference.value(), env)?;
+        let nanos = i128::from(stat.st_mtime_nsec);
+        if !(0..1_000_000_000).contains(&nanos) {
+            return Ok(None);
+        }
+        Ok(Some(i128::from(stat.st_mtime) * 1_000_000_000 + nanos))
     }
 }
 
 impl FileExistence {
-    fn verify(
+    fn stat(
         &self,
         reference: &str,
         env: &dyn Fn(&str) -> Option<OsString>,
-    ) -> Result<(), ReferenceCheckFailure> {
+    ) -> Result<fs::Stat, ReferenceCheckFailure> {
         if reference.len() > MAX_CHECKED_REFERENCE_BYTES || !is_plain_component(reference) {
             return Err(ReferenceCheckFailure::InvalidReference);
         }
@@ -529,7 +553,7 @@ impl FileExistence {
         root: &Path,
         wanted: &str,
         before_open: &mut dyn FnMut(&Path),
-    ) -> Result<(), ReferenceCheckFailure> {
+    ) -> Result<fs::Stat, ReferenceCheckFailure> {
         let mut path = root.to_path_buf();
         let mut directory = open_root(root)?;
         for component in self.dir.iter().flat_map(|dir| dir.split('/')) {
@@ -556,7 +580,7 @@ impl FileExistence {
         wanted: &str,
         visited: &mut usize,
         before_open: &mut dyn FnMut(&Path),
-    ) -> Result<(), ReferenceCheckFailure> {
+    ) -> Result<fs::Stat, ReferenceCheckFailure> {
         let entries =
             fs::Dir::read_from(directory).map_err(|_errno| ReferenceCheckFailure::Missing)?;
         let mut subdirectories = Vec::new();
@@ -580,7 +604,25 @@ impl FileExistence {
                         .to_str()
                         .is_some_and(|name| self.name_matches(name, wanted))
                     {
-                        return Ok(());
+                        let file = fs::openat(
+                            directory,
+                            name,
+                            fs::OFlags::RDONLY
+                                | fs::OFlags::NONBLOCK
+                                | fs::OFlags::NOFOLLOW
+                                | fs::OFlags::CLOEXEC,
+                            fs::Mode::empty(),
+                        )
+                        .map_err(|errno| {
+                            classify_open_error(errno, ReferenceCheckFailure::StoreChanged)
+                        })?;
+                        let opened = fs::fstat(&file)
+                            .map_err(|_errno| ReferenceCheckFailure::StoreChanged)?;
+                        if fs::FileType::from_raw_mode(opened.st_mode) != fs::FileType::RegularFile
+                        {
+                            return Err(ReferenceCheckFailure::StoreChanged);
+                        }
+                        return Ok(opened);
                     }
                 }
                 fs::FileType::Directory if depth < self.max_depth => {
@@ -1061,9 +1103,8 @@ mod tests {
             swapped = true;
         });
         assert!(swapped, "the hook ran between discovery and traversal");
-        assert_eq!(
-            outcome,
-            Err(ReferenceCheckFailure::StoreChanged),
+        assert!(
+            matches!(outcome, Err(ReferenceCheckFailure::StoreChanged)),
             "a match behind the swapped-in link must not be found"
         );
     }
@@ -1079,7 +1120,7 @@ mod tests {
             panic!("a file check");
         };
         let root = fs::canonicalize(root).expect("canonical root");
-        check.scan_store(&root, wanted, hook)
+        check.scan_store(&root, wanted, hook).map(|_| ())
     }
 
     #[test]

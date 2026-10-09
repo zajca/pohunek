@@ -1097,11 +1097,6 @@ const PROFILE: &str = "claude-test";
 /// six-teardrop-spoked asterisk (U+2733) and a space, then the product name.
 const IDLE_TITLE_PREFIX: &str = "\u{2733} ";
 
-/// How long the fork test waits for a hook report that the daemon rejects,
-/// before it asserts that none was adopted. The hook runs within a second of
-/// the fork's start; the wait is a multiple of that.
-const FORK_REPORT_GRACE_SECS: u64 = 5;
-
 /// The prompt the tests submit.
 const PROMPT: &str = "say hi";
 
@@ -2058,22 +2053,14 @@ async fn a_real_claude_resumes_and_forks_with_the_descriptor_arguments() {
     })
     .await;
 
-    // Pinned gap: Claude's SessionStart hook reports the fork's new
-    // conversation id, but the child keeps the reference it inherited from its
-    // source, so the daemon rejects the report as a launch identity mismatch
-    // (`launch_identity_reference_mismatch`, reconcile.rs). Resuming the fork
-    // would resume the source conversation. When the daemon accepts the fork's
-    // own id, this test fails and must assert the new id instead.
-    // timing-allowed: #146 negative wait: the rejected fork report has no readiness signal to wait on
-    tokio::time::sleep(Duration::from_secs(FORK_REPORT_GRACE_SECS)).await;
-    let fork_record = fixture.inspect(&fork_id).await;
+    let fork_record = fixture.wait_reported_conversation(&fork_id).await;
+    let fork_reference = fork_record["active_agent_session_id"]
+        .as_str()
+        .expect("the fork's own conversation id");
+    assert_ne!(fork_reference, reference);
     assert_eq!(
-        fork_record["native_session_id"], reference,
-        "the fork holds its source's reference: {fork_record}"
-    );
-    assert!(
-        fork_record["active_agent_session_id"].is_null(),
-        "the fork's own conversation id was not adopted: {fork_record}"
+        fork_record["native_session_id"], fork_reference,
+        "the fork adopts only its own verified conversation: {fork_record}"
     );
 
     fixture.stop(&fork_id).await;

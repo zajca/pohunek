@@ -15,11 +15,17 @@ use std::io;
 use std::sync::Arc;
 
 use crate::agent::host::{ProfileRevision, RuntimeDefinition};
-use crate::agent::{InputRules, LaunchEnv, NativeReferenceProvenance, ResolvedAgent};
+use crate::agent::{
+    ExistenceCheckKind, ExistenceSpec, InputRules, LaunchEnv, NameMatch, NativeReferenceProvenance,
+    ReferenceExistence, ResolvedAgent,
+};
 use crate::detect::Manifest;
 use crate::runtime::environment::{base_environment, effective_variable};
 use pohunek_worker_protocol::BaseEnv;
 use protocol::ErrorClass;
+
+/// Claude stores each transcript one project directory below `projects`.
+const CLAUDE_PROJECT_DEPTH: u8 = 1;
 
 /// Frozen structural relaunch snapshot for a session (Part C, C.4).
 ///
@@ -184,6 +190,65 @@ fn profile_changed(binding: &ResumeBinding, was_frozen: bool) -> ProtocolError {
 }
 
 impl SessionRegistry {
+    /// Adds verified Claude transcript activity to public response copies.
+    ///
+    /// Store records keep this field unset: transcript activity changes outside
+    /// the daemon, so a cached value would give clients a stale recovery time.
+    pub(crate) async fn enrich_native_activity(&self, sessions: &mut [SessionInfo]) {
+        let bindings = {
+            let entries = self.inner.sessions.lock().await;
+            sessions
+                .iter()
+                .map(|info| {
+                    (info.agent_base == protocol::RuntimeRef::claude()
+                        && info.native_session_id.is_some())
+                    .then(|| entries.get(&info.id))
+                    .flatten()
+                    .map(|entry| Self::resume_binding_from_entry(&info.id, entry))
+                })
+                .collect::<Vec<_>>()
+        };
+        if bindings.iter().all(Option::is_none) {
+            return;
+        }
+        let Ok(base_environment) = self.launch_base_environment() else {
+            return;
+        };
+        for (info, binding) in sessions.iter_mut().zip(bindings) {
+            let (Some(binding), Some(target)) = (binding, info.native_session_id.as_deref()) else {
+                continue;
+            };
+            let Ok(definition) = self.binding_definition(&binding) else {
+                continue;
+            };
+            let Ok(profile) = self.resolve_recovery_profile(&binding, ProfileChange::Refuse) else {
+                continue;
+            };
+            let Ok(reference) = SessionRef::id(target) else {
+                continue;
+            };
+            let Ok(existence) = claude_existence(&definition) else {
+                continue;
+            };
+            let profile_env = profile.env;
+            let base = base_environment.clone();
+            let modified = tokio::task::spawn_blocking(move || {
+                let lookup = |name: &str| effective_variable(&base, profile_env.as_slice(), name);
+                existence.modified_at_unix_nanos(&reference, &lookup)
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten();
+            info.native_last_activity_at = modified
+                .and_then(|nanos| time::OffsetDateTime::from_unix_timestamp_nanos(nanos).ok())
+                .and_then(|time| {
+                    time.format(&time::format_description::well_known::Rfc3339)
+                        .ok()
+                });
+        }
+    }
+
     /// Make the persisted resume binding for `id` match the session's CURRENT
     /// in-memory state, serialized against every other persister.
     ///
@@ -262,6 +327,12 @@ impl SessionRegistry {
     /// `native_identity_missing` or `native_identity_unverified` when a hook
     /// runtime lacks a trusted native reference, `not_resumable` when another
     /// entry lacks the reference required by its frozen resume template,
+    /// `native_identity_uncertain` when the worker journal carries a newer
+    /// conversation switch the daemon cannot verify, so recovery neither
+    /// launches an agent into a conversation it cannot confirm nor falls back
+    /// to the older verified target,
+    /// `agent_native_reference_missing` when a required conversation file is
+    /// absent or cannot be verified,
     /// `agent_profile_changed` or `agent_profile_missing`
     /// when the profile no longer matches the session, or any worker launch
     /// error from recovery.
@@ -352,7 +423,7 @@ impl SessionRegistry {
         let launch = binding_native_launch(&binding, &definition)
             .ok_or_else(|| agent_not_resumable(&binding.agent))?;
         if let Some(error) = self
-            .missing_hook_reference_error(&record, &binding, &launch)
+            .hook_recovery_journal_error(&record, &binding, &launch)
             .await
         {
             return Err(error);
@@ -371,6 +442,27 @@ impl SessionRegistry {
         };
         self.persist_resume_binding(&info.id).await;
         Ok(info)
+    }
+
+    /// Refuses recovery of a hook binding whose tested generation journal
+    /// invalidates the persisted state: a missing reference, or a newer
+    /// conversation switch the daemon cannot verify.
+    ///
+    /// Returns the typed error, or `None` when the launch may proceed.
+    async fn hook_recovery_journal_error(
+        &self,
+        record: &crate::store::SessionRecord,
+        binding: &ResumeBinding,
+        launch: &NativeSessionLaunch,
+    ) -> Option<ProtocolError> {
+        if let Some(error) = self
+            .missing_hook_reference_error(record, binding, launch)
+            .await
+        {
+            return Some(error);
+        }
+        self.unverified_switch_claim_error(record, binding, launch)
+            .await
     }
 
     async fn missing_hook_reference_error(
@@ -396,6 +488,103 @@ impl SessionRegistry {
             code,
             format!(
                 "session {} has no verified native conversation reference",
+                binding.session_id
+            ),
+        ))
+    }
+
+    /// Refuses recovery when the worker's journal carries a newer conversation
+    /// switch the daemon cannot verify (issue #421).
+    ///
+    /// The persisted target of a hook runtime follows only claims the daemon
+    /// admitted. A journaled native-reference claim of the record's worker
+    /// generation that names the session's provider and reference kind, is
+    /// newer than the durable ordering mark for that generation, and names a
+    /// conversation other than the persisted target, is such a claim the
+    /// durable record still refuses or has not imported. Recovery must not
+    /// silently fall back to the older verified target in that state: the
+    /// daemon cannot tell which conversation the agent last used.
+    ///
+    /// A claim at or behind the accepted ordering mark is stale and cannot
+    /// overwrite the newer verified target, so it leaves recovery alone. A
+    /// claim of another generation is history the record already moved past,
+    /// and a claim that re-affirms the persisted target is already imported.
+    /// Without a journal native-reference claim, an immutable launch claim of
+    /// this generation that names another conversation, with no ordering mark
+    /// of the generation, is the same uncertain switch. An assigned runtime
+    /// confirms its reference against its declared existence check instead of
+    /// ordering.
+    async fn unverified_switch_claim_error(
+        &self,
+        record: &crate::store::SessionRecord,
+        binding: &ResumeBinding,
+        launch: &NativeSessionLaunch,
+    ) -> Option<ProtocolError> {
+        if launch.assigned().is_some() {
+            return None;
+        }
+        let (ref_kind, stored) = match launch.reference_kind() {
+            SessionRefKind::Id => (
+                SessionRefKind::Id,
+                record.info.native_session_id.as_deref()?,
+            ),
+            SessionRefKind::Path => (
+                SessionRefKind::Path,
+                record.info.native_session_path.as_deref()?,
+            ),
+        };
+        // The journal of the last durable worker generation is the evidence a
+        // terminal runtime leaves behind. The in-memory entry may have already
+        // retired its job and dropped the generation token, so the durable
+        // record names it. A store problem leaves recovery on the verified
+        // target alone.
+        let durable = self
+            .load_durable_session_record(&SessionId(record.session_id.clone()))
+            .await
+            .ok()
+            .flatten();
+        let durable = durable.filter(|durable| durable.runtime.generation.is_some());
+        let durable = durable.as_ref().unwrap_or(record);
+        let snapshot = self.generation_journal_snapshot(durable).await?;
+        let instance = snapshot
+            .worker_instance_id
+            .as_ref()
+            .map(pohunek_worker_protocol::WorkerInstanceId::as_str);
+        if instance != durable.runtime.worker_instance_id.as_deref() {
+            return None;
+        }
+        let instance = instance?;
+        let provider = super::agent_kind_label(&durable.info.agent_base);
+        let ordering = durable
+            .native_identity_ordering
+            .as_ref()
+            .filter(|ordering| ordering.worker_instance_id == instance);
+        let uncertain = if let Some(reference) = snapshot.native_reference.as_ref() {
+            reference.provider == provider
+                && super::reconcile::parse_reference_kind(&reference.reference_kind)
+                    == Some(ref_kind)
+                && reference.native_reference != stored
+                && super::native_report_is_current(
+                    ordering,
+                    instance,
+                    reference.sequence,
+                    crate::store::ReportTransport::Worker,
+                )
+        } else if let Some(claim) = snapshot.launch_identity.as_ref() {
+            claim.provider == provider
+                && super::reconcile::parse_reference_kind(&claim.reference_kind) == Some(ref_kind)
+                && ordering.is_none()
+                && claim.native_reference != stored
+        } else {
+            false
+        };
+        if !uncertain {
+            return None;
+        }
+        Some(runtime_error(
+            "native_identity_uncertain",
+            format!(
+                "session {} has a newer native conversation switch that could not be verified; native recovery is unavailable",
                 binding.session_id
             ),
         ))
@@ -456,6 +645,11 @@ impl SessionRegistry {
     /// Returns `migration_manifest_missing` while unmigrated legacy resume
     /// bindings exist, before anything is written, `agent_profile_changed` or
     /// `agent_profile_missing` when the profile no longer matches the source,
+    /// `native_identity_uncertain` when the source's worker journal carries a
+    /// newer conversation switch the daemon cannot verify, so no fork child
+    /// launches from a source whose target the daemon cannot confirm,
+    /// `agent_native_reference_missing` when the source's conversation file is
+    /// absent or cannot be verified,
     /// and otherwise the source lookup, launch-template, or launch error.
     pub async fn fork(&self, params: SessionForkParams) -> Result<SessionInfo, ProtocolError> {
         self.ensure_migration_settled()?;
@@ -464,7 +658,8 @@ impl SessionRegistry {
         // persisted the fork's record, so the pinned package cannot be
         // uninstalled in between. A disabled package still forks.
         let package_authority = Arc::clone(&self.inner.package_lifecycle).read_owned().await;
-        let (binding, repo, branch, worktree_path) = self.fork_source(&params.session_id).await?;
+        let (binding, repo, branch, worktree_path, record) =
+            self.fork_source(&params.session_id).await?;
         let definition = self.binding_definition(&binding)?;
 
         // Fork is fail-closed: only a spec frozen into the binding can fork, never
@@ -474,6 +669,12 @@ impl SessionRegistry {
             .clone()
             .filter(NativeSessionLaunch::supports_fork)
             .ok_or_else(agent_fork_unsupported)?;
+        if let Some(error) = self
+            .hook_recovery_journal_error(&record, &binding, &launch)
+            .await
+        {
+            return Err(error);
+        }
         let change = ProfileChange::requested(params.accept_profile_change);
 
         // A fork starts a new process of the runtime, so a runtime with a
@@ -485,7 +686,7 @@ impl SessionRegistry {
         let input_rules = self.recovery_input_rules(&binding, &relaunch.definition);
 
         // Fork is fail-closed on a reference that no longer names a conversation.
-        verify_assigned_reference(&binding, &relaunch).await?;
+        verify_recovery_reference(&binding, &relaunch).await?;
         #[cfg(test)]
         self.hold_recovery(&id).await;
         let RelaunchPlan {
@@ -517,20 +718,14 @@ impl SessionRegistry {
             &session_ref,
             &opts,
         )?;
-        // The conversation a fork starts is new and core never learns its
-        // reference without an integration report, so a fork of an assigned
-        // reference starts without one instead of inheriting the source's.
-        let inherits_reference = launch.assigned().is_none();
+        // A fork reads the source reference but starts a distinct conversation.
+        // Only a verified report from the child process may set its own target.
         let snapshot = ResumeSnapshot {
             program,
             args: binding.args.clone(),
             native: Some(launch),
             launch_binding: binding.launch_binding.clone(),
-            reference_provenance: if inherits_reference {
-                binding.native_reference_provenance
-            } else {
-                NativeReferenceProvenance::Reported
-            },
+            reference_provenance: NativeReferenceProvenance::Reported,
             profile_revision: revision,
         };
         let guard = self.lock_lifecycle(&id).await;
@@ -549,12 +744,8 @@ impl SessionRegistry {
                     cols: params.cols,
                     rows: params.rows,
                     command,
-                    native_session_id: binding
-                        .native_session_id
-                        .filter(|_inherited| inherits_reference),
-                    native_session_path: binding
-                        .native_session_path
-                        .filter(|_inherited| inherits_reference),
+                    native_session_id: None,
+                    native_session_path: None,
                     project_id: binding.project_id,
                     is_linked_worktree: binding.is_linked_worktree,
                     repo,
@@ -749,6 +940,7 @@ impl SessionRegistry {
             Option<PathBuf>,
             Option<String>,
             Option<PathBuf>,
+            crate::store::SessionRecord,
         ),
         ProtocolError,
     > {
@@ -762,6 +954,7 @@ impl SessionRegistry {
             entry.info.repo.clone(),
             entry.info.branch.clone(),
             entry.info.worktree_path.clone(),
+            Self::session_record(id, entry, entry.desired_state, None),
         ))
     }
 
@@ -874,7 +1067,7 @@ impl SessionRegistry {
         // A reference core assigned is only as good as the conversation behind
         // it: relaunching into a conversation the agent never wrote, or one it
         // left, would silently start an empty session.
-        verify_assigned_reference(&binding, &relaunch).await?;
+        verify_recovery_reference(&binding, &relaunch).await?;
         #[cfg(test)]
         self.hold_recovery(&id).await;
         let RelaunchPlan {
@@ -1001,10 +1194,10 @@ impl SessionRegistry {
     }
 }
 
-/// Confirms that an assigned native reference still names an existing
-/// conversation, through the check the runtime declared at launch.
+/// Confirms that the native reference still names an existing conversation.
 ///
-/// A reference that arrived through an integration report is not checked here.
+/// Assigned references use the runtime's declared check. A Claude hook target
+/// uses the transcript tree below the runtime's declared config home.
 /// The check reads its config-home variable and `HOME` from the environment the
 /// agent is launched with (the filtered base environment, then the profile
 /// environment), and runs off the async runtime because it lists directories.
@@ -1013,17 +1206,26 @@ impl SessionRegistry {
 ///
 /// Returns `agent_native_reference_missing` when the conversation is not found
 /// or cannot be verified; the caller must not launch anything.
-async fn verify_assigned_reference(
+async fn verify_recovery_reference(
     binding: &ResumeBinding,
     relaunch: &RelaunchPlan,
 ) -> Result<(), ProtocolError> {
-    if binding.native_reference_provenance != NativeReferenceProvenance::Assigned {
-        return Ok(());
-    }
-    let Some(assigned) = relaunch.launch.assigned() else {
+    let existence = if binding.native_reference_provenance == NativeReferenceProvenance::Assigned {
+        let Some(assigned) = relaunch.launch.assigned() else {
+            return Ok(());
+        };
+        assigned.existence().clone()
+    } else if binding.agent_base == protocol::RuntimeRef::claude()
+        && binding.reference_kind() == Some(SessionRefKind::Id)
+    {
+        // A Claude conversation is named by its id and lives as a transcript
+        // file below the runtime's declared config home. A Claude-base profile
+        // that resumes a path reference keeps that reference as the agent's
+        // own transcript location; core cannot name a conversation for it.
+        claude_existence(&relaunch.definition)?
+    } else {
         return Ok(());
     };
-    let existence = assigned.existence().clone();
     let session_ref = relaunch.session_ref.clone();
     let profile_env = relaunch.profile.env.clone();
     let base_environment = relaunch.base_environment.clone();
@@ -1038,10 +1240,29 @@ async fn verify_assigned_reference(
         warn!(
             session_id = %binding.session_id,
             failure = %failure,
-            "assigned native reference is not recoverable"
+            "native reference is not recoverable"
         );
         ProtocolError::from(failure)
     })
+}
+
+fn claude_existence(definition: &RuntimeDefinition) -> Result<ReferenceExistence, ProtocolError> {
+    let home = definition.config_home().ok_or_else(|| {
+        runtime_error(
+            "agent_native_reference_missing",
+            "Claude runtime has no declared config home".to_owned(),
+        )
+    })?;
+    ReferenceExistence::try_from(ExistenceSpec {
+        check: ExistenceCheckKind::File,
+        root_env: Some(home.env().to_owned()),
+        root_home: Some(home.default_relative().to_owned()),
+        dir: Some(crate::external::CLAUDE_TRANSCRIPT_SUBDIR.to_owned()),
+        file_name: Some("{reference}.jsonl".to_owned()),
+        name_match: Some(NameMatch::Exact),
+        max_depth: Some(CLAUDE_PROJECT_DEPTH),
+    })
+    .map_err(|error| runtime_error("agent_native_reference_missing", error.to_string()))
 }
 
 fn binding_program(binding: &ResumeBinding, definition: &RuntimeDefinition) -> String {

@@ -206,6 +206,7 @@ fn session_info() -> SessionInfo {
         active_agent_pid: None,
         active_agent_session_id: None,
         active_agent_session_path: None,
+        native_last_activity_at: None,
         project_id: None,
         project_label: None,
         metadata: std::collections::BTreeMap::new(),

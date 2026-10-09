@@ -9,6 +9,8 @@
 
 // The daemon's unit tests share this view; it keeps `session.remove`
 // independent of the test host's processes whose markers cannot be read.
+#[path = "health_socket/native_recovery.rs"]
+mod native_recovery;
 #[path = "../src/procwatch/readable_host.rs"]
 mod readable_host;
 mod support;
@@ -520,13 +522,22 @@ fn worker_backed_registry(
 }
 
 /// Spawn the control server with a custom shell command.
+///
+/// Returns the shutdown sender, the server task, and the worker home
+/// directory the registry's real workers run under (their journals live
+/// below `<worker home>/state/pohunek/workers/<session>`).
 async fn spawn_server_with_config(
     socket: &std::path::Path,
     version: &str,
     config: SessionRegistryConfig,
-) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+) -> (
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+    std::path::PathBuf,
+) {
     let event_log_dir = config.event_log_dir.clone();
-    let (registry, worker_home) = worker_backed_registry(socket, config);
+    let (registry, worker_home_dir) = worker_backed_registry(socket, config);
+    let worker_home = worker_home_dir.path().to_path_buf();
     let notifications = NotificationService::open(&notification_data_dir(socket))
         .expect("notification service opens");
     if let Some(event_log_dir) = event_log_dir {
@@ -555,14 +566,14 @@ async fn spawn_server_with_config(
     let (tx, rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
         // Removed after the server and its registry are gone.
-        let _worker_home = worker_home;
+        let _worker_home_dir = worker_home_dir;
         server
             .serve(async move {
                 let _ = rx.await;
             })
             .await;
     });
-    (tx, handle)
+    (tx, handle, worker_home)
 }
 
 fn notification_data_dir(socket: &std::path::Path) -> PathBuf {
@@ -1753,7 +1764,7 @@ async fn attach_reporting_its_own_session_as_origin_is_rejected_over_the_socket(
     // `SessionAttachParams::origin_worker_id`), so the test reads the created
     // session's own worker id back off the wire to build the self-feeding request.
     let socket = temp_socket("attach-self-feedback");
-    let (shutdown, handle) =
+    let (shutdown, handle, _) =
         spawn_server_with_config(&socket, "0.0.0", support::hermetic_registry_config()).await;
     let mut control = connect(&socket).await;
 
@@ -2007,7 +2018,7 @@ async fn session_lifecycle_over_socket() {
         shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut client = connect(&socket).await;
     let created = create_session(&mut client, &socket).await;
@@ -2107,7 +2118,7 @@ async fn session_input_writes_text_to_shell_pty() {
         ),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut client = connect(&socket).await;
     let created = create_session(&mut client, &socket).await;
@@ -2151,7 +2162,7 @@ async fn session_new_with_input_writes_text_to_shell_pty() {
         ),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut client = connect(&socket).await;
     let mut params = session_params(&socket);
@@ -2209,7 +2220,7 @@ async fn codex_stub_session_publishes_blocked_and_receives_bracketed_input() {
     );
 
     let socket = temp_socket("codex-stub");
-    let (shutdown, handle) =
+    let (shutdown, handle, _) =
         spawn_server_with_config(&socket, "0.0.0", support::hermetic_registry_config()).await;
 
     let mut subscriber = connect(&socket).await;
@@ -2275,7 +2286,7 @@ async fn claude_stub_session_publishes_screen_blocked_and_receives_plain_input()
     );
 
     let socket = temp_socket("claude-stub");
-    let (shutdown, handle) =
+    let (shutdown, handle, _) =
         spawn_server_with_config(&socket, "0.0.0", support::hermetic_registry_config()).await;
 
     let mut subscriber = connect(&socket).await;
@@ -2328,7 +2339,7 @@ async fn session_survives_requesting_client_exit() {
         shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let created = {
         let mut first_client = connect(&socket).await;
@@ -2366,7 +2377,7 @@ async fn session_exit_detection_reports_done_and_failed() {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "exit 0"]),
         ..SessionRegistryConfig::default()
     };
-    let (success_shutdown, success_handle) =
+    let (success_shutdown, success_handle, _) =
         spawn_server_with_config(&success_socket, "0.0.0", success_config).await;
     let mut success_client = connect(&success_socket).await;
     let success = create_session(&mut success_client, &success_socket).await;
@@ -2380,7 +2391,7 @@ async fn session_exit_detection_reports_done_and_failed() {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "exit 7"]),
         ..SessionRegistryConfig::default()
     };
-    let (failure_shutdown, failure_handle) =
+    let (failure_shutdown, failure_handle, _) =
         spawn_server_with_config(&failure_socket, "0.0.0", failure_config).await;
     let mut failure_client = connect(&failure_socket).await;
     let failure = create_session(&mut failure_client, &failure_socket).await;
@@ -2397,7 +2408,7 @@ async fn subscribe_streams_session_created_event() {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     // A subscriber connection: send `subscribe`, expect an OK ack, then keep the
     // connection open to receive unsolicited event lines.
@@ -2437,7 +2448,7 @@ async fn notification_api_crud_policy_methods_work() {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
     let mut control = connect(&socket).await;
 
     let created = create_notification(&mut control, notification_params(None)).await;
@@ -2513,7 +2524,7 @@ async fn notification_retention_prune_dry_run_and_apply_methods_work() {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
     let mut control = connect(&socket).await;
 
     let read_record = create_notification(&mut control, notification_params(None)).await;
@@ -2587,7 +2598,7 @@ async fn notification_update_returns_typed_errors_for_missing_invalid_and_malfor
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
     let mut control = connect(&socket).await;
 
     let missing_req = Request::make(
@@ -2664,7 +2675,7 @@ async fn notification_create_enriches_live_session_context() {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
     let mut control = connect(&socket).await;
     let session = create_session(&mut control, &socket).await;
 
@@ -2685,7 +2696,7 @@ async fn notification_create_keeps_missing_session_reference() {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
     let mut control = connect(&socket).await;
     let missing = SessionId("s-missing".to_owned());
 
@@ -2706,7 +2717,7 @@ async fn subscribe_streams_notification_created_event() {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut subscriber = connect(&socket).await;
     let subscribe_req = Request::make(
@@ -2743,7 +2754,7 @@ async fn subscribe_streams_notification_updated_events_for_read_ack_and_archive(
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
     let mut control = connect(&socket).await;
     let created = create_notification(&mut control, notification_params(None)).await;
 
@@ -2794,7 +2805,7 @@ async fn subscribe_streams_notification_deleted_event() {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
     let mut control = connect(&socket).await;
     let created = create_notification(&mut control, notification_params(None)).await;
 
@@ -2839,7 +2850,7 @@ async fn report_agent_api_records_active_agent_and_streams_report_state() {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut subscriber = connect(&socket).await;
     let subscribe_req = Request::make("subscribe-report-agent", method::SUBSCRIBE, Value::Null);
@@ -2897,7 +2908,7 @@ async fn attach_raw_stream_round_trips_resizes_detaches_and_reattaches() {
         shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut control = connect(&socket).await;
     let created = create_session(&mut control, &socket).await;
@@ -2991,7 +3002,7 @@ async fn reattach_starts_from_current_snapshot_after_historical_resizes() {
         shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut control = connect(&socket).await;
     let created = create_session(&mut control, &socket).await;
@@ -3072,7 +3083,7 @@ async fn multiple_attach_clients_receive_output_and_disconnect_independently() {
         shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut subscriber = subscribe_events(&socket).await;
     let mut control = connect(&socket).await;
@@ -3137,7 +3148,7 @@ async fn dropping_an_attach_connection_detaches_without_stopping_the_session() {
         shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut subscriber = subscribe_events(&socket).await;
     let mut control = connect(&socket).await;
@@ -3212,7 +3223,7 @@ async fn detector_publishes_osc_title_activity_while_attach_receives_output() {
         ),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut subscriber = subscribe_events(&socket).await;
 
@@ -3276,7 +3287,7 @@ async fn detector_tick_publishes_debounced_static_osc_title_activity() {
         ),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut subscriber = connect(&socket).await;
     let subscribe_req = Request::make(
@@ -3339,7 +3350,7 @@ async fn two_sessions_on_one_repo_get_distinct_worktrees() {
         store_path: Some(store_path.clone()),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut control = connect(&socket).await;
     let alpha: SessionInfo = serde_json::from_value(ok_payload(
@@ -3467,7 +3478,7 @@ async fn event_log_records_lifecycle_and_never_terminal_bytes() {
         event_log_dir: Some(events_dir.clone()),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut control = connect(&socket).await;
     let created = create_session(&mut control, &socket).await;
@@ -3524,7 +3535,7 @@ async fn event_log_records_notification_control_events() {
         event_log_dir: Some(events_dir.clone()),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut control = connect(&socket).await;
     let created = create_notification(&mut control, notification_params(None)).await;
@@ -3580,7 +3591,7 @@ async fn worktree_session_persists_recovery_and_worktree_metadata() {
     let _path = PathGuard::prepend(&bin_dir);
 
     // --- Create phase: report a native id after the session commit. ---
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
     let mut control = connect(&socket).await;
     let created: SessionInfo = serde_json::from_value(ok_payload(
         create_worktree_session(&mut control, agent, repo.cwd().to_path_buf(), "feat/x").await,
@@ -3682,7 +3693,7 @@ async fn worktree_remove_over_the_socket_succeeds_and_fails_closed() {
         store_path: Some(store_dir.join("metadata.jsonl")),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
     let mut control = connect(&socket).await;
 
     let mut sessions = Vec::new();

@@ -669,14 +669,21 @@ shell-free, symlink-free file listing below a declared config home) and fail
 closed with `agent_native_reference_missing` instead of launching an agent into
 an empty conversation; a runtime that declares `check = "none"` is relaunched
 unchecked. Recovery never falls back to another runtime, the shell or
-"continue latest". A fork of an assigned reference holds no reference of its
-own and is not resumable. A later validated report always supersedes an
+"continue latest". A fork holds no reference of its own until its launch
+process reports one, regardless of the source reference's provenance; it
+cannot resume its parent's conversation. A later validated report always supersedes an
 assigned reference: an assigned runtime that declares an integration handler and
 hook schema may report, and the report replaces the stored value and its
 provenance (`reported`) in the session, its durable record and its resume
 binding, so `/clear` and in-session resume are followed and `session.resume` and
-`session.fork` launch with the reported conversation. The existence check runs
-only for a still-assigned reference. A report must pass the usual checks (the
+`session.fork` launch with the reported conversation. The declared existence
+check runs for a still-assigned reference. Claude hook targets additionally
+require a regular transcript file under the effective declared config home;
+either recovery action refuses with `agent_native_reference_missing` before
+launch when the file is absent or cannot be verified. A tested worker journal
+that carries a newer conversation switch the daemon cannot verify makes both
+recovery actions refuse with `native_identity_uncertain` instead of resuming
+the older verified target. A report must pass the usual checks (the
 process-identity, sequence and expiry checks for `session.report_native_id`, the
 launch process and sequence for the worker's active identity), a stale or
 refused one leaves the stored reference alone, and an assigned value never
@@ -706,8 +713,9 @@ hooks from a `codex app-server` child of the launched `codex`); a provider
 without a declared helper role gets no exemption. An independent same-provider
 child, a deeper process, a sibling, a process of another name, and a process
 whose PID or start time no longer matches are refused, so an agent a tool command starts never speaks for the session. The
-first accepted claim is the session's reference and is never replaced by a
-different one. Only the `SessionStart` identity report carries a conversation
+first accepted claim is the initial reference. A later switch replaces it only
+when the launch agent reports a newer verified conversation. Only the
+`SessionStart` identity report carries a conversation
 id; a subagent's `SubagentStart` and `SubagentStop` reports are a separate
 claim type that never touches the reference.
 The official Pi package is the worked example: see the [Pi runtime package](../guides/pi-package.md).
@@ -715,8 +723,9 @@ The official Pi package is the worked example: see the [Pi runtime package](../g
 `session.fork` creates a new pohunek session id and PTY from the source session's
 native agent conversation. The source may still be live; fork does not require a
 terminal state. With `cwd_mode: "same"`, the new session starts in the source
-cwd/worktree and carries the same launch-agent native metadata, so the fork is
-resumable too (except a fork of an assigned reference, which holds none). The fork argv comes from the session's frozen native-session
+cwd/worktree. The child begins without its own native recovery reference;
+only its own verified launch-agent report can set one. The fork argv comes
+from the session's frozen native-session
 launch spec: Claude forks as `claude --resume <native_session_id>
 --fork-session`, and a host profile that declares `fork_args` forks with exactly
 those arguments. Codex fork is intentionally not enabled in this daemon contract;
