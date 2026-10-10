@@ -16024,7 +16024,7 @@ handler = "codex-hook-v1"
         use nix::sys::signal::{kill, Signal};
         use nix::unistd::Pid;
         use pohunek_platform::supervisor::{DefinitionFacts, ServiceId, ServiceState};
-        use pohunek_test_support::wait::wait_until;
+        use pohunek_test_support::wait::{poll_until as wait_until_sync, wait_until};
         use pohunek_test_support::worker_binary;
         use protocol::{RuntimeState, SessionId, SessionInfo};
 
@@ -16571,8 +16571,12 @@ handler = "codex-hook-v1"
             }
         }
 
-        /// Kills every process still working in a scenario's directory when the
-        /// scenario ends, so a runtime the sweep left alive does not outlive it.
+        /// Kills every process working in a scenario's directory when the
+        /// scenario ends, so a runtime the sweep left alive does not outlive it,
+        /// and returns only once none of them runs.
+        ///
+        /// The scenario's processes are found by their working directory, so the
+        /// reaper must drop while that directory exists.
         struct ScopeReaper(ScopedHost);
 
         impl ScopeReaper {
@@ -16580,34 +16584,55 @@ handler = "codex-hook-v1"
                 Self(ScopedHost::new(directory))
             }
 
-            /// PIDs of the processes working in the scenario's directory.
-            fn pids(&self) -> BTreeSet<u32> {
+            /// Identities of the scenario's processes that still run.
+            fn running(&self) -> Vec<crate::procwatch::ProcessIdentity> {
                 self.0
                     .same_user_processes()
-                    .expect("enumerate the scenario's processes")
+                    .unwrap_or_default()
                     .into_iter()
-                    .map(|fact| fact.pid)
+                    .map(|fact| fact.identity())
+                    .filter(|identity| self.0.is_running(*identity).unwrap_or(false))
+                    .collect()
+            }
+
+            /// PIDs of the processes that still run in the scenario's directory.
+            fn pids(&self) -> BTreeSet<u32> {
+                self.running()
+                    .into_iter()
+                    .map(|identity| identity.pid)
                     .collect()
             }
         }
 
         impl Drop for ScopeReaper {
+            /// Signals every running process of the scenario again until a
+            /// listing finds none: a process that forked before it was signalled
+            /// shows up in the next listing.
             fn drop(&mut self) {
-                for pid in self.pids() {
-                    if let Ok(raw) = i32::try_from(pid) {
-                        let _signalled = kill(Pid::from_raw(raw), Signal::SIGKILL);
+                wait_until_sync("the scenario's processes to exit", || {
+                    let running = self.running();
+                    for identity in &running {
+                        if let Ok(raw) = i32::try_from(identity.pid) {
+                            let _signalled = kill(Pid::from_raw(raw), Signal::SIGKILL);
+                        }
                     }
-                }
+                    running.is_empty().then_some(())
+                });
             }
         }
 
         /// A scenario's real-host registry with its bystanders: one started
         /// before the worker, and a tree (a shell and its child) started after
         /// it by the test process, which is older than the worker.
+        ///
+        /// Fields drop in declaration order, which is the teardown order: the
+        /// reaper first, because it finds the runtime and the bystanders' children
+        /// by the fixture's directory; then the bystanders; then the fixture,
+        /// which removes the directory.
         struct Scene {
-            fixture: Fixture,
             scope: ScopeReaper,
             _bystanders: Bystanders,
+            fixture: Fixture,
             earlier: u32,
             tree: u32,
             tree_child: u32,
