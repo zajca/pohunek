@@ -764,14 +764,10 @@ async fn rollback_reconciles_a_stop_intent_before_the_old_job_was_stopped() {
         std::fs::read(installation.context.config_path()).expect("restored config"),
         old_bytes
     );
-    assert_ne!(
-        backend
-            .daemon()
-            .inspect()
-            .await
-            .expect("previous job")
-            .process,
-        Some(old_daemon),
+    assert!(
+        !HostInspector::new()
+            .is_running(old_daemon)
+            .expect("inspect previous daemon liveness"),
         "the journaled stop was reconciled before the restore"
     );
     repair_synthetic_previous_reader(&installation, &backend).await;
