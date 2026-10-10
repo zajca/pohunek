@@ -26,7 +26,7 @@ use super::darwin_layout::{
 };
 use super::{
     BootIdentity, Error, ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessIdentity,
-    ProcessInspector, StartIdentity,
+    ProcessInspector, ProcessLineage, SpawnId, StartIdentity,
 };
 
 /// Bounds consecutive empty kqueue drains after a readiness notification.
@@ -81,6 +81,10 @@ impl ProcessInspector for DarwinInspector {
         // there without becoming a zombie for as long as the kernel waits to
         // drain its controlling terminal.
         Ok(fact.start_identity == identity.start_identity && !fact.is_zombie && !fact.is_exiting)
+    }
+
+    fn lineage(&self, pid: Pid) -> Result<Option<ProcessLineage>, Error> {
+        read_lineage(pid, native::effective_uid(), "inspect_process_lineage")
     }
 
     fn parent_pid(&self, pid: Pid) -> Result<Option<Pid>, Error> {
@@ -323,6 +327,47 @@ fn read_identity(
     )
 }
 
+/// Reads the fork lineage of one same-user process.
+///
+/// The kernel serves the unique-identifier record for every process the caller
+/// owns, whatever the process hides from its argument region. The record names
+/// no start time, so the BSD record brackets the read: the lineage is kept only
+/// when the same process answered both BSD reads around it, which keeps a
+/// successor that reused the process id from being reported under the old one.
+fn read_lineage(
+    pid: Pid,
+    euid: u32,
+    operation: &'static str,
+) -> Result<Option<ProcessLineage>, Error> {
+    let Some(initial) = read_bsd_fact(pid, euid, operation)? else {
+        return Ok(None);
+    };
+    let raw = match native::unique_info(native_pid(pid, operation)?) {
+        Ok(raw) => raw,
+        Err(error) if is_process_race(&error) => return Ok(None),
+        Err(error) if is_permission_denied(&error) => {
+            // The same reasoning as for the BSD record: the process was served
+            // a moment ago, so ownership tells a vanished or re-credentialed
+            // process from a denial on one the caller still owns.
+            return match read_ownership(pid, euid, operation)? {
+                Ownership::SameUser => Err(Error::from_io(operation, error)),
+                Ownership::OtherUser | Ownership::Gone => Ok(None),
+            };
+        }
+        Err(source) => return Err(Error::from_io(operation, source)),
+    };
+    let Some(current) = read_bsd_fact(pid, euid, operation)? else {
+        return Ok(None);
+    };
+    if current.start_identity != initial.start_identity {
+        return Ok(None);
+    }
+    Ok(Some(ProcessLineage {
+        id: SpawnId::new(raw.unique_id),
+        parent: SpawnId::new(raw.parent_unique_id),
+    }))
+}
+
 /// Fails unless the exact identity is still the process behind its id.
 fn require_identity(
     expected: ProcessIdentity,
@@ -506,6 +551,18 @@ mod native {
     /// Width of `struct proc_bsdshortinfo`, which the kernel writes in full.
     const SHORT_RECORD_BYTES: usize = 64;
 
+    /// `PROC_PIDUNIQIDENTIFIERINFO` from XNU `bsd/sys/proc_info.h`.
+    ///
+    /// The flavor is declared only in the kernel's private header, so neither
+    /// the SDK nor `libc` exports it; the value is the one the kernel defines.
+    /// It serves the creation numbers of a process for every process the caller
+    /// owns, including a restricted platform binary that withholds its
+    /// environment.
+    const PROC_PIDUNIQIDENTIFIERINFO: libc::c_int = 17;
+
+    /// Width of `struct proc_uniqidentifierinfo`, which the kernel writes in full.
+    const UNIQUE_RECORD_BYTES: usize = 56;
+
     /// Caps the process table read in one inventory pass.
     ///
     /// Darwin's `kern.maxproc` is well below this on every supported machine,
@@ -586,6 +643,38 @@ mod native {
     // A transcription slip in the mirrored record must fail the build rather
     // than read a field from the wrong offset.
     const _: () = assert!(size_of::<ProcBsdShortInfo>() == SHORT_RECORD_BYTES);
+
+    /// Creation numbers of one process copied out of `proc_pidinfo`.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct RawUniqueInfo {
+        pub(super) unique_id: u64,
+        pub(super) parent_unique_id: u64,
+    }
+
+    /// `struct proc_uniqidentifierinfo` from XNU `bsd/sys/proc_info.h`, which
+    /// no public header exports.
+    ///
+    /// The declaration mirrors the kernel field order and widths so the compiler
+    /// computes the offsets: the executable image UUID, the process's own
+    /// creation number, the creation number of the process that created it (kept
+    /// when that process exits), the image version, and reserved words. Fields
+    /// the inspector does not read keep their kernel names behind an underscore
+    /// because they carry the layout.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ProcUniqIdentifierInfo {
+        _p_uuid: [u8; 16],
+        p_uniqueid: u64,
+        p_puniqueid: u64,
+        _p_idversion: i32,
+        _p_reserve2: i32,
+        _p_reserve3: u64,
+        _p_reserve4: u64,
+    }
+
+    // A transcription slip in the mirrored record must fail the build rather
+    // than read a field from the wrong offset.
+    const _: () = assert!(size_of::<ProcUniqIdentifierInfo>() == UNIQUE_RECORD_BYTES);
 
     /// Outcome of draining one kqueue after a readiness notification.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -691,6 +780,47 @@ mod native {
             start_microseconds: info.pbi_start_tvusec,
             is_zombie: info.pbi_status == libc::SZOMB,
             is_exiting: info.pbi_flags & PROC_FLAG_INEXIT != 0,
+        })
+    }
+
+    /// Reads the creation numbers of one process id.
+    ///
+    /// Like the BSD record, the kernel serves `PROC_PIDUNIQIDENTIFIERINFO` for
+    /// an exited process that is not yet reaped when asked to include zombies.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating-system error, or `InvalidData` when the kernel
+    /// wrote fewer bytes than the structure it documents.
+    pub(super) fn unique_info(pid: i32) -> io::Result<RawUniqueInfo> {
+        let size = buffer_length(size_of::<ProcUniqIdentifierInfo>())?;
+        let mut info = MaybeUninit::<ProcUniqIdentifierInfo>::zeroed();
+        // SAFETY: `proc_pidinfo` writes at most `size` bytes, and `info` is a
+        // live, correctly aligned allocation of exactly `size` bytes.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                PROC_PIDUNIQIDENTIFIERINFO,
+                INCLUDE_ZOMBIES,
+                info.as_mut_ptr().cast::<libc::c_void>(),
+                size,
+            )
+        };
+        if written <= 0 {
+            return Err(last_os_error());
+        }
+        if written != size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unique identifier record is shorter than the kernel structure",
+            ));
+        }
+        // SAFETY: the kernel wrote the whole record, and the structure is plain
+        // integer data, so every byte pattern it can write is a valid value.
+        let info = unsafe { info.assume_init() };
+        Ok(RawUniqueInfo {
+            unique_id: info.p_uniqueid,
+            parent_unique_id: info.p_puniqueid,
         })
     }
 

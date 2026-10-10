@@ -4,8 +4,13 @@
 //! identity both match within the current boot. Start identities are comparable
 //! for equality only; they are not portable timestamps. Persisted callers that
 //! cross a reboot boundary must additionally bind records to a [`BootIdentity`].
+//!
+//! A host that numbers its processes at creation also reports each process's
+//! [`ProcessLineage`], which proves fork ancestry even for a process whose
+//! environment and argument region the kernel withholds, and even after the
+//! parents in between have exited.
 
-// Rust guideline compliant 2026-09-22
+// Rust guideline compliant 2026-10-10
 
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
@@ -100,6 +105,52 @@ impl FromStr for StartIdentity {
     }
 }
 
+/// Kernel-assigned creation number of a process within one boot.
+///
+/// The kernel draws the number from a boot-wide counter when it creates the
+/// process, so numbers rise in creation order, no two processes of one boot
+/// share one, and a process keeps its number across `exec`. A process is always
+/// created after its parent, so a child's number is greater than its parent's.
+///
+/// Numbers compare meaningfully only between processes of one boot: the
+/// counter restarts at every reboot, so a persisted number is valid only
+/// together with the [`BootIdentity`] it was recorded under. The number is
+/// neither a process id nor a timestamp, and it is not portable across
+/// operating systems; see [`ProcessInspector::lineage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SpawnId(u64);
+
+impl SpawnId {
+    /// Creates a spawn id from its canonical integer representation.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the canonical integer representation.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for SpawnId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl FromStr for SpawnId {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value
+            .parse::<u64>()
+            .map(Self)
+            .map_err(|source| Error::InvalidSpawnId { source })
+    }
+}
+
 /// Opaque operating-system boot identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BootIdentity(String);
@@ -144,6 +195,20 @@ pub struct ProcessIdentity {
     pub pid: Pid,
     /// Opaque process start identity.
     pub start_identity: StartIdentity,
+}
+
+/// Fork lineage of one process within one boot.
+///
+/// The parent number is the one the kernel captured when it created the
+/// process. It keeps naming that parent after the parent exits and the process
+/// is reparented, so the pair links a process to its creator even when the
+/// parent process id names someone else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProcessLineage {
+    /// Creation number of the process itself.
+    pub id: SpawnId,
+    /// Creation number of the process that created it.
+    pub parent: SpawnId,
 }
 
 /// Process facts read from the operating system.
@@ -278,6 +343,13 @@ pub enum Error {
         /// Stable operation label.
         operation: &'static str,
     },
+    /// A decimal spawn id was invalid.
+    #[error("process spawn id is not an unsigned decimal integer")]
+    InvalidSpawnId {
+        /// Decimal parser failure.
+        #[source]
+        source: std::num::ParseIntError,
+    },
     /// A decimal start identity was invalid.
     #[error("process start identity is not an unsigned decimal integer")]
     InvalidStartIdentity {
@@ -372,6 +444,28 @@ pub trait ProcessInspector: Debug + Send + Sync + 'static {
     /// Returns typed failures when the minimal process record cannot be inspected.
     fn is_running(&self, identity: ProcessIdentity) -> Result<bool, Error> {
         Ok(self.identity(identity.pid)? == Some(identity))
+    }
+
+    /// Returns the fork lineage of one same-user process, or `None` if it exited.
+    ///
+    /// A host that reports lineage serves it for every same-user process,
+    /// including one whose environment and argument region the kernel
+    /// withholds, and it names the process that created it for as long as the
+    /// process lives. It describes the process that holds `pid` when the call
+    /// returns; callers that bind it to a [`ProcessIdentity`] recheck the
+    /// identity afterwards, as they do for any other fact.
+    ///
+    /// The default reports [`Error::Unavailable`], so a host that does not
+    /// number its processes at creation needs no implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unavailable`] when the host reports no lineage, or
+    /// another typed failure when the process record cannot be inspected.
+    fn lineage(&self, _pid: Pid) -> Result<Option<ProcessLineage>, Error> {
+        Err(Error::Unavailable {
+            operation: "inspect_process_lineage",
+        })
     }
 
     /// Returns the current parent PID without reading unrelated process facts.

@@ -7,16 +7,28 @@
 //! period, with `SIGKILL`. Every signal is preceded by a start-identity check,
 //! so a reused PID is never signalled, and any inspection failure other than a
 //! process disappearing aborts the sweep before further signals are sent.
+//!
+//! A process whose environment cannot be read carries no readable marker. When
+//! the caller names the lost worker's [`SpawnId`], the sweep decides such a
+//! process by its fork lineage instead: a process created, through any chain of
+//! creators, by that worker is selected like a marked one, a process the worker
+//! cannot have created is left out, and a process whose ancestry is not
+//! established stays skipped and reported.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-10-10
 
+use std::cell::OnceCell;
+use std::collections::HashMap;
 use std::io;
 use std::time::Duration;
 
 use rustix::process::{Pid as NativePid, Signal};
 use tokio::time::Instant;
 
-use super::{Error, ProcessIdentity, ProcessInspector, StartIdentity, WorkerInstanceMarker};
+use super::{
+    Error, ProcessFact, ProcessIdentity, ProcessInspector, ProcessLineage, SpawnId, StartIdentity,
+    WorkerInstanceMarker,
+};
 
 /// Largest accepted worker instance ID, in bytes.
 ///
@@ -31,6 +43,14 @@ pub const MAX_WORKER_INSTANCE_ID_BYTES: usize = 128;
 /// would stall reconciliation of the lost session for no realistic benefit.
 pub const MAX_SWEEP_GRACE: Duration = Duration::from_mins(10);
 
+/// Longest creator chain the lineage proof follows from one process.
+///
+/// Every step moves to a distinct live process of the same-user table, so no
+/// real chain is longer than the table, which the Darwin inspector bounds at
+/// 65,536 entries. A walk that reaches this bound proves nothing and leaves the
+/// process skipped, so the bound only keeps a corrupt table from looping.
+const MAX_LINEAGE_STEPS: usize = 65_536;
+
 /// Validated parameters of one runtime sweep.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweepRequest {
@@ -42,6 +62,9 @@ pub struct SweepRequest {
     /// Start identity of the worker process instance that owned the runtime,
     /// when the caller knows it; see [`Self::with_worker_start_identity`].
     worker_start_identity: Option<StartIdentity>,
+    /// Spawn id of the worker process instance that owned the runtime, when the
+    /// caller knows it; see [`Self::with_worker_spawn_id`].
+    worker_spawn_id: Option<SpawnId>,
 }
 
 impl SweepRequest {
@@ -81,6 +104,7 @@ impl SweepRequest {
             grace,
             poll,
             worker_start_identity: None,
+            worker_spawn_id: None,
         })
     }
 
@@ -89,14 +113,38 @@ impl SweepRequest {
     /// The daemon takes this from the dead worker's journal. With the bound,
     /// a same-user process whose markers cannot be read is still provably not
     /// a descendant of the worker when its own start identity strictly
-    /// precedes the worker's. Without the bound, every unreadable-marker
-    /// process stays skipped and the sweep is reported unconfirmed.
+    /// precedes the worker's, on a host whose start identities order process
+    /// starts. Without the bound, and without
+    /// [`Self::with_worker_spawn_id`], every unreadable-marker process stays
+    /// skipped and the sweep is reported unconfirmed.
     #[must_use]
     pub fn with_worker_start_identity(
         mut self,
         worker_start_identity: Option<StartIdentity>,
     ) -> Self {
         self.worker_start_identity = worker_start_identity;
+        self
+    }
+
+    /// Names the creation number of the worker process instance that owned the
+    /// runtime.
+    ///
+    /// The daemon takes this from the dead worker's journal. With it, a
+    /// same-user process whose markers cannot be read is decided by its fork
+    /// lineage on a host that reports lineage (see
+    /// [`ProcessInspector::lineage`]): the sweep selects it when the worker
+    /// created it, directly or through other processes, leaves it out when the
+    /// worker cannot have created it, and skips it as unreadable when neither is
+    /// established, for example when a creator in between has exited. A process
+    /// proven a descendant has no readable session marker, so under
+    /// [`Self::with_session_id`] it is skipped as session-unverified instead of
+    /// selected.
+    ///
+    /// Creation numbers restart at every boot, so the caller must pass the
+    /// number only when it was recorded in the current boot.
+    #[must_use]
+    pub fn with_worker_spawn_id(mut self, worker_spawn_id: Option<SpawnId>) -> Self {
+        self.worker_spawn_id = worker_spawn_id;
         self
     }
 
@@ -139,6 +187,12 @@ impl SweepRequest {
     pub const fn worker_start_identity(&self) -> Option<StartIdentity> {
         self.worker_start_identity
     }
+
+    /// Returns the worker creation number, when the caller knows it.
+    #[must_use]
+    pub const fn worker_spawn_id(&self) -> Option<SpawnId> {
+        self.worker_spawn_id
+    }
 }
 
 /// Accepts the worker-protocol identifier alphabet and bound.
@@ -162,8 +216,8 @@ pub enum SkipReason {
     CurrentProcess,
     /// The process environment could not be read (access was denied, the
     /// process was between images, or the kernel withholds the environment of
-    /// a restricted platform binary), so it cannot be proven to belong to the
-    /// runtime.
+    /// a restricted platform binary), and neither its start time nor its fork
+    /// lineage proves whether it belongs to the runtime.
     MarkersUnreadable,
     /// `POHUNEK_WORKER_INSTANCE_ID` and `POHUNEK_RUNTIME_ID` carry different
     /// values, so the process cannot be proven to belong to the runtime or not.
@@ -252,8 +306,11 @@ pub enum SweepError {
 /// The sweep enumerates the caller's processes and selects those whose
 /// allowlisted `POHUNEK_WORKER_INSTANCE_ID` marker equals the request's worker instance ID
 /// byte for byte; unmarked processes and other worker instance IDs are never
-/// selected. Selection finishes before the first signal, so an inspection
-/// failure during selection signals nothing. Each selected process then gets
+/// selected. A process whose markers cannot be read is selected only through
+/// its fork lineage, when the request names the worker's creation number and
+/// the process is proven to descend from that worker. Selection finishes
+/// before the first signal, so an inspection failure during selection signals
+/// nothing. Each selected process then gets
 /// `SIGTERM`; those still running after the grace period get `SIGKILL`; and
 /// the sweep waits up to the grace period again for them to exit. A process's
 /// start identity is rechecked immediately before every signal, and a process
@@ -423,9 +480,11 @@ fn select_targets(
     report: &mut SweepReport,
 ) -> Result<Vec<ProcessIdentity>, Fault> {
     let mut targets = Vec::new();
-    for fact in inspector.same_user_processes()? {
+    let facts = inspector.same_user_processes()?;
+    let lineage = SpawnLineage::new(inspector, &facts);
+    for fact in &facts {
         let identity = fact.identity();
-        match classify(inspector, identity, request)? {
+        match classify(inspector, identity, request, &lineage)? {
             Selection::Target if identity.pid == own_pid => {
                 skip(report, identity, SkipReason::CurrentProcess);
             }
@@ -446,6 +505,7 @@ fn classify(
     inspector: &dyn ProcessInspector,
     identity: ProcessIdentity,
     request: &SweepRequest,
+    lineage: &SpawnLineage<'_>,
 ) -> Result<Selection, Error> {
     let markers = match inspector.ownership_markers(identity.pid) {
         Ok(markers) => markers,
@@ -455,7 +515,7 @@ fn classify(
         // non-dumpable agents) or be between images; without the marker they
         // are never signalled, and the rest of the table is still classified.
         Err(Error::PermissionDenied { .. } | Error::Unobservable { .. }) => {
-            return Ok(classify_unreadable_markers(inspector, identity, request));
+            return classify_unreadable_markers(inspector, identity, request, lineage);
         }
         Err(error) => return Err(error),
     };
@@ -505,22 +565,31 @@ pub(super) const START_IDENTITY_ORDERS_PROCESS_STARTS: bool = cfg!(target_os = "
 /// A process inherits its environment only when it is forked or execs, and
 /// only the worker and its descendants ever carry this runtime's marker, so
 /// a process carrying the marker must have started at or after the worker
-/// that owns the runtime. A process whose start identity strictly precedes
-/// the journaled worker's start identity therefore cannot be a descendant of
-/// that worker, however unreadable its current markers are. The bound is the
-/// worker's start identity, which identifies the exact process instance, so
-/// a PID that was reused after the worker compares by its own, later start
-/// time and is never dismissed by the bound. Without a bound, when the
-/// process exited between the two reads, or when its start identity cannot
-/// be read either, the process is not provably foreign: it stays skipped
-/// unreadable, which makes the caller's cleanup unconfirmed. The same holds
-/// on a platform whose start identities are not ordered by a monotonic clock
-/// (see [`START_IDENTITY_ORDERS_PROCESS_STARTS`]).
+/// that owns the runtime, and must descend from it. Two bounds, each named by
+/// the request, decide such a process without its markers.
+///
+/// The worker's start identity bounds the start time: a process whose start
+/// identity strictly precedes it cannot be a descendant. It identifies the exact
+/// worker process instance, so a PID that was reused after the worker compares
+/// by its own, later start time and is never dismissed by the bound. It is used
+/// only where start identities are ordered by a monotonic clock (see
+/// [`START_IDENTITY_ORDERS_PROCESS_STARTS`]).
+///
+/// The worker's creation number bounds the fork lineage (see
+/// [`SpawnLineage::ancestry`]): a process the worker created, through any chain
+/// of creators, is selected like a marked one, after the same final identity
+/// check, and a process the worker cannot have created is foreign.
+///
+/// Without a bound, when the process exited between the two reads, or when its
+/// start identity cannot be read, the process is not provably foreign: it stays
+/// skipped unreadable, which makes the caller's cleanup unconfirmed. The same
+/// holds for a process whose ancestry the lineage does not establish.
 fn classify_unreadable_markers(
     inspector: &dyn ProcessInspector,
     identity: ProcessIdentity,
     request: &SweepRequest,
-) -> Selection {
+    lineage: &SpawnLineage<'_>,
+) -> Result<Selection, Error> {
     // An exited process can keep its identity while its parent has not reaped
     // it. Dismiss it only when a fresh read confirms the enumerated identity
     // and that exact process is no longer running. Missing or inconsistent
@@ -528,23 +597,166 @@ fn classify_unreadable_markers(
     if matches!(inspector.identity(identity.pid), Ok(Some(current)) if current == identity)
         && matches!(inspector.is_running(identity), Ok(false))
     {
-        return Selection::Foreign;
+        return Ok(Selection::Foreign);
     }
-    let Some(worker_start) = request.worker_start_identity() else {
-        return Selection::Skip(SkipReason::MarkersUnreadable);
-    };
+    let worker_start = request.worker_start_identity();
+    let worker_spawn = request.worker_spawn_id();
+    if worker_start.is_none() && worker_spawn.is_none() {
+        return Ok(Selection::Skip(SkipReason::MarkersUnreadable));
+    }
     match inspector.identity(identity.pid) {
         // The process exited between the marker read and this read, so it
         // cannot survive the sweep.
-        Ok(None) => Selection::Foreign,
+        Ok(None) => return Ok(Selection::Foreign),
         Ok(Some(current))
-            if START_IDENTITY_ORDERS_PROCESS_STARTS && current.start_identity < worker_start =>
+            if START_IDENTITY_ORDERS_PROCESS_STARTS
+                && worker_start.is_some_and(|start| current.start_identity < start) =>
         {
-            Selection::Foreign
+            return Ok(Selection::Foreign);
         }
-        // A process started at or after the worker, or one whose start read
-        // failed, proves nothing: it stays skipped unreadable.
-        _ => Selection::Skip(SkipReason::MarkersUnreadable),
+        Ok(Some(_)) => {}
+        // A process whose start read failed proves nothing: it stays skipped
+        // unreadable.
+        Err(_) => return Ok(Selection::Skip(SkipReason::MarkersUnreadable)),
+    }
+    let Some(worker) = worker_spawn else {
+        return Ok(Selection::Skip(SkipReason::MarkersUnreadable));
+    };
+    Ok(match lineage.ancestry(identity, worker)? {
+        // A session marker cannot be read from this process, so a request
+        // that requires one never selects it through the lineage.
+        Ancestry::Descendant if request.session_id.is_some() => {
+            Selection::Skip(SkipReason::SessionUnverified)
+        }
+        Ancestry::Descendant => match verify(inspector, identity)? {
+            None => Selection::Target,
+            Some(Delivery::IdentityChanged) => Selection::Skip(SkipReason::IdentityChanged),
+            Some(Delivery::Vanished | Delivery::Sent) => Selection::Skip(SkipReason::Vanished),
+        },
+        Ancestry::Unrelated => Selection::Foreign,
+        Ancestry::Unproven => Selection::Skip(SkipReason::MarkersUnreadable),
+    })
+}
+
+/// What the fork lineage proves about a process relative to one worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ancestry {
+    /// The worker created the process, directly or through other processes.
+    Descendant,
+    /// The worker cannot have created the process.
+    Unrelated,
+    /// The lineage does not establish either.
+    Unproven,
+}
+
+/// Fork lineage of the processes one selection enumerated.
+///
+/// The lineage of every enumerated process is read once, when the first
+/// candidate needs it, so the cost of a selection is linear in the size of the
+/// table however many candidates ask. Each read is bracketed by the enumerated
+/// identity, so an entry describes the enumerated process and never a process
+/// that reused its PID.
+struct SpawnLineage<'a> {
+    inspector: &'a dyn ProcessInspector,
+    enumerated: &'a [ProcessFact],
+    snapshot: OnceCell<Snapshot>,
+}
+
+/// Lineage of the live same-user processes at one moment.
+#[derive(Debug, Default)]
+struct Snapshot {
+    /// Lineage of each enumerated process whose read was consistent.
+    by_identity: HashMap<ProcessIdentity, ProcessLineage>,
+    /// Creator of each created process, by creation number.
+    creator_of: HashMap<SpawnId, SpawnId>,
+}
+
+impl<'a> SpawnLineage<'a> {
+    fn new(inspector: &'a dyn ProcessInspector, enumerated: &'a [ProcessFact]) -> Self {
+        Self {
+            inspector,
+            enumerated,
+            snapshot: OnceCell::new(),
+        }
+    }
+
+    /// Decides whether `worker` created the enumerated process `identity`.
+    ///
+    /// Creation numbers rise from creator to created, so the creators of a
+    /// process, followed upward from its recorded creator, have strictly
+    /// decreasing numbers. The chain reaches `worker` exactly when the worker is
+    /// an ancestor. It cannot once a creator is older than the worker, because
+    /// every creator above it is older still. A creator that has exited
+    /// and is newer than the worker names a creator the table cannot follow
+    /// further, so the chain, and with it the ancestry, stays unproven, and so
+    /// does a process whose lineage the host does not report.
+    fn ancestry(&self, identity: ProcessIdentity, worker: SpawnId) -> Result<Ancestry, Error> {
+        let snapshot = self.snapshot()?;
+        let Some(process) = snapshot.by_identity.get(&identity) else {
+            return Ok(Ancestry::Unproven);
+        };
+        // The worker's own number is not a descendant's, and a process
+        // created before the worker cannot descend from it.
+        if process.id == worker {
+            return Ok(Ancestry::Unproven);
+        }
+        if process.id < worker {
+            return Ok(Ancestry::Unrelated);
+        }
+        let mut creator = process.parent;
+        for _ in 0..MAX_LINEAGE_STEPS {
+            if creator == worker {
+                return Ok(Ancestry::Descendant);
+            }
+            if creator < worker {
+                return Ok(Ancestry::Unrelated);
+            }
+            match snapshot.creator_of.get(&creator) {
+                // Numbers must fall at every step; a creator that is not
+                // older than the process it created contradicts the kernel.
+                Some(next) if *next < creator => creator = *next,
+                Some(_) | None => return Ok(Ancestry::Unproven),
+            }
+        }
+        Ok(Ancestry::Unproven)
+    }
+
+    fn snapshot(&self) -> Result<&Snapshot, Error> {
+        if let Some(snapshot) = self.snapshot.get() {
+            return Ok(snapshot);
+        }
+        let read = self.read()?;
+        Ok(self.snapshot.get_or_init(|| read))
+    }
+
+    /// Reads the lineage of every enumerated process once.
+    ///
+    /// A host that reports no lineage yields an empty snapshot, which proves
+    /// nothing. A process that exited, changed identity, or cannot be read
+    /// leaves no entry, so the chains through it stay unproven.
+    fn read(&self) -> Result<Snapshot, Error> {
+        let mut snapshot = Snapshot::default();
+        for fact in self.enumerated {
+            let identity = fact.identity();
+            if verify(self.inspector, identity)?.is_some() {
+                continue;
+            }
+            let lineage = match self.inspector.lineage(identity.pid) {
+                Ok(Some(lineage)) => lineage,
+                Ok(None) | Err(Error::PermissionDenied { .. } | Error::Unobservable { .. }) => {
+                    continue
+                }
+                Err(error) if error.is_race() => continue,
+                Err(Error::Unavailable { .. }) => return Ok(Snapshot::default()),
+                Err(error) => return Err(error),
+            };
+            if verify(self.inspector, identity)?.is_some() {
+                continue;
+            }
+            snapshot.by_identity.insert(identity, lineage);
+            snapshot.creator_of.insert(lineage.id, lineage.parent);
+        }
+        Ok(snapshot)
     }
 }
 
