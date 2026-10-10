@@ -358,6 +358,13 @@ async fn pending_migration(
                 .install(&definition)
                 .await
                 .expect("register new daemon");
+            // A manager PID can appear before the daemon migrates its store.
+            // Wait for the public reader before tests change that store.
+            let mut client = installation.client().await;
+            client
+                .call::<protocol::method::DaemonHealth>(())
+                .await
+                .expect("new daemon serves control requests");
             let _daemon = daemon_process(backend).await;
         }
     }
