@@ -655,7 +655,8 @@ pub(crate) fn check_local(
         .transpose()?;
     let mut adoption = Adoption::NotApplicable;
     let config_path = context.config_path();
-    let pending = record::Store::new(context.paths().state_dir.clone()).load()?;
+    let store = record::Store::new(context.paths().state_dir.clone());
+    let pending = store.load()?;
     let pending_install = pending
         .as_ref()
         .is_some_and(|record| record.operation == record::Operation::Install);
@@ -683,9 +684,12 @@ pub(crate) fn check_local(
             (record::Operation::Install, prefix, namespace, plan, None)
         } else {
             let config_source = verified_config_source(context)?;
-            let config = config_source.config;
             engine::upgrade_preflight(context)?;
             let plan = engine::upgrade_plan(pending, version)?;
+            if let Some(record) = plan.record() {
+                engine::verify_pending_migration(context, &store, record, &config_source)?;
+            }
+            let config = &config_source.config;
             if engine::swaps_daemon(&plan, Some(config.active_version()), version) {
                 adoption = Adoption::Required;
             }
@@ -700,9 +704,7 @@ pub(crate) fn check_local(
             layout::verify_claim(layout, &config.namespace())?;
             // A schema-2 file means the checked upgrade is a migration: it stops
             // the daemon before it rewrites `service.toml`.
-            let config_schema_migration = (config_source.source_schema_version
-                != pohunek_service_config::SCHEMA_VERSION)
-                .then_some(config_source.source_schema_version);
+            let config_schema_migration = checked_config_migration(&plan, &config_source, version);
             (
                 record::Operation::Upgrade,
                 layout.prefix().to_path_buf(),
@@ -744,6 +746,34 @@ pub(crate) fn check_local(
         adoption,
         rollback,
     })
+}
+
+/// Reports a pending migration even after it has written the new schema.
+fn checked_config_migration(
+    plan: &engine::Plan,
+    source: &UpgradeSource,
+    version: &str,
+) -> Option<u32> {
+    match plan {
+        engine::Plan::Resume(record) => record
+            .config_backup
+            .as_ref()
+            .map(|backup| backup.source_schema_version),
+        engine::Plan::RollBack(record)
+            if record.config_backup.is_some()
+                && record.previous_version.as_deref() != Some(version) =>
+        {
+            record
+                .config_backup
+                .as_ref()
+                .map(|backup| backup.source_schema_version)
+        }
+        engine::Plan::Fresh if source.config.active_version() != version => {
+            (source.source_schema_version != pohunek_service_config::SCHEMA_VERSION)
+                .then_some(source.source_schema_version)
+        }
+        _ => None,
+    }
 }
 
 /// Runs [`check`] for `context` and `version` against `backend`.
@@ -1032,6 +1062,38 @@ mod tests {
         install_config(&context);
         let state_root = context.roots().expect("roots").0;
         (temp, root, context, state_root)
+    }
+
+    #[test]
+    fn check_reports_a_pending_rollback_migration_only_when_it_would_upgrade_again() {
+        let (_temp, root, context, _state) = installed();
+        let source = verified_config_source(&context).expect("current config");
+        let record = record::Record {
+            schema_version: record::SCHEMA_VERSION,
+            operation: record::Operation::Upgrade,
+            version: "2.0.0".to_owned(),
+            prefix: root.join("home/.local"),
+            previous_version: Some("1.0.0".to_owned()),
+            version_dir_preexisted: false,
+            config_backup: Some(record::ConfigBackup {
+                source_schema_version: 2,
+                digest: String::new(),
+            }),
+            step: record::Step::Registered,
+            rolling_back: false,
+        };
+        assert_eq!(
+            checked_config_migration(&engine::Plan::Resume(record.clone()), &source, "2.0.0"),
+            Some(2)
+        );
+        assert_eq!(
+            checked_config_migration(&engine::Plan::RollBack(record.clone()), &source, "3.0.0"),
+            Some(2)
+        );
+        assert_eq!(
+            checked_config_migration(&engine::Plan::RollBack(record), &source, "1.0.0"),
+            None
+        );
     }
 
     #[test]

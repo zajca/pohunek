@@ -601,7 +601,7 @@ impl<'a> Engine<'a> {
             // A resumed migration verifies its backup journal before any
             // further effect, so a moved, missing, or altered backup fails
             // the resume closed instead of at the rollback.
-            self.verify_resume_migration(record, &source)?;
+            verify_pending_migration(self.context, &self.store, record, &source)?;
         }
         let config = &source.config;
         let layout = config.layout().clone();
@@ -1077,7 +1077,7 @@ impl<'a> Engine<'a> {
                 path: self.context.config_path(),
             }
         })?;
-        self.verify_backup(record, backup, &source)?;
+        verify_migration_source(self.context, record, backup, &source)?;
         Ok(source)
     }
 
@@ -1180,99 +1180,6 @@ impl<'a> Engine<'a> {
             self.advance(record, Step::StopDaemon)?;
         }
         self.stop_daemon_for_migration().await
-    }
-
-    /// Fails closed when a resumed migration cannot prove its exact files.
-    ///
-    /// The check runs before any resumed effect: the journal's backup must
-    /// exist and match once the backup step completed. At `StopDaemon`, the
-    /// config can be either the exact old bytes or the exact newly rendered
-    /// target: a crash may have happened after the atomic write but before
-    /// its `Config` checkpoint. Later forward steps require the exact target;
-    /// a rollback already in progress can also have restored the exact old
-    /// bytes before it died. Any third content is refused.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::ConfigBackup`] without changing anything.
-    fn verify_resume_migration(
-        &self,
-        record: &Record,
-        source: &UpgradeSource,
-    ) -> Result<(), Error> {
-        if let Some(backup) = &record.config_backup {
-            if record.step >= Step::BackedUp {
-                let bytes = self
-                    .store
-                    .read_config_backup()?
-                    .ok_or_else(|| backup_error(self.store.config_backup_path(), "is missing"))?;
-                if config_digest(&bytes) != backup.digest {
-                    return Err(backup_error(
-                        self.store.config_backup_path(),
-                        "does not match the digest journaled in the transaction record",
-                    ));
-                }
-                if record.step >= Step::StopDaemon {
-                    let previous = ServiceConfig::load_upgrade_source_bytes(
-                        &self.store.config_backup_path(),
-                        &bytes,
-                    )?;
-                    if previous.source_schema_version != backup.source_schema_version {
-                        return Err(backup_error(
-                            self.store.config_backup_path(),
-                            "does not match the schema journaled in the transaction record",
-                        ));
-                    }
-                    let target = with_version(&previous.config, &record.version)?;
-                    if source.original_bytes() == target.to_toml().as_bytes()
-                        || (source.original_bytes() == bytes
-                            && (record.step == Step::StopDaemon || record.rolling_back))
-                    {
-                        return Ok(());
-                    }
-                    return Err(backup_error(
-                        self.context.config_path(),
-                        "does not match the exact configuration journaled for this migration step",
-                    ));
-                }
-            }
-            self.verify_backup(record, backup, source)?;
-        }
-        Ok(())
-    }
-
-    /// Verifies the pre-upgrade bytes against the transaction's journal.
-    ///
-    /// Runs wherever the migration claims the file on disk is still the exact
-    /// pre-upgrade configuration: a moved, edited, or replaced file fails the
-    /// step closed instead of being rewritten or backed up.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::ConfigBackup`] without changing anything.
-    fn verify_backup(
-        &self,
-        record: &Record,
-        backup: &ConfigBackup,
-        source: &UpgradeSource,
-    ) -> Result<(), Error> {
-        if record.step < Step::Config {
-            let detail = if digest_mismatch(source.original_bytes(), backup) {
-                format!(
-                    "does not match the digest journaled in the transaction record ({})",
-                    backup.digest
-                )
-            } else if source.source_schema_version != backup.source_schema_version {
-                format!(
-                    "is schema {} now, but the transaction recorded schema {}",
-                    source.source_schema_version, backup.source_schema_version
-                )
-            } else {
-                return Ok(());
-            };
-            return Err(backup_error(self.context.config_path(), detail));
-        }
-        Ok(())
     }
 
     /// Rolls back a failed transaction or keeps its record for resumption.
@@ -1514,7 +1421,7 @@ impl<'a> Engine<'a> {
             detail: "migration rollback has no config backup".to_owned(),
         })?;
         let current = ServiceConfig::load_upgrade_source(config_path)?;
-        self.verify_resume_migration(record, &current)?;
+        verify_pending_migration(self.context, &self.store, record, &current)?;
         let source = if record.step <= Step::StopDaemon {
             if record.step == Step::StopDaemon && digest_mismatch(current.original_bytes(), backup)
             {
@@ -2481,6 +2388,92 @@ fn load_config_for_upgrade(path: &Path) -> Result<Option<UpgradeSource>, Error> 
     } else {
         Ok(None)
     }
+}
+
+/// Checks a pending configuration migration without changing the file or job.
+///
+/// `service check`, upgrade resume, and rollback use the same journal and
+/// on-disk byte rules. A valid current config alone cannot prove that the
+/// previous daemon's exact config can be restored.
+/// At `StopDaemon`, the config can be either the old bytes or the rendered
+/// target: a crash may have happened after the atomic write and before its
+/// checkpoint. Later forward steps require the exact target; a rollback can
+/// also have restored the exact old bytes. Any third content is refused.
+///
+/// # Errors
+///
+/// Returns [`Error::ConfigBackup`] without changing anything.
+pub(crate) fn verify_pending_migration(
+    context: &Context,
+    store: &Store,
+    record: &Record,
+    source: &UpgradeSource,
+) -> Result<(), Error> {
+    let Some(backup) = &record.config_backup else {
+        return Ok(());
+    };
+    if record.step >= Step::BackedUp {
+        let bytes = store
+            .read_config_backup()?
+            .ok_or_else(|| backup_error(store.config_backup_path(), "is missing"))?;
+        if config_digest(&bytes) != backup.digest {
+            return Err(backup_error(
+                store.config_backup_path(),
+                "does not match the digest journaled in the transaction record",
+            ));
+        }
+        if record.step >= Step::StopDaemon {
+            let previous =
+                ServiceConfig::load_upgrade_source_bytes(&store.config_backup_path(), &bytes)?;
+            if previous.source_schema_version != backup.source_schema_version {
+                return Err(backup_error(
+                    store.config_backup_path(),
+                    "does not match the schema journaled in the transaction record",
+                ));
+            }
+            let target = with_version(&previous.config, &record.version)?;
+            if source.original_bytes() == target.to_toml().as_bytes()
+                || (source.original_bytes() == bytes
+                    && (record.step == Step::StopDaemon || record.rolling_back))
+            {
+                return Ok(());
+            }
+            return Err(backup_error(
+                context.config_path(),
+                "does not match the exact configuration journaled for this migration step",
+            ));
+        }
+    }
+    verify_migration_source(context, record, backup, source)
+}
+
+/// Checks the pre-rewrite source against the bytes journaled for a migration.
+///
+/// A moved, edited, or replaced source fails before it can be backed up or
+/// rewritten.
+fn verify_migration_source(
+    context: &Context,
+    record: &Record,
+    backup: &ConfigBackup,
+    source: &UpgradeSource,
+) -> Result<(), Error> {
+    if record.step < Step::Config {
+        let detail = if digest_mismatch(source.original_bytes(), backup) {
+            format!(
+                "does not match the digest journaled in the transaction record ({})",
+                backup.digest
+            )
+        } else if source.source_schema_version != backup.source_schema_version {
+            format!(
+                "is schema {} now, but the transaction recorded schema {}",
+                source.source_schema_version, backup.source_schema_version
+            )
+        } else {
+            return Ok(());
+        };
+        return Err(backup_error(context.config_path(), detail));
+    }
+    Ok(())
 }
 
 /// The migration backup description of an upgrade transaction.

@@ -602,10 +602,12 @@ failing `pohunekd`, an unparsable report) fails with
 ## Configuration migration from schema 2
 
 When the installed `service.toml` was written by release 0.33.x (schema 2, no
-`[input]` table), `pohunek service upgrade` turns into a configuration
-migration and the `--json` reports carry `config_schema_migration: 2`.
-`service check` reports the same field and writes nothing, so an archive
-updater sees the migration before any effect. The migration assigns the
+`[input]` table) and the target version differs, `pohunek service upgrade`
+turns into a configuration migration and the `--json` reports carry
+`config_schema_migration: 2`. `service check` verifies a pending migration's
+backup and reports the migration it would perform without writing anything,
+so an archive updater sees it before any effect. A same-version refresh runs
+no migration and reports `null`. The migration assigns the
 documented `[input]` defaults (5000 ms and 150 ms) explicitly; a schema-2
 installation never carries custom values here, so nothing is lost.
 

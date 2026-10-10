@@ -16,7 +16,10 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::Command;
 
+use pohunek_cli::service::record::{ConfigBackup, Operation, Record, Step, Store};
+use pohunek_cli::service::VERSION;
 use serde_json::Value;
+use sha2::Digest as _;
 
 /// The schema-2 `service.toml` of a v0.33.1 install, with the identity the
 /// isolated layout resolves. The `[input]` table that schema 3 adds does not
@@ -70,6 +73,16 @@ impl Host {
         }
     }
 
+    /// A previous schema-2 installation whose active version needs an upgrade.
+    fn schema_two_previous_version() -> Self {
+        Self {
+            repair: Box::new(|template| {
+                template.replace("active_version = \"0.33.1\"", "active_version = \"0.33.0\"")
+            }),
+            temporary: temp_root(),
+        }
+    }
+
     /// The same configuration with `schema_version` replaced.
     fn schema_of(version: u32) -> Self {
         Self {
@@ -87,6 +100,11 @@ fn temp_root() -> tempfile::TempDir {
 
 /// Builds the fixture and runs `service check --json` against it.
 fn check(host: &Host) -> (bool, Value) {
+    check_with_setup(host, |_, _, _| {})
+}
+
+/// Runs the real check after a fixture has set up an interrupted transaction.
+fn check_with_setup(host: &Host, setup: impl FnOnce(&Path, &Path, &[u8])) -> (bool, Value) {
     let root = host.temporary.path();
     let dir = |name: &str| {
         let path = root.join(name);
@@ -126,7 +144,12 @@ fn check(host: &Host) -> (bool, Value) {
     fs::write(&config, template).expect("write fixture, a checked-in value");
     // The previous release wrote the file owner-private.
     fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).expect("private service.toml");
+    let source = fs::read(&config).expect("read the exact schema-2 bytes");
+    setup(&config, &state.join("pohunek"), &source);
     let fixture = fs::read(&config).expect("read the exact fixture bytes");
+    let store = Store::new(state.join("pohunek"));
+    let record_before = fs::read(store.path()).ok();
+    let backup_before = fs::read(store.config_backup_path()).ok();
 
     let env_of = |base: &Path| base.to_str().expect("UTF-8 roots").to_owned();
     let output = Command::new(pohunek_test_support::bin_exe("pohunek"))
@@ -152,12 +175,61 @@ fn check(host: &Host) -> (bool, Value) {
         fixture,
         "the check writes nothing"
     );
+    assert_eq!(fs::read(store.path()).ok(), record_before);
+    assert_eq!(fs::read(store.config_backup_path()).ok(), backup_before);
     (output.status.success(), json)
+}
+
+/// Journals a previous-release configuration migration at a native boundary.
+fn pending_migration(
+    config: &Path,
+    state: &Path,
+    source: &[u8],
+    step: Step,
+    backup: Option<&[u8]>,
+) {
+    let store = Store::new(state.to_path_buf());
+    if let Some(bytes) = backup {
+        store.write_config_backup(bytes).expect("write backup");
+    }
+    if step >= Step::Config {
+        let mut spec = pohunek_service_config::ServiceConfig::load_upgrade_source(config)
+            .expect("schema-2 source")
+            .config
+            .to_spec();
+        VERSION.clone_into(&mut spec.active_version);
+        pohunek_service_config::ServiceConfig::new(spec)
+            .expect("target configuration")
+            .write(config)
+            .expect("write schema-3 target");
+    }
+    let record = Record {
+        schema_version: pohunek_cli::service::record::SCHEMA_VERSION,
+        operation: Operation::Upgrade,
+        version: VERSION.to_owned(),
+        prefix: config
+            .parent()
+            .expect("config directory")
+            .parent()
+            .expect("config root")
+            .parent()
+            .expect("fixture root")
+            .join("prefix"),
+        previous_version: Some("0.33.1".to_owned()),
+        version_dir_preexisted: false,
+        config_backup: Some(ConfigBackup {
+            source_schema_version: 2,
+            digest: format!("{:x}", sha2::Sha256::digest(source)),
+        }),
+        step,
+        rolling_back: false,
+    };
+    store.save(&record).expect("journal interrupted migration");
 }
 
 #[test]
 fn check_accepts_the_previous_release_config_and_names_the_migration() {
-    let host = Host::schema_two();
+    let host = Host::schema_two_previous_version();
     let (success, envelope) = check(&host);
     assert!(success, "{envelope}");
     let report = envelope
@@ -189,6 +261,20 @@ fn check_accepts_the_previous_release_config_and_names_the_migration() {
 }
 
 #[test]
+fn check_reports_no_migration_when_the_installed_version_is_already_active() {
+    let host = Host::schema_two();
+    let (success, envelope) = check(&host);
+    assert!(success, "{envelope}");
+    assert!(
+        envelope
+            .get("ok")
+            .and_then(|report| report.get("config_schema_migration"))
+            .is_some_and(Value::is_null),
+        "{envelope}: a same-version refresh leaves the schema-2 file in place"
+    );
+}
+
+#[test]
 fn check_refuses_a_config_this_version_neither_writes_nor_migrates() {
     for version in [1, 4] {
         let host = Host::schema_of(version);
@@ -208,4 +294,50 @@ fn check_refuses_a_config_this_version_neither_writes_nor_migrates() {
             "{refusal:?}: the refusal names the found schema"
         );
     }
+}
+
+#[test]
+fn check_refuses_an_unverifiable_pending_migration_before_contacting_the_manager() {
+    for step in [Step::StopDaemon, Step::Registered] {
+        for altered in [false, true] {
+            let host = Host::schema_two();
+            let (success, envelope) = check_with_setup(&host, |config, state, source| {
+                let backup = altered.then(|| {
+                    let mut bytes = source.to_vec();
+                    bytes[5] ^= 1;
+                    bytes
+                });
+                pending_migration(config, state, source, step, backup.as_deref());
+            });
+            assert!(!success, "{step:?}, altered={altered}: {envelope}");
+            let refusal = envelope.get("err").expect("the refusal document");
+            assert_eq!(
+                refusal.get("code").and_then(Value::as_str),
+                Some("service_config_backup_invalid"),
+                "{step:?}, altered={altered}: {refusal:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn check_reports_pending_migration_after_the_schema_three_write() {
+    let host = Host::schema_two();
+    let (success, envelope) = check_with_setup(&host, |config, state, source| {
+        pending_migration(config, state, source, Step::Registered, Some(source));
+    });
+    assert!(success, "{envelope}");
+    let report = envelope.get("ok").expect("the checked upgrade");
+    assert_eq!(
+        report.get("pending_action").and_then(Value::as_str),
+        Some("resume"),
+        "{report:?}"
+    );
+    assert_eq!(
+        report
+            .get("config_schema_migration")
+            .and_then(Value::as_u64),
+        Some(2),
+        "{report:?}: the journal still describes a schema-2 migration"
+    );
 }
