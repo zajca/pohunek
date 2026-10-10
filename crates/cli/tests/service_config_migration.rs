@@ -73,6 +73,19 @@ impl Host {
         }
     }
 
+    /// A schema-2 file whose installed binary already has this build's version.
+    fn schema_two_current_version() -> Self {
+        Self {
+            repair: Box::new(|template| {
+                template.replace(
+                    "active_version = \"0.33.1\"",
+                    &format!("active_version = \"{VERSION}\""),
+                )
+            }),
+            temporary: temp_root(),
+        }
+    }
+
     /// A previous schema-2 installation whose active version needs an upgrade.
     fn schema_two_previous_version() -> Self {
         Self {
@@ -262,7 +275,7 @@ fn check_accepts_the_previous_release_config_and_names_the_migration() {
 
 #[test]
 fn check_reports_no_migration_when_the_installed_version_is_already_active() {
-    let host = Host::schema_two();
+    let host = Host::schema_two_current_version();
     let (success, envelope) = check(&host);
     assert!(success, "{envelope}");
     assert!(
