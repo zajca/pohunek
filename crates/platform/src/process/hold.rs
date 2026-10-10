@@ -48,5 +48,6 @@ pub(super) fn shell_command(env: &TestEnv, script: &str) -> Command {
 #[test]
 #[ignore = "image of the fixture processes spawned by the process scenarios"]
 fn hold() {
+    // timing-allowed: #790 the fixture's own lifetime; no scenario waits on this sleep, it ends when the scenario kills the process
     std::thread::sleep(HOLD_LIFETIME);
 }
