@@ -259,7 +259,9 @@ before retrying; the refused operation creates no new worker or fork child.
   the processes carrying the session's runtime ownership markers and fails
   with `runtime_supervision_ambiguous`, keeping the session and its removal
   intent, while that sweep cannot confirm every marked process exited (for
-  example one whose environment cannot be read); look for leftover processes
+  example one whose environment cannot be read, such as any Apple platform
+  binary like `/bin/sh` or `/bin/zsh` on macOS 27, where the kernel withholds
+  it); look for leftover processes
   of the session with `ps`, stop them, and retry. When unreadable same-user
   processes are the only obstacle, the error message names each as
   `pid N (start S, command `name`)` (at most eight, then `and N more`) and

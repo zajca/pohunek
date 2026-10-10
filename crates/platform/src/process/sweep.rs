@@ -160,8 +160,9 @@ pub enum SkipReason {
     IdentityChanged,
     /// The process is the one running the sweep.
     CurrentProcess,
-    /// The process environment could not be read (access was denied, or the
-    /// process was between images), so it cannot be proven to belong to the
+    /// The process environment could not be read (access was denied, the
+    /// process was between images, or the kernel withholds the environment of
+    /// a restricted platform binary), so it cannot be proven to belong to the
     /// runtime.
     MarkersUnreadable,
     /// `POHUNEK_WORKER_INSTANCE_ID` and `POHUNEK_RUNTIME_ID` carry different
