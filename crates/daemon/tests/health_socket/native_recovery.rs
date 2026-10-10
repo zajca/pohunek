@@ -578,6 +578,70 @@ fn write_pi_transcripts(config_home: &std::path::Path, sessions: &[SessionInfo])
     project
 }
 
+async fn list_with_unreadable_pi_transcript(
+    control: &mut Framed<UnixStream, LinesCodec>,
+    config_home: &std::path::Path,
+    project: &std::path::Path,
+    sessions: &[SessionInfo],
+) -> (Vec<SessionInfo>, SessionInfo) {
+    let first_reference = sessions[0]
+        .native_session_id
+        .as_deref()
+        .expect("Pi assigned ID");
+    let first_name = format!("2026-10-10T00_{first_reference}.jsonl");
+    let inaccessible = config_home.join("sessions").join(&first_name);
+    std::fs::rename(project.join(&first_name), &inaccessible)
+        .expect("move first transcript ahead of the project directory");
+    std::fs::write(project.join(&first_name), "{}\n")
+        .expect("create later duplicate of the unreadable transcript");
+    std::fs::set_permissions(
+        &inaccessible,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o000),
+    )
+    .expect("make first transcript unreadable");
+    let listed = listed_sessions(control).await;
+    let inspected = inspect_session(control, &sessions[1].id).await;
+    std::fs::set_permissions(
+        &inaccessible,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .expect("restore first transcript permissions");
+    (listed, inspected)
+}
+
+async fn list_with_unreadable_pi_directory(
+    control: &mut Framed<UnixStream, LinesCodec>,
+    config_home: &std::path::Path,
+    project: &std::path::Path,
+    session: &SessionInfo,
+) -> (Vec<SessionInfo>, PathBuf) {
+    let root = config_home.join("sessions");
+    let blocked = root.join("blocked");
+    let healthy = root.join("healthy");
+    std::fs::create_dir(&blocked).expect("create unreadable sibling before the healthy one");
+    std::fs::create_dir(&healthy).expect("create healthy sibling");
+    let reference = session
+        .native_session_id
+        .as_deref()
+        .expect("Pi assigned ID");
+    let name = format!("2026-10-10T01_{reference}.jsonl");
+    let transcript = healthy.join(&name);
+    std::fs::rename(project.join(name), &transcript)
+        .expect("move healthy transcript behind unreadable sibling");
+    std::fs::set_permissions(
+        &blocked,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o000),
+    )
+    .expect("make sibling directory unreadable");
+    let listed = listed_sessions(control).await;
+    std::fs::set_permissions(
+        &blocked,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    )
+    .expect("restore sibling directory permissions");
+    (listed, transcript)
+}
+
 #[tokio::test]
 async fn pi_package_list_batches_suffix_matches_and_ignores_symlinks() {
     let bin = temp_dir("pi-batch-bin");
@@ -635,12 +699,11 @@ async fn pi_package_list_batches_suffix_matches_and_ignores_symlinks() {
     let project = write_pi_transcripts(&config_home, &sessions);
     let listed = listed_sessions(&mut control).await;
     let inspected = inspect_session(&mut control, &sessions[0].id).await;
-    let absent = sessions[1]
-        .native_session_id
-        .as_deref()
-        .expect("Pi assigned ID");
-    std::fs::remove_file(project.join(format!("2026-10-10T01_{absent}.jsonl")))
-        .expect("remove Pi transcript");
+    let (listed_unreadable, inspected_healthy) =
+        list_with_unreadable_pi_transcript(&mut control, &config_home, &project, &sessions).await;
+    let (listed_unreadable_directory, second_transcript) =
+        list_with_unreadable_pi_directory(&mut control, &config_home, &project, &sessions[1]).await;
+    std::fs::remove_file(second_transcript).expect("remove Pi transcript");
     let listed_missing = listed_sessions(&mut control).await;
     for session in &sessions {
         let request = Request::make(
@@ -662,6 +725,21 @@ async fn pi_package_list_batches_suffix_matches_and_ignores_symlinks() {
         Some("2023-11-14T22:15:00Z")
     );
     assert_eq!(activity_for(&sessions[2].id, &listed), None);
+    assert_eq!(activity_for(&sessions[0].id, &listed_unreadable), None);
+    assert_eq!(
+        activity_for(&sessions[1].id, &listed_unreadable),
+        Some("2023-11-14T22:15:00Z"),
+        "one unreadable transcript cannot hide another session's activity"
+    );
+    assert_eq!(
+        inspected_healthy.native_last_activity_at.as_deref(),
+        Some("2023-11-14T22:15:00Z")
+    );
+    assert_eq!(
+        activity_for(&sessions[1].id, &listed_unreadable_directory),
+        Some("2023-11-14T22:15:00Z"),
+        "one unreadable directory cannot hide a healthy sibling"
+    );
     assert_eq!(
         inspected.native_last_activity_at,
         activity_for(&sessions[0].id, &listed).map(str::to_owned)

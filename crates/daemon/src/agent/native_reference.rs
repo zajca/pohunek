@@ -524,8 +524,9 @@ impl ReferenceExistence {
         if wanted.iter().all(Option::is_none) {
             return vec![None; references.len()];
         }
-        // Each found file was opened and verified independently. A later scan
-        // failure leaves only unresolved references without activity.
+        // Each found file was opened and verified independently. An
+        // unverifiable candidate leaves only its matching references without
+        // activity, including when another file later has the same suffix.
         let _ = file.scan_store_many(root, &mut wanted, &mut found);
         found
             .into_iter()
@@ -615,7 +616,9 @@ impl FileExistence {
             fs::Dir::read_from(directory).map_err(|_errno| ReferenceCheckFailure::Missing)?;
         let mut subdirectories = Vec::new();
         for entry in entries {
-            let entry = entry.map_err(|_errno| ReferenceCheckFailure::Missing)?;
+            let Ok(entry) = entry else {
+                continue;
+            };
             let name_bytes = entry.file_name().to_bytes();
             if name_bytes == b"." || name_bytes == b".." {
                 continue;
@@ -646,7 +649,7 @@ impl FileExistence {
                     if matches.is_empty() {
                         continue;
                     }
-                    let file = fs::openat(
+                    let opened = fs::openat(
                         directory,
                         name,
                         fs::OFlags::RDONLY
@@ -655,16 +658,13 @@ impl FileExistence {
                             | fs::OFlags::CLOEXEC,
                         fs::Mode::empty(),
                     )
-                    .map_err(|errno| {
-                        classify_open_error(errno, ReferenceCheckFailure::StoreChanged)
-                    })?;
-                    let opened =
-                        fs::fstat(&file).map_err(|_errno| ReferenceCheckFailure::StoreChanged)?;
-                    if fs::FileType::from_raw_mode(opened.st_mode) != fs::FileType::RegularFile {
-                        return Err(ReferenceCheckFailure::StoreChanged);
-                    }
+                    .ok()
+                    .and_then(|file| fs::fstat(&file).ok())
+                    .filter(|stat| {
+                        fs::FileType::from_raw_mode(stat.st_mode) == fs::FileType::RegularFile
+                    });
                     for index in matches {
-                        found[index] = Some(opened);
+                        found[index] = opened;
                         wanted[index] = None;
                     }
                     if wanted.iter().all(Option::is_none) {
@@ -680,10 +680,13 @@ impl FileExistence {
         for name in subdirectories {
             let child = match open_child_directory(directory, &name) {
                 Ok(child) => child,
-                Err(rustix::io::Errno::NOENT) => continue,
-                Err(_errno) => return Err(ReferenceCheckFailure::StoreChanged),
+                Err(_errno) => continue,
             };
-            self.scan_directory_many(&child, depth + 1, wanted, found, visited)?;
+            if let Err(ReferenceCheckFailure::ScanLimit) =
+                self.scan_directory_many(&child, depth + 1, wanted, found, visited)
+            {
+                return Err(ReferenceCheckFailure::ScanLimit);
+            }
             if wanted.iter().all(Option::is_none) {
                 return Ok(());
             }
