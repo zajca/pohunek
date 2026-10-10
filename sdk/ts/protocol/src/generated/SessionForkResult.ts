@@ -123,11 +123,9 @@ export type SessionForkResult = {
    */
   active_agent_session_path?: string;
   /**
-   * Native agent session id captured via the `SessionStart` hook, when one
-   * has been reported (see `docs/plan-phase-1.md` "Resume Model"). A session
-   * is resumable after a daemon restart only while this is present **and** the
-   * session is non-terminal: the daemon drops the resume binding on exit, so a
-   * terminal session can retain this id for reference yet not be resumable.
+   * Selected native conversation id of the verified launch agent, when one
+   * has been reported. A later verified in-session switch replaces it.
+   * Recovery still requires a valid transcript and runtime binding.
    */
   native_session_id?: string;
   /**
@@ -138,6 +136,16 @@ export type SessionForkResult = {
    * chosen by its frozen `ref_kind`. `None` for the common id-resuming agents.
    */
   native_session_path?: string;
+  /**
+   * Last verified file modification of the selected native conversation.
+   *
+   * RFC3339 UTC, currently derived for Claude from a regular transcript
+   * file under its effective config home when `session.inspect` or
+   * `session.list` responds.
+   * `None` means no native file activity was verified. This never falls
+   * back to the control-plane [`Self::updated_at`] timestamp.
+   */
+  native_last_activity_at?: string;
   /**
    * Project this session belongs to, by derived id (`p-…`), when it started
    * inside (or was pointed at) a git repository. `None` for a session with no

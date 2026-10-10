@@ -339,6 +339,10 @@ pub struct RuntimeDefinition {
     version_probe_policy: Option<VersionProbePolicy>,
     integration: Option<Integration>,
     config_home: Option<ConfigHome>,
+    /// The existence check recovery runs on a hook runtime's id-kind
+    /// reference, as declared by `[native_reference.existence]`; `None` for a
+    /// hook runtime that leaves the check undeclared.
+    hook_existence: Option<ReferenceExistence>,
 }
 
 impl RuntimeDefinition {
@@ -437,7 +441,16 @@ impl RuntimeDefinition {
             version_probe_policy,
             integration,
             config_home: None,
+            hook_existence: None,
         })
+    }
+
+    /// This definition declaring the existence check recovery runs on a hook
+    /// runtime's id-kind reference.
+    #[must_use]
+    pub fn with_hook_existence(mut self, existence: ReferenceExistence) -> Self {
+        self.hook_existence = Some(existence);
+        self
     }
 
     /// This definition declaring `config_home` as the directory its agent keeps
@@ -511,7 +524,7 @@ impl RuntimeDefinition {
             raw.input.bracketed_paste,
             Duration::from_millis(raw.input.submit_delay_ms),
         );
-        let native = raw.native()?;
+        let (native, hook_existence) = raw.native_and_existence()?;
         let config_home = raw
             .config_home
             .as_ref()
@@ -554,6 +567,10 @@ impl RuntimeDefinition {
                 })
                 .transpose()?,
         })?;
+        let definition = match hook_existence {
+            Some(existence) => definition.with_hook_existence(existence),
+            None => definition,
+        };
         Ok(match config_home {
             Some(config_home) => definition.with_config_home(config_home),
             None => definition,
@@ -660,6 +677,14 @@ impl RuntimeDefinition {
     #[must_use]
     pub fn config_home(&self) -> Option<&ConfigHome> {
         self.config_home.as_ref()
+    }
+
+    /// The existence check recovery runs on a hook runtime's id-kind
+    /// reference, when the descriptor declares one under
+    /// `[native_reference.existence]`.
+    #[must_use]
+    pub fn hook_existence(&self) -> Option<&ReferenceExistence> {
+        self.hook_existence.as_ref()
     }
 }
 
@@ -1007,7 +1032,8 @@ struct RawNativeReference {
     /// Argv that passes the generated reference at launch; `assigned` only.
     #[serde(default)]
     launch_args: Option<Vec<String>>,
-    /// How recovery confirms the conversation exists; `assigned` only.
+    /// How recovery confirms the conversation exists; `assigned` always, or
+    /// `hook` with an id-kind reference.
     #[serde(default)]
     existence: Option<ExistenceSpec>,
 }
@@ -1027,9 +1053,16 @@ struct RawConfigHome {
 }
 
 impl RawDefinition {
-    /// Resolves `[resume]`, `[fork]` and `[native_reference]` into one native
-    /// launch spec, or `None` for a runtime that does not recover natively.
-    fn native(&self) -> Result<Option<NativeSessionLaunch>, DefinitionError> {
+    /// Resolves `[resume]`, `[fork]` and `[native_reference]` into the native
+    /// launch spec plus the hook existence check, or `None` for a runtime that
+    /// does not recover natively.
+    ///
+    /// A hook runtime declares its conversation-existence check only next to a
+    /// supported resume; the returned existence is `None` for a hook runtime
+    /// that leaves the check undeclared.
+    fn native_and_existence(
+        &self,
+    ) -> Result<(Option<NativeSessionLaunch>, Option<ReferenceExistence>), DefinitionError> {
         let native = self.resume_and_fork()?;
         self.apply_strategy(native)
     }
@@ -1038,39 +1071,56 @@ impl RawDefinition {
     /// fork launch the other tables describe.
     ///
     /// `none` freezes recovery off, so it must sit next to `resume.supported =
-    /// false`; `hook` and `assigned` both need a supported resume, and only
-    /// `assigned` carries a launch template and an explicit existence check.
+    /// false`; `hook` and `assigned` both need a supported resume; only
+    /// `assigned` carries a launch template and only `assigned`, or `hook`
+    /// with an id-kind reference, carries an explicit existence check.
     fn apply_strategy(
         &self,
         native: Option<NativeSessionLaunch>,
-    ) -> Result<Option<NativeSessionLaunch>, DefinitionError> {
+    ) -> Result<(Option<NativeSessionLaunch>, Option<ReferenceExistence>), DefinitionError> {
         let declaration = &self.native_reference;
         let invalid = |error| DefinitionError::NativeReference(error);
-        let reject_assigned_fields = || {
+        let reject_launch_args = || {
             if declaration.launch_args.is_some() {
                 return Err(invalid(NativeReferenceError::UnexpectedField {
                     field: "launch_args",
-                }));
-            }
-            if declaration.existence.is_some() {
-                return Err(invalid(NativeReferenceError::UnexpectedField {
-                    field: "existence",
                 }));
             }
             Ok(())
         };
         match (declaration.strategy, native) {
             (RawStrategy::None, None) => {
-                reject_assigned_fields()?;
-                Ok(None)
+                reject_launch_args()?;
+                if declaration.existence.is_some() {
+                    return Err(invalid(NativeReferenceError::UnexpectedField {
+                        field: "existence",
+                    }));
+                }
+                Ok((None, None))
             }
             (RawStrategy::None, Some(_)) => {
                 Err(invalid(NativeReferenceError::NoneRequiresNoResume))
             }
             (RawStrategy::Hook, None) => Err(invalid(NativeReferenceError::HookRequiresResume)),
             (RawStrategy::Hook, Some(native)) => {
-                reject_assigned_fields()?;
-                Ok(Some(native))
+                reject_launch_args()?;
+                if native.reference_kind() != SessionRefKind::Id {
+                    if declaration.existence.is_some() {
+                        return Err(invalid(NativeReferenceError::UnexpectedField {
+                            field: "existence",
+                        }));
+                    }
+                    return Ok((Some(native), None));
+                }
+                let existence = declaration
+                    .existence
+                    .as_ref()
+                    .map(|spec| {
+                        ReferenceExistence::try_from(spec.clone())
+                            .map_err(|source| invalid(NativeReferenceError::Existence(source)))
+                    })
+                    .transpose()?;
+                Ok((Some(native), existence))
             }
             (RawStrategy::Assigned, None) => {
                 Err(invalid(NativeReferenceError::AssignedRequiresResume))
@@ -1088,10 +1138,12 @@ impl RawDefinition {
                     .ok_or(invalid(NativeReferenceError::AssignedRequiresExistence))?;
                 let existence = ReferenceExistence::try_from(existence)
                     .map_err(|source| invalid(NativeReferenceError::Existence(source)))?;
-                native
+                let native = native
                     .with_assigned(AssignedReference::new(launch_args, existence))
-                    .map(Some)
-                    .map_err(|_source| invalid(NativeReferenceError::AssignedRequiresIdReference))
+                    .map_err(|_source| {
+                        invalid(NativeReferenceError::AssignedRequiresIdReference)
+                    })?;
+                Ok((Some(native), None))
             }
         }
     }

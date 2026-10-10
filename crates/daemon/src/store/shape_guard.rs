@@ -37,6 +37,7 @@ const SHAPE_SNAPSHOTS: &[(u32, &str)] = &[
     (2, include_str!("fixtures/shape/schema-2.txt")),
     (3, include_str!("fixtures/shape/schema-3.txt")),
     (4, include_str!("fixtures/shape/schema-4.txt")),
+    (5, include_str!("fixtures/shape/schema-5.txt")),
 ];
 
 /// A profile revision: 64 lowercase hex digits.
@@ -193,6 +194,7 @@ fn session_json() -> Value {
             "active_agent_session_path": "/work/native.jsonl",
             "native_session_id": "native-1",
             "native_session_path": "/work/native.jsonl",
+            "native_last_activity_at": "2026-01-01T00:00:01Z",
             "project_id": "p-1",
             "project_label": "repo",
             "is_linked_worktree": true,
@@ -350,6 +352,7 @@ fn assert_every_field_is_reviewed(
         active_agent_session_path: _,
         native_session_id: _,
         native_session_path: _,
+        native_last_activity_at: _,
         project_id: _,
         project_label: _,
         is_linked_worktree: _,

@@ -293,6 +293,7 @@ fn session_info(
         rename_in(runtime, site, direction)?;
     }
     if matches!(direction, Direction::ToLegacy) {
+        object.remove("native_last_activity_at");
         if let Some(Value::Array(warnings)) = object.get_mut("warnings") {
             warnings.retain(|warning| {
                 warning

@@ -220,6 +220,18 @@ async function everyRecordedMethod(fresh: boolean): Promise<void> {
 }
 
 describe("client against a daemon of the previous release", () => {
+  test("a previous daemon leaves native transcript activity unknown", async () => {
+    const daemon = await startPreviousDaemon();
+    const client = await connect(daemon);
+    const recorded = recordedExchanges().find((entry) => entry.method === "session.inspect");
+    if (recorded === undefined) {
+      throw new Error("no session.inspect recording");
+    }
+    const response = await rawRequest(client, "session.inspect", recorded.params) as Record<string, unknown>;
+    expect(response["native_last_activity_at"]).toBeUndefined();
+    expect(response).toEqual(recorded.expected);
+  });
+
   test("every previous-release method works on one connection", async () => {
     await everyRecordedMethod(false);
   });

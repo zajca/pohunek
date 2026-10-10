@@ -2643,14 +2643,30 @@ impl SessionRegistry {
         &self,
         record: &SessionRecord,
     ) -> Option<InspectSnapshot> {
-        let generation = record.runtime.generation.as_deref()?;
-        let journals = self.discover_worker_journals().await.ok()?;
-        let scan = journals.get(record.session_id.as_str())?;
-        scan.journal_of_generation(generation)
+        self.generation_journal_snapshot_checked(record)
+            .await
             .ok()
-            .flatten()?
-            .snapshot()
-            .ok()
+            .flatten()
+    }
+
+    /// Reads an exact generation without treating failed evidence as absence.
+    ///
+    /// Explicit recovery must propagate the reason; terminal import may use
+    /// [`Self::generation_journal_snapshot`] to leave a target unchanged.
+    pub(super) async fn generation_journal_snapshot_checked(
+        &self,
+        record: &SessionRecord,
+    ) -> Result<Option<InspectSnapshot>, String> {
+        let Some(generation) = record.runtime.generation.as_deref() else {
+            return Ok(None);
+        };
+        let journals = self.discover_worker_journals().await?;
+        let Some(scan) = journals.get(record.session_id.as_str()) else {
+            return Ok(None);
+        };
+        scan.journal_of_generation(generation)?
+            .map(|journal| journal.snapshot().map_err(str::to_owned))
+            .transpose()
     }
 
     /// Whether this generation journal carries an unpromoted native claim.
@@ -4976,7 +4992,7 @@ fn stored_under_other_kind(
     }
 }
 
-fn parse_reference_kind(kind: &str) -> Option<SessionRefKind> {
+pub(super) fn parse_reference_kind(kind: &str) -> Option<SessionRefKind> {
     match kind {
         "id" => Some(SessionRefKind::Id),
         "path" => Some(SessionRefKind::Path),
@@ -5745,6 +5761,37 @@ mod tests {
     /// open past the stop deadline.
     fn hermetic_shell() -> crate::session::ShellCommand {
         crate::session::ShellCommand::new("/bin/sh", std::iter::empty::<String>())
+    }
+
+    /// Claude's config-home variable the fixture registry declares, so a
+    /// Claude recovery binding's transcript preflight verifies a fixture
+    /// transcript instead of scanning the test host's own Claude home.
+    const FIXTURE_CLAUDE_CONFIG_DIR: &str = "CLAUDE_CONFIG_DIR";
+
+    /// A registry whose launch environment points Claude's config home at
+    /// `claude_home`, for tests whose fixtures restore a Claude recovery
+    /// binding through the transcript preflight.
+    fn replacement_registry_with_claude_fixture(
+        config: SessionRegistryConfig,
+        claude_home: &Path,
+    ) -> SessionRegistry {
+        let crate::runtime::EnvironmentSource::Fixed(mut variables) =
+            crate::test_support::thread_environment_source()
+        else {
+            panic!("a test fixture supplies an explicit environment");
+        };
+        variables.insert(FIXTURE_CLAUDE_CONFIG_DIR.into(), claude_home.into());
+        let allowlist = pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST
+            .iter()
+            .map(|name| (*name).to_owned())
+            .chain([FIXTURE_CLAUDE_CONFIG_DIR.to_owned()])
+            .collect();
+        SessionRegistry::new_with_runtimes_and_environment(
+            config,
+            crate::agent::host::fixture::builtin_host(),
+            crate::runtime::EnvironmentSource::Fixed(variables),
+            allowlist,
+        )
     }
 
     fn temp_root() -> crate::test_support::ScopedDir {
@@ -7295,6 +7342,14 @@ while os.getppid() == parent:
     )]
     async fn replacement_registry_preserves_native_recovery_and_fork_binding() {
         let root = temp_root();
+        // The Claude recovery binding this fixture forks clears the transcript
+        // preflight against a fixture config home: it declares it through the
+        // registry's launch environment, which its relaunch reads.
+        let claude_home = root.join("claude-home");
+        let fixture_project = claude_home.join("projects/fixture");
+        std::fs::create_dir_all(&fixture_project).expect("create fixture Claude config home");
+        std::fs::write(fixture_project.join("native-restart-test.jsonl"), "{}\n")
+            .expect("write fixture Claude transcript");
         let runtime_root = root.join("runtime/workers");
         let session_id = "s-91";
         let worker_id = "worker-restart-test";
@@ -7451,6 +7506,7 @@ while os.getppid() == parent:
             active_agent_session_path: None,
             native_session_id: None,
             native_session_path: None,
+            native_last_activity_at: None,
             project_id: None,
             project_label: None,
             is_linked_worktree: None,
@@ -7545,13 +7601,16 @@ while os.getppid() == parent:
         drop(first_controller);
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let replacement = SessionRegistry::new(SessionRegistryConfig {
-            shell_command: hermetic_shell(),
-            store_path: Some(store_path),
-            worker_runtime_root: Some(runtime_root),
-            worker_state_root: Some(root.join("state/workers")),
-            ..SessionRegistryConfig::default()
-        });
+        let replacement = replacement_registry_with_claude_fixture(
+            SessionRegistryConfig {
+                shell_command: hermetic_shell(),
+                store_path: Some(store_path),
+                worker_runtime_root: Some(runtime_root),
+                worker_state_root: Some(root.join("state/workers")),
+                ..SessionRegistryConfig::default()
+            },
+            &claude_home,
+        );
         Box::pin(replacement.reconcile_workers())
             .await
             .expect("reconcile replacement daemon");
@@ -7683,9 +7742,11 @@ while os.getppid() == parent:
             .await
             .expect("fork adopted session from preserved native binding");
         assert_ne!(forked.id, SessionId(session_id.to_owned()));
+        // A fork starts a distinct conversation: only the child's own verified
+        // launch report may give it a recovery reference of its own.
         assert_eq!(
-            forked.native_session_id.as_deref(),
-            Some("native-restart-test")
+            forked.native_session_id, None,
+            "the fork child cannot resume its source's conversation as its own"
         );
         replacement
             .stop(&forked.id)
@@ -8819,6 +8880,7 @@ while os.getppid() == parent:
                 active_agent_session_path: None,
                 native_session_id: None,
                 native_session_path: None,
+                native_last_activity_at: None,
                 project_id: None,
                 project_label: None,
                 is_linked_worktree: None,
@@ -10299,6 +10361,7 @@ handler = "codex-hook-v1"
             active_agent_session_path: None,
             native_session_id: None,
             native_session_path: None,
+            native_last_activity_at: None,
             project_id: None,
             project_label: None,
             is_linked_worktree: None,

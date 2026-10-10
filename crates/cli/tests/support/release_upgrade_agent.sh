@@ -18,14 +18,23 @@
 
 set -u
 
-: "${FAKE_AGENT_LOG:?}" "${FAKE_AGENT_HOOKS:?}" "${FAKE_AGENT_NATIVE_ID:?}"
+: "${FAKE_AGENT_LOG:?}" "${FAKE_AGENT_HOOKS:?}" "${FAKE_AGENT_NATIVE_ID:?}" "${HOME:?}"
+
+umask 077
 
 hook_input=$(mktemp) || exit 1
 trap 'rm -f "$hook_input"' EXIT HUP INT TERM
 
 # Hooks read their JSON payload from a file, not a pipe, so that no extra
 # process sits between this shell and the hook script.
+# Each reported id names a regular transcript in the fixture's Claude store.
 report_native() {
+    case "$1" in
+        ''|*[!A-Za-z0-9_-]*) exit 1 ;;
+    esac
+    transcript_dir="$HOME/.claude/projects/upgrade-fixture"
+    mkdir -p "$transcript_dir" || exit 1
+    printf '{}\n' >"$transcript_dir/$1.jsonl" || exit 1
     printf '{"session_id":"%s"}\n' "$1" >"$hook_input"
     "$FAKE_AGENT_HOOKS/pohunek-agent-state.sh" session <"$hook_input"
 }

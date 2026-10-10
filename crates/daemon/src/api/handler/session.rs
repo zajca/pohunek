@@ -50,6 +50,7 @@ pub(super) async fn handle_session_list(request: &Request, sessions: &SessionReg
     if !params.filters.is_empty() {
         list.retain(|session| params.filters.iter().all(|filter| filter.matches(session)));
     }
+    sessions.enrich_native_activity(&mut list).await;
     ok_value(request, &list)
 }
 
@@ -72,7 +73,12 @@ pub(super) async fn handle_session_inspect(
         Err(err) => return error_value(request, err),
     };
     match sessions.inspect(&id).await {
-        Ok(info) => ok_value(request, &info),
+        Ok(mut info) => {
+            sessions
+                .enrich_native_activity(std::slice::from_mut(&mut info))
+                .await;
+            ok_value(request, &info)
+        }
         Err(err) => error_value(request, err),
     }
 }

@@ -1675,6 +1675,22 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
     // The WARN column only counts; a lost native recovery record needs its
     // recovery hint where the operator looks for the session.
     for session in sessions {
+        if let Some(target) = session
+            .native_session_id
+            .as_deref()
+            .or(session.native_session_path.as_deref())
+        {
+            let _ = writeln!(
+                output,
+                "recovery {}: target={} last_activity={}",
+                session.id.0,
+                target,
+                session
+                    .native_last_activity_at
+                    .as_deref()
+                    .unwrap_or("<unknown>")
+            );
+        }
         for warning in session
             .warnings
             .iter()
@@ -1816,12 +1832,16 @@ fn render_inspect_human(info: &SessionInfo) -> String {
             info.native_session_id.clone().unwrap_or_else(none),
         ),
         (
-            "resumable",
-            // Resumable only while the session can still come back: it needs a
-            // captured native id AND a non-terminal state. On exit the daemon
-            // drops the resume binding, so a terminal session whose native id
-            // still lingers in its info is no longer resumable.
-            if info.native_session_id.is_some() && !is_terminal(info.state) {
+            "native_session_path",
+            info.native_session_path.clone().unwrap_or_else(none),
+        ),
+        (
+            "native_last_activity_at",
+            info.native_last_activity_at.clone().unwrap_or_else(none),
+        ),
+        (
+            "native_binding",
+            if info.native_session_id.is_some() || info.native_session_path.is_some() {
                 "yes".to_owned()
             } else {
                 "no".to_owned()
@@ -2027,16 +2047,6 @@ fn state_label(state: SessionState) -> &'static str {
     }
 }
 
-/// Whether a session has reached a terminal state (no further transitions).
-/// Mirrors the daemon's terminal-state set: a terminal session has had its
-/// resume binding dropped and can no longer be resumed.
-fn is_terminal(state: SessionState) -> bool {
-    matches!(
-        state,
-        SessionState::Stopped | SessionState::Done | SessionState::Failed
-    )
-}
-
 fn activity_label_option(activity: Option<AgentActivity>) -> &'static str {
     activity.map_or("-", activity_label)
 }
@@ -2096,6 +2106,7 @@ mod tests {
             subagents: Vec::new(),
             native_session_id: None,
             native_session_path: None,
+            native_last_activity_at: None,
             active_agent: None,
             active_agent_base: None,
             active_agent_pid: None,
@@ -2736,7 +2747,7 @@ mod tests {
         assert!(has_row(&output, "activity", "-"));
         assert!(has_row(&output, "state_source", "process"));
         assert!(has_row(&output, "native_session_id", "<none>"));
-        assert!(has_row(&output, "resumable", "no"));
+        assert!(has_row(&output, "native_binding", "no"));
         assert!(has_row(&output, "exit_code", "<none>"));
         assert!(has_row(&output, "repo", "<none>"));
         assert!(has_row(&output, "branch", "<none>"));
@@ -2756,18 +2767,18 @@ mod tests {
     }
 
     #[test]
-    fn renders_native_session_id_and_resumable_when_captured() {
+    fn renders_native_session_id_and_binding_when_captured() {
         let mut session = running_session("s-42");
         session.native_session_id = Some("native-abc".to_owned());
 
         let output = render_inspect_human(&session);
 
         assert!(has_row(&output, "native_session_id", "native-abc"));
-        assert!(has_row(&output, "resumable", "yes"));
+        assert!(has_row(&output, "native_binding", "yes"));
     }
 
     #[test]
-    fn terminal_session_is_not_resumable_despite_captured_native_id() {
+    fn terminal_session_still_shows_captured_native_binding() {
         for state in [
             SessionState::Stopped,
             SessionState::Done,
@@ -2779,16 +2790,13 @@ mod tests {
 
             let output = render_inspect_human(&session);
 
-            // The native id stays visible for reference (e.g. a manual resume
-            // outside the tool), but the daemon drops the resume binding on
-            // exit, so a terminal session must not report resumable=yes.
             assert!(
                 has_row(&output, "native_session_id", "native-abc"),
                 "native id stays visible in state {state:?}: {output}"
             );
             assert!(
-                has_row(&output, "resumable", "no"),
-                "a terminal session ({state:?}) must not report resumable=yes: {output}"
+                has_row(&output, "native_binding", "yes"),
+                "the native binding remains visible in state {state:?}: {output}"
             );
         }
     }

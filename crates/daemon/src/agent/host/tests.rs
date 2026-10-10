@@ -1388,7 +1388,7 @@ fn an_assigned_reference_must_be_an_id_with_a_template_and_an_explicit_check() {
 }
 
 #[test]
-fn only_an_assigned_strategy_accepts_a_template_or_a_check() {
+fn launch_templates_require_assigned_strategy_and_none_rejects_a_check() {
     for strategy in ["none", "hook"] {
         let resume = if strategy == "none" {
             "supported = false"
@@ -1405,17 +1405,16 @@ fn only_an_assigned_strategy_accepts_a_template_or_a_check() {
                 field: "launch_args"
             }
         );
-        assert_eq!(
-            native_reference_error(
-                resume,
-                "supported = false",
-                &format!(
-                    "strategy = \"{strategy}\"\n\n[native_reference.existence]\ncheck = \"none\""
-                )
-            ),
-            NativeReferenceError::UnexpectedField { field: "existence" }
-        );
     }
+    // A `none` runtime verifies nothing, so an existence check is stray data.
+    assert_eq!(
+        native_reference_error(
+            "supported = false",
+            "supported = false",
+            "strategy = \"none\"\n\n[native_reference.existence]\ncheck = \"none\""
+        ),
+        NativeReferenceError::UnexpectedField { field: "existence" }
+    );
 }
 
 #[test]

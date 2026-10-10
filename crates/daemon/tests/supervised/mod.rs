@@ -695,6 +695,7 @@ impl Installation {
     /// Persists a logical record the daemon never created, for inputs a
     /// running daemon cannot produce (a resumable binding, a foreign peer).
     pub(crate) fn seed_record(&self, session_id: &str, runtime: RuntimeRecord) {
+        seed_transcript(&self.home(), &format!("native-{session_id}"));
         let now = "2026-09-24T00:00:00Z".to_owned();
         let live = runtime.state == RuntimeState::Live;
         let info = SessionInfo {
@@ -734,6 +735,7 @@ impl Installation {
             active_agent_pid: None,
             active_agent_session_id: None,
             active_agent_session_path: None,
+            native_last_activity_at: None,
             native_session_id: Some(format!("native-{session_id}")),
             native_session_path: None,
             project_id: None,
@@ -1059,6 +1061,16 @@ fn private_dir(path: &Path) {
         .expect("create private directory");
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
         .expect("private directory mode");
+}
+
+/// Creates a private Claude transcript for a seeded native reference.
+fn seed_transcript(home: &Path, reference: &str) {
+    let transcript_dir = home.join(".claude/projects/fixture");
+    private_dir(&transcript_dir);
+    let transcript = transcript_dir.join(format!("{reference}.jsonl"));
+    std::fs::write(&transcript, "{}\n").expect("write fixture Claude transcript");
+    std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o600))
+        .expect("private Claude transcript");
 }
 
 /// Daemon and worker binaries of this build.

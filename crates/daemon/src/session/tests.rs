@@ -11291,14 +11291,27 @@ fn temp_resumable_agents_dir(tag: &str) -> PathBuf {
 /// Resumable agent whose first run stays alive until the returned gate is
 /// written, and whose `--resume` run stays alive for the whole test.
 ///
+/// The profile declares `claude_home` as the fixture Claude config home, and
+/// the transcript of `reference` exists there at launch, so the recovery
+/// transcript preflight of a Claude report verifies that conversation. Native
+/// references the fixture reports only later can be provisioned into the same
+/// home with [`write_claude_transcript`]. A test that installs hooks in the
+/// same home passes that home here, so the hook and transcript homes agree.
+///
 /// The test decides when the first runtime ends (one line on the gate per
 /// running agent), so the exit never races a fixed agent lifetime against
 /// session creation and native-id capture. The gate handle must outlive the
 /// agents: dropping it releases every waiting agent. Each run appends its argv
 /// to `marker`.
 #[cfg(unix)]
-fn temp_agent_that_exits_then_resumes(tag: &str, marker: &std::path::Path) -> (PathBuf, fs::File) {
+fn temp_agent_that_exits_then_resumes(
+    tag: &str,
+    marker: &std::path::Path,
+    reference: &str,
+    claude_home: &std::path::Path,
+) -> (PathBuf, fs::File) {
     let runtime = temp_dir(&format!("{tag}-runtime"));
+    write_claude_transcript(claude_home, reference);
     let script = runtime.join("resume-agent");
     let gate_path = runtime.join("exit.gate");
     let gate = hook_gate(&gate_path);
@@ -11314,11 +11327,22 @@ fn temp_agent_that_exits_then_resumes(tag: &str, marker: &std::path::Path) -> (P
         tag,
         "resumable",
         &format!(
-            "base = \"claude\"\nprogram = \"{}\"\nargs = [\"--model\", \"sonnet\"]\n",
-            script.display()
+            "base = \"claude\"\nprogram = \"{}\"\nargs = [\"--model\", \"sonnet\"]\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+            script.display(),
+            claude_home.display()
         ),
     );
     (agents_dir, gate)
+}
+
+/// Writes a fixture Claude transcript for `reference` below the declared
+/// fixture config home, so the transcript preflight of a later recovery
+/// verifies that conversation.
+fn write_claude_transcript(claude_home: &std::path::Path, reference: &str) {
+    let project = claude_home.join("projects/fixture");
+    std::fs::create_dir_all(&project).expect("create fixture Claude transcript directory");
+    std::fs::write(project.join(format!("{reference}.jsonl")), "{}\n")
+        .expect("write fixture Claude transcript");
 }
 
 #[cfg(unix)]
@@ -11381,6 +11405,11 @@ fn resumable_params() -> SessionNewParams {
 #[tokio::test]
 async fn fork_live_claude_session_mints_new_id_and_builds_fork_argv() {
     let dir = temp_dir("fork-claude-runtime");
+    let claude_home = dir.join("claude-home");
+    let transcripts = claude_home.join("projects/fixture");
+    std::fs::create_dir_all(&transcripts).expect("create Claude transcript store");
+    std::fs::write(transcripts.join("native-live.jsonl"), "{}\n")
+        .expect("write Claude source transcript");
     let script = dir.join("fork-agent");
     let marker = dir.join("argv.txt");
     write_executable(
@@ -11394,8 +11423,9 @@ async fn fork_live_claude_session_mints_new_id_and_builds_fork_argv() {
         "fork-claude",
         "forkable",
         &format!(
-            "base = \"claude\"\nprogram = \"{}\"\nargs = [\"--model\", \"sonnet\"]\n",
-            script.display()
+            "base = \"claude\"\nprogram = \"{}\"\nargs = [\"--model\", \"sonnet\"]\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+            script.display(),
+            claude_home.display()
         ),
     );
     let registry = SessionRegistry::new(SessionRegistryConfig {
@@ -11440,7 +11470,7 @@ async fn fork_live_claude_session_mints_new_id_and_builds_fork_argv() {
     assert_eq!(forked.name.as_deref(), Some("forked review"));
     assert_eq!(forked.cwd, created.cwd);
     assert_eq!((forked.cols, forked.rows), (100, 30));
-    assert_eq!(forked.native_session_id.as_deref(), Some("native-live"));
+    assert_eq!(forked.native_session_id, None);
 
     let argv = wait_for_file_contains(&marker, "--fork-session").await;
     let lines = argv.lines().collect::<Vec<_>>();
@@ -11877,7 +11907,9 @@ async fn legacy_harness_exit_during_daemon_shutdown_keeps_recovery_binding() {
 async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_is_idempotent() {
     let store_path = temp_store_path("manual-resume");
     let marker = temp_dir("manual-resume-marker").join("argv.txt");
-    let (agents_dir, mut exit_gate) = temp_agent_that_exits_then_resumes("manual-resume", &marker);
+    let claude_home = temp_dir("manual-resume-claude");
+    let (agents_dir, mut exit_gate) =
+        temp_agent_that_exits_then_resumes("manual-resume", &marker, "native-manual", &claude_home);
     let inspector = Arc::new(UnreadableCandidateHost::default());
     let registry = SessionRegistry::new_with_inspector(
         SessionRegistryConfig {
@@ -12323,8 +12355,10 @@ async fn hermes_resume_without_native_reference_fails_before_relaunch() {
     let error = registry
         .resume(&created.id)
         .await
-        .expect_err("resume requires an exact native reference");
+        .expect_err("resume requires a native claim of a hook runtime");
 
+    // Hermes reports identity through its hook, so a claim-less recovery is
+    // `native_identity_missing`, the typed code documented for hook runtimes.
     assert_eq!(error.code, "native_identity_missing");
     assert_eq!(
         fs::read_to_string(&marker).expect("argv marker after rejection"),
@@ -12335,9 +12369,15 @@ async fn hermes_resume_without_native_reference_fails_before_relaunch() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn recovery_keeps_a_hostile_native_id_as_one_argv_element() {
+async fn a_hostile_native_id_refuses_recovery_without_launching() {
+    let hostile = "native id;$(touch pwned)|`x` 'q' \"z\" *";
     let marker = temp_dir("hostile-id-marker").join("argv.txt");
-    let (agents_dir, mut gate) = temp_agent_that_exits_then_resumes("hostile-id", &marker);
+    let claude_home = temp_dir("hostile-id-claude");
+    // The reference can never name a transcript, and the preflight refuses it
+    // as an invalid reference before any store scan; the fixture transcript
+    // only keeps the config home nonempty.
+    let (agents_dir, mut gate) =
+        temp_agent_that_exits_then_resumes("hostile-id", &marker, hostile, &claude_home);
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
@@ -12349,7 +12389,6 @@ async fn recovery_keeps_a_hostile_native_id_as_one_argv_element() {
         .create(resumable_params())
         .await
         .expect("create session");
-    let hostile = "native id;$(touch pwned)|`x` 'q' \"z\" *";
     assert!(
         registry
             .report_native_id(native_report!(&registry;
@@ -12368,12 +12407,16 @@ async fn recovery_keeps_a_hostile_native_id_as_one_argv_element() {
         .await
         .expect("session exits");
 
-    registry.resume(&created.id).await.expect("native recovery");
-    let argv = wait_for_file_contains(&marker, "--resume").await;
+    let before = fs::read_to_string(&marker).expect("argv marker before recovery");
+    let error = registry
+        .resume(&created.id)
+        .await
+        .expect_err("a hostile reference is no valid conversation");
+    assert_eq!(error.code, "agent_native_reference_missing");
     assert_eq!(
-        argv.lines().collect::<Vec<_>>(),
-        ["--model", "sonnet", "--model", "sonnet", "--resume", hostile],
-        "the launch args stay frozen and the reference is one argv element"
+        fs::read_to_string(&marker).expect("argv marker after refusal"),
+        before,
+        "a hostile reference can never drive the recovery argv"
     );
 
     let _ = registry.stop(&created.id).await;
@@ -12609,6 +12652,25 @@ async fn set_metadata_after_capture_updates_persisted_binding() {
 async fn resume_binding_restores_metadata_from_store() {
     let store_path = temp_store_path("resume-metadata");
     let expected = metadata(&[("owner", "daemon"), ("ticket", "DMD-1356")]);
+    // The legacy-style binding names a Claude transcript its recovery
+    // preflight verifies in the descriptor-declared config home, which the
+    // fixture provides through the registry's launch environment.
+    let claude_home = temp_dir("resume-metadata-claude");
+    write_claude_transcript(&claude_home, "native-metadata");
+    #[cfg(unix)]
+    let registry = claude_home_registry(
+        &claude_home,
+        temp_dir("resume-metadata-agents"),
+        Some(store_path.clone()),
+    );
+    #[cfg(not(unix))]
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path),
+        ..SessionRegistryConfig::default()
+    });
+    let _ = &claude_home;
     let store = crate::store::Store::new(store_path.clone());
     store
         .record_resume(&crate::store::ResumeBinding {
@@ -12640,12 +12702,6 @@ async fn resume_binding_restores_metadata_from_store() {
         .into_iter()
         .next()
         .expect("one binding");
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: hermetic_shell(),
-        stop_grace: Duration::from_millis(50),
-        store_path: Some(store_path),
-        ..SessionRegistryConfig::default()
-    });
 
     let resumed = registry
         .resume_binding(binding)
@@ -12703,6 +12759,10 @@ async fn resize_without_captured_native_id_persists_no_binding() {
 async fn resume_after_profile_edit_and_resize_uses_original_snapshot() {
     let store_path = temp_store_path("resume-edit-resize");
     let dir = temp_dir("resume-edit-resize-runtime");
+    // The recovery preflight verifies the reported transcript in the
+    // descriptor-declared config home the fixture profile declares.
+    let claude_home = dir.join("claude-home");
+    write_claude_transcript(&claude_home, "native-edit-resize");
     let script_v1 = dir.join("agent-v1");
     let script_v2 = dir.join("agent-v2");
     let marker_v1 = dir.join("v1-argv.txt");
@@ -12713,8 +12773,9 @@ async fn resume_after_profile_edit_and_resize_uses_original_snapshot() {
         "resume-edit-resize",
         "editable",
         &format!(
-            "base = \"claude\"\nprogram = \"{}\"\nargs = [\"--model\", \"sonnet\"]\n",
-            script_v1.display()
+            "base = \"claude\"\nprogram = \"{}\"\nargs = [\"--model\", \"sonnet\"]\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+            script_v1.display(),
+            claude_home.display()
         ),
     );
     let registry = SessionRegistry::new(SessionRegistryConfig {
@@ -12763,8 +12824,9 @@ async fn resume_after_profile_edit_and_resize_uses_original_snapshot() {
     fs::write(
         agents_dir.join("editable.toml"),
         format!(
-            "base = \"claude\"\nprogram = \"{}\"\nargs = [\"--model\", \"opus\"]\n",
-            script_v2.display()
+            "base = \"claude\"\nprogram = \"{}\"\nargs = [\"--model\", \"opus\"]\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+            script_v2.display(),
+            claude_home.display()
         ),
     )
     .expect("edit profile");
@@ -16598,20 +16660,25 @@ async fn failed_commit_stop_and_retire_keep_the_session_reconnecting() {
 async fn terminal_resumable_session(
     registry: &SessionRegistry,
     exit_gate: &mut fs::File,
+    claude_home: &std::path::Path,
 ) -> SessionInfo {
     let created = registry
         .create(resumable_params())
         .await
         .expect("create session");
+    let reference = format!("native-{}", created.id.0);
     let recorded = registry
         .report_native_id(native_report!(registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
-            native_session_id: format!("native-{}", created.id.0),
+            native_session_id: reference.clone(),
             transcript_path: None,
         ))
         .await;
     assert!(recorded.recorded, "native id captured");
+    // A native reference the fixture reports for the created session needs a
+    // transcript in the fixture config home before the recovery preflight.
+    write_claude_transcript(claude_home, &reference);
     exit_gate
         .write_all(b"go\n")
         .expect("release the agent exit gate");
@@ -16626,8 +16693,13 @@ async fn terminal_resumable_session(
 #[tokio::test]
 async fn concurrent_recoveries_of_one_session_start_exactly_one_generation() {
     let marker = temp_dir("lifecycle-concurrent-resume-marker").join("argv.txt");
-    let (agents_dir, mut exit_gate) =
-        temp_agent_that_exits_then_resumes("lifecycle-concurrent-resume", &marker);
+    let claude_home = temp_dir("lifecycle-concurrent-resume-claude");
+    let (agents_dir, mut exit_gate) = temp_agent_that_exits_then_resumes(
+        "lifecycle-concurrent-resume",
+        &marker,
+        "native-fixture",
+        &claude_home,
+    );
     let (registry, supervisor) = scripted_registry(SessionRegistryConfig {
         shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
@@ -16636,7 +16708,7 @@ async fn concurrent_recoveries_of_one_session_start_exactly_one_generation() {
         socket_path: Some(PathBuf::from("/run/pohunek/d.sock")),
         ..SessionRegistryConfig::default()
     });
-    let done = terminal_resumable_session(&registry, &mut exit_gate).await;
+    let done = terminal_resumable_session(&registry, &mut exit_gate, &claude_home).await;
     let [first_job] = supervisor.started().try_into().expect("one created job");
 
     let (left, right) = tokio::join!(registry.resume(&done.id), registry.resume(&done.id));
@@ -16673,8 +16745,13 @@ async fn concurrent_recoveries_of_one_session_start_exactly_one_generation() {
 #[tokio::test]
 async fn recoveries_of_different_sessions_are_not_serialized() {
     let marker = temp_dir("lifecycle-parallel-resume-marker").join("argv.txt");
-    let (agents_dir, mut exit_gate) =
-        temp_agent_that_exits_then_resumes("lifecycle-parallel-resume", &marker);
+    let claude_home = temp_dir("lifecycle-parallel-resume-claude");
+    let (agents_dir, mut exit_gate) = temp_agent_that_exits_then_resumes(
+        "lifecycle-parallel-resume",
+        &marker,
+        "native-fixture",
+        &claude_home,
+    );
     let (registry, supervisor) = scripted_registry(SessionRegistryConfig {
         shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
@@ -16683,8 +16760,8 @@ async fn recoveries_of_different_sessions_are_not_serialized() {
         socket_path: Some(PathBuf::from("/run/pohunek/d.sock")),
         ..SessionRegistryConfig::default()
     });
-    let held = terminal_resumable_session(&registry, &mut exit_gate).await;
-    let free = terminal_resumable_session(&registry, &mut exit_gate).await;
+    let held = terminal_resumable_session(&registry, &mut exit_gate, &claude_home).await;
+    let free = terminal_resumable_session(&registry, &mut exit_gate, &claude_home).await;
     let gate = crate::runtime::lifecycle::tests::StartGate {
         session_id: Some(held.id.0.clone()),
         entered: Arc::new(tokio::sync::Notify::new()),
@@ -18289,9 +18366,36 @@ async fn migrated_legacy_bindings_resume_and_fork_with_the_native_argv() {
     }
 }
 
-/// Migrates one generation's store line for `case`, then resumes and forks the
-/// binding and checks the exact argv the agent is launched with.
+/// The registry a migrated binding resumes and forks through: the Claude case
+/// clears the recovery transcript preflight against a fixture config home the
+/// registry declares, because the legacy binding names a Claude transcript.
 #[cfg(unix)]
+fn migrated_agent_registry(
+    tag: &str,
+    case: &MigratedAgentCase,
+    store_path: std::path::PathBuf,
+) -> SessionRegistry {
+    if case.agent != "claude" {
+        return SessionRegistry::new(SessionRegistryConfig {
+            shell_command: hermetic_shell(),
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store_path),
+            ..SessionRegistryConfig::default()
+        });
+    }
+    // The legacy binding carries its own frozen program, so the empty fixture
+    // agents dir only serves host-profile resolution.
+    let claude_dir = temp_dir(&format!("{tag}-claude-home"));
+    write_claude_transcript(&claude_dir, "native-legacy");
+    claude_home_registry(
+        &claude_dir,
+        temp_dir(&format!("{tag}-agents")),
+        Some(store_path),
+    )
+}
+
+/// Migrates one generation's store line for `case`, then resumes and forks the
+/// binding and checks the exact argv the agent is launched with.#[cfg(unix)]
 async fn assert_migrated_binding_argv(generation: &str, case: &MigratedAgentCase) {
     let tag = format!("migrated-{generation}-{}", case.agent);
     let dir = temp_dir(&tag);
@@ -18327,12 +18431,7 @@ async fn assert_migrated_binding_argv(generation: &str, case: &MigratedAgentCase
         .into_iter()
         .next()
         .expect("one binding");
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: hermetic_shell(),
-        stop_grace: Duration::from_millis(50),
-        store_path: Some(store_path),
-        ..SessionRegistryConfig::default()
-    });
+    let registry = migrated_agent_registry(&tag, case, store_path);
 
     let resumed = registry
         .resume_binding(binding)
@@ -18901,6 +19000,9 @@ async fn a_launch_over_outdated_hook_assets_carries_a_hook_warning() {
 #[tokio::test]
 async fn a_fork_over_outdated_hook_assets_carries_a_hook_warning() {
     let claude_dir = temp_dir("outdated-fork-claude");
+    // The fork preflight verifies the conversation in the registry's config
+    // home, beside the hooks this test installs.
+    write_claude_transcript(&claude_dir, "native-fork");
     let dir = temp_dir("outdated-fork-runtime");
     let script = dir.join("fork-agent");
     write_executable(&script, "#!/bin/sh\nsleep 30\n");
@@ -18951,8 +19053,14 @@ async fn a_fork_over_outdated_hook_assets_carries_a_hook_warning() {
 async fn a_resume_over_outdated_hook_assets_carries_a_hook_warning() {
     let claude_dir = temp_dir("outdated-resume-claude");
     let marker = temp_dir("outdated-resume-marker").join("argv.txt");
-    let (agents_dir, mut exit_gate) =
-        temp_agent_that_exits_then_resumes("outdated-resume", &marker);
+    // The transcript lives beside the hooks this test installs, so the same
+    // config home serves the recovery preflight and the hook warning.
+    let (agents_dir, mut exit_gate) = temp_agent_that_exits_then_resumes(
+        "outdated-resume",
+        &marker,
+        "native-resume",
+        &claude_dir,
+    );
     let registry = claude_home_registry(
         &claude_dir,
         agents_dir,
@@ -19040,11 +19148,19 @@ fn install_shadowing_profile_hooks(registry: &SessionRegistry) {
     .expect("install the profile's Claude hooks");
 }
 
+/// The native reference the shadowing-profile recovery fixtures report, whose
+/// transcript must exist in the profile home before a recovery preflight.
+#[cfg(unix)]
+const SHADOW_NATIVE_REFERENCE: &str = "native-shadow";
+
 #[cfg(unix)]
 #[tokio::test]
 async fn a_fork_of_a_profile_named_after_its_runtime_checks_the_profile_home() {
     let default_dir = temp_dir("shadow-fork-default");
     let profile_dir = temp_dir("shadow-fork-profile");
+    // The fork preflight verifies the conversation in the profile home the
+    // shadowing profile declares.
+    write_claude_transcript(&profile_dir, SHADOW_NATIVE_REFERENCE);
     let dir = temp_dir("shadow-fork-runtime");
     let script = dir.join("fork-agent");
     write_executable(&script, "#!/bin/sh\nsleep 30\n");
@@ -19056,7 +19172,7 @@ async fn a_fork_of_a_profile_named_after_its_runtime_checks_the_profile_home() {
         .report_native_id(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
-            native_session_id: "native-shadow".to_owned(),
+            native_session_id: SHADOW_NATIVE_REFERENCE.to_owned(),
             transcript_path: None,
         ))
         .await;
@@ -19093,6 +19209,9 @@ async fn a_fork_of_a_profile_named_after_its_runtime_checks_the_profile_home() {
 async fn a_resume_of_a_profile_named_after_its_runtime_checks_the_profile_home() {
     let default_dir = temp_dir("shadow-resume-default");
     let profile_dir = temp_dir("shadow-resume-profile");
+    // The recovery preflight verifies the conversation in the profile home the
+    // shadowing profile declares.
+    write_claude_transcript(&profile_dir, SHADOW_NATIVE_REFERENCE);
     let runtime = temp_dir("shadow-resume-runtime");
     let script = runtime.join("resume-agent");
     let gate_path = runtime.join("exit.gate");
@@ -19119,7 +19238,7 @@ async fn a_resume_of_a_profile_named_after_its_runtime_checks_the_profile_home()
         .report_native_id(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
-            native_session_id: "native-shadow".to_owned(),
+            native_session_id: SHADOW_NATIVE_REFERENCE.to_owned(),
             transcript_path: None,
         ))
         .await;

@@ -2394,11 +2394,9 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub active_agent_session_path: Option<String>,
-    /// Native agent session id captured via the `SessionStart` hook, when one
-    /// has been reported (see `docs/plan-phase-1.md` "Resume Model"). A session
-    /// is resumable after a daemon restart only while this is present **and** the
-    /// session is non-terminal: the daemon drops the resume binding on exit, so a
-    /// terminal session can retain this id for reference yet not be resumable.
+    /// Selected native conversation id of the verified launch agent, when one
+    /// has been reported. A later verified in-session switch replaces it.
+    /// Recovery still requires a valid transcript and runtime binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub native_session_id: Option<String>,
@@ -2410,6 +2408,16 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub native_session_path: Option<String>,
+    /// Last verified file modification of the selected native conversation.
+    ///
+    /// RFC3339 UTC, currently derived for Claude from a regular transcript
+    /// file under its effective config home when `session.inspect` or
+    /// `session.list` responds.
+    /// `None` means no native file activity was verified. This never falls
+    /// back to the control-plane [`Self::updated_at`] timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub native_last_activity_at: Option<String>,
     /// Project this session belongs to, by derived id (`p-…`), when it started
     /// inside (or was pointed at) a git repository. `None` for a session with no
     /// git identity (a plain shell in a non-git directory).
@@ -3083,6 +3091,7 @@ mod tests {
             active_agent_session_path: None,
             native_session_id: None,
             native_session_path: None,
+            native_last_activity_at: None,
             project_id: None,
             project_label: None,
             is_linked_worktree: None,

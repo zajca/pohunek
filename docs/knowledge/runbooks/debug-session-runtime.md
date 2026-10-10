@@ -130,9 +130,23 @@ A terminal or lost hook runtime without a trusted native reference refuses
 means its own generation journal has no native claim;
 `runtime/native_identity_unverified` means it has a claim but no verified
 launch-process binding. `runtime/native_identity_evidence_unavailable` means
-the generation journal cannot be read or selected unambiguously. Preserve the
-journal for diagnosis. A foreign process claim keeps the existing typed
-process-identity reason and cannot replace the stored native reference.
+the durable session record or exact generation journal cannot be read, the
+journal is absent or ambiguous, or its worker id or instance does not match the
+record. Preserve both records for diagnosis. A foreign process claim keeps the
+existing typed process-identity reason and cannot replace the stored native
+reference.
+`runtime/native_identity_uncertain` means the generation journal carries a
+newer conversation switch that this daemon cannot verify: the journal names a
+different conversation than the persisted one and no newer accepted report
+covers it. Native recovery is unavailable with the older verified target
+intact, because the daemon cannot tell which conversation the agent last used.
+Resume the newer conversation in a fresh session with
+`<agent> --resume <resolved-id>` or clear the journal discrepancy in the
+session's own generation before retrying; never delete the journal.
+For Claude, `runtime/agent_native_reference_missing` on resume or fork means
+the selected conversation's regular transcript file could not be verified
+under the effective Claude config home. Restore or inspect the transcript tree
+before retrying; the refused operation creates no new worker or fork child.
 
 - `conflict`: multiple or mismatched identities claim the session. Never stop,
   unlink, or kill either candidate by hand, and the daemon never kills one
