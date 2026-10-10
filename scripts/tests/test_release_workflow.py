@@ -151,20 +151,21 @@ OIDC_LINES = [
     )
 ]
 
-# The caller job that grants the OIDC ceiling: it only passes inputs.
+# The caller job grants the OIDC ceiling and passes one signing secret.
 CALLER_LINES = [
     re.compile(pattern)
     for pattern in (
         rf"    (name|needs): {_SCALAR}",
         r"    needs: \[[a-z0-9, -]+\]",
         r"    uses: \./\.github/workflows/release-evidence\.yml",
-        r"    (permissions|with):",
+        r"    (permissions|with|secrets):",
         r"      contents: read",
         r"      id-token: write",
         r"      attestations: write",
         r"      version: \$\{\{ needs\.build\.outputs\.version \}\}",
         r"      commit: \$\{\{ github\.sha \}\}",
         r"      mode: release",
+        r"      CATALOG_SIGNING_KEY_CI: \$\{\{ secrets\.CATALOG_SIGNING_KEY_CI \}\}",
         _COMMENT,
     )
 ]
@@ -607,13 +608,18 @@ class OidcTests(ReleaseWorkflowFiles):
 
 
 class SigningTests(ReleaseWorkflowFiles):
-    def test_the_signing_secret_is_read_once_in_the_signing_step_of_assemble(self):
+    def test_the_signing_secret_is_forwarded_once_and_read_only_by_assemble(self):
         for file, text in self.texts.items():
-            expected = 1 if file == "release-evidence.yml" else 0
+            expected = 1 if file in ("release.yml", "release-evidence.yml") else 0
             self.assertEqual(text.count(f"secrets.{SIGNING_SECRET}"), expected, file)
             self.assertEqual(len(re.findall(r"\bsecrets\.", text)), expected, file)
             self.assertNotIn("secrets: inherit", text)
         self.assertNotIn(SIGNING_SECRET, self.ci)
+        caller = self.release_jobs["evidence"]
+        self.assertIn(f"    secrets:\n      {SIGNING_SECRET}: ${{{{ secrets.{SIGNING_SECRET} }}}}\n", caller)
+        declaration = self.evidence.split("\npermissions:", 1)[0]
+        self.assertIn(f"    secrets:\n      {SIGNING_SECRET}:\n", declaration)
+        self.assertIn("        required: false\n", declaration.split(f"      {SIGNING_SECRET}:\n", 1)[1])
         assemble = self.evidence_jobs[SIGNING_JOB]
         self.assertEqual(assemble.count(f"secrets.{SIGNING_SECRET}"), 1)
         step = assemble.split("      - name: Sign and assemble the bundle\n", 1)[1].split("\n      - name:", 1)[0]

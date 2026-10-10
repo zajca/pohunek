@@ -57,6 +57,10 @@ on:
         type: string
         required: false
         default: ""
+    secrets:
+      CATALOG_SIGNING_KEY_CI:
+        description: CI root seed, used only by the release assembly job
+        required: false
 
 permissions: {}
 
