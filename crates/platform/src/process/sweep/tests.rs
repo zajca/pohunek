@@ -373,7 +373,7 @@ async fn a_conflicting_pair_blocks_only_the_sweep_of_an_instance_it_names() {
 
 #[test]
 fn unreadable_marker_processes_are_classified_by_their_start_time() {
-    use super::{classify, Selection, START_IDENTITY_ORDERS_PROCESS_STARTS};
+    use super::{classify, Selection, SpawnLineage, START_IDENTITY_ORDERS_PROCESS_STARTS};
 
     let bounded = request(RUNTIME).with_worker_start_identity(Some(StartIdentity::new(100)));
     let inspector = ScriptedInspector::default()
@@ -381,12 +381,18 @@ fn unreadable_marker_processes_are_classified_by_their_start_time() {
         .with_process(identity(911, 100), MarkerAnswer::Denied)
         .with_process(identity(912, 200), MarkerAnswer::Unobservable)
         .with_process(identity(913, 50), MarkerAnswer::Unobservable);
+    let no_lineage = SpawnLineage::new(&inspector, &[]);
 
     // A process that started strictly before the worker cannot carry the
     // runtime's marker, however unreadable it is; where start identities do
     // not order process starts, nothing is provably foreign.
     for pid in [910, 913] {
-        let selection = classify(&inspector, identity(pid, 50), &bounded);
+        let selection = classify(
+            &inspector,
+            identity(pid, 50),
+            &bounded,
+            &SpawnLineage::new(&inspector, &[]),
+        );
         if START_IDENTITY_ORDERS_PROCESS_STARTS {
             assert!(matches!(selection, Ok(Selection::Foreign)));
         } else {
@@ -399,18 +405,18 @@ fn unreadable_marker_processes_are_classified_by_their_start_time() {
     // A process started at or after the worker may still be a descendant
     // whose markers happen to be unreadable.
     assert!(matches!(
-        classify(&inspector, identity(911, 100), &bounded),
+        classify(&inspector, identity(911, 100), &bounded, &no_lineage),
         Ok(Selection::Skip(SkipReason::MarkersUnreadable))
     ));
     assert!(matches!(
-        classify(&inspector, identity(912, 200), &bounded),
+        classify(&inspector, identity(912, 200), &bounded, &no_lineage),
         Ok(Selection::Skip(SkipReason::MarkersUnreadable))
     ));
 
     // Without the worker start bound nothing is provably foreign.
     let unbounded = request(RUNTIME);
     assert!(matches!(
-        classify(&inspector, identity(910, 50), &unbounded),
+        classify(&inspector, identity(910, 50), &unbounded, &no_lineage),
         Ok(Selection::Skip(SkipReason::MarkersUnreadable))
     ));
 
@@ -419,8 +425,9 @@ fn unreadable_marker_processes_are_classified_by_their_start_time() {
     let exited = ScriptedInspector::default()
         .with_process(identity(914, 200), MarkerAnswer::Denied)
         .with_identities(914, [None]);
+    let exited_lineage = SpawnLineage::new(&exited, &[]);
     assert!(matches!(
-        classify(&exited, identity(914, 200), &bounded),
+        classify(&exited, identity(914, 200), &bounded, &exited_lineage),
         Ok(Selection::Foreign)
     ));
 }
