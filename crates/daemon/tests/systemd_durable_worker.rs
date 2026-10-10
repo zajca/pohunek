@@ -491,6 +491,7 @@ impl Fixture {
                 .collect(),
             search_path: pohunek_platform::shell_env::SearchPath::default(),
             sweep_grace: SWEEP_GRACE,
+            input_timing: pohunek_service_config::DEFAULT_INPUT_TIMING,
             open_files: OPEN_FILES,
         })
         .expect("valid fixture service configuration");

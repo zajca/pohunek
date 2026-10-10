@@ -81,11 +81,12 @@ pub enum ConfigError {
         /// The parser diagnostic, naming the missing, unknown, or mistyped key.
         message: String,
     },
-    /// `schema_version` is not [`SCHEMA_VERSION`].
+    /// `schema_version` is not [`SCHEMA_VERSION`] for a normal service load.
     #[error(
         "service config schema_version {found} is unsupported; expected {SCHEMA_VERSION}; \
-         uninstall with the pohunek version that wrote it (`pohunek service uninstall`), \
-         then run `pohunek service install` to write a current file"
+         use `pohunek service upgrade` for a supported previous installation, or \
+         run `pohunek service uninstall` with the version that wrote it and \
+         `pohunek service install` with this version"
     )]
     UnsupportedSchema {
         /// The recorded schema version.

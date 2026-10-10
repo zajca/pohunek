@@ -33,8 +33,8 @@ use protocol::{
     NotificationUpdateParams, NotificationUpdateResult, ProcessStartIdentity, ReportSequence,
     Request as ProtocolRequest, Response, RuntimeId, RuntimeRef, SessionAttachParams,
     SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId, SessionInfo,
-    SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams,
-    SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams,
+    SessionNewParams, SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult,
     SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
     SessionResizeResult, SessionState, SessionStopResult, StateSource, TerminalDimensions,
     WorktreeRemoveParams, WorktreeRemoveResult, ENV_DAEMON_ID, ENV_SESSION_ID, PROTOCOL_VERSION,
@@ -2680,6 +2680,135 @@ async fn claude_stub_session_publishes_screen_blocked_and_receives_plain_input()
 
     let _ = shutdown.send(());
     let _ = handle.await;
+}
+
+/// The public waited-input result reveals whether the selected runtime's
+/// framing needs a delayed submit: a nonzero delay refuses the wait before
+/// writing, while zero can deliver and observe the fake agent's blocked OSC.
+async fn waited_input_with_host_submit_delay(
+    runtime: RuntimeRef,
+    host_delay: Duration,
+    override_delay: Option<Duration>,
+) -> (Response, Option<Vec<u8>>) {
+    let socket = temp_socket("host-submit-delay");
+    let bin_dir = socket.dir.join("bin");
+    std::fs::create_dir(&bin_dir).expect("fake-agent bin directory");
+    let agent_name = if runtime == RuntimeRef::claude() {
+        "claude"
+    } else {
+        "codex"
+    };
+    let received = socket.dir.join("waited-input.bin");
+    let ready = socket.dir.join("waited-input-ready");
+    write_executable(
+        &bin_dir.join(agent_name),
+        &format!(
+            r#"#!/usr/bin/python3
+import os
+import tty
+
+tty.setraw(0)
+with open({ready:?}, "wb") as marker:
+    marker.write(b"ready")
+body = bytearray()
+with open({received:?}, "wb") as capture:
+    while len(body) < len(b"hello\r"):
+        chunk = os.read(0, len(b"hello\r") - len(body))
+        body.extend(chunk)
+        capture.write(chunk)
+        capture.flush()
+os.write(1, b"\x1b]2;Action Required\x07")
+while True:
+    os.read(0, 1)
+"#,
+            received = received.display().to_string(),
+            ready = ready.display().to_string()
+        ),
+    );
+    let mut config = support::hermetic_registry_config();
+    config.host_submit_delay = Some(host_delay);
+    if let Some(delay) = override_delay {
+        config.submit_delay_overrides.insert(
+            RuntimeId::parse(agent_name).expect("known runtime id"),
+            delay,
+        );
+    }
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+    let created: SessionInfo = {
+        let _path = PathGuard::prepend(&bin_dir);
+        serde_json::from_value(ok_payload(
+            create_session_with_agent(&mut control, runtime, socket.work_dir()).await,
+        ))
+        .expect("fake-agent session")
+    };
+    wait_until("fake waited-input agent is reading", || async {
+        ready.exists().then_some(())
+    })
+    .await;
+    let request = Request::make(
+        "waited-host-input",
+        method::SESSION_INPUT,
+        serde_json::to_value(SessionInputParams {
+            session_id: created.id.clone(),
+            text: "hello".to_owned(),
+            wait: Some(SessionInputWait {
+                until: Some(vec![AgentActivity::Blocked]),
+                timeout_ms: Some(2_000),
+            }),
+        })
+        .expect("waited input params"),
+    );
+    let response = exchange(&mut control, &request).await;
+    let captured = tokio::fs::read(received).await.ok();
+    let stop = Request::make(
+        "stop-host-input",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize session id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop).await))
+            .expect("stop fake agent");
+    let _ = shutdown.send(());
+    let _ = handle.await;
+    (response, captured)
+}
+
+#[tokio::test]
+async fn host_zero_submit_delay_passes_wait_framing_for_opted_in_claude() {
+    let (response, captured) =
+        waited_input_with_host_submit_delay(RuntimeRef::claude(), Duration::ZERO, None).await;
+    let error = response
+        .into_result()
+        .expect_err("the fake agent leaves the activity wait incomplete");
+    assert_eq!(error.code, "session_input_timeout");
+    assert_eq!(captured, Some(b"hello\r".to_vec()));
+}
+
+#[tokio::test]
+async fn host_zero_submit_delay_does_not_override_non_opted_in_codex() {
+    let (response, captured) =
+        waited_input_with_host_submit_delay(RuntimeRef::codex(), Duration::ZERO, None).await;
+    let error = response
+        .into_result()
+        .expect_err("Codex keeps its descriptor delay");
+    assert_eq!(error.code, "session_input_wait_unsupported");
+    assert_eq!(captured, Some(Vec::new()));
+}
+
+#[tokio::test]
+async fn per_runtime_submit_delay_override_wins_over_host_zero() {
+    let (response, captured) = waited_input_with_host_submit_delay(
+        RuntimeRef::claude(),
+        Duration::ZERO,
+        Some(Duration::from_millis(40)),
+    )
+    .await;
+    let error = response
+        .into_result()
+        .expect_err("per-runtime delay takes precedence");
+    assert_eq!(error.code, "session_input_wait_unsupported");
+    assert_eq!(captured, Some(Vec::new()));
 }
 
 #[tokio::test]

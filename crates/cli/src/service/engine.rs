@@ -36,6 +36,35 @@
 //! Rollback, collection, and uninstall verify the claim before deleting
 //! anything; a rolled-back install and a finished uninstall release it.
 //!
+//! # Config migration
+//!
+//! A `service.toml` written by the previous release (`schema_version` 2, in
+//! contrast to this crate's [`SCHEMA_VERSION`]) is read only at the upgrade
+//! boundary, through `ServiceConfig::load_upgrade_source`, which adds the
+//! documented default input timings explicitly. Its upgrade is a dedicated
+//! migration flavor of the transaction, journaled in the record's
+//! `config_backup` (`source_schema_version` and the SHA-256 of the exact
+//! pre-upgrade bytes), with two consequences for ordering:
+//!
+//! * Before anything rewrites `service.toml`, the migration saves the exact
+//!   pre-upgrade bytes to an owner-private backup next to the record (the
+//!   `backed_up` step), so a rollback can restore them byte for byte.
+//! * A previous daemon cannot read a schema-3 file: the moment
+//!   `service.toml` is rewritten, its own strict reader would refuse a restart
+//!   and its restart policy would crash-loop it. The migration therefore
+//!   stops the daemon job (journaling the `stop_daemon` step) after the
+//!   adoption preflight and before the rewrite; registering then installs the
+//!   new definition.
+//!
+//! The migration's replay is closed around the backup: on resume, the backup
+//! must exist and match the journal's digest, and until the rewrite the file
+//! itself must still be the exact pre-upgrade bytes. A rollback first proves
+//! the backup and, once the migration stopped the daemon, judges the previous
+//! daemon's store reader and live-worker adoption. It then stops a registered
+//! replacement, judges the store again, restores the exact bytes, and starts
+//! the previous daemon against its own file. A missing or altered backup fails
+//! before changing any file or daemon.
+//!
 //! A failing upgrade step rolls the transaction back: the daemon job is
 //! replaced by the previous version, `service.toml` is restored, and a
 //! version directory this transaction created is removed unless something
@@ -125,7 +154,7 @@
 
 // Rust guideline compliant 2026-09-29
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use pohunek_paths::InstallLayout;
@@ -134,7 +163,7 @@ use pohunek_platform::shell_env::SearchPath;
 use pohunek_platform::supervisor::{
     self, JobDefinition, Namespace, ServiceObservation, ServiceState, WorkerKey,
 };
-use pohunek_service_config::ServiceConfig;
+use pohunek_service_config::{ServiceConfig, UpgradeSource, SCHEMA_VERSION};
 use protocol::SessionInfo;
 
 use super::backend::Backend;
@@ -145,7 +174,7 @@ use super::definition::{
 use super::error::{supervisor_error, Error, LiveSession, OutdatedWorker};
 use super::layout::{self, Staged};
 use super::preflight::{self, AdoptionPreflight, DaemonPreflight, Gated};
-use super::record::{self, Operation, Record, Step, Store, TransactionLock};
+use super::record::{self, ConfigBackup, Operation, Record, Step, Store, TransactionLock};
 use super::report::{
     state_name, InstallReport, JobReport, KeptVersion, PendingReport, SearchPathReport,
     StatusReport, UninstallReport, UpgradeReport, VersionReport, WorkerReport,
@@ -197,6 +226,16 @@ struct LateGate {
 #[cfg(test)]
 struct SwapHook(Box<dyn Fn() + Send + Sync>);
 
+#[cfg(feature = "test-util")]
+struct RollbackStopHook(Box<dyn Fn() + Send + Sync>);
+
+#[cfg(feature = "test-util")]
+impl std::fmt::Debug for RollbackStopHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RollbackStopHook(..)")
+    }
+}
+
 #[cfg(test)]
 impl std::fmt::Debug for SwapHook {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -235,6 +274,8 @@ pub struct Engine<'a> {
     before_swap: Option<SwapHook>,
     #[cfg(feature = "test-util")]
     reported_version: Option<String>,
+    #[cfg(feature = "test-util")]
+    after_rollback_stop: Option<RollbackStopHook>,
 }
 
 impl<'a> Engine<'a> {
@@ -259,6 +300,8 @@ impl<'a> Engine<'a> {
             before_swap: None,
             #[cfg(feature = "test-util")]
             reported_version: None,
+            #[cfg(feature = "test-util")]
+            after_rollback_stop: None,
         }
     }
 
@@ -279,6 +322,15 @@ impl<'a> Engine<'a> {
     #[must_use]
     pub fn with_runtime_loss_accepted(mut self, accepted: bool) -> Self {
         self.accept_runtime_loss = accepted;
+        self
+    }
+
+    /// Injects a fixture change after the native rollback stop and before
+    /// the second compatibility judgment.
+    #[cfg(feature = "test-util")]
+    #[must_use]
+    pub fn with_after_rollback_stop(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        self.after_rollback_stop = Some(RollbackStopHook(Box::new(hook)));
         self
     }
 
@@ -446,6 +498,7 @@ impl<'a> Engine<'a> {
                     prefix: prefix.to_path_buf(),
                     previous_version: None,
                     version_dir_preexisted: layout::version_exists(&layout, version)?,
+                    config_backup: None,
                     step: Step::Started,
                     rolling_back: false,
                 };
@@ -528,6 +581,9 @@ impl<'a> Engine<'a> {
     /// the new daemon would not adopt (unless the runtime loss is accepted),
     /// [`Error::UpgradeStoreUnusable`] for a store it cannot start with, and
     /// [`Error::UpgradePreflightFailed`] when the preflight gives no report.
+    /// A migration transaction additionally fails closed with
+    /// [`Error::ConfigBackup`] when this CLI's backup of the exact pre-upgrade
+    /// bytes, or the bytes still on disk, no longer match its journal.
     pub async fn upgrade(&self, from: &Path, version: &str) -> Result<UpgradeReport, Error> {
         let _transaction = self.transaction().await?;
         upgrade_preflight(self.context)?;
@@ -535,9 +591,19 @@ impl<'a> Engine<'a> {
         let plan = upgrade_plan(self.store.load()?, version)?;
         let gated = self.adoption_gate(&plan, from, version).await?;
         let (resume, rolled_back) = self.resolve_plan(plan).await?;
-        let config = load_config(&config_path)?.ok_or(Error::NotInstalled {
+        // The file is read as an upgrade source, so a previous release's
+        // schema-2 installation upgrades into this one instead of being
+        // refused: the migration below carries its exact bytes and schema.
+        let source = load_config_for_upgrade(&config_path)?.ok_or(Error::NotInstalled {
             path: config_path.clone(),
         })?;
+        if let Some(record) = &resume {
+            // A resumed migration verifies its backup journal before any
+            // further effect, so a moved, missing, or altered backup fails
+            // the resume closed instead of at the rollback.
+            verify_pending_migration(self.context, &self.store, record, &source)?;
+        }
+        let config = &source.config;
         let layout = config.layout().clone();
         check_layout_dirs(self.context, &layout)?;
         layout::claim_prefix(&layout, &config.namespace())?;
@@ -548,11 +614,9 @@ impl<'a> Engine<'a> {
             .and_then(|record| record.previous_version.clone())
             .unwrap_or_else(|| config.active_version().to_owned());
         if resume.is_none() && config.active_version() == version {
-            layout::verify_existing(&layout, &staged, version)?;
-            layout::discard(&layout, &staged)?;
-            layout::install_cli(&layout, version)?;
-            let (removed_versions, kept_versions, gc_error) =
-                self.collect_garbage_reported(&layout, version).await;
+            let (removed_versions, kept_versions, gc_error) = self
+                .refresh_active_version(staged, &layout, version)
+                .await?;
             return Ok(UpgradeReport {
                 from_version,
                 to_version: version.to_owned(),
@@ -568,27 +632,29 @@ impl<'a> Engine<'a> {
                     .as_ref()
                     .is_some_and(|report| report.accepted_runtime_loss),
                 rolled_back,
+                config_schema_migration: None,
             });
         }
-        let mut record = if let Some(record) = resume {
-            record
+        // A schema-2 source makes this a migration transaction: the record
+        // journals the exact backup from the start, before any effect.
+        let mut record = if let Some(record) = &resume {
+            record.clone()
         } else {
-            {
-                let record = Record {
-                    schema_version: record::SCHEMA_VERSION,
-                    operation: Operation::Upgrade,
-                    version: version.to_owned(),
-                    prefix: layout.prefix().to_path_buf(),
-                    previous_version: Some(from_version.clone()),
-                    version_dir_preexisted: layout::version_exists(&layout, version)?,
-                    step: Step::Started,
-                    rolling_back: false,
-                };
-                self.store.save(&record)?;
-                record
-            }
+            let record = Record {
+                schema_version: record::SCHEMA_VERSION,
+                operation: Operation::Upgrade,
+                version: version.to_owned(),
+                prefix: layout.prefix().to_path_buf(),
+                previous_version: Some(from_version.clone()),
+                version_dir_preexisted: layout::version_exists(&layout, version)?,
+                config_backup: config_backup_of(resume.as_ref(), &source),
+                step: Step::Started,
+                rolling_back: false,
+            };
+            self.store.save(&record)?;
+            record
         };
-        let target = with_version(&config, version)?;
+        let target = with_version(config, version)?;
         let mut late = LateGate::default();
         let result = self
             .run_steps(&mut record, &layout, staged, &target, &mut late)
@@ -623,13 +689,19 @@ impl<'a> Engine<'a> {
                     .and_then(|report| report.preflight.clone())
             }),
             rolled_back,
+            config_schema_migration: record
+                .config_backup
+                .as_ref()
+                .map(|backup| backup.source_schema_version),
         })
     }
 
     /// Asks the new daemon's adoption preflight about the live sessions when
     /// `plan` swaps the daemon, and applies the operator's choice.
     ///
-    /// Runs before any effect of the plan, a rollback included.
+    /// Runs before any effect of the plan, a rollback included. The installed
+    /// version is read leniently, so a schema-2 source is judged like any
+    /// other.
     async fn adoption_gate(
         &self,
         plan: &Plan,
@@ -639,7 +711,9 @@ impl<'a> Engine<'a> {
         // Only a fresh plan needs the installed version, which a rollback
         // would otherwise replace.
         let installed = match plan {
-            Plan::Fresh => load_config(&self.context.config_path())?,
+            Plan::Fresh => {
+                load_config_for_upgrade(&self.context.config_path())?.map(|source| source.config)
+            }
             Plan::Resume(_) | Plan::RollBack(_) => None,
         };
         if !swaps_daemon(
@@ -674,42 +748,15 @@ impl<'a> Engine<'a> {
         let _transaction = self.transaction().await?;
         self.context.bootstrap_environment()?;
         let mut report = UninstallReport::default();
-        let mut registered = None;
-        if let Some(pending) = self.store.load()? {
-            // A transaction that may already have registered its daemon
-            // cannot be rolled back here, whichever operation it is: at or
-            // after `registering` the previous daemon may be gone and the
-            // new one may own live workers, and the rollback instead would
-            // restore the previous daemon behind its compatibility gate. An
-            // upgrade whose previous reader the gate refuses — because the
-            // new daemon migrated the store or a worker changed meanwhile —
-            // would block even `--stop-sessions --purge` there, while
-            // uninstall exposes no runtime-loss acceptance; so the record is
-            // consumed by the session-checked removal below together with
-            // the installation, without restoring anything.
-            if pending.step >= Step::Registering {
-                registered = Some(pending);
-            } else if options.purge && pending.operation == Operation::Install {
-                // The rollback removes `service.toml`, so only the record lets
-                // a rerun after a failed purge find this installation; it is
-                // cleared once the purge below finished.
-                let mut rolled_back = pending_report(&pending);
-                if let Some(gated) = self.rollback(&pending).await? {
-                    rolled_back.accepted_runtime_loss = gated.accepted;
-                    rolled_back.preflight = Some(gated.report);
-                }
-                report.rolled_back = Some(rolled_back);
-            } else {
-                let mut rolled_back = pending_report(&pending);
-                if let Some(gated) = self.rollback_pending(&pending).await? {
-                    rolled_back.accepted_runtime_loss = gated.accepted;
-                    rolled_back.preflight = Some(gated.report);
-                }
-                report.rolled_back = Some(rolled_back);
-            }
-        }
+        let registered = self.resolve_uninstall_pending(options, &mut report).await?;
         let config_path = self.context.config_path();
-        let config = match (load_config(&config_path)?, &registered) {
+        // The uninstall reads the installed configuration as an upgrade
+        // source, so it removes a previous release's schema-2 installation
+        // with this version as well, without a migration.
+        let config = match (
+            load_config_for_upgrade(&config_path)?.map(|source| source.config),
+            &registered,
+        ) {
             (Some(config), _) => config,
             // The install wrote `service.toml` before registering, so a
             // missing file was removed afterwards; the record still names the
@@ -810,6 +857,37 @@ impl<'a> Engine<'a> {
         Ok(report)
     }
 
+    /// Handles a pending transaction before the session-checked removal.
+    async fn resolve_uninstall_pending(
+        &self,
+        options: UninstallOptions,
+        report: &mut UninstallReport,
+    ) -> Result<Option<Record>, Error> {
+        let Some(pending) = self.store.load()? else {
+            return Ok(None);
+        };
+        // A transaction that may have registered a replacement is removed
+        // through the session check. Restoring the previous daemon could
+        // fail its reader gate, while uninstall has no runtime-loss flag.
+        if pending.step >= Step::Registering {
+            return Ok(Some(pending));
+        }
+        // A rollback removes an unregistered install's service.toml. Keep
+        // its record during purge so a failed removal can be retried.
+        let mut rolled_back = pending_report(&pending);
+        let gated = if options.purge && pending.operation == Operation::Install {
+            self.rollback(&pending).await?
+        } else {
+            self.rollback_pending(&pending).await?
+        };
+        if let Some(gated) = gated {
+            rolled_back.accepted_runtime_loss = gated.accepted;
+            rolled_back.preflight = Some(gated.report);
+        }
+        report.rolled_back = Some(rolled_back);
+        Ok(None)
+    }
+
     /// Reports the installation's state.
     ///
     /// # Errors
@@ -907,6 +985,12 @@ impl<'a> Engine<'a> {
         }
         self.checkpoint(Step::Binaries)?;
 
+        self.run_migration_backup(record)?;
+        self.checkpoint(Step::BackedUp)?;
+
+        self.run_migration_daemon_stop(record, config, late).await?;
+        self.checkpoint(Step::StopDaemon)?;
+
         if record.step < Step::Config {
             config.write(&self.context.config_path())?;
             self.advance(record, Step::Config)?;
@@ -924,8 +1008,12 @@ impl<'a> Engine<'a> {
         // facility pauses it, so the adoption preflight runs here, after
         // staging and as close to the replacement as the steps allow. A transaction
         // past registration has replaced it, and the new daemon's own adoption
-        // decides.
-        if record.operation == Operation::Upgrade && replaces_daemon(record.step) {
+        // decides. A migration already gated and stopped the daemon above;
+        // nothing else can start between its stop and this point.
+        if record.operation == Operation::Upgrade
+            && record.config_backup.is_none()
+            && replaces_daemon(record.step)
+        {
             #[cfg(test)]
             if let Some(hook) = &self.before_swap {
                 (hook.0)();
@@ -970,6 +1058,128 @@ impl<'a> Engine<'a> {
         }
         self.checkpoint(Step::Cli)?;
         self.store.clear()
+    }
+
+    /// Verifies that the pre-upgrade bytes still on disk are the ones the
+    /// migration journal digests, and returns them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigBackup`] instead of rewriting anything when the
+    /// file does not match the journal any more.
+    fn verify_migration_bytes(
+        &self,
+        record: &Record,
+        backup: &ConfigBackup,
+    ) -> Result<UpgradeSource, Error> {
+        let source = load_config_for_upgrade(&self.context.config_path())?.ok_or_else(|| {
+            Error::NotInstalled {
+                path: self.context.config_path(),
+            }
+        })?;
+        verify_migration_source(self.context, record, backup, &source)?;
+        Ok(source)
+    }
+
+    /// Drops the daemon job after the adoption gate, before the rewrite.
+    ///
+    /// A missing job is tolerated: a resumed crash replay or an already
+    /// uninstalled job only ever means the daemon is unreachable while its
+    /// workers run on. The job is installed again when the new version is
+    /// registered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Supervisor`] when the service manager refuses.
+    async fn stop_daemon_for_migration(&self) -> Result<(), Error> {
+        match self.backend.daemon().uninstall().await {
+            Ok(()) | Err(supervisor::Error::NotFound(_)) => Ok(()),
+            Err(source) => Err(supervisor_error("stop daemon for config migration", source)),
+        }
+    }
+
+    /// Saves the exact pre-upgrade bytes before the migration rewrites them.
+    ///
+    /// Runs under the `backed_up` step: the migration has not changed
+    /// anything the previous daemon reads yet, so the file on disk still
+    /// holds the exact bytes its digest journals — a mismatch is never
+    /// rewritten, and a copy the resume cannot trust refuses the step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigBackup`] for untrustworthy bytes and
+    /// [`Error::Filesystem`] for the state directory.
+    fn run_migration_backup(&self, record: &mut Record) -> Result<(), Error> {
+        if record.step < Step::BackedUp {
+            if let Some(backup) = &record.config_backup {
+                let source = self.verify_migration_bytes(record, backup)?;
+                self.store.write_config_backup(source.original_bytes())?;
+            }
+            self.advance(record, Step::BackedUp)?;
+        }
+        Ok(())
+    }
+
+    /// Records a durable stop intent, then stops the migration's old daemon.
+    ///
+    /// A migration stops the daemon before the rewrite: once `service.toml`
+    /// is the new schema, a restart of the old daemon (its restart policy, a
+    /// crash) would be refused by its strict reader and crash-loop. The
+    /// adoption preflight runs first, so the still-live sessions are judged
+    /// while the old daemon runs, exactly where the other flavors record
+    /// their late gate before the swap. The other flavors mark the step
+    /// unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns the preflight refusals without any effect, journaling
+    /// failures, and [`Error::Supervisor`] when the service-manager stop
+    /// refuses.
+    async fn run_migration_daemon_stop(
+        &self,
+        record: &mut Record,
+        config: &ServiceConfig,
+        late: &mut LateGate,
+    ) -> Result<(), Error> {
+        if record.step > Step::StopDaemon {
+            return Ok(());
+        }
+        if record.config_backup.is_none() {
+            if record.step < Step::StopDaemon {
+                self.advance(record, Step::StopDaemon)?;
+            }
+            return Ok(());
+        }
+        #[cfg(test)]
+        if let Some(hook) = &self.before_swap {
+            (hook.0)();
+        }
+        if let Some(dir) = config.daemon_executable().parent() {
+            match preflight::gate(
+                &*self.preflight,
+                self.context,
+                dir,
+                self.reported(&record.version),
+                self.accept_runtime_loss,
+            )
+            .await
+            {
+                Ok(gated) => late.gated = Some(gated),
+                Err(error) => {
+                    late.refused = true;
+                    // Nothing stopped or written yet; the record rolls
+                    // back without stopping any daemon.
+                    return Err(error);
+                }
+            }
+        }
+        // Record the intent before the service-manager effect. A crash
+        // between these calls replays the idempotent stop on resume, and
+        // rollback knows that it may need to restart the old daemon.
+        if record.step < Step::StopDaemon {
+            self.advance(record, Step::StopDaemon)?;
+        }
+        self.stop_daemon_for_migration().await
     }
 
     /// Rolls back a failed transaction or keeps its record for resumption.
@@ -1028,6 +1238,11 @@ impl<'a> Engine<'a> {
     /// session check; `settle`, `install`, `upgrade`, and `uninstall` all
     /// route those records elsewhere, so reaching this is a broken invariant
     /// that must fail loudly rather than stop sessions.
+    ///
+    /// A migration rollback validates the backup and the previous reader
+    /// before stopping any registered new daemon, judges the store again
+    /// after that stop, restores exact schema-2 bytes, and only then starts
+    /// the previous daemon. An invalid backup fails before any effect.
     async fn rollback(&self, record: &Record) -> Result<Option<Gated>, Error> {
         let layout = install_layout(&record.prefix)?;
         let config_path = self.context.config_path();
@@ -1058,27 +1273,45 @@ impl<'a> Engine<'a> {
                         path: self.store.path(),
                         detail: "an upgrade record names no previous version".to_owned(),
                     })?;
-                if record.step >= Step::Registering {
+                if record.config_backup.is_some() {
+                    // Validate the exact backup before stopping a healthy new
+                    // daemon or changing the transaction record.
+                    self.rollback_source(record, previous, &config_path)?;
+                }
+                let restarts_previous = rollback_restarts_previous(record);
+                if restarts_previous {
                     gated = Some(self.rollback_gate(&layout, previous).await?);
                 }
                 self.mark_rolling_back(record)?;
-                if record.step >= Step::Registering {
-                    // Stopping the new daemon closes the store-write race.
-                    // A refused second judgment leaves the transaction and
-                    // the daemon stopped, without starting an unsafe reader.
-                    self.backend
-                        .daemon()
-                        .uninstall()
-                        .await
-                        .map_err(|source| supervisor_error("stop daemon for rollback", source))?;
+                if record.step >= Step::Registering
+                    || (record.config_backup.is_some() && record.step >= Step::StopDaemon)
+                {
+                    // A journaled migration stop may not have happened yet;
+                    // a later swap may have registered the new daemon. Stop
+                    // either job before restoring schema-2 bytes so neither
+                    // can restart against a file it cannot read.
+                    match self.backend.daemon().uninstall().await {
+                        Ok(()) | Err(supervisor::Error::NotFound(_)) => {}
+                        Err(source) => {
+                            return Err(supervisor_error("stop daemon for rollback", source));
+                        }
+                    }
+                }
+                #[cfg(feature = "test-util")]
+                if let Some(hook) = &self.after_rollback_stop {
+                    (hook.0)();
+                }
+                if restarts_previous {
+                    // The new daemon may have written the store while it was
+                    // stopping. Judge the previous reader again before the
+                    // config restore and daemon start.
                     gated = Some(self.rollback_gate(&layout, previous).await?);
                 }
-                let current = load_config(&config_path)?.ok_or(Error::NotInstalled {
-                    path: config_path.clone(),
-                })?;
-                let restored = with_version(&current, previous)?;
-                restored.write(&config_path)?;
-                if record.step >= Step::Registering {
+                let restored = self.restore_rollback_config(record, previous, &config_path)?;
+                if restarts_previous {
+                    // The swap stopped the old daemon by replacing its job;
+                    // the migration stopped it on purpose. Its own file is
+                    // back in place now, so it is installed again from it.
                     let definition = daemon_definition(self.context, &restored)?;
                     self.backend
                         .daemon()
@@ -1135,6 +1368,109 @@ impl<'a> Engine<'a> {
             self.accept_runtime_loss,
         )
         .await
+    }
+
+    /// Restores the `service.toml` an upgrade record rolls back to.
+    ///
+    /// A migration record restores the exact backed-up pre-upgrade bytes
+    /// after verifying them against the record's digest, so the previous
+    /// daemon starts against the file it wrote itself. Every other record
+    /// rewrites the current file with the previous version, which the
+    /// schema-3 reader of the running daemon understands.
+    ///
+    /// # Errors
+    ///
+    /// Returns the configuration read or write errors, and
+    /// [`Error::ConfigBackup`] for a missing, altered, or schema-mismatched
+    /// backup, without writing anything.
+    fn restore_rollback_config(
+        &self,
+        record: &Record,
+        previous: &str,
+        config_path: &Path,
+    ) -> Result<ServiceConfig, Error> {
+        if record.config_backup.is_some() {
+            let source = self.rollback_source(record, previous, config_path)?;
+            if record.step >= Step::StopDaemon {
+                source.write_original(config_path)?;
+            }
+            return Ok(source.config);
+        }
+        let current = load_config(config_path)?.ok_or(Error::NotInstalled {
+            path: config_path.to_path_buf(),
+        })?;
+        let restored = with_version(&current, previous)?;
+        restored.write(config_path)?;
+        Ok(restored)
+    }
+
+    /// Reads and verifies the exact config a migration rollback would restore.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ConfigBackup`] or [`Error::Record`] before any write
+    /// when the file, backup, schema, or previous version disagrees.
+    fn rollback_source(
+        &self,
+        record: &Record,
+        previous: &str,
+        config_path: &Path,
+    ) -> Result<UpgradeSource, Error> {
+        let backup = record.config_backup.as_ref().ok_or_else(|| Error::Record {
+            path: self.store.path(),
+            detail: "migration rollback has no config backup".to_owned(),
+        })?;
+        let current = ServiceConfig::load_upgrade_source(config_path)?;
+        verify_pending_migration(self.context, &self.store, record, &current)?;
+        let source = if record.step <= Step::StopDaemon {
+            if record.step == Step::StopDaemon && digest_mismatch(current.original_bytes(), backup)
+            {
+                let bytes = self
+                    .store
+                    .read_config_backup()?
+                    .ok_or_else(|| backup_error(self.store.config_backup_path(), "is missing"))?;
+                ServiceConfig::load_upgrade_source_bytes(&self.store.config_backup_path(), &bytes)?
+            } else {
+                current
+            }
+        } else {
+            let bytes = self
+                .store
+                .read_config_backup()?
+                .ok_or_else(|| backup_error(self.store.config_backup_path(), "is missing"))?;
+            ServiceConfig::load_upgrade_source_bytes(config_path, &bytes)?
+        };
+        if digest_mismatch(source.original_bytes(), backup) {
+            let path = if record.step < Step::Config {
+                config_path.to_path_buf()
+            } else {
+                self.store.config_backup_path()
+            };
+            return Err(backup_error(
+                path,
+                "does not match the digest journaled in the transaction record",
+            ));
+        }
+        if source.source_schema_version != backup.source_schema_version {
+            return Err(backup_error(
+                self.store.config_backup_path(),
+                format!(
+                    "is schema {}, but the transaction record recorded schema {}",
+                    source.source_schema_version, backup.source_schema_version
+                ),
+            ));
+        }
+        if source.config.active_version() != previous {
+            return Err(Error::Record {
+                path: self.store.path(),
+                detail: format!(
+                    "the transaction record names previous version {previous}, \
+                     but its backup names {}",
+                    source.config.active_version()
+                ),
+            });
+        }
+        Ok(source)
     }
 
     /// Journals that `record`'s rollback has begun.
@@ -1217,10 +1553,18 @@ impl<'a> Engine<'a> {
                     .map_err(|source| supervisor_error("install daemon", source)),
                 result => result.map_err(|source| supervisor_error("replace daemon", source)),
             },
-            (Operation::Upgrade, _) => daemon
-                .replace(definition)
-                .await
-                .map_err(|source| supervisor_error("replace daemon", source)),
+            (Operation::Upgrade, _) => match daemon.replace(definition).await {
+                // A migration stopped the daemon job before it rewrote
+                // `service.toml`, so there is nothing to replace; the new
+                // definition is installed instead. The fallback also covers a
+                // daemon job that disappeared on its own during the
+                // transaction.
+                Err(supervisor::Error::NotFound(_)) => daemon
+                    .install(definition)
+                    .await
+                    .map_err(|source| supervisor_error("install daemon", source)),
+                result => result.map_err(|source| supervisor_error("replace daemon", source)),
+            },
         }
     }
 
@@ -1578,6 +1922,28 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    /// Re-installs the CLI of an already active version and collects its
+    /// garbage, for an upgrade that restarts nothing.
+    ///
+    /// The staged binaries are only proven to match the existing version
+    /// directory; they were meant for this same version and replace nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the staging-trust and CLI-install errors before any garbage
+    /// is collected.
+    async fn refresh_active_version(
+        &self,
+        staged: layout::Staged,
+        layout: &InstallLayout,
+        version: &str,
+    ) -> Result<(Vec<String>, Vec<KeptVersion>, Option<String>), Error> {
+        layout::verify_existing(layout, &staged, version)?;
+        layout::discard(layout, &staged)?;
+        layout::install_cli(layout, version)?;
+        Ok(self.collect_garbage_reported(layout, version).await)
+    }
+
     /// Runs [`Self::collect_garbage`] for an upgrade report.
     ///
     /// The upgrade itself already succeeded, so a collection failure is
@@ -1688,6 +2054,13 @@ fn allowed_removal_versions(active: &str, pending: Option<&Record>) -> Vec<Strin
         }
     }
     allowed
+}
+
+/// Whether rollback would start the previous daemon after this recorded step.
+pub(crate) fn rollback_restarts_previous(record: &Record) -> bool {
+    record.operation == Operation::Upgrade
+        && (record.step >= Step::Registering
+            || (record.config_backup.is_some() && record.step >= Step::StopDaemon))
 }
 
 /// Returns whether a session may still own a live PTY.
@@ -2000,6 +2373,149 @@ fn load_config(path: &Path) -> Result<Option<ServiceConfig>, Error> {
         Ok(Some(ServiceConfig::load(path)?))
     } else {
         Ok(None)
+    }
+}
+
+/// Loads `service.toml` as an upgrade source, or `None` when it does not
+/// exist.
+///
+/// The current schema and the previous release's schema 2 are accepted; a
+/// schema the binary neither writes nor upgrades from is refused with its
+/// regular error, which names `pohunek service uninstall` and `install`.
+fn load_config_for_upgrade(path: &Path) -> Result<Option<UpgradeSource>, Error> {
+    if file_exists(path)? {
+        Ok(Some(ServiceConfig::load_upgrade_source(path)?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Checks a pending configuration migration without changing the file or job.
+///
+/// `service check`, upgrade resume, and rollback use the same journal and
+/// on-disk byte rules. A valid current config alone cannot prove that the
+/// previous daemon's exact config can be restored.
+/// At `StopDaemon`, the config can be either the old bytes or the rendered
+/// target: a crash may have happened after the atomic write and before its
+/// checkpoint. Later forward steps require the exact target; a rollback can
+/// also have restored the exact old bytes. Any third content is refused.
+///
+/// # Errors
+///
+/// Returns [`Error::ConfigBackup`] without changing anything.
+pub(crate) fn verify_pending_migration(
+    context: &Context,
+    store: &Store,
+    record: &Record,
+    source: &UpgradeSource,
+) -> Result<(), Error> {
+    let Some(backup) = &record.config_backup else {
+        return Ok(());
+    };
+    if record.step >= Step::BackedUp {
+        let bytes = store
+            .read_config_backup()?
+            .ok_or_else(|| backup_error(store.config_backup_path(), "is missing"))?;
+        if config_digest(&bytes) != backup.digest {
+            return Err(backup_error(
+                store.config_backup_path(),
+                "does not match the digest journaled in the transaction record",
+            ));
+        }
+        if record.step >= Step::StopDaemon {
+            let previous =
+                ServiceConfig::load_upgrade_source_bytes(&store.config_backup_path(), &bytes)?;
+            if previous.source_schema_version != backup.source_schema_version {
+                return Err(backup_error(
+                    store.config_backup_path(),
+                    "does not match the schema journaled in the transaction record",
+                ));
+            }
+            let target = with_version(&previous.config, &record.version)?;
+            if source.original_bytes() == target.to_toml().as_bytes()
+                || (source.original_bytes() == bytes
+                    && (record.step == Step::StopDaemon || record.rolling_back))
+            {
+                return Ok(());
+            }
+            return Err(backup_error(
+                context.config_path(),
+                "does not match the exact configuration journaled for this migration step",
+            ));
+        }
+    }
+    verify_migration_source(context, record, backup, source)
+}
+
+/// Checks the pre-rewrite source against the bytes journaled for a migration.
+///
+/// A moved, edited, or replaced source fails before it can be backed up or
+/// rewritten.
+fn verify_migration_source(
+    context: &Context,
+    record: &Record,
+    backup: &ConfigBackup,
+    source: &UpgradeSource,
+) -> Result<(), Error> {
+    if record.step < Step::Config {
+        let detail = if digest_mismatch(source.original_bytes(), backup) {
+            format!(
+                "does not match the digest journaled in the transaction record ({})",
+                backup.digest
+            )
+        } else if source.source_schema_version != backup.source_schema_version {
+            format!(
+                "is schema {} now, but the transaction recorded schema {}",
+                source.source_schema_version, backup.source_schema_version
+            )
+        } else {
+            return Ok(());
+        };
+        return Err(backup_error(context.config_path(), detail));
+    }
+    Ok(())
+}
+
+/// The migration backup description of an upgrade transaction.
+///
+/// A fresh transaction derives it from the file it read: a source schema
+/// other than the current one makes the transaction migrate, and the digest
+/// binds the journal to the exact bytes it backs. A resumed transaction
+/// keeps the record's description.
+fn config_backup_of(resume: Option<&Record>, source: &UpgradeSource) -> Option<ConfigBackup> {
+    resume
+        .and_then(|record| record.config_backup.clone())
+        .or_else(|| {
+            (source.source_schema_version != SCHEMA_VERSION).then_some(ConfigBackup {
+                source_schema_version: source.source_schema_version,
+                digest: config_digest(source.original_bytes()),
+            })
+        })
+}
+
+/// Hexadecimal SHA-256 of `bytes`, the digest a migration journal binds its
+/// backup to.
+fn config_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let mut text = String::with_capacity(2 * Sha256::output_size());
+    for byte in Sha256::digest(bytes) {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+
+/// Whether `bytes` no longer hash to a migration journal's digest.
+fn digest_mismatch(bytes: &[u8], backup: &ConfigBackup) -> bool {
+    config_digest(bytes) != backup.digest
+}
+
+/// Builds the [`Error::ConfigBackup`] with `detail`.
+fn backup_error(path: PathBuf, detail: impl Into<String>) -> Error {
+    Error::ConfigBackup {
+        path,
+        detail: detail.into(),
     }
 }
 

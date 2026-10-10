@@ -27,7 +27,7 @@ use std::process::ExitStatus;
 use std::time::Duration;
 
 use pohunek_platform::supervisor::Namespace;
-use pohunek_service_config::ServiceConfig;
+use pohunek_service_config::{ServiceConfig, UpgradeSource};
 
 pub mod backend;
 pub mod context;
@@ -655,61 +655,68 @@ pub(crate) fn check_local(
         .transpose()?;
     let mut adoption = Adoption::NotApplicable;
     let config_path = context.config_path();
-    let pending = record::Store::new(context.paths().state_dir.clone()).load()?;
+    let store = record::Store::new(context.paths().state_dir.clone());
+    let pending = store.load()?;
     let pending_install = pending
         .as_ref()
         .is_some_and(|record| record.operation == record::Operation::Install);
-    let (operation, prefix, namespace, plan) = if pending_install || !exists(&config_path)? {
-        let prefix = match prefix {
-            Some(prefix) => prefix,
-            None => context.default_prefix()?,
-        };
-        let layout = engine::install_preflight(context, &prefix)?;
-        let plan = engine::install_plan(pending, &prefix, version)?;
-        // A resume past the config step reads the written file, so check proves
-        // it exactly as install does.
-        if let engine::Plan::Resume(record) = &plan {
-            if record.step >= record::Step::Config {
-                engine::verify_resume_config(context, &prefix, version)?;
+    let (operation, prefix, namespace, plan, config_schema_migration) =
+        if pending_install || !exists(&config_path)? {
+            let prefix = match prefix {
+                Some(prefix) => prefix,
+                None => context.default_prefix()?,
+            };
+            let layout = engine::install_preflight(context, &prefix)?;
+            let plan = engine::install_plan(pending, &prefix, version)?;
+            // A resume past the config step reads the written file, so check proves
+            // it exactly as install does.
+            if let engine::Plan::Resume(record) = &plan {
+                if record.step >= record::Step::Config {
+                    engine::verify_resume_config(context, &prefix, version)?;
+                }
             }
-        }
-        // A rollback of the pending record removes the `service.toml` it wrote.
-        if matches!(plan, engine::Plan::Fresh) && exists(&config_path)? {
-            return Err(Error::AlreadyInstalled { path: config_path });
-        }
-        let namespace = context.namespace()?;
-        layout::verify_claim(&layout, &namespace)?;
-        (record::Operation::Install, prefix, namespace, plan)
-    } else {
-        let config = verified_config(context)?;
-        engine::upgrade_preflight(context)?;
-        let plan = engine::upgrade_plan(pending, version)?;
-        if engine::swaps_daemon(&plan, Some(config.active_version()), version) {
-            adoption = Adoption::Required;
-        }
-        let layout = config.layout();
-        if let Some(requested) = prefix.filter(|requested| requested != layout.prefix()) {
-            return Err(Error::PrefixMismatch {
-                requested,
-                installed: layout.prefix().to_path_buf(),
-            });
-        }
-        engine::check_layout_dirs(context, layout)?;
-        layout::verify_claim(layout, &config.namespace())?;
-        (
-            record::Operation::Upgrade,
-            layout.prefix().to_path_buf(),
-            config.namespace(),
-            plan,
-        )
-    };
+            // A rollback of the pending record removes the `service.toml` it wrote.
+            if matches!(plan, engine::Plan::Fresh) && exists(&config_path)? {
+                return Err(Error::AlreadyInstalled { path: config_path });
+            }
+            let namespace = context.namespace()?;
+            layout::verify_claim(&layout, &namespace)?;
+            (record::Operation::Install, prefix, namespace, plan, None)
+        } else {
+            let config_source = verified_config_source(context)?;
+            engine::upgrade_preflight(context)?;
+            let plan = engine::upgrade_plan(pending, version)?;
+            if let Some(record) = plan.record() {
+                engine::verify_pending_migration(context, &store, record, &config_source)?;
+            }
+            let config = &config_source.config;
+            if engine::swaps_daemon(&plan, Some(config.active_version()), version) {
+                adoption = Adoption::Required;
+            }
+            let layout = config.layout();
+            if let Some(requested) = prefix.filter(|requested| requested != layout.prefix()) {
+                return Err(Error::PrefixMismatch {
+                    requested,
+                    installed: layout.prefix().to_path_buf(),
+                });
+            }
+            engine::check_layout_dirs(context, layout)?;
+            layout::verify_claim(layout, &config.namespace())?;
+            // A schema-2 file means the checked upgrade is a migration: it stops
+            // the daemon before it rewrites `service.toml`.
+            let config_schema_migration = checked_config_migration(&plan, &config_source, version);
+            (
+                record::Operation::Upgrade,
+                layout.prefix().to_path_buf(),
+                config.namespace(),
+                plan,
+                config_schema_migration,
+            )
+        };
     let fresh_install =
         operation == record::Operation::Install && !matches!(plan, engine::Plan::Resume(_));
     let rollback = match &plan {
-        engine::Plan::RollBack(record)
-            if record.operation == record::Operation::Upgrade
-                && record.step >= record::Step::Registering =>
-        {
+        engine::Plan::RollBack(record) if engine::rollback_restarts_previous(record) => {
             Some(record.clone())
         }
         _ => None,
@@ -729,6 +736,7 @@ pub(crate) fn check_local(
         locked,
         preflight: None,
         accepted_runtime_loss: false,
+        config_schema_migration,
     };
     Ok(Checked {
         report,
@@ -738,6 +746,34 @@ pub(crate) fn check_local(
         adoption,
         rollback,
     })
+}
+
+/// Reports a pending migration even after it has written the new schema.
+fn checked_config_migration(
+    plan: &engine::Plan,
+    source: &UpgradeSource,
+    version: &str,
+) -> Option<u32> {
+    match plan {
+        engine::Plan::Resume(record) => record
+            .config_backup
+            .as_ref()
+            .map(|backup| backup.source_schema_version),
+        engine::Plan::RollBack(record)
+            if record.config_backup.is_some()
+                && record.previous_version.as_deref() != Some(version) =>
+        {
+            record
+                .config_backup
+                .as_ref()
+                .map(|backup| backup.source_schema_version)
+        }
+        engine::Plan::Fresh if source.config.active_version() != version => {
+            (source.source_schema_version != pohunek_service_config::SCHEMA_VERSION)
+                .then_some(source.source_schema_version)
+        }
+        _ => None,
+    }
 }
 
 /// Runs [`check`] for `context` and `version` against `backend`.
@@ -920,17 +956,31 @@ fn verified_connection(context: &Context) -> Result<(Namespace, Duration), Error
 /// Loads the installation recorded at `context.config_path()` and verifies
 /// its namespace inputs against the running process.
 ///
+/// The read is the upgrade-source read: a previous release's schema-2
+/// installation is reported, connected to, checked, and uninstalled by this
+/// version like a current one, while schemas this binary neither writes nor
+/// upgrades from stay refused.
+///
 /// # Errors
 ///
 /// See [`verified_connection`].
 fn verified_config(context: &Context) -> Result<ServiceConfig, Error> {
-    let config = ServiceConfig::load(&context.config_path())?;
-    config.verify_installation(
+    Ok(verified_config_source(context)?.config)
+}
+
+/// Like [`verified_config`], and reports how `service.toml` was read.
+///
+/// # Errors
+///
+/// See [`verified_connection`].
+fn verified_config_source(context: &Context) -> Result<UpgradeSource, Error> {
+    let source = ServiceConfig::load_upgrade_source(&context.config_path())?;
+    source.config.verify_installation(
         context.uid(),
         &context.paths().state_dir,
         &context.paths().runtime_dir,
     )?;
-    Ok(config)
+    Ok(source)
 }
 
 fn exists(path: &Path) -> Result<bool, Error> {
@@ -1012,6 +1062,38 @@ mod tests {
         install_config(&context);
         let state_root = context.roots().expect("roots").0;
         (temp, root, context, state_root)
+    }
+
+    #[test]
+    fn check_reports_a_pending_rollback_migration_only_when_it_would_upgrade_again() {
+        let (_temp, root, context, _state) = installed();
+        let source = verified_config_source(&context).expect("current config");
+        let record = record::Record {
+            schema_version: record::SCHEMA_VERSION,
+            operation: record::Operation::Upgrade,
+            version: "2.0.0".to_owned(),
+            prefix: root.join("home/.local"),
+            previous_version: Some("1.0.0".to_owned()),
+            version_dir_preexisted: false,
+            config_backup: Some(record::ConfigBackup {
+                source_schema_version: 2,
+                digest: String::new(),
+            }),
+            step: record::Step::Registered,
+            rolling_back: false,
+        };
+        assert_eq!(
+            checked_config_migration(&engine::Plan::Resume(record.clone()), &source, "2.0.0"),
+            Some(2)
+        );
+        assert_eq!(
+            checked_config_migration(&engine::Plan::RollBack(record.clone()), &source, "3.0.0"),
+            Some(2)
+        );
+        assert_eq!(
+            checked_config_migration(&engine::Plan::RollBack(record), &source, "1.0.0"),
+            None
+        );
     }
 
     #[test]

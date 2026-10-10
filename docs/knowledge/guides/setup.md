@@ -54,6 +54,18 @@ registers one daemon job: the systemd user unit
 `pohunek-<ns>-daemon.service` plus the slice `pohunek-<ns>-sessions.slice` on
 Linux, or the launchd agent
 `~/Library/LaunchAgents/io.github.zajca.pohunek.<ns>.daemon.plist` on macOS.
+The owner-private `service.toml` records `[input] initial_startup_grace_ms =
+5000` and `submit_delay_ms = 150` on a fresh install. These host-wide
+values control the maximum wait for an input-ready agent at `session new` and
+the delay between the prompt body and its separate submit write. Neither names
+a runtime: the submit delay applies exactly to the runtimes whose own runtime
+descriptor marks that delay configurable (Claude opts in; its descriptor value
+150 is replaced; the others keep their descriptor value). Both keys are whole
+milliseconds in `1..=600000`; a missing key, a value outside the
+range, or an unknown key makes the daemon refuse startup with the named
+configuration error. The startup grace ends early when the agent signals an
+editable prompt or enables bracketed paste; it only delays silent startups.
+The daemon reads edits when it starts, so restart the service to apply them.
 `<ns>` is a 12-hex-digit namespace derived from the user ID and the state and
 runtime roots, so separate installations never touch each other's jobs.
 They never share a prefix either: the first install claims it in
@@ -84,10 +96,26 @@ the same version and prefix finishes it (`pohunek service uninstall` removes it
 after checking for live sessions instead, even when its `service.toml` is
 already gone). Upgrades use
 `pohunek service upgrade`; `pohunek service status` shows the daemon job,
-versions, and workers. `pohunek service check [--prefix DIR]` runs every check
+versions, and workers. When the installed `service.toml` is a previous
+release's schema (schema 2, which predates the `[input]` table), the upgrade
+is a configuration migration: the upgrade first saves the exact pre-upgrade
+bytes owner-private next to its transaction record and journals their
+digest, stops the daemon job before it rewrites `service.toml` (a previous
+daemon's strict reader would refuse a restart against the new schema), then
+registers the new daemon; the migration assigns the documented
+`[input]` defaults explicitly and the `--json` report names it with
+`config_schema_migration`. A crash resumes from the record after re-verifying
+the backup and the file on disk against that digest while the transaction has
+not rewritten it yet; a failing step
+rolls the migration back by restoring the exact pre-upgrade bytes before
+starting the previous daemon. A missing or altered backup refuses the resume
+and the rollback closed with `service_config_backup_invalid` — nothing is
+written, no daemon restarts, and the record stays for a repaired retry.
+`pohunek service check [--prefix DIR]` runs every check
 the install or upgrade would make before changing anything, and changes
 nothing (an upgrade also runs a read-only live-session preflight that
-`--accept-runtime-loss` can override, except for an unusable store); `pohunek service lock -- <command>` runs a command that no other
+`--accept-runtime-loss` can override, except for an unusable store; on a
+schema-2 installation it names the migration it would perform); `pohunek service lock -- <command>` runs a command that no other
 service transaction can interleave with (the archive installer uses both). For
 upgrades, removal, and runtime diagnosis, see
 [update after release](../runbooks/update-after-release.md) and

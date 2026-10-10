@@ -180,7 +180,7 @@ const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_mins(5);
 /// delaying agents that publish readiness immediately. Overridable via
 /// [`SessionRegistryConfig::initial_input_startup_grace`].
 const DEFAULT_INITIAL_INPUT_STARTUP_GRACE: Duration =
-    pohunek_service_config::DEFAULT_INITIAL_INPUT_STARTUP_GRACE;
+    pohunek_service_config::DEFAULT_INPUT_TIMING.initial_startup_grace;
 
 /// Default minimum interval between detector "PTY output lag" WARN logs per
 /// session. The first lag in a window logs immediately; further lags are counted
@@ -308,9 +308,18 @@ pub struct SessionRegistryConfig {
     pub observation_global_waiters: usize,
     /// Maximum concurrent bounded waiters for one session.
     pub observation_session_waiters: usize,
-    /// Submit delay per runtime id, replacing the descriptor's delay for
-    /// runtimes whose descriptor marks it configurable.
+    /// Submit delay per runtime id, replacing the host setting and the
+    /// descriptor's delay for runtimes whose descriptor marks it
+    /// configurable. Production leaves this empty: the host setting below
+    /// applies provider-neutrally, and the overrides stay the explicit
+    /// per-runtime extension point.
     pub submit_delay_overrides: BTreeMap<RuntimeId, Duration>,
+    /// Submit delay of the host configuration, applied to every runtime
+    /// whose descriptor marks its submit delay configurable (see
+    /// `definition.submit_delay_configurable()`); a per-runtime override
+    /// above wins, and a runtime configured by neither keeps the value its
+    /// descriptor records. `None` leaves the setting out.
+    pub host_submit_delay: Option<Duration>,
     /// Upper bound on how long [`SessionRegistry::create`] waits for a freshly
     /// spawned agent to show an editable prompt or enable bracketed paste
     /// before injecting a `session.new --input` prompt. The wait short-circuits
@@ -416,6 +425,7 @@ impl Default for SessionRegistryConfig {
             observation_global_waiters: DEFAULT_GLOBAL_WAITERS,
             observation_session_waiters: DEFAULT_SESSION_WAITERS,
             submit_delay_overrides: BTreeMap::new(),
+            host_submit_delay: None,
             initial_input_startup_grace: DEFAULT_INITIAL_INPUT_STARTUP_GRACE,
             socket_path: None,
             store_path: None,

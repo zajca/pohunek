@@ -525,10 +525,12 @@ transaction, so rerunning with `--accept-runtime-loss` (or after the sessions
 end) resumes it. A rerun for the already active
 version skip it, as does a resume after the replacement.
 
-Cancelling an interrupted upgrade before the daemon registration step leaves
-the previous daemon in place. At or after registration, rollback judges the
-previous daemon against the current store and live workers before changing the
-service. A previous daemon with `upgrade-preflight` judges its own reader and
+Cancelling an interrupted upgrade before the daemon registration step usually
+leaves the previous daemon in place. A schema-2 configuration migration stops
+it earlier, before the rewrite; rollback from that `stop_daemon` step or later
+must restart it. Before such a restart, rollback judges the previous daemon
+against the current store and live workers before changing the service. A
+previous daemon with `upgrade-preflight` judges its own reader and
 adoption; v0.33.0 and v0.33.1 have no such command, so only their schema-1
 store is admitted, and each record must deserialize the way those releases
 read it: a line their reader would silently skip on its next whole-store
@@ -596,3 +598,41 @@ proceeds, and the `--json` report carries the full `preflight` object and
 `accepted_runtime_loss: true`. A preflight that cannot run at all (missing or
 failing `pohunekd`, an unparsable report) fails with
 `service_upgrade_preflight_failed`, which the flag does not override.
+
+## Configuration migration from schema 2
+
+When the installed `service.toml` was written by release 0.33.x (schema 2, no
+`[input]` table) and the target version differs, `pohunek service upgrade`
+turns into a configuration migration and the `--json` reports carry
+`config_schema_migration: 2`. `service check` verifies a pending migration's
+backup and reports the migration it would perform without writing anything,
+so an archive updater sees it before any effect. A same-version refresh runs
+no migration and reports `null`. The migration assigns the
+documented `[input]` defaults (5000 ms and 150 ms) explicitly; a schema-2
+installation never carries custom values here, so nothing is lost.
+
+The ordering follows the schema boundary. The transaction first saves the
+exact pre-upgrade bytes owner-private next to its record and journals their
+SHA-256 digest; the daemon job is then stopped before `service.toml` is
+rewritten, because a 0.33.x daemon's strict reader refuses a restart against
+the new file and its restart policy would crash-loop it. The new daemon is
+registered after the write, with the still-live session preflight judged
+while the old daemon runs. A live session keeps its worker PTY through the
+stopped daemon: the workers run in jobs of their own.
+
+An interrupted migration resumes from its record after re-verifying the
+digest: while the transaction has not rewritten `service.toml` yet, the file
+itself must still be the exact pre-upgrade bytes; a stray file where the
+backup will be written is harmless, the transaction rewrites it from the
+verified bytes. A failing step rolls the migration back: the exact backup is
+verified before any daemon is stopped, and the previous release's store reader
+and live-worker adoption are checked whenever rollback must restart it. A
+registered new daemon is then stopped, the store is checked again, the exact
+pre-upgrade bytes are restored, and only then does the previous daemon restart
+against its own file. An unreadable store refuses rollback even with
+`--accept-runtime-loss`. A missing or altered backup refuses both the resume and the
+rollback closed with `service_config_backup_invalid`: nothing is written, no
+daemon restarts, and the record stays for a repaired retry. The recovery is
+to restore both files to the bytes the record digests, or to run
+`pohunek service uninstall`, which checks live sessions before removing the
+installation.

@@ -24,15 +24,33 @@ use super::error::{fs_error, replace_error, Error};
 use super::inherited::Token;
 use super::settings::{LOCK_POLL, LOCK_WAIT, MAX_HOLDER_BYTES, MAX_RECORD_BYTES};
 
+/// Largest accepted backup file in bytes.
+///
+/// The backup is an exact copy of a `service.toml`, whose size the service
+/// configuration reader already bounds; this constant keeps the same ceiling
+/// on the copy.
+const MAX_CONFIG_BACKUP_BYTES: usize = pohunek_service_config::MAX_CONFIG_BYTES;
+
 /// Version of the record schema; any other version is rejected.
 ///
-/// Version 2 carries [`Record::rolling_back`]. A record of an earlier
-/// version cannot tell a half-rolled-back transaction from a resumable one,
-/// so it is refused rather than guessed at.
-pub const SCHEMA_VERSION: u32 = 2;
+/// Version 3 carries [`Record::config_backup`], the migration transaction's
+/// backup description. A record of an earlier version cannot say whether its
+/// `service.toml` was rewritten from the previous release's schema, so it is
+/// refused rather than guessed at. Version 2 carried
+/// [`Record::rolling_back`], which stays.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// File name of the record inside the application state directory.
 pub const FILE_NAME: &str = "service-install.json";
+
+/// File name of the owner-private backup of a pre-upgrade `service.toml`
+/// inside the application state directory.
+///
+/// A migration transaction writes the exact pre-upgrade bytes here before it
+/// touches `service.toml`, and rolls back by restoring them. The file is
+/// removed together with the record, so it never outlives the transaction
+/// that backs it.
+pub const CONFIG_BACKUP_NAME: &str = "service-install.config-backup.toml";
 
 /// File name of the transaction lock inside the application state directory.
 pub const LOCK_NAME: &str = "service-install.lock";
@@ -70,6 +88,12 @@ const STATE_DIR_MODE: u32 = 0o700;
 /// Prefix of a record file staged for removal.
 const REMOVAL_PREFIX: &str = ".service-install-removed-";
 
+/// Files a `Store::clear` removes together with the record.
+///
+/// The backup of a migration transaction is removed with the record, never
+/// after it, so a record that ends now never leaves its backup behind.
+const CLEARED_FILES: [&str; 2] = [FILE_NAME, CONFIG_BACKUP_NAME];
+
 /// Disambiguates temporary names of concurrent writes in one process.
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -94,12 +118,11 @@ impl Operation {
     }
 }
 
-/// The last step whose effects are known to be complete.
+/// The last durable transaction checkpoint.
 ///
-/// Steps are ordered; a transaction resumes with the step after the
-/// recorded one. `Registering` is written before the service manager is
-/// asked to install or replace the daemon, because that call's effect is
-/// visible before it returns.
+/// Steps are ordered. `StopDaemon` and `Registering` record intent before
+/// their service-manager effects, so a resume reconciles either effect even
+/// when the journaled call had not returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Step {
@@ -107,6 +130,14 @@ pub enum Step {
     Started,
     /// The version directory holds the verified binaries.
     Binaries,
+    /// A migration transaction saved the exact pre-upgrade `service.toml`
+    /// bytes owner-private and journaled their digest; the other flavors
+    /// mark this step unchanged.
+    BackedUp,
+    /// A migration transaction intends to stop the daemon job before it
+    /// rewrites `service.toml`; resume repeats that idempotent manager call.
+    /// The other flavors mark this step unchanged.
+    StopDaemon,
     /// `service.toml` names the new version.
     Config,
     /// The daemon definition was built and verified.
@@ -128,6 +159,8 @@ impl Step {
         match self {
             Self::Started => "started",
             Self::Binaries => "binaries",
+            Self::BackedUp => "backed_up",
+            Self::StopDaemon => "stop_daemon",
             Self::Config => "config",
             Self::Definition => "definition",
             Self::Registering => "registering",
@@ -136,6 +169,21 @@ impl Step {
             Self::Cli => "cli",
         }
     }
+}
+
+/// The journaled backup of a pre-upgrade `service.toml`.
+///
+/// A transaction whose source file was written by a previous release with
+/// another schema records the backup here, so a rollback restores the exact
+/// bytes the previous daemon reads and any resume knows which file to trust.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigBackup {
+    /// Schema of the backed-up file: the `SCHEMA_VERSION` of the release
+    /// that wrote it.
+    pub source_schema_version: u32,
+    /// SHA-256 of the exact pre-upgrade bytes, hexadecimal.
+    pub digest: String,
 }
 
 /// One in-flight install or upgrade.
@@ -155,6 +203,13 @@ pub struct Record {
     /// Whether the version directory existed before this transaction, in
     /// which case a rollback never removes it.
     pub version_dir_preexisted: bool,
+    /// The pre-upgrade `service.toml` this transaction migrates, when the
+    /// source was written by a previous release's schema.
+    ///
+    /// A present value changes the transaction's ordering: the daemon is
+    /// stopped before `service.toml` is rewritten, and a rollback restores
+    /// the exact backed-up bytes instead of re-rendering the current file.
+    pub config_backup: Option<ConfigBackup>,
     /// The last completed step.
     pub step: Step,
     /// Whether a rollback has begun.
@@ -297,6 +352,58 @@ impl Store {
     #[must_use]
     pub fn path(&self) -> PathBuf {
         self.state_dir.join(FILE_NAME)
+    }
+
+    /// Returns the migration backup path.
+    #[must_use]
+    pub fn config_backup_path(&self) -> PathBuf {
+        self.state_dir.join(CONFIG_BACKUP_NAME)
+    }
+
+    /// Writes the owner-private backup of a pre-upgrade `service.toml`.
+    ///
+    /// The copy is written atomically at mode `0600` before the transaction's
+    /// first configuration effect, so a crash never leaves a partial backup.
+    ///
+    /// # Errors
+    ///
+    /// Returns a filesystem error when the state directory is unsafe or the
+    /// write fails.
+    pub fn write_config_backup(&self, bytes: &[u8]) -> Result<(), Error> {
+        let directory = self
+            .open(true)?
+            .expect("open(create = true) always yields a directory");
+        let temporary = format!(
+            ".{CONFIG_BACKUP_NAME}.{}.{}.tmp",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        directory
+            .replace_file(CONFIG_BACKUP_NAME, temporary, bytes, FILE_MODE)
+            .map_err(|source| replace_error("write the pre-upgrade service.toml backup", source))
+    }
+
+    /// Reads the owner-private backup of a pre-upgrade `service.toml`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a filesystem error when the state directory or the backup is
+    /// unsafe, or when reading it fails.
+    pub fn read_config_backup(&self) -> Result<Option<Vec<u8>>, Error> {
+        let Some(directory) = self.open(false)? else {
+            return Ok(None);
+        };
+        if directory
+            .entry_identity(CONFIG_BACKUP_NAME, EntryKind::RegularFile)
+            .map_err(|source| fs_error("inspect the pre-upgrade service.toml backup", source))?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        directory
+            .read_file(CONFIG_BACKUP_NAME, FILE_MODE, MAX_CONFIG_BACKUP_BYTES)
+            .map(Some)
+            .map_err(|source| fs_error("read the pre-upgrade service.toml backup", source))
     }
 
     /// Loads the pending record, if any.
@@ -561,7 +668,7 @@ impl Store {
         Ok(try_lock(&directory)?.is_none())
     }
 
-    /// Removes the record; a missing record is not an error.
+    /// Removes the record and the backup it may reference; both are absent-ok.
     ///
     /// # Errors
     ///
@@ -570,7 +677,10 @@ impl Store {
         let Some(directory) = self.open(false)? else {
             return Ok(());
         };
-        remove_file(&directory, FILE_NAME)
+        for name in CLEARED_FILES {
+            remove_file(&directory, name)?;
+        }
+        Ok(())
     }
 
     fn open(&self, create: bool) -> Result<Option<TrustedDir>, Error> {
@@ -719,6 +829,7 @@ mod tests {
             prefix: PathBuf::from("/home/u/.local"),
             previous_version: Some("1.2.2".to_owned()),
             version_dir_preexisted: false,
+            config_backup: None,
             step,
             rolling_back: false,
         }

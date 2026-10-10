@@ -1122,6 +1122,7 @@ fn service_config(
             .collect(),
         search_path: pohunek_platform::shell_env::SearchPath::default(),
         sweep_grace: settings.sweep_grace,
+        input_timing: pohunek_service_config::DEFAULT_INPUT_TIMING,
         open_files: OPEN_FILES,
     })
     .expect("valid service configuration")

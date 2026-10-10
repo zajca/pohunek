@@ -1606,9 +1606,21 @@ recorded at install and reaches the daemon job only when the installer writes
 the job definition (install, or an upgrade to a different version); upgrades
 reuse the recorded list, so a manual edit takes effect only at the next
 version-changing upgrade, and an in-place refresh is tracked in #319. This key
-raised the `service.toml` `schema_version` to 2; a version 1 file is refused
-with a message to uninstall with the pohunek that wrote it and install again,
-because there is no migration. `pohunek service install --json` reports the
+raised the `service.toml` `schema_version` to 2, and the `[input]` table added
+for #496 raised it to 3: the current release refuses to serve a schema-2 file
+to the daemon, reads it only at the `pohunek service upgrade` boundary, and
+upgrades it as a migration. `service check` and the success reports of `pohunek
+service upgrade` name that migration in an additive `config_schema_migration`
+field (the source schema, `2`, or `null` when no migration runs); the check
+runs it read-only. The migration stops the daemon before it rewrites
+`service.toml`, carries the exact pre-upgrade bytes in an owner-private backup
+digest-verified against its transaction record, and restores those bytes on
+rollback; a resume or rollback that cannot prove the exact pre-upgrade bytes
+fails with `service_config_backup_invalid` and changes nothing (see
+[update after release](knowledge/runbooks/update-after-release.md)). A version
+1 file still has no migration: it is refused with a message to uninstall with
+the pohunek that wrote it and install again. `pohunek service install --json`
+reports the
 outcome in an additive `search_path` object: `source` (`login_shell`,
 `fallback`, `recorded`, `unmanaged`), `entries`, `shell_used`,
 `shell_defaulted`, `login_shell_failure` (the rendered typed reason when the
