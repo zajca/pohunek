@@ -205,11 +205,15 @@ impl ProcessInspector for DarwinInspector {
             return Ok(OwnershipMarkers::default());
         };
         match read_arguments(pid, &fact, OPERATION)? {
-            ArgumentRegion::Present(arguments) => Ok(arguments.markers),
+            ArgumentRegion::Present(arguments) if !arguments.environment_withheld => {
+                Ok(arguments.markers)
+            }
             ArgumentRegion::Ended => Ok(OwnershipMarkers::default()),
             // An unread environment is not an unmarked one; callers that
-            // decide ownership must not mistake it for one.
-            ArgumentRegion::Unobservable => Err(Error::Unobservable {
+            // decide ownership must not mistake it for one. That covers a
+            // region that cannot be read right now and one whose environment
+            // the kernel withholds (restricted platform binaries on macOS 27).
+            ArgumentRegion::Present(_) | ArgumentRegion::Unobservable => Err(Error::Unobservable {
                 operation: OPERATION,
             }),
         }
@@ -1057,7 +1061,8 @@ mod native {
 
 #[cfg(test)]
 mod tests {
-    use super::{DarwinInspector, Error, ExitWatch, ProcessInspector};
+    use super::{native, DarwinInspector, Error, ExitWatch, ProcessInspector};
+    use crate::process::hold;
     use crate::process::{OwnershipMarkers, Pid, ProcessIdentity, StartIdentity};
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
@@ -1193,6 +1198,22 @@ mod tests {
             command.current_dir(directory);
         }
         Fixture(command.spawn().expect("spawn shell fixture"), env)
+    }
+
+    /// Spawns a shell running `script`, which ends in the holding image (see
+    /// [`hold`]), so the process carries a marker environment the kernel
+    /// exposes on every macOS release.
+    fn spawn_holder(script: &str, environment: &[(&str, &str)]) -> Fixture {
+        let env = TestEnv::new().expect("test environment");
+        let mut command = hold::shell_command(&env, script);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        for (name, value) in environment {
+            command.env(name, value);
+        }
+        Fixture(command.spawn().expect("spawn holder fixture"), env)
     }
 
     /// Spawns `program` directly, without a shell, so its image is the one
@@ -1675,10 +1696,15 @@ mod tests {
     #[test]
     fn ownership_markers_describe_each_process_environment() {
         let inspector = DarwinInspector::new();
-        let outer = spawn_shell(
-            "POHUNEK_SESSION_ID=inner-session /bin/sh -c 'trap \"\" TERM; while :; do /bin/sleep 1; done' & wait",
-            &[("POHUNEK_SESSION_ID", "outer-session"), ("POHUNEK_DAEMON_ID", "outer-daemon")],
-            None,
+        let outer = spawn_holder(
+            &format!(
+                "POHUNEK_SESSION_ID=inner-session {hold} & exec {hold}",
+                hold = hold::HOLD
+            ),
+            &[
+                ("POHUNEK_SESSION_ID", "outer-session"),
+                ("POHUNEK_DAEMON_ID", "outer-daemon"),
+            ],
         );
         let root = live_identity(inspector, outer.pid());
 
@@ -1707,13 +1733,91 @@ mod tests {
         );
     }
 
+    /// What the kernel hands an unprivileged caller of one process environment,
+    /// judged from the raw `KERN_PROCARGS2` bytes without the production
+    /// decoder.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Exposure {
+        /// Strings follow the arguments, as for every image the kernel starts.
+        Exposed,
+        /// The arguments are the last thing in the region.
+        Withheld,
+        /// The region cannot be read, or does not hold its arguments yet.
+        Unreadable,
+    }
+
+    /// Classifies the raw argument region of `pid`: the count, the executable
+    /// path, and the arguments are skipped, and whatever string follows them is
+    /// the environment or the auxiliary strings the kernel always appends.
+    fn exposure(pid: Pid) -> Exposure {
+        let Ok(buffer) = native::process_arguments(i32::try_from(pid).expect("a pid fits")) else {
+            return Exposure::Unreadable;
+        };
+        let Some((count, rest)) = buffer.split_first_chunk::<4>() else {
+            return Exposure::Unreadable;
+        };
+        let mut strings = rest.split(|byte| *byte == 0);
+        // The executable path, then one string per argument; the empty entries
+        // are alignment padding and separators.
+        let mut remaining = usize::try_from(i32::from_ne_bytes(*count)).expect("argc") + 1;
+        let mut trailing = false;
+        for string in strings.by_ref() {
+            if string.is_empty() {
+                continue;
+            }
+            if remaining == 0 {
+                trailing = true;
+                break;
+            }
+            remaining -= 1;
+        }
+        match (remaining, trailing) {
+            (0, true) => Exposure::Exposed,
+            (0, false) => Exposure::Withheld,
+            _ => Exposure::Unreadable,
+        }
+    }
+
+    #[test]
+    fn a_platform_binary_environment_is_never_read_as_unmarked() {
+        // `/bin/sh` is a restricted platform binary. Where the kernel exposes
+        // its environment the markers must read back exactly; where it
+        // withholds the environment (macOS 27) the answer must be the typed
+        // unobservable state, never an unmarked process.
+        let inspector = DarwinInspector::new();
+        let fixture = spawn_shell(
+            "trap '' TERM; while :; do /bin/sleep 1; done",
+            &[("POHUNEK_SESSION_ID", "platform-session")],
+            None,
+        );
+        let pid = fixture.pid();
+        live_identity(inspector, pid);
+
+        wait_for("a verdict on the platform binary environment", || {
+            match (exposure(pid), inspector.ownership_markers(pid)) {
+                (Exposure::Exposed, Ok(markers)) => {
+                    assert_eq!(markers.session_id.as_deref(), Some("platform-session"));
+                    Some(())
+                }
+                (Exposure::Withheld, Err(Error::Unobservable { .. })) => Some(()),
+                (Exposure::Withheld, outcome) => {
+                    panic!("a withheld environment read as {outcome:?}")
+                }
+                // The region is not readable yet, or the read landed in the
+                // transient window right after `exec`.
+                (Exposure::Unreadable, _)
+                | (Exposure::Exposed, Err(Error::Unobservable { .. })) => None,
+                (Exposure::Exposed, Err(error)) => panic!("inspect platform markers: {error:?}"),
+            }
+        });
+    }
+
     #[test]
     fn an_argument_that_looks_like_a_marker_is_not_a_marker() {
         let inspector = DarwinInspector::new();
-        let fixture = spawn_shell(
-            "trap '' TERM; while :; do /bin/sleep 1; done # POHUNEK_SESSION_ID=argv-only",
+        let fixture = spawn_holder(
+            &format!("exec {} POHUNEK_SESSION_ID=argv-only", hold::HOLD),
             &[],
-            None,
         );
         let pid = fixture.pid();
 
@@ -1734,10 +1838,9 @@ mod tests {
     #[test]
     fn no_secret_environment_value_reaches_facts_or_errors() {
         let inspector = DarwinInspector::new();
-        let fixture = spawn_shell(
-            "trap '' TERM; while :; do /bin/sleep 1; done",
+        let fixture = spawn_holder(
+            &format!("exec {}", hold::HOLD),
             &[("POHUNEK_TEST_SECRET", SECRET_SENTINEL)],
-            None,
         );
         let pid = fixture.pid();
 

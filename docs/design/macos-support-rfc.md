@@ -55,6 +55,10 @@ Process start identities are opaque equality tokens, not portable timestamps.
 Persisted uses must bind them to the relevant boot identity. Only required
 process facts and allowlisted Pohunek ownership markers may leave the platform
 layer. Complete process environments never enter logs or public responses.
+A process whose environment the kernel withholds from the caller reads as
+unobservable, never as unmarked: macOS 27 returns the argument vector alone for
+restricted platform binaries such as `/bin/sh` and `/bin/zsh`, so the runtime
+sweep cannot prove such a process foreign or owned and leaves it alone (#790).
 
 Daemon runtime policy remains in `crates/daemon/src/runtime`. Its supervisor
 interface uses validated logical service IDs, portable states, and optional

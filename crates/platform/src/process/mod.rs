@@ -32,6 +32,9 @@ mod darwin;
 #[cfg(unix)]
 mod sweep;
 
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod hold;
+
 #[cfg(unix)]
 #[doc(inline)]
 pub use sweep::{
@@ -255,7 +258,9 @@ pub enum Error {
         operation: &'static str,
     },
     /// The process is live, but the requested evidence cannot be read right
-    /// now, for example while the process replaces its image.
+    /// now, for example while the process replaces its image, or the kernel
+    /// withholds it from the caller (the environment of a restricted platform
+    /// binary on macOS 27).
     #[error("process evidence from `{operation}` is not observable right now")]
     Unobservable {
         /// Stable operation label.
@@ -459,6 +464,9 @@ pub trait ProcessInspector: Debug + Send + Sync + 'static {
     fn exit_watch(&self, identity: ProcessIdentity) -> Result<ExitWatch, Error>;
 
     /// Returns only the allowlisted Pohunek environment markers.
+    ///
+    /// A process whose environment cannot be read is never reported as
+    /// unmarked: it is [`Error::Unobservable`].
     ///
     /// # Errors
     ///

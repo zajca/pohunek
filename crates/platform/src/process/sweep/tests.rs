@@ -770,6 +770,7 @@ mod host {
     use crate::process::{HostInspector, ProcessIdentity, ProcessInspector};
 
     use super::super::{sweep_runtime, SweepRequest};
+    use crate::process::hold;
 
     /// Short enough to keep the suite fast, long enough for a loaded runner
     /// to deliver `SIGTERM` and schedule the exiting process.
@@ -779,10 +780,25 @@ mod host {
     const READY_TIMEOUT: Duration = Duration::from_secs(10);
     const READY_POLL: Duration = Duration::from_millis(10);
 
-    /// Ignores hangup and termination, like an agent that outlives its PTY.
-    const STUBBORN: &str = "trap '' HUP TERM; exec /bin/sleep 300";
-    /// Exits on the default `SIGTERM` disposition.
-    const COMPLIANT: &str = "exec /bin/sleep 300";
+    /// How a fixture answers the signals a sweep sends.
+    #[derive(Debug, Clone, Copy)]
+    enum Behavior {
+        /// Ignores hangup and termination, like an agent that outlives its PTY.
+        Stubborn,
+        /// Exits on the default `SIGTERM` disposition.
+        Compliant,
+    }
+
+    impl Behavior {
+        /// Shell script that ends in the holding image with this disposition;
+        /// ignored signals stay ignored across `exec`.
+        fn script(self) -> String {
+            match self {
+                Self::Stubborn => format!("trap '' HUP TERM; exec {}", hold::HOLD),
+                Self::Compliant => format!("exec {}", hold::HOLD),
+            }
+        }
+    }
 
     /// Spawned fixture that is killed and reaped when dropped.
     #[derive(Debug)]
@@ -802,17 +818,24 @@ mod host {
         }
     }
 
-    fn spawn(inspector: HostInspector, script: &str, worker_instance_id: Option<&str>) -> Fixture {
+    fn spawn(
+        inspector: HostInspector,
+        behavior: Behavior,
+        worker_instance_id: Option<&str>,
+    ) -> Fixture {
         let marker = worker_instance_id.map(|value| ("POHUNEK_WORKER_INSTANCE_ID", value));
-        spawn_marked(inspector, script, marker.as_slice())
+        spawn_marked(inspector, behavior, marker.as_slice())
     }
 
     /// Spawns the fixture with the given `(name, value)` environment markers.
-    fn spawn_marked(inspector: HostInspector, script: &str, markers: &[(&str, &str)]) -> Fixture {
+    fn spawn_marked(
+        inspector: HostInspector,
+        behavior: Behavior,
+        markers: &[(&str, &str)],
+    ) -> Fixture {
         let env = pohunek_test_support::env::TestEnv::new().expect("test environment");
-        let mut command = env.command("/bin/sh");
+        let mut command = hold::shell_command(&env, &behavior.script());
         command
-            .args(["-c", script])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -830,21 +853,18 @@ mod host {
             _env: env,
         };
         // The trap must be installed before any signal arrives, so wait until
-        // the shell has replaced itself with `sleep`.
+        // the shell has replaced itself with the holding image.
+        let image = hold::image();
         let deadline = Instant::now() + READY_TIMEOUT;
         loop {
             let fact = inspector.process(pid).expect("inspect fixture");
-            if let Some(fact) = fact.filter(|fact| {
-                fact.cmdline
-                    .first()
-                    .is_some_and(|argument| argument.ends_with("sleep"))
-            }) {
+            if let Some(fact) = fact.filter(|fact| fact.cmdline.first() == Some(&image)) {
                 fixture.identity = fact.identity();
                 return fixture;
             }
             assert!(
                 Instant::now() < deadline,
-                "fixture {pid} never exec'd sleep"
+                "fixture {pid} never exec'd the holding image"
             );
             std::thread::sleep(READY_POLL);
         }
@@ -888,9 +908,9 @@ mod host {
         let inspector = HostInspector::new();
         let runtime_a = unique_runtime("a");
         let runtime_b = unique_runtime("b");
-        let stubborn = spawn(inspector, STUBBORN, Some(&runtime_a));
-        let other_runtime = spawn(inspector, STUBBORN, Some(&runtime_b));
-        let unmarked = spawn(inspector, STUBBORN, None);
+        let stubborn = spawn(inspector, Behavior::Stubborn, Some(&runtime_a));
+        let other_runtime = spawn(inspector, Behavior::Stubborn, Some(&runtime_b));
+        let unmarked = spawn(inspector, Behavior::Stubborn, None);
 
         let report = sweep_runtime(&inspector, &request(&runtime_a))
             .await
@@ -910,7 +930,7 @@ mod host {
     async fn a_term_honoring_process_is_terminated_by_sigterm() {
         let inspector = HostInspector::new();
         let runtime = unique_runtime("compliant");
-        let compliant = spawn(inspector, COMPLIANT, Some(&runtime));
+        let compliant = spawn(inspector, Behavior::Compliant, Some(&runtime));
 
         let report = sweep_runtime(&inspector, &request(&runtime))
             .await
@@ -925,8 +945,8 @@ mod host {
     async fn a_worker_instance_id_prefix_does_not_match_a_longer_worker_instance_id() {
         let inspector = HostInspector::new();
         let runtime = unique_runtime("prefix");
-        let exact = spawn(inspector, COMPLIANT, Some(&runtime));
-        let longer = spawn(inspector, COMPLIANT, Some(&format!("{runtime}B")));
+        let exact = spawn(inspector, Behavior::Compliant, Some(&runtime));
+        let longer = spawn(inspector, Behavior::Compliant, Some(&format!("{runtime}B")));
 
         let report = sweep_runtime(&inspector, &request(&runtime))
             .await
@@ -946,12 +966,12 @@ mod host {
         let other = unique_runtime("alternate-other");
         let descendant = spawn_marked(
             inspector,
-            COMPLIANT,
+            Behavior::Compliant,
             &[("POHUNEK_RUNTIME_ID", runtime.as_str())],
         );
         let other_instance = spawn_marked(
             inspector,
-            COMPLIANT,
+            Behavior::Compliant,
             &[("POHUNEK_RUNTIME_ID", other.as_str())],
         );
 
@@ -973,7 +993,7 @@ mod host {
         let other = unique_runtime("conflict-other");
         let conflicting = spawn_marked(
             inspector,
-            COMPLIANT,
+            Behavior::Compliant,
             &[
                 ("POHUNEK_WORKER_INSTANCE_ID", runtime.as_str()),
                 ("POHUNEK_RUNTIME_ID", other.as_str()),
@@ -1007,10 +1027,10 @@ mod host {
         let runtime = unique_runtime("unrelated-target");
         let a = unique_runtime("unrelated-a");
         let b = unique_runtime("unrelated-b");
-        let target = spawn(inspector, COMPLIANT, Some(&runtime));
+        let target = spawn(inspector, Behavior::Compliant, Some(&runtime));
         let unrelated = spawn_marked(
             inspector,
-            COMPLIANT,
+            Behavior::Compliant,
             &[
                 ("POHUNEK_WORKER_INSTANCE_ID", a.as_str()),
                 ("POHUNEK_RUNTIME_ID", b.as_str()),

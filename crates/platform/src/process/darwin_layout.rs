@@ -4,7 +4,7 @@
 //! buffer. Keeping the decoding here makes region separation, bounds, and
 //! integer conversions testable on every host, not only on macOS.
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-10-10
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
@@ -81,6 +81,15 @@ pub(super) struct NativeArguments {
     pub(super) argv: Vec<String>,
     /// Allowlisted markers found only in the environment region.
     pub(super) markers: OwnershipMarkers,
+    /// Whether the kernel withheld the environment region.
+    ///
+    /// A readable region always carries strings after the arguments: the
+    /// environment, then the auxiliary strings the kernel appends to every
+    /// image (at least `executable_path=`). Nothing after the arguments means
+    /// the kernel returned the argument vector alone, as macOS 27 does for
+    /// restricted platform binaries, so `markers` describes nothing and must
+    /// not be read as an unmarked environment.
+    pub(super) environment_withheld: bool,
 }
 
 /// What one argument-region read established about a same-user process.
@@ -147,10 +156,12 @@ pub(super) fn parse_process_arguments(buffer: &[u8]) -> Result<NativeArguments, 
         cursor = rest;
     }
 
+    let environment = skip_nul_padding(cursor);
     Ok(NativeArguments {
         executable: PathBuf::from(OsString::from_vec(executable.to_vec())),
         argv,
-        markers: collect_ownership_markers(skip_nul_padding(cursor))?,
+        markers: collect_ownership_markers(environment)?,
+        environment_withheld: environment.is_empty(),
     })
 }
 
@@ -344,8 +355,8 @@ mod tests {
         bounded_descendants, children_by_parent, controlling_terminal_group,
         decode_argument_region, decode_command_name, decode_kernel_path, encode_boot_identity,
         encode_start_identity, parse_process_arguments, ArgumentRegion, LayoutError,
-        MAX_ARGUMENT_COUNT, MAX_DESCENDANT_COUNT, MAX_DESCENDANT_DEPTH, MAX_ENVIRONMENT_ENTRIES,
-        MAX_MARKER_VALUE_BYTES, NO_CONTROLLING_DEVICE,
+        ARGUMENT_COUNT_BYTES, MAX_ARGUMENT_COUNT, MAX_DESCENDANT_COUNT, MAX_DESCENDANT_DEPTH,
+        MAX_ENVIRONMENT_ENTRIES, MAX_MARKER_VALUE_BYTES, NO_CONTROLLING_DEVICE,
     };
     use crate::process::Pid;
     use std::convert::Infallible;
@@ -373,6 +384,11 @@ mod tests {
             buffer.extend_from_slice(entry);
             buffer.push(0);
         }
+        // The kernel separates the environment from the auxiliary strings it
+        // appends to every image, so a readable region is never empty here.
+        buffer.push(0);
+        buffer.extend_from_slice(b"executable_path=");
+        buffer.extend_from_slice(executable);
         buffer.push(0);
         buffer
     }
@@ -447,7 +463,11 @@ mod tests {
             buffer.extend_from_slice(b"/bin/sh\0sh");
             buffer
         };
-        let more_arguments_than_strings = procargs(3, b"/bin/sh", 1, &[b"sh"], &[]);
+        let more_arguments_than_strings = {
+            let mut buffer = 3_i32.to_ne_bytes().to_vec();
+            buffer.extend_from_slice(b"/bin/sh\0\0sh\0\0");
+            buffer
+        };
         let oversized_marker = procargs(
             1,
             b"/bin/sh",
@@ -461,8 +481,13 @@ mod tests {
         );
 
         let count_only = 1_i32.to_ne_bytes();
+        // The count, the executable path, and the first of two arguments.
+        let after_first_argument = ARGUMENT_COUNT_BYTES + b"/bin/sh\0sh\0".len();
         for (case, buffer) in [
-            ("cut in half", &whole[..whole.len() / 2]),
+            (
+                "cut after the first argument",
+                &whole[..after_first_argument],
+            ),
             ("two bytes", &whole[..2]),
             ("three bytes", &[0_u8; 3][..]),
             ("empty", &[][..]),
