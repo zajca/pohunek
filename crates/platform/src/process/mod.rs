@@ -6,9 +6,12 @@
 //! cross a reboot boundary must additionally bind records to a [`BootIdentity`].
 //!
 //! A host that numbers its processes at creation also reports each process's
-//! [`ProcessLineage`], which proves fork ancestry even for a process whose
+//! [`ProcessLineage`], which can prove fork ancestry even for a process whose
 //! environment and argument region the kernel withholds, and even after the
-//! parents in between have exited.
+//! parents in between have exited. The parent number names the creator only
+//! until the process re-executes after being reparented; from then on it names
+//! the system's first process ([`SpawnId::LAUNCHD`]), so a parent number equal
+//! to that proves no ancestry and can never exclude a process.
 
 // Rust guideline compliant 2026-10-10
 
@@ -121,6 +124,18 @@ impl FromStr for StartIdentity {
 pub struct SpawnId(u64);
 
 impl SpawnId {
+    /// Creation number of the system's first user-space process (`launchd`).
+    ///
+    /// The kernel itself holds number 0 and starts `launchd` as number 1, so
+    /// every other process of the boot is numbered above it. The kernel hands
+    /// every orphan to `launchd`, and a process that executes a new image after
+    /// it was reparented has its recorded parent number rewritten to this one.
+    /// A parent number equal to this value is therefore ambiguous: the process
+    /// was created by `launchd`, or it is an orphan of any creator that
+    /// re-executed. Callers must not read it as evidence of who created the
+    /// process.
+    pub const LAUNCHD: Self = Self(1);
+
     /// Creates a spawn id from its canonical integer representation.
     #[must_use]
     pub const fn new(value: u64) -> Self {
@@ -200,9 +215,12 @@ pub struct ProcessIdentity {
 /// Fork lineage of one process within one boot.
 ///
 /// The parent number is the one the kernel captured when it created the
-/// process. It keeps naming that parent after the parent exits and the process
-/// is reparented, so the pair links a process to its creator even when the
-/// parent process id names someone else.
+/// process. It keeps naming that creator after the creator exits and the
+/// process is reparented, until the process executes a new image: that rewrites
+/// the parent number to the current parent's, which for an orphan is
+/// [`SpawnId::LAUNCHD`]. A parent number other than [`SpawnId::LAUNCHD`] was
+/// therefore never rewritten and names the creator, while one equal to it
+/// proves nothing about the creator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcessLineage {
     /// Creation number of the process itself.
@@ -450,10 +468,12 @@ pub trait ProcessInspector: Debug + Send + Sync + 'static {
     ///
     /// A host that reports lineage serves it for every same-user process,
     /// including one whose environment and argument region the kernel
-    /// withholds, and it names the process that created it for as long as the
-    /// process lives. It describes the process that holds `pid` when the call
-    /// returns; callers that bind it to a [`ProcessIdentity`] recheck the
-    /// identity afterwards, as they do for any other fact.
+    /// withholds. The parent number names the creator unless the process
+    /// executed a new image after being reparented, when it names
+    /// [`SpawnId::LAUNCHD`]; see [`ProcessLineage`]. The lineage describes the
+    /// process that holds `pid` when the call returns; callers that bind it to
+    /// a [`ProcessIdentity`] recheck the identity afterwards, as they do for
+    /// any other fact.
     ///
     /// The default reports [`Error::Unavailable`], so a host that does not
     /// number its processes at creation needs no implementation.

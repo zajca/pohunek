@@ -92,6 +92,13 @@ publish m.pids "$!"
 wait
 "#;
 
+/// The creator `m` of the orphaning shape: starts the orphaning fixture, which
+/// runs this test binary until its creator is gone.
+const ORPHANING_CREATOR: &str = r#""$IMAGE" --exact orphan --ignored &
+publish orphan.pids "$!"
+wait
+"#;
+
 /// A shell that starts a `sleep` outside the stand-in worker's tree.
 const SIBLING_CREATOR: &str = r#"/bin/sleep 600 &
 publish sibling.pids "$!"
@@ -107,6 +114,40 @@ wait
 fn hold() {
     // timing-allowed: #795 the fixture's own lifetime; no scenario waits on this sleep, it ends when the scenario kills the process
     std::thread::sleep(Duration::from_secs(300));
+}
+
+/// Body of the orphaning fixture: waits until its creator is gone and the
+/// kernel has reparented it, then execs `sleep` in its place.
+///
+/// The `exec` after the reparenting is the step under test: it keeps the process
+/// id, the environment, and the creation number, and the kernel rewrites the
+/// parent creation number it reports. Only the orphaning shape starts it, as a
+/// child of a shell script, so a normal run skips it.
+#[test]
+#[ignore = "image of the orphaning fixture spawned by the lineage scenarios"]
+fn orphan() {
+    use std::os::unix::process::CommandExt as _;
+
+    /// Process id the kernel gives an orphan as its new parent (`launchd`).
+    const REPARENTED_TO: i32 = 1;
+    /// Bounds the wait when the scenario died before it killed the creator, so
+    /// an abandoned fixture does not spin for long.
+    const ORPHAN_PATIENCE: Duration = Duration::from_secs(300);
+
+    let deadline = std::time::Instant::now() + ORPHAN_PATIENCE;
+    while rustix::process::getppid().map(|parent| parent.as_raw_nonzero().get())
+        != Some(REPARENTED_TO)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the creator never exited"
+        );
+        std::thread::yield_now();
+    }
+    let error = std::process::Command::new("/bin/sleep")
+        .arg(FIXTURE_LIFETIME_SECONDS)
+        .exec();
+    panic!("replace the orphan image with sleep: {error}");
 }
 
 /// Path of this test binary, which is also the holding image.
@@ -429,6 +470,39 @@ fn is_listed(report: &SweepReport, identity: ProcessIdentity) -> bool {
         || !skip_reasons(report, identity).is_empty()
 }
 
+/// Asserts the outcome that holds on every host for a hidden descendant whose
+/// creator chain the lineage cannot follow: reaped through a readable marker,
+/// or neither signalled nor dismissed but left visible as unproven.
+fn assert_orphan_outcome(
+    scenario: &Scenario,
+    report: &SweepReport,
+    orphan: &Member,
+    exposure: Exposure,
+) {
+    match exposure {
+        Exposure::Exposed => {
+            assert_eq!(
+                reaped(report),
+                BTreeSet::from([key(orphan.identity)]),
+                "a readable marker attributes the orphan"
+            );
+            assert!(!scenario.is_running(orphan));
+        }
+        Exposure::Withheld => {
+            assert!(
+                reaped(report).is_empty() && report.unconfirmed.is_empty(),
+                "nothing proves the orphan belongs to the runtime, so nothing is signalled: {report:?}"
+            );
+            assert!(scenario.is_running(orphan));
+            assert_eq!(
+                skip_reasons(report, orphan.identity),
+                vec![SkipReason::MarkersUnreadable],
+                "the orphan stays visible as unproven, never dismissed"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_withheld_process_still_reports_the_lineage_of_its_creator() {
     let mut scenario = Scenario::new("reports");
@@ -659,28 +733,7 @@ async fn a_hidden_descendant_of_a_dead_creator_is_never_signalled_unless_proven(
     .await
     .expect("sweep the lost worker's runtime");
 
-    match exposure {
-        Exposure::Exposed => {
-            assert_eq!(
-                reaped(&report),
-                BTreeSet::from([key(orphan.identity)]),
-                "a readable marker attributes the orphan"
-            );
-            assert!(!scenario.is_running(&orphan));
-        }
-        Exposure::Withheld => {
-            assert!(
-                reaped(&report).is_empty() && report.unconfirmed.is_empty(),
-                "nothing proves the orphan belongs to the runtime, so nothing is signalled: {report:?}"
-            );
-            assert!(scenario.is_running(&orphan));
-            assert_eq!(
-                skip_reasons(&report, orphan.identity),
-                vec![SkipReason::MarkersUnreadable],
-                "the orphan stays visible as unproven"
-            );
-        }
-    }
+    assert_orphan_outcome(&scenario, &report, &orphan, exposure);
 }
 
 #[tokio::test]
@@ -728,4 +781,42 @@ async fn without_a_spawn_id_hidden_descendants_stay_skipped_as_unreadable() {
     }
     assert_eq!(reaped(&report), expected_reaped);
     assert!(report.unconfirmed.is_empty());
+}
+
+#[tokio::test]
+async fn an_orphan_that_re_executes_after_losing_its_creator_is_never_dismissed() {
+    let mut scenario = Scenario::new("orphan-exec");
+    scenario.write_script("w.sh", WORKER_WITH_MORTAL_CREATOR);
+    scenario.write_script("m.sh", ORPHANING_CREATOR);
+    let worker = scenario.spawn_script("w.sh", true);
+    let creator = scenario.published("worker.pids")[0];
+    let orphan = scenario.published("orphan.pids")[0];
+    let creator = scenario.member("mortal creator", creator, "/bin/sh");
+    let image = image();
+    // The fixture runs this test binary and waits for the creator to die, so
+    // the image replacement it performs after that is the only `exec` that
+    // follows the reparenting.
+    scenario.member("waiting orphan", orphan, &image);
+    let worker_id = scenario.spawn_id(worker);
+    scenario.kill_and_wait(creator.identity);
+    let orphan = scenario.member("orphan sleeper", orphan, "/bin/sleep");
+    assert_eq!(
+        scenario
+            .inspector
+            .parent_pid(orphan.identity.pid)
+            .expect("inspect the orphan parent"),
+        Some(1),
+        "the creator is gone and the kernel handed the orphan to launchd"
+    );
+    let exposure = scenario.exposure(&orphan);
+    scenario.kill_and_wait(worker);
+
+    let report = sweep_runtime(
+        &scenario.inspector,
+        &scenario.request().with_worker_spawn_id(Some(worker_id)),
+    )
+    .await
+    .expect("sweep the lost worker's runtime");
+
+    assert_orphan_outcome(&scenario, &report, &orphan, exposure);
 }

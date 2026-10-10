@@ -13,7 +13,10 @@
 //! process by its fork lineage instead: a process created, through any chain of
 //! creators, by that worker is selected like a marked one, a process the worker
 //! cannot have created is left out, and a process whose ancestry is not
-//! established stays skipped and reported.
+//! established stays skipped and reported. Only a process created before the
+//! worker, or a creator link that is not [`SpawnId::LAUNCHD`] and precedes the
+//! worker, excludes a process: a launchd parent number is rewritten when an
+//! orphan re-executes, so it never excludes one.
 
 // Rust guideline compliant 2026-10-10
 
@@ -135,7 +138,10 @@ impl SweepRequest {
     /// [`ProcessInspector::lineage`]): the sweep selects it when the worker
     /// created it, directly or through other processes, leaves it out when the
     /// worker cannot have created it, and skips it as unreadable when neither is
-    /// established, for example when a creator in between has exited. A process
+    /// established, for example when a creator in between has exited or the
+    /// chain reaches a parent number of [`SpawnId::LAUNCHD`], which an orphan
+    /// that re-executed also carries and which therefore never excludes a
+    /// process. A process
     /// proven a descendant has no readable session marker, so under
     /// [`Self::with_session_id`] it is skipped as session-unverified instead of
     /// selected.
@@ -578,7 +584,10 @@ pub(super) const START_IDENTITY_ORDERS_PROCESS_STARTS: bool = cfg!(target_os = "
 /// The worker's creation number bounds the fork lineage (see
 /// [`SpawnLineage::ancestry`]): a process the worker created, through any chain
 /// of creators, is selected like a marked one, after the same final identity
-/// check, and a process the worker cannot have created is foreign.
+/// check, and a process the worker cannot have created is foreign. A process
+/// whose creator chain reaches a launchd parent number before either is
+/// decided is not provably foreign, because an orphan that re-executed carries
+/// that number whoever created it.
 ///
 /// Without a bound, when the process exited between the two reads, or when its
 /// start identity cannot be read, the process is not provably foreign: it stays
@@ -684,12 +693,20 @@ impl<'a> SpawnLineage<'a> {
     ///
     /// Creation numbers rise from creator to created, so the creators of a
     /// process, followed upward from its recorded creator, have strictly
-    /// decreasing numbers. The chain reaches `worker` exactly when the worker is
-    /// an ancestor. It cannot once a creator is older than the worker, because
-    /// every creator above it is older still. A creator that has exited
-    /// and is newer than the worker names a creator the table cannot follow
-    /// further, so the chain, and with it the ancestry, stays unproven, and so
-    /// does a process whose lineage the host does not report.
+    /// decreasing numbers. Every link was the real parent of its child at some
+    /// moment, so a chain that reaches `worker` proves a descendant.
+    ///
+    /// Two facts prove a process unrelated. Its own number is below `worker`'s:
+    /// the number is fixed at creation, so it predates the worker. Or a link
+    /// names a creator below `worker`'s that is not [`SpawnId::LAUNCHD`]: the
+    /// kernel rewrites a link only to launchd's number, so such a link was never
+    /// rewritten, and every creator above it is older still. A link naming
+    /// [`SpawnId::LAUNCHD`] excludes nothing, because an orphan that
+    /// re-executes after its creator died carries it whoever the creator was,
+    /// so the walk stops there unproven. A creator that has exited and is newer
+    /// than the worker names a creator the table cannot follow further, so the
+    /// ancestry stays unproven, and so does a process whose lineage the host
+    /// does not report.
     fn ancestry(&self, identity: ProcessIdentity, worker: SpawnId) -> Result<Ancestry, Error> {
         let snapshot = self.snapshot()?;
         let Some(process) = snapshot.by_identity.get(&identity) else {
@@ -707,6 +724,9 @@ impl<'a> SpawnLineage<'a> {
         for _ in 0..MAX_LINEAGE_STEPS {
             if creator == worker {
                 return Ok(Ancestry::Descendant);
+            }
+            if creator == SpawnId::LAUNCHD {
+                return Ok(Ancestry::Unproven);
             }
             if creator < worker {
                 return Ok(Ancestry::Unrelated);
