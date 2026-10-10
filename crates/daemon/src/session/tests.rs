@@ -4,7 +4,7 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use time::format_description::well_known::Rfc3339;
@@ -1557,7 +1557,33 @@ struct MockInspectorState {
 #[derive(Debug, Default)]
 struct ForegroundBlock {
     entered: AtomicBool,
-    released: AtomicBool,
+    released: Mutex<bool>,
+    release_cv: Condvar,
+}
+
+impl ForegroundBlock {
+    fn wait_for_release(&self) {
+        let mut released = self.released.lock().expect("foreground release lock");
+        while !*released {
+            released = self
+                .release_cv
+                .wait(released)
+                .expect("foreground release wait");
+        }
+    }
+
+    fn release(&self) {
+        *self.released.lock().expect("foreground release lock") = true;
+        self.release_cv.notify_all();
+    }
+}
+
+struct ForegroundReleaseGuard(Arc<ForegroundBlock>);
+
+impl Drop for ForegroundReleaseGuard {
+    fn drop(&mut self) {
+        self.0.release();
+    }
 }
 
 impl MockInspector {
@@ -1895,18 +1921,16 @@ impl ProcessInspector for MockInspector {
         root_pid: Pid,
     ) -> Result<Option<Pid>, crate::procwatch::Error> {
         let (kind, foreground, block) = {
-            let inner = self.inner.lock().expect("mock inspector lock");
+            let mut inner = self.inner.lock().expect("mock inspector lock");
             (
                 inner.foreground_error,
                 inner.foreground_groups.get(&root_pid).copied().flatten(),
-                inner.foreground_block.clone(),
+                inner.foreground_block.take(),
             )
         };
         if let Some(block) = block {
             block.entered.store(true, Ordering::Release);
-            while !block.released.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
+            block.wait_for_release();
         }
         if let Some(kind) = kind {
             return Err(crate::procwatch::Error::from_io(
@@ -8843,9 +8867,6 @@ const PID_REUSE_AGENT_PID: Pid = 225;
 const FOREIGN_AGENT_PID: Pid = 240;
 /// Delay separating pid-reuse observations so `first_seen` changes if reset.
 const PID_REUSE_RESCAN_DELAY: Duration = Duration::from_millis(5);
-/// Bound proving a blocked foreground probe does not hold the session mutex.
-const FOREGROUND_LOCK_TEST_TIMEOUT: Duration = Duration::from_secs(1);
-
 async fn mock_procwatch_registry(tag: &str) -> (SessionRegistry, Arc<MockInspector>, SessionInfo) {
     let inspector = Arc::new(MockInspector::default());
     let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
@@ -9224,6 +9245,7 @@ async fn foreground_probe_does_not_hold_global_session_lock() {
     inspector.set_descendants(created.pid, Vec::new());
     inspector.set_foreground_group(created.pid, Some(created.pid));
     let block = inspector.block_foreground();
+    let _release_guard = ForegroundReleaseGuard(Arc::clone(&block));
     let scan_registry = registry.clone();
     let scan_id = created.id.clone();
     let root_pid = created.pid;
@@ -9233,21 +9255,26 @@ async fn foreground_probe_does_not_hold_global_session_lock() {
             .await;
     });
 
-    tokio::time::timeout(FOREGROUND_LOCK_TEST_TIMEOUT, async {
+    let entered = tokio::time::timeout(HANG_GUARD, async {
         while !block.entered.load(Ordering::Acquire) {
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .expect("foreground probe should start");
+    .await;
 
-    tokio::time::timeout(FOREGROUND_LOCK_TEST_TIMEOUT, registry.inspect(&created.id))
-        .await
+    let inspected = if entered.is_ok() {
+        Some(tokio::time::timeout(HANG_GUARD, registry.inspect(&created.id)).await)
+    } else {
+        None
+    };
+
+    block.release();
+    scan.await.expect("foreground rescan task");
+    entered.expect("foreground probe should start");
+    inspected
+        .expect("inspect was attempted")
         .expect("inspect must not wait for foreground probe")
         .expect("inspect session");
-
-    block.released.store(true, Ordering::Release);
-    scan.await.expect("foreground rescan task");
     let _ = registry.stop(&created.id).await;
 }
 
