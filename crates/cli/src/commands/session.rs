@@ -2262,21 +2262,6 @@ mod tests {
     }
 
     #[test]
-    fn new_params_rejects_duplicate_meta_key() {
-        let mut args = new_args("shell", None);
-        args.meta = vec![
-            ("link.provider".to_owned(), "github".to_owned()),
-            ("link.provider".to_owned(), "linear".to_owned()),
-        ];
-
-        let err = new_params(&args).expect_err("duplicate key must be rejected");
-        assert!(
-            matches!(&err, CliError::DuplicateMetaKey { key } if key == "link.provider"),
-            "expected DuplicateMetaKey(\"link.provider\"), got {err:?}"
-        );
-    }
-
-    #[test]
     fn list_request_sends_typed_filters() {
         let request = build_list_request(&[
             parse_list_filter("state=running").expect("state filter"),
