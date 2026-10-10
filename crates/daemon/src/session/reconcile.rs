@@ -16585,19 +16585,30 @@ handler = "codex-hook-v1"
             }
 
             /// Identities of the scenario's processes that still run.
-            fn running(&self) -> Vec<crate::procwatch::ProcessIdentity> {
-                self.0
-                    .same_user_processes()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|fact| fact.identity())
-                    .filter(|identity| self.0.is_running(*identity).unwrap_or(false))
-                    .collect()
+            ///
+            /// # Errors
+            ///
+            /// Returns the inspection failure: a process table or liveness read
+            /// that failed proves nothing about whether the processes exited. A
+            /// process that exits during the read is not running.
+            fn running(&self) -> Result<Vec<crate::procwatch::ProcessIdentity>, Error> {
+                let mut running = Vec::new();
+                for fact in self.0.same_user_processes()? {
+                    let identity = fact.identity();
+                    match self.0.is_running(identity) {
+                        Ok(true) => running.push(identity),
+                        Ok(false) => {}
+                        Err(error) if error.is_race() => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(running)
             }
 
             /// PIDs of the processes that still run in the scenario's directory.
             fn pids(&self) -> BTreeSet<u32> {
                 self.running()
+                    .expect("inspect the scenario's processes")
                     .into_iter()
                     .map(|identity| identity.pid)
                     .collect()
@@ -16607,10 +16618,12 @@ handler = "codex-hook-v1"
         impl Drop for ScopeReaper {
             /// Signals every running process of the scenario again until a
             /// listing finds none: a process that forked before it was signalled
-            /// shows up in the next listing.
+            /// shows up in the next listing. A failed inspection is retried and
+            /// never counts as an exit, so a persistent failure ends in the hang
+            /// guard instead of a teardown that reports success.
             fn drop(&mut self) {
                 wait_until_sync("the scenario's processes to exit", || {
-                    let running = self.running();
+                    let running = self.running().ok()?;
                     for identity in &running {
                         if let Ok(raw) = i32::try_from(identity.pid) {
                             let _signalled = kill(Pid::from_raw(raw), Signal::SIGKILL);
