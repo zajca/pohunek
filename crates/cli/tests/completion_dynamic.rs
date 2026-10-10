@@ -11,8 +11,14 @@
 
 use std::ffi::OsString;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::PathBuf;
 
 use pohunek_test_support::env::TestEnv;
+
+#[cfg(unix)]
+const PUBLIC_COMPLETION_MODE: u32 = 0o644;
 
 /// Runs one bash completion request for `words` (the command line, cursor on
 /// the last word) and returns its output.
@@ -36,6 +42,100 @@ fn entries(dir: &std::path::Path) -> Vec<OsString> {
         .collect::<Vec<_>>();
     names.sort();
     names
+}
+
+#[test]
+fn completion_scripts_cover_active_commands_for_each_shell() {
+    for (shell, marker, host_marker) in [
+        ("bash", "complete", "--host"),
+        ("zsh", "#compdef pohunek", "--host"),
+        ("fish", "complete -c pohunek", "-l host"),
+    ] {
+        let env = TestEnv::new().expect("private completion environment");
+        let output = env
+            .command(pohunek_test_support::bin_exe("pohunek"))
+            .args(["completions", shell])
+            .output()
+            .expect("generate completion");
+        assert!(output.status.success(), "{shell}: {output:?}");
+        assert!(output.stderr.is_empty(), "{shell}: {output:?}");
+        let script = String::from_utf8(output.stdout).expect("UTF-8 completion");
+        for word in [
+            marker,
+            host_marker,
+            "agent-skill",
+            "session",
+            "service",
+            "plugin",
+            "accept-unconfirmed-cleanup",
+        ] {
+            assert!(script.contains(word), "{shell} lacks {word:?}");
+        }
+    }
+}
+
+#[test]
+fn dynamic_completion_bootstrap_uses_the_public_environment_protocol() {
+    for shell in ["bash", "zsh", "fish"] {
+        let env = TestEnv::new().expect("private completion environment");
+        let output = env
+            .command(pohunek_test_support::bin_exe("pohunek"))
+            .args(["completions", shell, "--dynamic"])
+            .output()
+            .expect("generate dynamic completion");
+        assert!(output.status.success(), "{shell}: {output:?}");
+        assert!(output.stderr.is_empty(), "{shell}: {output:?}");
+        let script = String::from_utf8(output.stdout).expect("UTF-8 bootstrap");
+        assert!(
+            script.contains(&format!("POHUNEK_COMPLETE={shell} pohunek")),
+            "{script}"
+        );
+    }
+}
+
+#[test]
+fn setup_installs_and_updates_completion_at_the_shell_paths() {
+    for (shell, relative) in [
+        ("bash", "bash-completion/completions/pohunek"),
+        ("zsh", "zsh/site-functions/_pohunek"),
+        ("fish", "fish/completions/pohunek.fish"),
+    ] {
+        let env = TestEnv::new().expect("private completion environment");
+        let path: PathBuf = if shell == "fish" {
+            env.config_home().join(relative)
+        } else {
+            env.data_home().join(relative)
+        };
+        let command = || env.command(pohunek_test_support::bin_exe("pohunek"));
+        let installed = command()
+            .args(["setup", "completions", shell])
+            .output()
+            .expect("install static completion");
+        assert!(installed.status.success(), "{shell}: {installed:?}");
+        let static_script = fs::read_to_string(&path).expect("read installed completion");
+        assert!(!static_script.contains("POHUNEK_COMPLETE="), "{shell}");
+
+        let updated = command()
+            .args(["setup", "completions", shell, "--dynamic"])
+            .output()
+            .expect("replace with dynamic completion");
+        assert!(updated.status.success(), "{shell}: {updated:?}");
+        let script = fs::read_to_string(&path).expect("read updated completion");
+        assert!(
+            script.contains(&format!("POHUNEK_COMPLETE={shell} pohunek")),
+            "{shell}"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("completion metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            PUBLIC_COMPLETION_MODE,
+            "{shell}: installed completion is owner-writable and public data"
+        );
+    }
 }
 
 /// Session-target and package completion with no daemon running exit
