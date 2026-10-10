@@ -43,7 +43,7 @@ use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::oneshot;
 use tokio_util::codec::{Framed, LinesCodec};
 
@@ -690,6 +690,7 @@ fn session_params_in(cwd: PathBuf) -> SessionNewParams {
         branch: None,
         base_branch: None,
         input: None,
+        extended_input_ready_wait: None,
         metadata: std::collections::BTreeMap::new(),
     }
 }
@@ -706,6 +707,7 @@ fn session_params_for_agent(agent: &RuntimeRef, cwd: PathBuf) -> SessionNewParam
         branch: None,
         base_branch: None,
         input: None,
+        extended_input_ready_wait: None,
         metadata: std::collections::BTreeMap::new(),
     }
 }
@@ -727,6 +729,7 @@ fn session_params_for_worktree(
         branch: Some(branch.to_owned()),
         base_branch: None,
         input: None,
+        extended_input_ready_wait: None,
         metadata: std::collections::BTreeMap::new(),
     }
 }
@@ -2200,6 +2203,351 @@ async fn session_new_with_input_writes_text_to_shell_pty() {
         serde_json::from_value(ok_payload(exchange(&mut client, &stop_req).await))
             .expect("stop result");
 
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Covers delayed reader startup while remaining below the configured
+/// five-second fallback.
+const INITIAL_READER_OBSERVATION_WINDOW: Duration = Duration::from_secs(3);
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the real worker setup, public observation, and cleanup share one lifecycle fixture"
+)]
+async fn initial_input_waits_for_reader(warning_first: bool, stale_mode_first: bool) {
+    let socket = temp_socket(if warning_first {
+        "initial-input-warning"
+    } else {
+        "initial-input-silent"
+    });
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let reader_socket = socket.dir.join("reader.sock");
+    let reader = UnixListener::bind(&reader_socket).expect("bind fake reader gate");
+    let received = socket.dir.join("received.bin");
+    let fake = agents_dir.join("reader.py");
+    let fake_source = format!(
+        r#"#!/usr/bin/python3
+import os
+import select
+import socket
+import termios
+import tty
+
+gate = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+gate.connect({reader_socket:?})
+tty.setraw(0)
+if {warning_first}:
+    os.write(1, b"Startup warning: checking workspace\r\n")
+if {stale_mode_first}:
+    os.write(1, b"\x1b[?1;2004h\x1b[?1;2004l")
+gate.sendall(b"s")
+while True:
+    ready, _, _ = select.select([gate, 0], [], [])
+    if gate in ready and gate.recv(1):
+        break
+    if 0 in ready:
+        os.read(0, 4096)
+        gate.sendall(b"e")
+termios.tcflush(0, termios.TCIFLUSH)
+if {stale_mode_first}:
+    os.write(1, b"\x1b[?1;20")
+    gate.sendall(b"p")
+    gate.recv(1)
+    os.write(1, b"04h\xe2\x9d\xaf ")
+else:
+    os.write(1, b"\x1b[?1;2004h\xe2\x9d\xaf ")
+body = bytearray()
+while len(body) < len(b"hello reader"):
+    body.extend(os.read(0, len(b"hello reader") - len(body)))
+submit = os.read(0, 1)
+with open({received:?}, "wb") as capture:
+    capture.write(body + submit)
+gate.sendall(b"d")
+gate.recv(1)
+ready, _, _ = select.select([0], [], [], 0)
+if ready:
+    with open({received:?}, "ab") as capture:
+        capture.write(os.read(0, 4096))
+gate.sendall(b"f")
+while True:
+    os.read(0, 1)
+"#,
+        reader_socket = reader_socket.display().to_string(),
+        received = received.display().to_string(),
+        warning_first = if warning_first { "True" } else { "False" },
+        stale_mode_first = if stale_mode_first { "True" } else { "False" },
+    );
+    write_executable(&fake, &fake_source);
+    std::fs::write(
+        agents_dir.join("readerclaude.toml"),
+        format!(
+            "base = \"claude\"\nprogram = {}\n",
+            toml::Value::String(fake.display().to_string())
+        ),
+    )
+    .expect("write Claude reader profile");
+    let config_dir = socket.dir.join("config");
+    std::fs::create_dir_all(config_dir.join("hooks")).expect("create session hook directory");
+    let hook_started = socket.dir.join("hook-started");
+    write_executable(
+        &config_dir.join("hooks/session-start"),
+        &format!("#!/bin/sh\nprintf ready > '{}'\n", hook_started.display()),
+    );
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        config_dir: Some(config_dir),
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut client = connect(&socket).await;
+    let mut params = session_params(&socket);
+    "readerclaude".clone_into(&mut params.agent);
+    params.input = Some("hello reader".to_owned());
+    params.extended_input_ready_wait = Some(true);
+    let create = tokio::spawn(async move { create_session_with_params(&mut client, params).await });
+    let (mut gate, _) = reader.accept().await.expect("fake agent connects to gate");
+    let mut started = [0];
+    gate.read_exact(&mut started)
+        .await
+        .expect("fake agent starts");
+    assert_eq!(started, [b's']);
+
+    let mut observer = connect(&socket).await;
+    let list = Request::make("reader-session-list", method::SESSION_LIST, Value::Null);
+    let id = wait::guard("fake agent is registered", async {
+        loop {
+            let sessions: Vec<SessionInfo> =
+                serde_json::from_value(ok_payload(exchange(&mut observer, &list).await))
+                    .expect("list running reader sessions");
+            if let Some(session) = sessions
+                .iter()
+                .find(|session| session.agent == "readerclaude")
+            {
+                break session.id.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    wait_until("session.start hook entered", || async {
+        hook_started.exists().then_some(())
+    })
+    .await;
+    if warning_first {
+        wait::guard("startup warning reaches public output", async {
+            loop {
+                let output = Request::make(
+                    "reader-output",
+                    method::SESSION_OUTPUT,
+                    serde_json::json!({"session_id": id, "max_bytes": 1024}),
+                );
+                let value = ok_payload(exchange(&mut observer, &output).await);
+                if value["next_offset"]
+                    .as_str()
+                    .and_then(|offset| offset.parse::<u64>().ok())
+                    .is_some_and(|offset| offset > 0)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+    }
+    let mut early_marker = [0];
+    // timing-allowed: #496 The real worker needs wall time to process PTY input; virtual time cannot drive its socket.
+    let early_input = match tokio::time::timeout(
+        INITIAL_READER_OBSERVATION_WINDOW,
+        gate.read_exact(&mut early_marker),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {
+            assert_eq!(early_marker, [b'e']);
+            true
+        }
+        Err(_) => false,
+        Ok(Err(error)) => panic!("early-input gate read failed: {error}"),
+    };
+    gate.write_all(b"g")
+        .await
+        .expect("release fake input reader");
+    if stale_mode_first {
+        let mut partial_marker = [0];
+        gate.read_exact(&mut partial_marker)
+            .await
+            .expect("fake agent wrote the partial CSI");
+        assert_eq!(partial_marker, [b'p']);
+        wait::guard("partial CSI reaches public output", async {
+            loop {
+                let output = Request::make(
+                    "reader-partial-output",
+                    method::SESSION_OUTPUT,
+                    serde_json::json!({"session_id": id, "max_bytes": 1024}),
+                );
+                let value = ok_payload(exchange(&mut observer, &output).await);
+                let expected = b"\x1b[?1;2004h\x1b[?1;2004l\x1b[?1;20".len() as u64;
+                if value["next_offset"]
+                    .as_str()
+                    .and_then(|offset| offset.parse::<u64>().ok())
+                    .is_some_and(|offset| offset >= expected)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        gate.write_all(b"c")
+            .await
+            .expect("complete the fragmented CSI");
+    }
+
+    let response = create.await.expect("session.new task");
+    let created: SessionInfo = serde_json::from_value(ok_payload(response)).expect("session info");
+    if !early_input {
+        let mut received_marker = [0];
+        gate.read_exact(&mut received_marker)
+            .await
+            .expect("fake agent accepted the framed input");
+        assert_eq!(received_marker, [b'd']);
+        gate.write_all(b"f")
+            .await
+            .expect("inspect the fake reader queue after create");
+        gate.read_exact(&mut received_marker)
+            .await
+            .expect("fake agent inspected remaining input");
+        assert_eq!(received_marker, [b'f']);
+        let accepted = tokio::fs::read(&received)
+            .await
+            .expect("read accepted input");
+        assert_eq!(accepted, b"hello reader\r");
+    }
+
+    let mut control = connect(&socket).await;
+    let stop_req = Request::make(
+        "stop-reader-agent",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+            .expect("stop result");
+    let _ = shutdown.send(());
+    let _ = handle.await;
+    assert!(
+        !early_input,
+        "initial input reached the fake agent before it enabled its reader"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_new_initial_input_waits_past_startup_warning() {
+    initial_input_waits_for_reader(true, false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_new_initial_input_waits_for_silent_reader() {
+    initial_input_waits_for_reader(false, false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_new_initial_input_waits_after_combined_mode_disable_and_fragmented_enable() {
+    initial_input_waits_for_reader(false, true).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn default_sdk_client_waits_for_initial_input_without_reader_signal() {
+    let socket = temp_socket("initial-input-default-client");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let received = socket.dir.join("received.bin");
+    let fake = agents_dir.join("silent-reader.py");
+    write_executable(
+        &fake,
+        &format!(
+            r#"#!/usr/bin/python3
+import os
+import tty
+
+tty.setraw(0)
+body = bytearray()
+while len(body) < len(b"hello reader\r"):
+    body.extend(os.read(0, len(b"hello reader\r") - len(body)))
+with open({received:?}, "wb") as capture:
+    capture.write(body)
+while True:
+    os.read(0, 1)
+"#,
+            received = received.display().to_string(),
+        ),
+    );
+    std::fs::write(
+        agents_dir.join("silentreader.toml"),
+        format!(
+            "base = \"claude\"\nprogram = {}\n",
+            toml::Value::String(fake.display().to_string())
+        ),
+    )
+    .expect("write silent reader profile");
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let mut client = pohunek_client::Client::connect_local(&socket.path)
+        .await
+        .expect("connect default SDK client");
+    let mut params = session_params(&socket);
+    params.agent = "silentreader".to_owned();
+    params.input = Some("hello reader".to_owned());
+
+    let created = client
+        .call::<protocol::method::SessionNew>(params)
+        .await
+        .expect("default client waits through reader grace");
+    assert_eq!(created.applied_input, Some(true));
+    wait_until("silent reader received the initial input", || async {
+        std::fs::read(&received)
+            .ok()
+            .filter(|bytes| bytes.as_slice() == b"hello reader\r")
+    })
+    .await;
+    assert_eq!(
+        std::fs::read(&received).expect("captured input"),
+        b"hello reader\r"
+    );
+
+    let mut observer = connect(&socket).await;
+    let list = Request::make(
+        "default-client-session-list",
+        method::SESSION_LIST,
+        Value::Null,
+    );
+    let sessions: Vec<SessionInfo> =
+        serde_json::from_value(ok_payload(exchange(&mut observer, &list).await))
+            .expect("list sessions");
+    assert_eq!(
+        sessions
+            .iter()
+            .filter(|session| session.agent == "silentreader")
+            .count(),
+        1,
+        "a request timeout must not leave a detached session for a retry"
+    );
+    let stop = Request::make(
+        "stop-silent-reader",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.session.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut observer, &stop).await))
+            .expect("stop result");
     let _ = shutdown.send(());
     let _ = handle.await;
 }

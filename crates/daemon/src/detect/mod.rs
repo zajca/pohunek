@@ -258,6 +258,18 @@ impl Detector {
         transitions
     }
 
+    /// Whether terminal output identifies an editable agent input reader.
+    #[must_use]
+    pub fn input_ready(&self) -> bool {
+        self.screen.bracketed_paste()
+            || self
+                .manifest_evidence(ContextFreshness::all())
+                .is_some_and(|evidence| {
+                    evidence.activity == AgentActivity::Idle
+                        && evidence.source == StateSource::Screen
+                })
+    }
+
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.screen.resize(rows, cols);
     }
@@ -275,8 +287,9 @@ impl Detector {
     ///
     /// A skipped broadcast chunk may have severed an in-flight escape sequence,
     /// so we discard the OSC parser state, the process-activity scanner state,
-    /// the cached OSC title/progress, and the `vt100` screen grid rather than
-    /// trust any of them. Fresh state repaints on the next agent refresh.
+    /// the cached OSC title/progress, bracketed-paste mode, and the `vt100`
+    /// screen grid rather than trust any of them. Fresh state repaints on the
+    /// next agent refresh.
     pub fn resync_after_lag(&mut self) {
         self.osc.reset();
         self.process_activity.reset();

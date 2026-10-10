@@ -8,6 +8,7 @@ use pohunek_client::protocol::{
 use pohunek_client::{next_request_id, Client, ClientError, ClientOptions, OriginSource};
 use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::process_env::ProcessEnv;
+use pohunek_test_support::time::{AutoAdvanceInhibitor, TIMER_TICK};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener};
@@ -579,6 +580,80 @@ fn request_response_client_options_default_timeout_matches_convenience_apis() {
             .connect_timeout,
         Duration::from_millis(75)
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn direct_request_timeout_assignment_bounds_session_creation_with_input() {
+    let inhibitor = AutoAdvanceInhibitor::new();
+    let socket_file = SocketFile::new();
+    let listener = UnixListener::bind(socket_file.path()).expect("bind fixture daemon");
+    let (request_tx, request_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (primary, _) = listener.accept().await.expect("accept primary connection");
+        let mut primary = BufReader::new(primary);
+        let mut health_line = String::new();
+        primary
+            .read_line(&mut health_line)
+            .await
+            .expect("read health request");
+        let health: Request =
+            serde_json::from_str(trim_line_end(&health_line)).expect("parse health request");
+        write_health_reply(primary.get_mut(), health.id()).await;
+
+        let (dedicated, _) = listener.accept().await.expect("accept creation connection");
+        let mut dedicated = BufReader::new(dedicated);
+        let mut create_line = String::new();
+        dedicated
+            .read_line(&mut create_line)
+            .await
+            .expect("read creation request");
+        let create: Request =
+            serde_json::from_str(trim_line_end(&create_line)).expect("parse creation request");
+        let create_id = create.id().to_owned();
+        request_tx.send(create).expect("report creation request");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let response = Response::ok(
+            protocol::PROTOCOL_VERSION,
+            create_id,
+            json!({"applied_input": true}),
+        )
+        .expect("create fixture response");
+        let _ = dedicated
+            .get_mut()
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&response).expect("response JSON")
+                )
+                .as_bytes(),
+            )
+            .await;
+    });
+
+    let mut options = no_origin_options();
+    options.request_timeout = Duration::from_millis(20);
+    let mut client = Client::connect_local_with_options(socket_file.path(), options)
+        .await
+        .expect("connect fixture daemon");
+    client.handshake().await.expect("negotiate protocol");
+    let params = serde_json::from_value(json!({
+        "agent": "shell", "cols": 80, "rows": 24, "input": "hello"
+    }))
+    .expect("valid creation parameters");
+    let creation = tokio::spawn(async move { client.session_new(params).await });
+    let request = request_rx.await.expect("creation request reached daemon");
+    assert_eq!(request.method(), protocol::method::SESSION_NEW);
+    assert_eq!(request.params()["extended_input_ready_wait"], true);
+    tokio::time::advance(Duration::from_millis(50) + TIMER_TICK).await;
+    let error = creation
+        .await
+        .expect("creation task completed")
+        .expect_err("direct assignment bounds the response wait");
+    assert!(
+        matches!(error, ClientError::RequestTimeout { timeout, .. } if timeout == Duration::from_millis(20))
+    );
+    server.await.expect("fixture daemon completed");
+    inhibitor.release().await;
 }
 
 #[test]

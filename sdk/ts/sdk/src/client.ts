@@ -13,6 +13,7 @@ import {
   type SessionInputParams,
   type SessionInputResult,
   type SessionInputWait,
+  type SessionNewParams,
   type SessionScreenParams,
   type SessionScreenResult,
   type StateSource,
@@ -26,7 +27,7 @@ import { decodeHostGovernanceInspect } from "./governance";
 import { hasValidWireOrigin, type RequestOrigin } from "./origin";
 import { Subscription } from "./subscription";
 import type { ConnectOptions, ControlChannel, ResolvedConnectOptions, Transport } from "./transport";
-import { resolveConnectOptions } from "./transport";
+import { resolveConnectOptions, SESSION_NEW_INPUT_REQUEST_BUDGET_MS } from "./transport";
 import { WsTransport } from "./transport-ws";
 
 // A 128-bit prefix keeps independently started SDK clients collision-resistant.
@@ -91,6 +92,13 @@ export class Client {
     method: K,
     params: Methods[K]["params"],
   ): Promise<Methods[K]["output"]> {
+    if (method === "session.new" && hasInitialInput(params)) {
+      return this.callDedicated(
+        "session.new",
+        { ...(params as SessionNewParams), extended_input_ready_wait: true },
+        SESSION_NEW_INPUT_REQUEST_BUDGET_MS,
+      );
+    }
     if (method === "session.input" && isWaitingSessionInput(params)) {
       return this.sessionInput(params);
     }
@@ -371,18 +379,18 @@ export class Client {
     this.selectedVersion = received;
   }
 
-  private async callDedicated<K extends "session.input" | "session.output" | "session.wait">(
+  private async callDedicated<K extends "session.new" | "session.input" | "session.output" | "session.wait">(
     method: K,
     params: Methods[K]["params"],
     wireTimeoutMs: number,
   ): Promise<Methods[K]["output"]> {
+    this.ensureUsable();
     // Parameters and the inherited version are captured before the first await.
     const snapshot = snapshotParams(params);
     const inherited = this.selectedVersion;
-    const requestTimeoutMs = Math.max(
-      this.options.requestTimeoutMs,
-      wireTimeoutMs + DEDICATED_REQUEST_HEADROOM_MS,
-    );
+    const requestTimeoutMs = method === "session.new" && this.options.explicitRequestTimeoutMs !== undefined
+      ? this.options.explicitRequestTimeoutMs
+      : Math.max(this.options.requestTimeoutMs, wireTimeoutMs + DEDICATED_REQUEST_HEADROOM_MS);
     const client = await Client.connectTransport(
       this.transport,
       { ...this.options, requestTimeoutMs },
@@ -391,6 +399,7 @@ export class Client {
     // The dedicated connection speaks the version this one already selected.
     client.selectedVersion = inherited;
     try {
+      this.ensureUsable();
       return await client.callDirect(method, snapshot);
     } finally {
       await client.close();
@@ -438,6 +447,13 @@ function narrowToWindow(allowed: ProtocolVersionRange): ProtocolVersionRange | u
   const minimum = Math.max(allowed.minimum, CLIENT_PROTOCOL_VERSIONS.minimum);
   const maximum = Math.min(allowed.maximum, CLIENT_PROTOCOL_VERSIONS.maximum);
   return minimum > maximum ? undefined : { minimum, maximum };
+}
+
+function hasInitialInput(value: unknown): value is SessionNewParams & { input: string } {
+  return typeof value === "object"
+    && value !== null
+    && "input" in value
+    && typeof (value as { input?: unknown }).input === "string";
 }
 
 function isWaitingSessionInput(value: unknown): value is SessionInputParams & { wait: SessionInputWait } {

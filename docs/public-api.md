@@ -2387,7 +2387,18 @@ diagnostics, or logs. The CLI validates observation byte/wait bounds and paired
 runtime coordinates before dialing. `session wait` and waiting `session output`
 use the Rust SDK's dedicated connections and preserve inherited request-origin
 markers. `session new --request-timeout-ms <u32>` overrides the response deadline
-for that creation request; zero is rejected.
+for that creation request; zero is rejected. Without that flag, a creation with
+initial input uses the Rust SDK's dedicated response budget described below.
+An explicitly shorter deadline may expire after the daemon created the session;
+inspect the session list before deciding what to do next.
+Initial input waits for an editable prompt or bracketed-paste enable signal,
+up to the bounded startup grace for a silent agent; the body and submit key
+are sent as separate PTY writes under the runtime input rules.
+Current SDK and CLI clients set `extended_input_ready_wait` on a typed
+`session.new` with initial input. The daemon then uses the configured host
+startup grace. A request that omits the optional field keeps its silent-reader
+wait capped at 500 ms, within the previous release's five-second client
+request deadline; a visible readiness signal still ends either wait at once.
 
 For example, keep untrusted prompt text out of argv by writing it on stdin:
 
@@ -2627,7 +2638,22 @@ Public exports:
 - `protocol`: re-export of `pohunek-protocol`.
 - `Client`: framed request/response and subscription client.
 - `ClientOptions`: `request_timeout` and `connect_timeout`, both defaulting to
-  5 seconds, and `origin_source`, set with `with_origin_source`.
+  5 seconds, and `origin_source`, set with `with_origin_source`. A typed
+  `session.new` with initial input uses a dedicated connection with a response
+  budget of 60 minutes plus 1 second of transport headroom. This covers the
+  valid host bounds of up to 10 minutes each for worker connection, worker
+  initialization, and reader grace, plus bounded setup and start hooks, with
+  room for other creation work. `with_request_timeout` explicitly overrides
+  that budget, including with a shorter deadline; assigning a nondefault value
+  to the public `ClientOptions.request_timeout` field has the same effect.
+  Dropping the Rust request
+  future ends the client's wait; it does not prove the daemon canceled a
+  creation already in progress. `session.new` without initial input and raw
+  envelope requests retain the ordinary timeout.
+- `ConnectionOptions.request_timeout` in the assistant host API is `None` by
+  default, preserving these SDK budgets. `Some(duration)` is an explicit
+  override even when `duration` equals the ordinary 5-second default. An
+  omitted serialized field also means `None`.
 - `OriginSource`: where a connection takes its request origin from.
   `Environment` (the default) reads `POHUNEK_SESSION_ID` and
   `POHUNEK_DAEMON_ID` from the calling process and rejects a partial or invalid
@@ -2814,7 +2840,13 @@ Public exports:
 - `ConnectOptions`: TypeScript counterpart to Rust `ClientOptions`; the package
   does not export a separate `ClientOptions` alias. It carries
   `connectTimeoutMs` and `requestTimeoutMs`, both defaulting to 5000 ms, plus an
-  optional validated `origin: {sessionId, daemonId}` pair.
+  optional validated `origin: {sessionId, daemonId}` pair. A typed `session.new`
+  with initial input uses the same dedicated 60-minute response budget and
+  1-second transport headroom unless `requestTimeoutMs` is explicitly supplied;
+  an explicit value replaces the dedicated budget. A timed-out creation may
+  still have completed on the daemon, so inspect sessions before any retry.
+  The typed call opts into the configured host reader grace when it sends
+  initial input.
 - `RequestOrigin` and `resolveRequestOrigin`: explicit browser-safe origin
   configuration and atomic identifier validation. Browser and Bun/Node defaults
   are absent; the SDK never reads `process.env`.

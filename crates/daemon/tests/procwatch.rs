@@ -360,6 +360,7 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
                 branch: None,
                 base_branch: None,
                 input: None,
+                extended_input_ready_wait: None,
                 metadata: BTreeMap::new(),
             })
             .await
@@ -450,6 +451,7 @@ async fn procwatch_keeps_worker_agent_after_daemon_restart() {
                                 branch: None,
                                 base_branch: None,
                                 input: None,
+                                extended_input_ready_wait: None,
                                 metadata: BTreeMap::new(),
                             })
                             .await
@@ -597,6 +599,7 @@ async fn procwatch_skips_nested_worker_agent_with_same_session_marker() {
                 branch: None,
                 base_branch: None,
                 input: None,
+                extended_input_ready_wait: None,
                 metadata: BTreeMap::new(),
             })
             .await
@@ -676,6 +679,7 @@ async fn procwatch_updates_cwd_after_shell_cd() {
             branch: None,
             base_branch: None,
             input: None,
+            extended_input_ready_wait: None,
             metadata: BTreeMap::new(),
         })
         .await

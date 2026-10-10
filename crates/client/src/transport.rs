@@ -14,11 +14,12 @@ use protocol::compat::{self, CompatError};
 use protocol::{
     AttachHeader, DoctorReport, Event, HostGovernanceStatus, Method, ProtocolError,
     ProtocolVersion, ProtocolVersionRange, Request, Response, SessionDetectionParams,
-    SessionDetectionResult, SessionId, SessionInputParams, SessionInputResult, SessionOutputParams,
-    SessionOutputResult, SessionReadParams, SessionReadResult, SessionResizeParams,
-    SessionResizeResult, SessionResumeParams, SessionResumeResult, SessionScreenParams,
-    SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionWaitParams,
-    SessionWaitResult, ENV_DAEMON_ID, ENV_SESSION_ID, MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION,
+    SessionDetectionResult, SessionId, SessionInputParams, SessionInputResult, SessionNewParams,
+    SessionNewResult, SessionOutputParams, SessionOutputResult, SessionReadParams,
+    SessionReadResult, SessionResizeParams, SessionResizeResult, SessionResumeParams,
+    SessionResumeResult, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
+    SessionSetMetadataResult, SessionWaitParams, SessionWaitResult, ENV_DAEMON_ID, ENV_SESSION_ID,
+    MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -31,6 +32,12 @@ use crate::ClientError;
 pub const LOCAL_HOST: &str = "local";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Initial input can wait for bounded worker startup, setup, and the host's
+/// configured reader grace. In a native service, worker connection,
+/// initialization, and reader grace can each reach 10 minutes; setup and
+/// start hooks each have a 5-minute cap. The remaining 20 minutes cover the
+/// rest of creation, so this client bound does not race those valid settings.
+const SESSION_NEW_INPUT_REQUEST_BUDGET_MS: u32 = 60 * 60 * 1_000;
 /// Transport processing budget added after a validated daemon-side deadline.
 ///
 /// One second leaves room for request framing, waiter teardown, scheduling,
@@ -229,6 +236,7 @@ pub struct ClientOptions {
     pub connect_timeout: Duration,
     /// Where the request origin is taken from.
     pub origin_source: OriginSource,
+    request_timeout_explicit: bool,
 }
 
 impl Default for ClientOptions {
@@ -237,6 +245,7 @@ impl Default for ClientOptions {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             origin_source: OriginSource::default(),
+            request_timeout_explicit: false,
         }
     }
 }
@@ -246,6 +255,7 @@ impl ClientOptions {
     #[must_use]
     pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
         self.request_timeout = request_timeout;
+        self.request_timeout_explicit = true;
         self
     }
 
@@ -533,7 +543,33 @@ impl Client {
             let result = self.session_input(params).await?;
             return Ok(serde_json::from_value(serde_json::to_value(result)?)?);
         }
+        if M::NAME == protocol::method::SESSION_NEW {
+            let params = serde_json::from_value::<SessionNewParams>(serde_json::to_value(params)?)?;
+            let result = self.session_new(params).await?;
+            return Ok(serde_json::from_value(serde_json::to_value(result)?)?);
+        }
         self.call_direct::<M>(params).await
+    }
+
+    /// Start a session, reserving a dedicated response budget when its initial
+    /// input must wait for the agent's reader.
+    pub async fn session_new(
+        &mut self,
+        mut params: SessionNewParams,
+    ) -> Result<SessionNewResult, ClientError> {
+        if params.input.is_some() {
+            params.extended_input_ready_wait = Some(true);
+            let timeout = session_new_input_request_timeout(self.options);
+            let mut client = self
+                .connect_dedicated(self.options.with_request_timeout(timeout))
+                .await?;
+            client
+                .call_direct::<protocol::method::SessionNew>(params)
+                .await
+        } else {
+            self.call_direct::<protocol::method::SessionNew>(params)
+                .await
+        }
     }
 
     async fn call_direct<M>(&mut self, params: M::Params) -> Result<M::Output, ClientError>
@@ -1195,6 +1231,14 @@ fn dedicated_request_timeout(configured: Duration, wire_timeout_ms: u32) -> Dura
         .checked_add(DEDICATED_WAIT_TRANSPORT_HEADROOM)
         .unwrap_or(Duration::MAX)
         .max(configured)
+}
+
+fn session_new_input_request_timeout(options: ClientOptions) -> Duration {
+    if options.request_timeout_explicit || options.request_timeout != DEFAULT_REQUEST_TIMEOUT {
+        options.request_timeout
+    } else {
+        dedicated_request_timeout(options.request_timeout, SESSION_NEW_INPUT_REQUEST_BUDGET_MS)
+    }
 }
 
 /// Open a raw, unframed control connection, selecting local or remote transport

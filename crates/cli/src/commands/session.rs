@@ -1426,6 +1426,7 @@ fn new_params(args: &NewArgs) -> Result<SessionNewParams, CliError> {
         branch: args.branch.clone(),
         base_branch: args.base_branch.clone(),
         input: args.input.clone(),
+        extended_input_ready_wait: None,
         metadata: parse_meta_pairs(&args.meta)?,
     })
 }

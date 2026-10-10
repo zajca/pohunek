@@ -809,6 +809,7 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
             branch: None,
             base_branch: None,
             input: Some(PROMPT.to_owned()),
+            extended_input_ready_wait: None,
             metadata: BTreeMap::new(),
         })
         .expect("serialize session.new params"),

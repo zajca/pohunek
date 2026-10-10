@@ -18,7 +18,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 # The socket transport tests spin a tokio runtime for the client/responder.
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 # Hermetic fixture roots; never std::env::temp_dir.
 pohunek-test-support = { workspace = true }
 

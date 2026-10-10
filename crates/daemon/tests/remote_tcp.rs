@@ -247,6 +247,7 @@ fn session_params(socket: &Path) -> SessionNewParams {
         branch: None,
         base_branch: None,
         input: None,
+        extended_input_ready_wait: None,
         metadata: std::collections::BTreeMap::new(),
     }
 }
