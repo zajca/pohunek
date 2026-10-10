@@ -18,7 +18,8 @@ use pohunek_platform::filesystem::{
     AdvisoryLock, EntryIdentity, EntryKind, FsError, MoveOutcome, StageOutcome, TrustedDir,
 };
 use pohunek_platform::process::{
-    HostInspector, ProcessIdentity as OsProcessIdentity, ProcessInspector, StartIdentity,
+    Error as PlatformProcessError, HostInspector, ProcessIdentity as OsProcessIdentity,
+    ProcessInspector, StartIdentity,
 };
 use pohunek_worker_protocol as protocol;
 use protocol::{
@@ -335,7 +336,7 @@ impl Server {
             .boot_identity()
             .map_err(|error| WorkerError::Protocol(error.to_string()))?;
         let journal = Journal::new(&args.journal_path);
-        let record = JournalRecord::bootstrap(
+        let mut record = JournalRecord::bootstrap(
             args.session_id,
             args.worker_id,
             origin,
@@ -348,6 +349,7 @@ impl Server {
             ),
             timestamp(),
         );
+        record.worker_spawn_id = own_spawn_id();
         journal.write(&record)?;
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         let (initialized_tx, _) = watch::channel(false);
@@ -4544,6 +4546,37 @@ fn process_start(pid: u32) -> Result<u64, WorkerError> {
         .map_err(|error| WorkerError::Protocol(error.to_string()))?
         .map(|identity| identity.start_identity.get())
         .ok_or_else(|| WorkerError::Protocol("process no longer exists".to_owned()))
+}
+
+/// Reads the worker's own kernel creation number for the journal.
+///
+/// The number lets a later runtime sweep attribute the worker's descendants
+/// whose environment the host withholds. It only speeds up cleanup, so a host
+/// that reports no lineage yields `None` silently and any other read failure
+/// yields `None` with a warning; neither stops the worker from starting.
+fn own_spawn_id() -> Option<String> {
+    match HostInspector::new().lineage(std::process::id()) {
+        Ok(Some(lineage)) => Some(lineage.id.to_string()),
+        Ok(None) => {
+            event!(
+                name: "worker.spawn_id.unreadable",
+                Level::WARN,
+                "worker process lineage vanished while reading the spawn id; journaling none",
+            );
+            None
+        }
+        Err(PlatformProcessError::Unavailable { .. }) => None,
+        Err(error) => {
+            event!(
+                name: "worker.spawn_id.unreadable",
+                Level::WARN,
+                error.type = "process_inspection",
+                error.message = %error,
+                "worker spawn id could not be read; journaling none: {{error.message}}",
+            );
+            None
+        }
+    }
 }
 
 fn is_descendant(pid: u32, root: u32) -> Result<bool, WorkerError> {

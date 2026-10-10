@@ -14356,7 +14356,11 @@ async fn removal_refusal_from_a_sweep_failure_lists_no_unreadable_process() {
     assert_eq!(refused.recover, None, "{refused:?}");
 
     let outcome = registry
-        .sweep_lost_runtime_detailed(&record_only.id.0, "rt-detail", None)
+        .sweep_lost_runtime_detailed(
+            &record_only.id.0,
+            "rt-detail",
+            super::supervision::WorkerBounds::NONE,
+        )
         .await;
     assert_eq!(outcome.cleanup, super::supervision::Cleanup::Unconfirmed);
     assert!(outcome.other_blockers);
@@ -14365,7 +14369,11 @@ async fn removal_refusal_from_a_sweep_failure_lists_no_unreadable_process() {
 
     inspector.set_listing_fails(false);
     let outcome = registry
-        .sweep_lost_runtime_detailed(&record_only.id.0, "rt-detail", None)
+        .sweep_lost_runtime_detailed(
+            &record_only.id.0,
+            "rt-detail",
+            super::supervision::WorkerBounds::NONE,
+        )
         .await;
     assert_eq!(outcome.cleanup, super::supervision::Cleanup::Unconfirmed);
     assert!(!outcome.other_blockers);

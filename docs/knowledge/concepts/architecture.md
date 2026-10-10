@@ -58,7 +58,16 @@ live process between images can expose an argument region that is absent,
 uncopyable, or not yet laid out; that process is still listed, without a
 command line, and its ownership markers read as unobservable rather than
 unmarked, so the runtime sweep skips it as unreadable and never signals it
-while the rest of the process table is still classified.
+while the rest of the process table is still classified. Darwin also reports the
+kernel's boot-wide creation number of every same-user process and of the process
+that created it. The recorded creator keeps its identity after it exits, until
+the process re-executes after being reparented, when the kernel rewrites it to
+launchd's number, so a launchd creator proves nothing. When the sweep knows the
+lost worker's creation number, that lineage decides a process whose environment
+the kernel withholds: a descendant of the worker is reaped, a process created
+before the worker or under an older non-launchd creator is ignored, and every
+other one (created after the worker by launchd, re-executed orphan, creator
+gone) stays skipped as unreadable.
 
 Darwin adds a privilege boundary Linux does not have: the kernel serves most
 process records only to the owner of the target process and refuses everyone

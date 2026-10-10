@@ -36,7 +36,9 @@ rule. The current state of each place is stated separately.
   `WORKER_JOURNAL_READABLE_SCHEMAS` (`crates/daemon/src/runtime/lifecycle.rs`);
   a schema is listed only when its layout names the worker generation, so today
   only the current `WORKER_JOURNAL_SCHEMA_VERSION` (4) is readable. Any other
-  schema gets a typed reason and a WARN.
+  schema gets a typed reason and a WARN. The optional field `worker_spawn_id`
+  is additive (no schema bump): the journal of an N-1 worker lacks it, and its
+  lost runtime is swept without the fork-lineage proof.
 - **Public-protocol clients.** Contract: a protocol change keeps the previous
   version served through adapters on both sides of the connection. An adapter
   translates shape only. A semantic change raises `MIN_PROTOCOL_VERSION` too

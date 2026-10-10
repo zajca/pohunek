@@ -10,3 +10,6 @@ pub use pohunek_platform::process::{
 
 #[cfg(test)]
 pub(crate) mod readable_host;
+
+#[cfg(test)]
+pub(crate) mod scoped_host;

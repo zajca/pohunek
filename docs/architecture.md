@@ -615,7 +615,11 @@ states the contract and then the current state.
   layout names the worker generation, because a generation is never inferred
   from the path, the persisted record or the supervisor job. Today only the
   current `WORKER_JOURNAL_SCHEMA_VERSION` (4) is listed; any other schema gets
-  a typed reason and a WARN and is never used as generation evidence.
+  a typed reason and a WARN and is never used as generation evidence. The
+  optional journal field `worker_spawn_id` (the worker's kernel creation number,
+  decimal string) is additive and needs no schema bump; the journal of a worker
+  started by the previous release lacks it, and the runtime sweep then has no
+  fork-lineage proof for processes whose environment the kernel withholds.
 - **Public-protocol clients.** The contract: a protocol change keeps the
   previous version served through adapters, so the advertised range is
   `MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION` with a minimum below the maximum.

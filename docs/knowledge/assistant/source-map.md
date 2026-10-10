@@ -389,7 +389,9 @@ Daemon, sessions, integrations, and project state:
 - `docs/knowledge/guides/environment-resolution.md` — how the daemon and
   agents resolve `PATH` and executables.
 - `crates/platform/src/process/sweep.rs` — ownership-marker sweep of a lost
-  runtime generation.
+  runtime generation, including the fork-lineage decision for processes whose
+  environment the kernel withholds (the worker's journaled `worker_spawn_id`;
+  a launchd creator number proves nothing).
 - `crates/service-config/src/lib.rs` — `service.toml` schema, trust, and
   validation.
 - `crates/service-config/src/preflight.rs` — the upgrade preflight report

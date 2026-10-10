@@ -5,11 +5,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use pohunek_platform::{
-    filesystem::TrustedDir,
-    process::{BootIdentity, StartIdentity},
-    supervisor::WorkerKey,
-};
+use pohunek_platform::{filesystem::TrustedDir, process::BootIdentity, supervisor::WorkerKey};
 use pohunek_worker_protocol::{
     AncestryMatcher, ControlCode, InspectSnapshot, PtyRelation, ReleasedIdentityClaim,
     RuntimePhase, SubagentField,
@@ -25,7 +21,7 @@ use sha2::{Digest, Sha256};
 use super::conflict_stop::is_conflict_proven_removal;
 use super::supervision::{
     classify_unreachable, describe_unreadable_candidates, job_identity_mismatch, observe,
-    record_accepted_process, Cleanup, JobEvidence, JournalWorker, Unreachable,
+    record_accepted_process, Cleanup, JobEvidence, JournalWorker, Unreachable, WorkerBounds,
     CREATE_COMPENSATION_PENDING, MAX_ACCEPTED_UNCONFIRMED_PROCESSES, RUNTIME_LOST,
     RUNTIME_LOST_CLEANUP_UNCONFIRMED, UNREADABLE_CANDIDATES_RECOVER, UNSUPERVISED_WORKER,
 };
@@ -165,6 +161,11 @@ pub(super) struct JournalEvidence {
     worker_pid: u32,
     worker_start_identity: String,
     boot_identity: String,
+    /// Kernel creation number of the worker, valid within `boot_identity`;
+    /// absent for a worker on a host without process lineage and for a worker
+    /// of the previous release.
+    #[serde(default)]
+    worker_spawn_id: Option<String>,
     #[serde(rename = "runtime_id")]
     worker_instance_id: Option<String>,
     child: Option<JournalChild>,
@@ -221,8 +222,12 @@ impl JournalEvidence {
     /// Returns the worker process facts this journal records.
     pub(super) fn worker(&self) -> JournalWorker<'_> {
         JournalWorker {
+            session_id: &self.session_id,
+            worker_id: &self.worker_id,
             pid: self.worker_pid,
             start_identity: &self.worker_start_identity,
+            boot_identity: &self.boot_identity,
+            spawn_id: self.worker_spawn_id.as_deref(),
             worker_instance_id: self.worker_instance_id.as_deref(),
         }
     }
@@ -1314,7 +1319,7 @@ impl SessionRegistry {
             Unreachable::Ended {
                 journaled,
                 worker_instance_id,
-                worker_start_identity,
+                bounds,
             } => {
                 // The removal finalizer sweeps every runtime of the
                 // generation itself and finishes only on a confirmed sweep.
@@ -1332,7 +1337,7 @@ impl SessionRegistry {
                 // sweep, so only its job is retired.
                 let cleanup = match worker_instance_id.as_deref() {
                     Some(worker_instance_id) => {
-                        self.sweep_lost_runtime(&id.0, worker_instance_id, worker_start_identity)
+                        self.sweep_lost_runtime(&id.0, worker_instance_id, bounds)
                             .await
                     }
                     None => Cleanup::Complete,
@@ -1779,7 +1784,7 @@ impl SessionRegistry {
             Unreachable::Ended {
                 journaled,
                 worker_instance_id,
-                worker_start_identity,
+                bounds,
             } => {
                 // Only a journaled worker whose process is proven gone proves
                 // which runtime died. Without a journal nothing proves what
@@ -1787,7 +1792,7 @@ impl SessionRegistry {
                 let cleanup = if journaled {
                     let worker_instance_id =
                         worker_instance_id.unwrap_or_else(|| expected.worker_instance_id.clone());
-                    self.sweep_lost_runtime(&id.0, &worker_instance_id, worker_start_identity)
+                    self.sweep_lost_runtime(&id.0, &worker_instance_id, bounds)
                         .await
                 } else {
                     Cleanup::Complete
@@ -2297,9 +2302,10 @@ impl SessionRegistry {
                         .to_owned(),
                 )
             })?;
-        let worker_start = journal.worker().identity().map_err(refusal)?.start_identity;
+        let worker = journal.worker();
+        worker.identity().map_err(refusal)?;
         let outcome = self
-            .sweep_lost_runtime_detailed(&id.0, worker_instance_id, Some(worker_start))
+            .sweep_lost_runtime_detailed(&id.0, worker_instance_id, worker.bounds())
             .await;
         if outcome.cleanup == Cleanup::Unconfirmed {
             return Err(refusal(
@@ -2351,7 +2357,7 @@ impl SessionRegistry {
             )
         };
         // The marker requirement applies only to a runtime no journal names.
-        let mut runtimes: Vec<(String, Option<StartIdentity>, bool)> = Vec::new();
+        let mut runtimes: Vec<(String, WorkerBounds, bool)> = Vec::new();
         if let Some(generation) = generation {
             let scan = self
                 .discover_worker_journals()
@@ -2376,16 +2382,13 @@ impl SessionRegistry {
                 // A malformed start identity proves no bystander foreign, so
                 // the sweep then treats every unreadable marker as the
                 // runtime's own.
-                let start = worker
-                    .identity()
-                    .ok()
-                    .map(|identity| identity.start_identity);
+                let bounds = worker.bounds();
                 match runtimes.iter_mut().find(|(known, _, _)| known == journaled) {
                     // Several workers journaling one runtime cannot tell
-                    // which one started it, so none of them bounds it.
-                    Some((_, known_start, _)) if *known_start != start => *known_start = None,
-                    Some(_) => {}
-                    None => runtimes.push((journaled.to_owned(), start, false)),
+                    // which one started it, so a fact bounds it only when
+                    // every one of them agrees on it.
+                    Some((_, known, _)) => *known = known.agreeing(bounds),
+                    None => runtimes.push((journaled.to_owned(), bounds, false)),
                 }
             }
         }
@@ -2394,18 +2397,18 @@ impl SessionRegistry {
                 .iter()
                 .any(|(known, _, _)| known == worker_instance_id)
             {
-                runtimes.push((worker_instance_id.to_owned(), None, true));
+                runtimes.push((worker_instance_id.to_owned(), WorkerBounds::NONE, true));
             }
         }
         // Each accepted process with the runtime that first listed it. The
         // caller logs them once the removal has completed.
         let mut accepted: Vec<(UnconfirmedProcess, String)> = Vec::new();
-        for (worker_instance_id, start, requires_session_marker) in runtimes {
+        for (worker_instance_id, bounds, requires_session_marker) in runtimes {
             let outcome = if requires_session_marker {
-                self.sweep_unjournaled_removed_runtime_detailed(&id.0, &worker_instance_id, None)
+                self.sweep_unjournaled_removed_runtime_detailed(&id.0, &worker_instance_id)
                     .await
             } else {
-                self.sweep_lost_runtime_detailed(&id.0, &worker_instance_id, start)
+                self.sweep_lost_runtime_detailed(&id.0, &worker_instance_id, bounds)
                     .await
             };
             if outcome.cleanup != Cleanup::Unconfirmed {
@@ -6553,6 +6556,7 @@ while os.getppid() == parent:
             worker_pid: 41,
             worker_start_identity: "410".to_owned(),
             boot_identity: "boot-test".to_owned(),
+            worker_spawn_id: None,
             worker_instance_id: record.runtime.worker_instance_id.clone(),
             child: Some(super::JournalChild {
                 pid: 50,
@@ -6738,6 +6742,7 @@ while os.getppid() == parent:
             worker_pid: 41,
             worker_start_identity: "410".to_owned(),
             boot_identity: "boot-test".to_owned(),
+            worker_spawn_id: None,
             worker_instance_id: record.runtime.worker_instance_id.clone(),
             child: Some(super::JournalChild {
                 pid: 50,
@@ -16010,19 +16015,26 @@ handler = "codex-hook-v1"
     /// launcher, so the journal records a real worker process that the test
     /// kills, and the PTY runs a hangup-ignoring marked descendant.
     mod running_loss {
+        use std::collections::BTreeSet;
         use std::os::unix::fs::PermissionsExt;
         use std::path::PathBuf;
         use std::sync::Arc;
         use std::time::Duration;
 
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
         use pohunek_platform::supervisor::{DefinitionFacts, ServiceId, ServiceState};
+        use pohunek_test_support::wait::wait_until;
         use pohunek_test_support::worker_binary;
         use protocol::{RuntimeState, SessionId, SessionInfo};
 
-        use super::super::super::supervision::RUNTIME_LOST;
+        use super::super::super::supervision::{
+            WorkerBounds, RUNTIME_LOST, RUNTIME_LOST_CLEANUP_UNCONFIRMED,
+        };
         use super::temp_root;
         use crate::procwatch::readable_host::ReadableHost;
-        use crate::procwatch::{HostInspector, ProcessInspector};
+        use crate::procwatch::scoped_host::ScopedHost;
+        use crate::procwatch::{Error, HostInspector, ProcessInspector};
         use crate::runtime::lifecycle::tests::{JobScript, ScriptedSupervisor};
         use crate::runtime::lifecycle::{
             IDENTITY_MISMATCH, SUPERVISION_AMBIGUOUS, SUPERVISION_UNAVAILABLE,
@@ -16047,7 +16059,20 @@ handler = "codex-hook-v1"
         }
 
         fn fixture(connect: Duration) -> Fixture {
+            fixture_over(connect, "sleep", |_root| Arc::new(ReadableHost::new()))
+        }
+
+        /// A fixture whose registry observes the host through the inspector
+        /// `host` builds for the fixture's directory.
+        ///
+        /// The PTY runs `sleep_program` for its descendant and its heartbeat.
+        fn fixture_over(
+            connect: Duration,
+            sleep_program: &str,
+            host: impl FnOnce(&std::path::Path) -> Arc<dyn ProcessInspector>,
+        ) -> Fixture {
             let root = temp_root();
+            let inspector = host(&root);
             let environment = SubprocessWorkerEnvironment {
                 runtime_home: root.join("r"),
                 state_home: root.join("s"),
@@ -16063,7 +16088,7 @@ handler = "codex-hook-v1"
             supervision.sweep_grace = SWEEP_GRACE;
             let marker_pid_file = root.join("descendant.pid");
             let script = format!(
-                "trap '' HUP; (trap '' HUP; exec sleep 300) & echo $! > {}; while :; do sleep 1; done",
+                "trap '' HUP; (trap '' HUP; exec {sleep_program} 300) & echo $! > {}; while :; do {sleep_program} 1; done",
                 marker_pid_file.display()
             );
             let launcher = SubprocessWorkerLauncher::new();
@@ -16079,7 +16104,7 @@ handler = "codex-hook-v1"
                     ..SessionRegistryConfig::default()
                 },
                 Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>,
-                Arc::new(ReadableHost::new()),
+                inspector,
             );
             Fixture {
                 root,
@@ -16415,7 +16440,7 @@ handler = "codex-hook-v1"
                     .and_then(|runtime| runtime.worker_instance_id.clone())
                     .expect("created runtime id");
                 self.registry
-                    .sweep_lost_runtime(&created.id.0, &worker_instance_id, None)
+                    .sweep_lost_runtime(&created.id.0, &worker_instance_id, WorkerBounds::NONE)
                     .await;
                 wait_gone(descendant).await;
             }
@@ -16500,9 +16525,353 @@ handler = "codex-hook-v1"
                 .expect("created runtime id");
             fixture
                 .registry
-                .sweep_lost_runtime(&created.id.0, &worker_instance_id, None)
+                .sweep_lost_runtime(&created.id.0, &worker_instance_id, WorkerBounds::NONE)
                 .await;
             wait_gone(descendant).await;
+        }
+
+        // A lost worker's runtime is swept on the real host, whose kernel may
+        // withhold the environment of platform binaries such as `/bin/sh` and
+        // `/bin/sleep`. The real worker runs a PTY of platform binaries and
+        // journals its own kernel creation number. Each scenario sees only the
+        // processes working in its own directory (`ScopedHost`), so the sweep
+        // decides the runtime and the bystanders started beside it, never the
+        // processes of a loaded host.
+
+        /// Child processes a scenario starts as bystanders; they are killed
+        /// and reaped when the scenario ends, also while a panic unwinds.
+        #[derive(Default)]
+        struct Bystanders(Vec<std::process::Child>);
+
+        impl Bystanders {
+            /// Starts `program` working in `directory` with an empty
+            /// environment and returns its PID.
+            fn start(&mut self, directory: &std::path::Path, program: &str, args: &[&str]) -> u32 {
+                let child = std::process::Command::new(program)
+                    .args(args)
+                    .current_dir(directory)
+                    .env_clear()
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("start a bystander");
+                let pid = child.id();
+                self.0.push(child);
+                pid
+            }
+        }
+
+        impl Drop for Bystanders {
+            fn drop(&mut self) {
+                for child in &mut self.0 {
+                    let _killed = child.kill();
+                    let _reaped = child.wait();
+                }
+            }
+        }
+
+        /// Kills every process still working in a scenario's directory when the
+        /// scenario ends, so a runtime the sweep left alive does not outlive it.
+        struct ScopeReaper(ScopedHost);
+
+        impl ScopeReaper {
+            fn new(directory: &std::path::Path) -> Self {
+                Self(ScopedHost::new(directory))
+            }
+
+            /// PIDs of the processes working in the scenario's directory.
+            fn pids(&self) -> BTreeSet<u32> {
+                self.0
+                    .same_user_processes()
+                    .expect("enumerate the scenario's processes")
+                    .into_iter()
+                    .map(|fact| fact.pid)
+                    .collect()
+            }
+        }
+
+        impl Drop for ScopeReaper {
+            fn drop(&mut self) {
+                for pid in self.pids() {
+                    if let Ok(raw) = i32::try_from(pid) {
+                        let _signalled = kill(Pid::from_raw(raw), Signal::SIGKILL);
+                    }
+                }
+            }
+        }
+
+        /// A scenario's real-host registry with its bystanders: one started
+        /// before the worker, and a tree (a shell and its child) started after
+        /// it by the test process, which is older than the worker.
+        struct Scene {
+            fixture: Fixture,
+            scope: ScopeReaper,
+            _bystanders: Bystanders,
+            earlier: u32,
+            tree: u32,
+            tree_child: u32,
+            session: protocol::SessionInfo,
+            job: ServiceId,
+            descendant: u32,
+        }
+
+        impl Scene {
+            async fn start() -> Self {
+                let fixture = fixture_over(LONG_CONNECT, "/bin/sleep", |root| {
+                    Arc::new(ScopedHost::new(root))
+                });
+                let scope = ScopeReaper::new(&fixture.root);
+                let mut bystanders = Bystanders::default();
+                let earlier = bystanders.start(&fixture.root, "/bin/sleep", &["300"]);
+                let (session, job, descendant) = fixture.create().await;
+                let tree =
+                    bystanders.start(&fixture.root, "/bin/sh", &["-c", "/bin/sleep 300 & wait"]);
+                let tree_child = wait_until("the sibling tree's child", || async {
+                    HostInspector::new()
+                        .descendants(tree)
+                        .ok()?
+                        .first()
+                        .map(|fact| fact.pid)
+                })
+                .await;
+                Self {
+                    fixture,
+                    scope,
+                    _bystanders: bystanders,
+                    earlier,
+                    tree,
+                    tree_child,
+                    session,
+                    job,
+                    descendant,
+                }
+            }
+
+            fn bystander_pids(&self) -> BTreeSet<u32> {
+                BTreeSet::from([self.earlier, self.tree, self.tree_child])
+            }
+
+            fn assert_bystanders_alive(&self) {
+                for pid in self.bystander_pids() {
+                    assert!(alive(pid), "bystander {pid} was signalled");
+                }
+            }
+
+            /// Whether the host withholds the environment of the runtime's own
+            /// platform binaries, read from a live process of the runtime.
+            fn environment_withheld(&self) -> bool {
+                matches!(
+                    HostInspector::new().ownership_markers(self.descendant),
+                    Err(Error::Unobservable { .. } | Error::PermissionDenied { .. })
+                )
+            }
+
+            /// Rewrites the only journal of the session while its worker is
+            /// stopped, so the worker cannot write the file back over the edit.
+            async fn rewrite_journal(
+                &self,
+                edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+            ) {
+                let worker = self
+                    .fixture
+                    .launcher
+                    .worker_process_id(&self.session.id.0)
+                    .await
+                    .expect("the worker runs");
+                kill(
+                    Pid::from_raw(i32::try_from(worker).expect("worker pid")),
+                    Signal::SIGSTOP,
+                )
+                .expect("stop the worker");
+                self.fixture.edit_journal(&self.session.id, edit);
+            }
+        }
+
+        impl Fixture {
+            /// Applies `edit` to the session's only journal in place.
+            fn edit_journal(
+                &self,
+                id: &SessionId,
+                edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+            ) {
+                let mut journals = std::fs::read_dir(self.journal_dir(id))
+                    .expect("list journals")
+                    .map(|entry| entry.expect("journal entry").path())
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "json"));
+                let path = journals.next().expect("the session journals");
+                assert!(journals.next().is_none(), "exactly one journal");
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).expect("read journal"))
+                        .expect("journal is JSON");
+                edit(value.as_object_mut().expect("journal is an object"));
+                std::fs::write(&path, serde_json::to_vec(&value).expect("encode journal"))
+                    .expect("write journal");
+            }
+        }
+
+        #[tokio::test]
+        async fn the_worker_journals_its_own_spawn_id_only_where_the_host_reports_lineage() {
+            let scene = Scene::start().await;
+            let worker = scene
+                .fixture
+                .launcher
+                .worker_process_id(&scene.session.id.0)
+                .await
+                .expect("the worker runs");
+            let mut journal = None;
+            scene.fixture.edit_journal(&scene.session.id, |fields| {
+                journal = Some(fields.clone());
+            });
+            let journal = journal.expect("journal read");
+            let recorded = journal
+                .get("worker_spawn_id")
+                .and_then(|value| value.as_str());
+
+            #[cfg(target_os = "macos")]
+            {
+                let lineage = HostInspector::new()
+                    .lineage(worker)
+                    .expect("the host reports lineage")
+                    .expect("the worker runs");
+                assert_eq!(recorded, Some(lineage.id.to_string().as_str()));
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = worker;
+                assert_eq!(recorded, None, "a host without lineage journals none");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_lost_runtime_of_platform_binaries_is_swept_to_a_confirmed_cleanup() {
+            let scene = Scene::start().await;
+
+            scene.fixture.crash(&scene.session.id).await;
+            let runtime = scene
+                .fixture
+                .wait_for(&scene.session.id, RuntimeState::Lost)
+                .await;
+
+            assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
+            wait_gone(scene.descendant).await;
+            let expected = scene.bystander_pids();
+            wait_until("only the bystanders to remain", || async {
+                (scene.scope.pids() == expected).then_some(())
+            })
+            .await;
+            scene.assert_bystanders_alive();
+            assert_eq!(scene.fixture.supervisor.retired(), vec![scene.job.clone()]);
+        }
+
+        /// What a sweep that was given no spawn id leaves of a lost runtime.
+        ///
+        /// Without lineage, a host that withholds the runtime's environment
+        /// keeps the cleanup unconfirmed and the runtime alive; a host that
+        /// exposes it reaps the runtime by its markers. Either way no bystander
+        /// is signalled.
+        async fn assert_unbounded_sweep(scene: &Scene) {
+            let withheld = scene.environment_withheld();
+            scene.fixture.crash(&scene.session.id).await;
+            let runtime = scene
+                .fixture
+                .wait_for(&scene.session.id, RuntimeState::Lost)
+                .await;
+
+            if withheld {
+                assert_eq!(
+                    runtime.loss_reason.as_deref(),
+                    Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED)
+                );
+                assert!(
+                    alive(scene.descendant),
+                    "unproven processes are not signalled"
+                );
+            } else {
+                assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
+                wait_gone(scene.descendant).await;
+            }
+            scene.assert_bystanders_alive();
+        }
+
+        #[tokio::test]
+        async fn a_journal_without_a_spawn_id_leaves_hidden_processes_unconfirmed() {
+            let scene = Scene::start().await;
+            scene
+                .rewrite_journal(|fields| {
+                    fields.remove("worker_spawn_id");
+                })
+                .await;
+
+            assert_unbounded_sweep(&scene).await;
+        }
+
+        /// A spawn id recorded in another boot never reaches the sweep: the
+        /// recorded number is that of a live bystander's parent, so trusting it
+        /// would attribute the bystander to the lost worker and signal it.
+        #[cfg(target_os = "macos")]
+        #[tokio::test]
+        async fn a_spawn_id_of_another_boot_is_never_given_to_the_sweep() {
+            let scene = Scene::start().await;
+            let stale = HostInspector::new()
+                .lineage(scene.tree)
+                .expect("the host reports lineage")
+                .expect("the bystander's shell runs")
+                .id;
+            scene
+                .rewrite_journal(|fields| {
+                    fields.insert(
+                        "boot_identity".to_owned(),
+                        serde_json::Value::String("boot-of-another-run".to_owned()),
+                    );
+                    fields.insert(
+                        "worker_spawn_id".to_owned(),
+                        serde_json::Value::String(stale.to_string()),
+                    );
+                })
+                .await;
+
+            assert_unbounded_sweep(&scene).await;
+        }
+
+        #[tokio::test]
+        async fn removal_needs_no_accepted_cleanup_once_the_journal_names_the_worker() {
+            let scene = Scene::start().await;
+            let recorded = {
+                let mut value = None;
+                scene.fixture.edit_journal(&scene.session.id, |fields| {
+                    value = fields.get("worker_spawn_id").cloned();
+                });
+                value.expect("journal read")
+            };
+            scene
+                .rewrite_journal(|fields| {
+                    fields.remove("worker_spawn_id");
+                })
+                .await;
+            scene.fixture.crash(&scene.session.id).await;
+            scene
+                .fixture
+                .wait_for(&scene.session.id, RuntimeState::Lost)
+                .await;
+            scene.fixture.edit_journal(&scene.session.id, |fields| {
+                fields.insert("worker_spawn_id".to_owned(), recorded);
+            });
+
+            scene
+                .fixture
+                .registry
+                .remove(&scene.session.id)
+                .await
+                .expect("the removal sweep confirms the cleanup");
+
+            wait_gone(scene.descendant).await;
+            let expected = scene.bystander_pids();
+            wait_until("only the bystanders to remain", || async {
+                (scene.scope.pids() == expected).then_some(())
+            })
+            .await;
+            scene.assert_bystanders_alive();
         }
     }
 
