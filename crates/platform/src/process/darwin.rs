@@ -11,7 +11,7 @@
 //! `PRIV_GLOBAL_PROC_INFO` privilege that only root holds, and such a refusal is
 //! reported as a denial rather than as absence.
 
-// Rust guideline compliant 2026-09-23
+// Rust guideline compliant 2026-10-10
 
 use std::io;
 use std::os::fd::AsFd;
@@ -1058,7 +1058,7 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::{DarwinInspector, Error, ExitWatch, ProcessInspector};
-    use crate::process::{Pid, ProcessIdentity, StartIdentity};
+    use crate::process::{OwnershipMarkers, Pid, ProcessIdentity, StartIdentity};
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
     use std::path::{Path, PathBuf};
@@ -1269,6 +1269,22 @@ mod tests {
         wait_for("the fixture to become observable", || {
             inspector.identity(pid).expect("inspect fixture identity")
         })
+    }
+
+    /// Returns the ownership markers of a live fixture once its argument
+    /// region is observable. Right after `exec` the kernel can transiently
+    /// refuse or half-publish that region (`EINVAL`, `EIO`, a layout still
+    /// being written); that reads as `Unobservable`, so the read is retried
+    /// until the deadline. Any other error fails the test at once.
+    fn observable_markers(inspector: DarwinInspector, pid: Pid) -> OwnershipMarkers {
+        wait_for(
+            "the fixture markers to become observable",
+            || match inspector.ownership_markers(pid) {
+                Ok(markers) => Some(markers),
+                Err(Error::Unobservable { .. }) => None,
+                Err(error) => panic!("inspect fixture markers: {error:?}"),
+            },
+        )
     }
 
     #[test]
@@ -1666,9 +1682,7 @@ mod tests {
         );
         let root = live_identity(inspector, outer.pid());
 
-        let markers = inspector
-            .ownership_markers(root.pid)
-            .expect("inspect outer markers");
+        let markers = observable_markers(inspector, root.pid);
         assert_eq!(markers.session_id.as_deref(), Some("outer-session"));
         assert_eq!(markers.daemon_id.as_deref(), Some("outer-daemon"));
 
@@ -1684,9 +1698,7 @@ mod tests {
                 })
         });
 
-        let nested_markers = inspector
-            .ownership_markers(nested.pid)
-            .expect("inspect nested markers");
+        let nested_markers = observable_markers(inspector, nested.pid);
         assert_eq!(nested_markers.session_id.as_deref(), Some("inner-session"));
         assert_eq!(
             nested_markers.daemon_id.as_deref(),
@@ -1714,10 +1726,7 @@ mod tests {
             .iter()
             .any(|argument| argument.contains("POHUNEK_SESSION_ID=argv-only")));
         assert!(
-            !inspector
-                .ownership_markers(pid)
-                .expect("inspect markers")
-                .is_marked(),
+            !observable_markers(inspector, pid).is_marked(),
             "an argument region entry must never become an ownership marker"
         );
     }
@@ -1735,7 +1744,7 @@ mod tests {
         let fact = wait_for("the fixture facts", || {
             inspector.process(pid).expect("inspect the fixture")
         });
-        let markers = inspector.ownership_markers(pid).expect("inspect markers");
+        let markers = observable_markers(inspector, pid);
         let stale = ProcessIdentity {
             pid,
             start_identity: StartIdentity::new(0),
