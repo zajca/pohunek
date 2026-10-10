@@ -298,6 +298,7 @@ pub async fn prepare_with_options(
         branch: params.branch,
         base_branch: params.base_branch,
         input: Some(prompt.clone()),
+        extended_input_ready_wait: None,
         metadata: std::collections::BTreeMap::new(),
     };
 

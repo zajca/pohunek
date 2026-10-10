@@ -555,9 +555,10 @@ impl Client {
     /// input must wait for the agent's reader.
     pub async fn session_new(
         &mut self,
-        params: SessionNewParams,
+        mut params: SessionNewParams,
     ) -> Result<SessionNewResult, ClientError> {
         if params.input.is_some() {
+            params.extended_input_ready_wait = Some(true);
             let timeout = session_new_input_request_timeout(self.options);
             let mut client = self
                 .connect_dedicated(self.options.with_request_timeout(timeout))
@@ -1233,7 +1234,7 @@ fn dedicated_request_timeout(configured: Duration, wire_timeout_ms: u32) -> Dura
 }
 
 fn session_new_input_request_timeout(options: ClientOptions) -> Duration {
-    if options.request_timeout_explicit {
+    if options.request_timeout_explicit || options.request_timeout != DEFAULT_REQUEST_TIMEOUT {
         options.request_timeout
     } else {
         dedicated_request_timeout(options.request_timeout, SESSION_NEW_INPUT_REQUEST_BUDGET_MS)

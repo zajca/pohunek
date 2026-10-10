@@ -137,6 +137,9 @@ the agent shows an editable prompt or enables bracketed paste. The bounded
 startup grace permits delivery when the agent stays silent. The daemon writes
 the prompt body and submit key as separate fragments using the runtime's input
 rules. A successful write confirms PTY delivery, not agent consumption.
+The current SDK and CLI opt into the host's full configured grace for initial
+input. An older client that does not send that option keeps a 500 ms silent
+startup bound so its five-second response deadline remains usable.
 
 A session can also carry owner metadata, set atomically at creation with
 repeatable `pohunek session new --meta key=value` flags (split on the first

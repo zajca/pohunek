@@ -690,6 +690,7 @@ fn session_params_in(cwd: PathBuf) -> SessionNewParams {
         branch: None,
         base_branch: None,
         input: None,
+        extended_input_ready_wait: None,
         metadata: std::collections::BTreeMap::new(),
     }
 }
@@ -706,6 +707,7 @@ fn session_params_for_agent(agent: &RuntimeRef, cwd: PathBuf) -> SessionNewParam
         branch: None,
         base_branch: None,
         input: None,
+        extended_input_ready_wait: None,
         metadata: std::collections::BTreeMap::new(),
     }
 }
@@ -727,6 +729,7 @@ fn session_params_for_worktree(
         branch: Some(branch.to_owned()),
         base_branch: None,
         input: None,
+        extended_input_ready_wait: None,
         metadata: std::collections::BTreeMap::new(),
     }
 }
@@ -2304,6 +2307,7 @@ while True:
     let mut params = session_params(&socket);
     "readerclaude".clone_into(&mut params.agent);
     params.input = Some("hello reader".to_owned());
+    params.extended_input_ready_wait = Some(true);
     let create = tokio::spawn(async move { create_session_with_params(&mut client, params).await });
     let (mut gate, _) = reader.accept().await.expect("fake agent connects to gate");
     let mut started = [0];
@@ -2509,7 +2513,9 @@ while True:
         .expect("default client waits through reader grace");
     assert_eq!(created.applied_input, Some(true));
     wait_until("silent reader received the initial input", || async {
-        received.exists().then_some(())
+        std::fs::read(&received)
+            .ok()
+            .filter(|bytes| bytes.as_slice() == b"hello reader\r")
     })
     .await;
     assert_eq!(

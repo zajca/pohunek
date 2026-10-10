@@ -2394,6 +2394,11 @@ inspect the session list before deciding what to do next.
 Initial input waits for an editable prompt or bracketed-paste enable signal,
 up to the bounded startup grace for a silent agent; the body and submit key
 are sent as separate PTY writes under the runtime input rules.
+Current SDK and CLI clients set `extended_input_ready_wait` on a typed
+`session.new` with initial input. The daemon then uses the configured host
+startup grace. A request that omits the optional field keeps its silent-reader
+wait capped at 500 ms, within the previous release's five-second client
+request deadline; a visible readiness signal still ends either wait at once.
 
 For example, keep untrusted prompt text out of argv by writing it on stdin:
 
@@ -2639,7 +2644,9 @@ Public exports:
   valid host bounds of up to 10 minutes each for worker connection, worker
   initialization, and reader grace, plus bounded setup and start hooks, with
   room for other creation work. `with_request_timeout` explicitly overrides
-  that budget, including with a shorter deadline. Dropping the Rust request
+  that budget, including with a shorter deadline; assigning a nondefault value
+  to the public `ClientOptions.request_timeout` field has the same effect.
+  Dropping the Rust request
   future ends the client's wait; it does not prove the daemon canceled a
   creation already in progress. `session.new` without initial input and raw
   envelope requests retain the ordinary timeout.
@@ -2838,6 +2845,8 @@ Public exports:
   1-second transport headroom unless `requestTimeoutMs` is explicitly supplied;
   an explicit value replaces the dedicated budget. A timed-out creation may
   still have completed on the daemon, so inspect sessions before any retry.
+  The typed call opts into the configured host reader grace when it sends
+  initial input.
 - `RequestOrigin` and `resolveRequestOrigin`: explicit browser-safe origin
   configuration and atomic identifier validation. Browser and Bun/Node defaults
   are absent; the SDK never reads `process.env`.

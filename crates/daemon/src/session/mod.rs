@@ -2063,6 +2063,7 @@ impl SessionRegistry {
         // daemon shutdown drains it.
         let registry = self.clone();
         self.spawn_create(async move {
+            let extended_input_ready_wait = params.extended_input_ready_wait.unwrap_or(false);
             let (info, pending_initial_input) = Box::pin(registry.create_transaction(
                 id,
                 params,
@@ -2072,7 +2073,9 @@ impl SessionRegistry {
                 fallback_cwd,
             ))
             .await?;
-            registry.complete_create(info, pending_initial_input).await
+            registry
+                .complete_create(info, pending_initial_input, extended_input_ready_wait)
+                .await
         })?
         .await
         .map_err(|_join_error| {
@@ -2097,6 +2100,7 @@ impl SessionRegistry {
         &self,
         info: SessionInfo,
         pending_initial_input: Option<String>,
+        extended_input_ready_wait: bool,
     ) -> Result<SessionInfo, ProtocolError> {
         // A reference assigned at launch makes the session resumable at once.
         if info.native_session_id.is_some() {
@@ -2120,7 +2124,8 @@ impl SessionRegistry {
         // the bytes are not delivered to a stdin reader that has not yet
         // entered raw/bracketed-paste mode (and would drop or mis-frame
         // them). Bounded, so a silent agent can never wedge `session.new`.
-        self.await_initial_input_readiness(&info.id).await;
+        self.await_initial_input_readiness(&info.id, extended_input_ready_wait)
+            .await;
         let delivered = match self.write_input_to_session(&info.id, &input).await {
             Ok(()) => self.commit_initial_input(&info.id).await,
             Err(error) => Err(error),
@@ -2502,8 +2507,19 @@ impl SessionRegistry {
     /// Wait for a freshly spawned agent to expose its input reader before a
     /// `session.new --input` prompt is injected, capped at
     /// [`SessionRegistryConfig::initial_input_startup_grace`].
-    async fn await_initial_input_readiness(&self, session_id: &SessionId) {
-        let grace = self.inner.config.initial_input_startup_grace;
+    async fn await_initial_input_readiness(
+        &self,
+        session_id: &SessionId,
+        extended_input_ready_wait: bool,
+    ) {
+        let grace = if extended_input_ready_wait {
+            self.inner.config.initial_input_startup_grace
+        } else {
+            self.inner
+                .config
+                .initial_input_startup_grace
+                .min(pohunek_service_config::COMPAT_INITIAL_INPUT_STARTUP_GRACE)
+        };
         if grace.is_zero() {
             return;
         }

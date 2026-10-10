@@ -833,6 +833,7 @@ fn session_new_params_json_shape_roundtrips() {
         branch: None,
         base_branch: None,
         input: None,
+        extended_input_ready_wait: None,
         metadata: BTreeMap::new(),
     };
 
@@ -864,6 +865,7 @@ fn session_new_params_roundtrips_with_metadata() {
         branch: None,
         base_branch: None,
         input: None,
+        extended_input_ready_wait: None,
         metadata: metadata(&[("owner", "cli"), ("ticket", "DMD-1356")]),
     };
 
@@ -899,6 +901,7 @@ fn session_new_params_roundtrips_with_worktree_fields() {
         branch: Some("feature/login".to_owned()),
         base_branch: Some("main".to_owned()),
         input: None,
+        extended_input_ready_wait: None,
         metadata: BTreeMap::new(),
     };
 
@@ -932,6 +935,7 @@ fn session_new_params_roundtrips_with_initial_input() {
         branch: None,
         base_branch: None,
         input: Some("run tests".to_owned()),
+        extended_input_ready_wait: None,
         metadata: BTreeMap::new(),
     };
 

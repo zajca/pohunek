@@ -44,11 +44,17 @@ use serde_json::Value;
 /// Source of the fake agent the session launches.
 const FAKE_AGENT: &str = include_str!("support/release_upgrade_agent.sh");
 
+/// Silent reader used to verify the previous client's request deadline.
+const SILENT_AGENT: &str = include_str!("support/release_upgrade_silent_agent.sh");
+
 /// Shell the fake agent is a copy of.
 const SHELL: &str = "/bin/sh";
 
 /// Host profile name of the fake agent.
 const PROFILE: &str = "fake-claude";
+
+/// Host profile used only for the previous client's initial-input create.
+const SILENT_PROFILE: &str = "silent-claude";
 
 /// Native id the fresh launch reports through the previous release's hook.
 const NATIVE_BEFORE: &str = "native-before-upgrade";
@@ -488,7 +494,20 @@ fn prepare_agent(run: &Run) {
     );
     let path = agents.join(format!("{PROFILE}.toml"));
     fs::write(&path, profile).expect("write the host profile");
+    let silent_script = run.agent_dir().join("silent-claude.sh");
+    fs::write(&silent_script, SILENT_AGENT).expect("write the silent agent");
+    fs::set_permissions(&silent_script, fs::Permissions::from_mode(0o700))
+        .expect("chmod the silent agent");
+    let silent_profile = format!(
+        "base = \"claude\"\nprogram = \"{}\"\nargs = [\"{}\"]\n[input_rules]\nbracketed_paste = false\n",
+        agent.display(),
+        silent_script.display(),
+    );
+    let silent_path = agents.join(format!("{SILENT_PROFILE}.toml"));
+    fs::write(&silent_path, silent_profile).expect("write the silent reader profile");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod the profile");
+    fs::set_permissions(&silent_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod the silent profile");
 }
 
 /// Copies the previous release's store, worker journals, `service.toml`, and
@@ -717,6 +736,36 @@ impl Upgrade {
         wait_screen(previous, id, "fake-agent ack input-from-previous-client");
     }
 
+    /// The published client's request deadline bounds a silent-reader create.
+    fn assert_previous_client_creates_with_input(&self) {
+        let cwd = self.run.home.display().to_string();
+        let created = self.previous.json(&[
+            "session",
+            "new",
+            "--agent",
+            SILENT_PROFILE,
+            "--cwd",
+            &cwd,
+            "--input",
+            "echo:input-from-previous-create",
+            "--json",
+        ]);
+        let id = created
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("previous client did not receive a session id: {created}"));
+        wait_screen(
+            &self.previous,
+            id,
+            "silent-agent ack echo:input-from-previous-create",
+        );
+        let removed = self.head.json(&["session", "rm", id, "--json"]);
+        assert_eq!(
+            removed["removed"], true,
+            "compat session was not removed: {removed}"
+        );
+    }
+
     /// Stops the session and waits until its runtime has ended.
     fn stop_and_wait(&self) {
         let (head, id) = (&self.head, &self.id);
@@ -806,6 +855,7 @@ fn previous_release_session_survives_the_upgrade_to_head() {
     upgrade.assert_session_works();
     upgrade.assert_previous_client(&after);
     upgrade.assert_stop_and_resume(&after);
+    upgrade.assert_previous_client_creates_with_input();
     upgrade.head.json(&[
         "service",
         "uninstall",

@@ -180,6 +180,12 @@ pub struct SessionNewParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub input: Option<String>,
+    /// Wait through the host's full reader startup grace before injecting
+    /// `input`. Omission keeps a shorter bound for clients whose response
+    /// deadline cannot accommodate a longer silent startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub extended_input_ready_wait: Option<bool>,
     /// Owner-controlled metadata for the session. Must not contain secrets.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,

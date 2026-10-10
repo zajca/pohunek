@@ -60,6 +60,12 @@ export type SessionNewParams = {
    */
   input?: string;
   /**
+   * Wait through the host's full reader startup grace before injecting
+   * `input`. Omission keeps a shorter bound for clients whose response
+   * deadline cannot accommodate a longer silent startup.
+   */
+  extended_input_ready_wait?: boolean;
+  /**
    * Owner-controlled metadata for the session. Must not contain secrets.
    */
   metadata?: { [key in string]: string };

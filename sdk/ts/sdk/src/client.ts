@@ -93,7 +93,11 @@ export class Client {
     params: Methods[K]["params"],
   ): Promise<Methods[K]["output"]> {
     if (method === "session.new" && hasInitialInput(params)) {
-      return this.callDedicated("session.new", params, SESSION_NEW_INPUT_REQUEST_BUDGET_MS);
+      return this.callDedicated(
+        "session.new",
+        { ...(params as SessionNewParams), extended_input_ready_wait: true },
+        SESSION_NEW_INPUT_REQUEST_BUDGET_MS,
+      );
     }
     if (method === "session.input" && isWaitingSessionInput(params)) {
       return this.sessionInput(params);
@@ -380,6 +384,7 @@ export class Client {
     params: Methods[K]["params"],
     wireTimeoutMs: number,
   ): Promise<Methods[K]["output"]> {
+    this.ensureUsable();
     // Parameters and the inherited version are captured before the first await.
     const snapshot = snapshotParams(params);
     const inherited = this.selectedVersion;
@@ -394,6 +399,7 @@ export class Client {
     // The dedicated connection speaks the version this one already selected.
     client.selectedVersion = inherited;
     try {
+      this.ensureUsable();
       return await client.callDirect(method, snapshot);
     } finally {
       await client.close();

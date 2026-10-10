@@ -190,6 +190,7 @@ pub(super) fn params() -> SessionNewParams {
         branch: None,
         base_branch: None,
         input: None,
+        extended_input_ready_wait: None,
         metadata: BTreeMap::new(),
     }
 }

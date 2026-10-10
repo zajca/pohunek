@@ -139,6 +139,12 @@ pub const MAX_DEADLINE: Duration = MAX_JOB_TIMEOUT;
 /// bracketed-paste enable sequence is observed.
 pub const DEFAULT_INITIAL_INPUT_STARTUP_GRACE: Duration = Duration::from_secs(5);
 
+/// Longest silent-reader wait for clients that omit the extended-wait opt-in.
+///
+/// A five-second client response deadline needs a short fallback so a silent
+/// reader does not consume the entire budget before input is delivered.
+pub const COMPAT_INITIAL_INPUT_STARTUP_GRACE: Duration = Duration::from_millis(500);
+
 /// Default PTY stop grace of daemon and session workers.
 ///
 /// The grace is how long a worker waits for the PTY to reach EOF after it

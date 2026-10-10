@@ -662,7 +662,137 @@ describe("Client request/response", () => {
         cols: 80,
         rows: 24,
         input: "hello reader",
+        extended_input_ready_wait: true,
       });
+      expect(parseRequestLine(await daemon.nextRequest())["method"]).toBe("daemon.health");
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("session.new with input rejects a closed client before opening a connection", async () => {
+    const daemon = startMemoryDaemon([]);
+    if (daemon.endpoint.kind !== "memory") {
+      throw new Error("memory daemon returned a different transport");
+    }
+    let connections = 0;
+    const source = daemon.endpoint.transport;
+    const transport: Transport = {
+      control: () => {
+        connections += 1;
+        return source.control();
+      },
+      raw: () => source.raw(),
+    };
+    try {
+      const client = await Client.connectTransport(transport);
+      await client.close();
+      const error = await expectClientError(client.call("session.new", {
+        agent: "claude", cols: 80, rows: 24, input: "hello",
+      }));
+      expect(error.toProtocolError().code).toBe("framing");
+      expect(connections).toBe(1);
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("session.new with input does not send after its client closes during connection", async () => {
+    const daemon = startMemoryDaemon([]);
+    if (daemon.endpoint.kind !== "memory") {
+      throw new Error("memory daemon returned a different transport");
+    }
+    let signalOpened!: () => void;
+    let releaseConnection!: () => void;
+    const opened = new Promise<void>((resolve) => { signalOpened = resolve; });
+    const release = new Promise<void>((resolve) => { releaseConnection = resolve; });
+    let connections = 0;
+    const source = daemon.endpoint.transport;
+    const transport: Transport = {
+      control: async () => {
+        connections += 1;
+        if (connections === 2) {
+          signalOpened();
+          await release;
+        }
+        return source.control();
+      },
+      raw: () => source.raw(),
+    };
+    try {
+      const client = await Client.connectTransport(transport);
+      const creating = client.call("session.new", {
+        agent: "claude", cols: 80, rows: 24, input: "hello",
+      });
+      await opened;
+      await client.close();
+      releaseConnection();
+      const error = await expectClientError(creating);
+      expect(error.toProtocolError().code).toBe("framing");
+      expect(connections).toBe(2);
+      await daemon.expectNoRequest(50);
+    } finally {
+      releaseConnection();
+      await daemon.close();
+    }
+  });
+
+  test("session.new with input rejects a consumed subscription client", async () => {
+    const daemon = startMemoryDaemon([{
+      kind: "subscription",
+      ack: (line) => okResponseLine(requestIdFromLine(line), { subscribed: true }),
+      events: [],
+    }]);
+    if (daemon.endpoint.kind !== "memory") {
+      throw new Error("memory daemon returned a different transport");
+    }
+    let connections = 0;
+    const source = daemon.endpoint.transport;
+    const transport: Transport = {
+      control: () => {
+        connections += 1;
+        return source.control();
+      },
+      raw: () => source.raw(),
+    };
+    try {
+      const client = await Client.connectTransport(transport);
+      await client.subscribe({ v: CLIENT_PROTOCOL_VERSIONS, id: "subscribe-consumed", method: "subscribe", params: null });
+      const error = await expectClientError(client.call("session.new", {
+        agent: "claude", cols: 80, rows: 24, input: "hello",
+      }));
+      expect(error.toProtocolError().code).toBe("framing");
+      expect(connections).toBe(1);
+      expect(parseRequestLine(await daemon.nextRequest())["method"]).toBe("subscribe");
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("session.new with input rejects a poisoned client", async () => {
+    const daemon = startMemoryDaemon([{ kind: "reply", line: () => "invalid json" }]);
+    if (daemon.endpoint.kind !== "memory") {
+      throw new Error("memory daemon returned a different transport");
+    }
+    let connections = 0;
+    const source = daemon.endpoint.transport;
+    const transport: Transport = {
+      control: () => {
+        connections += 1;
+        return source.control();
+      },
+      raw: () => source.raw(),
+    };
+    try {
+      const client = await Client.connectTransport(transport);
+      await expectClientError(client.call("daemon.health", null));
+      const error = await expectClientError(client.call("session.new", {
+        agent: "claude", cols: 80, rows: 24, input: "hello",
+      }));
+      expect(error.toProtocolError().code).toBe("framing");
+      expect(connections).toBe(1);
       expect(parseRequestLine(await daemon.nextRequest())["method"]).toBe("daemon.health");
       await client.close();
     } finally {
