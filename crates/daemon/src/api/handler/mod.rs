@@ -1242,6 +1242,12 @@ mod tests {
         assert!(std::path::Path::new(&result.bundle_path)
             .join("index.md")
             .is_file());
+        assert!(std::path::Path::new(&result.bundle_path)
+            .join(".complete")
+            .is_file());
+        assert!(std::path::Path::new(&result.bundle_path)
+            .join("concepts/architecture.md")
+            .is_file());
         assert_eq!(
             std::fs::read_to_string(&result.snapshot_path).expect("snapshot"),
             r#"{"daemon":"running"}"#
@@ -1304,6 +1310,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn assistant_materialize_reuses_complete_cache_without_overwriting() {
+        let _env = EnvGuard::set_all("asst-cache-reuse");
+        let state = daemon_state(
+            HealthInfo::new("test"),
+            SessionRegistry::new(SessionRegistryConfig::default()),
+        );
+        let first = assistant_materialize_result(&state, "asst-reuse-first", "{}").await;
+        let sentinel = std::path::Path::new(&first.bundle_path).join("sentinel.txt");
+        std::fs::write(&sentinel, "preserved").expect("write cache sentinel");
+
+        let second = assistant_materialize_result(&state, "asst-reuse-second", "{}").await;
+        assert_eq!(second.bundle_path, first.bundle_path);
+        assert_eq!(
+            std::fs::read_to_string(sentinel).expect("cache sentinel"),
+            "preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn assistant_materialize_concurrent_requests_share_a_complete_bundle() {
+        let _env = EnvGuard::set_all("asst-cache-race");
+        let state = daemon_state(
+            HealthInfo::new("test"),
+            SessionRegistry::new(SessionRegistryConfig::default()),
+        );
+        let handles = (0..8)
+            .map(|index| {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    assistant_materialize_result(&state, &format!("asst-race-{index}"), "{}").await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut paths = Vec::new();
+        for handle in handles {
+            paths.push(
+                handle
+                    .await
+                    .expect("materialization request completes")
+                    .bundle_path,
+            );
+        }
+        assert!(paths.iter().all(|path| path == &paths[0]));
+        let bundle = std::path::Path::new(&paths[0]);
+        assert!(bundle.join(".complete").is_file());
+        assert!(bundle.join("index.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn assistant_materialize_refuses_incomplete_cache_without_deleting_it() {
+        let _env = EnvGuard::set_all("asst-cache-incomplete");
+        let state = daemon_state(
+            HealthInfo::new("test"),
+            SessionRegistry::new(SessionRegistryConfig::default()),
+        );
+        let first = assistant_materialize_result(&state, "asst-incomplete-first", "{}").await;
+        let bundle = std::path::Path::new(&first.bundle_path);
+        std::fs::remove_file(bundle.join(".complete")).expect("remove completion marker");
+        std::fs::write(bundle.join("stale.txt"), "stale").expect("write incomplete cache data");
+
+        let error = assistant_materialize_error(&state, "asst-incomplete-second").await;
+        assert_eq!(error.code, "materialization_failed");
+        assert_eq!(
+            std::fs::read_to_string(bundle.join("stale.txt")).expect("incomplete cache data"),
+            "stale"
+        );
+        assert!(!bundle.join(".complete").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn assistant_materialize_refuses_symlinked_cache_directory() {
+        let _env = EnvGuard::set_all("asst-cache-symlink");
+        let state = daemon_state(
+            HealthInfo::new("test"),
+            SessionRegistry::new(SessionRegistryConfig::default()),
+        );
+        let first = assistant_materialize_result(&state, "asst-symlink-first", "{}").await;
+        let bundle = std::path::Path::new(&first.bundle_path);
+        std::fs::remove_dir_all(bundle).expect("remove materialized bundle");
+        let outside = bundle
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("cache directory")
+            .join("outside-complete");
+        std::fs::create_dir(&outside).expect("create outside directory");
+        std::fs::write(outside.join(".complete"), "complete").expect("write outside marker");
+        std::os::unix::fs::symlink(&outside, bundle).expect("replace cache with symlink");
+
+        let error = assistant_materialize_error(&state, "asst-symlink-second").await;
+        assert_eq!(error.code, "materialization_failed");
+        assert_eq!(
+            std::fs::read_to_string(outside.join(".complete")).expect("outside marker"),
+            "complete"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn assistant_materialize_refuses_symlinked_completion_marker() {
+        let _env = EnvGuard::set_all("asst-marker-symlink");
+        let state = daemon_state(
+            HealthInfo::new("test"),
+            SessionRegistry::new(SessionRegistryConfig::default()),
+        );
+        let first = assistant_materialize_result(&state, "asst-marker-first", "{}").await;
+        let bundle = std::path::Path::new(&first.bundle_path);
+        std::fs::remove_file(bundle.join(".complete")).expect("remove completion marker");
+        let outside = bundle
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("cache directory")
+            .join("outside-marker");
+        std::fs::write(&outside, "complete").expect("write outside marker");
+        std::os::unix::fs::symlink(&outside, bundle.join(".complete"))
+            .expect("replace marker with symlink");
+
+        let error = assistant_materialize_error(&state, "asst-marker-second").await;
+        assert_eq!(error.code, "materialization_failed");
+        assert_eq!(
+            std::fs::read_to_string(outside).expect("outside marker"),
+            "complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn assistant_materialize_prunes_stale_versions_but_preserves_other_paths() {
+        let _env = EnvGuard::set_all("asst-cache-prune");
+        let state = daemon_state(
+            HealthInfo::new("test"),
+            SessionRegistry::new(SessionRegistryConfig::default()),
+        );
+        let first = assistant_materialize_result(&state, "asst-prune-first", "{}").await;
+        let bundle = std::path::Path::new(&first.bundle_path);
+        let knowledge_dir = bundle.parent().expect("knowledge cache directory");
+        let old_version = knowledge_dir.join("sha256:old-version");
+        let in_progress = knowledge_dir.join(".tmp-sha256:next-123-456");
+        let unrelated = knowledge_dir
+            .parent()
+            .expect("cache directory")
+            .join("outside-knowledge");
+        for path in [&old_version, &in_progress, &unrelated] {
+            std::fs::create_dir(path).expect("create cache fixture directory");
+        }
+
+        let second = assistant_materialize_result(&state, "asst-prune-second", "{}").await;
+        assert_eq!(second.bundle_path, first.bundle_path);
+        assert!(!old_version.exists());
+        assert!(in_progress.is_dir());
+        assert!(unrelated.is_dir());
+        assert!(bundle.join(".complete").is_file());
+    }
+
+    #[tokio::test]
     async fn assistant_materialize_blocking_task_panic_returns_daemon_error() {
         let request = request(
             "assistant-materialize-panic",
@@ -1335,6 +1496,18 @@ mod tests {
         let response = handle_request(&request, state).await;
         let ok = ok_value(response, "assistant.materialize");
         serde_json::from_value(ok).expect("result deserializes")
+    }
+
+    async fn assistant_materialize_error(state: &DaemonState, id: &str) -> ProtocolError {
+        let request = request(
+            id,
+            method::ASSISTANT_MATERIALIZE,
+            serde_json::json!({ "snapshot": "{}" }),
+        );
+        error_value(
+            handle_request(&request, state).await,
+            "assistant.materialize",
+        )
     }
 
     /// A shell session body that stays alive without a `PATH` lookup, so a test
