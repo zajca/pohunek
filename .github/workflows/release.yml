@@ -29,8 +29,8 @@ name: Release
 # the only jobs with `id-token: write` and `attestations: write`; the caller
 # job `evidence` must grant them because a called workflow cannot hold a scope
 # its caller lacks. They run no repository or downloaded code. The signing key
-# (the secret CATALOG_SIGNING_KEY_CI of the environment `release`) is read only
-# by the signing step of the `assemble` job there.
+# (the secret CATALOG_SIGNING_KEY_CI of the environment `release`) is passed by
+# name to the reusable workflow and read only by its `assemble` signing step.
 on:
   push:
     tags:
@@ -567,6 +567,8 @@ jobs:
       version: ${{ needs.build.outputs.version }}
       commit: ${{ github.sha }}
       mode: release
+    secrets:
+      CATALOG_SIGNING_KEY_CI: ${{ secrets.CATALOG_SIGNING_KEY_CI }}
 
   # The one writer. It needs every producer and the evidence workflow (whose
   # `verdict` job requires assemble, attest-bundle and smoke to have

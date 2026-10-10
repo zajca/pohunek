@@ -349,7 +349,8 @@ has a build-provenance attestation from `release-evidence.yml`; the two jobs
 that hold `id-token: write` and `attestations: write` (`attest`,
 `attest-bundle`) download and attest only. Only the signing step of `assemble`
 reads the secret `CATALOG_SIGNING_KEY_CI` of the environment `release`
-(deployment policy: tags `v*`); it writes the seed to a 0700 tmpfs directory
+(deployment policy: tags `v*`), passed by name from the caller to the reusable
+workflow; it writes the seed to a 0700 tmpfs directory
 with mode 0600, removes it from the environment before any program starts, and
 shreds it afterwards. Developer ID signing and notarization are not part of the
 pipeline. The offline docs, the README, and the reference
