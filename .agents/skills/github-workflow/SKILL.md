@@ -33,6 +33,79 @@ stays `In Progress`. Being tracked as `Todo` for a design-proposal issue does
 not imply the proposed design is accepted — acceptance is an explicit
 decision recorded on the issue.
 
+## Public contributions and authority
+
+The `contributionPolicy` in `.github/agent-workflow.json` records the accepted
+permission and review route; it is guidance, not a runtime permission grant.
+Normal GitHub controls remain in force, and automatic reservation enforcement
+does not exist before the coordination service is delivered. An authenticated
+GitHub principal is accountable; agent and run IDs correlate activity but do
+not establish identity. Public issues, dependency links, reservation evidence,
+and pull requests must be
+enough to understand the work without access to the private Project.
+
+An outside contributor may propose work, request an eligible reservation,
+work in a fork they are authorized to use, and submit a pull request with
+evidence. A contributor does not need private Project access or maintainer
+credentials. These actions grant no repository write access, host or credential
+access, model budget, review, merge, release, or privileged-label authority.
+The repository owner's standing authorization for owner agents never transfers
+to an outside contributor. A contribution request does not authorize spending
+another person's credentials or budget.
+
+An agent acting for the repository owner keeps only the owner's existing
+standing issue and Project authorization and any separately authorized task
+scope. It must honor recorded reservation scope and conflicts. Commits, pushes,
+and releases still require their own authorization; this policy grants none.
+
+Until the coordination service in #805–#811 is delivered, only a maintainer
+may explicitly record a manual reservation in public issue evidence after
+reconciling active work, comments, and pull requests. A request, label, assignee,
+or unanswered comment is not a grant, and a manual record is not an atomic
+lease. Automatic admission starts only when the service transactionally
+enforces the published eligibility, capacity, WIP, expiry, and anti-hoarding
+rules. Numeric limits are owned by #805 and must not be invented here. A
+recognized holder works only within the granted scope and current authenticated
+generation. Submission and review retain custody. Expiry starts reconciliation
+of linked pull requests, branches, and pending effects; it does not silently
+reassign the work. A stale holder
+cannot mutate a successor's assignment.
+
+`zajca` triages, routes, resolves disputes, and integrates contributions under
+existing authorization. An available independent reviewer checks the relevant
+area contract and evidence. No permanently staffed area reviewer or response
+time commitment is promised. If an independent reviewer is unavailable, the
+candidate remains unaccepted; the maintainer records that state and retries
+routing when capacity exists. The submitter, author, executor, or manager
+cannot supply independent approval through another session. Automated review
+counts only after #700 resolves the reviewer-service defect and a completed
+review is verified against the exact pull request head under the corrected
+#700/#802 contract. An interrupted or stale-head run is not approval. #817 may
+request review only through its restricted broker contract. Review grants no
+merge authority; release remains separately authorized.
+
+Unsolicited competing pull requests remain welcome and use the same criteria.
+A reservation neither guarantees a merge nor prevents fork work; choosing a
+different candidate requires an explicit integration and custody decision.
+Conflicts must be disclosed. An appeal cites the decision, policy/spec revision,
+and new evidence on the issue or pull request through the maintainer route. An
+appeal or handoff acknowledgment alone does not change custody.
+
+### Permission walkthrough checks
+
+Use these checks when reviewing a contribution path; all outcomes must follow
+the `contributionPolicy` in `.github/agent-workflow.json`:
+
+| Walkthrough | Expected result |
+| --- | --- |
+| Outside contributor finds public scope and submits a fork pull request without private Project access or maintainer credentials. | The contribution can be proposed and reviewed; no privileged authority is granted. |
+| Owner agent records work using standing issue and Project authorization, then considers a commit, push, or release. | Standing authorization stays with the owner agent; commit and push need separate authorization, and release remains separately authorized. |
+| Maintainer checks active work and public evidence before recording a manual reservation while the service is absent. | Only explicit maintainer reconciliation grants the manual reservation; a request, label, assignee, or unanswered comment does not. |
+| A reservation expires, a successor is assigned, or a holder submits for review. | Expiry triggers reconciliation; stale generations cannot mutate successor custody; submission retains custody. |
+| The executor opens another session or no independent reviewer is available. | Another session does not satisfy independence; unavailable review leaves the candidate unaccepted and is recorded for retry. Automated review counts only for a completed exact-head review after #700 is resolved. |
+| An unsolicited pull request competes with reserved work. | It remains eligible under the same criteria, and the reservation does not guarantee a merge. |
+| A candidate passes review and gates and is ready to integrate. | `zajca` integrates under existing authorization; release still needs separate authorization. |
+
 ## Standing authorization — never ask whether to file
 
 The repository owner has durably pre-authorized these GitHub writes on the

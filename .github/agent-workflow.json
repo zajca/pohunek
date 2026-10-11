@@ -85,5 +85,46 @@
   "localFiles": {
     "NEXT.md": "Not a work authority and never required by any workflow. A pre-existing untracked NEXT.md is a migration read-only source at most.",
     "SiYuan": "Optional personal notes/pointers; never a competing project authority."
+  },
+  "contributionPolicy": {
+    "accountability": "The authenticated GitHub principal is accountable; agent and run identifiers are correlation metadata only. Public issue, dependency, reservation, and pull request evidence must be sufficient without private Project access.",
+    "outsideContributor": {
+      "may": [
+        "propose work",
+        "request an eligible reservation",
+        "work in an authorized fork",
+        "submit an unsolicited pull request and evidence"
+      ],
+      "privilegedGrants": [],
+      "limits": "No repository write, private Project, host, credential, model budget, review, merge, release, or privileged-label authority is conferred. The repository owner’s standing agent authorization does not transfer."
+    },
+    "reservations": {
+      "beforeService": "A maintainer explicitly records and reconciles a manual reservation after checking active work, comments, and pull requests; record it in public issue evidence. A request, label, assignee, or unanswered comment is not a grant; a manual record is not an atomic lease.",
+      "afterService": "Automatic admission is unavailable until #805–#811 deliver a coordination service that transactionally enforces published eligibility, capacity, WIP, expiry, and anti-hoarding rules. Numeric limits belong to #805 and are not set here.",
+      "custody": "A recognized holder acts only within granted scope and the current authenticated generation. Submission and review retain custody. Expiry starts reconciliation of linked pull requests, branches, and pending effects; it does not reassign work. A stale holder cannot mutate a successor assignment."
+    },
+    "reviewAndIntegration": {
+      "maintainer": "zajca triages, routes, reconciles disputes, and integrates contributions under existing authorization.",
+      "reviewer": "An available independent reviewer assesses the relevant area contract and evidence. No permanently staffed area reviewer or response-time commitment is claimed. The submitter, author, executor, and manager cannot supply the required independent approval through another session.",
+      "unavailable": "If no independent reviewer is available, the candidate remains unaccepted; the maintainer records the state and retries routing when capacity exists.",
+      "automatedReview": "Counts only after #700 resolves the reviewer-service defect and a completed review is verified against the exact pull request head under the corrected #700/#802 contract. Interrupted or stale-head runs are not approval; #817 may request review only through its restricted broker contract.",
+      "authority": "Review does not grant merge authority. Outside contributors receive no merge or release authority. Release remains separately authorized."
+    },
+    "competingWorkAndAppeals": {
+      "unsolicitedPullRequests": "Remain welcome without a recognized reservation and are evaluated against the same criteria. A reservation neither guarantees a merge nor prevents competing fork work. Selecting a different candidate requires an explicit integration and custody decision.",
+      "conflicts": "Disclose conflicts. Author, executor, and manager cannot replace independent acceptance by using another session.",
+      "appeals": "Cite the contested decision, policy/spec revision, and new evidence on the issue or pull request through the maintainer route. An appeal or handoff acknowledgment does not itself change custody."
+    },
+    "walkthroughChecks": [
+      "Outside contributor: find public scope, submit a fork pull request without private Project access or maintainer credentials, and confirm no privileged authority is granted.",
+      "Owner agent: verify standing issue and Project authorization applies only to the owner agent, commits and pushes have separate authorization, and release remains separately authorized.",
+      "Maintainer: before the service exists, reconcile active work and public evidence before explicitly recording a manual reservation; verify a request, label, assignee, or unanswered comment alone does not grant custody.",
+      "Custody and review: verify expiry requires reconciliation, stale generations cannot mutate a successor assignment, submission retains custody, and another executor session cannot satisfy independent review.",
+      "Unavailable reviewer: verify the candidate remains unaccepted and the maintainer records and retries routing when capacity exists; automated review counts only for a completed exact-head review after #700 is resolved.",
+      "Competing contribution: verify unsolicited pull requests remain eligible for the same criteria and that reservation alone does not guarantee merge.",
+      "Integration: verify only the maintainer integrates after required gates and independent review, and release requires separate authorization."
+    ],
+    "enforcement": "This is accepted workflow guidance, not a runtime permission grant. Normal GitHub controls remain in force; automatic reservation enforcement does not exist before the coordination service is delivered.",
+    "ownerAgent": "The owner agent retains only existing standing issue and Project authorization and separately authorized task scope. Commits, pushes, and releases require their own authorization; none is granted to outside contributors."
   }
 }
