@@ -694,6 +694,126 @@ async fn daemon_doctor_has_identical_unix_and_tcp_dispatch() {
 }
 
 #[tokio::test]
+async fn daemon_doctor_reports_profile_readiness_and_redacts_profile_content() {
+    let agents_root = pohunek_test_support::tempdir().expect("create profile fixture root");
+    let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
+    process_env.set("PATH", agents_root.path());
+    let agents = agents_root.path().join("agents");
+    std::fs::create_dir(&agents).expect("create agents directory");
+    std::fs::write(
+        agents.join("healthy.toml"),
+        "base = \"shell\"\nprogram = \"/bin/sh\"\n[env]\nAPI_KEY = \"PROFILE_SECRET_CANARY\"\n",
+    )
+    .expect("write healthy profile");
+    std::fs::write(
+        agents.join("malformed.toml"),
+        "base = \"shell\"\n[env]\nAPI_KEY = 12345\n",
+    )
+    .expect("write malformed profile");
+    std::fs::write(
+        agents.join("missing-executable.toml"),
+        "base = \"shell\"\nprogram = \"pohunek-missing-executable-canary\"\n",
+    )
+    .expect("write profile with missing executable");
+    std::fs::write(
+        agents.join("pinned-runtime.toml"),
+        "base = \"pi\"\npackage = \"acme.runtime.pi\"\ndigest = \"sha256:0000000000000000000000000000000000000000000000000000000000000000\"\n",
+    )
+    .expect("write profile with an unavailable pinned runtime");
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents),
+        ..shell_config()
+    };
+    let (_addr, socket, shutdown, handle) =
+        spawn_dual_servers("doctor-profile-readiness", "0.0.0", config).await;
+    let mut client = connect_unix(&socket).await;
+    let response = exchange(
+        &mut client,
+        &Request::make("doctor-profiles", method::DAEMON_DOCTOR, Value::Null),
+    )
+    .await;
+    let payload = ok_payload(response);
+    let checks = payload["report"]["checks"]
+        .as_array()
+        .expect("doctor checks array");
+    let find = |name: &str| {
+        checks
+            .iter()
+            .find(|check| check["name"] == name)
+            .unwrap_or_else(|| panic!("doctor reports {name}: {payload}"))
+    };
+    assert_eq!(find("agent_profile_healthy")["status"], "ok");
+    assert_eq!(find("agent_profile_malformed")["status"], "fail");
+    assert!(find("agent_profile_malformed")["detail"]
+        .as_str()
+        .expect("redacted detail")
+        .contains("repair"));
+    assert_eq!(find("agent_profile_missing-executable")["status"], "fail");
+    assert_eq!(find("agent_profile_pinned-runtime")["status"], "fail");
+    assert!(find("agent_profile_pinned-runtime")["detail"]
+        .as_str()
+        .expect("pinned runtime detail")
+        .contains("pinned runtime is unavailable"));
+    assert_eq!(find("agent_runtime_codex")["status"], "warn");
+    let rendered = serde_json::to_string(&payload).expect("serialize doctor payload");
+    assert!(!rendered.contains("PROFILE_SECRET_CANARY"));
+    assert!(!rendered.contains("pohunek-missing-executable-canary"));
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn daemon_doctor_reports_insecure_profile_directory_without_reading_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = pohunek_test_support::tempdir().expect("create insecure profile fixture root");
+    let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
+    process_env.set("PATH", root.path());
+    let agents = root.path().join("agents");
+    std::fs::create_dir(&agents).expect("create agents directory");
+    std::fs::write(
+        agents.join("unsafe.toml"),
+        "base = \"shell\"\n[env]\nAPI_KEY = \"INSECURE_PROFILE_SECRET_CANARY\"\n",
+    )
+    .expect("write unsafe profile canary");
+    std::fs::set_permissions(&agents, std::fs::Permissions::from_mode(0o777))
+        .expect("make configured directory insecure");
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents.clone()),
+        ..shell_config()
+    };
+    let (_addr, socket, shutdown, handle) =
+        spawn_dual_servers("doctor-insecure-profile", "0.0.0", config).await;
+    let mut client = connect_unix(&socket).await;
+    let payload = ok_payload(
+        exchange(
+            &mut client,
+            &Request::make("doctor-insecure", method::DAEMON_DOCTOR, Value::Null),
+        )
+        .await,
+    );
+    let checks = payload["report"]["checks"]
+        .as_array()
+        .expect("doctor checks array");
+    let profiles = checks
+        .iter()
+        .find(|check| check["name"] == "agent_profiles")
+        .expect("directory security check");
+    assert_eq!(profiles["status"], "fail");
+    assert_eq!(
+        profiles["detail"],
+        "the configured agents directory is not owner-secure"
+    );
+    let rendered = serde_json::to_string(&payload).expect("serialize doctor payload");
+    assert!(!rendered.contains("INSECURE_PROFILE_SECRET_CANARY"));
+    assert!(!rendered.contains(agents.to_string_lossy().as_ref()));
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
 async fn daemon_health_payload_is_identical_over_unix_and_tcp() {
     let (addr, socket, shutdown, handle) =
         spawn_dual_servers("remote-parity", "5.5.5-test", shell_config()).await;

@@ -79,6 +79,13 @@ for Claude, `CODEX_HOME` for Codex); a profile with `base = "claude"` sets that
 variable to an absolute path in its environment entries (a `~` is refused, not
 expanded). The pieces fit together like this:
 
+- **Readiness.** `pohunek doctor` reports each configured profile as an
+  `agent_profile_<name>` check after applying the same secure resolution,
+  installed-package, executable and provider-version rules used by launch.
+  Malformed or unsafe profiles remain visible as failures even when ordinary
+  profile enumeration skips them. Missing optional Codex, Claude or Hermes
+  executables warn only when no profile explicitly configures that provider.
+  Doctor details never include profile contents, arguments or environment values.
 - **Launch.** The agent starts with the daemon's base environment (an allowlist
   of session variables) overridden by the profile's `[env]`, so the profile's
   variable decides which home the agent reads. A variable that only the daemon's

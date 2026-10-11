@@ -50,6 +50,8 @@ pub(super) async fn handle_daemon_doctor(
         governance,
         sessions.active_supervision(),
         sessions.catalog_trust(),
+        sessions.profiles(),
+        sessions.inspect_base_environment(),
     )
     .await
     {

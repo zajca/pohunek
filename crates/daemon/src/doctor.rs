@@ -36,6 +36,8 @@ pub(crate) async fn report(
     governance: &HostGovernanceService,
     supervision: Option<ActiveSupervision>,
     catalog_trust: &CatalogTrust,
+    profiles: &crate::agent::ProfileRegistry,
+    base_env: pohunek_worker_protocol::BaseEnv,
 ) -> Result<DoctorReport, DoctorReportError> {
     let paths = paths.clone();
     let mode = supervision_mode(supervision.as_ref());
@@ -47,6 +49,12 @@ pub(crate) async fn report(
         tokio::task::spawn_blocking(move || standard_checks(&paths, worker.as_ref(), mode))
             .await
             .map_err(|_error| DoctorReportError)?;
+    let profiles = profiles.clone();
+    checks.extend(
+        tokio::task::spawn_blocking(move || profile_checks(&profiles, &base_env))
+            .await
+            .unwrap_or_else(|_| vec![check("agent_profiles", DoctorStatus::Fail, "Configured agent profiles could not be inspected; check daemon logs and profile ownership.")]),
+    );
     checks.extend(governance_checks(governance.diagnose().await));
     checks.push(catalog_trust_check(catalog_trust));
     Ok(DoctorReport::from_checks(checks))
@@ -59,6 +67,151 @@ fn supervision_mode(active: Option<&ActiveSupervision>) -> Supervision {
         Some(active) if active.native => Supervision::Native,
         Some(_) => Supervision::Subprocess,
         None => Supervision::Unknown,
+    }
+}
+
+/// Check configured profile resolution and the readiness of optional providers.
+fn profile_checks(
+    profiles: &crate::agent::ProfileRegistry,
+    base_env: &pohunek_worker_protocol::BaseEnv,
+) -> Vec<DoctorCheck> {
+    let configured = match profiles.doctor_profiles() {
+        Ok(configured) => configured,
+        Err(detail) => return vec![check("agent_profiles", DoctorStatus::Fail, detail)],
+    };
+    let configured_names: std::collections::HashSet<String> =
+        configured.iter().map(|(name, _)| name.clone()).collect();
+    let mut checks = Vec::new();
+    for (name, result) in configured {
+        let safe_name = safe_profile_name(&name);
+        let check_name = format!("agent_profile_{safe_name}");
+        let result = match result {
+            Ok(agent) => profile_runtime_check(profiles, &agent, base_env),
+            Err(crate::agent::DoctorProfileError::RuntimeUnavailable) => {
+                Err(RuntimeFailure::PinnedRuntime)
+            }
+            Err(crate::agent::DoctorProfileError::Invalid) => Err(RuntimeFailure::Profile),
+        };
+        let (status, detail) = match result {
+            Ok(()) => (
+                DoctorStatus::Ok,
+                "Configured profile and runtime are ready.",
+            ),
+            Err(RuntimeFailure::OptionalMissing) => (
+                DoctorStatus::Fail,
+                "The configured profile runtime is unavailable; repair the profile or install its runtime.",
+            ),
+            Err(RuntimeFailure::PinnedRuntime) => (
+                DoctorStatus::Fail,
+                "The pinned runtime is unavailable; install or select its pinned package again.",
+            ),
+            Err(RuntimeFailure::Profile) => (
+                DoctorStatus::Fail,
+                "The profile is malformed or cannot be resolved securely; repair its file or permissions.",
+            ),
+            Err(RuntimeFailure::Executable) => (
+                DoctorStatus::Fail,
+                "The configured executable is missing or not trusted; install it or repair the profile.",
+            ),
+            Err(RuntimeFailure::Version) => (
+                DoctorStatus::Fail,
+                "The configured executable's version is unsupported; repair the profile or runtime installation.",
+            ),
+        };
+        checks.push(DoctorCheck::new(check_name, status, detail));
+    }
+    for name in crate::agent::host::RESERVED_RUNTIME_IDS
+        .iter()
+        .copied()
+        .filter(|name| *name != protocol::RuntimeId::SHELL)
+    {
+        if configured_names.contains(name) {
+            continue;
+        }
+        let status = match profiles.resolve_agent(name) {
+            Ok(agent) => profile_runtime_check(profiles, &agent, base_env),
+            Err(_) => Err(RuntimeFailure::OptionalMissing),
+        };
+        let (status, detail) = match status {
+            Ok(()) => (DoctorStatus::Ok, "Optional provider runtime is ready."),
+            Err(RuntimeFailure::Executable) => (
+                DoctorStatus::Warn,
+                "Optional provider executable is missing; install it only if you use this agent.",
+            ),
+            Err(RuntimeFailure::Version) => (
+                DoctorStatus::Fail,
+                "Optional provider's installed version is unsupported; update the provider.",
+            ),
+            Err(RuntimeFailure::PinnedRuntime) => (
+                DoctorStatus::Fail,
+                "The pinned runtime is unavailable; install or select its pinned package again.",
+            ),
+            Err(RuntimeFailure::Profile) => (
+                DoctorStatus::Fail,
+                "The profile is malformed or cannot be resolved securely; repair its file or permissions.",
+            ),
+            Err(RuntimeFailure::OptionalMissing) => (
+                DoctorStatus::Warn,
+                "Optional provider is not installed; install it only if you use this agent.",
+            ),
+        };
+        checks.push(DoctorCheck::new(
+            format!("agent_runtime_{name}"),
+            status,
+            detail,
+        ));
+    }
+    checks
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeFailure {
+    OptionalMissing,
+    Profile,
+    PinnedRuntime,
+    Executable,
+    Version,
+}
+
+/// Validate a profile using the same package and provider-version gates as launch.
+fn profile_runtime_check(
+    profiles: &crate::agent::ProfileRegistry,
+    agent: &crate::agent::ResolvedAgent,
+    base_env: &pohunek_worker_protocol::BaseEnv,
+) -> Result<(), RuntimeFailure> {
+    profiles
+        .runtimes()
+        .verify_launchable(&agent.definition)
+        .map_err(|_error| RuntimeFailure::PinnedRuntime)?;
+    let profile_env = agent
+        .profile
+        .as_ref()
+        .map_or(&[][..], |profile| profile.env.as_slice());
+    let launch_path =
+        crate::runtime::environment::effective_variable(base_env, profile_env, "PATH");
+    if pohunek_platform::shell_env::resolve_executable_in_path_value(
+        std::ffi::OsStr::new(agent.program()),
+        launch_path.as_deref(),
+    )
+    .is_err()
+    {
+        return Err(RuntimeFailure::Executable);
+    }
+    crate::agent::host::validate_launch_runtime(
+        &agent.definition,
+        agent.program(),
+        launch_path.as_deref(),
+    )
+    .map_err(|_error| RuntimeFailure::Version)?;
+    Ok(())
+}
+
+/// Restrict dynamic check-name components to profile-name characters.
+fn safe_profile_name(name: &str) -> String {
+    if crate::project::config::validate_name("agent", name).is_ok() {
+        name.to_owned()
+    } else {
+        "invalid_name".to_owned()
     }
 }
 
@@ -262,9 +415,16 @@ mod tests {
         let paths = paths_at(&root);
 
         let service = crate::governance::HostGovernanceService::open_test();
-        let report = report(&paths, &service, None, &CatalogTrust::Absent)
-            .await
-            .expect("doctor report");
+        let report = report(
+            &paths,
+            &service,
+            None,
+            &CatalogTrust::Absent,
+            &crate::agent::ProfileRegistry::default(),
+            pohunek_worker_protocol::BaseEnv::default(),
+        )
+        .await
+        .expect("doctor report");
 
         assert!(report
             .checks
@@ -335,6 +495,8 @@ mod tests {
             &service,
             None,
             &CatalogTrust::Invalid(AnchorFault::TooLarge),
+            &crate::agent::ProfileRegistry::default(),
+            pohunek_worker_protocol::BaseEnv::default(),
         )
         .await
         .expect("doctor report");

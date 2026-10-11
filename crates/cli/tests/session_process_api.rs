@@ -38,6 +38,7 @@ enum Scenario {
     NativeRecovery,
     GovernanceInspectSuccess,
     GovernanceInspectError,
+    DoctorReport,
     Ambiguous,
     OutputRuntimeChanged,
     SlowWait,
@@ -351,6 +352,56 @@ fn doctor_process_redacts_an_unavailable_local_daemon_in_human_and_json_output()
 }
 
 #[test]
+fn doctor_renders_daemon_profile_failures_and_redacts_details_in_human_and_json() {
+    let home = TestHome::new();
+    let fixture = FixtureDaemon::start(&home.socket(), Scenario::DoctorReport);
+    let json_output = home
+        .command()
+        .args(["doctor", "--json"])
+        .output()
+        .expect("run JSON doctor process");
+    let document: Value = serde_json::from_slice(&json_output.stdout)
+        .unwrap_or_else(|error| panic!("doctor JSON: {error}\n{}", describe(&json_output)));
+    let checks = document["ok"]["checks"].as_array().expect("doctor checks");
+    let profile = checks
+        .iter()
+        .find(|check| check["name"] == "agent_profile_bad-profile")
+        .expect("CLI exposes daemon profile check");
+    assert_eq!(profile["status"], "fail");
+    assert!(!json_output
+        .stdout
+        .windows(b"PROFILE_SECRET_CANARY".len())
+        .any(|window| window == b"PROFILE_SECRET_CANARY"));
+
+    let human = home
+        .command()
+        .arg("doctor")
+        .output()
+        .expect("run human doctor process");
+    let human_text = utf8(&human.stdout);
+    assert!(
+        human_text.contains("agent_profile_bad-profile"),
+        "{}",
+        describe(&human)
+    );
+    assert!(human_text.contains("fail"), "{}", describe(&human));
+    assert!(!human_text.contains("PROFILE_SECRET_CANARY"));
+    assert!(
+        !human.status.success(),
+        "daemon profile failure controls CLI exit status"
+    );
+    let requests = fixture.finish();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method() == protocol::method::DAEMON_DOCTOR)
+            .count(),
+        2,
+        "JSON and human doctor both call daemon.doctor"
+    );
+}
+
+#[test]
 fn doctor_reports_only_a_safe_netbird_self_address() {
     let home = TestHome::new();
     let bin = home.root.join("doctor-netbird-bin");
@@ -656,6 +707,16 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
     }
     let ok = match request.method() {
         protocol::method::SESSION_LIST => session_list(scenario),
+        protocol::method::DAEMON_DOCTOR if matches!(scenario, Scenario::DoctorReport) => json!({
+            "report": {
+                "overall": "fail",
+                "checks": [{
+                    "name": "agent_profile_bad-profile",
+                    "status": "fail",
+                    "detail": "The profile is malformed; repair its configuration."
+                }]
+            }
+        }),
         protocol::method::SESSION_INSPECT => {
             session_for_scenario(SESSION_ID, Some(SESSION_NAME), scenario)
         }
