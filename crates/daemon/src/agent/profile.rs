@@ -241,6 +241,14 @@ impl ResolvedAgent {
     }
 }
 
+type DoctorProfileResult = (String, Result<ResolvedAgent, DoctorProfileError>);
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DoctorProfileError {
+    Invalid,
+    RuntimeUnavailable,
+}
+
 /// Loads + resolves host agent profiles from `<config_dir>/agents`.
 ///
 /// Resolution is on demand (per `session.new`), but the **owner-only security gate**
@@ -254,6 +262,8 @@ pub(crate) struct ProfileRegistry {
     /// The `agents/` directory, or `None` when the host-config layer is disabled
     /// (unconfigured, absent, or failing the owner-only gate).
     dir: Option<PathBuf>,
+    /// Original path, retained to report when the owner-only gate rejected it.
+    configured_dir: Option<PathBuf>,
     /// Resolves the base runtime a name or profile extends.
     runtimes: RuntimeHost,
     /// Host-local key that turns profile launch inputs into revisions.
@@ -272,12 +282,64 @@ impl ProfileRegistry {
         &self.runtimes
     }
 
+    /// Return configured profiles, including entries omitted by normal enumeration.
+    pub(crate) fn doctor_profiles(&self) -> Result<Vec<DoctorProfileResult>, &'static str> {
+        let Some(configured_dir) = &self.configured_dir else {
+            return Ok(Vec::new());
+        };
+        if self.dir.is_none() {
+            return Err("the configured agents directory is not owner-secure");
+        }
+        let entries = match std::fs::read_dir(configured_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(_error) => return Err("the configured agents directory cannot be listed"),
+        };
+        let mut profiles = Vec::new();
+        let mut scanned = 0_usize;
+        for entry in entries {
+            scanned += 1;
+            if scanned > MAX_SCANNED_PROFILES {
+                return Err("the configured agents directory has too many entries to inspect");
+            }
+            let entry =
+                entry.map_err(|_error| "the configured agents directory cannot be listed")?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                profiles.push(("invalid-name".to_owned(), Err(DoctorProfileError::Invalid)));
+                continue;
+            };
+            let result = if let Some(dir) = &self.dir {
+                read_profile_text(dir, name, &path)
+                    .map_err(|_error| DoctorProfileError::Invalid)
+                    .and_then(|_| {
+                        self.resolve_agent(name)
+                            .map_err(|error| match error.code.as_str() {
+                                "runtime_not_installed" | "runtime_incompatible" => {
+                                    DoctorProfileError::RuntimeUnavailable
+                                }
+                                _ => DoctorProfileError::Invalid,
+                            })
+                    })
+            } else {
+                Err(DoctorProfileError::Invalid)
+            };
+            profiles.push((name.to_owned(), result));
+        }
+        profiles.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(profiles)
+    }
+
     pub(crate) fn with_runtimes(dir: Option<PathBuf>, runtimes: RuntimeHost) -> Self {
         // C.5: gate the whole tree once at boot. An insecure `agents/` OR
         // `agents/manifests/` disables every host profile (fail-closed) — a
         // world-writable manifests dir means no manifest can be trusted, so no
         // profile may load. An absent dir is not "insecure" (there are simply no
         // profiles); the gate only rejects a present-but-unsafe dir.
+        let configured_dir = dir.clone();
         let dir = dir.filter(|dir| {
             let manifests = dir.join("manifests");
             let secure = dir_is_owner_secure(dir) && dir_is_owner_secure(&manifests);
@@ -291,6 +353,7 @@ impl ProfileRegistry {
         });
         Self {
             dir,
+            configured_dir,
             runtimes,
             revision_keys: Arc::default(),
         }

@@ -32,7 +32,8 @@ pub mod macos;
 
 pub use executable::{is_executable_file, resolve_executable};
 pub use macos::{
-    apply_supervision, doctor_request_timeout, LAUNCHD_CHECKS, PROBE_BUDGET, REPLY_HEADROOM,
+    apply_supervision, doctor_request_timeout, AGENT_RUNTIME_PROBE_BUDGET, LAUNCHD_CHECKS,
+    PROBE_BUDGET, REPLY_HEADROOM,
 };
 pub use macos::{
     resolve_worker_candidate, AccessDir, DomainProbe, MacosFacts, ProcessRunner, RunOutcome,

@@ -5,9 +5,10 @@
 //! that owns the agent runtime and assembles them into a [`DoctorReport`].
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use hostcheck::{StandardCheckInputs, Supervision, WorkerCandidate, WorkerSource};
-use protocol::{DoctorCheck, DoctorReport, DoctorStatus, QuarantineReason};
+use protocol::{DoctorCheck, DoctorReport, DoctorStatus, QuarantineReason, MAX_CONTROL_LINE_BYTES};
 
 use crate::catalog_anchor::{AnchorFault, CatalogTrust};
 use crate::governance::{HostGovernanceDiagnostic, HostGovernanceService};
@@ -36,6 +37,8 @@ pub(crate) async fn report(
     governance: &HostGovernanceService,
     supervision: Option<ActiveSupervision>,
     catalog_trust: &CatalogTrust,
+    profiles: &crate::agent::ProfileRegistry,
+    base_env: pohunek_worker_protocol::BaseEnv,
 ) -> Result<DoctorReport, DoctorReportError> {
     let paths = paths.clone();
     let mode = supervision_mode(supervision.as_ref());
@@ -47,9 +50,54 @@ pub(crate) async fn report(
         tokio::task::spawn_blocking(move || standard_checks(&paths, worker.as_ref(), mode))
             .await
             .map_err(|_error| DoctorReportError)?;
+    let profiles = profiles.clone();
+    checks.extend(
+        tokio::task::spawn_blocking(move || profile_checks(&profiles, &base_env))
+            .await
+            .unwrap_or_else(|_| vec![check("agent_profiles", DoctorStatus::Fail, "Configured agent profiles could not be inspected; check daemon logs and profile ownership.")]),
+    );
     checks.extend(governance_checks(governance.diagnose().await));
     checks.push(catalog_trust_check(catalog_trust));
-    Ok(DoctorReport::from_checks(checks))
+    Ok(bounded_report(checks))
+}
+
+/// Space held for the response envelope around the JSON doctor report.
+const DOCTOR_RESPONSE_HEADROOM_BYTES: usize = 1024;
+const MAX_DOCTOR_REPORT_BYTES: usize = MAX_CONTROL_LINE_BYTES - DOCTOR_RESPONSE_HEADROOM_BYTES;
+
+/// Keep the report inside the control-line limit and make omitted findings explicit.
+fn bounded_report(checks: Vec<DoctorCheck>) -> DoctorReport {
+    let report = DoctorReport::from_checks(checks.clone());
+    if serde_json::to_vec(&report)
+        .is_ok_and(|serialized| serialized.len() <= MAX_DOCTOR_REPORT_BYTES)
+    {
+        return report;
+    }
+
+    let truncated = DoctorCheck::new(
+        "doctor_checks_truncated",
+        DoctorStatus::Fail,
+        "Doctor findings exceeded the response-size limit; some checks were omitted.",
+    );
+    let truncated_bytes = serde_json::to_vec(&truncated).unwrap_or_default();
+    let template_bytes =
+        serde_json::to_vec(&DoctorReport::from_checks(vec![truncated.clone()])).unwrap_or_default();
+    let report_overhead = template_bytes.len().saturating_sub(truncated_bytes.len());
+    let mut retained = Vec::new();
+    let mut serialized_len = report_overhead.saturating_add(truncated_bytes.len());
+    for check in checks {
+        let check_bytes = serde_json::to_vec(&check).unwrap_or_default();
+        let next_len = serialized_len
+            .saturating_add(check_bytes.len())
+            .saturating_add(1);
+        if next_len > MAX_DOCTOR_REPORT_BYTES {
+            break;
+        }
+        retained.push(check);
+        serialized_len = next_len;
+    }
+    retained.push(truncated);
+    DoctorReport::from_checks(retained)
 }
 
 /// The launchd-relevant supervision mode: native jobs, direct children, or
@@ -59,6 +107,169 @@ fn supervision_mode(active: Option<&ActiveSupervision>) -> Supervision {
         Some(active) if active.native => Supervision::Native,
         Some(_) => Supervision::Subprocess,
         None => Supervision::Unknown,
+    }
+}
+
+/// Check configured profile resolution and the readiness of optional providers.
+fn profile_checks(
+    profiles: &crate::agent::ProfileRegistry,
+    base_env: &pohunek_worker_protocol::BaseEnv,
+) -> Vec<DoctorCheck> {
+    let probe_started = Instant::now();
+    let configured = match profiles.doctor_profiles() {
+        Ok(configured) => configured,
+        Err(detail) => return vec![check("agent_profiles", DoctorStatus::Fail, detail)],
+    };
+    let configured_names: std::collections::HashSet<String> =
+        configured.iter().map(|(name, _)| name.clone()).collect();
+    let mut checks = Vec::new();
+    for (name, result) in configured {
+        let safe_name = safe_profile_name(&name);
+        let check_name = format!("agent_profile_{safe_name}");
+        let result = match result {
+            Ok(agent) => profile_runtime_check(profiles, &agent, base_env, probe_started),
+            Err(crate::agent::DoctorProfileError::RuntimeUnavailable) => {
+                Err(RuntimeFailure::PinnedRuntime)
+            }
+            Err(crate::agent::DoctorProfileError::Invalid) => Err(RuntimeFailure::Profile),
+        };
+        let (status, detail) = match result {
+            Ok(()) => (
+                DoctorStatus::Ok,
+                "Configured profile and runtime are ready.",
+            ),
+            Err(RuntimeFailure::OptionalMissing) => (
+                DoctorStatus::Fail,
+                "The configured profile runtime is unavailable; repair the profile or install its runtime.",
+            ),
+            Err(RuntimeFailure::PinnedRuntime) => (
+                DoctorStatus::Fail,
+                "The pinned runtime is unavailable; install or select its pinned package again.",
+            ),
+            Err(RuntimeFailure::Profile) => (
+                DoctorStatus::Fail,
+                "The profile is malformed or cannot be resolved securely; repair its file or permissions.",
+            ),
+            Err(RuntimeFailure::Executable) => (
+                DoctorStatus::Fail,
+                "The configured executable is missing or not trusted; install it or repair the profile.",
+            ),
+            Err(RuntimeFailure::Version) => (
+                DoctorStatus::Fail,
+                "The configured executable's version is unsupported; repair the profile or runtime installation.",
+            ),
+            Err(RuntimeFailure::ProbeBudget) => (
+                DoctorStatus::Fail,
+                "The configured runtime version was not checked because the doctor probe budget was exhausted.",
+            ),
+        };
+        checks.push(DoctorCheck::new(check_name, status, detail));
+    }
+    for name in crate::agent::host::RESERVED_RUNTIME_IDS
+        .iter()
+        .copied()
+        .filter(|name| *name != protocol::RuntimeId::SHELL)
+    {
+        if configured_names.contains(name) {
+            continue;
+        }
+        let status = match profiles.resolve_agent(name) {
+            Ok(agent) => profile_runtime_check(profiles, &agent, base_env, probe_started),
+            Err(_) => Err(RuntimeFailure::OptionalMissing),
+        };
+        let (status, detail) = match status {
+            Ok(()) => (DoctorStatus::Ok, "Optional provider runtime is ready."),
+            Err(RuntimeFailure::Executable) => (
+                DoctorStatus::Warn,
+                "Optional provider executable is missing; install it only if you use this agent.",
+            ),
+            Err(RuntimeFailure::Version) => (
+                DoctorStatus::Fail,
+                "Optional provider's installed version is unsupported; update the provider.",
+            ),
+            Err(RuntimeFailure::PinnedRuntime) => (
+                DoctorStatus::Fail,
+                "The pinned runtime is unavailable; install or select its pinned package again.",
+            ),
+            Err(RuntimeFailure::Profile) => (
+                DoctorStatus::Fail,
+                "The profile is malformed or cannot be resolved securely; repair its file or permissions.",
+            ),
+            Err(RuntimeFailure::OptionalMissing) => (
+                DoctorStatus::Warn,
+                "Optional provider is not installed; install it only if you use this agent.",
+            ),
+            Err(RuntimeFailure::ProbeBudget) => (
+                DoctorStatus::Warn,
+                "Optional provider version was not checked because the doctor probe budget was exhausted.",
+            ),
+        };
+        checks.push(DoctorCheck::new(
+            format!("agent_runtime_{name}"),
+            status,
+            detail,
+        ));
+    }
+    checks
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeFailure {
+    OptionalMissing,
+    Profile,
+    PinnedRuntime,
+    Executable,
+    Version,
+    ProbeBudget,
+}
+
+/// Validate a profile using the same package and provider-version gates as launch.
+fn profile_runtime_check(
+    profiles: &crate::agent::ProfileRegistry,
+    agent: &crate::agent::ResolvedAgent,
+    base_env: &pohunek_worker_protocol::BaseEnv,
+    probe_started: Instant,
+) -> Result<(), RuntimeFailure> {
+    profiles
+        .runtimes()
+        .verify_launchable(&agent.definition)
+        .map_err(|_error| RuntimeFailure::PinnedRuntime)?;
+    let profile_env = agent
+        .profile
+        .as_ref()
+        .map_or(&[][..], |profile| profile.env.as_slice());
+    let launch_path =
+        crate::runtime::environment::effective_variable(base_env, profile_env, "PATH");
+    if crate::agent::which_executable(agent.program()).is_none() {
+        return Err(RuntimeFailure::Executable);
+    }
+    let probe_timeout = if agent.definition.version_probe_parser().is_some() {
+        hostcheck::AGENT_RUNTIME_PROBE_BUDGET.saturating_sub(probe_started.elapsed())
+    } else {
+        Duration::ZERO
+    };
+    if agent.definition.version_probe_parser().is_some() && probe_timeout.is_zero() {
+        return Err(RuntimeFailure::ProbeBudget);
+    }
+    crate::agent::host::validate_launch_runtime_with_timeout_detailed(
+        &agent.definition,
+        agent.program(),
+        launch_path.as_deref(),
+        probe_timeout,
+    )
+    .map_err(|error| match error {
+        crate::capabilities::LaunchValidationFailure::ProbeTimedOut => RuntimeFailure::ProbeBudget,
+        crate::capabilities::LaunchValidationFailure::Unsupported => RuntimeFailure::Version,
+    })?;
+    Ok(())
+}
+
+/// Restrict dynamic check-name components to profile-name characters.
+fn safe_profile_name(name: &str) -> String {
+    if crate::project::config::validate_name("agent", name).is_ok() {
+        name.to_owned()
+    } else {
+        "invalid_name".to_owned()
     }
 }
 
@@ -262,9 +473,16 @@ mod tests {
         let paths = paths_at(&root);
 
         let service = crate::governance::HostGovernanceService::open_test();
-        let report = report(&paths, &service, None, &CatalogTrust::Absent)
-            .await
-            .expect("doctor report");
+        let report = report(
+            &paths,
+            &service,
+            None,
+            &CatalogTrust::Absent,
+            &crate::agent::ProfileRegistry::default(),
+            pohunek_worker_protocol::BaseEnv::default(),
+        )
+        .await
+        .expect("doctor report");
 
         assert!(report
             .checks
@@ -335,6 +553,8 @@ mod tests {
             &service,
             None,
             &CatalogTrust::Invalid(AnchorFault::TooLarge),
+            &crate::agent::ProfileRegistry::default(),
+            pohunek_worker_protocol::BaseEnv::default(),
         )
         .await
         .expect("doctor report");

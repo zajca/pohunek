@@ -175,3 +175,18 @@ pub(crate) fn validate_launch_runtime(
 ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
     crate::capabilities::validate_definition_launch(definition, program, launch_path)
 }
+
+/// Validate a launch runtime while preserving a shortened-budget timeout.
+pub(crate) fn validate_launch_runtime_with_timeout_detailed(
+    definition: &RuntimeDefinition,
+    program: &str,
+    launch_path: Option<&std::ffi::OsStr>,
+    timeout: std::time::Duration,
+) -> Result<Option<ValidatedLaunchProgram>, crate::capabilities::LaunchValidationFailure> {
+    crate::capabilities::validate_definition_launch_with_timeout_detailed(
+        definition,
+        program,
+        launch_path,
+        timeout,
+    )
+}
