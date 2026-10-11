@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 import subprocess
@@ -1735,18 +1736,28 @@ class TierTimingTests(CliHarness):
         self.assertEqual(all_attempts["nightly"]["runs"], 0)
 
     def test_tiers_classify_only_known_workflow_dispatch_markers(self):
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        run_name = re.search(r"(?m)^run-name: (.+)$", workflow)
+        self.assertIsNotNone(run_name)
+        assert run_name is not None
+        self.assertIn("github.event_name == 'workflow_dispatch'", run_name.group(1))
+        self.assertIn("format('CI [tier={0}]', inputs.tier)", run_name.group(1))
+
         documents = []
-        for run_id, title in (
-            (101, "CI [tier=main] manual production measurement"),
-            (102, "CI [tier=nightly] manual nightly measurement"),
-            (103, "CI [tier=mainish] unknown marker"),
-            (104, "CI manual run without marker"),
+        for run_id, tier in (
+            (101, "main"),
+            (102, "nightly"),
+            (103, "mainish"),
+            (104, None),
         ):
             run = self._document(
                 run_id, created="2026-09-20T10:00:00Z",
                 updated="2026-09-20T10:05:00Z", event="workflow_dispatch",
             )
-            run["displayTitle"] = title
+            if tier is None:
+                run["displayTitle"] = "CI manual run without marker"
+            else:
+                run["displayTitle"] = f"CI [tier={tier}]"
             documents.append(run)
         snapshot = self.write_snapshot("dispatch.json", documents)
         payload = self.run_json("tiers", "--input", snapshot)

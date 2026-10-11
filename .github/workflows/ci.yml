@@ -28,6 +28,8 @@ on:
   schedule:
     - cron: '0 5 * * *'
 
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('CI [tier={0}]', inputs.tier) || ' ' }}
+
 
 # Cancel superseded PR and main runs on the same ref. Each scheduled or manual
 # run gets its own group, so neither cancels those latest-wins streams.
