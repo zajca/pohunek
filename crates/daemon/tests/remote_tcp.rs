@@ -1078,6 +1078,11 @@ fn write_manifest_doctor_fixture(root: &Path) -> (PathBuf, PathBuf) {
         .expect("write outside manifest canary");
     std::os::unix::fs::symlink(&outside, manifests.join("unsafe.toml"))
         .expect("link manifest outside the trusted tree");
+    std::os::unix::fs::symlink(
+        root.join("DANGLING_MANIFEST_SECRET_CANARY"),
+        manifests.join("dangling.toml"),
+    )
+    .expect("link an unreferenced manifest to a missing target");
     std::fs::set_permissions(
         manifests.join("empty.toml"),
         std::fs::Permissions::from_mode(0o600),
@@ -1143,10 +1148,12 @@ async fn daemon_doctor_reports_embedded_and_override_manifest_health_redacted() 
         );
     }
     assert_eq!(find("agent_manifest_override_unused")["status"], "warn");
+    assert_eq!(find("agent_manifest_override_dangling")["status"], "warn");
     let rendered = serde_json::to_string(&payload).expect("serialize doctor payload");
     assert!(!rendered.contains("MANIFEST_SECRET_CANARY"));
     assert!(!rendered.contains("MANIFEST_UNUSED_CANARY"));
     assert!(!rendered.contains("MANIFEST_UNSAFE_CANARY"));
+    assert!(!rendered.contains("DANGLING_MANIFEST_SECRET_CANARY"));
     assert!(!rendered.contains(outside.to_string_lossy().as_ref()));
 
     let _ = shutdown.send(());

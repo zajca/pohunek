@@ -366,11 +366,19 @@ impl ProfileRegistry {
         }
 
         let manifest_dir = dir.join("manifests");
-        let overrides = scanned_profile_files(&manifest_dir)
+        let overrides = scanned_manifest_candidates(&manifest_dir)
             .map_err(|_error| "configured detection manifests cannot be inspected")?;
-        let present: HashSet<String> = overrides.iter().map(|(name, _)| name.clone()).collect();
+        let present: HashSet<String> = overrides.iter().filter_map(Clone::clone).collect();
         let mut results = Vec::new();
-        for (name, _) in overrides {
+        for candidate in overrides {
+            let Some(name) = candidate else {
+                results.push((
+                    "invalid-name".to_owned(),
+                    false,
+                    Err(DoctorManifestError::Invalid),
+                ));
+                continue;
+            };
             let is_referenced = referenced.remove(&name);
             let result = resolve_manifest(&name, dir, Some(&name))
                 .map(|source| source.is_some_and(|source| source.disables_detection()))
@@ -675,6 +683,39 @@ fn scanned_profile_files(dir: &Path) -> std::io::Result<Vec<(String, PathBuf)>> 
         }
     }
     Ok(files)
+}
+
+/// TOML manifest candidates for doctor, including entries the resolver rejects.
+///
+/// Unlike profile enumeration, diagnostics must see dangling links and
+/// non-regular files so the resolver can report them as invalid. The scan keeps
+/// the same entry bound and missing-directory behavior as profile scanning.
+fn scanned_manifest_candidates(dir: &Path) -> std::io::Result<Vec<Option<String>>> {
+    let mut candidates = Vec::new();
+    let mut seen = 0_usize;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidates),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        seen += 1;
+        if seen > MAX_SCANNED_PROFILES {
+            return Err(std::io::Error::other(
+                "the agents directory holds too many entries to scan",
+            ));
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+            continue;
+        }
+        candidates.push(
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_owned),
+        );
+    }
+    Ok(candidates)
 }
 
 /// Largest profile file read, by a launch and by the retention scan alike: 1 MiB.
