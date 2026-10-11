@@ -1,0 +1,109 @@
+name: Work item
+description: Propose a public, reviewable unit of work
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Keep this issue self-contained and public. Do not include secrets or require access to the private Pohunek Project. Read the [contribution and readiness rules](https://github.com/zajca/pohunek/blob/main/.github/agent-workflow.json) and [workflow guidance](https://github.com/zajca/pohunek/blob/main/.agents/skills/github-workflow/SKILL.md).
+  - type: textarea
+    id: objective
+    attributes:
+      label: Objective
+      description: State the outcome and who benefits.
+      placeholder: One clear outcome.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and non-goals
+      description: Bound the change and name nearby work that is out of scope.
+    validations:
+      required: true
+  - type: textarea
+    id: criteria
+    attributes:
+      label: Definition of done
+      description: Use stable IDs D1, D2, ... so a PR can report evidence for each criterion.
+      placeholder: |
+        - D1: ...
+        - D2: ...
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: Link prerequisites with issue numbers. Maintainers record native blocking/dependency links; text links alone do not prove that relationship.
+      placeholder: None, or Depends on #123.
+  - type: textarea
+    id: entry-points
+    attributes:
+      label: Likely code entry points
+      description: Name likely files, crates, packages, or workflows. Mark unknown locations as unknown.
+    validations:
+      required: true
+  - type: dropdown
+    id: capability
+    attributes:
+      label: Capability class
+      description: Choose the main capability needed; add other relevant classes in the details.
+      options:
+        - docs
+        - rust
+        - typescript-sdk
+        - platform-native
+        - github-workflow
+        - verification
+    validations:
+      required: true
+  - type: dropdown
+    id: size
+    attributes:
+      label: Size
+      description: Scope cue, not a promised time budget. S is one bounded change; M spans related changes/components; L is broad and should normally be split.
+      options:
+        - S
+        - M
+        - L
+    validations:
+      required: true
+  - type: dropdown
+    id: readiness
+    attributes:
+      label: Readiness
+      description: Eligibility only. It never proves that work is vacant or grants a reservation. New proposals should remain design-needed until a maintainer reviews the public record.
+      options:
+        - design-needed
+        - blocked
+        - ready
+    validations:
+      required: true
+  - type: textarea
+    id: prerequisites
+    attributes:
+      label: Platform and runtime prerequisites
+      description: List required OS, architecture, services, tools, credentials, or test cost. State None when there are no special prerequisites.
+      placeholder: None, or Linux x86_64 with a running user systemd manager.
+    validations:
+      required: true
+  - type: textarea
+    id: checks
+    attributes:
+      label: Focused verification plan
+      description: Give exact commands and expected evidence. Mark unavailable checks as skipped or unverified; do not imply they passed.
+      placeholder: |
+        - `exact command` — expected result
+    validations:
+      required: true
+  - type: textarea
+    id: review-route
+    attributes:
+      label: Review route
+      description: Name the area. zajca is the maintainer triage, routing, and integration contact; an available independent reviewer examines the area. If none is available, the candidate remains unaccepted and no response-time promise applies. The submitter cannot provide independent approval; an author, executor, or manager cannot satisfy required independent review. Automated review counts only after the exact head and completed run are verified and #700 resolves the reviewer-service defect.
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        Readiness labels (`readiness:ready`, `readiness:design-needed`, `readiness:blocked`) are a maintainer-managed public projection. `Todo`, `In Progress`, and `Done` are separate delivery statuses. Until the claim service in #805–#811 ships, a maintainer must reconcile active work and explicitly confirm a manual reservation; a label, assignment, or unanswered request is not a grant. Outside contributors do not need private Project access.

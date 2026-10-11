@@ -99,6 +99,53 @@ issue stays open at `In Progress` until its own DoD is met.
   and their results), handoffs between agents, blockers, and the reason for
   any status change. Never overwrite or delete another author's comment.
 
+## Public contribution readiness
+
+Use `.github/ISSUE_TEMPLATE/work-item.yml` for new public work proposals and
+`.github/pull_request_template.md` to report a candidate. The vocabulary and
+label names live in `publicContribution` in `.github/agent-workflow.json`.
+Keep issue scope, stable `D1…Dn` criteria, dependencies, likely entry points,
+capability, size, prerequisites, focused checks, and a proposed review route
+in the public issue; do not require private Project access.
+
+Readiness is separate from delivery status. `ready` means only that the issue
+is eligible for consideration: its scope and checks are actionable, named
+dependencies and prerequisites are resolved, an available review route is
+identified, and no active recognized assignment or linked active PR makes
+immediate work misleading. It is not proof of vacancy or a reservation grant.
+`design-needed` means a decision or
+contract needed to implement remains open; `blocked` names a dependency or
+external prerequisite that prevents starting. Maintainers manage the public
+`readiness:*` labels manually. `Todo`, `In Progress`, and `Done` keep the
+meanings in `statusSemantics`; do not infer readiness from a Project status.
+
+Until the transactional claim service in #805–#811 ships, reconcile public
+issues, comments, assignments, and linked PRs before explicitly confirming a
+manual reservation. A label, assignment, request, or unanswered comment is
+not a grant. Do not invent a claim command or imply that a public label locks
+work. Automatic bounded admission begins only after the service is delivered.
+`zajca` is the maintainer triage, routing, and integration contact across
+areas. An available independent reviewer examines the relevant code, contract,
+and evidence for the area. If no independent reviewer is available, the
+candidate remains unaccepted; the maintainer records that state and retries
+routing when capacity exists. Do not promise a response time. An automated
+review counts only after the exact PR head and completed run are verified and
+#700 resolves the reviewer-service defect; interrupted or stale-head runs are
+not approval. The submitter cannot provide independent approval; an author,
+executor, or manager cannot satisfy a required independent review. Outside
+contributors receive no merge or release authority.
+
+Use the capability classes and S/M/L size meanings in the config as scope
+cues, not model-brand gates or time promises. Keep readiness labels separate
+from capability labels and delivery status. Link native dependency relations
+when available; a textual `Depends on #N` alone does not prove the relation.
+
+In the PR template, bind every criterion and check result to the exact
+candidate SHA and base. Record exact commands as `passed`, `failed`, `skipped`
+(with reason), or `unverified`; list remaining criteria and unresolved work.
+Update the evidence whenever the candidate changes. Review and submission do
+not grant merge or release authority.
+
 ## Project membership and status
 
 Actionable tracked work joins the configured default project and stays there
