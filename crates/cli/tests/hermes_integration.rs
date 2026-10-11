@@ -364,6 +364,54 @@ esac"#,
     let current = parse_ok(&run(&fixture, &status_json_arguments));
     assert_eq!(current["outdated"], false);
 
+    // The immediately previous release owned the original eight-file set.
+    // It remains readable for a safe update and uninstall, but is always outdated.
+    let reporter_path = plugin_root.join("_pohunek_reporter.py");
+    let marker_path = plugin_root.join(".pohunek-owned.json");
+    let current_marker = fs::read(&marker_path).expect("read current ownership marker");
+    let mut previous_marker: Value =
+        serde_json::from_slice(&current_marker).expect("parse current ownership marker");
+    previous_marker["assets"]
+        .as_object_mut()
+        .expect("asset map")
+        .remove("_pohunek_reporter.py");
+    fs::remove_file(&reporter_path).expect("remove reporter absent from previous inventory");
+    fs::write(
+        &marker_path,
+        serde_json::to_vec_pretty(&previous_marker).expect("serialize previous marker"),
+    )
+    .expect("write previous marker");
+    set_mode(&marker_path, 0o600);
+    let previous_status = parse_ok(&run(&fixture, &status_json_arguments));
+    assert_eq!(previous_status["outdated"], true);
+    assert_eq!(previous_status["modified"], false);
+
+    let mut arbitrary_inventory = previous_marker.clone();
+    arbitrary_inventory["assets"]["arbitrary.py"] = json!("0".repeat(64));
+    fs::write(
+        &marker_path,
+        serde_json::to_vec_pretty(&arbitrary_inventory).expect("serialize arbitrary marker"),
+    )
+    .expect("write arbitrary marker");
+    set_mode(&marker_path, 0o600);
+    assert_eq!(
+        parse_error(&run(&fixture, &status_json_arguments))["code"],
+        "hermes_invalid_marker"
+    );
+    fs::write(
+        &marker_path,
+        serde_json::to_vec_pretty(&previous_marker).expect("serialize previous marker"),
+    )
+    .expect("restore previous marker");
+    set_mode(&marker_path, 0o600);
+
+    let updated_previous = parse_ok(&run(&fixture, &modified_update));
+    assert_eq!(updated_previous["modified"], false);
+    assert_eq!(
+        parse_ok(&run(&fixture, &status_json_arguments))["outdated"],
+        false
+    );
+
     let doctor = run(
         &fixture,
         &[
@@ -436,6 +484,21 @@ esac"#,
 
     fs::write(plugin_root.join("hooks.py"), b"# explicitly modified\n")
         .expect("mutate managed plugin before uninstall");
+    let mut previous_uninstall_marker: Value =
+        serde_json::from_slice(&fs::read(&marker_path).expect("read marker before uninstall"))
+            .expect("parse marker before uninstall");
+    previous_uninstall_marker["assets"]
+        .as_object_mut()
+        .expect("asset map")
+        .remove("_pohunek_reporter.py");
+    fs::remove_file(plugin_root.join("_pohunek_reporter.py"))
+        .expect("remove asset absent from previous inventory");
+    fs::write(
+        &marker_path,
+        serde_json::to_vec_pretty(&previous_uninstall_marker).expect("serialize previous marker"),
+    )
+    .expect("write previous uninstall marker");
+    set_mode(&marker_path, 0o600);
     let uninstall_arguments = [
         "integration",
         "uninstall",
