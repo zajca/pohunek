@@ -10,17 +10,30 @@ import struct
 import sys
 import tempfile
 import threading
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
 
-HOOKS_PATH = Path(__file__).parents[1] / "pohunek" / "hooks.py"
-SPEC = importlib.util.spec_from_file_location("pohunek_hooks_under_test", HOOKS_PATH)
-assert SPEC is not None and SPEC.loader is not None
-hooks = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = hooks
-SPEC.loader.exec_module(hooks)
+PACKAGE_PATH = Path(__file__).parents[1] / "pohunek"
+package = types.ModuleType("pohunek")
+package.__path__ = [str(PACKAGE_PATH)]
+sys.modules["pohunek"] = package
+
+REPORTER_PATH = PACKAGE_PATH / "_pohunek_reporter.py"
+REPORTER_SPEC = importlib.util.spec_from_file_location("pohunek._pohunek_reporter", REPORTER_PATH)
+assert REPORTER_SPEC is not None and REPORTER_SPEC.loader is not None
+core_reporter = importlib.util.module_from_spec(REPORTER_SPEC)
+sys.modules[REPORTER_SPEC.name] = core_reporter
+REPORTER_SPEC.loader.exec_module(core_reporter)
+
+HOOKS_PATH = PACKAGE_PATH / "hooks.py"
+HOOKS_SPEC = importlib.util.spec_from_file_location("pohunek.hooks", HOOKS_PATH)
+assert HOOKS_SPEC is not None and HOOKS_SPEC.loader is not None
+hooks = importlib.util.module_from_spec(HOOKS_SPEC)
+sys.modules[HOOKS_SPEC.name] = hooks
+HOOKS_SPEC.loader.exec_module(hooks)
 HookReporter = hooks.HookReporter
 
 
@@ -53,30 +66,30 @@ def _host_start_identity() -> int:
 class StartIdentityTests(unittest.TestCase):
     def test_darwin_layout_decodes_the_rust_backend_encoding(self) -> None:
         self.assertEqual(len(_BSDINFO_PID_4242), 136)
-        self.assertEqual(hooks._darwin_start_identity_from_bsdinfo(_BSDINFO_PID_4242, 4242), 1_700_000_000_123_456)
+        self.assertEqual(core_reporter._darwin_start_identity_from_bsdinfo(_BSDINFO_PID_4242, 4242), 1_700_000_000_123_456)
 
     def test_darwin_layout_rejects_foreign_pid_short_buffer_and_bad_microseconds(self) -> None:
-        self.assertIsNone(hooks._darwin_start_identity_from_bsdinfo(_BSDINFO_PID_4242, 4243))
-        self.assertIsNone(hooks._darwin_start_identity_from_bsdinfo(_BSDINFO_PID_4242[:-1], 4242))
-        self.assertIsNone(hooks._darwin_start_identity_from_bsdinfo(b"", 4242))
+        self.assertIsNone(core_reporter._darwin_start_identity_from_bsdinfo(_BSDINFO_PID_4242, 4243))
+        self.assertIsNone(core_reporter._darwin_start_identity_from_bsdinfo(_BSDINFO_PID_4242[:-1], 4242))
+        self.assertIsNone(core_reporter._darwin_start_identity_from_bsdinfo(b"", 4242))
         scaled = bytearray(_BSDINFO_PID_4242)
         struct.pack_into("<Q", scaled, 128, 1_000_000)
-        self.assertIsNone(hooks._darwin_start_identity_from_bsdinfo(bytes(scaled), 4242))
+        self.assertIsNone(core_reporter._darwin_start_identity_from_bsdinfo(bytes(scaled), 4242))
         overflowing = bytearray(_BSDINFO_PID_4242)
         struct.pack_into("<Q", overflowing, 120, 2**64 - 1)
-        self.assertIsNone(hooks._darwin_start_identity_from_bsdinfo(bytes(overflowing), 4242))
+        self.assertIsNone(core_reporter._darwin_start_identity_from_bsdinfo(bytes(overflowing), 4242))
 
     def test_platform_dispatch_selects_the_matching_derivation(self) -> None:
-        with mock.patch.object(hooks.sys, "platform", "darwin"), \
-                mock.patch.object(hooks, "_darwin_process_start_identity", return_value=7) as darwin, \
-                mock.patch.object(hooks, "_linux_process_start_identity", return_value=9) as linux:
-            self.assertEqual(hooks._process_start_identity(1), 7)
+        with mock.patch.object(core_reporter.sys, "platform", "darwin"), \
+                mock.patch.object(core_reporter, "_darwin_process_start_identity", return_value=7) as darwin, \
+                mock.patch.object(core_reporter, "_linux_process_start_identity", return_value=9) as linux:
+            self.assertEqual(core_reporter._process_start_identity(1), 7)
         darwin.assert_called_once_with(1)
         linux.assert_not_called()
-        with mock.patch.object(hooks.sys, "platform", "linux"), \
-                mock.patch.object(hooks, "_darwin_process_start_identity", return_value=7) as darwin, \
-                mock.patch.object(hooks, "_linux_process_start_identity", return_value=9) as linux:
-            self.assertEqual(hooks._process_start_identity(1), 9)
+        with mock.patch.object(core_reporter.sys, "platform", "linux"), \
+                mock.patch.object(core_reporter, "_darwin_process_start_identity", return_value=7) as darwin, \
+                mock.patch.object(core_reporter, "_linux_process_start_identity", return_value=9) as linux:
+            self.assertEqual(core_reporter._process_start_identity(1), 9)
         linux.assert_called_once_with(1)
         darwin.assert_not_called()
 
@@ -99,11 +112,11 @@ class StartIdentityTests(unittest.TestCase):
 
             thread = threading.Thread(target=serve, daemon=True)
             thread.start()
-            reporter = HookReporter({
+            reporter = HookReporter(core_reporter.Reporter("hermes", environ={
                 "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_WORKER_INSTANCE_ID": "r-1",
                 "POHUNEK_WORKER_SOCKET_PATH": endpoint, "POHUNEK_PROTOCOL_VERSION": "1",
                 "POHUNEK_HOOK_TIMEOUT_MS": "1000",
-            })
+            }))
             self.assertTrue(reporter.active)
             reporter.on_session_start({"session_id": "native"})
             thread.join(timeout=5)

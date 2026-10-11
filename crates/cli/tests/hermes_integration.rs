@@ -94,6 +94,80 @@ fn parse_error(output: &Output) -> Value {
 }
 
 #[test]
+fn binary_install_uses_the_checked_embedded_operator_skill() {
+    let fixture = Fixture::new("operator-skill");
+    let home = fixture.private_directory("home");
+    fixture.private_directory("home/.hermes/profiles/default");
+    fixture.private_directory("state");
+    fixture.private_directory("run");
+    fixture.private_directory("data");
+    fixture.private_directory("config");
+    fixture.private_directory("cache");
+    let venv_bin = fixture.private_directory("installation/venv/bin");
+    let python_bin = fixture.private_directory("installation/python/bin");
+    write_executable(
+        &python_bin.join("python3"),
+        &format!("exec '{}' \"$@\"", interpreter::python().display()),
+    );
+    symlink("../../python/bin/python3", venv_bin.join("python3")).expect("link Python runtime");
+
+    let state_file = fixture.root.join("plugin-state");
+    fs::write(&state_file, "disabled\n").expect("write plugin state");
+    let plugin_root = home.join(".hermes/plugins/operators/pohunek");
+    let hermes_bin = venv_bin.join("hermes");
+    write_executable(
+        &hermes_bin,
+        &format!(
+            r#"case "$*" in
+  --version) printf '%s\n' 'Hermes Agent v0.20.0 (2026.8.3)' ;;
+  'plugins list --json')
+    if [ -d '{plugin_root}' ]; then state=$(/bin/cat '{state_file}'); printf '[{{"name":"pohunek","status":"%s","source":"user"}}]\n' "$state"; else printf '%s\n' '[]'; fi ;;
+  'plugins enable pohunek --no-allow-tool-override') printf '%s\n' enabled > '{state_file}' ;;
+  'plugins disable pohunek') printf '%s\n' disabled > '{state_file}' ;;
+  *) exit 90 ;;
+esac"#,
+            plugin_root = plugin_root.display(),
+            state_file = state_file.display(),
+        ),
+    );
+    let pohunek_bin = fixture.root.join("policy-pohunek");
+    write_executable(
+        &pohunek_bin,
+        &format!(
+            r#"printf '%s\n' '{{"cli_version":"fixture","protocol":{{"minimum":{version},"maximum":{version}}},"ok":{{}}}}'"#,
+            version = PROTOCOL_VERSION.get()
+        ),
+    );
+
+    parse_ok(&run(
+        &fixture,
+        &[
+            "integration",
+            "install",
+            "--agent",
+            "hermes",
+            "--hermes-profile",
+            "default",
+            "--hermes-bin",
+            hermes_bin.to_str().expect("Hermes path UTF-8"),
+            "--pohunek-bin",
+            pohunek_bin.to_str().expect("Pohunek path UTF-8"),
+            "--access-mode",
+            "manage",
+            "--allow-host",
+            "local",
+            "--json",
+        ],
+    ));
+    assert_eq!(
+        fs::read(plugin_root.join("skills/pohunek/SKILL.md"))
+            .expect("read installed operator skill"),
+        include_bytes!("../../../compat/hermes/operator/skills/pohunek/SKILL.md").as_slice(),
+        "CLI installation must use the sidecar-checked embedded operator payload"
+    );
+}
+
+#[test]
 #[expect(
     clippy::too_many_lines,
     reason = "the binary contract test intentionally exercises one complete isolated lifecycle"
@@ -101,7 +175,7 @@ fn parse_error(output: &Output) -> Value {
 fn binary_hermes_lifecycle_is_isolated_and_model_free() {
     let fixture = Fixture::new("lifecycle");
     let home = fixture.private_directory("home");
-    fixture.private_directory("home/.hermes");
+    fixture.private_directory("home/.hermes/profiles/default");
     fixture.private_directory("state");
     fixture.private_directory("run");
     fixture.private_directory("data");
@@ -209,6 +283,33 @@ esac"#,
     assert_eq!(installed["installed"], true);
     assert_eq!(installed["modified"], false);
     assert!(!plugin_root.join("__pycache__").exists());
+    let marker: Value = serde_json::from_slice(
+        &fs::read(plugin_root.join(".pohunek-owned.json")).expect("read ownership marker"),
+    )
+    .expect("parse ownership marker");
+    let operator_manifest = include_bytes!("../../../compat/hermes/operator.toml");
+    assert_eq!(marker["version"], 2);
+    assert_eq!(
+        marker["operator_sha256"],
+        format!(
+            "{:x}",
+            <sha2::Sha256 as sha2::Digest>::digest(operator_manifest)
+        )
+    );
+    let sidecar: toml::Value =
+        toml::from_str(std::str::from_utf8(operator_manifest).expect("sidecar UTF-8"))
+            .expect("parse closed operator sidecar");
+    let payload = sidecar["payload"].as_array().expect("payload list");
+    assert_eq!(payload.len(), 8, "the sidecar pins the exact S3 payload");
+    assert!(payload.iter().all(|record| {
+        record["path"]
+            .as_str()
+            .is_some_and(|path| path != "_pohunek_reporter.py")
+    }));
+    assert_eq!(
+        marker["assets"].as_object().expect("marker assets").len(),
+        9
+    );
 
     let status_arguments = [
         "integration",
@@ -279,6 +380,130 @@ esac"#,
     ));
     assert_eq!(update["modified"], false);
     assert_eq!(update["access_mode"], "full");
+
+    // Sidecar provenance drift keeps the installed payload intact but requires
+    // the operator-visible update path to refresh its ownership marker.
+    let marker_path = plugin_root.join(".pohunek-owned.json");
+    let clean_marker_bytes = fs::read(&marker_path).expect("read clean ownership marker");
+    let clean_marker: Value =
+        serde_json::from_slice(&clean_marker_bytes).expect("parse clean ownership marker");
+    let installed_files = clean_marker["assets"]
+        .as_object()
+        .expect("managed asset map")
+        .keys()
+        .map(|relative| {
+            (
+                relative.clone(),
+                fs::read(plugin_root.join(relative)).expect("read installed asset"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let policy_before_invalid_markers = fs::read(policy_path).expect("read installed policy");
+
+    let mut stale_provenance = clean_marker.clone();
+    let digest = stale_provenance["operator_sha256"]
+        .as_str()
+        .expect("operator digest")
+        .to_owned();
+    let replacement = if digest.starts_with('0') { '1' } else { '0' };
+    stale_provenance["operator_sha256"] = json!(format!("{replacement}{}", &digest[1..]));
+    fs::write(
+        &marker_path,
+        serde_json::to_vec_pretty(&stale_provenance).expect("serialize stale marker"),
+    )
+    .expect("write stale operator digest");
+    set_mode(&marker_path, 0o600);
+
+    let stale_status = parse_ok(&run(&fixture, &status_json_arguments));
+    assert_eq!(stale_status["outdated"], true);
+    assert_eq!(stale_status["modified"], false);
+    let stale_doctor_output = run(
+        &fixture,
+        &[
+            "integration",
+            "doctor",
+            "--agent",
+            "hermes",
+            "--hermes-profile",
+            "default",
+            "--hermes-bin",
+            hermes,
+            "--json",
+        ],
+    );
+    assert!(!stale_doctor_output.status.success());
+    let stale_doctor_envelope: Value =
+        serde_json::from_slice(&stale_doctor_output.stdout).expect("parse stale doctor envelope");
+    let stale_doctor = &stale_doctor_envelope["ok"];
+    let asset_current = stale_doctor["doctor"]["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|check| check["code"] == "asset_current")
+        .expect("asset current check");
+    assert_eq!(asset_current["status"], "fail");
+
+    let digest_update_arguments = [
+        "integration",
+        "update",
+        "--agent",
+        "hermes",
+        "--hermes-profile",
+        "default",
+        "--hermes-bin",
+        hermes,
+        "--json",
+    ];
+    let digest_update = parse_ok(&run(&fixture, &digest_update_arguments));
+    assert_eq!(digest_update["modified"], false);
+    let restored_status = parse_ok(&run(&fixture, &status_json_arguments));
+    assert_eq!(restored_status["outdated"], false);
+    assert_eq!(restored_status["modified"], false);
+
+    for (description, mut invalid_marker) in [
+        ("missing digest", clean_marker.clone()),
+        ("invalid digest", clean_marker.clone()),
+    ] {
+        if description == "missing digest" {
+            invalid_marker
+                .as_object_mut()
+                .expect("ownership marker object")
+                .remove("operator_sha256");
+        } else {
+            invalid_marker["operator_sha256"] = json!("invalid-digest");
+        }
+        fs::write(
+            &marker_path,
+            serde_json::to_vec_pretty(&invalid_marker).expect("serialize invalid marker"),
+        )
+        .expect("write invalid v2 marker");
+        set_mode(&marker_path, 0o600);
+        assert_eq!(
+            parse_error(&run(&fixture, &status_json_arguments))["code"],
+            "hermes_invalid_marker",
+            "CLI rejects a v2 marker with {description}"
+        );
+        assert_eq!(
+            parse_error(&run(&fixture, &digest_update_arguments))["code"],
+            "hermes_invalid_marker",
+            "CLI update rejects a v2 marker with {description}"
+        );
+        for (relative, expected) in &installed_files {
+            assert_eq!(
+                fs::read(plugin_root.join(relative))
+                    .expect("read asset after invalid marker rejection"),
+                expected.as_slice(),
+                "invalid marker rejection preserves {relative}"
+            );
+        }
+        assert_eq!(
+            fs::read(policy_path).expect("read policy after invalid marker rejection"),
+            policy_before_invalid_markers,
+            "invalid marker rejection preserves installed policy"
+        );
+    }
+    fs::write(&marker_path, &clean_marker_bytes).expect("restore clean ownership marker");
+    set_mode(&marker_path, 0o600);
 
     fs::write(plugin_root.join("tools.py"), b"# explicitly modified\n")
         .expect("mutate managed plugin");
@@ -364,6 +589,59 @@ esac"#,
     let current = parse_ok(&run(&fixture, &status_json_arguments));
     assert_eq!(current["outdated"], false);
 
+    // The immediately previous release owned the original eight-file set.
+    // It remains readable for a safe update and uninstall, but is always outdated.
+    let reporter_path = plugin_root.join("_pohunek_reporter.py");
+    let marker_path = plugin_root.join(".pohunek-owned.json");
+    let current_marker = fs::read(&marker_path).expect("read current ownership marker");
+    let mut previous_marker: Value =
+        serde_json::from_slice(&current_marker).expect("parse current ownership marker");
+    previous_marker["version"] = json!(1);
+    previous_marker
+        .as_object_mut()
+        .expect("marker object")
+        .remove("operator_sha256");
+    previous_marker["assets"]
+        .as_object_mut()
+        .expect("asset map")
+        .remove("_pohunek_reporter.py");
+    fs::remove_file(&reporter_path).expect("remove reporter absent from previous inventory");
+    fs::write(
+        &marker_path,
+        serde_json::to_vec_pretty(&previous_marker).expect("serialize previous marker"),
+    )
+    .expect("write previous marker");
+    set_mode(&marker_path, 0o600);
+    let previous_status = parse_ok(&run(&fixture, &status_json_arguments));
+    assert_eq!(previous_status["outdated"], true);
+    assert_eq!(previous_status["modified"], false);
+
+    let mut arbitrary_inventory = previous_marker.clone();
+    arbitrary_inventory["assets"]["arbitrary.py"] = json!("0".repeat(64));
+    fs::write(
+        &marker_path,
+        serde_json::to_vec_pretty(&arbitrary_inventory).expect("serialize arbitrary marker"),
+    )
+    .expect("write arbitrary marker");
+    set_mode(&marker_path, 0o600);
+    assert_eq!(
+        parse_error(&run(&fixture, &status_json_arguments))["code"],
+        "hermes_invalid_marker"
+    );
+    fs::write(
+        &marker_path,
+        serde_json::to_vec_pretty(&previous_marker).expect("serialize previous marker"),
+    )
+    .expect("restore previous marker");
+    set_mode(&marker_path, 0o600);
+
+    let updated_previous = parse_ok(&run(&fixture, &modified_update));
+    assert_eq!(updated_previous["modified"], false);
+    assert_eq!(
+        parse_ok(&run(&fixture, &status_json_arguments))["outdated"],
+        false
+    );
+
     let doctor = run(
         &fixture,
         &[
@@ -392,8 +670,70 @@ esac"#,
         Some(16)
     );
 
+    let reporter_path = plugin_root.join("_pohunek_reporter.py");
+    fs::write(&reporter_path, b"# private reporter mutation sentinel\n")
+        .expect("mutate the reserved core reporter asset");
+    assert!(
+        parse_ok(&run(&fixture, &status_json_arguments))["modified"]
+            .as_bool()
+            .unwrap_or(false),
+        "status treats a changed core reporter as a modified managed asset"
+    );
+    let reporter_doctor = run(
+        &fixture,
+        &[
+            "integration",
+            "doctor",
+            "--agent",
+            "hermes",
+            "--hermes-profile",
+            "default",
+            "--hermes-bin",
+            hermes,
+            "--json",
+        ],
+    );
+    let reporter_doctor_text = String::from_utf8_lossy(&reporter_doctor.stdout).into_owned()
+        + String::from_utf8_lossy(&reporter_doctor.stderr).as_ref();
+    let reporter_doctor_json: Value =
+        serde_json::from_slice(&reporter_doctor.stdout).expect("parse reporter doctor output");
+    assert_eq!(reporter_doctor_json["ok"]["doctor"]["ok"], false);
+    assert_eq!(
+        reporter_doctor_json["ok"]["doctor"]["checks"]
+            .as_array()
+            .expect("doctor checks")
+            .iter()
+            .find(|check| check["code"] == "asset_integrity")
+            .expect("asset integrity check")["status"],
+        "fail"
+    );
+    assert!(
+        !reporter_doctor_text.contains("private reporter mutation sentinel"),
+        "doctor does not expose modified reporter contents"
+    );
+
     fs::write(plugin_root.join("hooks.py"), b"# explicitly modified\n")
         .expect("mutate managed plugin before uninstall");
+    let mut previous_uninstall_marker: Value =
+        serde_json::from_slice(&fs::read(&marker_path).expect("read marker before uninstall"))
+            .expect("parse marker before uninstall");
+    previous_uninstall_marker["assets"]
+        .as_object_mut()
+        .expect("asset map")
+        .remove("_pohunek_reporter.py");
+    previous_uninstall_marker["version"] = json!(1);
+    previous_uninstall_marker
+        .as_object_mut()
+        .expect("marker object")
+        .remove("operator_sha256");
+    fs::remove_file(plugin_root.join("_pohunek_reporter.py"))
+        .expect("remove asset absent from previous inventory");
+    fs::write(
+        &marker_path,
+        serde_json::to_vec_pretty(&previous_uninstall_marker).expect("serialize previous marker"),
+    )
+    .expect("write previous uninstall marker");
+    set_mode(&marker_path, 0o600);
     let uninstall_arguments = [
         "integration",
         "uninstall",
@@ -409,6 +749,7 @@ esac"#,
         parse_error(&run(&fixture, &uninstall_arguments))["code"],
         "hermes_modified_confirmation_required"
     );
+    fs::remove_file(policy_path).expect("remove the original external policy before uninstall");
     let mut confirmed_uninstall = uninstall_arguments.to_vec();
     confirmed_uninstall.insert(confirmed_uninstall.len() - 1, "--confirm-modified");
     let uninstall = parse_ok(&run(&fixture, &confirmed_uninstall));

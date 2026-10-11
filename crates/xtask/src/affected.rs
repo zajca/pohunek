@@ -195,6 +195,16 @@ const RULES: &[Rule] = &[
         "knowledge bundle embedded by pohunek-knowledge's build script and read by xtask tests",
     ),
     rule(
+        Pattern::File("compat/hermes/operator.toml"),
+        Effect::Packages(&["pohunek-cli"]),
+        "Hermes operator manifest embedded by pohunek-cli's Hermes integration",
+    ),
+    rule(
+        Pattern::Dir("compat/hermes/operator"),
+        Effect::Packages(&["pohunek-cli"]),
+        "Hermes operator payload embedded by pohunek-cli's Hermes integration",
+    ),
+    rule(
         Pattern::Dir("compat/hermes"),
         Effect::Packages(&["pohunek-daemon", "xtask"]),
         "Hermes compatibility lock embedded by the daemon; lock and goldens read by xtask",

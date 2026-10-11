@@ -2946,7 +2946,11 @@ dependencies = [
  "pohunek-platform",
  "pohunek-protocol",
  "pohunek-test-support",
+ "pohunek-worker-protocol",
  "rustix",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -5781,6 +5785,7 @@ dependencies = [
  "tar",
  "tempfile",
  "toml",
+ "toml_edit 0.22.27",
  "vt100",
  "zeroize",
 ]

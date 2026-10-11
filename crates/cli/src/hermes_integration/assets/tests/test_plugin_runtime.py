@@ -28,6 +28,7 @@ PLUGIN.__dict__["__POHUNEK_POLICY_PATH__"] = "/tmp/pohunek-plugin-test-policy.js
 SPEC.loader.exec_module(PLUGIN)
 
 from pohunek.cli import CliError, CliRunner, Invocation, _minimal_env, _stdout_wire_cap
+from pohunek._pohunek_reporter import Reporter
 from pohunek.hooks import HookReporter
 from pohunek.policy import POLICY_PATH_TOKEN, Policy, PolicyError, load_policy
 from pohunek.redact import diagnostic
@@ -41,6 +42,10 @@ TRUE_BINARY = "/usr/bin/true"
 # scheduler latency on shared runners: an unloaded run takes ~20 ms against the
 # 100 ms default deadline, which a loaded runner can exceed.
 _BULK_COLLECTION_TIMEOUT_MS = 5_000
+
+
+def hook_reporter(environ: dict[str, str] | None = None) -> HookReporter:
+    return HookReporter(Reporter("hermes", environ=environ))
 
 
 def policy(
@@ -848,32 +853,70 @@ class ToolTests(unittest.TestCase):
 
 
 class HookTests(unittest.TestCase):
+    def test_reporter_rejects_unsupported_provider(self) -> None:
+        with self.assertRaises(ValueError):
+            Reporter("untrusted-provider", environ={})
+
+    def test_reporter_rejects_arbitrary_public_rpc_methods(self) -> None:
+        reporter = Reporter("hermes", environ={
+            "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_WORKER_INSTANCE_ID": "r-1",
+            "POHUNEK_SOCKET_PATH": "/tmp/daemon", "POHUNEK_PROTOCOL_VERSION": "1",
+        })
+        with mock.patch.object(reporter, "_send") as send:
+            reporter._send_public("session.remove", {"session_id": "s-1"})
+        send.assert_not_called()
+        self.assertEqual(reporter.failures, 1)
+
+    def test_reporter_supports_fixed_fields_for_another_provider(self) -> None:
+        reporter = Reporter("codex", environ={
+            "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_WORKER_INSTANCE_ID": "r-1",
+            "POHUNEK_WORKER_SOCKET_PATH": "/tmp/worker", "POHUNEK_SOCKET_PATH": "/tmp/daemon",
+            "POHUNEK_PROTOCOL_VERSION": "1", "POHUNEK_DAEMON_ID": "host-a",
+        })
+        reporter._start_identity = 1
+        worker: list[dict[str, object]] = []
+        with mock.patch.object(reporter, "_send_worker", side_effect=lambda payload: worker.append(payload) or True), \
+                mock.patch.object(reporter, "_send_public") as public:
+            reporter.identity("native-session")
+            reporter.activity("working")
+            reporter.attention("turn_completed", "success")
+            reporter.release()
+
+        self.assertEqual([item["provider"] for item in worker], ["codex", "codex"])
+        self.assertEqual([item["type"] for item in worker], ["identity_report", "identity_release"])
+        activity = public.call_args_list[0].args[1]
+        attention = public.call_args_list[1].args[1]
+        self.assertEqual((activity["source"], activity["agent"]), ("pohunek:codex", "codex"))
+        self.assertEqual(attention["source"]["provider"], "codex")
+        self.assertEqual(attention["agent_kind"], "codex")
+        self.assertEqual(attention["title"], "Codex session update")
+
     def test_unmanaged_process_never_reports(self) -> None:
-        reporter = HookReporter({})
-        with mock.patch.object(reporter, "_send", wraps=reporter._send) as send:
+        reporter = hook_reporter({})
+        with mock.patch.object(reporter._reporter, "_send", wraps=reporter._reporter._send) as send:
             reporter.pre_llm_call({"session_id": "native"})
         send.assert_not_called()
 
     def test_endpoint_failure_respects_short_deadline_and_excludes_payload(self) -> None:
-        reporter = HookReporter({
+        reporter = hook_reporter({
             "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_WORKER_INSTANCE_ID": "r-1",
             "POHUNEK_SOCKET_PATH": "/tmp/does-not-exist", "POHUNEK_PROTOCOL_VERSION": "1",
             "POHUNEK_HOOK_TIMEOUT_MS": "10",
         })
-        reporter._start_identity = 1
+        reporter._reporter._start_identity = 1
         started = time.monotonic()
         reporter.pre_llm_call({"session_id": "native", "prompt": "must-not-leak"})
         self.assertLess(time.monotonic() - started, 0.2)
         self.assertGreaterEqual(reporter.failures, 1)
 
     def test_send_reads_fragmented_first_response_line(self) -> None:
-        reporter = HookReporter({})
+        reporter = hook_reporter({})
         client = mock.MagicMock()
         client.__enter__.return_value = client
         client.recv.side_effect = [b'{"ok":', b'true}\nignored']
 
-        with mock.patch("pohunek.hooks.socket.socket", return_value=client):
-            response = reporter._send("/tmp/worker", {"type": "identity_report"})
+        with mock.patch("pohunek._pohunek_reporter.socket.socket", return_value=client):
+            response = reporter._reporter._send("/tmp/worker", {"type": "identity_report"})
 
         self.assertEqual(response, {"ok": True})
         self.assertEqual(client.recv.call_count, 2)
@@ -890,54 +933,54 @@ class HookTests(unittest.TestCase):
         ]
         for name, extra, expected in cases:
             with self.subTest(name):
-                reporter = HookReporter({**base, **extra})
-                reporter._start_identity = 1
+                reporter = hook_reporter({**base, **extra})
+                reporter._reporter._start_identity = 1
                 captured: list[dict[str, object]] = []
-                with mock.patch.object(reporter, "_send_worker", side_effect=lambda payload: captured.append(payload) or True):
+                with mock.patch.object(reporter._reporter, "_send_worker", side_effect=lambda payload: captured.append(payload) or True):
                     reporter.on_session_start({"session_id": "launch"})
                 self.assertEqual([item["runtime_id"] for item in captured], [expected])
 
     def test_no_worker_instance_environment_name_means_inactive(self) -> None:
-        reporter = HookReporter({"POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_WORKER_SOCKET_PATH": "/tmp/worker"})
-        reporter._start_identity = 1
+        reporter = hook_reporter({"POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_WORKER_SOCKET_PATH": "/tmp/worker"})
+        reporter._reporter._start_identity = 1
         self.assertFalse(reporter.active)
 
     def test_continuation_identity_uses_monotonic_sequences(self) -> None:
-        reporter = HookReporter({
+        reporter = hook_reporter({
             "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_WORKER_INSTANCE_ID": "r-1",
             "POHUNEK_WORKER_SOCKET_PATH": "/tmp/worker", "POHUNEK_PROTOCOL_VERSION": "1",
         })
-        reporter._start_identity = 1
+        reporter._reporter._start_identity = 1
         captured: list[dict[str, object]] = []
-        with mock.patch.object(reporter, "_send_worker", side_effect=lambda payload: captured.append(payload) or True):
+        with mock.patch.object(reporter._reporter, "_send_worker", side_effect=lambda payload: captured.append(payload) or True):
             reporter.on_session_start({"session_id": "launch"})
             reporter.pre_llm_call({"session_id": "continuation"})
         self.assertEqual([item["native_reference"] for item in captured], ["launch", "continuation"])
         self.assertLess(captured[0]["sequence"], captured[1]["sequence"])
 
     def test_pending_launch_is_worker_owned_and_does_not_trigger_public_fallback(self) -> None:
-        reporter = HookReporter({
+        reporter = hook_reporter({
             "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_WORKER_INSTANCE_ID": "r-1",
             "POHUNEK_WORKER_SOCKET_PATH": "/tmp/worker", "POHUNEK_SOCKET_PATH": "/tmp/daemon",
             "POHUNEK_PROTOCOL_VERSION": "1",
         })
-        reporter._start_identity = 1
+        reporter._reporter._start_identity = 1
         response = {"ok": True, "launch_identity_accepted": False, "launch_identity_status": "pending"}
-        with mock.patch.object(reporter, "_send", return_value=response) as send, mock.patch.object(reporter, "_send_public") as public:
+        with mock.patch.object(reporter._reporter, "_send", return_value=response) as send, mock.patch.object(reporter._reporter, "_send_public") as public:
             reporter.on_session_start({"session_id": "launch"})
         self.assertEqual(send.call_count, 1)
         self.assertEqual(send.call_args.args[1]["native_reference"], "launch")
         public.assert_not_called()
 
     def test_finalize_prefers_private_release_and_transition_mapping_is_payload_free(self) -> None:
-        reporter = HookReporter({
+        reporter = hook_reporter({
             "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_WORKER_INSTANCE_ID": "r-1",
             "POHUNEK_WORKER_SOCKET_PATH": "/tmp/worker", "POHUNEK_SOCKET_PATH": "/tmp/daemon",
             "POHUNEK_PROTOCOL_VERSION": "1", "POHUNEK_DAEMON_ID": "host-a",
         })
-        reporter._start_identity = 1
+        reporter._reporter._start_identity = 1
         worker: list[dict[str, object]] = []
-        with mock.patch.object(reporter, "_send_worker", side_effect=lambda payload: worker.append(payload) or True), mock.patch.object(reporter, "_send_public") as public:
+        with mock.patch.object(reporter._reporter, "_send_worker", side_effect=lambda payload: worker.append(payload) or True), mock.patch.object(reporter._reporter, "_send_public") as public:
             reporter.on_session_finalize()
             reporter.on_session_end(interrupted=True, user_message="secret")
         self.assertEqual(worker[0]["type"], "identity_release")
@@ -947,9 +990,9 @@ class HookTests(unittest.TestCase):
         self.assertNotIn("secret", repr(public.call_args_list))
 
     def test_end_outcomes_map_completed_interrupted_and_failed(self) -> None:
-        reporter = HookReporter({"POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s", "POHUNEK_WORKER_INSTANCE_ID": "r", "POHUNEK_SOCKET_PATH": "/tmp/d", "POHUNEK_PROTOCOL_VERSION": "1"})
-        reporter._start_identity = 1
-        with mock.patch.object(reporter, "_send_public") as public:
+        reporter = hook_reporter({"POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s", "POHUNEK_WORKER_INSTANCE_ID": "r", "POHUNEK_SOCKET_PATH": "/tmp/d", "POHUNEK_PROTOCOL_VERSION": "1"})
+        reporter._reporter._start_identity = 1
+        with mock.patch.object(reporter._reporter, "_send_public") as public:
             reporter.on_session_end(completed=True)
             reporter.on_session_end(interrupted=True)
             reporter.on_session_end(failed=True)
@@ -959,14 +1002,14 @@ class HookTests(unittest.TestCase):
         self.assertEqual(kinds, ["agent_blocked", "error"])
 
     def test_pinned_false_completed_maps_to_failed_and_semantic_response_errors_count(self) -> None:
-        reporter = HookReporter({"POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s", "POHUNEK_WORKER_INSTANCE_ID": "r", "POHUNEK_SOCKET_PATH": "/tmp/d", "POHUNEK_WORKER_SOCKET_PATH": "/tmp/w", "POHUNEK_PROTOCOL_VERSION": "1"})
-        reporter._start_identity = 1
-        with mock.patch.object(reporter, "_send_public") as public:
+        reporter = hook_reporter({"POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s", "POHUNEK_WORKER_INSTANCE_ID": "r", "POHUNEK_SOCKET_PATH": "/tmp/d", "POHUNEK_WORKER_SOCKET_PATH": "/tmp/w", "POHUNEK_PROTOCOL_VERSION": "1"})
+        reporter._reporter._start_identity = 1
+        with mock.patch.object(reporter._reporter, "_send_public") as public:
             reporter.on_session_end(completed=False, interrupted=False)
         self.assertEqual(public.call_args_list[1].args[1]["kind"], "error")
-        with mock.patch.object(reporter, "_send", side_effect=[{"err": {"code": "denied"}}, {"malformed": True}]):
-            self.assertFalse(reporter._send_worker({"type": "identity_report"}))
-            reporter._send_public("session.report_agent", {})
+        with mock.patch.object(reporter._reporter, "_send", side_effect=[{"err": {"code": "denied"}}, {"malformed": True}]):
+            self.assertFalse(reporter._reporter._send_worker({"type": "identity_report"}))
+            reporter._reporter._send_public("session.report_agent", {})
         self.assertGreaterEqual(reporter.failures, 2)
 
 

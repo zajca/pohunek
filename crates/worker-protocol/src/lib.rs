@@ -11,7 +11,8 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-10-05
+/// Schema version of the worker's machine-readable capability response.
+pub const WORKER_DIAGNOSTIC_SCHEMA_VERSION: u32 = 1;
 
 /// Maximum lifetime accepted for a worker-private identity claim.
 ///

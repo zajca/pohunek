@@ -32,6 +32,8 @@ const HERMES_PLUGIN_ASSETS = join(
   "assets",
 );
 const HERMES_PLUGIN_FIXTURE = join(TEST_DIR, "fixtures", "hermes-plugin-e2e.py");
+const IDENTITY_DELAY_TRACE_NAME = "identity-delay-trace.log";
+const IDENTITY_DELAY_ENV = "LC_POHUNEK_TEST_IDENTITY_DELAY_TRACE";
 // Frozen plugin assets from v0.33.0; policy.json records that release's schema and v3 range.
 const PREVIOUS_HERMES_ASSETS = join(TEST_DIR, "fixtures", "hermes-v0.33.0");
 const PREVIOUS_HERMES_POLICY = join(PREVIOUS_HERMES_ASSETS, "policy.json");
@@ -52,11 +54,15 @@ const REMOTE_HOST = "plugin-remote.netbird.test";
 // accepts its owner-private launch identity. This remains far below the fixture timeout.
 const CONTROLLED_HERMES_IDENTITY_RETRY_ATTEMPTS = 40;
 const CONTROLLED_HERMES_IDENTITY_TOTAL_CEILING_MS = 2_000;
-const HERMES_HOOKS_SOURCE = join(HERMES_PLUGIN_ASSETS, "pohunek", "hooks.py");
+const HERMES_REPORTER_SOURCE = join(
+  HERMES_PLUGIN_ASSETS,
+  "pohunek",
+  "_pohunek_reporter.py",
+);
 // The worker acknowledges an identity report only after its journal is durable, so each
-// step gets exactly the product hook's default socket timeout, read from the shipped hook.
+// step gets exactly the product hook's default socket timeout, read from the core reporter.
 const CONTROLLED_HERMES_IDENTITY_STEP_BUDGET_MS = productHookTimeoutMs(
-  readFileSync(HERMES_HOOKS_SOURCE, "utf8"),
+  readFileSync(HERMES_REPORTER_SOURCE, "utf8"),
 );
 const CONTROLLED_HERMES_IDENTITY_RETRY_DELAY_MS = 25;
 const PLUGIN_NETBIRD_FIXTURE_SCRIPT = `#!/bin/sh
@@ -71,6 +77,7 @@ interface PluginDaemonHarness extends DaemonContext {
   readonly pythonBin: string;
   readonly cliWrapper: string;
   readonly remoteCapture: string;
+  readonly identityTrace: string;
   stop(): Promise<void>;
 }
 
@@ -285,6 +292,13 @@ async function runHermesPluginScenario(
   expect(result.hermes_fork_unsupported).toBe(true);
   expect(result.output_gap_recovered).toBe(true);
   expect(result.remote_loopback).toBe(true);
+  const identityEvents = (await readFile(daemon.identityTrace, "utf8"))
+    .split("\n")
+    .filter(Boolean);
+  expect(identityEvents.filter((event) => event === "identity_request_sent").length).toBe(2);
+  expect(identityEvents.filter((event) => event === "response_read_eagain_injected").length).toBe(1);
+  expect(identityEvents.filter((event) => event === "response_wait_timeout_injected").length).toBe(1);
+  expect(identityEvents.filter((event) => event === "response_step_timeout").length).toBeGreaterThanOrEqual(1);
   await assertRemoteTargets(daemon.remoteCapture, `${REMOTE_SELF_IP}:${REMOTE_PORT}`);
 }
 
@@ -534,6 +548,8 @@ async function startPluginDaemon(
   await access(daemonBin, constants.X_OK);
   const worker = await isolatedDurableWorkerFixture(daemonBin);
   const controlled = await preparePluginExecutables(prerequisites, tempRoot, dirs);
+  const identityTrace = join(tempRoot, IDENTITY_DELAY_TRACE_NAME);
+  await writeFile(identityTrace, "", { mode: 0o600 });
   const env: NodeJS.ProcessEnv = {
     XDG_RUNTIME_DIR: dirs.runtime,
     XDG_DATA_HOME: dirs.data,
@@ -548,6 +564,7 @@ async function startPluginDaemon(
     ...worker.env,
     LD_PRELOAD: controlled.interposer,
     POHUNEK_TEST_SOCKET_CAPTURE: controlled.capture,
+    [IDENTITY_DELAY_ENV]: identityTrace,
     POHUNEK_REMOTE_PORT: String(REMOTE_PORT),
   };
   const daemon = await startDaemonProcess({
@@ -563,6 +580,7 @@ async function startPluginDaemon(
     pythonBin: controlled.pythonBin,
     cliWrapper: controlled.cliWrapper,
     remoteCapture: controlled.capture,
+    identityTrace,
     socketPath: daemon.socketPath,
     stdout: () => daemon.stdout(),
     stderr: () => daemon.stderr(),
@@ -588,6 +606,7 @@ interface ControlledPluginExecutables {
   readonly capture: string;
   readonly cliWrapper: string;
   readonly pythonBin: string;
+  readonly hermes: string;
 }
 
 async function preparePluginExecutables(
@@ -651,7 +670,7 @@ exec /usr/bin/env -i \
   ${shellQuote(prerequisites.cliBin)} "$@"
 `;
   await writeFile(cliWrapper, wrapper, { mode: 0o700 });
-  return { interposer, capture, cliWrapper, pythonBin: prerequisites.pythonBin };
+  return { interposer, capture, cliWrapper, pythonBin: prerequisites.pythonBin, hermes };
 }
 
 function shellQuote(value: string): string {
@@ -732,10 +751,10 @@ function productHookTimeoutMs(source: string): number {
   const defaultMs = hookSecondsConstantMs(source, "_DEFAULT_HOOK_TIMEOUT_SECONDS");
   const maximumMs = hookSecondsConstantMs(source, "_MAX_HOOK_TIMEOUT_SECONDS");
   if (defaultMs > maximumMs) {
-    throw new Error(`${HERMES_HOOKS_SOURCE}: default hook timeout exceeds its maximum`);
+    throw new Error(`${HERMES_REPORTER_SOURCE}: default hook timeout exceeds its maximum`);
   }
   if (defaultMs >= CONTROLLED_HERMES_IDENTITY_TOTAL_CEILING_MS) {
-    throw new Error(`${HERMES_HOOKS_SOURCE}: hook timeout leaves no identity retry window`);
+    throw new Error(`${HERMES_REPORTER_SOURCE}: hook timeout leaves no identity retry window`);
   }
   return defaultMs;
 }
@@ -744,7 +763,7 @@ function hookSecondsConstantMs(source: string, name: string): number {
   const match = new RegExp(`^${name} = ([0-9]+(?:\\.[0-9]+)?)$`, "m").exec(source);
   const seconds = match?.[1] === undefined ? Number.NaN : Number(match[1]);
   if (!Number.isFinite(seconds) || seconds <= 0) {
-    throw new Error(`${HERMES_HOOKS_SOURCE}: missing positive ${name}`);
+    throw new Error(`${HERMES_REPORTER_SOURCE}: missing positive ${name}`);
   }
   return Math.round(seconds * 1_000);
 }
@@ -773,10 +792,47 @@ enum {
 };
 
 enum hook_response {
-    HOOK_RESPONSE_TERMINAL = -1,
+    HOOK_RESPONSE_PRE_SEND_FAILURE = -7,
+    HOOK_RESPONSE_UNCERTAIN_SEND = -6,
+    HOOK_RESPONSE_UNCERTAIN_TIMEOUT = -5,
+    HOOK_RESPONSE_UNCERTAIN_EOF = -4,
+    HOOK_RESPONSE_UNCERTAIN_INVALID = -3,
+    HOOK_RESPONSE_INVALID_SETUP = -2,
+    HOOK_RESPONSE_REJECTED = -1,
     HOOK_RESPONSE_PENDING = 0,
     HOOK_RESPONSE_ACCEPTED = 1,
 };
+
+enum request_send_result {
+    REQUEST_SEND_PARTIAL = -1,
+    REQUEST_SEND_NONE = 0,
+    REQUEST_SEND_COMPLETE = 1,
+};
+
+static void trace_identity_phase(const char *phase) {
+    const char *path = getenv("${IDENTITY_DELAY_ENV}");
+    if (path == NULL) return;
+    int fd = open(path, O_WRONLY | O_APPEND | O_CLOEXEC);
+    if (fd < 0) return;
+    (void)write(fd, phase, strlen(phase));
+    (void)write(fd, "\n", 1);
+    close(fd);
+}
+
+static int claim_identity_delay_injection(void) {
+    const char *path = getenv("${IDENTITY_DELAY_ENV}");
+    if (path == NULL) return 0;
+    char claim_path[PATH_MAX];
+    int length = snprintf(claim_path, sizeof(claim_path), "%s.claim", path);
+    if (length <= 0 || (size_t)length >= sizeof(claim_path)) return 0;
+    int fd = open(claim_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) return 0;
+    close(fd);
+    return 1;
+}
+
+static int identity_delay_wait_pending;
+static int identity_delay_wait_injected;
 
 static long long monotonic_millis(void) {
     struct timespec now;
@@ -792,6 +848,12 @@ static int remaining_millis(long long deadline) {
 }
 
 static int wait_for_fd(int fd, short events, long long total_deadline) {
+    if (events == POLLIN && identity_delay_wait_pending && !identity_delay_wait_injected) {
+        identity_delay_wait_pending = 0;
+        identity_delay_wait_injected = 1;
+        trace_identity_phase("response_wait_timeout_injected");
+        return 0;
+    }
     long long now = monotonic_millis();
     if (now < 0 || now >= total_deadline) return 0;
     long long candidate_deadline = now + IDENTITY_STEP_BUDGET_MS;
@@ -859,9 +921,9 @@ static enum hook_response parse_hook_response(const char *response) {
         "{\"ok\":false,\"launch_identity_accepted\":false,\"launch_identity_status\":\"not_applicable\"}\n";
     if (strcmp(response, accepted) == 0) return HOOK_RESPONSE_ACCEPTED;
     if (strcmp(response, pending) == 0) return HOOK_RESPONSE_PENDING;
-    if (strcmp(response, rejected_claim) == 0) return HOOK_RESPONSE_TERMINAL;
-    if (strcmp(response, rejected) == 0) return HOOK_RESPONSE_TERMINAL;
-    return HOOK_RESPONSE_TERMINAL;
+    if (strcmp(response, rejected_claim) == 0) return HOOK_RESPONSE_REJECTED;
+    if (strcmp(response, rejected) == 0) return HOOK_RESPONSE_REJECTED;
+    return HOOK_RESPONSE_UNCERTAIN_INVALID;
 }
 
 static int connect_before_send(
@@ -898,82 +960,110 @@ static int send_request(
             sent_bytes += (size_t)sent;
             continue;
         }
-        if (sent == 0) return 0;
+        if (sent == 0) {
+            return sent_bytes == 0 ? REQUEST_SEND_NONE : REQUEST_SEND_PARTIAL;
+        }
         if (errno == EINTR) {
-            if (remaining_millis(total_deadline) == 0) return 0;
+            if (remaining_millis(total_deadline) == 0) {
+                return sent_bytes == 0 ? REQUEST_SEND_NONE : REQUEST_SEND_PARTIAL;
+            }
             continue;
         }
-        if (errno != EAGAIN && errno != EWOULDBLOCK) return 0;
-        if (wait_for_fd(fd, POLLOUT, total_deadline) != 1) return 0;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            return sent_bytes == 0 ? REQUEST_SEND_NONE : REQUEST_SEND_PARTIAL;
+        }
+        if (wait_for_fd(fd, POLLOUT, total_deadline) != 1) {
+            return sent_bytes == 0 ? REQUEST_SEND_NONE : REQUEST_SEND_PARTIAL;
+        }
     }
-    return 1;
+    return REQUEST_SEND_COMPLETE;
 }
 
 static enum hook_response read_response(int fd, long long total_deadline) {
     char response[IDENTITY_RESPONSE_MAX_BYTES];
     size_t response_length = 0;
     int newline_seen = 0;
+    int first_read = 1;
     for (;;) {
-        if (response_length == sizeof(response) - 1) return HOOK_RESPONSE_TERMINAL;
-        ssize_t received = recv(
-            fd,
-            response + response_length,
-            sizeof(response) - 1 - response_length,
-            0
-        );
+        if (response_length == sizeof(response) - 1) return HOOK_RESPONSE_UNCERTAIN_INVALID;
+        ssize_t received;
+        if (first_read && claim_identity_delay_injection()) {
+            first_read = 0;
+            identity_delay_wait_pending = 1;
+            errno = EAGAIN;
+            received = -1;
+            trace_identity_phase("response_read_eagain_injected");
+        } else {
+            first_read = 0;
+            received = recv(
+                fd,
+                response + response_length,
+                sizeof(response) - 1 - response_length,
+                0
+            );
+        }
         if (received > 0) {
             size_t chunk_length = (size_t)received;
             const char *newline = memchr(response + response_length, '\n', chunk_length);
             if (newline_seen || (newline != NULL && newline != response + response_length + chunk_length - 1)) {
-                return HOOK_RESPONSE_TERMINAL;
+                return HOOK_RESPONSE_UNCERTAIN_INVALID;
             }
             response_length += chunk_length;
             if (newline != NULL) newline_seen = 1;
             continue;
         }
         if (received == 0) {
-            if (!newline_seen) return HOOK_RESPONSE_TERMINAL;
+            if (!newline_seen) return HOOK_RESPONSE_UNCERTAIN_EOF;
             response[response_length] = '\0';
             return parse_hook_response(response);
         }
         if (errno == EINTR) {
-            if (remaining_millis(total_deadline) == 0) return HOOK_RESPONSE_TERMINAL;
+            if (remaining_millis(total_deadline) == 0) return HOOK_RESPONSE_UNCERTAIN_TIMEOUT;
             continue;
         }
-        if (errno != EAGAIN && errno != EWOULDBLOCK) return HOOK_RESPONSE_TERMINAL;
-        if (wait_for_fd(fd, POLLIN, total_deadline) != 1) return HOOK_RESPONSE_TERMINAL;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) return HOOK_RESPONSE_UNCERTAIN_EOF;
+        int ready = wait_for_fd(fd, POLLIN, total_deadline);
+        if (ready == 0 && remaining_millis(total_deadline) > 0) {
+            trace_identity_phase("response_step_timeout");
+            continue;
+        }
+        if (ready != 1) {
+            return remaining_millis(total_deadline) == 0
+                ? HOOK_RESPONSE_UNCERTAIN_TIMEOUT
+                : HOOK_RESPONSE_UNCERTAIN_EOF;
+        }
     }
 }
 
 static enum hook_response report_identity(void) {
     const char *endpoint = getenv("POHUNEK_WORKER_SOCKET_PATH");
     const char *runtime = getenv("POHUNEK_WORKER_INSTANCE_ID");
-    if (endpoint == NULL || runtime == NULL) return HOOK_RESPONSE_TERMINAL;
+    if (endpoint == NULL || runtime == NULL) return HOOK_RESPONSE_INVALID_SETUP;
     unsigned long long start = process_start_identity();
-    if (start == 0) return HOOK_RESPONSE_TERMINAL;
+    if (start == 0) return HOOK_RESPONSE_INVALID_SETUP;
     time_t current_time = time(NULL);
-    if (current_time == (time_t)-1) return HOOK_RESPONSE_TERMINAL;
+    if (current_time == (time_t)-1) return HOOK_RESPONSE_INVALID_SETUP;
     time_t expiry_time = current_time + 30;
     struct tm expiry;
     char expires[32];
-    if (gmtime_r(&expiry_time, &expiry) == NULL) return HOOK_RESPONSE_TERMINAL;
+    if (gmtime_r(&expiry_time, &expiry) == NULL) return HOOK_RESPONSE_INVALID_SETUP;
     if (strftime(expires, sizeof(expires), "%Y-%m-%dT%H:%M:%SZ", &expiry) == 0) {
-        return HOOK_RESPONSE_TERMINAL;
+        return HOOK_RESPONSE_INVALID_SETUP;
     }
     struct sockaddr_un address;
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
-    if (strlen(endpoint) >= sizeof(address.sun_path)) return HOOK_RESPONSE_TERMINAL;
+    if (strlen(endpoint) >= sizeof(address.sun_path)) return HOOK_RESPONSE_INVALID_SETUP;
     strcpy(address.sun_path, endpoint);
     socklen_t address_length = (socklen_t)(
         offsetof(struct sockaddr_un, sun_path) + strlen(address.sun_path) + 1
     );
     long long started = monotonic_millis();
-    if (started < 0) return HOOK_RESPONSE_TERMINAL;
+    if (started < 0) return HOOK_RESPONSE_INVALID_SETUP;
     long long total_deadline = started + IDENTITY_TOTAL_CEILING_MS;
 
     for (int attempt = 0; attempt < IDENTITY_RETRY_ATTEMPTS; attempt++) {
-        if (remaining_millis(total_deadline) == 0) return HOOK_RESPONSE_TERMINAL;
+        if (remaining_millis(total_deadline) == 0) return HOOK_RESPONSE_PRE_SEND_FAILURE;
         char request[2048];
         unsigned int sequence = (unsigned int)attempt + 1U;
         int request_length = snprintf(request, sizeof(request),
@@ -983,7 +1073,7 @@ static enum hook_response report_identity(void) {
             "\"native_reference\":\"hermes-e2e-native\"}\n",
             runtime, (long)getpid(), start, sequence, expires);
         if (request_length <= 0 || (size_t)request_length >= sizeof(request)) {
-            return HOOK_RESPONSE_TERMINAL;
+            return HOOK_RESPONSE_INVALID_SETUP;
         }
 
         // Each fresh sequence gets one fresh owner-private nonblocking connection. Only a
@@ -998,15 +1088,22 @@ static enum hook_response report_identity(void) {
             wait_before_retry(total_deadline);
             continue;
         }
-        if (!send_request(fd, request, (size_t)request_length, total_deadline)) {
+        enum request_send_result sent = send_request(fd, request, (size_t)request_length, total_deadline);
+        if (sent == REQUEST_SEND_PARTIAL) {
             close(fd);
-            return HOOK_RESPONSE_TERMINAL;
+            return HOOK_RESPONSE_UNCERTAIN_SEND;
         }
+        if (sent == REQUEST_SEND_NONE) {
+            close(fd);
+            wait_before_retry(total_deadline);
+            continue;
+        }
+        trace_identity_phase("identity_request_sent");
         enum hook_response response = read_response(fd, total_deadline);
         close(fd);
         return response;
     }
-    return HOOK_RESPONSE_TERMINAL;
+    return HOOK_RESPONSE_PRE_SEND_FAILURE;
 }
 
 int main(int argc, char **argv) {
@@ -1019,8 +1116,21 @@ int main(int argc, char **argv) {
                   strcmp(argv[3], "hermes-e2e-native") == 0;
     if (argc != 2 && !resumed) return 2;
     enum hook_response identity = report_identity();
-    if (identity == HOOK_RESPONSE_TERMINAL) {
-        fputs("controlled Hermes launch identity was not accepted\n", stderr);
+    if (identity < HOOK_RESPONSE_PENDING) {
+        const char *reason = identity == HOOK_RESPONSE_REJECTED
+            ? "explicit_rejection"
+            : identity == HOOK_RESPONSE_PRE_SEND_FAILURE
+                ? "pre_send_unavailable"
+            : identity == HOOK_RESPONSE_UNCERTAIN_SEND
+                ? "uncertain_after_send_partial_request"
+            : identity == HOOK_RESPONSE_UNCERTAIN_TIMEOUT
+                ? "uncertain_after_send_timeout"
+                : identity == HOOK_RESPONSE_UNCERTAIN_EOF
+                    ? "uncertain_after_send_eof"
+                    : identity == HOOK_RESPONSE_INVALID_SETUP
+                        ? "identity_setup_invalid"
+                        : "uncertain_after_send_invalid_response";
+        fprintf(stderr, "pohunek_identity_diagnostic=%s\n", reason);
         return 1;
     }
     puts("hermes-e2e-ready");

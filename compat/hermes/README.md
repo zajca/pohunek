@@ -16,6 +16,18 @@ The reserved `hermes` runtime id can be served by a package only when a signed
 catalog authorizes its digest. Hermes is not in the published catalog, and no
 Hermes release package artifact exists yet.
 
+`operator.toml` and `operator/` are the closed S3 fixture for the allowlisted
+Hermes operator payload. The CLI embeds and verifies this exact sidecar and its
+payload before installing; the core-owned `_pohunek_reporter.py` remains outside
+the sidecar and is embedded separately. This fixture does not create a
+`runtime-packages/hermes/` release inventory.
+
+The skill payload is generated from `docs/knowledge/guides/hermes-operator.md`.
+Run `cargo xtask hermes generate-skill` after changing that guide; the command
+writes the embedded payload under `operator/` and refreshes its `operator.toml`
+checksum. `cargo xtask hermes check-skill` and `cargo xtask docs check` verify
+that exact embedded payload and checksum.
+
 Run the model-free CI gate with an installed pinned executable on `PATH`:
 
 ```bash

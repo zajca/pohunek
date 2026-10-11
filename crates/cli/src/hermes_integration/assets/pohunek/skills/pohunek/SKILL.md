@@ -32,9 +32,10 @@ validation, not a published or released package. It preserves the built-in
 launch and detection contract and supports only the locked 0.20.0 release. The
 reserved `hermes` runtime id requires authorization by a signed catalog;
 Hermes is not in the published catalog, and no Hermes release package artifact
-exists yet. The fixture contains only the runtime descriptor and detection
-manifest. The operator plugin, its generated skill, and the generic hook
-reporter remain part of Pohunek's compiled integration.
+exists yet. `compat/hermes/operator.toml` closes the allowlist for the local
+operator payload fixture in `compat/hermes/operator/`; the CLI verifies its
+paths and digests before installation. The generic hook reporter remains
+exclusively core-owned and is embedded separately by Pohunek.
 
 The Hermes operator plugin is an owner-private, Pohunek-managed integration. It
 is not a same-user sandbox: the daemon remains authoritative for its public API,

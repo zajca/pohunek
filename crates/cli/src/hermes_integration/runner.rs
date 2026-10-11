@@ -124,7 +124,7 @@ HOOKS = [
     "post_approval_response", "post_llm_call", "on_session_end",
     "on_session_finalize",
 ]
-PYTHON_FILES = ["__init__.py", "cli.py", "hooks.py", "policy.py", "redact.py", "tools.py"]
+PYTHON_FILES = ["__init__.py", "_pohunek_reporter.py", "cli.py", "hooks.py", "policy.py", "redact.py", "tools.py"]
 MANIFEST_KEYS = {"name", "version", "description", "provides_tools", "provides_hooks"}
 
 if len(sys.argv) != 4 or sys.argv[1] != "--":
@@ -174,10 +174,13 @@ for relative in PYTHON_FILES:
     compile(parsed, relative, "exec")
 
 marker = json.loads(managed_file(".pohunek-owned.json").read_text(encoding="utf-8"))
-if not isinstance(marker, dict) or set(marker) != {"version", "hermes_home", "policy_path", "assets"}:
+if not isinstance(marker, dict) or set(marker) != {"version", "hermes_home", "policy_path", "operator_sha256", "assets"}:
     raise ValueError("ownership marker is invalid")
-if marker.get("version") != 1 or not isinstance(marker.get("policy_path"), str):
+if marker.get("version") != 2 or not isinstance(marker.get("policy_path"), str):
     raise ValueError("ownership marker policy is invalid")
+operator_digest = marker.get("operator_sha256")
+if not isinstance(operator_digest, str) or len(operator_digest) != 64 or any(character not in "0123456789abcdef" for character in operator_digest):
+    raise ValueError("ownership marker provenance is invalid")
 bound_policy = Path(marker["policy_path"])
 if not bound_policy.is_absolute():
     raise ValueError("bound policy must be absolute")
@@ -286,7 +289,7 @@ def private(path, directory):
 
 if not private(plugin, True) or not private(policy_path, False):
     raise ValueError("managed paths are not private")
-for relative in ("__init__.py", "hooks.py", "tools.py", "cli.py", "policy.py", "redact.py", "skills/pohunek/SKILL.md"):
+for relative in ("__init__.py", "_pohunek_reporter.py", "hooks.py", "tools.py", "cli.py", "policy.py", "redact.py", "skills/pohunek/SKILL.md"):
     candidate = plugin / relative
     if candidate.is_symlink() or not private(candidate, False):
         raise ValueError("managed plugin asset is unsafe")

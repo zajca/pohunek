@@ -197,7 +197,7 @@ fn install_with(
     let marker = assets::marker_bytes(&desired)?;
     assets::parse_marker(&marker)?;
     let policy_bytes = request.policy.to_json()?;
-    let existing = installed(request.target, request.policy_path, &assets)?;
+    let existing = installed(request.target, request.policy_path, Some(&assets))?;
     if existing.as_ref().is_some_and(|value| value.modified) && !request.confirm_modified {
         return Err(Error::ConfirmationRequired);
     }
@@ -333,17 +333,16 @@ fn uninstall_with(
     files: &mut impl FileOps,
 ) -> Result<LifecycleState, Error> {
     validate_request_target(request.target, request.policy_path)?;
-    let assets = assets::render(request.policy_path)?;
-    let Some(existing) = installed(request.target, request.policy_path, &assets)? else {
+    let Some(existing) = installed(request.target, request.policy_path, None)? else {
         return inspect(control, request.target, request.policy_path);
     };
     if existing.modified && !request.confirm_modified {
         return Err(Error::ConfirmationRequired);
     }
-    if !path_exists(request.policy_path)? {
-        return Err(Error::InvalidMarker);
+    let policy_exists = path_exists(request.policy_path)?;
+    if policy_exists {
+        validate_private_file(request.policy_path, Error::UnsafePolicyPath)?;
     }
-    validate_private_file(request.policy_path, Error::UnsafePolicyPath)?;
 
     let was_enabled = control.is_enabled(request.target)?;
     if was_enabled {
@@ -371,6 +370,7 @@ fn uninstall_with(
         request.policy_path,
         &existing.ownership,
         &trash,
+        policy_exists,
     );
     if let Err(failure) = moves {
         let recovery = restore_moves(files, &failure.moves, &trash).and_then(|()| {
@@ -404,7 +404,7 @@ pub(crate) fn inspect(
 ) -> Result<LifecycleState, Error> {
     validate_request_target(target, policy_path)?;
     let assets = assets::render(policy_path)?;
-    let current = installed(target, policy_path, &assets)?;
+    let current = installed(target, policy_path, Some(&assets))?;
     let (stale_stage, stale_backup) = stale_siblings(target, policy_path, &assets)?;
     Ok(LifecycleState {
         installed: current.is_some(),
@@ -420,7 +420,7 @@ pub(crate) fn inspect(
 struct Installed {
     ownership: Ownership,
     modified: bool,
-    /// The marker's recorded checksums differ from the embedded assets'.
+    /// The marker's recorded payload or sidecar provenance differs from this binary.
     outdated: bool,
 }
 
@@ -677,7 +677,7 @@ fn trusted_remove_dir_all(path: &Path) -> Result<(), Error> {
 fn installed(
     target: &ResolvedTarget,
     policy_path: &Path,
-    expected_assets: &[Asset],
+    expected_assets: Option<&[Asset]>,
 ) -> Result<Option<Installed>, Error> {
     let root = target.plugin_root();
     match fs::symlink_metadata(root) {
@@ -690,9 +690,17 @@ fn installed(
     }
     let ownership = read_matching_ownership(root, target, policy_path, expected_assets)?;
     let modified = managed_modified(root, &ownership)? || has_unmanaged_entries(root, &ownership)?;
-    let outdated = expected_assets
-        .iter()
-        .any(|asset| ownership.assets.get(asset.path()) != Some(&asset.checksum()));
+    let outdated = if let Some(expected) = expected_assets {
+        let assets_outdated = expected
+            .iter()
+            .any(|asset| ownership.assets.get(asset.path()) != Some(&asset.checksum()));
+        let current_operator_sha256 = assets::operator_sha256()?;
+        let provenance_outdated =
+            ownership.operator_sha256.as_deref() != Some(current_operator_sha256.as_str());
+        assets_outdated || provenance_outdated
+    } else {
+        false
+    };
     Ok(Some(Installed {
         ownership,
         modified,
@@ -716,7 +724,7 @@ fn read_matching_ownership(
     root: &Path,
     target: &ResolvedTarget,
     policy_path: &Path,
-    expected_assets: &[Asset],
+    expected_assets: Option<&[Asset]>,
 ) -> Result<Ownership, Error> {
     let marker_path = root.join(MARKER_NAME);
     if !path_exists(&marker_path)? {
@@ -726,11 +734,14 @@ fn read_matching_ownership(
     let ownership = assets::parse_marker(&fs::read(marker_path)?)?;
     let target_text = target.hermes_home().to_str().ok_or(Error::InvalidMarker)?;
     let policy_text = policy_path.to_str().ok_or(Error::InvalidMarker)?;
-    let expected: BTreeSet<_> = expected_assets.iter().map(Asset::path).collect();
-    let recorded: BTreeSet<_> = ownership.assets.keys().map(String::as_str).collect();
+    let inventory_matches = expected_assets.is_none_or(|assets| {
+        let expected: BTreeSet<_> = assets.iter().map(Asset::path).collect();
+        let recorded: BTreeSet<_> = ownership.assets.keys().map(String::as_str).collect();
+        expected == recorded || assets::has_previous_inventory(&ownership)
+    });
     if ownership.hermes_home != target_text
         || ownership.policy_path != policy_text
-        || expected != recorded
+        || !inventory_matches
     {
         return Err(Error::InvalidMarker);
     }
@@ -1074,6 +1085,7 @@ fn move_managed_to_trash(
     policy_path: &Path,
     ownership: &Ownership,
     trash: &Path,
+    policy_exists: bool,
 ) -> Result<Vec<MoveRecord>, MoveFailure> {
     let mut moves = Vec::with_capacity(ownership.assets.len() + 2);
     for relative in ownership.assets.keys() {
@@ -1128,21 +1140,23 @@ fn move_managed_to_trash(
         });
     }
     moves.push(marker_move);
-    let policy_destination = trash.join("policy");
-    let policy_move = MoveRecord {
-        source: policy_path.to_owned(),
-        destination: policy_destination,
-    };
-    if let Err(error) = files.rename(&policy_move.source, &policy_move.destination) {
-        if error.committed() {
-            moves.push(policy_move);
+    if policy_exists {
+        let policy_destination = trash.join("policy");
+        let policy_move = MoveRecord {
+            source: policy_path.to_owned(),
+            destination: policy_destination,
+        };
+        if let Err(error) = files.rename(&policy_move.source, &policy_move.destination) {
+            if error.committed() {
+                moves.push(policy_move);
+            }
+            return Err(MoveFailure {
+                error: error.error(),
+                moves,
+            });
         }
-        return Err(MoveFailure {
-            error: error.error(),
-            moves,
-        });
+        moves.push(policy_move);
     }
-    moves.push(policy_move);
     if let Err(error) = remove_empty_managed_directories(root) {
         return Err(MoveFailure { error, moves });
     }
@@ -1246,7 +1260,8 @@ fn stale_siblings(
         }
         if metadata.is_dir()
             && validate_private_directory(&path).is_ok()
-            && (read_matching_ownership(&path, target, policy_path, assets).is_ok() || is_stage)
+            && (read_matching_ownership(&path, target, policy_path, Some(assets)).is_ok()
+                || is_stage)
         {
             stage |= is_stage;
             backup |= is_backup;
@@ -2247,8 +2262,8 @@ esac"#,
 
     #[test]
     fn every_staged_write_and_activation_rename_failure_restores_exact_update_state() {
-        // Eight assets, one marker, and one policy write precede four activation moves.
-        const TRANSACTION_FILE_OPS: usize = 14;
+        // Stage writes (assets, marker, policy) precede four activation moves.
+        const TRANSACTION_FILE_OPS: usize = assets::ASSET_COUNT + 2 + 4;
         for failure_at in 1..=TRANSACTION_FILE_OPS {
             let (_root, target, policy_path, policy) = setup("all-install-failures");
             let mut hermes = ControlledHermes::default();
@@ -2346,8 +2361,8 @@ esac"#,
             &InstallRequest::new(&target, &policy_path, &policy, false),
         )
         .expect("initial install");
-        // Fourteen writes/moves precede the first committed backup deletion.
-        let mut files = FailingFileOps::new(15);
+        // Stage writes and activation moves precede committed backup cleanup.
+        let mut files = FailingFileOps::new(assets::ASSET_COUNT + 2 + 4 + 1);
         assert_eq!(
             install_with(
                 &mut hermes,
@@ -2380,6 +2395,7 @@ esac"#,
             &InstallRequest::new(&target, &policy_path, &policy, false),
         )
         .expect("install");
+        fs::remove_file(&policy_path).expect("remove external policy before uninstall");
         hermes.status_calls = 0;
         assert_eq!(
             uninstall(
@@ -2397,12 +2413,13 @@ esac"#,
             }
         );
         assert_eq!(hermes.status_calls, 1);
+        assert!(!target.plugin_root().exists());
     }
 
     #[test]
     fn every_uninstall_trash_move_failure_restores_exact_state() {
-        // Eight immutable assets, the marker, then the external policy are moved.
-        const UNINSTALL_MOVES: usize = 10;
+        // Every managed asset, the marker, and the external policy are moved.
+        const UNINSTALL_MOVES: usize = assets::ASSET_COUNT + 2;
         for failure_at in 1..=UNINSTALL_MOVES {
             let (_root, target, policy_path, policy) = setup("all-uninstall-failures");
             let mut hermes = ControlledHermes::default();
@@ -2721,7 +2738,7 @@ esac"#,
             inspect(&mut hermes, &target, &link),
             Err(Error::UnsafePolicyPath)
         );
-        assert_eq!(assets.len(), 8);
+        assert_eq!(assets.len(), assets::ASSET_COUNT);
     }
 
     #[test]

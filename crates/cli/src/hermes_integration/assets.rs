@@ -7,7 +7,7 @@
     reason = "asset errors intentionally redact parser and path details from operator output"
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::de::{Error as _, MapAccess, Visitor};
@@ -17,23 +17,55 @@ use sha2::{Digest as _, Sha256};
 use super::error::Error;
 
 /// Version of the marker format written into one managed plugin root.
-pub(crate) const MARKER_VERSION: u32 = 1;
+pub(crate) const MARKER_VERSION: u32 = 2;
 /// The generated marker is deliberately not self-checksummed.
 pub(crate) const MARKER_NAME: &str = ".pohunek-owned.json";
-/// Immutable embedded production assets, in normalized relative-path order.
-const ASSETS: [(&str, &[u8]); 7] = [
-    ("plugin.yaml", include_bytes!("assets/pohunek/plugin.yaml")),
-    ("__init__.py", include_bytes!("assets/pohunek/__init__.py")),
-    ("cli.py", include_bytes!("assets/pohunek/cli.py")),
-    ("hooks.py", include_bytes!("assets/pohunek/hooks.py")),
-    ("policy.py", include_bytes!("assets/pohunek/policy.py")),
-    ("redact.py", include_bytes!("assets/pohunek/redact.py")),
-    ("tools.py", include_bytes!("assets/pohunek/tools.py")),
+/// Closed operator sidecar embedded into the CLI for verification at install time.
+const OPERATOR_MANIFEST: &[u8] = include_bytes!("../../../../compat/hermes/operator.toml");
+/// Payload files available to the closed operator manifest.
+const OPERATOR_PAYLOAD: [(&str, &[u8]); 8] = [
+    (
+        "plugin.yaml",
+        include_bytes!("../../../../compat/hermes/operator/plugin.yaml"),
+    ),
+    (
+        "__init__.py",
+        include_bytes!("../../../../compat/hermes/operator/__init__.py"),
+    ),
+    (
+        "cli.py",
+        include_bytes!("../../../../compat/hermes/operator/cli.py"),
+    ),
+    (
+        "hooks.py",
+        include_bytes!("../../../../compat/hermes/operator/hooks.py"),
+    ),
+    (
+        "policy.py",
+        include_bytes!("../../../../compat/hermes/operator/policy.py"),
+    ),
+    (
+        "redact.py",
+        include_bytes!("../../../../compat/hermes/operator/redact.py"),
+    ),
+    (
+        "tools.py",
+        include_bytes!("../../../../compat/hermes/operator/tools.py"),
+    ),
+    (
+        "skills/pohunek/SKILL.md",
+        include_bytes!("../../../../compat/hermes/operator/skills/pohunek/SKILL.md"),
+    ),
 ];
-const SKILL_PATH: &str = "skills/pohunek/SKILL.md";
-const SKILL: &[u8] = include_bytes!("assets/pohunek/skills/pohunek/SKILL.md");
+/// The reporter stays embedded and owned exclusively by the core CLI.
+const CORE_OWNED_ASSETS: [(&str, &[u8]); 1] = [(
+    "_pohunek_reporter.py",
+    include_bytes!("assets/pohunek/_pohunek_reporter.py"),
+)];
 const POLICY_TOKEN: &str = "__POHUNEK_POLICY_PATH__";
-const EXPECTED_PATHS: [&str; 8] = [
+/// Immutable core assets excluded from any future runtime-package overlay.
+const CORE_OWNED_ASSET_PATHS: [&str; 1] = ["_pohunek_reporter.py"];
+const EXPECTED_PAYLOAD_PATHS: [&str; 8] = [
     "plugin.yaml",
     "__init__.py",
     "cli.py",
@@ -41,8 +73,47 @@ const EXPECTED_PATHS: [&str; 8] = [
     "policy.py",
     "redact.py",
     "tools.py",
-    SKILL_PATH,
+    "skills/pohunek/SKILL.md",
 ];
+const EXPECTED_PATHS: [&str; 9] = [
+    "plugin.yaml",
+    "__init__.py",
+    "cli.py",
+    "hooks.py",
+    "policy.py",
+    "redact.py",
+    "tools.py",
+    "skills/pohunek/SKILL.md",
+    "_pohunek_reporter.py",
+];
+/// Exact inventory written before the core reporter became a managed asset.
+/// This inventory is accepted only for reading; every install writes the current set.
+const PREVIOUS_PATHS: [&str; 8] = [
+    "plugin.yaml",
+    "__init__.py",
+    "cli.py",
+    "hooks.py",
+    "policy.py",
+    "redact.py",
+    "tools.py",
+    "skills/pohunek/SKILL.md",
+];
+#[cfg(test)]
+pub(crate) const ASSET_COUNT: usize = EXPECTED_PATHS.len();
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorManifest {
+    schema: u32,
+    payload: Vec<OperatorAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorAsset {
+    path: String,
+    sha256: String,
+}
 
 /// One rendered asset ready to write below the managed plugin root.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +152,9 @@ pub(crate) struct Ownership {
     pub(crate) hermes_home: String,
     /// Absolute external mutable policy selected by the installer.
     pub(crate) policy_path: String,
+    /// Digest of the exact closed operator sidecar used for this install.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) operator_sha256: Option<String>,
     /// Rendered checksum for every immutable managed asset.
     #[serde(deserialize_with = "deserialize_checksums")]
     pub(crate) assets: BTreeMap<String, String>,
@@ -93,8 +167,17 @@ pub(crate) fn render(policy_path: &Path) -> Result<Vec<Asset>, Error> {
     }
     let escaped = serde_json::to_string(policy_path.to_str().ok_or(Error::UnsafePolicyPath)?)
         .map_err(|_| Error::UnsafePolicyPath)?;
-    let mut rendered = Vec::with_capacity(ASSETS.len() + 1);
-    for (path, bytes) in ASSETS {
+    let manifest = verified_operator_manifest()?;
+    let mut rendered = Vec::with_capacity(EXPECTED_PATHS.len());
+    for record in manifest.payload {
+        let (path, bytes) = OPERATOR_PAYLOAD
+            .iter()
+            .find(|(path, _)| *path == record.path)
+            .ok_or(Error::InvalidAsset)?;
+        if checksum(bytes) != record.sha256 {
+            return Err(Error::InvalidAsset);
+        }
+        let path = *path;
         validate_relative_path(path)?;
         let bytes = if path == "__init__.py" {
             replace_policy_token(bytes, &escaped)?
@@ -106,11 +189,66 @@ pub(crate) fn render(policy_path: &Path) -> Result<Vec<Asset>, Error> {
             bytes,
         });
     }
-    rendered.push(Asset {
-        path: SKILL_PATH.to_owned(),
-        bytes: SKILL.to_vec(),
-    });
+    for (path, bytes) in CORE_OWNED_ASSETS {
+        validate_relative_path(path)?;
+        rendered.push(Asset {
+            path: path.to_owned(),
+            bytes: bytes.to_vec(),
+        });
+    }
+    let rendered_paths: BTreeSet<_> = rendered.iter().map(|asset| asset.path.as_str()).collect();
+    if rendered_paths.len() != EXPECTED_PATHS.len()
+        || EXPECTED_PATHS
+            .iter()
+            .any(|path| !rendered_paths.contains(path))
+    {
+        return Err(Error::InvalidAsset);
+    }
     Ok(rendered)
+}
+
+/// Returns a parsed sidecar only when its closed schema and exact payload set match.
+fn verified_operator_manifest() -> Result<OperatorManifest, Error> {
+    verified_operator_manifest_bytes(OPERATOR_MANIFEST)
+}
+
+fn verified_operator_manifest_bytes(source: &[u8]) -> Result<OperatorManifest, Error> {
+    let source = std::str::from_utf8(source).map_err(|_| Error::InvalidAsset)?;
+    let manifest: OperatorManifest =
+        toml_edit::de::from_str(source).map_err(|_| Error::InvalidAsset)?;
+    if manifest.schema != 1 || manifest.payload.len() != EXPECTED_PAYLOAD_PATHS.len() {
+        return Err(Error::InvalidAsset);
+    }
+    let paths: Vec<_> = manifest
+        .payload
+        .iter()
+        .map(|asset| asset.path.as_str())
+        .collect();
+    if paths != EXPECTED_PAYLOAD_PATHS {
+        return Err(Error::InvalidAsset);
+    }
+    if manifest
+        .payload
+        .iter()
+        .any(|asset| !is_sha256(&asset.sha256))
+    {
+        return Err(Error::InvalidAsset);
+    }
+    for record in &manifest.payload {
+        let (_, bytes) = OPERATOR_PAYLOAD
+            .iter()
+            .find(|(path, _)| *path == record.path)
+            .ok_or(Error::InvalidAsset)?;
+        if checksum(bytes) != record.sha256 {
+            return Err(Error::InvalidAsset);
+        }
+    }
+    Ok(manifest)
+}
+
+pub(crate) fn operator_sha256() -> Result<String, Error> {
+    verified_operator_manifest()?;
+    Ok(checksum(OPERATOR_MANIFEST))
 }
 
 /// Builds a marker from rendered assets and selected target metadata.
@@ -134,13 +272,14 @@ pub(crate) fn ownership(
             return Err(Error::InvalidAsset);
         }
     }
-    if !has_expected_paths(&checksums) {
+    if !has_current_paths(&checksums) {
         return Err(Error::InvalidAsset);
     }
     Ok(Ownership {
         version: MARKER_VERSION,
         hermes_home: hermes_home.to_owned(),
         policy_path: policy_path.to_owned(),
+        operator_sha256: Some(operator_sha256()?),
         assets: checksums,
     })
 }
@@ -153,8 +292,18 @@ pub(crate) fn marker_bytes(ownership: &Ownership) -> Result<Vec<u8>, Error> {
 /// Parses an ownership marker without accepting unknown fields or versions.
 pub(crate) fn parse_marker(bytes: &[u8]) -> Result<Ownership, Error> {
     let ownership: Ownership = serde_json::from_slice(bytes).map_err(|_| Error::InvalidMarker)?;
-    if ownership.version != MARKER_VERSION
-        || !has_expected_paths(&ownership.assets)
+    let inventory_valid =
+        has_current_paths(&ownership.assets) || has_previous_paths(&ownership.assets);
+    let provenance_valid = match ownership.version {
+        1 => ownership.operator_sha256.is_none(),
+        MARKER_VERSION => {
+            ownership.operator_sha256.as_deref().is_some_and(is_sha256)
+                && has_current_paths(&ownership.assets)
+        }
+        _ => false,
+    };
+    if !inventory_valid
+        || !provenance_valid
         || !Path::new(&ownership.hermes_home).is_absolute()
         || !Path::new(&ownership.policy_path).is_absolute()
     {
@@ -205,11 +354,25 @@ fn validate_relative_path(path: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn has_expected_paths(checksums: &BTreeMap<String, String>) -> bool {
+fn has_current_paths(checksums: &BTreeMap<String, String>) -> bool {
     checksums.len() == EXPECTED_PATHS.len()
         && EXPECTED_PATHS
             .iter()
             .all(|path| checksums.contains_key(*path))
+        && CORE_OWNED_ASSET_PATHS
+            .iter()
+            .all(|path| checksums.contains_key(*path))
+}
+
+fn has_previous_paths(checksums: &BTreeMap<String, String>) -> bool {
+    checksums.len() == PREVIOUS_PATHS.len()
+        && PREVIOUS_PATHS
+            .iter()
+            .all(|path| checksums.contains_key(*path))
+}
+
+pub(crate) fn has_previous_inventory(ownership: &Ownership) -> bool {
+    has_previous_paths(&ownership.assets)
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -277,7 +440,11 @@ mod tests {
             &assets,
         )
         .expect("ownership");
-        assert_eq!(ownership.assets.len(), 8);
+        assert_eq!(ownership.assets.len(), 9);
+        assert_eq!(
+            ownership.operator_sha256.as_deref(),
+            Some(checksum(OPERATOR_MANIFEST).as_str())
+        );
         assert!(!ownership.assets.contains_key(MARKER_NAME));
         assert_eq!(
             parse_marker(&marker_bytes(&ownership).expect("marker")).expect("parsed"),
@@ -314,13 +481,19 @@ mod tests {
     #[test]
     fn start_identity_suite_passes_on_the_host_interpreter() {
         let env = TestEnv::new().expect("hermetic test environment");
-        let hooks = ASSETS
+        let hooks = OPERATOR_PAYLOAD
             .iter()
             .find(|(path, _)| *path == "hooks.py")
             .expect("embedded hooks asset")
             .1;
+        let reporter = CORE_OWNED_ASSETS
+            .iter()
+            .find(|(path, _)| *path == "_pohunek_reporter.py")
+            .expect("embedded core reporter asset")
+            .1;
         for (relative, bytes) in [
             ("pohunek/hooks.py", hooks),
+            ("pohunek/_pohunek_reporter.py", reporter),
             (
                 "tests/test_start_identity.py",
                 include_bytes!("assets/tests/test_start_identity.py").as_slice(),
@@ -411,5 +584,57 @@ mod tests {
             let marker = marker_bytes(&ownership).expect("marker");
             assert_eq!(parse_marker(&marker).expect("parsed marker"), ownership);
         }
+    }
+
+    #[test]
+    fn marker_accepts_only_the_previous_exact_asset_inventory() {
+        let assets = render(Path::new("/work/policy.json")).expect("rendered assets");
+        let ownership = ownership(
+            Path::new("/work/hermes"),
+            Path::new("/work/policy.json"),
+            &assets,
+        )
+        .expect("ownership");
+        let mut previous = ownership.clone();
+        previous.version = 1;
+        previous.operator_sha256 = None;
+        previous.assets.remove("_pohunek_reporter.py");
+        assert!(has_previous_inventory(&previous));
+        assert_eq!(
+            parse_marker(&marker_bytes(&previous).expect("previous marker"))
+                .expect("previous marker remains readable"),
+            previous
+        );
+
+        let mut reporter_release = ownership.clone();
+        reporter_release.version = 1;
+        reporter_release.operator_sha256 = None;
+        assert_eq!(
+            parse_marker(&marker_bytes(&reporter_release).expect("v1 reporter marker"))
+                .expect("previous S2 marker remains readable"),
+            reporter_release
+        );
+
+        let mut missing_provenance = ownership.clone();
+        missing_provenance.operator_sha256 = None;
+        assert_eq!(
+            parse_marker(&marker_bytes(&missing_provenance).expect("v2 marker without digest")),
+            Err(Error::InvalidMarker)
+        );
+        let mut unexpected_provenance = reporter_release.clone();
+        unexpected_provenance.operator_sha256 = Some("0".repeat(64));
+        assert_eq!(
+            parse_marker(&marker_bytes(&unexpected_provenance).expect("v1 marker with digest")),
+            Err(Error::InvalidMarker)
+        );
+
+        previous
+            .assets
+            .insert("arbitrary.py".to_owned(), "0".repeat(64));
+        assert!(!has_previous_inventory(&previous));
+        assert_eq!(
+            parse_marker(&marker_bytes(&previous).expect("arbitrary marker")),
+            Err(Error::InvalidMarker)
+        );
     }
 }
