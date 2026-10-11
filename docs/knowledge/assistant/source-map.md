@@ -622,7 +622,7 @@ Hermes operator plugin and managed lifecycle:
 - `crates/cli/src/hermes_integration/assets.rs`
 - `crates/cli/src/hermes_integration/doctor.rs`
 - `crates/cli/src/hermes_integration/skill.rs`
-- `crates/cli/src/hermes_integration/assets/pohunek/plugin.yaml`
+- `compat/hermes/operator/plugin.yaml`
 - `crates/cli/src/hermes_integration/assets/pohunek/__init__.py`
 - `crates/cli/src/hermes_integration/assets/pohunek/cli.py`
 - `crates/cli/src/hermes_integration/assets/pohunek/hooks.py`

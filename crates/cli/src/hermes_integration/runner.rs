@@ -174,10 +174,13 @@ for relative in PYTHON_FILES:
     compile(parsed, relative, "exec")
 
 marker = json.loads(managed_file(".pohunek-owned.json").read_text(encoding="utf-8"))
-if not isinstance(marker, dict) or set(marker) != {"version", "hermes_home", "policy_path", "assets"}:
+if not isinstance(marker, dict) or set(marker) != {"version", "hermes_home", "policy_path", "operator_sha256", "assets"}:
     raise ValueError("ownership marker is invalid")
-if marker.get("version") != 1 or not isinstance(marker.get("policy_path"), str):
+if marker.get("version") != 2 or not isinstance(marker.get("policy_path"), str):
     raise ValueError("ownership marker policy is invalid")
+operator_digest = marker.get("operator_sha256")
+if not isinstance(operator_digest, str) or len(operator_digest) != 64 or any(character not in "0123456789abcdef" for character in operator_digest):
+    raise ValueError("ownership marker provenance is invalid")
 bound_policy = Path(marker["policy_path"])
 if not bound_policy.is_absolute():
     raise ValueError("bound policy must be absolute")
