@@ -21,11 +21,15 @@ pub(crate) const MARKER_VERSION: u32 = 1;
 /// The generated marker is deliberately not self-checksummed.
 pub(crate) const MARKER_NAME: &str = ".pohunek-owned.json";
 /// Immutable embedded production assets, in normalized relative-path order.
-const ASSETS: [(&str, &[u8]); 7] = [
+const ASSETS: [(&str, &[u8]); 8] = [
     ("plugin.yaml", include_bytes!("assets/pohunek/plugin.yaml")),
     ("__init__.py", include_bytes!("assets/pohunek/__init__.py")),
     ("cli.py", include_bytes!("assets/pohunek/cli.py")),
     ("hooks.py", include_bytes!("assets/pohunek/hooks.py")),
+    (
+        "_pohunek_reporter.py",
+        include_bytes!("assets/pohunek/_pohunek_reporter.py"),
+    ),
     ("policy.py", include_bytes!("assets/pohunek/policy.py")),
     ("redact.py", include_bytes!("assets/pohunek/redact.py")),
     ("tools.py", include_bytes!("assets/pohunek/tools.py")),
@@ -33,7 +37,22 @@ const ASSETS: [(&str, &[u8]); 7] = [
 const SKILL_PATH: &str = "skills/pohunek/SKILL.md";
 const SKILL: &[u8] = include_bytes!("assets/pohunek/skills/pohunek/SKILL.md");
 const POLICY_TOKEN: &str = "__POHUNEK_POLICY_PATH__";
-const EXPECTED_PATHS: [&str; 8] = [
+/// Immutable core assets excluded from any future runtime-package overlay.
+const CORE_OWNED_ASSET_PATHS: [&str; 1] = ["_pohunek_reporter.py"];
+const EXPECTED_PATHS: [&str; 9] = [
+    "plugin.yaml",
+    "__init__.py",
+    "cli.py",
+    "hooks.py",
+    "_pohunek_reporter.py",
+    "policy.py",
+    "redact.py",
+    "tools.py",
+    SKILL_PATH,
+];
+/// Exact inventory written by the immediately preceding marker-v1 release.
+/// This inventory is accepted only for reading; every install writes the current set.
+const PREVIOUS_PATHS: [&str; 8] = [
     "plugin.yaml",
     "__init__.py",
     "cli.py",
@@ -43,6 +62,8 @@ const EXPECTED_PATHS: [&str; 8] = [
     "tools.py",
     SKILL_PATH,
 ];
+#[cfg(test)]
+pub(crate) const ASSET_COUNT: usize = EXPECTED_PATHS.len();
 
 /// One rendered asset ready to write below the managed plugin root.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,7 +155,7 @@ pub(crate) fn ownership(
             return Err(Error::InvalidAsset);
         }
     }
-    if !has_expected_paths(&checksums) {
+    if !has_current_paths(&checksums) {
         return Err(Error::InvalidAsset);
     }
     Ok(Ownership {
@@ -154,7 +175,7 @@ pub(crate) fn marker_bytes(ownership: &Ownership) -> Result<Vec<u8>, Error> {
 pub(crate) fn parse_marker(bytes: &[u8]) -> Result<Ownership, Error> {
     let ownership: Ownership = serde_json::from_slice(bytes).map_err(|_| Error::InvalidMarker)?;
     if ownership.version != MARKER_VERSION
-        || !has_expected_paths(&ownership.assets)
+        || !(has_current_paths(&ownership.assets) || has_previous_paths(&ownership.assets))
         || !Path::new(&ownership.hermes_home).is_absolute()
         || !Path::new(&ownership.policy_path).is_absolute()
     {
@@ -205,11 +226,25 @@ fn validate_relative_path(path: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn has_expected_paths(checksums: &BTreeMap<String, String>) -> bool {
+fn has_current_paths(checksums: &BTreeMap<String, String>) -> bool {
     checksums.len() == EXPECTED_PATHS.len()
         && EXPECTED_PATHS
             .iter()
             .all(|path| checksums.contains_key(*path))
+        && CORE_OWNED_ASSET_PATHS
+            .iter()
+            .all(|path| checksums.contains_key(*path))
+}
+
+fn has_previous_paths(checksums: &BTreeMap<String, String>) -> bool {
+    checksums.len() == PREVIOUS_PATHS.len()
+        && PREVIOUS_PATHS
+            .iter()
+            .all(|path| checksums.contains_key(*path))
+}
+
+pub(crate) fn has_previous_inventory(ownership: &Ownership) -> bool {
+    has_previous_paths(&ownership.assets)
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -277,7 +312,7 @@ mod tests {
             &assets,
         )
         .expect("ownership");
-        assert_eq!(ownership.assets.len(), 8);
+        assert_eq!(ownership.assets.len(), 9);
         assert!(!ownership.assets.contains_key(MARKER_NAME));
         assert_eq!(
             parse_marker(&marker_bytes(&ownership).expect("marker")).expect("parsed"),
@@ -319,8 +354,14 @@ mod tests {
             .find(|(path, _)| *path == "hooks.py")
             .expect("embedded hooks asset")
             .1;
+        let reporter = ASSETS
+            .iter()
+            .find(|(path, _)| *path == "_pohunek_reporter.py")
+            .expect("embedded core reporter asset")
+            .1;
         for (relative, bytes) in [
             ("pohunek/hooks.py", hooks),
+            ("pohunek/_pohunek_reporter.py", reporter),
             (
                 "tests/test_start_identity.py",
                 include_bytes!("assets/tests/test_start_identity.py").as_slice(),
@@ -411,5 +452,33 @@ mod tests {
             let marker = marker_bytes(&ownership).expect("marker");
             assert_eq!(parse_marker(&marker).expect("parsed marker"), ownership);
         }
+    }
+
+    #[test]
+    fn marker_accepts_only_the_previous_exact_asset_inventory() {
+        let assets = render(Path::new("/work/policy.json")).expect("rendered assets");
+        let ownership = ownership(
+            Path::new("/work/hermes"),
+            Path::new("/work/policy.json"),
+            &assets,
+        )
+        .expect("ownership");
+        let mut previous = ownership.clone();
+        previous.assets.remove("_pohunek_reporter.py");
+        assert!(has_previous_inventory(&previous));
+        assert_eq!(
+            parse_marker(&marker_bytes(&previous).expect("previous marker"))
+                .expect("previous marker remains readable"),
+            previous
+        );
+
+        previous
+            .assets
+            .insert("arbitrary.py".to_owned(), "0".repeat(64));
+        assert!(!has_previous_inventory(&previous));
+        assert_eq!(
+            parse_marker(&marker_bytes(&previous).expect("arbitrary marker")),
+            Err(Error::InvalidMarker)
+        );
     }
 }

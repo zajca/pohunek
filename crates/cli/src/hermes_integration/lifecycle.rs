@@ -730,7 +730,7 @@ fn read_matching_ownership(
     let recorded: BTreeSet<_> = ownership.assets.keys().map(String::as_str).collect();
     if ownership.hermes_home != target_text
         || ownership.policy_path != policy_text
-        || expected != recorded
+        || (expected != recorded && !assets::has_previous_inventory(&ownership))
     {
         return Err(Error::InvalidMarker);
     }
@@ -2247,8 +2247,8 @@ esac"#,
 
     #[test]
     fn every_staged_write_and_activation_rename_failure_restores_exact_update_state() {
-        // Eight assets, one marker, and one policy write precede four activation moves.
-        const TRANSACTION_FILE_OPS: usize = 14;
+        // Stage writes (assets, marker, policy) precede four activation moves.
+        const TRANSACTION_FILE_OPS: usize = assets::ASSET_COUNT + 2 + 4;
         for failure_at in 1..=TRANSACTION_FILE_OPS {
             let (_root, target, policy_path, policy) = setup("all-install-failures");
             let mut hermes = ControlledHermes::default();
@@ -2346,8 +2346,8 @@ esac"#,
             &InstallRequest::new(&target, &policy_path, &policy, false),
         )
         .expect("initial install");
-        // Fourteen writes/moves precede the first committed backup deletion.
-        let mut files = FailingFileOps::new(15);
+        // Stage writes and activation moves precede committed backup cleanup.
+        let mut files = FailingFileOps::new(assets::ASSET_COUNT + 2 + 4 + 1);
         assert_eq!(
             install_with(
                 &mut hermes,
@@ -2401,8 +2401,8 @@ esac"#,
 
     #[test]
     fn every_uninstall_trash_move_failure_restores_exact_state() {
-        // Eight immutable assets, the marker, then the external policy are moved.
-        const UNINSTALL_MOVES: usize = 10;
+        // Every managed asset, the marker, and the external policy are moved.
+        const UNINSTALL_MOVES: usize = assets::ASSET_COUNT + 2;
         for failure_at in 1..=UNINSTALL_MOVES {
             let (_root, target, policy_path, policy) = setup("all-uninstall-failures");
             let mut hermes = ControlledHermes::default();
@@ -2721,7 +2721,7 @@ esac"#,
             inspect(&mut hermes, &target, &link),
             Err(Error::UnsafePolicyPath)
         );
-        assert_eq!(assets.len(), 8);
+        assert_eq!(assets.len(), assets::ASSET_COUNT);
     }
 
     #[test]

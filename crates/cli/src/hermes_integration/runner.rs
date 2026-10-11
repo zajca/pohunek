@@ -124,7 +124,7 @@ HOOKS = [
     "post_approval_response", "post_llm_call", "on_session_end",
     "on_session_finalize",
 ]
-PYTHON_FILES = ["__init__.py", "cli.py", "hooks.py", "policy.py", "redact.py", "tools.py"]
+PYTHON_FILES = ["__init__.py", "_pohunek_reporter.py", "cli.py", "hooks.py", "policy.py", "redact.py", "tools.py"]
 MANIFEST_KEYS = {"name", "version", "description", "provides_tools", "provides_hooks"}
 
 if len(sys.argv) != 4 or sys.argv[1] != "--":
@@ -286,7 +286,7 @@ def private(path, directory):
 
 if not private(plugin, True) or not private(policy_path, False):
     raise ValueError("managed paths are not private")
-for relative in ("__init__.py", "hooks.py", "tools.py", "cli.py", "policy.py", "redact.py", "skills/pohunek/SKILL.md"):
+for relative in ("__init__.py", "_pohunek_reporter.py", "hooks.py", "tools.py", "cli.py", "policy.py", "redact.py", "skills/pohunek/SKILL.md"):
     candidate = plugin / relative
     if candidate.is_symlink() or not private(candidate, False):
         raise ValueError("managed plugin asset is unsafe")
