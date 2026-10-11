@@ -471,7 +471,7 @@ async fn session_new_with_input_over_tcp_writes_text_to_shell_pty() {
             "/bin/sh",
             [
                 "-c",
-                "IFS= read -r line; printf 'got:%s\\n' \"$line\"; sleep 30",
+                "IFS= read -r line; printf 'got:%s\\n' \"$line\"; /bin/sleep 30",
             ],
         ),
         ..SessionRegistryConfig::default()
@@ -912,13 +912,15 @@ async fn daemon_doctor_bounds_aggregate_version_probes_across_slow_profiles() {
     std::fs::write(
         &slow_runtime,
         format!(
-            "#!/bin/sh\nprintf x >> '{}'\nexec /bin/sleep 20\n",
+            "#!/bin/sh\nprintf x >> '{}'\n/bin/sleep 20\nprintf 'Hermes Agent v0.20.0\\n'\n",
             probe_count.display()
         ),
     )
     .expect("write blocking version-probe executable");
     std::fs::set_permissions(&slow_runtime, std::fs::Permissions::from_mode(0o755))
         .expect("make slow runtime executable");
+    std::os::unix::fs::symlink(&slow_runtime, root.path().join("hermes"))
+        .expect("expose the valid slow runtime as the optional Hermes provider");
     for index in 0..6 {
         std::fs::write(
             agents.join(format!("slow-{index}.toml")),
@@ -946,15 +948,23 @@ async fn daemon_doctor_bounds_aggregate_version_probes_across_slow_profiles() {
     let checks = payload["report"]["checks"]
         .as_array()
         .expect("doctor checks array");
+    let find = |name: &str| {
+        checks
+            .iter()
+            .find(|check| check["name"] == name)
+            .unwrap_or_else(|| panic!("doctor reports {name}: {payload}"))
+    };
     assert!(
-        checks.iter().any(|check| {
-            check["name"] == "agent_profile_slow-5"
-                && check["detail"]
-                    .as_str()
-                    .is_some_and(|detail| detail.contains("probe budget was exhausted"))
-        }),
-        "expected exhausted probe budget for slow-5: {payload}"
+        find("agent_profile_slow-1")["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("probe budget was exhausted")),
+        "a timeout under the shortened aggregate budget must not be called an unsupported version: {payload}"
     );
+    assert_eq!(find("agent_profile_slow-1")["status"], "fail");
+    assert_eq!(find("agent_runtime_hermes")["status"], "warn");
+    assert!(find("agent_runtime_hermes")["detail"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("probe budget was exhausted")));
     let launches = std::fs::read_to_string(&probe_count).expect("read version-probe count");
     assert_eq!(
         launches.len(),

@@ -251,13 +251,16 @@ fn profile_runtime_check(
     if agent.definition.version_probe_parser().is_some() && probe_timeout.is_zero() {
         return Err(RuntimeFailure::ProbeBudget);
     }
-    crate::agent::host::validate_launch_runtime_with_timeout(
+    crate::agent::host::validate_launch_runtime_with_timeout_detailed(
         &agent.definition,
         agent.program(),
         launch_path.as_deref(),
         probe_timeout,
     )
-    .map_err(|_error| RuntimeFailure::Version)?;
+    .map_err(|error| match error {
+        crate::capabilities::LaunchValidationFailure::ProbeTimedOut => RuntimeFailure::ProbeBudget,
+        crate::capabilities::LaunchValidationFailure::Unsupported => RuntimeFailure::Version,
+    })?;
     Ok(())
 }
 

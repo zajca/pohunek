@@ -88,15 +88,40 @@ impl<'a> VersionProbe<'a> {
         launch_path: Option<&OsStr>,
         timeout: Duration,
     ) -> Option<String> {
-        match self {
-            Self::HermesV1 => run_hermes_version_probe_with_timeout(path, timeout)
-                .and_then(|output| parse_hermes_version(&output)),
-            Self::Declared(policy) => run_semver_version_probe(path, policy, launch_path, timeout)
-                .and_then(|output| {
-                    policy
-                        .read_output(&output)
-                        .map(|version| version.to_string())
-                }),
+        self.detect_version_with_outcome(path, launch_path, timeout)
+            .ok()
+    }
+
+    /// Runs the probe while retaining timeout separately from other failures.
+    fn detect_version_with_outcome(
+        self,
+        path: &Path,
+        launch_path: Option<&OsStr>,
+        timeout: Duration,
+    ) -> Result<String, ProbeOutcome> {
+        let outcome = match self {
+            Self::HermesV1 => probe_hermes_version(path, timeout, &[]),
+            Self::Declared(policy) => spawn_and_collect_probe(
+                path,
+                ProbeKind::Semver {
+                    policy,
+                    launch_path,
+                },
+                timeout,
+                &[],
+                &Instant::now,
+            )
+            .unwrap_or(ProbeOutcome::Unavailable),
+        };
+        match outcome {
+            ProbeOutcome::Output(output) => match self {
+                Self::HermesV1 => parse_hermes_version(&output).ok_or(ProbeOutcome::Failed),
+                Self::Declared(policy) => policy
+                    .read_output(&output)
+                    .map(|version| version.to_string())
+                    .ok_or(ProbeOutcome::Failed),
+            },
+            failure => Err(failure),
         }
     }
 
@@ -408,21 +433,48 @@ pub(crate) fn validate_definition_launch_with_timeout(
     launch_path: Option<&OsStr>,
     timeout: Duration,
 ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
+    validate_definition_launch_with_timeout_detailed(definition, binary, launch_path, timeout)
+        .map_err(|_failure| ProtocolError::agent_runtime_unsupported())
+}
+
+/// Why a launch-time version validation failed, retaining a shortened-budget timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LaunchValidationFailure {
+    Unsupported,
+    ProbeTimedOut,
+}
+
+/// Validate a launch definition and preserve whether its version probe timed out.
+pub(crate) fn validate_definition_launch_with_timeout_detailed(
+    definition: &RuntimeDefinition,
+    binary: &str,
+    launch_path: Option<&OsStr>,
+    timeout: Duration,
+) -> Result<Option<ValidatedLaunchProgram>, LaunchValidationFailure> {
     if definition.version_probe_parser().is_none() {
         return Ok(None);
     }
+    let shortened_budget = timeout < VERSION_PROBE_TIMEOUT;
     let timeout = timeout.min(VERSION_PROBE_TIMEOUT);
 
-    let program = ValidatedLaunchProgram::resolve(binary)
-        .ok_or_else(ProtocolError::agent_runtime_unsupported)?;
-    let supported = VersionProbe::for_definition(definition).is_some_and(|probe| {
-        probe
-            .detect_version(program.as_path(), launch_path, timeout)
-            .is_some_and(|version| probe.accepts(&version))
-    });
-    supported
+    let program =
+        ValidatedLaunchProgram::resolve(binary).ok_or(LaunchValidationFailure::Unsupported)?;
+    let Some(probe) = VersionProbe::for_definition(definition) else {
+        return Err(LaunchValidationFailure::Unsupported);
+    };
+    let version = probe
+        .detect_version_with_outcome(program.as_path(), launch_path, timeout)
+        .map_err(|outcome| match outcome {
+            ProbeOutcome::TimedOut if shortened_budget => LaunchValidationFailure::ProbeTimedOut,
+            ProbeOutcome::Failed | ProbeOutcome::Unavailable | ProbeOutcome::Output(_) => {
+                LaunchValidationFailure::Unsupported
+            }
+            ProbeOutcome::TimedOut => LaunchValidationFailure::Unsupported,
+        })?;
+    probe
+        .accepts(&version)
         .then_some(Some(program))
-        .ok_or_else(ProtocolError::agent_runtime_unsupported)
+        .ok_or(LaunchValidationFailure::Unsupported)
 }
 
 /// Minimal view of the checked-in compatibility lock needed at runtime.
@@ -443,13 +495,7 @@ fn supported_hermes_version() -> &'static str {
 }
 
 /// Run `--version` with isolated Hermes state, bounded time, and bounded output.
-fn run_hermes_version_probe_with_timeout(
-    path: &std::path::Path,
-    timeout: Duration,
-) -> Option<String> {
-    run_hermes_version_probe_with_seeded_env(path, timeout, &[])
-}
-
+#[cfg(test)]
 fn run_hermes_version_probe_with_seeded_env(
     path: &std::path::Path,
     timeout: Duration,
@@ -500,29 +546,6 @@ fn probe_hermes_version_with_clock(
 ) -> ProbeOutcome {
     spawn_and_collect_probe(path, ProbeKind::Pinned, timeout, seeded_env, &now)
         .unwrap_or(ProbeOutcome::Unavailable)
-}
-
-/// Runs the data-driven probe `policy` declares with isolated state, bounded
-/// time and bounded output, and returns its standard output.
-fn run_semver_version_probe(
-    path: &Path,
-    policy: &VersionProbePolicy,
-    launch_path: Option<&OsStr>,
-    timeout: Duration,
-) -> Option<String> {
-    match spawn_and_collect_probe(
-        path,
-        ProbeKind::Semver {
-            policy,
-            launch_path,
-        },
-        timeout,
-        &[],
-        &Instant::now,
-    )? {
-        ProbeOutcome::Output(output) => Some(output),
-        ProbeOutcome::Failed | ProbeOutcome::TimedOut | ProbeOutcome::Unavailable => None,
-    }
 }
 
 /// Which probe `spawn_and_collect_probe` runs: it fixes the arguments and the
