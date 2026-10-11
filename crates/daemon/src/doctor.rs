@@ -115,14 +115,18 @@ fn profile_checks(
     profiles: &crate::agent::ProfileRegistry,
     base_env: &pohunek_worker_protocol::BaseEnv,
 ) -> Vec<DoctorCheck> {
+    let mut checks = embedded_manifest_checks();
+    checks.extend(manifest_override_checks(profiles));
     let probe_started = Instant::now();
     let configured = match profiles.doctor_profiles() {
         Ok(configured) => configured,
-        Err(detail) => return vec![check("agent_profiles", DoctorStatus::Fail, detail)],
+        Err(detail) => {
+            checks.push(check("agent_profiles", DoctorStatus::Fail, detail));
+            return checks;
+        }
     };
     let configured_names: std::collections::HashSet<String> =
         configured.iter().map(|(name, _)| name.clone()).collect();
-    let mut checks = Vec::new();
     for (name, result) in configured {
         let safe_name = safe_profile_name(&name);
         let check_name = format!("agent_profile_{safe_name}");
@@ -211,6 +215,68 @@ fn profile_checks(
         ));
     }
     checks
+}
+
+/// Validate the canonical embedded manifest sources without invoking their panic-on-error loaders.
+fn embedded_manifest_checks() -> Vec<DoctorCheck> {
+    crate::agent::host::RESERVED_RUNTIME_IDS
+        .iter()
+        .copied()
+        .zip(crate::detect::embedded_manifest_sources())
+        .map(|(runtime, source)| {
+            let (status, detail) = match crate::detect::Manifest::parse_str(source) {
+                Ok(_) => (DoctorStatus::Ok, "Embedded detection manifest is valid."),
+                Err(_) => (
+                    DoctorStatus::Fail,
+                    "Embedded detection manifest is invalid; repair the daemon build input.",
+                ),
+            };
+            DoctorCheck::new(format!("agent_manifest_embedded_{runtime}"), status, detail)
+        })
+        .collect()
+}
+
+/// Report host overrides validated by the profile layer's launch-equivalent resolver.
+fn manifest_override_checks(profiles: &crate::agent::ProfileRegistry) -> Vec<DoctorCheck> {
+    match profiles.doctor_manifest_overrides() {
+        Ok(overrides) => overrides
+            .into_iter()
+            .map(|(name, referenced, result)| {
+                let (status, detail) = match result {
+                    Ok(true) => (
+                        DoctorStatus::Ok,
+                        "Manifest override is valid and intentionally disables detection.",
+                    ),
+                    Ok(false) if referenced => (
+                        DoctorStatus::Ok,
+                        "Manifest override is valid and takes precedence for its configured profile.",
+                    ),
+                    Ok(false) => (
+                        DoctorStatus::Ok,
+                        "Unreferenced manifest override is valid.",
+                    ),
+                    Err(crate::agent::DoctorManifestError::Invalid) if referenced => (
+                        DoctorStatus::Fail,
+                        "A configured profile references a missing or invalid manifest override; repair the override.",
+                    ),
+                    Err(crate::agent::DoctorManifestError::Invalid) => (
+                        DoctorStatus::Warn,
+                        "An unreferenced manifest override is invalid; repair or remove it.",
+                    ),
+                };
+                DoctorCheck::new(
+                    format!("agent_manifest_override_{}", safe_profile_name(&name)),
+                    status,
+                    detail,
+                )
+            })
+            .collect(),
+        Err(detail) => vec![check(
+            "agent_manifest_overrides",
+            DoctorStatus::Fail,
+            detail,
+        )],
+    }
 }
 
 #[derive(Clone, Copy)]
