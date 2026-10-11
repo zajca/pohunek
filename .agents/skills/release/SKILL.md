@@ -47,8 +47,9 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    scripts/release <patch|minor|major|X.Y.Z> [--notes FILE] --dry-run
    ```
 
-   This prints the current and next version, the tag, and every changed
-   compatibility constant with its old and new value. Confirm it matches
+   This prints the current and next version, the tag, and whether the release
+   notes cover any changed compatibility constants. It also describes the
+   commit, evidence checks, and pushes it would perform. Confirm that matches
    intent.
 
 4. **Cut the release.** Run the real thing:
@@ -58,10 +59,16 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    ```
 
    The script bumps `version` in `[workspace.package]` in `Cargo.toml`, refreshes
-   `Cargo.lock`, commits `Release vX.Y.Z`, creates an annotated tag `vX.Y.Z`, and
-   pushes both the branch and the tag to `origin`. Use `--no-push` if the user
-   wants to inspect the commit/tag locally before pushing (then push the branch
-   and tag manually as the script prints).
+   `Cargo.lock`, commits `Release vX.Y.Z`, and requires successful main and
+   nightly CI evidence for that exact commit before creating an annotated tag
+   `vX.Y.Z`. By default it pushes the release branch before waiting for evidence
+   and pushes the tag after verification. With `--no-push`, it checks only
+   already-existing exact-commit evidence and leaves the commit and tag local;
+   it does not dispatch CI or push either ref. After local tagging, the script
+   reminds you to push the release branch and tag manually. If the evidence
+   check fails or times out, resolve the CI issue and rerun with the same
+   explicit `X.Y.Z`; the workspace is already bumped, so do not request another
+   relative bump such as `patch`.
 
 5. **Publish the notes.** When a notes file was needed, attach it to the GitHub
    Release once the workflow has created it (`gh release edit "vX.Y.Z"

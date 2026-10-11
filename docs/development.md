@@ -309,9 +309,14 @@ unavailable).
 
 ## Release
 
-`scripts/release` bumps the workspace version, tags `vX.Y.Z`, and pushes; the
-Release workflow (`.github/workflows/release.yml`) re-runs the gates on the tag
-and then builds, assembles and publishes the release in one fixed flow:
+`scripts/release` bumps the workspace version and refreshes the lockfile, then
+requires successful main and nightly CI evidence for the exact release commit
+before tagging `vX.Y.Z`. By default it pushes the release branch before waiting
+for that evidence and pushes the tag after verification. `--no-push` checks
+already-existing evidence and leaves the commit and tag local; it does not
+dispatch CI or push either ref. The Release workflow
+(`.github/workflows/release.yml`) re-runs the gates on the tag and then builds,
+assembles and publishes the release in one fixed flow:
 
 1. **Producers** upload workflow artifacts only: `release-build.yml` (reusable)
    builds the glibc and MUSL x86_64 CLI and daemon archives, the glibc relay
