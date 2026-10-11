@@ -1787,48 +1787,6 @@ mod tests {
     }
 
     #[test]
-    fn changed_operator_provenance_is_outdated_and_update_restores_current_marker() {
-        let (_root, target, policy_path, policy) = setup("operator-provenance");
-        let request = InstallRequest::new(&target, &policy_path, &policy, false);
-        let mut hermes = ControlledHermes::default();
-        install(&mut hermes, &request).expect("install current sidecar");
-
-        let marker_path = target.plugin_root().join(MARKER_NAME);
-        let mut ownership = assets::parse_marker(&fs::read(&marker_path).expect("read marker"))
-            .expect("parse marker");
-        let mut stale_digest = assets::operator_sha256().expect("current sidecar hash");
-        stale_digest.replace_range(
-            ..1,
-            if stale_digest.starts_with('0') {
-                "1"
-            } else {
-                "0"
-            },
-        );
-        ownership.operator_sha256 = Some(stale_digest);
-        fs::write(
-            &marker_path,
-            assets::marker_bytes(&ownership).expect("stale provenance marker"),
-        )
-        .expect("write stale provenance marker");
-        fs::set_permissions(&marker_path, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
-            .expect("restore private marker mode");
-
-        let stale = inspect(&mut hermes, &target, &policy_path).expect("inspect stale marker");
-        assert!(stale.outdated);
-        assert!(!stale.modified);
-
-        let updated = install(&mut hermes, &request).expect("update stale provenance");
-        assert!(!updated.outdated);
-        let marker = assets::parse_marker(&fs::read(&marker_path).expect("read updated marker"))
-            .expect("parse updated marker");
-        assert_eq!(
-            marker.operator_sha256,
-            Some(assets::operator_sha256().expect("sidecar hash"))
-        );
-    }
-
-    #[test]
     fn confirmed_update_preserves_unrelated_owner_file() {
         let (_root, target, policy_path, policy) = setup("update-unrelated");
         let mut hermes = ControlledHermes::default();

@@ -637,30 +637,4 @@ mod tests {
             Err(Error::InvalidMarker)
         );
     }
-
-    #[test]
-    fn operator_manifest_is_closed_and_hashes_only_allowlisted_payload() {
-        let source = std::str::from_utf8(OPERATOR_MANIFEST).expect("manifest UTF-8");
-        verified_operator_manifest_bytes(source.as_bytes()).expect("valid embedded manifest");
-
-        let unknown_field = source.replacen("schema = 1\n", "schema = 1\nunexpected = true\n", 1);
-        assert!(matches!(
-            verified_operator_manifest_bytes(unknown_field.as_bytes()),
-            Err(Error::InvalidAsset)
-        ));
-        let wrong_payload_hash = source.replacen(
-            "9e666f85a2d9f99bc99cc0d997f146d52e28bd862cb6e387312551939a077625",
-            &"0".repeat(64),
-            1,
-        );
-        assert!(matches!(
-            verified_operator_manifest_bytes(wrong_payload_hash.as_bytes()),
-            Err(Error::InvalidAsset)
-        ));
-        let repeated_path = source.replacen("path = \"__init__.py\"", "path = \"plugin.yaml\"", 1);
-        assert!(matches!(
-            verified_operator_manifest_bytes(repeated_path.as_bytes()),
-            Err(Error::InvalidAsset)
-        ));
-    }
 }

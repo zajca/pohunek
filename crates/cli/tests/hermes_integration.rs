@@ -307,6 +307,130 @@ esac"#,
     assert_eq!(update["modified"], false);
     assert_eq!(update["access_mode"], "full");
 
+    // Sidecar provenance drift keeps the installed payload intact but requires
+    // the operator-visible update path to refresh its ownership marker.
+    let marker_path = plugin_root.join(".pohunek-owned.json");
+    let clean_marker_bytes = fs::read(&marker_path).expect("read clean ownership marker");
+    let clean_marker: Value =
+        serde_json::from_slice(&clean_marker_bytes).expect("parse clean ownership marker");
+    let installed_files = clean_marker["assets"]
+        .as_object()
+        .expect("managed asset map")
+        .keys()
+        .map(|relative| {
+            (
+                relative.clone(),
+                fs::read(plugin_root.join(relative)).expect("read installed asset"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let policy_before_invalid_markers = fs::read(policy_path).expect("read installed policy");
+
+    let mut stale_provenance = clean_marker.clone();
+    let digest = stale_provenance["operator_sha256"]
+        .as_str()
+        .expect("operator digest")
+        .to_owned();
+    let replacement = if digest.starts_with('0') { '1' } else { '0' };
+    stale_provenance["operator_sha256"] = json!(format!("{replacement}{}", &digest[1..]));
+    fs::write(
+        &marker_path,
+        serde_json::to_vec_pretty(&stale_provenance).expect("serialize stale marker"),
+    )
+    .expect("write stale operator digest");
+    set_mode(&marker_path, 0o600);
+
+    let stale_status = parse_ok(&run(&fixture, &status_json_arguments));
+    assert_eq!(stale_status["outdated"], true);
+    assert_eq!(stale_status["modified"], false);
+    let stale_doctor_output = run(
+        &fixture,
+        &[
+            "integration",
+            "doctor",
+            "--agent",
+            "hermes",
+            "--hermes-profile",
+            "default",
+            "--hermes-bin",
+            hermes,
+            "--json",
+        ],
+    );
+    assert!(!stale_doctor_output.status.success());
+    let stale_doctor_envelope: Value =
+        serde_json::from_slice(&stale_doctor_output.stdout).expect("parse stale doctor envelope");
+    let stale_doctor = &stale_doctor_envelope["ok"];
+    let asset_current = stale_doctor["doctor"]["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|check| check["code"] == "asset_current")
+        .expect("asset current check");
+    assert_eq!(asset_current["status"], "fail");
+
+    let digest_update_arguments = [
+        "integration",
+        "update",
+        "--agent",
+        "hermes",
+        "--hermes-profile",
+        "default",
+        "--hermes-bin",
+        hermes,
+        "--json",
+    ];
+    let digest_update = parse_ok(&run(&fixture, &digest_update_arguments));
+    assert_eq!(digest_update["modified"], false);
+    let restored_status = parse_ok(&run(&fixture, &status_json_arguments));
+    assert_eq!(restored_status["outdated"], false);
+    assert_eq!(restored_status["modified"], false);
+
+    for (description, mut invalid_marker) in [
+        ("missing digest", clean_marker.clone()),
+        ("invalid digest", clean_marker.clone()),
+    ] {
+        if description == "missing digest" {
+            invalid_marker
+                .as_object_mut()
+                .expect("ownership marker object")
+                .remove("operator_sha256");
+        } else {
+            invalid_marker["operator_sha256"] = json!("invalid-digest");
+        }
+        fs::write(
+            &marker_path,
+            serde_json::to_vec_pretty(&invalid_marker).expect("serialize invalid marker"),
+        )
+        .expect("write invalid v2 marker");
+        set_mode(&marker_path, 0o600);
+        assert_eq!(
+            parse_error(&run(&fixture, &status_json_arguments))["code"],
+            "hermes_invalid_marker",
+            "CLI rejects a v2 marker with {description}"
+        );
+        assert_eq!(
+            parse_error(&run(&fixture, &digest_update_arguments))["code"],
+            "hermes_invalid_marker",
+            "CLI update rejects a v2 marker with {description}"
+        );
+        for (relative, expected) in &installed_files {
+            assert_eq!(
+                fs::read(plugin_root.join(relative))
+                    .expect("read asset after invalid marker rejection"),
+                expected.as_slice(),
+                "invalid marker rejection preserves {relative}"
+            );
+        }
+        assert_eq!(
+            fs::read(policy_path).expect("read policy after invalid marker rejection"),
+            policy_before_invalid_markers,
+            "invalid marker rejection preserves installed policy"
+        );
+    }
+    fs::write(&marker_path, &clean_marker_bytes).expect("restore clean ownership marker");
+    set_mode(&marker_path, 0o600);
+
     fs::write(plugin_root.join("tools.py"), b"# explicitly modified\n")
         .expect("mutate managed plugin");
     let modified_update = [
