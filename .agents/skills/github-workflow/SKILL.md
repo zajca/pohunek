@@ -124,9 +124,16 @@ issues, comments, assignments, and linked PRs before explicitly confirming a
 manual reservation. A label, assignment, request, or unanswered comment is
 not a grant. Do not invent a claim command or imply that a public label locks
 work. Automatic bounded admission begins only after the service is delivered.
-Reviewer and escalation wording must remain subject to #798 D3 until that
-decision is accepted; never imply a guaranteed review SLA. An author,
-executor, or manager cannot satisfy a required independent review.
+`zajca` is the maintainer triage, routing, and integration contact across
+areas. An available independent reviewer examines the relevant code, contract,
+and evidence for the area. If no independent reviewer is available, the
+candidate remains unaccepted; the maintainer records that state and retries
+routing when capacity exists. Do not promise a response time. An automated
+review counts only after the exact PR head and completed run are verified and
+#700 resolves the reviewer-service defect; interrupted or stale-head runs are
+not approval. The submitter cannot provide independent approval; an author,
+executor, or manager cannot satisfy a required independent review. Outside
+contributors receive no merge or release authority.
 
 Use the capability classes and S/M/L size meanings in the config as scope
 cues, not model-brand gates or time promises. Keep readiness labels separate

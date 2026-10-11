@@ -79,7 +79,7 @@
       "note": "A scope cue only; never a promised time budget."
     },
     "deliveryStatus": "Todo, In Progress, and Done retain the meanings in statusSemantics; readiness is separate. A public contributor does not need private Project access.",
-    "review": "Name the area and proposed reviewer route in the public issue. The maintainer or an explicitly designated area reviewer coordinates review; author, executor, or manager cannot satisfy a required independent review. The final reviewer and escalation route remain subject to #798 D3.",
+    "review": "zajca is the maintainer triage, routing, and integration contact across areas. An available independent reviewer examines the relevant code, contract, and evidence for the area; the submitter cannot provide independent approval, and an author, executor, or manager cannot satisfy a required independent review. If no independent reviewer is available, the candidate remains unaccepted, the maintainer records that state, and routing is retried when capacity exists; no response-time promise is made. An automated review counts only after the exact PR head and completed run are verified and #700 resolves the reviewer-service defect; interrupted or stale-head runs are not approval. Outside contributors receive no merge or release authority.",
     "labelsAreManual": true
   },
   "localFiles": {

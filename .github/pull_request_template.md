@@ -34,7 +34,7 @@ Record exact commands and actual outcomes. Use `passed`, `failed`, `skipped` (wi
 
 ## Review and handoff
 
-- Proposed area reviewer / route:
+- Area reviewer (if available):
 - Independent review required by policy: pending / complete (link exact-head review evidence)
 - Remaining work, blockers, or unresolved effects:
 - Next permitted action / handoff owner:

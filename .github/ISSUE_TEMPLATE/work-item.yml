@@ -100,7 +100,7 @@ body:
     id: review-route
     attributes:
       label: Review route
-      description: Name the area and proposed maintainer or explicitly designated area reviewer. The final reviewer and escalation route remain subject to #798 D3.
+      description: Name the area. zajca is the maintainer triage, routing, and integration contact; an available independent reviewer examines the area. If none is available, the candidate remains unaccepted and no response-time promise applies. The submitter cannot provide independent approval; an author, executor, or manager cannot satisfy required independent review. Automated review counts only after the exact head and completed run are verified and #700 resolves the reviewer-service defect.
     validations:
       required: true
   - type: markdown
