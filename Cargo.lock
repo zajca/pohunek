@@ -5781,6 +5781,7 @@ dependencies = [
  "tar",
  "tempfile",
  "toml",
+ "toml_edit 0.22.27",
  "vt100",
  "zeroize",
 ]

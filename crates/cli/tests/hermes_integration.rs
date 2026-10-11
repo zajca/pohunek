@@ -94,6 +94,80 @@ fn parse_error(output: &Output) -> Value {
 }
 
 #[test]
+fn binary_install_uses_the_checked_embedded_operator_skill() {
+    let fixture = Fixture::new("operator-skill");
+    let home = fixture.private_directory("home");
+    fixture.private_directory("home/.hermes/profiles/default");
+    fixture.private_directory("state");
+    fixture.private_directory("run");
+    fixture.private_directory("data");
+    fixture.private_directory("config");
+    fixture.private_directory("cache");
+    let venv_bin = fixture.private_directory("installation/venv/bin");
+    let python_bin = fixture.private_directory("installation/python/bin");
+    write_executable(
+        &python_bin.join("python3"),
+        &format!("exec '{}' \"$@\"", interpreter::python().display()),
+    );
+    symlink("../../python/bin/python3", venv_bin.join("python3")).expect("link Python runtime");
+
+    let state_file = fixture.root.join("plugin-state");
+    fs::write(&state_file, "disabled\n").expect("write plugin state");
+    let plugin_root = home.join(".hermes/plugins/operators/pohunek");
+    let hermes_bin = venv_bin.join("hermes");
+    write_executable(
+        &hermes_bin,
+        &format!(
+            r#"case "$*" in
+  --version) printf '%s\n' 'Hermes Agent v0.20.0 (2026.8.3)' ;;
+  'plugins list --json')
+    if [ -d '{plugin_root}' ]; then state=$(/bin/cat '{state_file}'); printf '[{{"name":"pohunek","status":"%s","source":"user"}}]\n' "$state"; else printf '%s\n' '[]'; fi ;;
+  'plugins enable pohunek --no-allow-tool-override') printf '%s\n' enabled > '{state_file}' ;;
+  'plugins disable pohunek') printf '%s\n' disabled > '{state_file}' ;;
+  *) exit 90 ;;
+esac"#,
+            plugin_root = plugin_root.display(),
+            state_file = state_file.display(),
+        ),
+    );
+    let pohunek_bin = fixture.root.join("policy-pohunek");
+    write_executable(
+        &pohunek_bin,
+        &format!(
+            r#"printf '%s\n' '{{"cli_version":"fixture","protocol":{{"minimum":{version},"maximum":{version}}},"ok":{{}}}}'"#,
+            version = PROTOCOL_VERSION.get()
+        ),
+    );
+
+    parse_ok(&run(
+        &fixture,
+        &[
+            "integration",
+            "install",
+            "--agent",
+            "hermes",
+            "--hermes-profile",
+            "default",
+            "--hermes-bin",
+            hermes_bin.to_str().expect("Hermes path UTF-8"),
+            "--pohunek-bin",
+            pohunek_bin.to_str().expect("Pohunek path UTF-8"),
+            "--access-mode",
+            "manage",
+            "--allow-host",
+            "local",
+            "--json",
+        ],
+    ));
+    assert_eq!(
+        fs::read(plugin_root.join("skills/pohunek/SKILL.md"))
+            .expect("read installed operator skill"),
+        include_bytes!("../../../compat/hermes/operator/skills/pohunek/SKILL.md").as_slice(),
+        "CLI installation must use the sidecar-checked embedded operator payload"
+    );
+}
+
+#[test]
 #[expect(
     clippy::too_many_lines,
     reason = "the binary contract test intentionally exercises one complete isolated lifecycle"

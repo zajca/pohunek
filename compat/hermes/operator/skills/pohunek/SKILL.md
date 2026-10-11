@@ -27,7 +27,7 @@ from an ambient Hermes conversation. Hermes native fork is unsupported, so a
 fork request returns typed unsupported data instead of creating a child session
 or worktree.
 
-`compat/hermes/package/` is a production-format local runtime fixture under
+`compat/hermes/package/` is a production-format local package fixture under
 validation, not a published or released package. It preserves the built-in
 launch and detection contract and supports only the locked 0.20.0 release. The
 reserved `hermes` runtime id requires authorization by a signed catalog;
