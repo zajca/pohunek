@@ -770,6 +770,8 @@ async fn daemon_doctor_reports_profile_readiness_and_redacts_profile_content() {
     reason = "The RPC scenario verifies several redaction and provider states together."
 )]
 async fn daemon_doctor_reports_redacted_provider_integration_readiness() {
+    use std::os::unix::fs::PermissionsExt as _;
+
     let root = pohunek_test_support::tempdir().expect("create integration fixture root");
     let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
     process_env.set("PATH", root.path());
@@ -778,10 +780,12 @@ async fn daemon_doctor_reports_redacted_provider_integration_readiness() {
     let agents = root.path().join("agents");
     std::fs::create_dir(&agents).expect("create agents directory");
     let shared_home = root.path().join("shared-codex-home");
+    let symlink_home = root.path().join("a-link-codex-home");
     let different_home = root.path().join("different-codex-home");
     let malformed_home = root.path().join("malformed-codex-home");
     let incomplete_home = root.path().join("incomplete-codex-home");
     std::fs::create_dir(&shared_home).expect("create shared Codex home");
+    std::os::unix::fs::symlink(&shared_home, &symlink_home).expect("symlink shared Codex home");
     std::fs::create_dir(&different_home).expect("create separate Codex home");
     std::fs::create_dir(&malformed_home).expect("create malformed Codex home");
     std::fs::write(malformed_home.join("config.toml"), "= invalid\n")
@@ -793,8 +797,8 @@ async fn daemon_doctor_reports_redacted_provider_integration_readiness() {
     )
     .expect("write quarantine fixture");
     for (name, home) in [
-        ("alpha", &shared_home),
-        ("shared", &shared_home),
+        ("a-link", &symlink_home),
+        ("b-real", &shared_home),
         ("different", &different_home),
         ("malformed", &malformed_home),
         ("incomplete", &incomplete_home),
@@ -823,7 +827,7 @@ async fn daemon_doctor_reports_redacted_provider_integration_readiness() {
     let mut local = connect_unix(&socket).await;
     let params = protocol::IntegrationInstallParams {
         agent: Some(protocol::RuntimeRef::codex()),
-        profile: Some("alpha".to_owned()),
+        profile: Some("b-real".to_owned()),
         all_profiles: false,
     };
     let install_payload = ok_payload(
@@ -864,11 +868,11 @@ async fn daemon_doctor_reports_redacted_provider_integration_readiness() {
             .unwrap_or_else(|| panic!("doctor reports {name}: {local_payload}"))
     };
     assert_eq!(
-        find("agent_integration_codex_profile_alpha")["status"],
+        find("agent_integration_codex_profile_b-real")["status"],
         "ok"
     );
     assert_eq!(
-        find("agent_integration_codex_profile_alpha")
+        find("agent_integration_codex_profile_b-real")
             .as_object()
             .expect("stable DoctorCheck object")
             .len(),
@@ -899,6 +903,73 @@ async fn daemon_doctor_reports_redacted_provider_integration_readiness() {
     assert!(!rendered.contains(shared_home.to_string_lossy().as_ref()));
     assert!(!rendered.contains(different_home.to_string_lossy().as_ref()));
 
+    let alias_doctor = ok_payload(
+        exchange(
+            &mut local,
+            &Request::make(
+                "doctor-profile-alias-selector",
+                method::INTEGRATION_DOCTOR,
+                serde_json::json!({ "agent": "codex", "all_profiles": true }),
+            ),
+        )
+        .await,
+    );
+    let alias_home = alias_doctor["agents"]
+        .as_array()
+        .expect("integration doctor agents")
+        .iter()
+        .find(|agent| agent["home"]["profiles"] == serde_json::json!(["a-link", "b-real"]))
+        .expect("the aliased home is grouped");
+    assert_eq!(alias_home["home"]["selector"]["name"], "b-real");
+
+    std::fs::set_permissions(&installed_hook, std::fs::Permissions::from_mode(0o700))
+        .expect("make the installed hook owner-only executable");
+    let benign_mode_payload = ok_payload(
+        exchange(
+            &mut local,
+            &Request::make(
+                "doctor-benign-hook-mode",
+                method::DAEMON_DOCTOR,
+                Value::Null,
+            ),
+        )
+        .await,
+    );
+    let benign_mode = benign_mode_payload["report"]["checks"]
+        .as_array()
+        .expect("doctor checks array")
+        .iter()
+        .find(|check| check["name"] == "agent_integration_codex_profile_b-real")
+        .expect("integration check");
+    assert_eq!(benign_mode["status"], "warn");
+    assert!(benign_mode["detail"]
+        .as_str()
+        .expect("detail")
+        .contains("pohunek integration install --agent codex --profile b-real"));
+
+    std::fs::set_permissions(&installed_hook, std::fs::Permissions::from_mode(0o777))
+        .expect("make the installed hook writable by other users");
+    let unsafe_mode_payload = ok_payload(
+        exchange(
+            &mut local,
+            &Request::make(
+                "doctor-unsafe-hook-mode",
+                method::DAEMON_DOCTOR,
+                Value::Null,
+            ),
+        )
+        .await,
+    );
+    let unsafe_mode = unsafe_mode_payload["report"]["checks"]
+        .as_array()
+        .expect("doctor checks array")
+        .iter()
+        .find(|check| check["name"] == "agent_integration_codex_profile_b-real")
+        .expect("integration check");
+    assert_eq!(unsafe_mode["status"], "fail");
+    std::fs::set_permissions(&installed_hook, std::fs::Permissions::from_mode(0o755))
+        .expect("restore the installer mode before the content-drift case");
+
     let shared_root =
         pohunek_platform::filesystem::TrustedDir::open_absolute_owner_safe(&shared_home, 0o022)
             .expect("open shared home");
@@ -925,7 +996,7 @@ async fn daemon_doctor_reports_redacted_provider_integration_readiness() {
         .as_array()
         .expect("locked doctor checks array")
         .iter()
-        .find(|check| check["name"] == "agent_integration_codex_profile_alpha")
+        .find(|check| check["name"] == "agent_integration_codex_profile_b-real")
         .expect("locked integration check");
     assert_eq!(locked["status"], "warn");
     assert!(locked["detail"]
@@ -951,7 +1022,7 @@ async fn daemon_doctor_reports_redacted_provider_integration_readiness() {
         .as_array()
         .expect("outdated doctor checks array")
         .iter()
-        .find(|check| check["name"] == "agent_integration_codex_profile_alpha")
+        .find(|check| check["name"] == "agent_integration_codex_profile_b-real")
         .expect("outdated integration check");
     assert_eq!(outdated["status"], "warn");
     assert!(outdated["detail"]

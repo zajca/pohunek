@@ -338,10 +338,14 @@ fn integration_checks(
 /// Convert one typed integration diagnosis without exposing inspected paths or prose.
 fn integration_agent_check(diagnosis: &protocol::IntegrationAgentDoctor) -> DoctorCheck {
     let runtime = diagnosis.agent.as_wire();
-    let profile = diagnosis
+    let selector = diagnosis
         .home
         .as_ref()
-        .and_then(|home| home.profiles.first());
+        .and_then(|home| home.selector.as_ref());
+    let profile = match selector {
+        Some(protocol::IntegrationSelector::Profile { name }) => Some(name.as_str()),
+        Some(protocol::IntegrationSelector::Default) | None => None,
+    };
     let target = profile
         .map(|name| format!("_profile_{}", safe_profile_name(name)))
         .unwrap_or_default();
@@ -354,17 +358,19 @@ fn integration_agent_check(diagnosis: &protocol::IntegrationAgentDoctor) -> Doct
         .home
         .as_ref()
         .map_or(0, |home| home.profiles.len().saturating_sub(1));
+    let repair_required = diagnosis.status.as_ref().is_some_and(|status| {
+        status.recovery == protocol::IntegrationRecovery::RepairConfiguration
+    });
     let has_security_or_malformed_finding = diagnosis.findings.iter().any(|finding| {
         matches!(
             finding.code,
             IntegrationFindingCode::ConfigRootInvalid
-                | IntegrationFindingCode::AssetUnsafe
                 | IntegrationFindingCode::ProviderConfigInvalid
                 | IntegrationFindingCode::HookSocketPathInvalid
                 | IntegrationFindingCode::UnsafeInstallerLock
                 | IntegrationFindingCode::DisplacedOriginalLeftBehind
                 | IntegrationFindingCode::QuarantineScanIncomplete
-        )
+        ) || (finding.code == IntegrationFindingCode::AssetUnsafe && repair_required)
     });
     let (status, detail) = match &diagnosis.status {
         None => (
