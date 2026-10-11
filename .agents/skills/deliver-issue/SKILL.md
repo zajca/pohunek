@@ -24,7 +24,7 @@ the review loop, CI triage, and the merge decision. Where a step below says
 
 - Invoking this skill **is** the owner's explicit request to commit, push,
   open the issue's PRs, and merge them once the merge criteria (below) hold
-  (AGENTS.md, "Accepted harness trade-offs"). It does not authorize
+  ([accepted harness trade-offs](../../instructions/workflow.md)). It does not authorize
   releases, tags, force-pushes to `main`, or work outside the issue's scope.
 - Never ask the operator. Resolve every ambiguity yourself: take the most
   conservative interpretation consistent with `docs/architecture.md`, the
@@ -55,8 +55,8 @@ the review loop, CI triage, and the merge decision. Where a step below says
 ## Phase 2 — plan
 
 1. Read AGENTS.md, `docs/architecture.md`, and every doc the issue names.
-   Before any `.rs` work, read `.agents/rust-guidelines/` per AGENTS.md
-   ("Coding conventions") or the guidelines' own `SKILL.md` index.
+   Before any `.rs` work, read `.agents/rust-guidelines/` per
+   `.agents/instructions/coding.md` or the guidelines' own `SKILL.md` index.
 2. Split the work into a PR stack per `milestone` step 4 and
    `pullRequests` in `.github/agent-workflow.json`: one concern per slice,
    dependency order, each slice mapped to its DoD items. Record the slice
@@ -77,7 +77,7 @@ slice:
 1. Write a **shared context file** (in the session scratchpad) holding: the
    worktree path and HEAD, "no commits, no pushes, no branches", the mandatory
    repo rules (Rust guidelines, comment rules below, no hardcoded tuning
-   values, the AGENTS.md "Testing policy", knowledge-bundle updates), the local test
+   values, the [testing policy](../../instructions/verification.md#testing-policy), knowledge-bundle updates), the local test
    environment rules (below), and the report format. Brief every worker with
    "read the context file first" plus its own 4-step briefing (known facts,
    `path:line` starts, testable success criteria, owned files).
@@ -92,7 +92,7 @@ slice:
      driving the real product processes — extending the existing scenario
      when one fits, and show it fails without the change and passes with it;
      add no test for a trivial helper change or a refactor existing scenarios
-     already cover, and never write a new unit test (AGENTS.md "Testing policy");
+     already cover, and never write a new unit test ([testing policy](../../instructions/verification.md#testing-policy));
    - run the checks its change affects: its crate's tests, clippy `-D warnings` (host, and
      `scripts/darwin-check` for platform/daemon code), `cargo fmt`,
      and `cargo xtask docs check` when docs changed;
@@ -266,7 +266,7 @@ address its findings in a new fix PR off the updated `main` (same loop).
   watchers, reconciliation) must not act on work a live task still owns.
 - **Fail closed**: uncertain evidence never deletes, kills, or retires
   anything; it keeps a visible, retryable state.
-- **Tests** follow AGENTS.md "Testing policy": integration scenarios driving
+- **Tests** follow the [testing policy](../../instructions/verification.md#testing-policy): integration scenarios driving
   cooperating production components through a supported boundary, or E2E
   scenarios driving the real product processes, with independent expected
   results; no new unit tests, no coverage targets, no duplicates of covered

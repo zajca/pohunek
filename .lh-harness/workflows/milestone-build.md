@@ -111,7 +111,7 @@ contains, and never spend an episode investigating it beyond that.
 - `#![forbid(unsafe_code)]` in library crates stays. `strict_types` and
   existing code style are not negotiable. Follow existing patterns; do not
   add backward-compatibility shims.
-- Tests follow the AGENTS.md "Testing policy": new observable behavior gets
+- Tests follow the [testing policy](../../.agents/instructions/verification.md#testing-policy): new observable behavior gets
   an integration scenario (multiple production components cooperating
   through a supported boundary) or an E2E scenario driving the real product
   processes; a bug or lifecycle fix gets a regression scenario at such a
@@ -133,7 +133,8 @@ contains, and never spend an episode investigating it beyond that.
 
 ## Gate set (run from the worktree root, in this order)
 
-The full set mirrors CI exactly (see `AGENTS.md`). Run it in full, in this
+The full set mirrors CI exactly (see
+`.agents/instructions/verification.md`). Run it in full, in this
 order, as the closing verification of the milestone:
 
 ```bash
