@@ -29,8 +29,6 @@ pub mod executable;
 pub mod macos;
 pub mod worker_probe;
 
-// Rust guideline compliant 2026-10-11
-
 pub use executable::{is_executable_file, resolve_executable};
 pub use macos::{
     apply_supervision, doctor_request_timeout, AGENT_RUNTIME_PROBE_BUDGET, LAUNCHD_CHECKS,
@@ -41,6 +39,7 @@ pub use macos::{
     Runner, Supervision, WorkerCandidate, WorkerSource, WORKER_EXECUTABLE_CHECK,
 };
 pub use pohunek_paths::Platform;
+pub use worker_probe::WORKER_PROBE_DEADLINE;
 
 /// Name prefix of the writability probe file.
 ///

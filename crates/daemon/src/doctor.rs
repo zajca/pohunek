@@ -50,10 +50,21 @@ pub(crate) async fn report(
         path: active.worker_executable,
         source: WorkerSource::Supervision,
     });
-    let mut checks =
-        tokio::task::spawn_blocking(move || standard_checks(&paths, worker.as_ref(), mode))
-            .await
-            .map_err(|_error| DoctorReportError)?;
+    let mut checks = tokio::task::spawn_blocking(move || {
+        let mut checks = standard_checks(&paths, worker.as_ref(), mode);
+        let readiness = worker_readiness_check(worker.as_ref());
+        if let Some(existing) = checks
+            .iter_mut()
+            .find(|existing| existing.name == hostcheck::WORKER_EXECUTABLE_CHECK)
+        {
+            *existing = readiness;
+        } else {
+            checks.push(readiness);
+        }
+        checks
+    })
+    .await
+    .map_err(|_error| DoctorReportError)?;
     let profiles = profiles.clone();
     checks.extend(
         tokio::task::spawn_blocking(move || {
@@ -548,6 +559,52 @@ fn standard_checks(
         access_dirs: &[],
         supervision,
     })
+}
+
+/// The daemon's active worker executable and protocol readiness.
+fn worker_readiness_check(worker: Option<&WorkerCandidate>) -> DoctorCheck {
+    let Some(worker) = worker else {
+        return check(
+            hostcheck::WORKER_EXECUTABLE_CHECK,
+            DoctorStatus::Fail,
+            "The daemon has no active session worker; configure worker supervision before starting sessions.",
+        );
+    };
+    if !worker.path.is_absolute() || !hostcheck::is_executable_file(&worker.path) {
+        return check(
+            hostcheck::WORKER_EXECUTABLE_CHECK,
+            DoctorStatus::Fail,
+            "The active session worker is missing or unsafe; install a trusted worker executable and restart the daemon.",
+        );
+    }
+
+    match hostcheck::worker_probe::probe_worker(
+        &worker.path,
+        hostcheck::WORKER_PROBE_DEADLINE,
+        crate::runtime::lifecycle::WORKER_JOURNAL_READABLE_SCHEMAS,
+        pohunek_worker_protocol::SUPPORTED_RANGE,
+    ) {
+        Ok(_) => check(
+            hostcheck::WORKER_EXECUTABLE_CHECK,
+            DoctorStatus::Ok,
+            "The active session worker reports a readable journal schema and overlapping worker protocol.",
+        ),
+        Err(hostcheck::worker_probe::WorkerProbeError::Unsupported) => check(
+            hostcheck::WORKER_EXECUTABLE_CHECK,
+            DoctorStatus::Warn,
+            "The active session worker does not report capabilities; compatibility is unverified.",
+        ),
+        Err(hostcheck::worker_probe::WorkerProbeError::TimedOut) => check(
+            hostcheck::WORKER_EXECUTABLE_CHECK,
+            DoctorStatus::Fail,
+            "The active session worker did not answer the bounded capability probe; repair or reinstall it.",
+        ),
+        Err(_) => check(
+            hostcheck::WORKER_EXECUTABLE_CHECK,
+            DoctorStatus::Fail,
+            "The active session worker is malformed or incompatible; repair or reinstall the worker binary.",
+        ),
+    }
 }
 
 /// Name of the check that reports the catalog trust anchor.

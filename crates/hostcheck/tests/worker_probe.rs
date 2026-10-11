@@ -1,5 +1,3 @@
-// Rust guideline compliant 2026-10-11
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -74,6 +72,50 @@ fn rejects_malformed_and_wrong_identity_responses() {
             SUPPORTED_RANGE
         ),
         Err(WorkerProbeError::IdentityMismatch)
+    ));
+}
+
+#[test]
+fn recognizes_an_older_worker_without_the_capability_flag_as_unverified() {
+    let root = tempdir().expect("create fixture root");
+    let legacy = executable(
+        root.path(),
+        "legacy",
+        "case \"$1\" in --protocol-info) printf '%s\\n' 'pohunek-sessiond: fatal: worker protocol failed: unknown worker argument `--protocol-info`' >&2; exit 2;; --version) printf '%s\\n' 'pohunek-sessiond 0.33.0';; esac",
+    );
+
+    assert!(matches!(
+        probe_worker(
+            &legacy,
+            PROBE_TEST_DEADLINE,
+            &[EXPECTED_SCHEMA],
+            SUPPORTED_RANGE
+        ),
+        Err(WorkerProbeError::Unsupported)
+    ));
+}
+
+// timing-allowed: #68 Exercises the deadline after a worker closes its pipes but stays alive.
+#[test]
+fn times_out_when_protocol_info_closes_output_but_the_process_hangs() {
+    let root = tempdir().expect("create fixture root");
+    let hangs_after_response = executable(
+        root.path(),
+        "hanging-worker",
+        &format!(
+            "case \"$1\" in --protocol-info) {}; exec 1>&- 2>&-; exec /bin/sleep 10;; --version) printf '%s\\n' 'pohunek-sessiond 0.33.0';; esac",
+            valid_info()
+        ),
+    );
+
+    assert!(matches!(
+        probe_worker(
+            &hangs_after_response,
+            TIMEOUT_TEST_DEADLINE,
+            &[EXPECTED_SCHEMA],
+            SUPPORTED_RANGE
+        ),
+        Err(WorkerProbeError::TimedOut)
     ));
 }
 

@@ -1,5 +1,3 @@
-// Rust guideline compliant 2026-10-11
-
 use std::process::Command;
 
 use pohunek_session_worker::JOURNAL_SCHEMA_VERSION;

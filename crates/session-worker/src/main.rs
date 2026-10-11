@@ -1,7 +1,5 @@
 //! Runs one durable pohunek session worker.
 
-// Rust guideline compliant 2026-10-11
-
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
