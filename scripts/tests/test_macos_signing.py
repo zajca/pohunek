@@ -382,11 +382,11 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("packaging/smoke-hermes-plugin-release", self.release)
         self.assertIn('"$root/$binary" --version', self.release)
         self.assertNotIn("action-gh-release", self.stage + self.package + self.release)
-        self.assertIn("needs: [package-macos]", self.release)
-        self.assertIn("needs: [stage-macos]", self.package)
+        self.assertIn("needs: [tier-evidence, package-macos]", self.release)
+        self.assertIn("needs: [tier-evidence, stage-macos]", self.package)
 
     def test_the_evidence_workflow_attests_and_assembles_the_macos_archives(self):
-        self.assertIn("needs: [build, verify-macos]", self.job("evidence", "publish"))
+        self.assertIn("needs: [tier-evidence, build, verify-macos]", self.job("evidence", "publish"))
         for name in ("attest", "assemble"):
             block = self.evidence[self.evidence.index("\n  %s:\n" % name):]
             block = block.split("\n  attest-bundle:\n" if name == "attest" else "\n  assemble-rehearsal:\n")[0]
