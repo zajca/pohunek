@@ -9249,10 +9249,10 @@ async fn foreground_probe_does_not_hold_global_session_lock() {
     let scan_registry = registry.clone();
     let scan_id = created.id.clone();
     let root_pid = created.pid;
-    let scan = tokio::spawn(async move {
-        scan_registry
-            .rescan_procwatch_at(&scan_id, root_pid, Instant::now())
-            .await;
+    let runtime = tokio::runtime::Handle::current();
+    // The probe deliberately blocks synchronously; keep it off Tokio's worker pool.
+    let scan = std::thread::spawn(move || {
+        runtime.block_on(scan_registry.rescan_procwatch_at(&scan_id, root_pid, Instant::now()));
     });
 
     let entered = tokio::time::timeout(HANG_GUARD, async {
@@ -9269,12 +9269,13 @@ async fn foreground_probe_does_not_hold_global_session_lock() {
     };
 
     block.release();
-    scan.await.expect("foreground rescan task");
+    let scan_result = scan.join();
     entered.expect("foreground probe should start");
     inspected
         .expect("inspect was attempted")
         .expect("inspect must not wait for foreground probe")
         .expect("inspect session");
+    scan_result.expect("foreground rescan thread");
     let _ = registry.stop(&created.id).await;
 }
 
