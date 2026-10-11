@@ -1385,6 +1385,34 @@ async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home(
     .await
     .expect("daemon.health returns before control timeout");
     assert!(response.is_ok(), "daemon health succeeds after bootstrap");
+
+    let doctor_response = tokio::time::timeout(
+        DAEMON_CONTROL_REQUEST_TIMEOUT,
+        exchange(
+            &mut client,
+            &Request::make(
+                "startup-private-state-daemon-doctor",
+                method::DAEMON_DOCTOR,
+                Value::Null,
+            ),
+        ),
+    )
+    .await
+    .expect("daemon.doctor returns before the control timeout");
+    let doctor: protocol::DaemonDoctorResult =
+        serde_json::from_value(ok_payload(doctor_response)).expect("typed daemon doctor report");
+    let worker_check = doctor
+        .report
+        .checks
+        .iter()
+        .find(|check| check.name == "worker_executable")
+        .expect("daemon reports worker readiness");
+    assert_eq!(worker_check.status, protocol::DoctorStatus::Ok);
+    assert!(worker_check.detail.contains("readable journal schema"));
+    assert!(
+        !worker_check.detail.contains('/'),
+        "detail remains path-redacted"
+    );
     assert!(
         data_home.join(APP_DIR).join("data.lock").is_file(),
         "the running daemon owns the data authority lock in the XDG data root"

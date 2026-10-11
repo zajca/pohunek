@@ -44,17 +44,15 @@ pub const LAUNCHCTL_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Aggregate budget for agent version probes in one daemon doctor call.
 ///
-/// Each individual probe accepts the remaining portion, so a list of profiles
-/// cannot multiply the per-runtime deadline.
+/// Each agent version probe accepts the remaining aggregate budget.
 pub const AGENT_RUNTIME_PROBE_BUDGET: Duration = Duration::from_secs(4);
 
-/// Longest time the deadline-bounded probes of one doctor run can block.
+/// Longest time the launchd, worker, and agent probes of one doctor run can block.
 ///
-/// This includes the `launchctl` domain probe and aggregate agent runtime
-/// probes; a probe added later must extend this sum because
-/// [`doctor_request_timeout`] derives the transport limit from it.
-pub const PROBE_BUDGET: Duration =
-    Duration::from_secs(LAUNCHCTL_DEADLINE.as_secs() + AGENT_RUNTIME_PROBE_BUDGET.as_secs());
+/// [`doctor_request_timeout`] derives the transport limit from this sum.
+pub const PROBE_BUDGET: Duration = LAUNCHCTL_DEADLINE
+    .saturating_add(crate::WORKER_PROBE_DEADLINE)
+    .saturating_add(AGENT_RUNTIME_PROBE_BUDGET);
 
 /// Time a `daemon.doctor` reply needs after the last probe finishes: framing,
 /// serialization and scheduling on the local socket. One second matches the
@@ -1848,14 +1846,14 @@ mod tests {
 
     #[test]
     fn the_doctor_request_timeout_outlasts_every_bounded_probe() {
-        // A wedged service-manager probe and the full agent-probe budget must
-        // fit before the client deadline so the daemon's bounded result is delivered.
+        // The service-manager, worker, and full agent-probe budgets must fit
+        // before the client deadline so the daemon's bounded result is delivered.
         assert!(PROBE_BUDGET >= LAUNCHCTL_DEADLINE);
         assert!(doctor_request_timeout() > PROBE_BUDGET);
         assert_eq!(doctor_request_timeout(), PROBE_BUDGET + REPLY_HEADROOM);
         assert_eq!(
             PROBE_BUDGET,
-            LAUNCHCTL_DEADLINE + AGENT_RUNTIME_PROBE_BUDGET
+            LAUNCHCTL_DEADLINE + crate::WORKER_PROBE_DEADLINE + AGENT_RUNTIME_PROBE_BUDGET
         );
         assert!(PROBE_BUDGET > Duration::from_secs(5));
     }
