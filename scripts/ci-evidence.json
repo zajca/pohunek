@@ -1,0 +1,89 @@
+{
+  "workflow_path": ".github/workflows/ci.yml",
+  "workflow_file": "ci.yml",
+  "wait_timeout_seconds": 1800,
+  "poll_interval_seconds": 15,
+  "required_jobs": {
+    "main": [
+      "platform contracts (arm64)",
+      "macOS package install and upgrade (macos-15)",
+      "fmt + clippy",
+      "macOS lint from Linux (aarch64-apple-darwin clippy)",
+      "build tests (nextest archive)",
+      "tests (core, fast)",
+      "tests (daemon, fast)",
+      "tests (relay, fast)",
+      "tests (cli, fast)",
+      "required jobs (paths filter)",
+      "tests (heavy, PTY + Hermes)",
+      "real systemd supervision",
+      "upgrade from the previous release",
+      "doctests",
+      "release build",
+      "release rehearsal (build)",
+      "release rehearsal (evidence, assembly, archive smoke)",
+      "TS binding drift (xs check)",
+      "pinned Hermes compatibility (model-free)",
+      "Pi runtime package (locked release, model-free)",
+      "Codex runtime package (locked release, model-free)",
+      "Claude Code runtime package (locked release, model-free)",
+      "pinned Hermes compatibility (macOS arm64, model-free)",
+      "build bins (pohunekd + pohunek-sessiond + pohunek)",
+      "SDK workspace",
+      "SDK workspace (macOS arm64)",
+      "cargo-audit (RustSec advisories)",
+      "docs check (schema + drift + source-map + runbooks + secrets + release)",
+      "cargo-hack (feature powerset)",
+      "cargo-udeps (unused dependencies)",
+      "cargo-shear (unused dependencies)"
+    ],
+    "nightly": [
+      "platform contracts (arm64)",
+      "macOS package install and upgrade (macos-14)",
+      "macOS package install and upgrade (macos-15)",
+      "fmt + clippy",
+      "macOS lint from Linux (aarch64-apple-darwin clippy)",
+      "build tests (nextest archive)",
+      "tests (core, fast)",
+      "tests (daemon, fast)",
+      "tests (relay, fast)",
+      "tests (cli, fast)",
+      "required jobs (paths filter)",
+      "tests (heavy, PTY + Hermes)",
+      "real systemd supervision",
+      "upgrade from the previous release",
+      "tests (relay DB, PostgreSQL)",
+      "doctests",
+      "release build",
+      "release rehearsal (build)",
+      "release rehearsal (evidence, assembly, archive smoke)",
+      "TS binding drift (xs check)",
+      "pinned Hermes compatibility (model-free)",
+      "Pi runtime package (locked release, model-free)",
+      "Codex runtime package (locked release, model-free)",
+      "Claude Code runtime package (locked release, model-free)",
+      "pinned Hermes compatibility (macOS arm64, model-free)",
+      "build bins (pohunekd + pohunek-sessiond + pohunek)",
+      "SDK workspace",
+      "SDK workspace (macOS arm64)",
+      "cargo-audit (RustSec advisories)",
+      "docs check (schema + drift + source-map + runbooks + secrets + release)",
+      "cargo-hack (feature powerset)",
+      "cargo-udeps (unused dependencies)",
+      "cargo-shear (unused dependencies)"
+    ]
+  },
+  "required_steps": {
+    "main": [],
+    "nightly": [
+      {
+        "job": "macOS package install and upgrade (macos-14)",
+        "step": "Install, upgrade, and uninstall from the archives"
+      },
+      {
+        "job": "macOS package install and upgrade (macos-15)",
+        "step": "Rebuild from a cold release directory and compare"
+      }
+    ]
+  }
+}
