@@ -166,6 +166,13 @@ and values remain opaque strings and use the same validation as
 protocol-3 daemon, a metadata filter fails with
 `daemon/daemon_protocol_too_old` before the request is sent.
 
+The CLI exposes these predicates as repeatable `pohunek session list
+--meta-eq key=value` and `--meta-has key` options. Equality splits on the first
+`=` so values can contain `=`; empty keys and values are valid. Repeated
+predicates are all required to match, including contradictory values for the
+same key, which produce no sessions. These options affect selection only and do
+not add metadata to the human table or quiet output.
+
 Sessions created by older review flows may retain `review.source` and
 `review.dispatched_at` metadata. Those keys remain opaque session metadata.
 

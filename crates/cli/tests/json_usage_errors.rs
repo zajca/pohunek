@@ -86,6 +86,22 @@ fn session_new_rejects_malformed_metadata_at_the_cli_process_boundary() {
 }
 
 #[test]
+fn session_list_rejects_metadata_equality_without_separator_at_the_cli_process_boundary() {
+    assert_json_usage_error(
+        &["session", "list", "--meta-eq", "no-equals-sign", "--json"],
+        "expected key=value",
+    );
+}
+
+#[test]
+fn session_list_rejects_missing_metadata_filter_value_at_the_cli_process_boundary() {
+    assert_json_usage_error(
+        &["session", "list", "--meta-eq", "--json"],
+        "value is required",
+    );
+}
+
+#[test]
 fn session_new_rejects_mixed_input_sources_at_the_cli_process_boundary() {
     assert_json_usage_error(
         &[

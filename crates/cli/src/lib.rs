@@ -1132,9 +1132,17 @@ enum SessionAction {
         #[arg(short = 'q', long = "quiet", conflicts_with = "json")]
         quiet: bool,
         /// Exact-match filter in key=value form. May be repeated and filters
-        /// are `ANDed`. Supported keys: state, activity, agent, id.
+        /// are `ANDed`. Supported keys: state, activity, agent, id, project.
         #[arg(long = "filter", value_name = "key=value", value_parser = commands::session::parse_list_filter)]
         filters: Vec<commands::session::ListFilter>,
+        /// Match metadata with an exact value. May be repeated; filters are `ANDed`.
+        /// Split at the first `=`; empty keys and values are allowed.
+        #[arg(long = "meta-eq", value_name = "key=value", value_parser = commands::session::parse_metadata_eq_filter)]
+        metadata_eq: Vec<(String, String)>,
+        /// Match metadata by key presence, including keys with an empty value.
+        /// May be repeated; filters are `ANDed`.
+        #[arg(long = "meta-has", value_name = "key")]
+        metadata_has: Vec<String>,
     },
 
     /// Inspect one session.
@@ -1842,8 +1850,18 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 SessionAction::List {
                     json,
                     quiet,
-                    filters,
+                    mut filters,
+                    metadata_eq,
+                    metadata_has,
                 } => {
+                    filters.extend(metadata_eq.into_iter().map(|(key, value)| {
+                        commands::session::ListFilter::MetadataEq { key, value }
+                    }));
+                    filters.extend(
+                        metadata_has
+                            .into_iter()
+                            .map(|key| commands::session::ListFilter::MetadataHas { key }),
+                    );
                     let host = effective_host(&global_host, None);
                     let output_mode = if quiet {
                         commands::session::ListOutputMode::Quiet

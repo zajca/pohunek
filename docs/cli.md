@@ -38,7 +38,7 @@ port is retained.
 | `pohunek daemon start [--detach] [--dev-subprocess]` | Run the installed daemon by hand (needs `service.toml`), or with `--dev-subprocess` a development daemon with plain subprocess workers. |
 | `pohunek health` / `status` | Daemon liveness, build, and protocol version. |
 | `pohunek session new` | Start a session: `--agent`, `--name`, `--project`/`--repo`, `--branch`, `--base-branch`, `--cwd`, `--input`, `--request-timeout-ms`, `--meta k=v`. |
-| `pohunek session list` | List sessions, including a `running/recent` subagent count; `--filter state=running --filter agent=codex` (ANDed), `-q` for ids only. |
+| `pohunek session list` | List sessions, including a `running/recent` subagent count; repeat `--filter state=running`, `--meta-eq key=value`, and `--meta-has key` to combine predicates with AND. Metadata values split at the first `=` and may be empty; keys are opaque. `-q` prints ids only. |
 | `pohunek session inspect <target>` | Full logical session record: agent state, current/recent subagents, runtime state and generation, cwd, project, branch, worktree, recovery binding. |
 | `pohunek attach <target>` | Attach the current terminal; `Ctrl-]` detaches. |
 | `pohunek session input <target> <text>` | Inject a prompt with agent-correct framing; use `--stdin` for non-argv input. `--until <activity>` (repeatable) and `--timeout <ms>` wait for the agent's reaction in the same call, for zero-delay profiles only. |
