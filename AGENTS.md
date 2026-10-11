@@ -6,6 +6,11 @@ code, comments, and commit messages are in English. Security takes priority over
 quality, simplicity, and speed. Follow the user's authorized scope; never infer
 permission to publish, merge, release, deploy, or use credentials.
 
+For every task, including read-only inspection, diagnosis, and review, never
+read `.env*`, key or certificate files, or disclose token values. The detailed
+secret-handling policy lives in
+[.agents/instructions/coding.md](.agents/instructions/coding.md).
+
 ## About this repository
 
 Pohunek is an owner-first control plane for durable coding-agent sessions. The
