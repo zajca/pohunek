@@ -2721,7 +2721,7 @@ esac"#,
             inspect(&mut hermes, &target, &link),
             Err(Error::UnsafePolicyPath)
         );
-        assert_eq!(assets.len(), 8);
+        assert_eq!(assets.len(), assets::ASSET_COUNT);
     }
 
     #[test]
