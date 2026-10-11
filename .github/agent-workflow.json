@@ -51,6 +51,37 @@
     "body": "Full scope, accepted decisions with their rationale, definition-of-done items with stable IDs (D1, D2, ...), dependencies, and the plan. Long-lived content; prefer editing own sections over rewriting.",
     "comments": "Progress reports, verification evidence (commands run and results), handoffs, blockers, and status-change rationale. Append, never overwrite others' comments."
   },
+  "publicContribution": {
+    "readiness": {
+      "labels": ["readiness:ready", "readiness:design-needed", "readiness:blocked"],
+      "meaning": {
+        "ready": "Public eligibility only: objective scope, stable D1..Dn, exact focused checks, capability and size, prerequisites, resolved dependencies, and a named available review route are recorded; no active recognized assignment or linked active PR makes immediate work misleading. It is not a reservation, vacancy proof, grant, merge promise, or private Project status.",
+        "design-needed": "A decision, scope, acceptance criterion, or review route needed before implementation remains unresolved.",
+        "blocked": "A named dependency or external prerequisite prevents eligible work from starting."
+      },
+      "manualProjection": "Until the transactional claim service in #805-#811 ships, a maintainer must inspect public issues, comments, assignments and linked PRs, then explicitly reconcile and confirm any manual reservation. A label, assignment, or unanswered request is not a grant."
+    },
+    "capabilities": {
+      "docs": "Documentation, knowledge sources, and user-facing written contracts.",
+      "rust": "Rust crates, binaries, and core behavior.",
+      "typescript-sdk": "The TypeScript SDK workspace and its release artifacts.",
+      "platform-native": "Operating-system integrations, native supervision, and platform-specific behavior.",
+      "github-workflow": "Issue/PR forms, repository workflow configuration, and agent guidance.",
+      "verification": "Test, gate, compatibility, or evidence work that does not primarily change another capability area."
+    },
+    "size": {
+      "values": ["S", "M", "L"],
+      "meaning": {
+        "S": "One bounded change with a focused verification path.",
+        "M": "Several related changes or multiple affected components with a clear verification path.",
+        "L": "Broad or cross-cutting work that should normally be split into sequential, independently verifiable slices."
+      },
+      "note": "A scope cue only; never a promised time budget."
+    },
+    "deliveryStatus": "Todo, In Progress, and Done retain the meanings in statusSemantics; readiness is separate. A public contributor does not need private Project access.",
+    "review": "Name the area and proposed reviewer route in the public issue. The maintainer or an explicitly designated area reviewer coordinates review; author, executor, or manager cannot satisfy a required independent review. The final reviewer and escalation route remain subject to #798 D3.",
+    "labelsAreManual": true
+  },
   "localFiles": {
     "NEXT.md": "Not a work authority and never required by any workflow. A pre-existing untracked NEXT.md is a migration read-only source at most.",
     "SiYuan": "Optional personal notes/pointers; never a competing project authority."
