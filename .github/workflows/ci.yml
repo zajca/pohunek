@@ -91,10 +91,9 @@ env:
 jobs:
   platform-contracts:
     name: platform contracts (arm64)
-    # macOS runners are costly (issue #125): run only on schedule, push to
-    # main, manual dispatch (always a full run), or when platform inputs
-    # change via the paths filter.
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.macos == 'true' }}
+    # macOS runners are costly (issue #125): run in the main/nightly tiers or
+    # on a PR when platform inputs change via the paths filter.
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && needs.changes.outputs.macos == 'true') }}
     needs: changes
     runs-on: macos-15
     env:
@@ -326,10 +325,9 @@ jobs:
   # they carry ad-hoc signatures and `signing adhoc` in the MANIFEST, and
   # `verify-signed --adhoc` checks them.
   macos-package:
-    # macos-15 is the required leg. macos-14 is the minimum supported macOS and
-    # exercises the packaged archives on it, but GitHub retires that hosted
-    # image on 2026-11-02, so its result is informational and cannot block a
-    # merge; the minimum-OS acceptance is a #105 gate on a runner that stays.
+    # macos-15 is the required leg. The nightly macos-14 leg is informational:
+    # GitHub retires that hosted image on 2026-11-02, and issue #355 tracks its
+    # replacement; its result cannot block a merge.
     name: macOS package install and upgrade (${{ matrix.runner }})
     if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') || (matrix.runner == 'macos-15' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'main') || (github.event_name == 'pull_request' && needs.changes.outputs.macos_package == 'true'))) }}
     needs: changes

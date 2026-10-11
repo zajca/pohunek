@@ -283,6 +283,26 @@ the [macOS project](https://github.com/users/zajca/projects/4), and the issue
 hierarchy rooted at #94. `docs/design/macos-support-rfc.md` records design
 constraints and rationale, not live delivery state.
 
+CI uses three execution tiers (issue #477). Pull requests always run the
+required Linux checks; macOS platform contracts run when their input filter
+matches, the macOS package job runs on `macos-15` only for packaging or
+launchd-service inputs, and the Hermes and SDK macOS jobs run only for their
+own narrow input filters. A change to `.github/workflows/ci.yml` selects all
+four macOS jobs. A push to `main` runs the main tier: platform contracts, the
+`macos-15` package job, Hermes macOS, and SDK macOS, alongside the Linux jobs
+selected on main. PR and main runs cancel superseded runs on the same ref. A
+daily 05:00 UTC nightly run includes the main tier, the informational
+`macos-14` package leg, the cold rebuild comparison, and the nightly-only
+relay database suite. Until #355 replaces the retiring hosted image,
+`macos-14` remains `continue-on-error` and is not a required result. Manual
+dispatch requires the `main` or `nightly` choice; nightly adds the nightly-only
+checks to main. Schedule and manual runs do not cancel PR or main runs.
+
+The automatic red-main issue reporter and release evidence gate are not part
+of S2: #477 S3 and S4 own those changes. Failures on main still need direct
+inspection in Actions; this workflow does not yet open or close issues for
+them.
+
 SDK workspace gates (one Bun workspace root at the repository root spans `sdk/ts/*`):
 
 ```bash
@@ -402,9 +422,20 @@ In CI, the Postgres-backed
 relay job is gated by a paths filter and does not run (its PostgreSQL service
 never starts) for non-relay changes.
 
+The CI workflow's PR/macOS path ownership and tier conditions are guarded by
+`scripts/tests/test_ci_tiers.py`; run
+`python3 -m unittest scripts.tests.test_ci_tiers` when changing the workflow.
+The inventory distinguishes PR-triggering inputs from inputs covered by the
+post-merge main tier, so narrowing a filter cannot silently drop coverage.
+Manual runs use `workflow_dispatch` input `tier=main|nightly`; the daily
+schedule selects nightly. The main tier is latest-wins on pushes to `main`,
+while PR runs are latest-wins per pull request. S3's red-main reporter and
+S4's release evidence gate are still pending and must not be assumed by local
+or release workflows.
+
 Doctests and the release build: the `doctests` job runs on
 every pull request. The release build (`release-build` job) runs on push to
-`main`, the weekly schedule, and manual dispatch, and on a pull request only
+`main`, the daily schedule, and manual dispatch, and on a pull request only
 when it touches a `release` filter input in `ci.yml` (`Cargo.toml`,
 `crates/**/Cargo.toml`, `Cargo.lock`, `.cargo/**`, toolchain pins, the CI and
 release workflows, `scripts/release`, `packaging/**`); run the release build
@@ -693,7 +724,7 @@ Extra CI jobs (run if your change touches deps/features): `cargo audit`,
 `cargo shear --locked --deny-warnings` (stable, seconds; the unused-dependency
 gate on every PR), and
 optionally `cargo +nightly udeps --workspace --all-targets --all-features`
-(CI runs it only on `main`, the weekly sweep and manual dispatch, as the
+(CI runs it only on `main`, the nightly sweep and manual dispatch, as the
 backstop for a dependency referenced only in code compiled out for the host).
 Suppress a verified `cargo shear` false positive with
 `[package.metadata.cargo-shear] ignored = ["<crate>"]` and a reason comment.
