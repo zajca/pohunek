@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -116,6 +117,12 @@ def run_tier(run: dict[str, Any], workflow_path: str) -> str | None:
     return None
 
 
+def run_dispatch_id(run: dict[str, Any]) -> str | None:
+    title = run.get("display_title") or run.get("displayTitle") or ""
+    match = re.fullmatch(r"CI \[tier=(?:main|nightly)\] \[dispatch=([0-9a-f]{32})\]", title)
+    return match.group(1) if match else None
+
+
 def list_runs(
     repo: str,
     workflow_file: str,
@@ -178,8 +185,13 @@ def resolve_dispatch_ref(repo: str, ref: str, sha: str) -> None:
         raise EvidenceError(f"dispatch ref {ref!r} resolves to {resolved}, expected {sha}; refusing dispatch")
 
 
-def dispatch(repo: str, workflow_file: str, ref: str, tier: str) -> None:
-    gh("workflow", "run", workflow_file, "--repo", repo, "--ref", ref, "-f", f"tier={tier}")
+def dispatch(repo: str, workflow_file: str, ref: str, tier: str) -> str:
+    request_id = secrets.token_hex(16)
+    gh(
+        "workflow", "run", workflow_file, "--repo", repo, "--ref", ref,
+        "-f", f"tier={tier}", "-f", f"dispatch_id={request_id}",
+    )
+    return request_id
 
 
 def get_jobs(repo: str, run_id: int) -> list[dict[str, Any]]:
@@ -262,6 +274,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     runs = list_runs(args.repo, config["workflow_file"], sha=args.sha)
     candidates = matching_runs(runs, args.sha, args.tier, config["workflow_path"])
     dispatched_ids: set[int] = set()
+    dispatch_request_id: str | None = None
     did_dispatch = False
     if not candidates:
         if not args.dispatch_ref:
@@ -271,7 +284,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         )
         dispatched_ids = {item["id"] for item in previous_dispatches if isinstance(item.get("id"), int)}
         resolve_dispatch_ref(args.repo, args.dispatch_ref, args.sha)
-        dispatch(args.repo, config["workflow_file"], args.dispatch_ref, args.tier)
+        dispatch_request_id = dispatch(args.repo, config["workflow_file"], args.dispatch_ref, args.tier)
         did_dispatch = True
     deadline = time.monotonic() + config["wait_timeout_seconds"]
     run = None
@@ -286,7 +299,6 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
                 break
         time.sleep(config["poll_interval_seconds"])
         runs = list_runs(args.repo, config["workflow_file"], sha=args.sha)
-        candidates = matching_runs(runs, args.sha, args.tier, config["workflow_path"])
         if did_dispatch:
             recent_dispatches = list_runs(
                 args.repo, config["workflow_file"], event="workflow_dispatch"
@@ -295,6 +307,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
                 item for item in recent_dispatches
                 if item.get("id") not in dispatched_ids
                 and run_tier(item, config["workflow_path"]) == args.tier
+                and run_dispatch_id(item) == dispatch_request_id
             ]
             if new_dispatches:
                 new_dispatches.sort(key=lambda item: item.get("run_number", 0), reverse=True)
@@ -305,8 +318,9 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
                         f"dispatch ref {args.dispatch_ref!r} moved: run {url} has head SHA "
                         f"{dispatched_run.get('head_sha')}, expected {args.sha}"
                     )
-                if dispatched_run not in candidates:
-                    candidates.append(dispatched_run)
+                candidates = [dispatched_run]
+        else:
+            candidates = matching_runs(runs, args.sha, args.tier, config["workflow_path"])
     if run is None:
         raise EvidenceError(
             f"timed out after {config['wait_timeout_seconds']}s waiting for completed {args.tier} tier evidence for {args.sha}"

@@ -22,13 +22,17 @@ on:
         options:
           - main
           - nightly
+      dispatch_id:
+        description: Correlates an automated evidence request with its workflow run
+        required: false
+        type: string
   # Daily sweep to catch regressions in jobs that are path-filtered out on
   # normal PRs (issue #125). Runs at 05:00 UTC; `pull_request_target`
   # is intentionally avoided to keep the default pull-request provenance model.
   schedule:
     - cron: '0 5 * * *'
 
-run-name: ${{ github.event_name == 'workflow_dispatch' && format('CI [tier={0}]', inputs.tier) || ' ' }}
+run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_id != '' && format('CI [tier={0}] [dispatch={1}]', inputs.tier, inputs.dispatch_id) || (github.event_name == 'workflow_dispatch' && format('CI [tier={0}]', inputs.tier)) || ' ' }}
 
 
 # Cancel superseded PR and main runs on the same ref. Each scheduled or manual

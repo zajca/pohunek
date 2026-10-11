@@ -52,6 +52,13 @@ if "/actions/workflows/" in endpoint:
         index = fixture.get("run_queries", 0)
         query_key = "run_queries"
     page = sequence[min(index, len(sequence) - 1)] if sequence else {"workflow_runs": []}
+    dispatch_call = next((call for call in fixture.get("dispatches", []) if call[:2] == ["workflow", "run"]), None)
+    dispatch_id = None
+    if dispatch_call:
+        dispatch_id = next((arg.split("=", 1)[1] for arg in dispatch_call if arg.startswith("dispatch_id=")), None)
+    for run in page.get("workflow_runs", []):
+        if "__REQUEST_ID__" in (run.get("display_title") or ""):
+            run["display_title"] = run["display_title"].replace("__REQUEST_ID__", dispatch_id or "missing")
     fixture[query_key] = index + 1
     fixture_path.write_text(json.dumps(fixture))
     print(json.dumps([page]))
@@ -343,7 +350,8 @@ class CiEvidenceCliTests(unittest.TestCase):
         self.write_fixture(
             run_pages=[page([]), page([])],
             dispatch_pages=[page([]), page([run_doc(
-                event="workflow_dispatch", branch="main", title="CI [tier=main]", run_id=457
+                event="workflow_dispatch", branch="main",
+                title="CI [tier=main] [dispatch=__REQUEST_ID__]", run_id=457
             )])],
             jobs_page=jobs_page(),
         )
@@ -355,12 +363,46 @@ class CiEvidenceCliTests(unittest.TestCase):
         self.assertIn("--ref", dispatch_call)
         self.assertEqual(dispatch_call[dispatch_call.index("--ref") + 1], "main")
         self.assertIn("tier=main", dispatch_call)
+        self.assertRegex(next(arg for arg in dispatch_call if arg.startswith("dispatch_id=")), r"dispatch_id=[0-9a-f]{32}$")
+
+    def test_unrelated_concurrent_dispatch_on_another_branch_is_ignored(self):
+        unrelated = run_doc(
+            sha=OTHER_SHA, event="workflow_dispatch", branch="feature/other",
+            title="CI [tier=main]", run_id=458,
+        )
+        requested = run_doc(
+            event="workflow_dispatch", title="CI [tier=main] [dispatch=__REQUEST_ID__]", run_id=459,
+        )
+        self.write_fixture(
+            run_pages=[page([]), page([])],
+            dispatch_pages=[page([]), page([unrelated, requested])],
+        )
+        result = self.invoke("main", "--dispatch-ref", "main")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("/actions/runs/459", result.stdout)
+
+    def test_same_ref_concurrent_dispatch_does_not_claim_another_request(self):
+        collision = run_doc(
+            sha=OTHER_SHA, event="workflow_dispatch", branch="main",
+            title="CI [tier=main]", run_id=460,
+        )
+        requested = run_doc(
+            event="workflow_dispatch", branch="main",
+            title="CI [tier=main] [dispatch=__REQUEST_ID__]", run_id=461,
+        )
+        self.write_fixture(
+            run_pages=[page([]), page([])],
+            dispatch_pages=[page([]), page([collision, requested])],
+        )
+        result = self.invoke("main", "--dispatch-ref", "main")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("/actions/runs/461", result.stdout)
 
     def test_dispatch_that_runs_after_ref_moved_fails_with_run_link(self):
         moved = run_doc(
             sha=OTHER_SHA,
             event="workflow_dispatch",
-            title="CI [tier=main]",
+            title="CI [tier=main] [dispatch=__REQUEST_ID__]",
             run_id=458,
         )
         self.write_fixture(
