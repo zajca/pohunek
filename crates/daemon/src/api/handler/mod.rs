@@ -389,7 +389,13 @@ async fn handle_negotiated(
             session::handle_session_release_agent(request, &state.sessions).await
         }
         method::DAEMON_DOCTOR => {
-            daemon::handle_daemon_doctor(request, &state.governance, &state.sessions).await
+            daemon::handle_daemon_doctor(
+                request,
+                &state.governance,
+                &state.sessions,
+                state.transport,
+            )
+            .await
         }
         method::ASSISTANT_MATERIALIZE => assistant::handle_assistant_materialize(request).await,
         method::INTEGRATION_INSTALL => {

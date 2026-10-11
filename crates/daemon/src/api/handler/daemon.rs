@@ -3,6 +3,7 @@
 use protocol::{ProtocolError, Request, Response};
 
 use super::util::{error_value, ok_value, selected_version};
+use super::ControlTransport;
 use super::HealthInfo;
 use crate::governance::HostGovernanceService;
 use crate::session::SessionRegistry;
@@ -24,6 +25,7 @@ pub(super) async fn handle_daemon_doctor(
     request: &Request,
     governance: &HostGovernanceService,
     sessions: &SessionRegistry,
+    transport: ControlTransport,
 ) -> Response {
     if !request.params().is_null() {
         return error_value(
@@ -52,6 +54,7 @@ pub(super) async fn handle_daemon_doctor(
         sessions.catalog_trust(),
         sessions.profiles(),
         sessions.inspect_base_environment(),
+        transport == ControlTransport::Local,
     )
     .await
     {

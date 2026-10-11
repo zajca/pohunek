@@ -154,8 +154,15 @@ Linux: `bin:git` (required), `bin:codex`, `bin:claude`, the socket, state and
 log directory writability checks, `netbird_cli`, and `schema_version`.
 Executables count only when they are regular files the effective user can execute according to the kernel (`faccessat` with `X_OK`); a file it cannot execute is skipped and the `PATH` search continues. The writability probes create a randomly named file exclusively (never following a planted symlink) and remove it.
 
-macOS adds the following checks. Hook interpreter readiness (`python3`) is
-reported by `pohunek integration doctor`, not by `pohunek doctor`:
+macOS adds the following checks. The daemon report also includes redacted
+Codex and Claude hook integration readiness. A local request checks each
+distinct configured profile home; a remote request checks only runtime homes.
+Current hooks are `ok`, missing or outdated hooks are `warn`, and malformed or
+unsafe provider state is `fail`. Configured Hermes profiles are explicitly
+reported as unverified because the daemon has no inspection policy for their
+CLI-managed hooks. No provider home or profile environment value is returned.
+For detailed hook findings, including Python interpreter readiness, run
+`pohunek integration doctor` on the daemon host:
 
 | Check | Failure status | Meaning and remediation |
 | --- | --- | --- |

@@ -8,7 +8,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use hostcheck::{StandardCheckInputs, Supervision, WorkerCandidate, WorkerSource};
-use protocol::{DoctorCheck, DoctorReport, DoctorStatus, QuarantineReason, MAX_CONTROL_LINE_BYTES};
+use protocol::{
+    DoctorCheck, DoctorReport, DoctorStatus, IntegrationDoctorParams, IntegrationFindingCode,
+    IntegrationInstallState, QuarantineReason, RuntimeId, MAX_CONTROL_LINE_BYTES,
+};
 
 use crate::catalog_anchor::{AnchorFault, CatalogTrust};
 use crate::governance::{HostGovernanceDiagnostic, HostGovernanceService};
@@ -39,6 +42,7 @@ pub(crate) async fn report(
     catalog_trust: &CatalogTrust,
     profiles: &crate::agent::ProfileRegistry,
     base_env: pohunek_worker_protocol::BaseEnv,
+    include_profile_homes: bool,
 ) -> Result<DoctorReport, DoctorReportError> {
     let paths = paths.clone();
     let mode = supervision_mode(supervision.as_ref());
@@ -52,7 +56,9 @@ pub(crate) async fn report(
             .map_err(|_error| DoctorReportError)?;
     let profiles = profiles.clone();
     checks.extend(
-        tokio::task::spawn_blocking(move || profile_checks(&profiles, &base_env))
+        tokio::task::spawn_blocking(move || {
+            profile_checks(&profiles, &base_env, include_profile_homes)
+        })
             .await
             .unwrap_or_else(|_| vec![check("agent_profiles", DoctorStatus::Fail, "Configured agent profiles could not be inspected; check daemon logs and profile ownership.")]),
     );
@@ -114,6 +120,7 @@ fn supervision_mode(active: Option<&ActiveSupervision>) -> Supervision {
 fn profile_checks(
     profiles: &crate::agent::ProfileRegistry,
     base_env: &pohunek_worker_protocol::BaseEnv,
+    include_profile_homes: bool,
 ) -> Vec<DoctorCheck> {
     let mut checks = embedded_manifest_checks();
     checks.extend(manifest_override_checks(profiles));
@@ -122,99 +129,278 @@ fn profile_checks(
         Ok(configured) => configured,
         Err(detail) => {
             checks.push(check("agent_profiles", DoctorStatus::Fail, detail));
+            checks.extend(integration_checks(profiles, base_env, false, &[]));
             return checks;
         }
     };
+    configured_checks(
+        profiles,
+        base_env,
+        include_profile_homes,
+        configured,
+        checks,
+        probe_started,
+    )
+}
+
+fn configured_checks(
+    profiles: &crate::agent::ProfileRegistry,
+    base_env: &pohunek_worker_protocol::BaseEnv,
+    include_profile_homes: bool,
+    configured: Vec<(
+        String,
+        Result<crate::agent::ResolvedAgent, crate::agent::DoctorProfileError>,
+    )>,
+    mut checks: Vec<DoctorCheck>,
+    probe_started: Instant,
+) -> Vec<DoctorCheck> {
     let configured_names: std::collections::HashSet<String> =
         configured.iter().map(|(name, _)| name.clone()).collect();
-    for (name, result) in configured {
-        let safe_name = safe_profile_name(&name);
-        let check_name = format!("agent_profile_{safe_name}");
-        let result = match result {
-            Ok(agent) => profile_runtime_check(profiles, &agent, base_env, probe_started),
-            Err(crate::agent::DoctorProfileError::RuntimeUnavailable) => {
-                Err(RuntimeFailure::PinnedRuntime)
-            }
-            Err(crate::agent::DoctorProfileError::Invalid) => Err(RuntimeFailure::Profile),
-        };
-        let (status, detail) = match result {
-            Ok(()) => (
-                DoctorStatus::Ok,
-                "Configured profile and runtime are ready.",
-            ),
-            Err(RuntimeFailure::OptionalMissing) => (
-                DoctorStatus::Fail,
-                "The configured profile runtime is unavailable; repair the profile or install its runtime.",
-            ),
-            Err(RuntimeFailure::PinnedRuntime) => (
-                DoctorStatus::Fail,
-                "The pinned runtime is unavailable; install or select its pinned package again.",
-            ),
-            Err(RuntimeFailure::Profile) => (
-                DoctorStatus::Fail,
-                "The profile is malformed or cannot be resolved securely; repair its file or permissions.",
-            ),
-            Err(RuntimeFailure::Executable) => (
-                DoctorStatus::Fail,
-                "The configured executable is missing or not trusted; install it or repair the profile.",
-            ),
-            Err(RuntimeFailure::Version) => (
-                DoctorStatus::Fail,
-                "The configured executable's version is unsupported; repair the profile or runtime installation.",
-            ),
-            Err(RuntimeFailure::ProbeBudget) => (
-                DoctorStatus::Fail,
-                "The configured runtime version was not checked because the doctor probe budget was exhausted.",
-            ),
-        };
-        checks.push(DoctorCheck::new(check_name, status, detail));
+    let hermes_profiles: Vec<String> = configured
+        .iter()
+        .filter_map(|(name, result)| match result {
+            Ok(agent) if agent.base.as_str() == RuntimeId::HERMES => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    checks.extend(configured_profile_checks(
+        profiles,
+        base_env,
+        configured,
+        probe_started,
+    ));
+    checks.extend(optional_runtime_checks(
+        profiles,
+        base_env,
+        &configured_names,
+        probe_started,
+    ));
+    checks.extend(integration_checks(
+        profiles,
+        base_env,
+        include_profile_homes,
+        &hermes_profiles,
+    ));
+    checks
+}
+
+fn configured_profile_checks(
+    profiles: &crate::agent::ProfileRegistry,
+    base_env: &pohunek_worker_protocol::BaseEnv,
+    configured: Vec<(
+        String,
+        Result<crate::agent::ResolvedAgent, crate::agent::DoctorProfileError>,
+    )>,
+    probe_started: Instant,
+) -> Vec<DoctorCheck> {
+    configured
+        .into_iter()
+        .map(|(name, result)| {
+            let result = match result {
+                Ok(agent) => profile_runtime_check(profiles, &agent, base_env, probe_started),
+                Err(crate::agent::DoctorProfileError::RuntimeUnavailable) => {
+                    Err(RuntimeFailure::PinnedRuntime)
+                }
+                Err(crate::agent::DoctorProfileError::Invalid) => Err(RuntimeFailure::Profile),
+            };
+            let (status, detail) = configured_profile_result(result);
+            DoctorCheck::new(
+                format!("agent_profile_{}", safe_profile_name(&name)),
+                status,
+                detail,
+            )
+        })
+        .collect()
+}
+
+fn configured_profile_result(result: Result<(), RuntimeFailure>) -> (DoctorStatus, &'static str) {
+    match result {
+        Ok(()) => (
+            DoctorStatus::Ok,
+            "Configured profile and runtime are ready.",
+        ),
+        Err(RuntimeFailure::OptionalMissing) => (
+            DoctorStatus::Fail,
+            "The configured profile runtime is unavailable; repair the profile or install its runtime.",
+        ),
+        Err(RuntimeFailure::PinnedRuntime) => (
+            DoctorStatus::Fail,
+            "The pinned runtime is unavailable; install or select its pinned package again.",
+        ),
+        Err(RuntimeFailure::Profile) => (
+            DoctorStatus::Fail,
+            "The profile is malformed or cannot be resolved securely; repair its file or permissions.",
+        ),
+        Err(RuntimeFailure::Executable) => (
+            DoctorStatus::Fail,
+            "The configured executable is missing or not trusted; install it or repair the profile.",
+        ),
+        Err(RuntimeFailure::Version) => (
+            DoctorStatus::Fail,
+            "The configured executable's version is unsupported; repair the profile or runtime installation.",
+        ),
+        Err(RuntimeFailure::ProbeBudget) => (
+            DoctorStatus::Fail,
+            "The configured runtime version was not checked because the doctor probe budget was exhausted.",
+        ),
     }
-    for name in crate::agent::host::RESERVED_RUNTIME_IDS
+}
+
+fn optional_runtime_checks(
+    profiles: &crate::agent::ProfileRegistry,
+    base_env: &pohunek_worker_protocol::BaseEnv,
+    configured_names: &std::collections::HashSet<String>,
+    probe_started: Instant,
+) -> Vec<DoctorCheck> {
+    crate::agent::host::RESERVED_RUNTIME_IDS
         .iter()
         .copied()
-        .filter(|name| *name != protocol::RuntimeId::SHELL)
-    {
-        if configured_names.contains(name) {
-            continue;
-        }
-        let status = match profiles.resolve_agent(name) {
-            Ok(agent) => profile_runtime_check(profiles, &agent, base_env, probe_started),
-            Err(_) => Err(RuntimeFailure::OptionalMissing),
-        };
-        let (status, detail) = match status {
-            Ok(()) => (DoctorStatus::Ok, "Optional provider runtime is ready."),
-            Err(RuntimeFailure::Executable) => (
+        .filter(|name| *name != protocol::RuntimeId::SHELL && !configured_names.contains(*name))
+        .map(|name| {
+            let result = profiles
+                .resolve_agent(name)
+                .map_or(Err(RuntimeFailure::OptionalMissing), |agent| {
+                    profile_runtime_check(profiles, &agent, base_env, probe_started)
+                });
+            let (status, detail) = optional_runtime_result(result);
+            DoctorCheck::new(format!("agent_runtime_{name}"), status, detail)
+        })
+        .collect()
+}
+
+fn optional_runtime_result(result: Result<(), RuntimeFailure>) -> (DoctorStatus, &'static str) {
+    match result {
+        Ok(()) => (DoctorStatus::Ok, "Optional provider runtime is ready."),
+        Err(RuntimeFailure::Executable) => (
+            DoctorStatus::Warn,
+            "Optional provider executable is missing; install it only if you use this agent.",
+        ),
+        Err(RuntimeFailure::Version) => (
+            DoctorStatus::Fail,
+            "Optional provider's installed version is unsupported; update the provider.",
+        ),
+        Err(RuntimeFailure::PinnedRuntime) => (
+            DoctorStatus::Fail,
+            "The pinned runtime is unavailable; install or select its pinned package again.",
+        ),
+        Err(RuntimeFailure::Profile) => (
+            DoctorStatus::Fail,
+            "The profile is malformed or cannot be resolved securely; repair its file or permissions.",
+        ),
+        Err(RuntimeFailure::OptionalMissing) => (
+            DoctorStatus::Warn,
+            "Optional provider is not installed; install it only if you use this agent.",
+        ),
+        Err(RuntimeFailure::ProbeBudget) => (
+            DoctorStatus::Warn,
+            "Optional provider version was not checked because the doctor probe budget was exhausted.",
+        ),
+    }
+}
+
+/// Add redacted hook-integration readiness using the launch-equivalent homes.
+fn integration_checks(
+    profiles: &crate::agent::ProfileRegistry,
+    base_env: &pohunek_worker_protocol::BaseEnv,
+    include_profile_homes: bool,
+    hermes_profiles: &[String],
+) -> Vec<DoctorCheck> {
+    let params = IntegrationDoctorParams {
+        agent: None,
+        profile: None,
+        all_profiles: include_profile_homes,
+    };
+    let homes = crate::integration::ConfigHomes::new(profiles.clone(), base_env.clone());
+    let mut checks = match crate::integration::doctor_in(&homes, params) {
+        Ok(report) => report
+            .agents
+            .iter()
+            .map(integration_agent_check)
+            .collect(),
+        Err(_) => vec![check(
+            "agent_integrations",
+            DoctorStatus::Fail,
+            "Provider integrations could not be safely inspected; check daemon logs and configuration ownership.",
+        )],
+    };
+    if include_profile_homes {
+        checks.extend(hermes_profiles.iter().map(|name| {
+            DoctorCheck::new(
+                format!("agent_integration_hermes_profile_{}", safe_profile_name(name)),
                 DoctorStatus::Warn,
-                "Optional provider executable is missing; install it only if you use this agent.",
-            ),
-            Err(RuntimeFailure::Version) => (
-                DoctorStatus::Fail,
-                "Optional provider's installed version is unsupported; update the provider.",
-            ),
-            Err(RuntimeFailure::PinnedRuntime) => (
-                DoctorStatus::Fail,
-                "The pinned runtime is unavailable; install or select its pinned package again.",
-            ),
-            Err(RuntimeFailure::Profile) => (
-                DoctorStatus::Fail,
-                "The profile is malformed or cannot be resolved securely; repair its file or permissions.",
-            ),
-            Err(RuntimeFailure::OptionalMissing) => (
-                DoctorStatus::Warn,
-                "Optional provider is not installed; install it only if you use this agent.",
-            ),
-            Err(RuntimeFailure::ProbeBudget) => (
-                DoctorStatus::Warn,
-                "Optional provider version was not checked because the doctor probe budget was exhausted.",
-            ),
-        };
-        checks.push(DoctorCheck::new(
-            format!("agent_runtime_{name}"),
-            status,
-            detail,
-        ));
+                "Hermes hook integration is unverified; this configured profile uses CLI-managed hooks, and the daemon has no inspection policy for its config home. Review its hook setup with Hermes's supported local tooling.",
+            )
+        }));
     }
     checks
+}
+
+/// Convert one typed integration diagnosis without exposing inspected paths or prose.
+fn integration_agent_check(diagnosis: &protocol::IntegrationAgentDoctor) -> DoctorCheck {
+    let runtime = diagnosis.agent.as_wire();
+    let profile = diagnosis
+        .home
+        .as_ref()
+        .and_then(|home| home.profiles.first());
+    let target = profile
+        .map(|name| format!("_profile_{}", safe_profile_name(name)))
+        .unwrap_or_default();
+    let name = format!("agent_integration_{runtime}{target}");
+    let recovery = profile.map_or_else(
+        || format!("pohunek integration install --agent {runtime}"),
+        |profile| format!("pohunek integration install --agent {runtime} --profile {profile}"),
+    );
+    let shared_profiles = diagnosis
+        .home
+        .as_ref()
+        .map_or(0, |home| home.profiles.len().saturating_sub(1));
+    let has_security_or_malformed_finding = diagnosis.findings.iter().any(|finding| {
+        matches!(
+            finding.code,
+            IntegrationFindingCode::ConfigRootInvalid
+                | IntegrationFindingCode::AssetUnsafe
+                | IntegrationFindingCode::ProviderConfigInvalid
+                | IntegrationFindingCode::HookSocketPathInvalid
+                | IntegrationFindingCode::UnsafeInstallerLock
+                | IntegrationFindingCode::DisplacedOriginalLeftBehind
+                | IntegrationFindingCode::QuarantineScanIncomplete
+        )
+    });
+    let (status, detail) = match &diagnosis.status {
+        None => (
+            DoctorStatus::Warn,
+            "Integration inspection is busy; retry doctor after the current install or uninstall finishes.".to_owned(),
+        ),
+        Some(_) if has_security_or_malformed_finding => (
+            DoctorStatus::Fail,
+            format!("Provider integration state is malformed, unsafe, or incomplete; repair it before running `{recovery}`."),
+        ),
+        Some(status) if status.state == IntegrationInstallState::Current && diagnosis.ok => (
+            DoctorStatus::Ok,
+            "Managed integration is current.".to_owned(),
+        ),
+        Some(status) if status.state == IntegrationInstallState::NotInstalled => (
+            DoctorStatus::Warn,
+            format!("Managed integration is absent; install it if hooks are needed with `{recovery}`."),
+        ),
+        Some(status) => {
+            let state = if status.state == IntegrationInstallState::Outdated {
+                "outdated"
+            } else {
+                "unhealthy"
+            };
+            let shared = if shared_profiles == 0 {
+                String::new()
+            } else {
+                format!(" This home is shared with {shared_profiles} other configured profile(s).")
+            };
+            (
+                DoctorStatus::Warn,
+                format!("Managed integration is {state}; repair provider configuration if needed, then run `{recovery}`.{shared}"),
+            )
+        }
+    };
+    DoctorCheck::new(name, status, &detail)
 }
 
 /// Validate the canonical embedded manifest sources without invoking their panic-on-error loaders.
@@ -546,6 +732,7 @@ mod tests {
             &CatalogTrust::Absent,
             &crate::agent::ProfileRegistry::default(),
             pohunek_worker_protocol::BaseEnv::default(),
+            false,
         )
         .await
         .expect("doctor report");
@@ -621,6 +808,7 @@ mod tests {
             &CatalogTrust::Invalid(AnchorFault::TooLarge),
             &crate::agent::ProfileRegistry::default(),
             pohunek_worker_protocol::BaseEnv::default(),
+            false,
         )
         .await
         .expect("doctor report");
