@@ -885,12 +885,30 @@ describe("@pohunek/testkit fixture daemon", () => {
         name: "SDK honesty",
         cols: TEST_COLS,
         rows: TEST_ROWS,
+        metadata: { ticket: "ABC-1", team: "runtime" },
+      });
+      await localClient.call("session.new", {
+        agent: "codex",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
       });
       const listed = await localClient.call("session.list", {
-        filters: [{ key: "id", value: created.id }],
+        filters: [{ key: "metadata_eq", value: { key: "ticket", value: "ABC-1" } }],
       });
-      expect(listed.length).toBe(1);
-      expect(listed[0]?.id).toBe(created.id);
+      expect(listed.map((session) => session.id)).toEqual([created.id]);
+      expect((await localClient.call("session.list", {
+        filters: [{ key: "metadata_has", value: { key: "team" } }],
+      })).map((session) => session.id)).toEqual([created.id]);
+      expect((await localClient.call("session.list", {
+        filters: [
+          { key: "metadata_has", value: { key: "ticket" } },
+          { key: "metadata_eq", value: { key: "team", value: "runtime" } },
+          { key: "id", value: created.id },
+        ],
+      })).map((session) => session.id)).toEqual([created.id]);
+      expect(await localClient.call("session.list", {
+        filters: [{ key: "metadata_eq", value: { key: "ticket", value: "ABC-2" } }],
+      })).toEqual([]);
 
       const subscriberClient = await connectTcp("fixture-host", tcpAddress);
       const subscription = await subscriberClient.subscribe(subscribeRequest("sub-honesty"));
@@ -921,6 +939,41 @@ describe("@pohunek/testkit fixture daemon", () => {
       await daemon.close();
     }
   });
+
+  test("session-list metadata filters enforce daemon byte and serialized-size limits", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("metadata-filter-bounds") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+
+      await expectProtocolError(client.call("session.list", {
+        filters: [{ key: "metadata_has", value: { key: "x".repeat(65) } }],
+      }), "bad_request");
+      await expectProtocolError(client.call("session.list", {
+        filters: [{ key: "metadata_has", value: { key: "é".repeat(33) } }],
+      }), "bad_request");
+      await expectProtocolError(client.call("session.list", {
+        filters: [{ key: "metadata_eq", value: { key: "ticket", value: "x".repeat(4097) } }],
+      }), "bad_request");
+      await expectProtocolError(client.call("session.list", {
+        filters: [{ key: "metadata_eq", value: { key: "ticket", value: "é".repeat(2049) } }],
+      }), "bad_request");
+      await expectProtocolError(client.call("session.list", {
+        filters: [{ key: "metadata_eq", value: { key: "ticket", value: "\u0000".repeat(3000) } }],
+      }), "bad_request");
+
+      expect(await client.call("session.list", {
+        filters: [{ key: "metadata_has", value: { key: "é".repeat(32) } }],
+      })).toEqual([]);
+      expect(await client.call("session.list", {
+        filters: [{ key: "metadata_eq", value: { key: "ticket", value: "é".repeat(2048) } }],
+      })).toEqual([]);
+
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
   test("models session lifecycle parity and project/worktree safeguards", async () => {
     const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("parity") } });
     try {

@@ -11,4 +11,6 @@ export type SessionListFilter =
   | { "key": "activity"; "value": AgentActivity }
   | { "key": "agent"; "value": string }
   | { "key": "id"; "value": string }
-  | { "key": "project"; "value": string };
+  | { "key": "project"; "value": string }
+  | { "key": "metadata_eq"; "value": { key: string; value: string } }
+  | { "key": "metadata_has"; "value": { key: string } };

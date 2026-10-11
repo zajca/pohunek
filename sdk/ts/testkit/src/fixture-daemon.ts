@@ -186,6 +186,9 @@ const FIRST_FIXTURE_PID = 42_000;
 const SESSION_ID_PREFIX = "s-testkit-";
 const NOTIFICATION_ID_PREFIX = "n-testkit-";
 const PROJECT_ID_PREFIX = "p-testkit-";
+const MAX_SESSION_METADATA_KEY_BYTES = 64;
+const MAX_SESSION_METADATA_VALUE_BYTES = 4096;
+const MAX_SESSION_METADATA_SERIALIZED_BYTES = 16 * 1024;
 const LINE_FEED = 0x0a;
 const CARRIAGE_RETURN = 0x0d;
 const SUPPORTED_AGENTS = ["shell", "codex", "claude", "hermes"] as const;
@@ -2058,7 +2061,7 @@ function isSessionListParams(value: SessionListParams): boolean {
   if (!Array.isArray(filters)) {
     return false;
   }
-  return filters.every(isSessionListFilter);
+  return filters.every((filter) => isSessionListFilter(filter) && isSessionListMetadataFilterValid(filter));
 }
 
 function isSessionListFilter(value: unknown): value is SessionListFilter {
@@ -2075,9 +2078,38 @@ function isSessionListFilter(value: unknown): value is SessionListFilter {
     case "id":
     case "project":
       return typeof filterValue === "string";
+    case "metadata_eq":
+      return (
+        isRecord(filterValue) &&
+        typeof filterValue["key"] === "string" &&
+        typeof filterValue["value"] === "string"
+      );
+    case "metadata_has":
+      return isRecord(filterValue) && typeof filterValue["key"] === "string";
     default:
       return false;
   }
+}
+
+function isSessionListMetadataFilterValid(filter: SessionListFilter): boolean {
+  switch (filter.key) {
+    case "metadata_eq":
+      return isSessionMetadataEntryValid(filter.value.key, filter.value.value);
+    case "metadata_has":
+      return isSessionMetadataEntryValid(filter.value.key, "");
+    default:
+      return true;
+  }
+}
+
+function isSessionMetadataEntryValid(key: string, value: string): boolean {
+  if (Buffer.byteLength(key, "utf8") > MAX_SESSION_METADATA_KEY_BYTES) {
+    return false;
+  }
+  if (Buffer.byteLength(value, "utf8") > MAX_SESSION_METADATA_VALUE_BYTES) {
+    return false;
+  }
+  return Buffer.byteLength(JSON.stringify({ [key]: value }), "utf8") <= MAX_SESSION_METADATA_SERIALIZED_BYTES;
 }
 
 function sessionMatchesFilter(session: SessionInfo, filter: SessionListFilter): boolean {
@@ -2092,6 +2124,10 @@ function sessionMatchesFilter(session: SessionInfo, filter: SessionListFilter): 
       return session.id === filter.value;
     case "project":
       return session.project_id === filter.value || session.project_label === filter.value;
+    case "metadata_eq":
+      return session.metadata?.[filter.value.key] === filter.value.value;
+    case "metadata_has":
+      return session.metadata !== undefined && Object.hasOwn(session.metadata, filter.value.key);
   }
 }
 

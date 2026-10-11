@@ -249,6 +249,23 @@ describe("client against a daemon of the previous release", () => {
     expect(daemon.seen.violations).toEqual([]);
   });
 
+  test("metadata list filters fail before the previous daemon receives them", async () => {
+    const daemon = await startPreviousDaemon();
+    const client = await connect(daemon);
+    const error = await client.call("session.list", {
+      filters: [{ key: "metadata_eq", value: { key: "ticket", value: "ABC-1" } }],
+    }).then(() => undefined, (caught: unknown) => caught as ClientError);
+    expect(error?.kind).toBe("daemonProtocolTooOld");
+    expect(error?.tooOld).toEqual({
+      host: HOST,
+      method: "session.list",
+      daemonVersion: PREVIOUS,
+      requiredVersion: PROTOCOL_VERSION,
+    });
+    expect(daemon.methods()).toEqual(["daemon.health"]);
+    expect(daemon.seen.violations).toEqual([]);
+  });
+
   test("a version-dependent request learns the version before it is sent", async () => {
     const daemon = await startPreviousDaemon();
     const client = await connect(daemon);
