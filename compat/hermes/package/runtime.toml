@@ -1,0 +1,34 @@
+# Hermes Agent 0.20.0 package descriptor, preserving the core runtime contract.
+
+schema = 1
+id = "pohunek.runtime.hermes"
+version = "1.0.0"
+runtime_api = 1
+
+[runtime]
+id = "hermes"
+name = "Hermes Agent"
+program = "hermes"
+args = ["chat"]
+detect_manifest = "detect.toml"
+version_probe = { parser = "semver-line-v1", args = ["--version"], min = "0.20.0", below = "0.20.1", line = "Hermes Agent v{version} {annotation}" }
+
+[input]
+bracketed_paste = true
+submit_delay_ms = 150
+text_policy = "hermes_safe_text"
+
+[resume]
+supported = true
+reference_kind = "id"
+args = ["--resume", "{reference}"]
+
+[fork]
+supported = false
+
+[native_reference]
+strategy = "hook"
+
+[integration]
+handler = "hermes-hook-v1"
+hook_schema = "identity-v1"

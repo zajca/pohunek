@@ -7,6 +7,15 @@ SHA-256 `1e9319c58a7f5e95808546af1091d58472be7437adc63fae0cbb53316e2711aa`.
 Runtime code that needs the supported Hermes version should consume this lock
 rather than repeat `0.20.0` in another mutable source.
 
+`package/` contains a production-format local package fixture under validation,
+not a published or released package. Its descriptor uses the data-driven
+`semver-line-v1` probe for the locked banner and limits support to
+`[0.20.0, 0.20.1)`. The lock remains authoritative for the upstream release and
+source digest; it intentionally does not duplicate the package's launch policy.
+The reserved `hermes` runtime id can be served by a package only when a signed
+catalog authorizes its digest. Hermes is not in the published catalog, and no
+Hermes release package artifact exists yet.
+
 Run the model-free CI gate with an installed pinned executable on `PATH`:
 
 ```bash
