@@ -128,9 +128,29 @@ slice:
 ## Phase 5 — the CI + review loop
 
 Every push creates a new head, and the automated review (a PR review whose
-body starts with `<!-- hermes-codex-review:<repo>#<pr>:<sha> -->`) lands per
-head commit, typically minutes after CI. **Both** must be checked for every
-head; checking only CI loses review rounds.
+body starts with `<!-- hermes-codex-review:<repo>#<pr>:<sha> -->`) should land
+per head commit, typically minutes after CI. **Both** must be checked for
+every head; checking only CI loses review rounds. A marker and matching GitHub
+`commit_id` identify the request and reported head, but do not prove that a
+review ran. A review that says the trusted-head/checkout comparison failed,
+that no review was performed, or that assessment stopped is an aborted review:
+it is not a clean result, does not satisfy the gate, and must never be used as
+the previous reviewed head for an incremental review. Generic text such as
+"No actionable findings" does not override an explicit abort.
+
+Until the reviewer service publishes a structured outcome, read the review
+from the PR reviews API and verify its marker identifies this repository, PR,
+and exact pushed SHA; its GitHub `commit_id` equals that SHA; and its body
+affirmatively establishes that the trusted head matched the checkout and the
+requested diff was actually assessed. Also verify that the API review's GitHub
+`state` is neither `PENDING` nor `DISMISSED`. Reject explicit mismatch, abort,
+or "no review performed" language even when the other fields match. For an
+incremental review, also establish that its prior reviewed head is a
+previously accepted completed review and is an ancestor of this head. Do not
+treat a label event, review submission, marker, SHA, generic clean summary, or
+human fallback as proof that the automated review service recovered. The
+service-side structured outcome and recovery remain separate work; this
+readback is a safety check, not a permanent substitute for them.
 
 1. **Label first.** The automated review runs only for a PR labeled
    `ai:review`. Before arming the watch verify the label with `gh pr view
@@ -140,16 +160,19 @@ head; checking only CI loses review rounds.
 2. **Watch.** Start one background watcher per push (a monitor tool where
    the runtime has one; otherwise a polling loop or repeated scheduled
    checks) that polls until (a) every check of
-   the PR is non-pending and (b) a review whose `commit_id` equals the pushed
-   head exists (`gh api repos/<repo>/pulls/<n>/reviews`); emit each failed
-   check and the review id as events. Also read human reviews, inline review
+   the PR is non-pending and (b) a completed review for the pushed head passes
+   the evidence checks above (`gh api repos/<repo>/pulls/<n>/reviews`). Apply
+   those checks to every candidate; emit failed checks, rejected/aborted
+   review IDs, and the accepted completed review ID as events. Rejected or
+   aborted reviews do not satisfy (b); a matching marker and `commit_id` alone
+   do not satisfy it either. Also read human reviews, inline review
    comments, and PR conversation comments since the last round. Re-arm on
    expiry. The reviewer normally answers within about 10 minutes of the push.
-   If no review of the head exists 15 minutes after the push (or after CI
-   finished, whichever is later), the reviewer is stuck: first check the
-   `ai:review` label (a missing label is the usual cause), then re-fire the
-   `labeled` event by removing and re-adding `ai:review` (no new head, so no
-   CI churn), and only if that also gets no review within 15 minutes
+   If no acceptable completed review of the head exists 15 minutes after the
+   push (or after CI finished, whichever is later), the reviewer is stuck:
+   first check the `ai:review` label (a missing label is the usual cause),
+   then re-fire the `labeled` event by removing and re-adding `ai:review` (no
+   new head, so no CI churn), and only if that also gets no review within 15 minutes
    re-trigger it by pushing a new head — rebase onto the current `main` when it moved,
    otherwise `git commit --amend --no-edit --date=now` and
    `--force-with-lease` with the old head SHA — and record the retrigger on
@@ -202,9 +225,10 @@ head; checking only CI loses review rounds.
    head SHA. Go back to step 1 (re-check the `ai:review` label).
 
 **Merge criteria** for a PR (all must hold on its current head):
-every required check green; the automated review of that exact head exists
-and has no actionable finding, or each remaining finding was answered with
-evidence as a false positive; no unresolved human review request; every
+every required check green; a completed automated review of that exact head
+affirmatively establishes the trusted checkout and actual assessment; it has
+no actionable finding, or each remaining finding is answered with evidence as
+a false positive; no unresolved human review request; every
 DoD item the slice owns is met with evidence.
 
 If the operator asked for **merge on green CI** in the invocation, merge as
