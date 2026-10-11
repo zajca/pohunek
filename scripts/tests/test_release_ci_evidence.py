@@ -61,6 +61,7 @@ args = sys.argv[1:]
 with events.open("a") as stream:
     if args[:2] == ["workflow", "run"]:
         tier = next(value.split("=", 1)[1] for value in args if value.startswith("tier="))
+        dispatch_id = next(value.split("=", 1)[1] for value in args if value.startswith("dispatch_id="))
         run_id = 900 + len(state["runs"])
         run = {
             "id": run_id,
@@ -70,7 +71,7 @@ with events.open("a") as stream:
             "head_branch": "main",
             "path": ".github/workflows/ci.yml@refs/heads/main",
             "event": "workflow_dispatch",
-            "display_title": f"CI [tier={tier}]",
+            "display_title": f"CI [tier={tier}] [dispatch={dispatch_id}]",
             "status": "completed",
             "conclusion": "success",
             "html_url": f"https://github.com/example/pohunek/actions/runs/{run_id}",
