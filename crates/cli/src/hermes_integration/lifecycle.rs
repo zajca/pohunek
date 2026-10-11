@@ -420,7 +420,7 @@ pub(crate) fn inspect(
 struct Installed {
     ownership: Ownership,
     modified: bool,
-    /// The marker's recorded checksums differ from the embedded assets'.
+    /// The marker's recorded payload or sidecar provenance differs from this binary.
     outdated: bool,
 }
 
@@ -690,11 +690,17 @@ fn installed(
     }
     let ownership = read_matching_ownership(root, target, policy_path, expected_assets)?;
     let modified = managed_modified(root, &ownership)? || has_unmanaged_entries(root, &ownership)?;
-    let outdated = expected_assets.is_some_and(|expected| {
-        expected
+    let outdated = if let Some(expected) = expected_assets {
+        let assets_outdated = expected
             .iter()
-            .any(|asset| ownership.assets.get(asset.path()) != Some(&asset.checksum()))
-    });
+            .any(|asset| ownership.assets.get(asset.path()) != Some(&asset.checksum()));
+        let current_operator_sha256 = assets::operator_sha256()?;
+        let provenance_outdated =
+            ownership.operator_sha256.as_deref() != Some(current_operator_sha256.as_str());
+        assets_outdated || provenance_outdated
+    } else {
+        false
+    };
     Ok(Some(Installed {
         ownership,
         modified,
@@ -1778,6 +1784,48 @@ mod tests {
             PRIVATE_FILE_MODE
         );
         assert!(!install(&mut hermes, &request).expect("idempotent").modified);
+    }
+
+    #[test]
+    fn changed_operator_provenance_is_outdated_and_update_restores_current_marker() {
+        let (_root, target, policy_path, policy) = setup("operator-provenance");
+        let request = InstallRequest::new(&target, &policy_path, &policy, false);
+        let mut hermes = ControlledHermes::default();
+        install(&mut hermes, &request).expect("install current sidecar");
+
+        let marker_path = target.plugin_root().join(MARKER_NAME);
+        let mut ownership = assets::parse_marker(&fs::read(&marker_path).expect("read marker"))
+            .expect("parse marker");
+        let mut stale_digest = assets::operator_sha256().expect("current sidecar hash");
+        stale_digest.replace_range(
+            ..1,
+            if stale_digest.starts_with('0') {
+                "1"
+            } else {
+                "0"
+            },
+        );
+        ownership.operator_sha256 = Some(stale_digest);
+        fs::write(
+            &marker_path,
+            assets::marker_bytes(&ownership).expect("stale provenance marker"),
+        )
+        .expect("write stale provenance marker");
+        fs::set_permissions(&marker_path, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+            .expect("restore private marker mode");
+
+        let stale = inspect(&mut hermes, &target, &policy_path).expect("inspect stale marker");
+        assert!(stale.outdated);
+        assert!(!stale.modified);
+
+        let updated = install(&mut hermes, &request).expect("update stale provenance");
+        assert!(!updated.outdated);
+        let marker = assets::parse_marker(&fs::read(&marker_path).expect("read updated marker"))
+            .expect("parse updated marker");
+        assert_eq!(
+            marker.operator_sha256,
+            Some(assets::operator_sha256().expect("sidecar hash"))
+        );
     }
 
     #[test]

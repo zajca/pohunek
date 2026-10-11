@@ -246,7 +246,7 @@ fn verified_operator_manifest_bytes(source: &[u8]) -> Result<OperatorManifest, E
     Ok(manifest)
 }
 
-fn operator_sha256() -> Result<String, Error> {
+pub(crate) fn operator_sha256() -> Result<String, Error> {
     verified_operator_manifest()?;
     Ok(checksum(OPERATOR_MANIFEST))
 }
