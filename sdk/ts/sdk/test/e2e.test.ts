@@ -84,6 +84,106 @@ e2eTest(
   E2E_TEST_TIMEOUT_MS,
 );
 
+e2eTest(
+  "real pohunekd filters session metadata through the WebSocket relay without exposing non-matches",
+  async () => {
+    await withDaemon(async (daemon) => {
+      const transport = await wsTransport(daemon);
+      let client: Client | undefined;
+      const sessionIds: string[] = [];
+      let scenarioFailed = false;
+      let scenarioError: unknown;
+
+      try {
+        client = await transport.connectClient();
+        const permitted = await client.call("session.new", {
+          agent: "shell",
+          cols: SESSION_COLS,
+          rows: SESSION_ROWS,
+          metadata: { share: "team", ticket: "ABC-1" },
+        });
+        sessionIds.push(permitted.id);
+
+        const missingVisibility = await client.call("session.new", {
+          agent: "shell",
+          cols: SESSION_COLS,
+          rows: SESSION_ROWS,
+          metadata: { ticket: "ABC-1" },
+        });
+        sessionIds.push(missingVisibility.id);
+
+        const differentValue = await client.call("session.new", {
+          agent: "shell",
+          cols: SESSION_COLS,
+          rows: SESSION_ROWS,
+          metadata: { share: "team", ticket: "ABC-2" },
+        });
+        sessionIds.push(differentValue.id);
+
+        const listed = await client.call("session.list", {
+          filters: [
+            { key: "metadata_has", value: { key: "share" } },
+            { key: "metadata_eq", value: { key: "share", value: "team" } },
+            { key: "metadata_eq", value: { key: "ticket", value: "ABC-1" } },
+            { key: "state", value: "running" },
+          ],
+        });
+
+        expect(listed.map((session) => session.id)).toEqual([permitted.id]);
+        const listedJson = JSON.stringify(listed);
+        expect(listedJson.includes(missingVisibility.id)).toBe(false);
+        expect(listedJson.includes(differentValue.id)).toBe(false);
+      } catch (error: unknown) {
+        scenarioFailed = true;
+        scenarioError = addDaemonContext(error, daemon);
+      }
+
+      const cleanupErrors: unknown[] = [];
+      if (client !== undefined) {
+        for (const sessionId of sessionIds) {
+          try {
+            await client.call("session.stop", sessionId);
+          } catch (error: unknown) {
+            cleanupErrors.push(error);
+          }
+          try {
+            await client.call("session.remove", sessionId);
+          } catch (error: unknown) {
+            cleanupErrors.push(error);
+          }
+        }
+        try {
+          await client.close();
+        } catch (error: unknown) {
+          cleanupErrors.push(error);
+        }
+      }
+      try {
+        await transport.close();
+      } catch (error: unknown) {
+        cleanupErrors.push(error);
+      }
+
+      if (scenarioFailed) {
+        if (cleanupErrors.length > 0) {
+          throw new AggregateError(
+            [scenarioError, ...cleanupErrors],
+            "metadata relay scenario and cleanup both failed",
+          );
+        }
+        throw scenarioError;
+      }
+      if (cleanupErrors.length === 1) {
+        throw cleanupErrors[0];
+      }
+      if (cleanupErrors.length > 1) {
+        throw new AggregateError(cleanupErrors, "metadata relay scenario cleanup failed");
+      }
+    });
+  },
+  E2E_TEST_TIMEOUT_MS,
+);
+
 async function runSessionScenario(daemon: DaemonHarness, transport: E2eTransport): Promise<void> {
   let client: Client | undefined;
   let eventClient: Client | undefined;

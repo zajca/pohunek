@@ -1753,6 +1753,117 @@ async fn session_list_with_malformed_filter_returns_typed_error() {
     assert_eq!(response.id(), "bad-filter-value");
     assert_eq!(err_payload(response).code, "bad_request");
 
+    let oversized_key = Request::make(
+        "bad-filter-metadata-key",
+        method::SESSION_LIST,
+        serde_json::json!({
+            "filters": [{ "key": "metadata_has", "value": { "key": "x".repeat(65) } }]
+        }),
+    );
+    assert_eq!(
+        err_payload(exchange(&mut client, &oversized_key).await).code,
+        "bad_request"
+    );
+
+    let oversized_value = Request::make(
+        "bad-filter-metadata-value",
+        method::SESSION_LIST,
+        serde_json::json!({
+            "filters": [{
+                "key": "metadata_eq",
+                "value": { "key": "tag", "value": "x".repeat(4097) }
+            }]
+        }),
+    );
+    assert_eq!(
+        err_payload(exchange(&mut client, &oversized_value).await).code,
+        "bad_request"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn session_list_filters_metadata_at_the_socket_boundary() {
+    let socket = temp_socket("session-list-metadata");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let mut client = connect(&socket).await;
+
+    let mut tagged_params = session_params(&socket);
+    tagged_params.metadata = BTreeMap::from([
+        ("ticket".to_owned(), "ABC-1".to_owned()),
+        ("team".to_owned(), "runtime".to_owned()),
+    ]);
+    let tagged: SessionInfo = serde_json::from_value(ok_payload(
+        create_session_with_params(&mut client, tagged_params).await,
+    ))
+    .expect("tagged session");
+    let untagged = create_session(&mut client, &socket).await;
+
+    let cases = [
+        (
+            "metadata-exact",
+            vec![SessionListFilter::MetadataEq {
+                key: "ticket".to_owned(),
+                value: "ABC-1".to_owned(),
+            }],
+            vec![tagged.id.clone()],
+        ),
+        (
+            "metadata-presence",
+            vec![SessionListFilter::MetadataHas {
+                key: "team".to_owned(),
+            }],
+            vec![tagged.id.clone()],
+        ),
+        (
+            "metadata-and",
+            vec![
+                SessionListFilter::MetadataHas {
+                    key: "ticket".to_owned(),
+                },
+                SessionListFilter::MetadataEq {
+                    key: "team".to_owned(),
+                    value: "runtime".to_owned(),
+                },
+                SessionListFilter::Id(tagged.id.0.clone()),
+            ],
+            vec![tagged.id.clone()],
+        ),
+        (
+            "metadata-no-match",
+            vec![SessionListFilter::MetadataEq {
+                key: "ticket".to_owned(),
+                value: "ABC-2".to_owned(),
+            }],
+            Vec::new(),
+        ),
+    ];
+    for (id, filters, expected) in cases {
+        let request = Request::make(
+            id,
+            method::SESSION_LIST,
+            serde_json::to_value(SessionListParams { filters }).expect("serialize filters"),
+        );
+        let sessions: Vec<SessionInfo> =
+            serde_json::from_value(ok_payload(exchange(&mut client, &request).await))
+                .expect("filtered list");
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| &session.id)
+                .collect::<Vec<_>>(),
+            expected.iter().collect::<Vec<_>>(),
+            "filter scenario {id}"
+        );
+    }
+    assert_ne!(tagged.id, untagged.id);
+
     let _ = shutdown.send(());
     let _ = handle.await;
 }

@@ -17,7 +17,9 @@ use protocol::{
 
 use super::util::{error_value, ok_value, ok_value_bounded, parse_optional_params, parse_params};
 use super::{ControlTransport, DaemonState};
-use crate::session::{ProfileChange, SessionRegistry, UnconfirmedCleanup};
+use crate::session::{
+    validate_session_list_filters, ProfileChange, SessionRegistry, UnconfirmedCleanup,
+};
 
 pub(super) async fn handle_session_new(request: &Request, sessions: &SessionRegistry) -> Response {
     let params = match parse_params::<SessionNewParams>(request) {
@@ -46,6 +48,9 @@ pub(super) async fn handle_session_list(request: &Request, sessions: &SessionReg
         Ok(params) => params,
         Err(err) => return error_value(request, err),
     };
+    if let Err(err) = validate_session_list_filters(&params.filters) {
+        return error_value(request, err);
+    }
     let mut list = sessions.list().await;
     if !params.filters.is_empty() {
         list.retain(|session| params.filters.iter().all(|filter| filter.matches(session)));

@@ -157,6 +157,15 @@ and the launch scripts write exactly these five keys through the shared
 of which surface created the session. The daemon treats all metadata as
 opaque owner-controlled strings.
 
+The `session.list` protocol request can filter this metadata with exact-value
+(`metadata_eq`) and key-presence (`metadata_has`) predicates. Equality compares
+the complete value; presence also matches an empty value. Metadata filters
+combine with each other and existing session filters using AND semantics. Keys
+and values remain opaque strings and use the same validation as
+`session.set_metadata`. When a current Rust or TypeScript client targets a
+protocol-3 daemon, a metadata filter fails with
+`daemon/daemon_protocol_too_old` before the request is sent.
+
 Sessions created by older review flows may retain `review.source` and
 `review.dispatched_at` metadata. Those keys remain opaque session metadata.
 

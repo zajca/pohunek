@@ -158,6 +158,17 @@ export function downgradeRequestParams(version: number, method: string, params: 
     return params;
   }
   rejectIntroduced(method);
+  const filters = isObject(params) ? params["filters"] : undefined;
+  if (
+    method === "session.list" &&
+    Array.isArray(filters) &&
+    filters.some((filter) =>
+      isObject(filter) &&
+      (filter["key"] === "metadata_eq" || filter["key"] === "metadata_has"),
+    )
+  ) {
+    throw new CompatError({ kind: "methodNotDefined", method });
+  }
   const translated = copy(params);
   switch (method) {
     case "session.output":

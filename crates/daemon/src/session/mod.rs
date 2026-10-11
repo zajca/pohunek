@@ -17,11 +17,11 @@ use protocol::{
     Event, ProjectRemoveResult, ProtocolError, RuntimeId, RuntimeInventoryEntry,
     RuntimeInventoryResult, RuntimeRef, RuntimeState, SessionAttachParams, SessionEvent,
     SessionForkParams, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
-    SessionInputWait, SessionNativeRecoveredEvent, SessionNewParams, SessionReleaseAgentParams,
-    SessionReleaseAgentResult, SessionRemoveResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionRuntime, SessionRuntimeIdentity, SessionSetMetadataResult, SessionState,
-    SessionStopResult, SessionWarning, StateSource, SubagentInfo, SubagentLifecycle,
+    SessionInputWait, SessionListFilter, SessionNativeRecoveredEvent, SessionNewParams,
+    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
+    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionRuntime, SessionRuntimeIdentity, SessionSetMetadataResult,
+    SessionState, SessionStopResult, SessionWarning, StateSource, SubagentInfo, SubagentLifecycle,
     SubagentRevision, UnconfirmedProcess, WorktreeRemoveResult, PROTOCOL_VERSION,
 };
 use serde_json::Value;
@@ -5532,6 +5532,26 @@ fn validate_session_metadata(metadata: &BTreeMap<String, String>) -> Result<(), 
         return Err(ProtocolError::bad_request(format!(
             "session metadata serialized size exceeds {MAX_SESSION_METADATA_SERIALIZED_BYTES} bytes"
         )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_session_list_filters(
+    filters: &[SessionListFilter],
+) -> Result<(), ProtocolError> {
+    for filter in filters {
+        let metadata = match filter {
+            SessionListFilter::MetadataEq { key, value } => {
+                Some(BTreeMap::from([(key.clone(), value.clone())]))
+            }
+            SessionListFilter::MetadataHas { key } => {
+                Some(BTreeMap::from([(key.clone(), String::new())]))
+            }
+            _ => None,
+        };
+        if let Some(metadata) = metadata {
+            validate_session_metadata(&metadata)?;
+        }
     }
     Ok(())
 }

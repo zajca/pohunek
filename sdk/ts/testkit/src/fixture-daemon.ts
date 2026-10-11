@@ -2075,6 +2075,14 @@ function isSessionListFilter(value: unknown): value is SessionListFilter {
     case "id":
     case "project":
       return typeof filterValue === "string";
+    case "metadata_eq":
+      return (
+        isRecord(filterValue) &&
+        typeof filterValue["key"] === "string" &&
+        typeof filterValue["value"] === "string"
+      );
+    case "metadata_has":
+      return isRecord(filterValue) && typeof filterValue["key"] === "string";
     default:
       return false;
   }
@@ -2092,6 +2100,10 @@ function sessionMatchesFilter(session: SessionInfo, filter: SessionListFilter): 
       return session.id === filter.value;
     case "project":
       return session.project_id === filter.value || session.project_label === filter.value;
+    case "metadata_eq":
+      return session.metadata?.[filter.value.key] === filter.value.value;
+    case "metadata_has":
+      return session.metadata !== undefined && Object.hasOwn(session.metadata, filter.value.key);
   }
 }
 

@@ -326,6 +326,10 @@ pub enum SessionListFilter {
     /// ([`SessionInfo::project_label`]). Requires the list to be project-enriched
     /// (it is, by `session.list`).
     Project(String),
+    /// Match an owner-controlled metadata key to an exact value.
+    MetadataEq { key: String, value: String },
+    /// Match sessions that contain an owner-controlled metadata key.
+    MetadataHas { key: String },
 }
 
 impl SessionListFilter {
@@ -349,6 +353,8 @@ impl SessionListFilter {
                 session.project_id.as_deref() == Some(reference)
                     || session.project_label.as_deref() == Some(reference)
             }
+            Self::MetadataEq { key, value } => session.metadata.get(key) == Some(value),
+            Self::MetadataHas { key } => session.metadata.contains_key(key),
         }
     }
 }

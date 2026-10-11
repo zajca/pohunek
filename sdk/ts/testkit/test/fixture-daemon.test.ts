@@ -885,12 +885,30 @@ describe("@pohunek/testkit fixture daemon", () => {
         name: "SDK honesty",
         cols: TEST_COLS,
         rows: TEST_ROWS,
+        metadata: { ticket: "ABC-1", team: "runtime" },
+      });
+      await localClient.call("session.new", {
+        agent: "codex",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
       });
       const listed = await localClient.call("session.list", {
-        filters: [{ key: "id", value: created.id }],
+        filters: [{ key: "metadata_eq", value: { key: "ticket", value: "ABC-1" } }],
       });
-      expect(listed.length).toBe(1);
-      expect(listed[0]?.id).toBe(created.id);
+      expect(listed.map((session) => session.id)).toEqual([created.id]);
+      expect((await localClient.call("session.list", {
+        filters: [{ key: "metadata_has", value: { key: "team" } }],
+      })).map((session) => session.id)).toEqual([created.id]);
+      expect((await localClient.call("session.list", {
+        filters: [
+          { key: "metadata_has", value: { key: "ticket" } },
+          { key: "metadata_eq", value: { key: "team", value: "runtime" } },
+          { key: "id", value: created.id },
+        ],
+      })).map((session) => session.id)).toEqual([created.id]);
+      expect(await localClient.call("session.list", {
+        filters: [{ key: "metadata_eq", value: { key: "ticket", value: "ABC-2" } }],
+      })).toEqual([]);
 
       const subscriberClient = await connectTcp("fixture-host", tcpAddress);
       const subscription = await subscriberClient.subscribe(subscribeRequest("sub-honesty"));

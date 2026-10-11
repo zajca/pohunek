@@ -571,6 +571,41 @@ async fn a_request_that_is_the_same_in_both_versions_is_sent_without_a_probe() {
 }
 
 #[tokio::test]
+async fn metadata_list_filters_fail_before_the_previous_daemon_receives_them() {
+    guard("the current-only metadata list filter", async {
+        let daemon = PreviousDaemon::start().await;
+        let mut client = daemon.client().await;
+        let request = request_for(
+            method::SESSION_LIST,
+            json!({
+                "filters": [{
+                    "key": "metadata_eq",
+                    "value": { "key": "ticket", "value": "ABC-1" }
+                }]
+            }),
+        );
+        let error = client
+            .request(&request)
+            .await
+            .expect_err("the previous daemon cannot apply metadata filters");
+        assert!(matches!(
+            error,
+            ClientError::DaemonProtocolTooOld {
+                method: ref name,
+                daemon_version,
+                required_version,
+                ..
+            } if name == method::SESSION_LIST
+                && daemon_version == previous()
+                && required_version == PROTOCOL_VERSION
+        ));
+        assert_eq!(daemon.methods(), [method::DAEMON_HEALTH]);
+        assert_eq!(daemon.violations(), Vec::<String>::new());
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_version_dependent_request_learns_the_version_before_it_is_sent() {
     guard("the dependent request", async {
         let daemon = PreviousDaemon::start().await;

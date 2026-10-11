@@ -152,6 +152,14 @@ fn translate_request(
     direction: Direction,
 ) -> Result<Value, CompatError> {
     reject_introduced(method)?;
+    if method == method::SESSION_LIST
+        && matches!(direction, Direction::ToLegacy)
+        && has_metadata_list_filter(&params)
+    {
+        return Err(CompatError::MethodNotDefined {
+            method: method.to_owned(),
+        });
+    }
     match method {
         method::SESSION_OUTPUT | method::SESSION_WAIT => {
             nested_identity(&mut params, "params.runtime", direction)?;
@@ -162,6 +170,20 @@ fn translate_request(
         _ => {}
     }
     Ok(params)
+}
+
+fn has_metadata_list_filter(params: &Value) -> bool {
+    params
+        .get("filters")
+        .and_then(Value::as_array)
+        .is_some_and(|filters| {
+            filters.iter().any(|filter| {
+                matches!(
+                    filter.get("key").and_then(Value::as_str),
+                    Some("metadata_eq" | "metadata_has")
+                )
+            })
+        })
 }
 
 fn translate_result(
