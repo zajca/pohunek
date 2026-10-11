@@ -66,7 +66,7 @@ LIST_FIELDS = (
     "attempt,startedAt,workflowName"
 )
 VIEW_FIELDS = (
-    "databaseId,name,displayTitle,event,conclusion,createdAt,updatedAt,"
+    "databaseId,name,displayTitle,event,status,conclusion,createdAt,updatedAt,"
     "startedAt,attempt,headBranch,workflowName,jobs"
 )
 # GitHub bills each job's runner time rounded UP to a whole minute, so
@@ -222,6 +222,7 @@ def summarize_run(document, with_steps=False):
         "last_finishing_job": last_job,
         # Attempts above one are reruns; keep them out of the aggregates.
         "attempt": document.get("attempt") or 1,
+        "status": document.get("status"),
         "conclusion": document.get("conclusion"),
         "event": document.get("event"),
         "branch": document.get("headBranch"),
@@ -1252,7 +1253,7 @@ def command_tiers(args):
     for name, runs in tiers.items():
         complete = [
             run for run in runs
-            if run["conclusion"] is not None
+            if ((run["conclusion"] or "") or run["status"] == "completed")
             and run["total_wall_seconds"] is not None
         ]
         queue = [run["queue_seconds"] for run in complete if run["queue_seconds"] is not None]
@@ -1338,6 +1339,14 @@ def command_compare(args):
         raise ValueError(
             "both windows need at least one run; " + "; ".join(empty)
         )
+    for label, summary in (
+        ("baseline", baseline_summary),
+        ("current", current_summary),
+    ):
+        if summary["wall_seconds"] is None:
+            raise ValueError(
+                f"{label} window has no measurable workflow wall clock"
+            )
     for label, loaded_window, window in (
         ("baseline", baseline_loaded, baseline_window),
         ("current", current_loaded, current_window),

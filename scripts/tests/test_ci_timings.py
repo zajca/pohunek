@@ -664,6 +664,29 @@ class RunTimingTests(CliHarness):
 
     # -- comparison ------------------------------------------------------
 
+    def test_compare_rejects_windows_without_measurable_workflow_wall_clock(self):
+        snapshot = self.write_snapshot(
+            "unmeasurable.json",
+            [
+                self._document(
+                    68, created="2026-09-14T10:00:00Z", updated=None,
+                ),
+                self._document(
+                    69, created="2026-09-20T10:00:00Z", updated=None,
+                ),
+            ],
+        )
+
+        result = self.run_cli(
+            "compare", "--input", snapshot,
+            "--baseline", "2026-09-14..2026-09-14",
+            "--current", "2026-09-20..2026-09-20",
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("baseline window has no measurable workflow wall clock", result.stderr)
+        self.assertNotIn("TypeError", result.stderr)
+
     def test_compare_reports_deltas_and_jobs_missing_from_one_window(self):
         # Jobs that exist in only one window still get a row with `n/a` on
         # the missing side, so added or removed shards stay visible both in
@@ -1801,6 +1824,27 @@ class TierTimingTests(CliHarness):
         self.assertEqual(rendered.returncode, 0, rendered.stderr)
         self.assertIn("main: 0/1 complete; wall p50/p90 n/a/n/a", rendered.stdout)
         self.assertIn("last finishers n/a", rendered.stdout)
+
+    def test_tiers_treat_empty_conclusion_as_incomplete_unless_status_completed(self):
+        interim = self._document(
+            6, created="2026-09-20T10:00:00Z",
+            updated="2026-09-20T10:10:00Z", event="push", branch="main",
+        )
+        interim["conclusion"] = ""
+        interim["status"] = "in_progress"
+        completed = self._document(
+            7, created="2026-09-20T11:00:00Z",
+            updated="2026-09-20T11:10:00Z", event="push", branch="main",
+        )
+        completed["conclusion"] = ""
+        completed["status"] = "completed"
+        snapshot = self.write_snapshot("empty-conclusion.json", [interim, completed])
+
+        payload = self.run_json("tiers", "--input", snapshot)
+
+        self.assertEqual(payload["main"]["runs"], 2)
+        self.assertEqual(payload["main"]["complete_runs"], 1)
+        self.assertEqual(payload["main"]["wall_seconds_p50"], 600)
 
     def test_runs_last_finisher_ignores_skipped_jobs(self):
         jobs = [
