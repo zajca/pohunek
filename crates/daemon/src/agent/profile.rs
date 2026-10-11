@@ -15,7 +15,7 @@
 //! package explicitly with the `package` and `digest` keys and resolves from
 //! exactly that digest; a profile over a built-in base carries neither key.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -243,10 +243,17 @@ impl ResolvedAgent {
 
 type DoctorProfileResult = (String, Result<ResolvedAgent, DoctorProfileError>);
 
+pub(crate) type DoctorManifestResult = (String, bool, Result<bool, DoctorManifestError>);
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum DoctorProfileError {
     Invalid,
     RuntimeUnavailable,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DoctorManifestError {
+    Invalid,
 }
 
 /// Loads + resolves host agent profiles from `<config_dir>/agents`.
@@ -331,6 +338,53 @@ impl ProfileRegistry {
         }
         profiles.sort_by(|left, right| left.0.cmp(&right.0));
         Ok(profiles)
+    }
+
+    /// Inspect host manifest overrides with the launch-equivalent resolver.
+    pub(crate) fn doctor_manifest_overrides(
+        &self,
+    ) -> Result<Vec<DoctorManifestResult>, &'static str> {
+        let Some(configured_dir) = &self.configured_dir else {
+            return Ok(Vec::new());
+        };
+        let Some(dir) = &self.dir else {
+            return Err("the configured agents directory is not owner-secure");
+        };
+        let profiles = scanned_profile_files(configured_dir)
+            .map_err(|_error| "configured agent profiles cannot be inspected")?;
+        let mut referenced = HashSet::new();
+        for (name, path) in profiles {
+            let Ok(content) = read_profile_text(dir, &name, &path) else {
+                continue;
+            };
+            let Ok(profile) = toml::from_str::<RawProfile>(&content) else {
+                continue;
+            };
+            if let Some(manifest) = profile.manifest {
+                referenced.insert(manifest);
+            }
+        }
+
+        let manifest_dir = dir.join("manifests");
+        let overrides = scanned_profile_files(&manifest_dir)
+            .map_err(|_error| "configured detection manifests cannot be inspected")?;
+        let present: HashSet<String> = overrides.iter().map(|(name, _)| name.clone()).collect();
+        let mut results = Vec::new();
+        for (name, _) in overrides {
+            let is_referenced = referenced.remove(&name);
+            let result = resolve_manifest(&name, dir, Some(&name))
+                .map(|source| source.is_some_and(|source| source.disables_detection()))
+                .map_err(|_error| DoctorManifestError::Invalid);
+            results.push((name, is_referenced, result));
+        }
+        for name in referenced.difference(&present) {
+            let result = resolve_manifest(name, dir, Some(name))
+                .map(|source| source.is_some_and(|source| source.disables_detection()))
+                .map_err(|_error| DoctorManifestError::Invalid);
+            results.push((name.clone(), true, result));
+        }
+        results.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(results)
     }
 
     pub(crate) fn with_runtimes(dir: Option<PathBuf>, runtimes: RuntimeHost) -> Self {
@@ -1113,6 +1167,12 @@ fn resolve_manifest(
 struct ManifestSource {
     manifest: Manifest,
     text: String,
+}
+
+impl ManifestSource {
+    fn disables_detection(&self) -> bool {
+        self.manifest.disables_detection()
+    }
 }
 
 /// `runtime/agent_profile_not_found`: a name resolved to neither a host profile nor

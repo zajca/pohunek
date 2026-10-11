@@ -111,6 +111,12 @@ impl Manifest {
     pub fn process_matchers(&self) -> Option<&ProcessMatchers> {
         self.process.as_ref()
     }
+
+    /// Whether this manifest contains no screen rules or effective process matchers.
+    #[must_use]
+    pub(crate) fn disables_detection(&self) -> bool {
+        self.rules.is_empty() && self.process.as_ref().is_none_or(ProcessMatchers::is_empty)
+    }
 }
 
 /// Process-level matchers compiled from a manifest `[process]` section.
@@ -138,6 +144,10 @@ impl ProcessMatchers {
                     .cmdline
                     .iter()
                     .any(|regex| regex.is_match(&fact.cmdline.join(" "))))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.comm.is_empty() && self.cmdline.is_empty()
     }
 }
 

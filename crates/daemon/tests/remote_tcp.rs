@@ -1022,6 +1022,137 @@ async fn daemon_doctor_truncates_oversized_reports_below_control_line_limit() {
     let _ = handle.await;
 }
 
+fn write_manifest_doctor_fixture(root: &Path) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let agents = root.join("agents");
+    let manifests = agents.join("manifests");
+    std::fs::create_dir_all(&manifests).expect("create manifest directory");
+    std::fs::write(
+        agents.join("empty-override.toml"),
+        "base = \"shell\"\nmanifest = \"empty\"\n",
+    )
+    .expect("write profile with empty override");
+    std::fs::write(
+        agents.join("process-only-override.toml"),
+        "base = \"shell\"\nmanifest = \"process-only\"\n",
+    )
+    .expect("write profile with process-only override");
+    std::fs::write(
+        agents.join("missing-override.toml"),
+        "base = \"shell\"\nmanifest = \"missing\"\n",
+    )
+    .expect("write profile with missing override");
+    std::fs::write(
+        agents.join("malformed-override.toml"),
+        "base = \"shell\"\nmanifest = \"malformed\"\n",
+    )
+    .expect("write profile with malformed override");
+    std::fs::write(
+        agents.join("unsafe-override.toml"),
+        "base = \"shell\"\nmanifest = \"unsafe\"\n",
+    )
+    .expect("write profile with unsafe override");
+    std::fs::write(
+        manifests.join("empty.toml"),
+        "# An empty rule list intentionally disables detection.\nrules = []\n",
+    )
+    .expect("write empty manifest");
+    std::fs::write(
+        manifests.join("process-only.toml"),
+        "[process]\ncomm = [\"^codex$\"]\n",
+    )
+    .expect("write process-only manifest");
+    std::fs::write(
+        manifests.join("malformed.toml"),
+        "[[rules]]\nid = \"MANIFEST_SECRET_CANARY\"\n",
+    )
+    .expect("write malformed manifest canary");
+    std::fs::write(
+        manifests.join("unused.toml"),
+        "[[rules]]\nid = \"MANIFEST_UNUSED_CANARY\"\n",
+    )
+    .expect("write malformed unused manifest canary");
+    let outside = root.join("outside.toml");
+    std::fs::write(&outside, "[[rules]]\nid = \"MANIFEST_UNSAFE_CANARY\"\n")
+        .expect("write outside manifest canary");
+    std::os::unix::fs::symlink(&outside, manifests.join("unsafe.toml"))
+        .expect("link manifest outside the trusted tree");
+    std::fs::set_permissions(
+        manifests.join("empty.toml"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .expect("keep empty manifest owner-only");
+    (agents, outside)
+}
+
+#[tokio::test]
+async fn daemon_doctor_reports_embedded_and_override_manifest_health_redacted() {
+    let root = pohunek_test_support::tempdir().expect("create manifest fixture root");
+    let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
+    process_env.set("PATH", root.path());
+    let (agents, outside) = write_manifest_doctor_fixture(root.path());
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents),
+        ..shell_config()
+    };
+    let (_addr, socket, shutdown, handle) =
+        spawn_dual_servers("doctor-manifest-readiness", "0.0.0", config).await;
+    let mut client = connect_unix(&socket).await;
+    let payload = ok_payload(
+        exchange(
+            &mut client,
+            &Request::make("doctor-manifests", method::DAEMON_DOCTOR, Value::Null),
+        )
+        .await,
+    );
+    let checks = payload["report"]["checks"]
+        .as_array()
+        .expect("doctor checks array");
+    let find = |name: &str| {
+        checks
+            .iter()
+            .find(|check| check["name"] == name)
+            .unwrap_or_else(|| panic!("doctor reports {name}: {payload}"))
+    };
+    for runtime in ["shell", "codex", "claude", "hermes"] {
+        assert_eq!(
+            find(&format!("agent_manifest_embedded_{runtime}"))["status"],
+            "ok"
+        );
+    }
+    assert_eq!(find("agent_manifest_override_empty")["status"], "ok");
+    assert!(find("agent_manifest_override_empty")["detail"]
+        .as_str()
+        .expect("empty override detail")
+        .contains("disables detection"));
+    assert_eq!(find("agent_manifest_override_process-only")["status"], "ok");
+    let process_only_detail = find("agent_manifest_override_process-only")["detail"]
+        .as_str()
+        .expect("process-only override detail");
+    assert!(process_only_detail.contains("takes precedence"));
+    assert!(!process_only_detail.contains("disables detection"));
+    for name in ["missing", "malformed", "unsafe"] {
+        assert_eq!(
+            find(&format!("agent_manifest_override_{name}"))["status"],
+            "fail"
+        );
+        assert_eq!(
+            find(&format!("agent_profile_{name}-override"))["status"],
+            "fail"
+        );
+    }
+    assert_eq!(find("agent_manifest_override_unused")["status"], "warn");
+    let rendered = serde_json::to_string(&payload).expect("serialize doctor payload");
+    assert!(!rendered.contains("MANIFEST_SECRET_CANARY"));
+    assert!(!rendered.contains("MANIFEST_UNUSED_CANARY"));
+    assert!(!rendered.contains("MANIFEST_UNSAFE_CANARY"));
+    assert!(!rendered.contains(outside.to_string_lossy().as_ref()));
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
 #[tokio::test]
 async fn daemon_health_payload_is_identical_over_unix_and_tcp() {
     let (addr, socket, shutdown, handle) =

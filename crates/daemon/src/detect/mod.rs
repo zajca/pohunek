@@ -41,6 +41,16 @@ const CODEX_MANIFEST: &str = include_str!("manifests/codex.toml");
 const CLAUDE_MANIFEST: &str = include_str!("manifests/claude.toml");
 const HERMES_MANIFEST: &str = include_str!("manifests/hermes.toml");
 
+/// Compiled manifest sources checked by daemon readiness diagnostics.
+pub(crate) fn embedded_manifest_sources() -> [&'static str; 4] {
+    [
+        GENERIC_SHELL_MANIFEST,
+        CODEX_MANIFEST,
+        CLAUDE_MANIFEST,
+        HERMES_MANIFEST,
+    ]
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DetectorConfig {
     pub detection: DetectionConfig,

@@ -14,6 +14,14 @@ or `hermes`, or to a host profile resolved by the daemon. Profiles define the pr
 arguments, optional environment entries, input behavior, resume behavior, and
 manifest metadata for that host.
 
+`daemon.doctor` validates the daemon's embedded detection manifests and reports
+host override manifests through the same bounded, contained loader used at
+launch. A configured profile's valid override takes precedence over its base
+runtime manifest; an empty override is valid and disables detection. A missing
+or malformed referenced override fails its profile check, while an invalid
+unreferenced override is a warning. Doctor details never include manifest
+contents or host paths.
+
 The assistant should run on a capable coding-agent runtime. The design ranking
 prefers a user-defined `pohunek-assistant` profile when available, then `codex`,
 then `claude`, then `hermes`, then other profiles based on those runtimes. The selected agent
