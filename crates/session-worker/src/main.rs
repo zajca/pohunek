@@ -1,6 +1,6 @@
 //! Runs one durable pohunek session worker.
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-10-11
 
 use std::fmt::Write as _;
 use std::fs;
@@ -24,13 +24,25 @@ const WORKER_ID_RANDOM_BYTES: usize = 16;
 /// referencing it, so it must work without any environment or paths.
 const VERSION_FLAG: &str = "--version";
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    if arguments == [VERSION_FLAG] {
+    if arguments.len() == 1 && arguments[0] == VERSION_FLAG {
         return print_version();
     }
-    match run().await {
+    if arguments.len() == 1 && arguments[0] == "--protocol-info" {
+        return print_protocol_info();
+    }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("pohunek-sessiond: failed to initialize runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(run()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("pohunek-sessiond: fatal: {error}");
@@ -41,6 +53,41 @@ async fn main() -> ExitCode {
                 error.message = %error,
                 "session worker failed: {{error.message}}",
             );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Prints machine-readable worker capabilities without initializing the runtime.
+fn print_protocol_info() -> ExitCode {
+    use std::io::Write as _;
+
+    let range = pohunek_worker_protocol::SUPPORTED_RANGE;
+    let info = serde_json::json!({
+        "schema_version": pohunek_worker_protocol::WORKER_DIAGNOSTIC_SCHEMA_VERSION,
+        "binary": "pohunek-sessiond",
+        "version": env!("CARGO_PKG_VERSION"),
+        "journal_schema_version": pohunek_session_worker::JOURNAL_SCHEMA_VERSION,
+        "worker_protocol": {
+            "minimum": range.minimum().get(),
+            "maximum": range.maximum().get(),
+        },
+    });
+    let output = match serde_json::to_vec(&info) {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!("pohunek-sessiond: failed to encode protocol info: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut stdout = std::io::stdout().lock();
+    match stdout
+        .write_all(&output)
+        .and_then(|()| stdout.write_all(b"\n"))
+    {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("pohunek-sessiond: failed to print protocol info: {error}");
             ExitCode::FAILURE
         }
     }

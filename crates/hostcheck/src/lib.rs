@@ -27,8 +27,9 @@ use protocol::{DoctorCheck, DoctorStatus};
 
 pub mod executable;
 pub mod macos;
+pub mod worker_probe;
 
-// Rust guideline compliant 2026-09-30
+// Rust guideline compliant 2026-10-11
 
 pub use executable::{is_executable_file, resolve_executable};
 pub use macos::{

@@ -15,7 +15,11 @@ pohunek-protocol = { workspace = true }
 pohunek-netbird = { workspace = true }
 pohunek-paths = { workspace = true }
 pohunek-platform = { workspace = true }
+pohunek-worker-protocol = { workspace = true }
 rustix = { workspace = true, features = ["fs", "process"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 pohunek-test-support = { workspace = true }
