@@ -42,12 +42,19 @@ pub const LAUNCHCTL: &str = "/bin/launchctl";
 /// value makes `pohunek doctor` hang on such a host.
 pub const LAUNCHCTL_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Longest time the deadline-bounded probes of one host-check run can block.
+/// Aggregate budget for agent version probes in one daemon doctor call.
 ///
-/// The `launchctl` domain probe is the only such probe; a probe added later
-/// must extend this sum, because [`doctor_request_timeout`] derives the
-/// transport limit from it.
-pub const PROBE_BUDGET: Duration = LAUNCHCTL_DEADLINE;
+/// Each individual probe accepts the remaining portion, so a list of profiles
+/// cannot multiply the per-runtime deadline.
+pub const AGENT_RUNTIME_PROBE_BUDGET: Duration = Duration::from_secs(4);
+
+/// Longest time the deadline-bounded probes of one doctor run can block.
+///
+/// This includes the `launchctl` domain probe and aggregate agent runtime
+/// probes; a probe added later must extend this sum because
+/// [`doctor_request_timeout`] derives the transport limit from it.
+pub const PROBE_BUDGET: Duration =
+    Duration::from_secs(LAUNCHCTL_DEADLINE.as_secs() + AGENT_RUNTIME_PROBE_BUDGET.as_secs());
 
 /// Time a `daemon.doctor` reply needs after the last probe finishes: framing,
 /// serialization and scheduling on the local socket. One second matches the
@@ -1841,13 +1848,15 @@ mod tests {
 
     #[test]
     fn the_doctor_request_timeout_outlasts_every_bounded_probe() {
-        // A wedged `launchctl` blocks the daemon's probe for up to
-        // `PROBE_BUDGET` (10 s), longer than the client's default 5 s request
-        // timeout; the derived timeout must exceed the budget so the daemon's
-        // own timed-out result is delivered.
+        // A wedged service-manager probe and the full agent-probe budget must
+        // fit before the client deadline so the daemon's bounded result is delivered.
         assert!(PROBE_BUDGET >= LAUNCHCTL_DEADLINE);
         assert!(doctor_request_timeout() > PROBE_BUDGET);
         assert_eq!(doctor_request_timeout(), PROBE_BUDGET + REPLY_HEADROOM);
+        assert_eq!(
+            PROBE_BUDGET,
+            LAUNCHCTL_DEADLINE + AGENT_RUNTIME_PROBE_BUDGET
+        );
         assert!(PROBE_BUDGET > Duration::from_secs(5));
     }
 

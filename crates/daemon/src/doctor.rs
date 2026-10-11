@@ -5,9 +5,10 @@
 //! that owns the agent runtime and assembles them into a [`DoctorReport`].
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use hostcheck::{StandardCheckInputs, Supervision, WorkerCandidate, WorkerSource};
-use protocol::{DoctorCheck, DoctorReport, DoctorStatus, QuarantineReason};
+use protocol::{DoctorCheck, DoctorReport, DoctorStatus, QuarantineReason, MAX_CONTROL_LINE_BYTES};
 
 use crate::catalog_anchor::{AnchorFault, CatalogTrust};
 use crate::governance::{HostGovernanceDiagnostic, HostGovernanceService};
@@ -57,7 +58,46 @@ pub(crate) async fn report(
     );
     checks.extend(governance_checks(governance.diagnose().await));
     checks.push(catalog_trust_check(catalog_trust));
-    Ok(DoctorReport::from_checks(checks))
+    Ok(bounded_report(checks))
+}
+
+/// Space held for the response envelope around the JSON doctor report.
+const DOCTOR_RESPONSE_HEADROOM_BYTES: usize = 1024;
+const MAX_DOCTOR_REPORT_BYTES: usize = MAX_CONTROL_LINE_BYTES - DOCTOR_RESPONSE_HEADROOM_BYTES;
+
+/// Keep the report inside the control-line limit and make omitted findings explicit.
+fn bounded_report(checks: Vec<DoctorCheck>) -> DoctorReport {
+    let report = DoctorReport::from_checks(checks.clone());
+    if serde_json::to_vec(&report)
+        .is_ok_and(|serialized| serialized.len() <= MAX_DOCTOR_REPORT_BYTES)
+    {
+        return report;
+    }
+
+    let truncated = DoctorCheck::new(
+        "doctor_checks_truncated",
+        DoctorStatus::Fail,
+        "Doctor findings exceeded the response-size limit; some checks were omitted.",
+    );
+    let truncated_bytes = serde_json::to_vec(&truncated).unwrap_or_default();
+    let template_bytes =
+        serde_json::to_vec(&DoctorReport::from_checks(vec![truncated.clone()])).unwrap_or_default();
+    let report_overhead = template_bytes.len().saturating_sub(truncated_bytes.len());
+    let mut retained = Vec::new();
+    let mut serialized_len = report_overhead.saturating_add(truncated_bytes.len());
+    for check in checks {
+        let check_bytes = serde_json::to_vec(&check).unwrap_or_default();
+        let next_len = serialized_len
+            .saturating_add(check_bytes.len())
+            .saturating_add(1);
+        if next_len > MAX_DOCTOR_REPORT_BYTES {
+            break;
+        }
+        retained.push(check);
+        serialized_len = next_len;
+    }
+    retained.push(truncated);
+    DoctorReport::from_checks(retained)
 }
 
 /// The launchd-relevant supervision mode: native jobs, direct children, or
@@ -75,6 +115,7 @@ fn profile_checks(
     profiles: &crate::agent::ProfileRegistry,
     base_env: &pohunek_worker_protocol::BaseEnv,
 ) -> Vec<DoctorCheck> {
+    let probe_started = Instant::now();
     let configured = match profiles.doctor_profiles() {
         Ok(configured) => configured,
         Err(detail) => return vec![check("agent_profiles", DoctorStatus::Fail, detail)],
@@ -86,7 +127,7 @@ fn profile_checks(
         let safe_name = safe_profile_name(&name);
         let check_name = format!("agent_profile_{safe_name}");
         let result = match result {
-            Ok(agent) => profile_runtime_check(profiles, &agent, base_env),
+            Ok(agent) => profile_runtime_check(profiles, &agent, base_env, probe_started),
             Err(crate::agent::DoctorProfileError::RuntimeUnavailable) => {
                 Err(RuntimeFailure::PinnedRuntime)
             }
@@ -117,6 +158,10 @@ fn profile_checks(
                 DoctorStatus::Fail,
                 "The configured executable's version is unsupported; repair the profile or runtime installation.",
             ),
+            Err(RuntimeFailure::ProbeBudget) => (
+                DoctorStatus::Fail,
+                "The configured runtime version was not checked because the doctor probe budget was exhausted.",
+            ),
         };
         checks.push(DoctorCheck::new(check_name, status, detail));
     }
@@ -129,7 +174,7 @@ fn profile_checks(
             continue;
         }
         let status = match profiles.resolve_agent(name) {
-            Ok(agent) => profile_runtime_check(profiles, &agent, base_env),
+            Ok(agent) => profile_runtime_check(profiles, &agent, base_env, probe_started),
             Err(_) => Err(RuntimeFailure::OptionalMissing),
         };
         let (status, detail) = match status {
@@ -154,6 +199,10 @@ fn profile_checks(
                 DoctorStatus::Warn,
                 "Optional provider is not installed; install it only if you use this agent.",
             ),
+            Err(RuntimeFailure::ProbeBudget) => (
+                DoctorStatus::Warn,
+                "Optional provider version was not checked because the doctor probe budget was exhausted.",
+            ),
         };
         checks.push(DoctorCheck::new(
             format!("agent_runtime_{name}"),
@@ -171,6 +220,7 @@ enum RuntimeFailure {
     PinnedRuntime,
     Executable,
     Version,
+    ProbeBudget,
 }
 
 /// Validate a profile using the same package and provider-version gates as launch.
@@ -178,6 +228,7 @@ fn profile_runtime_check(
     profiles: &crate::agent::ProfileRegistry,
     agent: &crate::agent::ResolvedAgent,
     base_env: &pohunek_worker_protocol::BaseEnv,
+    probe_started: Instant,
 ) -> Result<(), RuntimeFailure> {
     profiles
         .runtimes()
@@ -189,18 +240,22 @@ fn profile_runtime_check(
         .map_or(&[][..], |profile| profile.env.as_slice());
     let launch_path =
         crate::runtime::environment::effective_variable(base_env, profile_env, "PATH");
-    if pohunek_platform::shell_env::resolve_executable_in_path_value(
-        std::ffi::OsStr::new(agent.program()),
-        launch_path.as_deref(),
-    )
-    .is_err()
-    {
+    if crate::agent::which_executable(agent.program()).is_none() {
         return Err(RuntimeFailure::Executable);
     }
-    crate::agent::host::validate_launch_runtime(
+    let probe_timeout = if agent.definition.version_probe_parser().is_some() {
+        hostcheck::AGENT_RUNTIME_PROBE_BUDGET.saturating_sub(probe_started.elapsed())
+    } else {
+        Duration::ZERO
+    };
+    if agent.definition.version_probe_parser().is_some() && probe_timeout.is_zero() {
+        return Err(RuntimeFailure::ProbeBudget);
+    }
+    crate::agent::host::validate_launch_runtime_with_timeout(
         &agent.definition,
         agent.program(),
         launch_path.as_deref(),
+        probe_timeout,
     )
     .map_err(|_error| RuntimeFailure::Version)?;
     Ok(())

@@ -76,8 +76,9 @@ pub(crate) async fn run(paths: &Paths, json: bool) -> Result<bool, CliError> {
         None
     };
 
-    // The daemon's bounded probes (a wedged `launchctl` waits up to
-    // `PROBE_BUDGET`) must be able to finish before the client gives up.
+    // The daemon's bounded probes (launchd plus aggregate agent version
+    // probes, captured by `PROBE_BUDGET`) must finish before the client gives
+    // up.
     let (connected, remote) = match Client::connect_with_request_timeout(
         "local",
         paths,

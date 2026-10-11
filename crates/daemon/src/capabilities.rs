@@ -82,18 +82,21 @@ impl<'a> VersionProbe<'a> {
     /// `launch_path` is the `PATH` the agent launch sees. A data-driven probe
     /// hands it to the child so an interpreter script resolves the interpreter
     /// the launch will use; the pinned probe keeps its fixed search path.
-    fn detect_version(self, path: &Path, launch_path: Option<&OsStr>) -> Option<String> {
+    fn detect_version(
+        self,
+        path: &Path,
+        launch_path: Option<&OsStr>,
+        timeout: Duration,
+    ) -> Option<String> {
         match self {
-            Self::HermesV1 => {
-                run_hermes_version_probe(path).and_then(|output| parse_hermes_version(&output))
-            }
-            Self::Declared(policy) => {
-                run_semver_version_probe(path, policy, launch_path).and_then(|output| {
+            Self::HermesV1 => run_hermes_version_probe_with_timeout(path, timeout)
+                .and_then(|output| parse_hermes_version(&output)),
+            Self::Declared(policy) => run_semver_version_probe(path, policy, launch_path, timeout)
+                .and_then(|output| {
                     policy
                         .read_output(&output)
                         .map(|version| version.to_string())
-                })
-            }
+                }),
         }
     }
 
@@ -364,7 +367,9 @@ fn probe_versioned_runtime(
     };
 
     let probe = VersionProbe::for_definition(definition);
-    let version = probe.and_then(|probe| probe.detect_version(program.as_path(), launch_path));
+    let version = probe.and_then(|probe| {
+        probe.detect_version(program.as_path(), launch_path, VERSION_PROBE_TIMEOUT)
+    });
     let supported = probe
         .zip(version.as_deref())
         .is_some_and(|(probe, version)| probe.accepts(version));
@@ -393,15 +398,26 @@ pub(crate) fn validate_definition_launch(
     binary: &str,
     launch_path: Option<&OsStr>,
 ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
+    validate_definition_launch_with_timeout(definition, binary, launch_path, VERSION_PROBE_TIMEOUT)
+}
+
+/// Validate a launch definition using the caller's remaining version-probe budget.
+pub(crate) fn validate_definition_launch_with_timeout(
+    definition: &RuntimeDefinition,
+    binary: &str,
+    launch_path: Option<&OsStr>,
+    timeout: Duration,
+) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
     if definition.version_probe_parser().is_none() {
         return Ok(None);
     }
+    let timeout = timeout.min(VERSION_PROBE_TIMEOUT);
 
     let program = ValidatedLaunchProgram::resolve(binary)
         .ok_or_else(ProtocolError::agent_runtime_unsupported)?;
     let supported = VersionProbe::for_definition(definition).is_some_and(|probe| {
         probe
-            .detect_version(program.as_path(), launch_path)
+            .detect_version(program.as_path(), launch_path, timeout)
             .is_some_and(|version| probe.accepts(&version))
     });
     supported
@@ -427,10 +443,6 @@ fn supported_hermes_version() -> &'static str {
 }
 
 /// Run `--version` with isolated Hermes state, bounded time, and bounded output.
-fn run_hermes_version_probe(path: &std::path::Path) -> Option<String> {
-    run_hermes_version_probe_with_timeout(path, VERSION_PROBE_TIMEOUT)
-}
-
 fn run_hermes_version_probe_with_timeout(
     path: &std::path::Path,
     timeout: Duration,
@@ -496,6 +508,7 @@ fn run_semver_version_probe(
     path: &Path,
     policy: &VersionProbePolicy,
     launch_path: Option<&OsStr>,
+    timeout: Duration,
 ) -> Option<String> {
     match spawn_and_collect_probe(
         path,
@@ -503,7 +516,7 @@ fn run_semver_version_probe(
             policy,
             launch_path,
         },
-        VERSION_PROBE_TIMEOUT,
+        timeout,
         &[],
         &Instant::now,
     )? {

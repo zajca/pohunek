@@ -639,6 +639,7 @@ async fn host_governance_inspect_has_identical_unix_and_tcp_dispatch() {
 
 #[tokio::test]
 async fn daemon_doctor_has_identical_unix_and_tcp_dispatch() {
+    let _process_env = pohunek_test_support::process_env::ProcessEnv::lock();
     let (addr, socket, shutdown, handle) =
         spawn_dual_servers("remote-daemon-doctor", "0.0.0", shell_config()).await;
 
@@ -808,6 +809,204 @@ async fn daemon_doctor_reports_insecure_profile_directory_without_reading_it() {
     let rendered = serde_json::to_string(&payload).expect("serialize doctor payload");
     assert!(!rendered.contains("INSECURE_PROFILE_SECRET_CANARY"));
     assert!(!rendered.contains(agents.to_string_lossy().as_ref()));
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn daemon_doctor_uses_daemon_path_for_executable_and_profile_path_for_probe_child() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = pohunek_test_support::tempdir().expect("create path fixture root");
+    let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
+    let daemon_path = root.path().join("daemon-bin");
+    let profile_path = root.path().join("profile-bin");
+    let agents = root.path().join("agents");
+    std::fs::create_dir_all(&daemon_path).expect("create daemon PATH");
+    std::fs::create_dir_all(&profile_path).expect("create profile PATH");
+    std::fs::create_dir(&agents).expect("create agents directory");
+    process_env.set("PATH", &daemon_path);
+
+    std::fs::write(
+        profile_path.join("profile-only-runtime"),
+        "#!/bin/sh\nprintf 'codex-cli 0.160.0\\n'\n",
+    )
+    .expect("write executable present only on profile PATH");
+    std::fs::set_permissions(
+        profile_path.join("profile-only-runtime"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("make profile-only runtime executable");
+    std::fs::write(
+        agents.join("profile-only.toml"),
+        format!(
+            "base = \"codex\"\nprogram = \"profile-only-runtime\"\n[env]\nPATH = \"{}\"\n",
+            profile_path.display()
+        ),
+    )
+    .expect("write profile whose executable is missing from daemon PATH");
+
+    let runtime_script = daemon_path.join("runtime-script");
+    std::fs::write(
+        &runtime_script,
+        "#!/usr/bin/env sh\nprintf 'codex-cli 0.160.0\\n'\n",
+    )
+    .expect("write runtime script with PATH-resolved interpreter");
+    std::fs::set_permissions(&runtime_script, std::fs::Permissions::from_mode(0o755))
+        .expect("make runtime script executable");
+    std::fs::write(
+        agents.join("profile-path-probe.toml"),
+        format!(
+            "base = \"codex\"\nprogram = \"{}\"\n[env]\nPATH = \"/bin\"\n",
+            runtime_script.display()
+        ),
+    )
+    .expect("write profile with an interpreter supplied by effective launch PATH");
+
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents),
+        ..shell_config()
+    };
+    let (_addr, socket, shutdown, handle) =
+        spawn_dual_servers("doctor-path-readiness", "0.0.0", config).await;
+    let mut client = connect_unix(&socket).await;
+    let payload = ok_payload(
+        exchange(
+            &mut client,
+            &Request::make("doctor-paths", method::DAEMON_DOCTOR, Value::Null),
+        )
+        .await,
+    );
+    let checks = payload["report"]["checks"]
+        .as_array()
+        .expect("doctor checks array");
+    let find = |name: &str| {
+        checks
+            .iter()
+            .find(|check| check["name"] == name)
+            .unwrap_or_else(|| panic!("doctor reports {name}: {payload}"))
+    };
+    assert_eq!(find("agent_profile_profile-only")["status"], "fail");
+    assert!(find("agent_profile_profile-only")["detail"]
+        .as_str()
+        .expect("missing executable detail")
+        .contains("executable is missing"));
+    assert_eq!(find("agent_profile_profile-path-probe")["status"], "ok");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn daemon_doctor_bounds_aggregate_version_probes_across_slow_profiles() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = pohunek_test_support::tempdir().expect("create slow profile fixture root");
+    let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
+    process_env.set("PATH", root.path());
+    let agents = root.path().join("agents");
+    std::fs::create_dir(&agents).expect("create agents directory");
+    let probe_count = root.path().join("probe-count");
+    let slow_runtime = root.path().join("slow-runtime");
+    std::fs::write(
+        &slow_runtime,
+        format!(
+            "#!/bin/sh\nprintf x >> '{}'\nexec /bin/sleep 20\n",
+            probe_count.display()
+        ),
+    )
+    .expect("write blocking version-probe executable");
+    std::fs::set_permissions(&slow_runtime, std::fs::Permissions::from_mode(0o755))
+        .expect("make slow runtime executable");
+    for index in 0..6 {
+        std::fs::write(
+            agents.join(format!("slow-{index}.toml")),
+            format!(
+                "base = \"hermes\"\nprogram = \"{}\"\n[env]\nPATH = \"/bin\"\n",
+                slow_runtime.display()
+            ),
+        )
+        .expect("write slow profile");
+    }
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents),
+        ..shell_config()
+    };
+    let (_addr, socket, shutdown, handle) =
+        spawn_dual_servers("doctor-probe-budget", "0.0.0", config).await;
+    let mut client = connect_unix(&socket).await;
+    let payload = ok_payload(
+        exchange(
+            &mut client,
+            &Request::make("doctor-probe-budget", method::DAEMON_DOCTOR, Value::Null),
+        )
+        .await,
+    );
+    let checks = payload["report"]["checks"]
+        .as_array()
+        .expect("doctor checks array");
+    assert!(
+        checks.iter().any(|check| {
+            check["name"] == "agent_profile_slow-5"
+                && check["detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.contains("probe budget was exhausted"))
+        }),
+        "expected exhausted probe budget for slow-5: {payload}"
+    );
+    let launches = std::fs::read_to_string(&probe_count).expect("read version-probe count");
+    assert_eq!(
+        launches.len(),
+        2,
+        "aggregate budget permits only two full probes"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn daemon_doctor_truncates_oversized_reports_below_control_line_limit() {
+    let root = pohunek_test_support::tempdir().expect("create large profile fixture root");
+    let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
+    process_env.set("PATH", root.path());
+    let agents = root.path().join("agents");
+    std::fs::create_dir(&agents).expect("create agents directory");
+    for index in 0..4096 {
+        let name = format!("p{index:04}-{}", "x".repeat(235));
+        std::fs::write(agents.join(format!("{name}.toml")), "base = \"shell\"\n")
+            .expect("write large-report profile");
+    }
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents),
+        ..shell_config()
+    };
+    let (_addr, socket, shutdown, handle) =
+        spawn_dual_servers("doctor-report-limit", "0.0.0", config).await;
+    let mut client = connect_unix(&socket).await;
+    let response = exchange(
+        &mut client,
+        &Request::make("doctor-report-limit", method::DAEMON_DOCTOR, Value::Null),
+    )
+    .await;
+    let response_size = serde_json::to_vec(&response)
+        .expect("serialize response envelope")
+        .len();
+    assert!(
+        response_size <= protocol::MAX_CONTROL_LINE_BYTES,
+        "response is {response_size} bytes"
+    );
+    let payload = ok_payload(response);
+    assert_eq!(payload["report"]["overall"], "fail");
+    let checks = payload["report"]["checks"]
+        .as_array()
+        .expect("doctor checks array");
+    let truncated = checks
+        .iter()
+        .find(|check| check["name"] == "doctor_checks_truncated")
+        .expect("explicit report truncation failure");
+    assert_eq!(truncated["status"], "fail");
 
     let _ = shutdown.send(());
     let _ = handle.await;

@@ -31,7 +31,9 @@ pub use handle::{PackageReport, ReloadError, RuntimeHost};
 #[cfg(test)]
 pub(crate) use launch::check_pin;
 pub use launch::LaunchPin;
-pub(crate) use launch::{launch_command, validate_launch_runtime};
+pub(crate) use launch::{
+    launch_command, validate_launch_runtime, validate_launch_runtime_with_timeout,
+};
 pub(crate) use package::may_serve_reserved;
 pub use package::{
     definition_from_archive, PackageLoad, PackageRejection, PackageSource, PackageStore,
