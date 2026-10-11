@@ -21,11 +21,15 @@ pub(crate) const MARKER_VERSION: u32 = 1;
 /// The generated marker is deliberately not self-checksummed.
 pub(crate) const MARKER_NAME: &str = ".pohunek-owned.json";
 /// Immutable embedded production assets, in normalized relative-path order.
-const ASSETS: [(&str, &[u8]); 7] = [
+const ASSETS: [(&str, &[u8]); 8] = [
     ("plugin.yaml", include_bytes!("assets/pohunek/plugin.yaml")),
     ("__init__.py", include_bytes!("assets/pohunek/__init__.py")),
     ("cli.py", include_bytes!("assets/pohunek/cli.py")),
     ("hooks.py", include_bytes!("assets/pohunek/hooks.py")),
+    (
+        "_pohunek_reporter.py",
+        include_bytes!("assets/pohunek/_pohunek_reporter.py"),
+    ),
     ("policy.py", include_bytes!("assets/pohunek/policy.py")),
     ("redact.py", include_bytes!("assets/pohunek/redact.py")),
     ("tools.py", include_bytes!("assets/pohunek/tools.py")),
@@ -33,11 +37,14 @@ const ASSETS: [(&str, &[u8]); 7] = [
 const SKILL_PATH: &str = "skills/pohunek/SKILL.md";
 const SKILL: &[u8] = include_bytes!("assets/pohunek/skills/pohunek/SKILL.md");
 const POLICY_TOKEN: &str = "__POHUNEK_POLICY_PATH__";
-const EXPECTED_PATHS: [&str; 8] = [
+/// Immutable core assets excluded from any future runtime-package overlay.
+const CORE_OWNED_ASSET_PATHS: [&str; 1] = ["_pohunek_reporter.py"];
+const EXPECTED_PATHS: [&str; 9] = [
     "plugin.yaml",
     "__init__.py",
     "cli.py",
     "hooks.py",
+    "_pohunek_reporter.py",
     "policy.py",
     "redact.py",
     "tools.py",
@@ -210,6 +217,9 @@ fn has_expected_paths(checksums: &BTreeMap<String, String>) -> bool {
         && EXPECTED_PATHS
             .iter()
             .all(|path| checksums.contains_key(*path))
+        && CORE_OWNED_ASSET_PATHS
+            .iter()
+            .all(|path| checksums.contains_key(*path))
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -277,7 +287,7 @@ mod tests {
             &assets,
         )
         .expect("ownership");
-        assert_eq!(ownership.assets.len(), 8);
+        assert_eq!(ownership.assets.len(), 9);
         assert!(!ownership.assets.contains_key(MARKER_NAME));
         assert_eq!(
             parse_marker(&marker_bytes(&ownership).expect("marker")).expect("parsed"),
@@ -319,8 +329,14 @@ mod tests {
             .find(|(path, _)| *path == "hooks.py")
             .expect("embedded hooks asset")
             .1;
+        let reporter = ASSETS
+            .iter()
+            .find(|(path, _)| *path == "_pohunek_reporter.py")
+            .expect("embedded core reporter asset")
+            .1;
         for (relative, bytes) in [
             ("pohunek/hooks.py", hooks),
+            ("pohunek/_pohunek_reporter.py", reporter),
             (
                 "tests/test_start_identity.py",
                 include_bytes!("assets/tests/test_start_identity.py").as_slice(),

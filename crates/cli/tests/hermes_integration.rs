@@ -392,6 +392,48 @@ esac"#,
         Some(16)
     );
 
+    let reporter_path = plugin_root.join("_pohunek_reporter.py");
+    fs::write(&reporter_path, b"# private reporter mutation sentinel\n")
+        .expect("mutate the reserved core reporter asset");
+    assert!(
+        parse_ok(&run(&fixture, &status_json_arguments))["modified"]
+            .as_bool()
+            .unwrap_or(false),
+        "status treats a changed core reporter as a modified managed asset"
+    );
+    let reporter_doctor = run(
+        &fixture,
+        &[
+            "integration",
+            "doctor",
+            "--agent",
+            "hermes",
+            "--hermes-profile",
+            "default",
+            "--hermes-bin",
+            hermes,
+            "--json",
+        ],
+    );
+    let reporter_doctor_text = String::from_utf8_lossy(&reporter_doctor.stdout).into_owned()
+        + String::from_utf8_lossy(&reporter_doctor.stderr).as_ref();
+    let reporter_doctor_json: Value =
+        serde_json::from_slice(&reporter_doctor.stdout).expect("parse reporter doctor output");
+    assert_eq!(reporter_doctor_json["ok"]["doctor"]["ok"], false);
+    assert_eq!(
+        reporter_doctor_json["ok"]["doctor"]["checks"]
+            .as_array()
+            .expect("doctor checks")
+            .iter()
+            .find(|check| check["code"] == "asset_integrity")
+            .expect("asset integrity check")["status"],
+        "fail"
+    );
+    assert!(
+        !reporter_doctor_text.contains("private reporter mutation sentinel"),
+        "doctor does not expose modified reporter contents"
+    );
+
     fs::write(plugin_root.join("hooks.py"), b"# explicitly modified\n")
         .expect("mutate managed plugin before uninstall");
     let uninstall_arguments = [
