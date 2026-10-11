@@ -681,12 +681,45 @@ async fn a_restart_with_a_live_old_version_worker_keeps_the_newer_incompatible_v
     install(&v.fixture, &new, true).await;
     assert_held_back(&v.fixture, &new, &v.old).await;
 
+    let (old_worker, expected) = {
+        let sessions = v.fixture.registry.inner.sessions.lock().await;
+        let entry = sessions
+            .get(&created.id)
+            .expect("session entry before restart");
+        let crate::session::RuntimeHandle::Worker(worker) = &entry.runtime else {
+            panic!("session has a worker before restart");
+        };
+        (
+            worker.clone(),
+            crate::session::RuntimeWatchIdentity::from_info(&entry.info)
+                .expect("worker watch identity before restart"),
+        )
+    };
     let restarted = v.fixture.reopen_with_workers().await;
-    restarted
+    let old_reconnect = v
+        .fixture
         .registry
-        .reconcile_workers()
-        .await
-        .expect("startup reconciliation");
+        .reconnect_worker(
+            &created.id,
+            &expected,
+            old_worker.socket_path(),
+            &tokio_util::sync::CancellationToken::new(),
+            &crate::runtime::WorkerError::Protocol("restart handoff probe".to_owned()),
+            v.fixture.registry.inner.config.worker_connect_deadline,
+        )
+        .await;
+    assert!(
+        old_reconnect.is_none(),
+        "the shutting-down registry must not reclaim the released worker controller"
+    );
+    if let Err(error) = restarted.registry.reconcile_workers().await {
+        let inventory = restarted.registry.runtime_inventory().await;
+        panic!(
+            "startup reconciliation failed: {error}; worker inventory: {:#?}",
+            inventory.entries
+        );
+    }
+    let inventory = restarted.registry.runtime_inventory().await;
     let adopted = restarted
         .registry
         .inspect(&created.id)
@@ -695,7 +728,26 @@ async fn a_restart_with_a_live_old_version_worker_keeps_the_newer_incompatible_v
     assert_eq!(
         adopted.runtime.as_ref().map(|runtime| runtime.state),
         Some(protocol::RuntimeState::Live),
-        "the worker of the old version is adopted, not lost"
+        "the worker of the old version is adopted, not lost; inventory: {:#?}",
+        inventory.entries
+    );
+    assert_eq!(
+        adopted
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.worker_id.as_deref()),
+        Some(expected.worker_id.as_str()),
+        "the restarted registry adopted the same worker; inventory: {:#?}",
+        inventory.entries
+    );
+    assert_eq!(
+        adopted
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.worker_instance_id.as_deref()),
+        Some(expected.worker_instance_id.as_str()),
+        "the restarted registry adopted the same worker instance; inventory: {:#?}",
+        inventory.entries
     );
     assert_held_back(&restarted, &new, &v.old).await;
 
