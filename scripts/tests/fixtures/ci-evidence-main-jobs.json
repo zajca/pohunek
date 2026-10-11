@@ -1,0 +1,269 @@
+{
+  "jobs": [
+    {
+      "name": "fmt + clippy",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "cargo-audit (RustSec advisories)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "docs check (schema + drift + source-map + runbooks + secrets + release)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "build tests (nextest archive)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "macOS lint from Linux (aarch64-apple-darwin clippy)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "build bins (pohunekd + pohunek-sessiond + pohunek)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "doctests",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "real systemd supervision",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "cargo-shear (unused dependencies)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "cargo-udeps (unused dependencies)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "required jobs (paths filter)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "TS binding drift (xs check)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "macOS package install and upgrade (macos-14)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Claude Code runtime package (locked release, model-free)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "SDK workspace (macOS arm64)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "macOS package install and upgrade (macos-15)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Pi runtime package (locked release, model-free)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "release build",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "pinned Hermes compatibility (macOS arm64, model-free)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "cargo-hack (feature powerset)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "upgrade from the previous release / upgrade from the previous release",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "release rehearsal (build) / Resolve the release version",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "platform contracts (arm64)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Codex runtime package (locked release, model-free)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "release rehearsal (build) / Pack TypeScript SDK release assets",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "release rehearsal (build) / Build the runtime package archives",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "release rehearsal (build) / Build relay for x86_64-unknown-linux-gnu",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "release rehearsal (build) / Build daemon for x86_64-unknown-linux-musl",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "release rehearsal (build) / Build cli for x86_64-unknown-linux-musl",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "release rehearsal (build) / Build cli for x86_64-unknown-linux-gnu",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "release rehearsal (build) / Build daemon for x86_64-unknown-linux-gnu",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "SDK workspace",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "pinned Hermes compatibility (model-free)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "tests (core, fast)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "tests (daemon, fast)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "tests (heavy, PTY + Hermes)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "tests (relay, fast)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "tests (cli, fast)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "tests (relay DB, PostgreSQL)",
+      "status": "completed",
+      "conclusion": "skipped"
+    },
+    {
+      "name": "release rehearsal (evidence, assembly, archive smoke) / Plan the compatibility rows",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "release rehearsal (evidence, assembly, archive smoke) / Build the release consumer executable",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "release rehearsal (evidence, assembly, archive smoke) / Row codex on x86_64-unknown-linux-gnu",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "release rehearsal (evidence, assembly, archive smoke) / Row claude on x86_64-unknown-linux-musl",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "release rehearsal (evidence, assembly, archive smoke) / Row pi on x86_64-unknown-linux-musl",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "release rehearsal (evidence, assembly, archive smoke) / Row claude on x86_64-unknown-linux-gnu",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "release rehearsal (evidence, assembly, archive smoke) / Row pi on x86_64-unknown-linux-gnu",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "release rehearsal (evidence, assembly, archive smoke) / Row codex on x86_64-unknown-linux-musl",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "release rehearsal (evidence, assembly, archive smoke) / Assemble the rehearsal bundle",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "release rehearsal (evidence, assembly, archive smoke) / Attest the producer artifacts",
+      "status": "completed",
+      "conclusion": "skipped"
+    },
+    {
+      "name": "release rehearsal (evidence, assembly, archive smoke) / Attest the release bundle",
+      "status": "completed",
+      "conclusion": "skipped"
+    },
+    {
+      "name": "release rehearsal (evidence, assembly, archive smoke) / Assemble and sign the release bundle",
+      "status": "completed",
+      "conclusion": "skipped"
+    },
+    {
+      "name": "release rehearsal (evidence, assembly, archive smoke) / Archive smoke (network-isolated)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "release rehearsal (evidence, assembly, archive smoke) / Evidence verdict",
+      "status": "completed",
+      "conclusion": "success"
+    }
+  ]
+}

@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""Require successful exact-commit evidence from the CI execution tiers."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import secrets
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_CONFIG = Path(__file__).with_name("ci-evidence.json")
+SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+REF_PATTERN = re.compile(r"^[A-Za-z0-9._/-]+$")
+REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+class EvidenceError(Exception):
+    """A refusal to accept incomplete or mismatched Actions evidence."""
+
+
+def gh(*arguments: str) -> str:
+    """Run gh without a shell and return its standard output."""
+    try:
+        result = subprocess.run(
+            ["gh", *arguments], capture_output=True, text=True, check=False
+        )
+    except FileNotFoundError as error:
+        raise EvidenceError("gh is required to read GitHub Actions evidence") from error
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"gh exited with status {result.returncode}"
+        raise EvidenceError(detail)
+    return result.stdout
+
+
+def read_json(arguments: tuple[str, ...]) -> Any:
+    try:
+        return json.loads(gh(*arguments))
+    except json.JSONDecodeError as error:
+        raise EvidenceError("gh returned invalid JSON") from error
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    try:
+        config = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise EvidenceError(f"cannot read config {path}: {error}") from error
+    if not isinstance(config, dict):
+        raise EvidenceError("config must be a JSON object")
+    for field in (
+        "workflow_path",
+        "workflow_file",
+        "wait_timeout_seconds",
+        "poll_interval_seconds",
+        "required_jobs",
+        "required_steps",
+    ):
+        if field not in config:
+            raise EvidenceError(f"config is missing {field}")
+    jobs_by_tier = config["required_jobs"]
+    if not isinstance(jobs_by_tier, dict) or set(jobs_by_tier) != {"main", "nightly"}:
+        raise EvidenceError("config required_jobs must define exactly main and nightly")
+    for tier, jobs in jobs_by_tier.items():
+        if not isinstance(jobs, list) or not jobs or any(not isinstance(job, str) for job in jobs):
+            raise EvidenceError(f"config required_jobs.{tier} must be a non-empty string list")
+        if len(jobs) != len(set(jobs)):
+            raise EvidenceError(f"config required_jobs.{tier} contains duplicate jobs")
+    steps_by_tier = config["required_steps"]
+    if not isinstance(steps_by_tier, dict) or set(steps_by_tier) != {"main", "nightly"}:
+        raise EvidenceError("config required_steps must define exactly main and nightly")
+    for tier, steps in steps_by_tier.items():
+        if not isinstance(steps, list) or any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("job"), str)
+            or not isinstance(item.get("step"), str)
+            for item in steps
+        ):
+            raise EvidenceError(f"config required_steps.{tier} must contain job and step names")
+        for item in steps:
+            if item["job"] not in jobs_by_tier[tier]:
+                raise EvidenceError(
+                    f"config required_steps.{tier} references non-required job {item['job']}"
+                )
+    for field in ("wait_timeout_seconds", "poll_interval_seconds"):
+        if not isinstance(config[field], int) or config[field] <= 0:
+            raise EvidenceError(f"config {field} must be a positive integer")
+    if not isinstance(config["workflow_path"], str) or not config["workflow_path"].startswith(".github/workflows/"):
+        raise EvidenceError("config workflow_path must be under .github/workflows")
+    if (
+        not isinstance(config["workflow_file"], str)
+        or Path(config["workflow_file"]).name != config["workflow_file"]
+        or not config["workflow_file"].endswith(".yml")
+    ):
+        raise EvidenceError("config workflow_file must be a YAML workflow filename")
+    return config
+
+
+def run_tier(run: dict[str, Any], workflow_path: str) -> str | None:
+    if (run.get("path") or "").split("@", 1)[0] != workflow_path:
+        return None
+    event = run.get("event")
+    if event == "push" and run.get("head_branch") == "main":
+        return "main"
+    if event == "schedule":
+        return "nightly"
+    if event == "workflow_dispatch":
+        title = run.get("display_title") or run.get("displayTitle") or ""
+        for tier in ("main", "nightly"):
+            marker = f"CI [tier={tier}]"
+            if title == marker or title.startswith(marker + " "):
+                return tier
+    return None
+
+
+def run_dispatch_id(run: dict[str, Any]) -> str | None:
+    title = run.get("display_title") or run.get("displayTitle") or ""
+    match = re.fullmatch(r"CI \[tier=(?:main|nightly)\] \[dispatch=([0-9a-f]{32})\]", title)
+    return match.group(1) if match else None
+
+
+def list_runs(
+    repo: str,
+    workflow_file: str,
+    *,
+    sha: str | None = None,
+    event: str | None = None,
+) -> list[dict[str, Any]]:
+    arguments = [
+        "api",
+        "--method",
+        "GET",
+        "--paginate",
+        "--slurp",
+        f"repos/{repo}/actions/workflows/{workflow_file}/runs",
+    ]
+    if sha is not None:
+        arguments.extend(("-f", f"head_sha={sha}"))
+    if event is not None:
+        arguments.extend(("-f", f"event={event}"))
+    arguments.extend(("-f", "per_page=100"))
+    pages = read_json(tuple(arguments))
+    if not isinstance(pages, list):
+        raise EvidenceError("Actions API returned an invalid workflow-run list")
+    runs: list[dict[str, Any]] = []
+    for page in pages:
+        if isinstance(page, dict):
+            values = page.get("workflow_runs")
+            if not isinstance(values, list):
+                raise EvidenceError("Actions API response has no workflow_runs list")
+            runs.extend(run for run in values if isinstance(run, dict))
+    return runs
+
+
+def matching_runs(
+    runs: list[dict[str, Any]], sha: str, tier: str, workflow_path: str
+) -> list[dict[str, Any]]:
+    return [
+        run for run in runs
+        if run.get("head_sha") == sha and run_tier(run, workflow_path) == tier
+    ]
+
+
+def resolve_dispatch_ref(repo: str, ref: str, sha: str) -> None:
+    if not REF_PATTERN.fullmatch(ref) or ".." in ref or ref.startswith("/") or ref.endswith("/"):
+        raise EvidenceError(f"unsafe dispatch ref: {ref!r}")
+    commits = read_json(
+        (
+            "api",
+            f"repos/{repo}/commits",
+            "--method",
+            "GET",
+            "-f",
+            f"sha={ref}",
+            "-f",
+            "per_page=1",
+        )
+    )
+    if not isinstance(commits, list) or not commits or commits[0].get("sha") != sha:
+        resolved = commits[0].get("sha") if isinstance(commits, list) and commits else "unavailable"
+        raise EvidenceError(f"dispatch ref {ref!r} resolves to {resolved}, expected {sha}; refusing dispatch")
+
+
+def dispatch(repo: str, workflow_file: str, ref: str, tier: str) -> str:
+    request_id = secrets.token_hex(16)
+    gh(
+        "workflow", "run", workflow_file, "--repo", repo, "--ref", ref,
+        "-f", f"tier={tier}", "-f", f"dispatch_id={request_id}",
+    )
+    return request_id
+
+
+def get_jobs(repo: str, run_id: int) -> list[dict[str, Any]]:
+    pages = read_json(
+        (
+            "api",
+            "--method",
+            "GET",
+            "--paginate",
+            "--slurp",
+            f"repos/{repo}/actions/runs/{run_id}/jobs",
+            "-f",
+            "per_page=100",
+        )
+    )
+    jobs: list[dict[str, Any]] = []
+    if not isinstance(pages, list):
+        raise EvidenceError("Actions API returned an invalid job list")
+    for page in pages:
+        if isinstance(page, dict):
+            values = page.get("jobs")
+            if not isinstance(values, list):
+                raise EvidenceError("Actions API response has no jobs list")
+            jobs.extend(job for job in values if isinstance(job, dict))
+    return jobs
+
+
+def verify_steps(jobs: list[dict[str, Any]], required_steps: list[dict[str, str]]) -> list[str]:
+    failures = []
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for job in jobs:
+        by_name.setdefault(job.get("name", ""), []).append(job)
+    for required in required_steps:
+        name = required["job"]
+        matching = by_name.get(name, [])
+        if not matching:
+            failures.append(f"missing job for required step {name}: {required['step']}")
+            continue
+        for job in matching:
+            steps = job.get("steps") or []
+            found = [step for step in steps if step.get("name") == required["step"]]
+            if not found:
+                failures.append(f"missing required step {required['step']} in {name}")
+                continue
+            for step in found:
+                conclusion = step.get("conclusion") or "missing"
+                if conclusion != "success":
+                    failures.append(
+                        f"required step {required['step']} in {name}: conclusion={conclusion}"
+                    )
+    return failures
+
+
+def verify_jobs(jobs: list[dict[str, Any]], required_jobs: list[str]) -> list[str]:
+    by_name: dict[str, list[str]] = {}
+    for job in jobs:
+        by_name.setdefault(job.get("name", ""), []).append(job.get("conclusion") or "missing")
+    failures = []
+    for name in required_jobs:
+        conclusions = by_name.get(name)
+        if not conclusions:
+            failures.append(f"missing required job: {name}")
+        elif any(conclusion != "success" for conclusion in conclusions):
+            failures.append(f"required job {name}: {', '.join(conclusions)}")
+    required = set(required_jobs)
+    for job in jobs:
+        name = job.get("name", "")
+        conclusion = job.get("conclusion") or "missing"
+        if name not in required and conclusion not in ("success", "skipped"):
+            failures.append(f"additional job {name or '<unnamed>'}: {conclusion}")
+    return failures
+
+
+def verify(args: argparse.Namespace) -> dict[str, Any]:
+    if not REPO_PATTERN.fullmatch(args.repo):
+        raise EvidenceError("--repo must be in owner/name form")
+    if not SHA_PATTERN.fullmatch(args.sha):
+        raise EvidenceError("--sha must be a full 40-character lowercase commit SHA")
+    config = load_config(args.config)
+    runs = list_runs(args.repo, config["workflow_file"], sha=args.sha)
+    candidates = matching_runs(runs, args.sha, args.tier, config["workflow_path"])
+    dispatched_ids: set[int] = set()
+    dispatch_request_id: str | None = None
+    did_dispatch = False
+    if not candidates:
+        if not args.dispatch_ref:
+            raise EvidenceError(f"no {args.tier} tier run exists for {args.sha}; --dispatch-ref is required")
+        previous_dispatches = list_runs(
+            args.repo, config["workflow_file"], event="workflow_dispatch"
+        )
+        dispatched_ids = {item["id"] for item in previous_dispatches if isinstance(item.get("id"), int)}
+        resolve_dispatch_ref(args.repo, args.dispatch_ref, args.sha)
+        dispatch_request_id = dispatch(args.repo, config["workflow_file"], args.dispatch_ref, args.tier)
+        did_dispatch = True
+    deadline = time.monotonic() + config["wait_timeout_seconds"]
+    run = None
+    while time.monotonic() < deadline:
+        if candidates:
+            candidates.sort(
+                key=lambda item: (item.get("run_number", 0), item.get("run_attempt", 1)),
+                reverse=True,
+            )
+            if candidates[0].get("status") == "completed":
+                run = candidates[0]
+                break
+        time.sleep(config["poll_interval_seconds"])
+        runs = list_runs(args.repo, config["workflow_file"], sha=args.sha)
+        if did_dispatch:
+            recent_dispatches = list_runs(
+                args.repo, config["workflow_file"], event="workflow_dispatch"
+            )
+            new_dispatches = [
+                item for item in recent_dispatches
+                if item.get("id") not in dispatched_ids
+                and run_tier(item, config["workflow_path"]) == args.tier
+                and run_dispatch_id(item) == dispatch_request_id
+            ]
+            if new_dispatches:
+                new_dispatches.sort(key=lambda item: item.get("run_number", 0), reverse=True)
+                dispatched_run = new_dispatches[0]
+                if dispatched_run.get("head_sha") != args.sha:
+                    url = dispatched_run.get("html_url") or f"run {dispatched_run.get('id', 'unknown')}"
+                    raise EvidenceError(
+                        f"dispatch ref {args.dispatch_ref!r} moved: run {url} has head SHA "
+                        f"{dispatched_run.get('head_sha')}, expected {args.sha}"
+                    )
+                candidates = [dispatched_run]
+        else:
+            candidates = matching_runs(runs, args.sha, args.tier, config["workflow_path"])
+    if run is None:
+        raise EvidenceError(
+            f"timed out after {config['wait_timeout_seconds']}s waiting for completed {args.tier} tier evidence for {args.sha}"
+        )
+    url = run.get("html_url") or f"run {run.get('id', 'unknown')}"
+    if not isinstance(run.get("id"), int):
+        raise EvidenceError(f"run {url} has no valid run id")
+    if run.get("head_sha") != args.sha:
+        raise EvidenceError(f"run {url} has head SHA {run.get('head_sha')}, expected {args.sha}")
+    if run.get("status") != "completed":
+        raise EvidenceError(f"{args.tier} tier run is still {run.get('status')}: {url}")
+    jobs = get_jobs(args.repo, run["id"])
+    failures = verify_jobs(jobs, config["required_jobs"][args.tier])
+    failures.extend(verify_steps(jobs, config["required_steps"][args.tier]))
+    if run.get("conclusion") != "success":
+        failures.insert(0, f"workflow conclusion is {run.get('conclusion')}")
+    if failures:
+        raise EvidenceError(f"{args.tier} tier failed for {args.sha}: {'; '.join(failures)} ({url})")
+    return {
+        "tier": args.tier,
+        "sha": args.sha,
+        "event": run.get("event"),
+        "run_id": run.get("id"),
+        "url": run.get("html_url"),
+        "required_jobs": len(config["required_jobs"][args.tier]),
+        "required_steps": len(config["required_steps"][args.tier]),
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", required=True, help="GitHub repository in owner/name form")
+    parser.add_argument("--sha", required=True, help="exact candidate commit SHA")
+    parser.add_argument("--tier", choices=("main", "nightly"), required=True)
+    parser.add_argument("--dispatch-ref", help="branch or tag to dispatch if tier evidence is missing")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+    try:
+        result = verify(args)
+    except EvidenceError as error:
+        print(f"ci-evidence: {error}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(result, sort_keys=True))
+    else:
+        print(f"ci-evidence: {args.tier} tier passed for {args.sha}: {result['url']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

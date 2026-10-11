@@ -241,7 +241,10 @@ class CiTierWorkflowTests(unittest.TestCase):
             for payload in re.findall(r"'({\"runner\":\[.*?\]})'", matrix.group(1))
         ]
         self.assertEqual(matrix_values, [["macos-14", "macos-15"], ["macos-15"]])
-        self.assertIn("continue-on-error: ${{ matrix.runner == 'macos-14' }}", package)
+        self.assertIn(
+            "continue-on-error: ${{ matrix.runner == 'macos-14' && github.event_name != 'schedule' && !(github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') }}",
+            package,
+        )
 
         scenarios = (
             ("schedule", None, ["macos-14", "macos-15"]),

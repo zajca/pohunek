@@ -362,7 +362,10 @@ Release packaging and contributor verification:
   evaluates its observations (tested by
   `scripts/tests/test_launchd_lifetime_evidence.py`).
 - `docs/acceptance/README.md` — manual acceptance evidence and its schema.
-- `scripts/release`
+- `scripts/release` — release versioning, exact-commit main/nightly CI evidence
+  gate, and local-only `--no-push` behavior.
+- `scripts/ci-evidence` — verifies successful Actions jobs and steps for an
+  exact commit, with optional dispatch and bounded polling.
 - `scripts/provision-hermes-compat`
 - `scripts/tests/provision-hermes-compat.sh`
 - `scripts/smoke-hermes-plugin-release`

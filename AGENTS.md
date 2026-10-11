@@ -292,17 +292,18 @@ and SDK macOS jobs run for their own narrow input filters. A change to
 `main` runs the main tier: platform contracts, the
 `macos-15` package job, Hermes macOS, and SDK macOS, alongside the Linux jobs
 selected on main. PR and main runs cancel superseded runs on the same ref. A
-daily 05:00 UTC nightly run includes the main tier, the informational
-`macos-14` package leg, the cold rebuild comparison, and the nightly-only
-relay database suite. Until #355 replaces the retiring hosted image,
-`macos-14` remains `continue-on-error` and is not a required result. Manual
+daily 05:00 UTC nightly run includes the main tier, the required `macos-14`
+package leg, the cold rebuild comparison, and the nightly-only relay database
+suite. The `macos-14` package leg runs only in nightly schedule and `nightly`
+manual dispatch, and must pass for nightly CI evidence. Manual
 dispatch requires the `main` or `nightly` choice; nightly adds the nightly-only
 checks to main. Schedule and manual runs do not cancel PR or main runs.
 
-The automatic red-main issue reporter and release evidence gate are not part
-of S2: #477 S3 and S4 own those changes. Failures on main still need direct
-inspection in Actions; this workflow does not yet open or close issues for
-them.
+The automatic red-main issue reporter remains pending under #477 S3. The S4
+release evidence gate is implemented: `scripts/release` requires successful
+main and nightly CI evidence for the exact release commit before tagging. The
+script dispatches those tiers when it pushes the candidate; `--no-push` checks
+existing evidence only.
 
 SDK workspace gates (one Bun workspace root at the repository root spans `sdk/ts/*`):
 
@@ -430,9 +431,10 @@ The inventory distinguishes PR-triggering inputs from inputs covered by the
 post-merge main tier, so narrowing a filter cannot silently drop coverage.
 Manual runs use `workflow_dispatch` input `tier=main|nightly`; the daily
 schedule selects nightly. The main tier is latest-wins on pushes to `main`,
-while PR runs are latest-wins per pull request. S3's red-main reporter and
-S4's release evidence gate are still pending and must not be assumed by local
-or release workflows.
+while PR runs are latest-wins per pull request. S3's automatic red-main issue
+reporter remains pending. The S4 release evidence gate is enforced by
+`scripts/release`, which accepts only successful main and nightly evidence for
+the exact candidate commit; `--no-push` requires those runs to exist already.
 
 Doctests and the release build: the `doctests` job runs on
 every pull request. The release build (`release-build` job) runs on push to
