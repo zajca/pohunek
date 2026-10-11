@@ -782,11 +782,14 @@ async fn a_restart_after_an_integration_activation_still_sees_the_schema_of_the_
     assert_held_back(&v.fixture, &new, &v.old).await;
 
     let restarted = v.fixture.reopen_with_workers().await;
-    restarted
-        .registry
-        .reconcile_workers()
-        .await
-        .expect("startup reconciliation");
+    if let Err(error) = restarted.registry.reconcile_workers().await {
+        let inventory = restarted.registry.runtime_inventory().await;
+        panic!(
+            "startup reconciliation failed: {error}; worker inventory: {:#?}",
+            inventory.entries
+        );
+    }
+    let inventory = restarted.registry.runtime_inventory().await;
     let adopted = restarted
         .registry
         .inspect(&created.id)
@@ -794,7 +797,9 @@ async fn a_restart_after_an_integration_activation_still_sees_the_schema_of_the_
         .expect("the live session survives the restart");
     assert_eq!(
         adopted.runtime.as_ref().map(|runtime| runtime.state),
-        Some(protocol::RuntimeState::Live)
+        Some(protocol::RuntimeState::Live),
+        "the activated package session remains live after restart; worker inventory: {:#?}",
+        inventory.entries
     );
 
     let (schemas, installed) = activate_integration(&restarted, &codex)
