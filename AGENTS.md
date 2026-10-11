@@ -284,11 +284,12 @@ hierarchy rooted at #94. `docs/design/macos-support-rfc.md` records design
 constraints and rationale, not live delivery state.
 
 CI uses three execution tiers (issue #477). Pull requests always run the
-required Linux checks; macOS platform contracts run when their input filter
-matches, the macOS package job runs on `macos-15` only for packaging or
-launchd-service inputs, and the Hermes and SDK macOS jobs run only for their
-own narrow input filters. A change to `.github/workflows/ci.yml` selects all
-four macOS jobs. A push to `main` runs the main tier: platform contracts, the
+required Linux checks. On PRs, macOS platform contracts run when their input
+filter matches; the package job runs on `macos-15` only for packaging,
+install-acceptance, launchd-service, or relevant workflow inputs; and Hermes
+and SDK macOS jobs run for their own narrow input filters. A change to
+`.github/workflows/ci.yml` selects all four macOS jobs. A push to
+`main` runs the main tier: platform contracts, the
 `macos-15` package job, Hermes macOS, and SDK macOS, alongside the Linux jobs
 selected on main. PR and main runs cancel superseded runs on the same ref. A
 daily 05:00 UTC nightly run includes the main tier, the informational

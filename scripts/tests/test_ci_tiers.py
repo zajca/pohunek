@@ -1,6 +1,7 @@
 """Contract checks for the PR, main, and nightly CI tiers."""
 
 from pathlib import Path
+import json
 import re
 import unittest
 
@@ -214,11 +215,46 @@ class CiTierWorkflowTests(unittest.TestCase):
     def test_nightly_only_runs_macOS_14_cold_rebuild_and_relay_database_suite(self):
         jobs = workflow_jobs()
         package = jobs["macos-package"]
-        self.assertIn("github.event_name == 'schedule'", package)
-        self.assertIn("inputs.tier == 'nightly'", package)
-        self.assertIn("matrix.runner == 'macos-15'", package)
-        self.assertIn("inputs.tier == 'main'", package)
-        self.assertIn("needs.changes.outputs.macos_package == 'true'", package)
+        condition = re.search(r"(?m)^    if: \$\{\{ (.+) \}\}$", package)
+        self.assertIsNotNone(condition)
+        assert condition is not None
+        self.assertNotIn("matrix.", condition.group(1))
+        self.assertIn("github.event_name == 'schedule'", condition.group(1))
+        self.assertIn("inputs.tier == 'nightly'", condition.group(1))
+        self.assertIn("inputs.tier == 'main'", condition.group(1))
+        self.assertIn("github.event_name == 'push'", condition.group(1))
+        self.assertIn("needs.changes.outputs.macos_package == 'true'", condition.group(1))
+
+        strategy = block(package, "strategy", indent=4)
+        matrix = re.search(r"(?m)^      matrix: \$\{\{ (.+) \}\}$", strategy)
+        self.assertIsNotNone(matrix)
+        assert matrix is not None
+        self.assertEqual(
+            matrix.group(1),
+            "fromJSON((github.event_name == 'schedule' || "
+            "(github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly')) "
+            "&& '{\"runner\":[\"macos-14\",\"macos-15\"]}' "
+            "|| '{\"runner\":[\"macos-15\"]}')",
+        )
+        matrix_values = [
+            json.loads(payload)["runner"]
+            for payload in re.findall(r"'({\"runner\":\[.*?\]})'", matrix.group(1))
+        ]
+        self.assertEqual(matrix_values, [["macos-14", "macos-15"], ["macos-15"]])
+        self.assertIn("continue-on-error: ${{ matrix.runner == 'macos-14' }}", package)
+
+        scenarios = (
+            ("schedule", None, ["macos-14", "macos-15"]),
+            ("workflow_dispatch", "nightly", ["macos-14", "macos-15"]),
+            ("workflow_dispatch", "main", ["macos-15"]),
+            ("push", None, ["macos-15"]),
+            ("pull_request", None, ["macos-15"]),
+        )
+        for event, tier, runners in scenarios:
+            with self.subTest(event=event, tier=tier):
+                nightly = event == "schedule" or (event == "workflow_dispatch" and tier == "nightly")
+                selected = matrix_values[0 if nightly else 1]
+                self.assertEqual(selected, runners)
 
         cold_rebuild = re.search(
             r"(?ms)^      - name: Rebuild from a cold release directory and compare\n"
@@ -241,7 +277,7 @@ class CiTierWorkflowTests(unittest.TestCase):
             name
             for name, definition in jobs.items()
             if re.search(r"(?m)^    runs-on:.*macos", definition)
-            or re.search(r"(?m)^        runner: \[macos-", definition)
+            or re.search(r"(?m)^    runs-on: \$\{\{ matrix\.runner \}\}", definition)
         }
         self.assertEqual(discovered_macos_jobs, set(MACOS_PATH_OWNERSHIP))
 
