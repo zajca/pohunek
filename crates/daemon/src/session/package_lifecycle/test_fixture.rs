@@ -219,9 +219,10 @@ impl Fixture {
     /// fixture, so the second daemon finds the workers the first one started
     /// and can adopt them once this daemon has handed them over.
     ///
-    /// Every worker of this daemon releases its controller lease first, as a
-    /// daemon does before another instance takes its workers.
+    /// Shutdown cancels reconnect watchers before this daemon releases worker
+    /// controller leases for another instance to adopt.
     pub(super) async fn reopen_with_workers(&self) -> Self {
+        self.registry.begin_daemon_shutdown();
         let workers: Vec<_> = self
             .registry
             .inner
