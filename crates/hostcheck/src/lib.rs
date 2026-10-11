@@ -27,8 +27,7 @@ use protocol::{DoctorCheck, DoctorStatus};
 
 pub mod executable;
 pub mod macos;
-
-// Rust guideline compliant 2026-09-30
+pub mod worker_probe;
 
 pub use executable::{is_executable_file, resolve_executable};
 pub use macos::{
@@ -40,6 +39,7 @@ pub use macos::{
     Runner, Supervision, WorkerCandidate, WorkerSource, WORKER_EXECUTABLE_CHECK,
 };
 pub use pohunek_paths::Platform;
+pub use worker_probe::WORKER_PROBE_DEADLINE;
 
 /// Name prefix of the writability probe file.
 ///

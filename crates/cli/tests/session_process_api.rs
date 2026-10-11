@@ -368,6 +368,11 @@ fn doctor_renders_daemon_profile_failures_and_redacts_details_in_human_and_json(
         .find(|check| check["name"] == "agent_profile_bad-profile")
         .expect("CLI exposes daemon profile check");
     assert_eq!(profile["status"], "fail");
+    let worker = checks
+        .iter()
+        .find(|check| check["name"] == "worker_executable")
+        .expect("CLI exposes daemon worker readiness check");
+    assert_eq!(worker["status"], "fail");
     assert!(!json_output
         .stdout
         .windows(b"PROFILE_SECRET_CANARY".len())
@@ -714,6 +719,10 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
                     "name": "agent_profile_bad-profile",
                     "status": "fail",
                     "detail": "The profile is malformed; repair its configuration."
+                }, {
+                    "name": "worker_executable",
+                    "status": "fail",
+                    "detail": "The active session worker is malformed or incompatible; repair or reinstall the worker binary."
                 }]
             }
         }),

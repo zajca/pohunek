@@ -128,6 +128,18 @@ impl Harness {
     /// Starts the daemon with `catalog_trust` as the host's catalog trust
     /// anchor, the way a release daemon holds the one beside its executable.
     pub(crate) async fn start_with_trust(catalog_trust: CatalogTrust) -> Self {
+        Self::start_with_trust_and_worker(catalog_trust, worker_binary()).await
+    }
+
+    /// Starts the production server with a caller-owned worker executable.
+    pub(crate) async fn start_with_worker(worker_executable: PathBuf) -> Self {
+        Self::start_with_trust_and_worker(CatalogTrust::Absent, worker_executable).await
+    }
+
+    async fn start_with_trust_and_worker(
+        catalog_trust: CatalogTrust,
+        worker_executable: PathBuf,
+    ) -> Self {
         let env = TestEnv::new().expect("create the hermetic test environment");
         let runtime = env.runtime_dir().join("pohunek");
         fs::create_dir_all(&runtime).expect("create the runtime directory");
@@ -162,7 +174,7 @@ impl Harness {
             worker_state_root: Some(environment.state_home.join("pohunek/workers")),
             supervision: Some(
                 environment
-                    .supervision(worker_binary())
+                    .supervision(worker_executable)
                     .with_environment_source(EnvironmentSource::fixed(env.environment().clone())),
             ),
             shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),

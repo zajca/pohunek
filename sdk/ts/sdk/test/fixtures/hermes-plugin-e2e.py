@@ -132,6 +132,29 @@ def lifecycle_diagnostic(session: Any) -> str:
     )
 
 
+def identity_failure_phase(handlers: dict[str, Any], session_id: str) -> str | None:
+    """Extract only fixed identity diagnostic labels from the controlled PTY."""
+    try:
+        screen = invoke(handlers, "pohunek_session_screen", {"session": session_id})
+    except FixtureError:
+        return None
+    text = screen.get("text") if isinstance(screen, dict) else None
+    if not isinstance(text, str):
+        return None
+    for phase in (
+        "explicit_rejection",
+        "pre_send_unavailable",
+        "uncertain_after_send_partial_request",
+        "uncertain_after_send_timeout",
+        "uncertain_after_send_eof",
+        "uncertain_after_send_invalid_response",
+        "identity_setup_invalid",
+    ):
+        if f"pohunek_identity_diagnostic={phase}" in text:
+            return phase
+    return None
+
+
 def require_live(handlers: dict[str, Any], session_id: str, context: str) -> str:
     """Require one live session and return its diagnostic for a later assertion."""
     session = invoke(handlers, "pohunek_session_get", {"session": session_id})
@@ -149,8 +172,11 @@ def inspect_until_live(handlers: dict[str, Any], session_id: str) -> tuple[dict[
         session = invoke(handlers, "pohunek_session_get", {"session": session_id})
         if isinstance(session, dict):
             if session.get("state") in _TERMINAL_STATES:
+                phase = identity_failure_phase(handlers, session_id)
+                phase_diagnostic = f" identity_phase={phase}" if phase is not None else ""
                 raise FixtureError(
-                    f"session is terminal while a live runtime is required ({lifecycle_diagnostic(session)})"
+                    f"session is terminal while a live runtime is required "
+                    f"({lifecycle_diagnostic(session)}{phase_diagnostic})"
                 )
             try:
                 worker_instance_id, generation = runtime_from(session)

@@ -36,6 +36,8 @@ body:
       label: Dependencies
       description: Link prerequisites with issue numbers. Maintainers record native blocking/dependency links; text links alone do not prove that relationship.
       placeholder: None, or Depends on #123.
+    validations:
+      required: true
   - type: textarea
     id: entry-points
     attributes:
