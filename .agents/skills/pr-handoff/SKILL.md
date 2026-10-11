@@ -127,7 +127,18 @@ unpublished slices as pending.
    ai:review` if the repository does not have it yet) and verify it from
    `gh pr view <n> --json labels`. Re-apply it after every push to the PR
    when the reviewer removed it, and never assume a review is coming for an
-   unlabeled PR.
+   unlabeled PR. A label, review marker, or matching GitHub `commit_id` does
+   not prove that assessment completed. When checking a review, verify its
+   marker identifies this repository, PR, and exact head, its `commit_id`
+   matches that head, the API review's GitHub `state` is neither `PENDING` nor
+   `DISMISSED`, and its body affirmatively establishes that the trusted head
+   matched the checkout and the requested diff was assessed. Treat an
+   explicit head/checkout mismatch, abort, or statement that no review was
+   performed as a failed review even if the body also says there are no
+   actionable findings. Do not use such a review as an incremental baseline.
+   Use the same completed-review evidence rules as `deliver-issue` before
+   treating the review gate as satisfied; a human fallback does not establish
+   recovery of the automated service.
 6. **Update the milestone tracking.** Via the `github-workflow` skill, comment
    the ordered list of stack PR links on the milestone issue with the standard
    handoff content (branch/worktree, HEAD revision, scope covered, exact
