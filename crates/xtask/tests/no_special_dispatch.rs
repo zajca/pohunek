@@ -48,6 +48,8 @@ enum Owner {
     Handlers,
     /// Transcript parsing of external sessions (#487).
     Transcripts,
+    /// The profile doctor reports runtime integrations it cannot inspect (#68).
+    Doctor,
     /// Data tables that stay data: reserved ids and wire spellings.
     Data,
 }
@@ -58,6 +60,7 @@ impl Owner {
             Self::Packages => "#145 #146 #147",
             Self::Handlers => "handlers",
             Self::Transcripts => "#487",
+            Self::Doctor => "#68",
             Self::Data => "data",
         }
     }
@@ -185,6 +188,20 @@ const ALLOW_LIST: &[Entry] = &[
 ]),
         Owner::Packages,
         "compiled detection manifests of the built-in descriptors",
+    ),
+    (
+        "crates/daemon/src/doctor.rs",
+        Approved::Lines(&[
+    "\"Hermes hook integration is unverified; this configured profile uses CLI-managed hooks, and the daemon has no inspection policy for its config home. Review its hook setup with Hermes's supported local tooling.\",",
+    "&hermes_profiles,",
+    "Ok(agent) if agent.base.as_str() == RuntimeId::HERMES => Some(name.clone()),",
+    "checks.extend(hermes_profiles.iter().map(|name| {",
+    "format!(\"agent_integration_hermes_profile_{}\", safe_profile_name(name)),",
+    "hermes_profiles: &[String],",
+    "let hermes_profiles: Vec<String> = configured",
+]),
+        Owner::Doctor,
+        "issue #68 reports Hermes profiles as unverified because the daemon cannot inspect its CLI-managed integration",
     ),
     (
         "crates/daemon/src/external/mod.rs",
@@ -492,6 +509,7 @@ fn regenerate_allow_list() {
             Owner::Packages => "Packages",
             Owner::Handlers => "Handlers",
             Owner::Transcripts => "Transcripts",
+            Owner::Doctor => "Doctor",
             Owner::Data => "Data",
         });
         let reason = known.map_or("TODO", |entry| entry.3);
