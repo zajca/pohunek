@@ -288,6 +288,8 @@ class RunTimingTests(CliHarness):
             "runs", "--input", snapshot, "--window", "2026-09-19..2026-09-19"
         )
         self.assertEqual([run["id"] for run in before["runs"]], [25])
+        self.assertEqual(before["runs"][0]["wall_seconds"], 570)
+        self.assertEqual(before["runs"][0]["total_wall_seconds"], 1770)
 
     def test_runs_keeps_first_attempts_unless_attempts_all_is_passed(self):
         documents = [
@@ -1086,6 +1088,9 @@ class FetchTests(unittest.TestCase):
             "    if key not in views:\n"
             "        raise SystemExit('fake gh has no scripted view: ' + key)\n"
             "    print(json.dumps(views[key]))\n"
+            "elif args[:1] == ['api']:\n"
+            "    payload = json.loads(Path(os.environ.get('GH_API_JOBS', '{}')).read_text())\n"
+            "    print(json.dumps(payload))\n"
             "else:\n"
             "    raise SystemExit('unexpected gh request: ' + repr(args))\n"
         )
@@ -1100,6 +1105,7 @@ class FetchTests(unittest.TestCase):
             "GH_LIST": str(self.list),
             "GH_VIEWS": str(self.views),
             "GH_CALLS": str(self.calls),
+            "GH_API_JOBS": str(self.root / "gh-api-jobs.json"),
         }
 
     # -- fixture helpers ---------------------------------------------------
@@ -1338,8 +1344,30 @@ class FetchTests(unittest.TestCase):
         )
         self.assertEqual(payload["runs"], [])
         self.assertEqual(self.view_attempts(), [])
-        self.assertEqual([call[1] for call in self.gh_calls()], ["list"])
+        self.assertEqual(
+            [call[1] for call in self.gh_calls() if call[1] == "list"],
+            ["list"],
+        )
         self.assertFalse(self.cache.exists())
+
+    def test_fetch_enriches_job_queue_time_from_actions_jobs_api(self):
+        self.set_listing([{"databaseId": 78, "attempt": 1, "conclusion": "success"}])
+        view = self.view_document(78, attempt=1)
+        view["jobs"] = [{
+            "databaseId": 9001,
+            "name": "tests",
+            "startedAt": "2026-09-20T10:03:00Z",
+            "completedAt": "2026-09-20T10:09:00Z",
+            "conclusion": "success",
+        }]
+        self.set_views({"78:1": view})
+        Path(self.environment["GH_API_JOBS"]).write_text(json.dumps({"jobs": [{
+            "id": 9001, "created_at": "2026-09-20T10:01:00Z",
+        }]}))
+        payload = self.run_json("tiers")
+        self.assertEqual(payload["pr"]["jobs"]["tests"]["queue_seconds_p50"], 120)
+        api_call = next(call for call in self.gh_calls() if call[0] == "api")
+        self.assertIn("/attempts/1/jobs?per_page=100", api_call[1])
 
 
 class LogCacheCommandTests(unittest.TestCase):
@@ -1630,6 +1658,166 @@ class RunnerMinuteTests(CliHarness):
         self.assertIn("runner minutes p50 8 min, summed 8 min", rendered.stdout)
 
 
+class TierTimingTests(CliHarness):
+    """CLI scenarios for trigger tiers and partially available timestamps."""
+
+    def test_tiers_apply_attempt_event_conclusion_branch_and_window_filters(self):
+        documents = [
+            self._document(
+                90, created="2026-09-20T10:00:00Z",
+                updated="2026-09-20T10:05:00Z", attempt=1,
+                conclusion="failure", event="pull_request", branch="topic",
+            ),
+            self._document(
+                90, created="2026-09-20T10:00:00Z",
+                updated="2026-09-20T10:06:00Z", attempt=2,
+                conclusion="success", event="pull_request", branch="topic",
+            ),
+            self._document(
+                91, created="2026-09-20T11:00:00Z",
+                updated="2026-09-20T11:08:00Z", event="push", branch="main",
+            ),
+            self._document(
+                92, created="2026-09-19T11:00:00Z",
+                updated="2026-09-19T11:08:00Z", event="schedule", branch="main",
+            ),
+            self._document(
+                93, created="2026-09-20T12:00:00Z",
+                updated="2026-09-20T12:08:00Z", conclusion="failure",
+                event="push", branch="main",
+            ),
+            self._document(
+                94, created="2026-09-20T13:00:00Z",
+                updated="2026-09-20T13:08:00Z", event="pull_request", branch="other",
+            ),
+            self._document(
+                95, created="2026-09-18T13:00:00Z",
+                updated="2026-09-18T13:08:00Z", event="pull_request", branch="topic",
+            ),
+        ]
+        snapshot = self.write_snapshot("selection.json", documents)
+        selection = [
+            "--input", snapshot,
+            "--window", "2026-09-20..2026-09-20",
+            "--conclusion", "success",
+            "--event", "pull_request",
+            "--branch", "topic",
+        ]
+        first_attempt = self.run_json("tiers", *selection)
+        self.assertEqual(first_attempt["pr"]["runs"], 0)
+        all_attempts = self.run_json("tiers", *selection, "--attempts", "all")
+        self.assertEqual(all_attempts["pr"]["runs"], 1)
+        self.assertEqual(all_attempts["pr"]["wall_seconds_p50"], 360)
+        self.assertEqual(all_attempts["main"]["runs"], 0)
+        self.assertEqual(all_attempts["nightly"]["runs"], 0)
+
+    def test_tiers_classify_only_known_workflow_dispatch_markers(self):
+        documents = []
+        for run_id, title in (
+            (101, "CI [tier=main] manual production measurement"),
+            (102, "CI [tier=nightly] manual nightly measurement"),
+            (103, "CI [tier=mainish] unknown marker"),
+            (104, "CI manual run without marker"),
+        ):
+            run = self._document(
+                run_id, created="2026-09-20T10:00:00Z",
+                updated="2026-09-20T10:05:00Z", event="workflow_dispatch",
+            )
+            run["displayTitle"] = title
+            documents.append(run)
+        snapshot = self.write_snapshot("dispatch.json", documents)
+        payload = self.run_json("tiers", "--input", snapshot)
+        self.assertEqual(payload["main"]["runs"], 1)
+        self.assertEqual(payload["nightly"]["runs"], 1)
+        self.assertEqual(payload["unclassified"]["runs"], 2)
+
+    def test_tiers_include_queue_and_report_slowest_finishing_job(self):
+        jobs = [
+            {
+                **self._job("compile", "2026-09-20T10:02:00Z", "2026-09-20T10:05:00Z"),
+                "createdAt": "2026-09-20T10:00:00Z",
+            },
+            {
+                **self._job("tests", "2026-09-20T10:03:00Z", "2026-09-20T10:09:00Z"),
+                "createdAt": "2026-09-20T10:01:00Z",
+            },
+        ]
+        documents = [
+            self._document(1, created="2026-09-20T10:00:00Z",
+                           started="2026-09-20T10:02:00Z",
+                           updated="2026-09-20T10:10:00Z", jobs=jobs),
+            self._document(4, created="2026-09-20T10:20:00Z",
+                           started="2026-09-20T10:24:00Z",
+                           updated="2026-09-20T10:40:00Z", jobs=[
+                               {
+                                   **self._job("tests", "2026-09-20T10:24:00Z",
+                                               "2026-09-20T10:38:00Z"),
+                                   "createdAt": "2026-09-20T10:20:00Z",
+                               },
+                               {
+                                   **self._job("compile", "2026-09-20T10:24:00Z",
+                                               "2026-09-20T10:39:00Z"),
+                                   "createdAt": "2026-09-20T10:20:00Z",
+                               },
+                           ]),
+        ]
+        snapshot = self.write_snapshot("tiers.json", documents)
+        payload = self.run_json("tiers", "--input", snapshot)
+        self.assertEqual(payload["pr"]["wall_seconds_p50"], 900)
+        self.assertEqual(payload["pr"]["wall_seconds_p90"], 1200)
+        self.assertEqual(payload["pr"]["queue_seconds_p50"], 180)
+        self.assertEqual(payload["pr"]["queue_seconds_p90"], 240)
+        self.assertEqual(payload["pr"]["execution_seconds_p50"], 720)
+        self.assertEqual(payload["pr"]["last_finishing_jobs"], {"compile": 1, "tests": 1})
+        self.assertEqual(payload["pr"]["jobs"]["tests"]["queue_seconds_p50"], 180)
+        self.assertEqual(payload["pr"]["jobs"]["tests"]["queue_seconds_p90"], 240)
+        self.assertEqual(payload["pr"]["jobs"]["tests"]["run_seconds_p50"], 600)
+        self.assertEqual(payload["main"]["runs"], 0)
+        self.assertEqual(payload["nightly"]["runs"], 0)
+
+    def test_tiers_keep_incomplete_runs_and_ignore_missing_job_times(self):
+        partial = self._document(
+            2, created="2026-09-20T10:00:00Z", started=None, updated=None,
+            event="push", branch="main",
+        )
+        partial["startedAt"] = None
+        partial["conclusion"] = None
+        partial["jobs"] = [self._job(
+            "incomplete run job", None, "2026-09-20T10:02:00Z"
+        )]
+        scheduled = self._document(
+            3, created="2026-09-20T11:00:00Z", updated="2026-09-20T11:03:00Z",
+            event="schedule", branch="main",
+        )
+        snapshot = self.write_snapshot("partial.json", [partial, scheduled])
+        payload = self.run_json("tiers", "--input", snapshot)
+        self.assertEqual(payload["main"]["runs"], 1)
+        self.assertEqual(payload["main"]["complete_runs"], 0)
+        self.assertIsNone(payload["main"]["wall_seconds_p50"])
+        self.assertIsNone(payload["main"]["last_finishing_job"])
+        self.assertEqual(payload["main"]["jobs"], {})
+        self.assertEqual(payload["nightly"]["runs"], 1)
+        rendered = self.run_cli("tiers", "--input", snapshot)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertIn("main: 0/1 complete; wall p50/p90 n/a/n/a", rendered.stdout)
+        self.assertIn("last finishers n/a", rendered.stdout)
+
+    def test_runs_last_finisher_ignores_skipped_jobs(self):
+        jobs = [
+            self._job("real finisher", "2026-09-20T10:01:00Z",
+                      "2026-09-20T10:04:00Z"),
+            self._job("skipped later job", "2026-09-20T10:01:00Z",
+                      "2026-09-20T10:09:00Z", conclusion="skipped"),
+        ]
+        document = self._document(
+            5, created="2026-09-20T10:00:00Z",
+            updated="2026-09-20T10:10:00Z", jobs=jobs,
+        )
+        snapshot = self.write_snapshot("skipped-job.json", [document])
+        payload = self.run_json("runs", "--input", snapshot)
+        self.assertEqual(payload["runs"][0]["last_finishing_job"], "real finisher")
+
+
 class StepTimingTests(CliHarness):
     """Per-step timing scenarios driven through the real `steps` command.
 
@@ -1873,4 +2061,3 @@ class CompareRunnerMinuteTests(CliHarness):
             "**-6 min** | **-75 %** | **1/1** |",
             rendered.stdout,
         )
-

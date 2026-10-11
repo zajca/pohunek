@@ -3,12 +3,17 @@
 
 Implements the measurement half of issue #127 (epic #115): per-job workflow
 wall clock, JUnit execution times, and sccache/rust-cache cache-hit evidence.
+The `tiers` command separately reports PR, main-branch, and scheduled-run
+end-to-end timing, including queue time and per-job queue/run durations.
 
 Every number printed by this tool comes from one of three sources:
 
 * `runs` / `compare` -- GitHub Actions run and job metadata (`gh`), which is
   per-job wall clock, not test execution time. Wall clock includes checkout,
-  toolchain setup, cache restore, compilation, and the tests themselves.
+  toolchain setup, cache restore, compilation, and the tests themselves;
+  their workflow wall clock remains `startedAt` to `updatedAt` for compatibility.
+* `tiers` -- total workflow wall clock from run creation through completion,
+  including queue time, plus the queue/execution split and per-job timing.
 * `junit` -- nextest JUnit XML (`target/nextest/<profile>/junit.xml` or an
   uploaded CI artifact). JUnit has test execution time only; compilation and
   setup are deliberately *not* part of it.
@@ -146,21 +151,75 @@ def summarize_run(document, with_steps=False):
     carries the per-job step durations (`steps` key) for the `steps`
     subcommand; the default keeps the summary shape unchanged.
     """
-    started = parse_timestamp(document.get("startedAt"))
+    reported_started = parse_timestamp(document.get("startedAt"))
+    started = reported_started
     created = parse_timestamp(document.get("createdAt"))
     updated = parse_timestamp(document.get("updatedAt"))
-    if updated is None or (started is None and created is None):
+    if started is None and created is None:
         raise ValueError(f"run {document.get('databaseId')} has no timestamps")
     if started is None:
         # Older snapshots predate the startedAt field.
         started = created
     jobs = job_seconds(document)
+    job_timings = {}
+    for job in document.get("jobs") or []:
+        name = job.get("name")
+        if not name or (job.get("conclusion") or "") == "skipped":
+            continue
+        queued = parse_timestamp(job.get("createdAt") or job.get("queuedAt"))
+        job_started = parse_timestamp(job.get("startedAt"))
+        completed = parse_timestamp(job.get("completedAt"))
+        queue_seconds = (
+            (job_started - queued).total_seconds()
+            if queued and job_started and queued.year > 1 and job_started.year > 1
+            else None
+        )
+        run_seconds = (
+            (completed - job_started).total_seconds()
+            if completed and job_started and completed.year > 1 and job_started.year > 1
+            else None
+        )
+        if queue_seconds is not None or run_seconds is not None:
+            job_timings[name] = {
+                "queue_seconds": (
+                    queue_seconds
+                    if queue_seconds is not None and queue_seconds >= 0 else None
+                ),
+                "run_seconds": (
+                    run_seconds
+                    if run_seconds is not None and run_seconds > 0 else None
+                ),
+            }
+    completed_jobs = [
+        (parse_timestamp(job.get("completedAt")), job.get("name"))
+        for job in document.get("jobs") or []
+        if job.get("name") and parse_timestamp(job.get("completedAt"))
+        and (job.get("conclusion") or "") != "skipped"
+        and parse_timestamp(job.get("completedAt")).year > 1
+    ]
+    last_job = max(completed_jobs, default=(None, None), key=lambda item: item[0])[1]
     summary = {
         "id": document["databaseId"],
         "created_at": created,
         "started_at": started,
         "updated_at": updated,
-        "wall_seconds": (updated - started).total_seconds(),
+        # Keep wall_seconds as startedAt to updatedAt for existing reports.
+        "wall_seconds": (
+            (updated - started).total_seconds() if updated and started else None
+        ),
+        # This distinct measure includes initial queueing and rerun gaps.
+        "total_wall_seconds": (
+            (updated - created).total_seconds() if updated and created else None
+        ),
+        "queue_seconds": (
+            (reported_started - created).total_seconds()
+            if created and reported_started else None
+        ),
+        "execution_seconds": (
+            (updated - reported_started).total_seconds()
+            if updated and reported_started else None
+        ),
+        "last_finishing_job": last_job,
         # Attempts above one are reruns; keep them out of the aggregates.
         "attempt": document.get("attempt") or 1,
         "conclusion": document.get("conclusion"),
@@ -168,8 +227,13 @@ def summarize_run(document, with_steps=False):
         "branch": document.get("headBranch"),
         "title": document.get("displayTitle"),
         "jobs": jobs,
+        "job_timings": job_timings,
         "runner_minutes": runner_minutes(jobs),
     }
+    if updated is None:
+        summary["wall_seconds"] = None
+        summary["total_wall_seconds"] = None
+        summary["execution_seconds"] = None
     if with_steps:
         summary["steps"] = step_durations(document)
     return summary
@@ -265,14 +329,14 @@ def window_summary(runs):
     per run and summed across the window, beside the wall-clock medians.
     """
     jobs = {}
-    walls = [run["wall_seconds"] for run in runs]
+    walls = [run["wall_seconds"] for run in runs if run["wall_seconds"] is not None]
     minutes = [run["runner_minutes"] for run in runs]
     for run in runs:
         for name, seconds in run["jobs"].items():
             jobs.setdefault(name, []).append(seconds)
     return {
         "runs": len(runs),
-        "wall_seconds": statistics.median(walls) if runs else None,
+        "wall_seconds": statistics.median(walls) if walls else None,
         "wall_p90": percentile(walls, 0.90),
         "runner_minutes": statistics.median(minutes) if runs else None,
         "runner_minutes_total": sum(minutes),
@@ -338,15 +402,16 @@ def render_runs_markdown(runs):
         lines.append(
             f"| {run['id']} | {run['created_at'].date()} | {run['event']} | "
             f"{run['branch']}{rerun} | {run['conclusion']} | "
-            f"{format_seconds(run['wall_seconds'])} | {run['runner_minutes']} |"
+            f"{format_seconds(run['wall_seconds']) if run['wall_seconds'] is not None else 'n/a'} | "
+            f"{run['runner_minutes']} |"
         )
     summary = window_summary(runs)
     if summary["runs"]:
         lines.append("")
         lines.append(
             f"Workflow wall clock over {summary['runs']} run(s): "
-            f"p50 {format_seconds(summary['wall_seconds'])}, "
-            f"p90 {format_seconds(summary['wall_p90'])}; "
+            f"p50 {format_seconds(summary['wall_seconds']) if summary['wall_seconds'] is not None else 'n/a'}, "
+            f"p90 {format_seconds(summary['wall_p90']) if summary['wall_p90'] is not None else 'n/a'}; "
             f"runner minutes p50 {format_minutes(summary['runner_minutes'])}, "
             f"summed {format_minutes(summary['runner_minutes_total'])}"
         )
@@ -725,6 +790,22 @@ def gh_json(arguments):
     return json.loads(result.stdout)
 
 
+def job_queue_timestamps(run_id, attempt):
+    """Fetch REST job creation times, absent from `gh run view --json jobs`."""
+    endpoint = (
+        f"repos/{{owner}}/{{repo}}/actions/runs/{run_id}/attempts/{attempt}/jobs"
+        "?per_page=100"
+    )
+    try:
+        result = gh_json(["api", endpoint])
+    except subprocess.CalledProcessError:
+        # Queue time is supplementary: keep run and job execution metrics
+        # usable when permissions or an older GitHub API omit this endpoint.
+        return {}
+    jobs = result.get("jobs", []) if isinstance(result, dict) else []
+    return {job.get("id"): job.get("created_at") for job in jobs if job.get("id")}
+
+
 def read_snapshot(path):
     """Read a run snapshot: a JSON list of `gh run view` documents."""
     documents = json.loads(Path(path).read_text())
@@ -815,6 +896,7 @@ def list_documents(args, window=None):
     )
     selected = {}
     fetched = 0
+    enriched = False
     for entry in listed:
         # An unfinished run has no completed job timestamps to measure.
         if not entry.get("conclusion"):
@@ -828,8 +910,18 @@ def list_documents(args, window=None):
                 document = gh_json(view_command + ["--attempt", str(attempt)])
                 by_key[document_key(document)] = document
                 fetched += 1
+            if args.command == "tiers":
+                jobs = document.get("jobs") or []
+                if any(job.get("databaseId") and not job.get("createdAt")
+                       and not job.get("queuedAt") for job in jobs):
+                    created_at_by_id = job_queue_timestamps(run_id, attempt)
+                    for job in jobs:
+                        created_at = created_at_by_id.get(job.get("databaseId"))
+                        if created_at:
+                            job["createdAt"] = created_at
+                            enriched = True
             selected[document_key(document)] = document
-    if fetched:
+    if fetched or enriched:
         write_snapshot(
             cache_path, sorted(by_key.values(), key=document_key)
         )
@@ -921,6 +1013,7 @@ Reproducing the numbers in docs/design/test-performance-report.md:
   scripts/ci-timings junit --label "tests (core, fast)" --run RUN_ID \
       junit-core.xml
   scripts/ci-timings cache --run 35564038269
+  scripts/ci-timings tiers --window 2026-09-20..2026-09-21
 
 Fetched run metadata accumulates in target/ci-timings/ci-runs.json. Without
 --input every runs/compare invocation queries `gh` first; pass the snapshot as
@@ -1114,6 +1207,107 @@ def command_runs(args):
         )
     else:
         print(render_runs_markdown(selected))
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    return 0
+
+
+def classify_tier(run):
+    """Map CI triggers to the three operator-facing timing tiers."""
+    if run.get("event") == "pull_request":
+        return "pr"
+    if run.get("event") == "schedule":
+        return "nightly"
+    if run.get("event") == "push" and run.get("branch") == "main":
+        return "main"
+    if run.get("event") == "workflow_dispatch":
+        title = run.get("title") or ""
+        for tier in ("main", "nightly"):
+            marker = f"CI [tier={tier}]"
+            if title == marker or title.startswith(marker + " "):
+                return tier
+    return None
+
+
+def command_tiers(args):
+    """Report end-to-end and per-job timing by PR, main, and nightly tier."""
+    window = parse_window(args.window) if args.window else None
+    loaded = load_run_summaries(args, window)
+    selected = select_runs(loaded.runs, args, window)
+    warnings = []
+    if loaded.truncated and window is not None:
+        warnings.append(truncation_warning("requested", window, args.limit))
+    coverage = selection_coverage_warning(args, window, loaded.runs, selected)
+    if coverage:
+        warnings.append(coverage)
+    tiers = {name: [] for name in ("pr", "main", "nightly")}
+    unclassified = 0
+    for run in selected:
+        tier = classify_tier(run)
+        if tier:
+            tiers[tier].append(run)
+        else:
+            unclassified += 1
+    payload = {}
+    for name, runs in tiers.items():
+        complete = [
+            run for run in runs
+            if run["conclusion"] is not None
+            and run["total_wall_seconds"] is not None
+        ]
+        queue = [run["queue_seconds"] for run in complete if run["queue_seconds"] is not None]
+        execution = [run["execution_seconds"] for run in complete if run["execution_seconds"] is not None]
+        job_queue = collections.defaultdict(list)
+        job_run = collections.defaultdict(list)
+        last = collections.Counter()
+        for run in runs:
+            if run in complete and run["last_finishing_job"]:
+                last[run["last_finishing_job"]] += 1
+            for job, timing in run["job_timings"].items():
+                if timing["queue_seconds"] is not None:
+                    job_queue[job].append(timing["queue_seconds"])
+                if timing["run_seconds"] is not None:
+                    job_run[job].append(timing["run_seconds"])
+        payload[name] = {
+            "runs": len(runs),
+            "complete_runs": len(complete),
+            "wall_seconds_p50": statistics.median([r["total_wall_seconds"] for r in complete]) if complete else None,
+            "wall_seconds_p90": percentile([r["total_wall_seconds"] for r in complete], 0.90),
+            "queue_seconds_p50": statistics.median(queue) if queue else None,
+            "queue_seconds_p90": percentile(queue, 0.90),
+            "execution_seconds_p50": statistics.median(execution) if execution else None,
+            "last_finishing_job": last.most_common(1)[0][0] if last else None,
+            "last_finishing_jobs": dict(sorted(last.items())),
+            "jobs": {
+                job: {
+                    "queue_seconds_p50": statistics.median(job_queue[job]) if job_queue[job] else None,
+                    "queue_seconds_p90": percentile(job_queue[job], 0.90),
+                    "run_seconds_p50": statistics.median(job_run[job]) if job_run[job] else None,
+                    "queue_samples": len(job_queue[job]),
+                    "run_samples": len(job_run[job]),
+                }
+                for job in sorted(job_queue.keys() | job_run.keys())
+            },
+        }
+    if args.json:
+        payload["unclassified"] = {"runs": unclassified}
+        print(json.dumps(payload, indent=1))
+    else:
+        for name, summary in payload.items():
+            print(f"{name}: {summary['complete_runs']}/{summary['runs']} complete; "
+                  f"wall p50/p90 {format_seconds(summary['wall_seconds_p50']) if summary['wall_seconds_p50'] is not None else 'n/a'}/"
+                  f"{format_seconds(summary['wall_seconds_p90']) if summary['wall_seconds_p90'] is not None else 'n/a'}; "
+                  f"queue p50/p90 {format_seconds(summary['queue_seconds_p50']) if summary['queue_seconds_p50'] is not None else 'n/a'}/"
+                  f"{format_seconds(summary['queue_seconds_p90']) if summary['queue_seconds_p90'] is not None else 'n/a'}; "
+                  f"execution p50 {format_seconds(summary['execution_seconds_p50']) if summary['execution_seconds_p50'] is not None else 'n/a'}; "
+                  f"last finishers {', '.join(f'{job}={count}' for job, count in summary['last_finishing_jobs'].items()) or 'n/a'}")
+            for job, timing in summary["jobs"].items():
+                queue_text = format_seconds(timing["queue_seconds_p50"]) if timing["queue_seconds_p50"] is not None else "n/a"
+                queue_p90_text = format_seconds(timing["queue_seconds_p90"]) if timing["queue_seconds_p90"] is not None else "n/a"
+                run_text = format_seconds(timing["run_seconds_p50"]) if timing["run_seconds_p50"] is not None else "n/a"
+                print(f"  {job}: queue p50/p90 {queue_text}/{queue_p90_text} ({timing['queue_samples']}), "
+                      f"run p50 {run_text} ({timing['run_samples']})")
+        print(f"unclassified: {unclassified} run(s)")
     for warning in warnings:
         print(f"warning: {warning}", file=sys.stderr)
     return 0
@@ -1391,6 +1585,17 @@ def build_parser():
         help="inclusive START..END window of YYYY-MM-DD dates (default: newest runs)",
     )
     runs.set_defaults(handler=command_runs)
+
+    tiers = subparsers.add_parser(
+        "tiers", help="PR, main push, and scheduled CI timing summaries"
+    )
+    add_selection_arguments(tiers)
+    tiers.add_argument(
+        "--window",
+        default=None,
+        help="inclusive START..END window of YYYY-MM-DD dates (default: newest runs)",
+    )
+    tiers.set_defaults(handler=command_tiers)
 
     steps = subparsers.add_parser(
         "steps", help="per-job step medians over the run-selection flags"
