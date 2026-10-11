@@ -4,7 +4,7 @@ name: CI
 # lints (warnings are errors), the full test suite, and a release build of both
 # binaries so a broken release profile is caught before tagging. Doctests run on
 # every pull request. The release build (job `release-build`) runs on push to
-# main, the weekly schedule, and manual dispatch, and on pull requests only when
+# main, the daily schedule, and manual dispatch, and on pull requests only when
 # the `release` paths filter matches (manifests, lockfile, .cargo, toolchain
 # pins, the release/CI workflows, scripts/release, packaging). The release
 # rehearsal (jobs `release-rehearsal-build` and `release-rehearsal`) runs the
@@ -14,18 +14,27 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
-  # Weekly sweep to catch regressions in jobs that are path-filtered out on
-  # normal PRs (issue #125). Runs at 05:00 UTC every Monday; `pull_request_target`
+    inputs:
+      tier:
+        description: CI tier to run
+        required: true
+        type: choice
+        options:
+          - main
+          - nightly
+  # Daily sweep to catch regressions in jobs that are path-filtered out on
+  # normal PRs (issue #125). Runs at 05:00 UTC; `pull_request_target`
   # is intentionally avoided to keep the default pull-request provenance model.
   schedule:
-    - cron: '0 5 * * 1'
+    - cron: '0 5 * * *'
+
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('CI [tier={0}]', inputs.tier) || ' ' }}
 
 
-# Cancel superseded runs on the same ref to save CI minutes. The event name is
-# part of the group so a manual (workflow_dispatch) full run never cancels an
-# in-progress push or weekly sweep on the same ref (and vice versa).
+# Cancel superseded PR and main runs on the same ref. Each scheduled or manual
+# run gets its own group, so neither cancels those latest-wins streams.
 concurrency:
-  group: ci-${{ github.ref }}-${{ github.event_name }}
+  group: ci-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.event_name == 'push' && 'main' || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -84,10 +93,9 @@ env:
 jobs:
   platform-contracts:
     name: platform contracts (arm64)
-    # macOS runners are costly (issue #125): run only on schedule, push to
-    # main, manual dispatch (always a full run), or when platform inputs
-    # change via the paths filter.
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.macos == 'true' }}
+    # macOS runners are costly (issue #125): run in the main/nightly tiers or
+    # on a PR when platform inputs change via the paths filter.
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && needs.changes.outputs.macos == 'true') }}
     needs: changes
     runs-on: macos-15
     env:
@@ -319,20 +327,18 @@ jobs:
   # they carry ad-hoc signatures and `signing adhoc` in the MANIFEST, and
   # `verify-signed --adhoc` checks them.
   macos-package:
-    # macos-15 is the required leg. macos-14 is the minimum supported macOS and
-    # exercises the packaged archives on it, but GitHub retires that hosted
-    # image on 2026-11-02, so its result is informational and cannot block a
-    # merge; the minimum-OS acceptance is a #105 gate on a runner that stays.
+    # macos-15 is the required leg. The nightly macos-14 leg is informational:
+    # GitHub retires that hosted image on 2026-11-02, and issue #355 tracks its
+    # replacement; its result cannot block a merge.
     name: macOS package install and upgrade (${{ matrix.runner }})
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.macos_package == 'true' }}
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || github.event_name == 'push' || (github.event_name == 'pull_request' && needs.changes.outputs.macos_package == 'true') }}
     needs: changes
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     continue-on-error: ${{ matrix.runner == 'macos-14' }}
     strategy:
       fail-fast: false
-      matrix:
-        runner: [macos-14, macos-15]
+      matrix: ${{ fromJSON((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly')) && '{"runner":["macos-14","macos-15"]}' || '{"runner":["macos-15"]}') }}
     env:
       # mold is Linux-only: keep the default linker on macOS runners.
       RUSTFLAGS: -D warnings
@@ -386,6 +392,7 @@ jobs:
       # RUSTFLAGS text (which carries the checkout path for path remapping)
       # into every crate's metadata hash, so the path itself stays fixed.
       - name: Rebuild from a cold release directory and compare
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') }}
         shell: bash
         run: |
           set -euo pipefail
@@ -635,6 +642,7 @@ jobs:
       macos_package: ${{ steps.filter.outputs.macos_package }}
       sdk_macos: ${{ steps.filter.outputs.sdk_macos }}
       hermes: ${{ steps.filter.outputs.hermes }}
+      hermes_macos: ${{ steps.filter.outputs.hermes_macos }}
       pi_package: ${{ steps.filter.outputs.pi_package }}
       codex_package: ${{ steps.filter.outputs.codex_package }}
       claude_package: ${{ steps.filter.outputs.claude_package }}
@@ -703,78 +711,27 @@ jobs:
               - 'Cargo.lock'
               - '.cargo/**'
               - '.github/workflows/ci.yml'
-            # Native macOS release packaging (issue #104): the archive scripts,
-            # the install acceptance, and every crate the packaged daemon
-            # archive contains or the installer drives.
+            # Native macOS release packaging (issue #104): PRs gate the archive
+            # scripts, install acceptance and launchd service code. Main and
+            # nightly runs cover the complete packaged daemon dependency tree.
+            # The macOS package job is part of PR CI only when its packaging,
+            # install-acceptance, or launchd-specific inputs change. Main and
+            # nightly runs provide the broad package-build coverage.
             macos_package:
               - 'packaging/**'
-              - 'docs/knowledge/**'
-              - 'crates/xtask/**'
-              - 'rust-toolchain*'
-              - 'compat/**'
-              - 'README.md'
-              - 'LICENSE'
-              - 'docs/features.md'
-              - 'docs/install.md'
-              - 'docs/cli.md'
-              - 'docs/sdk.md'
-              - 'docs/development.md'
               - 'scripts/acceptance/macos-package-install'
               - 'scripts/acceptance/launchd_lifetime_evidence.py'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - '.cargo/**'
-              - 'crates/cli/**'
-              - 'crates/daemon/**'
-              - 'crates/session-worker/**'
-              - 'crates/platform/**'
-              - 'crates/paths/**'
-              - 'crates/service-config/**'
-              - 'crates/worker-protocol/**'
-              - 'crates/logging/**'
-              - 'crates/terminal/**'
-              - 'crates/protocol/**'
-              - 'crates/client/**'
-              - 'crates/knowledge/**'
-              - 'crates/hostcheck/**'
-              - 'crates/netbird/**'
-              - 'crates/overlay/**'
-              - 'crates/prompt/**'
-              - 'crates/relay-client/**'
-              - 'crates/relay-protocol/**'
+              - 'crates/platform/src/supervisor/launchd/**'
               - '.github/workflows/ci.yml'
               - '.github/workflows/release.yml'
             # The SDK workspace runs natively on Apple Silicon against the
-            # real macOS daemon (issue #103): gate on the SDK workspace, the
-            # shared path contract it consumes, and the crates behind the
-            # binaries the real-daemon suites spawn.
+            # real macOS daemon (issue #103): PRs run it for SDK workspace
+            # inputs; main and nightly also exercise the Rust binaries.
             sdk_macos:
               - 'sdk/ts/**'
               - 'package.json'
               - 'bun.lock'
               - '.bun-version'
-              - 'tsconfig*.json'
-              - 'eslint.config.js'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - '.cargo/**'
-              - 'crates/paths/**'
-              - 'crates/protocol/**'
-              - 'crates/platform/**'
-              - 'crates/daemon/**'
-              - 'crates/session-worker/**'
-              - 'crates/worker-protocol/**'
-              - 'crates/terminal/**'
-              - 'crates/logging/**'
-              - 'crates/service-config/**'
-              - 'crates/cli/**'
-              - 'crates/client/**'
-              - 'crates/netbird/**'
-              - 'crates/overlay/**'
-              - 'crates/hostcheck/**'
-              - 'crates/knowledge/**'
-              - 'crates/relay-client/**'
-              - 'crates/relay-protocol/**'
               - '.github/workflows/ci.yml'
             # Pinned Hermes compatibility provisioning + runtime check
             # (issue #125): gate on the locked runtime metadata, the full CLI
@@ -787,9 +744,24 @@ jobs:
             # resolves its install home via `pohunek_paths::state_home()` and
             # negotiates via `pohunek_protocol` types
             # (`SUPPORTED_PROTOCOL_VERSIONS`, `IntegrationRecovery`). The
-            # `hermes-compatibility` (Linux) and `hermes-compatibility-macos`
-            # jobs share this filter; the smoke script and its fixtures are
-            # inputs of the macOS job's packaged-plugin smoke.
+            # `hermes-compatibility` (Linux) uses this broad source filter.
+            # The macOS job has a separate narrow PR filter below; both run on
+            # main and nightly.
+            hermes_macos:
+              - 'compat/hermes/**'
+              - 'crates/cli/src/hermes_integration/**'
+              - 'crates/xtask/src/hermes*.rs'
+              - 'crates/daemon/src/agent/hermes.rs'
+              - 'scripts/provision-hermes-compat'
+              - 'scripts/tests/provision-hermes-compat.sh'
+              - 'scripts/smoke-hermes-plugin-release'
+              - 'scripts/tests/smoke-hermes-plugin-release.sh'
+              - 'scripts/tests/fixtures/smoke-*'
+              - 'sdk/ts/sdk/test/e2e.test.ts'
+              - 'sdk/ts/sdk/test/hermes-plugin.e2e.test.ts'
+              - '.github/workflows/ci.yml'
+            # Linux Hermes compatibility keeps the broader source filter: Linux
+            # runner capacity is not the constrained macOS budget.
             hermes:
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -1090,15 +1062,15 @@ jobs:
 
   # Relay heavy tests are the only PostgreSQL fixture consumers, so they get
   # their own job whose Postgres service only starts when relay-relevant files
-  # changed (issue #121) — except on the weekly sweep and manual dispatch,
-  # which are documented as full runs even when the paths filter is empty.
+  # changed (issue #121) — except on the nightly sweep and nightly manual
+  # dispatch, which are full runs even when the paths filter is empty.
   # Push to main stays filtered on purpose: the merged commit's relay files
   # still trigger the job via fetch-depth-2 detection, while unrelated pushes
   # never start the Postgres service.
   integration-relay:
     name: tests (relay DB, PostgreSQL)
     needs: [changes, build-tests]
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.relay == 'true' }}
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') || needs.changes.outputs.relay == 'true' }}
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -1675,7 +1647,7 @@ jobs:
   # is skipped.
   hermes-compatibility-macos:
     name: pinned Hermes compatibility (macOS arm64, model-free)
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.hermes == 'true' }}
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && needs.changes.outputs.hermes_macos == 'true') }}
     needs: changes
     runs-on: macos-15
     env:
@@ -1975,7 +1947,7 @@ jobs:
   # pohunek-sessiond and pohunek.
   sdk-macos:
     name: SDK workspace (macOS arm64)
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.sdk_macos == 'true' }}
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && needs.changes.outputs.sdk_macos == 'true') }}
     needs: changes
     runs-on: macos-15
     timeout-minutes: 60
@@ -2133,7 +2105,7 @@ jobs:
 
   # Pull requests get the stable source-level `shear` job below. cargo-udeps
   # needs the nightly toolchain and a full workspace build, so it runs only on
-  # push to main, the weekly sweep, and manual dispatch. It is the backstop for
+  # push to main, the nightly sweep, and manual dispatch. It is the backstop for
   # what cargo-shear cannot see: a dependency whose only reference sits in code
   # compiled out for the host (e.g. `#[cfg(target_os = "macos")]` on Linux).
   udeps:
