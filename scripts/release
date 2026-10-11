@@ -284,7 +284,7 @@ if [ "$push" = true ]; then
 fi
 [ "$(git -C "$repo_root" rev-parse HEAD)" = "$candidate_sha" ] || pohunek_fail "HEAD moved while CI evidence was running; refusing to tag"
 
-git -C "$repo_root" tag -a "$tag" -m "Release $tag"
+git -C "$repo_root" tag -a "$tag" "$candidate_sha" -m "Release $tag"
 pohunek_info "committed, verified and tagged $tag"
 
 if [ "$push" = true ]; then

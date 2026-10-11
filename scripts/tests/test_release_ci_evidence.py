@@ -25,9 +25,18 @@ args = sys.argv[1:]
 real = os.environ["REAL_GIT"]
 repo = args[args.index("-C") + 1] if "-C" in args else os.getcwd()
 command = args[args.index("-C") + 2] if "-C" in args else args[0]
-with open(os.environ["EVENTS"], "a") as stream:
-    if command in ("push", "tag"):
+if command in ("push", "tag"):
+    with open(os.environ["EVENTS"], "a") as stream:
         stream.write(json.dumps(["git", command, *args[args.index("-C") + 2:]]) + "\n")
+if command == "tag" and os.environ.get("ADVANCE_HEAD_BEFORE_TAG") == "1":
+    subprocess.run(
+        [real, "-C", repo, "-c", "user.name=Concurrent Commit", "-c",
+         "user.email=concurrent@example.invalid", "commit", "--allow-empty",
+         "-m", "Concurrent commit"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 if command == "push":
     raise SystemExit(0)
 if command == "ls-remote":
@@ -152,7 +161,7 @@ class ReleaseEvidenceTests(unittest.TestCase):
             text=True,
         )
 
-    def run_release(self, *args, remote_sha=None):
+    def run_release(self, *args, remote_sha=None, advance_head_before_tag=False):
         env = os.environ.copy()
         env.update({
             "PATH": f"{self.bin}{os.pathsep}{env['PATH']}",
@@ -164,6 +173,8 @@ class ReleaseEvidenceTests(unittest.TestCase):
         })
         if remote_sha is not None:
             env["REMOTE_SHA"] = remote_sha
+        if advance_head_before_tag:
+            env["ADVANCE_HEAD_BEFORE_TAG"] = "1"
         return subprocess.run(
             [str(self.repo / "scripts/release"), "patch", *args],
             cwd=self.repo,
@@ -209,8 +220,14 @@ class ReleaseEvidenceTests(unittest.TestCase):
         decoded = [json.loads(event) if event.startswith("[") else event for event in events]
         self.assertLess(decoded.index(["git", "push", "push", "origin", "main"]), decoded.index("gh-dispatch-main"))
         self.assertLess(decoded.index("gh-dispatch-main"), decoded.index("gh-dispatch-nightly"))
-        self.assertLess(decoded.index("gh-dispatch-nightly"), decoded.index(["git", "tag", "tag", "-a", "v0.1.1", "-m", "Release v0.1.1"]))
-        self.assertLess(decoded.index(["git", "tag", "tag", "-a", "v0.1.1", "-m", "Release v0.1.1"]), decoded.index(["git", "push", "push", "origin", "v0.1.1"]))
+        tag_event = next(
+            event
+            for event in decoded
+            if isinstance(event, list) and event[:5] == ["git", "tag", "tag", "-a", "v0.1.1"]
+        )
+        self.assertIn(json.loads(self.state.read_text())["sha"], tag_event)
+        self.assertLess(decoded.index("gh-dispatch-nightly"), decoded.index(tag_event))
+        self.assertLess(decoded.index(tag_event), decoded.index(["git", "push", "push", "origin", "v0.1.1"]))
 
     def test_no_push_refuses_to_tag_without_existing_evidence(self):
         result = self.run_release("--no-push")
@@ -232,6 +249,22 @@ class ReleaseEvidenceTests(unittest.TestCase):
         self.assertIn("moved while CI evidence was running", result.stderr)
         self.assertFalse(any(event.startswith('["git", "tag"') for event in self.read_events()))
         self.assertFalse(any(event.startswith('["git", "push", "push", "origin", "v') for event in self.read_events()))
+
+    def test_concurrent_head_advance_tags_the_verified_candidate(self):
+        result = self.run_release(advance_head_before_tag=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        candidate_sha = json.loads(self.state.read_text())["sha"]
+        head_sha = subprocess.check_output(
+            [shutil.which("git"), "-C", str(self.repo), "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+        tagged_sha = subprocess.check_output(
+            [shutil.which("git"), "-C", str(self.repo), "rev-parse", "v0.1.1^{}"],
+            text=True,
+        ).strip()
+        self.assertNotEqual(head_sha, candidate_sha)
+        self.assertEqual(tagged_sha, candidate_sha)
 
 
 if __name__ == "__main__":
