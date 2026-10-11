@@ -365,7 +365,27 @@ then sweeps processes carrying a journal-proven runtime marker. A recorded
 runtime absent from its worker journal is swept only when its process also
 carries the removed session's ID. A process with that runtime marker but
 another session ID is left alone; one with no session ID is not signalled and
-keeps cleanup unconfirmed. A descendant that left the worker's process group
+keeps cleanup unconfirmed. A process whose environment the kernel withholds
+(on macOS 27, Apple platform binaries such as `/bin/sh` and `/bin/zsh`) is
+decided by fork lineage when the sweep knows the lost worker's creation number,
+which the worker journals as the optional `worker_spawn_id`. The kernel records
+the creation number of each process's creator; it keeps naming that creator after
+the creator exits, until the process re-executes after being reparented, when it
+is rewritten to launchd's number. A creator number equal to launchd's is
+therefore ambiguous and never excludes a process. A descendant of the worker is
+reaped like a marked process. A process created before the worker, or whose
+chain reaches a non-launchd creator older than the worker, is ignored and not
+reported. Every other hidden process stays an unreadable candidate and keeps
+cleanup unconfirmed: one created after the worker by launchd, an orphan that
+re-executed after its creator died, and one whose creator exited after the
+worker started. The daemon uses the journaled number only when the journal was
+written in the boot the host reports now, because creation numbers restart at
+reboot, and several journals of one runtime bound it only when they agree. Every
+journal-backed sweep passes it; the sweep of a runtime absent from its journal
+passes none. A journal without it (a worker started by the previous release)
+gives no lineage proof. Under the session-ID requirement a lineage-proven
+process is not signalled either, since its session marker cannot be read. Linux
+has no lineage proof and keeps its start-time ordering. A descendant that left the worker's process group
 (macOS kills only the group) can outlive the stop and job retirement. A sweep
 that cannot confirm every marked process exited fails
 the removal with `runtime_supervision_ambiguous` and keeps the session listed
@@ -378,7 +398,11 @@ says to inspect and end the ones that belong to the session before retrying.
 A refusal for any other reason lists no processes.
 `session rm <id> --accept-unconfirmed-cleanup` (the `session.remove_accepting_unconfirmed`
 method; plain `session rm` uses `session.remove`, which always refuses) is the operator's way out when
-those unreadable processes are the only obstacle. The flag is per call: nothing
+those unreadable processes are the only obstacle. After a lost runtime on macOS
+27 the runtime's own platform-binary processes are reaped without it, but it may
+still be needed for hidden processes created after the worker by launchd, which
+the refusal lists by pid and command name for you to judge, and for every hidden
+process when the worker journaled no creation number. The flag is per call: nothing
 stores it, a retried removal needs it again, and neither the reconciliation that
 finishes an interrupted removal nor the retention sweep ever has it. With it the
 removal proceeds past the unreadable candidates without signalling them,

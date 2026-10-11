@@ -1156,7 +1156,9 @@ The daemon reconciles before advertising readiness:
    launchd definitions directory), bounded at 4,096 entries, with foreign,
    malformed, and other-namespace names rejected and never touched;
 4. scan owner-private worker journals (schema 4: `generation`, `executable`,
-   `worker_pid`, `worker_start_identity`) and runtime sockets, and join the
+   `worker_pid`, `worker_start_identity`, and the optional `worker_spawn_id`, the
+   worker's kernel creation number as a decimal string, absent from journals of
+   workers started by the previous release) and runtime sockets, and join the
    three sources on each record's current generation (`runtime.generation`,
    `runtime.service_id`). A socket counts only when the connected worker's
    journal names that generation; terminal journals of other generations are

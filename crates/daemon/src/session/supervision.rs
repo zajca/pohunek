@@ -15,8 +15,8 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use pohunek_platform::process::{
-    sweep_runtime, ProcessIdentity, ProcessInspector, SkipReason, StartIdentity, SweepReport,
-    SweepRequest,
+    sweep_runtime, HostInspector, ProcessIdentity, ProcessInspector, SkipReason, SpawnId,
+    StartIdentity, SweepReport, SweepRequest,
 };
 use pohunek_platform::supervisor::{
     Error as SupervisorError, ServiceId, ServiceObservation, WorkerKey,
@@ -203,10 +203,19 @@ pub(super) async fn observe(
 /// Journal facts that identify one generation's worker process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct JournalWorker<'a> {
+    /// Session the journal belongs to; names the worker in diagnostics.
+    pub(super) session_id: &'a str,
+    /// Worker identifier the journal is named after.
+    pub(super) worker_id: &'a str,
     /// Worker process identifier recorded by the worker itself.
     pub(super) pid: u32,
     /// Worker process start identity, as recorded.
     pub(super) start_identity: &'a str,
+    /// Boot identity the worker recorded; scopes `spawn_id`.
+    pub(super) boot_identity: &'a str,
+    /// Kernel creation number of the worker process, as recorded; absent when
+    /// the worker's host reported no lineage or the journal predates the field.
+    pub(super) spawn_id: Option<&'a str>,
     /// Runtime (PTY) identifier after initialization; its processes carry it
     /// as their ownership marker.
     pub(super) worker_instance_id: Option<&'a str>,
@@ -223,6 +232,82 @@ impl JournalWorker<'_> {
             pid: self.pid,
             start_identity,
         })
+    }
+
+    /// The facts of this journal that bound which processes the worker's
+    /// runtime can own, as the sweep of that runtime consumes them.
+    ///
+    /// The start identity is the recorded one when it parses. The spawn id is
+    /// the recorded one only when it parses and the worker recorded it in the
+    /// boot the host reports now: creation numbers restart at every reboot, so
+    /// a number from another boot could coincide with the creator number of an
+    /// unrelated process. A boot the host cannot name counts as another boot.
+    pub(super) fn bounds(&self) -> WorkerBounds {
+        let start_identity = self.identity().ok().map(|identity| identity.start_identity);
+        let Some(recorded) = self.spawn_id else {
+            return WorkerBounds {
+                start_identity,
+                spawn_id: None,
+            };
+        };
+        let spawn_id = match recorded.parse::<SpawnId>() {
+            Ok(spawn_id) => Some(spawn_id),
+            Err(error) => {
+                tracing::warn!(
+                    session_id = self.session_id,
+                    worker_id = self.worker_id,
+                    error = %error,
+                    "worker journal spawn id is malformed; the runtime sweep ignores it"
+                );
+                None
+            }
+        };
+        let same_boot = HostInspector::new()
+            .boot_identity()
+            .is_ok_and(|current| current.as_str() == self.boot_identity);
+        WorkerBounds {
+            start_identity,
+            spawn_id: spawn_id.filter(|_| same_boot),
+        }
+    }
+}
+
+/// What a lost worker's journal proves about the processes of its runtime.
+///
+/// Each field is absent when the journal lacks it, cannot be interpreted, or
+/// (for the spawn id) was recorded in another boot. An absent field proves
+/// nothing, and the sweep then treats every process whose ownership markers
+/// it cannot read as possibly the runtime's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct WorkerBounds {
+    /// Start identity of the worker process instance. A same-user process
+    /// whose markers cannot be read is provably foreign when it started
+    /// before the worker, on a host whose start identities order starts.
+    pub(super) start_identity: Option<StartIdentity>,
+    /// Kernel creation number of the worker in the current boot. It lets the
+    /// sweep prove membership or exclusion of an unreadable-marker process by
+    /// fork lineage, on hosts that report one.
+    pub(super) spawn_id: Option<SpawnId>,
+}
+
+impl WorkerBounds {
+    /// Bounds that prove nothing.
+    pub(super) const NONE: Self = Self {
+        start_identity: None,
+        spawn_id: None,
+    };
+
+    /// Keeps each bound only when `other` carries the same one.
+    ///
+    /// Several workers journaling one runtime cannot tell which one started
+    /// it, so a fact bounds the runtime only when every worker agrees on it.
+    pub(super) fn agreeing(self, other: Self) -> Self {
+        Self {
+            start_identity: self
+                .start_identity
+                .filter(|start| other.start_identity == Some(*start)),
+            spawn_id: self.spawn_id.filter(|spawn| other.spawn_id == Some(*spawn)),
+        }
     }
 }
 
@@ -258,12 +343,11 @@ pub(super) enum Unreachable {
         /// only when `journaled`, since only the journal's PID check proves
         /// which runtime died.
         worker_instance_id: Option<String>,
-        /// Start identity of the journaled worker process instance; set
-        /// alongside `worker_instance_id`. The marker sweep compares it against the
-        /// start identity of unreadable-marker processes, so long-lived
-        /// non-dumpable bystanders are provably not descendants of the
-        /// runtime.
-        worker_start_identity: Option<StartIdentity>,
+        /// What the journal proves about the worker process instance; set
+        /// alongside `worker_instance_id`. The marker sweep decides
+        /// unreadable-marker processes with it, so long-lived non-dumpable
+        /// bystanders are provably not descendants of the runtime.
+        bounds: WorkerBounds,
     },
 }
 
@@ -304,7 +388,7 @@ pub(super) fn classify_unreachable(
         return Unreachable::Ended {
             journaled: false,
             worker_instance_id: None,
-            worker_start_identity: None,
+            bounds: WorkerBounds::NONE,
         };
     };
     let identity = match worker.identity() {
@@ -315,7 +399,7 @@ pub(super) fn classify_unreachable(
         Ok(false) => Unreachable::Ended {
             journaled: true,
             worker_instance_id: worker.worker_instance_id.map(ToOwned::to_owned),
-            worker_start_identity: Some(identity.start_identity),
+            bounds: worker.bounds(),
         },
         Ok(true) => Unreachable::Ambiguous(format!(
             "worker process {} is running but its socket is not reachable",
@@ -468,17 +552,19 @@ impl SessionRegistry {
     /// through its backed-off retry, because it must not finish while a
     /// marked process may survive.
     ///
-    /// `worker_start_identity` is the journaled worker's own start identity.
-    /// With it, a same-user process whose markers cannot be read is provably
-    /// foreign when it started before the worker; without it, every
-    /// unreadable-marker process keeps the cleanup unconfirmed.
+    /// `bounds` are the facts the journaled worker proves. With them, a
+    /// same-user process whose markers cannot be read is provably foreign when
+    /// it started before the worker or its fork lineage excludes the worker,
+    /// and provably the runtime's when its fork lineage reaches the worker;
+    /// without them, every unreadable-marker process keeps the cleanup
+    /// unconfirmed.
     pub(super) async fn sweep_lost_runtime(
         &self,
         session_id: &str,
         worker_instance_id: &str,
-        worker_start_identity: Option<StartIdentity>,
+        bounds: WorkerBounds,
     ) -> Cleanup {
-        self.sweep_lost_runtime_detailed(session_id, worker_instance_id, worker_start_identity)
+        self.sweep_lost_runtime_detailed(session_id, worker_instance_id, bounds)
             .await
             .cleanup
     }
@@ -489,23 +575,26 @@ impl SessionRegistry {
         &self,
         session_id: &str,
         worker_instance_id: &str,
-        worker_start_identity: Option<StartIdentity>,
+        bounds: WorkerBounds,
     ) -> SweepOutcome {
-        self.sweep_runtime_detailed(session_id, worker_instance_id, worker_start_identity, None)
+        self.sweep_runtime_detailed(session_id, worker_instance_id, bounds, None)
             .await
     }
 
     /// Sweeps a runtime absent from the journal only when its marker names this session.
+    ///
+    /// No journal bounds the runtime, and a process whose session marker is
+    /// unreadable cannot be attributed to this session, so the sweep takes no
+    /// worker bounds.
     pub(super) async fn sweep_unjournaled_removed_runtime_detailed(
         &self,
         session_id: &str,
         worker_instance_id: &str,
-        worker_start_identity: Option<StartIdentity>,
     ) -> SweepOutcome {
         self.sweep_runtime_detailed(
             session_id,
             worker_instance_id,
-            worker_start_identity,
+            WorkerBounds::NONE,
             Some(session_id),
         )
         .await
@@ -515,7 +604,7 @@ impl SessionRegistry {
         &self,
         session_id: &str,
         worker_instance_id: &str,
-        worker_start_identity: Option<StartIdentity>,
+        bounds: WorkerBounds,
         expected_session_id: Option<&str>,
     ) -> SweepOutcome {
         let Some(grace) = self
@@ -539,7 +628,9 @@ impl SessionRegistry {
             SWEEP_POLL_INTERVAL.min(grace),
         ) {
             Ok(request) => {
-                let request = request.with_worker_start_identity(worker_start_identity);
+                let request = request
+                    .with_worker_start_identity(bounds.start_identity)
+                    .with_worker_spawn_id(bounds.spawn_id);
                 match expected_session_id {
                     Some(id) => request.with_session_id(id),
                     None => request,

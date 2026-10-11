@@ -369,8 +369,14 @@ pub struct JournalRecord {
     pub worker_pid: u32,
     /// Worker process start identity.
     pub worker_start_identity: String,
-    /// Operating-system boot identity that scopes process start identities.
+    /// Operating-system boot identity that scopes process start identities
+    /// and the worker's spawn id.
     pub boot_identity: String,
+    /// Kernel creation number of the worker process, as a decimal string, valid
+    /// only within the boot named by `boot_identity`. Absent when the host
+    /// reports no process lineage or the worker could not read it.
+    #[serde(default)]
+    pub worker_spawn_id: Option<String>,
     /// Managed PTY root identity.
     pub child: Option<ChildIdentity>,
     /// PTY creation timestamp.
@@ -427,6 +433,7 @@ impl Debug for JournalRecord {
             .field("worker_pid", &self.worker_pid)
             .field("worker_start_identity", &self.worker_start_identity)
             .field("boot_identity", &self.boot_identity)
+            .field("worker_spawn_id", &self.worker_spawn_id)
             .field("child", &self.child)
             .field("pty_created_at", &self.pty_created_at)
             .field("cols", &self.cols)
@@ -476,6 +483,7 @@ impl JournalRecord {
             worker_pid: process_id,
             worker_start_identity,
             boot_identity,
+            worker_spawn_id: None,
             child: None,
             pty_created_at: None,
             cols: None,

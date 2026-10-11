@@ -57,8 +57,43 @@ process facts and allowlisted Pohunek ownership markers may leave the platform
 layer. Complete process environments never enter logs or public responses.
 A process whose environment the kernel withholds from the caller reads as
 unobservable, never as unmarked: macOS 27 returns the argument vector alone for
-restricted platform binaries such as `/bin/sh` and `/bin/zsh`, so the runtime
-sweep cannot prove such a process foreign or owned and leaves it alone (#790).
+restricted platform binaries such as `/bin/sh` and `/bin/zsh` (#790). The
+runtime sweep decides such a process by fork lineage instead of markers (#795).
+The kernel gives every process a boot-wide creation number (`SpawnId`, read
+through `PROC_PIDUNIQIDENTIFIERINFO`, served for every same-user process,
+withheld environment or not) and records the creation number of the process
+that created it. Numbers are never reused within a boot and rise from creator to
+created. The recorded creator number keeps naming the creator after the creator
+exits, until the process executes a new image after being reparented: the exec
+rewrites it to launchd's number (`SpawnId::LAUNCHD`, 1). A creator number equal
+to launchd's is therefore ambiguous, a genuine launchd child or a re-executed
+orphan of any creator, and never excludes a process. Given the lost worker's
+creation number, a withheld-environment process is:
+
+- attributed to the runtime and reaped like a marked one when its creator chain
+  reaches the worker;
+- dismissed, and not reported, only when its own number is below the worker's
+  or its chain reaches a non-launchd creator older than the worker;
+- otherwise left alone and reported as an unreadable candidate, and the cleanup
+  stays unconfirmed (fail closed): a process created after the worker by
+  launchd, an orphan that re-executed after its creator died, and a process
+  whose creator exited after the worker started and is absent from the
+  process table.
+
+Under a session-marker requirement a lineage-proven descendant is skipped as
+session-unverified, because its session marker cannot be read. Only a host that
+reports lineage (macOS) has this proof; Linux decides an unreadable process by
+start-time ordering only. Darwin start identities stay wall-clock tokens that
+do not order process starts, so they play no part in the decision.
+
+The worker journals its creation number as the optional `worker_spawn_id`
+(decimal string). The daemon passes it to the sweep only when it parses and the
+journal's boot identity equals the boot identity the host reports now, because
+creation numbers restart at reboot; several journals of one runtime bound it only
+when they agree on the number. Every journal-backed sweep (lost-runtime
+reconciliation, stop and removal) passes it. The sweep of a runtime absent from
+its journal, which requires the removed session's ID in a process's markers,
+passes none.
 
 Daemon runtime policy remains in `crates/daemon/src/runtime`. Its supervisor
 interface uses validated logical service IDs, portable states, and optional

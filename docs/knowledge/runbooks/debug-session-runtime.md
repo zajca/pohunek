@@ -259,10 +259,21 @@ before retrying; the refused operation creates no new worker or fork child.
   the processes carrying the session's runtime ownership markers and fails
   with `runtime_supervision_ambiguous`, keeping the session and its removal
   intent, while that sweep cannot confirm every marked process exited (for
-  example one whose environment cannot be read, such as any Apple platform
-  binary like `/bin/sh` or `/bin/zsh` on macOS 27, where the kernel withholds
-  it); look for leftover processes
-  of the session with `ps`, stop them, and retry. When unreadable same-user
+  example one whose environment cannot be read); look for leftover processes
+  of the session with `ps`, stop them, and retry. On macOS 27 the kernel
+  withholds the environment of Apple platform binaries such as `/bin/sh` and
+  `/bin/zsh`; the sweep decides those by fork lineage from the lost worker's
+  journaled creation number (`worker_spawn_id`, used only when the journal was
+  written in the current boot). A descendant of the worker (a `/bin/zsh`
+  session root and its helpers) is reaped, and a process created before the
+  worker is ignored. A hidden process created after the worker by launchd (a
+  launchd job or agent started later), an orphan that re-executed after its
+  creator died, and a process whose creator exited after the worker started stay
+  unreadable candidates, so `session rm` may still need
+  `--accept-unconfirmed-cleanup` after you judge the listed processes. A runtime
+  whose worker journaled no creation number (a worker started by the previous
+  release) has no lineage proof, so every hidden process is a candidate. When
+  unreadable same-user
   processes are the only obstacle, the error message names each as
   `pid N (start S, command `name`)` (at most eight, then `and N more`) and
   `recover` says to inspect them, end the ones that belong to the session, and
