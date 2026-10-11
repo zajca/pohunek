@@ -101,7 +101,7 @@ fn parse_error(output: &Output) -> Value {
 fn binary_hermes_lifecycle_is_isolated_and_model_free() {
     let fixture = Fixture::new("lifecycle");
     let home = fixture.private_directory("home");
-    fixture.private_directory("home/.hermes");
+    fixture.private_directory("home/.hermes/profiles/default");
     fixture.private_directory("state");
     fixture.private_directory("run");
     fixture.private_directory("data");
@@ -209,6 +209,33 @@ esac"#,
     assert_eq!(installed["installed"], true);
     assert_eq!(installed["modified"], false);
     assert!(!plugin_root.join("__pycache__").exists());
+    let marker: Value = serde_json::from_slice(
+        &fs::read(plugin_root.join(".pohunek-owned.json")).expect("read ownership marker"),
+    )
+    .expect("parse ownership marker");
+    let operator_manifest = include_bytes!("../../../compat/hermes/operator.toml");
+    assert_eq!(marker["version"], 2);
+    assert_eq!(
+        marker["operator_sha256"],
+        format!(
+            "{:x}",
+            <sha2::Sha256 as sha2::Digest>::digest(operator_manifest)
+        )
+    );
+    let sidecar: toml::Value =
+        toml::from_str(std::str::from_utf8(operator_manifest).expect("sidecar UTF-8"))
+            .expect("parse closed operator sidecar");
+    let payload = sidecar["payload"].as_array().expect("payload list");
+    assert_eq!(payload.len(), 8, "the sidecar pins the exact S3 payload");
+    assert!(payload.iter().all(|record| {
+        record["path"]
+            .as_str()
+            .is_some_and(|path| path != "_pohunek_reporter.py")
+    }));
+    assert_eq!(
+        marker["assets"].as_object().expect("marker assets").len(),
+        9
+    );
 
     let status_arguments = [
         "integration",
@@ -371,6 +398,11 @@ esac"#,
     let current_marker = fs::read(&marker_path).expect("read current ownership marker");
     let mut previous_marker: Value =
         serde_json::from_slice(&current_marker).expect("parse current ownership marker");
+    previous_marker["version"] = json!(1);
+    previous_marker
+        .as_object_mut()
+        .expect("marker object")
+        .remove("operator_sha256");
     previous_marker["assets"]
         .as_object_mut()
         .expect("asset map")
@@ -491,6 +523,11 @@ esac"#,
         .as_object_mut()
         .expect("asset map")
         .remove("_pohunek_reporter.py");
+    previous_uninstall_marker["version"] = json!(1);
+    previous_uninstall_marker
+        .as_object_mut()
+        .expect("marker object")
+        .remove("operator_sha256");
     fs::remove_file(plugin_root.join("_pohunek_reporter.py"))
         .expect("remove asset absent from previous inventory");
     fs::write(
@@ -514,6 +551,7 @@ esac"#,
         parse_error(&run(&fixture, &uninstall_arguments))["code"],
         "hermes_modified_confirmation_required"
     );
+    fs::remove_file(policy_path).expect("remove the original external policy before uninstall");
     let mut confirmed_uninstall = uninstall_arguments.to_vec();
     confirmed_uninstall.insert(confirmed_uninstall.len() - 1, "--confirm-modified");
     let uninstall = parse_ok(&run(&fixture, &confirmed_uninstall));

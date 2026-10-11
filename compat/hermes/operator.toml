@@ -1,0 +1,33 @@
+schema = 1
+
+[[payload]]
+path = "plugin.yaml"
+sha256 = "9e666f85a2d9f99bc99cc0d997f146d52e28bd862cb6e387312551939a077625"
+
+[[payload]]
+path = "__init__.py"
+sha256 = "16627704226fe092e2351404b3ed27a1bdc2f6e83eb43301996c80316454aa6f"
+
+[[payload]]
+path = "cli.py"
+sha256 = "93befddbaaf63de59e6a0e31f435515198ab8ef992ebf1a0c2ac65ba1a13cd51"
+
+[[payload]]
+path = "hooks.py"
+sha256 = "1419f9667cee773804922d03f9584406f07df67a8b36fcebaaee9e3750afb2bc"
+
+[[payload]]
+path = "policy.py"
+sha256 = "12baa01bdffa1768245726b07100d297a29b5aa9cdacb6455e40743e77141134"
+
+[[payload]]
+path = "redact.py"
+sha256 = "056da14e090a3e968b6940ee8f0dd5a41e91496415e6f2ff78c48afe9e4f2072"
+
+[[payload]]
+path = "tools.py"
+sha256 = "f5de9f6249cc96eb94ca12f46d6e032f88ad2bec6465ec55eef82f809ec1e482"
+
+[[payload]]
+path = "skills/pohunek/SKILL.md"
+sha256 = "c1362991209ca71e5b83e994ec5e6142250b7c2854ef8d3cfffbb5a9b96763b5"
