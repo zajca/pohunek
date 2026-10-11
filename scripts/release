@@ -1,7 +1,8 @@
 #!/bin/sh
 
 # Cut a new release: bump the workspace version, refresh the lockfile, commit,
-# tag `vX.Y.Z`, and push. Pushing the tag triggers .github/workflows/release.yml,
+# push the candidate to main, require exact-commit CI evidence, then tag it.
+# Pushing the tag triggers .github/workflows/release.yml,
 # which builds the binaries, runs the compatibility rows, signs the runtime
 # catalog and publishes the GitHub Release as a draft that becomes visible only
 # after its assets were verified.
@@ -14,7 +15,7 @@
 #
 # Options:
 #   --dry-run    Show what would happen without changing anything.
-#   --no-push    Commit and tag locally, but do not push.
+#   --no-push    Commit and tag locally only when exact-commit CI evidence exists.
 #   --notes FILE Release-notes file with one line naming each schema or protocol
 #                constant that changed since the previous tag (required when
 #                any changed; see the compatibility check below).
@@ -69,6 +70,7 @@ done
 
 pohunek_need_cmd git
 pohunek_need_cmd cargo
+pohunek_need_cmd python3
 
 # Read the current version from the [workspace.package] table.
 current="$(awk '
@@ -108,6 +110,10 @@ case "$bump" in
 esac
 
 tag="v$next"
+version_already_bumped=false
+if [ "$bump" != patch ] && [ "$bump" != minor ] && [ "$bump" != major ] && [ "$next" = "$current" ]; then
+  version_already_bumped=true
+fi
 
 # Persisted-state and wire-compatibility constants, as "NAME|git pathspec". A
 # change to any of them alters the upgrade contract (AGENTS.md, "Upgrade
@@ -205,7 +211,7 @@ pohunek_info "next version:    $next  (tag $tag)"
 pohunek_check_compat_notes
 
 if [ "$dry_run" = true ]; then
-  pohunek_info "dry run: would bump $manifest to $next, refresh Cargo.lock, commit, tag $tag$( [ "$push" = true ] && printf ', and push' )"
+  pohunek_info "dry run: would bump $manifest to $next, refresh Cargo.lock, commit, push the candidate, verify exact-commit main and nightly CI evidence, then tag $tag$( [ "$push" = true ] && printf ' and push the tag' )"
   exit 0
 fi
 
@@ -221,33 +227,69 @@ if git -C "$repo_root" rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
   pohunek_fail "tag $tag already exists"
 fi
 
-# Bump the version in [workspace.package] (only that table's `version` line).
-tmp="$manifest.tmp"
-awk -v nextver="$next" '
-  /^\[workspace\.package\]/ { in_pkg = 1; print; next }
-  /^\[/ { in_pkg = 0 }
-  in_pkg && /^version[[:space:]]*=/ {
-    print "version = \"" nextver "\""
-    in_pkg = 0
-    next
-  }
-  { print }
-' "$manifest" > "$tmp"
-mv "$tmp" "$manifest"
+if [ "$version_already_bumped" = true ]; then
+  pohunek_info "workspace is already at $next; checking this commit as the release candidate"
+else
+  # Bump the version in [workspace.package] (only that table's `version` line).
+  tmp="$manifest.tmp"
+  awk -v nextver="$next" '
+    /^\[workspace\.package\]/ { in_pkg = 1; print; next }
+    /^\[/ { in_pkg = 0 }
+    in_pkg && /^version[[:space:]]*=/ {
+      print "version = \"" nextver "\""
+      in_pkg = 0
+      next
+    }
+    { print }
+  ' "$manifest" > "$tmp"
+  mv "$tmp" "$manifest"
 
-# Refresh Cargo.lock so the workspace members record the new version.
-( cd "$repo_root" && cargo update --workspace --offline >/dev/null 2>&1 || cargo update --workspace >/dev/null )
+  # Refresh Cargo.lock so the workspace members record the new version.
+  ( cd "$repo_root" && cargo update --workspace --offline >/dev/null 2>&1 || cargo update --workspace >/dev/null )
 
-git -C "$repo_root" add Cargo.toml Cargo.lock
-git -C "$repo_root" commit -m "Release $tag"
-git -C "$repo_root" tag -a "$tag" -m "Release $tag"
-
-pohunek_info "committed and tagged $tag"
+  git -C "$repo_root" add Cargo.toml Cargo.lock
+  git -C "$repo_root" commit -m "Release $tag"
+fi
+candidate_sha="$(git -C "$repo_root" rev-parse HEAD)"
 
 if [ "$push" = true ]; then
   git -C "$repo_root" push origin "$release_branch"
-  git -C "$repo_root" push origin "$tag"
-  pohunek_info "pushed $release_branch and $tag; the Release workflow will build and publish the binaries"
+fi
+
+ci_repo_url="$(git -C "$repo_root" remote get-url origin)"
+case "$ci_repo_url" in
+  https://github.com/* | ssh://git@github.com/*)
+    ci_repo="${ci_repo_url#https://github.com/}"
+    ci_repo="${ci_repo#ssh://git@github.com/}"
+    ;;
+  git@github.com:*) ci_repo="${ci_repo_url#git@github.com:}" ;;
+  *) pohunek_fail "origin must be a GitHub repository URL to verify CI evidence: $ci_repo_url" ;;
+esac
+ci_repo="${ci_repo%.git}"
+
+if [ "$push" = true ]; then
+  pohunek_info "waiting for main-tier evidence on $candidate_sha"
+  python3 "$script_dir/ci-evidence" --repo "$ci_repo" --sha "$candidate_sha" --tier main --dispatch-ref "$release_branch"
+  pohunek_info "waiting for nightly-tier evidence on $candidate_sha"
+  python3 "$script_dir/ci-evidence" --repo "$ci_repo" --sha "$candidate_sha" --tier nightly --dispatch-ref "$release_branch"
 else
-  pohunek_info "skipped push (--no-push); run: git push origin $release_branch && git push origin $tag"
+  pohunek_info "checking existing exact-commit CI evidence for $candidate_sha"
+  python3 "$script_dir/ci-evidence" --repo "$ci_repo" --sha "$candidate_sha" --tier main
+  python3 "$script_dir/ci-evidence" --repo "$ci_repo" --sha "$candidate_sha" --tier nightly
+fi
+
+if [ "$push" = true ]; then
+  remote_sha="$(git -C "$repo_root" ls-remote origin "refs/heads/$release_branch" | awk 'NR == 1 { print $1 }')"
+  [ "$remote_sha" = "$candidate_sha" ] || pohunek_fail "$release_branch moved while CI evidence was running; expected $candidate_sha, found ${remote_sha:-missing}; refusing to tag"
+fi
+[ "$(git -C "$repo_root" rev-parse HEAD)" = "$candidate_sha" ] || pohunek_fail "HEAD moved while CI evidence was running; refusing to tag"
+
+git -C "$repo_root" tag -a "$tag" -m "Release $tag"
+pohunek_info "committed, verified and tagged $tag"
+
+if [ "$push" = true ]; then
+  git -C "$repo_root" push origin "$tag"
+  pohunek_info "pushed $tag; the Release workflow will build and publish the binaries"
+else
+  pohunek_info "skipped push (--no-push); push $release_branch and $tag manually when ready"
 fi

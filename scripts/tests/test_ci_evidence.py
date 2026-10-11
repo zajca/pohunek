@@ -153,15 +153,19 @@ class CiEvidenceCliTests(unittest.TestCase):
         self.write_config()
 
     @staticmethod
-    def nightly_macos_jobs(*, acceptance_outcome="success", acceptance_conclusion="success", cold_outcome="success", cold_conclusion="success", omit_acceptance=False, omit_cold=False):
+    def nightly_macos_jobs(
+        *,
+        acceptance_conclusion="success",
+        cold_conclusion="success",
+        omit_acceptance=False,
+        omit_cold=False,
+    ):
         macos14_steps = [] if omit_acceptance else [{
             "name": "Install, upgrade, and uninstall from the archives",
-            "outcome": acceptance_outcome,
             "conclusion": acceptance_conclusion,
         }]
         macos15_steps = [] if omit_cold else [{
             "name": "Rebuild from a cold release directory and compare",
-            "outcome": cold_outcome,
             "conclusion": cold_conclusion,
         }]
         return [
@@ -188,7 +192,7 @@ class CiEvidenceCliTests(unittest.TestCase):
         base.update(values)
         self.fixture.write_text(json.dumps(base))
 
-    def invoke(self, tier="main", *extra):
+    def invoke(self, tier="main", *extra, config=None):
         env = os.environ.copy()
         env.update({
             "PATH": f"{self.bin_dir}{os.pathsep}{env['PATH']}",
@@ -197,7 +201,7 @@ class CiEvidenceCliTests(unittest.TestCase):
         })
         return subprocess.run(
             [str(SCRIPT), "--repo", "example/pohunek", "--sha", SHA,
-             "--tier", tier, "--config", str(self.config), *extra],
+             "--tier", tier, "--config", str(config or self.config), *extra],
             capture_output=True,
             text=True,
             check=False,
@@ -232,11 +236,36 @@ class CiEvidenceCliTests(unittest.TestCase):
                 workflow_names.add(name)
         for tier in ("main", "nightly"):
             for name in config["required_jobs"][tier]:
-                self.assertIn(name, workflow_names)
+                self.assertIn(name.split(" / ", 1)[0], workflow_names)
         self.assertNotIn("macOS package install and upgrade (macos-14)", config["required_jobs"]["main"])
         self.assertIn("macOS package install and upgrade (macos-14)", config["required_jobs"]["nightly"])
         self.assertNotIn("tests (relay DB, PostgreSQL)", config["required_jobs"]["main"])
         self.assertIn("tests (relay DB, PostgreSQL)", config["required_jobs"]["nightly"])
+        macos_job = workflow.split("  macos-package:\n", 1)[1].split("\n  test:\n", 1)[0]
+        self.assertIn(
+            "continue-on-error: ${{ matrix.runner == 'macos-14' && github.event_name != 'schedule' && !(github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') }}",
+            macos_job,
+        )
+
+    def test_real_main_jobs_fixture_satisfies_the_inventory(self):
+        fixture = json.loads(
+            (ROOT / "scripts/tests/fixtures/ci-evidence-main-jobs.json").read_text()
+        )
+        config = json.loads(DEFAULT_CONFIG.read_text())
+        successful = {job["name"] for job in fixture["jobs"] if job["conclusion"] == "success"}
+        skipped = {job["name"] for job in fixture["jobs"] if job["conclusion"] == "skipped"}
+        self.assertFalse(set(config["required_jobs"]["main"]) - successful)
+        self.assertTrue(skipped)
+        self.assertNotIn("tests (relay DB, PostgreSQL)", config["required_jobs"]["main"])
+        self.write_fixture(
+            run_pages=[page([run_doc(sha="a3523d7365677852cf9321499e9f4cfa65a749fd")])],
+            jobs_page=fixture,
+        )
+        result = self.invoke(
+            "main", "--sha", "a3523d7365677852cf9321499e9f4cfa65a749fd",
+            config=DEFAULT_CONFIG,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_successful_main_push_requires_exact_workflow_sha_and_all_jobs(self):
         self.write_fixture(
@@ -247,6 +276,12 @@ class CiEvidenceCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(SHA, result.stdout)
         self.assertIn("/actions/runs/456", result.stdout)
+        api_calls = [call for call in self.calls_json() if call[0] == "api"]
+        self.assertTrue(api_calls)
+        self.assertTrue(all(
+            "--method" in call and call[call.index("--method") + 1] == "GET"
+            for call in api_calls
+        ))
 
     def test_nightly_accepts_schedule_on_exact_sha(self):
         self.require_nightly_release_evidence()
@@ -257,24 +292,24 @@ class CiEvidenceCliTests(unittest.TestCase):
         result = self.invoke("nightly")
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_nightly_requires_green_macos14_acceptance_even_when_job_is_nonblocking(self):
+    def test_nightly_requires_green_macos14_acceptance(self):
         self.require_nightly_release_evidence()
         self.write_fixture(
             run_pages=[page([run_doc(event="schedule", branch="main")])],
             jobs_page=jobs_page(extra=self.nightly_macos_jobs(
-                acceptance_outcome="failure", acceptance_conclusion="success"
+                acceptance_conclusion="failure"
             )),
         )
         result = self.invoke("nightly")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("outcome=failure, conclusion=success", result.stderr)
+        self.assertIn("conclusion=failure", result.stderr)
         self.assertIn("/actions/runs/456", result.stderr)
 
     def test_nightly_refuses_missing_skipped_or_failed_cold_rebuild_step(self):
         self.require_nightly_release_evidence()
         cases = (
-            self.nightly_macos_jobs(cold_outcome="skipped", cold_conclusion="skipped"),
-            self.nightly_macos_jobs(cold_outcome="failure", cold_conclusion="success"),
+            self.nightly_macos_jobs(cold_conclusion="skipped"),
+            self.nightly_macos_jobs(cold_conclusion="failure"),
             self.nightly_macos_jobs(omit_cold=True),
         )
         for macos_jobs in cases:
@@ -403,6 +438,15 @@ class CiEvidenceCliTests(unittest.TestCase):
         result = self.invoke()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("additional job tests (relay DB, PostgreSQL): failure", result.stderr)
+
+    def test_missing_job_conclusion_does_not_use_success_status_as_fallback(self):
+        jobs = jobs_page()
+        jobs["jobs"][0]["conclusion"] = None
+        jobs["jobs"][0]["status"] = "success"
+        self.write_fixture(run_pages=[page([run_doc()])], jobs_page=jobs)
+        result = self.invoke()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing", result.stderr)
 
     def test_cancelled_or_failed_workflow_fails_with_run_link(self):
         for status, conclusion in (("completed", "failure"), ("completed", "cancelled")):

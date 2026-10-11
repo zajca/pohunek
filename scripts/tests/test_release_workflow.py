@@ -72,6 +72,7 @@ REHEARSAL_INPUTS = {
 # Every producer and evidence job the writer waits for, spelled out so that
 # transitivity is never relied on.
 PUBLISH_NEEDS = [
+    "tier-evidence",
     "gate",
     "docs-gate",
     "sdk-gate",
@@ -98,8 +99,11 @@ OIDC_BLOCK = (
     r"    permissions:\n      contents: read\n      id-token: write\n"
     r"      attestations: write\n(?!      \S)"
 )
+TIER_READ_BLOCK = (
+    r"    permissions:\n      contents: read\n      actions: read\n(?!      \S)"
+)
 CANONICAL_PERMISSIONS = re.compile(
-    "^(?:" + "|".join((READ_BLOCK, WRITE_BLOCK_FULL, EMPTY_BLOCK, OIDC_BLOCK)) + ")", re.M
+    "^(?:" + "|".join((READ_BLOCK, WRITE_BLOCK_FULL, EMPTY_BLOCK, OIDC_BLOCK, TIER_READ_BLOCK)) + ")", re.M
 )
 
 # A plain scalar value: its first character may not open a flow collection,
@@ -170,7 +174,26 @@ CALLER_LINES = [
     )
 ]
 
+TIER_EVIDENCE_LINES = [
+    re.compile(pattern)
+    for pattern in (
+        rf"    (name|runs-on): {_SCALAR}",
+        r"    (permissions|env|steps):",
+        r"      (contents|actions): read",
+        r"      (GH_TOKEN|GH_REPO|COMMIT): \$\{\{ github\.(token|repository|sha) \}\}",
+        rf"      - name: {_SCALAR}",
+        r"      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262(?: # v[0-9.]+)?",
+        r"        with:",
+        r"          persist-credentials: false",
+        r"        run: python3 scripts/ci-evidence --repo \"\$GH_REPO\" --sha \"\$COMMIT\" --tier (main|nightly)",
+        _COMMENT,
+    )
+]
+
 EVIDENCE_CALL = "./.github/workflows/release-evidence.yml"
+TIER_EVIDENCE_JOB = "tier-evidence"
+CHECKOUT = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+CHECKOUT = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
 PUBLISH_ACTIONS = {DOWNLOAD}
 OIDC_ACTIONS = {DOWNLOAD, ATTEST_ACTION}
 
@@ -424,7 +447,12 @@ def workflow_violations(
     violations.extend(jobs_section_violations(text))
     for name, block in jobs(text).items():
         violations.extend(permission_violations(name, block, oidc | set(callers)))
-        if name == writer:
+        if name == TIER_EVIDENCE_JOB:
+            violations.extend(job_shape_violations(name, block, TIER_EVIDENCE_LINES, {CHECKOUT}, {
+                ("python3 scripts/ci-evidence --repo \"$GH_REPO\" --sha \"$COMMIT\" --tier main",),
+                ("python3 scripts/ci-evidence --repo \"$GH_REPO\" --sha \"$COMMIT\" --tier nightly",),
+            }))
+        elif name == writer:
             if not holds_write_token(block):
                 violations.append(f"{name} must hold the write token")
             violations.extend(
@@ -459,6 +487,22 @@ class ReleaseWorkflowFiles(unittest.TestCase):
 
 
 class WriterTests(ReleaseWorkflowFiles):
+    def test_exact_commit_tier_evidence_gates_every_producer_and_writer(self):
+        gate = self.release_jobs[TIER_EVIDENCE_JOB]
+        self.assertIn("--tier main", gate)
+        self.assertIn("--tier nightly", gate)
+        self.assertNotIn("--dispatch-ref", gate)
+        for name in (
+            "gate", "upgrade-test", "docs-gate", "sdk-gate", "build",
+            "stage-macos", "package-macos", "verify-macos", "evidence", WRITER,
+        ):
+            with self.subTest(job=name):
+                self.assertIn(TIER_EVIDENCE_JOB, needs_of(self.release_jobs[name]))
+        self.assertEqual(
+            workflow_violations(self.release, writer=WRITER, oidc=set(), callers={RELEASE_CALLER}),
+            [],
+        )
+
     def test_exactly_one_job_holds_the_write_token(self):
         holders = sorted(
             (file, name)
@@ -474,10 +518,10 @@ class WriterTests(ReleaseWorkflowFiles):
             self.assertIn(name, self.release_jobs)
 
     def test_the_evidence_job_waits_for_every_artifact_it_downloads(self):
-        self.assertEqual(needs_of(self.release_jobs[RELEASE_CALLER]), ["build", "verify-macos"])
+        self.assertEqual(needs_of(self.release_jobs[RELEASE_CALLER]), ["tier-evidence", "build", "verify-macos"])
         self.assertIn("uses: ./.github/workflows/release-build.yml", self.release_jobs["build"])
         self.assertEqual(
-            needs_of(self.release_jobs["build"]), ["gate", "docs-gate", "sdk-gate", "upgrade-test"]
+            needs_of(self.release_jobs["build"]), ["tier-evidence", "gate", "docs-gate", "sdk-gate", "upgrade-test"]
         )
 
     def test_the_writer_runs_nothing_from_the_repository_or_the_bundle(self):

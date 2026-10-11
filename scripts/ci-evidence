@@ -125,6 +125,8 @@ def list_runs(
 ) -> list[dict[str, Any]]:
     arguments = [
         "api",
+        "--method",
+        "GET",
         "--paginate",
         "--slurp",
         f"repos/{repo}/actions/workflows/{workflow_file}/runs",
@@ -184,6 +186,8 @@ def get_jobs(repo: str, run_id: int) -> list[dict[str, Any]]:
     pages = read_json(
         (
             "api",
+            "--method",
+            "GET",
             "--paginate",
             "--slurp",
             f"repos/{repo}/actions/runs/{run_id}/jobs",
@@ -221,16 +225,10 @@ def verify_steps(jobs: list[dict[str, Any]], required_steps: list[dict[str, str]
                 failures.append(f"missing required step {required['step']} in {name}")
                 continue
             for step in found:
-                outcome = (
-                    step.get("outcome")
-                    or step.get("conclusion")
-                    or step.get("status")
-                    or "missing"
-                )
-                conclusion = step.get("conclusion") or outcome
-                if outcome != "success" or conclusion != "success":
+                conclusion = step.get("conclusion") or "missing"
+                if conclusion != "success":
                     failures.append(
-                        f"required step {required['step']} in {name}: outcome={outcome}, conclusion={conclusion}"
+                        f"required step {required['step']} in {name}: conclusion={conclusion}"
                     )
     return failures
 
@@ -238,7 +236,7 @@ def verify_steps(jobs: list[dict[str, Any]], required_steps: list[dict[str, str]
 def verify_jobs(jobs: list[dict[str, Any]], required_jobs: list[str]) -> list[str]:
     by_name: dict[str, list[str]] = {}
     for job in jobs:
-        by_name.setdefault(job.get("name", ""), []).append(job.get("conclusion") or job.get("status") or "missing")
+        by_name.setdefault(job.get("name", ""), []).append(job.get("conclusion") or "missing")
     failures = []
     for name in required_jobs:
         conclusions = by_name.get(name)
@@ -249,7 +247,7 @@ def verify_jobs(jobs: list[dict[str, Any]], required_jobs: list[str]) -> list[st
     required = set(required_jobs)
     for job in jobs:
         name = job.get("name", "")
-        conclusion = job.get("conclusion") or job.get("status") or "missing"
+        conclusion = job.get("conclusion") or "missing"
         if name not in required and conclusion not in ("success", "skipped"):
             failures.append(f"additional job {name or '<unnamed>'}: {conclusion}")
     return failures

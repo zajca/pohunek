@@ -327,15 +327,15 @@ jobs:
   # they carry ad-hoc signatures and `signing adhoc` in the MANIFEST, and
   # `verify-signed --adhoc` checks them.
   macos-package:
-    # macos-15 is the required leg. The nightly macos-14 leg is informational:
-    # GitHub retires that hosted image on 2026-11-02, and issue #355 tracks its
-    # replacement; its result cannot block a merge.
+    # macos-15 is the required leg. The nightly macos-14 leg is informational
+    # on pull requests and main pushes, but release evidence requires its real
+    # acceptance result until issue #355 provides an accepted replacement.
     name: macOS package install and upgrade (${{ matrix.runner }})
     if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || github.event_name == 'push' || (github.event_name == 'pull_request' && needs.changes.outputs.macos_package == 'true') }}
     needs: changes
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
-    continue-on-error: ${{ matrix.runner == 'macos-14' }}
+    continue-on-error: ${{ matrix.runner == 'macos-14' && github.event_name != 'schedule' && !(github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly')) && '{"runner":["macos-14","macos-15"]}' || '{"runner":["macos-15"]}') }}

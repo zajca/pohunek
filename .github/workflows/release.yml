@@ -3,6 +3,7 @@ name: Release
 # Triggered by pushing a `vX.Y.Z` tag (created by `scripts/release`). The flow
 # has one producer half, one evidence half and ONE writer:
 #
+#   tier-evidence     exact-commit main and nightly CI evidence
 #   gate, docs-gate, sdk-gate, upgrade-test   the quality gate on the tagged
 #       commit (a tag push does not run the CI workflow, so the gate is
 #       duplicated here);
@@ -51,9 +52,31 @@ env:
   # "could not execute process `sccache ...` (never executed)".
 
 jobs:
+  tier-evidence:
+    name: Verify exact-commit main and nightly CI evidence
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Require exact-commit main-tier evidence
+        run: python3 scripts/ci-evidence --repo "$GH_REPO" --sha "$COMMIT" --tier main
+
+      - name: Require exact-commit nightly-tier evidence
+        run: python3 scripts/ci-evidence --repo "$GH_REPO" --sha "$COMMIT" --tier nightly
+
   gate:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
+    needs: [tier-evidence]
     permissions:
       contents: read
     env:
@@ -133,11 +156,13 @@ jobs:
   upgrade-test:
     name: upgrade from the previous release
     uses: ./.github/workflows/upgrade.yml
+    needs: [tier-evidence]
     permissions:
       contents: read
 
   docs-gate:
     name: docs check (deterministic build + secret scan)
+    needs: [tier-evidence]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -175,6 +200,7 @@ jobs:
   # SDK and Hermes plugin suites against freshly built real binaries.
   sdk-gate:
     name: SDK typecheck + lint + test + pack contract + e2e
+    needs: [tier-evidence]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -270,7 +296,7 @@ jobs:
 
   build:
     name: Build the release artifacts
-    needs: [gate, docs-gate, sdk-gate, upgrade-test]
+    needs: [tier-evidence, gate, docs-gate, sdk-gate, upgrade-test]
     uses: ./.github/workflows/release-build.yml
     permissions:
       contents: read
@@ -303,7 +329,7 @@ jobs:
   # Running the archives on macOS 14 itself is a separate acceptance gate.
   stage-macos:
     name: Stage ${{ matrix.component }} for aarch64-apple-darwin
-    needs: [gate, docs-gate, sdk-gate, upgrade-test]
+    needs: [tier-evidence, gate, docs-gate, sdk-gate, upgrade-test]
     runs-on: macos-15
     timeout-minutes: 120
     permissions:
@@ -373,7 +399,7 @@ jobs:
 
   package-macos:
     name: Package ${{ matrix.component }} for aarch64-apple-darwin
-    needs: [stage-macos]
+    needs: [tier-evidence, stage-macos]
     runs-on: macos-15
     timeout-minutes: 30
     permissions:
@@ -445,7 +471,7 @@ jobs:
 
   verify-macos:
     name: Verify ${{ matrix.component }} for aarch64-apple-darwin
-    needs: [package-macos]
+    needs: [tier-evidence, package-macos]
     runs-on: macos-15
     timeout-minutes: 120
     permissions:
@@ -557,7 +583,7 @@ jobs:
   # for its attest jobs; every other job there holds `contents: read`.
   evidence:
     name: Evidence, signed bundle and archive smoke
-    needs: [build, verify-macos]
+    needs: [tier-evidence, build, verify-macos]
     uses: ./.github/workflows/release-evidence.yml
     permissions:
       contents: read
@@ -577,7 +603,7 @@ jobs:
   # draft it created, so no partial release stays behind.
   publish:
     name: Publish the release
-    needs: [gate, docs-gate, sdk-gate, upgrade-test, build, stage-macos, package-macos, verify-macos, evidence]
+    needs: [tier-evidence, gate, docs-gate, sdk-gate, upgrade-test, build, stage-macos, package-macos, verify-macos, evidence]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
