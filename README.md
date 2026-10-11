@@ -35,6 +35,10 @@ pohunek host discover
 pohunek session new --host buildbox --project myapp --agent codex \
   --branch feat/parser --input "Fix the parser fuzz failures." --yes
 
+# Find sessions linked to one work item; repeated metadata predicates are ANDed.
+pohunek session list --meta-eq link.provider=github \
+  --meta-eq link.id=owner/repo#123 --meta-has link.url
+
 # Go do something else. When the agent waits for an approval or is blocked,
 # the record lands here, from every host at once.
 pohunek notifications watch --all-hosts

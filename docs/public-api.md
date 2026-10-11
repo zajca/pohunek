@@ -198,6 +198,13 @@ but cannot apply these predicates, current Rust and TypeScript clients probe
 the negotiated version and return `daemon/daemon_protocol_too_old` before
 sending the filtered request.
 
+The CLI exposes these predicates as repeatable `session list --meta-eq
+key=value` and `--meta-has key` options. They combine with `--filter` and each
+other using AND semantics; equality splits at the first `=` and opaque keys or
+values may be empty. A CLI targeting a protocol-3 daemon fails before sending
+a metadata-filtered request, while an unfiltered `session list` remains
+available.
+
 A Rust client, CLI or TypeScript SDK client whose connection selected protocol 3 (a daemon of the previous
 release, typically on another host) translates in the opposite direction through the
 same adapter: it sends requests in the protocol 3 spelling (`runtime_id`, pinned to

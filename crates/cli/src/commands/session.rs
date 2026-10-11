@@ -316,6 +316,10 @@ pub(crate) enum ListFilter {
     Agent(String),
     /// Match the session's project by `<id|label>` reference.
     Project(String),
+    /// Match an opaque metadata key and its exact value.
+    MetadataEq { key: String, value: String },
+    /// Match the presence of an opaque metadata key.
+    MetadataHas { key: String },
 }
 
 impl ListFilter {
@@ -332,8 +336,24 @@ impl ListFilter {
             ListFilter::Activity(activity) => SessionListFilter::Activity(*activity),
             ListFilter::Agent(agent) => SessionListFilter::Agent(agent.clone()),
             ListFilter::Project(reference) => SessionListFilter::Project(reference.clone()),
+            ListFilter::MetadataEq { key, value } => SessionListFilter::MetadataEq {
+                key: key.clone(),
+                value: value.clone(),
+            },
+            ListFilter::MetadataHas { key } => SessionListFilter::MetadataHas { key: key.clone() },
         }
     }
+}
+
+/// Parse one `session list --meta-eq key=value` argument.
+///
+/// Metadata keys and values are opaque, so only the separator is required;
+/// unlike the legacy named filters, either side may be empty.
+pub(crate) fn parse_metadata_eq_filter(input: &str) -> Result<(String, String), String> {
+    let (key, value) = input
+        .split_once('=')
+        .ok_or_else(|| format!("invalid metadata equality filter {input:?}: expected key=value"))?;
+    Ok((key.to_owned(), value.to_owned()))
 }
 
 /// Parse one `session list --filter key=value` argument.
@@ -1724,12 +1744,10 @@ fn render_list_output(
     output_mode: ListOutputMode,
 ) -> Result<String, CliError> {
     // Defense-in-depth re-filter: the daemon already applies these filters
-    // (`build_list_request` sends them as typed params), but a daemon that
-    // predates the filter API ignores unknown params and returns every session.
-    // Re-applying the predicate here guarantees a correctly filtered set against
-    // such a peer. `ListFilter::matches` mirrors `protocol::SessionListFilter::matches`
-    // exactly (a unit test pins that they agree), so this never narrows further
-    // than the daemon would.
+    // (`build_list_request` sends them as typed params). Re-applying the
+    // predicate also protects legacy filters from peers that ignore unknown
+    // params. Metadata filters are gated by protocol negotiation before send,
+    // so a protocol-3 daemon cannot silently ignore them.
     let filtered: Vec<SessionInfo> = sessions
         .iter()
         .filter(|session| session_matches_filters(session, filters))
