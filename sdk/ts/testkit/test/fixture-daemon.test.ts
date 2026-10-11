@@ -939,6 +939,41 @@ describe("@pohunek/testkit fixture daemon", () => {
       await daemon.close();
     }
   });
+
+  test("session-list metadata filters enforce daemon byte and serialized-size limits", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("metadata-filter-bounds") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+
+      await expectProtocolError(client.call("session.list", {
+        filters: [{ key: "metadata_has", value: { key: "x".repeat(65) } }],
+      }), "bad_request");
+      await expectProtocolError(client.call("session.list", {
+        filters: [{ key: "metadata_has", value: { key: "é".repeat(33) } }],
+      }), "bad_request");
+      await expectProtocolError(client.call("session.list", {
+        filters: [{ key: "metadata_eq", value: { key: "ticket", value: "x".repeat(4097) } }],
+      }), "bad_request");
+      await expectProtocolError(client.call("session.list", {
+        filters: [{ key: "metadata_eq", value: { key: "ticket", value: "é".repeat(2049) } }],
+      }), "bad_request");
+      await expectProtocolError(client.call("session.list", {
+        filters: [{ key: "metadata_eq", value: { key: "ticket", value: "\u0000".repeat(3000) } }],
+      }), "bad_request");
+
+      expect(await client.call("session.list", {
+        filters: [{ key: "metadata_has", value: { key: "é".repeat(32) } }],
+      })).toEqual([]);
+      expect(await client.call("session.list", {
+        filters: [{ key: "metadata_eq", value: { key: "ticket", value: "é".repeat(2048) } }],
+      })).toEqual([]);
+
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
   test("models session lifecycle parity and project/worktree safeguards", async () => {
     const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("parity") } });
     try {
