@@ -33,7 +33,8 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    `PREVIOUS_VERSION` (`crates/worker-protocol/src/version.rs`),
    `WORKER_JOURNAL_SCHEMA_VERSION` (`crates/daemon/src/runtime/lifecycle.rs`),
    and `EXPECTED_INTEGRATION_VERSION` (`crates/protocol/src/integration.rs`).
-   Each one that changed alters the upgrade contract in `AGENTS.md` ("Upgrade
+   Each one that changed alters the upgrade contract in
+   `.agents/instructions/project.md` ("Upgrade
    window"), so the release needs a notes file with one line naming each changed
    constant and what an operator must do. Write it before the dry run and pass
    it as `--notes FILE`; the script aborts when a changed constant has no line.

@@ -26,7 +26,7 @@ The issue is the spec — there is no `NEXT.md`.
    evidence that refine the body. Extract the scope and the DoD items with
    their stable IDs — these are the testable success criteria. If they are
    ambiguous, resolve the ambiguity before implementation; do not invent scope.
-   Core ships no UI (AGENTS.md "Hard constraints"): a milestone that needs a
+   Core ships no UI (project constraints (`.agents/instructions/project.md`)): a milestone that needs a
    GUI, web, or launcher change is work for `zajca/pohunek-work`.
 2. **Create a worktree off `main`.** Use the script, which fetches
    `origin/main`, creates `pohunek-worktrees/<milestone-slug>` beside the
@@ -74,7 +74,7 @@ The issue is the spec — there is no `NEXT.md`.
    with concrete `path:line` context (per the global briefing protocol); they
    start with a clean context window. If the wire protocol
    (`crates/protocol`) changes, expect ripples in `client`, `daemon`, and `cli` — update and test all of them, plus `docs/public-api.md`.
-6. **Test cooperating behavior, not functions** (AGENTS.md "Testing policy").
+6. **Test cooperating behavior, not functions** (testing policy (`.agents/instructions/verification.md#testing-policy`)).
    New observable behavior gets an integration scenario — multiple production
    components cooperating through the supported boundary its callers use — or
    an E2E scenario driving the real product processes; a bug, lifecycle,

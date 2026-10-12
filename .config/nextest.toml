@@ -11,7 +11,8 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 # <failure> in JUnit). Retries only tell "fails every time" apart from "fails
 # sometimes"; they never turn a failure green. A FLAKY result means a bug
 # issue with the root cause. A per-test `flaky-result = "pass"` override needs
-# a linked issue and a reason next to it (see AGENTS.md "Flaky tests").
+# a linked issue and a reason next to it (see
+# .agents/instructions/verification.md, "Flaky tests").
 flaky-result = "fail"
 
 [profile.default.archive]

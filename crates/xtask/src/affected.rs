@@ -126,8 +126,8 @@ impl Reminder {
                 format!("scripts changed: also run `{SCRIPT_TESTS_COMMAND}`")
             }
             Self::SdkGates => "SDK workspace changed: also run the Bun gates from the \
-                               repository root (AGENTS.md \"SDK workspace gates\") and \
-                               `cargo xtask ts check`"
+                               repository root (.agents/instructions/verification.md \
+                               \"SDK workspace gates\") and `cargo xtask ts check`"
                 .to_owned(),
         }
     }
@@ -1166,7 +1166,8 @@ mod tests {
              bindings, checked by `cargo xtask ts check`)\n\
              selection: pohunek-cli plus their dependents\n\
              reminder: SDK workspace changed: also run the Bun gates from the repository \
-             root (AGENTS.md \"SDK workspace gates\") and `cargo xtask ts check`\n\
+             root (.agents/instructions/verification.md \"SDK workspace gates\") and \
+             `cargo xtask ts check`\n\
              cargo t -E 'rdeps(=pohunek-cli)'\n"
         );
     }

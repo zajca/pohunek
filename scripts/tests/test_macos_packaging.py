@@ -302,7 +302,7 @@ class ToolingTest(unittest.TestCase):
         text = (ROOT / ".github/workflows/ci.yml").read_text()
         for value in re.findall(r'MACOSX_DEPLOYMENT_TARGET[:=] ?"?([0-9.]+)', text):
             self.assertEqual(value, target)
-        for doc in ("AGENTS.md", "docs/design/macos-support-rfc.md"):
+        for doc in (".agents/instructions/verification.md", "docs/design/macos-support-rfc.md"):
             self.assertIn("MACOSX_DEPLOYMENT_TARGET={}".format(target), (ROOT / doc).read_text(), doc)
 
     def test_the_development_package_is_never_a_release_name(self):

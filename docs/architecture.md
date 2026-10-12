@@ -602,7 +602,7 @@ Unix and overlay owner contexts remain relay-independent.
 
 The no-shim rule has one bounded exception. The contract is that release N
 carries release N-1 in four places so that an update never strands live work
-(the same contract is in `AGENTS.md`, "Upgrade window"). Each place below
+(the same contract is in [the project instructions](../.agents/instructions/project.md)). Each place below
 states the contract and then the current state.
 
 - **Live workers.** The private worker protocol negotiates the range
@@ -1392,8 +1392,10 @@ production components through supported boundaries (integration) or the real
 product processes (E2E); there is no unit-test tier, whatever file a scenario
 lives in. The full boundary, the migration state of the unit-tier tests still
 in the suite ([#671](https://github.com/zajca/pohunek/issues/671)), and the
-expected-result rules are the AGENTS.md "Testing policy". The obligations
-below must each stay represented by integration or E2E scenarios.
+expected-result rules are in the
+[verification guide](../.agents/instructions/verification.md#testing-policy).
+The obligations below must each stay represented by integration or E2E
+scenarios.
 
 Integration and E2E obligations:
 

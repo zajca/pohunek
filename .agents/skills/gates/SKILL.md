@@ -10,13 +10,13 @@ description: >-
 
 # gates — run the CI gate set
 
-CI is the source of truth for this repo. This skill mirrors the exact gate
-set AGENTS.md ("Build, test, lint — the gates that must pass") mirrors from
-CI, in the same order, so a local pass lines up with what CI will run. Never
-claim a gate passed without running it; report failures with the real command
-output. AGENTS.md lists the full, current gate set — including SDK workspace
-gates, the real-daemon suite, and `cargo xtask hermes compatibility` — and
-always wins over this summary.
+CI is the source of truth for this repo. This skill mirrors the repository
+verification guide (`.agents/instructions/verification.md`) and the current CI gate set, in the
+same order, so a local pass lines up with what CI will run. Never claim a gate
+passed without running it; report failures with the real command output. The
+verification guide is the current inventory — including SDK workspace gates,
+the real-daemon suite, and `cargo xtask hermes compatibility` — and always wins
+over this procedural summary.
 
 ## Core gate set
 
@@ -48,7 +48,8 @@ a CLI command/flag, a protocol method/event, or `docs/public-api.md`.
 
 ## When the change touches the SDK workspace
 
-Run from the repository root (see AGENTS.md for the full commands): `bun install
+Run from the repository root (see `.agents/instructions/verification.md` for
+the full commands): `bun install
 --frozen-lockfile`, `bun run typecheck`, `bun run lint`, `bun test`, and
 `bun test sdk/ts/scripts` (the SDK release pack contract). The real-daemon suite runs
 with the built `pohunekd`/`pohunek-sessiond`/`pohunek` binaries when the
@@ -64,14 +65,15 @@ change can affect daemon/worker behavior.
    workspace-wide inputs (`Cargo.toml`, `Cargo.lock`, `.config/nextest.toml`,
    the CI workflow) re-runs the whole set. The reported set must hold for the
    final revision: every step's evidence was produced on inputs identical to
-   it (AGENTS.md "Testing policy").
+   it (testing policy (`.agents/instructions/verification.md#testing-policy`)).
 3. Report a compact status per gate (pass / fail + first failing lines, or
    explicitly skipped with why). Say plainly what actually ran. If all pass,
    say so plainly; if any fail or were skipped, say which and why, with output.
 
 ## Narrower loops while iterating
 
-Use these to shorten the feedback loop (see AGENTS.md "Fast loops" —
+Use these to shorten the feedback loop (see
+`.agents/instructions/verification.md` "Fast loops" —
 `cargo t`, `cargo tw`, `python3 scripts/test-partitions run <shard>`),
 but always finish with the full set above.
 

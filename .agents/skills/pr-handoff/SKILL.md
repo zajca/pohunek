@@ -16,7 +16,8 @@ Authorization semantics: a milestone-build harness run whose final audit
 reports every DoD item met with all gates green **pre-authorizes** this
 handoff — publishing is then part of the autonomous loop, no further ask.
 This intentionally supersedes the default "commit/push only when the user
-asks" for that one path (see AGENTS.md, "Accepted harness trade-offs"); for
+asks" for that one path (see
+`.agents/instructions/workflow.md`, "Accepted harness trade-offs"); for
 any other branch, wait for the user to request it. This preauthorization is
 for publishing only — it does not authorize merging the PR or anything beyond
 it.
@@ -27,7 +28,7 @@ it.
   milestone that is the gate set in `.lh-harness/workflows/milestone-build.md`
   (already run by the milestone's audit); for a plain branch, run that same
   set by hand. Follow the `gates` skill together with the authoritative
-  AGENTS.md commands, including Hermes compatibility, SDK workspace, and real-daemon
+  `.agents/instructions/verification.md` commands, including Hermes compatibility, SDK workspace, and real-daemon
   checks. A partial run never authorizes this handoff.
 - You are on a milestone slice branch, not on `main` itself. The bottom
   slice is based on `main`; every other slice is based on the slice below it

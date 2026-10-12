@@ -1,7 +1,8 @@
 # Development
 
 Workspace layout, the CI gate set, fast test loops, and the release pipeline.
-[AGENTS.md](../AGENTS.md) remains the canonical contributor guide.
+[AGENTS.md](../AGENTS.md) is the canonical instruction entry point; detailed
+policy lives in its linked scoped guides.
 
 The workspace is a Cargo monorepo (edition 2021, MSRV 1.96) plus a Bun
 workspace (rooted at the repository root, spanning `sdk/ts/*`) for the TypeScript packages.
@@ -24,7 +25,8 @@ workspace (rooted at the repository root, spanning `sdk/ts/*`) for the TypeScrip
 | `crates/xtask` | Workspace automation: docs build/check, TS type generation. |
 | `sdk/ts/` | `@pohunek/protocol` (`sdk/ts/protocol`), `@pohunek/sdk` (`sdk/ts/sdk`), `@pohunek/testkit` (`sdk/ts/testkit`). |
 
-Read **[AGENTS.md](../AGENTS.md)** first — it is the canonical contributor guide.
+Read **[AGENTS.md](../AGENTS.md)** first, then follow its task-specific
+instruction routes.
 Authoritative design lives in [docs/architecture.md](architecture.md);
 the protocol contract in [docs/public-api.md](public-api.md).
 
@@ -42,8 +44,9 @@ cargo build --workspace --release
 cargo xtask docs check          # knowledge bundle: schema/drift/secrets/runbooks
 ```
 
-Routine loops (cargo-nextest profiles live in `.config/nextest.toml`; see
-`AGENTS.md` "Fast loops" for watcher, and CI-timing variants):
+Routine loops (cargo-nextest profiles live in `.config/nextest.toml`; see the
+[verification guide](../.agents/instructions/verification.md) for watcher and
+CI-timing variants):
 
 ```bash
 cargo t                        # all fast tests, no PTY/DB fixtures
@@ -300,7 +303,7 @@ unavailable).
 - **Protocol ripples**: touching `crates/protocol` means updating `client`,
   `daemon`, `cli`, the generated TS types, `docs/public-api.md`,
   and the `docs/knowledge/` bundle in the same change.
-- **Integration/E2E tests, not unit tests** (AGENTS.md "Testing policy"): a
+- **Integration/E2E tests, not unit tests** ([testing policy](../.agents/instructions/verification.md#testing-policy)): a
   test drives cooperating production components through a supported boundary,
   or the real product processes — never a unit test. Extending an existing
   suite does not exempt an added test from that boundary; the unit-tier

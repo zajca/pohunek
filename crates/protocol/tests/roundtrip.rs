@@ -1904,7 +1904,8 @@ fn attach_header_json_shape_roundtrips() {
 
 /// The request, response and event envelopes follow the shapes documented in
 /// `docs/public-api.md`, written by hand and checked in both directions. The
-/// request range is the client window of the AGENTS.md "Upgrade window".
+/// request range is the client window of the "Upgrade window" in
+/// `.agents/instructions/project.md`.
 #[test]
 fn envelopes_match_the_documented_wire_shapes() {
     let request = Request::new("req-7f3", method::SESSION_LIST, json!({})).expect("valid request");

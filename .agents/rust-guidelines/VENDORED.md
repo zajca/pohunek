@@ -34,4 +34,4 @@ cp /tmp/ms-rust-skill/{0,1}*.md /tmp/ms-rust-skill/SKILL.md /tmp/ms-rust-skill/R
 ```
 
 Do not hand-edit the guideline files in place; edits would be lost on the next
-sync. Project-specific deviations belong in `AGENTS.md`.
+sync. Project-specific deviations belong in `.agents/instructions/coding.md`.

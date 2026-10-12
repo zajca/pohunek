@@ -1,133 +1,23 @@
-# CLAUDE.md
+# Claude Code
 
-Project guidance for Claude Code. **Read [AGENTS.md](AGENTS.md) first** — it is
-the canonical guide (what pohunek is, repo map, build/test/lint gates,
-conventions, workflow). This file only adds Claude-specific notes; it does not
-repeat AGENTS.md.
+Read [AGENTS.md](AGENTS.md) first. It routes tasks to Pohunek's canonical,
+scoped instructions; do not maintain a second copy of repository policy here.
 
-Your personal global instructions in `~/.claude/CLAUDE.md` also apply and take
-precedence where they are stricter (Czech communication, English files,
-security > quality > simplicity > time, no mocks, no hardcoded values). The one
-exception is testing: AGENTS.md "Testing policy" replaces the global "write
-tests for all new code" rule and **prohibits new unit tests entirely** — a
-test is only an integration scenario (cooperating production components
-through a supported boundary) or an E2E scenario (real product processes).
-For the full boundary, required evidence, and the state of the unit-tier
-tests still in the suite (`#671` migration), read AGENTS.md "Testing policy".
+- For product boundaries and compatibility, follow
+  [.agents/instructions/project.md](.agents/instructions/project.md) and
+  [docs/architecture.md](docs/architecture.md).
+- For code, tests, and verification, follow
+  [.agents/instructions/coding.md](.agents/instructions/coding.md) and
+  [.agents/instructions/verification.md](.agents/instructions/verification.md).
+- Before any Rust edit, follow
+  [.agents/rust-guidelines/SKILL.md](.agents/rust-guidelines/SKILL.md).
+- For issue and project writes, follow the
+  [github-workflow skill](.agents/skills/github-workflow/SKILL.md).
+- Use the relevant milestone, review, gate, handoff, or release skill under
+  `.agents/skills/` when its workflow applies. `.claude/skills/` points to those
+  canonical files; edit only `.agents/skills/`.
 
-## Mandatory: read the Rust guidelines before any Rust edit
-
-Before creating or modifying **any** `.rs` file — even a one-line change — read
-the guideline files relevant to the task from **`.agents/rust-guidelines/`**
-(vendored in-repo, no external checkout needed). Use
-`.agents/rust-guidelines/SKILL.md` as the which-file-when index; at minimum read
-`11_universal_guidelines.md`, adding correctness/application/library files as the
-task warrants. Apply `M-CANONICAL-DOCS` and the rest, and update the
-`// Rust guideline compliant <date>` marker when a file is fully compliant. This
-is non-negotiable for this repo.
-
-If you have the `ms-rust` Agent Skill registered locally (e.g. symlinked into
-`~/.claude/skills/`), you may invoke it instead — it wraps the same guidelines.
-But the vendored copy is the source of truth here so the rule holds for every
-agent and machine, not just a personally-configured one.
-
-## Scope: core ships no UI
-
-This repository holds the daemon, session worker, CLI, relay, Rust crates, and
-the TypeScript SDK workspace (`sdk/ts/`). Do not add a GUI, web frontend or
-backend, desktop launcher, or an issue/PR provider here: those live in
-`zajca/pohunek-work`, which consumes core only through public contracts (CLI
-`--json` and the public protocol via the pinned Rust crates and SDK tarballs).
-The constraints are spelled out in AGENTS.md ("Hard constraints").
-
-## Verifying work
-
-CI is the source of truth. While iterating, run the checks your change affects;
-before reporting a Rust change as done, run the applicable gate set from
-AGENTS.md ("Build, test, lint") once on the final revision — clippy is
-`-D warnings`, so a warning is a failure. A later fix re-runs only the checks
-whose inputs it changed (AGENTS.md "Testing policy"). For docs/knowledge
-changes, also run `cargo xtask docs check`.
-
-## Milestone workflow skills
-
-The milestone loop described in AGENTS.md (plan → implement in a worktree →
-review against the issue's DoD → merge and advance → release) is encoded as
-skills under `.agents/skills/` (the canonical file layout; `.claude/skills/<name>`
-is a relative symlink to `../../.agents/skills/<name>`, kept for Claude Code
-skill discovery — the symlink resolves to the same files, so edits belong only
-in the canonical tree). Prefer them over re-deriving the steps each
-time; they auto-trigger from the usual phrasing. All of them route their
-GitHub-issue and project updates through the shared **`github-workflow`**
-skill (deduplication, issue body/comment structure, project status
-semantics, safe persistence — config in `.github/agent-workflow.json`).
-
-- **`github-workflow`** — shared GitHub Issues + Project tracking rules that
-  every milestone-loop skill inherits; use it for any issue or project write.
-- **`plan-phase`** — plan the next phase interactively (one open question at
-  a time) and record the complete end-to-end plan as a GitHub issue.
-- **`milestone`** — implement the pohunek milestone specified by a GitHub
-  issue in a fresh worktree, then run the gates.
-- **`milestone-review`** — review a branch/worktree against the issue's DoD
-  with `path:line` evidence, record findings on the issue, delegate fixes,
-  re-run the checks the fixes affect and the final gates.
-- **`merge-advance`** — commit unsigned, merge to `main`, prune the
-  branch/worktree, update the milestone issue and project status.
-- **`release`** — cut a version with `scripts/release` and verify the Release
-  workflow publishes the glibc + MUSL x86_64 binaries.
-- **`gates`** — the shared verification block mirroring the AGENTS.md gate
-  set; the other skills call it.
-- **`deliver-issue`** — hand over one larger issue and get it back merged:
-  plan, parallel subagents, gates, stacked PRs, then a loop on CI and the
-  automated review of every pushed head until it is clean, merge, verify
-  the landing, close the issue, and file follow-ups — without asking.
-
-## Keep the assistant knowledge bundle current
-
-`docs/knowledge/` is the hand-authored source for the Universal Pohunek
-Assistant. Per AGENTS.md, treat it as part of the change, never a follow-up:
-whenever you touch something it describes — a CLI command/flag, a protocol
-method/event, an operating-model concept, a safety rule, the
-`docs/public-api.md` surface, or a path in
-`docs/knowledge/assistant/source-map.md` — update the matching knowledge file in
-the *same* change and re-run `cargo xtask docs check`. For wire-protocol work
-this is one more ripple target alongside `client`/`daemon`/`cli` and the
-generated `sdk/ts/` types (`cargo xtask ts check`): a new method/event is not
-done until the bundle and `docs/public-api.md` reflect it. The `zajca/pohunek-work`
-clients follow a protocol change by bumping their pinned core tag; core keeps
-no compatibility shim for them. If unsure whether a change is assistant-visible, check whether any file under
-`docs/knowledge/` mentions the surface you changed.
-
-## Agent teams and sub-agents
-
-This is a layered Rust workspace where reviews and features benefit from
-parallel exploration. Good fits here:
-
-- **Pre-PR / code review:** `security-reviewer` (secret handling, the `sh -c`
-  attach surface, NetBird trust boundary) + `silent-failure-hunter` (swallowed
-  errors in the daemon/state machines) + `performance-reviewer`, synthesized by
-  `product-engineer`.
-- **Protocol changes:** spawn parallel implementers per affected crate
-  (`protocol` → `client`/`daemon`/`cli`/`sdk/ts`), coordinated by `tech-lead`,
-  because one wire change ripples across crates — and out into
-  `docs/public-api.md` and the `docs/knowledge/` bundle (see "Keep the assistant
-  knowledge bundle current").
-- **State-machine bugs:** competing-hypothesis investigation across
-  `client`/`daemon` session detection.
-
-By default, delegate milestone implementation and post-review fixes to parallel
-subagents or Codex — this is the standing mode of work here, not something to
-wait for permission on. Brief every sub-agent with concrete `path:line` context
-(per your global briefing protocol); they start with a clean context window.
-
-## Project memory
-
-The **GitHub issue's body and comments are the cross-session authority** for
-this project's work (scope, decisions, evidence, handoffs — the
-`github-workflow` skill holds the rules). Local memory under
-`~/.claude/projects/-home-zajca-Code-me-zremoteng/memory/` (index:
-`MEMORY.md`) and SiYuan notes are **optional pointers only** — consult them
-for standing facts (pohunek is experimental with no back-compat; the native
-GUI lives in `zajca/pohunek-work`; the `ms-rust` skill must precede
-Rust edits), but they are not a mandatory second writing location and never a
-competing project authority.
+Host-level instructions may add constraints. They do not replace this
+repository's security, compatibility, testing, and authorization requirements,
+and the testing policy in `.agents/instructions/verification.md` takes
+precedence over a host rule that asks for tests for all new code.

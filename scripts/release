@@ -116,8 +116,9 @@ if [ "$bump" != patch ] && [ "$bump" != minor ] && [ "$bump" != major ] && [ "$n
 fi
 
 # Persisted-state and wire-compatibility constants, as "NAME|git pathspec". A
-# change to any of them alters the upgrade contract (AGENTS.md, "Upgrade
-# window"), so the release notes must carry a line naming each changed one.
+# change to any of them alters the upgrade contract
+# (.agents/instructions/project.md, "Upgrade window"), so the release notes
+# must carry a line naming each changed one.
 compat_constants="
 STORE_SCHEMA_VERSION|crates/daemon/src/store
 PROTOCOL_VERSION|crates/protocol/src/version.rs
