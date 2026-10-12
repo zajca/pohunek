@@ -21,7 +21,7 @@ mod profile;
 
 pub use launch_env::LaunchEnv;
 pub use native_launch::{
-    NativeArg, NativeArgs, NativeLaunchError, NativeSessionLaunch, REFERENCE_PLACEHOLDER,
+    ForkArgv, NativeArg, NativeArgs, NativeLaunchError, NativeSessionLaunch, REFERENCE_PLACEHOLDER,
 };
 pub(crate) use native_reference::{env_name_problem, is_plain_relative_path};
 pub use native_reference::{
@@ -416,16 +416,20 @@ pub(crate) fn resume_pty_command_from_launch(
 }
 
 /// Build the PTY command that forks a native session from a frozen snapshot.
+///
+/// Returns the command with the reference core assigned to the forked
+/// conversation, when the frozen spec assigns forks one.
 pub(crate) fn fork_pty_command_from_launch(
     program: &str,
     frozen_args: Vec<String>,
     launch: &NativeSessionLaunch,
     session_ref: &SessionRef,
     opts: &LaunchOpts,
-) -> Result<LaunchCommand, ProtocolError> {
+) -> Result<(LaunchCommand, Option<SessionRef>), ProtocolError> {
+    let ForkArgv { argv, reference } = launch.fork_argv(session_ref)?;
     let mut args = frozen_args;
-    args.extend(launch.fork_argv(session_ref)?);
-    build_pty_command(program, args, opts)
+    args.extend(argv);
+    Ok((build_pty_command(program, args, opts)?, reference))
 }
 
 pub(crate) fn agent_not_resumable(agent: &str) -> ProtocolError {
@@ -912,6 +916,7 @@ mod tests {
                 &launch_opts(&cwd),
             )
             .expect("fork command")
+            .0
         });
 
         assert_eq!(
@@ -1002,7 +1007,8 @@ mod tests {
                     &path,
                     &launch_opts(&cwd),
                 )
-                .expect("path fork"),
+                .expect("path fork")
+                .0,
             )
         });
         assert_eq!(

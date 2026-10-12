@@ -14,5 +14,5 @@
     "min": "1.0.0",
     "below": "1.1.0"
   },
-  "verified_with": "PTY run of the pinned release: session file layout, bracketed paste, idle and working screens, process name, session-id resume and fork"
+  "verified_with": "PTY run of the pinned release: session file layout, bracketed paste, idle and working screens, process name, session-id resume, and fork under an assigned session id resumed by that id"
 }

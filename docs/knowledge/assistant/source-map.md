@@ -596,7 +596,7 @@ Runtime package archive format:
 - `docs/knowledge/guides/codex-package.md`
 - `docs/knowledge/guides/claude-package.md`
 - `runtime-packages/README.md` — layout convention of the official package sources.
-- `runtime-packages/pi/runtime.toml` — Pi runtime descriptor (assigned reference, existence check, version probe).
+- `runtime-packages/pi/runtime.toml` — Pi runtime descriptor (assigned reference for launches and forks, existence check, version probe).
 - `runtime-packages/pi/detect.toml` — Pi detection manifest verified against real screens.
 - `compat/pi/compatibility-lock.json` — pinned Pi release, supported range and Node requirement.
 - `compat/pi/screens/` — screens captured from a real Pi that the manifest test classifies.

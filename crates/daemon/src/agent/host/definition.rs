@@ -1088,6 +1088,10 @@ struct RawNativeReference {
     /// Argv that passes the generated reference at launch; `assigned` only.
     #[serde(default)]
     launch_args: Option<Vec<String>>,
+    /// Whether a fork also gets a generated reference, passed with
+    /// `launch_args` after the fork arguments; `assigned` only.
+    #[serde(default)]
+    assign_fork: Option<bool>,
     /// How recovery confirms the conversation exists; `assigned` always, or
     /// `hook` with an id-kind reference.
     #[serde(default)]
@@ -1135,8 +1139,9 @@ impl RawDefinition {
     ///
     /// `none` freezes recovery off, so it must sit next to `resume.supported =
     /// false`; `hook` and `assigned` both need a supported resume; only
-    /// `assigned` carries a launch template and only `assigned`, or `hook`
-    /// with an id-kind reference, carries an explicit existence check.
+    /// `assigned` carries a launch template and `assign_fork` (which needs a
+    /// supported fork), and only `assigned`, or `hook` with an id-kind
+    /// reference, carries an explicit existence check.
     fn apply_strategy(
         &self,
         native: Option<NativeSessionLaunch>,
@@ -1147,6 +1152,11 @@ impl RawDefinition {
             if declaration.launch_args.is_some() {
                 return Err(invalid(NativeReferenceError::UnexpectedField {
                     field: "launch_args",
+                }));
+            }
+            if declaration.assign_fork.is_some() {
+                return Err(invalid(NativeReferenceError::UnexpectedField {
+                    field: "assign_fork",
                 }));
             }
             Ok(())
@@ -1201,10 +1211,20 @@ impl RawDefinition {
                     .ok_or(invalid(NativeReferenceError::AssignedRequiresExistence))?;
                 let existence = ReferenceExistence::try_from(existence)
                     .map_err(|source| invalid(NativeReferenceError::Existence(source)))?;
+                let mut assigned = AssignedReference::new(launch_args, existence);
+                if declaration.assign_fork == Some(true) {
+                    if !native.supports_fork() {
+                        return Err(invalid(NativeReferenceError::AssignForkRequiresFork));
+                    }
+                    assigned = assigned.with_fork_assignment();
+                }
                 let native = native
-                    .with_assigned(AssignedReference::new(launch_args, existence))
-                    .map_err(|_source| {
-                        invalid(NativeReferenceError::AssignedRequiresIdReference)
+                    .with_assigned(assigned)
+                    .map_err(|source| match source {
+                        NativeLaunchError::AssignedForkRequiresFork => {
+                            invalid(NativeReferenceError::AssignForkRequiresFork)
+                        }
+                        _ => invalid(NativeReferenceError::AssignedRequiresIdReference),
                     })?;
                 Ok((Some(native), None))
             }

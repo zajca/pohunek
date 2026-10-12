@@ -38,6 +38,7 @@ const SHAPE_SNAPSHOTS: &[(u32, &str)] = &[
     (3, include_str!("fixtures/shape/schema-3.txt")),
     (4, include_str!("fixtures/shape/schema-4.txt")),
     (5, include_str!("fixtures/shape/schema-5.txt")),
+    (6, include_str!("fixtures/shape/schema-6.txt")),
 ];
 
 /// A profile revision: 64 lowercase hex digits.
@@ -71,7 +72,8 @@ fn resume_builtin_json() -> Value {
             "fork_args": [{"literal": "--fork"}, "reference"],
             "assigned": {
                 "launch_args": [{"literal": "--session-id"}, "reference"],
-                "existence": {"check": "none"}
+                "existence": {"check": "none"},
+                "assign_fork": true
             }
         },
         "launch_binding": {

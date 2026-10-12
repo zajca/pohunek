@@ -36,7 +36,7 @@ use super::{
 ///
 /// Bump it, and add a [`MIGRATIONS`] step, whenever the serialized shape of a
 /// persisted record kind changes.
-pub const STORE_SCHEMA_VERSION: u32 = 5;
+pub const STORE_SCHEMA_VERSION: u32 = 6;
 
 /// Schema assumed for a line that has no `schema_version` field.
 pub(super) const UNVERSIONED_LINE_SCHEMA: u32 = 1;
@@ -71,6 +71,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         from: 4,
         apply: migrate_v4_to_v5,
     },
+    Migration {
+        from: 5,
+        apply: migrate_v5_to_v6,
+    },
 ];
 
 /// Schema the [`legacy_binding`] step upgrades from.
@@ -103,6 +107,14 @@ fn migrate_v3_to_v4(_record: &mut Map<String, Value>) {}
 /// The field is derived only for public responses, so historical store lines
 /// retain no cached timestamp and only their schema version changes.
 fn migrate_v4_to_v5(_record: &mut Map<String, Value>) {}
+
+/// Schema 5 to 6: an assigned native reference may also cover forks
+/// (`assign_fork`).
+///
+/// A spec written without the field assigns forks no reference, which is how
+/// every schema 5 session was launched and forked, so no record needs
+/// rewriting.
+fn migrate_v5_to_v6(_record: &mut Map<String, Value>) {}
 
 /// A metadata store whose schema this daemon cannot use as is.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

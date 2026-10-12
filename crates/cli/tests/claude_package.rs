@@ -423,7 +423,7 @@ fn the_descriptor_declares_the_verified_claude_launch_contract() {
     );
     assert!(native.supports_fork(), "Claude sessions are forkable");
     assert_eq!(
-        native.fork_argv(&reference).expect("fork"),
+        native.fork_argv(&reference).expect("fork").argv,
         ["--resume", reference.value(), "--fork-session"]
     );
 
@@ -2054,7 +2054,8 @@ async fn a_real_claude_resumes_and_forks_with_the_descriptor_arguments() {
             .native()
             .expect("native recovery")
             .fork_argv(&SessionRef::id(&reference).expect("reference"))
-            .expect("fork argv"),
+            .expect("fork argv")
+            .argv,
         ["--resume", reference.as_str(), "--fork-session"]
     );
     // The fork runs a conversation of its own: a second transcript appears

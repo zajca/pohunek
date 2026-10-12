@@ -12,7 +12,7 @@
 //! package root is described by its identity, its trust origin and typed
 //! health, never by where it sits on disk.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 use serde::{Deserialize, Serialize};
 
@@ -174,6 +174,12 @@ pub struct PackageRuntimeInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub fork_args: Option<Vec<String>>,
+    /// Arguments core appends after `fork_args` to pass the forked
+    /// conversation's own generated reference; `{reference}` marks where that
+    /// reference goes. Absent when a fork gets no assigned reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub fork_launch_args: Option<Vec<String>>,
     /// Whether the first prompt of a session is appended to the launch
     /// arguments instead of being typed into the terminal.
     pub prompt_argument: bool,

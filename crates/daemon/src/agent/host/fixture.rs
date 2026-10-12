@@ -283,6 +283,41 @@ pub(crate) fn pi_shaped_host(program: &Path, existence: &str) -> RuntimeHost {
     RuntimeHost::new(registry)
 }
 
+/// Like [`pi_shaped_host`], with the fixture runtime also assigning every fork
+/// a reference of its own (`assign_fork = true`), so a fork launches as
+/// `--fork <source> --session-id <fork>`.
+///
+/// # Panics
+///
+/// Panics when the document or the registry is invalid, which would be a
+/// defect of the fixture.
+pub(crate) fn pi_shaped_forking_host(program: &Path, existence: &str) -> RuntimeHost {
+    let launch_args = "launch_args = [\"--session-id\", \"{reference}\"]\n";
+    let document = pi_shaped_document(program, existence)
+        .replace(launch_args, &format!("{launch_args}assign_fork = true\n"));
+    let definition = RuntimeDefinition::from_toml(
+        &document,
+        |package| DefinitionOrigin::Package {
+            package,
+            digest: PackageDigest::parse(PACKAGE_DIGEST).expect("valid digest"),
+        },
+        |_name| Ok(Arc::new(generic_shell_manifest().clone())),
+    )
+    .expect("the forking fixture document is valid");
+    assert!(
+        definition
+            .native()
+            .and_then(crate::agent::NativeSessionLaunch::assigned)
+            .is_some_and(crate::agent::AssignedReference::assigns_fork),
+        "the forking fixture assigns fork references"
+    );
+    let builtin = BuiltinSource::new("/bin/sh");
+    let fixture = FixtureSource(vec![definition]);
+    let registry =
+        RuntimeRegistry::from_sources(&[&builtin, &fixture]).expect("the fixture registry builds");
+    RuntimeHost::new(registry)
+}
+
 /// Detection manifest shipped by [`installed_pi_host`] packages.
 const PACKAGED_DETECT_MANIFEST: &str = r#"[[rules]]
 id = "idle_prompt"

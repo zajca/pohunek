@@ -51,10 +51,11 @@ reserved, so either way of installing serves it.
   The probe runs under the `PATH` the launch will see (the daemon's forwarded
   environment overridden by the profile's `PATH`), so a profile that selects a
   Node installation is probed with that Node; every other variable is isolated.
-- Native reference: `strategy = "assigned"`. The daemon generates a UUID, starts
-  `pi --session-id <id>` (Pi creates the conversation with that id), resumes with
-  `pi --session <id>`, and forks with `pi --fork <id>`. No integration hook is
-  involved.
+- Native reference: `strategy = "assigned"` with `assign_fork = true`. The
+  daemon generates a UUID, starts `pi --session-id <id>` (Pi creates the
+  conversation with that id), resumes with `pi --session <id>`, and forks with
+  `pi --fork <id> --session-id <fork id>` under a second UUID it generates for
+  the fork. No integration hook is involved.
 - Existence check: before resume or fork the daemon looks for a regular file
   named `*_<id>.jsonl` in a project directory below
   `$PI_CODING_AGENT_DIR/sessions/` (default `~/.pi/agent/sessions/`). Pi writes
@@ -90,7 +91,16 @@ reserved, so either way of installing serves it.
 - A session that never received a model reply has no session file; `resume` is
   refused with `agent_native_reference_missing` before any worker starts, as is
   a resume after the file was deleted.
-- A forked session holds no reference of its own and is not resumable.
+- A forked session holds its own assigned reference from the start: Pi writes
+  the fork's file `<ISO time>_<fork id>.jsonl` at once (its header names the
+  source file as `parentSession`), before any model turn, so the fork resumes
+  with `pi --session <fork id>` after a stop or a daemon restart. Pi refuses a
+  fork id that already names a session; the daemon generates a fresh UUID for
+  every fork. Package version 1.0.1 declares this; a host with 1.0.0 installed
+  gets it with `pohunek plugin update pohunek.runtime.pi <archive>` (installed
+  beside 1.0.0 and selected). A session launched from 1.0.0, or from a profile
+  still pinned to its digest, keeps the spec it was launched with, so its forks
+  hold no reference and are not resumable.
 - A Pi configured to store sessions elsewhere (`--session-dir`,
   `PI_CODING_AGENT_SESSION_DIR`, `sessionDir`) fails recovery closed; set
   `PI_CODING_AGENT_DIR` in the host profile's `[env]` to move the whole agent
@@ -110,7 +120,7 @@ reserved, so either way of installing serves it.
   Pi's real file layout.
 - The same file holds two `#[ignore]`d tests that drive a real `pi` through an
   installed package: launch, idle and working detection, input, stop, resume,
-  fork, and refusal without a session file. A loopback chat-completions stub
+  fork, stop and resume of the fork, and refusal without a session file. A loopback chat-completions stub
   stands in for the model, so no provider, credential or network is involved.
   Run them with `POHUNEK_PI_E2E=1 cargo test -p pohunek-cli --test pi_package --
   --ignored`; the variable and a `pi` on `PATH` are required, otherwise the run

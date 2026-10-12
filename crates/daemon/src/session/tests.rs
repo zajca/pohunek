@@ -17167,6 +17167,134 @@ async fn a_hook_less_runtime_launches_with_an_assigned_reference_and_recovers_fr
     let _ = registry.stop(&created.id).await;
 }
 
+/// A Pi-shaped agent that records every start in `marker` and stays alive.
+/// Like Pi, a start with `--fork` writes the forked conversation at once, as
+/// `$PI_SHAPED_HOME/sessions/proj/<stamp>_<id>.jsonl` for the `--session-id`
+/// it was given. The start is recorded after that write, so a recorded fork
+/// start means its conversation exists even if the agent is stopped next.
+#[cfg(unix)]
+fn forking_agent_script(dir: &std::path::Path, marker: &std::path::Path) -> PathBuf {
+    let script = dir.join("pi-forking");
+    write_executable(
+        &script,
+        &format!(
+            "#!/bin/sh\ncase \" $* \" in *\" --fork \"*)\n\
+             previous=\n\
+             for argument in \"$@\"; do\n\
+             if [ \"$previous\" = --session-id ]; then\n\
+             mkdir -p \"$PI_SHAPED_HOME/sessions/proj\"\n\
+             : > \"$PI_SHAPED_HOME/sessions/proj/2026-10-12T10-00-00-000Z_$argument.jsonl\"\n\
+             fi\n\
+             previous=$argument\n\
+             done ;;\n\
+             esac\n{record}exec sleep 30\n",
+            record = append_launch_record(marker, "printf 'launch\\n'; printf '%s\\n' \"$@\""),
+        ),
+    );
+    script
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_fork_of_a_runtime_assigning_forks_resumes_its_own_conversation_after_a_restart() {
+    let dir = temp_dir("assigned-fork");
+    let home = temp_dir("assigned-fork-home");
+    let marker = dir.join("argv.txt");
+    let script = forking_agent_script(&dir, &marker);
+    let store_path = temp_store_path("assigned-fork");
+    // The profile points the runtime's config home at a test directory, so the
+    // existence check and the agent never touch the host's.
+    let agents_dir = temp_agents_dir_with(
+        "assigned-fork",
+        "pi-home",
+        &format!(
+            "base = \"pi\"\n{}program = \"{}\"\n[env]\n{} = \"{}\"\n",
+            crate::agent::host::fixture::pi_shaped_profile_pin(),
+            script.display(),
+            crate::agent::host::fixture::PI_SHAPED_HOME_ENV,
+            home.display()
+        ),
+    );
+    let registry_at = |store_path: &std::path::Path| {
+        SessionRegistry::new_with_runtimes(
+            SessionRegistryConfig {
+                shell_command: hermetic_shell(),
+                stop_grace: Duration::from_millis(50),
+                store_path: Some(store_path.to_path_buf()),
+                agents_dir: Some(agents_dir.clone()),
+                ..SessionRegistryConfig::default()
+            },
+            crate::agent::host::fixture::pi_shaped_forking_host(
+                &script,
+                crate::agent::host::fixture::PI_SHAPED_FILE_CHECK,
+            ),
+        )
+    };
+    let registry = registry_at(&store_path);
+
+    let created = registry
+        .create(SessionNewParams {
+            agent: "pi-home".to_owned(),
+            cwd: Some(dir.clone()),
+            ..params()
+        })
+        .await
+        .expect("create a hook-less package session");
+    let source = created
+        .native_session_id
+        .clone()
+        .expect("assigned reference");
+    wait_for_file_contains(&marker, &format!("--session-id\n{source}\n")).await;
+    // The source conversation exists once the agent took a turn.
+    write_conversation(&home, &source);
+
+    // Fork: the fork template with the source's reference, then the launch
+    // template with a reference core generated for the fork.
+    let forked = registry
+        .fork(SessionForkParams {
+            session_id: created.id.clone(),
+            name: None,
+            cwd_mode: ForkCwdMode::Same,
+            cols: 80,
+            rows: 24,
+            accept_profile_change: false,
+        })
+        .await
+        .expect("native fork");
+    let fork = forked
+        .native_session_id
+        .clone()
+        .expect("the fork holds a reference of its own at once");
+    assert_ne!(fork, source, "the fork is a conversation of its own");
+    assert!(
+        uuid::Uuid::parse_str(&fork).is_ok(),
+        "core generates a UUID"
+    );
+    assert!(forked.capabilities.resume && forked.capabilities.fork);
+    wait_for_file_contains(&marker, &format!("--session-id\n{fork}\n")).await;
+    assert_eq!(
+        recorded_launch(&marker, 1),
+        ["--fork", source.as_str(), "--session-id", fork.as_str()]
+    );
+    let store = crate::store::Store::new(store_path.clone());
+    assert_assigned_binding_persisted(&store, &forked.id, &fork);
+
+    // Restart: a new registry over the same store recovers the fork from its
+    // persisted binding, into the fork's conversation and not the source's.
+    registry.stop(&forked.id).await.expect("stop the fork");
+    registry.stop(&created.id).await.expect("stop the source");
+    drop(registry);
+    let restarted = registry_at(&store_path);
+    let resumed = restarted
+        .resume_binding(durable_recovery(&store_path, &forked.id))
+        .await
+        .expect("the fork recovers from its own conversation");
+    wait_for_file_contains(&marker, &format!("--session\n{fork}\n")).await;
+    assert_eq!(recorded_launch(&marker, 2), ["--session", fork.as_str()]);
+    assert_eq!(resumed.native_session_id.as_deref(), Some(fork.as_str()));
+    let _ = restarted.stop(&resumed.id).await;
+}
+
 /// A Pi-shaped agent that answers `--version` from `version_file` and records
 /// every other start in `marker`. A start with `--session-id` stays alive until
 /// the returned gate is written; every other start stays alive for the whole

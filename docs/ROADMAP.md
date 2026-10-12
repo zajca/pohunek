@@ -96,7 +96,8 @@ core consumes no plugin data in v1 (#480). Open:
   [#149](https://github.com/zajca/pohunek/issues/149) and package
   documentation [#151](https://github.com/zajca/pohunek/issues/151) — blocked
   by the extractions (and #151 by #148).
-- Follow-ups #487, #493, #546, #547, and the flaky test #597.
+- Follow-ups #487, #493, #547, and the flaky test #597; #546 (resumable Pi
+  forks) is delivered.
 
 Guide: [`knowledge/guides/runtime-packages.md`](knowledge/guides/runtime-packages.md).
 
@@ -119,8 +120,9 @@ official runtime package (#538, guide
 2026-10-11 keeps #50 open for durable-worker, activity/turn-completion,
 security, and external-client acceptance; #52–#54 are not to be implemented as
 the original compiled-runtime chain, and #55 must restate the end-to-end matrix
-against the installed package. Follow-ups: #546 (fork references), #547
-(blocked/overlay screens).
+against the installed package. #546 (resumable forks with an assigned
+reference, Pi package 1.0.1) is delivered; follow-up: #547 (blocked/overlay
+screens).
 
 ### Delegated task runs — [#182](https://github.com/zajca/pohunek/issues/182) (milestone D)
 

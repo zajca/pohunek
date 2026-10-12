@@ -46,6 +46,12 @@ export type PackageRuntimeInfo = {
    */
   fork_args?: Array<string>;
   /**
+   * Arguments core appends after `fork_args` to pass the forked
+   * conversation's own generated reference; `{reference}` marks where that
+   * reference goes. Absent when a fork gets no assigned reference.
+   */
+  fork_launch_args?: Array<string>;
+  /**
    * Whether the first prompt of a session is appended to the launch
    * arguments instead of being typed into the terminal.
    */

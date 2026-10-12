@@ -1,4 +1,4 @@
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 //! Native session reference strategies: how core obtains the reference a
 //! runtime recovers its conversation with.
@@ -119,6 +119,9 @@ pub enum NativeReferenceError {
     /// Strategy `assigned` has no explicit existence declaration.
     #[error("strategy `assigned` requires native_reference.existence")]
     AssignedRequiresExistence,
+    /// `assign_fork = true` was declared next to an unsupported fork.
+    #[error("native_reference.assign_fork requires fork.supported = true")]
+    AssignForkRequiresFork,
     /// A strategy that does not use this field carries it.
     #[error("native_reference.{field} is not accepted by this strategy")]
     UnexpectedField {
@@ -159,16 +162,37 @@ impl ExistenceError {
 pub struct AssignedReference {
     launch_args: NativeArgs,
     existence: ReferenceExistence,
+    /// Whether a fork also gets a generated reference of its own, passed with
+    /// `launch_args` after the fork arguments. Absent in a stored spec means
+    /// no: such a fork holds no reference until a report names one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    assign_fork: bool,
 }
 
 impl AssignedReference {
-    /// Pairs the launch template with the declared existence check.
+    /// Pairs the launch template with the declared existence check; forks get
+    /// no assigned reference.
     #[must_use]
     pub fn new(launch_args: NativeArgs, existence: ReferenceExistence) -> Self {
         Self {
             launch_args,
             existence,
+            assign_fork: false,
         }
+    }
+
+    /// Also assigns every fork a generated reference of its own, for an agent
+    /// that accepts `launch_args` together with its fork arguments.
+    #[must_use]
+    pub fn with_fork_assignment(mut self) -> Self {
+        self.assign_fork = true;
+        self
+    }
+
+    /// Whether a fork gets a generated reference of its own.
+    #[must_use]
+    pub fn assigns_fork(&self) -> bool {
+        self.assign_fork
     }
 
     /// The argv fragment that passes the generated reference at launch.

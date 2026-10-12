@@ -78,6 +78,7 @@ fn fork_argv(binding: &ResumeBinding, id: &str) -> Option<Vec<String>> {
         launch
             .fork_argv(&SessionRef::id(id).expect("id reference"))
             .ok()
+            .map(|fork| fork.argv)
     })
 }
 
