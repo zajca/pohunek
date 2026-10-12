@@ -117,7 +117,8 @@ const client = await connectLocal(socketPath, {
 
 The origin is an atomic pair of bounded safe identifiers. The SDK copies it to
 ordinary calls, subscriptions, waiting `session.input`, waiting
-`session.output`, and `session.wait`, including their dedicated connections. A
+`session.output`, `session.wait`, and `session.wait_turn`, including their
+dedicated connections. A
 partial, unsafe, oversized, or
 conflicting pair is rejected before a control line is written. Omit `origin`
 for ordinary browser or host-side clients that are not running inside a managed
@@ -145,6 +146,50 @@ to resend.
 
 `session_input_timeout` uses the same no-blind-retry posture: delivery may have
 completed, so inspect the current session before deciding whether to resend.
+
+## Turn Waits
+
+`client.sessionWaitTurn(params)` waits for the next `turn_completed`,
+`agent_blocked`, `approval_required`, or `exited` event of up to
+`MAX_SESSION_WAIT_TURN_TARGETS` sessions after an opaque cursor. Pass the
+returned `cursor` as `after` to the next wait so no event is missed between
+calls, and branch on `reason` (`event`, `timeout`, `cursor_reset`,
+`targets_ended`); every result carries per-session `progress`.
+
+```ts
+let after: string | undefined;
+for (;;) {
+  const result = await client.sessionWaitTurn({
+    session_ids: ["s-41", "s-42"],
+    until: ["turn_completed", "agent_blocked", "approval_required", "exited"],
+    ...(after === undefined ? {} : { after }),
+    timeout_ms: 300_000,
+  });
+  after = result.cursor;
+  if (result.reason === "event") {
+    console.log(result.event?.session_id, result.event?.kind);
+  } else if (result.reason === "cursor_reset") {
+    // Events between the old cursor and the reset are lost, not absent:
+    // inspect every target before waiting again with the fresh cursor.
+    for (const progress of result.progress) {
+      console.log(await client.call("session.inspect", progress.session_id));
+    }
+  } else if (result.reason === "targets_ended") {
+    break;
+  }
+}
+```
+
+The call runs on a dedicated connection whose response deadline is
+`timeout_ms` plus fixed headroom, or `MAX_SESSION_WAIT_TURN_MS` plus headroom
+when `timeout_ms` is omitted and the daemon default applies, so the client's
+`requestTimeoutMs` never cuts a valid wait short. Generic typed
+`call("session.wait_turn", ...)` takes the same path. A `timeout_ms` that is not
+a nonzero `u32` fails with `daemon/bad_request` before anything is sent. A
+daemon of the previous protocol version makes the call fail with
+`daemon_protocol_too_old` before it is sent; `host.inspect` reports
+`session_wait_turn_supported` on daemons that serve it. See
+[Turn Waits](../../../docs/public-api.md#turn-waits) for the full contract.
 
 ## Attach
 

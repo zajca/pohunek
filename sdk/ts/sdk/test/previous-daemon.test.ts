@@ -15,6 +15,7 @@ import {
   type SessionOutputParams,
   type SessionScreenParams,
   type SessionWaitParams,
+  type SessionWaitTurnParams,
 } from "@pohunek/sdk";
 import {
   containsKey,
@@ -483,6 +484,44 @@ describe("client against a daemon of the previous release", () => {
       expect(daemon.methods()).toEqual(["daemon.health"]);
       expect(daemon.seen.violations).toEqual([]);
     }
+  });
+
+  test("a turn wait on its dedicated connection fails before it is sent", async () => {
+    const params: SessionWaitTurnParams = { session_ids: ["s-1"], until: ["turn_completed"] };
+    const expected = {
+      host: HOST,
+      method: "session.wait_turn",
+      daemonVersion: PREVIOUS,
+      requiredVersion: PROTOCOL_VERSION,
+    };
+
+    // A cold client learns the version on the dedicated connection's probe.
+    const cold = await startPreviousDaemon();
+    const coldClient = await connect(cold);
+    const coldError = await coldClient.sessionWaitTurn(params).then(
+      () => undefined,
+      (caught: unknown) => caught as ClientError,
+    );
+    expect(coldError?.kind).toBe("daemonProtocolTooOld");
+    expect(coldError?.tooOld).toEqual(expected);
+    expect(cold.methods()).toEqual(["daemon.health"]);
+    expect(cold.seen.violations).toEqual([]);
+
+    // A connection that already selected the previous version sends nothing more,
+    // through the typed helper and the generic typed call alike.
+    const warm = await startPreviousDaemon();
+    const warmClient = await connect(warm);
+    expect(await warmClient.handshake()).toBe(PREVIOUS);
+    for (const call of [
+      () => warmClient.sessionWaitTurn(params),
+      () => warmClient.call("session.wait_turn", params),
+    ]) {
+      const error = await call().then(() => undefined, (caught: unknown) => caught as ClientError);
+      expect(error?.kind).toBe("daemonProtocolTooOld");
+      expect(error?.tooOld).toEqual(expected);
+    }
+    expect(warm.methods()).toEqual(["daemon.health"]);
+    expect(warm.seen.violations).toEqual([]);
   });
 
   test("the typed error names the host, the versions and the upgrade", async () => {

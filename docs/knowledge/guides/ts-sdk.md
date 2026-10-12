@@ -47,6 +47,23 @@ Production relays, and their bind and trust policy, belong to the client that
 hosts them. `@pohunek/sdk` implements only the client side of this contract
 (`WsTransport`).
 
+## Turn waits
+
+`client.sessionWaitTurn(params)` calls `session.wait_turn` on a dedicated
+connection whose deadline follows `timeout_ms` (or `MAX_SESSION_WAIT_TURN_MS`
+when the daemon default applies), so the client's `requestTimeoutMs` never cuts
+a long wait short; generic `call("session.wait_turn", ...)` takes the same
+path. Against a protocol 3 daemon it fails with `daemon_protocol_too_old`
+before sending. The `@pohunek/testkit` fixture daemon serves the method:
+`scenario.recordTurnEvent(sessionId, kind, notificationId?)` records a turn
+signal at once, standing for one the daemon already accepted and debounced,
+`session.stop` records `exited` when the stopped state is committed, the
+`turnWait` start option sets the default, ceiling, and journal size, and
+`activeTurnWaiterCount` lets a test wait until a request is pending. The
+fixture models no attention debounce or `turn_completed` drop rule, no hook
+admission or notification-policy coupling, no waiter-pool limit, and no
+hangup release.
+
 ## Test relay
 
 `startTestRelay` from `@pohunek/testkit/bun-relay` is a real relay over real sockets for

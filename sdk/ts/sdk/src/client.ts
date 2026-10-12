@@ -1,5 +1,6 @@
 import {
   MAX_SESSION_WAIT_MS,
+  MAX_SESSION_WAIT_TURN_MS,
   MAX_WORKER_INSTANCE_ID_BYTES,
   PROTOCOL_VERSION,
   CLIENT_PROTOCOL_VERSIONS,
@@ -19,6 +20,8 @@ import {
   type StateSource,
   type SessionWaitParams,
   type SessionWaitResult,
+  type SessionWaitTurnParams,
+  type SessionWaitTurnResult,
 } from "@pohunek/protocol";
 import { CompatError, downgradeRequestParams, requestIsVersionIndependent, upgradeResult } from "./compat";
 import { ClientError } from "./error";
@@ -35,6 +38,8 @@ const RUN_TOKEN_RANDOM_BYTES = 16;
 // Dedicated calls need response headroom beyond the daemon's overall wire deadline.
 const DEDICATED_REQUEST_HEADROOM_MS = 1_000;
 const MAX_U64 = 18_446_744_073_709_551_615n;
+// `timeout_ms` is a `u32` on the wire.
+const MAX_U32 = 4_294_967_295;
 const UTF8_ENCODER = new TextEncoder();
 const STATE_SOURCES = new Set<StateSource>([
   "osc_title",
@@ -102,6 +107,9 @@ export class Client {
     if (method === "session.input" && isWaitingSessionInput(params)) {
       return this.sessionInput(params);
     }
+    if (method === "session.wait_turn") {
+      return this.sessionWaitTurn(params as SessionWaitTurnParams);
+    }
     return this.callDirect(method, params);
   }
 
@@ -152,6 +160,34 @@ export class Client {
 
   public async sessionWait(params: SessionWaitParams): Promise<SessionWaitResult> {
     return this.callDedicated("session.wait", params, params.timeout_ms);
+  }
+
+  /**
+   * Waits for the next turn event of one or more sessions on a dedicated
+   * connection.
+   *
+   * The connection deadline is `timeout_ms` plus response headroom. When the
+   * request leaves the duration to the daemon default, the client cannot know
+   * that default and bounds the connection by `MAX_SESSION_WAIT_TURN_MS`, the
+   * ceiling no daemon setting may exceed. A `timeout_ms` that is not a nonzero
+   * `u32` is refused before sending, because JSON would turn `NaN` or
+   * `Infinity` into `null`, which the daemon reads as "use the default".
+   * Against a daemon of the previous protocol version the call fails with
+   * `daemon_protocol_too_old` before anything is sent.
+   */
+  public async sessionWaitTurn(params: SessionWaitTurnParams): Promise<SessionWaitTurnResult> {
+    const timeoutMs = params.timeout_ms;
+    if (timeoutMs !== undefined && !isNonzeroU32(timeoutMs)) {
+      throw ClientError.protocol({
+        class: "daemon",
+        code: "bad_request",
+        msg: "timeout_ms must be a nonzero u32 number of milliseconds",
+      });
+    }
+    // A daemon refuses a duration above the protocol ceiling at once, so the
+    // deadline never needs to exceed it.
+    const wireTimeoutMs = Math.min(timeoutMs ?? MAX_SESSION_WAIT_TURN_MS, MAX_SESSION_WAIT_TURN_MS);
+    return this.callDedicated("session.wait_turn", params, wireTimeoutMs);
   }
 
   /**
@@ -379,7 +415,9 @@ export class Client {
     this.selectedVersion = received;
   }
 
-  private async callDedicated<K extends "session.new" | "session.input" | "session.output" | "session.wait">(
+  private async callDedicated<
+    K extends "session.new" | "session.input" | "session.output" | "session.wait" | "session.wait_turn",
+  >(
     method: K,
     params: Methods[K]["params"],
     wireTimeoutMs: number,
@@ -461,6 +499,10 @@ function isWaitingSessionInput(value: unknown): value is SessionInputParams & { 
     && value !== null
     && "wait" in value
     && (value as { wait?: unknown }).wait !== undefined;
+}
+
+function isNonzeroU32(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= MAX_U32;
 }
 
 function validatedInputWaitTimeout(wait: SessionInputWait): number {
