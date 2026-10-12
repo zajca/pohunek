@@ -102,10 +102,10 @@ body:
     id: review-route
     attributes:
       label: Review route
-      description: Name the area. zajca is the maintainer triage, routing, and integration contact; an available independent reviewer examines the area. If none is available, the candidate remains unaccepted and no response-time promise applies. The submitter cannot provide independent approval; an author, executor, or manager cannot satisfy required independent review. Automated review counts only after the exact head and completed run are verified and #700 resolves the reviewer-service defect.
+      description: Name the area. zajca is the maintainer triage, routing, and integration contact; an available independent reviewer examines the code, contract, and evidence for the area. If none is available, the candidate remains unaccepted and no response-time promise applies. The submitter, author, executor, or manager cannot provide independent approval. Automated review counts only under the contributionPolicy in .github/agent-workflow.json (exact head verified, #700 resolved, corrected #700/#802 contract).
     validations:
       required: true
   - type: markdown
     attributes:
       value: |
-        Readiness labels (`readiness:ready`, `readiness:design-needed`, `readiness:blocked`) are a maintainer-managed public projection. `Todo`, `In Progress`, and `Done` are separate delivery statuses. Until the claim service in #805–#811 ships, a maintainer must reconcile active work and explicitly confirm a manual reservation; a label, assignment, or unanswered request is not a grant. Outside contributors do not need private Project access.
+        Readiness labels (`readiness:ready`, `readiness:design-needed`, `readiness:blocked`) are a maintainer-managed public projection. `Todo`, `In Progress`, and `Done` are separate delivery statuses. Until the coordination service in #805–#811 ships, a maintainer must reconcile active work and the principal's outstanding reservations, then explicitly record a manual reservation in public issue evidence; a request, label, assignment, or unanswered comment is not a grant. Outside contributors do not need private Project access.

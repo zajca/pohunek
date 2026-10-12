@@ -39,4 +39,4 @@ Record exact commands and actual outcomes. Use `passed`, `failed`, `skipped` (wi
 - Remaining work, blockers, or unresolved effects:
 - Next permitted action / handoff owner:
 
-Review does not grant merge or release authority. Author, executor, or manager cannot satisfy a required independent review. Follow the issue's public route; private Project access is not required.
+Review does not grant merge or release authority. The submitter, author, executor, or manager cannot satisfy a required independent review. Follow the issue's public route; private Project access is not required.
