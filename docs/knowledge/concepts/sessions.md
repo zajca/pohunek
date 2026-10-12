@@ -641,8 +641,14 @@ Protocol 3 connections never receive `background_state`, and their session
 objects carry no `background` key. The field and the event are current-version
 additions; see the protocol window in `docs/public-api.md`.
 
-Human-readable `pohunek session list` shows the running/recent child count, and
-`pohunek session inspect` includes the corresponding lifecycle rows. Streaming
+Human-readable `pohunek session list` shows the running/recent child count in
+`SUBAGENTS` and the background snapshot's per-kind counts in `BACKGROUND` (for
+example `2a 2s 1m`: agents, shells, monitors; `w` workflows, `t` teammates, `o`
+every other kind). `pohunek session inspect` includes the corresponding
+lifecycle rows, each subagent with the label of the snapshot item of the same
+id and its age, then every other background item with its kind, status,
+program, label and the age since pohunek first saw it (`>=`, because Claude
+reports no start time). `--json` carries the full `background` model. Streaming
 clients accept `subagent_state` only when its runtime id and generation match
 the current session snapshot; a full list or inspect snapshot seeds state after
 reconnect or native recovery.
