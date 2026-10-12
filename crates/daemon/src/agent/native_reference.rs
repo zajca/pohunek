@@ -22,6 +22,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs as std_fs;
+use std::io::Read as _;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
@@ -58,6 +59,22 @@ pub const MAX_EXISTENCE_TEXT_BYTES: usize = 128;
 
 /// Longest reference value an existence check accepts, in bytes.
 const MAX_CHECKED_REFERENCE_BYTES: usize = 128;
+
+/// Most entries `relocating_args` or `relocating_settings` may declare.
+///
+/// An agent has a handful of ways to move its store; the bound keeps a
+/// declaration from making every launch read many files.
+pub const MAX_RELOCATING_ENTRIES: usize = 8;
+
+/// Largest settings file the relocation check reads, in bytes.
+///
+/// Agent settings files are a few KiB. A larger file is not parsed, and the
+/// launch is refused because the check cannot tell whether it moves the store.
+const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
+
+/// UTF-8 byte order mark, which settings files may start with and JSON
+/// parsers reject.
+const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
 
 /// Prefix of environment variables reserved for pohunek itself.
 const RESERVED_ENV_PREFIX: &str = "POHUNEK_";
@@ -285,6 +302,45 @@ pub struct ExistenceSpec {
     /// Directory levels below `dir` the scan descends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_depth: Option<u8>,
+    /// Environment variable that, when the launch sets it, names the
+    /// conversation directory itself in place of the config home and `dir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_env: Option<String>,
+    /// Directory levels below the `store_env` directory the scan descends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_max_depth: Option<u8>,
+    /// Launch arguments with which the agent keeps its conversations in a
+    /// directory of its own choosing; a launch passing one is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relocating_args: Option<Vec<String>>,
+    /// Settings-file keys with which the agent keeps its conversations in a
+    /// directory of its own choosing; unless `store_env` is set, a launch whose
+    /// settings set one is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relocating_settings: Option<Vec<RelocatingSetting>>,
+}
+
+/// A top-level key of a JSON settings file that moves the agent's
+/// conversations out of the declared store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelocatingSetting {
+    /// Directory `path` is relative to.
+    pub base: SettingsBase,
+    /// Relative path of the settings file, plain components only.
+    pub path: String,
+    /// Top-level key that names the other directory.
+    pub key: String,
+}
+
+/// The directory a [`RelocatingSetting`] file is relative to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingsBase {
+    /// The config home (`root_env`, else `root_home` below `HOME`).
+    Root,
+    /// The working directory the agent is launched in.
+    Cwd,
 }
 
 /// A validated file-existence declaration.
@@ -299,6 +355,50 @@ pub struct FileExistence {
     file_name: String,
     name_match: NameMatch,
     max_depth: u8,
+    store: Option<StoreEnv>,
+    relocating_args: Vec<String>,
+    relocating_settings: Vec<RelocatingSetting>,
+}
+
+/// A variable that names the conversation directory, and the scan depth below
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoreEnv {
+    name: String,
+    max_depth: u8,
+}
+
+/// Where one existence scan runs: a canonical directory, the declared
+/// directory below it, and how deep the scan descends below that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoreRoot {
+    root: PathBuf,
+    dir: Option<String>,
+    max_depth: u8,
+}
+
+/// The launch an agent's store location is judged against.
+///
+/// Recovery and a first launch read the same three inputs the agent will see:
+/// its environment, its program arguments (without the reference or the
+/// prompt) and its working directory.
+pub struct LaunchView<'a> {
+    /// Resolves a variable of the launch environment.
+    pub env: &'a dyn Fn(&str) -> Option<OsString>,
+    /// Program arguments of the launch.
+    pub args: &'a [String],
+    /// Working directory of the launch.
+    pub cwd: &'a Path,
+}
+
+impl std::fmt::Debug for LaunchView<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The environment may hold secrets; only the shape is shown.
+        f.debug_struct("LaunchView")
+            .field("args", &self.args.len())
+            .field("cwd", &self.cwd)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TryFrom<ExistenceSpec> for ReferenceExistence {
@@ -314,6 +414,10 @@ impl TryFrom<ExistenceSpec> for ReferenceExistence {
                     ("file_name", spec.file_name.is_some()),
                     ("name_match", spec.name_match.is_some()),
                     ("max_depth", spec.max_depth.is_some()),
+                    ("store_env", spec.store_env.is_some()),
+                    ("store_max_depth", spec.store_max_depth.is_some()),
+                    ("relocating_args", spec.relocating_args.is_some()),
+                    ("relocating_settings", spec.relocating_settings.is_some()),
                 ]
                 .into_iter()
                 .find_map(|(field, present)| present.then_some(field));
@@ -341,6 +445,10 @@ impl From<ReferenceExistence> for ExistenceSpec {
                 file_name: None,
                 name_match: None,
                 max_depth: None,
+                store_env: None,
+                store_max_depth: None,
+                relocating_args: None,
+                relocating_settings: None,
             },
             ReferenceExistence::File(file) => Self {
                 check: ExistenceCheckKind::File,
@@ -350,6 +458,11 @@ impl From<ReferenceExistence> for ExistenceSpec {
                 file_name: Some(file.file_name),
                 name_match: Some(file.name_match),
                 max_depth: Some(file.max_depth),
+                store_max_depth: file.store.as_ref().map(|store| store.max_depth),
+                store_env: file.store.map(|store| store.name),
+                relocating_args: (!file.relocating_args.is_empty()).then_some(file.relocating_args),
+                relocating_settings: (!file.relocating_settings.is_empty())
+                    .then_some(file.relocating_settings),
             },
         }
     }
@@ -382,12 +495,33 @@ impl FileExistence {
         let max_depth = spec
             .max_depth
             .ok_or(ExistenceError::new("max_depth", "is required"))?;
-        if max_depth > MAX_EXISTENCE_DEPTH {
-            return Err(ExistenceError::new(
-                "max_depth",
-                "exceeds the supported scan depth",
-            ));
-        }
+        validate_depth(max_depth, "max_depth")?;
+        let store = match (spec.store_env, spec.store_max_depth) {
+            (Some(name), Some(max_depth)) => {
+                env_name_problem(&name).map_or(Ok(()), |reason| {
+                    Err(ExistenceError::new("store_env", reason))
+                })?;
+                validate_depth(max_depth, "store_max_depth")?;
+                Some(StoreEnv { name, max_depth })
+            }
+            (Some(_), None) => {
+                return Err(ExistenceError::new(
+                    "store_max_depth",
+                    "is required with store_env",
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(ExistenceError::new(
+                    "store_max_depth",
+                    "is accepted only with store_env",
+                ))
+            }
+            (None, None) => None,
+        };
+        let relocating_args = declared_list(spec.relocating_args, "relocating_args")?;
+        validate_relocating_args(&relocating_args)?;
+        let relocating_settings = declared_list(spec.relocating_settings, "relocating_settings")?;
+        validate_relocating_settings(&relocating_settings)?;
         Ok(Self {
             root_env: spec.root_env,
             root_home: spec.root_home,
@@ -395,8 +529,74 @@ impl FileExistence {
             file_name,
             name_match,
             max_depth,
+            store,
+            relocating_args,
+            relocating_settings,
         })
     }
+}
+
+fn validate_depth(depth: u8, field: &'static str) -> Result<(), ExistenceError> {
+    if depth > MAX_EXISTENCE_DEPTH {
+        Err(ExistenceError::new(
+            field,
+            "exceeds the supported scan depth",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// A declared list holds one to [`MAX_RELOCATING_ENTRIES`] entries. An absent
+/// list declares nothing, so an explicit empty one is a mistake.
+fn declared_list<T>(list: Option<Vec<T>>, field: &'static str) -> Result<Vec<T>, ExistenceError> {
+    match list {
+        None => Ok(Vec::new()),
+        Some(list) if list.is_empty() => Err(ExistenceError::new(field, "must not be empty")),
+        Some(list) if list.len() > MAX_RELOCATING_ENTRIES => {
+            Err(ExistenceError::new(field, "has too many entries"))
+        }
+        Some(list) => Ok(list),
+    }
+}
+
+/// Each relocating argument is an option name: a leading `-` and then ASCII
+/// letters, digits and `-`, so it compares against whole argv tokens only.
+fn validate_relocating_args(args: &[String]) -> Result<(), ExistenceError> {
+    let option = |arg: &str| {
+        arg.len() <= MAX_EXISTENCE_TEXT_BYTES
+            && arg.starts_with('-')
+            && arg.len() > 1
+            && arg
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    };
+    if args.iter().all(|arg| option(arg)) {
+        Ok(())
+    } else {
+        Err(ExistenceError::new(
+            "relocating_args",
+            "each entry must be an option name such as --name",
+        ))
+    }
+}
+
+fn validate_relocating_settings(settings: &[RelocatingSetting]) -> Result<(), ExistenceError> {
+    for setting in settings {
+        if !is_plain_relative_path(&setting.path) {
+            return Err(ExistenceError::new(
+                "relocating_settings",
+                "path must be a relative path of plain components",
+            ));
+        }
+        if setting.key.len() > MAX_EXISTENCE_TEXT_BYTES || !is_plain_component(&setting.key) {
+            return Err(ExistenceError::new(
+                "relocating_settings",
+                "key must be a plain name",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Why `name` cannot be a declared environment variable name: upper-case ASCII,
@@ -494,32 +694,169 @@ pub enum ReferenceCheckFailure {
     /// being searched.
     #[error("the declared session store changed during verification")]
     StoreChanged,
+    /// The declared store variable is set to a path that is not absolute.
+    #[error("the session store variable of the launch is not an absolute path")]
+    StoreEnvRelative,
+    /// A launch argument moves the conversations out of the declared store.
+    #[error("a launch argument keeps the agent's sessions outside the declared session store")]
+    RelocatedByArgument,
+    /// A settings file moves the conversations out of the declared store.
+    #[error("the agent's settings keep its sessions outside the declared session store")]
+    RelocatedBySetting,
+    /// A settings file that may move the store cannot be read or parsed.
+    #[error("a settings file that may move the agent's session store cannot be read")]
+    SettingsUnreadable,
 }
 
-impl From<ReferenceCheckFailure> for ProtocolError {
-    fn from(failure: ReferenceCheckFailure) -> Self {
-        Self::new(
-            ErrorClass::Runtime,
-            "agent_native_reference_missing",
-            failure.to_string(),
-            None,
+/// Which operation a store refusal stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalPhase {
+    /// A first launch (`session.new`): nothing was written yet.
+    Launch,
+    /// A resume or fork of a session launched with the declared store.
+    Recovery,
+}
+
+/// Error code of a launch or recovery refused because the agent keeps its
+/// conversations somewhere the declared check cannot resolve.
+const STORE_RELOCATED_CODE: &str = "agent_native_store_relocated";
+
+/// Error code of a recovery refused because the conversation is not found or
+/// cannot be verified.
+const REFERENCE_MISSING_CODE: &str = "agent_native_reference_missing";
+
+impl ReferenceCheckFailure {
+    /// Whether the failure is about where the agent keeps its store rather
+    /// than about the conversation itself.
+    #[must_use]
+    pub fn is_relocation(self) -> bool {
+        matches!(
+            self,
+            Self::StoreEnvRelative
+                | Self::RelocatedByArgument
+                | Self::RelocatedBySetting
+                | Self::SettingsUnreadable
         )
     }
 }
 
+impl From<ReferenceCheckFailure> for ProtocolError {
+    fn from(failure: ReferenceCheckFailure) -> Self {
+        let code = if failure.is_relocation() {
+            STORE_RELOCATED_CODE
+        } else {
+            REFERENCE_MISSING_CODE
+        };
+        Self::new(ErrorClass::Runtime, code, failure.to_string(), None)
+    }
+}
+
 impl ReferenceExistence {
-    /// The canonical store root used to group activity lookups safely.
+    /// The error a launch or recovery refused with `failure` returns, with a
+    /// hint for the step that resolves it.
+    ///
+    /// At a first launch nothing exists yet, so the hint points the declared
+    /// store variable at the directory the agent was told to use. At recovery
+    /// the launch passed this refusal, so something changed since: a setting
+    /// or argument appeared, or the store variable the launch had is gone or
+    /// different. The hint says to undo that change (pointing the variable at
+    /// a new directory would not find the conversation), and a profile edit
+    /// needs `--accept-profile-change`.
+    #[must_use]
+    pub fn refusal(&self, failure: ReferenceCheckFailure, phase: RefusalPhase) -> ProtocolError {
+        let mut error = ProtocolError::from(failure);
+        let Self::File(FileExistence {
+            store: Some(store), ..
+        }) = self
+        else {
+            return error;
+        };
+        let options = self.relocating_args().join(", ");
+        error.recover = match (failure, phase) {
+            (ReferenceCheckFailure::StoreEnvRelative, RefusalPhase::Launch) => {
+                Some(format!("set {} to an absolute path", store.name))
+            }
+            (ReferenceCheckFailure::StoreEnvRelative, RefusalPhase::Recovery) => Some(format!(
+                "set {} back to the absolute path the session was launched with, or remove \
+                 it; a profile edit then needs --accept-profile-change",
+                store.name
+            )),
+            // The argument wins over the variable, so it has to go.
+            (ReferenceCheckFailure::RelocatedByArgument, RefusalPhase::Launch) => Some(format!(
+                "remove {options} from the agent profile args; to keep the sessions in another \
+                 directory, set {} in the profile [env] instead",
+                store.name
+            )),
+            (ReferenceCheckFailure::RelocatedByArgument, RefusalPhase::Recovery) => Some(format!(
+                "remove {options} from the agent profile args; the conversation is still in \
+                 the session store the launch used"
+            )),
+            (ReferenceCheckFailure::RelocatedBySetting, RefusalPhase::Launch) => Some(format!(
+                "set {} in the agent profile [env] to the directory the setting names",
+                store.name
+            )),
+            (ReferenceCheckFailure::RelocatedBySetting, RefusalPhase::Recovery) => Some(format!(
+                "undo what changed since the launch: remove the setting that moves the agent's \
+                 session store, or restore {} to the absolute path the session was launched \
+                 with; a profile edit then needs --accept-profile-change",
+                store.name
+            )),
+            (ReferenceCheckFailure::SettingsUnreadable, RefusalPhase::Launch) => Some(format!(
+                "make the agent's settings files readable JSON, or set {} in the agent \
+                 profile [env] to the directory that holds the sessions",
+                store.name
+            )),
+            (ReferenceCheckFailure::SettingsUnreadable, RefusalPhase::Recovery) => Some(format!(
+                "make the agent's settings files readable JSON again or remove them, or restore \
+                 {} to the absolute path the session was launched with; a profile edit then \
+                 needs --accept-profile-change",
+                store.name
+            )),
+            _ => None,
+        };
+        error
+    }
+
+    /// The declared launch arguments that move the store.
+    fn relocating_args(&self) -> &[String] {
+        match self {
+            Self::Unchecked => &[],
+            Self::File(file) => &file.relocating_args,
+        }
+    }
+
+    /// Refuses a launch whose agent would keep its conversations outside the
+    /// store this check can resolve.
+    ///
+    /// Mirrors the agent's own precedence: a declared relocating argument
+    /// always moves the store; else a set `store_env` names it (and must be
+    /// absolute); else a declared settings key with a value moves it. A
+    /// setting below an unresolvable config home is no evidence and is
+    /// skipped; recovery then fails on the root itself. Blocking filesystem
+    /// I/O: it reads the declared settings files.
     ///
     /// # Errors
     ///
-    /// Returns the same root failure as a single reference lookup.
+    /// Returns the relocation [`ReferenceCheckFailure`] the launch shows.
+    pub fn check_relocation(&self, launch: &LaunchView<'_>) -> Result<(), ReferenceCheckFailure> {
+        match self {
+            Self::Unchecked => Ok(()),
+            Self::File(file) => file.check_relocation(launch),
+        }
+    }
+
+    /// Where activity lookups of this check scan, used to group them safely.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same store failure as a single reference lookup.
     pub(crate) fn activity_store_root(
         &self,
         env: &dyn Fn(&str) -> Option<OsString>,
-    ) -> Result<Option<PathBuf>, ReferenceCheckFailure> {
+    ) -> Result<Option<StoreRoot>, ReferenceCheckFailure> {
         match self {
             Self::Unchecked => Ok(None),
-            Self::File(file) => canonicalize(&file.resolve_root(env)?).map(Some),
+            Self::File(file) => file.resolve_store(env).map(Some),
         }
     }
 
@@ -530,7 +867,7 @@ impl ReferenceExistence {
     /// uses [`Self::verify`] and its typed failure instead.
     pub(crate) fn modified_many_unix_nanos(
         &self,
-        root: &Path,
+        store: &StoreRoot,
         references: &[SessionRef],
     ) -> Vec<Option<i128>> {
         let Self::File(file) = self else {
@@ -551,7 +888,7 @@ impl ReferenceExistence {
         // Each found file was opened and verified independently. An
         // unverifiable candidate leaves only its matching references without
         // activity, including when another file later has the same suffix.
-        let _ = file.scan_store_many(root, &mut wanted, &mut found);
+        let _ = file.scan_store_many(store, &mut wanted, &mut found);
         found
             .into_iter()
             .map(|stat: Option<fs::Stat>| {
@@ -568,7 +905,8 @@ impl ReferenceExistence {
     /// Confirms that the conversation `reference` names still exists.
     ///
     /// `env` resolves environment variables for the launch: the session's
-    /// profile environment first, then the daemon's. Blocking filesystem I/O.
+    /// profile environment first, then the daemon's. A set `store_env` names
+    /// the store; else the config home and `dir` do. Blocking filesystem I/O.
     ///
     /// # Errors
     ///
@@ -613,25 +951,27 @@ impl ReferenceExistence {
 impl FileExistence {
     fn scan_store_many(
         &self,
-        root: &Path,
+        store: &StoreRoot,
         wanted: &mut [Option<String>],
         found: &mut [Option<fs::Stat>],
     ) -> Result<(), ReferenceCheckFailure> {
-        let mut directory = open_root(root)?;
-        for component in self.dir.iter().flat_map(|dir| dir.split('/')) {
+        let mut directory = open_root(&store.root)?;
+        for component in store.dir.iter().flat_map(|dir| dir.split('/')) {
             directory =
                 open_child_directory(&directory, OsStr::new(component)).map_err(|errno| {
                     classify_open_error(errno, ReferenceCheckFailure::RootUnavailable)
                 })?;
         }
         let mut visited = 0_usize;
-        self.scan_directory_many(&directory, 0, wanted, found, &mut visited)
+        let max_depth = store.max_depth;
+        self.scan_directory_many(&directory, 0, max_depth, wanted, found, &mut visited)
     }
 
     fn scan_directory_many(
         &self,
         directory: &OwnedFd,
         depth: u8,
+        max_depth: u8,
         wanted: &mut [Option<String>],
         found: &mut [Option<fs::Stat>],
         visited: &mut usize,
@@ -695,7 +1035,7 @@ impl FileExistence {
                         return Ok(());
                     }
                 }
-                fs::FileType::Directory if depth < self.max_depth => {
+                fs::FileType::Directory if depth < max_depth => {
                     subdirectories.push(name.to_os_string());
                 }
                 _ => {}
@@ -707,7 +1047,7 @@ impl FileExistence {
                 Err(_errno) => continue,
             };
             if let Err(ReferenceCheckFailure::ScanLimit) =
-                self.scan_directory_many(&child, depth + 1, wanted, found, visited)
+                self.scan_directory_many(&child, depth + 1, max_depth, wanted, found, visited)
             {
                 return Err(ReferenceCheckFailure::ScanLimit);
             }
@@ -726,33 +1066,38 @@ impl FileExistence {
         if reference.len() > MAX_CHECKED_REFERENCE_BYTES || !is_plain_component(reference) {
             return Err(ReferenceCheckFailure::InvalidReference);
         }
-        let root = canonicalize(&self.resolve_root(env)?)?;
+        let store = self.resolve_store(env)?;
         let wanted = self.file_name.replace(NAME_PLACEHOLDER, reference);
-        self.scan_store(&root, &wanted, &mut |_directory| {})
+        self.scan_store(&store, &wanted, &mut |_directory| {})
     }
 
-    /// Opens the declared root once and searches it through directory
+    /// Opens the store root once and searches it through directory
     /// descriptors only.
     ///
     /// `before_open` runs after a subdirectory is discovered and before it is
     /// opened; it receives the directory's diagnostic path.
     fn scan_store(
         &self,
-        root: &Path,
+        store: &StoreRoot,
         wanted: &str,
         before_open: &mut dyn FnMut(&Path),
     ) -> Result<fs::Stat, ReferenceCheckFailure> {
-        let mut path = root.to_path_buf();
-        let mut directory = open_root(root)?;
-        for component in self.dir.iter().flat_map(|dir| dir.split('/')) {
+        let mut path = store.root.clone();
+        let mut directory = open_root(&store.root)?;
+        for component in store.dir.iter().flat_map(|dir| dir.split('/')) {
             directory =
                 open_child_directory(&directory, OsStr::new(component)).map_err(|errno| {
                     classify_open_error(errno, ReferenceCheckFailure::RootUnavailable)
                 })?;
             path.push(component);
         }
-        let mut visited = 0_usize;
-        self.scan_directory(&directory, &path, 0, wanted, &mut visited, before_open)
+        let mut scan = Scan {
+            max_depth: store.max_depth,
+            wanted,
+            visited: 0,
+            before_open,
+        };
+        self.scan_directory(&directory, &path, 0, &mut scan)
     }
 
     /// Depth-first search of `directory`. A directory is read through its
@@ -765,9 +1110,7 @@ impl FileExistence {
         directory: &OwnedFd,
         path: &Path,
         depth: u8,
-        wanted: &str,
-        visited: &mut usize,
-        before_open: &mut dyn FnMut(&Path),
+        scan: &mut Scan<'_, '_>,
     ) -> Result<fs::Stat, ReferenceCheckFailure> {
         let entries =
             fs::Dir::read_from(directory).map_err(|_errno| ReferenceCheckFailure::Missing)?;
@@ -778,8 +1121,8 @@ impl FileExistence {
             if name_bytes == b"." || name_bytes == b".." {
                 continue;
             }
-            *visited += 1;
-            if *visited > MAX_EXISTENCE_ENTRIES {
+            scan.visited += 1;
+            if scan.visited > MAX_EXISTENCE_ENTRIES {
                 return Err(ReferenceCheckFailure::ScanLimit);
             }
             let name = OsStr::from_bytes(name_bytes);
@@ -790,7 +1133,7 @@ impl FileExistence {
                 fs::FileType::RegularFile => {
                     if name
                         .to_str()
-                        .is_some_and(|name| self.name_matches(name, wanted))
+                        .is_some_and(|name| self.name_matches(name, scan.wanted))
                     {
                         let file = fs::openat(
                             directory,
@@ -813,7 +1156,7 @@ impl FileExistence {
                         return Ok(opened);
                     }
                 }
-                fs::FileType::Directory if depth < self.max_depth => {
+                fs::FileType::Directory if depth < scan.max_depth => {
                     subdirectories.push(name.to_os_string());
                 }
                 _ => {}
@@ -821,7 +1164,7 @@ impl FileExistence {
         }
         for name in subdirectories {
             let child_path = path.join(&name);
-            before_open(&child_path);
+            (scan.before_open)(&child_path);
             // A directory removed after discovery is simply gone; any other
             // failure (a symlink swapped in, a type change, permissions) is
             // not something the scan may step over.
@@ -830,13 +1173,74 @@ impl FileExistence {
                 Err(rustix::io::Errno::NOENT) => continue,
                 Err(_errno) => return Err(ReferenceCheckFailure::StoreChanged),
             };
-            match self.scan_directory(&child, &child_path, depth + 1, wanted, visited, before_open)
-            {
+            match self.scan_directory(&child, &child_path, depth + 1, scan) {
                 Err(ReferenceCheckFailure::Missing) => {}
                 outcome => return outcome,
             }
         }
         Err(ReferenceCheckFailure::Missing)
+    }
+
+    /// Where the conversations are: the directory a set `store_env` names,
+    /// else `dir` below the config home, as a canonical root.
+    fn resolve_store(
+        &self,
+        env: &dyn Fn(&str) -> Option<OsString>,
+    ) -> Result<StoreRoot, ReferenceCheckFailure> {
+        if let Some(store) = &self.store {
+            if let Some(value) = env(&store.name).filter(|value| !value.is_empty()) {
+                let path = PathBuf::from(value);
+                if !path.is_absolute() {
+                    return Err(ReferenceCheckFailure::StoreEnvRelative);
+                }
+                return Ok(StoreRoot {
+                    root: canonicalize(&path)?,
+                    dir: None,
+                    max_depth: store.max_depth,
+                });
+            }
+        }
+        Ok(StoreRoot {
+            root: canonicalize(&self.resolve_root(env)?)?,
+            dir: self.dir.clone(),
+            max_depth: self.max_depth,
+        })
+    }
+
+    fn check_relocation(&self, launch: &LaunchView<'_>) -> Result<(), ReferenceCheckFailure> {
+        let relocating_arg = launch.args.iter().any(|arg| {
+            self.relocating_args.iter().any(|option| {
+                arg == option
+                    || arg
+                        .strip_prefix(option.as_str())
+                        .is_some_and(|rest| rest.starts_with('='))
+            })
+        });
+        if relocating_arg {
+            return Err(ReferenceCheckFailure::RelocatedByArgument);
+        }
+        if let Some(store) = &self.store {
+            if let Some(value) = (launch.env)(&store.name).filter(|value| !value.is_empty()) {
+                return if Path::new(&value).is_absolute() {
+                    Ok(())
+                } else {
+                    Err(ReferenceCheckFailure::StoreEnvRelative)
+                };
+            }
+        }
+        for setting in &self.relocating_settings {
+            let base = match setting.base {
+                SettingsBase::Root => match self.resolve_root(launch.env) {
+                    Ok(root) => root,
+                    Err(_unresolved) => continue,
+                },
+                SettingsBase::Cwd => launch.cwd.to_path_buf(),
+            };
+            if sets_key(&base.join(&setting.path), &setting.key)? {
+                return Err(ReferenceCheckFailure::RelocatedBySetting);
+            }
+        }
+        Ok(())
     }
 
     /// The config home: the declared variable when it is set to an absolute
@@ -876,6 +1280,60 @@ impl FileExistence {
             NameMatch::EndsWith => name.ends_with(wanted),
         }
     }
+}
+
+/// One depth-first search for a single file name.
+struct Scan<'w, 'f> {
+    max_depth: u8,
+    wanted: &'w str,
+    visited: usize,
+    before_open: &'f mut dyn FnMut(&Path),
+}
+
+/// Whether the JSON settings file at `path` gives the top-level `key` a value
+/// the agent acts on: anything but `null`, `false`, `0` and `""`, the values a
+/// JavaScript truthiness test skips. An absent file sets nothing.
+///
+/// The file is opened following symlinks, as the agent reads it, but without
+/// blocking and without adopting a terminal: a settings path in the working
+/// directory is repository content, and a FIFO or device there must not hold
+/// the launch. Anything but a
+/// regular file is unreadable. The read is bounded and never writes.
+fn sets_key(path: &Path, key: &str) -> Result<bool, ReferenceCheckFailure> {
+    let descriptor = match fs::open(
+        path,
+        fs::OFlags::RDONLY | fs::OFlags::NONBLOCK | fs::OFlags::NOCTTY | fs::OFlags::CLOEXEC,
+        fs::Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(rustix::io::Errno::NOENT) => return Ok(false),
+        Err(_errno) => return Err(ReferenceCheckFailure::SettingsUnreadable),
+    };
+    let regular = fs::fstat(&descriptor)
+        .is_ok_and(|stat| fs::FileType::from_raw_mode(stat.st_mode) == fs::FileType::RegularFile);
+    if !regular {
+        return Err(ReferenceCheckFailure::SettingsUnreadable);
+    }
+    let file = std_fs::File::from(descriptor);
+    let mut bytes = Vec::new();
+    file.take(MAX_SETTINGS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_error| ReferenceCheckFailure::SettingsUnreadable)?;
+    if u64::try_from(bytes.len()).map_or(true, |len| len > MAX_SETTINGS_BYTES) {
+        return Err(ReferenceCheckFailure::SettingsUnreadable);
+    }
+    let text = bytes.strip_prefix(UTF8_BOM).unwrap_or(&bytes);
+    if text.is_empty() {
+        return Ok(false);
+    }
+    let settings: serde_json::Value =
+        serde_json::from_slice(text).map_err(|_error| ReferenceCheckFailure::SettingsUnreadable)?;
+    Ok(match settings.get(key) {
+        None | Some(serde_json::Value::Null | serde_json::Value::Bool(false)) => false,
+        Some(serde_json::Value::String(value)) => !value.is_empty(),
+        Some(serde_json::Value::Number(number)) => number.as_f64() != Some(0.0),
+        Some(_) => true,
+    })
 }
 
 /// Opens the canonical store root as a directory descriptor.
@@ -939,6 +1397,19 @@ mod tests {
             file_name: None,
             name_match: None,
             max_depth: None,
+            store_env: None,
+            store_max_depth: None,
+            relocating_args: None,
+            relocating_settings: None,
+        }
+    }
+
+    /// The default store of `check` below the canonical `root`.
+    fn default_store(check: &FileExistence, root: PathBuf) -> StoreRoot {
+        StoreRoot {
+            root,
+            dir: check.dir.clone(),
+            max_depth: check.max_depth,
         }
     }
 
@@ -1334,13 +1805,17 @@ mod tests {
         let root = fs::canonicalize(&store.root).expect("canonical root");
         let target = outside.path().to_path_buf();
         let mut swapped = false;
-        let outcome = check.scan_store(&root, "_abc.jsonl", &mut |directory| {
-            // The scan has typed `proj` as a directory and is about to open
-            // it: replace it with a link to a directory that holds a match.
-            fs::remove_dir_all(directory).expect("remove discovered directory");
-            std::os::unix::fs::symlink(&target, directory).expect("swap in a symlink");
-            swapped = true;
-        });
+        let outcome = check.scan_store(
+            &default_store(&check, root),
+            "_abc.jsonl",
+            &mut |directory| {
+                // The scan has typed `proj` as a directory and is about to open
+                // it: replace it with a link to a directory that holds a match.
+                fs::remove_dir_all(directory).expect("remove discovered directory");
+                std::os::unix::fs::symlink(&target, directory).expect("swap in a symlink");
+                swapped = true;
+            },
+        );
         assert!(swapped, "the hook ran between discovery and traversal");
         assert!(
             matches!(outcome, Err(ReferenceCheckFailure::StoreChanged)),
@@ -1359,7 +1834,9 @@ mod tests {
             panic!("a file check");
         };
         let root = fs::canonicalize(root).expect("canonical root");
-        check.scan_store(&root, wanted, hook).map(|_| ())
+        check
+            .scan_store(&default_store(&check, root), wanted, hook)
+            .map(|_| ())
     }
 
     #[test]

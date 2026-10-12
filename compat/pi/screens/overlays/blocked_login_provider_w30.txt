@@ -1,0 +1,24 @@
+
+[Extensions]
+  dialogs.ts
+
+
+──────────────────────────────
+
+ Select provider to config...
+
+>
+
+ → Anthropic • not configured
+   GitHub Copilot • not co...
+   Kimi For Coding • not c...
+   Meta • not configured
+   OpenAI • not configured
+   OpenAI Codex (legacy) •...
+   OpenRouter • not config...
+   Radius • not configured
+   (1/9)
+
+──────────────────────────────
+~/work
+0.0%/128k (auto)    stub-model

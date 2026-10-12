@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Builds and checks the frame regexes of runtime-packages/pi/detect.toml.
 
-  pi-detect-regex            print the working and idle regexes (TOML-ready)
+  pi-detect-regex            print the frame regexes (TOML-ready)
   pi-detect-regex --verify   prove, over every short string, that the body
-                             class is the exact complement of the border class
+                             class is the exact complement of the border class,
+                             and that every dialog and overlay line is a body line
 
 A border is a busy border ("── " and a braille spinner, any width) or a plain
 border (PURE or more rules, or a scroll marker between runs of MARK or more).
@@ -12,6 +13,16 @@ empty line. Because footer lines are never borders, the lower border of the
 frame is the last border on the screen and the upper border the nearest one
 above it, so the working rule (busy upper border) and the idle rule (plain
 upper border) can never both match.
+
+Dialogs and overlays take the editor's place between two plain borders, so
+their frame looks like the idle editor. A DIALOG frame (blocked) holds the key
+hint or title of a Pi prompt that waits for an answer; hint words may wrap onto
+padded continuation lines, so words are joined by SEP. An OVERLAY frame holds
+the two lines a Pi selector list draws: the selection cursor row and a row
+indented by two spaces (another item, a counter or the selected item's
+details); the idle rule excludes it. A draft rarely holds both, and a draft
+line that starts with ">" (a quote) holds neither. Every hint and selector line
+starts with a character that never starts a border, so both stay body lines.
 """
 import itertools
 import re
@@ -45,12 +56,75 @@ def build(pure, mark):
     return dict(busy=busy, plain=plain, body=body, foot=foot)
 
 
+# Between two words of a key hint: the spaces Pi writes, or a wrap onto the
+# next line, which Pi pads with one space (two where it wraps at a double space).
+SEP = r'(?: +|\n +)'
+# A key name; the user's keybindings choose it.
+KEY = r'\S+'
+
+
+def words(*tokens):
+    return SEP.join(tokens)
+
+
+# Lines of the Pi 1.0.2 prompts that wait for an answer, each starting at its
+# line start and ending its line. Key hints:
+#   select:   ExtensionSelectorComponent (extension select and confirm, project
+#             trust, missing session cwd, login method) and the /trust selector
+#   input:    ExtensionInputComponent
+#   editor:   ExtensionEditorComponent
+#   login:    LoginDialogComponent (API key, browser and pasted-code login)
+# and the title of the login provider list, which Pi truncates with "...":
+#   provider: OAuthSelectorComponent (/login and /logout)
+DIALOG_LINES = {
+    'select': ' ' + words('↑↓', 'navigate', KEY, '(?:select|save)', KEY, 'cancel'),
+    'input': ' ' + words(KEY, 'submit', KEY, 'cancel'),
+    'editor': ' ' + words(KEY, 'submit', KEY, 'newline', KEY, 'cancel', KEY,
+                          'external', 'editor'),
+    'login': r' \(' + words(KEY, 'to', r'(?:cancel\)|cancel,' + SEP
+                             + words(KEY, 'to', r'submit\)') + ')'),
+    'provider': r' Select provider(?: to (?:configure|logout):|[^\n]*\.\.\.)',
+}
+
+# The selection cursor row of a Pi selector list ("→ " at column zero or padded
+# by one, "› "), and the row indented by exactly two spaces that every selector
+# also draws in the same body: an unselected item, the "(n/m)" counter or the
+# selected item's details ("  Model Name: ...", "  Message 1 of 1").
+CURSOR = r'(?: ?→ |› )[^\n]*'
+INDENTED = r'  [^ \n][^\n]*'
+
+
+
 def frames(pure=PURE, mark=MARK):
     p = build(pure, mark)
     def frame(upper):
         return (f"(?m)^{upper}\\n(?:{p['body']}\\n)*{p['plain']}"
                 f"(?:\\n{p['foot']}){{1,4}}\\z")
     return frame(p['busy']), frame(p['plain'])
+
+
+def holding(lines, footer, top):
+    """A frame whose body holds `lines` at a line start, below a plain upper
+    border or, when `top` is set, below the screen's first line."""
+    p = build(PURE, MARK)
+    upper = f"(?:\\A|^{p['plain']}\\n)" if top else f"^{p['plain']}\\n"
+    return (f"(?m){upper}(?:{p['body']}\\n)*(?:{lines})\\n"
+            f"(?:{p['body']}\\n)*{p['plain']}(?:\\n{p['foot']}){footer}\\z")
+
+
+def dialog():
+    """Blocked: a prompt's line in the frame, with or without the footer
+    (startup prompts draw none). A prompt taller than the terminal pushes its
+    upper border off the screen, so the frame may start at the first line."""
+    return holding('|'.join(DIALOG_LINES.values()), '{0,4}', True)
+
+
+def overlay():
+    """Withholds idle: a selector's cursor row and an indented row, in either
+    order, in the editor frame."""
+    p = build(PURE, MARK)
+    gap = f"\\n(?:{p['body']}\\n)*"
+    return holding(f'{CURSOR}{gap}{INDENTED}|{INDENTED}{gap}{CURSOR}', '{1,4}', False)
 
 
 def verify(pure, mark, maxlen):
@@ -71,11 +145,59 @@ def verify(pure, mark, maxlen):
     print(f'ok pure={pure} mark={mark}: {count} strings')
 
 
+def verify_lines():
+    """Every dialog line and selector line matches the screens Pi draws,
+    wrapped as Pi wraps them, and each of their lines is a body line."""
+    p = build(PURE, MARK)
+    body = re.compile(p['body'])
+    drawn = {
+        'select': [' ↑↓ navigate  enter select  escape/ctrl+c cancel',
+                   ' ↑↓ navigate  enter\n  select\n escape/ctrl+c\n cancel',
+                   ' ↑↓ navigate  enter save  esc cancel'],
+        'input': [' enter submit  escape/ctrl+c cancel',
+                  ' enter submit\n escape/ctrl+c\n cancel'],
+        'editor': [' enter submit  shift+enter/ctrl+j newline  escape/ctrl+c cancel'
+                   '  ctrl+g external editor',
+                   ' enter submit\n shift+enter/ctrl+j\n newline  escape/ctrl+c\n'
+                   '  cancel  ctrl+g\n external editor'],
+        'login': [' (escape/ctrl+c to cancel, enter to submit)',
+                  ' (escape/ctrl+c to cancel)',
+                  ' (escape/ctrl+c to\n cancel, enter to\n submit)'],
+        'provider': [' Select provider to configure:', ' Select provider to logout:',
+                     ' Select provider...', ' Select provider to co...'],
+    }
+    count = 0
+    for name, samples in drawn.items():
+        for sample in samples:
+            if not re.fullmatch(DIALOG_LINES[name], sample):
+                sys.exit(f'{name} does not match {sample!r}')
+            for line in sample.split('\n'):
+                if not body.fullmatch(line):
+                    sys.exit(f'{name} line is not a body line: {line!r}')
+            count += 1
+    for pattern, lines in [
+        (CURSOR, ['→ ✓ stub-model [stub]', ' → Yes', '› first question']),
+        (INDENTED, ['  Model Name: stub-model', '  (3/3)', '  Message 1 of 1']),
+    ]:
+        for line in lines:
+            if not re.fullmatch(pattern, line) or not body.fullmatch(line):
+                sys.exit(f'selector line is not matched as a body line: {line!r}')
+            count += 1
+    for line in ['>', '> quoted', '   No', ' indented once', '→next']:
+        if re.fullmatch(CURSOR, line) or re.fullmatch(INDENTED, line):
+            sys.exit(f'draft line is read as a selector line: {line!r}')
+        count += 1
+    print(f'ok dialog and overlay lines: {count} samples')
+
+
 if __name__ == '__main__':
     if '--verify' in sys.argv:
         verify(5, 3, 9)
         verify(6, 4, 9)
+        verify_lines()
     else:
         working, idle = frames()
         print(f"working_rule regex = ['{working}']")
+        print(f"dialog_rule regex = ['{dialog()}']")
         print(f"idle_editor_rule regex = ['{idle}']")
+        print(f"idle_editor_rule not.regex = ['{overlay()}']")

@@ -4,10 +4,11 @@
 //! and footer from pieces of the screens captured from a real Pi
 //! (`compat/pi/screens/`), mixed with hostile text, and checks each rule on its
 //! own through the real manifest matcher: the working rule and the idle rule
-//! never both match, the classification follows the upper border and nothing
-//! else, and a busy upper border is never read as idle.
+//! never both match, the dialog rule never matches an editor frame, the
+//! classification follows the upper border and nothing else, and a busy upper
+//! border is never read as idle.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 #![cfg(unix)]
 
@@ -35,10 +36,10 @@ fn detect_toml() -> String {
         .expect("read the Pi manifest")
 }
 
-/// The manifest with all rules, with only the working rule, and with only the
-/// idle rule.
+/// The manifest with all rules, and with each frame rule alone.
 struct Manifests {
     full: Manifest,
+    dialog: Manifest,
     working: Manifest,
     idle: Manifest,
 }
@@ -46,14 +47,23 @@ struct Manifests {
 fn manifests() -> Manifests {
     let text = detect_toml();
     let parts: Vec<&str> = text.split("[[rules]]").collect();
-    assert_eq!(parts.len(), 3, "the manifest declares the two frame rules");
-    let only = |rule: &str| {
+    assert_eq!(
+        parts.len(),
+        4,
+        "the manifest declares the three frame rules"
+    );
+    let only = |id: &str| {
+        let rule = parts[1..]
+            .iter()
+            .find(|rule| rule.contains(&format!("id = \"{id}\"")))
+            .unwrap_or_else(|| panic!("the manifest declares {id}"));
         Manifest::parse_str(&format!("{}[[rules]]{rule}", parts[0])).expect("single-rule manifest")
     };
     Manifests {
         full: Manifest::parse_str(&text).expect("the manifest parses"),
-        working: only(parts[1]),
-        idle: only(parts[2]),
+        dialog: only("dialog_rule"),
+        working: only("working_rule"),
+        idle: only("idle_editor_rule"),
     }
 }
 
@@ -392,6 +402,11 @@ fn the_frame_rules_are_mutually_exclusive_and_follow_the_upper_border() {
         assert!(
             working.is_none() || idle.is_none(),
             "both rules match {context}"
+        );
+        assert_eq!(
+            read(&manifests.dialog, &screen.lines),
+            None,
+            "an editor frame read as a dialog {context}"
         );
         assert_eq!(
             working.or(idle),

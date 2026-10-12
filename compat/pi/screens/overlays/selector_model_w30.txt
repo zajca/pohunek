@@ -1,0 +1,24 @@
+  dialogs.ts
+
+
+──────────────────────────────
+
+Only showing models from
+configured providers. Use
+/login to add providers.
+
+>
+
+→ ✓ stub-model [stub] ·
+default
+
+  Model Name: stub-model
+
+  Model catalogs refreshed.
+
+  Enter to select · Ctrl+S to
+set as default · Escape/Ctrl+C
+to cancel
+──────────────────────────────
+~/work
+0.0%/128k (auto)    stub-model

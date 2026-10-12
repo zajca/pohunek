@@ -1,0 +1,24 @@
+
+ %3Aprofile+user%3Ainference+
+ user%3Asessions%3Aclaude_cod
+ e+user%3Amcp_servers+user%3A
+ file_upload&code_challenge=a
+ rahmRKHx8Wiv6It6ZaRLoVNDAd3K
+ MX1NviAA4pnL38&code_challeng
+ e_method=S256&state=XZD9TS0k
+ 7Dsm40lah43w4jbba5b4OdlCCzjx
+ ViHmQNQ
+ Ctrl+click to open • ctrl+x
+ to copy
+
+ Complete login in your
+ browser. If the browser is
+ on another machine, paste
+ the final redirect URL here.
+
+ Complete login in your
+ browser, or paste the
+ authorization code /
+ redirect URL here:
+>
+~/work

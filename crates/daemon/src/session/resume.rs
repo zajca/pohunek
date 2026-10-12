@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use crate::agent::host::{ProfileRevision, RuntimeDefinition};
 use crate::agent::{
-    InputRules, LaunchEnv, NativeReferenceProvenance, ReferenceExistence, ResolvedAgent,
+    InputRules, LaunchEnv, LaunchView, NativeReferenceProvenance, ReferenceExistence,
+    ResolvedAgent, StoreRoot,
 };
 use crate::detect::Manifest;
 use crate::runtime::environment::{base_environment, effective_variable};
@@ -148,7 +149,7 @@ pub(super) struct RelaunchPlan {
 
 struct ActivityGroup {
     existence: ReferenceExistence,
-    root: PathBuf,
+    store: StoreRoot,
     references: Vec<(usize, SessionRef)>,
 }
 
@@ -267,18 +268,18 @@ impl SessionRegistry {
                 let resolve = |name: &str| {
                     effective_variable(&base_environment, profile_env.as_slice(), name)
                 };
-                let Ok(Some(root)) = existence.activity_store_root(&resolve) else {
+                let Ok(Some(store)) = existence.activity_store_root(&resolve) else {
                     continue;
                 };
                 if let Some(group) = groups
                     .iter_mut()
-                    .find(|group| group.existence == existence && group.root == root)
+                    .find(|group| group.existence == existence && group.store == store)
                 {
                     group.references.push((index, reference));
                 } else {
                     groups.push(ActivityGroup {
                         existence,
-                        root,
+                        store,
                         references: vec![(index, reference)],
                     });
                 }
@@ -293,7 +294,7 @@ impl SessionRegistry {
                 for ((index, _), nanos) in group.references.into_iter().zip(
                     group
                         .existence
-                        .modified_many_unix_nanos(&group.root, &references),
+                        .modified_many_unix_nanos(&group.store, &references),
                 ) {
                     modified[index] = nanos;
                 }
@@ -399,7 +400,8 @@ impl SessionRegistry {
     /// launches an agent into a conversation it cannot confirm nor falls back
     /// to the older verified target,
     /// `agent_native_reference_missing` when a required conversation file is
-    /// absent or cannot be verified,
+    /// absent or cannot be verified, `agent_native_store_relocated` when the
+    /// agent would keep its conversations outside the declared store,
     /// `agent_profile_changed` or `agent_profile_missing`
     /// when the profile no longer matches the session, or any worker launch
     /// error from recovery.
@@ -744,7 +746,8 @@ impl SessionRegistry {
     /// newer conversation switch the daemon cannot verify, so no fork child
     /// launches from a source whose target the daemon cannot confirm,
     /// `agent_native_reference_missing` when the source's conversation file is
-    /// absent or cannot be verified,
+    /// absent or cannot be verified, `agent_native_store_relocated` when the
+    /// agent would keep its conversations outside the declared store,
     /// and otherwise the source lookup, launch-template, or launch error.
     pub async fn fork(&self, params: SessionForkParams) -> Result<SessionInfo, ProtocolError> {
         self.ensure_migration_settled()?;
@@ -887,7 +890,7 @@ impl SessionRegistry {
     }
 
     /// The base environment a launch of this registry hands to the agent.
-    fn launch_base_environment(&self) -> Result<BaseEnv, ProtocolError> {
+    pub(super) fn launch_base_environment(&self) -> Result<BaseEnv, ProtocolError> {
         let lifecycle = self.lifecycle()?;
         base_environment(
             &lifecycle.config.environment_allowlist,
@@ -1297,14 +1300,19 @@ impl SessionRegistry {
 /// hook runtime's id-kind reference verifies against the
 /// `[native_reference.existence]` check its runtime descriptor declares; a hook
 /// runtime that leaves the check undeclared pointed the reference there itself.
-/// The check reads its config-home variable and `HOME` from the environment the
-/// agent is launched with (the filtered base environment, then the profile
-/// environment), and runs off the async runtime because it lists directories.
+/// The check reads its variables and `HOME` from the environment the agent is
+/// launched with (the filtered base environment, then the profile
+/// environment), first refuses a relaunch whose arguments, store variable or
+/// settings move the store out of reach (with the binding's arguments and
+/// working directory), and runs off the async runtime because it reads files
+/// and lists directories.
 ///
 /// # Errors
 ///
-/// Returns `agent_native_reference_missing` when the conversation is not found
-/// or cannot be verified; the caller must not launch anything.
+/// Returns `agent_native_store_relocated` when the agent would keep its
+/// conversations elsewhere, and `agent_native_reference_missing` when the
+/// conversation is not found or cannot be verified; the caller must not launch
+/// anything.
 async fn verify_recovery_reference(
     binding: &ResumeBinding,
     relaunch: &RelaunchPlan,
@@ -1317,20 +1325,39 @@ async fn verify_recovery_reference(
     let session_ref = relaunch.session_ref.clone();
     let profile_env = relaunch.profile.env.clone();
     let base_environment = relaunch.base_environment.clone();
+    let args = binding.args.clone();
+    let cwd = binding.cwd.clone();
+    let checked = existence.clone();
     let verdict = tokio::task::spawn_blocking(move || {
         let lookup =
             |name: &str| effective_variable(&base_environment, profile_env.as_slice(), name);
-        existence.verify(&session_ref, &lookup)
+        checked.check_relocation(&LaunchView {
+            env: &lookup,
+            args: &args,
+            cwd: &cwd,
+        })?;
+        checked.verify(&session_ref, &lookup)
     })
     .await
-    .map_err(|error| runtime_error("agent_native_reference_missing", error.to_string()))?;
+    .map_err(|_join_error| {
+        // Covers the whole check: the store refusal and the existence scan.
+        ProtocolError::new(
+            ErrorClass::Daemon,
+            "native_store_check_task_panicked",
+            format!(
+                "the native reference check of session {} panicked; nothing was launched",
+                binding.session_id
+            ),
+            None,
+        )
+    })?;
     verdict.map_err(|failure| {
         warn!(
             session_id = %binding.session_id,
             failure = %failure,
             "native reference is not recoverable"
         );
-        ProtocolError::from(failure)
+        existence.refusal(failure, crate::agent::RefusalPhase::Recovery)
     })
 }
 

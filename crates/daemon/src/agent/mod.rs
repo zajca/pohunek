@@ -23,12 +23,14 @@ pub use launch_env::LaunchEnv;
 pub use native_launch::{
     ForkArgv, NativeArg, NativeArgs, NativeLaunchError, NativeSessionLaunch, REFERENCE_PLACEHOLDER,
 };
+pub(crate) use native_reference::StoreRoot;
 pub(crate) use native_reference::{env_name_problem, is_plain_relative_path};
 pub use native_reference::{
     generate_assigned_reference, AssignedReference, ExistenceCheckKind, ExistenceError,
-    ExistenceSpec, FileExistence, NameMatch, NativeReferenceError, NativeReferenceProvenance,
-    NativeReferenceStrategy, ReferenceCheckFailure, ReferenceExistence, MAX_EXISTENCE_DEPTH,
-    MAX_EXISTENCE_ENTRIES, MAX_EXISTENCE_PATH_COMPONENTS, MAX_EXISTENCE_TEXT_BYTES,
+    ExistenceSpec, FileExistence, LaunchView, NameMatch, NativeReferenceError,
+    NativeReferenceProvenance, NativeReferenceStrategy, ReferenceCheckFailure, ReferenceExistence,
+    RefusalPhase, RelocatingSetting, SettingsBase, MAX_EXISTENCE_DEPTH, MAX_EXISTENCE_ENTRIES,
+    MAX_EXISTENCE_PATH_COMPONENTS, MAX_EXISTENCE_TEXT_BYTES, MAX_RELOCATING_ENTRIES,
 };
 #[cfg(test)]
 pub(crate) use profile::MAX_PROFILE_BYTES;

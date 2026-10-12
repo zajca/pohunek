@@ -2,7 +2,7 @@
 type: Guide
 id: guide/pi-package
 title: Pi runtime package
-description: Install and operate the official Pi coding agent runtime package (Pi 1.0.x), including what was verified against a real Pi, how resume and fork work, and what fails closed.
+description: Install and operate the official Pi coding agent runtime package (Pi 1.0.x), including what was verified against a real Pi, how detection reads dialogs and selectors, how resume and fork work, where sessions may live, and what fails closed.
 source_kind: manual
 intents: [setup, update, debug, help]
 ---
@@ -60,30 +60,95 @@ reserved, so either way of installing serves it.
   named `*_<id>.jsonl` in a project directory below
   `$PI_CODING_AGENT_DIR/sessions/` (default `~/.pi/agent/sessions/`). Pi writes
   `sessions/--<cwd with / as ->--/<ISO time with : and . as ->_<id>.jsonl`, and
-  only after the first model reply.
-- Detection: both rules read the editor frame anchored at the bottom of the
-  screen: an upper border, the draft, a plain lower border, then one to four
+  only after the first model reply. When the launch environment sets
+  `PI_CODING_AGENT_SESSION_DIR` (from the profile `[env]` or the daemon's
+  forwarded environment), Pi keeps the files directly in that directory and the
+  check looks there instead; the value must be an absolute path.
+- Session-dir overrides: Pi picks its session directory as `--session-dir`,
+  else `PI_CODING_AGENT_SESSION_DIR`, else the `sessionDir` setting of
+  `$PI_CODING_AGENT_DIR/settings.json` or the project's `.pi/settings.json`.
+  The daemon follows the variable, and refuses a launch it could not recover
+  from with `agent_native_store_relocated` before any worker starts: a profile
+  whose `args` pass `--session-dir`, a relative variable, or (while the
+  variable is unset) a `sessionDir` set in either settings file, or a settings
+  path that is not a readable JSON file (a FIFO or a directory there is
+  refused without waiting on it). At launch the hint names
+  `PI_CODING_AGENT_SESSION_DIR`: setting it in the profile `[env]` to the
+  directory the setting names satisfies both Pi and the check, because Pi
+  follows the variable over the setting; the flag wins over the variable, so
+  its hint says to remove it. Resume and fork run the same refusal against the
+  session's arguments and working directory first. The launch passed that
+  refusal, so a refusal there means something changed since: a `sessionDir`
+  setting appeared, or the variable the launch had is gone (a daemon restarted
+  without forwarding it, or a profile edit accepted with
+  `--accept-profile-change`) and an older setting now wins. The hint says to
+  undo the change: remove the setting (or make an unreadable settings file
+  readable JSON), or restore `PI_CODING_AGENT_SESSION_DIR` to the absolute
+  path the session was launched with; an edited profile then needs
+  `--accept-profile-change`. Pointing the variable at a new directory would
+  not find the conversation.
+- Detection: every rule reads the editor frame anchored at the bottom of the
+  screen: an upper border, a body, a plain lower border, then one to four
   footer lines. A busy Pi writes `── `, a braille spinner and its message
   (`Working`, `Compacting context...`, `Auto-compacting...`, `Retrying (n/m) in
   Ns...`) into the upper border, cut to the terminal width, so its closing rule
   can be a single `─`; the `── <spinner>` start alone marks a busy border at any
   width, and it means `working`. A plain upper border (a rule of 20 or more `─`,
-  or a `↑ N more` / `↓ N more` marker between runs of four or more) means
-  `idle`. Terminals narrower than 20 columns are never read as idle. Body and footer lines
-  are never borders, so the lower border is the last border on the screen and the
-  working and idle rules cannot both match; `scripts/pi-detect-regex` generates
-  and checks the patterns. Draft and
-  transcript text never decides: a rule above the editor cannot stand in for the
-  upper border, a line that starts with `─` is text, and a draft line that
-  starts `── <spinner>` or is itself a complete plain border cannot be told from
-  the frame. The idle, busy, compaction, retry, scrolled-draft and
+  or a `↑ N more` / `↓ N more` marker between runs of four or more) around the
+  draft means `idle`. Terminals narrower than 20 columns are never read as idle.
+  Body and footer lines are never borders, so the lower border is the last
+  border on the screen and the working and idle rules cannot both match;
+  `scripts/pi-detect-regex` generates and checks the patterns.
+- Dialogs and selectors: Pi draws them in place of the editor, between plain
+  borders and without the busy border even while a turn waits on them, so the
+  body decides. `blocked` (priority above `working`) is a body that holds the
+  key hint or title of a prompt waiting for an answer, whoever opened it:
+  - an extension's select, confirm, input or editor dialog, also when a
+    permission check raises it mid-turn;
+  - Pi's own confirms drawn the same way: the project trust prompt at startup,
+    the missing session cwd prompt, "Summarize branch?" in `/tree` and "Import
+    session";
+  - the `/trust` selector;
+  - every login step (method, provider list, API key, browser or pasted-code
+    login).
+
+  The owner-opened ones (`/trust`, `/login`, `/tree`'s summary question,
+  import) read `blocked` and notify too: each holds the session on a question,
+  and their screens cannot be told from an extension's dialog. Hint words may
+  wrap onto padded continuation lines, the startup prompts draw no footer, and
+  a prompt taller than the terminal may push its upper border off the screen;
+  all three still read `blocked`. A prompt so tall that Pi clips its bottom
+  rows loses its lower border, and in some cases its key hint; it shows no
+  frame and matches no rule. A body that holds the two rows a selector list draws (a cursor row
+  starting `→ `, ` → ` or `› `, and a row indented by exactly two spaces: another
+  item, the `(n/m)` counter or the selected item's details) withholds `idle`,
+  so the model, session, tree, fork and settings selectors (opened by the
+  owner, asking nothing) match no rule and keep the byte-activity fallback,
+  which publishes `working` from process output until the editor returns. A blocked session raises the "Agent needs attention"
+  notification and the `agent_blocked` turn event, and ends `session wait
+  --activity blocked`. The package's unrestricted input policy still accepts a
+  plain `session input` while Pi is blocked (and Pi's submit delay rules out
+  the waited form), so an orchestrator waits for `idle` or `blocked` before it
+  sends and leaves a blocked session to the owner.
+- What was verified: the idle, busy, compaction, retry, scrolled-draft and
   transcript-rule screens in `compat/pi/screens/` (widths 20 to 200 in
-  `widths/`) were rendered by a real Pi. No blocked signal (extension dialogs,
-  login) and no overlay (model or session selector) was exercised, so no
-  `blocked` rule exists, an unrecognized screen keeps the byte-activity
-  fallback, and a replacement editor or an extension that changes the spinner is
-  not recognised as busy. Process matchers accept the kernel name `pi` (Pi retitles its
-  process shortly after start) and `node` running
+  `widths/`), and the dialog, `/trust`, login and selector screens in
+  `compat/pi/screens/overlays/` (each at widths 20 to 200, the unframed
+  `[y/N]` question at 100 only), were rendered by a real Pi driven with real
+  key presses. Not covered, and matching no rule: a dialog an
+  extension draws with `ctx.ui.custom()`, a replacement editor or an extension
+  that changes the spinner, and Pi's plain-text `Fork this session into
+  current directory? [y/N]` question before its interface starts (Pi asks it
+  only when the session belongs to another directory; pohunek relaunches a
+  session in its own). Draft and transcript text: transcript lines never
+  decide; a quote (`> text`) or a single line starting with a cursor is draft
+  text and reads `idle`; a draft that holds both selector rows (a line
+  starting `→ ` or `› ` and one indented by two spaces) withholds `idle`, so
+  the session stays `working` until the draft no longer holds both rows; a
+  draft line that reproduces a dialog's key hint reads `blocked`; and a draft line that starts
+  `── <spinner>` or is itself a complete plain border cannot be told from the
+  frame. Process matchers accept the kernel name `pi` (Pi
+  retitles its process shortly after start) and `node` running
   `…/coding-agent/dist/bundle/cli.js` for the first moments.
 
 ## Operating notes
@@ -96,15 +161,22 @@ reserved, so either way of installing serves it.
   source file as `parentSession`), before any model turn, so the fork resumes
   with `pi --session <fork id>` after a stop or a daemon restart. Pi refuses a
   fork id that already names a session; the daemon generates a fresh UUID for
-  every fork. Package version 1.0.1 declares this; a host with 1.0.0 installed
-  gets it with `pohunek plugin update pohunek.runtime.pi <archive>` (installed
-  beside 1.0.0 and selected). A session launched from 1.0.0, or from a profile
-  still pinned to its digest, keeps the spec it was launched with, so its forks
-  hold no reference and are not resumable.
-- A Pi configured to store sessions elsewhere (`--session-dir`,
-  `PI_CODING_AGENT_SESSION_DIR`, `sessionDir`) fails recovery closed; set
-  `PI_CODING_AGENT_DIR` in the host profile's `[env]` to move the whole agent
-  directory instead.
+  every fork. Package version 1.0.1 and later declare this; a host with 1.0.0
+  installed gets it with `pohunek plugin update pohunek.runtime.pi <archive>`
+  (installed beside 1.0.0 and selected). A session launched from 1.0.0, or from
+  a profile still pinned to its digest, keeps the spec it was launched with, so
+  its forks hold no reference and are not resumable.
+- Package version 1.0.2 adds the `blocked` and overlay-aware idle rules and the
+  session-dir handling. A session keeps the existence check it was launched
+  with: one launched from 1.0.1 or earlier searches only the agent directory's
+  store and refuses nothing at launch, so it fails closed at recovery when its
+  Pi kept the files elsewhere. Detection uses the manifest of the package
+  version a session was launched from, so a session launched from 1.0.1 keeps
+  reading its dialogs and selectors as `idle`.
+- To keep sessions outside the agent directory, set
+  `PI_CODING_AGENT_SESSION_DIR` (absolute) in the host profile's `[env]`, or
+  set `PI_CODING_AGENT_DIR` to move the whole agent directory; do not pass
+  `--session-dir` in profile `args`.
 - Pin a profile to the installed digest (`pohunek plugin profile migrate`) so a
   later `plugin update` cannot change an existing profile's package. A profile
   `[env]` may set `PI_OFFLINE`, `PI_SKIP_VERSION_CHECK` and `PI_TELEMETRY`; never
@@ -116,11 +188,14 @@ reserved, so either way of installing serves it.
   twice and requires identical bytes, parses it with the daemon's install
   parser, requires the descriptor's supported range to equal
   `compat/pi/compatibility-lock.json`, runs the manifest on real Pi screens
-  (`compat/pi/screens/`) and process forms, and runs the existence check on
-  Pi's real file layout.
-- The same file holds two `#[ignore]`d tests that drive a real `pi` through an
+  (`compat/pi/screens/`, with `overlays/`) and process forms, and runs the
+  existence check and the session-dir refusals on Pi's real file layouts.
+- The same file holds `#[ignore]`d tests that drive a real `pi` through an
   installed package: launch, idle and working detection, input, stop, resume,
-  fork, stop and resume of the fork, and refusal without a session file. A loopback chat-completions stub
+  fork, stop and resume of the fork, refusal without a session file, an
+  extension dialog and the project trust prompt read `blocked`, a session kept
+  in `PI_CODING_AGENT_SESSION_DIR` resumes, and a `sessionDir` setting or the
+  `--session-dir` flag refuses the launch. A loopback chat-completions stub
   stands in for the model, so no provider, credential or network is involved.
   Run them with `POHUNEK_PI_E2E=1 cargo test -p pohunek-cli --test pi_package --
   --ignored`; the variable and a `pi` on `PATH` are required, otherwise the run
@@ -130,5 +205,6 @@ reserved, so either way of installing serves it.
 
 Update procedure for a new Pi release: install it, rerun the real-Pi tests, move
 the lock (`release`, and `supported` if the range changes) and the descriptor's
-`min`/`below` together, refresh the captured screens if the interface changed,
-and bump the package `version`.
+`min`/`below` together, refresh the captured screens (including the dialog and
+selector screens in `overlays/`) if the interface changed, and bump the package
+`version`.

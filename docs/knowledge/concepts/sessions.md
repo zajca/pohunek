@@ -815,7 +815,13 @@ kind of check under `[native_reference.existence]` for its id-kind reference;
 the built-in `claude` declares one, so its recovery additionally requires a
 regular transcript file under its effective declared config home; either
 recovery action refuses with `agent_native_reference_missing` before
-launch when the file is absent or cannot be verified. A tested worker journal
+launch when the file is absent or cannot be verified. A check may also declare
+how the agent moves its store: a variable that names the store directly (the
+check follows it; Pi's `PI_CODING_AGENT_SESSION_DIR`), and launch arguments or
+settings-file keys it cannot follow (Pi's `--session-dir` and `sessionDir`).
+`session.new`, `session.resume` and `session.fork` refuse a launch that moves
+the store out of reach with `agent_native_store_relocated` before anything is
+spawned; its hint names the variable to set instead. A tested worker journal
 that carries a newer conversation switch the daemon cannot verify makes both
 recovery actions refuse with `native_identity_uncertain` instead of resuming
 the older verified target. A report must pass the usual checks (the

@@ -121,8 +121,8 @@ official runtime package (#538, guide
 security, and external-client acceptance; #52–#54 are not to be implemented as
 the original compiled-runtime chain, and #55 must restate the end-to-end matrix
 against the installed package. #546 (resumable forks with an assigned
-reference, Pi package 1.0.1) is delivered; follow-up: #547 (blocked/overlay
-screens).
+reference, Pi package 1.0.1) and #547 (blocked dialogs, overlay-aware idle and
+session-dir overrides, Pi package 1.0.2) are delivered.
 
 ### Delegated task runs — [#182](https://github.com/zajca/pohunek/issues/182) (milestone D)
 

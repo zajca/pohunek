@@ -6,7 +6,7 @@
 
 schema = 1
 id = "pohunek.runtime.pi"
-version = "1.0.1"
+version = "1.0.2"
 runtime_api = 1
 
 [runtime]
@@ -49,6 +49,14 @@ assign_fork = true
 # Pi writes `<agent dir>/sessions/--<encoded cwd>--/<timestamp>_<id>.jsonl`
 # once the first assistant message exists. `--session` for an id with no such
 # file fails to start, so recovery checks for the file first.
+#
+# Pi picks its session directory as `--session-dir`, else
+# `PI_CODING_AGENT_SESSION_DIR`, else the `sessionDir` setting of the agent
+# directory's `settings.json` or the project's `.pi/settings.json`, and keeps
+# the files directly in it. The variable is read from the launch environment,
+# so the check follows it (it must be absolute). A launch passing the flag is
+# refused; so is one whose settings name a directory while the variable is
+# unset, because Pi follows the variable over the settings.
 [native_reference.existence]
 check = "file"
 root_env = "PI_CODING_AGENT_DIR"
@@ -57,3 +65,10 @@ dir = "sessions"
 file_name = "_{reference}.jsonl"
 name_match = "ends_with"
 max_depth = 1
+store_env = "PI_CODING_AGENT_SESSION_DIR"
+store_max_depth = 0
+relocating_args = ["--session-dir"]
+relocating_settings = [
+  { base = "root", path = "settings.json", key = "sessionDir" },
+  { base = "cwd", path = ".pi/settings.json", key = "sessionDir" },
+]
