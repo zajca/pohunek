@@ -93,7 +93,7 @@
         "propose work",
         "request an eligible reservation",
         "work in an authorized fork",
-        "submit an unsolicited pull request and evidence"
+        "submit pull requests and evidence, including unsolicited pull requests"
       ],
       "privilegedGrants": [],
       "limits": "No repository write, private Project, host, credential, model budget, review, merge, release, or privileged-label authority is conferred. The repository owner's standing agent authorization does not transfer."
@@ -105,11 +105,11 @@
       "handoff": "A custody handoff preserves the holder, generation when available, issue/spec revision, exact commit or pull request, actual checks, unresolved effects, and the next permitted action. Acknowledging a handoff does not transfer custody."
     },
     "reviewAndIntegration": {
-      "maintainer": "zajca triages, routes, reconciles disputes, and integrates contributions under existing authorization. Product or authority changes require the applicable owner decision.",
-      "reviewer": "An available independent reviewer assesses the relevant area contract and evidence. No permanently staffed area reviewer or response-time commitment is claimed. The submitter, author, executor, and manager cannot supply the required independent approval through another session.",
+      "maintainer": "zajca triages, routes, resolves disputes, and integrates contributions after the required gates and independent review under existing authorization. Product or authority changes require the applicable owner decision.",
+      "reviewer": "An available independent reviewer examines the relevant code, contract, and evidence for the area, assesses the exact candidate against the issue criteria, and records findings without needing an implementation reservation. No permanently staffed area reviewer or response-time commitment is claimed. The submitter, author, executor, and manager cannot supply the required independent approval, including through another session.",
       "unavailable": "If no independent reviewer is available, the candidate remains unaccepted; the maintainer records the state and retries routing when capacity exists.",
       "automatedReview": "Counts only after #700 resolves the reviewer-service defect and a completed review is verified against the exact pull request head under the corrected #700/#802 contract. Interrupted or stale-head runs are not approval.",
-      "reviewBroker": "The restricted broker of #817 may request ai:review only for a validated submission under its exact-candidate contract. Contributors, executors, and models never receive the broker credential, and the broker's preliminary assessment is not independent review.",
+      "reviewBroker": "The restricted broker of #817 may request ai:review only for a validated exact-head submission under its exact-candidate contract and the corrected #700/#802 contract. Contributors, executors, and models never receive the broker credential, and the broker's preliminary assessment is not independent review.",
       "authority": "Review does not grant merge authority. Outside contributors receive no merge or release authority. Release remains separately authorized."
     },
     "competingWorkAndAppeals": {
@@ -118,6 +118,6 @@
       "appeals": "Cite the contested decision, policy/spec revision, and new evidence on the issue or pull request through the maintainer route. An appeal or handoff acknowledgment does not itself change custody, transfer the work, or grant acceptance."
     },
     "enforcement": "This is accepted workflow guidance, not a runtime permission grant. Normal GitHub controls remain in force; automatic reservation enforcement does not exist before the coordination service is delivered.",
-    "ownerAgent": "The owner agent retains only existing standing issue and Project authorization and separately authorized task scope. Commits, pushes, and releases require their own authorization; none is granted to outside contributors."
+    "ownerAgent": "The owner agent retains only existing standing issue and Project authorization and separately authorized task scope; recognized assignments, reservation scope, and conflicts remain binding on it. Commits, pushes, and releases require their own authorization; none is granted to outside contributors."
   }
 }

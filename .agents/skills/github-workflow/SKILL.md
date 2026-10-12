@@ -47,8 +47,9 @@ enough to understand the work without access to the private Project.
 An outside contributor may propose work, request an eligible reservation,
 work in a fork they are authorized to use, and submit a pull request with
 evidence. A contributor does not need private Project access or maintainer
-credentials. These actions grant no repository write access, host or credential
-access, model budget, review, merge, release, or privileged-label authority.
+credentials. These actions grant no repository write access, private Project,
+host, or credential access, model budget, review, merge, release, or
+privileged-label authority.
 The repository owner's standing authorization for owner agents never transfers
 to an outside contributor. A contribution request does not authorize spending
 another person's credentials or budget.
@@ -83,19 +84,22 @@ generation when available, issue/spec revision, exact commit or pull request,
 actual checks, unresolved effects, and the next permitted action;
 acknowledging it does not transfer custody.
 
-`zajca` triages, routes, resolves disputes, and integrates contributions under
-existing authorization; product or authority changes require the applicable
-owner decision. An available independent reviewer checks the relevant
-area contract and evidence. No permanently staffed area reviewer or response
+`zajca` triages, routes, resolves disputes, and integrates contributions after
+the required gates and independent review under existing authorization;
+product or authority changes require the applicable owner decision. An
+available independent reviewer examines the relevant code, contract, and
+evidence for the area, assesses the exact candidate against the issue
+criteria, and records findings without needing an implementation reservation. No permanently staffed area reviewer or response
 time commitment is promised. If an independent reviewer is unavailable, the
 candidate remains unaccepted; the maintainer records that state and retries
 routing when capacity exists. The submitter, author, executor, or manager
-cannot supply independent approval through another session. Automated review
+cannot supply independent approval, including through another session. Automated review
 counts only after #700 resolves the reviewer-service defect and a completed
 review is verified against the exact pull request head under the corrected
 #700/#802 contract. An interrupted or stale-head run is not approval. The
 restricted broker of #817 may request `ai:review` only for a validated
-submission under its exact-candidate contract; contributors, executors, and
+exact-head submission under its exact-candidate contract and the corrected
+#700/#802 contract; contributors, executors, and
 models never receive its credential, and its preliminary assessment is not
 independent review. Review grants no merge authority; release remains
 separately authorized.
