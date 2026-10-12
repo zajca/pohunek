@@ -42,7 +42,9 @@ JSON log under `~/.local/state/pohunek/logs/` (see the
      daemon still runs the release whose catalog authorized the package and no
      newer catalog has been accepted; otherwise it is refused with
      `package_incompatible` or `package_untrusted`. In that case release the
-     lost digest first, as step 4 describes, then install the current
+     lost digest first as step 4 describes, then remove its record with
+     `pohunek plugin uninstall <package> --digest <digest> --yes` (without
+     `--remove-modified`, which refuses a missing root), then install the current
      release's package with `pohunek plugin install
      runtime/packages/<runtime>.tar.zst --catalog runtime/runtime-catalog.json
      --yes` (use `pohunek plugin update <package>` with the same archive and
@@ -77,8 +79,8 @@ JSON log under `~/.local/state/pohunek/logs/` (see the
      installed but unselected" in the runtime packages guide.
 3. Remove a modified root with
    `pohunek plugin uninstall <package> --digest <digest> --remove-modified --yes`.
-   A root that still verifies is refused with `package_root_intact`; uninstall
-   it without the flag. Then reinstall the package from an archive whose digest
+   A root that still verifies or is missing is refused with
+   `package_root_intact`; uninstall it without the flag. Then reinstall the package from an archive whose digest
    you verified.
 4. If that removal is refused with `package_referenced`, a session or a host
    profile pins the damaged digest. There is no in-place repair: sessions
