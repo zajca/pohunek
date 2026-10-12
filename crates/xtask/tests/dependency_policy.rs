@@ -343,7 +343,10 @@ fn zbus_is_never_built_with_its_tokio_backend() {
         .expect("workspace metadata");
     assert!(
         output.status.success(),
-        "workspace metadata failed: {}",
+        "workspace metadata failed; this offline resolution covers the crates of every \
+         target, so it needs the sources of every locked crate in the cargo registry. \
+         Prerequisite: run `cargo fetch --locked` once (the CI heavy job does). \
+         cargo said: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let metadata: serde_json::Value =

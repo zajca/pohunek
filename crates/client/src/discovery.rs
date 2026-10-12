@@ -725,13 +725,23 @@ mod tests {
         );
     }
 
-    /// A loopback endpoint that refuses every connection and that no other
+    /// How long a connect to a [`RefusedEndpoint`] may stay pending before the
+    /// host counts as one that does not reset connects to a bound,
+    /// non-listening socket.
+    ///
+    /// A reset on loopback is produced inside the connect call, so a kernel
+    /// that resets has answered long before this deadline; raising it only
+    /// makes a host that never answers slower to be recognized.
+    const RESET_DEADLINE: Duration = Duration::from_millis(500);
+
+    /// A loopback endpoint that never accepts a connection and that no other
     /// socket can claim while the value is alive.
     ///
-    /// The socket is bound but never put into the listening state, so the
-    /// kernel answers a connect with a reset. Keeping the socket open keeps the
-    /// port reserved; a port that was merely released could be handed to any
-    /// concurrently started listener.
+    /// The socket is bound but never put into the listening state. A Linux
+    /// kernel answers a connect to it with a reset; macOS drops the SYN, so the
+    /// connect stays pending until the kernel's connect timeout. Keeping the
+    /// socket open keeps the port reserved; a port that was merely released
+    /// could be handed to any concurrently started listener.
     struct RefusedEndpoint {
         addr: SocketAddr,
         _reservation: TcpSocket,
@@ -772,10 +782,23 @@ mod tests {
     async fn refused_endpoint_refuses_connects_and_cannot_be_claimed() {
         let closed = RefusedEndpoint::reserve();
 
-        let connect_error = TcpStream::connect(closed.addr)
-            .await
-            .expect_err("a reserved, non-listening port refuses connects");
-        assert_eq!(connect_error.kind(), std::io::ErrorKind::ConnectionRefused);
+        match tokio::time::timeout(RESET_DEADLINE, TcpStream::connect(closed.addr)).await {
+            Ok(connected) => {
+                let connect_error =
+                    connected.expect_err("a reserved, non-listening port refuses connects");
+                assert_eq!(connect_error.kind(), std::io::ErrorKind::ConnectionRefused);
+            }
+            // Only the macOS network stack silently drops a SYN sent to a
+            // bound socket; on any other host a pending connect is a defect.
+            #[cfg(target_os = "macos")]
+            Err(_pending) => {}
+            #[cfg(not(target_os = "macos"))]
+            Err(_pending) => {
+                panic!(
+                    "a reserved, non-listening port must refuse connects, not leave them pending"
+                )
+            }
+        }
 
         let claim_error = TcpListener::bind(closed.addr)
             .await

@@ -851,8 +851,11 @@ fn resolved_inside(stage_root: &Path, path: &Path, target: &Path) -> bool {
         }
     }
     // Path::components discards a trailing slash or dot, while the kernel
-    // rejects either when the preceding component is a regular file.
-    fs::canonicalize(path).is_ok_and(|resolved| resolved.starts_with(stage_root))
+    // rejects either when the preceding component is a regular file. A libc
+    // `realpath` may not (macOS accepts `file/.` and `file/..`), so the link
+    // is also resolved by the kernel itself with a plain `stat`.
+    fs::metadata(path).is_ok()
+        && fs::canonicalize(path).is_ok_and(|resolved| resolved.starts_with(stage_root))
 }
 
 /// A path rendered with control characters escaped, for error messages.
