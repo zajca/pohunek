@@ -1,7 +1,7 @@
 # Track D — Native Desktop Companion App (detailed design)
 
-Status: **design** (pre-spike). Supersedes the terminal-renderer direction in
-`docs/ROADMAP.md` §3 Track D — see [Roadmap corrections](#10-roadmap-corrections).
+Status: **design** (pre-spike). Where this design departs from the roadmap's
+Track D assumptions, see [Roadmap corrections](#8-roadmap-corrections).
 
 Last updated: 2026-07-19.
 

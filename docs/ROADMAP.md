@@ -1,20 +1,37 @@
 # Pohunek — Roadmap
 
-Consolidated, top-level roadmap for the whole project. This is a repository
-snapshot and index. For active GitHub-planned initiatives, issue hierarchy,
-milestones, and Projects are the source of truth for delivery scope, sequencing,
-and status. The per-phase documents under [`docs/phases/`](phases/) and
+Consolidated, top-level roadmap for the whole project: a reconciled snapshot
+and index, not a planning authority.
+
+**Source of truth.** Delivery scope, sequencing, and status live in GitHub:
+
+- the epic issues and their native sub-issue and blocked-by links;
+- the [repository milestones](https://github.com/zajca/pohunek/milestones),
+  including the agent program milestones A–E and
+  [Complete macOS support](https://github.com/zajca/pohunek/milestone/2);
+- the GitHub Projects of `zajca`: **Pohunek** (project 1, the default board),
+  **Team control plane** (2), **Pohunek test performance** (3), **Pohunek macOS
+  support** (4), **Runtime plugin packages** (5), and **Pohunek dev workflow
+  performance II** (7).
+
+The Projects are private, so public contributors work from the issues and
+milestones, which carry the same scope and dependencies. Where this document
+and GitHub disagree, GitHub wins and this document is reconciled again. Status
+here comes from issue state and sub-issue counts, not from Project board
+columns. The per-phase documents under [`docs/phases/`](phases/) and
 [`docs/design/`](design/) record product and architecture rationale.
 
-Status reflects the **code on `main`**. Where a phase/plan doc's own status
-header lags the code, the code wins and the lag is noted. Accepted future work
-is marked explicitly and must not be read as shipped functionality.
+This repository is the core: daemon, session worker, CLI, relay, Rust crates,
+and the TypeScript SDK workspace. It ships no UI. The native desktop app, the
+mesh-local browser control center, the rofi/sway launchers, and issue/PR
+providers live in [`zajca/pohunek-work`](https://github.com/zajca/pohunek-work)
+and consume core only through public contracts.
 
-Last reconciled: 2026-09-19.
+Last reconciled: 2026-10-12.
 
 ---
 
-## 1. Completed foundations (shipped)
+## 1. Shipped foundations
 
 | Track | What it delivers | Where |
 |---|---|---|
@@ -24,250 +41,269 @@ Last reconciled: 2026-09-19.
 | **Milestone 10** | `--json` everywhere + `cli_usage` typed error envelope. | branch `milestone-10` (merged) |
 | **Projects** | Git-repo awareness; `project` commands; all 7 follow-ups (F1–F7) resolved. | [`design/projects*.md`](design/) |
 | **Per-project actions + worktree hooks + agent profiles** | All slices incl. session/agent-state hooks (B2, `ed6b778`); env-clear + allowlist; host agent profiles. | [`design/per-project-actions-*`](design/) |
-| **Phase 5 / Milestone 12 — rofi/sway launcher** | `session list --filter` (chassis); `session new --input` (atomic launch); transient attach menu and status banner. The rofi/sway launcher scripts moved to `zajca/pohunek-work`. | [`phases/05`](phases/05-rofi-sway-launcher.md) |
+| **Phase 5 / Milestone 12 — launcher chassis** | `session list --filter`; `session new --input` (atomic launch). The rofi/sway launcher scripts live in `zajca/pohunek-work`. | [`phases/05`](phases/05-rofi-sway-launcher.md) |
+| **Universal Assistant (P0–P11)** | `pohunek assistant`, the embedded knowledge bundle, the hook write gate, `cargo xtask eval`, and `cargo xtask docs site` with offline docs in each release tarball. | [`design/universal-assistant-plan.md`](design/universal-assistant-plan.md) |
+| **Track S — Public API + SDKs** | S.1 Rust SDK (`crates/client`); S.2 versioned public API with version negotiation ([`public-api.md`](public-api.md)); S.3 TypeScript SDK (`sdk/ts/`) with `ts-rs` generated types, a CI drift check, and a WebSocket transport tested against the loopback relay in `@pohunek/testkit`. | `crates/client`, `sdk/ts/` |
+| **Track H — Hermes runtime and operator plugin** | Local Hermes Agent runtime pinned to `0.20.0` in Pohunek-owned PTYs, exact native resume, and the operator plugin for a selected Hermes profile with an external access policy. | [operator guide](knowledge/guides/hermes-operator.md), [runbook](runbooks/hermes-operator-plugin.md), [migration](migrations/hermes-operator-plugin.md) |
+| **Track B / Track D — browser control center and native desktop app** | Browser M1 (multi-host sessions workspace, notifications inbox, in-browser terminal) and the Iced desktop control plane are clients maintained in `zajca/pohunek-work`. Core keeps the shared contracts: the protocol, both SDKs, `crates/prompt` (`pohunek prompt render`), opaque `link.*` session metadata, and `session new --input`. The browser M2/M3 plan to grow into a public multi-user backend is superseded by the [team-relay RFC](design/team-relay-control-plane-rfc.md). | [`phases/04`](phases/04-browser-control-center.md), [Track B plan](design/track-b-web-control-center-plan-2026-07-22.md), [Track D design](design/track-d-native-app.md) |
+| **Test performance milestone** | Milestone "Test performance" (13/13 closed) and project 3 (13/13 Done). | [milestone 1](https://github.com/zajca/pohunek/milestone/1) |
 
-> This roadmap supersedes older milestone notes. Use the recommended sequence
-> below for next work.
-
----
-
-## 2. Completed — Universal Assistant
-
-Plan: [`design/universal-assistant-plan.md`](design/universal-assistant-plan.md).
-**P0–P11 are implemented** in this tree.
-
-Final finish-only items are closed:
-
-- **P8 — hook write hard gate.** The assistant prompt and embedded knowledge
-  bundle now require explicit per-file hook confirmation independent of `--yes`
-  and define quarantine paths for non-interactive contexts.
-- **P10 — behavior eval.** `cargo xtask eval` writes a concrete manual release
-  gate package and validates captured transcripts for parser-valid `pohunek`
-  commands plus required outcome terms.
-- **P11 — human docs outputs.** `cargo xtask docs site` renders site/offline
-  docs, and the release workflow packages `docs/offline/` plus the docs
-  manifest into each tarball.
-
-This track is closed. The forward path below starts with the public API / SDK
-work.
+**Public API stability.** There is no compatibility promise before 1.0. SDK
+semver tracks the protocol version, and breaking changes are allowed with a
+version bump until the promise is made. Clients pin the core release and the
+`PROTOCOL_VERSION` they were built against; core keeps no compatibility shim
+for them.
 
 ---
 
-## 3. Forward tracks
+## 2. Open epics and tracks
 
-The shipped forward work built client surfaces on top of the owner-first
-chassis: **SDKs → mesh-local browser control center** (the browser control center and
-the native desktop app are separate clients in `zajca/pohunek-work`). The
-daemon remains provider-agnostic and presentation-agnostic.
+Counts are closed/total native sub-issues on 2026-10-12.
 
-The accepted next product track is an **optional team relay**. It adds a
-host-initiated network path and multi-team authorization without replacing
-standalone or direct NetBird operation. It is tracked separately below because
-none of its runtime features are shipped yet.
+### Agent program — [#797](https://github.com/zajca/pohunek/issues/797) (milestones A–E)
 
-### Track M — Complete macOS host and client support
+Makes the repository usable by agents, acting for their owners, to discover
+Pohunek, pick bounded work, coordinate, and contribute. #797 has 4/22 direct
+children closed. The five outcome milestones reuse the existing epics below
+instead of competing with them.
 
-The [macOS project](https://github.com/users/zajca/projects/4),
-[`Complete macOS support` milestone](https://github.com/zajca/pohunek/milestone/2),
-and issue hierarchy rooted at [#94](https://github.com/zajca/pohunek/issues/94)
-own delivery scope, sequencing, and status. The
-[accepted macOS RFC](design/macos-support-rfc.md) records the design constraints:
-native Apple Silicon hosts and clients, macOS 14.0 minimum target,
-launchd-owned durable workers, real PTYs and agent integrations,
-retained owner-path browser client, direct overlay operation, installation, signing, and
-cross-stack acceptance. Intel Macs are outside this release scope.
+| Milestone | Status on 2026-10-12 |
+|---|---|
+| [A. Agents discover Pohunek and make their first contribution](https://github.com/zajca/pohunek/milestone/4) | 3 closed, 6 open. Contributor authority [#798](https://github.com/zajca/pohunek/issues/798), entry points and contribution skill [#799](https://github.com/zajca/pohunek/issues/799), and issue contracts [#800](https://github.com/zajca/pohunek/issues/800) closed 2026-10-12. Toolchain pin [#360](https://github.com/zajca/pohunek/issues/360) is in progress (PR #850 merged; issue open). Open: [#801](https://github.com/zajca/pohunek/issues/801)–[#804](https://github.com/zajca/pohunek/issues/804) and this roadmap ([#517](https://github.com/zajca/pohunek/issues/517)). |
+| [B. Agents from different owners coordinate work safely](https://github.com/zajca/pohunek/milestone/5) | 0 closed, 9 open: claim service [#805](https://github.com/zajca/pohunek/issues/805)–[#811](https://github.com/zajca/pohunek/issues/811), [#817](https://github.com/zajca/pohunek/issues/817), [#818](https://github.com/zajca/pohunek/issues/818). #805 (service contract) is in progress; the service itself is built in `zajca/pohunek-work`. |
+| [C. Agents operate and extend Pohunek reliably](https://github.com/zajca/pohunek/milestone/6) | 2 closed ([#812](https://github.com/zajca/pohunek/issues/812), [#480](https://github.com/zajca/pohunek/issues/480)), 22 open: the runtime-package, workflow-plugin, and Pi epics below, doctor checks [#68](https://github.com/zajca/pohunek/issues/68) (in progress), operating recipes [#813](https://github.com/zajca/pohunek/issues/813), external runtime author [#814](https://github.com/zajca/pohunek/issues/814), and the assistant roles design [#823](https://github.com/zajca/pohunek/issues/823). |
+| [D. Agents delegate work with verifiable results](https://github.com/zajca/pohunek/milestone/7) | 0 closed, 15 open: delegated task runs (#182, WS1–WS8). |
+| [E. Pohunek develops itself through accountable agents](https://github.com/zajca/pohunek/milestone/8) | 0 closed, 11 open: dark factory (#185, FS0–FS8), [#815](https://github.com/zajca/pohunek/issues/815), [#816](https://github.com/zajca/pohunek/issues/816). |
 
-The shared platform foundation in #95 is complete: `crates/platform` owns
-portable process, peer, and supervisor contracts; shipped Linux consumers use
-the extracted implementations; target dependency graphs separate systemd,
-Secret Service, and Keychain; and native Darwin
-contract CI runs on Apple Silicon. This does **not** advertise working macOS
-applications.
+### Runtime plugin packages — [#139](https://github.com/zajca/pohunek/issues/139) (milestone C, project 5)
 
-Durable workers under launchd (#100) are implemented: one job per worker
-generation through `/bin/launchctl`, a shared daemon lifecycle engine and
-supervisor-evidence reconciliation on both targets (Linux moved to systemd
-transient units), the ownership-marker sweep of lost generations, the
-allowlisted agent base environment, and `pohunek service
-install|upgrade|uninstall|status` over versioned executables. The daemon and CLI
-build and test on the macOS runner against the real `gui/<uid>` domain. The
-logout/login and reboot lifetime still needs its manual acceptance evidence
-(`scripts/acceptance/macos-launchd-lifetime`, recorded in `docs/acceptance/`).
+Runtimes become signed, content-addressed packages installed per host; only
+`shell` stays built in. **15/28.** Landed: the accepted RFC (#152), the
+`RuntimeId` protocol and generic runtime host (#140), the authenticated package
+registry (#141), the CLI lifecycle and profile migration (#143), generic hook
+schemas and integration activation (#144), digest-bound package releases with
+catalog signing (#150), the official Pi package (#538), and the decision that
+core consumes no plugin data in v1 (#480). Open:
 
-The live delivery order and dependencies are maintained in GitHub rather than
-duplicated here. #105 remains the support declaration gate.
+- Codex package [#145](https://github.com/zajca/pohunek/issues/145) — in
+  progress, 2/3 (open: #592).
+- Claude Code package [#146](https://github.com/zajca/pohunek/issues/146) — in
+  progress; slices 1–2 merged, clean-host catalog install and built-in cutover
+  open (#612, #613 related).
+- Hermes package [#147](https://github.com/zajca/pohunek/issues/147) — in
+  progress (PR #839 merged 2026-10-11; issue open).
+- Package CI and compatibility matrix
+  [#149](https://github.com/zajca/pohunek/issues/149) and package
+  documentation [#151](https://github.com/zajca/pohunek/issues/151) — blocked
+  by the extractions (and #151 by #148).
+- Follow-ups #487, #493, #546, #547, and the flaky test #597.
 
-### Track H — Hermes runtime and operator plugin
+Guide: [`knowledge/guides/runtime-packages.md`](knowledge/guides/runtime-packages.md).
 
-The first-class local Hermes Agent runtime is pinned to `0.20.0`. The runtime
-launches in Pohunek-owned PTYs, resumes only an exact recorded native reference,
-and reports native fork as unsupported data. Hermes remains limited to its local
-interactive backend; it does not turn Pohunek into a Hermes gateway, database
-reader, SSH bridge, or remote-provider client.
+### Workflow plugins — [#148](https://github.com/zajca/pohunek/issues/148) (child of #139; milestone C, project 5)
 
-The operator-plugin milestone adds an explicitly selected Hermes profile or
-custom owner-private home to the existing CLI integration surface. The release
-CLI embeds the managed plugin and the skill generated from `docs/knowledge`.
-Its policy is external to immutable plugin checksums and requires explicit
-access mode and host allowlist. Read/manage/full tool availability is bounded;
-`full` alone exposes stop/remove. Hook reporting is local and best effort, while
-the daemon stays authoritative for the exact eight origin-session denials and
-the three lifecycle-report exceptions. No public protocol bump is introduced:
-the one-time M1 range-negotiation boundary already covers M2 and M3.
+Bounded out-of-process plugins with declared actions and jobs. **2/4.** Landed:
+`session.list` metadata filter (#327) and the display decision (#328: core adds
+no UI data contract; `zajca/pohunek-work` renders plugin data from public
+contracts). Open: CLI action
+invocation [#325](https://github.com/zajca/pohunek/issues/325) and periodic
+jobs/services in manifests [#326](https://github.com/zajca/pohunek/issues/326).
+Core consumes no plugin data for launch-profile policy in v1
+([#480](https://github.com/zajca/pohunek/issues/480), closed).
 
-Operational rollout is ordinary after M1: install matching local binaries,
-reconcile workers, run integration doctor for a selected profile, and validate a
-canary before enabling remote or full policy. Binary downgrade after Hermes enum
-or provider-keyed notification-policy persistence is unsupported; recover by
-upgrading forward. See the [operator guide](knowledge/guides/hermes-operator.md),
-[rollout runbook](runbooks/hermes-operator-plugin.md), and
-[migration guide](migrations/hermes-operator-plugin.md).
+### Pi coding agent — [#50](https://github.com/zajca/pohunek/issues/50) (milestone C)
 
-### Track S — Public API + SDKs *(foundational, split out)*
+**1/5** (#51 generalized resume/fork launch specs closed). Pi ships as the
+official runtime package (#538, guide
+[`pi-package.md`](knowledge/guides/pi-package.md)). The #812 reconciliation on
+2026-10-11 keeps #50 open for durable-worker, activity/turn-completion,
+security, and external-client acceptance; #52–#54 are not to be implemented as
+the original compiled-runtime chain, and #55 must restate the end-to-end matrix
+against the installed package. Follow-ups: #546 (fork references), #547
+(blocked/overlay screens).
 
-Promote the control protocol from an internal CLI wire format to a **documented,
-versioned public API**, consumed only through SDKs (never hand-rolled wire code).
-This is the shared base for every client below; it is broken out of the old
-Phase 4 so every client builds on the same contract.
+### Delegated task runs — [#182](https://github.com/zajca/pohunek/issues/182) (milestone D)
 
-- **S.1 — Rust SDK (`crates/client`) — complete.** Extract the
-  transport-agnostic client that lived `pub(crate)` in `crates/cli/src/client.rs`:
-  connect (Unix socket / NetBird TCP), request/response, event subscription, and
-  the **attach duplex byte stream**, with its own error type. The CLI is now a
-  consumer with no behavior change.
-- **S.2 — Public API doc + version negotiation — complete.** The versioned
-  public API is documented in [`docs/public-api.md`](public-api.md): methods,
-  envelopes, error classes/codes, events, version negotiation, and the attach
-  stream as public protocol surface.
-- **S.3 — TS SDK (`sdk/ts/sdk`) — complete.** `ts-rs`-generated types
-  (`sdk/ts/protocol`) + a runtime client with pluggable transports (TCP for Node/Bun
-  → daemon direct; WebSocket for browser → relay). CI **drift check** fails if
-  generated TS types diverge from the Rust source. The SDK's `WsTransport`
-  is tested against the loopback test relay in `@pohunek/testkit`.
+Tasks and turns over ordinary sessions: causal settlement, `task.wait`, typed
+results with evidence and checks, an optional MCP adapter.
+[RFC](design/delegated-task-runs-rfc.md). **2/16.** The RFCs are on `main`
+(#218) and amended (#510). Implementation has started: WS1 protocol
+[#219](https://github.com/zajca/pohunek/issues/219) is in progress; WS2–WS8
+([#220](https://github.com/zajca/pohunek/issues/220)–[#232](https://github.com/zajca/pohunek/issues/232))
+are open and follow the chain in section 3.
 
-**Stability:** no compatibility promise pre-1.0; SDK semver tracks the protocol
-version; breaking changes allowed with a version bump until the promise is made.
+### Relay dark factory — [#185](https://github.com/zajca/pohunek/issues/185) (milestone E)
 
-*Done when:* minimal clients on the Rust SDK and TypeScript SDK do `daemon.health`
-/ `session.list`, subscribe to an event, and round-trip an attach stream against
-a daemon; the TypeScript SDK also verifies the same flow through the WebSocket
-relay transport.
+Unattended manager/auditor delegation over the team relay, built as a relay
+client. [RFC](design/relay-dark-factory-rfc.md). **0/8.** FS0
+[#233](https://github.com/zajca/pohunek/issues/233) (amend the team relay RFC
+for `task.*`) is in progress; FS2–FS8
+([#234](https://github.com/zajca/pohunek/issues/234)–[#240](https://github.com/zajca/pohunek/issues/240))
+depend on both the task-run workstreams and the relay implementation. Factory
+client work items live in `zajca/pohunek-work`.
 
-### Track D — Native Desktop Companion App *(moved out of this repository)*
+### Session durability and recovery — [#426](https://github.com/zajca/pohunek/issues/426) (project 1)
 
-The native desktop client (an Iced control plane over the Rust SDK, with no
-embedded terminal and no aggregator backend) is developed in
-[`zajca/pohunek-work`](https://github.com/zajca/pohunek-work). This repository
-ships no UI and keeps only what every client shares: the versioned protocol, the Rust and
-TypeScript SDKs, the shared prompt renderer (`crates/prompt` and `pohunek
-prompt render`), the opaque `link.*` session metadata (`pohunek prompt link`),
-and atomic launch via `session new --input`. Clients consume core through public
-contracts only (CLI `--json`, and the public protocol through SDKs pinned by git
-tag or release tarball) and pin the `PROTOCOL_VERSION` they were built against. Issue/PR
-providers live only in `zajca/pohunek-work`. Provider credentials never enter
-daemon state, session metadata, or the event log.
+Clean recovery from a host-wide session loss. **2/6.** Landed in the 0.34
+milestone: a dead worker is classified `lost` (#420) and recovery binds the last
+conversation (#421). Open: loss cause and one crashed state
+[#422](https://github.com/zajca/pohunek/issues/422), one-action in-place
+recovery [#423](https://github.com/zajca/pohunek/issues/423), a crash note for
+the recovered agent [#424](https://github.com/zajca/pohunek/issues/424), and
+host memory warnings and per-session bounds
+[#425](https://github.com/zajca/pohunek/issues/425). Related:
+[#402](https://github.com/zajca/pohunek/issues/402) (stop with force-closed PTY
+output leaves a dead root; in progress, PR #444 open).
 
-### Track B — Mesh-local Browser Control Center *(M1 complete; later plan superseded)*
+### Activity detection — no epic
 
-Phase 4 as designed ([`phases/04`](phases/04-browser-control-center.md)),
-reconciled by the
-[Track B plan](design/track-b-web-control-center-plan-2026-07-22.md): a thin
-**Bun backend** (pure transparent tunnels, host discovery via
-the local daemon, SPA serving) + browser-side aggregation in a
-client-core package + a **Svelte 5 SPA** (xterm.js) + optional
-single-cert **mobile PWA**, with the same provider seam. The browser speaks
-the public protocol verbatim over those tunnels; the backend holds no
-protocol state. It remains an optional surface for **mobile /
-from-any-device** access (the one thing a desktop app cannot give
-you), reusing **Track S** (TS SDK).
+[#59](https://github.com/zajca/pohunek/issues/59) explain diagnostics,
+[#60](https://github.com/zajca/pohunek/issues/60) refreshed Codex/Claude rules,
+[#61](https://github.com/zajca/pohunek/issues/61) manifest viewer and
+visible-state semantics, [#63](https://github.com/zajca/pohunek/issues/63)
+manifest reload and status, and
+[#67](https://github.com/zajca/pohunek/issues/67) state arbitration are open
+with no parent epic, no milestone, and no Project. Runtime-specific detection
+gaps are tracked under the package epics (#592, #613, #547).
 
-**M1 is implemented:** Slices B + C, the notifications inbox, and the
-in-browser terminal provide the multi-host sessions workspace and live session
-lifecycle through one mesh-local backend origin. This is a shipped owner-path
-client, now maintained in [`zajca/pohunek-work`](https://github.com/zajca/pohunek-work),
-not the accepted public team relay.
+### Test stability and feedback loop — [#359](https://github.com/zajca/pohunek/issues/359) (project 1)
 
-The old M2/M3 plan to grow this owner gateway into a public multi-user backend
-is superseded by the [team-relay RFC](design/team-relay-control-plane-rfc.md).
-The M1 owner WebUI remains supported permanently alongside the relay.
-The Rust relay and its separate team web/CLI surfaces are implemented by
-[#71](https://github.com/zajca/pohunek/issues/71) and
-[#86](https://github.com/zajca/pohunek/issues/86); later provider delivery is
-tracked by [#73](https://github.com/zajca/pohunek/issues/73). Presentation
-components may be shared, but owner and team transports, credentials, state,
-and origins remain explicit with no cross-mode fallback.
+Test and CI stability by failure class. **7/21.** Landed: deterministic timing
+(P2 #362), hermetic `TestEnv` (P3 #363), Linux-side macOS clippy (P5 #365),
+optimized test hot-loop dependencies (P7 #641). Open: CI tiers P6
+[#477](https://github.com/zajca/pohunek/issues/477), toolchain pin P0
+[#360](https://github.com/zajca/pohunek/issues/360) (in progress, pin merged in
+PR #850, also in milestone A), macOS nextest sharding P1
+[#361](https://github.com/zajca/pohunek/issues/361) (3/4, open #377), flake
+detection P4 [#364](https://github.com/zajca/pohunek/issues/364), and the
+cost/maintenance items P8–P14
+([#642](https://github.com/zajca/pohunek/issues/642)–[#648](https://github.com/zajca/pohunek/issues/648)),
+#774, #847, #855. The unit-test migration of the testing policy is
+[#671](https://github.com/zajca/pohunek/issues/671) (in progress). Project 7
+(dev workflow performance II) has 21 of 23 issues closed; #272 and #323 remain
+open.
 
-### Track R — Optional Team Relay *(foundation implemented; transport and team surfaces deferred)*
+### macOS host and client support — [#94](https://github.com/zajca/pohunek/issues/94) ([milestone](https://github.com/zajca/pohunek/milestone/2), project 4)
 
-Umbrella: [#56](https://github.com/zajca/pohunek/issues/56). Source of truth:
-the [accepted team-relay RFC](design/team-relay-control-plane-rfc.md).
+Native Apple Silicon hosts, macOS 14.0 minimum target, launchd-owned durable
+workers ([RFC](design/macos-support-rfc.md)); Intel Macs are out of scope.
+**7/12;** the milestone has 6 open and 6 closed issues. Landed: platform
+contracts (#95), runtime paths (#96), process inspection (#97), peer identity
+(#98), portable PTY I/O (#99), external observation and integrations (#101), and
+ad-hoc signed archives with a Homebrew tap (#481). Open:
 
-This track adds one trusted, public, PostgreSQL-backed Rust `pohunek-relayd`.
-Hosts initiate an embedded userspace WireGuard tunnel and every control/attach
-connection. The relay owns principals, service accounts, teams, roles, session
-ACLs, routing, aggregation, audit, and quotas; `pohunekd` owns stable host state,
-local `HostShare` ceilings, immutable session origin, PTYs, processes, and
-worktrees. Local and direct-NetBird sessions never become relay-visible.
+- launchd supervision [#100](https://github.com/zajca/pohunek/issues/100) —
+  5/9; implementation is on `main`, the manual logout/login and reboot lifetime
+  evidence is still missing (open: #186, #187, #189, #194).
+- CLI setup and diagnostics [#102](https://github.com/zajca/pohunek/issues/102)
+  — 1/4 (open: #319, #332, #333).
+- owner WebUI and direct-overlay workflows
+  [#103](https://github.com/zajca/pohunek/issues/103) — its only sub-issue is
+  closed; the issue is open.
+- installation and release artifacts
+  [#104](https://github.com/zajca/pohunek/issues/104) — rescoped to ad-hoc
+  signing; real-Mac install/upgrade/uninstall acceptance remains.
+- support gate [#105](https://github.com/zajca/pohunek/issues/105) — 0/1 (#355),
+  blocked by #100, #102, #103, #104.
 
-Standalone, direct NetBird, relay-only, and NetBird-plus-relay topologies remain
-first-class. A host has at most one relay enrollment but may expose multiple
-locally approved shares to multiple teams. The implementation order follows the
-live blocker graph:
+The core part covers CLI, daemon, worker, SDK, and archives; the macOS GUI and
+owner web control center are tracked in `zajca/pohunek-work`.
 
-1. Completed [#69](https://github.com/zajca/pohunek/issues/69),
-   [#80](https://github.com/zajca/pohunek/issues/80), and
-   [#81](https://github.com/zajca/pohunek/issues/81) provide configured overlays,
-   the original accepted design, and host-local governance. [#91](https://github.com/zajca/pohunek/issues/91)
-   reconciles the normative RFC and canonical documentation.
-2. Completed [#85](https://github.com/zajca/pohunek/issues/85) supplies the
-   Rust relay foundation: PostgreSQL, lease fencing, recovery quarantine,
-   protected initial Owner/service-account provisioning, generic OIDC browser
-   and device login, bounded HTTPS auth/account/credential operations, and the
-   native credential CLI. [#107](https://github.com/zajca/pohunek/issues/107)
-   adds account linking, [#108](https://github.com/zajca/pohunek/issues/108)
-   adds team administration, and [#92](https://github.com/zajca/pohunek/issues/92)
-   supplies Keycloak-brokered Google/GitHub verification and bounded external
-   evidence. Only then can [#72](https://github.com/zajca/pohunek/issues/72)
-   complete host enrollment and the userspace WireGuard/TCP transport.
-3. After that foundation, [#70](https://github.com/zajca/pohunek/issues/70),
-   [#82](https://github.com/zajca/pohunek/issues/82),
-   [#83](https://github.com/zajca/pohunek/issues/83),
-   [#84](https://github.com/zajca/pohunek/issues/84), and
-   [#71](https://github.com/zajca/pohunek/issues/71) deliver the v4 host link,
-   `SessionOrigin`, `HostShare`, authorization, synchronization, routing, attach
-   proxying, and typed public API.
-4. [#86](https://github.com/zajca/pohunek/issues/86) delivers team clients and
-   the separate team web surface; [#87](https://github.com/zajca/pohunek/issues/87)
-   delivers operational audit, quota, deployment, backup/restore, observability,
-   and incident evidence. Post-release [#73](https://github.com/zajca/pohunek/issues/73)
-   and [#88](https://github.com/zajca/pohunek/issues/88) add provider delivery
-   and real workload isolation.
+### Optional team relay — [#56](https://github.com/zajca/pohunek/issues/56) (project 2)
+
+One trusted, public, PostgreSQL-backed `pohunek-relayd`; hosts initiate an
+embedded userspace WireGuard tunnel; the relay adds principals, teams, session
+ACLs, routing, aggregation, audit, and quotas. Standalone and direct NetBird
+operation stay first-class. [RFC](design/team-relay-control-plane-rfc.md).
+**4/14.** Landed: overlay abstraction (#69), architecture and threat model
+(#80), host identity and single-relay state (#81), relay foundation and
+authentication (#85); outside the sub-issue tree, RFC reconciliation (#91),
+Google/GitHub admission (#92), and account linking (#107). Open: enrollment and
+WireGuard transport [#72](https://github.com/zajca/pohunek/issues/72) (all
+native blockers closed), the v4 host link
+[#70](https://github.com/zajca/pohunek/issues/70), HostShare
+[#82](https://github.com/zajca/pohunek/issues/82), visibility and sharing
+[#83](https://github.com/zajca/pohunek/issues/83), snapshots
+[#84](https://github.com/zajca/pohunek/issues/84), routing core
+[#71](https://github.com/zajca/pohunek/issues/71), team surfaces
+[#86](https://github.com/zajca/pohunek/issues/86), operational hardening
+[#87](https://github.com/zajca/pohunek/issues/87), and post-release
+[#73](https://github.com/zajca/pohunek/issues/73) and
+[#88](https://github.com/zajca/pohunek/issues/88). Team administration API
+[#108](https://github.com/zajca/pohunek/issues/108) is open outside the epic and
+outside project 2. The relay stays in core for now and later moves, with the
+team web UI of #86, into a dedicated repository (owner decision on #415,
+2026-10-02); the trigger and cross-repository reuse are open in
+[#417](https://github.com/zajca/pohunek/issues/417).
+
+### UI move to `zajca/pohunek-work` — [#415](https://github.com/zajca/pohunek/issues/415)
+
+The core side is delivered: its three sub-issues are closed and core release
+v0.32.1 (2026-10-03) was published without GUI or web assets, followed by
+v0.32.3, the release `zajca/pohunek-work` pins. #415 stays open for the receiving side, tracked in
+[pohunek-work#10](https://github.com/zajca/pohunek-work/issues/10) and
+[pohunek-work#33](https://github.com/zajca/pohunek-work/issues/33).
+
+---
+
+## 3. Recommended sequence
+
+Derived from native blocked-by links on 2026-10-12. `A → B` means A blocks B.
+Edges marked *(text)* exist only in issue text, not as native links. Lanes run
+in parallel unless a cross-lane edge says otherwise.
+
+1. **Contribution loop (A, B).** #477 → #360 → #801. #700 → #802 → #803 (also
+   after closed #800) → #804 (also after #801). B: #805 → #806 → #807 and #808
+   (#808 also after #802);
+   #808 and #807 → #809; #802 and #808 → #817; #805 → #818; #807, #808, #809,
+   #817, #818 → #810 → #811 (also after #803).
+2. **Runtime packages and plugins (C).** #145, #146, #147 → #149; #145, #146,
+   #147, #148 → #151; #149, #151, #804 → #814. #68 → #813. #325 and #326 are
+   sub-issues of #148, not native blockers of it *(text: "#148 → #325/#326" in
+   #797)*. Pi: the native edge #54 → #55 exists, but the #812 reconciliation on
+   #50 supersedes the old #52 → #53 → #54 chain; the remaining Pi order needs a
+   decision on #50.
+3. **Delegated task runs (D).** #219 → #220 → #221 → #222 → #223 and #224;
+   #224 → #225 → #226 (also after #222); #222 → #227 and #228; #223 and #226 →
+   #229; #226 → #230; #229 → #231; #227, #228, #229, #230 → #232.
+4. **Team relay.** #72 → #70 → #82 and #83; #82 → #84; #70, #72, #82, #83, #84
+   → #71 → #86 and #87 (#87 also after #72) → #56 closes. Post-release: #71,
+   #84, #86, #87 → #73; #82, #86, #87 → #88. #108 has no native blockers and
+   blocks #238. #417 is a decision with no native edges *(text: its trigger is an
+   open question, for example after #86 or the first relay release)*.
+5. **Dark factory (E).** FS0 #233 is unblocked. #233, #221, #225, #82 → #234;
+   #219, #233, #234, #70, #71, #83 → #235; #235, #70, #87 → #236; #235, #226,
+   #84 → #237; #235, #237, #108 → #238; #229, #230, #235–#238 → #239; #232,
+   #239 → #240. Then #239, #804, #811 → #815; #814, #240, #815 → #816. E
+   therefore follows D and the relay lane.
+6. **Platform and reliability.** macOS: #100, #102, #103, #104 → #105;
+   #100–#103 → #104 *(text: #104 "Dependencies")*. Durability: #422 → #423 and
+   #424; #425 is independent. Tests: #477 → #360 → #361 → #364.
+
+#360's pin landed through PR #850 while its native blocker #477 is still
+open; the link stays authoritative until it is changed on the issue.
+
+Shortest path to a first public contribution: #477 → #360 → #801, with #700 →
+#802 → #803, closing on #804. The longest chain runs D (#219 … #232) and the
+relay (#72 … #87) into E (#233 … #240) and #816.
 
 ---
 
 ## 4. Deferred / out of scope
 
-- **Application auth in the mesh-local Bun backend (external client)** — intentionally
-  absent under the owner-path NetBird/filesystem trust boundary. The separate
-  relay foundation now provides generic OIDC, credential lifecycle, and account
-  linking; its complete team administration and session ACLs remain
+- **Application auth in the mesh-local owner backend (external client)** —
+  intentionally absent under the owner-path NetBird/filesystem trust boundary.
+  The relay foundation provides generic OIDC, credential lifecycle, and account
+  linking; team administration and session ACLs remain
   [#108](https://github.com/zajca/pohunek/issues/108) and
   [#83](https://github.com/zajca/pohunek/issues/83).
 - **In-tree provider adapters in the chassis** — never; providers stay shell-out
   (`gh`) / GraphQL (Linear) in the clients.
-- **libghostty / GTK / Electron native GUI** — dropped (the native desktop client
-  lives in `zajca/pohunek-work`; the browser app covers mobile).
+- **Any UI in core** — the native desktop app, browser control center, and
+  launchers live in `zajca/pohunek-work`; libghostty / GTK / Electron GUIs are
+  dropped.
 - **Filesystem scanning / auto-discovery of repos; cross-host project unification;
   GC of stale auto-projects; per-project policy beyond `default_base_branch`** —
   out of scope (from the Projects design).
-
----
-
-## 5. Recommended sequence
-
-Tracks S, D, and Browser M1 are shipped and remain usable throughout the relay
-work. The remaining Track R sequence is #91 → completed #85 → #107/#108/#92 →
-complete #72 → #70/#82/#83/#84/#71 → #86 and #87 → post-release #73/#88.
-Existing owner-path work may
-continue independently only when it does not create a second production relay
-authority or pre-empt a locked RFC boundary.
+- **Intel Macs and `x86_64-apple-darwin` artifacts** — outside the macOS
+  release scope (#94).
