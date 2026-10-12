@@ -481,6 +481,12 @@ pub(crate) fn validate_definition_launch_with_timeout_detailed(
 /// Minimal view of the checked-in compatibility lock needed at runtime.
 #[derive(Deserialize)]
 struct HermesCompatibilityLock {
+    upstream: PinnedUpstream,
+}
+
+/// The pinned upstream release of the compatibility lock.
+#[derive(Deserialize)]
+struct PinnedUpstream {
     release: String,
 }
 
@@ -490,6 +496,7 @@ fn supported_hermes_version() -> &'static str {
         .get_or_init(|| {
             serde_json::from_str::<HermesCompatibilityLock>(HERMES_COMPATIBILITY_LOCK)
                 .expect("embedded Hermes compatibility lock must be valid JSON")
+                .upstream
                 .release
         })
         .as_str()

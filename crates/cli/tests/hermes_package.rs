@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use package::{build_archive, read_archive, ArchiveEntry, CatalogEntry, Limits, PackageDigest};
+use pohunek_daemon::agent::host::{definition_from_archive, HandlerId, ProbeVersion};
 use pohunek_daemon::catalog_anchor::CatalogTrust;
 use pohunek_daemon::session::HostTrustAnchor;
 use pohunek_test_support::bin_exe;
@@ -596,6 +597,37 @@ async fn install_official(
     (bytes, digest, archive, catalog)
 }
 
+/// Requires the descriptor's version probe, as the daemon parses it from the
+/// built package, to accept exactly the lock's `supported` range, and the lock
+/// to name this package and runtime.
+fn assert_supported_range_equals_the_lock(lock: &Value, locked_release: &str) {
+    let (bytes, digest) = built_archive();
+    let archive = read_archive(&bytes, &Limits::DEFAULT).expect("the archive reads");
+    let definition = definition_from_archive(archive.entries(), &digest)
+        .expect("the daemon accepts the package descriptor");
+    let policy = definition
+        .version_probe_policy()
+        .expect("the descriptor declares a version probe");
+    assert_eq!(
+        definition.version_probe_parser().map(HandlerId::as_str),
+        Some("semver-line-v1")
+    );
+    assert_eq!(lock["package"], PACKAGE_ID);
+    assert_eq!(lock["runtime"], definition.runtime_id().as_str());
+    assert_eq!(lock["supported"]["min"], policy.min().to_string());
+    assert_eq!(lock["supported"]["below"], policy.below().to_string());
+    let release =
+        ProbeVersion::parse(locked_release).expect("the locked release is MAJOR.MINOR.PATCH");
+    assert!(
+        policy.supports(release),
+        "the locked release lies in the supported range"
+    );
+    assert!(
+        !policy.supports(policy.below()),
+        "the first release above the range is unsupported"
+    );
+}
+
 /// Checks the exact locked release and the first release outside the range.
 async fn assert_supported_boundary(
     harness: &Harness,
@@ -1035,8 +1067,11 @@ async fn the_signed_hermes_package_is_selected_and_failed_installs_preserve_it()
         &fs::read(workspace_root().join(LOCK_PATH)).expect("read compatibility lock"),
     )
     .expect("the compatibility lock is JSON");
-    let locked_release = lock["release"].as_str().expect("locked release");
+    let locked_release = lock["upstream"]["release"]
+        .as_str()
+        .expect("locked release");
     assert_eq!(locked_release, "0.20.0");
+    assert_supported_range_equals_the_lock(&lock, locked_release);
     let locked_banner = lock["cli_checks"]
         .as_array()
         .expect("CLI checks")

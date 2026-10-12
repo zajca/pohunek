@@ -1,16 +1,30 @@
 {
-  "schema_version": 1,
-  "release": "0.20.0",
-  "tag": "v2026.8.3",
-  "published": "2026-08-03",
-  "repository": "https://github.com/NousResearch/hermes-agent",
-  "commit": "3c27eb6234bf91b8ceee9e9071591b31e9b148cb",
-  "tree": "b217767ccb994605dad522e693fa1b4cdbc2f352",
-  "source_archive": {
-    "format": "git archive --format=tar",
-    "sha256": "1e9319c58a7f5e95808546af1091d58472be7437adc63fae0cbb53316e2711aa"
+  "schema": 1,
+  "package": "pohunek.runtime.hermes",
+  "runtime": "hermes",
+  "upstream": {
+    "kind": "provisioner",
+    "name": "Hermes Agent",
+    "provisioner": "scripts/provision-hermes-compat",
+    "repository": "https://github.com/NousResearch/hermes-agent",
+    "release": "0.20.0",
+    "tag": "v2026.8.3",
+    "published": "2026-08-03",
+    "commit": "3c27eb6234bf91b8ceee9e9071591b31e9b148cb",
+    "tree": "b217767ccb994605dad522e693fa1b4cdbc2f352",
+    "source_archive": {
+      "format": "git archive --format=tar",
+      "sha256": "1e9319c58a7f5e95808546af1091d58472be7437adc63fae0cbb53316e2711aa"
+    },
+    "binary": "hermes",
+    "version_output": "Hermes Agent v{release} (2026.8.3)"
   },
-  "runtime": {
+  "supported": {
+    "min": "0.20.0",
+    "below": "0.20.1"
+  },
+  "verified_with": "Model-free runs of the pinned release provisioned from its verified source archive, with an isolated HOME and HERMES_HOME and no provider credential: the version banner, the CLI, profile and plugin command shapes, plugin list, enable and disable in a named profile, plugin tool, hook and skill registration, pohunek integration install, status, doctor and uninstall, and PTY goldens of the nine classic-display states against the repository-owned loopback model mock; the alternate-screen TUI state is recorded as unsupported",
+  "launch": {
     "program": "hermes",
     "fresh_argv": ["chat"],
     "resume_argv": ["chat", "--resume", "<reference>"],

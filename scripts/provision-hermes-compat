@@ -6,7 +6,7 @@ set -euo pipefail
 readonly SCRIPT_NAME="${0##*/}"
 readonly REQUIRED_ARGUMENTS=1
 readonly LOCK_RELATIVE_PATH="compat/hermes/compatibility-lock.json"
-readonly EXPECTED_LOCK_SHA256="a4ccdde37aa679859f03485a36b895610c9c2f44f46a44562a9e180bb97825b4"
+readonly EXPECTED_LOCK_SHA256="c670328dd5ed3241a6e5c60fc16c1128a58dd5950dd9d3048600df46c3bb2ed7"
 readonly EXPECTED_ARCHIVE_FORMAT="git archive --format=tar"
 readonly PYTHON_MINIMUM_MINOR=11
 readonly PYTHON_MAXIMUM_MINOR=14
@@ -92,15 +92,15 @@ import json
 import pathlib
 import sys
 
-lock = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+upstream = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["upstream"]
 fields = (
-    lock["release"],
-    lock["tag"],
-    lock["repository"],
-    lock["commit"],
-    lock["tree"],
-    lock["source_archive"]["format"],
-    lock["source_archive"]["sha256"],
+    upstream["release"],
+    upstream["tag"],
+    upstream["repository"],
+    upstream["commit"],
+    upstream["tree"],
+    upstream["source_archive"]["format"],
+    upstream["source_archive"]["sha256"],
 )
 if not all(isinstance(field, str) for field in fields):
     raise SystemExit("Hermes compatibility lock fields must be strings")
