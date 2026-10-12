@@ -2,7 +2,7 @@
 # installed by pohunek
 # managed by pohunek; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
-# POHUNEK_INTEGRATION_ID=claude
+# POHUNEK_INTEGRATION_ID=@POHUNEK_AGENT_ID@
 # POHUNEK_INTEGRATION_VERSION=14
 #
 # Session and subagent lifecycle hook: report active-agent identity, capture the
@@ -26,7 +26,7 @@ esac
 [ -n "${POHUNEK_SESSION_ID:-}" ] || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
 # BEGIN agent-pid
-# Claude runs a hook command as `/bin/sh -c "sh '<this script>' <action>"`. A
+# @POHUNEK_AGENT_NAME@ runs a hook command as `/bin/sh -c "sh '<this script>' <action>"`. A
 # shell that does not exec its last command (dash) stays between the agent and
 # this script, so the agent is the parent of that wrapper shell, not `$PPID`.
 # Only a parent whose full command line contains exactly that hook invocation,
@@ -76,7 +76,7 @@ from datetime import datetime, timedelta, timezone
 # stdin, so a large provider input never delays the moment it records.
 sequence = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
 
-agent = "claude"
+agent = "@POHUNEK_AGENT_ID@"
 ACTION_SESSION = "session"
 ACTION_RELEASE = "release"
 ACTION_SUBAGENT_START = "subagent-start"

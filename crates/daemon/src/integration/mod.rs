@@ -90,22 +90,16 @@ pub use protocol::{
 
 /// Path of a runnable copy of `script` for `agent` under test.
 ///
-/// The Codex scripts exist only as rendered text, so their bytes are written
-/// into a directory scoped to the calling test thread; the other agents' scripts
-/// are run from the source tree.
+/// The managed scripts exist only as rendered text, so their bytes are written
+/// into a directory scoped to the calling test thread.
 #[cfg(test)]
 pub(crate) fn runnable_script(agent: &str, script: &str) -> PathBuf {
-    let source = pohunek_test_support::manifest_dir()
-        .join("src/integration/assets")
-        .join(agent)
-        .join(script);
-    if agent != RuntimeId::CODEX {
-        return source;
-    }
-    let body = match script {
-        STATE_HOOK_INSTALL_NAME => CODEX_HOOK_ASSET.as_str(),
-        NOTIFY_HOOK_INSTALL_NAME => CODEX_NOTIFY_HOOK_ASSET.as_str(),
-        other => panic!("no rendered Codex script named {other}"),
+    let body = match (agent, script) {
+        (RuntimeId::CODEX, STATE_HOOK_INSTALL_NAME) => CODEX_HOOK_ASSET.as_str(),
+        (RuntimeId::CODEX, NOTIFY_HOOK_INSTALL_NAME) => CODEX_NOTIFY_HOOK_ASSET.as_str(),
+        (RuntimeId::CLAUDE, STATE_HOOK_INSTALL_NAME) => CLAUDE_HOOK_ASSET.as_str(),
+        (RuntimeId::CLAUDE, NOTIFY_HOOK_INSTALL_NAME) => CLAUDE_NOTIFY_HOOK_ASSET.as_str(),
+        (agent, script) => panic!("no rendered {agent} script named {script}"),
     };
     let path = crate::test_support::thread_scoped_dir("pohunek-rendered-script-").join(script);
     fs::write(&path, body).expect("write the rendered script");
@@ -118,10 +112,30 @@ const STATE_HOOK_INSTALL_NAME: &str = "pohunek-agent-state.sh";
 const NOTIFY_HOOK_INSTALL_NAME: &str = "pohunek-agent-notify.sh";
 /// Marker prefix used to identify the installed managed asset version.
 const INTEGRATION_VERSION_PREFIX: &str = "# POHUNEK_INTEGRATION_VERSION=";
-/// The Claude hook script, embedded at compile time.
-const CLAUDE_HOOK_ASSET: &str = include_str!("assets/claude/pohunek-agent-state.sh");
-/// The Claude notification hook script, embedded at compile time.
-const CLAUDE_NOTIFY_HOOK_ASSET: &str = include_str!("assets/claude/pohunek-agent-notify.sh");
+/// The Claude state hook template, embedded at compile time.
+const CLAUDE_HOOK_TEMPLATE: &str = include_str!("assets/claude/pohunek-agent-state.sh");
+/// The Claude notification hook template, embedded at compile time.
+const CLAUDE_NOTIFY_HOOK_TEMPLATE: &str = include_str!("assets/claude/pohunek-agent-notify.sh");
+/// Display name of the runtime the Claude handler's scripts are rendered for.
+const CLAUDE_REPORTER_NAME: &str = "Claude";
+/// The runtime values the Claude handler renders its templates with.
+static CLAUDE_REPORTER: LazyLock<ReporterIdentity> = LazyLock::new(|| {
+    ReporterIdentity::new(RuntimeId::CLAUDE, CLAUDE_REPORTER_NAME)
+        .expect("the Claude reporter identity is a valid constant")
+});
+/// The Claude hook script rendered for the Claude runtime; its bytes are what
+/// is installed and what drift is measured against.
+static CLAUDE_HOOK_ASSET: LazyLock<String> = LazyLock::new(|| {
+    CLAUDE_REPORTER
+        .render(CLAUDE_HOOK_TEMPLATE)
+        .expect("the Claude state template renders")
+});
+/// The Claude notification hook script rendered for the Claude runtime.
+static CLAUDE_NOTIFY_HOOK_ASSET: LazyLock<String> = LazyLock::new(|| {
+    CLAUDE_REPORTER
+        .render(CLAUDE_NOTIFY_HOOK_TEMPLATE)
+        .expect("the Claude notification template renders")
+});
 /// The state hook template, embedded at compile time.
 const CODEX_HOOK_TEMPLATE: &str = include_str!("assets/codex/pohunek-agent-state.sh");
 /// The notification hook template, embedded at compile time.
@@ -448,8 +462,8 @@ fn agent_status_at(agent: StatusAgent, dir: &Path) -> IntegrationAgentStatus {
         StatusAgent::Claude => status_at(
             StatusAgent::Claude,
             dir,
-            CLAUDE_HOOK_ASSET,
-            CLAUDE_NOTIFY_HOOK_ASSET,
+            CLAUDE_HOOK_ASSET.as_str(),
+            CLAUDE_NOTIFY_HOOK_ASSET.as_str(),
         ),
         StatusAgent::Codex => status_at(
             StatusAgent::Codex,
@@ -1814,12 +1828,12 @@ fn stage_claude(claude_dir: &Path) -> Result<StagedClaude, ProtocolError> {
             &[
                 ManagedScript {
                     path: &hook_path,
-                    asset: CLAUDE_HOOK_ASSET,
+                    asset: CLAUDE_HOOK_ASSET.as_str(),
                     role: ScriptRole::State,
                 },
                 ManagedScript {
                     path: &notify_hook_path,
-                    asset: CLAUDE_NOTIFY_HOOK_ASSET,
+                    asset: CLAUDE_NOTIFY_HOOK_ASSET.as_str(),
                     role: ScriptRole::Notify,
                 },
             ],
@@ -1871,7 +1885,7 @@ impl StagedClaude {
                 name: STATE_HOOK_INSTALL_NAME,
                 label: "Claude state hook",
                 action: Action::Write {
-                    body: CLAUDE_HOOK_ASSET,
+                    body: CLAUDE_HOOK_ASSET.as_str(),
                     mode: MANAGED_HOOK_MODE,
                 },
                 expected: Expected::Any,
@@ -1881,7 +1895,7 @@ impl StagedClaude {
                 name: NOTIFY_HOOK_INSTALL_NAME,
                 label: "Claude notification hook",
                 action: Action::Write {
-                    body: CLAUDE_NOTIFY_HOOK_ASSET,
+                    body: CLAUDE_NOTIFY_HOOK_ASSET.as_str(),
                     mode: MANAGED_HOOK_MODE,
                 },
                 expected: Expected::Any,
@@ -4202,7 +4216,7 @@ mod tests {
     #[test]
     fn assets_fire_active_agent_then_native_id_with_our_env_and_exit_zero_on_missing_env() {
         for (agent, asset) in [
-            ("claude", CLAUDE_HOOK_ASSET),
+            ("claude", CLAUDE_HOOK_ASSET.as_str()),
             ("codex", CODEX_HOOK_ASSET.as_str()),
         ] {
             assert!(

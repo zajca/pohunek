@@ -350,7 +350,7 @@ fn the_embedded_scripts_accept_only_arguments_the_registration_table_maps() {
     };
     let expected = [
         (
-            CLAUDE_HOOK_ASSET,
+            CLAUDE_HOOK_ASSET.as_str(),
             ScriptRole::State,
             vec![
                 "release",
@@ -366,7 +366,7 @@ fn the_embedded_scripts_accept_only_arguments_the_registration_table_maps() {
             vec!["session", "subagent-start", "subagent-stop"],
         ),
         (
-            CLAUDE_NOTIFY_HOOK_ASSET,
+            CLAUDE_NOTIFY_HOOK_ASSET.as_str(),
             ScriptRole::Notify,
             vec!["notification", "stop", "stop_failure"],
         ),

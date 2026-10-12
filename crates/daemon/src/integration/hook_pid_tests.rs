@@ -5,12 +5,9 @@
 //! stays between the agent and the script, so the script must propose the
 //! agent, the parent of that shell, as the reporting process.
 
-// Rust guideline compliant 2026-10-07
+// Rust guideline compliant 2026-10-12
 
 use std::process::Command;
-
-const CLAUDE_STATE_ASSET: &str = include_str!("assets/claude/pohunek-agent-state.sh");
-const CLAUDE_NOTIFY_ASSET: &str = include_str!("assets/claude/pohunek-agent-notify.sh");
 
 /// Markers that delimit the agent-pid resolution in the managed scripts.
 const BEGIN: &str = "# BEGIN agent-pid\n";
@@ -67,8 +64,8 @@ fn resolved_pid(block: &str, wrapped: bool, directory: &str) -> (u32, u32) {
 
 fn both_assets() -> [(&'static str, &'static str); 2] {
     [
-        ("state", CLAUDE_STATE_ASSET),
-        ("notify", CLAUDE_NOTIFY_ASSET),
+        ("state", super::CLAUDE_HOOK_ASSET.as_str()),
+        ("notify", super::CLAUDE_NOTIFY_HOOK_ASSET.as_str()),
     ]
 }
 
@@ -127,7 +124,7 @@ fn the_hook_scripts_keep_a_parent_shell_that_is_not_the_hook_invocation() {
 #[test]
 fn both_scripts_carry_the_same_resolution_block() {
     assert_eq!(
-        resolution_block(CLAUDE_STATE_ASSET),
-        resolution_block(CLAUDE_NOTIFY_ASSET)
+        resolution_block(&super::CLAUDE_HOOK_ASSET),
+        resolution_block(&super::CLAUDE_NOTIFY_HOOK_ASSET)
     );
 }
