@@ -577,8 +577,9 @@ mod subagent_sequences {
     /// than every other action.
     const STOP_INPUT_BOUND: usize = 1_048_576;
 
-    /// Input bound of every other Claude state hook action:
-    /// `MAX_HOOK_INPUT_BYTES` of `pohunek-agent-state.sh`.
+    /// Input bound of every other Claude state hook action and of every Codex
+    /// state hook action: `MAX_HOOK_INPUT_BYTES` of both
+    /// `pohunek-agent-state.sh` assets.
     const OTHER_INPUT_BOUND: usize = 65_536;
 
     /// A final assistant message longer than [`OTHER_INPUT_BOUND`] and well
@@ -1126,6 +1127,73 @@ mod subagent_sequences {
         replay(&root, steps, &completed).await.finish().await;
     }
 
+    /// `input` with a `padding` field that makes its JSON text exactly
+    /// `bytes` long. Providers send fields the hook does not read, so the
+    /// padding leaves the input valid.
+    fn padded_to(input: &Value, bytes: usize) -> Value {
+        let mut padded = input.clone();
+        padded["padding"] = json!("");
+        let unpadded = padded.to_string().len();
+        padded["padding"] = json!("x".repeat(
+            bytes
+                .checked_sub(unpadded)
+                .expect("the input is shorter than the target"),
+        ));
+        assert_eq!(padded.to_string().len(), bytes, "{bytes} bytes of input");
+        padded
+    }
+
+    /// `provider`'s subagent start `input`, under two ids: once one byte over
+    /// [`OTHER_INPUT_BOUND`], which the hook drops whole, and once exactly at
+    /// the bound, which it reports.
+    async fn start_at_the_input_bound(prefix: &str, provider: &str, input: &Value) {
+        /// Subagent whose start input exceeds the bound.
+        const OVER: &str = "a7b1c5d9e3f6a0b4c";
+        /// Subagent whose start input is exactly at the bound.
+        const AT: &str = "a0d4f8b2c6e9a3d7f";
+        let root = crate::test_support::scoped_dir(prefix);
+        let start = |id: &str, bytes: usize| {
+            let mut input = input.clone();
+            input["agent_id"] = json!(id);
+            Step::Hook {
+                asset: state_asset(provider),
+                action: "subagent-start",
+                payload: padded_to(&input, bytes),
+            }
+        };
+        let steps = vec![
+            start(OVER, OTHER_INPUT_BOUND + 1),
+            start(AT, OTHER_INPUT_BOUND),
+        ];
+        let running = Rows::from([((provider.to_owned(), AT.to_owned()), SubagentPhase::Running)]);
+        replay(&root, steps, &running).await.finish().await;
+    }
+
+    /// The Claude state hook bounds a `subagent-start` input at
+    /// `MAX_HOOK_INPUT_BYTES`: a valid start one byte over it creates no row,
+    /// one exactly at it creates a running row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_claude_subagent_start_over_the_input_bound_creates_no_row() {
+        let agent_type = recorded("spawn_handback_resume").events[0]
+            .subagent()
+            .agent_type
+            .clone();
+        let input =
+            json!({"hook_event_name": "SubagentStart", "agent_id": "", "agent_type": agent_type});
+        start_at_the_input_bound("ph-subagent-claude-bound-", CLAUDE, &input).await;
+    }
+
+    /// The Codex state hook bounds a `subagent-start` input at
+    /// `MAX_HOOK_INPUT_BYTES`: a valid start one byte over it creates no row,
+    /// one exactly at it creates a running row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_codex_subagent_start_over_the_input_bound_creates_no_row() {
+        let fixture: Value =
+            serde_json::from_str(crate::integration::CODEX_SUBAGENT_COMPATIBILITY_FIXTURE)
+                .expect("the Codex hook fixture parses");
+        start_at_the_input_bound("ph-subagent-codex-bound-", CODEX, &fixture["start"]).await;
+    }
+
     /// The end of the runtime retires a running row as lost.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_running_subagent_is_lost_when_its_runtime_ends() {
@@ -1614,6 +1682,13 @@ mod subagent_sequences {
         /// Name of the worker event for a claim that hit a bound.
         const REFUSED_EVENT: &str = "worker.subagent.claim.refused";
 
+        /// Name of the worker event for a subagent a snapshot completed or
+        /// reopened.
+        const RECONCILED_EVENT: &str = "worker.subagent.reconciled";
+
+        /// Name of the worker event that sums up one applied snapshot.
+        const APPLIED_EVENT: &str = "worker.subagent.snapshot.applied";
+
         /// Crafted-claim client: `<results file> <provider> <plan file>`.
         ///
         /// The plan is a JSON list of `{"type", "sequence"}` claims, with `id`
@@ -1808,13 +1883,35 @@ for claim in plan:
             }
         }
 
-        /// The worker's subagent claim events, captured on the test thread.
+        /// The counts of one applied snapshot, as the worker logged them.
+        #[derive(Debug, Clone, Default, PartialEq, Eq)]
+        struct Applied {
+            listed: u64,
+            terminalized: u64,
+            reopened: u64,
+            deferred: u64,
+            hosts: bool,
+        }
+
+        /// Everything [`ClaimLog`] captured.
+        #[derive(Default)]
+        struct Captured {
+            /// Ignored and refused claims.
+            claims: Vec<Logged>,
+            /// `(subagent id, reason)` of each reconciled subagent.
+            reconciled: Vec<(String, String)>,
+            /// Each applied snapshot.
+            applied: Vec<Applied>,
+        }
+
+        /// The worker's subagent claim and snapshot events, captured on the
+        /// test thread.
         ///
         /// These scenarios serve the worker in process on a current-thread
         /// runtime, so the worker logs on the thread whose default subscriber
         /// this installs.
         #[derive(Clone, Default)]
-        struct ClaimLog(Arc<Mutex<Vec<Logged>>>);
+        struct ClaimLog(Arc<Mutex<Captured>>);
 
         impl ClaimLog {
             /// Installs this capture as the thread's default subscriber.
@@ -1831,34 +1928,50 @@ for claim in plan:
                 tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
             }
 
+            /// Ignored and refused claims, in the order the worker logged them.
             fn events(&self) -> Vec<Logged> {
-                self.0.lock().expect("claim log").clone()
+                self.0.lock().expect("claim log").claims.clone()
+            }
+
+            /// `(subagent id, reason)` of each subagent a snapshot completed
+            /// or reopened, in the order the worker logged them.
+            fn reconciled(&self) -> Vec<(String, String)> {
+                self.0.lock().expect("claim log").reconciled.clone()
+            }
+
+            /// The counts of each applied snapshot, in order.
+            fn applied(&self) -> Vec<Applied> {
+                self.0.lock().expect("claim log").applied.clone()
             }
         }
 
         impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ClaimLog {
             fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
                 let name = event.metadata().name();
-                if name != IGNORED_EVENT && name != REFUSED_EVENT {
-                    return;
-                }
                 let mut fields = ClaimFields::default();
                 event.record(&mut fields);
-                self.0.lock().expect("claim log").push(Logged {
-                    name: name.to_owned(),
-                    action: fields.action,
-                    id: fields.id,
-                    reason: fields.reason,
-                });
+                let mut captured = self.0.lock().expect("claim log");
+                match name {
+                    IGNORED_EVENT | REFUSED_EVENT => captured.claims.push(Logged {
+                        name: name.to_owned(),
+                        action: fields.action,
+                        id: fields.id,
+                        reason: fields.reason,
+                    }),
+                    RECONCILED_EVENT => captured.reconciled.push((fields.id, fields.reason)),
+                    APPLIED_EVENT => captured.applied.push(fields.applied),
+                    _ => {}
+                }
             }
         }
 
-        /// The string fields of a subagent claim event.
+        /// The fields of a subagent claim or snapshot event.
         #[derive(Default)]
         struct ClaimFields {
             action: String,
             id: String,
             reason: String,
+            applied: Applied,
         }
 
         impl tracing::field::Visit for ClaimFields {
@@ -1870,6 +1983,23 @@ for claim in plan:
                     _ => return,
                 };
                 value.clone_into(slot);
+            }
+
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                let slot = match field.name() {
+                    "subagent.snapshot.listed" => &mut self.applied.listed,
+                    "subagent.snapshot.terminalized" => &mut self.applied.terminalized,
+                    "subagent.snapshot.reopened" => &mut self.applied.reopened,
+                    "subagent.snapshot.deferred" => &mut self.applied.deferred,
+                    _ => return,
+                };
+                *slot = value;
+            }
+
+            fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+                if field.name() == "subagent.snapshot.hosts" {
+                    self.applied.hosts = value;
+                }
             }
 
             fn record_debug(
@@ -2153,12 +2283,17 @@ for claim in plan:
         /// its stop was decided reopens nothing: R4 shows a stopping agent
         /// listed as running in its own stop, so a main `Stop` taken before
         /// that stop can list it too.
-        #[tokio::test(flavor = "multi_thread")]
+        ///
+        /// The worker logs the reopen as `snapshot_listed`, the settlement as
+        /// `snapshot_absent`, and the counts of each snapshot (#883 D5).
+        #[tokio::test]
         async fn a_snapshot_listing_a_completed_subagent_reopens_it() {
             /// The listed subagent, of the recorded id shape.
             const LISTED: &str = "a2c6e0b4d8f1a5c9e";
             /// Another background agent the worker has no record of.
             const OTHER: &str = "a6e0c4b8d2f5a9e3c";
+            let log = ClaimLog::default();
+            let _subscriber = log.install();
             let root = crate::test_support::scoped_dir("ph-subagent-reopen-listed-");
             let client = Client::new(&root);
             let steps = vec![
@@ -2196,6 +2331,100 @@ for claim in plan:
                 "{completed:?} {reopened:?}"
             );
             assert!(settled.finished_at_ms.is_some(), "{settled:?}");
+            assert_eq!(
+                log.reconciled(),
+                [
+                    (LISTED.to_owned(), "snapshot_listed".to_owned()),
+                    (LISTED.to_owned(), "snapshot_absent".to_owned()),
+                ]
+            );
+            // Every snapshot lists a subagent, a task type that can host
+            // agents.
+            assert_eq!(
+                log.applied(),
+                [
+                    Applied {
+                        hosts: true,
+                        ..Applied::default()
+                    },
+                    Applied {
+                        reopened: 1,
+                        hosts: true,
+                        ..Applied::default()
+                    },
+                    Applied {
+                        terminalized: 1,
+                        hosts: true,
+                        ..Applied::default()
+                    },
+                ]
+            );
+            assert_eq!(log.events(), [], "no claim is ignored or refused");
+            run.finish().await;
+        }
+
+        /// A snapshot that lists a terminal subagent while
+        /// [`ACTIVE_CAPACITY`] listed subagents run cannot reopen it: the
+        /// subagent stays completed, the snapshot is still acknowledged, and
+        /// the worker logs a refused `snapshot` claim for it with reason
+        /// `capacity`, beside the snapshot's counts (#883 D4, D5).
+        #[tokio::test]
+        async fn a_snapshot_reopen_beyond_the_active_capacity_is_refused() {
+            /// The terminal subagent the snapshot lists, of the recorded id
+            /// shape.
+            const LISTED: &str = "a5e9c3f7b1d4a8e2c";
+            /// Sequence of the snapshot, after every start and stop.
+            const SNAPSHOT_SEQUENCE: u64 = 1_000;
+            let log = ClaimLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-subagent-reopen-capacity-");
+            let client = Client::new(&root);
+            let running_ids: Vec<String> = (0..ACTIVE_CAPACITY)
+                .map(|index| format!("ad{index:015x}"))
+                .collect();
+            let mut claims = vec![(START, 1, LISTED), (STOP, 2, LISTED)];
+            claims.extend(
+                running_ids
+                    .iter()
+                    .zip(3_u64..)
+                    .map(|(id, sequence)| (START, sequence, id.as_str())),
+            );
+            let mut rows: Rows = running_ids
+                .iter()
+                .map(|id| ((CLAUDE.to_owned(), id.clone()), SubagentPhase::Running))
+                .collect();
+            rows.insert(
+                (CLAUDE.to_owned(), LISTED.to_owned()),
+                SubagentPhase::Completed,
+            );
+            let mut every: Vec<&str> = running_ids.iter().map(String::as_str).collect();
+            every.push(LISTED);
+            let steps = vec![
+                client.step(CLAUDE, &claims),
+                Step::Checkpoint(rows.clone()),
+                client.snapshot(SNAPSHOT_SEQUENCE, &listed(&every)),
+            ];
+            let run = replay(&root, steps, &rows).await;
+
+            let mut expected: Vec<Answer> = claims
+                .iter()
+                .map(|(action, sequence, id)| Answer::new(action, *sequence, id, true))
+                .collect();
+            expected.push(snapshot_answer(SNAPSHOT_SEQUENCE, true));
+            assert_eq!(client.answers(), expected);
+            assert_eq!(
+                log.events(),
+                [Logged::new(REFUSED_EVENT, "snapshot", LISTED, "capacity")]
+            );
+            assert_eq!(log.reconciled(), [], "nothing is completed or reopened");
+            assert_eq!(
+                log.applied(),
+                [Applied {
+                    listed: u64::try_from(ACTIVE_CAPACITY).expect("the capacity fits u64"),
+                    hosts: true,
+                    ..Applied::default()
+                }]
+            );
             run.finish().await;
         }
 

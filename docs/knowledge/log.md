@@ -39,8 +39,11 @@
   no task that can host an unlisted agent (any type except `shell`, `monitor`
   and `MCP task`) is listed, and a listed terminal row is reopened within the
   running-child limit. It logs `worker.subagent.reconciled` (`snapshot_absent`,
-  `snapshot_listed`) and `worker.subagent.snapshot.applied` with the counts
-  `listed`, `terminalized`, `reopened` and `deferred` and the `hosts` flag.
+  `snapshot_listed`) and `worker.subagent.snapshot.applied` with the task
+  count `tasks`, the `hosts` flag and the row counts `listed` (running rows the
+  snapshot kept), `terminalized`, `reopened` and `deferred`. A stopping agent
+  Claude still lists, or an agent started just before a listing built without
+  it, settles at the next main-turn end.
   Codex has no snapshot (#916).
 - The sequence contract names the clock the Codex and Claude hooks read:
   `time.clock_gettime_ns(time.CLOCK_MONOTONIC)`, system-wide, because

@@ -79,8 +79,8 @@ reported and recorded sequences, and a `subagent.reason` code:
 prompt-suggestion helper after every main turn), `stale_sequence` (a claim not
 newer than the recorded one, or a start not newer than a remembered Claude
 stop without a start) and `not_running` (a newer stop for a terminal child) at INFO,
-and `capacity` (a start refused because the running-child limit is full) at
-WARN. A child's phase follows the highest-sequence claim the worker admitted
+and `capacity` (a start, or a snapshot reopen with `subagent.action`
+`snapshot`, refused because the running-child limit is full) at WARN. A child's phase follows the highest-sequence claim the worker admitted
 for it, for every provider: an ignored `duplicate_start` or `not_running`
 claim newer than the record still advances the record's journaled sequence,
 so a later `stale_sequence` line for an older claim of the same child is the
@@ -91,15 +91,21 @@ process or runtime, is the `worker.identity.rejected` warning with
 
 At every Claude main-turn end the state hook sends the worker a snapshot of
 Claude's running background tasks. The worker logs one
-`worker.subagent.snapshot.applied` at INFO per admitted snapshot, with the
-counts `listed` (tasks in the snapshot), `terminalized`, `reopened` and
-`deferred`, and `hosts` (whether the snapshot listed a task that can host an
-unlisted agent, any type except `shell`, `monitor` and `MCP task`). Each row it
+`worker.subagent.snapshot.applied` at INFO per admitted snapshot, with
+`subagent.provider`, `subagent.sequence.reported`, and the `subagent.snapshot.*`
+fields `tasks` (tasks in the snapshot), `hosts` (whether the snapshot listed a
+task that can host an unlisted agent, any type except `shell`, `monitor` and
+`MCP task`), and the counts of the reporting process's rows: `listed` (running
+rows the snapshot listed and kept running), `terminalized`, `reopened` and
+`deferred`. Each row it
 changes is a `worker.subagent.reconciled` INFO event with `subagent.provider`,
-`subagent.id`, the snapshot and recorded sequences, and `subagent.reason`:
+`subagent.id`, `subagent.sequence.reported` (the snapshot's),
+`subagent.sequence.recorded`, and `subagent.reason`:
 `snapshot_absent` (a running row completed because the snapshot omitted it)
 or `snapshot_listed` (a terminal row reopened because the snapshot listed it).
-A reopen refused by the running-child limit is logged with reason `capacity`.
+A reopen refused by the running-child limit is a
+`worker.subagent.claim.refused` WARN with `subagent.action` `snapshot` and
+reason `capacity`.
 A listed running row stays `running` with no `reconciled` event, but its
 journaled sequence advances to the snapshot's, so a delayed stop older than the
 snapshot is then logged as `stale_sequence` and leaves the row running; its
@@ -114,6 +120,14 @@ check the agent in Claude first. A row whose stop was missed stays `running`
 until a snapshot lists no hosting task or the runtime ends, when it becomes
 `lost`. Rows started by another process, such as a second Claude in a shell
 session, are not counted.
+
+Two races settle one main turn later and need no action. A `snapshot_listed`
+reopen of an agent whose `SubagentStop` was logged just before it (or a
+`stale_sequence` stop just after it) means Claude still listed a stopping
+agent; the next main-turn end completes it with `snapshot_absent`. A
+`snapshot_absent` for an agent whose start was logged just before the snapshot
+means Claude built its listing before that agent started while no hosting task
+was listed; the next listing of its id reopens it with `snapshot_listed`.
 
 When a Claude main turn ends without a `snapshot.applied` event, check in this
 order: a `worker.identity.rejected` warning with `identity.operation`

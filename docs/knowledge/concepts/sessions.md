@@ -406,7 +406,16 @@ stop always wins over the snapshot:
 Each main turn therefore settles the Claude rows it can prove: a background
 agent that a main `Stop` listed and whose own stop never arrived holds a
 running-child slot only until the next main-turn end after it finished. A
-reconciled row looks like any other completed or reopened row; the reason is recorded only in the worker log. Rows of another reporting
+reconciled row looks like any other completed or reopened row; the reason is
+recorded only in the worker log.
+
+The listing is Claude's view at the moment of the main `Stop`, so two races
+settle one main turn later. A snapshot can still list an agent whose own
+`SubagentStop` is ordered before it: the row is reopened, or the delayed stop
+is ignored as stale, and the next main-turn end completes it. A background
+agent whose start is ordered before the snapshot but is missing from a listing
+Claude built before it started can be completed early when no hosting task is
+listed; a later listing of its id reopens it. Rows of another reporting
 process, such as a second Claude in a shell session, are outside a snapshot's
 scope. The reporting process and the last listing of each row are kept in
 worker memory only. Codex `Stop` carries no task list, so Codex rows are never
@@ -420,9 +429,11 @@ a snapshot whose task list breaks a bound, is logged as the
 `worker.identity.rejected` warning. A snapshot logs one
 `worker.subagent.reconciled` at INFO for each row it completes (reason
 `snapshot_absent`) or reopens (reason `snapshot_listed`), and one
-`worker.subagent.snapshot.applied` at INFO with the counts `listed`,
-`terminalized`, `reopened` and `deferred` and the `hosts` flag; a reopen the
-running-child limit prevents is logged with reason `capacity`. The worker
+`worker.subagent.snapshot.applied` at INFO with the number of `tasks` in the
+snapshot, the `hosts` flag, and the row counts `listed` (running rows kept
+because the snapshot listed them), `terminalized`, `reopened` and `deferred`;
+a reopen the running-child limit prevents is logged as a refused `snapshot`
+claim with reason `capacity` at WARN. The worker
 answers the hook with success when it admitted the claim and either applied it
 or ignored it for one of the INFO reasons, and an admitted, valid snapshot
 whether or not it changed a row; it answers with failure when the claim was
