@@ -187,9 +187,13 @@ Release packaging and contributor verification:
   is separate from the approximately two-minute fast-feedback target.
 - `scripts/tests/test_partitions.py` — regression checks for coverage validation.
 - `scripts/upgrade-test` — the upgrade test: downloads the previous release's
-  Linux daemon archive (checksum verified), builds the target binaries, and
-  runs `crates/cli/tests/release_upgrade.rs` as a throwaway local account with
-  its own systemd user manager. `.github/workflows/upgrade.yml` runs it from
+  Linux daemon archive (checksum verified), requires its
+  `runtime/packages/claude.tar.zst` and an unexpired signed catalog (v0.34.2 or
+  later), builds the target binaries, and runs
+  `crates/cli/tests/release_upgrade.rs` as a throwaway local account with its
+  own systemd user manager. The test installs the Claude package with the
+  previous release, starts its session from the package, and checks the
+  package pin survives the upgrade and `resume`. `.github/workflows/upgrade.yml` runs it from
   CI (pull requests touching the daemon, worker, protocol, or CLI crates),
   from `release.yml` before any publishable binary is built, and from
   `gh workflow run upgrade.yml -f previous_tag=<tag> -f head_ref=<ref>`.

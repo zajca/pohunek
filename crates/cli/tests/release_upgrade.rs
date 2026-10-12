@@ -3,11 +3,26 @@
 //! published binaries of the previous release and the real binaries of this
 //! build.
 //!
-//! The previous release installs the service, installs its managed Claude
-//! hooks, and starts a session whose agent is a fake `claude` that runs those
-//! hook scripts. This build's CLI then checks and upgrades the service. The
-//! assertions follow the live session across the daemon swap, through the
-//! previous release's own client, and through `stop` and `resume`.
+//! The previous release installs the service, installs the official Claude
+//! runtime package from its own release archive under that archive's signed
+//! catalog, pins both host profiles to the package with `plugin profile
+//! migrate`, installs its managed Claude hooks, and starts a session whose
+//! agent is a fake `claude` that runs those hook scripts. The session is
+//! launched from the package, so its recorded launch binding names the package
+//! digest. This build's CLI then checks and upgrades the service: the
+//! preflight must judge the session adoptable, and the store must keep the
+//! same package pin after the adoption and after `resume`, which relaunches
+//! from that digest. The assertions follow the live session across the daemon
+//! swap, through the previous release's own client, and through `stop` and
+//! `resume`.
+//!
+//! The fake agent is a script whose interpreter line names a copy of the shell
+//! called `fake-claude-sh`. The worker designates the agent process by an
+//! executable name containing the provider name, and a script's executable is
+//! its interpreter, so the copy's name is what qualifies the process. The
+//! profile launches the script directly, so the package's version probe runs
+//! it too, and it answers `--version` with the lowest release the installed
+//! package's descriptor accepts.
 //!
 //! The test runs as the invoking user with that user's real default layout
 //! (`$HOME/.config`, `$HOME/.local`), which is what a released binary uses, so
@@ -19,6 +34,9 @@
 //! Inputs, all required, none defaulted:
 //! - `POHUNEK_PREVIOUS_BIN_DIR`: directory with the previous release's
 //!   `pohunek`, `pohunekd`, and `pohunek-sessiond`;
+//! - `POHUNEK_PREVIOUS_RUNTIME_DIR`: the `runtime/` directory of the previous
+//!   release's daemon archive, holding `packages/claude.tar.zst` and
+//!   `runtime-catalog.json` (v0.34.2 is the first release that ships both);
 //! - `POHUNEK_HEAD_BIN_DIR`: the same three binaries of this build, with a
 //!   version that differs from the previous release;
 //! - `POHUNEK_UPGRADE_ARTIFACTS_DIR`: writable directory receiving the
@@ -30,7 +48,7 @@
 
 #![cfg(target_os = "linux")]
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
@@ -38,6 +56,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use package::{read_archive, Limits};
 use pohunek_test_support::wait::poll_until;
 use serde_json::Value;
 
@@ -47,8 +66,39 @@ const FAKE_AGENT: &str = include_str!("support/release_upgrade_agent.sh");
 /// Silent reader used to verify the previous client's request deadline.
 const SILENT_AGENT: &str = include_str!("support/release_upgrade_silent_agent.sh");
 
-/// Shell the fake agent is a copy of.
+/// Shell the fake agents' interpreter is a copy of.
 const SHELL: &str = "/bin/sh";
+
+/// File name of that copy. It must contain `claude`: the worker accepts a
+/// launch process for the claude hooks only when its executable name does.
+const AGENT_INTERPRETER: &str = "fake-claude-sh";
+
+/// Longest interpreter line (`#!` and the path) the kernel reads. Linux reads
+/// the first `BINPRM_BUF_SIZE` (256) bytes of a script, newline included, and
+/// refuses to execute a script whose interpreter path does not fit.
+const MAX_INTERPRETER_LINE_BYTES: usize = 255;
+
+/// Package id of the official Claude runtime package.
+const CLAUDE_PACKAGE_ID: &str = "pohunek.runtime.claude";
+
+/// Runtime id the Claude package serves; the host profiles' base.
+const CLAUDE_RUNTIME_ID: &str = "claude";
+
+/// The Claude package archive, relative to the release archive's `runtime/`.
+const CLAUDE_PACKAGE_ARCHIVE: &str = "packages/claude.tar.zst";
+
+/// The signed runtime catalog, relative to the release archive's `runtime/`.
+const RUNTIME_CATALOG: &str = "runtime-catalog.json";
+
+/// The runtime descriptor inside a package archive.
+const PACKAGE_DESCRIPTOR: &str = "runtime.toml";
+
+/// Version-probe parser whose `line` template the descriptor must declare; the
+/// fake agents print that template filled with the lowest accepted release.
+const VERSION_LINE_PARSER: &str = "semver-line-v1";
+
+/// Placeholder of the release inside a `semver-line-v1` `line` template.
+const VERSION_PLACEHOLDER: &str = "{version}";
 
 /// Host profile name of the fake agent.
 const PROFILE: &str = "fake-claude";
@@ -232,6 +282,7 @@ fn is_profile_change(failure: &str) -> bool {
 struct Run {
     home: PathBuf,
     previous_dir: PathBuf,
+    previous_runtime_dir: PathBuf,
     head_dir: PathBuf,
     artifacts: PathBuf,
 }
@@ -258,6 +309,7 @@ impl Run {
         Self {
             home: path("HOME"),
             previous_dir: path("POHUNEK_PREVIOUS_BIN_DIR"),
+            previous_runtime_dir: path("POHUNEK_PREVIOUS_RUNTIME_DIR"),
             head_dir: path("POHUNEK_HEAD_BIN_DIR"),
             artifacts: path("POHUNEK_UPGRADE_ARTIFACTS_DIR"),
         }
@@ -455,9 +507,115 @@ fn worker_version(status: &Value, id: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Writes the fake agent, its host profile, and the Claude config directory
-/// the managed hooks are installed into.
-fn prepare_agent(run: &Run) {
+/// The official Claude package the previous release ships, read from its
+/// archive so the test knows what the install must report.
+struct ClaudePackage {
+    /// The package archive inside the previous release's `runtime/`.
+    archive: PathBuf,
+    /// The signed catalog that authorizes it.
+    catalog: PathBuf,
+    /// Digest of the archive bytes, `sha256:<hex>`.
+    digest: String,
+    /// What `claude --version` prints for the lowest release the package's
+    /// version probe accepts.
+    version_line: String,
+}
+
+impl ClaudePackage {
+    /// Reads the package archive of the previous release with the strict
+    /// archive reader and takes the version line from its own descriptor, the
+    /// one both releases probe the fake agent with.
+    fn read(runtime_dir: &Path) -> Self {
+        let archive = runtime_dir.join(CLAUDE_PACKAGE_ARCHIVE);
+        let catalog = runtime_dir.join(RUNTIME_CATALOG);
+        assert!(
+            catalog.is_file(),
+            "the previous release ships no {}",
+            catalog.display()
+        );
+        let bytes = fs::read(&archive)
+            .unwrap_or_else(|error| panic!("read {}: {error}", archive.display()));
+        let verified = read_archive(&bytes, &Limits::DEFAULT)
+            .unwrap_or_else(|error| panic!("{} is not a package: {error}", archive.display()));
+        let descriptor = verified
+            .entries()
+            .iter()
+            .find(|entry| entry.path == PACKAGE_DESCRIPTOR)
+            .unwrap_or_else(|| panic!("{} has no {PACKAGE_DESCRIPTOR}", archive.display()));
+        let text = std::str::from_utf8(&descriptor.contents).expect("the descriptor is UTF-8");
+        let descriptor: toml::Table = toml::from_str(text).expect("the descriptor is TOML");
+        assert_eq!(
+            descriptor.get("id").and_then(toml::Value::as_str),
+            Some(CLAUDE_PACKAGE_ID),
+            "{} is not the Claude package",
+            archive.display()
+        );
+        let probe = descriptor
+            .get("runtime")
+            .and_then(|runtime| runtime.get("version_probe"))
+            .and_then(toml::Value::as_table)
+            .expect("the Claude descriptor declares a version probe");
+        let field = |name: &str| {
+            probe
+                .get(name)
+                .and_then(toml::Value::as_str)
+                .unwrap_or_else(|| panic!("the Claude version probe has no `{name}`"))
+        };
+        assert_eq!(
+            field("parser"),
+            VERSION_LINE_PARSER,
+            "the fake agents answer only a line-template version probe"
+        );
+        let line = field("line");
+        assert_eq!(
+            line.matches(VERSION_PLACEHOLDER).count(),
+            1,
+            "the version line template names the release once: {line}"
+        );
+        Self {
+            archive,
+            catalog,
+            digest: verified.digest().as_str().to_owned(),
+            version_line: line.replace(VERSION_PLACEHOLDER, field("min")),
+        }
+    }
+}
+
+/// Writes `source` as an owner-only executable script interpreted by
+/// `interpreter`, defining the `FAKE_CLAUDE_VERSION_LINE` its `--version`
+/// answer prints.
+fn write_agent_script(path: &Path, source: &str, interpreter: &Path, version_line: &str) {
+    let (first, body) = source.split_once('\n').expect("an agent script has a body");
+    assert!(
+        first.starts_with("#!"),
+        "an agent script starts with an interpreter line"
+    );
+    let interpreter = interpreter.to_str().expect("the interpreter path is UTF-8");
+    let interpreter_line = format!("#!{interpreter}");
+    assert!(
+        interpreter_line.len() <= MAX_INTERPRETER_LINE_BYTES
+            && !interpreter.contains(char::is_whitespace),
+        "the kernel cannot run an interpreter at {interpreter}: \
+         the line is too long or the path has whitespace"
+    );
+    // The line is assigned single-quoted, so it must contain no quote and no
+    // line break.
+    assert!(
+        !version_line.contains(['\'', '\n']),
+        "the version line cannot be quoted for the shell: {version_line}"
+    );
+    let text = format!("{interpreter_line}\nFAKE_CLAUDE_VERSION_LINE='{version_line}'\n{body}");
+    fs::write(path, text).unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .unwrap_or_else(|error| panic!("chmod {}: {error}", path.display()));
+}
+
+/// Writes the fake agents, their host profiles, and the Claude config
+/// directory the managed hooks are installed into.
+///
+/// The profiles carry no package pin: the previous release adds it with
+/// `plugin profile migrate` once the package is installed.
+fn prepare_agent(run: &Run, package: &ClaudePackage) {
     let private = |path: &Path| {
         fs::DirBuilder::new()
             .recursive(true)
@@ -467,40 +625,37 @@ fn prepare_agent(run: &Run) {
     };
     private(&run.agent_dir());
     private(&run.home.join(".claude"));
-    // The worker designates the agent process by an executable name containing
-    // the provider name, and a script's executable is its interpreter. The
-    // agent is therefore a copy of the shell named `fake-claude-sh` running the
-    // script, which is what the profile launches.
-    let script = run.agent_dir().join("fake-claude.sh");
-    fs::write(&script, FAKE_AGENT).expect("write the fake agent");
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("chmod the fake agent");
-    let agent = run.agent_dir().join("fake-claude-sh");
+    let interpreter = run.agent_dir().join(AGENT_INTERPRETER);
     let shell = fs::canonicalize(SHELL).expect("resolve the shell");
-    fs::copy(&shell, &agent).expect("copy the shell as the agent executable");
-    fs::set_permissions(&agent, fs::Permissions::from_mode(0o700)).expect("chmod the agent");
+    fs::copy(&shell, &interpreter).expect("copy the shell as the agent interpreter");
+    fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o700))
+        .expect("chmod the agent interpreter");
+    let script = run.agent_dir().join("fake-claude.sh");
+    write_agent_script(&script, FAKE_AGENT, &interpreter, &package.version_line);
+    let silent_script = run.agent_dir().join("silent-claude.sh");
+    write_agent_script(
+        &silent_script,
+        SILENT_AGENT,
+        &interpreter,
+        &package.version_line,
+    );
 
     let agents = run.config_dir().join("agents");
     private(&agents);
     // Input is pasted as plain text: the fake agent reads lines with `read`
     // and would see the bracketed-paste escapes otherwise.
     let profile = format!(
-        "base = \"claude\"\nprogram = \"{}\"\nargs = [\"{}\"]\n[env]\nFAKE_AGENT_LOG = \"{}\"\n\
+        "base = \"{CLAUDE_RUNTIME_ID}\"\nprogram = \"{}\"\n[env]\nFAKE_AGENT_LOG = \"{}\"\n\
          FAKE_AGENT_HOOKS = \"{}\"\nFAKE_AGENT_NATIVE_ID = \"{NATIVE_BEFORE}\"\n\
          [input_rules]\nbracketed_paste = false\n",
-        agent.display(),
         script.display(),
         run.agent_log().display(),
         run.claude_hooks().display(),
     );
     let path = agents.join(format!("{PROFILE}.toml"));
     fs::write(&path, profile).expect("write the host profile");
-    let silent_script = run.agent_dir().join("silent-claude.sh");
-    fs::write(&silent_script, SILENT_AGENT).expect("write the silent agent");
-    fs::set_permissions(&silent_script, fs::Permissions::from_mode(0o700))
-        .expect("chmod the silent agent");
     let silent_profile = format!(
-        "base = \"claude\"\nprogram = \"{}\"\nargs = [\"{}\"]\n[input_rules]\nbracketed_paste = false\n",
-        agent.display(),
+        "base = \"{CLAUDE_RUNTIME_ID}\"\nprogram = \"{}\"\n[input_rules]\nbracketed_paste = false\n",
         silent_script.display(),
     );
     let silent_path = agents.join(format!("{SILENT_PROFILE}.toml"));
@@ -508,6 +663,188 @@ fn prepare_agent(run: &Run) {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod the profile");
     fs::set_permissions(&silent_path, fs::Permissions::from_mode(0o600))
         .expect("chmod the silent profile");
+}
+
+/// Installs the official Claude package through the previous release's CLI,
+/// authorized by the signed catalog of its own archive, and checks that the
+/// installed version is that archive, official, enabled and selected.
+fn install_package(previous: &Cli, package: &ClaudePackage) {
+    let archive = package.archive.display().to_string();
+    let catalog = package.catalog.display().to_string();
+    let installed = previous.json(&[
+        "plugin",
+        "install",
+        &archive,
+        "--catalog",
+        &catalog,
+        "--yes",
+        "--json",
+    ]);
+    let info = &installed["package"];
+    assert_eq!(info["digest"], package.digest.as_str(), "{installed}");
+    assert_eq!(info["package"]["id"], CLAUDE_PACKAGE_ID, "{installed}");
+    assert_eq!(info["origin"], "official", "{installed}");
+    assert_eq!(info["enabled"], true, "{installed}");
+    assert_eq!(info["selected"], true, "{installed}");
+    assert_eq!(info["runtime_id"], CLAUDE_RUNTIME_ID, "{installed}");
+}
+
+/// Pins both host profiles to the installed package through the previous
+/// release's CLI.
+fn migrate_profiles(previous: &Cli, package: &ClaudePackage) {
+    for profile in [PROFILE, SILENT_PROFILE] {
+        let migrated = previous.json(&["plugin", "profile", "migrate", profile, "--yes", "--json"]);
+        assert_eq!(migrated["status"], "bound", "{profile}: {migrated}");
+        assert_eq!(migrated["base"], CLAUDE_RUNTIME_ID, "{profile}: {migrated}");
+        assert_eq!(
+            migrated["package"]["digest"],
+            package.digest.as_str(),
+            "{profile}: {migrated}"
+        );
+    }
+}
+
+/// Where the metadata store keeps a copy of a session's launch binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindingCopy {
+    /// `recovery.launch_binding` of the session's `kind: "session"` record.
+    SessionRecovery,
+    /// `launch_binding` of the session's `kind: "resume"` record.
+    ResumeRecord,
+}
+
+/// The copies every checked phase requires. The session record carries the
+/// recovery binding the session was launched with. The resume record exists
+/// while the session is live and has reported its native reference: the daemon
+/// upserts it after the report and removes it when the session ends
+/// (`persist_resume_binding` in `crates/daemon/src/session/resume.rs`, the same
+/// in v0.34.2). Each check runs after the live session reported its native id.
+const REQUIRED_COPIES: [BindingCopy; 2] = [BindingCopy::SessionRecovery, BindingCopy::ResumeRecord];
+
+/// Every stored copy of the launch binding of session `id` in the store text,
+/// with `None` for a copy whose binding is absent.
+///
+/// The store serializes an unpinned binding by omitting `launch_binding`, so a
+/// copy is identified by its record kind, never by the key: a recovery or resume
+/// record without the key is a copy that lost its pin. Lines are read as
+/// untyped JSON, so a schema difference between the releases changes nothing
+/// as long as the record kinds and these fields keep their spelling.
+fn parse_launch_bindings(
+    text: &str,
+    id: &str,
+) -> Result<Vec<(BindingCopy, Option<Value>)>, String> {
+    let mut copies = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: Value = serde_json::from_str(line)
+            .map_err(|error| format!("line {}: not JSON: {error}", number + 1))?;
+        if record.get("session_id").and_then(Value::as_str) != Some(id) {
+            continue;
+        }
+        match record.get("kind").and_then(Value::as_str) {
+            Some("session") => {
+                if let Some(recovery) = record.get("recovery").filter(|value| !value.is_null()) {
+                    copies.push((
+                        BindingCopy::SessionRecovery,
+                        recovery.get("launch_binding").cloned(),
+                    ));
+                }
+            }
+            Some("resume") => {
+                copies.push((
+                    BindingCopy::ResumeRecord,
+                    record.get("launch_binding").cloned(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(copies)
+}
+
+/// Whether `copies` holds each of [`REQUIRED_COPIES`] exactly once and every
+/// copy pins the Claude package with `digest`; the error names the first
+/// violation.
+fn check_pins(copies: &[(BindingCopy, Option<Value>)], digest: &str) -> Result<(), String> {
+    for required in REQUIRED_COPIES {
+        let count = copies.iter().filter(|(copy, _)| *copy == required).count();
+        if count != 1 {
+            return Err(format!("{count} {required:?} copies, expected one"));
+        }
+    }
+    for (copy, binding) in copies {
+        let Some(binding) = binding else {
+            return Err(format!("the {copy:?} copy has no launch binding"));
+        };
+        let provenance = &binding["provenance"];
+        if !(binding["runtime_id"] == CLAUDE_RUNTIME_ID
+            && provenance["kind"] == "package"
+            && provenance["package"]["id"] == CLAUDE_PACKAGE_ID
+            && provenance["package_digest"] == digest)
+        {
+            return Err(format!(
+                "the {copy:?} copy is not pinned to {CLAUDE_PACKAGE_ID} {digest}: {binding}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The store pins session `id` to the Claude package with `digest` in each of
+/// [`REQUIRED_COPIES`], and nothing else.
+///
+/// The resume record is written after the native report the caller waited
+/// for, so the check waits until every required copy is present, then judges
+/// the copies once: a copy that is present but unpinned or pinned elsewhere
+/// fails at once.
+fn assert_store_pin(run: &Run, id: &str, digest: &str, phase: &str) {
+    let path = run.data_dir().join("metadata.jsonl");
+    let read = || {
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{phase}: read {}: {error}", path.display()));
+        parse_launch_bindings(&text, id)
+            .unwrap_or_else(|error| panic!("{phase}: {}: {error}", path.display()))
+    };
+    let copies = poll_until(&format!("{phase}: stored launch bindings of {id}"), || {
+        let copies = read();
+        REQUIRED_COPIES
+            .iter()
+            .all(|required| copies.iter().any(|(copy, _)| copy == required))
+            .then_some(copies)
+    });
+    if let Err(violation) = check_pins(&copies, digest) {
+        panic!("{phase}: {id}: {violation}: {copies:?}");
+    }
+}
+
+/// The adoption preflight in a `service check` or `service upgrade` payload
+/// was run by this build's daemon, judges session `id` adoptable, and puts no
+/// live session at risk. The daemon version rules out the previous daemon's
+/// rollback verdict, which the same field carries for a rollback.
+fn assert_preflight_adoptable(payload: &Value, id: &str, head_version: &str, operation: &str) {
+    assert_eq!(
+        payload.pointer("/preflight/daemon_version"),
+        Some(&Value::from(head_version)),
+        "{operation}: the preflight was not run by this build's daemon: {payload}"
+    );
+    let sessions = payload
+        .pointer("/preflight/sessions")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("{operation} carries no preflight sessions: {payload}"));
+    assert!(
+        sessions
+            .iter()
+            .any(|session| session["session_id"] == id && session["verdict"] == "adoptable"),
+        "{operation}: the preflight does not judge {id} adoptable: {payload}"
+    );
+    assert!(
+        sessions
+            .iter()
+            .all(|session| session["verdict"] == "adoptable"),
+        "{operation}: the preflight puts a session at risk: {payload}"
+    );
 }
 
 /// Copies the previous release's store, worker journals, `service.toml`, and
@@ -578,10 +915,14 @@ struct Upgrade {
     previous_version: String,
     head_version: String,
     id: String,
+    /// Digest of the Claude package the session is pinned to.
+    digest: String,
 }
 
-/// The previous release installs itself and its managed hooks, then runs a
-/// session whose agent reports a native id and a notification through them.
+/// The previous release installs itself, the official Claude package and its
+/// managed hooks, pins the host profiles to the package, then runs a session
+/// launched from the package whose agent reports a native id and a
+/// notification through the hooks.
 fn start_on_previous(run: Run, previous: Cli, head: Cli) -> (Upgrade, Runtime, u64) {
     let (previous_version, head_version) = (previous.version(), head.version());
     assert_ne!(
@@ -589,9 +930,16 @@ fn start_on_previous(run: Run, previous: Cli, head: Cli) -> (Upgrade, Runtime, u
         "an upgrade to the same version is a no-op and proves nothing"
     );
     eprintln!("upgrade {previous_version} -> {head_version}");
-    prepare_agent(&run);
+    let package = ClaudePackage::read(&run.previous_runtime_dir);
+    eprintln!(
+        "claude package {} answers `{}`",
+        package.digest, package.version_line
+    );
+    prepare_agent(&run, &package);
     let from = run.previous_dir.display().to_string();
     previous.json(&["service", "install", "--from", &from, "--json"]);
+    install_package(&previous, &package);
+    migrate_profiles(&previous, &package);
     previous.json(&["integration", "install", "--agent", "claude", "--json"]);
     for hook in ["pohunek-agent-state.sh", "pohunek-agent-notify.sh"] {
         let installed = run.claude_hooks().join(hook);
@@ -627,6 +975,7 @@ fn start_on_previous(run: Run, previous: Cli, head: Cli) -> (Upgrade, Runtime, u
         1,
         "one launch before the upgrade: {launches:?}"
     );
+    assert_store_pin(&run, &id, &package.digest, "before the upgrade");
     let daemon = daemon_pid(&service_status(&previous));
     let upgrade = Upgrade {
         run,
@@ -635,6 +984,7 @@ fn start_on_previous(run: Run, previous: Cli, head: Cli) -> (Upgrade, Runtime, u
         previous_version,
         head_version,
         id,
+        digest: package.digest,
     };
     (upgrade, before, daemon)
 }
@@ -665,16 +1015,19 @@ impl Upgrade {
     }
 
     /// The operator path: this build's CLI checks, then upgrades. Neither
-    /// accepts runtime loss, so a refusal by the adoption preflight fails here.
+    /// accepts runtime loss, so a refusal by the adoption preflight fails here,
+    /// and both preflights must judge the package-pinned session adoptable.
     fn upgrade(&self) {
         let check = self.head.json(&["service", "check", "--json"]);
         eprintln!("service check: {check}");
+        assert_preflight_adoptable(&check, &self.id, &self.head_version, "service check");
         let from = self.run.head_dir.display().to_string();
         let report = self
             .head
             .json(&["service", "upgrade", "--from", &from, "--json"]);
         eprintln!("service upgrade: {report}");
         assert_upgrade_report(&report, &self.previous_version, &self.head_version);
+        assert_preflight_adoptable(&report, &self.id, &self.head_version, "service upgrade");
     }
 
     /// The same worker still owns the session: adoption, not a relaunch.
@@ -693,7 +1046,30 @@ impl Upgrade {
             Some(self.previous_version.as_str()),
             "the adopted worker keeps running the previous release: {status}"
         );
+        assert_store_pin(&self.run, &self.id, &self.digest, "after the adoption");
+        self.assert_package_served();
         after
+    }
+
+    /// This build serves the package version the previous release installed,
+    /// healthy, enabled, and held by the session's pin.
+    fn assert_package_served(&self) {
+        let inspected = self.head.json(&[
+            "plugin",
+            "inspect",
+            CLAUDE_PACKAGE_ID,
+            "--digest",
+            &self.digest,
+            "--json",
+        ]);
+        let info = &inspected["package"];
+        assert_eq!(info["digest"], self.digest.as_str(), "{inspected}");
+        assert_eq!(info["enabled"], true, "{inspected}");
+        assert_eq!(info["referenced"], true, "{inspected}");
+        assert!(
+            info.get("fault").is_none_or(Value::is_null),
+            "the installed package has a fault: {inspected}"
+        );
     }
 
     /// `screen` and `input` reach the adopted worker through the new daemon,
@@ -828,6 +1204,7 @@ impl Upgrade {
         assert_eq!(status["active_version"], self.head_version.as_str());
         wait_native_id(head, id, NATIVE_AFTER);
         wait_notification(head, id, EVENT_AFTER_RESUME);
+        assert_store_pin(&self.run, id, &self.digest, "after the resume");
 
         // The relaunch froze the profile revision.
         self.stop_and_wait();
