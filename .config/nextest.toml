@@ -86,3 +86,33 @@ retries = { backoff = "fixed", count = 2, delay = "1s" }
 
 [profile.relay-db.junit]
 path = "junit.xml"
+
+# Runtime package jobs of ci.yml (`pi-package`, `codex-package`,
+# `claude-package`): one `<runtime>_package` test binary with its ignored
+# real-upstream tests, which drive a real runtime through PTYs, a real daemon
+# and a session worker.
+[profile.package]
+inherits = "default"
+# One test at a time: the test daemons observe the host's process table, so a
+# concurrent test's real runtime and workers would be in each other's view.
+test-threads = 1
+# A failure still runs the remaining tests, so the report times every test.
+fail-fast = false
+# No retries: a real-upstream failure is a behavior change of the locked
+# release or a bug, never something to retry away.
+retries = 0
+# A hung test is killed after 3 minutes and reported as a TIMEOUT in the JUnit
+# report. The termination stays above the `HANG_GUARD` of
+# crates/test-support/src/wait.rs, so a hung readiness wait fails with a
+# message naming what it awaited before nextest kills the test. Measured on the
+# locked releases: the slowest real-upstream test takes 21 s on a warm local
+# host (claude_package), and the whole CI test step, compile included, took
+# 96-98 s in the claude-package job (ci.yml runs of 2026-10-12). If all 7
+# real-Claude tests hung, they would take 21 minutes plus nextest's kill grace
+# period, leaving the rest of the jobs' 30-minute timeout (which cancels a job
+# before nextest writes its report) to setup, about 2 minutes with a warm build
+# cache.
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[profile.package.junit]
+path = "junit.xml"

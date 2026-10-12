@@ -23,6 +23,7 @@ only in its canonical spelling and anything else (whitespace before a colon,
 quoted keys, flow mappings, anchors, aliases, merge keys) is reported.
 """
 
+import fnmatch
 import json
 from pathlib import Path
 import re
@@ -765,6 +766,26 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
         self.assertIn("compat attest", script)
         self.assertIn("compat stage-upstream", script)
         self.assertNotIn("cargo build", script)
+
+    def test_rows_upload_their_junit_report_whatever_the_result(self):
+        rows = self.evidence_jobs["rows"]
+        start = rows.index("      - name: Upload the row test report\n")
+        self.assertLess(rows.index("      - name: Run the row and write its attestation\n"), start)
+        end = rows.find("\n      - ", start)
+        upload = rows[start:] if end < 0 else rows[start : end + 1]
+        self.assertIn("        if: always()\n", upload)
+        self.assertIn("uses: actions/upload-artifact@", upload)
+        self.assertIn("          name: matrix-junit-${{ matrix.runtime }}-${{ matrix.target }}\n", upload)
+        self.assertIn("          OUT_DIR: ${{ runner.temp }}/row\n", rows)
+        self.assertIn(
+            "          path: ${{ runner.temp }}/row/junit-${{ matrix.runtime }}-${{ matrix.target }}.xml\n",
+            upload,
+        )
+        self.assertIn("junit=$OUT_DIR/junit-$RUNTIME-$TARGET.xml", (SCRIPTS / "run-row").read_text())
+        # The report is no release input: no download pattern may pick it up.
+        for pattern in re.findall(r"(?m)^\s+pattern: (\S+)$", self.release + self.build + self.evidence + self.ci):
+            with self.subTest(pattern=pattern):
+                self.assertFalse(fnmatch.fnmatchcase("matrix-junit-runtime-target", pattern))
 
     def test_rows_and_smoke_run_on_the_node_the_locks_require(self):
         for name in ("rows", "smoke"):

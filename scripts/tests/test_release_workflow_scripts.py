@@ -1,9 +1,11 @@
 """Scenarios for the helper scripts of the release workflows (stdlib only).
 
 They cover the scripts that need neither the network nor a built xtask:
-version resolution, the row matrix, the policy filter, input collection and
-the refusals of the assembler wrapper. The scripts that run the consumer, stage
-upstreams or sign are exercised by the release rehearsal job of ci.yml.
+version resolution, the row matrix, the policy filter, input collection, the
+refusals of the assembler wrapper, and run-row's own steps around the consumer
+(checksums, extraction, the timed consumer run and its JUnit report) with a
+stand-in xtask and consumer. Staging the real upstreams, the real consumer and
+signing are exercised by the release rehearsal job of ci.yml.
 """
 
 import hashlib
@@ -11,8 +13,11 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
+import tarfile
 import tempfile
 import unittest
+import xml.etree.ElementTree as ElementTree
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts" / "release-workflow"
@@ -122,6 +127,173 @@ class RowMatrixTests(unittest.TestCase):
         runtimes = {row["runtime"] for row in json.loads(result.stdout)["include"]}
         packages = {path.name for path in (ROOT / "runtime-packages").iterdir() if path.is_dir()}
         self.assertEqual(runtimes, packages)
+
+
+
+# The out-of-process test of crates/cli/tests/release_consumer.rs that a row
+# runs, as packaging/smoke-archive also names it.
+CONSUMER_TEST = "the_release_binaries_serve_the_runtime_out_of_process"
+
+
+class RowFixture:
+    """A checkout, row artifacts and stand-ins that take run-row through a row.
+
+    The stand-in xtask stages an empty upstream and writes a placeholder
+    attestation; the consumer is a shell script given by the scenario. Every
+    other step is run-row's own: the checksum checks, the archive extraction,
+    the scrubbed consumer run, its timing and the JUnit report.
+    """
+
+    RUNTIME = "alpha"
+    TARGET = "x86_64-unknown-linux-gnu"
+    VERSION = "1.0.0"
+
+    def __init__(self, directory: Path):
+        self.directory = directory
+        self.checkout = directory / "checkout"
+        (self.checkout / "runtime-packages" / self.RUNTIME).mkdir(parents=True)
+        lock = self.checkout / "compat" / self.RUNTIME / "compatibility-lock.json"
+        lock.parent.mkdir(parents=True)
+        lock.write_text("{}\n")
+
+        stem = f"pohunek-daemon-{self.VERSION}-{self.TARGET}"
+        self.daemon_dir = directory / "daemon"
+        self.daemon_dir.mkdir()
+        binaries = directory / "binaries" / stem
+        binaries.mkdir(parents=True)
+        for name in ("pohunek", "pohunekd", "pohunek-sessiond"):
+            (binaries / name).write_text("#!/bin/sh\n")
+        archive = self.daemon_dir / f"{stem}.tar.gz"
+        with tarfile.open(archive, "w:gz") as bundle:
+            bundle.add(binaries, arcname=stem)
+        self.sidecar(archive)
+
+        self.packages_dir = directory / "packages"
+        self.packages_dir.mkdir()
+        self.package = self.packages_dir / f"pohunek-runtime-{self.RUNTIME}-{self.VERSION}.tar.zst"
+        self.package.write_bytes(b"package")
+        self.sidecar(self.package)
+
+        tools = directory / "tools"
+        tools.mkdir()
+        self.xtask = tools / "xtask"
+        self.xtask.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            'command="$1 $2"\n'
+            "shift 2\n"
+            'while [ "$#" -gt 1 ]; do\n'
+            '    case $1 in --runtime) runtime=$2 ;; --out) out=$2 ;; --output) output=$2 ;; esac\n'
+            "    shift 2\n"
+            "done\n"
+            'case $command in\n'
+            '    "compat stage-upstream") mkdir -p "$out/$runtime/bin" ;;\n'
+            "    \"compat attest\") printf '{}\\n' > \"$output\" ;;\n"
+            '    *) echo "unexpected xtask call: $command" >&2; exit 2 ;;\n'
+            "esac\n"
+        )
+        node = tools / "node"
+        node.write_text("#!/bin/sh\n")
+        for tool in (self.xtask, node):
+            tool.chmod(0o755)
+        self.tools = tools
+        self.consumer_path = directory / "release_consumer"
+        self.out_dir = directory / "row"
+
+    @staticmethod
+    def sidecar(archive: Path) -> None:
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        Path(f"{archive}.sha256").write_text(f"{digest}  {archive.name}\n")
+
+    def consumer(self, body: str) -> None:
+        """The consumer stand-in; it runs under run-row's scrubbed environment."""
+        self.consumer_path.write_text(f"#!/bin/sh\n{body}\n")
+
+    def run(self) -> subprocess.CompletedProcess:
+        return run(
+            "run-row",
+            cwd=self.checkout,
+            env={
+                "PATH": f"{self.tools}{os.pathsep}{os.environ['PATH']}",
+                "VERSION": self.VERSION,
+                "COMMIT": "0" * 40,
+                "RUNTIME": self.RUNTIME,
+                "TARGET": self.TARGET,
+                "DAEMON_DIR": str(self.daemon_dir),
+                "PACKAGES_DIR": str(self.packages_dir),
+                "CONSUMER": str(self.consumer_path),
+                "OUT_DIR": str(self.out_dir),
+                "XTASK": str(self.xtask),
+            },
+        )
+
+    @property
+    def junit(self) -> Path:
+        return self.out_dir / f"junit-{self.RUNTIME}-{self.TARGET}.xml"
+
+    @property
+    def attestation(self) -> Path:
+        return self.out_dir / f"attestation-{self.RUNTIME}-{self.TARGET}.json"
+
+
+# The passing and failing consumers sleep this long, so the reported time is
+# known to cover the consumer run.
+CONSUMER_SECONDS = 0.2
+PASSING_CONSUMER = f'sleep {CONSUMER_SECONDS}\nprintf "{{}}" > "$POHUNEK_CONSUMER_REPORT"'
+FAILING_CONSUMER = f"sleep {CONSUMER_SECONDS}\nexit 3"
+
+
+@unittest.skipUnless(sys.platform == "linux", "run-row targets the Linux row runners (row-matrix)")
+class RunRowTests(unittest.TestCase):
+    def setUp(self):
+        self.row = RowFixture(Path(self.enterContext(tempfile.TemporaryDirectory())))
+
+    def reported_case(self) -> ElementTree.Element:
+        root = ElementTree.parse(self.row.junit).getroot()
+        self.assertEqual(root.tag, "testsuites")
+        cases = list(root.iter("testcase"))
+        self.assertEqual(len(cases), 1)
+        self.assertEqual(cases[0].get("name"), CONSUMER_TEST)
+        self.assertGreaterEqual(float(cases[0].get("time")), CONSUMER_SECONDS)
+        return cases[0]
+
+    def test_a_passing_consumer_run_is_timed_as_one_passing_testcase(self):
+        self.row.consumer(PASSING_CONSUMER)
+        result = self.row.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        case = self.reported_case()
+        self.assertEqual([child.tag for child in case], [])
+        self.assertEqual(ElementTree.parse(self.row.junit).getroot().get("failures"), "0")
+        self.assertTrue(self.row.attestation.is_file())
+
+    def test_a_failing_consumer_run_is_reported_before_the_row_fails(self):
+        self.row.consumer(FAILING_CONSUMER)
+        result = self.row.run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the consumer run failed", result.stderr)
+        failures = self.reported_case().findall("failure")
+        self.assertEqual(len(failures), 1)
+        self.assertIn("status 3", failures[0].get("message"))
+        self.assertEqual(ElementTree.parse(self.row.junit).getroot().get("failures"), "1")
+        self.assertFalse(self.row.attestation.exists())
+
+    def test_a_consumer_that_writes_no_report_is_a_failure(self):
+        self.row.consumer(f"sleep {CONSUMER_SECONDS}")
+        result = self.row.run()
+        self.assertNotEqual(result.returncode, 0)
+        failures = self.reported_case().findall("failure")
+        self.assertEqual([failure.get("message") for failure in failures], ["the consumer wrote no report"])
+        self.assertFalse(self.row.attestation.exists())
+
+    def test_a_row_that_stops_before_the_consumer_leaves_no_report(self):
+        self.row.consumer(PASSING_CONSUMER)
+        self.row.out_dir.mkdir()
+        self.row.junit.write_text("<testsuites/>")
+        Path(f"{self.row.package}.sha256").write_text(f"{'0' * 64}  {self.row.package.name}\n")
+        result = self.row.run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("package archive checksum mismatch", result.stderr)
+        self.assertFalse(self.row.junit.exists())
 
 
 class NodeVersionTests(unittest.TestCase):

@@ -1,5 +1,7 @@
 """Regression checks for the CI timing/measurement helper (stdlib only)."""
 
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -11,6 +13,15 @@ import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "ci-timings"
 ROOT = Path(__file__).resolve().parents[2]  # TODO: unused, consider removing
+
+# The run-row fixture of the release workflow script scenarios, loaded by path
+# so the module also imports when run as `scripts.tests.test_ci_timings`.
+ROW_LOADER = importlib.machinery.SourceFileLoader(
+    "release_workflow_scripts", str(Path(__file__).resolve().parent / "test_release_workflow_scripts.py")
+)
+ROW_SPEC = importlib.util.spec_from_loader(ROW_LOADER.name, ROW_LOADER)
+release_workflow_scripts = importlib.util.module_from_spec(ROW_SPEC)
+ROW_LOADER.exec_module(release_workflow_scripts)
 
 RUN = {
     "databaseId": 1,
@@ -1066,6 +1077,33 @@ class JunitCommandTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["job"]["step_seconds"], 258.0)
 
 
+
+
+@unittest.skipUnless(sys.platform == "linux", "run-row targets the Linux row runners (row-matrix)")
+class RowJunitTests(unittest.TestCase):
+    """The reports run-row writes for compatibility rows read like nextest's."""
+
+    def row_report(self, consumer: str) -> Path:
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        row = release_workflow_scripts.RowFixture(directory)
+        row.consumer(consumer)
+        row.run()
+        self.assertTrue(row.junit.is_file(), "run-row wrote no JUnit report")
+        return row.junit
+
+    def test_row_reports_count_their_consumer_run_and_its_failure(self):
+        passed = self.row_report(release_workflow_scripts.PASSING_CONSUMER)
+        failed = self.row_report(release_workflow_scripts.FAILING_CONSUMER)
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "junit", "--json", str(passed), str(failed)],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertEqual((summary["cases"], summary["failures"], summary["errors"]), (2, 1, 0))
+        self.assertEqual(len(summary["suites"]), 2)
+        self.assertEqual({name for name, _ in summary["slowest"]}, {release_workflow_scripts.CONSUMER_TEST})
+        self.assertGreaterEqual(summary["seconds"], 2 * release_workflow_scripts.CONSUMER_SECONDS)
 
 
 class FetchTests(unittest.TestCase):
