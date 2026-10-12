@@ -217,6 +217,17 @@ A verified baseline proves the package inputs only. The attestations bind the
 release's own binary sets, not the candidate core, so a baseline never replaces
 running the package job when the core changed.
 
+CI use: the `package-selection` job of `ci.yml` downloads the assets of release
+`v<workspace version>` with `gh release download` and the read-only run token
+into a directory outside the checkout and runs `baseline --json` with the
+anchor `packaging/runtime-catalog-anchor.json`. A pull request runs package
+`<p>`'s job when the core changed, `<p>` changed, or `<p>` is not `verified`; a
+failed or timed-out download only makes every package missing. A non-zero exit fails the
+selector, which runs every package job. The selector also passes each verified
+digest to the package job, which requires its rebuilt archive to hash to it: a
+difference is a non-reproducible build and fails the job. Release and
+rehearsal workflows never run `baseline`; a tag builds and tests every package.
+
 ## Install and verify a package root
 
 `package::install::install_archive` extracts a verified archive into

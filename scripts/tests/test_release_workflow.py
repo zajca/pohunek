@@ -755,6 +755,16 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
             self.assertIn(f'"{name}"', verdict)
         self.assertIn('"skipped"', verdict)
 
+    def test_the_release_never_consults_a_baseline_or_a_selection(self):
+        # The tag builds, tests and attests every official package from its
+        # own commit; the per-pull-request selection and the release baseline
+        # it verifies are CI cost decisions only.
+        scripts = {f"scripts/release-workflow/{path.name}": path.read_text() for path in sorted(SCRIPTS.iterdir()) if path.is_file()}
+        for file, text in {**self.texts, **scripts}.items():
+            for forbidden in ("package baseline", "package affected", "package-selection", "gh release download", "_baseline_digest"):
+                with self.subTest(file=file, forbidden=forbidden):
+                    self.assertNotIn(forbidden, text)
+
     def test_rows_are_data_driven_and_run_the_archive_binaries(self):
         rows = self.evidence_jobs["rows"]
         self.assertIn("matrix: ${{ fromJSON(needs.plan.outputs.rows) }}", rows)

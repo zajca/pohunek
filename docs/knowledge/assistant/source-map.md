@@ -174,8 +174,10 @@ Release packaging and contributor verification:
   `cargo t` with an `rdeps` filterset; workspace-wide and unmapped paths run
   everything, and only a reviewed non-Rust allowlist selects no tests.
 - `crates/xtask/src/package_affected.rs` — `cargo xtask package affected`: maps
-  changed files to the official runtime packages the per-PR package jobs run;
-  a core change, an embedded file, or an unknown path selects every package.
+  changed files to the official runtime packages a change selects; a core
+  change, an embedded file, or an unknown path selects every package. The
+  per-PR package jobs also run every package without a verified release
+  baseline (`package_baseline.rs`).
 - `scripts/test-partitions` — disjoint unit/daemon/relay/cli/relay-db/heavy CI
   shards and exhaustive inventory check. Heavy is the exact complement of the
   fast filter; relay heavy tests (`relay-db`, the only PostgreSQL fixture
