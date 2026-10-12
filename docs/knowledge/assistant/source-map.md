@@ -221,18 +221,27 @@ Release packaging and contributor verification:
   `aarch64-apple-darwin` target and `zig`), `relay-db`
   (`POHUNEK_RELAY_TEST_DATABASE_URL` as set/unset only, never passed to child
   commands) and `native` (the systemd user manager or the launchd `gui/<uid>`
-  domain; the other platform's suites are `ci-only`);
-  `--json` prints one versioned document (`pohunek.dev-bootstrap`, version 1)
-  with stable status and error codes; exit 2 on an unknown path, a
-  configuration error, or (under `--json`) an unexpected internal error.
+  domain; the other platform's suites are `ci-only`). Each path also lists,
+  never runs, its `focused` commands (e.g. `cargo xtask affected`, the Bun
+  gates, `scripts/darwin-check`), a `final` pointer to the gate set in
+  `.agents/skills/gates/SKILL.md` and `.agents/instructions/verification.md`,
+  and its `ci-only` CI jobs; the report prints them only with an explicit
+  `--path`. `--json` prints one versioned document (`pohunek.dev-bootstrap`,
+  version 1; keys and new status, category, check-kind or error-code values
+  are only added within a version, and a consumer treats an unknown value as
+  not ok) with stable status and error codes and a `checks` array (`[]` in an error document); exit 2 on an unknown
+  path, a configuration error, or (under `--json`) an unexpected internal
+  error.
 - `scripts/tests/test_dev_bootstrap.py` — integration scenarios that run the
   real script as a child process against a disposable repository copy with
   fake tools on `PATH`: version parsing, the config-derived nextest minimum,
   required vs. optional and `--strict` exit status, MSRV and missing-`cargo`
   handling, the `rust-toolchain.toml` pin row and malformed pins, shadowed
-  copies, the byte-exact default report, every contribution path, the
-  `--json` contract and its error codes, and that the relay database URL
-  never reaches any output.
+  copies, the byte-exact default report, every contribution path, each
+  path's focused checks and final-gate pointer (listed only with an explicit
+  `--path`), the `--json` contract and its error codes, and that the relay
+  database URL never reaches any output. The `platform contracts (arm64)` CI
+  job runs it on macOS and asserts the real host's `launchd-gui-domain` row.
 - `scripts/ci-timings` — reproduction of CI timing evidence from `gh` run
   data: per-job wall clock and workflow medians (`runs`, `compare`), per-shard
   nextest JUnit summaries (`junit`), sccache/rust-cache

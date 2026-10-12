@@ -32,9 +32,69 @@ instruction routes.
 Authoritative design lives in [docs/architecture.md](architecture.md);
 the protocol contract in [docs/public-api.md](public-api.md).
 
+## Contributor readiness
+
+A fresh clone needs no maintainer caches and no host changes. Check the tools
+of your contribution path and run the fixes it prints:
+
+```bash
+git clone https://github.com/zajca/pohunek.git && cd pohunek
+scripts/dev-bootstrap --path rust          # rust, sdk, scripts, macos-lint, relay-db, native; repeatable
+scripts/dev-bootstrap --json --path sdk    # one versioned JSON document, for agents
+```
+
+The script installs nothing: every failing row names the exact command or
+step that fixes it. It needs `python3` >= 3.11 itself (`tomllib`). With an
+explicit `--path`, the report also lists that path's focused checks, a
+pointer to the final gates, and the CI jobs that hold the evidence this host
+cannot produce (`checks` in `--json`).
+
+Worktrees: `scripts/worktree-new <slug>` creates `pohunek-worktrees/<slug>`
+beside the primary checkout on the branch `zajca/<slug>` (`--branch NAME`
+picks another). It seeds `target/debug` from the main checkout by reflink
+(btrfs/XFS) or not at all: it never falls back to a copy, so on a fresh clone
+without a built main `target/`, or on a filesystem without reflinks, it fails
+closed and says why. `scripts/worktree-new --no-seed <slug>` accepts a cold
+first build instead; a plain clone works as well.
+
+Focused checks per path (`scripts/dev-bootstrap --path NAME` is the source of
+this table and prints a note per check):
+
+| Path | Focused checks | CI-only evidence |
+|------|----------------|------------------|
+| `rust` | `cargo xtask affected` (`cargo ta`), `cargo t -p <crate>` | — |
+| `sdk` | `bun install --frozen-lockfile`, `bun run typecheck`, `bun run lint`, `bun test`, `bun test sdk/ts/scripts` | `SDK workspace (macOS arm64)`, off macOS |
+| `scripts` | `python3 -m unittest discover -s scripts/tests -p 'test_*.py'` (one file: `-p test_<name>.py`) | — |
+| `macos-lint` | `scripts/darwin-check` | `platform contracts (arm64)` |
+| `relay-db` | `python3 scripts/test-partitions run relay-db` with `POHUNEK_RELAY_TEST_DATABASE_URL` exported | `tests (relay DB, PostgreSQL)` |
+| `native` | `cargo build --locked -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli --bins`, then on Linux `POHUNEK_SYSTEMD_E2E=1 cargo test <suite> -- --ignored --test-threads 1` for each `<suite>` of `-p pohunek-platform --test systemd`, `-p pohunek-daemon --test systemd_durable_worker`, `-p pohunek-cli --test service_systemd`, `-p pohunek-daemon --test supervised_lifecycle`, `-p pohunek-cli --test service_upgrade`; on macOS `cargo test --locked -p` each of `pohunek-platform`, `pohunek-daemon`, `pohunek-cli` | the other OS's suites, as a `ci-only` row: `platform contracts (arm64)` or `real systemd supervision` |
+
+Final gates: run the applicable set once, on the final revision, before
+calling the change done: the "Core gate set" of the
+[gates skill](../.agents/skills/gates/SKILL.md) (plus its SDK section for SDK
+changes), with the [verification guide](../.agents/instructions/verification.md)
+as the full inventory.
+
+A check this host cannot run stays unverified. `dev-bootstrap` reports it as
+`ci-only` or `unavailable`, never `ok`, and names the CI job whose run is the
+evidence; report it the same way, never as a green skip.
+
+macOS: put the rustup proxies (`$CARGO_HOME/bin`, by default `~/.cargo/bin`)
+first on PATH so rustup selects the `rust-toolchain.toml` pin, and install bun
+at the `.bun-version` pin (`--path sdk` prints the installer). The system
+`/usr/bin/python3` is too old for `tomllib`; put a Homebrew or uv-managed
+`python3` >= 3.11 first on PATH. `scripts/dev-bootstrap --path native` reports
+the launchd `gui/<uid>` domain as `launchd-gui-domain`; run it, and the
+launchd suites, from the logged-in GUI session, because an SSH-only session
+has no such domain. The `macos-lint` rows are `not-applicable` there:
+`scripts/darwin-check` lints natively. The `platform contracts (arm64)` CI job
+runs the `dev-bootstrap` scenarios and this native check on the macOS runner.
+
 ## Gates
 
-CI treats warnings as errors. Run the full set before calling anything done:
+CI treats warnings as errors. This list is the core of the set; the gates
+skill and the verification guide linked above are the full, authoritative set.
+Run the full set before calling anything done:
 
 ```bash
 cargo fmt --all --check
