@@ -789,8 +789,9 @@ mod tests {
         assert!(error.msg.contains("`codex`"));
         assert!(!error.msg.contains('/'));
         let recover = error.recover.as_deref().expect("a recovery hint");
-        assert!(recover.contains("disable or uninstall"));
-        assert!(recover.contains("start a new session"));
+        assert!(recover.contains("`pohunek session new --agent codex`"));
+        assert!(recover.contains("cannot be rebound"));
+        assert!(!recover.contains("disable"));
         let json = serde_json::to_string(&error).expect("serialize");
         assert_eq!(
             serde_json::from_str::<ProtocolError>(&json).expect("roundtrip"),

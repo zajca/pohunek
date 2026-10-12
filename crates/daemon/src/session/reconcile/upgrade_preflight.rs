@@ -7,13 +7,14 @@
 //! worker journals on disk and the process table. Each live session gets the
 //! verdict startup reconciliation of this build would reach for it, decided by
 //! the functions reconciliation itself uses: the store load, the journal
-//! reader, the resume-binding merge and the launch-identity check. Evidence
-//! that cannot be read counts against the session.
+//! reader, the resume-binding merge, the launch-identity check and the
+//! launch-pin resolution resume applies. Evidence that cannot be read counts
+//! against the session.
 //!
 //! Evidence only a worker's socket can give (its answering protocol version,
 //! the identity it reports) is judged from what its journal recorded of it.
-//! The runtime registry is not built, so a binding that needs it to complete
-//! its launch spec is reported as unverified.
+//! The store migration does not consult the runtime registry, so a binding
+//! that needs it to complete its launch spec is reported as unverified.
 
 // Rust guideline compliant 2026-10-12
 
@@ -28,9 +29,9 @@ use pohunek_service_config::preflight::{
     CODE_JOURNAL_SCHEMA_UNSUPPORTED, CODE_JOURNAL_UNREADABLE, CODE_NO_SESSION_RECORD,
     CODE_PROTOCOL_INCOMPATIBLE, CODE_RECORD_UNREADABLE, CODE_RECOVERY_UNMAPPABLE,
     CODE_RECOVERY_UNVERIFIED, CODE_RESUME_RECORD_UNREADABLE, CODE_RUNTIME_IDENTITY_MISMATCH,
-    CODE_STORE_UNUSABLE, CODE_WORKER_CHILD_MISSING, CODE_WORKER_ENDED, CODE_WORKER_MARKER_LEGACY,
-    CODE_WORKER_NOT_ADVANCED, CODE_WORKER_NOT_INITIALIZED, CODE_WORKER_NOT_RUNNING,
-    CODE_WORKER_UNVERIFIABLE, REPORT_VERSION,
+    CODE_RUNTIME_SOURCE_NOT_SERVED, CODE_STORE_UNUSABLE, CODE_WORKER_CHILD_MISSING,
+    CODE_WORKER_ENDED, CODE_WORKER_MARKER_LEGACY, CODE_WORKER_NOT_ADVANCED,
+    CODE_WORKER_NOT_INITIALIZED, CODE_WORKER_NOT_RUNNING, CODE_WORKER_UNVERIFIABLE, REPORT_VERSION,
 };
 use pohunek_worker_protocol::{negotiate, Version, VersionRange, SUPPORTED_RANGE};
 
@@ -538,7 +539,7 @@ fn judge(
     if let Some(judgement) = judge_identity(journal, &mut candidate, inspector, runtimes) {
         return judgement;
     }
-    judge_recovery(facts, &candidate)
+    judge_recovery(facts, &candidate, runtimes)
 }
 
 /// Picks the one live journal of the record's generation.
@@ -685,11 +686,17 @@ fn judge_identity(
         match runtime_hook_schema(runtimes, &candidate.info.agent_base, &pin) {
             HookSchemaLookup::Schema(schema) => snapshot.hook_schema = Some(schema.id.to_owned()),
             HookSchemaLookup::NoIntegration => {}
-            HookSchemaLookup::Unresolved(_) => {
+            HookSchemaLookup::Unresolved(error) => {
                 return Some(not_adopted(
                     CODE_IDENTITY_UNVERIFIED,
-                    "the worker journaled an active identity without a hook schema, and the \
-                     definition of its runtime cannot be read to supply one",
+                    format!(
+                        "the worker journaled an active identity without a hook schema, and \
+                         this daemon serves no \
+                         definition of the session's launch pin to supply one ({}: {}); the \
+                         session's runtime source is not served or cannot be read, so the \
+                         identity cannot be verified",
+                        error.code, error.msg
+                    ),
                 ));
             }
         }
@@ -736,7 +743,11 @@ fn judge_protocol(journal: &JournalEvidence) -> Option<Judgement> {
 }
 
 /// Whether the session keeps its native recovery.
-fn judge_recovery(facts: &Facts<'_>, candidate: &SessionRecord) -> Judgement {
+fn judge_recovery(
+    facts: &Facts<'_>,
+    candidate: &SessionRecord,
+    runtimes: &RuntimeHost,
+) -> Judgement {
     if facts.recovery == RecoveryOutcome::Lost {
         return (
             Verdict::WouldLoseRecovery,
@@ -766,9 +777,44 @@ fn judge_recovery(facts: &Facts<'_>, candidate: &SessionRecord) -> Judgement {
                 .to_owned(),
         );
     }
+    if let Some(judgement) = judge_pin(candidate, runtimes) {
+        return judgement;
+    }
     (
         Verdict::Adoptable,
         CODE_ADOPTABLE,
         "the worker journal, process, protocol range and stored recovery are consistent".to_owned(),
     )
+}
+
+/// The session's launch pin must name a runtime source the new daemon serves:
+/// resume and fork resolve exactly that source, and nothing else stands in.
+///
+/// The pin is resolved as resume resolves it, against the built-in runtimes
+/// of this binary and the packages installed now, so a built-in this binary
+/// does not ship, a built-in an official package serves in place of, and a
+/// package digest that is not installed each lose the session's recovery. A
+/// session without native resume or fork has no recovery to lose.
+fn judge_pin(candidate: &SessionRecord, runtimes: &RuntimeHost) -> Option<Judgement> {
+    let binding = candidate.recovery.as_ref()?;
+    let capabilities = &candidate.info.capabilities;
+    if !capabilities.resume && !capabilities.fork {
+        return None;
+    }
+    let error = runtimes
+        .resolve_pinned(&binding.agent_base, &binding.launch_binding)
+        .err()?;
+    let runtime = binding.agent_base.as_wire();
+    Some((
+        Verdict::WouldLoseRecovery,
+        CODE_RUNTIME_SOURCE_NOT_SERVED,
+        format!(
+            "the session was launched from a runtime source this daemon does not serve ({}: \
+             {}), so the worker is adopted but resume and fork are refused; a session cannot \
+             be rebound to another runtime source, so finish the work in the live session and \
+             continue in a new session started with `pohunek session new --agent {runtime}` \
+             while this daemon serves that runtime, or upgrade with --accept-runtime-loss",
+            error.code, error.msg
+        ),
+    ))
 }

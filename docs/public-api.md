@@ -667,10 +667,35 @@ official package whose `runtime_id` is that alias in `package.list` and
 
 A session launched from the built-in runtime of an alias that a package serves
 now cannot be resumed or forked: the request is refused with
-`runtime/runtime_served_by_package`, its recovery hint names the way back
-(disable or uninstall the official package, or start a new session on the
-package), and the stored binding is kept unchanged. A live session keeps being
-observed with the built-in definition it was launched from.
+`runtime/runtime_served_by_package`, whose recovery hint names the one
+migration (start a new session with `pohunek session new --agent <runtime>`,
+which the official package serves; a session is never rebound to another
+runtime source), and the stored binding is kept unchanged. A session pinned to a
+runtime source the daemon does not serve otherwise (a built-in it does not ship,
+a package digest that is not installed) is refused with
+`runtime/runtime_not_installed`. Stop and remove still work. A session the
+daemon launched keeps the definition it was launched from while that daemon
+runs; a session adopted at startup whose pin the daemon does not serve is
+observed only through its launch-time facts: the generic shell manifest (a
+manifest override of the session's host profile still applies), the input
+framing persisted at launch, and the hook schema its worker journaled. Hook
+reports and processes naming its own runtime are not attributed through the
+package that serves the runtime id now: `session.report_agent` and
+`session.release_agent` for that runtime are ignored (logged at INFO as
+`session.callback.unserved_pin`), and the public socket admits a hook report (a
+notification, for example) only by the schema the session's worker journaled,
+the rule the worker applies on its own socket. This holds until a daemon
+restart adopts the session again, also when the pinned source is served again
+in between (the package uninstalled, for example). A recovery binding whose
+launch spec the store migration left unresolved is completed only from the
+definition its pin names; while the pin is not served it stays unrepaired and
+the session carries a `native_recovery` warning.
+A worker of a release before 0.34.0 journals no hook schema, so a live session
+whose worker journaled an active identity on such a pin cannot have it verified:
+the upgrade preflight reports it `would_not_be_adopted` with
+`worker_identity_unverified`, and startup does not adopt it (the identity import
+fails with `active_identity_provider_invalid` and the runtime is reported as a
+`conflict`).
 Catalog trust fails closed with
 `official_trust_unavailable` on a host without a trust anchor and with
 `official_trust_anchor_invalid` on a host whose anchor cannot be trusted. The
@@ -1672,7 +1697,13 @@ which the flag overrides. The `--json` success reports of both commands carry
 flag accepted them). The preflight reads the store, the worker
 journals and the process table only; it never connects to a worker socket. A
 live session whose worker journal names a release before 0.33.1, or no release,
-is `would_not_be_adopted` with code `worker_marker_legacy`. See
+is `would_not_be_adopted` with code `worker_marker_legacy`. A live session that
+can resume or fork natively and whose launch pin names a runtime source the new
+binary does not serve (resolved as resume resolves it, against that binary's
+built-in runtimes and the installed packages: a built-in it does not ship, a
+built-in an official package serves in place of, or a package digest that is
+not installed) is `would_lose_recovery` with code `runtime_source_not_served`;
+its `detail` names the resume error and the migration to a new session. See
 [update after release](knowledge/runbooks/update-after-release.md).
 
 Identity hooks prefer the owner-private worker endpoint so an accepted launch

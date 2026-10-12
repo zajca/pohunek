@@ -4,11 +4,12 @@
 //!
 //! The catalog is signed with a test key derived from a fixed label.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 use std::fs;
 
 use package::PackageDigest;
+use pohunek_service_config::preflight::{Verdict, CODE_ADOPTABLE, CODE_RUNTIME_SOURCE_NOT_SERVED};
 use protocol::{
     PackageBindProfileParams, PackageBindStatus, PackageErrorKind, PackageInstallStatus,
     PackageOrigin, PackageSetEnabledParams, PackageUninstallParams, RuntimeId,
@@ -17,7 +18,10 @@ use protocol::{
 use super::catalog_tests::{anchor, catalog, catalog_install, entry, signed_by, signing_key};
 use super::test_fixture::{explicit, Fixture, Package, INERT_PROGRAM, RUNTIME};
 use crate::agent::host::ServedBy;
+use crate::procwatch::HostInspector;
+use crate::session::procwatch::OwnRuntime;
 use crate::session::tests::{durable_recovery, params, temp_dir, temp_store_path};
+use crate::session::upgrade_preflight::{self, PreflightInputs};
 
 /// Package id of the official packages these tests install.
 const OFFICIAL_PACKAGE: &str = "pohunek.runtime.official";
@@ -71,6 +75,71 @@ fn served_by(fixture: &Fixture, alias: &str) -> Option<ServedBy> {
 
 fn is_builtin(fixture: &Fixture, alias: &str) -> bool {
     served_by(fixture, alias) == Some(ServedBy::Builtin)
+}
+
+/// Asserts the refusal of a built-in session `alias` an official package
+/// serves now: the typed code, and a recovery hint that names the one
+/// migration (a new session the package serves) and no way back or rebind.
+fn assert_migration_refusal(refused: &protocol::ProtocolError, alias: &str) {
+    assert_eq!(refused.code, "runtime_served_by_package", "{refused:?}");
+    let hint = refused.recover.as_deref().expect("a recovery hint");
+    assert!(
+        hint.contains(&format!("`pohunek session new --agent {alias}`")),
+        "{hint}"
+    );
+    assert!(hint.contains("cannot be rebound"), "{hint}");
+    for stale in [
+        "disable",
+        "uninstall",
+        "resume the session from the built-in",
+    ] {
+        assert!(!hint.contains(stale), "{hint}");
+    }
+}
+
+/// A same-directory fork of session `id`.
+fn fork_params(id: &protocol::SessionId) -> protocol::SessionForkParams {
+    protocol::SessionForkParams {
+        session_id: id.clone(),
+        name: None,
+        cwd_mode: protocol::ForkCwdMode::Same,
+        cols: 100,
+        rows: 30,
+        accept_profile_change: false,
+    }
+}
+
+/// The preflight inputs of `fixture`'s installed state.
+fn preflight_inputs(fixture: &Fixture, store_path: &std::path::Path) -> PreflightInputs {
+    PreflightInputs {
+        store_path: store_path.to_path_buf(),
+        worker_state_root: fixture
+            .registry
+            .inner
+            .config
+            .worker_state_root
+            .clone()
+            .expect("the fixture's worker state root"),
+        plugins_dir: fixture.plugins.clone(),
+    }
+}
+
+/// The verdict, code and detail the preflight gives session `id`.
+fn preflight_verdict(
+    inputs: &PreflightInputs,
+    id: &protocol::SessionId,
+) -> (Verdict, String, String) {
+    let report = upgrade_preflight::run(inputs, &HostInspector::new());
+    let verdict = report
+        .sessions
+        .iter()
+        .find(|verdict| verdict.session_id == id.0)
+        .unwrap_or_else(|| panic!("no verdict for {}: {:?}", id.0, report.sessions));
+    (
+        verdict.verdict,
+        verdict.code.clone(),
+        verdict.detail.clone(),
+    )
 }
 
 #[tokio::test]
@@ -249,11 +318,6 @@ async fn disabling_or_uninstalling_the_official_package_returns_the_alias_to_the
             .expect("uninstall");
         assert!(is_builtin(&fixture, alias), "{alias} uninstalled");
         assert_eq!(fixture.serving(alias), None);
-        assert!(fixture
-            .host
-            .registry()
-            .shadowed_builtin(&runtime_id(alias))
-            .is_none());
     }
 }
 
@@ -360,11 +424,7 @@ async fn a_built_in_launched_session_fails_closed_after_the_takeover_and_resumes
         .resume(&created.id)
         .await
         .expect_err("the package serves the runtime now");
-    assert_eq!(refused.code, "runtime_served_by_package");
-    assert!(refused
-        .recover
-        .as_deref()
-        .is_some_and(|hint| hint.contains("uninstall")));
+    assert_migration_refusal(&refused, RuntimeId::CODEX);
     assert_eq!(
         fs::read(&store_path).expect("read the store"),
         before,
@@ -393,6 +453,426 @@ async fn a_built_in_launched_session_fails_closed_after_the_takeover_and_resumes
         "the built-in serves the pin again"
     );
     let _ = fixture.registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn a_built_in_claude_session_is_neither_resumed_nor_forked_after_the_takeover() {
+    let key = signing_key("root");
+    let dir = temp_dir("alias-claude-fork");
+    let store_path = temp_store_path("alias-claude-fork");
+    let fixture = Fixture::with_anchor_and_store(
+        "alias-claude-fork-plugins",
+        anchor(&[&key], Vec::new()),
+        store_path.clone(),
+    );
+    fixture.write_profile(
+        PROFILE,
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n",
+    );
+    let created = fixture
+        .registry
+        .create(protocol::SessionNewParams {
+            agent: PROFILE.to_owned(),
+            cwd: Some(dir),
+            ..params()
+        })
+        .await
+        .expect("a session of the built-in runtime");
+    assert!(
+        created.capabilities.fork,
+        "the built-in Claude runtime forks"
+    );
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+    install_official(&fixture, &official(RuntimeId::CLAUDE), RuntimeId::CLAUDE, 5).await;
+    let before = fs::read(&store_path).expect("read the store");
+
+    let resumed = fixture
+        .registry
+        .resume(&created.id)
+        .await
+        .expect_err("the package serves the runtime now");
+    assert_migration_refusal(&resumed, RuntimeId::CLAUDE);
+    let forked = fixture
+        .registry
+        .fork(fork_params(&created.id))
+        .await
+        .expect_err("a fork never launches the package for a built-in session");
+    assert_migration_refusal(&forked, RuntimeId::CLAUDE);
+    assert_eq!(
+        fs::read(&store_path).expect("read the store"),
+        before,
+        "the refusals leave the stored session untouched"
+    );
+
+    fixture
+        .registry
+        .remove(&created.id)
+        .await
+        .expect("a refused session is still removable");
+}
+
+/// A live session of the built-in Codex runtime, launched through the
+/// [`PROFILE`] host profile, before any package serves `codex`.
+struct LaunchedCodex {
+    fixture: Fixture,
+    store_path: std::path::PathBuf,
+    created: protocol::SessionInfo,
+    /// The input rules the session was launched with.
+    input_rules: crate::agent::InputRules,
+}
+
+async fn launch_built_in_codex(tag: &str) -> LaunchedCodex {
+    let key = signing_key("root");
+    let dir = temp_dir(tag);
+    let store_path = temp_store_path(tag);
+    let fixture = Fixture::with_anchor_and_store(
+        &format!("{tag}-plugins"),
+        anchor(&[&key], Vec::new()),
+        store_path.clone(),
+    );
+    fixture.write_profile(
+        PROFILE,
+        "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n",
+    );
+    let created = fixture
+        .registry
+        .create(protocol::SessionNewParams {
+            agent: PROFILE.to_owned(),
+            cwd: Some(dir),
+            ..params()
+        })
+        .await
+        .expect("a session of the built-in runtime");
+    let input_rules = fixture
+        .registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get(&created.id)
+        .expect("the live session")
+        .input_rules;
+    LaunchedCodex {
+        fixture,
+        store_path,
+        created,
+        input_rules,
+    }
+}
+
+/// Installs the official Codex package, whose detection differs from the
+/// built-in's, so it serves `codex` in place of the built-in.
+async fn take_codex_over(fixture: &Fixture) -> Package {
+    let package = Package::build_with_detect(
+        OFFICIAL_PACKAGE,
+        "1.0.0",
+        RuntimeId::CODEX,
+        INERT_PROGRAM,
+        OFFICIAL_MANIFEST,
+    );
+    install_official(fixture, &package, RuntimeId::CODEX, 5).await;
+    package
+}
+
+/// Starts a second daemon over `launched`'s state and checks that it adopts
+/// the live worker.
+async fn adopt(launched: &LaunchedCodex) -> Fixture {
+    let restarted = launched.fixture.reopen_with_workers().await;
+    restarted
+        .registry
+        .reconcile_workers()
+        .await
+        .expect("startup reconciliation");
+    let adopted = restarted
+        .registry
+        .inspect(&launched.created.id)
+        .await
+        .expect("the live session survives the restart");
+    assert_eq!(
+        adopted.runtime.as_ref().map(|runtime| runtime.state),
+        Some(protocol::RuntimeState::Live)
+    );
+    restarted
+}
+
+#[tokio::test]
+async fn a_built_in_session_adopted_after_a_takeover_is_observed_only_through_its_pin() {
+    let launched = launch_built_in_codex("alias-adopted").await;
+    let created = &launched.created;
+    assert!(created.capabilities.resume, "the built-in Codex resumes");
+    let inputs = preflight_inputs(&launched.fixture, &launched.store_path);
+    let (verdict, code, _detail) = preflight_verdict(&inputs, &created.id);
+    assert_eq!(
+        (verdict, code.as_str()),
+        (Verdict::Adoptable, CODE_ADOPTABLE),
+        "the built-in serves the pin before the takeover"
+    );
+
+    take_codex_over(&launched.fixture).await;
+
+    // The upgrade preflight reports the lost recovery with its migration.
+    let (verdict, code, detail) = preflight_verdict(&inputs, &created.id);
+    assert_eq!(
+        (verdict, code.as_str()),
+        (Verdict::WouldLoseRecovery, CODE_RUNTIME_SOURCE_NOT_SERVED),
+        "{detail}"
+    );
+    assert!(detail.contains("runtime_served_by_package"), "{detail}");
+    assert!(
+        detail.contains("`pohunek session new --agent codex`"),
+        "{detail}"
+    );
+
+    let restarted = adopt(&launched).await;
+    let launched_rules = launched.input_rules;
+    assert_observed_only_through_the_pin(&restarted, &created.id, launched_rules).await;
+    assert_hooks_not_attributed_through_the_package(&restarted, &created.id).await;
+
+    // Resume and fork are refused; Codex declares no fork at all.
+    let resumed = restarted
+        .registry
+        .resume(&created.id)
+        .await
+        .expect_err("the built-in pin is not served");
+    assert_migration_refusal(&resumed, RuntimeId::CODEX);
+    let forked = restarted
+        .registry
+        .fork(fork_params(&created.id))
+        .await
+        .expect_err("Codex does not fork");
+    assert_eq!(forked.code, "agent_fork_unsupported");
+
+    // Stop and remove release what the session owns.
+    restarted
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the adopted session");
+    restarted
+        .registry
+        .remove(&created.id)
+        .await
+        .expect("remove the adopted session");
+}
+
+/// Asserts that the adopted session `id` of `fixture` is observed with the
+/// generic manifest and its launch-time input framing, never through the
+/// package that serves `codex` now.
+async fn assert_observed_only_through_the_pin(
+    fixture: &Fixture,
+    id: &protocol::SessionId,
+    launched_rules: crate::agent::InputRules,
+) {
+    let own = {
+        let sessions = fixture.registry.inner.sessions.lock().await;
+        let entry = sessions.get(id).expect("the adopted session");
+        assert!(
+            entry.pinned.is_none(),
+            "no definition stands in for the built-in pin"
+        );
+        assert_eq!(
+            format!("{:?}", entry.default_detector_config.manifest),
+            format!("{:?}", Some(crate::detect::generic_shell_manifest())),
+        );
+        assert_eq!(entry.input_rules, launched_rules);
+        OwnRuntime::of(entry)
+    };
+    let recognized = observe(
+        fixture,
+        id,
+        fact(4002, "official-codex"),
+        std::time::Instant::now(),
+        Some(&own),
+    );
+    assert!(
+        recognized.is_empty(),
+        "a process the package recognizes is not attributed to the session"
+    );
+}
+
+/// An identity report of `agent` for session `id` carrying a native id.
+fn identity_report(id: &protocol::SessionId, agent: &str) -> protocol::SessionReportAgentParams {
+    protocol::SessionReportAgentParams {
+        session_id: id.clone(),
+        source: "pohunek:codex".to_owned(),
+        agent: agent.to_owned(),
+        activity: None,
+        seq: None,
+        pid: None,
+        agent_session_id: Some("native-after-takeover".to_owned()),
+        agent_session_path: None,
+    }
+}
+
+/// Asserts that hook callbacks naming the own runtime of the adopted session
+/// `id` are not attributed through the package definition, while hook
+/// admission follows the schema its worker journaled.
+async fn assert_hooks_not_attributed_through_the_package(
+    fixture: &Fixture,
+    id: &protocol::SessionId,
+) {
+    for agent in [RuntimeId::CODEX, PROFILE] {
+        let reported = fixture
+            .registry
+            .report_agent(identity_report(id, agent))
+            .await;
+        assert!(!reported.recorded, "{agent}: the report is not recorded");
+    }
+    let released = fixture
+        .registry
+        .release_agent(protocol::SessionReleaseAgentParams {
+            session_id: id.clone(),
+            source: "pohunek:codex".to_owned(),
+            agent: RuntimeId::CODEX.to_owned(),
+            seq: None,
+        })
+        .await;
+    assert!(!released.released, "the release is not applied");
+    // The public socket admits hook reports by the schema the live worker
+    // journaled, as the worker does on its own socket.
+    fixture
+        .registry
+        .admit_session_hook(
+            id,
+            pohunek_worker_protocol::HookAction::Notification,
+            RuntimeId::CODEX,
+        )
+        .await
+        .expect("the journaled schema admits a Codex notification");
+    let inspected = fixture.registry.inspect(id).await.expect("inspect");
+    assert_ne!(
+        inspected.native_session_id.as_deref(),
+        Some("native-after-takeover")
+    );
+    assert_eq!(inspected.active_agent_base, None);
+}
+
+#[tokio::test]
+async fn an_adopted_built_in_session_stays_unattributed_after_the_built_in_returns() {
+    let launched = launch_built_in_codex("alias-returned").await;
+    let id = launched.created.id.clone();
+    let package = take_codex_over(&launched.fixture).await;
+    let restarted = adopt(&launched).await;
+
+    // The built-in serves `codex` again, but the session was adopted without
+    // a definition of its pin; that holds until a restart adopts it again.
+    restarted
+        .registry
+        .package_uninstall(uninstall(&package.digest))
+        .await
+        .expect("uninstall the official package");
+    assert!(is_builtin(&restarted, RuntimeId::CODEX));
+
+    let own = {
+        let sessions = restarted.registry.inner.sessions.lock().await;
+        OwnRuntime::of(sessions.get(&id).expect("the adopted session"))
+    };
+    let now = std::time::Instant::now();
+    assert!(
+        observe(&restarted, &id, fact(4001, "codex"), now, Some(&own)).is_empty(),
+        "process recognition does not attribute the built-in process"
+    );
+    let reported = restarted
+        .registry
+        .report_agent(identity_report(&id, RuntimeId::CODEX))
+        .await;
+    assert!(
+        !reported.recorded,
+        "callbacks follow the same rule as process recognition"
+    );
+    let inspected = restarted.registry.inspect(&id).await.expect("inspect");
+    assert_eq!(
+        inspected.active_agent_base, None,
+        "no active agent flaps in"
+    );
+    assert_ne!(
+        inspected.native_session_id.as_deref(),
+        Some("native-after-takeover")
+    );
+
+    restarted.registry.stop(&id).await.expect("stop");
+    restarted.registry.remove(&id).await.expect("remove");
+}
+
+/// Store written by the v0.33.1 daemon for a session whose native launch
+/// spec was lost; the migration marks a profile session's spec unresolved.
+const V0_33_1_DAMAGED_STORE: &str =
+    include_str!("../../store/fixtures/v0.33.1-damaged/metadata.jsonl");
+
+/// Profile the damaged session of [`V0_33_1_DAMAGED_STORE`] is rebound to.
+const DAMAGED_PROFILE: &str = "work";
+
+#[tokio::test]
+async fn an_unresolved_built_in_spec_is_never_repaired_from_the_package_that_serves_its_runtime() {
+    let key = signing_key("root");
+    let store_path = temp_store_path("alias-repair");
+    fs::write(
+        &store_path,
+        V0_33_1_DAMAGED_STORE.replace(
+            "\"agent\":\"claude\"",
+            &format!("\"agent\":\"{DAMAGED_PROFILE}\""),
+        ),
+    )
+    .expect("write the damaged store");
+    fs::set_permissions(
+        &store_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .expect("private store");
+    crate::store::migrate_at_startup(&store_path).expect("migrate the damaged store");
+    let fixture = Fixture::with_anchor_and_store(
+        "alias-repair-plugins",
+        anchor(&[&key], Vec::new()),
+        store_path.clone(),
+    );
+    let profile =
+        fixture.write_profile(DAMAGED_PROFILE, "base = \"claude\"\nprogram = \"claude\"\n");
+    let package = official(RuntimeId::CLAUDE);
+    install_official(&fixture, &package, RuntimeId::CLAUDE, 5).await;
+    // The profile now resolves to the package, so only the pin of the
+    // damaged binding (unpinned, launched from the built-in) can refuse it.
+    fixture
+        .registry
+        .package_bind_profile(PackageBindProfileParams {
+            profile: DAMAGED_PROFILE.to_owned(),
+            digest: None,
+            dry_run: false,
+        })
+        .await
+        .expect("pin the profile to the official package");
+    assert!(fs::read_to_string(&profile)
+        .expect("read the profile")
+        .contains(package.digest.as_str()));
+
+    let restarted = fixture.reopen();
+    Box::pin(restarted.registry.reconcile_workers())
+        .await
+        .expect("rehydrate the damaged store");
+
+    let sessions = restarted.registry.list().await;
+    assert_eq!(sessions.len(), 1, "the session stays listed");
+    let session = &sessions[0];
+    assert!(!session.capabilities.resume, "{session:?}");
+    let warning = session
+        .warnings
+        .iter()
+        .find(|warning| warning.kind == protocol::SessionWarningKind::NativeRecovery)
+        .unwrap_or_else(|| panic!("no native recovery warning: {session:?}"));
+    assert!(
+        warning.message.contains("is not served by this daemon"),
+        "{}",
+        warning.message
+    );
+    let refused = restarted
+        .registry
+        .resume(&session.id)
+        .await
+        .expect_err("the unrepaired session is never resumed");
+    assert_eq!(refused.code, "runtime_served_by_package");
 }
 
 #[tokio::test]
@@ -437,6 +917,19 @@ fn fact(pid: crate::procwatch::Pid, comm: &str) -> crate::procwatch::ProcessFact
         comm: comm.to_owned(),
         cmdline: vec![format!("/usr/bin/{comm}")],
     }
+}
+
+/// The agents process recognition of session `id` observes in `process`.
+fn observe(
+    fixture: &Fixture,
+    id: &protocol::SessionId,
+    process: crate::procwatch::ProcessFact,
+    now: std::time::Instant,
+    own: Option<&OwnRuntime>,
+) -> std::collections::HashMap<crate::procwatch::Pid, super::super::ObservedAgent> {
+    fixture
+        .registry
+        .observed_agents_from_facts(id, vec![process], now, own)
 }
 
 #[tokio::test]
@@ -508,34 +1001,26 @@ async fn a_live_built_in_session_keeps_its_own_observation_through_a_takeover() 
     // Process recognition uses the built-in matchers of the session, and the
     // package's matchers only recognize processes the package describes.
     let now = std::time::Instant::now();
-    let builtin_process = fixture.registry.observed_agents_from_facts(
-        &created.id,
-        vec![fact(4001, "codex")],
-        now,
-        Some(&pinned),
-    );
+    let own = OwnRuntime::Pinned(std::sync::Arc::clone(&pinned));
+    let builtin_process = observe(&fixture, &created.id, fact(4001, "codex"), now, Some(&own));
     assert_eq!(
         builtin_process.len(),
         1,
         "the built-in process is recognized"
     );
-    let official_process = fixture.registry.observed_agents_from_facts(
+    let official_process = observe(
+        &fixture,
         &created.id,
-        vec![fact(4002, "official-codex")],
+        fact(4002, "official-codex"),
         now,
-        Some(&pinned),
+        Some(&own),
     );
     assert_eq!(
         official_process.len(),
         1,
         "the package process is recognized by the registry"
     );
-    let unretained = fixture.registry.observed_agents_from_facts(
-        &created.id,
-        vec![fact(4001, "codex")],
-        now,
-        None,
-    );
+    let unretained = observe(&fixture, &created.id, fact(4001, "codex"), now, None);
     assert!(
         unretained.is_empty(),
         "without the retained definition the built-in process is lost"

@@ -582,14 +582,6 @@ fn an_official_source_takes_an_official_alias_over_from_the_built_in_in_any_orde
                 .provenance,
             BindingProvenance::Package { .. }
         ));
-        assert!(matches!(
-            registry
-                .shadowed_builtin(&id("codex"))
-                .expect("the replaced built-in is kept")
-                .binding()
-                .provenance,
-            BindingProvenance::Builtin { .. }
-        ));
         for untouched in ["claude", "hermes", "shell"] {
             assert!(matches!(
                 registry
@@ -599,7 +591,6 @@ fn an_official_source_takes_an_official_alias_over_from_the_built_in_in_any_orde
                     .provenance,
                 BindingProvenance::Builtin { .. }
             ));
-            assert!(registry.shadowed_builtin(&id(untouched)).is_none());
         }
         assert_eq!(registry.inventory().len(), 4);
     }
@@ -1068,7 +1059,7 @@ fn a_pin_needs_the_same_runtime_from_the_same_origin() {
     assert_eq!(takeover.code, "runtime_served_by_package");
     assert!(takeover
         .recover
-        .is_some_and(|hint| hint.contains("uninstall")));
+        .is_some_and(|hint| hint.contains("pohunek session new --agent claude")));
     assert_eq!(
         check_pin(&LaunchPin::Unpinned, &package_definition("claude"))
             .expect_err("a package serving the id of an unpinned snapshot")

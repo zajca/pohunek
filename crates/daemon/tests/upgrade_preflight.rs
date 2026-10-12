@@ -16,8 +16,8 @@ use pohunek_service_config::preflight::{
     PreflightReport, StoreState, Verdict, CODE_ADOPTABLE, CODE_GENERATION_MISSING,
     CODE_JOURNAL_MISSING, CODE_JOURNAL_SCHEMA_UNSUPPORTED, CODE_NO_SESSION_RECORD,
     CODE_PROTOCOL_INCOMPATIBLE, CODE_RECORD_UNREADABLE, CODE_RECOVERY_UNMAPPABLE,
-    CODE_RESUME_RECORD_UNREADABLE, CODE_RUNTIME_IDENTITY_MISMATCH, CODE_STORE_UNUSABLE,
-    CODE_WORKER_ENDED, CODE_WORKER_NOT_RUNNING, REPORT_VERSION,
+    CODE_RESUME_RECORD_UNREADABLE, CODE_RUNTIME_IDENTITY_MISMATCH, CODE_RUNTIME_SOURCE_NOT_SERVED,
+    CODE_STORE_UNUSABLE, CODE_WORKER_ENDED, CODE_WORKER_NOT_RUNNING, REPORT_VERSION,
 };
 use pohunek_test_support::bin_exe;
 use pohunek_test_support::env::TestEnv;
@@ -903,4 +903,86 @@ fn reading_runtime_definitions_creates_nothing_even_in_an_existing_plugin_root()
         before,
         "no packages directory or lock appears"
     );
+}
+
+/// Descriptor digest of a built-in launch pin; the preflight compares the
+/// pin's runtime and package identity, never this digest.
+const DESCRIPTOR_DIGEST: &str =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+/// Archive digest of a package launch pin no installed package has.
+const MISSING_PACKAGE_DIGEST: &str =
+    "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+/// Pins the recovery of `line` to `binding`, as a daemon that launched the
+/// session from that runtime source records it.
+fn pin_recovery(line: &mut Value, binding: Value) {
+    line["recovery"]["launch_binding"] = binding;
+}
+
+#[test]
+fn a_session_pinned_to_a_runtime_source_this_binary_does_not_serve_loses_recovery() {
+    // `pi` ships as no built-in runtime of this binary, and no package
+    // serves it, so neither pin resolves.
+    let unserved = [
+        (
+            "a built-in this binary does not ship",
+            json!({
+                "runtime_id": "pi",
+                "provenance": {
+                    "kind": "builtin",
+                    "package": {"id": "pohunek.runtime.pi", "version": "1.0.0"},
+                    "descriptor_digest": DESCRIPTOR_DIGEST,
+                },
+            }),
+        ),
+        (
+            "a package digest that is not installed",
+            json!({
+                "runtime_id": "pi",
+                "provenance": {
+                    "kind": "package",
+                    "package": {"id": "acme.runtime.pi", "version": "1.0.0"},
+                    "package_digest": MISSING_PACKAGE_DIGEST,
+                },
+            }),
+        ),
+    ];
+    for (case, binding) in unserved {
+        let host = Host::new();
+        let mut line = session_line("s-1", "w-fixture");
+        rebind_agent(&mut line, "pi");
+        pin_recovery(&mut line, binding);
+        host.write_store(&[line, session_line("s-2", "w-two")]);
+        host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
+        host.write_journal("s-2", "w-two", &journal("s-2", "w-two"));
+        let before = host.snapshot();
+
+        let report = host.report();
+
+        assert_eq!(
+            verdict_of(&report, "s-1"),
+            (&Verdict::WouldLoseRecovery, CODE_RUNTIME_SOURCE_NOT_SERVED),
+            "{case}: {:?}",
+            report.sessions
+        );
+        let detail = &report
+            .sessions
+            .iter()
+            .find(|verdict| verdict.session_id == "s-1")
+            .expect("the verdict of s-1")
+            .detail;
+        assert!(detail.contains("runtime_not_installed"), "{case}: {detail}");
+        assert!(
+            detail.contains("`pohunek session new --agent pi`"),
+            "{case}: {detail}"
+        );
+        assert!(detail.contains("--accept-runtime-loss"), "{case}: {detail}");
+        assert_eq!(
+            verdict_of(&report, "s-2"),
+            (&Verdict::Adoptable, CODE_ADOPTABLE),
+            "{case}: an unpinned session of a served built-in is unchanged"
+        );
+        assert_eq!(host.snapshot(), before, "{case}: nothing is written");
+    }
 }

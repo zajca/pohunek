@@ -667,7 +667,10 @@ created); only an unreadable runtime definition leaves it unavailable
 (`worker_identity_unverified`). The remaining blind spots are the supervisor
 job's identity and socket failures at connect time. A binding that needs the
 runtime registry to complete its launch spec is reported as
-`native_recovery_unverified`. A live worker journal without a store record is
+`native_recovery_unverified`. A session whose launch pin names a runtime source
+the new binary does not serve, resolved as resume resolves it against that
+binary's built-in runtimes and the installed packages, is `would_lose_recovery`
+with `runtime_source_not_served`. A live worker journal without a store record is
 listed as an unmanaged worker and does not refuse the upgrade, unless a store
 line that names no session cannot be read (`worker_without_session_record`).
 Sessions at risk refuse the upgrade with
