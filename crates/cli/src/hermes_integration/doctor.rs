@@ -25,6 +25,8 @@ use super::target::ResolvedTarget;
 const MAX_POLICY_BYTES: usize = 64 * 1024;
 /// Recovery for managed assets that differ from their marker or fail to import.
 const ASSET_INTEGRITY_HINT: &str = "replace the managed plugin assets from the selected source with `pohunek integration update --agent hermes`, adding `--confirm-modified` when status reports `modified=true`";
+/// Recovery for modified managed assets while no usable source can replace them.
+const ASSET_INTEGRITY_SOURCE_HINT: &str = "restore the Hermes operator source as the `asset_source` check describes, then replace the managed plugin assets with `pohunek integration update --agent hermes --confirm-modified`";
 /// The installed probe accepts only the seven contract-defined lifecycle hooks.
 const MANAGED_HOOK_COUNT: u8 = 7;
 /// Hooks must finish inside the one-second bound enforced by the Python probe.
@@ -196,7 +198,11 @@ pub(crate) fn diagnose(
                 &mut checks,
                 "asset_integrity",
                 state.installed && !state.modified,
-                ASSET_INTEGRITY_HINT,
+                if state.package_source_error.is_none() {
+                    ASSET_INTEGRITY_HINT
+                } else {
+                    ASSET_INTEGRITY_SOURCE_HINT
+                },
             );
             // Without a usable source no update can apply, so currency is not judged.
             if state.package_source_error.is_none() {

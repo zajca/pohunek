@@ -1077,6 +1077,19 @@ async fn losing_the_recorded_package_refuses_update_without_mutation() {
     )
     .await;
     assert_source_hint(&harness, &hermes, "hermes_package_not_selected").await;
+    let tools = hermes.plugin_root.join("tools.py");
+    let tools_bytes = fs::read(&tools).expect("installed tools");
+    let mut edited = tools_bytes.clone();
+    edited.extend_from_slice(b"\n# owner edit\n");
+    fs::write(&tools, &edited).expect("edit installed tools");
+    let doctor = hermes.doctor(&harness).await;
+    let (integrity, hint) = check(&doctor, "asset_integrity");
+    assert_eq!(integrity, "fail", "{doctor:#}");
+    assert!(
+        hint.starts_with("restore the Hermes operator source"),
+        "a modified install without a usable source is not told to update first: {doctor:#}"
+    );
+    fs::write(&tools, &tools_bytes).expect("restore installed tools");
     let (code, enabled) = harness
         .json(&["plugin", "enable", PACKAGE_ID, "--digest", digest.as_str()])
         .await;
