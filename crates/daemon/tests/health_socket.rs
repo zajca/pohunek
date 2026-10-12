@@ -21,7 +21,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use protocol::{
     event, method, AgentActivity, AttachHeader, ErrorClass, Event, HostDiscoverParams, HostRecord,
     IntegrationDoctorResult, IntegrationInstallState, IntegrationStatusResult,
@@ -4386,6 +4386,231 @@ async fn worktree_remove_over_the_socket_succeeds_and_fails_closed() {
         serde_json::to_value(&live.id).expect("serialize id"),
     );
     let _ = exchange(&mut control, &stop_live).await;
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Timeout of a wait held across a hangup: the largest `session.wait` accepts,
+/// so the release on hangup is as far as possible from the release at the
+/// wait's own deadline, and short enough that a missing release fails fast.
+const HELD_WAIT_TIMEOUT_MS: u32 = 8_000;
+
+/// Timeout of a waiter-slot probe: admitted, it returns `timeout` at once; with
+/// the slot taken, it returns `session_waiter_limit_reached` without waiting.
+const SLOT_PROBE_TIMEOUT_MS: u32 = 1;
+
+/// Registry configuration with one observation waiter and one turn waiter per
+/// session, so a single held wait fills a session's cap in its pool.
+fn single_waiter_registry_config() -> SessionRegistryConfig {
+    SessionRegistryConfig {
+        observation_session_waiters: 1,
+        turn_session_waiters: 1,
+        ..support::hermetic_registry_config()
+    }
+}
+
+/// Builds one request line of a bounded wait: `(id, session, timeout_ms)`.
+type WaitLine = fn(&str, &SessionId, u32) -> String;
+
+/// A `session.wait` line that a live shell session never satisfies on its own:
+/// it ends at `timeout_ms` or when the session is stopped.
+fn stop_wait_line(id: &str, session_id: &SessionId, timeout_ms: u32) -> String {
+    let request = Request::make(
+        id,
+        method::SESSION_WAIT,
+        serde_json::json!({
+            "session_id": session_id,
+            "states": [SessionState::Stopped],
+            "timeout_ms": timeout_ms,
+        }),
+    );
+    serde_json::to_string(&request).expect("serialize session.wait")
+}
+
+/// A `session.wait_turn` line that a shell session never satisfies: a shell
+/// records no `turn_completed`, so it ends at `timeout_ms`, or with
+/// `targets_ended` once the session is stopped.
+fn turn_wait_line(id: &str, session_id: &SessionId, timeout_ms: u32) -> String {
+    let request = Request::make(
+        id,
+        method::SESSION_WAIT_TURN,
+        serde_json::json!({
+            "session_ids": [session_id],
+            "until": ["turn_completed"],
+            "timeout_ms": timeout_ms,
+        }),
+    );
+    serde_json::to_string(&request).expect("serialize session.wait_turn")
+}
+
+/// Asks on a fresh connection whether `session_id`'s only waiter slot in the
+/// pool of `wait_line`'s method is taken.
+async fn waiter_slot_taken(socket: &Path, session_id: &SessionId, wait_line: WaitLine) -> bool {
+    let mut probe = connect(socket).await;
+    let response = exchange_line(
+        &mut probe,
+        wait_line("slot-probe", session_id, SLOT_PROBE_TIMEOUT_MS),
+    )
+    .await;
+    match response.into_result() {
+        Ok(result) => {
+            assert_eq!(result["reason"], "timeout", "an admitted probe times out");
+            false
+        }
+        Err(error) => {
+            assert_eq!(error.code, "session_waiter_limit_reached");
+            true
+        }
+    }
+}
+
+/// Opens a connection whose `wait_line` wait owns `session_id`'s only waiter
+/// slot in that method's pool.
+///
+/// The wait is confirmed in flight when a probe is refused. A probe admitted
+/// while the wait is still registering can make the daemon refuse the wait
+/// instead; that refusal is read and the wait is sent again.
+async fn hold_only_waiter_slot(
+    socket: &Path,
+    session_id: &SessionId,
+    id: &str,
+    wait_line: WaitLine,
+) -> Framed<UnixStream, LinesCodec> {
+    let line = wait_line(id, session_id, HELD_WAIT_TIMEOUT_MS);
+    let holder = tokio::sync::Mutex::new(connect(socket).await);
+    holder
+        .lock()
+        .await
+        .send(line.clone())
+        .await
+        .expect("send the held wait");
+    wait_until(
+        "the held wait to own the session's only waiter slot",
+        || async {
+            if waiter_slot_taken(socket, session_id, wait_line).await {
+                return Some(());
+            }
+            let mut holder = holder.lock().await;
+            if let Some(reply) = holder.next().now_or_never() {
+                let reply = reply
+                    .expect("the held wait connection stays open")
+                    .expect("response framing ok");
+                let response: Response = serde_json::from_str(&reply).expect("parse response");
+                assert_eq!(
+                    err_payload(response).code,
+                    "session_waiter_limit_reached",
+                    "the held wait only ends early when a probe owned the slot"
+                );
+                holder
+                    .send(line.clone())
+                    .await
+                    .expect("send the held wait again");
+            }
+            None
+        },
+    )
+    .await;
+    holder.into_inner()
+}
+
+async fn stop_session(framed: &mut Framed<UnixStream, LinesCodec>, session_id: &SessionId) {
+    let request = Request::make(
+        "session-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(session_id).expect("serialize id"),
+    );
+    let stopped: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(framed, &request).await)).expect("stop result");
+    assert!(stopped.stopped);
+}
+
+/// Proves that a client hanging up during a `wait_line` wait frees its waiter
+/// slot before the wait's deadline.
+///
+/// The witness wait on another session owns its slot before the held wait
+/// starts, with the same timeout, so its deadline comes first. A slot freed only
+/// at the held wait's deadline would let the witness reply before a new wait is
+/// admitted.
+async fn assert_hangup_frees_waiter_slot(tag: &str, wait_line: WaitLine) {
+    let socket = temp_socket(tag);
+    let (shutdown, handle, _) =
+        spawn_server_with_config(&socket, "0.0.0", single_waiter_registry_config()).await;
+    let mut control = connect(&socket).await;
+    let held_session = create_session(&mut control, &socket).await;
+    let witness_session = create_session(&mut control, &socket).await;
+
+    let mut witness =
+        hold_only_waiter_slot(&socket, &witness_session.id, "witness-wait", wait_line).await;
+    let held = hold_only_waiter_slot(&socket, &held_session.id, "held-wait", wait_line).await;
+    drop(held);
+
+    tokio::select! {
+        biased;
+        reply = witness.next() => panic!(
+            "the witness wait ended before the closed connection's waiter slot was free: {reply:?}"
+        ),
+        () = wait_until("a new wait to be admitted after the client hung up", || async {
+            (!waiter_slot_taken(&socket, &held_session.id, wait_line).await).then_some(())
+        }) => {}
+    }
+
+    stop_session(&mut control, &held_session.id).await;
+    stop_session(&mut control, &witness_session.id).await;
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// A client that hangs up during `session.wait` frees its observation waiter
+/// slot before the wait's deadline.
+#[tokio::test]
+async fn session_wait_hangup_releases_the_waiter_slot_before_its_deadline() {
+    assert_hangup_frees_waiter_slot("wait-hangup", stop_wait_line).await;
+}
+
+/// A client that hangs up during `session.wait_turn` frees its turn waiter
+/// slot before the wait's deadline.
+#[tokio::test]
+async fn session_wait_turn_hangup_releases_the_turn_waiter_slot_before_its_deadline() {
+    assert_hangup_frees_waiter_slot("turn-hangup", turn_wait_line).await;
+}
+
+/// A request line pipelined behind an in-flight `session.wait` is answered
+/// after the wait's own reply, on the same connection.
+#[tokio::test]
+async fn session_wait_answers_a_pipelined_request_after_the_wait() {
+    let socket = temp_socket("wait-pipeline");
+    let (shutdown, handle, _) =
+        spawn_server_with_config(&socket, "0.0.0", single_waiter_registry_config()).await;
+    let mut control = connect(&socket).await;
+    let session = create_session(&mut control, &socket).await;
+
+    let mut held = hold_only_waiter_slot(&socket, &session.id, "held-wait", stop_wait_line).await;
+    let pipelined = Request::make("pipelined-health", method::DAEMON_HEALTH, Value::Null);
+    held.send(serde_json::to_string(&pipelined).expect("serialize health"))
+        .await
+        .expect("send the pipelined request");
+    stop_session(&mut control, &session.id).await;
+
+    let mut replies = Vec::new();
+    for _ in 0..2 {
+        let reply = wait::guard("a reply on the pipelined connection", held.next())
+            .await
+            .expect("a response line")
+            .expect("response framing ok");
+        replies.push(serde_json::from_str::<Response>(&reply).expect("parse response"));
+    }
+    assert_eq!(
+        replies.iter().map(Response::id).collect::<Vec<_>>(),
+        ["held-wait", "pipelined-health"],
+        "replies keep request order"
+    );
+    let mut replies = replies.into_iter();
+    let wait = ok_payload(replies.next().expect("the wait reply"));
+    assert_eq!(wait["reason"], "state_matched");
+    assert_eq!(wait["session"]["state"], "stopped");
+    let health = ok_payload(replies.next().expect("the pipelined reply"));
+    assert_eq!(health["status"], "ok");
+
     let _ = shutdown.send(());
     let _ = handle.await;
 }
