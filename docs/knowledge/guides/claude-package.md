@@ -167,16 +167,45 @@ captured screen through the package manifest.
   id is its `agent_id`; teammates, synchronous children and workflow agents are
   not listed by agent id. The installer registers two Stop hooks in
   `settings.json`: the notify hook (`turn_completed`) and the state hook
-  (`stop`), which forwards only each task's `id`, `type` and `status` as a
-  `subagent_snapshot` claim to the worker, reads at most 1 MiB, and sends
-  nothing for a Stop with a non-empty `agent_id` or a missing, invalid or
-  over-long list. Claude builds the list before the hook reads its clock and
+  (`stop`), which sends each task's `id`, `type` and `status` as a
+  `subagent_snapshot` claim to the worker, with three optional fields sanitized
+  in the hook: `label` (from `description`, for every type; control and format
+  characters removed, whitespace collapsed, cut to the configured byte limit),
+  `program` (the basename of the command word, for `shell` tasks only; `NAME=value`
+  assignments, `cd <dir> &&` and `env` options are skipped, and a name that does
+  not match `[A-Za-z0-9][A-Za-z0-9._+-]*` is omitted) and `agent_type` (for
+  `subagent` tasks only; a value containing a control, format, line or paragraph
+  separator or surrogate character is dropped from its task). A command longer
+  than 64 KiB gets no `program`, because shell tokenizing grows superlinearly
+  with token length (about 32 ms at 64 KiB, 6 s at 1 MiB) and a cut command word could name another program. The command and its
+  arguments are never forwarded.
+  The label and program limits come from `POHUNEK_BACKGROUND_LABEL_MAX_BYTES` and
+  `POHUNEK_BACKGROUND_PROGRAM_MAX_BYTES`, which the worker injects; a missing or
+  invalid value forwards no label or program. An invalid optional field is
+  dropped from its task only, while a missing or invalid `id`, `type` or
+  `status` voids the list. The hook reads at most 1 MiB and sends nothing for a
+  Stop with a non-empty `agent_id` or a missing, invalid or over-long list. Claude
+  builds the list before the hook reads its clock and
   often still lists a fast background agent whose own SubagentStop already
   arrived, so the worker never reopens a listed row: it completes background
   agents of the same Claude process that an earlier list named and this one
   omits, and leaves listed rows to their own start and stop (see
   [sessions](../concepts/sessions.md); evidence in
   [#883](https://github.com/zajca/pohunek/issues/883)).
+- The `session` action (Claude `SessionStart`) forwards the hook input `source`
+  as `session_source` in its identity report only when it is `startup`,
+  `resume`, `clear` or `compact`; any other value, or none, omits the key.
+  `fork` is not forwarded: a forked session is a new process and must not clear
+  the snapshot of the session it was forked from. A `SessionStart` from another
+  process clears the snapshot; `startup` and `resume` of the same process clear
+  it too, while `clear` and `compact` keep it.
+- The `release` action (Claude `SessionEnd`) forwards the hook input `reason` as
+  `release_reason` in its `identity_release` request only when it is `clear`,
+  `resume`, `logout`, `prompt_input_exit` or `other`; any other value omits the
+  key. The snapshot belongs to the reporting Claude process: any process in the
+  managed PTY tree may report, the latest turn end wins, and the owner's release
+  with a reason other than `clear` clears it. A `/clear` keeps it, because Claude
+  follows that release with a `SessionStart` of the same process.
 - A Claude state hook action (`session`, `release`, `subagent-start`,
   `subagent-stop`, `stop`) that fails to deliver its report, including a `stop`
   that sends no snapshot, still exits 0 and appends one payload-free line per

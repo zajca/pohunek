@@ -15,6 +15,7 @@
 
 // Rust guideline compliant 2026-09-24
 
+mod background;
 mod config;
 mod error;
 mod identity;

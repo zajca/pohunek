@@ -374,13 +374,18 @@ child, because Codex reports resumed children with stops and no start
 
 At the end of every main-agent turn, Claude's `Stop` hook input lists the
 backgrounded tasks that are still running or pending (`background_tasks`). The
-Claude state hook forwards only each task's `id`, `type` and `status` to the
-worker as one `subagent_snapshot` claim, identified by the reporting process
-like a start and stamped with a sequence taken before the hook reads its input.
+Claude state hook forwards each task's `id`, `type` and `status`, its sanitized
+`label` (from `description`), the program name of a `shell` task and the
+`agent_type` of a `subagent` task, as one `subagent_snapshot` claim, identified
+by the reporting process like a start and stamped with a sequence taken before
+the hook reads its input. The command of a shell and its arguments are never
+forwarded.
 It sends no snapshot when the input exceeds 1 MiB or is not a JSON object, when
 the `Stop` carries a non-empty `agent_id` (it is not the main agent's), when
 `background_tasks` is missing or not a list, when the list has more than 256
-entries, or when any entry lacks a non-empty string `id`, `type` or `status`;
+entries, or when any entry lacks a non-empty string `id`, `type` or `status`
+(an optional field that fails its own check is dropped alone, and the claim
+still goes out);
 the hook never truncates the list, and a missing list never means that nothing
 runs. A snapshot is evidence, not a claim on a row's phase: it settles only
 rows whose end it proves. Claude builds the listing before the hook reads its
@@ -445,7 +450,8 @@ a snapshot whose task list breaks a bound, is logged as the
 `snapshot_absent`), and one `worker.subagent.snapshot.applied` at INFO with the
 number of `tasks` in the snapshot, the `hosts` flag, and the row counts
 `listed` (running rows the snapshot listed), `terminalized` and `deferred`.
-The worker
+The background events are listed in the
+[debug-session-runtime](../runbooks/debug-session-runtime.md) runbook. The worker
 answers the hook with success when it admitted the claim and either applied it
 or ignored it for one of the INFO reasons, and an admitted, valid snapshot
 whether or not it changed a row; it answers with failure when the claim was
@@ -465,11 +471,134 @@ This collection does not change the parent session's
 `activity`, launch identity, or recovery binding. The hook validates its action
 and Pohunek handshake before reading a bounded payload directly from stdin (at
 most 64 KiB, or 1 MiB for the main `Stop`, whose input also carries the final
-assistant message and each task's description); it does not create a payload
-file. Only the lifecycle fields are retained: a snapshot's task `type` and
-`status` decide the reconciliation and are never stored, so the collection
-never contains prompts, results, messages, task descriptions or commands,
-transcript paths, or raw hook payloads.
+assistant message and each task's description and command); it does not create a payload
+file. Subagent lifecycle rows keep lifecycle fields only: a snapshot's task
+`type` and `status` decide the reconciliation and are not stored in the rows.
+The background snapshot below is the one place where task text is kept. No
+prompt, result, final message, transcript path or raw hook payload is kept
+anywhere, and no command or argument of any task is kept.
+
+The current privacy rule for background tasks is the operator decision of
+2026-10-12 in [#890](https://github.com/zajca/pohunek/issues/890). It exposes a
+task's sanitized label and a shell's program name to clients, including over
+the relay, and never its command or arguments. That rule revises the rule that
+only lifecycle fields are retained, which the subagent collection above still
+follows for its rows.
+
+The worker keeps the latest background snapshot of the session's main agent
+(`background` in the worker inspect snapshot), replaced as a whole by each
+applied turn-end snapshot. Each item holds `id`; a closed `kind` (`subagent`,
+`workflow`, `shell`, `monitor`, `mcp_task`, `teammate`, `dream`,
+`auto_mode_scan`, `memory_import`, `cloud_session`, or `other` with the
+provider's own type label in `provider_kind`); a closed `status` (`running`,
+`pending`, or `other`); the `agent_type` of a subagent; the `label`; the
+`program` of a shell; `first_seen_ms`, the first snapshot that listed the item,
+which is not a start time because Claude reports none; and `last_seen_ms`. The
+label is the task description with every control, separator and format
+character removed, whitespace runs collapsed to one space, trimmed, and cut to
+`BACKGROUND_LABEL_MAX_BYTES` (160) bytes on a character boundary. The program
+is the basename of the first command word, after leading `NAME=value`
+assignments, an `env` prefix and `cd <dir> &&` or `;` prefixes; it is kept only
+when it matches `[A-Za-z0-9][A-Za-z0-9._+-]*` within
+`BACKGROUND_PROGRAM_MAX_BYTES` (64) bytes, and otherwise dropped. The command
+and its arguments are never stored, journaled, served or logged.
+
+Snapshots are ordered by sequence, not by identity. A snapshot from any
+admitted, process-valid report replaces the stored one when its sequence is
+newer than the sequence mark, which is the highest sequence of an applied
+background snapshot or of a clear (see the clearing rules below); an older one
+is ignored with reason `stale_sequence`. The reporting process becomes the snapshot's owner, a private
+journal field (pid and start identity) that never reaches the inspect snapshot
+or the logs. Every applied snapshot takes a new revision, even when its items
+are unchanged, so a client sees the refreshed `observed_at_ms`. An item keeps
+its `first_seen_ms` only when the same process reported it before. A snapshot
+item of kind `subagent` changes no subagent row. The subagent reconciliation
+above applies to every snapshot unchanged, whichever process reported it.
+
+Who may report is the same trust boundary as subagent claims: any process in the
+managed PTY tree whose ancestry the schema admits, such as the agent or a
+Claude it started. The active identity is not consulted, so the background
+does not depend on which agent last reported an identity.
+
+Nested Claude sessions have one trade-off. While two Claude processes are live
+in one session, the latest turn end wins, so the outer agent's background can
+be replaced by the nested one's. When the nested owner releases, its snapshot
+is cleared and the background is empty until the outer agent's next turn end
+restores it. A background can therefore stay empty for as long as the outer
+agent runs no turn, which is the price of not scoping by identity.
+
+A snapshot listing more than `BACKGROUND_MAX_ITEMS` (64) tasks does not replace
+the background; it is ignored with reason `too_many_items`, while the
+reconciliation still applies it under its own 256-task bound. A hook input over
+1 MiB sends no snapshot at all, so the previous background stays, and its
+`observed_at_ms` shows its age.
+
+The worker checks each optional field again. A label or program that fails its
+check, an optional field of the wrong JSON type, and an `agent_type` on a
+non-subagent or a `program` on a non-shell (a kind mismatch) are dropped alone,
+counted by reason, and never logged with their values; the rest of the snapshot
+applies. The limits are configuration in `pohunek-worker-protocol`. The worker
+injects the two byte limits the hook needs into the agent environment as
+`POHUNEK_BACKGROUND_LABEL_MAX_BYTES` and `POHUNEK_BACKGROUND_PROGRAM_MAX_BYTES`,
+and the hook forwards no label and no program when either is missing or
+invalid.
+
+A snapshot belongs to the agent process that reported it, so the background is
+cleared in these cases:
+
+- the runtime ends (`runtime_end`);
+- the owner releases its session (`release`), unless the hook forwards the
+  release reason `clear`: a `/clear` ends the session and starts it again in
+  the same process, so the snapshot stays. The release reasons the hook
+  forwards are `clear`, `resume`, `logout`, `prompt_input_exit` and `other`,
+  and every one of them except `clear`, as well as an absent
+  reason clears. The release is matched to the owner whether or not it also
+  ends the active identity, so a later release of the owner still clears after
+  a `clear` release whose session start never arrived. A release from another
+  process changes nothing;
+- an admitted, process-valid identity report comes from a process other than
+  the owner, and the stored sequence is older than the report's
+  (`agent_changed`), whatever its session source. This holds even when the
+  identity rules refuse the report;
+- an admitted, process-valid identity report from the owner with source
+  `startup` or `resume`, ordered after the stored sequence (`session_start`);
+- the owner process is not running (`owner_exited`): it has exited and been
+  reaped, it is a zombie that was not reaped, or its pid now names a process
+  with another start identity. The worker checks this with the platform's
+  `is_running`, which rejects zombies and mismatched start identities. The
+  inspect path runs the check on every inspect, which the daemon polls every
+  100 ms, and the clear is persisted before the inspect answers. A process that
+  cannot be read keeps the snapshot, since the owner may still be alive. A killed
+  agent sends no release, so this check is what ends its snapshot.
+
+A `compact` session of the owner, or a `clear` session after a `clear` release
+of the owner, keeps the background.
+
+A release clear and a session-start clear raise the sequence mark to the
+sequence of the release or report that caused them. A claim ordered before that
+point is stale, even when it arrives late and was begun before the clear. This
+is what keeps a hook that began before a release from restoring the snapshot the
+release ended. An owner-exit clear does not raise the mark: a late claim from the
+dead owner is already refused, because its process must still be alive with its
+start identity, and raising the mark would refuse a new owner's Stop whose hook
+read its clock just before that inspect. A runtime end needs no mark, because
+the runtime's claims end with it.
+
+Every hook claim is checked against the worker's clock, whatever its kind:
+subagent start, stop and snapshot claims, identity reports and releases,
+notifications, and the background snapshot. Each hook takes its sequence from
+`CLOCK_MONOTONIC` before it connects, so a genuine sequence is never greater
+than the worker's own reading of that clock taken when the claim arrives. A
+claim whose sequence is greater is refused whole with reason `future_sequence`,
+logged as `worker.identity.rejected` at WARN. No tolerance is needed: both
+readings come from the same kernel clock on the same host.
+
+Bounds the daemon re-checks for stored items are public constants in
+`pohunek-worker-protocol`: `BACKGROUND_TASK_ID_MAX_BYTES` (256),
+`BACKGROUND_TASK_TYPE_MAX_BYTES` (64), `BACKGROUND_TASK_STATUS_MAX_BYTES` (32),
+and `BACKGROUND_AGENT_TYPE_MAX_BYTES` (128). The worker refuses a snapshot whose
+task id, type or status exceeds its bound, and drops an agent type that exceeds
+its bound from that item alone.
 
 Human-readable `pohunek session list` shows the running/recent child count, and
 `pohunek session inspect` includes the corresponding lifecycle rows. Streaming

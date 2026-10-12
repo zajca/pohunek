@@ -275,7 +275,7 @@ daemon more than one release apart are refused.
 Notification hooks deliver through the worker socket when
 `POHUNEK_WORKER_SOCKET_PATH` is set and fall back to the daemon socket otherwise;
 the worker's `notification_create` hook request is additive to the private
-worker protocol, so a worker that predates it simply refuses it. Managed hook assets carry `POHUNEK_INTEGRATION_VERSION=13`; an asset of
+worker protocol, so a worker that predates it simply refuses it. Managed hook assets carry `POHUNEK_INTEGRATION_VERSION=14`; an asset of
 an earlier version still sends the old key, which the daemon accepts only from a
 session whose launch baked protocol 3 (and an earlier notification hook still
 sends a bare integer `v` instead of the `{minimum, maximum}` range, so the daemon
@@ -1958,6 +1958,10 @@ nothing else can shadow them:
   under Provider Notification Hooks)
 - `POHUNEK_HOOK_TRACE_MAX_BYTES` (size in bytes at which the state hooks rotate
   that trace)
+- `POHUNEK_BACKGROUND_LABEL_MAX_BYTES` (byte limit of a background task label
+  the Claude `Stop` hook forwards; a missing or invalid value forwards no label)
+- `POHUNEK_BACKGROUND_PROGRAM_MAX_BYTES` (byte limit of a background shell's
+  program name; a missing or invalid value forwards no program)
 
 A managed child does not inherit the daemon's or the worker's process
 environment. Its environment is built from an empty base: the allowlisted
@@ -2103,7 +2107,7 @@ worker instance key `runtime_id` in `session.report_native_id`, which the
 daemon serves through the protocol 3 adapter. `pid` is the OS process id for the active nested agent. When present, the daemon
 binds the active claim to that process and clears the claim when procwatch sees
 the process exit. The shipped integration state hooks use
-`POHUNEK_INTEGRATION_VERSION=13`, run their interpreter in isolated mode (`-I`,
+`POHUNEK_INTEGRATION_VERSION=14`, run their interpreter in isolated mode (`-I`,
 so the session working directory never shadows the standard library), read the
 worker instance from `POHUNEK_WORKER_INSTANCE_ID`, read
 provider JSON through a bounded direct pipe without staging it on disk, and send the hook process's parent PID on
@@ -2382,14 +2386,43 @@ lifecycle identifiers and agent type. A Claude `SubagentStop` with no recorded
 start is not a subagent and adds no row, while a Codex one records a completed
 child; see `subagents` under `SessionInfo`. For Claude the state adapter also
 registers the main-agent `Stop` (action `stop`): it sends the worker one
-`subagent_snapshot` claim carrying only the `id`, `type` and `status` of each
-entry of `background_tasks`, and sends nothing for a `Stop` with a non-empty
-`agent_id`, a missing or invalid list, a list over 256 entries, or input over
-1 MiB. A worker that predates the claim refuses it and nothing is applied. Codex `Stop` carries
-no task list, so the Codex state adapter registers no `Stop`. The hook
+`subagent_snapshot` claim with, for each entry of `background_tasks`, the
+required `id`, `type` and `status`, and the optional fields that sanitize:
+`label` from `description` (every type; control and format characters removed,
+whitespace collapsed, cut to the byte limit), `program` from `command` (shell
+tasks only; the basename of the command word, after skipped `NAME=value`
+assignments, `cd <dir> &&` or `;`, and `env` options, accepted only when it
+matches `[A-Za-z0-9][A-Za-z0-9._+-]*`; a command longer than 64 KiB gets no
+program, because shell tokenizing grows superlinearly with token length, about
+32 ms at 64 KiB and 6 s at 1 MiB, and a cut command word could name another
+program), and `agent_type` (subagent tasks only; a value with
+a control, format, line or paragraph separator or surrogate character is
+dropped). An invalid optional field is omitted from its task alone. The command
+and its arguments are never forwarded. The label and program byte limits come from the
+worker-injected reserved variables `POHUNEK_BACKGROUND_LABEL_MAX_BYTES` and
+`POHUNEK_BACKGROUND_PROGRAM_MAX_BYTES`; when one is missing or invalid, the hook
+sends no label or program at all. The hook sends nothing for a `Stop` with a
+non-empty `agent_id`, a missing or invalid list, a list over 256 entries, or
+input over 1 MiB, and a missing or invalid required field voids the list. A
+worker that predates the claim refuses it and nothing is applied. Codex `Stop`
+carries no task list, so the Codex state adapter registers no `Stop`. The hook
 validates its action and Pohunek handshake before reading, rejects oversized
 JSON, and never stages the payload on disk; provider prompts, results,
-messages, task descriptions and commands, and transcript paths are discarded.
+messages, and transcript paths are discarded.
+
+On `SessionStart` (action `session`) the hook's identity report carries the
+hook input `source` as `session_source` only when it is `startup`, `resume`,
+`clear` or `compact`; any other value, or none, omits the key. The worker clears
+the background snapshot only on `startup` and `resume`. `fork` is not forwarded:
+a forked session is a new process and must not clear the snapshot of the session
+it was forked from. On `SessionEnd` (action `release`) the identity release
+carries the hook input `reason` as `release_reason` only when it is `clear`,
+`resume`, `logout`, `prompt_input_exit` or `other`; any other value omits the
+key. The snapshot belongs to the reporting Claude process: any process in the
+managed PTY tree may report, the latest turn end wins, the owner's release with
+a reason other than `clear` clears it, and a `SessionStart` from another process
+clears it. A `/clear` keeps the snapshot, because Claude follows that release
+with a `SessionStart` of the same process.
 
 The four integration methods classify an explicit `agent` before acting: a
 value outside the runtime-id grammar is `runtime/agent_kind_unsupported`, a

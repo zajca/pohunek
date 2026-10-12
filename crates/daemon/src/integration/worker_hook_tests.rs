@@ -542,17 +542,19 @@ async fn a_report_of_a_newer_asset_set_is_refused_by_a_session_on_an_older_schem
 mod subagent_sequences {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use pohunek_test_support::wait::wait_until;
     use pohunek_worker_protocol::{
-        InspectSnapshot, SubagentPhase, SubagentSnapshot, TransactionId,
+        BackgroundItem, BackgroundKind, BackgroundSnapshot, BackgroundStatus, InspectSnapshot,
+        RuntimePhase, SubagentPhase, SubagentSnapshot, TransactionId,
     };
     use serde::Deserialize;
     use serde_json::{json, Value};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
+    use tracing_subscriber::layer::SubscriberExt;
 
     use super::{start_worker_with_schema, state_asset, DaemonStub, SESSION_ID};
     use crate::runtime::Worker;
@@ -668,60 +670,72 @@ mod subagent_sequences {
         /// Runs a shell command, such as a nested hook or the crafted-claim
         /// client.
         Command(String),
-        /// Reports an identity barrier and waits on the gate; the test checks
-        /// these rows before it releases the gate.
+        /// Writes the checkpoint's marker and waits on the gate; the test checks
+        /// the worker's state before it releases the gate.
         Checkpoint(Rows),
+        /// Runs `steps` in one child shell of the PTY root, which is one agent
+        /// process: its hooks report the same identity, and a checkpoint inside
+        /// it pauses that same process.
+        Process(Vec<Step>),
+        /// Runs `steps` in a shell whose parent never reaps it, so the shell is a
+        /// zombie once it exits. A launcher process holds it: it waits for the exit
+        /// without reaping (`waitid` with `WNOWAIT`), writes the shell's state to
+        /// `process-N.state` (N numbers the processes of the replay), and sleeps.
+        #[cfg(target_os = "linux")]
+        Background(Vec<Step>),
+        /// Waits at the final state without recording a checkpoint. A replay
+        /// that ends in a process renders its final barrier inside that process,
+        /// so the agent is still alive when the test reads the final state.
+        Barrier,
     }
 
-    /// A real worker whose PTY script waits on a gate after its last step.
+    /// A real worker whose PTY script waits on a gate at each checkpoint.
     struct HookRun {
         worker: Worker,
         task: tokio::task::JoinHandle<Result<(), pohunek_session_worker::WorkerError>>,
         /// Write end of the FIFO the PTY script reads one line from per pause.
         gate: std::fs::File,
-        /// Sequence of the last identity barrier the worker recorded.
-        barrier: Option<u64>,
+        /// The scenario directory, where each checkpoint writes its marker.
+        root: PathBuf,
+        /// Checkpoints whose state the test has already read.
+        passed: usize,
         /// The worker's snapshot at each checkpoint, then after the last step.
         snapshots: Vec<InspectSnapshot>,
     }
 
     impl HookRun {
-        /// Waits until the worker records an identity barrier newer than the
-        /// last one and returns the snapshot at that point.
+        /// Waits until the PTY script reaches the next checkpoint and returns
+        /// the worker's snapshot there.
         ///
-        /// The PTY script runs every hook to completion before it reports the
-        /// barrier, so every earlier claim has been decided by then.
+        /// A checkpoint's marker is written only after the hooks before it have
+        /// run to completion, and each hook returns only once the worker has
+        /// answered its claim, so every earlier claim is decided by then.
         async fn pass_barrier(&mut self) -> InspectSnapshot {
-            let worker = &self.worker;
-            let previous = self.barrier;
-            let snapshot = Box::pin(wait_until(
-                "the worker records the identity barrier",
-                || async move {
-                    let snapshot = worker.inspect().await.expect("inspect");
-                    let sequence = snapshot.active_identity.as_ref()?.sequence;
-                    previous
-                        .is_none_or(|previous| sequence > previous)
-                        .then_some(snapshot)
-                },
-            ))
+            let marker = self.root.join(format!("barrier-{}", self.passed));
+            Box::pin(wait_until("the agent reaches the checkpoint", || async {
+                marker.exists().then_some(())
+            }))
             .await;
-            self.barrier = snapshot
-                .active_identity
-                .as_ref()
-                .map(|identity| identity.sequence);
-            snapshot
+            self.passed += 1;
+            self.worker.inspect().await.expect("inspect")
         }
 
         /// Lets the PTY script continue past its current pause.
         ///
-        /// Waits first until the wall clock is past every row timestamp in
-        /// `snapshot`, so a transition after the pause is stamped later than
-        /// every transition before it.
+        /// Waits first until the wall clock is past every row timestamp and
+        /// the background observation time in `snapshot`, so a transition after
+        /// the pause is stamped later than every transition before it.
         async fn release(&mut self, snapshot: &InspectSnapshot) {
             let latest = snapshot
                 .subagents
                 .iter()
                 .map(|row| row.updated_at_ms)
+                .chain(
+                    snapshot
+                        .background
+                        .iter()
+                        .map(|background| background.observed_at_ms),
+                )
                 .max()
                 .unwrap_or_default();
             Box::pin(wait_until(
@@ -767,6 +781,93 @@ mod subagent_sequences {
         format!("'{text}'")
     }
 
+    /// Renders the PTY script of a replay, numbering the hook inputs and the
+    /// checkpoints, and collects the rows each checkpoint expects.
+    struct Script<'a> {
+        root: &'a Path,
+        gate: PathBuf,
+        inputs: usize,
+        barriers: usize,
+        processes: usize,
+        checkpoints: Vec<Rows>,
+    }
+
+    impl Script<'_> {
+        /// The command line that runs `step` in the shell it is rendered for.
+        fn command(&mut self, step: Step) -> String {
+            match step {
+                Step::Hook {
+                    asset,
+                    action,
+                    payload,
+                } => {
+                    let input = self.root.join(format!("hook-{}.json", self.inputs));
+                    self.inputs += 1;
+                    std::fs::write(&input, payload.to_string()).expect("write the hook input");
+                    format!("/bin/sh {} {action} < {}", quoted(&asset), quoted(&input))
+                }
+                Step::Command(command) => command,
+                Step::Process(steps) => {
+                    // A script file keeps nested processes free of quoting
+                    // layers: each process is one shell running its own file.
+                    let index = self.processes;
+                    self.processes += 1;
+                    let inner: Vec<String> =
+                        steps.into_iter().map(|step| self.command(step)).collect();
+                    let file = self.root.join(format!("process-{index}.sh"));
+                    std::fs::write(&file, format!("{}\ntrue\n", inner.join("\n")))
+                        .expect("write the process script");
+                    format!("/bin/sh {}", quoted(&file))
+                }
+                Step::Checkpoint(rows) => {
+                    self.checkpoints.push(rows);
+                    self.barrier()
+                }
+                Step::Barrier => self.barrier(),
+                #[cfg(target_os = "linux")]
+                Step::Background(steps) => {
+                    let index = self.processes;
+                    self.processes += 1;
+                    let inner: Vec<String> =
+                        steps.into_iter().map(|step| self.command(step)).collect();
+                    let file = self.root.join(format!("process-{index}.sh"));
+                    std::fs::write(&file, format!("{}\ntrue\n", inner.join("\n")))
+                        .expect("write the background script");
+                    let state = self.root.join(format!("process-{index}.state"));
+                    let launcher = self.root.join(format!("launcher-{index}.py"));
+                    std::fs::write(
+                        &launcher,
+                        format!(
+                            "import os, subprocess, time\n\
+                             owner = subprocess.Popen([\"/bin/sh\", {file:?}])\n\
+                             os.waitid(os.P_PID, owner.pid, os.WEXITED | os.WNOWAIT)\n\
+                             with open(\"/proc/%d/status\" % owner.pid) as status:\n\
+                             \x20   zombie = any(line.startswith(\"State:\") and \"Z\" in line for line in status)\n\
+                             with open({state:?}, \"w\") as handle:\n\
+                             \x20   handle.write(\"zombie\" if zombie else \"other\")\n\
+                             time.sleep(3600)\n",
+                            file = file.display().to_string(),
+                            state = state.display().to_string(),
+                        ),
+                    )
+                    .expect("write the launcher");
+                    format!("python3 -I {} &", quoted(&launcher))
+                }
+            }
+        }
+
+        /// Writes the marker of the next checkpoint, then waits on the gate.
+        fn barrier(&mut self) -> String {
+            let marker = self.root.join(format!("barrier-{}", self.barriers));
+            self.barriers += 1;
+            format!(
+                "echo done > {}; read -r step < {}",
+                quoted(&marker),
+                quoted(&self.gate)
+            )
+        }
+    }
+
     /// Starts a real worker whose PTY runs `steps` with the real hooks, checks
     /// the rows at every checkpoint, and checks `final_rows` after the last
     /// step. The PTY stays up until [`HookRun::finish`].
@@ -777,6 +878,16 @@ mod subagent_sequences {
     /// [`replay`], with the rows after the last step checked only when
     /// `final_rows` is given; the caller checks the last snapshot otherwise.
     async fn replay_checking(root: &Path, steps: Vec<Step>, final_rows: Option<&Rows>) -> HookRun {
+        replay_with_schema(root, steps, final_rows, SCHEMA).await
+    }
+
+    /// [`replay_checking`] for a worker initialized with the hook schema `schema`.
+    async fn replay_with_schema(
+        root: &Path,
+        steps: Vec<Step>,
+        final_rows: Option<&Rows>,
+        schema: &str,
+    ) -> HookRun {
         let gate_path = root.join("replay.gate");
         nix::unistd::mkfifo(&gate_path, nix::sys::stat::Mode::S_IRWXU).expect("create the gate");
         // Opened read-write so the test never blocks on a reader and the
@@ -786,58 +897,41 @@ mod subagent_sequences {
             .write(true)
             .open(&gate_path)
             .expect("open the gate");
-        let barrier_input = root.join("barrier.json");
-        std::fs::write(&barrier_input, br#"{"session_id":"barrier"}"#)
-            .expect("write the barrier input");
-        // The identity hook runs under an intermediate shell, so it reports that
-        // shell rather than the PTY root, as in `report_through_worker`.
-        let barrier = format!(
-            "/bin/sh -c '/bin/sh \"$0\" session; true' {} < {}",
-            quoted(&state_asset(CLAUDE)),
-            quoted(&barrier_input)
-        );
-        let pause = format!("read -r step < {}", quoted(&gate_path));
 
         // Every hook runs before the script's last command, so the shell never
-        // execs it and the hook's parent is the PTY root the worker attests.
-        let mut lines = Vec::new();
-        let mut checkpoints = Vec::new();
-        for (index, step) in steps.into_iter().enumerate() {
-            match step {
-                Step::Hook {
-                    asset,
-                    action,
-                    payload,
-                } => {
-                    let input = root.join(format!("hook-{index}.json"));
-                    std::fs::write(&input, payload.to_string()).expect("write the hook input");
-                    lines.push(format!(
-                        "/bin/sh {} {action} < {}",
-                        quoted(&asset),
-                        quoted(&input)
-                    ));
-                }
-                Step::Command(command) => lines.push(command),
-                Step::Checkpoint(rows) => {
-                    lines.extend([barrier.clone(), pause.clone()]);
-                    checkpoints.push(rows);
-                }
-            }
+        // execs it and the hook's parent is the shell that runs it.
+        let mut script = Script {
+            root,
+            gate: gate_path,
+            inputs: 0,
+            barriers: 0,
+            processes: 0,
+            checkpoints: Vec::new(),
+        };
+        let mut steps = steps;
+        let trailing_process = matches!(steps.last(), Some(Step::Process(_)));
+        if let Some(Step::Process(inner)) = steps.last_mut().filter(|_| trailing_process) {
+            inner.push(Step::Barrier);
         }
-        lines.extend([barrier, pause]);
+        let mut lines: Vec<String> = steps.into_iter().map(|step| script.command(step)).collect();
+        if !trailing_process {
+            lines.push(script.barrier());
+        }
+        let checkpoints = script.checkpoints;
 
         let (worker, task, _socket) = start_worker_with_schema(
             root,
             &lines.join("\n"),
             protocol::PROTOCOL_VERSION.get(),
-            SCHEMA,
+            schema,
         )
         .await;
         let mut run = HookRun {
             worker,
             task,
             gate,
-            barrier: None,
+            root: root.to_path_buf(),
+            passed: 0,
             snapshots: Vec::new(),
         };
         for (index, rows) in checkpoints.iter().enumerate() {
@@ -1562,6 +1656,14 @@ mod subagent_sequences {
             )
             .env("POHUNEK_WORKER_SOCKET_PATH", &worker_socket)
             .env("POHUNEK_WORKER_INSTANCE_ID", SCRIPTED_INSTANCE)
+            .env(
+                "POHUNEK_BACKGROUND_LABEL_MAX_BYTES",
+                pohunek_worker_protocol::BACKGROUND_LABEL_MAX_BYTES.to_string(),
+            )
+            .env(
+                "POHUNEK_BACKGROUND_PROGRAM_MAX_BYTES",
+                pohunek_worker_protocol::BACKGROUND_PROGRAM_MAX_BYTES.to_string(),
+            )
             .stdin(std::process::Stdio::piped())
             .spawn()
             .expect("run the state hook");
@@ -1577,21 +1679,193 @@ mod subagent_sequences {
         (claims, daemon)
     }
 
-    /// The `stop` action sends each recorded task as its `id`, `type` and
-    /// `status` alone, in order, with the hook's sequence and the agent
-    /// process that runs the hook, to the worker socket only: a refused
-    /// snapshot reaches no daemon (#883 D3).
+    /// Secret-shaped command of a background shell: a secret after a variable
+    /// assignment, after a flag, and the full command line around them.
+    const SECRET: &str = "sk-live-0123456789abcdef";
+    const SECRET_COMMAND: &str = "API_KEY=sk-live-0123456789abcdef cd /work && env FOO=bar /usr/bin/cargo test --token=sk-live-0123456789abcdef";
+
+    /// A background subagent listed by a main-agent turn end.
+    fn subagent_task(id: &str, description: &str, agent_type: &str) -> Value {
+        json!({
+            "id": id,
+            "type": "subagent",
+            "status": "running",
+            "description": description,
+            "agent_type": agent_type,
+        })
+    }
+
+    /// A background shell listed by a main-agent turn end.
+    fn shell_task(id: &str, description: &str, command: &str) -> Value {
+        json!({
+            "id": id,
+            "type": "shell",
+            "status": "running",
+            "description": description,
+            "command": command,
+        })
+    }
+
+    /// A background monitor listed by a main-agent turn end.
+    fn monitor_task(id: &str, description: &str) -> Value {
+        json!({
+            "id": id,
+            "type": "monitor",
+            "status": "running",
+            "description": description,
+        })
+    }
+
+    /// The agent's session identity report from the PTY root, which the hooks
+    /// that follow report as. `source` is the session start Claude reports.
+    fn session_hook(source: Option<&str>) -> Step {
+        let mut payload = json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "native-background",
+        });
+        if let Some(source) = source {
+            payload["source"] = json!(source);
+        }
+        Step::Hook {
+            asset: state_asset(CLAUDE),
+            action: "session",
+            payload,
+        }
+    }
+
+    /// A main-agent turn end listing `tasks`, through the real Claude hook.
+    fn stop_with(tasks: Vec<Value>) -> Step {
+        claude_hook(&Event::Stop {
+            background_tasks: tasks,
+        })
+    }
+
+    /// One agent process: `steps` run in one child shell of the PTY root, as
+    /// Claude runs its hooks, so the identity they report and the claims that
+    /// follow it name the same reporter.
+    fn turn(steps: Vec<Step>) -> Step {
+        Step::Process(steps)
+    }
+
+    /// The background snapshot of `snapshot`, which must hold one.
+    fn background_of(snapshot: &InspectSnapshot) -> &BackgroundSnapshot {
+        snapshot
+            .background
+            .as_ref()
+            .unwrap_or_else(|| panic!("a background snapshot: {snapshot:?}"))
+    }
+
+    /// The item of `background` with id `id`.
+    fn item<'a>(background: &'a BackgroundSnapshot, id: &str) -> &'a BackgroundItem {
+        background
+            .items
+            .iter()
+            .find(|item| item.id == id)
+            .unwrap_or_else(|| panic!("no background item {id}: {:?}", background.items))
+    }
+
+    /// One event the worker logged, with every field rendered as text.
+    #[derive(Debug, Clone)]
+    struct LoggedEvent {
+        name: String,
+        fields: BTreeMap<String, String>,
+    }
+
+    /// Captures every event the worker logs on the test thread.
+    ///
+    /// Scenarios that use it run the worker in process on a current-thread
+    /// runtime, so the worker logs on the thread that installed this capture.
+    #[derive(Clone, Default)]
+    struct EventLog(Arc<Mutex<Vec<LoggedEvent>>>);
+
+    impl EventLog {
+        /// Installs this capture as the thread's default subscriber, after a
+        /// process-wide anchor dispatcher, as the crafted-claim capture does.
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            static ANCHOR: OnceLock<tracing::Dispatch> = OnceLock::new();
+            ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new()));
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+        }
+
+        /// The fields of every logged event named `name`, in logging order.
+        fn named(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+            self.0
+                .lock()
+                .expect("event log")
+                .iter()
+                .filter(|event| event.name == name)
+                .map(|event| event.fields.clone())
+                .collect()
+        }
+
+        /// Every logged event name, field name and field value, one per line:
+        /// the text of every record the worker logged.
+        fn rendered(&self) -> String {
+            self.0
+                .lock()
+                .expect("event log")
+                .iter()
+                .flat_map(|event| {
+                    std::iter::once(event.name.clone()).chain(
+                        event
+                            .fields
+                            .iter()
+                            .flat_map(|(name, value)| [name.clone(), value.clone()]),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventLog {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = FieldText::default();
+            event.record(&mut fields);
+            self.0.lock().expect("event log").push(LoggedEvent {
+                name: event.metadata().name().to_owned(),
+                fields: fields.0,
+            });
+        }
+    }
+
+    /// Renders every field of an event as text, including its message.
+    #[derive(Default)]
+    struct FieldText(BTreeMap<String, String>);
+
+    impl tracing::field::Visit for FieldText {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+    }
+
+    /// The Stop hook forwards each task's id, type and status, with the label
+    /// from its description, the program of a shell and the agent type of a
+    /// subagent. Nothing else of the task, and nothing of the final message,
+    /// reaches the worker socket, and a refused snapshot has no daemon fallback
+    /// (#883 D3, #890 D2).
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_stop_hook_forwards_only_task_ids_types_and_statuses() {
+    async fn the_stop_hook_forwards_ids_types_statuses_and_the_sanitized_label_program_and_agent_type(
+    ) {
         /// A final assistant message the claim must not carry.
-        const MESSAGE: &str = "Both background agents are still working.";
-        let sequence = recorded("lost_stop_corrected_by_snapshot");
-        let tasks = stop_tasks(&sequence, 1);
+        const MESSAGE: &str = "Both background tasks are still working.";
         let input = json!({
             "hook_event_name": "Stop",
             "stop_hook_active": false,
             "last_assistant_message": MESSAGE,
-            "background_tasks": tasks,
+            "background_tasks": [
+                subagent_task("sub-1", "Port the parser", "general-purpose"),
+                shell_task("shell-1", "Test watch", SECRET_COMMAND),
+                monitor_task("mon-1", "Watch the CI run"),
+            ],
         });
         let (claims, daemon) = stop_hook_claims(&input).await;
 
@@ -1633,22 +1907,40 @@ mod subagent_sequences {
                 .is_some_and(|sequence| sequence > 0),
             "{claim}"
         );
-        let expected: Vec<Value> = tasks
-            .iter()
-            .map(|task| json!({"id": task["id"], "type": task["type"], "status": task["status"]}))
-            .collect();
-        assert_eq!(claim["tasks"], Value::Array(expected), "{claim}");
-        let dropped: Vec<&str> = tasks
-            .iter()
-            .flat_map(|task| ["description", "command", "agent_type"].map(|field| &task[field]))
-            .filter_map(Value::as_str)
-            .chain([MESSAGE])
-            .collect();
-        assert!(
-            dropped.iter().any(|text| text.contains("cargo")),
-            "the recorded tasks carry a shell command: {dropped:?}"
+        assert_eq!(
+            claim["tasks"],
+            json!([
+                {
+                    "id": "sub-1",
+                    "type": "subagent",
+                    "status": "running",
+                    "label": "Port the parser",
+                    "agent_type": "general-purpose",
+                },
+                {
+                    "id": "shell-1",
+                    "type": "shell",
+                    "status": "running",
+                    "label": "Test watch",
+                    "program": "cargo",
+                },
+                {
+                    "id": "mon-1",
+                    "type": "monitor",
+                    "status": "running",
+                    "label": "Watch the CI run",
+                },
+            ]),
+            "{claim}"
         );
-        for text in dropped {
+        for text in [
+            SECRET,
+            SECRET_COMMAND,
+            "--token",
+            "API_KEY",
+            "FOO=bar",
+            MESSAGE,
+        ] {
             assert!(!line.contains(text), "{text:?} is forwarded: {line}");
         }
         assert!(
@@ -1656,6 +1948,656 @@ mod subagent_sequences {
             "the snapshot has no daemon fallback: {:?}",
             daemon.request_lines()
         );
+    }
+
+    /// A secret-shaped shell command reaches no record the worker writes or
+    /// serves: not the journal, not the inspect response, not any worker log
+    /// event, and not the hook trace. The program name, which is allowed, does.
+    #[tokio::test]
+    async fn a_secret_shaped_shell_command_reaches_no_record() {
+        let log = EventLog::default();
+        let _subscriber = log.install();
+        let root = crate::test_support::scoped_dir("ph-background-secret-");
+        let steps = vec![turn(vec![
+            session_hook(None),
+            stop_with(vec![shell_task(
+                "shell-1",
+                "Run the workspace tests",
+                SECRET_COMMAND,
+            )]),
+        ])];
+        let run = replay_checking(&root, steps, None).await;
+        let snapshot = run.snapshots.last().expect("the final snapshot");
+        let shell = item(background_of(snapshot), "shell-1");
+        assert_eq!(shell.program.as_deref(), Some("cargo"));
+        assert_eq!(shell.label.as_deref(), Some("Run the workspace tests"));
+
+        let journal =
+            std::fs::read_to_string(root.join("journal/worker.json")).expect("the worker journal");
+        let served = serde_json::to_string(snapshot).expect("the inspect snapshot as JSON");
+        // The `Debug` output of the snapshot is what logs and debugger views
+        // print, so it must keep the label and program out too.
+        let rendered = format!("{snapshot:?}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        assert!(
+            !rendered.contains("Run the workspace tests"),
+            "the label reaches the Debug output: {rendered}"
+        );
+        let logged = log.rendered();
+        let hook_trace = std::fs::read_to_string(super::hook_trace_path(&root)).unwrap_or_default();
+        assert!(journal.contains("cargo"), "the journal keeps the program");
+        assert_eq!(log.named("worker.background.applied").len(), 1, "{logged}");
+        for (sink, text) in [
+            ("journal", journal.as_str()),
+            ("inspect response", served.as_str()),
+            ("debug output", rendered.as_str()),
+            ("worker log", logged.as_str()),
+            ("hook trace", hook_trace.as_str()),
+        ] {
+            for secret in [
+                SECRET,
+                "--token",
+                "API_KEY",
+                "FOO=bar",
+                "cd /work",
+                "/usr/bin/cargo",
+            ] {
+                assert!(
+                    !text.contains(secret),
+                    "{secret:?} reaches the {sink}: {text}"
+                );
+            }
+        }
+        run.finish().await;
+    }
+
+    /// A `Stop` input over the hook's bound is dropped whole, so the last
+    /// background snapshot stays as it was, with the same revision and
+    /// observation time, and the hook traces its refusal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_oversized_stop_input_keeps_the_last_background_snapshot() {
+        let root = crate::test_support::scoped_dir("ph-background-oversized-");
+        let oversized = padded_to(
+            &json!({
+                "hook_event_name": "Stop",
+                "background_tasks": [shell_task("shell-2", "Too long", "cargo build")],
+            }),
+            STOP_INPUT_BOUND + 1,
+        );
+        let steps = vec![turn(vec![
+            session_hook(None),
+            stop_with(vec![shell_task("shell-1", "Test watch", "cargo test")]),
+            Step::Checkpoint(Rows::new()),
+            Step::Hook {
+                asset: state_asset(CLAUDE),
+                action: "stop",
+                payload: oversized,
+            },
+        ])];
+        let run = replay_checking(&root, steps, None).await;
+        let [before, after] = run.snapshots.as_slice() else {
+            panic!("one checkpoint and the final rows: {:?}", run.snapshots);
+        };
+        assert_eq!(background_of(before), background_of(after));
+        assert!(
+            background_of(after)
+                .items
+                .iter()
+                .all(|item| item.id != "shell-2"),
+            "{after:?}"
+        );
+        let trace = std::fs::read_to_string(super::hook_trace_path(&root))
+            .expect("the hook traced its refusal");
+        assert!(trace.contains("input_too_large"), "{trace}");
+        run.finish().await;
+    }
+
+    /// A turn end listing a subagent, a shell and a monitor, then a later turn
+    /// end of the same agent process that drops the monitor and adds a shell:
+    /// the first snapshot renders each kind with its fields, and the second keeps
+    /// the first sightings of the items it still lists, under a new revision.
+    /// Background items never create subagent rows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_end_snapshot_renders_its_items_and_a_later_one_keeps_first_sightings() {
+        let root = crate::test_support::scoped_dir("ph-background-snapshot-");
+        let steps = vec![turn(vec![
+            session_hook(None),
+            stop_with(vec![
+                subagent_task("sub-1", "Port the parser", "general-purpose"),
+                shell_task("shell-1", "Test watch", "cargo test --workspace"),
+                monitor_task("mon-1", "Watch the CI run"),
+            ]),
+            Step::Checkpoint(Rows::new()),
+            stop_with(vec![
+                subagent_task("sub-1", "Port the parser", "general-purpose"),
+                shell_task("shell-1", "Test watch", "cargo test --workspace"),
+                shell_task("shell-2", "Clippy watch", "bacon clippy"),
+            ]),
+        ])];
+        let run = replay_checking(&root, steps, None).await;
+        let [after_first, after_second] = run.snapshots.as_slice() else {
+            panic!("one checkpoint and the final rows: {:?}", run.snapshots);
+        };
+
+        let first = background_of(after_first);
+        assert_eq!(first.items.len(), 3, "{first:?}");
+        let subagent = item(first, "sub-1");
+        assert_eq!(subagent.kind, BackgroundKind::Subagent);
+        assert_eq!(subagent.status, BackgroundStatus::Running);
+        assert_eq!(subagent.label.as_deref(), Some("Port the parser"));
+        assert_eq!(subagent.agent_type.as_deref(), Some("general-purpose"));
+        assert_eq!(subagent.program, None);
+        let shell = item(first, "shell-1");
+        assert_eq!(shell.kind, BackgroundKind::Shell);
+        assert_eq!(shell.label.as_deref(), Some("Test watch"));
+        assert_eq!(shell.program.as_deref(), Some("cargo"));
+        assert_eq!(shell.agent_type, None);
+        let monitor = item(first, "mon-1");
+        assert_eq!(monitor.kind, BackgroundKind::Monitor);
+        assert_eq!(monitor.label.as_deref(), Some("Watch the CI run"));
+        assert_eq!(monitor.program, None);
+        for item in &first.items {
+            assert_eq!(item.first_seen_ms, first.observed_at_ms, "{item:?}");
+            assert_eq!(item.last_seen_ms, first.observed_at_ms, "{item:?}");
+        }
+
+        let second = background_of(after_second);
+        assert!(second.revision > first.revision, "{first:?} {second:?}");
+        assert!(
+            second.observed_at_ms > first.observed_at_ms,
+            "{first:?} {second:?}"
+        );
+        let ids: BTreeSet<&str> = second.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, BTreeSet::from(["sub-1", "shell-1", "shell-2"]));
+        assert_eq!(item(second, "sub-1").first_seen_ms, subagent.first_seen_ms);
+        assert_eq!(item(second, "shell-1").first_seen_ms, shell.first_seen_ms);
+        let added = item(second, "shell-2");
+        assert_eq!(added.first_seen_ms, second.observed_at_ms, "{added:?}");
+        assert_eq!(added.program.as_deref(), Some("bacon"));
+        assert_eq!(item(second, "shell-1").last_seen_ms, second.observed_at_ms);
+        assert!(
+            after_second.subagents.is_empty(),
+            "{:?}",
+            after_second.subagents
+        );
+        run.finish().await;
+    }
+
+    /// Clearing follows the agent process. A compact session of the same
+    /// process keeps the background, and a later snapshot of that process keeps
+    /// the first sightings. A new process that starts a session clears the
+    /// background whatever its source, with the reason `agent_changed`.
+    #[tokio::test]
+    async fn a_compact_session_keeps_the_background_and_a_new_agent_process_clears_it() {
+        let log = EventLog::default();
+        let _subscriber = log.install();
+        let root = crate::test_support::scoped_dir("ph-background-clear-");
+        let tasks = || vec![shell_task("shell-1", "Test watch", "cargo test")];
+        let steps = vec![
+            turn(vec![
+                session_hook(None),
+                stop_with(tasks()),
+                Step::Checkpoint(Rows::new()),
+                session_hook(Some("compact")),
+                Step::Checkpoint(Rows::new()),
+                stop_with(tasks()),
+                Step::Checkpoint(Rows::new()),
+            ]),
+            turn(vec![
+                session_hook(Some("startup")),
+                Step::Checkpoint(Rows::new()),
+            ]),
+            turn(vec![
+                session_hook(None),
+                stop_with(tasks()),
+                Step::Checkpoint(Rows::new()),
+            ]),
+            turn(vec![
+                session_hook(Some("resume")),
+                Step::Checkpoint(Rows::new()),
+            ]),
+        ];
+        let run = replay_checking(&root, steps, None).await;
+        let [applied, compacted, reapplied, cleared, applied_again, resumed, ..] =
+            run.snapshots.as_slice()
+        else {
+            panic!("six checkpoints and the final rows: {:?}", run.snapshots);
+        };
+        let first_seen = item(background_of(applied), "shell-1").first_seen_ms;
+
+        let revision = background_of(applied).revision;
+        assert_eq!(
+            background_of(compacted).revision,
+            revision,
+            "compact keeps it"
+        );
+        let kept = background_of(reapplied);
+        assert_eq!(kept.revision, revision + 1, "{kept:?}");
+        assert_eq!(item(kept, "shell-1").first_seen_ms, first_seen, "{kept:?}");
+        assert!(cleared.background.is_none(), "{:?}", cleared.background);
+        let again = background_of(applied_again);
+        assert_eq!(
+            item(again, "shell-1").first_seen_ms,
+            again.observed_at_ms,
+            "{again:?}"
+        );
+        assert!(resumed.background.is_none(), "{:?}", resumed.background);
+        let reasons: Vec<String> = log
+            .named("worker.background.cleared")
+            .iter()
+            .map(|fields| fields["background.reason"].clone())
+            .collect();
+        assert_eq!(
+            reasons,
+            ["agent_changed", "agent_changed"],
+            "{}",
+            log.rendered()
+        );
+        run.finish().await;
+    }
+
+    /// A new agent process that starts a session with `clear` or `compact`
+    /// clears the background of the previous process, with reason
+    /// `agent_changed`. The new process's own snapshot then stands alone.
+    #[tokio::test]
+    async fn a_new_agent_process_clears_the_background_on_clear_or_compact() {
+        let log = EventLog::default();
+        let _subscriber = log.install();
+        let root = crate::test_support::scoped_dir("ph-background-new-process-");
+        let tasks = || vec![shell_task("shell-1", "Test watch", "cargo test")];
+        let steps = vec![
+            turn(vec![
+                session_hook(None),
+                stop_with(tasks()),
+                Step::Checkpoint(Rows::new()),
+            ]),
+            turn(vec![
+                session_hook(Some("clear")),
+                Step::Checkpoint(Rows::new()),
+            ]),
+            turn(vec![
+                session_hook(None),
+                stop_with(tasks()),
+                Step::Checkpoint(Rows::new()),
+            ]),
+            turn(vec![
+                session_hook(Some("compact")),
+                Step::Checkpoint(Rows::new()),
+            ]),
+        ];
+        let run = replay_checking(&root, steps, None).await;
+        let [applied, cleared, reapplied, compacted, ..] = run.snapshots.as_slice() else {
+            panic!("four checkpoints and the final rows: {:?}", run.snapshots);
+        };
+        assert!(applied.background.is_some(), "{applied:?}");
+        assert!(cleared.background.is_none(), "{:?}", cleared.background);
+        assert!(reapplied.background.is_some(), "{reapplied:?}");
+        assert!(compacted.background.is_none(), "{:?}", compacted.background);
+        let reasons: Vec<String> = log
+            .named("worker.background.cleared")
+            .iter()
+            .map(|fields| fields["background.reason"].clone())
+            .collect();
+        assert_eq!(
+            reasons,
+            ["agent_changed", "agent_changed"],
+            "{}",
+            log.rendered()
+        );
+        run.finish().await;
+    }
+
+    /// One agent process lists a shell, checks its background, then ends its
+    /// session with a release carrying `reason`. Returns the snapshots at the
+    /// checkpoint and after the release.
+    async fn released_background(
+        prefix: &str,
+        reason: Option<&str>,
+    ) -> (InspectSnapshot, InspectSnapshot) {
+        let root = crate::test_support::scoped_dir(prefix);
+        let mut payload =
+            json!({"hook_event_name": "SessionEnd", "session_id": "native-background"});
+        if let Some(reason) = reason {
+            payload["reason"] = json!(reason);
+        }
+        let steps = vec![turn(vec![
+            session_hook(None),
+            stop_with(vec![shell_task("shell-1", "Test watch", "cargo test")]),
+            Step::Checkpoint(Rows::new()),
+            Step::Hook {
+                asset: state_asset(CLAUDE),
+                action: "release",
+                payload,
+            },
+        ])];
+        let mut run = replay_checking(&root, steps, None).await;
+        let [held, released] = std::mem::take(&mut run.snapshots)
+            .try_into()
+            .unwrap_or_else(|snapshots: Vec<InspectSnapshot>| {
+                panic!("one checkpoint and the final rows: {snapshots:?}")
+            });
+        run.finish().await;
+        (held, released)
+    }
+
+    /// A session release by the active agent clears the background, and the
+    /// worker logs the clear with its reason.
+    #[tokio::test]
+    async fn a_session_release_clears_the_background() {
+        let log = EventLog::default();
+        let _subscriber = log.install();
+        let (held, released) = released_background("ph-background-release-", None).await;
+        assert_eq!(background_of(&held).items.len(), 1, "{held:?}");
+        assert!(released.background.is_none(), "{:?}", released.background);
+        let cleared = log.named("worker.background.cleared");
+        assert_eq!(cleared.len(), 1, "{}", log.rendered());
+        assert_eq!(cleared[0]["background.reason"], "release");
+    }
+
+    /// A release for `prompt_input_exit` ends the session like any release
+    /// other than `clear`, so the background is cleared.
+    #[tokio::test]
+    async fn a_prompt_input_exit_release_clears_the_background() {
+        let log = EventLog::default();
+        let _subscriber = log.install();
+        let (held, released) =
+            released_background("ph-background-prompt-exit-", Some("prompt_input_exit")).await;
+        assert_eq!(background_of(&held).items.len(), 1, "{held:?}");
+        assert!(released.background.is_none(), "{:?}", released.background);
+        assert_eq!(
+            log.named("worker.background.cleared").len(),
+            1,
+            "{}",
+            log.rendered()
+        );
+    }
+
+    /// A `/clear` releases the session and starts it again in the same process,
+    /// so the release and the new session keep the background. The checkpoint
+    /// between them shows the release was accepted.
+    #[tokio::test]
+    async fn a_clear_release_and_a_clear_session_from_the_same_process_keep_the_background() {
+        let log = EventLog::default();
+        let _subscriber = log.install();
+        let root = crate::test_support::scoped_dir("ph-background-clear-release-");
+        let steps = vec![turn(vec![
+            session_hook(None),
+            stop_with(vec![shell_task("shell-1", "Test watch", "cargo test")]),
+            Step::Hook {
+                asset: state_asset(CLAUDE),
+                action: "release",
+                payload: json!({
+                    "hook_event_name": "SessionEnd",
+                    "session_id": "native-background",
+                    "reason": "clear",
+                }),
+            },
+            Step::Checkpoint(Rows::new()),
+            session_hook(Some("clear")),
+            Step::Checkpoint(Rows::new()),
+        ])];
+        let run = replay_checking(&root, steps, None).await;
+        let [released, restarted, ..] = run.snapshots.as_slice() else {
+            panic!("two checkpoints and the final rows: {:?}", run.snapshots);
+        };
+        assert!(released.active_identity.is_none(), "{released:?}");
+        assert!(released.active_identity_release.is_some(), "{released:?}");
+        let kept = background_of(released);
+        assert_eq!(kept.revision, 1, "{kept:?}");
+        assert_eq!(background_of(restarted), kept, "{restarted:?}");
+        assert!(
+            log.named("worker.background.cleared").is_empty(),
+            "{}",
+            log.rendered()
+        );
+        run.finish().await;
+    }
+
+    /// A nested Claude started inside the agent reports a snapshot of its own,
+    /// which replaces the agent's. Its release clears its snapshot, and the
+    /// agent's next turn end restores the agent's background. The nested
+    /// session start is another process, so it clears the agent's snapshot
+    /// first, with reason `agent_changed`.
+    #[tokio::test]
+    async fn a_nested_agent_replaces_and_releases_the_background_and_the_agent_restores_it() {
+        let log = EventLog::default();
+        let _subscriber = log.install();
+        let root = crate::test_support::scoped_dir("ph-background-nested-");
+        let steps = vec![turn(vec![
+            session_hook(None),
+            stop_with(vec![shell_task("outer-shell", "Outer watch", "cargo test")]),
+            turn(vec![
+                session_hook(None),
+                stop_with(vec![shell_task("nested-shell", "Nested watch", "bacon")]),
+                Step::Checkpoint(Rows::new()),
+                Step::Hook {
+                    asset: state_asset(CLAUDE),
+                    action: "release",
+                    payload: json!({"hook_event_name": "SessionEnd", "session_id": "native-background"}),
+                },
+            ]),
+            Step::Checkpoint(Rows::new()),
+            stop_with(vec![shell_task(
+                "outer-again",
+                "Outer again",
+                "cargo build",
+            )]),
+            Step::Checkpoint(Rows::new()),
+        ])];
+        let run = replay_checking(&root, steps, None).await;
+        let [nested, released, restored, ..] = run.snapshots.as_slice() else {
+            panic!("three checkpoints and the final rows: {:?}", run.snapshots);
+        };
+        let ids = |snapshot: &InspectSnapshot| -> Vec<String> {
+            background_of(snapshot)
+                .items
+                .iter()
+                .map(|item| item.id.clone())
+                .collect()
+        };
+        assert_eq!(ids(nested), ["nested-shell"], "{nested:?}");
+        assert!(released.background.is_none(), "{released:?}");
+        assert_eq!(ids(restored), ["outer-again"], "{restored:?}");
+        let reasons: Vec<String> = log
+            .named("worker.background.cleared")
+            .iter()
+            .map(|fields| fields["background.reason"].clone())
+            .collect();
+        assert_eq!(reasons, ["agent_changed", "release"], "{}", log.rendered());
+        run.finish().await;
+    }
+
+    /// After a `clear` release, whose session start never arrives, the same
+    /// process's `prompt_input_exit` release still ends the snapshot's session.
+    /// The identity release is not accepted the second time, because the first
+    /// one already ended the active identity.
+    #[tokio::test]
+    async fn a_clear_release_then_a_prompt_input_exit_release_from_the_same_process_clears() {
+        let log = EventLog::default();
+        let _subscriber = log.install();
+        let root = crate::test_support::scoped_dir("ph-background-clear-then-exit-");
+        let release = |reason: &str| Step::Hook {
+            asset: state_asset(CLAUDE),
+            action: "release",
+            payload: json!({
+                "hook_event_name": "SessionEnd",
+                "session_id": "native-background",
+                "reason": reason,
+            }),
+        };
+        let steps = vec![turn(vec![
+            session_hook(None),
+            stop_with(vec![shell_task("shell-1", "Test watch", "cargo test")]),
+            release("clear"),
+            Step::Checkpoint(Rows::new()),
+            release("prompt_input_exit"),
+            Step::Checkpoint(Rows::new()),
+        ])];
+        let run = replay_checking(&root, steps, None).await;
+        let [kept, cleared, ..] = run.snapshots.as_slice() else {
+            panic!("two checkpoints and the final rows: {:?}", run.snapshots);
+        };
+        assert_eq!(background_of(kept).items.len(), 1, "{kept:?}");
+        assert!(cleared.background.is_none(), "{cleared:?}");
+        let reasons: Vec<String> = log
+            .named("worker.background.cleared")
+            .iter()
+            .map(|fields| fields["background.reason"].clone())
+            .collect();
+        assert_eq!(reasons, ["release"], "{}", log.rendered());
+        run.finish().await;
+    }
+
+    /// A release from a process that did not report the snapshot leaves it in
+    /// place. The owner's snapshot ends only with the owner's release.
+    #[tokio::test]
+    async fn a_release_from_another_process_keeps_the_owners_background() {
+        let log = EventLog::default();
+        let _subscriber = log.install();
+        let root = crate::test_support::scoped_dir("ph-background-non-owner-");
+        let steps = vec![turn(vec![
+            session_hook(None),
+            stop_with(vec![shell_task("shell-1", "Test watch", "cargo test")]),
+            turn(vec![Step::Hook {
+                asset: state_asset(CLAUDE),
+                action: "release",
+                payload: json!({"hook_event_name": "SessionEnd", "session_id": "native-background"}),
+            }]),
+            Step::Checkpoint(Rows::new()),
+        ])];
+        let run = replay_checking(&root, steps, None).await;
+        let [kept, ..] = run.snapshots.as_slice() else {
+            panic!("one checkpoint and the final rows: {:?}", run.snapshots);
+        };
+        assert_eq!(background_of(kept).items.len(), 1, "{kept:?}");
+        assert!(
+            log.named("worker.background.cleared").is_empty(),
+            "{}",
+            log.rendered()
+        );
+        run.finish().await;
+    }
+
+    /// A worker on the identity-only schema refuses a Stop's background
+    /// snapshot, so the session shows no background, and the hook records the
+    /// refusal in its trace.
+    #[tokio::test]
+    async fn an_identity_only_schema_refuses_the_background_snapshot() {
+        let log = EventLog::default();
+        let _subscriber = log.install();
+        let root = crate::test_support::scoped_dir("ph-background-identity-only-");
+        let steps = vec![turn(vec![
+            session_hook(None),
+            stop_with(vec![shell_task("shell-1", "Test watch", "cargo test")]),
+        ])];
+        let run = replay_with_schema(&root, steps, None, "identity-v1").await;
+        let snapshot = run.snapshots.last().expect("the final snapshot");
+        assert!(snapshot.background.is_none(), "{snapshot:?}");
+        assert!(
+            log.named("worker.background.applied").is_empty(),
+            "{}",
+            log.rendered()
+        );
+        let trace = std::fs::read_to_string(super::hook_trace_path(&root))
+            .expect("the hook traced the refused snapshot");
+        assert!(trace.contains("worker_refused"), "{trace}");
+        run.finish().await;
+    }
+
+    /// An agent process that exits but is never reaped stays a zombie, and a
+    /// zombie is not a running owner. The root shell is blocked on a checkpoint
+    /// while the process is a zombie, so the inspect at that checkpoint finds
+    /// the owner exited and clears the snapshot with reason `owner_exited`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_background_owner_left_as_a_zombie_is_cleared() {
+        let log = EventLog::default();
+        let _subscriber = log.install();
+        let root = crate::test_support::scoped_dir("ph-background-zombie-");
+        let state = root.join("process-0.state");
+        // Builtins only: the root never waits on a child, so it cannot reap the owner.
+        let watch = format!("while [ ! -s {} ]; do :; done", quoted(&state));
+        let steps = vec![
+            Step::Background(vec![
+                session_hook(None),
+                stop_with(vec![shell_task("shell-1", "Test watch", "cargo test")]),
+            ]),
+            Step::Command(watch),
+            Step::Checkpoint(Rows::new()),
+        ];
+        let run = replay_checking(&root, steps, None).await;
+        let [after_exit, ..] = run.snapshots.as_slice() else {
+            panic!("one checkpoint and the final rows: {:?}", run.snapshots);
+        };
+        let observed = std::fs::read_to_string(&state).expect("the launcher recorded the owner");
+        assert_eq!(
+            observed.trim(),
+            "zombie",
+            "the owner was a zombie at the checkpoint"
+        );
+        assert!(after_exit.background.is_none(), "{after_exit:?}");
+        let reasons: Vec<String> = log
+            .named("worker.background.cleared")
+            .iter()
+            .map(|fields| fields["background.reason"].clone())
+            .collect();
+        assert_eq!(reasons, ["owner_exited"], "{}", log.rendered());
+        run.finish().await;
+    }
+
+    /// An agent process that ends without a release, as a killed Claude does,
+    /// leaves no owner to clear its snapshot. The next inspect finds the owner
+    /// gone and clears the snapshot with reason `owner_exited`.
+    #[tokio::test]
+    async fn a_background_owner_that_exits_without_a_release_is_cleared() {
+        let log = EventLog::default();
+        let _subscriber = log.install();
+        let root = crate::test_support::scoped_dir("ph-background-owner-exit-");
+        let steps = vec![
+            turn(vec![
+                session_hook(None),
+                stop_with(vec![shell_task("shell-1", "Test watch", "cargo test")]),
+            ]),
+            Step::Checkpoint(Rows::new()),
+        ];
+        let run = replay_checking(&root, steps, None).await;
+        let [after_exit, ..] = run.snapshots.as_slice() else {
+            panic!("one checkpoint and the final rows: {:?}", run.snapshots);
+        };
+        assert!(after_exit.background.is_none(), "{after_exit:?}");
+        let reasons: Vec<String> = log
+            .named("worker.background.cleared")
+            .iter()
+            .map(|fields| fields["background.reason"].clone())
+            .collect();
+        assert_eq!(reasons, ["owner_exited"], "{}", log.rendered());
+        run.finish().await;
+    }
+
+    /// Ending the runtime clears the background, as it settles the subagent rows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ending_the_runtime_clears_the_background() {
+        let root = crate::test_support::scoped_dir("ph-background-runtime-end-");
+        let steps = vec![turn(vec![
+            session_hook(None),
+            stop_with(vec![shell_task("shell-1", "Test watch", "cargo test")]),
+        ])];
+        let run = replay_checking(&root, steps, None).await;
+        let before = run.snapshots.last().expect("the final snapshot");
+        assert_eq!(background_of(before).items.len(), 1, "{before:?}");
+
+        run.stop_runtime().await;
+        let worker = &run.worker;
+        let after = Box::pin(wait_until(
+            "the runtime end clears the background",
+            || async move {
+                let snapshot = worker.inspect().await.expect("inspect");
+                snapshot.background.is_none().then_some(snapshot)
+            },
+        ))
+        .await;
+        assert_eq!(after.phase, RuntimePhase::Exited, "{after:?}");
+        run.close();
     }
 
     /// Ordering scenarios driven by crafted subagent claims with explicit
@@ -1673,13 +2615,17 @@ mod subagent_sequences {
         use std::path::{Path, PathBuf};
         use std::sync::{Arc, Mutex, OnceLock};
 
-        use pohunek_worker_protocol::SubagentPhase;
+        use pohunek_worker_protocol::{
+            BackgroundKind, SubagentPhase, BACKGROUND_LABEL_MAX_BYTES, BACKGROUND_MAX_ITEMS,
+        };
         use serde_json::{json, Value};
         use tracing_subscriber::layer::{Context, SubscriberExt};
 
         use super::{
-            claude_rows, journaled_rows, quoted, recorded, replay, replay_checking, row, Row, Rows,
-            Step, CLAUDE, CODEX, SNAPSHOT_TASK_BOUND, TERMINAL_HISTORY,
+            background_of, claude_hook, claude_rows, item, journaled_rows, quoted, recorded,
+            replay, replay_checking, row, session_hook, shell_task, state_asset, stop_with, turn,
+            Event, EventLog, Row, Rows, Step, SubagentEvent, CLAUDE, CODEX, SNAPSHOT_TASK_BOUND,
+            TERMINAL_HISTORY,
         };
 
         /// Claim type of a subagent start.
@@ -1690,6 +2636,10 @@ mod subagent_sequences {
 
         /// Claim type of a main-`Stop` task snapshot.
         const SNAPSHOT: &str = "subagent_snapshot";
+
+        /// A sequence no hook of these scenarios reaches, so a claim carrying it
+        /// is ordered after every real one of the session.
+        const FAR_FUTURE_SEQUENCE: u64 = 1 << 62;
 
         /// Synthetic subagent id of the recorded Claude shape.
         const REORDERED: &str = "a1b3d5f7c9e0a2b4d";
@@ -1745,6 +2695,8 @@ import json
 import os
 import socket
 import sys
+import time
+from datetime import datetime, timedelta, timezone
 
 results_path, provider, plan_path = sys.argv[1], sys.argv[2], sys.argv[3]
 
@@ -1767,6 +2719,10 @@ with open(plan_path, encoding="utf-8") as handle:
 
 for claim in plan:
     action, sequence = claim["type"], claim["sequence"]
+    if sequence == "now":
+        # The worker refuses a sequence ahead of its own reading of this clock,
+        # so a claim meant to be ordered after the hooks reads it at send time.
+        sequence = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
     request = {
         "type": action,
         "runtime_id": os.environ["POHUNEK_WORKER_INSTANCE_ID"],
@@ -1779,6 +2735,12 @@ for claim in plan:
         request.update({"subagent_id": claim["id"], "agent_type": "general-purpose", "parent_id": None})
     elif action == "subagent_stop":
         request.update({"subagent_id": claim["id"], "outcome": "completed"})
+    elif action == "identity_report":
+        request.update({
+            "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat().replace("+00:00", "Z"),
+            "reference_kind": None,
+            "native_reference": None,
+        })
     else:
         request["tasks"] = claim["tasks"]
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1865,9 +2827,7 @@ for claim in plan:
             /// A step sending the claims of `plan` as `provider` from one
             /// process, in order.
             fn send(&self, provider: &str, plan: &Value) -> Step {
-                let index = self.plans.replace(self.plans.get() + 1);
-                let path = self.root.join(format!("crafted-plan-{index}.json"));
-                std::fs::write(&path, plan.to_string()).expect("write the claim plan");
+                let path = self.write_plan(plan);
                 Step::Command(format!(
                     "python3 -I {} {} {provider} {}",
                     quoted(&self.script),
@@ -1881,16 +2841,22 @@ for claim in plan:
             /// names that shell: a reporter distinct from the PTY root and
             /// from every other such step.
             fn snapshot_from_own_reporter(&self, sequence: u64, tasks: &[Value]) -> Step {
-                let index = self.plans.replace(self.plans.get() + 1);
-                let path = self.root.join(format!("crafted-plan-{index}.json"));
-                let plan = json!([{"type": SNAPSHOT, "sequence": sequence, "tasks": tasks}]);
-                std::fs::write(&path, plan.to_string()).expect("write the claim plan");
+                let path = self
+                    .write_plan(&json!([{"type": SNAPSHOT, "sequence": sequence, "tasks": tasks}]));
                 Step::Command(format!(
                     "/bin/sh -c 'python3 -I \"$0\" \"$1\" {CLAUDE} \"$2\"; true' {} {} {}",
                     quoted(&self.script),
                     quoted(&self.results),
                     quoted(&path)
                 ))
+            }
+
+            /// Writes `plan` to the next numbered plan file and returns its path.
+            fn write_plan(&self, plan: &Value) -> PathBuf {
+                let index = self.plans.replace(self.plans.get() + 1);
+                let path = self.root.join(format!("crafted-plan-{index}.json"));
+                std::fs::write(&path, plan.to_string()).expect("write the claim plan");
+                path
             }
 
             /// Every answered claim, in the order the worker answered them.
@@ -3204,6 +4170,361 @@ for claim in plan:
                     },
                 ],
                 "only the valid snapshots are applied"
+            );
+            run.finish().await;
+        }
+
+        /// A background snapshot delivered after a newer one is ignored: the
+        /// newer one stays, and the worker logs `stale_sequence`.
+        #[tokio::test]
+        async fn a_stale_background_snapshot_is_ignored() {
+            let log = EventLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-background-stale-");
+            let client = Client::new(&root);
+            let steps = vec![turn(vec![
+                    session_hook(None),
+                    client.send(
+                        CLAUDE,
+                        &json!([
+                            {"type": SNAPSHOT, "sequence": 200, "tasks": [shell_task("s-new", "Newer", "cargo test")]},
+                            {"type": SNAPSHOT, "sequence": 100, "tasks": [shell_task("s-old", "Older", "bacon")]},
+                        ]),
+                    ),
+                ],
+            )];
+            let run = replay_checking(&root, steps, None).await;
+            assert_eq!(
+                client.answers(),
+                [
+                    Answer::new(SNAPSHOT, 200, "", true),
+                    Answer::new(SNAPSHOT, 100, "", true),
+                ]
+            );
+            let background = background_of(run.snapshots.last().expect("the final snapshot"));
+            let ids: Vec<&str> = background
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect();
+            assert_eq!(ids, ["s-new"], "{background:?}");
+            let ignored = log.named("worker.background.ignored");
+            assert_eq!(ignored.len(), 1, "{}", log.rendered());
+            assert_eq!(
+                ignored[0].get("background.reason").map(String::as_str),
+                Some("stale_sequence")
+            );
+            assert_eq!(
+                ignored[0]
+                    .get("background.sequence.reported")
+                    .map(String::as_str),
+                Some("100")
+            );
+            run.finish().await;
+        }
+
+        /// Invalid optional fields are dropped by the worker, each counted by
+        /// reason, while every task and every valid field of the snapshot apply.
+        #[tokio::test]
+        async fn invalid_background_fields_are_dropped_and_the_rest_of_the_snapshot_applies() {
+            let log = EventLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-background-fields-");
+            let client = Client::new(&root);
+            let too_long = "x".repeat(BACKGROUND_LABEL_MAX_BYTES + 1);
+            let steps = vec![turn(vec![
+                session_hook(None),
+                client.snapshot(
+                    10,
+                    &[
+                        json!({"id": "c-1", "type": "shell", "status": "running", "label": "bad\u{7}label", "program": "cargo"}),
+                        json!({"id": "c-2", "type": "shell", "status": "running", "label": too_long, "program": "bacon"}),
+                        json!({"id": "c-3", "type": "shell", "status": "running", "label": "ok label", "program": "cargo", "agent_type": "general-purpose"}),
+                        json!({"id": "c-4", "type": "subagent", "status": "running", "label": "ok", "agent_type": "bad\u{1}type"}),
+                        json!({"id": "c-5", "type": "shell", "status": "running", "label": 7, "program": "./evil"}),
+                        json!({"id": "c-6", "type": "x\u{202E}y", "status": "running"}),
+                        json!({"id": "c-7", "type": "subagent", "status": "running", "label": "ok", "agent_type": "x\u{202E}y"}),
+                    ],
+                ),
+                ],
+            )];
+            let run = replay_checking(&root, steps, None).await;
+            assert_eq!(client.answers(), [Answer::new(SNAPSHOT, 10, "", true)]);
+            let background = background_of(run.snapshots.last().expect("the final snapshot"));
+            assert_eq!(background.items.len(), 7, "{background:?}");
+            let kept = item(background, "c-7");
+            assert_eq!(
+                (kept.kind, kept.agent_type.as_deref()),
+                (BackgroundKind::Subagent, None)
+            );
+            let kept = item(background, "c-6");
+            assert_eq!(
+                (kept.kind, kept.provider_kind.as_deref()),
+                (BackgroundKind::Other, None)
+            );
+            let kept = item(background, "c-1");
+            assert_eq!(
+                (kept.label.as_deref(), kept.program.as_deref()),
+                (None, Some("cargo"))
+            );
+            let kept = item(background, "c-2");
+            assert_eq!(
+                (kept.label.as_deref(), kept.program.as_deref()),
+                (None, Some("bacon"))
+            );
+            let kept = item(background, "c-3");
+            assert_eq!(
+                (
+                    kept.label.as_deref(),
+                    kept.program.as_deref(),
+                    kept.agent_type.as_deref()
+                ),
+                (Some("ok label"), Some("cargo"), None)
+            );
+            let kept = item(background, "c-4");
+            assert_eq!(
+                (kept.kind, kept.label.as_deref(), kept.agent_type.as_deref()),
+                (BackgroundKind::Subagent, Some("ok"), None)
+            );
+            let kept = item(background, "c-5");
+            assert_eq!(
+                (kept.label.as_deref(), kept.program.as_deref()),
+                (None, None)
+            );
+            let dropped = log.named("worker.background.fields_dropped");
+            assert_eq!(dropped.len(), 1, "{}", log.rendered());
+            assert_eq!(
+                dropped[0]
+                    .get("background.dropped.invalid")
+                    .map(String::as_str),
+                Some("7")
+            );
+            assert_eq!(
+                dropped[0]
+                    .get("background.dropped.kind_mismatch")
+                    .map(String::as_str),
+                Some("1")
+            );
+            run.finish().await;
+        }
+
+        /// Snapshots are ordered by sequence, not by reporter: a nested process's
+        /// newer snapshot replaces the outer agent's, and an older snapshot from
+        /// the outer process is then refused as `stale_sequence`. The subagent the
+        /// outer agent started keeps its row, because the nested reporter never
+        /// owned it. The nested process exits after its claim, so the background
+        /// it owned is then cleared as `owner_exited`.
+        #[tokio::test]
+        async fn a_nested_process_replaces_the_background_by_sequence() {
+            let log = EventLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-background-ordering-");
+            let client = Client::new(&root);
+            let steps = vec![turn(vec![
+                session_hook(None),
+                stop_with(vec![shell_task("shell-1", "Test watch", "cargo test")]),
+                claude_hook(&Event::SubagentStart(SubagentEvent {
+                    agent_id: "sub-root".to_owned(),
+                    agent_type: "general-purpose".to_owned(),
+                })),
+                Step::Process(vec![
+                    client.send(
+                        CLAUDE,
+                        &json!([{"type": SNAPSHOT, "sequence": "now", "tasks": [shell_task("nested-1", "Nested", "bacon")]}]),
+                    ),
+                    Step::Checkpoint(one("sub-root", SubagentPhase::Running)),
+                ]),
+                client.snapshot(20, &[shell_task("outer-late", "Late", "cargo test")]),
+            ])];
+            let run = replay_checking(&root, steps, None).await;
+            let outcomes: Vec<(String, bool)> = client
+                .answers()
+                .into_iter()
+                .map(|answer| (answer.action, answer.ok))
+                .collect();
+            assert_eq!(
+                outcomes,
+                [(SNAPSHOT.to_owned(), true), (SNAPSHOT.to_owned(), true)]
+            );
+            let [nested, ..] = run.snapshots.as_slice() else {
+                panic!("one checkpoint and the final rows: {:?}", run.snapshots);
+            };
+            let ids = |background: &pohunek_worker_protocol::BackgroundSnapshot| -> Vec<String> {
+                background
+                    .items
+                    .iter()
+                    .map(|item| item.id.clone())
+                    .collect()
+            };
+            assert_eq!(ids(background_of(nested)), ["nested-1"], "{nested:?}");
+            let last = run.snapshots.last().expect("the final snapshot");
+            assert!(last.background.is_none(), "{last:?}");
+            let ignored = log.named("worker.background.ignored");
+            assert_eq!(ignored.len(), 1, "{}", log.rendered());
+            assert_eq!(
+                ignored[0].get("background.reason").map(String::as_str),
+                Some("stale_sequence")
+            );
+            assert_eq!(
+                ignored[0]
+                    .get("background.sequence.reported")
+                    .map(String::as_str),
+                Some("20")
+            );
+            let reasons: Vec<String> = log
+                .named("worker.background.cleared")
+                .iter()
+                .map(|fields| fields["background.reason"].clone())
+                .collect();
+            assert_eq!(reasons, ["owner_exited"], "{}", log.rendered());
+            run.finish().await;
+        }
+
+        /// A claim whose sequence is ahead of the worker's clock is refused whole,
+        /// whatever its kind: a background snapshot, a subagent start and an
+        /// identity report. The refusal is logged with its reason, and a normal
+        /// snapshot later in the same agent still applies.
+        #[tokio::test]
+        async fn a_claim_ahead_of_the_workers_clock_is_refused_and_later_claims_apply() {
+            let log = EventLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-background-future-");
+            let client = Client::new(&root);
+            let steps = vec![turn(vec![
+                session_hook(None),
+                client.send(
+                    CLAUDE,
+                    &json!([
+                        {"type": SNAPSHOT, "sequence": FAR_FUTURE_SEQUENCE, "tasks": [shell_task("far-shell", "Far", "cargo test")]},
+                        {"type": START, "sequence": FAR_FUTURE_SEQUENCE, "id": "far-sub"},
+                        {"type": "identity_report", "sequence": FAR_FUTURE_SEQUENCE},
+                        {"type": SNAPSHOT, "sequence": "now", "tasks": [shell_task("normal", "Normal", "bacon")]},
+                    ]),
+                ),
+            ])];
+            let run = replay_checking(&root, steps, None).await;
+            let outcomes: Vec<(String, bool)> = client
+                .answers()
+                .into_iter()
+                .map(|answer| (answer.action, answer.ok))
+                .collect();
+            assert_eq!(
+                outcomes,
+                [
+                    (SNAPSHOT.to_owned(), false),
+                    (START.to_owned(), false),
+                    ("identity_report".to_owned(), false),
+                    (SNAPSHOT.to_owned(), true),
+                ],
+                "{}",
+                log.rendered()
+            );
+            let background = background_of(run.snapshots.last().expect("the final snapshot"));
+            let ids: Vec<&str> = background
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect();
+            assert_eq!(ids, ["normal"], "{background:?}");
+            let final_state = run.snapshots.last().expect("the final snapshot");
+            assert!(
+                final_state.subagents.is_empty(),
+                "{:?}",
+                final_state.subagents
+            );
+            let refusals: Vec<String> = log
+                .named("worker.identity.rejected")
+                .iter()
+                .map(|fields| fields["identity.reason"].clone())
+                .collect();
+            assert_eq!(refusals, ["future_sequence"; 3], "{}", log.rendered());
+            run.finish().await;
+        }
+
+        /// A snapshot that began before a release and arrives after it is stale:
+        /// the release's clear raised the sequence mark past it. Without that,
+        /// the late snapshot would restore the background the release ended.
+        #[tokio::test]
+        async fn a_late_snapshot_ordered_before_a_release_is_stale() {
+            let log = EventLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-background-late-stop-");
+            let client = Client::new(&root);
+            let steps = vec![turn(vec![
+                session_hook(None),
+                client.snapshot(100, &[shell_task("first", "First", "cargo test")]),
+                Step::Hook {
+                    asset: state_asset(CLAUDE),
+                    action: "release",
+                    payload: json!({"hook_event_name": "SessionEnd", "session_id": "native-background"}),
+                },
+                client.snapshot(110, &[shell_task("late", "Late", "bacon")]),
+            ])];
+            let run = replay_checking(&root, steps, None).await;
+            let final_state = run.snapshots.last().expect("the final snapshot");
+            assert!(final_state.background.is_none(), "{final_state:?}");
+            let ignored = log.named("worker.background.ignored");
+            assert_eq!(ignored.len(), 1, "{}", log.rendered());
+            assert_eq!(
+                ignored[0].get("background.reason").map(String::as_str),
+                Some("stale_sequence")
+            );
+            assert_eq!(
+                ignored[0]
+                    .get("background.sequence.reported")
+                    .map(String::as_str),
+                Some("110")
+            );
+            assert_eq!(
+                log.named("worker.background.cleared").len(),
+                1,
+                "{}",
+                log.rendered()
+            );
+            run.finish().await;
+        }
+
+        /// A snapshot listing more than `BACKGROUND_MAX_ITEMS` tasks does not
+        /// replace the previous background, and the worker logs
+        /// `too_many_items`. The reconciliation still applies to it.
+        #[tokio::test]
+        async fn an_item_list_over_the_bound_keeps_the_previous_background() {
+            let log = EventLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-background-bound-");
+            let client = Client::new(&root);
+            let many: Vec<Value> = (0..=BACKGROUND_MAX_ITEMS)
+                .map(|index| shell_task(&format!("many-{index}"), "Watch", "bacon"))
+                .collect();
+            let steps = vec![turn(vec![
+                session_hook(None),
+                client.snapshot(10, &[shell_task("keep-1", "Kept", "cargo test")]),
+                client.snapshot(20, &many),
+            ])];
+            let run = replay_checking(&root, steps, None).await;
+            assert_eq!(
+                client.answers(),
+                [
+                    Answer::new(SNAPSHOT, 10, "", true),
+                    Answer::new(SNAPSHOT, 20, "", true),
+                ]
+            );
+            let background = background_of(run.snapshots.last().expect("the final snapshot"));
+            let ids: Vec<&str> = background
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect();
+            assert_eq!(ids, ["keep-1"], "{background:?}");
+            let ignored = log.named("worker.background.ignored");
+            assert_eq!(ignored.len(), 1, "{}", log.rendered());
+            assert_eq!(
+                ignored[0].get("background.reason").map(String::as_str),
+                Some("too_many_items")
+            );
+            assert_eq!(
+                ignored[0].get("background.items").map(String::as_str),
+                Some((BACKGROUND_MAX_ITEMS + 1).to_string().as_str())
             );
             run.finish().await;
         }

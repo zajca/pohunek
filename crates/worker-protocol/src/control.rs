@@ -705,6 +705,157 @@ pub struct SubagentSnapshot {
     pub finished_at_ms: Option<u64>,
 }
 
+/// Most background items one snapshot may carry.
+///
+/// Claude Code lists its live background tasks at each turn end, and a
+/// session rarely runs more than a few dozen at once. 64 keeps the snapshot
+/// small beside the subagent rows, which are bounded by the worker's active
+/// and terminal capacities. A longer snapshot is not applied, so the previous
+/// one stays, marked by its observation time.
+pub const BACKGROUND_MAX_ITEMS: usize = 64;
+/// Byte bound of a background item label, which is the sanitized description.
+///
+/// A description is a short phrase; 160 bytes keeps it readable in a list
+/// line and bounds the snapshot's size with the other fields.
+pub const BACKGROUND_LABEL_MAX_BYTES: usize = 160;
+/// Byte bound of a background item's program name.
+///
+/// The program is the basename of a shell's first command word. Names such as
+/// `cargo`, `bacon` or `npm` are short; 64 bytes admits longer tool names while
+/// keeping arguments and paths out of the field.
+pub const BACKGROUND_PROGRAM_MAX_BYTES: usize = 64;
+/// Byte bound of a provider task id, which is also the bound of a subagent id.
+///
+/// A background item id is the provider task id, and for a background subagent
+/// it equals the subagent id. Provider ids are UUID-like strings; 256 bytes
+/// leaves room for longer ids. A snapshot task with a longer id is refused
+/// whole by the worker, so no stored item exceeds this bound. The daemon
+/// re-checks stored items against this constant.
+pub const BACKGROUND_TASK_ID_MAX_BYTES: usize = 256;
+/// Byte bound of a provider task type label, as in `subagent`, `shell` or `MCP task`.
+///
+/// Claude Code's type labels are short words; 64 bytes leaves room for labels
+/// added later. The worker keeps a type label as the item's `provider_kind`
+/// only when it is within this bound, and refuses a longer one whole.
+pub const BACKGROUND_TASK_TYPE_MAX_BYTES: usize = 64;
+/// Byte bound of a provider task status, as in `running` or `pending`.
+///
+/// Claude Code's statuses are short words; 32 bytes leaves room for statuses
+/// added later. A longer status is refused whole by the worker.
+pub const BACKGROUND_TASK_STATUS_MAX_BYTES: usize = 32;
+/// Byte bound of a provider agent type of a background subagent.
+///
+/// Agent types are short names such as `general-purpose`; 128 bytes leaves
+/// room for longer names. The same bound applies to every subagent claim, so
+/// the worker drops a longer agent type from the background item alone.
+pub const BACKGROUND_AGENT_TYPE_MAX_BYTES: usize = 128;
+
+/// Latest background-work snapshot of the session's main agent.
+///
+/// Replaced as a whole by each applied snapshot. Every item reports what the
+/// provider listed; the worker never stores arguments or full commands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundSnapshot {
+    /// Worker-owned revision, bumped by every applied snapshot and by each
+    /// clear, so a client detects any change by comparing it.
+    pub revision: u64,
+    /// Millisecond Unix timestamp of the snapshot the worker applied.
+    pub observed_at_ms: u64,
+    /// Background items the snapshot listed, at most [`BACKGROUND_MAX_ITEMS`].
+    pub items: Vec<BackgroundItem>,
+}
+
+/// One background task the provider listed, as the worker keeps it.
+///
+/// The label and program are shown as they were kept, so `Debug` redacts
+/// them and the `Debug` output of a journal or inspect snapshot stays free of
+/// task text.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundItem {
+    /// Provider task id; for a background subagent it equals the subagent id.
+    pub id: String,
+    /// Closed kind of the task.
+    pub kind: BackgroundKind,
+    /// Provider's own type label, present only when `kind` is
+    /// [`BackgroundKind::Other`].
+    pub provider_kind: Option<String>,
+    /// Closed status of the task.
+    pub status: BackgroundStatus,
+    /// Provider agent type, present only for a [`BackgroundKind::Subagent`].
+    pub agent_type: Option<String>,
+    /// Sanitized, bounded task description.
+    pub label: Option<String>,
+    /// Program name of a [`BackgroundKind::Shell`]'s command, never its
+    /// arguments.
+    pub program: Option<String>,
+    /// Millisecond Unix timestamp of the first snapshot that listed the task.
+    /// The provider reports no start time, so this is the earliest the worker
+    /// knows of.
+    pub first_seen_ms: u64,
+    /// Millisecond Unix timestamp of the latest snapshot that listed the task.
+    pub last_seen_ms: u64,
+}
+
+impl Debug for BackgroundItem {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackgroundItem")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("provider_kind", &self.provider_kind)
+            .field("status", &self.status)
+            .field("agent_type", &self.agent_type)
+            .field("label", &self.label.as_ref().map(|_| "[REDACTED]"))
+            .field("program", &self.program.as_ref().map(|_| "[REDACTED]"))
+            .field("first_seen_ms", &self.first_seen_ms)
+            .field("last_seen_ms", &self.last_seen_ms)
+            .finish()
+    }
+}
+
+/// Closed kind of a background task.
+///
+/// Each variant is one of the task types Claude Code reports. A type this
+/// build does not know is [`BackgroundKind::Other`], which keeps the
+/// provider's label in [`BackgroundItem::provider_kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundKind {
+    /// A background agent.
+    Subagent,
+    /// A workflow run.
+    Workflow,
+    /// A background shell command.
+    Shell,
+    /// A monitor watching an MCP or WebSocket source.
+    Monitor,
+    /// A background MCP tool call.
+    McpTask,
+    /// A teammate agent.
+    Teammate,
+    /// A background memory consolidation.
+    Dream,
+    /// An auto-mode scan.
+    AutoModeScan,
+    /// A memory import.
+    MemoryImport,
+    /// A cloud session.
+    CloudSession,
+    /// A type this build does not know.
+    Other,
+}
+
+/// Closed status of a background task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundStatus {
+    /// The task is running.
+    Running,
+    /// The task is queued and not yet running.
+    Pending,
+    /// Any other status the provider reports.
+    Other,
+}
+
 /// Reports current worker and runtime authority facts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectSnapshot {
@@ -750,6 +901,10 @@ pub struct InspectSnapshot {
     /// whose runtime has no integration.
     #[serde(default)]
     pub hook_schema: Option<String>,
+    /// Latest background-work snapshot of the session's main agent, absent
+    /// when none was applied or the last one was cleared.
+    #[serde(default)]
+    pub background: Option<BackgroundSnapshot>,
 }
 
 /// Defines one daemon-to-worker request.

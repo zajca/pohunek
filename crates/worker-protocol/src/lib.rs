@@ -27,6 +27,7 @@ mod env;
 mod hook_schema;
 mod id;
 mod secret;
+mod text;
 mod token;
 mod version;
 
@@ -34,12 +35,16 @@ mod version;
 pub use codec::{ControlCodecError, ControlReader, ControlWriter, MAX_CONTROL_LINE_BYTES};
 #[doc(inline)]
 pub use control::{
-    ActiveIdentityClaim, AttachStart, Capability, ControlCode, ControlError, ControlEvent,
-    ControlMessage, ControlRequest, ControlResponse, ControlTypeError, Dimensions, EventKind,
-    ExitStatus, Initialize, InitializeLimits, InputFragment, InputPlan, InspectSnapshot,
-    LaunchIdentity, OutputGap, ProcessIdentity, ReleasedIdentityClaim, ReportedLaunchIdentity,
+    ActiveIdentityClaim, AttachStart, BackgroundItem, BackgroundKind, BackgroundSnapshot,
+    BackgroundStatus, Capability, ControlCode, ControlError, ControlEvent, ControlMessage,
+    ControlRequest, ControlResponse, ControlTypeError, Dimensions, EventKind, ExitStatus,
+    Initialize, InitializeLimits, InputFragment, InputPlan, InspectSnapshot, LaunchIdentity,
+    OutputGap, ProcessIdentity, ReleasedIdentityClaim, ReportedLaunchIdentity,
     ReportedNativeReference, RequestKind, ResizeRequest, ResponseKind, RuntimePhase, RuntimeScope,
     StopPolicy, StopRequest, StreamMode, SubagentPhase, SubagentSnapshot, WriteAck,
+    BACKGROUND_AGENT_TYPE_MAX_BYTES, BACKGROUND_LABEL_MAX_BYTES, BACKGROUND_MAX_ITEMS,
+    BACKGROUND_PROGRAM_MAX_BYTES, BACKGROUND_TASK_ID_MAX_BYTES, BACKGROUND_TASK_STATUS_MAX_BYTES,
+    BACKGROUND_TASK_TYPE_MAX_BYTES,
 };
 #[doc(inline)]
 pub use data::{
@@ -66,6 +71,8 @@ pub use id::{
 #[doc(inline)]
 pub use secret::{DataToken, LeaseChallenge, SecretBytes, SecretEnv, SecretError};
 #[doc(inline)]
+#[doc(inline)]
+pub use text::is_hidden_or_separator;
 pub use token::{TokenClaims, TokenError, TokenVault};
 #[doc(inline)]
 pub use version::{

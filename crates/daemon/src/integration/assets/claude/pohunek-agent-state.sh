@@ -3,7 +3,7 @@
 # managed by pohunek; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # POHUNEK_INTEGRATION_ID=claude
-# POHUNEK_INTEGRATION_VERSION=13
+# POHUNEK_INTEGRATION_VERSION=14
 #
 # Session and subagent lifecycle hook: report active-agent identity, capture the
 # agent's native session id for direct-session resume, release active-agent
@@ -60,10 +60,13 @@ import errno
 import fcntl
 import json
 import os
+import re
+import shlex
 import socket
 import stat
 import sys
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 # Every hook event is its own short-lived interpreter, and the worker orders the
@@ -102,8 +105,43 @@ MAX_HOOK_INPUT_BYTES = 65536
 MAX_STOP_HOOK_INPUT_BYTES = 1048576
 # Mirrors the worker's snapshot task bound; a longer list is not sent at all.
 MAX_SNAPSHOT_TASKS = 256
-# The only task fields a snapshot forwards; descriptions and commands stay local.
+# Fields every snapshot task must carry as non-empty strings; one bad task voids the list.
 SNAPSHOT_TASK_FIELDS = ("id", "type", "status")
+# Optional task fields are sanitized per task and dropped alone when invalid.
+# `label` comes from `description` for every type, `program` from `command` for
+# shells only, and `agent_type` for subagents only. `command` and its arguments
+# are never forwarded.
+SHELL_TASK_TYPE = "shell"
+SUBAGENT_TASK_TYPE = "subagent"
+# Mirrors the worker's subagent type bound; a longer agent_type is dropped from its task.
+MAX_SUBAGENT_TYPE_BYTES = 128
+# Injected by the worker into the agent environment; a missing or invalid value
+# forwards no label or program (fail closed, there is no fallback literal).
+ENV_LABEL_MAX_BYTES = "POHUNEK_BACKGROUND_LABEL_MAX_BYTES"
+ENV_PROGRAM_MAX_BYTES = "POHUNEK_BACKGROUND_PROGRAM_MAX_BYTES"
+# Digits accepted in those limit variables. Nine digits exceed any real bound and
+# stay far below the length at which int() raises.
+MAX_LIMIT_DIGITS = 9
+# Unicode categories removed from a label or program: C0/C1 controls, format
+# characters (bidi overrides, zero-width marks), line and paragraph separators,
+# and surrogates, which cannot be encoded as UTF-8.
+STRIPPED_CATEGORIES = frozenset(("Cc", "Cf", "Zl", "Zp", "Cs"))
+# Controls that separate words, replaced by one space before stripping so that
+# "a\tb" reads as "a b" rather than "ab".
+WORD_SEPARATOR_CHARS = "\t\n\v\f\r"
+PROGRAM_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
+ASSIGNMENT_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+CHAIN_OPERATORS = ("&&", ";")
+# `env` options that take a separate value argument; other options stand alone.
+ENV_OPTIONS_WITH_VALUE = ("-u", "-C", "--unset", "--chdir")
+# `env -S` splits one string into the command line, so no command word is visible.
+ENV_SPLIT_OPTIONS = ("-S", "--split-string")
+# The only SessionStart sources forwarded to the worker; any other value is
+# omitted. `fork` is deliberately absent: a forked session is a new process
+# that must not clear the snapshot of the session it was forked from.
+SESSION_SOURCES = ("startup", "resume", "clear", "compact")
+# The only SessionEnd reasons forwarded to the worker; any other value is omitted.
+RELEASE_REASONS = ("clear", "resume", "logout", "prompt_input_exit", "other")
 # Bounds one trace line in bytes, enough for every field at its longest fixed
 # code and a session id; a longer line is dropped. Lines of concurrent hooks
 # stay apart because each is one write under the exclusive trace lock.
@@ -143,12 +181,12 @@ trace_path = os.environ.get("POHUNEK_HOOK_TRACE_PATH")
 trace_max_raw = os.environ.get("POHUNEK_HOOK_TRACE_MAX_BYTES")
 
 
-def positive_int(raw):
+def strict_positive_int(raw, max_digits):
     # ASCII digits without a leading zero, the form the worker writes; any
-    # other value, including an overlong one, disables the trace.
+    # other value, including an overlong one, is None.
     if (
         raw
-        and len(raw) <= MAX_TRACE_BYTES_DIGITS
+        and len(raw) <= max_digits
         and raw.isascii()
         and raw.isdigit()
         and raw[0] != "0"
@@ -157,7 +195,7 @@ def positive_int(raw):
     return None
 
 
-trace_max_bytes = positive_int(trace_max_raw)
+trace_max_bytes = strict_positive_int(trace_max_raw, MAX_TRACE_BYTES_DIGITS)
 trace_enabled = bool(trace_path) and os.path.isabs(trace_path) and trace_max_bytes is not None
 trace_lines = []
 
@@ -296,11 +334,138 @@ if action == ACTION_STOP:
         raise SystemExit(0)
 
 
+background_label_max_bytes = strict_positive_int(
+    os.environ.get(ENV_LABEL_MAX_BYTES), MAX_LIMIT_DIGITS
+)
+background_program_max_bytes = strict_positive_int(
+    os.environ.get(ENV_PROGRAM_MAX_BYTES), MAX_LIMIT_DIGITS
+)
+
+
+def strip_controls(text):
+    # Word separators become spaces, then every stripped category is removed and
+    # runs of whitespace collapse to one space.
+    spaced = "".join(" " if char in WORD_SEPARATOR_CHARS else char for char in text)
+    kept = "".join(
+        char for char in spaced if unicodedata.category(char) not in STRIPPED_CATEGORIES
+    )
+    return " ".join(kept.split())
+
+
+def truncate_utf8(text, max_bytes):
+    # Cuts to at most max_bytes on a character boundary; the trailing space a cut
+    # can leave is trimmed.
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore").rstrip()
+
+
+def sanitize_label(description, max_bytes):
+    # The task description as a display label, or None when nothing is left.
+    if not isinstance(description, str):
+        return None
+    return truncate_utf8(strip_controls(description), max_bytes) or None
+
+
+def command_word_index(words):
+    # Index of the command word after the launch prefix the shell skips: leading
+    # NAME=value assignments, `cd <dir>` followed by `&&` or `;`, and `env` with
+    # its options. None when no command word can be identified.
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if ASSIGNMENT_PATTERN.match(word):
+            index += 1
+        elif word == "cd" and index + 2 < len(words) and words[index + 2] in CHAIN_OPERATORS:
+            index += 3
+        elif word == "env":
+            index = env_command_index(words, index + 1)
+            if index is None:
+                return None
+        else:
+            return index
+    return None
+
+
+def env_command_index(words, index):
+    # Index of the command after the options and assignments of `env`, or None
+    # when `env -S` hides it inside one argument.
+    while index < len(words):
+        option = words[index]
+        if option.startswith(ENV_SPLIT_OPTIONS):
+            return None
+        if option in ENV_OPTIONS_WITH_VALUE:
+            index += 2
+        elif option.startswith("-") or ASSIGNMENT_PATTERN.match(option):
+            index += 1
+        else:
+            return index
+    return None
+
+
+def sanitize_program(command, max_bytes):
+    # The basename of the command word, or None. Arguments are never returned,
+    # and an operator or subshell as the command word fails the name pattern.
+    # shlex time grows superlinearly with the length of one token (about 32 ms at
+    # 64 KiB, about 6 s at 1 MiB), so a command longer than the hook input bound
+    # gets no program; a truncated command word could name a different program,
+    # so the command is never cut.
+    if not isinstance(command, str):
+        return None
+    if len(command.encode("utf-8", "surrogatepass")) > MAX_HOOK_INPUT_BYTES:
+        return None
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        words = list(lexer)
+    except ValueError:
+        return None
+    index = command_word_index(words)
+    if index is None or index >= len(words):
+        return None
+    name = words[index].rsplit("/", 1)[-1]
+    if PROGRAM_NAME_PATTERN.fullmatch(name) is None or len(name) > max_bytes:
+        return None
+    return name
+
+
+def valid_agent_type(value):
+    # The worker's subagent text rule (non-empty, within the bound, no controls)
+    # plus the hidden characters STRIPPED_CATEGORIES, which a label also removes.
+    # An invalid value drops the agent_type field of its task only.
+    if not isinstance(value, str) or not value:
+        return False
+    if any(unicodedata.category(char) in STRIPPED_CATEGORIES for char in value):
+        return False
+    return len(value.encode("utf-8")) <= MAX_SUBAGENT_TYPE_BYTES
+
+
+def snapshot_task(entry):
+    # One task reduced to SNAPSHOT_TASK_FIELDS plus the optional fields that
+    # sanitize. None when a required field is missing; an invalid optional field
+    # is left out of this task only.
+    task = {field: entry.get(field) for field in SNAPSHOT_TASK_FIELDS}
+    if not all(isinstance(value, str) and value for value in task.values()):
+        return None
+    if background_label_max_bytes is not None:
+        label = sanitize_label(entry.get("description"), background_label_max_bytes)
+        if label is not None:
+            task["label"] = label
+    if task["type"] == SHELL_TASK_TYPE and background_program_max_bytes is not None:
+        program = sanitize_program(entry.get("command"), background_program_max_bytes)
+        if program is not None:
+            task["program"] = program
+    if task["type"] == SUBAGENT_TASK_TYPE and valid_agent_type(entry.get("agent_type")):
+        task["agent_type"] = entry["agent_type"]
+    return task
+
+
 def snapshot_tasks(parsed):
-    # The main agent's background tasks reduced to SNAPSHOT_TASK_FIELDS, or
-    # None and the reason no snapshot is sent. A missing or malformed list means
-    # "no snapshot", never "nothing running", so one bad entry voids the whole
-    # list instead of being skipped.
+    # The main agent's background tasks reduced to the snapshot fields, or None
+    # and the reason no snapshot is sent. A missing or malformed list means
+    # "no snapshot", never "nothing running", so one bad required field voids the
+    # whole list instead of being skipped.
     agent_id = parsed.get("agent_id")
     if isinstance(agent_id, str) and agent_id:
         return None, "subagent_stop"
@@ -315,8 +480,8 @@ def snapshot_tasks(parsed):
     for entry in entries:
         if not isinstance(entry, dict):
             return None, "tasks_invalid"
-        task = {field: entry.get(field) for field in SNAPSHOT_TASK_FIELDS}
-        if not all(isinstance(value, str) and value for value in task.values()):
+        task = snapshot_task(entry)
+        if task is None:
             return None, "tasks_invalid"
         tasks.append(task)
     return tasks, None
@@ -353,7 +518,7 @@ def read_hook_input():
     fields = (
         ("agent_id", "agent_type", "parent_agent_id")
         if action in (ACTION_SUBAGENT_START, ACTION_SUBAGENT_STOP)
-        else ("session_id", "transcript_path")
+        else ("session_id", "transcript_path", "source", "reason")
     )
     return {field: parsed.get(field) for field in fields}, None
 
@@ -520,6 +685,17 @@ def send_worker_hook(request_type):
             "reference_kind": reference_kind,
             "native_reference": native_reference if reference_kind in ("id", "path") else None,
         })
+        # The worker reads the source only to clear a background snapshot on
+        # startup or resume; the key is absent for any other value.
+        source = hook_input.get("source")
+        if isinstance(source, str) and source in SESSION_SOURCES:
+            request["session_source"] = source
+    if request_type == "identity_release":
+        # The worker keeps the background snapshot when the session ends for a
+        # `/clear`, which Claude follows with a SessionStart in the same process.
+        reason = hook_input.get("reason")
+        if isinstance(reason, str) and reason in RELEASE_REASONS:
+            request["release_reason"] = reason
     # Pending launch verification is durably owned and retried by the worker.
     return send_worker(request)
 

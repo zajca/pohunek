@@ -24,16 +24,17 @@ use pohunek_platform::process::{
 };
 use pohunek_worker_protocol as protocol;
 use protocol::{
-    ActiveIdentityClaim, AncestryMatcher, AttachStart, Capability, CloseReason, ControlCode,
-    ControlError, ControlEvent, ControlMessage, ControlReader, ControlRequest, ControlResponse,
-    ControlWriter, Cursor, DaemonId, DataFrame, DataToken, Dimensions, EventKind, ExitStatus,
-    FrameError, FrameHeader, FrameKind, HookAction, HookSchema, Initialize, InspectSnapshot,
-    LaunchProcess, LeaseChallenge, LeaseId, OutputGap, ProcessIdentity as WireProcessIdentity,
-    PtyRelation, ReleasedIdentityClaim, ReportedLaunchIdentity, ReportedNativeReference,
-    RequestKind, ResponseKind, RuntimePhase as WireRuntimePhase, RuntimeScope, SessionId, StreamId,
-    StreamMode, SubagentField, SubagentPhase as WireSubagentPhase, SubagentSequence,
-    SubagentSnapshot, TerminalSnapshot as WireTerminalSnapshot, TransactionId, Version, WorkerId,
-    WorkerInstanceId, WriteAck, WriteId, ATTACH_SNAPSHOT_VERSION, SUPPORTED_RANGE,
+    ActiveIdentityClaim, AncestryMatcher, AttachStart, BackgroundSnapshot, Capability, CloseReason,
+    ControlCode, ControlError, ControlEvent, ControlMessage, ControlReader, ControlRequest,
+    ControlResponse, ControlWriter, Cursor, DaemonId, DataFrame, DataToken, Dimensions, EventKind,
+    ExitStatus, FrameError, FrameHeader, FrameKind, HookAction, HookSchema, Initialize,
+    InspectSnapshot, LaunchProcess, LeaseChallenge, LeaseId, OutputGap,
+    ProcessIdentity as WireProcessIdentity, PtyRelation, ReleasedIdentityClaim,
+    ReportedLaunchIdentity, ReportedNativeReference, RequestKind, ResponseKind,
+    RuntimePhase as WireRuntimePhase, RuntimeScope, SessionId, StreamId, StreamMode, SubagentField,
+    SubagentPhase as WireSubagentPhase, SubagentSequence, SubagentSnapshot,
+    TerminalSnapshot as WireTerminalSnapshot, TransactionId, Version, WorkerId, WorkerInstanceId,
+    WriteAck, WriteId, ATTACH_SNAPSHOT_VERSION, BACKGROUND_MAX_ITEMS, SUPPORTED_RANGE,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -44,11 +45,13 @@ use tokio::sync::{broadcast, oneshot, watch, Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{event, Level};
 
+use crate::background::{self, Candidate, Dropped};
 use crate::identity::{PeerContext, RejectReason};
 use crate::journal::{
-    ActiveIdentity, ChildIdentity, JournalRecord, LaunchIdentity, NativeReferenceClaim,
-    PendingLaunchClaim, ReleasedIdentity, RuntimeOutcome, RuntimePhase as JournalPhase,
-    SubagentPhase as JournalSubagentPhase, SubagentRecord, WorkerOrigin,
+    ActiveIdentity, BackgroundOwner, ChildIdentity, JournalRecord, LaunchIdentity,
+    NativeReferenceClaim, PendingLaunchClaim, ReleasedIdentity, RuntimeOutcome,
+    RuntimePhase as JournalPhase, SubagentPhase as JournalSubagentPhase, SubagentRecord,
+    WorkerOrigin,
 };
 use crate::launch::{self, LaunchClaimStatus};
 use crate::notification;
@@ -87,9 +90,13 @@ const ORPHAN_STOP_CAPACITY: usize = 64;
 /// loop or a long recovery delay once the journal becomes writable again.
 const TERMINAL_JOURNAL_RETRY_DELAY: Duration = Duration::from_millis(250);
 /// Maximum accepted provider-native subagent identifier length.
-const MAX_SUBAGENT_ID_BYTES: usize = 256;
+///
+/// The same bound the daemon re-checks for background task ids.
+const MAX_SUBAGENT_ID_BYTES: usize = protocol::BACKGROUND_TASK_ID_MAX_BYTES;
 /// Maximum accepted provider-defined subagent type length.
-const MAX_SUBAGENT_TYPE_BYTES: usize = 128;
+///
+/// The same bound the daemon re-checks for background agent types.
+pub(crate) const MAX_SUBAGENT_TYPE_BYTES: usize = protocol::BACKGROUND_AGENT_TYPE_MAX_BYTES;
 /// Maximum tasks accepted in one subagent snapshot.
 ///
 /// Claude Code does not cap its main-`Stop` `background_tasks` list. Four
@@ -103,13 +110,13 @@ const MAX_SNAPSHOT_TASKS: usize = 256;
 /// Claude Code's task-type labels are short words such as `subagent`, `shell`,
 /// or `MCP task`; 64 bytes leaves room for labels added later. A longer label
 /// rejects the whole snapshot.
-const MAX_SNAPSHOT_TYPE_BYTES: usize = 64;
+const MAX_SNAPSHOT_TYPE_BYTES: usize = protocol::BACKGROUND_TASK_TYPE_MAX_BYTES;
 /// Maximum accepted byte length of a snapshot task's status.
 ///
 /// Claude Code lists tasks with short statuses such as `running` or
 /// `pending`; 32 bytes leaves room for statuses added later. A longer status
 /// rejects the whole snapshot.
-const MAX_SNAPSHOT_STATUS_BYTES: usize = 32;
+const MAX_SNAPSHOT_STATUS_BYTES: usize = protocol::BACKGROUND_TASK_STATUS_MAX_BYTES;
 /// Snapshot task types that run no agent.
 ///
 /// These are the labels of Claude Code's task-type label map for its
@@ -1137,10 +1144,57 @@ async fn inspect_request(
     lease_id: &LeaseId,
 ) -> Result<ResponseKind, ControlError> {
     validate_lease(shared, connection, lease_id)?;
-    let state = shared.state.lock().await;
+    let mut state = shared.state.lock().await;
+    clear_exited_owner(shared, &mut state).await?;
     Ok(ResponseKind::Inspected {
         snapshot: Box::new(inspect_snapshot(shared, &state).await?),
     })
+}
+
+/// Clears the background snapshot once its owner process is provably gone or
+/// replaced.
+///
+/// A killed agent sends no release, and a release can fail to reach the worker,
+/// so the owner's exit is checked here, from the inspect the daemon polls. The
+/// owner counts as running only when `is_running` confirms its pid still names
+/// a live process with the stored start identity. That rejects a zombie, which
+/// has exited but is not reaped (the worker is not a subreaper, so a grandchild
+/// can stay one), and a pid reused by another process. A missing process is not
+/// running. A read error, or a start identity that cannot be parsed, keeps the
+/// snapshot, because the owner may still be alive.
+///
+/// The exit does not raise the sequence mark. A late claim from the dead owner
+/// is already refused by `hook_claim_valid`, which requires the reporting
+/// process to be alive with its start identity. Raising the mark would also
+/// refuse a new owner's Stop whose hook read its clock just before this
+/// inspect. The clear is persisted before the inspect answers.
+async fn clear_exited_owner(shared: &Shared, state: &mut State) -> Result<(), ControlError> {
+    let Some(owner) = state.journal.background_owner.clone() else {
+        return Ok(());
+    };
+    let Ok(start) = owner.start_identity.parse::<u64>() else {
+        return Ok(());
+    };
+    let Ok(running) = HostInspector::new().is_running(OsProcessIdentity {
+        pid: owner.pid,
+        start_identity: StartIdentity::new(start),
+    }) else {
+        return Ok(());
+    };
+    if running {
+        return Ok(());
+    }
+    let mut journal = state.journal.clone();
+    if !background::clear(&mut journal) {
+        return Ok(());
+    }
+    journal.updated_at = timestamp();
+    persist(shared.journal.clone(), journal.clone())
+        .await
+        .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
+    state.journal = journal;
+    log_background_cleared(shared, "owner_exited");
+    Ok(())
 }
 
 /// Resolves the hook schema `initialize` names against the compiled registry.
@@ -1897,6 +1951,7 @@ async fn inspect_snapshot(shared: &Shared, state: &State) -> Result<InspectSnaps
             })
             .collect(),
         hook_schema: state.journal.hook_schema.clone(),
+        background: state.journal.background.clone(),
     })
 }
 
@@ -2143,6 +2198,7 @@ async fn commit_runtime_completion(
     journal.phase = JournalPhase::Terminal;
     journal.pending_launch_claims.clear();
     mark_running_subagents_lost(&mut journal, status.exited_at_ms);
+    let background_cleared = background::clear(&mut journal);
     journal.outcome = Some(RuntimeOutcome {
         exit_code: exit.exit_code,
         signal: exit.signal.clone(),
@@ -2160,6 +2216,9 @@ async fn commit_runtime_completion(
     state.phase = WireRuntimePhase::Exited;
     state.exit = Some(status.clone());
     state.journal = journal;
+    if background_cleared {
+        log_background_cleared(shared, "runtime_end");
+    }
     let state = &mut *state;
     state.subagent_evidence.retain_recorded(&state.journal);
     shared.state_changed.notify_waiters();
@@ -2184,20 +2243,28 @@ async fn mark_runtime_faulted_at_offset(
     error: WorkerError,
     next_output_offset: Option<u64>,
 ) {
-    let commit = {
+    let (commit, background_cleared) = {
         let mut state = shared.state.lock().await;
         state.phase = WireRuntimePhase::Faulted;
-        state.journal.phase = JournalPhase::Faulted;
+        let mut journal = state.journal.clone();
+        journal.phase = JournalPhase::Faulted;
         if let Some(next_output_offset) = next_output_offset {
-            state.journal.next_output_offset = next_output_offset;
+            journal.next_output_offset = next_output_offset;
         }
-        state.journal.pending_launch_claims.clear();
-        mark_running_subagents_lost(&mut state.journal, unix_ms());
+        journal.pending_launch_claims.clear();
+        mark_running_subagents_lost(&mut journal, unix_ms());
+        let background_cleared = background::clear(&mut journal);
+        journal.updated_at = timestamp();
+        let commit = persist(shared.journal.clone(), journal.clone()).await;
+        let committed = commit.is_ok();
+        state.journal = journal;
         let state = &mut *state;
         state.subagent_evidence.retain_recorded(&state.journal);
-        state.journal.updated_at = timestamp();
-        persist(shared.journal.clone(), state.journal.clone()).await
+        (commit, background_cleared && committed)
     };
+    if background_cleared {
+        log_background_cleared(shared, "runtime_end");
+    }
     shared.state_changed.notify_waiters();
     if let Err(persist_error) = commit {
         event!(
@@ -3118,6 +3185,10 @@ enum HookRequest {
         expires_at: String,
         reference_kind: Option<String>,
         native_reference: Option<String>,
+        /// How the provider session started, as the hook forwards it. Only
+        /// `startup` and `resume` clear the background snapshot.
+        #[serde(default)]
+        session_source: Option<String>,
     },
     IdentityRelease {
         #[serde(rename = "runtime_id")]
@@ -3126,6 +3197,10 @@ enum HookRequest {
         pid: u32,
         start_identity: u64,
         sequence: u64,
+        /// Why the session ended, as the hook forwards it. `clear` keeps the
+        /// background snapshot, because the same process starts the session again.
+        #[serde(default)]
+        release_reason: Option<String>,
     },
     SubagentStart {
         #[serde(rename = "runtime_id")]
@@ -3175,7 +3250,7 @@ struct SnapshotRequest {
 }
 
 /// One task of a [`SnapshotRequest`], as the provider labels it.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct SnapshotTask {
     /// Task id; for a background subagent it equals the subagent id.
     id: String,
@@ -3184,6 +3259,33 @@ struct SnapshotTask {
     task_type: String,
     /// Provider task status; validated but not interpreted.
     status: String,
+    /// Sanitized task description. Kept as raw JSON so that a wrong-typed
+    /// value drops this field alone.
+    #[serde(default)]
+    label: Option<serde_json::Value>,
+    /// Program name of a shell task, never its arguments.
+    #[serde(default)]
+    program: Option<serde_json::Value>,
+    /// Provider agent type of a subagent task.
+    #[serde(default)]
+    agent_type: Option<serde_json::Value>,
+}
+
+impl std::fmt::Debug for SnapshotTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The optional fields are provider text, so only their presence is shown.
+        f.debug_struct("SnapshotTask")
+            .field("id", &self.id)
+            .field("task_type", &self.task_type)
+            .field("status", &self.status)
+            .field("label", &self.label.as_ref().map(|_| "[REDACTED]"))
+            .field("program", &self.program.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "agent_type",
+                &self.agent_type.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -3235,6 +3337,7 @@ where
             expires_at,
             reference_kind,
             native_reference,
+            session_source,
         } => {
             let mut state = shared.state.lock().await;
             let current_runtime = state.worker_instance_id.as_ref().map(ToString::to_string);
@@ -3248,6 +3351,7 @@ where
                 admitted.as_ref().err().copied(),
                 current_runtime.as_deref() == Some(worker_instance_id.as_str()),
                 state.phase == WireRuntimePhase::Running,
+                sequence,
             )
             .or_else(|| (!valid_identity_expiry(&expires_at)).then_some(RejectReason::ClaimExpired))
             .or_else(|| {
@@ -3280,6 +3384,20 @@ where
                     root_identity.pid,
                 ) && root_report_from_root(&shared, peer, pid, &root_identity);
                 let sequence_valid = identity_sequence_is_fresh(&state.journal, sequence);
+                // The background snapshot follows its reporting process, so an
+                // admitted, process-valid report clears it even when the identity
+                // rules below refuse the report.
+                let background_clear = process_valid
+                    .then(|| {
+                        report_background_clear(
+                            &state.journal,
+                            pid,
+                            start_identity,
+                            sequence,
+                            session_source.as_deref(),
+                        )
+                    })
+                    .flatten();
                 if !sequence_valid {
                     reject_identity(
                         &shared,
@@ -3289,6 +3407,17 @@ where
                     );
                 }
                 if !process_valid || !sequence_valid {
+                    if background_clear.is_some() {
+                        let mut journal = state.journal.clone();
+                        if background::clear_at(&mut journal, sequence) {
+                            journal.updated_at = timestamp();
+                            persist(shared.journal.clone(), journal.clone()).await?;
+                            state.journal = journal;
+                            if let Some(reason) = background_clear {
+                                log_background_cleared(&shared, reason);
+                            }
+                        }
+                    }
                     (false, false, current_runtime, None)
                 } else {
                     let mut journal = state.journal.clone();
@@ -3306,6 +3435,9 @@ where
                         native_reference: native_reference.clone(),
                     });
                     journal.active_identity_release = None;
+                    let background_cleared = background_clear.and_then(|reason| {
+                        background::clear_at(&mut journal, sequence).then_some(reason)
+                    });
                     if let (Some(reference_kind), Some(native_reference), Some(launch_base)) = (
                         reference_kind,
                         native_reference,
@@ -3345,6 +3477,9 @@ where
                     journal.updated_at = timestamp();
                     persist(shared.journal.clone(), journal.clone()).await?;
                     state.journal = journal;
+                    if let Some(reason) = background_cleared {
+                        log_background_cleared(&shared, reason);
+                    }
                     (
                         true,
                         launch_identity_status == LaunchClaimStatus::Accepted,
@@ -3360,6 +3495,7 @@ where
             pid,
             start_identity,
             sequence,
+            release_reason,
         } => {
             let mut state = shared.state.lock().await;
             let current_runtime = state.worker_instance_id.as_ref().map(ToString::to_string);
@@ -3373,6 +3509,7 @@ where
                 admitted.as_ref().err().copied(),
                 current_runtime.as_deref() == Some(worker_instance_id.as_str()),
                 true,
+                sequence,
             );
             if let Some(reason) = inadmissible {
                 reject_identity(&shared, "identity_release", reason, peer);
@@ -3391,6 +3528,18 @@ where
                     start_identity,
                     pty.identity().pid,
                 ) && root_report_from_root(&shared, peer, pid, pty.identity());
+                // A `/clear` ends the session and starts it again in the same
+                // process, so only the other reasons end the snapshot's owner.
+                let owner_released = process_valid
+                    && release_reason.as_deref() != Some("clear")
+                    && sequence > state.journal.background_sequence
+                    && state
+                        .journal
+                        .background_owner
+                        .as_ref()
+                        .is_some_and(|owner| {
+                            owner.pid == pid && owner.start_identity == start_identity.to_string()
+                        });
                 let released_process = if process_valid {
                     state
                         .journal
@@ -3419,10 +3568,27 @@ where
                         process,
                         sequence,
                     });
+                    let background_cleared =
+                        owner_released && background::clear_at(&mut journal, sequence);
                     journal.updated_at = timestamp();
                     persist(shared.journal.clone(), journal.clone()).await?;
                     state.journal = journal;
+                    if background_cleared {
+                        log_background_cleared(&shared, "release");
+                    }
                     (true, false, current_runtime, None)
+                } else if owner_released {
+                    // The identity release was not accepted, for example after a
+                    // `clear` release whose session start never arrived. The owner
+                    // still ends its snapshot.
+                    let mut journal = state.journal.clone();
+                    if background::clear_at(&mut journal, sequence) {
+                        journal.updated_at = timestamp();
+                        persist(shared.journal.clone(), journal.clone()).await?;
+                        state.journal = journal;
+                        log_background_cleared(&shared, "release");
+                    }
+                    (false, false, current_runtime, None)
                 } else {
                     (false, false, current_runtime, None)
                 }
@@ -3451,6 +3617,7 @@ where
                 admitted.as_ref().err().copied(),
                 current_runtime.as_deref() == Some(worker_instance_id.as_str()),
                 state.phase == WireRuntimePhase::Running,
+                sequence,
             )
             .or_else(|| {
                 let fields_admitted = admitted.is_ok_and(|schema| {
@@ -3559,6 +3726,7 @@ where
                 admitted.as_ref().err().copied(),
                 current_runtime.as_deref() == Some(worker_instance_id.as_str()),
                 state.phase == WireRuntimePhase::Running,
+                sequence,
             )
             .or_else(|| {
                 let outcome_admitted = admitted.is_ok_and(|schema| {
@@ -3655,6 +3823,7 @@ where
                     admitted.as_ref().err().copied(),
                     current_runtime.as_deref() == Some(worker_instance_id.as_str()),
                     state.phase == WireRuntimePhase::Running,
+                    sequence,
                 );
                 if let Some(reason) = inadmissible {
                     reject_identity(&shared, "notification_create", reason, peer);
@@ -3773,6 +3942,7 @@ async fn apply_subagent_snapshot(
         admitted.as_ref().err().copied(),
         current_runtime.as_deref() == Some(request.worker_instance_id.as_str()),
         state.phase == WireRuntimePhase::Running,
+        request.sequence,
     )
     .or_else(|| {
         let valid = admitted.is_ok_and(HookSchema::admits_subagents)
@@ -3805,6 +3975,7 @@ async fn apply_subagent_snapshot(
         return Ok(false);
     }
     admitted_subagent_rule(admitted)?;
+    let candidates = background_candidates(shared, &request);
     let claim = SnapshotClaim {
         provider: &request.provider,
         reporter: Reporter {
@@ -3821,12 +3992,24 @@ async fn apply_subagent_snapshot(
         claim,
         occurred_at_ms,
     );
-    let changed = !result.completed.is_empty();
-    if changed {
+    let reconciled = !result.completed.is_empty();
+
+    // The background snapshot is replaced only by the active agent's report,
+    // only in sequence order, and only within the item bound. Each refusal is
+    // logged with its reason and leaves the stored snapshot untouched.
+    let applied = apply_background(shared, &mut journal, &request, candidates, occurred_at_ms);
+    let background_changed = applied.is_some();
+
+    if reconciled || background_changed {
         journal.updated_at = timestamp();
         persist(shared.journal.clone(), journal.clone()).await?;
         state.journal = journal;
+    }
+    if reconciled {
         state.subagent_evidence.retain_recorded(&state.journal);
+    }
+    if let Some((revision, items, kinds)) = applied {
+        log_background_applied(shared, revision, request.sequence, items, &kinds);
     }
     for id in &result.listed {
         state
@@ -3839,10 +4022,119 @@ async fn apply_subagent_snapshot(
     log_snapshot(shared, claim, &result);
     let worker_instance_id = state.worker_instance_id.clone();
     drop(guard);
-    if let (true, Some(worker_instance_id)) = (changed, worker_instance_id) {
+    if let (true, Some(worker_instance_id)) = (reconciled, worker_instance_id) {
         shared.emit(EventKind::SubagentsChanged { worker_instance_id });
     }
     Ok(true)
+}
+
+/// Checks the background fields of each task of `request`.
+///
+/// The optional fields it drops are logged by reason and count.
+fn background_candidates(shared: &Shared, request: &SnapshotRequest) -> Vec<Candidate> {
+    let mut dropped = Dropped::default();
+    let candidates = request
+        .tasks
+        .iter()
+        .map(|task| {
+            Candidate::new(
+                &task.id,
+                &task.task_type,
+                &task.status,
+                task.label.as_ref(),
+                task.program.as_ref(),
+                task.agent_type.as_ref(),
+                &mut dropped,
+            )
+        })
+        .collect();
+    if !dropped.is_empty() {
+        log_background_fields_dropped(shared, dropped);
+    }
+    candidates
+}
+
+/// Why an admitted, process-valid identity report clears the background
+/// snapshot, if it does.
+///
+/// Only a snapshot ordered before the report can be cleared. A report from the
+/// snapshot's owner clears it when the owner starts or resumes its session. A
+/// report from any other process clears it, whatever its source, because that
+/// process did not report the snapshot. The owner's `clear` session keeps it,
+/// since the same process starts the session again.
+fn report_background_clear(
+    journal: &JournalRecord,
+    pid: u32,
+    start_identity: u64,
+    sequence: u64,
+    session_source: Option<&str>,
+) -> Option<&'static str> {
+    let owner = journal.background_owner.as_ref()?;
+    if journal.background_sequence >= sequence {
+        return None;
+    }
+    let is_owner = owner.pid == pid && owner.start_identity == start_identity.to_string();
+    if !is_owner {
+        Some("agent_changed")
+    } else if matches!(session_source, Some("startup" | "resume")) {
+        Some("session_start")
+    } else {
+        None
+    }
+}
+
+/// Replaces the background snapshot of `journal` with the one `request` reports.
+///
+/// The snapshot belongs to the process that reported it, so any admitted
+/// report replaces the stored one: it must be newer than the applied mark and
+/// within [`BACKGROUND_MAX_ITEMS`]. A refusal is logged with its reason and
+/// leaves `journal` untouched. On success the sequence mark moves to
+/// `request.sequence`, the reporter becomes the owner, and the returned tuple
+/// holds the new revision, the item count and the kind summary. An item keeps
+/// its `first_seen_ms` only when the same process reported it before.
+fn apply_background(
+    shared: &Shared,
+    journal: &mut JournalRecord,
+    request: &SnapshotRequest,
+    candidates: Vec<Candidate>,
+    occurred_at_ms: u64,
+) -> Option<(u64, usize, String)> {
+    // `active_identity.expires_at` is not checked here: it bounds a claim's
+    // retries, while the snapshot belongs to the process that reported it.
+    let refusal = if request.sequence <= journal.background_sequence {
+        Some("stale_sequence")
+    } else if request.tasks.len() > BACKGROUND_MAX_ITEMS {
+        Some("too_many_items")
+    } else {
+        None
+    };
+    if let Some(reason) = refusal {
+        log_background_ignored(shared, reason, request.sequence, request.tasks.len());
+        return None;
+    }
+    let same_owner = journal.background_owner.as_ref().is_some_and(|owner| {
+        owner.pid == request.pid && owner.start_identity == request.start_identity.to_string()
+    });
+    let previous = if same_owner {
+        journal.background.as_ref()
+    } else {
+        None
+    };
+    let items = background::build_items(candidates, previous, occurred_at_ms);
+    journal.background_revision = journal.background_revision.saturating_add(1);
+    journal.background_sequence = request.sequence;
+    journal.background_owner = Some(BackgroundOwner {
+        pid: request.pid,
+        start_identity: request.start_identity.to_string(),
+    });
+    let kinds = background::kind_summary(&items);
+    let applied = (journal.background_revision, items.len(), kinds);
+    journal.background = Some(BackgroundSnapshot {
+        revision: journal.background_revision,
+        observed_at_ms: occurred_at_ms,
+        items,
+    });
+    Some(applied)
 }
 
 /// Checks one hook operation against the session's hook schema with the rule
@@ -5266,6 +5558,69 @@ fn stop_subagent(
     SubagentOutcome::Applied
 }
 
+/// Logs one applied background snapshot by revision and counts per kind.
+///
+/// Ids, labels and programs are never logged.
+fn log_background_applied(
+    shared: &Shared,
+    revision: u64,
+    sequence: u64,
+    items: usize,
+    kinds: &str,
+) {
+    event!(
+        name: "worker.background.applied",
+        Level::INFO,
+        worker.id = %shared.worker_id,
+        session.id = %shared.session_id,
+        background.revision = revision,
+        background.sequence.reported = sequence,
+        background.items = items,
+        background.kinds = kinds,
+        "background snapshot applied: revision {{background.revision}}, {{background.items}} items",
+    );
+}
+
+/// Logs one background snapshot that was refused, with the reason it was.
+fn log_background_ignored(shared: &Shared, reason: &'static str, sequence: u64, items: usize) {
+    event!(
+        name: "worker.background.ignored",
+        Level::INFO,
+        worker.id = %shared.worker_id,
+        session.id = %shared.session_id,
+        background.reason = reason,
+        background.sequence.reported = sequence,
+        background.items = items,
+        "background snapshot ignored: {{background.reason}}",
+    );
+}
+
+/// Logs the background snapshot dropped by a clear and why it was cleared.
+fn log_background_cleared(shared: &Shared, reason: &'static str) {
+    event!(
+        name: "worker.background.cleared",
+        Level::INFO,
+        worker.id = %shared.worker_id,
+        session.id = %shared.session_id,
+        background.reason = reason,
+        "background snapshot cleared: {{background.reason}}",
+    );
+}
+
+/// Logs the optional snapshot fields the worker dropped, by reason, as counts.
+fn log_background_fields_dropped(shared: &Shared, dropped: Dropped) {
+    event!(
+        name: "worker.background.fields_dropped",
+        Level::INFO,
+        worker.id = %shared.worker_id,
+        session.id = %shared.session_id,
+        background.dropped.invalid = dropped.invalid,
+        background.dropped.kind_mismatch = dropped.kind_mismatch,
+        "background fields dropped: {{background.dropped.invalid}} invalid, \
+         {{background.dropped.kind_mismatch}} kind mismatch",
+    );
+}
+
 /// Records one admissible subagent claim that left the public state unchanged.
 ///
 /// The claim already passed schema admission and the process-ancestry check,
@@ -5482,6 +5837,7 @@ fn hook_claim_admissible(
     schema_rejection: Option<RejectReason>,
     runtime_matches: bool,
     phase_running: bool,
+    sequence: u64,
 ) -> Option<RejectReason> {
     if let Some(reason) = schema_rejection {
         return Some(reason);
@@ -5492,7 +5848,28 @@ fn hook_claim_admissible(
     if !phase_running {
         return Some(RejectReason::PhaseNotRunning);
     }
-    None
+    // Every hook takes its sequence from `CLOCK_MONOTONIC` before it connects,
+    // and this reading is taken after the claim arrived, so a genuine sequence
+    // is never ahead of it. No tolerance is needed: both readings come from the
+    // same kernel clock on the same host.
+    (sequence > monotonic_nanos()).then_some(RejectReason::FutureSequence)
+}
+
+/// Nanoseconds in one second.
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+
+/// Reads the worker's `CLOCK_MONOTONIC` in nanoseconds.
+///
+/// This is the clock the state and notify hooks take their claim sequences
+/// from, through `time.clock_gettime_ns(time.CLOCK_MONOTONIC)`. The reading is
+/// used only to refuse sequences ahead of it, so an unrepresentable value
+/// saturates instead of failing.
+fn monotonic_nanos() -> u64 {
+    let time = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    u64::try_from(time.tv_sec)
+        .unwrap_or(0)
+        .saturating_mul(NANOS_PER_SECOND)
+        .saturating_add(u64::try_from(time.tv_nsec).unwrap_or(0))
 }
 
 /// Validates one hook claim end to end and records why it was rejected.
@@ -5656,6 +6033,14 @@ fn command_from_initialize(
         (
             "POHUNEK_HOOK_TRACE_MAX_BYTES".to_owned(),
             pohunek_logging::config::HOOK_TRACE_MAX_FILE_BYTES.to_string(),
+        ),
+        (
+            "POHUNEK_BACKGROUND_LABEL_MAX_BYTES".to_owned(),
+            protocol::BACKGROUND_LABEL_MAX_BYTES.to_string(),
+        ),
+        (
+            "POHUNEK_BACKGROUND_PROGRAM_MAX_BYTES".to_owned(),
+            protocol::BACKGROUND_PROGRAM_MAX_BYTES.to_string(),
         ),
     ]);
     if let Some(daemon_id) = &initialize.daemon_instance_id {
