@@ -30,6 +30,7 @@ flags a differing `rustc`.
 
 ```bash
 cargo fmt --all --check
+scripts/check-rust-toolchain-pin                        # no floating Rust channel in CI
 cargo clippy --workspace --all-targets --all-features   # under -D warnings
 scripts/darwin-check                                    # macOS-only code; needs zig on a Linux host
 cargo build -p pohunek-session-worker --bin pohunek-sessiond
