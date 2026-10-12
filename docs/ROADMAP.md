@@ -69,20 +69,21 @@ instead of competing with them.
 
 | Milestone | Status on 2026-10-12 |
 |---|---|
-| [A. Agents discover Pohunek and make their first contribution](https://github.com/zajca/pohunek/milestone/4) | 3 closed, 6 open. Contributor authority [#798](https://github.com/zajca/pohunek/issues/798), entry points and contribution skill [#799](https://github.com/zajca/pohunek/issues/799), and issue contracts [#800](https://github.com/zajca/pohunek/issues/800) closed 2026-10-12. Toolchain pin [#360](https://github.com/zajca/pohunek/issues/360) is in progress (PR #850 open). Open: [#801](https://github.com/zajca/pohunek/issues/801)–[#804](https://github.com/zajca/pohunek/issues/804) and this roadmap ([#517](https://github.com/zajca/pohunek/issues/517)). |
+| [A. Agents discover Pohunek and make their first contribution](https://github.com/zajca/pohunek/milestone/4) | 3 closed, 6 open. Contributor authority [#798](https://github.com/zajca/pohunek/issues/798), entry points and contribution skill [#799](https://github.com/zajca/pohunek/issues/799), and issue contracts [#800](https://github.com/zajca/pohunek/issues/800) closed 2026-10-12. Toolchain pin [#360](https://github.com/zajca/pohunek/issues/360) is in progress (PR #850 merged; issue open). Open: [#801](https://github.com/zajca/pohunek/issues/801)–[#804](https://github.com/zajca/pohunek/issues/804) and this roadmap ([#517](https://github.com/zajca/pohunek/issues/517)). |
 | [B. Agents from different owners coordinate work safely](https://github.com/zajca/pohunek/milestone/5) | 0 closed, 9 open: claim service [#805](https://github.com/zajca/pohunek/issues/805)–[#811](https://github.com/zajca/pohunek/issues/811), [#817](https://github.com/zajca/pohunek/issues/817), [#818](https://github.com/zajca/pohunek/issues/818). #805 (service contract) is in progress; the service itself is built in `zajca/pohunek-work`. |
-| [C. Agents operate and extend Pohunek reliably](https://github.com/zajca/pohunek/milestone/6) | 1 closed ([#812](https://github.com/zajca/pohunek/issues/812)), 23 open: the runtime-package, workflow-plugin, and Pi epics below, doctor checks [#68](https://github.com/zajca/pohunek/issues/68) (in progress), operating recipes [#813](https://github.com/zajca/pohunek/issues/813), external runtime author [#814](https://github.com/zajca/pohunek/issues/814), and the assistant roles design [#823](https://github.com/zajca/pohunek/issues/823). |
+| [C. Agents operate and extend Pohunek reliably](https://github.com/zajca/pohunek/milestone/6) | 2 closed ([#812](https://github.com/zajca/pohunek/issues/812), [#480](https://github.com/zajca/pohunek/issues/480)), 22 open: the runtime-package, workflow-plugin, and Pi epics below, doctor checks [#68](https://github.com/zajca/pohunek/issues/68) (in progress), operating recipes [#813](https://github.com/zajca/pohunek/issues/813), external runtime author [#814](https://github.com/zajca/pohunek/issues/814), and the assistant roles design [#823](https://github.com/zajca/pohunek/issues/823). |
 | [D. Agents delegate work with verifiable results](https://github.com/zajca/pohunek/milestone/7) | 0 closed, 15 open: delegated task runs (#182, WS1–WS8). |
 | [E. Pohunek develops itself through accountable agents](https://github.com/zajca/pohunek/milestone/8) | 0 closed, 11 open: dark factory (#185, FS0–FS8), [#815](https://github.com/zajca/pohunek/issues/815), [#816](https://github.com/zajca/pohunek/issues/816). |
 
 ### Runtime plugin packages — [#139](https://github.com/zajca/pohunek/issues/139) (milestone C, project 5)
 
 Runtimes become signed, content-addressed packages installed per host; only
-`shell` stays built in. **13/28.** Landed: the accepted RFC (#152), the
+`shell` stays built in. **15/28.** Landed: the accepted RFC (#152), the
 `RuntimeId` protocol and generic runtime host (#140), the authenticated package
 registry (#141), the CLI lifecycle and profile migration (#143), generic hook
 schemas and integration activation (#144), digest-bound package releases with
-catalog signing (#150), and the official Pi package (#538). Open:
+catalog signing (#150), the official Pi package (#538), and the decision that
+core consumes no plugin data in v1 (#480). Open:
 
 - Codex package [#145](https://github.com/zajca/pohunek/issues/145) — in
   progress, 2/3 (open: #592).
@@ -95,7 +96,7 @@ catalog signing (#150), and the official Pi package (#538). Open:
   [#149](https://github.com/zajca/pohunek/issues/149) and package
   documentation [#151](https://github.com/zajca/pohunek/issues/151) — blocked
   by the extractions (and #151 by #148).
-- Follow-ups #480, #487, #493, #546, #547, and the flaky tests #532 and #597.
+- Follow-ups #487, #493, #546, #547, and the flaky test #597.
 
 Guide: [`knowledge/guides/runtime-packages.md`](knowledge/guides/runtime-packages.md).
 
@@ -106,9 +107,9 @@ Bounded out-of-process plugins with declared actions and jobs. **2/4.** Landed:
 no UI data contract; `zajca/pohunek-work` renders plugin data from public
 contracts). Open: CLI action
 invocation [#325](https://github.com/zajca/pohunek/issues/325) and periodic
-jobs/services in manifests [#326](https://github.com/zajca/pohunek/issues/326);
-the decision whether core consumes plugin data for launch-profile policy is
-[#480](https://github.com/zajca/pohunek/issues/480).
+jobs/services in manifests [#326](https://github.com/zajca/pohunek/issues/326).
+Core consumes no plugin data for launch-profile policy in v1
+([#480](https://github.com/zajca/pohunek/issues/480), closed).
 
 ### Pi coding agent — [#50](https://github.com/zajca/pohunek/issues/50) (milestone C)
 
@@ -167,19 +168,19 @@ gaps are tracked under the package epics (#592, #613, #547).
 
 ### Test stability and feedback loop — [#359](https://github.com/zajca/pohunek/issues/359) (project 1)
 
-Test and CI stability by failure class. **7/20.** Landed: deterministic timing
+Test and CI stability by failure class. **7/21.** Landed: deterministic timing
 (P2 #362), hermetic `TestEnv` (P3 #363), Linux-side macOS clippy (P5 #365),
 optimized test hot-loop dependencies (P7 #641). Open: CI tiers P6
 [#477](https://github.com/zajca/pohunek/issues/477), toolchain pin P0
-[#360](https://github.com/zajca/pohunek/issues/360) (in progress, also in
-milestone A), macOS nextest sharding P1
+[#360](https://github.com/zajca/pohunek/issues/360) (in progress, pin merged in
+PR #850, also in milestone A), macOS nextest sharding P1
 [#361](https://github.com/zajca/pohunek/issues/361) (3/4, open #377), flake
 detection P4 [#364](https://github.com/zajca/pohunek/issues/364), and the
 cost/maintenance items P8–P14
 ([#642](https://github.com/zajca/pohunek/issues/642)–[#648](https://github.com/zajca/pohunek/issues/648)),
-#774, #847. The unit-test migration of the testing policy is
+#774, #847, #855. The unit-test migration of the testing policy is
 [#671](https://github.com/zajca/pohunek/issues/671) (in progress). Project 7
-(dev workflow performance II) has 20 of 23 items Done; #272 and #323 remain
+(dev workflow performance II) has 21 of 23 issues closed; #272 and #323 remain
 open.
 
 ### macOS host and client support — [#94](https://github.com/zajca/pohunek/issues/94) ([milestone](https://github.com/zajca/pohunek/milestone/2), project 4)
@@ -239,7 +240,7 @@ team web UI of #86, into a dedicated repository (owner decision on #415,
 
 The core side is delivered: its three sub-issues are closed and core release
 v0.32.1 (2026-10-03) was published without GUI or web assets, followed by
-v0.32.3 as the first pin for `zajca/pohunek-work`. #415 stays open for the receiving side, tracked in
+v0.32.3, the release `zajca/pohunek-work` pins. #415 stays open for the receiving side, tracked in
 [pohunek-work#10](https://github.com/zajca/pohunek-work/issues/10) and
 [pohunek-work#33](https://github.com/zajca/pohunek-work/issues/33).
 
@@ -279,7 +280,7 @@ in parallel unless a cross-lane edge says otherwise.
    #100–#103 → #104 *(text: #104 "Dependencies")*. Durability: #422 → #423 and
    #424; #425 is independent. Tests: #477 → #360 → #361 → #364.
 
-#360 is in progress through PR #850 while its native blocker #477 is still
+#360's pin landed through PR #850 while its native blocker #477 is still
 open; the link stays authoritative until it is changed on the issue.
 
 Shortest path to a first public contribution: #477 → #360 → #801, with #700 →
