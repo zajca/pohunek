@@ -702,7 +702,7 @@ pub(crate) fn check_local(
             }
             engine::check_layout_dirs(context, layout)?;
             layout::verify_claim(layout, &config.namespace())?;
-            // A schema-2 file means the checked upgrade is a migration: it stops
+            // A previous-schema file means the checked upgrade is a migration: it stops
             // the daemon before it rewrites `service.toml`.
             let config_schema_migration = checked_config_migration(&plan, &config_source, version);
             (
@@ -956,8 +956,8 @@ fn verified_connection(context: &Context) -> Result<(Namespace, Duration), Error
 /// Loads the installation recorded at `context.config_path()` and verifies
 /// its namespace inputs against the running process.
 ///
-/// The read is the upgrade-source read: a previous release's schema-2
-/// installation is reported, connected to, checked, and uninstalled by this
+/// The read is the upgrade-source read: a previous release's schema-2 or
+/// schema-3 installation is reported, connected to, checked, and uninstalled by this
 /// version like a current one, while schemas this binary neither writes nor
 /// upgrades from stay refused.
 ///

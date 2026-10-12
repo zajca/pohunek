@@ -526,7 +526,7 @@ end) resumes it. A rerun for the already active
 version skip it, as does a resume after the replacement.
 
 Cancelling an interrupted upgrade before the daemon registration step usually
-leaves the previous daemon in place. A schema-2 configuration migration stops
+leaves the previous daemon in place. A configuration migration stops
 it earlier, before the rewrite; rollback from that `stop_daemon` step or later
 must restart it. Before such a restart, rollback judges the previous daemon
 against the current store and live workers before changing the service. A
@@ -611,22 +611,24 @@ proceeds, and the `--json` report carries the full `preflight` object and
 failing `pohunekd`, an unparsable report) fails with
 `service_upgrade_preflight_failed`, which the flag does not override.
 
-## Configuration migration from schema 2
+## Configuration migration from schemas 2 and 3
 
 When the installed `service.toml` was written by release 0.33.x (schema 2, no
-`[input]` table) and the target version differs, `pohunek service upgrade`
-turns into a configuration migration and the `--json` reports carry
-`config_schema_migration: 2`. `service check` verifies a pending migration's
+`[input]` or `[waits]` table) or by a release with schema 3 (no `[waits]`
+table) and the target version differs, `pohunek service upgrade` turns into a
+configuration migration and the `--json` reports carry the source schema,
+`config_schema_migration: 2` or `3`. `service check` verifies a pending migration's
 backup and reports the migration it would perform without writing anything,
 so an archive updater sees it before any effect. A same-version refresh runs
-no migration and reports `null`. The migration assigns the
-documented `[input]` defaults (5000 ms and 150 ms) explicitly; a schema-2
-installation never carries custom values here, so nothing is lost.
+no migration and reports `null`. The migration assigns the documented
+defaults of the missing tables explicitly: `[input]` 5000 ms and 150 ms for
+schema 2, `[waits]` 300000 ms and 1800000 ms for both. Every value the file
+records, including tuned `[input]` timings of a schema-3 file, is kept.
 
 The ordering follows the schema boundary. The transaction first saves the
 exact pre-upgrade bytes owner-private next to its record and journals their
 SHA-256 digest; the daemon job is then stopped before `service.toml` is
-rewritten, because a 0.33.x daemon's strict reader refuses a restart against
+rewritten, because a previous daemon's strict reader refuses a restart against
 the new file and its restart policy would crash-loop it. The new daemon is
 registered after the write, with the still-live session preflight judged
 while the old daemon runs. A live session keeps its worker PTY through the

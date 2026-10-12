@@ -30,21 +30,23 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use nix::sys::signal::Signal;
+use pohunek_client::ClientError;
 use pohunek_platform::process::ProcessIdentity;
 use pohunek_platform::supervisor::{
     JobDefinition, JobLogs, JobSpec, Namespace, RestartPolicy, Supervisor, WorkerKey,
 };
+use pohunek_service_config::WaitTiming;
 use pohunek_worker_protocol::{
     ControlCode, ControlError, ControlMessage, ControlReader, ControlResponse, ControlWriter,
     ResponseKind,
 };
 use protocol::{
     method, RuntimeInventoryStatus, RuntimeState, SessionId, SessionInputParams,
-    SessionResizeParams,
+    SessionResizeParams, SessionTurnEventKind, SessionWaitTurnParams, SessionWaitTurnReason,
 };
 use supervised::{
     backend, contains, counters, eventually, explained, loss_reason, read_until, runtime_state,
-    signal, stays, Installation, Settings, Snapshot,
+    signal, stays, Installation, Settings, Snapshot, WAIT,
 };
 
 /// Reason of a proven worker crash whose marker sweep completed.
@@ -285,6 +287,75 @@ async fn two_workers_survive_graceful_restart_and_sigkill() {
         fixture.assert_same_runtime(snapshot).await;
     }
     assert_eq!(fixture.job_ids().await, jobs, "no duplicate generation");
+}
+
+/// `[waits]` written for the turn-wait scenario: the smallest accepted default
+/// keeps the scenario short, and both values are far below the built-in
+/// 5 min and 30 min, so only a daemon that applied the file passes.
+const CONFIGURED_WAITS: WaitTiming = WaitTiming {
+    turn_default: Duration::from_secs(5),
+    turn_max: Duration::from_mins(1),
+};
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"
+)]
+async fn service_config_waits_bound_the_daemon_turn_wait() {
+    let mut fixture = Installation::new(Settings::default()).await;
+    fixture.rewrite_config(|spec| spec.wait_timing = CONFIGURED_WAITS);
+    fixture.start_daemon().await;
+    let session = fixture.new_session("turn-wait").await.id;
+    let wait = |timeout_ms: Option<u32>| {
+        SessionWaitTurnParams::new(
+            vec![session.clone()],
+            vec![SessionTurnEventKind::Exited],
+            None,
+            timeout_ms,
+        )
+        .expect("valid turn wait")
+    };
+    let ceiling = u32::try_from(CONFIGURED_WAITS.turn_max.as_millis()).expect("ceiling fits");
+
+    // One millisecond above the configured ceiling is refused, never clamped;
+    // the built-in 30 min ceiling would have accepted and parked it.
+    let above = tokio::time::timeout(
+        WAIT,
+        fixture
+            .client()
+            .await
+            .session_wait_turn(wait(Some(ceiling + 1))),
+    )
+    .await
+    .expect("a wait above the configured ceiling is refused at once");
+    match above {
+        Err(ClientError::Protocol(error)) => {
+            assert_eq!(error.code, "session_wait_limit_exceeded", "{error:?}");
+        }
+        other => panic!("expected session_wait_limit_exceeded, got {other:?}"),
+    }
+
+    // An omitted timeout takes the configured default. The live session never
+    // exits here, so the wait can only end by timing out; the built-in 5 min
+    // default would outlast the fixture deadline.
+    let started = Instant::now();
+    let defaulted =
+        tokio::time::timeout(WAIT, fixture.client().await.session_wait_turn(wait(None)))
+            .await
+            .expect("the configured default ends the wait within the fixture deadline")
+            .expect("the defaulted wait succeeds");
+    let elapsed = started.elapsed();
+    assert_eq!(
+        defaulted.reason,
+        SessionWaitTurnReason::Timeout,
+        "{defaulted:?}"
+    );
+    assert!(defaulted.event.is_none(), "{defaulted:?}");
+    assert!(
+        elapsed >= CONFIGURED_WAITS.turn_default,
+        "the wait lasted the configured default: {elapsed:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

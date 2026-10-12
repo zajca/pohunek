@@ -255,13 +255,6 @@ impl Installation {
     }
 
     /// Rewrites `service.toml` through `change`; the daemon reads it on start.
-    #[cfg_attr(
-        target_os = "linux",
-        expect(
-            dead_code,
-            reason = "only the launchd outage scenario rewrites deadlines"
-        )
-    )]
     pub(crate) fn rewrite_config(&mut self, change: impl FnOnce(&mut ConfigSpec)) {
         let mut spec = self.config.to_spec();
         change(&mut spec);
@@ -1123,6 +1116,7 @@ fn service_config(
         search_path: pohunek_platform::shell_env::SearchPath::default(),
         sweep_grace: settings.sweep_grace,
         input_timing: pohunek_service_config::DEFAULT_INPUT_TIMING,
+        wait_timing: pohunek_service_config::DEFAULT_WAIT_TIMING,
         open_files: OPEN_FILES,
     })
     .expect("valid service configuration")

@@ -66,6 +66,14 @@ range, or an unknown key makes the daemon refuse startup with the named
 configuration error. The startup grace ends early when the agent signals an
 editable prompt or enables bracketed paste; it only delays silent startups.
 The daemon reads edits when it starts, so restart the service to apply them.
+The file also records `[waits] turn_default_ms = 300000` and `turn_max_ms =
+1800000` on a fresh install: the timeout of a `session.wait_turn` call that
+names none (5 min) and the ceiling a requested timeout may not exceed (30 min);
+a request above the ceiling is an error, never clamped. Both keys are whole
+milliseconds in `5000..=3600000`, and the default must not exceed the
+ceiling; a violation makes the daemon refuse startup with the named
+configuration error. A daemon started without `service.toml` uses the same
+5 min and 30 min.
 `<ns>` is a 12-hex-digit namespace derived from the user ID and the state and
 runtime roots, so separate installations never touch each other's jobs.
 They never share a prefix either: the first install claims it in
@@ -97,14 +105,15 @@ after checking for live sessions instead, even when its `service.toml` is
 already gone). Upgrades use
 `pohunek service upgrade`; `pohunek service status` shows the daemon job,
 versions, and workers. When the installed `service.toml` is a previous
-release's schema (schema 2, which predates the `[input]` table), the upgrade
+release's schema (schema 2, which predates the `[input]` and `[waits]`
+tables, or schema 3, which predates `[waits]`), the upgrade
 is a configuration migration: the upgrade first saves the exact pre-upgrade
 bytes owner-private next to its transaction record and journals their
 digest, stops the daemon job before it rewrites `service.toml` (a previous
 daemon's strict reader would refuse a restart against the new schema), then
 registers the new daemon; the migration assigns the documented
-`[input]` defaults explicitly and the `--json` report names it with
-`config_schema_migration`. A crash resumes from the record after re-verifying
+defaults of the missing tables explicitly, keeps every recorded value, and
+the `--json` report names the source schema with `config_schema_migration`. A crash resumes from the record after re-verifying
 the backup and the file on disk against that digest while the transaction has
 not rewritten it yet; a failing step
 rolls the migration back by restoring the exact pre-upgrade bytes before
@@ -115,7 +124,7 @@ written, no daemon restarts, and the record stays for a repaired retry.
 the install or upgrade would make before changing anything, and changes
 nothing (an upgrade also runs a read-only live-session preflight that
 `--accept-runtime-loss` can override, except for an unusable store; on a
-schema-2 installation it names the migration it would perform); `pohunek service lock -- <command>` runs a command that no other
+schema-2 or schema-3 installation it names the migration it would perform); `pohunek service lock -- <command>` runs a command that no other
 service transaction can interleave with (the archive installer uses both). For
 upgrades, removal, and runtime diagnosis, see
 [update after release](../runbooks/update-after-release.md) and

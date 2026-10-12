@@ -41,8 +41,8 @@ To follow agents across turns, a client calls the protocol method
 next turn event of one or more sessions, `turn_completed`, `agent_blocked`,
 `approval_required`, or `exited`, newer than an opaque cursor (or newer than
 the call when no cursor is given), bounded by an agent-chosen `timeout_ms`
-(daemon default 5 minutes, ceiling 30 minutes; a longer request fails with
-`session_wait_limit_exceeded`). Every result carries the next `cursor` and, for
+(daemon default 5 minutes, ceiling 30 minutes, both set by `service.toml`
+`[waits]`; a longer request fails with `session_wait_limit_exceeded`). Every result carries the next `cursor` and, for
 every target, `state`, `activity`, `last_output_at`, `output_advanced` (output
 since the cursor), and `turn_started_at`, so a timeout still tells "still
 working" from "stuck". Chain waits with the returned cursor; an event recorded

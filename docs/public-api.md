@@ -1662,7 +1662,7 @@ returned cursor and branch on the reason.
 | `session_ids` | `SessionId[]` | Required, 1 to `MAX_SESSION_WAIT_TURN_TARGETS` (32), no repeats. Every target must exist when the call starts, or it fails with `session_not_found` before taking a waiter slot. |
 | `until` | `SessionTurnEventKind[]` | Required, non-empty, no repeats: `turn_completed`, `agent_blocked`, `approval_required`, `exited`. |
 | `after` | opaque string, optional | The `cursor` of an earlier result; 1 to `MAX_SESSION_TURN_CURSOR_BYTES` (256) printable ASCII bytes. |
-| `timeout_ms` | `u32`, optional | Non-zero. Omitted means the daemon default (5 minutes). Above the daemon ceiling (30 minutes) the call fails with `session_wait_limit_exceeded`; it is never clamped. |
+| `timeout_ms` | `u32`, optional | Non-zero. Omitted means the daemon default (5 minutes unless `service.toml` `[waits]` `turn_default_ms` sets another). Above the daemon ceiling (`turn_max_ms`, 30 minutes by default) the call fails with `session_wait_limit_exceeded`; it is never clamped. |
 
 The wait is edge-triggered: it completes only with an event recorded after
 `after`, or after the call started when `after` is omitted, never with the
@@ -1832,13 +1832,17 @@ recorded at install and reaches the daemon job only when the installer writes
 the job definition (install, or an upgrade to a different version); upgrades
 reuse the recorded list, so a manual edit takes effect only at the next
 version-changing upgrade, and an in-place refresh is tracked in #319. This key
-raised the `service.toml` `schema_version` to 2, and the `[input]` table added
-for #496 raised it to 3: the current release refuses to serve a schema-2 file
-to the daemon, reads it only at the `pohunek service upgrade` boundary, and
-upgrades it as a migration. `service check` and the success reports of `pohunek
-service upgrade` name that migration in an additive `config_schema_migration`
-field (the source schema, `2`, or `null` when no migration runs); the check
-runs it read-only. The migration stops the daemon before it rewrites
+raised the `service.toml` `schema_version` to 2, the `[input]` table added
+for #496 raised it to 3, and the `[waits]` table added for #858 (`turn_default_ms`
+and `turn_max_ms`, the default timeout and the ceiling of `session.wait_turn`,
+each in `5000..=3600000` with the default at most the ceiling; fresh installs
+and migrations write 300000 and 1800000) raised it to 4: the current release
+refuses to serve a schema-2 or schema-3 file to the daemon, reads it only at
+the `pohunek service upgrade` boundary, and upgrades it as a migration that
+assigns the defaults of the missing tables and keeps every recorded value.
+`service check` and the success reports of `pohunek service upgrade` name that
+migration in an additive `config_schema_migration` field (the source schema,
+`2` or `3`, or `null` when no migration runs); the check runs it read-only. The migration stops the daemon before it rewrites
 `service.toml`, carries the exact pre-upgrade bytes in an owner-private backup
 digest-verified against its transaction record, and restores those bytes on
 rollback; a resume or rollback that cannot prove the exact pre-upgrade bytes

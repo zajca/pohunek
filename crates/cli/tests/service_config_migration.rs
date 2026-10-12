@@ -1,7 +1,8 @@
-//! `pohunek service check` over the previous release's `service.toml`.
+//! `pohunek service check` over a previous release's `service.toml`.
 //!
 //! The real CLI binary runs against an isolated XDG layout holding the exact
-//! schema-2 configuration a v0.33.1 release wrote. No service manager is
+//! schema-2 configuration a v0.33.1 release wrote, the exact schema-3 shape
+//! that precedes `[waits]`, or a current-schema file. No service manager is
 //! involved: the check of an existing installation contacts only the new
 //! daemon's `upgrade-preflight`, which reads the store below the isolated
 //! roots beside this build's binaries — so `pohunekd` is expected next to
@@ -56,8 +57,53 @@ grace_ms = 5000
 open_files = 8192
 "#;
 
+/// The schema-3 `service.toml` of a release before `[waits]`, with the
+/// identity the isolated layout resolves. Its `[input]` values differ from
+/// the defaults, as an operator may have tuned them.
+const SCHEMA_THREE_TEMPLATE: &str = r#"
+# Pohunek service configuration, written by `pohunek service install`.
+# Every key is required; unknown keys are rejected.
+
+schema_version = 3
+prefix = "{PREFIX}"
+active_version = "0.40.0"
+
+[namespace]
+uid = {UID}
+state_root = "{STATE_ROOT}"
+runtime_root = "{RUNTIME_ROOT}"
+
+[deadlines]
+worker_connect_ms = 10000
+worker_initialize_ms = 45000
+launchctl_command_ms = 10000
+worker_exit_timeout_ms = 30000
+daemon_exit_timeout_ms = 30000
+daemon_restart_throttle_ms = 5000
+
+[environment]
+search_path = ["/usr/bin"]
+allowlist = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*"]
+
+[sweep]
+grace_ms = 5000
+
+[input]
+initial_startup_grace_ms = 9000
+submit_delay_ms = 275
+
+[limits]
+open_files = 8192
+"#;
+
+/// The current schema's `[waits]` table, inserted into the schema-3 template
+/// to build a schema-4 file.
+const WAITS_TABLE: &str = "[waits]\nturn_default_ms = 300000\nturn_max_ms = 1800000\n\n[limits]";
+
 /// An isolated XDG layout where the real CLI checks the previous installation.
 struct Host {
+    /// The frozen `service.toml` shape the fixture starts from.
+    template: &'static str,
     /// Overrides the fixture template before it is written; a schema the CLI
     /// neither writes nor migrates is exercised here.
     repair: Box<dyn Fn(&str) -> String>,
@@ -68,6 +114,7 @@ impl Host {
     /// The exact configuration a previous release could have written.
     fn schema_two() -> Self {
         Self {
+            template: SCHEMA_TWO_TEMPLATE,
             repair: Box::new(std::borrow::ToOwned::to_owned),
             temporary: temp_root(),
         }
@@ -76,6 +123,7 @@ impl Host {
     /// A schema-2 file whose installed binary already has this build's version.
     fn schema_two_current_version() -> Self {
         Self {
+            template: SCHEMA_TWO_TEMPLATE,
             repair: Box::new(|template| {
                 template.replace(
                     "active_version = \"0.33.1\"",
@@ -89,8 +137,36 @@ impl Host {
     /// A previous schema-2 installation whose active version needs an upgrade.
     fn schema_two_previous_version() -> Self {
         Self {
+            template: SCHEMA_TWO_TEMPLATE,
             repair: Box::new(|template| {
                 template.replace("active_version = \"0.33.1\"", "active_version = \"0.33.0\"")
+            }),
+            temporary: temp_root(),
+        }
+    }
+
+    /// A previous schema-3 installation whose active version needs an upgrade.
+    fn schema_three_previous_version() -> Self {
+        Self {
+            template: SCHEMA_THREE_TEMPLATE,
+            repair: Box::new(std::borrow::ToOwned::to_owned),
+            temporary: temp_root(),
+        }
+    }
+
+    /// A schema-4 file with the given `[waits]` values.
+    fn schema_four_with_waits(default_ms: u64, max_ms: u64) -> Self {
+        Self {
+            template: SCHEMA_THREE_TEMPLATE,
+            repair: Box::new(move |template| {
+                template
+                    .replace("schema_version = 3", "schema_version = 4")
+                    .replace(
+                        "[limits]",
+                        &WAITS_TABLE
+                            .replace("300000", &default_ms.to_string())
+                            .replace("1800000", &max_ms.to_string()),
+                    )
             }),
             temporary: temp_root(),
         }
@@ -99,6 +175,7 @@ impl Host {
     /// The same configuration with `schema_version` replaced.
     fn schema_of(version: u32) -> Self {
         Self {
+            template: SCHEMA_TWO_TEMPLATE,
             repair: Box::new(move |template| {
                 template.replace("schema_version = 2", &format!("schema_version = {version}"))
             }),
@@ -149,7 +226,7 @@ fn check_with_setup(host: &Host, setup: impl FnOnce(&Path, &Path, &[u8])) -> (bo
     fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700))
         .expect("private config dir");
     let config = config_dir.join("service.toml");
-    let template = (host.repair)(SCHEMA_TWO_TEMPLATE)
+    let template = (host.repair)(host.template)
         .replace("{PREFIX}", &root.join("prefix").display().to_string())
         .replace("{UID}", &nix::unistd::Uid::effective().as_raw().to_string())
         .replace("{STATE_ROOT}", &state.join("pohunek").display().to_string())
@@ -157,7 +234,7 @@ fn check_with_setup(host: &Host, setup: impl FnOnce(&Path, &Path, &[u8])) -> (bo
     fs::write(&config, template).expect("write fixture, a checked-in value");
     // The previous release wrote the file owner-private.
     fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).expect("private service.toml");
-    let source = fs::read(&config).expect("read the exact schema-2 bytes");
+    let source = fs::read(&config).expect("read the exact source bytes");
     setup(&config, &state.join("pohunek"), &source);
     let fixture = fs::read(&config).expect("read the exact fixture bytes");
     let store = Store::new(state.join("pohunek"));
@@ -214,7 +291,7 @@ fn pending_migration(
         pohunek_service_config::ServiceConfig::new(spec)
             .expect("target configuration")
             .write(config)
-            .expect("write schema-3 target");
+            .expect("write current-schema target");
     }
     let record = Record {
         schema_version: pohunek_cli::service::record::SCHEMA_VERSION,
@@ -274,6 +351,88 @@ fn check_accepts_the_previous_release_config_and_names_the_migration() {
 }
 
 #[test]
+fn check_accepts_a_schema_three_config_and_names_the_migration() {
+    let host = Host::schema_three_previous_version();
+    let (success, envelope) = check(&host);
+    assert!(success, "{envelope}");
+    let report = envelope
+        .get("ok")
+        .expect("the checked upgrade is the report");
+    assert_eq!(
+        report.get("operation").and_then(Value::as_str),
+        Some("upgrade"),
+        "{report:?}"
+    );
+    assert_eq!(
+        report
+            .get("config_schema_migration")
+            .and_then(Value::as_u64),
+        Some(3),
+        "{report:?}: the check names the schema-3 migration"
+    );
+}
+
+#[test]
+fn check_accepts_a_current_schema_config_without_a_migration() {
+    let host = Host::schema_four_with_waits(120_000, 2_700_000);
+    let (success, envelope) = check(&host);
+    assert!(success, "{envelope}");
+    assert!(
+        envelope
+            .get("ok")
+            .and_then(|report| report.get("config_schema_migration"))
+            .is_some_and(Value::is_null),
+        "{envelope}: a current-schema file needs no migration"
+    );
+}
+
+#[test]
+fn check_refuses_a_default_turn_wait_above_its_ceiling() {
+    let host = Host::schema_four_with_waits(1_800_001, 1_800_000);
+    let (success, envelope) = check(&host);
+    assert!(!success, "{envelope}: the default exceeds the ceiling");
+    let refusal = envelope.get("err").expect("the refusal document");
+    assert_eq!(
+        refusal.get("code").and_then(Value::as_str),
+        Some("service_config_invalid"),
+        "{refusal:?}"
+    );
+    assert!(
+        refusal
+            .get("msg")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("waits.turn_default_ms")
+                && message.contains("waits.turn_max_ms")),
+        "{refusal:?}: the refusal names both keys"
+    );
+}
+
+#[test]
+fn check_refuses_a_turn_wait_outside_its_bounds() {
+    for (default_ms, max_ms, key) in [
+        (4_999, 1_800_000, "waits.turn_default_ms"),
+        (300_000, 3_600_001, "waits.turn_max_ms"),
+    ] {
+        let host = Host::schema_four_with_waits(default_ms, max_ms);
+        let (success, envelope) = check(&host);
+        assert!(!success, "{envelope}: {key} is out of range");
+        let refusal = envelope.get("err").expect("the refusal document");
+        assert_eq!(
+            refusal.get("code").and_then(Value::as_str),
+            Some("service_config_invalid"),
+            "{refusal:?}"
+        );
+        assert!(
+            refusal
+                .get("msg")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains(key) && message.contains("5000..=3600000")),
+            "{refusal:?}: the refusal names {key} and its bounds"
+        );
+    }
+}
+
+#[test]
 fn check_reports_no_migration_when_the_installed_version_is_already_active() {
     let host = Host::schema_two_current_version();
     let (success, envelope) = check(&host);
@@ -289,7 +448,7 @@ fn check_reports_no_migration_when_the_installed_version_is_already_active() {
 
 #[test]
 fn check_refuses_a_config_this_version_neither_writes_nor_migrates() {
-    for version in [1, 4] {
+    for version in [1, 5] {
         let host = Host::schema_of(version);
         let (success, envelope) = check(&host);
         assert!(!success, "{envelope}: schema {version} is not a source");
@@ -334,7 +493,7 @@ fn check_refuses_an_unverifiable_pending_migration_before_contacting_the_manager
 }
 
 #[test]
-fn check_reports_pending_migration_after_the_schema_three_write() {
+fn check_reports_pending_migration_after_the_current_schema_write() {
     let host = Host::schema_two();
     let (success, envelope) = check_with_setup(&host, |config, state, source| {
         pending_migration(config, state, source, Step::Registered, Some(source));

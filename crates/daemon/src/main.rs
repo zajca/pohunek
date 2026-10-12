@@ -64,7 +64,7 @@ use pohunek_daemon::session::{
 };
 use pohunek_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
 use pohunek_platform::supervisor::{self, Namespace};
-use pohunek_service_config::{InputTiming, ServiceConfig};
+use pohunek_service_config::{InputTiming, ServiceConfig, WaitTiming};
 
 /// File name of the unified logical-session metadata store under the data dir.
 const STORE_NAME: &str = pohunek_paths::METADATA_STORE_NAME;
@@ -527,6 +527,12 @@ fn apply_input_timing(config: &mut SessionRegistryConfig, timing: InputTiming) {
     config.host_submit_delay = Some(timing.submit_delay);
 }
 
+/// Applies the validated `session.wait_turn` default and ceiling.
+fn apply_wait_timing(config: &mut SessionRegistryConfig, timing: WaitTiming) {
+    config.turn_wait_default = timing.turn_default;
+    config.turn_wait_max = timing.turn_max;
+}
+
 /// Builds the session registry with the worker supervisor of `mode`.
 async fn build_session_registry(
     mut config: SessionRegistryConfig,
@@ -546,6 +552,7 @@ async fn build_session_registry(
             let deadlines = service.deadlines();
             config.worker_connect_deadline = deadlines.worker_connect;
             apply_input_timing(&mut config, service.input_timing());
+            apply_wait_timing(&mut config, service.wait_timing());
             let (supervisor, worker_logs) = native_supervisor(&service, paths).await?;
             info!(
                 service.namespace = %service.namespace(),

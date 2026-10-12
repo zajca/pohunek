@@ -7,7 +7,7 @@ use pohunek_platform::filesystem::{AtomicReplaceError, FsError};
 
 use crate::SCHEMA_VERSION;
 
-// Rust guideline compliant 2026-09-30
+// Rust guideline compliant 2026-10-12
 
 /// A failure while handling the service configuration.
 ///
@@ -136,6 +136,17 @@ pub enum ConfigError {
         min: u64,
         /// The largest accepted value.
         max: u64,
+    },
+    /// `waits.turn_default_ms` exceeds the `waits.turn_max_ms` ceiling.
+    #[error(
+        "service config key waits.turn_default_ms = {default_ms} exceeds \
+         waits.turn_max_ms = {max_ms}; the default turn wait must not exceed its ceiling"
+    )]
+    WaitDefaultAboveMax {
+        /// The recorded default in milliseconds.
+        default_ms: u64,
+        /// The recorded ceiling in milliseconds.
+        max_ms: u64,
     },
     /// A duration cannot be recorded as whole milliseconds.
     #[error("service config key {key} must be a whole number of milliseconds")]
