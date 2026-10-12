@@ -44,26 +44,31 @@ the [github-workflow skill](../github-workflow/SKILL.md) for issue handling.
 
 ## Understand reservation and custody
 
-Automatic reservation is unavailable until coordination service #805–#811 is
-delivered. Today, only a maintainer can explicitly reconcile current issues,
-comments, and pull requests and record a manual reservation in public issue
-evidence. A request, label, assignee, or unanswered comment is not a grant;
-a manual record is not an atomic lease. Do not invent or imply a claim command.
+The binding rules are in
+[Public contributions and authority](../github-workflow/SKILL.md#public-contributions-and-authority)
+and `contributionPolicy` in
+[`.github/agent-workflow.json`](../../../.github/agent-workflow.json). In
+practice:
 
-You may propose work, request a reservation, work in a fork you are authorized
-to use, and submit an unsolicited pull request through the normal GitHub route.
-Without a recognized reservation, keep the work independent and disclose
-conflicts; do not act in an owner's checkout, use someone else's credentials
-or budget, or claim exclusive custody. A recognized holder stays within the
-granted scope and current generation. Submission and review retain custody;
-expiry triggers reconciliation rather than silent reassignment.
+- Automatic reservation is unavailable until the coordination service of
+  #805–#811 is delivered. Until then, only a maintainer records a manual reservation
+  in public issue evidence. A request, label, assignee, or unanswered comment
+  is not a grant. Do not invent or imply a claim command.
+- You may propose work, request a reservation, work in a fork you are
+  authorized to use, and submit pull requests, including unsolicited ones.
+  Without a recognized reservation, keep the work independent and disclose
+  conflicts; do not act in an owner's checkout, use someone else's credentials
+  or budget, or claim exclusive custody.
+- A recognized holder stays within the granted scope and current generation.
+  Submission and review retain custody but are not acceptance; expiry starts
+  reconciliation rather than silent reassignment.
 
 ## Work and verify
 
 Use a branch in your authorized fork and keep changes within the issue's
 criteria. Read [AGENTS.md](../../../AGENTS.md) and the task-specific guides it
 routes to. For testing boundaries and repository gates, use the
-[verification guide](../../instructions/verification.md); for issue/project
+[verification guide](../../../.agents/instructions/verification.md); for issue/project
 operations, use the [github-workflow skill](../github-workflow/SKILL.md).
 
 When a task involves operating Pohunek itself, reuse the shipped
@@ -80,29 +85,36 @@ compatibility evidence when the issue requires them.
 ## Submit and hand off
 
 Open a pull request from your authorized fork using the
-[public pull-request template](../../../.github/pull_request_template.md). For a
-single-PR change or the bottom slice, target the repository's default branch;
-for each higher slice, target the preceding slice's branch. Follow the
-[stacked PR workflow](../../instructions/workflow.md) and its
-[repository configuration](../../../.github/agent-workflow.json), including
-retargeting each slice after the one below it lands.
-Use `Refs #NUMBER` for a non-final slice; use `Closes #NUMBER` only on the final
-slice when the issue's full definition of done is met. GitHub web or
-`gh pr create --repo zajca/pohunek --base BASE_BRANCH` are both available
-paths. Creating a PR from a fork does not require write access to the upstream
-repository; use only an account and fork you are authorized to use.
+[public pull-request template](../../../.github/pull_request_template.md),
+targeting the repository's default branch. A pull request into this repository
+can only use one of its own branches as the base, so a fork cannot target the
+branch of a preceding slice. Split larger work into the slices described by the
+[stacked PR workflow](../../../.agents/instructions/workflow.md) and keep one
+slice open at a time: prepare the next slice on its own branch, and open its
+pull request only after the slice below it lands. Use `Refs #NUMBER` for a
+non-final slice; use `Closes #NUMBER` only on the final slice when the issue's
+full definition of done is met. GitHub web or
+`gh pr create --repo zajca/pohunek --base main` are both available paths.
+Creating a pull request from a fork does not require write access to this
+repository; use only an account and fork you are authorized to use. Until a
+contributor has a merged contribution, each workflow run on their pull requests
+waits for maintainer approval.
 
 In the PR, provide the candidate SHA, base SHA, issue criteria, exact check
 commands and outcomes, unresolved work, and the next permitted action. Request
-review through the public route. The maintainer `zajca` triages, routes, and
-integrates; an available independent reviewer checks the relevant area. If no
-independent reviewer is available, the candidate remains unaccepted and the
-maintainer records and retries routing. An author, executor, or manager cannot
-supply independent approval through another session. Automated review counts
-only for a completed review verified against the exact PR head after #700
-resolves the reviewer-service defect; interrupted or stale-head runs are not
-approval. #817 may request review only through its restricted broker contract.
-Review does not grant merge authority; release remains separately authorized.
+review through the public route defined in
+[Public contributions and authority](../github-workflow/SKILL.md#public-contributions-and-authority):
+the maintainer `zajca` triages, routes, and integrates after the required gates
+and independent review, and an available independent reviewer examines the
+code, contract, and evidence of the exact candidate. If no independent reviewer
+is available, the candidate stays unaccepted until routing succeeds. You cannot
+supply independent approval for your own work, including through another
+session or agent. An automated review counts only under the conditions in
+`contributionPolicy.reviewAndIntegration.automatedReview` (a completed review of
+the exact head after #700, under the corrected #700/#802 contract); an
+interrupted or stale-head run is not approval, and the #817 broker's assessment
+is not independent review. Review grants no merge authority; release is
+separately authorized.
 
 For a handoff, record the issue/spec revision, current reservation and
 identity generation when applicable, exact branch/commit/PR, actual checks,
