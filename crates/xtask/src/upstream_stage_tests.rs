@@ -1473,12 +1473,12 @@ fn the_hermes_lock_is_not_a_shape_this_command_stages() {
     };
     refused(
         stage_upstream(&root, "hermes", out.path(), &tools),
-        "lock.schema",
+        "upstream.npm",
         Fault::Unsupported,
     );
     refused(
         verify_stage(&root, "hermes", out.path()),
-        "lock.schema",
+        "upstream.npm",
         Fault::Unsupported,
     );
 }

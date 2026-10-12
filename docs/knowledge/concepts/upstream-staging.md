@@ -36,8 +36,12 @@ ranges, no other dependency kind) and `compat/<runtime>/npm/package-lock.json`
 integrity and a `resolved` URL on one `https` origin, which becomes the
 registry npm is told to use. Regenerate it with `npm install
 --package-lock-only --ignore-scripts` after changing the release. A lock that
-is not an npm release (another `schema`, no `upstream.npm`, such as the Hermes
-lock) is refused as an unsupported shape.
+is not an npm release (another `schema`, or no `upstream.npm`) is refused as an
+unsupported shape. The Hermes lock is one: it has the common official-package
+fields (`schema`, `package`, `runtime`, `upstream.release`, `supported`), so the
+attestation checks can read it, but its `upstream.kind` is
+`provisioner`, and `scripts/provision-hermes-compat` installs it from the
+pinned source archive instead (`compat/hermes/README.md`).
 
 Lock bytes are hashed into every attestation (`upstream_lock_digest`), so any
 edit of a lock file, including adding these fields, changes the digests of the

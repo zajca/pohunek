@@ -7,11 +7,30 @@ SHA-256 `1e9319c58a7f5e95808546af1091d58472be7437adc63fae0cbb53316e2711aa`.
 Runtime code that needs the supported Hermes version should consume this lock
 rather than repeat `0.20.0` in another mutable source.
 
+The lock has the shape of the other official-package locks
+(`compat/<runtime>/compatibility-lock.json`), so `cargo xtask compat attest`
+and `compat verify` read it through `--lock` like any other lock, and
+`compat matrix-check` reads it once `runtime-packages/hermes/` exists:
+
+| Field | Meaning |
+| --- | --- |
+| `schema`, `package`, `runtime` | Lock schema `1`, package `pohunek.runtime.hermes`, runtime `hermes`. |
+| `upstream` | The pinned release. Kind `provisioner` means the script named by `provisioner` (`scripts/provision-hermes-compat`) installs it from the verified source archive of `repository` at `tag`, `commit` and `tree` (`source_archive`), not from an npm lockfile. `release`, `binary` and `version_output` (the `--version` banner with one `{release}` placeholder) are as in the npm locks. |
+| `supported` | The supported release range `[min, below)`, equal to the package descriptor's `version_probe` range. |
+| `verified_with` | What the pinned release was checked with. |
+| `launch` | The command contract the gate checks: program, fresh and resume arguments, display modes. |
+| `cli_checks`, `plugin_contract`, `golden_states` | The CLI, plugin and PTY evidence contracts of the gate. |
+
+`cargo xtask hermes compatibility` and the provisioner both pin the lock's
+exact SHA-256, so any lock edit changes both digests and the CI runtime cache
+key, which hashes the lock.
+
 `package/` contains a production-format local package fixture under validation,
 not a published or released package. Its descriptor uses the data-driven
 `semver-line-v1` probe for the locked banner and limits support to
-`[0.20.0, 0.20.1)`. The lock remains authoritative for the upstream release and
-source digest; it intentionally does not duplicate the package's launch policy.
+`[0.20.0, 0.20.1)`, the lock's `supported` range
+(`crates/cli/tests/hermes_package.rs` keeps the two equal). The lock remains
+authoritative for the upstream release and source digest.
 The reserved `hermes` runtime id can be served by a package only when a signed
 catalog authorizes its digest. Hermes is not in the published catalog, and no
 Hermes release package artifact exists yet.

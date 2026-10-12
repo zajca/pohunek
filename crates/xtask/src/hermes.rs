@@ -30,11 +30,28 @@ const GOLDEN_SCHEMA: u32 = 1;
 /// Updating the upstream pin requires reviewing the complete lock and changing
 /// this digest in the same compatibility-infrastructure change.
 const EXPECTED_LOCK_SHA256: &str =
-    "a4ccdde37aa679859f03485a36b895610c9c2f44f46a44562a9e180bb97825b4";
+    "c670328dd5ed3241a6e5c60fc16c1128a58dd5950dd9d3048600df46c3bb2ed7";
 /// The pinned source archive digest recorded by the M2 baseline review.
 const EXPECTED_SOURCE_SHA256: &str =
     "1e9319c58a7f5e95808546af1091d58472be7437adc63fae0cbb53316e2711aa";
 const EXPECTED_SOURCE_FORMAT: &str = "git archive --format=tar";
+/// Package id of the official Hermes runtime package the lock pins.
+const EXPECTED_PACKAGE_ID: &str = "pohunek.runtime.hermes";
+/// Runtime id the lock pins; `cargo xtask compat` requires it to equal the
+/// package directory name.
+const EXPECTED_RUNTIME_ID: &str = "hermes";
+/// Upstream kind of a release that a repository script provisions from a
+/// verified source archive rather than from an npm lockfile.
+const EXPECTED_UPSTREAM_KIND: &str = "provisioner";
+/// The provisioner the lock names, relative to the repository root. It pins
+/// this lock's digest, so the two change together.
+const EXPECTED_PROVISIONER: &str = "scripts/provision-hermes-compat";
+/// Upstream source repository; the provisioner fetches the locked tag from it.
+const EXPECTED_REPOSITORY: &str = "https://github.com/NousResearch/hermes-agent";
+/// Placeholder of `upstream.version_output` that the pinned release replaces.
+const RELEASE_PLACEHOLDER: &str = "{release}";
+/// Id of the lock's CLI check whose first required text is the version banner.
+const VERSION_CHECK_ID: &str = "version";
 const EXPECTED_FRESH_ARGV: [&str; 1] = ["chat"];
 const EXPECTED_RESUME_ARGV: [&str; 3] = ["chat", "--resume", "<reference>"];
 const EXPECTED_DISPLAY_MODES: [&str; 2] = ["classic", "alternate_screen_tui"];
@@ -315,21 +332,49 @@ pub(crate) struct RefreshSummary {
     pub(crate) manifest_path: PathBuf,
 }
 
+/// `compat/hermes/compatibility-lock.json`: the official-package lock fields
+/// (`schema`, `package`, `runtime`, `upstream`, `supported`, `verified_with`)
+/// that `cargo xtask compat` reads for every runtime, plus the Hermes launch,
+/// CLI, plugin and golden-state contracts this gate checks.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Lock {
-    schema_version: u32,
-    release: String,
-    tag: String,
-    published: String,
-    repository: String,
-    commit: String,
-    tree: String,
-    source_archive: SourceArchive,
-    runtime: RuntimeContract,
+    schema: u32,
+    package: String,
+    runtime: String,
+    upstream: Upstream,
+    supported: SupportedRange,
+    verified_with: String,
+    launch: LaunchContract,
     cli_checks: Vec<CliCheck>,
     plugin_contract: PluginContract,
     golden_states: Vec<String>,
+}
+
+/// The pinned upstream release and the provenance facts the provisioner verifies.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Upstream {
+    kind: String,
+    name: String,
+    provisioner: String,
+    repository: String,
+    release: String,
+    tag: String,
+    published: String,
+    commit: String,
+    tree: String,
+    source_archive: SourceArchive,
+    binary: String,
+    version_output: String,
+}
+
+/// Supported upstream releases, `[min, below)`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SupportedRange {
+    min: String,
+    below: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -341,7 +386,7 @@ struct SourceArchive {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RuntimeContract {
+struct LaunchContract {
     program: String,
     fresh_argv: Vec<String>,
     resume_argv: Vec<String>,
@@ -1188,8 +1233,8 @@ fn compatibility_with(
 
 fn compatibility_summary(lock: Lock, manifest: &GoldenManifest) -> CompatibilitySummary {
     CompatibilitySummary {
-        release: lock.release,
-        tag: lock.tag,
+        release: lock.upstream.release,
+        tag: lock.upstream.tag,
         cli_checks: lock.cli_checks.len(),
         plugin_checks: lock.plugin_contract.cli_checks.len()
             + PLUGIN_LIFECYCLE_CHECKS
@@ -1656,35 +1701,47 @@ fn load_lock(repo: &Path) -> Result<Lock, XtaskError> {
 }
 
 fn validate_lock(lock: &Lock) -> Result<(), XtaskError> {
-    if lock.schema_version != LOCK_SCHEMA {
+    if lock.schema != LOCK_SCHEMA {
         return Err(fail("unsupported Hermes compatibility lock schema"));
     }
-    if lock.source_archive.format != EXPECTED_SOURCE_FORMAT
-        || lock.source_archive.sha256 != EXPECTED_SOURCE_SHA256
-    {
-        return Err(fail("Hermes source archive checksum contract changed"));
+    if lock.package != EXPECTED_PACKAGE_ID || lock.runtime != EXPECTED_RUNTIME_ID {
+        return Err(fail(
+            "Hermes lock does not name the official Hermes package and runtime",
+        ));
     }
-    for (name, value) in [("commit", &lock.commit), ("tree", &lock.tree)] {
-        if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(fail(format!(
-                "Hermes lock {name} is not a full Git object id"
-            )));
-        }
+    if lock.verified_with.trim().is_empty() {
+        return Err(fail(
+            "Hermes lock does not record what verified the release",
+        ));
     }
-    if lock.release.is_empty()
-        || lock.tag.is_empty()
-        || lock.published.is_empty()
-        || lock.repository != "https://github.com/NousResearch/hermes-agent"
-    {
-        return Err(fail("Hermes release metadata is incomplete"));
-    }
-    if lock.runtime.program != "hermes"
-        || string_slice(&lock.runtime.fresh_argv) != EXPECTED_FRESH_ARGV
-        || string_slice(&lock.runtime.resume_argv) != EXPECTED_RESUME_ARGV
-        || lock.runtime.default_display_mode != "classic"
-        || string_slice(&lock.runtime.local_display_modes) != EXPECTED_DISPLAY_MODES
+    validate_upstream(&lock.upstream)?;
+    validate_supported_range(&lock.upstream.release, &lock.supported)?;
+    if lock.launch.program != "hermes"
+        || lock.launch.program != lock.upstream.binary
+        || string_slice(&lock.launch.fresh_argv) != EXPECTED_FRESH_ARGV
+        || string_slice(&lock.launch.resume_argv) != EXPECTED_RESUME_ARGV
+        || lock.launch.default_display_mode != "classic"
+        || string_slice(&lock.launch.local_display_modes) != EXPECTED_DISPLAY_MODES
     {
         return Err(fail("Hermes runtime command contract changed"));
+    }
+    let banner = lock
+        .upstream
+        .version_output
+        .replace(RELEASE_PLACEHOLDER, &lock.upstream.release);
+    if lock
+        .upstream
+        .version_output
+        .matches(RELEASE_PLACEHOLDER)
+        .count()
+        != 1
+        || !lock.cli_checks.iter().any(|check| {
+            check.id == VERSION_CHECK_ID && check.required_text.first() == Some(&banner)
+        })
+    {
+        return Err(fail(
+            "Hermes lock version_output does not render the banner its version check requires",
+        ));
     }
     if string_slice(&lock.golden_states) != GOLDEN_STATES {
         return Err(fail("Hermes golden-state inventory changed"));
@@ -1697,6 +1754,57 @@ fn validate_lock(lock: &Lock) -> Result<(), XtaskError> {
         return Err(fail("Hermes CLI check inventory is incomplete"));
     }
     validate_plugin_contract(&lock.plugin_contract)?;
+    Ok(())
+}
+
+/// Checks the pinned upstream provenance that `scripts/provision-hermes-compat`
+/// verifies before it installs anything.
+fn validate_upstream(upstream: &Upstream) -> Result<(), XtaskError> {
+    if upstream.kind != EXPECTED_UPSTREAM_KIND || upstream.provisioner != EXPECTED_PROVISIONER {
+        return Err(fail(
+            "Hermes lock does not select the repository Hermes provisioner",
+        ));
+    }
+    if upstream.source_archive.format != EXPECTED_SOURCE_FORMAT
+        || upstream.source_archive.sha256 != EXPECTED_SOURCE_SHA256
+    {
+        return Err(fail("Hermes source archive checksum contract changed"));
+    }
+    for (name, value) in [("commit", &upstream.commit), ("tree", &upstream.tree)] {
+        if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(fail(format!(
+                "Hermes lock {name} is not a full Git object id"
+            )));
+        }
+    }
+    if upstream.name.is_empty()
+        || upstream.release.is_empty()
+        || upstream.tag.is_empty()
+        || upstream.published.is_empty()
+        || upstream.repository != EXPECTED_REPOSITORY
+    {
+        return Err(fail("Hermes release metadata is incomplete"));
+    }
+    Ok(())
+}
+
+/// Requires the pinned release to lie in the lock's `[min, below)` range.
+fn validate_supported_range(release: &str, supported: &SupportedRange) -> Result<(), XtaskError> {
+    let parse = |field: &str, text: &str| {
+        semver::Version::parse(text).map_err(|error| {
+            fail(format!(
+                "Hermes lock {field} is not a semver release: {error}"
+            ))
+        })
+    };
+    let release = parse("upstream.release", release)?;
+    let min = parse("supported.min", &supported.min)?;
+    let below = parse("supported.below", &supported.below)?;
+    if release < min || release >= below {
+        return Err(fail(
+            "Hermes lock upstream.release lies outside its supported range",
+        ));
+    }
     Ok(())
 }
 
@@ -2257,7 +2365,7 @@ fn validate_golden_manifest(
     max_bytes: usize,
     allow_pending: bool,
 ) -> Result<(), XtaskError> {
-    if manifest.schema_version != GOLDEN_SCHEMA || manifest.release != lock.release {
+    if manifest.schema_version != GOLDEN_SCHEMA || manifest.release != lock.upstream.release {
         return Err(fail(
             "Hermes golden manifest does not match the pinned release",
         ));
@@ -2271,7 +2379,7 @@ fn validate_golden_manifest(
         return Err(fail("Hermes golden manifest state inventory is incomplete"));
     }
     for record in &manifest.records {
-        validate_golden_record(repo, &lock.release, record, max_bytes)?;
+        validate_golden_record(repo, &lock.upstream.release, record, max_bytes)?;
     }
     if !allow_pending {
         if let Some(record) = manifest
@@ -3593,7 +3701,7 @@ fn write_goldens(
         }
         let rendered = format!(
             "# Hermes PTY compatibility golden\nstate: {id}\nmode: {mode}\nrelease: {}\nterminal: {terminal}\nprocess: {disposition}\nassistant_panel: {panel_label}\n\n{}\n",
-            lock.release,
+            lock.upstream.release,
             evidence.trim_end()
         );
         if rendered.len() > limits.pty_output_bytes {
@@ -3625,7 +3733,7 @@ fn write_goldens(
     }
     let manifest = GoldenManifest {
         schema_version: GOLDEN_SCHEMA,
-        release: lock.release.clone(),
+        release: lock.upstream.release.clone(),
         records,
     };
     let mut manifest_json = serde_json::to_string_pretty(&manifest).map_err(|error| {
