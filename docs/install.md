@@ -199,7 +199,7 @@ pohunek-daemon-<version>-<target>/
 The same catalog and package archives are also published as separate release
 assets (`runtime-catalog.json`, `pohunek-runtime-<runtime>-<version>.tar.zst`).
 Every catalog entry pins its package to exactly the core version of its release
-(`core = "=<version>"`). Current releases list only the Linux glibc and musl
+(`core = "=<version>"`). Current releases list only the Linux x86_64 glibc and musl
 targets; the Apple Silicon archive carries the catalog and no package.
 
 1. Install or upgrade the daemon from this same archive with
@@ -235,8 +235,9 @@ catalog signature against its anchor, refuses a catalog older than the newest
 one it has accepted, and requires an entry that binds this package id, runtime
 id, version and digest for this core version and platform. The package is
 extracted into the owner-private package store and launches never read the
-archive again; keep the archive and catalog (or the release assets), because
-restoring a damaged installation needs the same files. The upstream agent itself is not part of the package: it
+archive again; keep the archive and catalog (or the release assets): restoring a damaged
+installation needs the same files, and an official archive can be restored only
+while the daemon still runs the release whose catalog authorized it. The upstream agent itself is not part of the package: it
 must be on the daemon's `PATH` in the range the package declares (see the
 [Pi](knowledge/guides/pi-package.md), [Codex](knowledge/guides/codex-package.md)
 and [Claude Code](knowledge/guides/claude-package.md) package guides), or the
@@ -251,14 +252,16 @@ from the built-in runtime at once:
   resumed or forked (`runtime_served_by_package`) until the package is disabled
   or uninstalled again;
 - a host agent profile on that base must be pinned to the package with
-  `pohunek plugin profile migrate <name>`; until then its launches fail with
-  `invalid_profile`.
+  `pohunek plugin profile migrate <name> --yes` (without `--yes` it only
+  previews the change); until then its launches fail with `invalid_profile`.
 
 To prepare first, install with `--no-enable` and run
 `pohunek plugin enable <package-id>` when you are ready to switch. `pohunek
 plugin disable` or `pohunek plugin uninstall` hands the id back to the built-in
 runtime. A daemon upgrade does not change installed packages; they keep
-serving until you install or update another version with `pohunek plugin`.
+serving until you run `pohunek plugin update <package> runtime/packages/<runtime>.tar.zst
+--catalog runtime/runtime-catalog.json` from the new release's archive. A plain
+`install` of another version leaves it installed but unselected.
 The trust model and the package classes are described
 in [the architecture](architecture.md#runtime-packages-and-trust) and the
 [runtime packages guide](knowledge/guides/runtime-packages.md).

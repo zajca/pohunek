@@ -38,8 +38,15 @@ JSON log under `~/.local/state/pohunek/logs/` (see the
    - `root missing`: the package files are gone but the record remains.
      Reinstall the same archive with the same trust (`--sha256 <digest>` or
      `--catalog <file>`); the daemon extracts it again and reports
-     `root_restored`. An uninstall without `--remove-modified` also clears the
-     record when nothing pins it.
+     `root_restored`. A `--catalog` reinstall restores the root only while the
+     daemon still runs the release whose catalog authorized the package and no
+     newer catalog has been accepted; otherwise it is refused with
+     `package_incompatible` or `package_untrusted`. In that case install the
+     current release's package with `pohunek plugin update <package>
+     runtime/packages/<runtime>.tar.zst --catalog runtime/runtime-catalog.json`,
+     then migrate the profiles and remove the sessions that pin the lost
+     digest. An uninstall without `--remove-modified` also clears the record
+     when nothing pins it.
    - `root modified` or `root unsafe`: content, a mode, an owner or a link
      count changed after install. Enable, select and uninstall fail with
      `package_root_invalid`, launches with `runtime_incompatible`, and
@@ -61,7 +68,8 @@ JSON log under `~/.local/state/pohunek/logs/` (see the
    - `unregistered root`: package files without a record, for example after an
      interrupted uninstall. Installing the same archive again adopts the root
      after verifying it.
-   - `pinned but not installed`: go to step 5.
+   - `pinned but not installed`: a session or host profile pins a digest that
+     is not installed; see sections 4 and 5.
    - `selection blocked by <digest>`: a session or profile still uses an
      incompatible version of the same package; see "Incompatible updates stay
      installed but unselected" in the runtime packages guide.
@@ -74,7 +82,7 @@ JSON log under `~/.local/state/pohunek/logs/` (see the
    profile pins the damaged digest. There is no in-place repair: sessions
    pinned to it fail to launch or resume with `runtime_incompatible`, and
    nothing falls back to another package. Remove each pinning session with
-   `pohunek session remove <id>`. For each pinning profile, either install
+   `pohunek session rm <id>`. For each pinning profile, either install
    another version of the package and pin the profile to it with
    `pohunek plugin profile migrate <name> --digest <digest> --yes`, or delete
    the profile's `package` and `digest` lines when no installed package serves
@@ -89,14 +97,16 @@ The install is refused before anything is recorded; the registry is unchanged.
   Recompute the digest of the file you have (`sha256sum`), compare it with the
   digest its publisher announced, and download the archive again on a
   mismatch. Never adjust `--sha256` to match a file you cannot vouch for.
-- `package_source_unreadable`: the archive or catalog path does not exist or is
-  not readable by the daemon's user.
+- `plugin_source_invalid`: the archive or catalog path does not exist or is not
+  a file; the CLI refuses it before contacting the daemon.
+- `package_source_unreadable`: the daemon cannot open the path as a regular
+  file, for example a symbolic link or a file its user cannot read.
 - `package_descriptor_invalid`: the archive is intact but its runtime
   descriptor is not a valid runtime definition for this daemon, for example an
   integration handler or hook schema this core does not provide.
 - `package_runtime_not_claimable`: a `--sha256` or `link` install claims
-  `shell`, `codex`, `claude` or `hermes`. Those ids are served only by an
-  official package installed with `--catalog`.
+  `shell`, `codex`, `claude` or `hermes`. `shell` is never claimable; the other
+  three are served only by an official package installed with `--catalog`.
 - `package_identity_installed`: the same package id and version are already
   installed from a different archive. Compare the digests with
   `pohunek plugin list`; do not replace an installed version with other bytes
@@ -139,8 +149,10 @@ The checks are in `crates/daemon/src/session/package_lifecycle/trust.rs` and
    the anchor, a signer outside its validity window or revoked, an expired
    catalog, a catalog older than the newest one this host has accepted, and a
    catalog with no entry binding this package id, runtime id, version and
-   digest. The daemon log names the cause in a `a package catalog was refused`
-   warning. Check that the catalog and the package archive come from the same
+   digest. Signature, signer validity, expiry and high-water refusals are
+   logged as an `a package catalog was refused` warning; a catalog without an
+   entry binding this package id, runtime id, version and digest is refused
+   without a log line. Check that the catalog and the package archive come from the same
    extracted release archive. Do not pair an archive with the catalog of
    another release, and never edit the catalog: its signature covers its
    canonical bytes.
@@ -169,7 +181,10 @@ pinned to the package never does.
   `runtime_not_installed`, and one whose pinned root fails verification fails
   with `runtime_incompatible`. Reinstall exactly the pinned archive (the
   digest is shown by `pohunek plugin doctor` as `pinned but not installed`);
-  a newer version does not stand in for it.
+  a newer version does not stand in for it. A `--catalog` reinstall of an
+  official archive succeeds only while the daemon still runs the release whose
+  catalog authorized it; after a daemon upgrade, migrate or remove what pins
+  the lost digest instead.
 - `runtime_served_by_package`: the session was launched from the built-in
   Codex or Claude runtime, and an official package serves that id now. Disable
   or uninstall the official package to resume it from the built-in, or start
