@@ -219,12 +219,17 @@ const RULES: &[Rule] = &[
     rule(
         Pattern::Dir("compat/codex"),
         Effect::Packages(&["pohunek-daemon", "pohunek-cli", "xtask"]),
-        "Codex subagent hook contract embedded by the daemon; compatibility lock and captured screens read by pohunek-cli's codex_package test; lock and npm project read by xtask's upstream staging scenarios",
+        "Codex subagent hook contract embedded by the daemon; compatibility lock read by the daemon's integration tests, whose fake agents report its pinned release to the package version probe; compatibility lock and captured screens read by pohunek-cli's codex_package test; lock and npm project read by xtask's upstream staging scenarios",
     ),
     rule(
         Pattern::Dir("compat/claude"),
         Effect::Packages(&["pohunek-daemon", "pohunek-cli", "xtask"]),
         "Claude Code subagent hook sequences embedded by the daemon's worker hook scenarios; compatibility lock and captured screens read by pohunek-cli's claude_package test; lock and npm project read by xtask's upstream staging scenarios",
+    ),
+    rule(
+        Pattern::File("compat/claude/compatibility-lock.json"),
+        Effect::Packages(&["pohunek-daemon"]),
+        "Claude Code compatibility lock whose pinned release the fake agents of the daemon's integration tests report to the package version probe",
     ),
     rule(
         Pattern::Dir("compat/codex/builtin-v0.34"),
@@ -254,12 +259,12 @@ const RULES: &[Rule] = &[
     rule(
         Pattern::Dir("runtime-packages/codex"),
         Effect::Packages(&["pohunek-daemon"]),
-        "Codex package descriptor and detection manifest embedded by the daemon's in-crate official package fixture",
+        "Codex package descriptor and detection manifest embedded by the daemon's in-crate official package fixture and built into the package its integration tests install",
     ),
     rule(
         Pattern::Dir("runtime-packages/claude"),
         Effect::Packages(&["pohunek-daemon"]),
-        "Claude Code package descriptor and detection manifest embedded by the daemon's in-crate official package fixture",
+        "Claude Code package descriptor and detection manifest embedded by the daemon's in-crate official package fixture and built into the package its integration tests install",
     ),
     reminding(
         Pattern::Dir("scripts"),
@@ -1038,7 +1043,7 @@ mod tests {
 
     #[test]
     fn embedded_paths_map_to_their_embedding_packages() {
-        let cases: [(&str, &[&str]); 19] = [
+        let cases: [(&str, &[&str]); 20] = [
             (
                 "docs/knowledge/guides/agent-skill.md",
                 &["pohunek-knowledge", "xtask"],
@@ -1063,6 +1068,10 @@ mod tests {
             (
                 "compat/claude/screens/idle.txt",
                 &["pohunek-daemon", "pohunek-cli", "xtask"],
+            ),
+            (
+                "compat/claude/compatibility-lock.json",
+                &["pohunek-cli", "pohunek-daemon", "xtask"],
             ),
             (
                 "compat/codex/builtin-v0.34/runtime.toml",

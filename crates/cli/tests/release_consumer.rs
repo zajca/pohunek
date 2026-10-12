@@ -23,8 +23,6 @@
 use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::wait::poll_until;
 
-#[path = "support/catalog_fixture.rs"]
-mod catalog_fixture;
 #[path = "support/messages_stub.rs"]
 mod messages_stub;
 #[path = "support/model_stub.rs"]

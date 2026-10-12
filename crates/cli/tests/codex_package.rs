@@ -46,8 +46,6 @@ use protocol::{
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
-#[path = "support/catalog_fixture.rs"]
-mod catalog_fixture;
 #[path = "support/native_reference_diagnostics.rs"]
 mod native_reference_diagnostics;
 #[path = "support/plugin_harness.rs"]
@@ -55,12 +53,12 @@ mod plugin_harness;
 #[path = "support/responses_stub.rs"]
 mod responses_stub;
 
-use catalog_fixture::{
+use native_reference_diagnostics::{NativeReferenceDiagnostics, MAX_EVENTS};
+use plugin_harness::{path_str, Harness};
+use pohunek_test_support::catalog::{
     attestations_for, catalog_of, host_platform, root_of, signed, test_key, ANY_CORE, RUNTIME_API,
     WINDOW_END, WINDOW_START,
 };
-use native_reference_diagnostics::{NativeReferenceDiagnostics, MAX_EVENTS};
-use plugin_harness::{path_str, Harness};
 use responses_stub::ResponsesStub;
 
 /// Directory of the package source, relative to the workspace root.

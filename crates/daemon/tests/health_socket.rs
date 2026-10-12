@@ -11,6 +11,8 @@
 // independent of the test host's processes whose markers cannot be read.
 #[path = "health_socket/native_recovery.rs"]
 mod native_recovery;
+#[path = "support/official_runtimes.rs"]
+mod official_runtimes;
 #[path = "../src/procwatch/readable_host.rs"]
 mod readable_host;
 mod support;
@@ -52,7 +54,9 @@ use pohunek_daemon::events::{spawn_drain, EventLog};
 use pohunek_daemon::governance::HostGovernanceService;
 use pohunek_daemon::notifications::NotificationService;
 use pohunek_daemon::procwatch::{HostInspector, ProcessInspector};
-use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
+use pohunek_daemon::runtime::{
+    EnvironmentSource, SubprocessWorkerEnvironment, SubprocessWorkerLauncher,
+};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 use pohunek_daemon::store::{ResumeBinding, Store, WorktreeBinding};
 use pohunek_paths::{
@@ -290,7 +294,15 @@ async fn integration_status_accepts_null_at_daemon_boundary() {
     pohunek_daemon::integration::install_codex(&codex).expect("install Codex fixture");
     let before = tree_snapshot(&xdg.home());
     let socket = temp_socket("integration-status-rpc");
-    let (shutdown, server) = spawn_server(&socket, "test").await;
+    // The daemon resolves provider homes from its own environment, which the
+    // guard above isolates.
+    let (shutdown, server, _) = spawn_server_serving_official_runtimes_in(
+        &socket,
+        "test",
+        support::hermetic_registry_config(),
+        EnvironmentSource::Process,
+    )
+    .await;
     let mut framed = connect(&socket).await;
     let request = Request::make(
         "integration-status",
@@ -357,7 +369,15 @@ async fn integration_uninstall_and_doctor_run_at_daemon_boundary() {
     pohunek_daemon::integration::install_claude(&claude).expect("install Claude fixture");
     pohunek_daemon::integration::install_codex(&codex).expect("install Codex fixture");
     let socket = temp_socket("integration-uninstall-doctor-rpc");
-    let (shutdown, server) = spawn_server(&socket, "test").await;
+    // The daemon resolves provider homes from its own environment, which the
+    // guard above isolates.
+    let (shutdown, server, _) = spawn_server_serving_official_runtimes_in(
+        &socket,
+        "test",
+        support::hermetic_registry_config(),
+        EnvironmentSource::Process,
+    )
+    .await;
     let mut framed = connect(&socket).await;
 
     let doctor = Request::make(
@@ -489,7 +509,16 @@ fn tree_snapshot(root: &Path) -> Vec<(PathBuf, u32, Vec<u8>)> {
 /// long as the registry runs.
 fn worker_backed_registry(
     socket: &std::path::Path,
+    config: SessionRegistryConfig,
+) -> (SessionRegistry, tempfile::TempDir) {
+    worker_backed_registry_in(socket, config, support::hermetic_environment_source())
+}
+
+/// [`worker_backed_registry`] whose agent children start from `environment`.
+fn worker_backed_registry_in(
+    socket: &std::path::Path,
     mut config: SessionRegistryConfig,
+    environment: EnvironmentSource,
 ) -> (SessionRegistry, tempfile::TempDir) {
     // Short, because the worker nests its control socket below it.
     let worker_home_dir =
@@ -510,7 +539,7 @@ fn worker_backed_registry(
     config.supervision = Some(
         worker_environment
             .supervision(worker_binary())
-            .with_environment_source(support::hermetic_environment_source()),
+            .with_environment_source(environment),
     );
     let launcher = Arc::new(SubprocessWorkerLauncher::new());
     let inspector = Arc::new(readable_host::ReadableHost::new());
@@ -539,6 +568,64 @@ async fn spawn_server_with_config(
 ) {
     let event_log_dir = config.event_log_dir.clone();
     let (registry, worker_home_dir) = worker_backed_registry(socket, config);
+    serve_registry(socket, version, event_log_dir, registry, worker_home_dir).await
+}
+
+/// [`spawn_server_with_config`] over a plugin root next to `socket` that holds
+/// the official Codex and Claude packages, installed through `package.install`
+/// with a catalog the registry's throwaway trust anchor authorizes.
+async fn spawn_server_serving_official_runtimes(
+    socket: &std::path::Path,
+    version: &str,
+    config: SessionRegistryConfig,
+) -> (
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+    std::path::PathBuf,
+) {
+    spawn_server_serving_official_runtimes_in(
+        socket,
+        version,
+        config,
+        support::hermetic_environment_source(),
+    )
+    .await
+}
+
+/// [`spawn_server_serving_official_runtimes`] whose agent children, and the
+/// provider homes the daemon resolves for them, start from `environment`.
+async fn spawn_server_serving_official_runtimes_in(
+    socket: &std::path::Path,
+    version: &str,
+    config: SessionRegistryConfig,
+    environment: EnvironmentSource,
+) -> (
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+    std::path::PathBuf,
+) {
+    let dir = socket.parent().expect("test socket has an isolated parent");
+    let catalog = official_runtimes::OfficialCatalog::new();
+    let config = catalog.configure(config, dir.join("plugins"));
+    let event_log_dir = config.event_log_dir.clone();
+    let (registry, worker_home_dir) = worker_backed_registry_in(socket, config, environment);
+    catalog.install(&registry, dir).await;
+    serve_registry(socket, version, event_log_dir, registry, worker_home_dir).await
+}
+
+/// Serves `registry` on `socket` with a notification inbox, and the event log
+/// at `event_log_dir` when one is configured.
+async fn serve_registry(
+    socket: &std::path::Path,
+    version: &str,
+    event_log_dir: Option<PathBuf>,
+    registry: SessionRegistry,
+    worker_home_dir: tempfile::TempDir,
+) -> (
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+    std::path::PathBuf,
+) {
     let worker_home = worker_home_dir.path().to_path_buf();
     let notifications = NotificationService::open(&notification_data_dir(socket))
         .expect("notification service opens");
@@ -1238,11 +1325,15 @@ async fn wait_for_notification_event(
 }
 
 /// Build a stub agent script that logs its argv and then idles.
-fn stub_agent_script(argv_log: &Path) -> String {
+/// A fake `runtime` agent that answers the official package's version probe,
+/// logs its arguments to `argv_log` and idles.
+fn stub_agent_script(runtime: &str, argv_log: &Path) -> String {
     format!(
         "#!/bin/sh\n\
+{version}\
 printf '%s\\n' \"$*\" >> '{argv}'\n\
 /bin/sleep 30\n",
+        version = official_runtimes::sh_version_answer(runtime),
         argv = argv_log.display(),
     )
 }
@@ -2368,6 +2459,7 @@ async fn initial_input_waits_for_reader(warning_first: bool, stale_mode_first: b
     let fake = agents_dir.join("reader.py");
     let fake_source = format!(
         r#"#!/usr/bin/python3
+{version}
 import os
 import select
 import socket
@@ -2413,6 +2505,7 @@ gate.sendall(b"f")
 while True:
     os.read(0, 1)
 "#,
+        version = official_runtimes::python_version_answer("claude"),
         reader_socket = reader_socket.display().to_string(),
         received = received.display().to_string(),
         warning_first = if warning_first { "True" } else { "False" },
@@ -2422,7 +2515,8 @@ while True:
     std::fs::write(
         agents_dir.join("readerclaude.toml"),
         format!(
-            "base = \"claude\"\nprogram = {}\n",
+            "base = \"claude\"\n{}program = {}\n",
+            official_runtimes::profile_pin("claude"),
             toml::Value::String(fake.display().to_string())
         ),
     )
@@ -2440,7 +2534,8 @@ while True:
         config_dir: Some(config_dir),
         ..support::hermetic_registry_config()
     };
-    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
 
     let mut client = connect(&socket).await;
     let mut params = session_params(&socket);
@@ -2610,6 +2705,7 @@ async fn default_sdk_client_waits_for_initial_input_without_reader_signal() {
         &fake,
         &format!(
             r#"#!/usr/bin/python3
+{version}
 import os
 import tty
 
@@ -2622,13 +2718,15 @@ with open({received:?}, "wb") as capture:
 while True:
     os.read(0, 1)
 "#,
+            version = official_runtimes::python_version_answer("claude"),
             received = received.display().to_string(),
         ),
     );
     std::fs::write(
         agents_dir.join("silentreader.toml"),
         format!(
-            "base = \"claude\"\nprogram = {}\n",
+            "base = \"claude\"\n{}program = {}\n",
+            official_runtimes::profile_pin("claude"),
             toml::Value::String(fake.display().to_string())
         ),
     )
@@ -2638,7 +2736,8 @@ while True:
         host_state_dir: Some(socket.dir.join("host-state")),
         ..support::hermetic_registry_config()
     };
-    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
     let mut client = pohunek_client::Client::connect_local(&socket.path)
         .await
         .expect("connect default SDK client");
@@ -2702,15 +2801,20 @@ async fn codex_stub_session_publishes_blocked_and_receives_bracketed_input() {
     write_executable(
         &bin_dir.join("codex"),
         &format!(
-            "#!/bin/sh\npwd > \"{}\"\n/bin/sleep 0.2\nprintf '\\033]2;Action Required\\007'\nIFS= read -r line\nprintf '%s' \"$line\" > \"{}\"\n/bin/sleep 30\n",
+            "#!/bin/sh\n{}pwd > \"{}\"\n/bin/sleep 0.2\nprintf '\\033]2;Action Required\\007'\nIFS= read -r line\nprintf '%s' \"$line\" > \"{}\"\n/bin/sleep 30\n",
+            official_runtimes::sh_version_answer("codex"),
             cwd_log.display(),
             input_log.display()
         ),
     );
 
     let socket = temp_socket("codex-stub");
-    let (shutdown, handle, _) =
-        spawn_server_with_config(&socket, "0.0.0", support::hermetic_registry_config()).await;
+    let (shutdown, handle, _) = spawn_server_serving_official_runtimes(
+        &socket,
+        "0.0.0",
+        support::hermetic_registry_config(),
+    )
+    .await;
 
     let mut subscriber = connect(&socket).await;
     let subscribe_req = Request::make("subscribe-codex-stub", method::SUBSCRIBE, Value::Null);
@@ -2769,14 +2873,19 @@ async fn claude_stub_session_publishes_screen_blocked_and_receives_plain_input()
     write_executable(
         &bin_dir.join("claude"),
         &format!(
-            "#!/bin/sh\n/bin/sleep 0.2\nprintf '\\033[2J\\033[HReview\\r\\n────\\r\\nenter to select\\r\\nesc to cancel\\r\\n↑/↓ to navigate\\r\\n'\nIFS= read -r line\nprintf '%s' \"$line\" > \"{}\"\n/bin/sleep 30\n",
+            "#!/bin/sh\n{}/bin/sleep 0.2\nprintf '\\033[2J\\033[HReview\\r\\n────\\r\\nenter to select\\r\\nesc to cancel\\r\\n↑/↓ to navigate\\r\\n'\nIFS= read -r line\nprintf '%s' \"$line\" > \"{}\"\n/bin/sleep 30\n",
+            official_runtimes::sh_version_answer("claude"),
             input_log.display()
         ),
     );
 
     let socket = temp_socket("claude-stub");
-    let (shutdown, handle, _) =
-        spawn_server_with_config(&socket, "0.0.0", support::hermetic_registry_config()).await;
+    let (shutdown, handle, _) = spawn_server_serving_official_runtimes(
+        &socket,
+        "0.0.0",
+        support::hermetic_registry_config(),
+    )
+    .await;
 
     let mut subscriber = connect(&socket).await;
     let subscribe_req = Request::make("subscribe-claude-stub", method::SUBSCRIBE, Value::Null);
@@ -2843,6 +2952,7 @@ async fn waited_input_with_host_submit_delay(
         &bin_dir.join(agent_name),
         &format!(
             r#"#!/usr/bin/python3
+{version}
 import os
 import tty
 
@@ -2860,6 +2970,7 @@ os.write(1, b"\x1b]2;Action Required\x07")
 while True:
     os.read(0, 1)
 "#,
+            version = official_runtimes::python_version_answer(agent_name),
             received = received.display().to_string(),
             ready = ready.display().to_string()
         ),
@@ -2872,7 +2983,8 @@ while True:
             delay,
         );
     }
-    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
     let mut control = connect(&socket).await;
     let created: SessionInfo = {
         let _path = PathGuard::prepend(&bin_dir);
@@ -3468,7 +3580,8 @@ async fn report_agent_api_records_active_agent_and_streams_report_state() {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
         ..SessionRegistryConfig::default()
     };
-    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
 
     let mut subscriber = connect(&socket).await;
     let subscribe_req = Request::make("subscribe-report-agent", method::SUBSCRIBE, Value::Null);
@@ -4196,7 +4309,10 @@ async fn worktree_session_persists_recovery_and_worktree_metadata() {
     let worktree_root = data_dir.join("worktrees");
     let argv_log_dir = temp_dir("wt-resume-argv");
     let argv_log = argv_log_dir.join("argv.log");
-    write_executable(&bin_dir.join(bin_name), &stub_agent_script(&argv_log));
+    write_executable(
+        &bin_dir.join(bin_name),
+        &stub_agent_script(bin_name, &argv_log),
+    );
 
     let socket = temp_socket("wt-resume");
     let config = SessionRegistryConfig {
@@ -4209,7 +4325,8 @@ async fn worktree_session_persists_recovery_and_worktree_metadata() {
     let _path = PathGuard::prepend(&bin_dir);
 
     // --- Create phase: report a native id after the session commit. ---
-    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
     let mut control = connect(&socket).await;
     let created: SessionInfo = serde_json::from_value(ok_payload(
         create_worktree_session(&mut control, agent, repo.cwd().to_path_buf(), "feat/x").await,

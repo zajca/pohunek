@@ -165,8 +165,9 @@ absence of egress), and the older folder-dialog wording the rule still names.
 - The daemon-backed tests install the built archive through `pohunek plugin
   install --catalog`, the way a host with a catalog trust anchor does: the test
   process generates a throwaway signing key, gives the daemon an anchor that
-  trusts it (`crates/cli/tests/support/catalog_fixture.rs`), and signs a catalog
-  entry binding the package id, the runtime id `codex` and the archive digest.
+  trusts it (`crates/test-support/src/catalog.rs`, feature `catalog`), and
+  signs a catalog entry binding the package id, the runtime id `codex` and the
+  archive digest.
   The key never leaves the process and no real key or catalog is involved. The
   package then serves `codex` with official trust, profiles carry its
   `package`/`digest` pin, and a launch runs the package's version probe on the

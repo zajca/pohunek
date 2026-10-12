@@ -33,6 +33,9 @@ const GENERATION: &str = "abcd2345";
 const SESSION: &str = "s-01KYAPVPFVHD56Z69B9CX3XWN2";
 /// Worker of the session.
 const WORKER: &str = "w-1";
+/// Built-in runtime with a hook-reported native identity, whose definition
+/// the daemon under test serves to verify the journaled identity.
+const IDENTITY_RUNTIME: &str = "hermes";
 
 struct Host {
     _temporary: tempfile::TempDir,
@@ -95,13 +98,14 @@ impl Host {
     }
 
     /// Like [`Self::seed_live_session`]; with `reported_identity` the session
-    /// is a `claude` agent whose worker journaled the active identity it reported.
+    /// is an agent of the built-in hook runtime [`IDENTITY_RUNTIME`] whose
+    /// worker journaled the active identity it reported.
     fn seed_session(&self, broken_record: bool, reported_identity: bool) {
         let executable = self.root.join("libexec/pohunek-sessiond");
         let mut info = session_info();
         if reported_identity {
-            "claude".clone_into(&mut info.agent);
-            info.agent_base = RuntimeRef::claude();
+            IDENTITY_RUNTIME.clone_into(&mut info.agent);
+            info.agent_base = RuntimeRef::hermes();
         }
         let record = SessionRecord {
             schema_version: pohunek_daemon::store::STORE_SCHEMA_VERSION,
@@ -165,7 +169,7 @@ impl Host {
                     .child
                     .clone()
                     .map(|process| pohunek_session_worker::ActiveIdentity {
-                        provider: "claude".to_owned(),
+                        provider: IDENTITY_RUNTIME.to_owned(),
                         process,
                         sequence: 1,
                         expires_at,
