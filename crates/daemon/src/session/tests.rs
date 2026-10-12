@@ -24,6 +24,9 @@ use protocol::{
     SubagentRevision, TerminalWatermark, MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES,
 };
 
+use crate::agent::host::fixture::{
+    compiled_in_host, official_host, official_launch_pin, official_manifest, pin_official_base,
+};
 use crate::agent::host::{
     DefinitionOrigin, DefinitionParts, LaunchProgram, RuntimeDefinition, RuntimeHost,
 };
@@ -1306,19 +1309,21 @@ async fn resume_refuses_a_runtime_it_cannot_resolve_or_whose_pin_does_not_match(
         profile_revision: None,
         native_launch_unresolved: false,
     };
-    let package_pin = LaunchPin::Pinned(Box::new(LaunchBinding {
-        runtime_id: RuntimeId::parse("claude").expect("runtime id"),
-        provenance: BindingProvenance::Package {
-            package: PackageIdentity {
-                id: PackageId::parse("acme.runtime").expect("package id"),
-                version: PackageVersion::parse("1.0.0").expect("version"),
+    let package_pin = |runtime: &str| {
+        LaunchPin::Pinned(Box::new(LaunchBinding {
+            runtime_id: RuntimeId::parse(runtime).expect("runtime id"),
+            provenance: BindingProvenance::Package {
+                package: PackageIdentity {
+                    id: PackageId::parse("acme.runtime").expect("package id"),
+                    version: PackageVersion::parse("1.0.0").expect("version"),
+                },
+                package_digest: PackageDigest::parse(
+                    "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+                )
+                .expect("digest"),
             },
-            package_digest: PackageDigest::parse(
-                "sha256:4444444444444444444444444444444444444444444444444444444444444444",
-            )
-            .expect("digest"),
-        },
-    }));
+        }))
+    };
     let cases = [
         // Not installed, with and without a recorded pin.
         (
@@ -1328,7 +1333,7 @@ async fn resume_refuses_a_runtime_it_cannot_resolve_or_whose_pin_does_not_match(
         ),
         (
             RuntimeRef::from_wire("acme"),
-            package_pin.clone(),
+            package_pin("acme"),
             "runtime_not_installed",
         ),
         // Outside the runtime-id grammar.
@@ -1338,12 +1343,28 @@ async fn resume_refuses_a_runtime_it_cannot_resolve_or_whose_pin_does_not_match(
             "agent_kind_unsupported",
         ),
         // Resolves, but a package pin cannot be served by the built-in.
-        (RuntimeRef::claude(), package_pin, "runtime_not_installed"),
+        (
+            RuntimeRef::hermes(),
+            package_pin(RuntimeId::HERMES),
+            "runtime_not_installed",
+        ),
+        // Resolves, but neither another package's pin nor an unpinned line
+        // (launched from a built-in) is served by the official package.
+        (
+            RuntimeRef::claude(),
+            package_pin(RuntimeId::CLAUDE),
+            "runtime_not_installed",
+        ),
+        (
+            RuntimeRef::claude(),
+            LaunchPin::Unpinned,
+            "runtime_served_by_package",
+        ),
         // Resolves and the pin matches (unpinned lines resume through a
         // built-in); the binding is then refused only for lacking a native
         // launch spec, which is checked after the runtime.
         (
-            RuntimeRef::claude(),
+            RuntimeRef::hermes(),
             LaunchPin::Unpinned,
             "agent_not_resumable",
         ),
@@ -1476,8 +1497,10 @@ pub(super) fn complete_lines(text: &str) -> std::str::Lines<'_> {
     text[..text.rfind('\n').map_or(0, |end| end + 1)].lines()
 }
 
+/// Writes an executable at `path` that answers the Hermes version probe as a
+/// supported release and otherwise runs `launch_body`.
 #[cfg(unix)]
-fn write_supported_hermes_executable(path: &std::path::Path, launch_body: &str) {
+pub(super) fn write_supported_hermes_executable(path: &std::path::Path, launch_body: &str) {
     write_executable(
         path,
         &format!(
@@ -2334,7 +2357,7 @@ async fn foreground_replacement_replaces_hook_identity_and_detector() {
     assert_eq!(replaced.state_source, StateSource::Process);
     assert_eq!(
         replacement_detector.borrow().config.detection,
-        DetectorConfig::for_agent(&RuntimeHost::default(), &RuntimeRef::claude()).detection
+        DetectorConfig::for_agent(&official_host(), &RuntimeRef::claude()).detection
     );
 
     let _ = registry.stop(&created.id).await;
@@ -5114,7 +5137,7 @@ fn delayed_submit_input_frame_splits_text_and_submit() {
 
 #[test]
 fn hermes_multiline_input_is_one_bracketed_paste_then_separate_submit() {
-    let rules = builtin_input_rules(&RuntimeRef::hermes(), &SessionRegistryConfig::default());
+    let rules = served_input_rules(&RuntimeRef::hermes(), &SessionRegistryConfig::default());
     let writes = super::build_input_writes("first line\nsecond line", rules)
         .expect("Hermes multiline safe text");
 
@@ -5127,7 +5150,7 @@ fn hermes_multiline_input_is_one_bracketed_paste_then_separate_submit() {
 
 #[test]
 fn hermes_input_rejects_terminal_controls_without_mutating_text() {
-    let rules = builtin_input_rules(&RuntimeRef::hermes(), &SessionRegistryConfig::default());
+    let rules = served_input_rules(&RuntimeRef::hermes(), &SessionRegistryConfig::default());
     for unsafe_text in [
         "prompt\u{1b}[201~\rsubmit",
         "prompt\0suffix",
@@ -5148,7 +5171,7 @@ fn hermes_input_rejects_terminal_controls_without_mutating_text() {
 
 #[test]
 fn hermes_input_enforces_shared_byte_ceiling() {
-    let rules = builtin_input_rules(&RuntimeRef::hermes(), &SessionRegistryConfig::default());
+    let rules = served_input_rules(&RuntimeRef::hermes(), &SessionRegistryConfig::default());
     let at_limit = "x".repeat(protocol::MAX_SESSION_INPUT_BYTES);
     super::build_input_writes(&at_limit, rules).expect("Hermes input at the ceiling is accepted");
 
@@ -5160,7 +5183,7 @@ fn hermes_input_enforces_shared_byte_ceiling() {
 
 #[test]
 fn codex_input_control_behavior_is_unchanged() {
-    let rules = builtin_input_rules(&RuntimeRef::codex(), &SessionRegistryConfig::default());
+    let rules = served_input_rules(&RuntimeRef::codex(), &SessionRegistryConfig::default());
     let text = "prompt\u{1b}[201~\rsubmit";
     let writes = super::build_input_writes(text, rules).expect("Codex remains unrestricted");
 
@@ -5172,7 +5195,7 @@ fn codex_input_control_behavior_is_unchanged() {
 
 #[test]
 fn hermes_programmatic_input_fails_closed_while_blocked() {
-    let hermes = builtin_input_rules(&RuntimeRef::hermes(), &SessionRegistryConfig::default());
+    let hermes = served_input_rules(&RuntimeRef::hermes(), &SessionRegistryConfig::default());
     let error = hermes
         .validate_activity(Some(AgentActivity::Blocked))
         .expect_err("Hermes input must be denied while approval is visible");
@@ -5182,7 +5205,7 @@ fn hermes_programmatic_input_fails_closed_while_blocked() {
     hermes
         .validate_activity(Some(AgentActivity::Idle))
         .expect("Hermes input is allowed after approval clears");
-    let codex = builtin_input_rules(&RuntimeRef::codex(), &SessionRegistryConfig::default());
+    let codex = served_input_rules(&RuntimeRef::codex(), &SessionRegistryConfig::default());
     codex
         .validate_activity(Some(AgentActivity::Blocked))
         .expect("Codex blocked-input behavior remains unchanged");
@@ -5434,7 +5457,7 @@ async fn session_input_wait_rejects_delayed_provider_framing_before_delivery() {
     );
     std::fs::write(
         agents_dir.join("input-wait-claude.toml"),
-        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n",
+        pin_official_base("base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n"),
     )
     .expect("write Claude profile");
     let registry = SessionRegistry::new(SessionRegistryConfig {
@@ -5486,7 +5509,7 @@ async fn session_input_wait_rejects_blocked_transition_during_gate_for_all_adapt
     );
     std::fs::write(
         agents_dir.join("input-wait-gate-claude.toml"),
-        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n",
+        pin_official_base("base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n"),
     )
     .expect("write Claude profile");
     let registry = SessionRegistry::new(SessionRegistryConfig {
@@ -8187,10 +8210,12 @@ fn initial_input_is_a_prompt_argument_only_for_bare_codex_and_claude() {
     let agents_dir = temp_dir("profile-initial-prompt-agents");
     fs::write(
         agents_dir.join("wrapped-codex.toml"),
-        "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n",
+        pin_official_base(
+            "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n",
+        ),
     )
     .expect("write profile");
-    let profiles = crate::agent::ProfileRegistry::new(Some(agents_dir));
+    let profiles = crate::agent::ProfileRegistry::with_runtimes(Some(agents_dir), official_host());
     let input = "# Pohunek Assistant\nsecond line";
     let shell_args: &[&str] = &["-c", "sleep 30"];
 
@@ -9439,7 +9464,7 @@ async fn procwatch_refreshes_agent_base_when_pid_is_reused() {
         assert_eq!(observed.agent_base, RuntimeRef::codex());
         assert_eq!(
             format!("{:?}", observed.definition.0.manifest()),
-            format!("{:?}", crate::detect::codex_manifest())
+            format!("{:?}", official_manifest(RuntimeId::CODEX))
         );
         observed.first_seen
     };
@@ -9467,7 +9492,7 @@ async fn procwatch_refreshes_agent_base_when_pid_is_reused() {
         assert_eq!(observed.agent_base, RuntimeRef::claude());
         assert_eq!(
             format!("{:?}", observed.definition.0.manifest()),
-            format!("{:?}", crate::detect::claude_manifest()),
+            format!("{:?}", official_manifest(RuntimeId::CLAUDE)),
             "the replacement is detected with its own manifest"
         );
         assert_eq!(observed.start_identity, u64::from(PID_REUSE_AGENT_PID) + 1);
@@ -11440,13 +11465,16 @@ async fn report_native_id_rejects_stale_expired_and_mismatched_claims() {
 }
 
 /// Create a temp `agents/` dir holding one profile file; return the dir path.
+/// A Codex or Claude base is bound to its official fixture package
+/// ([`pin_official_base`]).
 fn temp_agents_dir_with(tag: &str, name: &str, body: &str) -> PathBuf {
     let dir = temp_store_path(tag)
         .parent()
         .expect("store parent")
         .join("agents");
     std::fs::create_dir_all(&dir).expect("create agents dir");
-    std::fs::write(dir.join(format!("{name}.toml")), body).expect("write profile");
+    std::fs::write(dir.join(format!("{name}.toml")), pin_official_base(body))
+        .expect("write profile");
     dir
 }
 
@@ -11948,7 +11976,7 @@ async fn non_resumable_profile_binding_reports_agent_not_resumable() {
         args: Vec::new(),
         input_rules: crate::store::StoredInputRules::default(),
         native_launch: None,
-        launch_binding: crate::agent::host::LaunchPin::Unpinned,
+        launch_binding: official_launch_pin(RuntimeId::CODEX),
         native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
         profile_revision: None,
         native_launch_unresolved: false,
@@ -12828,9 +12856,9 @@ async fn set_metadata_after_capture_updates_persisted_binding() {
 async fn resume_binding_restores_metadata_from_store() {
     let store_path = temp_store_path("resume-metadata");
     let expected = metadata(&[("owner", "daemon"), ("ticket", "DMD-1356")]);
-    // The legacy-style binding names a Claude transcript its recovery
-    // preflight verifies in the descriptor-declared config home, which the
-    // fixture provides through the registry's launch environment.
+    // The binding names a Claude transcript its recovery preflight verifies
+    // in the descriptor-declared config home, which the fixture provides
+    // through the registry's launch environment.
     let claude_home = temp_dir("resume-metadata-claude");
     write_claude_transcript(&claude_home, "native-metadata");
     #[cfg(unix)]
@@ -12866,7 +12894,7 @@ async fn resume_binding_restores_metadata_from_store() {
             args: vec!["-c".to_owned(), "sleep 30".to_owned()],
             input_rules: crate::store::StoredInputRules::default(),
             native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
-            launch_binding: crate::agent::host::LaunchPin::Unpinned,
+            launch_binding: official_launch_pin(RuntimeId::CLAUDE),
             native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
             profile_revision: None,
             native_launch_unresolved: false,
@@ -13001,11 +13029,11 @@ async fn resume_after_profile_edit_and_resize_uses_original_snapshot() {
     fs::write(&marker_v1, "").expect("clear v1 marker");
     fs::write(
         agents_dir.join("editable.toml"),
-        format!(
+        pin_official_base(&format!(
             "base = \"claude\"\nprogram = \"{}\"\nargs = [\"--model\", \"opus\"]\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
             script_v2.display(),
             claude_home.display()
-        ),
+        )),
     )
     .expect("edit profile");
 
@@ -13276,9 +13304,10 @@ async fn report_native_id_ignores_unknown_invalid_and_terminal() {
     assert!(!terminal.recorded);
 }
 
-/// Input rules of a built-in runtime resolved through a default host.
-fn builtin_input_rules(agent: &RuntimeRef, config: &SessionRegistryConfig) -> InputRules {
-    super::input_rules_for_agent(&RuntimeHost::default(), agent, config)
+/// Input rules of a runtime resolved through the official fixture host, so
+/// Codex and Claude come from their official packages.
+fn served_input_rules(agent: &RuntimeRef, config: &SessionRegistryConfig) -> InputRules {
+    super::input_rules_for_agent(&official_host(), agent, config)
 }
 
 /// A submit-delay override map holding one runtime.
@@ -13336,9 +13365,9 @@ fn submit_delay_override_applies_to_the_configured_runtime_id() {
     assert!(rules.bracketed_paste);
     assert_eq!(rules.submit_delay, Duration::from_millis(40));
 
-    // The built-in Claude runtime allows the override and types without
+    // The Claude runtime package allows the override and types without
     // bracketed paste.
-    let claude = builtin_input_rules(
+    let claude = served_input_rules(
         &RuntimeRef::claude(),
         &SessionRegistryConfig {
             submit_delay_overrides: submit_delay_override("claude", Duration::from_millis(75)),
@@ -13366,7 +13395,7 @@ fn submit_delay_override_is_ignored_unless_the_definition_allows_it() {
     };
 
     let acme = super::input::input_rules_for_definition(&acme_definition(false, false), &config);
-    let codex = builtin_input_rules(&RuntimeRef::codex(), &config);
+    let codex = served_input_rules(&RuntimeRef::codex(), &config);
 
     assert_eq!(acme.submit_delay, Duration::from_millis(150));
     assert_eq!(codex.submit_delay, Duration::from_millis(150));
@@ -13376,7 +13405,7 @@ fn submit_delay_override_is_ignored_unless_the_definition_allows_it() {
 fn submit_delay_without_an_override_is_the_descriptor_value() {
     let config = SessionRegistryConfig::default();
 
-    let rules = builtin_input_rules(&RuntimeRef::claude(), &config);
+    let rules = served_input_rules(&RuntimeRef::claude(), &config);
     let other_runtime_override = SessionRegistryConfig {
         submit_delay_overrides: submit_delay_override("acme", Duration::ZERO),
         ..SessionRegistryConfig::default()
@@ -13384,7 +13413,7 @@ fn submit_delay_without_an_override_is_the_descriptor_value() {
 
     assert_eq!(rules.submit_delay, Duration::from_millis(150));
     assert_eq!(
-        builtin_input_rules(&RuntimeRef::claude(), &other_runtime_override).submit_delay,
+        served_input_rules(&RuntimeRef::claude(), &other_runtime_override).submit_delay,
         Duration::from_millis(150)
     );
 }
@@ -14997,8 +15026,11 @@ fn scripted_registry(
         supervisor = supervisor.recording_store(store);
     }
     let supervisor = Arc::new(supervisor);
-    let registry = SessionRegistry::new_with_launcher_and_inspector(
+    let registry = SessionRegistry::new_with_runtimes_and_launcher(
         config,
+        crate::agent::host::fixture::official_host_over(
+            &crate::agent::host::BuiltinSource::from_host_environment(),
+        ),
         Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>,
         Arc::new(ReadableHost::new()),
     );
@@ -18681,9 +18713,12 @@ async fn migrated_legacy_bindings_resume_and_fork_with_the_native_argv() {
     }
 }
 
-/// The registry a migrated binding resumes and forks through: the Claude case
-/// clears the recovery transcript preflight against a fixture config home the
-/// registry declares, because the legacy binding names a Claude transcript.
+/// The registry a migrated binding resumes and forks through. A migrated
+/// binding is unpinned, so it resumes only through a built-in runtime: the
+/// registry serves Codex and Claude as built-ins ([`compiled_in_host`]), as
+/// the daemon that wrote the binding did. The Claude case clears the recovery
+/// transcript preflight against a fixture config home the registry declares,
+/// because the legacy binding names a Claude transcript.
 #[cfg(unix)]
 fn migrated_agent_registry(
     tag: &str,
@@ -18691,18 +18726,22 @@ fn migrated_agent_registry(
     store_path: std::path::PathBuf,
 ) -> SessionRegistry {
     if case.agent != "claude" {
-        return SessionRegistry::new(SessionRegistryConfig {
-            shell_command: hermetic_shell(),
-            stop_grace: Duration::from_millis(50),
-            store_path: Some(store_path),
-            ..SessionRegistryConfig::default()
-        });
+        return SessionRegistry::new_with_runtimes(
+            SessionRegistryConfig {
+                shell_command: hermetic_shell(),
+                stop_grace: Duration::from_millis(50),
+                store_path: Some(store_path),
+                ..SessionRegistryConfig::default()
+            },
+            compiled_in_host(),
+        );
     }
     // The legacy binding carries its own frozen program, so the empty fixture
     // agents dir only serves host-profile resolution.
     let claude_dir = temp_dir(&format!("{tag}-claude-home"));
     write_claude_transcript(&claude_dir, "native-legacy");
-    claude_home_registry(
+    claude_home_registry_over(
+        compiled_in_host(),
         &claude_dir,
         temp_dir(&format!("{tag}-agents")),
         Some(store_path),
@@ -18843,8 +18882,9 @@ fn adapter_script(dir: &std::path::Path, public_only: bool) -> (PathBuf, PathBuf
     (script, done)
 }
 
-/// A session registry over `host` (the built-in runtimes when `None`) with a
-/// real control server on the daemon socket the session hooks fall back to.
+/// A session registry over `host` (the default test host of
+/// [`SessionRegistry::new`] when `None`) with a real control server on the
+/// daemon socket the session hooks fall back to.
 #[cfg(unix)]
 struct HookRig {
     registry: SessionRegistry,
@@ -19340,6 +19380,17 @@ fn claude_home_registry(
     agents_dir: PathBuf,
     store_path: Option<PathBuf>,
 ) -> SessionRegistry {
+    claude_home_registry_over(official_host(), claude_dir, agents_dir, store_path)
+}
+
+/// [`claude_home_registry`] serving the runtimes of `host`.
+#[cfg(unix)]
+fn claude_home_registry_over(
+    host: RuntimeHost,
+    claude_dir: &std::path::Path,
+    agents_dir: PathBuf,
+    store_path: Option<PathBuf>,
+) -> SessionRegistry {
     let crate::runtime::EnvironmentSource::Fixed(mut variables) =
         crate::test_support::thread_environment_source()
     else {
@@ -19360,7 +19411,7 @@ fn claude_home_registry(
             socket_path: Some(PathBuf::from("/run/pohunek/d.sock")),
             ..SessionRegistryConfig::default()
         },
-        crate::agent::host::fixture::builtin_host(),
+        host,
         crate::runtime::EnvironmentSource::Fixed(variables),
         allowlist,
     )

@@ -26,7 +26,7 @@ use super::{
     observed_roots, start_transcript_index_with, ExternalSessions, LaunchHomeRoots, SkippedHome,
     TranscriptRoot, WatcherHandle,
 };
-use crate::agent::host::fixture::builtin_host;
+use crate::agent::host::fixture::{install_official_packages, official_host, pin_official_base};
 use crate::agent::host::TranscriptParser;
 use crate::agent::host::{BuiltinSource, PackageSource, PackageStore, RuntimeHost};
 use crate::agent::ProfileRegistry;
@@ -55,14 +55,16 @@ impl Rig {
     /// A rig whose daemon environment holds `daemon_env` on top of `HOME`;
     /// only what the default allowlist forwards reaches the launch base.
     fn with_daemon_env(daemon_env: &[(&str, &Path)]) -> Self {
-        Self::build(daemon_env, |_root| builtin_host())
+        Self::build(daemon_env, |_root| official_host())
     }
 
-    /// A rig whose host serves the built-ins and the packages `install` puts
-    /// into the plugin root it is given.
+    /// A rig whose host serves the built-ins, the official Codex and Claude
+    /// packages and the packages `install` puts into the plugin root it is
+    /// given.
     fn with_packages(install: impl FnOnce(&Path)) -> Self {
         Self::build(&[], |root| {
             let plugins = root.join("plugins");
+            install_official_packages(&plugins);
             install(&plugins);
             RuntimeHost::with_packages(
                 BuiltinSource::new("/bin/sh"),
@@ -109,10 +111,10 @@ impl Rig {
     fn profile(&self, name: &str, base: &str, variable: &str, home: &Path) {
         fs::write(
             self.root.join("agents").join(format!("{name}.toml")),
-            format!(
+            pin_official_base(&format!(
                 "base = \"{base}\"\n[env]\n{variable} = \"{}\"\n",
                 home.display()
-            ),
+            )),
         )
         .expect("write a profile");
     }
@@ -252,7 +254,7 @@ fn a_profile_without_a_transcript_tree_or_a_resolvable_home_is_skipped() {
     rig.claude_profile("fresh", &fresh);
     fs::write(
         rig.root.join("agents/tilde.toml"),
-        "base = \"claude\"\n[env]\nCLAUDE_CONFIG_DIR = \"~/accounts/work\"\n",
+        pin_official_base("base = \"claude\"\n[env]\nCLAUDE_CONFIG_DIR = \"~/accounts/work\"\n"),
     )
     .expect("write a profile");
 
@@ -336,7 +338,7 @@ async fn the_registry_provider_resolves_homes_from_its_own_launch_environment() 
             agents_dir: Some(rig.root.join("agents")),
             ..SessionRegistryConfig::default()
         },
-        builtin_host(),
+        official_host(),
         EnvironmentSource::fixed([
             (OsString::from("HOME"), rig.home().into_os_string()),
             (
@@ -836,8 +838,9 @@ fn install_acme_version(
     digest
 }
 
-/// The roots of a host with only the built-in runtimes and no profiles.
-fn builtin_roots(rig: &Rig) -> BTreeSet<(String, PathBuf)> {
+/// The roots of the official Codex and Claude runtimes on a host without
+/// profiles.
+fn official_roots(rig: &Rig) -> BTreeSet<(String, PathBuf)> {
     BTreeSet::from([
         root(&RuntimeRef::claude(), rig.home().join(".claude/projects")),
         root(&RuntimeRef::codex(), rig.home().join(".codex/sessions")),
@@ -874,7 +877,7 @@ async fn a_runtime_without_a_transcript_declaration_is_observed_without_a_root()
         declared.home.as_ref().expect("the home resolves").dir,
         rig.home().join(".acme")
     );
-    assert_eq!(pairs(&rig.roots()), builtin_roots(&rig));
+    assert_eq!(pairs(&rig.roots()), official_roots(&rig));
     assert!(rig.skipped().is_empty(), "{:?}", rig.skipped());
 
     let watched = Watched::start(&rig).await;
@@ -909,7 +912,7 @@ async fn a_package_runtime_is_observed_below_the_transcript_dir_it_declares() {
     let outside = rig.home().join(".acme/sessions/p/s.jsonl");
     write_transcript(&outside, "acme-outside");
 
-    let mut expected = builtin_roots(&rig);
+    let mut expected = official_roots(&rig);
     expected.insert(root(&acme, tree));
     assert_eq!(pairs(&rig.roots()), expected);
 
@@ -1027,7 +1030,7 @@ fn a_profile_pinned_to_another_version_observes_the_tree_that_version_declares()
 
     let roots = rig.roots();
 
-    let mut expected = builtin_roots(&rig);
+    let mut expected = official_roots(&rig);
     expected.insert(root(&acme, home.join("chats")));
     expected.insert(root(&acme, home.join("logs/chats")));
     assert_eq!(pairs(&roots), expected);

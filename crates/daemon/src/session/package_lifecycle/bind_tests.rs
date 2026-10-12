@@ -1,7 +1,7 @@
 //! Behavioural tests of `package.bind_profile` over a real plugin root, real
 //! archives, a real agents directory and a real session registry.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt as _, PermissionsExt as _};
@@ -13,7 +13,6 @@ use protocol::{
 };
 
 use super::test_fixture::{explicit, Fixture, Package, INERT_PROGRAM, PACKAGE, RUNTIME};
-use crate::agent::host::RESERVED_RUNTIME_IDS;
 
 /// Program of the second fixture version.
 const SECOND_PROGRAM: &str = "/bin/true";
@@ -234,9 +233,9 @@ async fn a_builtin_base_is_refused() {
     let fixture = Fixture::new("bind-builtin");
     let package = Package::pi();
     install(&fixture, &package).await;
-    let mut bases = vec![protocol::RuntimeId::SHELL];
-    bases.extend(RESERVED_RUNTIME_IDS);
-    for base in bases {
+    // Shell and Hermes stay built in whether or not the binary embeds Codex
+    // and Claude.
+    for base in [protocol::RuntimeId::SHELL, protocol::RuntimeId::HERMES] {
         let text = format!("base = \"{base}\"\n");
         let path = fixture.write_profile(PROFILE, &text);
         for digest in [None, Some(&package.digest)] {

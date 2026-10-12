@@ -1481,8 +1481,10 @@ impl SessionRegistry {
         }
     }
 
-    /// Creates a unit-test registry over in-process workers, optionally
-    /// serving `runtimes` instead of the built-in runtime set.
+    /// Creates a unit-test registry over in-process workers serving
+    /// `runtimes`, or by default the host's built-in runtimes with Codex and
+    /// Claude served by their official packages
+    /// ([`host::fixture::official_host_over`]).
     #[cfg(test)]
     fn new_for_test(
         config: SessionRegistryConfig,
@@ -1507,7 +1509,10 @@ impl SessionRegistry {
             runtime_root,
             state_root,
         ));
-        let registry = Self::build(config, Some(launcher), inspector, runtimes);
+        let runtimes = runtimes.unwrap_or_else(|| {
+            host::fixture::official_host_over(&host::BuiltinSource::from_host_environment())
+        });
+        let registry = Self::build(config, Some(launcher), inspector, Some(runtimes));
         *registry
             .inner
             .test_dirs
@@ -1516,8 +1521,8 @@ impl SessionRegistry {
         registry
     }
 
-    /// Creates a unit-test registry that serves `runtimes` (for example a
-    /// non-built-in definition) next to or instead of the built-in set.
+    /// Creates a unit-test registry that serves exactly the runtimes of
+    /// `runtimes`.
     #[cfg(test)]
     pub(crate) fn new_with_runtimes(config: SessionRegistryConfig, runtimes: RuntimeHost) -> Self {
         Self::new_for_test(
