@@ -309,6 +309,10 @@ UV_CACHE_DIR="$uv_cache_root" \
   UV_PYTHON_DOWNLOADS=never \
   UV_PROJECT_ENVIRONMENT="$venv_root" \
   uv sync --extra all --frozen --project "$source_root" >&2
+# The cache is only an install-time input: the environment holds its own
+# copies or hard links, and the cache's absolute links would leave a
+# verified stage.
+rm -rf -- "$uv_cache_root"
 
 # Symlink-free install root, so the containment check below also holds when the
 # caller's path crosses a symlink (macOS /var -> /private/var).
