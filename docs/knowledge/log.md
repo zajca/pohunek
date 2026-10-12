@@ -32,19 +32,24 @@
   sends nothing for a `Stop` with a non-empty `agent_id` or a missing, invalid
   or over-256-entry list. `identity-subagent-v1` admits the snapshot.
 - The worker reconciles the rows of the same reporting process with an older
-  sequence: a listed running row stays `running` and its journaled sequence
-  advances to the snapshot's, so a delayed older stop cannot complete it; a
-  running row listed earlier in its run and missing from the snapshot is
-  `completed`, a never-listed running row is `completed` only when
-  no task that can host an unlisted agent (any type except `shell`, `monitor`
-  and `MCP task`) is listed, and a listed terminal row is reopened within the
-  running-child limit. It logs `worker.subagent.reconciled` (`snapshot_absent`,
-  `snapshot_listed`) and `worker.subagent.snapshot.applied` with the task
-  count `tasks`, the `hosts` flag and the row counts `listed` (running rows the
-  snapshot kept), `terminalized`, `reopened` and `deferred`. A stopping agent
-  Claude still lists, or an agent started just before a listing built without
-  it, settles at the next main-turn end.
-  Codex has no snapshot (#916).
+  sequence and settles only rows whose end the snapshot proves: a running row
+  missing from the snapshot whose newest listing by the reporter falls within
+  its run and is older than the snapshot is `completed`, and any other missing
+  running row is `completed` only when no task that can host an unlisted agent
+  (any type except `shell`, `monitor` and `MCP task`) is listed and the
+  reporter's newest snapshot is older than this one and newer than the row,
+  because Claude builds the listing before the hook reads its clock. Only that
+  newest evidence is kept, so a snapshot older than it, delivered out of
+  order, settles nothing from it. A listed row,
+  running or terminal, is left unchanged, so a fast agent's own stop completes
+  it and a self-woken agent reopens through its own start; a completed row keeps its
+  own sequence, so a resume start ordered before the snapshot still reopens
+  it. It logs `worker.subagent.reconciled` (`snapshot_absent`) and
+  `worker.subagent.snapshot.applied` with the task count `tasks`, the `hosts`
+  flag and the row counts `listed`, `terminalized` and `deferred`. A
+  never-listed row settles at the earliest at the second main-turn end after
+  its start; a row whose reporter never ends another main turn stays
+  `running` until the runtime ends (`lost`). Codex has no snapshot (#916).
 - The sequence contract names the clock the Codex and Claude hooks read:
   `time.clock_gettime_ns(time.CLOCK_MONOTONIC)`, system-wide, because
   `time.monotonic_ns()` is defined only within one process.

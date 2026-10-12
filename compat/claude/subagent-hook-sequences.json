@@ -163,14 +163,19 @@
     },
     "never_listed_agent_with_only_shells": {
       "recording": "R4",
-      "description": "A subagent whose stop never reached the worker is never listed, and the main Stop lists only a background shell. A shell runs no agent, so no live task can hold an unlisted subagent, and the subagent settles as completed.",
+      "description": "A subagent whose stop never reached the worker is never listed, and each main Stop lists only a background shell. A shell runs no agent, so no live task can hold an unlisted subagent. Claude builds a Stop listing before the hook reads its clock (S4: real Claude 2.1.289 and 2.1.296), so only an earlier main Stop of the same agent proves the subagent had started before a listing was built: the first Stop leaves it running, and the next one settles it as completed.",
       "events": [
         {"hook_event_name": "SubagentStart", "agent_id": "a2e5b8d1f4c7a0e3b", "agent_type": "general-purpose"},
+        {"hook_event_name": "Stop", "background_tasks": [{"id": "b7t1y5u9i", "type": "shell", "status": "running", "description": "Watch the build", "command": "cargo build --workspace 2>&1 | tail -n 40"}]},
         {"hook_event_name": "Stop", "background_tasks": [{"id": "b7t1y5u9i", "type": "shell", "status": "running", "description": "Watch the build", "command": "cargo build --workspace 2>&1 | tail -n 40"}]}
       ],
       "checkpoints": [
         {
           "after_events": 1,
+          "rows": [{"agent_id": "a2e5b8d1f4c7a0e3b", "lifecycle": "running"}]
+        },
+        {
+          "after_events": 2,
           "rows": [{"agent_id": "a2e5b8d1f4c7a0e3b", "lifecycle": "running"}]
         }
       ],

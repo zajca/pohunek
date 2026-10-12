@@ -14,6 +14,19 @@
 //! question, a subagent task) until the conversation holds a tool result. Every
 //! other request gets a complete text reply.
 //!
+//! A user turn that carries [`BACKGROUND_MARKER`] or [`RESUME_MARKER`] is
+//! answered with a tool call that launches a background agent or resumes one
+//! by id. Only the conversation's last message decides those replies, so a
+//! later turn of the same conversation is not answered with an earlier turn's
+//! tool call. Every model request of that background agent waits on a run
+//! gate the test opens: [`MessagesStub::open_run_gate`] releases its first run
+//! and [`MessagesStub::open_resume_gate`] the run a resume starts, so the test
+//! observes each run while it is in progress. The main agent's request that
+//! carries the launch call's result waits on the launch-result gate, and the
+//! one that carries the resume call's result on the resume-result gate, so
+//! the main turn that launched or resumed the agent ends, and runs its `Stop`
+//! hooks, only once the test opens that gate.
+//!
 //! The stub never sees a credential: a request may carry only the dummy
 //! [`API_KEY`] in `x-api-key`, and the stub records whether any request carried
 //! an `Authorization` header or another key; a test asserts that none did.
@@ -23,7 +36,7 @@
     reason = "each test binary uses a different subset of these helpers"
 )]
 
-// Rust guideline compliant 2026-10-06
+// Rust guideline compliant 2026-10-12
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
@@ -77,8 +90,40 @@ pub(crate) const QUESTION_TEXT: &str = "Which flavor do you want?";
 
 /// Name of the tool the subagent reply calls.
 ///
-/// Claude Code 2.1.289 names its subagent tool `Task`.
+/// Claude Code 2.1.289 and 2.1.296 declare the subagent tool as `Agent` and
+/// accept `Task` as an alias of it.
 pub(crate) const SUBAGENT_TOOL: &str = "Task";
+
+/// Prompt text that makes the stub answer with a background agent task.
+///
+/// The reply passes no `run_in_background`: Claude Code 2.1.289 and 2.1.296
+/// run an `Agent` call in the background by default, and their `Agent` input
+/// schema admits no such property (`additionalProperties: false`).
+pub(crate) const BACKGROUND_MARKER: &str = "[background]";
+
+/// Prompt text of the background agent task. A request whose first message
+/// carries it is the background agent's own and waits on a run gate.
+pub(crate) const BACKGROUND_PROMPT: &str = "background job: reply with one word";
+
+/// Name of the tool the background reply calls: the name Claude Code 2.1.289
+/// and 2.1.296 declare.
+pub(crate) const BACKGROUND_TOOL: &str = "Agent";
+
+/// Prompt text that makes the stub answer with a message to a background
+/// agent; the agent id follows the marker after one space.
+pub(crate) const RESUME_MARKER: &str = "[resume]";
+
+/// Message the resume reply sends. The resumed agent's request carries it in
+/// its last message and waits on the resume gate.
+pub(crate) const RESUME_MESSAGE: &str = "background follow-up: reply with one word";
+
+/// Name of the tool the resume reply calls; Claude Code resumes a finished
+/// background agent that it addresses by id.
+pub(crate) const RESUME_TOOL: &str = "SendMessage";
+
+/// Opening of the last message of a prompt-suggestion request, the helper
+/// Claude Code runs after a main turn when prompt suggestions are enabled.
+pub(crate) const SUGGESTION_OPENING: &str = "[SUGGESTION MODE:";
 
 /// Largest request body the stub reads, in bytes.
 ///
@@ -92,6 +137,23 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 
 /// Substring of a request body that marks a tool result in the conversation.
 const TOOL_RESULT_MARKER: &str = "\"tool_result\"";
+
+/// Prefix of the `tool_use` id of every tool reply; a serial number follows,
+/// so two tool calls of one conversation never share an id.
+const TOOL_USE_PREFIX: &str = "toolu_stub_";
+
+/// Prefix of the id of every reply message; a serial number follows. Claude
+/// Code joins assistant messages that share an id into one, so a fixed id
+/// would fold one turn's reply into an earlier turn's.
+const MESSAGE_PREFIX: &str = "msg_stub_";
+
+/// Prefix of the `tool_use` id of a background launch reply, so the request
+/// carrying that call's result is recognized by the id its tool result names.
+const LAUNCH_TOOL_USE_PREFIX: &str = "toolu_stub_launch_";
+
+/// Prefix of the `tool_use` id of a resume reply, so the request carrying that
+/// call's result is recognized by the id its tool result names.
+const RESUME_TOOL_USE_PREFIX: &str = "toolu_stub_resume_";
 
 /// A closed-until-opened barrier a response thread waits on.
 #[derive(Debug, Default)]
@@ -123,8 +185,16 @@ struct State {
     stopping: AtomicBool,
     start_gate: Gate,
     stream_gate: Gate,
+    run_gate: Gate,
+    resume_gate: Gate,
+    launch_result_gate: Gate,
+    resume_result_gate: Gate,
+    background_runs: AtomicUsize,
+    resumed_runs: AtomicUsize,
     paths: Mutex<Vec<String>>,
     bodies: Mutex<Vec<String>>,
+    /// Last-message summaries of the kept bodies, parsed once on receipt.
+    endings: Mutex<Vec<Ending>>,
 }
 
 /// Most recent `/v1/messages` request bodies the stub keeps for
@@ -226,6 +296,66 @@ impl MessagesStub {
     pub(crate) fn open_stream_gate(&self) {
         self.state.stream_gate.set(true);
     }
+
+    /// Opens the run gate: the background agent's requests of its first run,
+    /// held before any response byte, are answered.
+    pub(crate) fn open_run_gate(&self) {
+        self.state.run_gate.set(true);
+    }
+
+    /// Opens the resume gate: the background agent's requests of the run a
+    /// resume started, held before any response byte, are answered.
+    pub(crate) fn open_resume_gate(&self) {
+        self.state.resume_gate.set(true);
+    }
+
+    /// Opens the launch-result gate: the main agent's request that carries the
+    /// background launch call's result is answered.
+    pub(crate) fn open_launch_result_gate(&self) {
+        self.state.launch_result_gate.set(true);
+    }
+
+    /// Opens the resume-result gate: the main agent's request that carries the
+    /// resume call's result is answered.
+    pub(crate) fn open_resume_result_gate(&self) {
+        self.state.resume_result_gate.set(true);
+    }
+
+    /// Requests of the background agent's first run the stub received.
+    pub(crate) fn background_requests(&self) -> usize {
+        self.state.background_runs.load(Ordering::SeqCst)
+    }
+
+    /// Requests of the background agent's resumed run the stub received.
+    pub(crate) fn resumed_requests(&self) -> usize {
+        self.state.resumed_runs.load(Ordering::SeqCst)
+    }
+
+    /// How many of the most recent message requests end their conversation
+    /// with the user prompt `prompt`: a text block of the last message is
+    /// exactly `prompt`. Claude Code's title request quotes the prompt inside
+    /// a longer text, so it is not counted.
+    pub(crate) fn requests_with_prompt(&self, prompt: &str) -> usize {
+        self.state
+            .endings
+            .lock()
+            .expect("endings lock")
+            .iter()
+            .filter(|ending| ending.prompts.iter().any(|text| text == prompt))
+            .count()
+    }
+
+    /// How many of the most recent message requests carried `needle` in the
+    /// last message of their conversation.
+    pub(crate) fn last_messages_containing(&self, needle: &str) -> usize {
+        self.state
+            .endings
+            .lock()
+            .expect("endings lock")
+            .iter()
+            .filter(|ending| ending.last.contains(needle))
+            .count()
+    }
 }
 
 impl Drop for MessagesStub {
@@ -233,6 +363,10 @@ impl Drop for MessagesStub {
         self.state.stopping.store(true, Ordering::SeqCst);
         self.open_gate();
         self.open_stream_gate();
+        self.open_run_gate();
+        self.open_resume_gate();
+        self.open_launch_result_gate();
+        self.open_resume_result_gate();
         // A throwaway connection wakes the blocked `accept`.
         let _ = TcpStream::connect(self.address);
         if let Some(acceptor) = self.acceptor.take() {
@@ -296,13 +430,28 @@ fn respond(stream: TcpStream, state: &State) -> io::Result<()> {
             b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
         );
     }
-    state.started.fetch_add(1, Ordering::SeqCst);
-    keep_body(state, &request.body);
-    let reply = reply_for(&request.body);
+    let serial = state.started.fetch_add(1, Ordering::SeqCst);
+    let conversation = Conversation::parse(&request.body);
+    keep_body(state, &request.body, &conversation);
+    match conversation.hold() {
+        Some(Hold::FirstRun) => {
+            state.background_runs.fetch_add(1, Ordering::SeqCst);
+            state.run_gate.wait_open();
+        }
+        Some(Hold::ResumedRun) => {
+            state.resumed_runs.fetch_add(1, Ordering::SeqCst);
+            state.resume_gate.wait_open();
+        }
+        Some(Hold::LaunchResult) => state.launch_result_gate.wait_open(),
+        Some(Hold::ResumeResult) => state.resume_result_gate.wait_open(),
+        None => {}
+    }
+    let reply = reply_for(&request.body, &conversation, serial);
     if request.wants_stream() {
         stream_reply(
             &mut writer,
             state,
+            &format!("{MESSAGE_PREFIX}{serial}"),
             &reply,
             &Holds {
                 before_text: request.body.contains(HOLD_MARKER),
@@ -310,27 +459,48 @@ fn respond(stream: TcpStream, state: &State) -> io::Result<()> {
             },
         )?;
     } else {
-        write_json(&mut writer, &message_json(&reply.blocks()))?;
+        write_json(
+            &mut writer,
+            &message_json(&format!("{MESSAGE_PREFIX}{serial}"), &reply.blocks()),
+        )?;
     }
     writer.flush()?;
     state.finished.fetch_add(1, Ordering::SeqCst);
     Ok(())
 }
 
-/// Remembers `body` for [`MessagesStub::requests_containing`], dropping the
-/// oldest one beyond [`KEPT_BODIES`].
-fn keep_body(state: &State, body: &str) {
+/// Remembers `body` for [`MessagesStub::requests_containing`] and the ending
+/// of its `conversation` for the last-message counters, dropping the oldest
+/// of each beyond [`KEPT_BODIES`].
+fn keep_body(state: &State, body: &str, conversation: &Conversation) {
     let mut bodies = state.bodies.lock().expect("bodies lock");
     if bodies.len() == KEPT_BODIES {
         bodies.remove(0);
     }
     bodies.push(body.to_owned());
+    drop(bodies);
+    let mut endings = state.endings.lock().expect("endings lock");
+    if endings.len() == KEPT_BODIES {
+        endings.remove(0);
+    }
+    endings.push(Ending {
+        last: conversation.last.clone(),
+        prompts: conversation.prompts.clone(),
+    });
+}
+
+/// The last message of one kept request: serialized, and its text blocks.
+#[derive(Debug, Default)]
+struct Ending {
+    last: String,
+    prompts: Vec<String>,
 }
 
 /// What the stub answers one request with.
 enum Reply {
     Text,
     Tool {
+        id: String,
         name: &'static str,
         input: serde_json::Value,
     },
@@ -343,9 +513,9 @@ impl Reply {
                 "type": "text",
                 "text": format!("{FIRST_CHUNK}{CHUNK_BREAK}{SECOND_CHUNK}"),
             })],
-            Self::Tool { name, input } => vec![serde_json::json!({
+            Self::Tool { id, name, input } => vec![serde_json::json!({
                 "type": "tool_use",
-                "id": "toolu_stub",
+                "id": id,
                 "name": name,
                 "input": input,
             })],
@@ -360,14 +530,132 @@ impl Reply {
     }
 }
 
-/// The reply for a request body: a marked prompt without a tool result in the
-/// conversation gets its tool call, everything else plain text.
-fn reply_for(body: &str) -> Reply {
+/// The gate a request waits on before any response byte.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Hold {
+    /// A request of the background agent's first run: the run gate.
+    FirstRun,
+    /// A request of the run a resume message started: the resume gate.
+    ResumedRun,
+    /// The main agent's request carrying the launch call's result: the
+    /// launch-result gate.
+    LaunchResult,
+    /// The main agent's request carrying the resume call's result: the
+    /// resume-result gate.
+    ResumeResult,
+}
+
+/// The first and last message of a request's conversation, serialized, and
+/// the text blocks of the last message; all empty when the body is not a
+/// Messages request.
+struct Conversation {
+    first: String,
+    last: String,
+    prompts: Vec<String>,
+}
+
+impl Conversation {
+    fn parse(body: &str) -> Self {
+        let parsed = serde_json::from_str::<serde_json::Value>(body).unwrap_or_default();
+        let messages = parsed["messages"].as_array().cloned().unwrap_or_default();
+        let text = |message: Option<&serde_json::Value>| {
+            message.map(ToString::to_string).unwrap_or_default()
+        };
+        let prompts = messages
+            .last()
+            .and_then(|message| message["content"].as_array())
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|block| block["type"] == "text")
+                    .filter_map(|block| block["text"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            first: text(messages.first()),
+            last: text(messages.last()),
+            prompts,
+        }
+    }
+
+    /// The gate this request waits on. A background agent's conversation
+    /// opens with the background task; its resumed run's last message carries
+    /// the resume message.
+    fn hold(&self) -> Option<Hold> {
+        if self.first.contains(BACKGROUND_PROMPT) {
+            return Some(if self.last.contains(RESUME_MESSAGE) {
+                Hold::ResumedRun
+            } else {
+                Hold::FirstRun
+            });
+        }
+        if !self.last.contains(TOOL_RESULT_MARKER) {
+            return None;
+        }
+        if self.last.contains(LAUNCH_TOOL_USE_PREFIX) {
+            return Some(Hold::LaunchResult);
+        }
+        self.last
+            .contains(RESUME_TOOL_USE_PREFIX)
+            .then_some(Hold::ResumeResult)
+    }
+
+    /// The tool call a marked user turn asks for: a last message that carries
+    /// [`BACKGROUND_MARKER`] or [`RESUME_MARKER`] and no tool result. `serial`
+    /// numbers the call's `tool_use` id.
+    fn turn_reply(&self, serial: usize) -> Option<Reply> {
+        if self.last.contains(TOOL_RESULT_MARKER) {
+            return None;
+        }
+        if self.last.contains(BACKGROUND_MARKER) {
+            return Some(Reply::Tool {
+                id: format!("{LAUNCH_TOOL_USE_PREFIX}{serial}"),
+                name: BACKGROUND_TOOL,
+                input: serde_json::json!({
+                    "description": "Stub background agent",
+                    "prompt": BACKGROUND_PROMPT,
+                    "subagent_type": "general-purpose",
+                }),
+            });
+        }
+        let target = resume_target(&self.last)?;
+        Some(Reply::Tool {
+            id: format!("{RESUME_TOOL_USE_PREFIX}{serial}"),
+            name: RESUME_TOOL,
+            input: serde_json::json!({
+                "to": target,
+                "message": RESUME_MESSAGE,
+                "summary": "Resume the background agent",
+            }),
+        })
+    }
+}
+
+/// The agent id after [`RESUME_MARKER`] and one space in `text`.
+fn resume_target(text: &str) -> Option<&str> {
+    let (_before, after) = text.split_once(RESUME_MARKER)?;
+    let id = after.strip_prefix(' ')?;
+    let end = id
+        .find(|character: char| !character.is_ascii_alphanumeric())
+        .unwrap_or(id.len());
+    (end > 0).then(|| &id[..end])
+}
+
+/// The reply for request number `serial`: a marked last user turn gets its
+/// tool call; else a marked prompt without a tool result in the conversation
+/// gets its tool call; everything else plain text.
+fn reply_for(body: &str, conversation: &Conversation, serial: usize) -> Reply {
+    if let Some(reply) = conversation.turn_reply(serial) {
+        return reply;
+    }
     if body.contains(TOOL_RESULT_MARKER) {
         return Reply::Text;
     }
+    let id = format!("{TOOL_USE_PREFIX}{serial}");
     if body.contains(APPROVAL_MARKER) {
         return Reply::Tool {
+            id,
             name: "Bash",
             input: serde_json::json!({
                 "command": APPROVAL_COMMAND,
@@ -377,6 +665,7 @@ fn reply_for(body: &str) -> Reply {
     }
     if body.contains(QUESTION_MARKER) {
         return Reply::Tool {
+            id,
             name: "AskUserQuestion",
             input: serde_json::json!({
                 "questions": [{
@@ -393,6 +682,7 @@ fn reply_for(body: &str) -> Reply {
     }
     if body.contains(SUBAGENT_MARKER) {
         return Reply::Tool {
+            id,
             name: SUBAGENT_TOOL,
             input: serde_json::json!({
                 "description": "Stub subagent",
@@ -404,14 +694,14 @@ fn reply_for(body: &str) -> Reply {
     Reply::Text
 }
 
-fn message_json(content: &[serde_json::Value]) -> serde_json::Value {
+fn message_json(id: &str, content: &[serde_json::Value]) -> serde_json::Value {
     let stop_reason = if content.iter().any(|block| block["type"] == "tool_use") {
         "tool_use"
     } else {
         "end_turn"
     };
     serde_json::json!({
-        "id": "msg_stub",
+        "id": id,
         "type": "message",
         "role": "assistant",
         "model": MODEL_ID,
@@ -441,17 +731,19 @@ struct Holds {
     mid_stream: bool,
 }
 
-/// Streams `reply` as Messages events; a held text reply waits on its gates.
+/// Streams `reply` as Messages events of message `message_id`; a held text
+/// reply waits on its gates.
 fn stream_reply(
     writer: &mut TcpStream,
     state: &State,
+    message_id: &str,
     reply: &Reply,
     holds: &Holds,
 ) -> io::Result<()> {
     writer.write_all(
         b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n",
     )?;
-    let mut start = message_json(&[]);
+    let mut start = message_json(message_id, &[]);
     start["stop_reason"] = serde_json::Value::Null;
     send_event(
         writer,
@@ -478,7 +770,7 @@ fn stream_reply(
             }
             send_text_delta(writer, SECOND_CHUNK)?;
         }
-        Reply::Tool { name, input } => {
+        Reply::Tool { id, name, input } => {
             send_event(
                 writer,
                 "content_block_start",
@@ -487,7 +779,7 @@ fn stream_reply(
                     "index": 0,
                     "content_block": {
                         "type": "tool_use",
-                        "id": "toolu_stub",
+                        "id": id,
                         "name": name,
                         "input": {},
                     },

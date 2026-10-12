@@ -1297,15 +1297,21 @@ Important fields:
   recorded start (the prompt-suggestion helper Claude runs after every main
   turn) produces no item; a Codex one records a completed child. At the end of
   every Claude main-agent turn the rows of that Claude process are reconciled
-  against Claude's own list of running background tasks: a listed running row
-  stays `running` and the list counts as its latest claim, so a delayed stop
-  older than the list does not complete it; a running row whose background
-  agent was listed earlier and is missing from the list becomes `completed`; a
-  running row never listed during its current run becomes `completed` only
-  when the list holds no task that can host an unlisted agent; and a listed
-  terminal row returns to `running`. A row with a newer claim than the list is
-  never touched. A reconciled row has the same shape as any other; the reason is
-  only in the worker log. No prompt, result, task description, transcript path,
+  against Claude's own list of running background tasks. The list only settles
+  rows it proves ended: a running row missing from this list whose newest
+  listing by the same process falls within its run and is older than this
+  list becomes `completed`, and any other missing running row becomes
+  `completed` only when the list holds no task that can host an unlisted
+  agent and the same process's newest list is older than this one and newer
+  than the row (Claude builds a list before the hook reads its clock, so only
+  an earlier list proves the agent had started). A list older than that
+  newest evidence, delivered out of order, settles nothing from it. A listed row is left unchanged, whether running or terminal; a
+  self-woken agent reopens through its own start. A completed row keeps its own
+  claim sequence, so a resume start ordered before the list still reopens it,
+  and a row with a newer claim than the list is never touched. A reconciled row
+  has the same shape as any other; the reason is only in the worker log. A row
+  whose Claude process never ends another main turn stays `running` until its
+  own stop or the end of the runtime (`lost`). No prompt, result, task description, transcript path,
   or raw hook payload is exposed.
 - `cwd`: current host-local working directory. It starts as the launch
   directory and can change while the session runs when procwatch observes the
@@ -2344,8 +2350,7 @@ registers the main-agent `Stop` (action `stop`): it sends the worker one
 `subagent_snapshot` claim carrying only the `id`, `type` and `status` of each
 entry of `background_tasks`, and sends nothing for a `Stop` with a non-empty
 `agent_id`, a missing or invalid list, a list over 256 entries, or input over
-1 MiB. A worker
-that predates the claim refuses it and nothing is applied. Codex `Stop` carries
+1 MiB. A worker that predates the claim refuses it and nothing is applied. Codex `Stop` carries
 no task list, so the Codex state adapter registers no `Stop`. The hook
 validates its action and Pohunek handshake before reading, rejects oversized
 JSON, and never stages the payload on disk; provider prompts, results,

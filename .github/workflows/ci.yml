@@ -1889,7 +1889,9 @@ jobs:
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
       POHUNEK_CLAUDE_E2E: "1"
-    timeout-minutes: 30
+    # Ten real-Claude tests at the package profile's 3-minute kill must all end
+    # before the job timeout (.config/nextest.toml, profile.package).
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:

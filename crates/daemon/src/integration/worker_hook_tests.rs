@@ -1288,6 +1288,12 @@ mod subagent_sequences {
     /// R4: a subagent that no snapshot ever listed is settled by a main `Stop`
     /// that lists only shells, because a shell runs no agent that could hold
     /// it (#883 D4).
+    ///
+    /// Claude builds a `Stop` listing before the hook reads its clock (S4
+    /// evidence, real Claude 2.1.289 and 2.1.296), so the first such `Stop`
+    /// cannot prove the subagent had started when the listing was built and
+    /// leaves it running; the next one, whose predecessor is newer than the
+    /// start, settles it.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_never_listed_subagent_is_settled_when_only_shells_are_listed() {
         replay_recorded("ph-subagent-shells-", "never_listed_agent_with_only_shells")
@@ -1396,11 +1402,14 @@ mod subagent_sequences {
     /// A main `Stop` input without a valid task list yields no snapshot,
     /// never one that lists nothing (#883 D3).
     ///
-    /// Each invalid input lists no task that could host a subagent, so if the
-    /// hook took it as a snapshot, or skipped or truncated its entries, the
-    /// running subagent would be settled; a checkpoint follows each one. A
-    /// valid `Stop` whose final message exceeds every other action's input
-    /// bound then settles the subagent.
+    /// A valid empty `Stop` first leaves the never-listed subagent running,
+    /// because a listing is built before the hook reads its clock (S4
+    /// evidence) and no earlier `Stop` proves the subagent predates it; it
+    /// gives every later `Stop` that proof. Each invalid input then lists no
+    /// task that could host a subagent, so if the hook took it as a snapshot,
+    /// or skipped or truncated its entries, the running subagent would be
+    /// settled; a checkpoint follows each one. A valid `Stop` whose final
+    /// message exceeds every other action's input bound then settles it.
     #[tokio::test(flavor = "multi_thread")]
     async fn invalid_main_stop_inputs_change_nothing() {
         let root = crate::test_support::scoped_dir("ph-subagent-invalid-stop-");
@@ -1411,9 +1420,14 @@ mod subagent_sequences {
             agent_id: start.subagent().agent_id.clone(),
             lifecycle: SubagentPhase::Running,
         }]);
-        // Checkpoint 0 follows the start, and checkpoint `n + 1` the `n`th
-        // input of `invalid_stop_inputs`.
-        let mut steps = vec![claude_hook(start), Step::Checkpoint(running.clone())];
+        // Checkpoint 0 follows the start and the first valid `Stop`, and
+        // checkpoint `n + 1` the `n`th input of `invalid_stop_inputs`.
+        let first = json!({"hook_event_name": "Stop", "background_tasks": []});
+        let mut steps = vec![
+            claude_hook(start),
+            stop_hook_reading(&root, "first-stop.json", first.to_string().as_bytes()),
+            Step::Checkpoint(running.clone()),
+        ];
         for (index, input) in invalid.iter().enumerate() {
             steps.push(stop_hook_reading(
                 &root,
@@ -1440,13 +1454,20 @@ mod subagent_sequences {
     }
 
     /// A nested Claude's main `Stop` settles only subagents its own process
-    /// started: its empty snapshot settles its own subagent and leaves the
+    /// started: its empty snapshots settle its own subagent and leave the
     /// outer agent's running one alone, which the outer agent's own empty
-    /// snapshot then settles (#883 D4).
+    /// snapshots then settle (#883 D4).
+    ///
+    /// A never-listed subagent is settled only by a `Stop` whose reporter has
+    /// an earlier `Stop` newer than the subagent's start, because Claude
+    /// builds a listing before the hook reads its clock (S4 evidence). Each
+    /// agent therefore reports two empty `Stop`s, and the outer agent's first
+    /// one leaves its subagent running: the nested agent's `Stop`s are not its
+    /// own.
     ///
     /// The nested hooks run under one intermediate shell, which stands in for
-    /// the nested Claude: both of its hooks report that shell, while the
-    /// outer hooks report the PTY root.
+    /// the nested Claude: all of its hooks report that shell, while the outer
+    /// hooks report the PTY root.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_nested_agents_snapshot_settles_only_its_own_subagents() {
         /// Subagent of the outer agent, of the recorded id shape.
@@ -1469,7 +1490,7 @@ mod subagent_sequences {
             json!({"hook_event_name": "Stop", "background_tasks": []}),
         );
         let nested = format!(
-            "/bin/sh -c '/bin/sh \"$0\" subagent-start < \"$1\"; /bin/sh \"$0\" stop < \"$2\"; true' {} {} {}",
+            "/bin/sh -c '/bin/sh \"$0\" subagent-start < \"$1\"; /bin/sh \"$0\" stop < \"$2\"; /bin/sh \"$0\" stop < \"$2\"; true' {} {} {}",
             quoted(&asset),
             quoted(&nested_start),
             quoted(&empty_stop)
@@ -1490,6 +1511,8 @@ mod subagent_sequences {
                 agent_type: "general-purpose".to_owned(),
             })),
             Step::Command(nested),
+            Step::Checkpoint(rows(SubagentPhase::Running)),
+            Step::Command(outer_stop.clone()),
             Step::Checkpoint(rows(SubagentPhase::Running)),
             Step::Command(outer_stop),
         ];
@@ -1686,14 +1709,19 @@ mod subagent_sequences {
         /// `MAX_SNAPSHOT_STATUS_BYTES`.
         const TASK_STATUS_BOUND: usize = 32;
 
+        /// Reporters whose last snapshot the worker remembers:
+        /// `SNAPSHOT_REPORTER_CAPACITY` in `crates/session-worker/src/server.rs`,
+        /// which is private to the worker.
+        const SNAPSHOT_REPORTERS: usize = 16;
+
         /// Name of the worker event for a claim that changed no phase.
         const IGNORED_EVENT: &str = "worker.subagent.claim.ignored";
 
         /// Name of the worker event for a claim that hit a bound.
         const REFUSED_EVENT: &str = "worker.subagent.claim.refused";
 
-        /// Name of the worker event for a subagent a snapshot completed or
-        /// reopened.
+        /// Name of the worker event for a running subagent a snapshot
+        /// completed.
         const RECONCILED_EVENT: &str = "worker.subagent.reconciled";
 
         /// Name of the worker event that sums up one applied snapshot.
@@ -1848,6 +1876,23 @@ for claim in plan:
                 ))
             }
 
+            /// A step sending one main-`Stop` snapshot of `tasks` as Claude
+            /// from a client under its own intermediate shell, so the claim
+            /// names that shell: a reporter distinct from the PTY root and
+            /// from every other such step.
+            fn snapshot_from_own_reporter(&self, sequence: u64, tasks: &[Value]) -> Step {
+                let index = self.plans.replace(self.plans.get() + 1);
+                let path = self.root.join(format!("crafted-plan-{index}.json"));
+                let plan = json!([{"type": SNAPSHOT, "sequence": sequence, "tasks": tasks}]);
+                std::fs::write(&path, plan.to_string()).expect("write the claim plan");
+                Step::Command(format!(
+                    "/bin/sh -c 'python3 -I \"$0\" \"$1\" {CLAUDE} \"$2\"; true' {} {} {}",
+                    quoted(&self.script),
+                    quoted(&self.results),
+                    quoted(&path)
+                ))
+            }
+
             /// Every answered claim, in the order the worker answered them.
             fn answers(&self) -> Vec<Answer> {
                 if let Ok(failure) =
@@ -1896,9 +1941,9 @@ for claim in plan:
         /// The counts of one applied snapshot, as the worker logged them.
         #[derive(Debug, Clone, Default, PartialEq, Eq)]
         struct Applied {
+            tasks: u64,
             listed: u64,
             terminalized: u64,
-            reopened: u64,
             deferred: u64,
             hosts: bool,
         }
@@ -1943,8 +1988,8 @@ for claim in plan:
                 self.0.lock().expect("claim log").claims.clone()
             }
 
-            /// `(subagent id, reason)` of each subagent a snapshot completed
-            /// or reopened, in the order the worker logged them.
+            /// `(subagent id, reason)` of each running subagent a snapshot
+            /// completed, in the order the worker logged them.
             fn reconciled(&self) -> Vec<(String, String)> {
                 self.0.lock().expect("claim log").reconciled.clone()
             }
@@ -1999,7 +2044,7 @@ for claim in plan:
                 let slot = match field.name() {
                     "subagent.snapshot.listed" => &mut self.applied.listed,
                     "subagent.snapshot.terminalized" => &mut self.applied.terminalized,
-                    "subagent.snapshot.reopened" => &mut self.applied.reopened,
+                    "subagent.snapshot.tasks" => &mut self.applied.tasks,
                     "subagent.snapshot.deferred" => &mut self.applied.deferred,
                     _ => return,
                 };
@@ -2249,11 +2294,22 @@ for claim in plan:
             Answer::new(SNAPSHOT, sequence, "", ok)
         }
 
+        /// Main-`Stop` tasks listing only a background shell, a task type
+        /// that runs no agent.
+        fn shells() -> Vec<Value> {
+            vec![json!({"id": "b5v9n3m7k", "type": "shell", "status": "running"})]
+        }
+
         /// R2 ordering against a main `Stop`: a self-woken subagent's start
         /// (sequence 30) is decided before an older snapshot (sequence 20)
         /// that does not list it yet. The snapshot is acknowledged and leaves
-        /// the newer run running; a later empty snapshot (sequence 40) settles
-        /// it (#883 D4, D6).
+        /// the newer run running (#883 D4, D6).
+        ///
+        /// Claude builds a listing before the `Stop` hook reads its clock (S4
+        /// evidence, real Claude 2.1.289 and 2.1.296), so the empty snapshot
+        /// at 40, whose predecessor (20) is older than the start, cannot
+        /// prove the run had started when its listing was built and leaves it
+        /// running; the snapshot at 50 settles it.
         #[tokio::test(flavor = "multi_thread")]
         async fn a_self_wake_start_after_an_older_snapshot_stays_running() {
             let woken = recorded("self_wake").events[0].subagent().agent_id.clone();
@@ -2267,6 +2323,8 @@ for claim in plan:
                 client.snapshot(20, &[]),
                 Step::Checkpoint(one(&woken, SubagentPhase::Running)),
                 client.snapshot(40, &[]),
+                Step::Checkpoint(one(&woken, SubagentPhase::Running)),
+                client.snapshot(50, &[]),
             ];
             let run = replay(&root, steps, &one(&woken, SubagentPhase::Completed)).await;
             assert_eq!(
@@ -2277,44 +2335,391 @@ for claim in plan:
                     Answer::new(START, 30, &woken, true),
                     snapshot_answer(20, true),
                     snapshot_answer(40, true),
+                    snapshot_answer(50, true),
                 ]
             );
             run.finish().await;
         }
 
-        /// A terminal subagent that a newer main `Stop` snapshot lists as live
-        /// is reopened: its stop at sequence 10 lost the race with a self-wake
-        /// start that the snapshot at sequence 20 already shows. A snapshot at
-        /// sequence 30 that lists another background agent but not this one
-        /// settles it again, because a snapshot listed it during its current
-        /// run (#883 D4).
-        ///
-        /// An older snapshot (sequence 8) that still lists the subagent after
-        /// its stop was decided reopens nothing: R4 shows a stopping agent
-        /// listed as running in its own stop, so a main `Stop` taken before
-        /// that stop can list it too.
-        ///
-        /// The worker logs the reopen as `snapshot_listed`, the settlement as
-        /// `snapshot_absent`, and the counts of each snapshot (#883 D5).
+        /// Main-`Stop` snapshots of one reporter can reach the worker out of
+        /// order, since each hook is its own process. A background agent
+        /// started at 10 and listed by the snapshot at 30 is not completed by
+        /// an older empty snapshot (20) delivered after it: the listing at 30
+        /// is newer than that snapshot, so it does not make the agent a known
+        /// background agent whose absence at 20 proves it finished, and no
+        /// earlier snapshot proves it predates the listing at 20. The row
+        /// keeps its revision, and the snapshot at 20 defers it. A later empty
+        /// snapshot (40) then settles it as a known background agent
+        /// (#883 D4).
         #[tokio::test]
-        async fn a_snapshot_listing_a_completed_subagent_reopens_it() {
+        async fn an_older_empty_snapshot_after_a_newer_listing_keeps_the_agent_running() {
+            /// The listed background agent, of the recorded id shape.
+            const LISTED: &str = "a6b0d4f8c2e5a9b3d";
+            let log = ClaimLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-subagent-reordered-snapshots-");
+            let client = Client::new(&root);
+            let running = one(LISTED, SubagentPhase::Running);
+            let steps = vec![
+                client.step(CLAUDE, &[(START, 10, LISTED)]),
+                client.snapshot(30, &listed(&[LISTED])),
+                Step::Checkpoint(running.clone()),
+                client.snapshot(20, &[]),
+                Step::Checkpoint(running),
+                client.snapshot(40, &[]),
+            ];
+            let run = replay(&root, steps, &one(LISTED, SubagentPhase::Completed)).await;
+            assert_eq!(
+                client.answers(),
+                [
+                    Answer::new(START, 10, LISTED, true),
+                    snapshot_answer(30, true),
+                    snapshot_answer(20, true),
+                    snapshot_answer(40, true),
+                ]
+            );
+            let [listed_row, after_older, settled] = run.snapshots.as_slice() else {
+                panic!("two checkpoints and the final rows: {:?}", run.snapshots);
+            };
+            let [listed_row, after_older, settled] =
+                [listed_row, after_older, settled].map(|snapshot| row(snapshot, LISTED));
+            assert_eq!(
+                after_older, listed_row,
+                "the older snapshot changes nothing: {listed_row:?} {after_older:?}"
+            );
+            assert!(settled.revision > listed_row.revision, "{settled:?}");
+            assert_eq!(settled.finished_at_ms, Some(settled.updated_at_ms));
+            assert_eq!(
+                log.reconciled(),
+                [(LISTED.to_owned(), "snapshot_absent".to_owned())],
+                "only the snapshot at 40 reconciles"
+            );
+            assert_eq!(
+                log.applied(),
+                [
+                    Applied {
+                        tasks: 1,
+                        listed: 1,
+                        hosts: true,
+                        ..Applied::default()
+                    },
+                    Applied {
+                        deferred: 1,
+                        ..Applied::default()
+                    },
+                    Applied {
+                        terminalized: 1,
+                        ..Applied::default()
+                    },
+                ]
+            );
+            assert_eq!(log.events(), [], "no claim is ignored or refused");
+            run.finish().await;
+        }
+
+        /// A reporter's newer snapshot delivered first (60) is never taken as
+        /// the previous snapshot of its older one (45) delivered after it: a
+        /// never-listed subagent started at 30 stays running through both
+        /// shells-only snapshots, because neither has an older snapshot of
+        /// its reporter proving the start predates its listing (S4 evidence:
+        /// Claude builds the listing before the `Stop` hook reads its clock).
+        /// A later shells-only snapshot (70), whose previous one (60) is
+        /// newer than the start, settles it (#883 D4).
+        #[tokio::test]
+        async fn a_newer_snapshot_delivered_first_proves_nothing_for_an_older_one() {
+            /// The never-listed subagent, of the recorded id shape.
+            const UNLISTED: &str = "a3e7b1d5f9c2a6e0b";
+            let log = ClaimLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-subagent-reordered-previous-");
+            let client = Client::new(&root);
+            let running = one(UNLISTED, SubagentPhase::Running);
+            let steps = vec![
+                client.step(CLAUDE, &[(START, 30, UNLISTED)]),
+                client.snapshot(60, &shells()),
+                Step::Checkpoint(running.clone()),
+                client.snapshot(45, &shells()),
+                Step::Checkpoint(running),
+                client.snapshot(70, &shells()),
+            ];
+            let run = replay(&root, steps, &one(UNLISTED, SubagentPhase::Completed)).await;
+            assert_eq!(
+                client.answers(),
+                [
+                    Answer::new(START, 30, UNLISTED, true),
+                    snapshot_answer(60, true),
+                    snapshot_answer(45, true),
+                    snapshot_answer(70, true),
+                ]
+            );
+            let deferred = Applied {
+                tasks: 1,
+                deferred: 1,
+                ..Applied::default()
+            };
+            assert_eq!(
+                log.applied(),
+                [
+                    deferred.clone(),
+                    deferred,
+                    Applied {
+                        tasks: 1,
+                        terminalized: 1,
+                        ..Applied::default()
+                    },
+                ]
+            );
+            assert_eq!(
+                log.reconciled(),
+                [(UNLISTED.to_owned(), "snapshot_absent".to_owned())]
+            );
+            run.finish().await;
+        }
+
+        /// The worker remembers the last snapshot of at most
+        /// [`SNAPSHOT_REPORTERS`] reporters, and a forgotten reporter's next
+        /// snapshot has no previous one: it proves nothing about a
+        /// never-listed subagent's start (#883 D4).
+        ///
+        /// The PTY root starts a subagent at 10 and sends a shells-only
+        /// snapshot (20), which defers it and is remembered. Then
+        /// [`SNAPSHOT_REPORTERS`] other reporters, each a client under its own
+        /// intermediate shell, send one snapshot each, which forgets the
+        /// root's. The root's next shells-only snapshot (40) therefore defers
+        /// the subagent again, and the one after it (50) settles it.
+        #[tokio::test]
+        async fn a_forgotten_reporters_snapshot_proves_nothing() {
+            /// The never-listed subagent, of the recorded id shape.
+            const UNLISTED: &str = "a7c1e5b9d3f6a0c4e";
+            /// Sequence of the first snapshot of every other reporter; each
+            /// next one is one higher.
+            const OTHERS_FROM: u64 = 21;
+            let log = ClaimLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-subagent-forgotten-reporter-");
+            let client = Client::new(&root);
+            let running = one(UNLISTED, SubagentPhase::Running);
+            let others: Vec<u64> = (OTHERS_FROM..).take(SNAPSHOT_REPORTERS).collect();
+            let mut steps = vec![
+                client.step(CLAUDE, &[(START, 10, UNLISTED)]),
+                client.snapshot(20, &shells()),
+            ];
+            steps.extend(
+                others
+                    .iter()
+                    .map(|sequence| client.snapshot_from_own_reporter(*sequence, &[])),
+            );
+            steps.extend([
+                Step::Checkpoint(running.clone()),
+                client.snapshot(40, &shells()),
+                Step::Checkpoint(running),
+                client.snapshot(50, &shells()),
+            ]);
+            let run = replay(&root, steps, &one(UNLISTED, SubagentPhase::Completed)).await;
+
+            let mut expected = vec![
+                Answer::new(START, 10, UNLISTED, true),
+                snapshot_answer(20, true),
+            ];
+            expected.extend(
+                others
+                    .iter()
+                    .map(|sequence| snapshot_answer(*sequence, true)),
+            );
+            expected.extend([snapshot_answer(40, true), snapshot_answer(50, true)]);
+            assert_eq!(client.answers(), expected);
+            let deferred = Applied {
+                tasks: 1,
+                deferred: 1,
+                ..Applied::default()
+            };
+            // Another reporter's snapshot does not consider the root's
+            // subagent at all.
+            let mut applied = vec![deferred.clone()];
+            applied.extend(others.iter().map(|_| Applied::default()));
+            applied.extend([
+                deferred,
+                Applied {
+                    tasks: 1,
+                    terminalized: 1,
+                    ..Applied::default()
+                },
+            ]);
+            assert_eq!(log.applied(), applied);
+            assert_eq!(
+                log.reconciled(),
+                [(UNLISTED.to_owned(), "snapshot_absent".to_owned())]
+            );
+            run.finish().await;
+        }
+
+        /// A listing from an earlier run of the same subagent does not make
+        /// its current run a known background agent. The run listed at 30
+        /// stops at 35, and a self-wake start at 40 opens a new run. The empty
+        /// snapshot at 50 defers it: the listing at 30 predates the run, and
+        /// the previous snapshot (30) is older than the start, so nothing
+        /// proves the run predates the listing at 50 (S4 evidence: Claude
+        /// builds the listing before the `Stop` hook reads its clock). The
+        /// empty snapshot at 60, whose previous one (50) is newer than the
+        /// start, settles it (#883 D1, D4).
+        #[tokio::test]
+        async fn a_listing_of_an_earlier_run_does_not_settle_a_self_woken_run() {
+            /// The self-woken subagent, of the recorded id shape.
+            const WOKEN: &str = "a0e4c8f2b6d9a3e7c";
+            let log = ClaimLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-subagent-earlier-run-listing-");
+            let client = Client::new(&root);
+            let running = one(WOKEN, SubagentPhase::Running);
+            let steps = vec![
+                client.step(CLAUDE, &[(START, 10, WOKEN)]),
+                client.snapshot(30, &listed(&[WOKEN])),
+                client.step(CLAUDE, &[(STOP, 35, WOKEN), (START, 40, WOKEN)]),
+                Step::Checkpoint(running.clone()),
+                client.snapshot(50, &[]),
+                Step::Checkpoint(running),
+                client.snapshot(60, &[]),
+            ];
+            let run = replay(&root, steps, &one(WOKEN, SubagentPhase::Completed)).await;
+            assert_eq!(
+                client.answers(),
+                [
+                    Answer::new(START, 10, WOKEN, true),
+                    snapshot_answer(30, true),
+                    Answer::new(STOP, 35, WOKEN, true),
+                    Answer::new(START, 40, WOKEN, true),
+                    snapshot_answer(50, true),
+                    snapshot_answer(60, true),
+                ]
+            );
+            let [woken, after_empty, _] = run.snapshots.as_slice() else {
+                panic!("two checkpoints and the final rows: {:?}", run.snapshots);
+            };
+            assert_eq!(row(after_empty, WOKEN), row(woken, WOKEN));
+            assert_eq!(
+                log.applied(),
+                [
+                    Applied {
+                        tasks: 1,
+                        listed: 1,
+                        hosts: true,
+                        ..Applied::default()
+                    },
+                    Applied {
+                        deferred: 1,
+                        ..Applied::default()
+                    },
+                    Applied {
+                        terminalized: 1,
+                        ..Applied::default()
+                    },
+                ]
+            );
+            assert_eq!(
+                log.reconciled(),
+                [(WOKEN.to_owned(), "snapshot_absent".to_owned())]
+            );
+            assert_eq!(log.events(), [], "no claim is ignored or refused");
+            run.finish().await;
+        }
+
+        /// A listing delivered out of order never lowers the newest listing
+        /// of a subagent. The background agent started at 10 is listed at
+        /// 30, then by a late snapshot at 20, and a late empty snapshot at 25
+        /// follows. The newest listing (30) is newer than 25, so it does not
+        /// make the agent a known background agent whose absence at 25 proves
+        /// it finished, and no older snapshot proves its start predates the
+        /// listing at 25: the agent stays running. The empty snapshot at 40
+        /// then settles it as a known background agent (#883 D4).
+        #[tokio::test]
+        async fn a_late_older_listing_does_not_lower_the_newest_listing() {
+            /// The listed background agent, of the recorded id shape.
+            const LISTED: &str = "a4d8b2f6e0c3a7d1b";
+            let log = ClaimLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-subagent-late-listing-");
+            let client = Client::new(&root);
+            let running = one(LISTED, SubagentPhase::Running);
+            let steps = vec![
+                client.step(CLAUDE, &[(START, 10, LISTED)]),
+                client.snapshot(30, &listed(&[LISTED])),
+                client.snapshot(20, &listed(&[LISTED])),
+                Step::Checkpoint(running.clone()),
+                client.snapshot(25, &[]),
+                Step::Checkpoint(running),
+                client.snapshot(40, &[]),
+            ];
+            let run = replay(&root, steps, &one(LISTED, SubagentPhase::Completed)).await;
+            assert_eq!(
+                client.answers(),
+                [
+                    Answer::new(START, 10, LISTED, true),
+                    snapshot_answer(30, true),
+                    snapshot_answer(20, true),
+                    snapshot_answer(25, true),
+                    snapshot_answer(40, true),
+                ]
+            );
+            let [listed_row, after_late, _] = run.snapshots.as_slice() else {
+                panic!("two checkpoints and the final rows: {:?}", run.snapshots);
+            };
+            assert_eq!(row(after_late, LISTED), row(listed_row, LISTED));
+            let listing = Applied {
+                tasks: 1,
+                listed: 1,
+                hosts: true,
+                ..Applied::default()
+            };
+            assert_eq!(
+                log.applied(),
+                [
+                    listing.clone(),
+                    listing,
+                    Applied {
+                        deferred: 1,
+                        ..Applied::default()
+                    },
+                    Applied {
+                        terminalized: 1,
+                        ..Applied::default()
+                    },
+                ]
+            );
+            assert_eq!(
+                log.reconciled(),
+                [(LISTED.to_owned(), "snapshot_absent".to_owned())]
+            );
+            assert_eq!(log.events(), [], "no claim is ignored or refused");
+            run.finish().await;
+        }
+
+        /// A snapshot never touches a terminal subagent, even one it lists
+        /// as live: an older snapshot (sequence 8) and a newer one (20) list
+        /// the subagent completed at 10, and one at 30 lists another agent.
+        /// The row stays completed with its revision and timestamps (#883 D4).
+        ///
+        /// R4 and the S4 evidence show a stopping agent still listed as
+        /// running in the main `Stop` after its own `SubagentStop`; a
+        /// self-woken run reopens through its own newer `SubagentStart`.
+        #[tokio::test]
+        async fn a_snapshot_listing_a_completed_subagent_leaves_it_completed() {
             /// The listed subagent, of the recorded id shape.
             const LISTED: &str = "a2c6e0b4d8f1a5c9e";
             /// Another background agent the worker has no record of.
             const OTHER: &str = "a6e0c4b8d2f5a9e3c";
             let log = ClaimLog::default();
             let _subscriber = log.install();
-            let root = crate::test_support::scoped_dir("ph-subagent-reopen-listed-");
+            let root = crate::test_support::scoped_dir("ph-subagent-listed-terminal-");
             let client = Client::new(&root);
+            let completed = one(LISTED, SubagentPhase::Completed);
             let steps = vec![
                 client.step(CLAUDE, &[(START, 5, LISTED), (STOP, 10, LISTED)]),
+                Step::Checkpoint(completed.clone()),
                 client.snapshot(8, &listed(&[LISTED])),
-                Step::Checkpoint(one(LISTED, SubagentPhase::Completed)),
                 client.snapshot(20, &listed(&[LISTED])),
-                Step::Checkpoint(one(LISTED, SubagentPhase::Running)),
                 client.snapshot(30, &listed(&[OTHER])),
             ];
-            let run = replay(&root, steps, &one(LISTED, SubagentPhase::Completed)).await;
+            let run = replay(&root, steps, &completed).await;
             assert_eq!(
                 client.answers(),
                 [
@@ -2325,142 +2730,113 @@ for claim in plan:
                     snapshot_answer(30, true),
                 ]
             );
-            let [completed, reopened, settled] = run.snapshots.as_slice() else {
-                panic!("two checkpoints and the final rows: {:?}", run.snapshots);
+            let [before, after] = run.snapshots.as_slice() else {
+                panic!("one checkpoint and the final rows: {:?}", run.snapshots);
             };
-            let [completed, reopened, settled] =
-                [completed, reopened, settled].map(|snapshot| row(snapshot, LISTED));
-            assert!(
-                completed.revision < reopened.revision && reopened.revision < settled.revision,
-                "{completed:?} {reopened:?} {settled:?}"
-            );
-            assert_eq!(reopened.finished_at_ms, None, "{reopened:?}");
-            assert_eq!(reopened.started_at_ms, completed.started_at_ms);
-            assert!(
-                reopened.updated_at_ms > completed.updated_at_ms,
-                "{completed:?} {reopened:?}"
-            );
-            assert!(settled.finished_at_ms.is_some(), "{settled:?}");
+            assert_eq!(row(after, LISTED), row(before, LISTED));
+            assert_eq!(log.reconciled(), [], "nothing is reconciled");
+            let listing_one = Applied {
+                tasks: 1,
+                hosts: true,
+                ..Applied::default()
+            };
             assert_eq!(
-                log.reconciled(),
+                log.applied(),
+                [listing_one.clone(), listing_one.clone(), listing_one]
+            );
+            assert_eq!(log.events(), [], "no claim is ignored or refused");
+            run.finish().await;
+        }
+
+        /// S4 evidence (real Claude 2.1.289 and 2.1.296): a fast background
+        /// agent, listed by the main `Stop` at 15 while it ran, sends its own
+        /// `SubagentStop` (20) before the next main `Stop` (30), whose listing
+        /// was built earlier and still shows it as running. The row stays
+        /// completed through that snapshot and the next empty one, with no
+        /// running flicker and no new revision (#883 D4).
+        #[tokio::test]
+        async fn a_fast_background_agent_stays_completed_under_a_lagging_listing() {
+            /// The fast background agent, of the recorded id shape.
+            const FAST: &str = "a1e5c9f3b7d0a4e8c";
+            let log = ClaimLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-subagent-lagging-listing-");
+            let client = Client::new(&root);
+            let completed = one(FAST, SubagentPhase::Completed);
+            let steps = vec![
+                client.step(CLAUDE, &[(START, 10, FAST)]),
+                client.snapshot(15, &listed(&[FAST])),
+                Step::Checkpoint(one(FAST, SubagentPhase::Running)),
+                client.step(CLAUDE, &[(STOP, 20, FAST)]),
+                Step::Checkpoint(completed.clone()),
+                client.snapshot(30, &listed(&[FAST])),
+                Step::Checkpoint(completed.clone()),
+                client.snapshot(40, &[]),
+            ];
+            let run = replay(&root, steps, &completed).await;
+            assert_eq!(
+                client.answers(),
                 [
-                    (LISTED.to_owned(), "snapshot_listed".to_owned()),
-                    (LISTED.to_owned(), "snapshot_absent".to_owned()),
+                    Answer::new(START, 10, FAST, true),
+                    snapshot_answer(15, true),
+                    Answer::new(STOP, 20, FAST, true),
+                    snapshot_answer(30, true),
+                    snapshot_answer(40, true),
                 ]
             );
-            // Every snapshot lists a subagent, a task type that can host
-            // agents.
+            let [_, stopped, listed_again, last] = run.snapshots.as_slice() else {
+                panic!("three checkpoints and the final rows: {:?}", run.snapshots);
+            };
+            let stopped = row(stopped, FAST);
+            assert_eq!(row(listed_again, FAST), stopped);
+            assert_eq!(row(last, FAST), stopped);
+            assert_eq!(log.reconciled(), [], "nothing is reconciled");
             assert_eq!(
                 log.applied(),
                 [
                     Applied {
+                        tasks: 1,
+                        listed: 1,
                         hosts: true,
                         ..Applied::default()
                     },
                     Applied {
-                        reopened: 1,
+                        tasks: 1,
                         hosts: true,
                         ..Applied::default()
                     },
-                    Applied {
-                        terminalized: 1,
-                        hosts: true,
-                        ..Applied::default()
-                    },
+                    Applied::default(),
                 ]
             );
             assert_eq!(log.events(), [], "no claim is ignored or refused");
             run.finish().await;
         }
 
-        /// A snapshot that lists a terminal subagent while
-        /// [`ACTIVE_CAPACITY`] listed subagents run cannot reopen it: the
-        /// subagent stays completed, the snapshot is still acknowledged, and
-        /// the worker logs a refused `snapshot` claim for it with reason
-        /// `capacity`, beside the snapshot's counts (#883 D4, D5).
+        /// A main `Stop` snapshot (sequence 30) that lists a running subagent
+        /// leaves its recorded sequence alone, so the subagent's own stop (20),
+        /// delivered after the snapshot, still completes it; the listing
+        /// changes no public state. A later stop (40) on the completed row is
+        /// ignored as `not_running` (#883 D4, ordering invariant).
         #[tokio::test]
-        async fn a_snapshot_reopen_beyond_the_active_capacity_is_refused() {
-            /// The terminal subagent the snapshot lists, of the recorded id
-            /// shape.
-            const LISTED: &str = "a5e9c3f7b1d4a8e2c";
-            /// Sequence of the snapshot, after every start and stop.
-            const SNAPSHOT_SEQUENCE: u64 = 1_000;
-            let log = ClaimLog::default();
-            let _subscriber = log.install();
-            let root = crate::test_support::scoped_dir("ph-subagent-reopen-capacity-");
-            let client = Client::new(&root);
-            let running_ids: Vec<String> = (0..ACTIVE_CAPACITY)
-                .map(|index| format!("ad{index:015x}"))
-                .collect();
-            let mut claims = vec![(START, 1, LISTED), (STOP, 2, LISTED)];
-            claims.extend(
-                running_ids
-                    .iter()
-                    .zip(3_u64..)
-                    .map(|(id, sequence)| (START, sequence, id.as_str())),
-            );
-            let mut rows: Rows = running_ids
-                .iter()
-                .map(|id| ((CLAUDE.to_owned(), id.clone()), SubagentPhase::Running))
-                .collect();
-            rows.insert(
-                (CLAUDE.to_owned(), LISTED.to_owned()),
-                SubagentPhase::Completed,
-            );
-            let mut every: Vec<&str> = running_ids.iter().map(String::as_str).collect();
-            every.push(LISTED);
-            let steps = vec![
-                client.step(CLAUDE, &claims),
-                Step::Checkpoint(rows.clone()),
-                client.snapshot(SNAPSHOT_SEQUENCE, &listed(&every)),
-            ];
-            let run = replay(&root, steps, &rows).await;
-
-            let mut expected: Vec<Answer> = claims
-                .iter()
-                .map(|(action, sequence, id)| Answer::new(action, *sequence, id, true))
-                .collect();
-            expected.push(snapshot_answer(SNAPSHOT_SEQUENCE, true));
-            assert_eq!(client.answers(), expected);
-            assert_eq!(
-                log.events(),
-                [Logged::new(REFUSED_EVENT, "snapshot", LISTED, "capacity")]
-            );
-            assert_eq!(log.reconciled(), [], "nothing is completed or reopened");
-            assert_eq!(
-                log.applied(),
-                [Applied {
-                    listed: u64::try_from(ACTIVE_CAPACITY).expect("the capacity fits u64"),
-                    hosts: true,
-                    ..Applied::default()
-                }]
-            );
-            run.finish().await;
-        }
-
-        /// A running subagent that a main `Stop` snapshot (sequence 30) lists
-        /// takes the snapshot's sequence, so a delayed stop between its start
-        /// (10) and the snapshot (20) is stale and leaves it running; the
-        /// listing changes no public state. A newer stop (40) completes it
-        /// (#883 D4, ordering invariant).
-        #[tokio::test]
-        async fn a_listed_subagent_ignores_a_stop_older_than_the_listing() {
+        async fn a_stop_older_than_the_listing_completes_the_subagent() {
             /// The listed subagent, of the recorded id shape.
             const LISTED: &str = "a9c3e7b1d5f8a2c6e";
             let log = ClaimLog::default();
             let _subscriber = log.install();
-            let root = crate::test_support::scoped_dir("ph-subagent-listed-stale-stop-");
+            let root = crate::test_support::scoped_dir("ph-subagent-listed-older-stop-");
             let client = Client::new(&root);
             let running = one(LISTED, SubagentPhase::Running);
+            let completed = one(LISTED, SubagentPhase::Completed);
             let steps = vec![
                 client.step(CLAUDE, &[(START, 10, LISTED)]),
                 Step::Checkpoint(running.clone()),
                 client.snapshot(30, &listed(&[LISTED])),
-                client.step(CLAUDE, &[(STOP, 20, LISTED)]),
                 Step::Checkpoint(running),
+                client.step(CLAUDE, &[(STOP, 20, LISTED)]),
+                Step::Checkpoint(completed.clone()),
                 client.step(CLAUDE, &[(STOP, 40, LISTED)]),
             ];
-            let run = replay(&root, steps, &one(LISTED, SubagentPhase::Completed)).await;
+            let run = replay(&root, steps, &completed).await;
             assert_eq!(
                 client.answers(),
                 [
@@ -2472,34 +2848,182 @@ for claim in plan:
             );
             assert_eq!(
                 log.events(),
-                [Logged::new(IGNORED_EVENT, "stop", LISTED, "stale_sequence")],
-                "the stop older than the listing is ignored as stale"
+                [Logged::new(IGNORED_EVENT, "stop", LISTED, "not_running")],
+                "only the stop on the completed row is ignored"
             );
-            let [started, listed_row, completed] = run.snapshots.as_slice() else {
-                panic!("two checkpoints and the final rows: {:?}", run.snapshots);
+            let [started, listed_row, stopped, last] = run.snapshots.as_slice() else {
+                panic!("three checkpoints and the final rows: {:?}", run.snapshots);
             };
-            let [started, listed_row, completed] =
-                [started, listed_row, completed].map(|snapshot| row(snapshot, LISTED));
+            let [started, listed_row, stopped, last] =
+                [started, listed_row, stopped, last].map(|snapshot| row(snapshot, LISTED));
             assert_eq!(
-                listed_row.revision, started.revision,
+                listed_row, started,
                 "the listing changes no public state: {started:?} {listed_row:?}"
             );
-            assert!(completed.revision > listed_row.revision, "{completed:?}");
+            assert!(stopped.revision > listed_row.revision, "{stopped:?}");
+            assert_eq!(last.revision, stopped.revision, "{stopped:?} {last:?}");
+            assert_eq!(
+                log.reconciled(),
+                [],
+                "the stop, not the snapshot, completes it"
+            );
+            assert_eq!(
+                log.applied(),
+                [Applied {
+                    tasks: 1,
+                    listed: 1,
+                    hosts: true,
+                    ..Applied::default()
+                }]
+            );
+            run.finish().await;
+        }
+
+        /// A start (30) whose listing may have been built before it: the
+        /// first snapshot of its reporter (40) lists only a shell, which runs
+        /// no agent, but no earlier snapshot proves the start predates the
+        /// listing (S4 evidence: Claude builds the listing before the `Stop`
+        /// hook reads its clock), so the subagent is deferred and stays
+        /// running. The next shells-only snapshot (50) settles it (#883 D4).
+        #[tokio::test]
+        async fn a_start_racing_a_shells_only_listing_stays_running_until_the_next_one() {
+            /// The racing subagent, of the recorded id shape.
+            const RACING: &str = "a4f8b2e6c0d3a7f1b";
+            let log = ClaimLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-subagent-racing-start-");
+            let client = Client::new(&root);
+            let steps = vec![
+                client.step(CLAUDE, &[(START, 30, RACING)]),
+                client.snapshot(40, &shells()),
+                Step::Checkpoint(one(RACING, SubagentPhase::Running)),
+                client.snapshot(50, &shells()),
+            ];
+            let run = replay(&root, steps, &one(RACING, SubagentPhase::Completed)).await;
+            assert_eq!(
+                client.answers(),
+                [
+                    Answer::new(START, 30, RACING, true),
+                    snapshot_answer(40, true),
+                    snapshot_answer(50, true),
+                ]
+            );
+            assert_eq!(
+                log.reconciled(),
+                [(RACING.to_owned(), "snapshot_absent".to_owned())]
+            );
+            assert_eq!(
+                log.applied(),
+                [
+                    Applied {
+                        tasks: 1,
+                        deferred: 1,
+                        ..Applied::default()
+                    },
+                    Applied {
+                        tasks: 1,
+                        terminalized: 1,
+                        ..Applied::default()
+                    },
+                ]
+            );
+            assert_eq!(log.events(), [], "no claim is ignored or refused");
+            run.finish().await;
+        }
+
+        /// A known background agent (listed at 30) that a later snapshot (40)
+        /// omits is completed, keeping its own recorded sequence (10). A
+        /// resume start (35) that falls between the record and that snapshot,
+        /// in the window between Claude building the listing and the `Stop`
+        /// hook reading its clock (S4 evidence), still reopens it with a new
+        /// revision; its stop (50) completes it again (#883 D1, D4).
+        #[tokio::test]
+        async fn a_settled_background_agent_keeps_its_sequence_for_a_resume() {
+            /// The background agent, of the recorded id shape.
+            const RESUMED: &str = "a8d2f6b0c4e7a1d5f";
+            let log = ClaimLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-subagent-settled-resume-");
+            let client = Client::new(&root);
+            let completed = one(RESUMED, SubagentPhase::Completed);
+            let steps = vec![
+                client.step(CLAUDE, &[(START, 10, RESUMED)]),
+                client.snapshot(30, &listed(&[RESUMED])),
+                Step::Checkpoint(one(RESUMED, SubagentPhase::Running)),
+                client.snapshot(40, &[]),
+                Step::Checkpoint(completed.clone()),
+                client.step(CLAUDE, &[(START, 35, RESUMED)]),
+                Step::Checkpoint(one(RESUMED, SubagentPhase::Running)),
+                client.step(CLAUDE, &[(STOP, 50, RESUMED)]),
+            ];
+            let run = replay(&root, steps, &completed).await;
+            assert_eq!(
+                client.answers(),
+                [
+                    Answer::new(START, 10, RESUMED, true),
+                    snapshot_answer(30, true),
+                    snapshot_answer(40, true),
+                    Answer::new(START, 35, RESUMED, true),
+                    Answer::new(STOP, 50, RESUMED, true),
+                ]
+            );
+            let [running, settled, reopened, last] = run.snapshots.as_slice() else {
+                panic!("three checkpoints and the final rows: {:?}", run.snapshots);
+            };
+            let [running, settled, reopened, last] =
+                [running, settled, reopened, last].map(|snapshot| row(snapshot, RESUMED));
+            assert!(
+                running.revision < settled.revision
+                    && settled.revision < reopened.revision
+                    && reopened.revision < last.revision,
+                "{running:?} {settled:?} {reopened:?} {last:?}"
+            );
+            assert_eq!(settled.finished_at_ms, Some(settled.updated_at_ms));
+            assert_eq!(reopened.finished_at_ms, None, "{reopened:?}");
+            assert_eq!(reopened.started_at_ms, running.started_at_ms);
+            assert_eq!(
+                log.reconciled(),
+                [(RESUMED.to_owned(), "snapshot_absent".to_owned())]
+            );
+            assert_eq!(
+                log.applied(),
+                [
+                    Applied {
+                        tasks: 1,
+                        listed: 1,
+                        hosts: true,
+                        ..Applied::default()
+                    },
+                    Applied {
+                        terminalized: 1,
+                        ..Applied::default()
+                    },
+                ]
+            );
+            assert_eq!(log.events(), [], "the resume start is applied, not ignored");
             run.finish().await;
         }
 
         /// Records left running by lost stops cannot exhaust the subagent
         /// capacity (#883 D4).
         ///
-        /// At capacity, a further start is refused and adds no row. One empty
-        /// main `Stop` snapshot settles every stale record, the terminal
-        /// history keeps its bound, and the refused subagent then starts.
-        #[tokio::test(flavor = "multi_thread")]
+        /// At capacity, a further start is refused and adds no row. The
+        /// reporter's first empty main `Stop` snapshot defers every stale
+        /// record, because Claude builds a listing before the `Stop` hook
+        /// reads its clock (S4 evidence) and no earlier snapshot proves the
+        /// records predate it. The next empty snapshot settles all of them,
+        /// the terminal history keeps its bound, and the refused subagent
+        /// then starts.
+        #[tokio::test]
         async fn stale_running_subagents_cannot_exhaust_the_capacity() {
             /// The start beyond the capacity, of the recorded id shape.
             const EXTRA: &str = "ae1f2a3b4c5d6e7f8";
-            /// Sequence of the snapshot, after every start.
+            /// Sequence of the first snapshot, after every start.
+            const FIRST_SNAPSHOT: u64 = 900;
+            /// Sequence of the snapshot that settles the stale records.
             const SNAPSHOT_SEQUENCE: u64 = 1_000;
+            let log = ClaimLog::default();
+            let _subscriber = log.install();
             let root = crate::test_support::scoped_dir("ph-subagent-stale-capacity-");
             let client = Client::new(&root);
             let stale: Vec<String> = (0..ACTIVE_CAPACITY)
@@ -2518,6 +3042,8 @@ for claim in plan:
                 .collect();
             let steps = vec![
                 client.step(CLAUDE, &starts),
+                Step::Checkpoint(full.clone()),
+                client.snapshot(FIRST_SNAPSHOT, &[]),
                 Step::Checkpoint(full),
                 client.snapshot(SNAPSHOT_SEQUENCE, &[]),
                 client.step(CLAUDE, &[(START, SNAPSHOT_SEQUENCE + 1, EXTRA)]),
@@ -2529,10 +3055,36 @@ for claim in plan:
                 .map(|(action, sequence, id)| Answer::new(action, *sequence, id, *id != EXTRA))
                 .collect();
             expected.extend([
+                snapshot_answer(FIRST_SNAPSHOT, true),
                 snapshot_answer(SNAPSHOT_SEQUENCE, true),
                 Answer::new(START, SNAPSHOT_SEQUENCE + 1, EXTRA, true),
             ]);
             assert_eq!(client.answers(), expected);
+            assert_eq!(
+                log.events(),
+                [Logged::new(REFUSED_EVENT, "start", EXTRA, "capacity")]
+            );
+            let capacity = u64::try_from(ACTIVE_CAPACITY).expect("the capacity fits u64");
+            assert_eq!(
+                log.applied(),
+                [
+                    Applied {
+                        deferred: capacity,
+                        ..Applied::default()
+                    },
+                    Applied {
+                        terminalized: capacity,
+                        ..Applied::default()
+                    },
+                ]
+            );
+            let mut reconciled = log.reconciled();
+            reconciled.sort();
+            let every_stale: Vec<(String, String)> = stale
+                .iter()
+                .map(|id| (id.clone(), "snapshot_absent".to_owned()))
+                .collect();
+            assert_eq!(reconciled, every_stale);
 
             let rows = journaled_rows(run.snapshots.last().expect("the final rows"));
             let running: Vec<&String> = rows
@@ -2561,22 +3113,30 @@ for claim in plan:
         }
 
         /// The worker refuses a snapshot whose task list breaks a bound or
-        /// holds invalid text as a whole: it answers `ok: false` and settles
-        /// nothing. A valid snapshot of the same agent then settles the
-        /// subagent (#883 D4).
+        /// holds invalid text as a whole: it answers `ok: false`, settles
+        /// nothing and logs no applied snapshot. A valid snapshot of the same
+        /// agent then settles the subagent (#883 D4).
         ///
-        /// Apart from the over-long type, which is a type that can host
-        /// agents, each refused list would settle the subagent if it were
-        /// applied, or applied without its invalid entry.
-        #[tokio::test(flavor = "multi_thread")]
+        /// A first valid shells-only snapshot (7) defers the subagent and gives
+        /// later snapshots the earlier snapshot that a never-listed subagent's
+        /// settlement needs (S4 evidence: Claude builds the listing before the
+        /// `Stop` hook reads its clock). Apart from the over-long type, which
+        /// is a type that can host agents, each refused list would then settle
+        /// the subagent if it were applied, or applied without its invalid
+        /// entry.
+        #[tokio::test]
         async fn an_invalid_snapshot_task_list_is_refused_whole() {
             /// The running subagent, of the recorded id shape.
             const STALE: &str = "a3d7f1b5c9e2a6d0f";
+            /// Sequence of the first valid snapshot.
+            const FIRST_VALID: u64 = 7;
             /// Sequence of the first refused snapshot; each next one is one
             /// higher.
             const FIRST_REFUSED: u64 = 10;
-            /// Sequence of the valid snapshot, after every refused one.
+            /// Sequence of the valid snapshot that settles the subagent.
             const VALID: u64 = 100;
+            let log = ClaimLog::default();
+            let _subscriber = log.install();
             let root = crate::test_support::scoped_dir("ph-subagent-invalid-snapshot-");
             let client = Client::new(&root);
             let task = |id: &str, kind: &str, status: &str| json!({"id": id, "type": kind, "status": status});
@@ -2604,16 +3164,24 @@ for claim in plan:
             let plan: Vec<Value> = invalid
                 .into_iter()
                 .zip(&refused)
-                .map(|(tasks, sequence)| json!({"type": SNAPSHOT, "sequence": sequence, "tasks": tasks}))
+                .map(|(tasks, sequence)| {
+                    json!({"type": SNAPSHOT, "sequence": sequence, "tasks": tasks})
+                })
                 .collect();
+            let running = one(STALE, SubagentPhase::Running);
             let steps = vec![
                 client.step(CLAUDE, &[(START, 5, STALE)]),
+                client.snapshot(FIRST_VALID, std::slice::from_ref(&shell)),
+                Step::Checkpoint(running.clone()),
                 client.send(CLAUDE, &Value::Array(plan)),
-                Step::Checkpoint(one(STALE, SubagentPhase::Running)),
+                Step::Checkpoint(running),
                 client.snapshot(VALID, std::slice::from_ref(&shell)),
             ];
             let run = replay(&root, steps, &one(STALE, SubagentPhase::Completed)).await;
-            let mut expected = vec![Answer::new(START, 5, STALE, true)];
+            let mut expected = vec![
+                Answer::new(START, 5, STALE, true),
+                snapshot_answer(FIRST_VALID, true),
+            ];
             expected.extend(
                 refused
                     .iter()
@@ -2621,6 +3189,22 @@ for claim in plan:
             );
             expected.push(snapshot_answer(VALID, true));
             assert_eq!(client.answers(), expected);
+            assert_eq!(
+                log.applied(),
+                [
+                    Applied {
+                        tasks: 1,
+                        deferred: 1,
+                        ..Applied::default()
+                    },
+                    Applied {
+                        tasks: 1,
+                        terminalized: 1,
+                        ..Applied::default()
+                    },
+                ],
+                "only the valid snapshots are applied"
+            );
             run.finish().await;
         }
     }
