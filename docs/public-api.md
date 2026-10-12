@@ -1668,7 +1668,9 @@ but observation returns `worker_feature_unavailable`.
 `session.wait_turn` blocks until one of the targeted sessions records a turn
 event newer than a cursor, or until the timeout elapses. It is the primitive for
 a manager agent that starts sessions and follows them: chain waits with the
-returned cursor and branch on the reason.
+returned cursor and branch on the reason. The CLI form is `pohunek session wait
+<target>... [--until <kinds>] [--after <cursor>] [--timeout <duration>] --json`
+(see `docs/cli.md`).
 
 ```json
 {

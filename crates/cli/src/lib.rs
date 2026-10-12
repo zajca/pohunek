@@ -1286,25 +1286,89 @@ enum SessionAction {
         json: bool,
     },
 
-    /// Wait for one bounded session change.
+    /// Wait for the next turn event of sessions, or for one bounded session change.
+    ///
+    /// Turn mode, the default (also with no flags at all): waits until one of
+    /// the targets, all on one host, records a `turn_completed`,
+    /// `agent_blocked`, `approval_required`, or `exited` event newer than
+    /// `--after` (or newer than the call), or until `--timeout` elapses (daemon
+    /// default when omitted). Every result prints the per-target progress and
+    /// the next cursor to pass as `--after`.
+    ///
+    /// Legacy mode, selected by any of `--state`, `--activity`,
+    /// `--after-updated-at`, `--after-terminal-watermark`,
+    /// `--after-output-offset`, `--worker-instance-id`, `--runtime-generation`,
+    /// or `--timeout-ms`: waits up to 8000 ms for one target to match the
+    /// predicates. It takes exactly one target and requires `--timeout-ms`.
+    ///
+    /// Both modes exit 0 for every completion reason, including a timeout.
+    #[command(group(
+        clap::ArgGroup::new("legacy_wait")
+            .multiple(true)
+            .args([
+                "worker_instance_id",
+                "runtime_generation",
+                "after_updated_at",
+                "after_terminal_watermark",
+                "after_output_offset",
+                "states",
+                "activities",
+                "timeout_ms",
+            ])
+    ))]
     Wait {
-        target: Target,
-        #[arg(long, alias = "runtime-id", requires = "runtime_generation")]
+        /// Session targets: `session-id`, a display name, or `host/session-id`.
+        /// Every target must be on the same host; legacy mode takes one.
+        #[arg(required = true, value_name = "TARGET")]
+        target: Vec<Target>,
+        /// Turn event kinds that end the wait, as a comma list or repeated
+        /// flag. Defaults to all four kinds.
+        #[arg(
+            long,
+            value_enum,
+            value_delimiter = ',',
+            value_name = "KIND",
+            conflicts_with = "legacy_wait"
+        )]
+        until: Vec<commands::session::TurnKindArg>,
+        /// Cursor of an earlier turn-mode result; only newer events end the wait.
+        #[arg(
+            long,
+            value_name = "CURSOR",
+            value_parser = commands::session::parse_turn_cursor,
+            conflicts_with = "legacy_wait"
+        )]
+        after: Option<protocol::SessionTurnCursor>,
+        /// Turn-mode wait duration with a unit: `ms`, `s`, `m`, or `h`, for
+        /// example `90s` or `5m`. Omitted means the daemon default.
+        #[arg(
+            long,
+            value_name = "DURATION",
+            value_parser = commands::session::parse_turn_timeout,
+            conflicts_with = "legacy_wait"
+        )]
+        timeout: Option<u32>,
+        #[arg(
+            long,
+            alias = "runtime-id",
+            requires_all = ["runtime_generation", "timeout_ms"]
+        )]
         worker_instance_id: Option<String>,
-        #[arg(long, requires = "worker_instance_id")]
+        #[arg(long, requires_all = ["worker_instance_id", "timeout_ms"])]
         runtime_generation: Option<u64>,
-        #[arg(long)]
+        #[arg(long, requires = "timeout_ms")]
         after_updated_at: Option<String>,
-        #[arg(long)]
+        #[arg(long, requires = "timeout_ms")]
         after_terminal_watermark: Option<u64>,
-        #[arg(long)]
+        #[arg(long, requires = "timeout_ms")]
         after_output_offset: Option<u64>,
-        #[arg(long = "state", value_parser = commands::session::parse_state_filter)]
+        #[arg(long = "state", value_parser = commands::session::parse_state_filter, requires = "timeout_ms")]
         states: Vec<protocol::SessionState>,
-        #[arg(long = "activity", value_parser = commands::session::parse_activity_filter)]
+        #[arg(long = "activity", value_parser = commands::session::parse_activity_filter, requires = "timeout_ms")]
         activities: Vec<protocol::AgentActivity>,
+        /// Legacy-mode wait duration in milliseconds, 1 to 8000.
         #[arg(long, value_parser = commands::session::parse_wait_timeout_ms)]
-        timeout_ms: u32,
+        timeout_ms: Option<u32>,
         #[arg(long)]
         json: bool,
     },
@@ -1730,6 +1794,9 @@ pub async fn run_cli() -> ExitCode {
         );
         return error::render_clap_error(&err, error::args_request_json(&args));
     }
+    if let Some(err) = session_wait_usage_error(&cli) {
+        return error::render_clap_error(&err, error::args_request_json(&args));
+    }
     // Capture whether the active command requested `--json` before `run` consumes
     // `cli`, so a failure is rendered in the same mode a success would have been.
     let json = cli.command.wants_json();
@@ -2018,6 +2085,9 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 }
                 SessionAction::Wait {
                     target,
+                    until,
+                    after,
+                    timeout,
                     worker_instance_id,
                     runtime_generation,
                     after_updated_at,
@@ -2028,24 +2098,50 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     timeout_ms,
                     json,
                 } => {
-                    let host = effective_host(&global_host, Some(&target));
-                    commands::session::run_wait(
-                        &host,
-                        &paths,
-                        &target,
-                        commands::session::WaitArgs {
-                            worker_instance_id,
-                            runtime_generation,
-                            after_updated_at,
-                            after_terminal_watermark,
-                            after_output_offset,
-                            states,
-                            activities,
-                            timeout_ms,
-                        },
-                        json,
-                    )
-                    .await?;
+                    // `run_cli` already rejected targets on different hosts, so
+                    // the first target selects the host of every target.
+                    let host = effective_host(&global_host, target.first());
+                    // Every legacy flag requires `--timeout-ms`, so its presence
+                    // alone selects legacy mode.
+                    if let Some(timeout_ms) = timeout_ms {
+                        // `run_cli` rejects this as a usage error first; the
+                        // check keeps the dispatch total without a panic.
+                        let [target] = target.as_slice() else {
+                            return Err(CliError::InvalidObservation {
+                                detail: LEGACY_WAIT_SINGLE_TARGET.to_owned(),
+                            });
+                        };
+                        commands::session::run_wait(
+                            &host,
+                            &paths,
+                            target,
+                            commands::session::WaitArgs {
+                                worker_instance_id,
+                                runtime_generation,
+                                after_updated_at,
+                                after_terminal_watermark,
+                                after_output_offset,
+                                states,
+                                activities,
+                                timeout_ms,
+                            },
+                            json,
+                        )
+                        .await?;
+                    } else {
+                        commands::session::run_wait_turn(
+                            &host,
+                            &paths,
+                            &target,
+                            commands::session::TurnWaitArgs {
+                                until,
+                                after,
+                                timeout_ms: timeout,
+                            },
+                            json,
+                        )
+                        .await?;
+                    }
                 }
                 SessionAction::Resume {
                     target,
@@ -2661,6 +2757,52 @@ fn effective_host(global: &str, target: Option<&Target>) -> String {
         Some(host) => host.to_owned(),
         None => global.to_owned(),
     }
+}
+
+/// Usage message for a legacy `session wait` with several targets.
+const LEGACY_WAIT_SINGLE_TARGET: &str = "a legacy `session wait` (any of --state, --activity, \
+     --after-updated-at, --after-terminal-watermark, --after-output-offset, \
+     --worker-instance-id, --runtime-generation, --timeout-ms) takes exactly one target; \
+     drop the legacy flags to wait for turn events of several sessions";
+
+/// Rejects the `session wait` target lists clap cannot express, before any
+/// request: several targets in legacy mode, and targets on different hosts.
+///
+/// A turn wait is one daemon request, so all of its targets must resolve to
+/// the same effective host; waiting across hosts is a client-side concern.
+fn session_wait_usage_error(cli: &Cli) -> Option<clap::Error> {
+    let Commands::Session {
+        action: SessionAction::Wait {
+            target, timeout_ms, ..
+        },
+    } = &cli.command
+    else {
+        return None;
+    };
+    if timeout_ms.is_some() && target.len() > 1 {
+        return Some(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            // A raw clap message is printed verbatim, newline included.
+            format!("{LEGACY_WAIT_SINGLE_TARGET}\n"),
+        ));
+    }
+    let host_of = |entry: &Target| {
+        let host = effective_host(&cli.host, Some(entry));
+        if crate::target::is_local_host(&host) {
+            LOCAL_HOST.to_owned()
+        } else {
+            host
+        }
+    };
+    let first = target.first().map(host_of)?;
+    let other = target.iter().map(host_of).find(|host| *host != first)?;
+    Some(clap::Error::raw(
+        clap::error::ErrorKind::ArgumentConflict,
+        format!(
+            "`session wait` targets must all be on one host, got `{first}` and `{other}`; \
+             run one wait per host\n"
+        ),
+    ))
 }
 
 fn effective_notification_host(
