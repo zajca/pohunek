@@ -5,7 +5,7 @@
 //! Everything goes through the release CLI of the layout; the scenario reads
 //! only `--json` documents and the processes it started.
 
-// Rust guideline compliant 2026-10-08
+// Rust guideline compliant 2026-10-12
 
 use std::path::{Path, PathBuf};
 
@@ -17,7 +17,7 @@ use serde_json::Value;
 use crate::native_reference_diagnostics::NativeReferenceDiagnostics;
 use crate::release_bounded::{run as run_bounded, PROBE_TIMEOUT};
 use crate::release_catalog::PackageFacts;
-use crate::release_drivers::{write_profile, Driver, Prepared, Stub};
+use crate::release_drivers::{write_profile, Driver, Integration, Prepared, Stub};
 use crate::release_host::Host;
 use crate::release_layout::Layout;
 
@@ -40,6 +40,14 @@ const SECOND_TOKEN: &str = "second-turn-9c1d";
 
 /// Name of the session the suite starts.
 const SESSION_NAME: &str = "consumer";
+
+/// Access mode of the Hermes operator plugin policy. The scenario never calls
+/// a plugin tool, so the narrowest mode suffices.
+const HERMES_ACCESS_MODE: &str = "read_only";
+
+/// The one host the Hermes operator plugin policy allows: the daemon of this
+/// run.
+const HERMES_ALLOWED_HOST: &str = "local";
 
 /// What a run established, for the report.
 #[derive(Debug)]
@@ -296,9 +304,11 @@ fn stop_resume_and_check_history(
     let finished = prepared.stub.finished();
     host.ok(&["session", "input", id, SECOND_PROMPT]);
     poll_until("the model request of the turn after the resume", || {
+        prepared.stub.assert_healthy();
         (!prepared.stub.bodies_containing(SECOND_TOKEN).is_empty()).then_some(())
     });
     poll_until("the second turn's reply", || {
+        prepared.stub.assert_healthy();
         (prepared.stub.finished() > finished).then_some(())
     });
     host.wait_activity(id, "idle");
@@ -322,6 +332,95 @@ fn stop_resume_and_check_history(
     host.stop_session(id);
 }
 
+/// Installs the driver's integration, if it has one.
+fn install_integration(
+    host: &Host,
+    driver: &Driver,
+    facts: &PackageFacts,
+    prepared: &Prepared,
+    upstream: &Path,
+) {
+    match driver.integration {
+        Integration::None => {}
+        Integration::ProfileHook => {
+            let installed = host.ok(&[
+                "integration",
+                "install",
+                "--agent",
+                driver.runtime,
+                "--profile",
+                PROFILE,
+            ]);
+            assert!(
+                installed["failed"].as_array().is_none_or(Vec::is_empty),
+                "{installed}"
+            );
+        }
+        Integration::HermesPlugin => install_hermes_plugin(host, facts, prepared, upstream),
+    }
+}
+
+/// Installs the Hermes operator plugin into the driver's Hermes home and
+/// checks that its assets came from the installed package, not from the
+/// copies the CLI embeds.
+///
+/// The CLI refuses a Hermes executable path with a symlink component, and a
+/// stage's `bin/hermes` is a link into its virtual environment, so the plugin
+/// commands run the resolved file. `--pohunek-bin` is left out: the policy
+/// then names the running CLI, the layout's `pohunek`.
+fn install_hermes_plugin(host: &Host, facts: &PackageFacts, prepared: &Prepared, upstream: &Path) {
+    let home = prepared
+        .runtime_home
+        .as_deref()
+        .expect("the Hermes driver names the Hermes home it wrote");
+    let home = home.to_str().expect("utf-8 Hermes home");
+    let hermes = upstream
+        .canonicalize()
+        .unwrap_or_else(|error| panic!("resolve {}: {error}", upstream.display()));
+    let hermes = hermes.to_str().expect("utf-8 Hermes path");
+    let expected = serde_json::json!({
+        "source": "package",
+        "package_id": facts.package_id.as_str(),
+        "package_digest": facts.digest.as_str(),
+    });
+
+    let installed = host.ok(&[
+        "integration",
+        "install",
+        "--agent",
+        "hermes",
+        "--hermes-home",
+        home,
+        "--hermes-bin",
+        hermes,
+        "--access-mode",
+        HERMES_ACCESS_MODE,
+        "--allow-host",
+        HERMES_ALLOWED_HOST,
+    ]);
+    assert_eq!(installed["provenance"], expected, "{installed}");
+    assert_eq!(installed["installed"], true, "{installed}");
+    assert_eq!(installed["enabled"], true, "{installed}");
+
+    // Status reads the ownership marker the install wrote.
+    let status = host.ok(&[
+        "integration",
+        "status",
+        "--agent",
+        "hermes",
+        "--hermes-home",
+        home,
+        "--hermes-bin",
+        hermes,
+    ]);
+    assert_eq!(status["provenance"], expected, "{status}");
+    assert_eq!(status["installed"], true, "{status}");
+    assert_eq!(status["enabled"], true, "{status}");
+    assert_eq!(status["modified"], false, "{status}");
+    assert_eq!(status["outdated"], false, "{status}");
+    assert_eq!(status["package_source_missing"], false, "{status}");
+}
+
 /// Drives the whole scenario of `driver` against the installed package.
 ///
 /// # Panics
@@ -343,20 +442,7 @@ pub(crate) fn run_scenario(
         facts.digest.as_str(),
         &prepared.profile_env,
     );
-    if driver.hooks {
-        let installed = host.ok(&[
-            "integration",
-            "install",
-            "--agent",
-            driver.runtime,
-            "--profile",
-            PROFILE,
-        ]);
-        assert!(
-            installed["failed"].as_array().is_none_or(Vec::is_empty),
-            "{installed}"
-        );
-    }
+    install_integration(host, driver, facts, prepared, upstream);
 
     let entry = inventory_entry(host);
     assert_eq!(entry["available"], true, "{entry}");
@@ -404,6 +490,7 @@ pub(crate) fn run_scenario(
     host.ok(&["session", "input", &id, &prompt]);
     host.wait_activity(&id, "working");
     poll_until("the stub to receive the turn's request", || {
+        prepared.stub.assert_healthy();
         (prepared.stub.started() >= 1).then_some(())
     });
     prepared.stub.open_gate();
@@ -431,6 +518,10 @@ pub(crate) fn run_scenario(
 
     stop_resume_and_check_history(host, driver, prepared, &id, &reference);
 
+    prepared.stub.assert_healthy();
+    prepared
+        .stub
+        .assert_exchanges(&[prompt.as_str(), SECOND_PROMPT]);
     assert_ne!(
         prepared.stub.saw_foreign_credential(),
         Some(true),

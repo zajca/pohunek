@@ -14,6 +14,7 @@
 #![cfg(unix)]
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -41,7 +42,7 @@ mod interpreter;
 #[path = "support/plugin_harness.rs"]
 mod plugin_harness;
 
-use hermes_provider::{HermesProvider, API_KEY, MODEL};
+use hermes_provider::{write_home, HermesProvider};
 use plugin_harness::{path_str, Harness};
 use pohunek_test_support::catalog::{
     attestations_for, catalog_of, host_platform, root_of, signed, test_key, ANY_CORE, RUNTIME_API,
@@ -107,20 +108,6 @@ const REAL_TURN_PROMPT: &str = "Reply with the Hermes package turn marker.";
 
 /// Deterministic response emitted by the loopback Hermes provider.
 const REAL_TURN_RESPONSE: &str = "HERMES_PACKAGE_TURN_OK";
-
-/// Proxy variables that route every non-loopback request of a real Hermes
-/// process to the fail-closed loopback provider.
-const PROXY_VARIABLES: [&str; 6] = [
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "ALL_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "all_proxy",
-];
-
-/// Hosts a real Hermes process reaches directly instead of through the proxy.
-const LOOPBACK_NO_PROXY: &str = "localhost,127.0.0.1";
 
 /// Seconds the paused Hermes startup and its provider-named child may take to
 /// meet the test-owned barrier. It bounds a hung real Hermes start instead of
@@ -422,61 +409,6 @@ fn worker_journal(root: &Path, session_id: &str) -> Value {
     panic!("the real worker journal exists for the paused E2E session");
 }
 
-/// Writes one private model-free Hermes configuration and its offline caches.
-fn configure_real_hermes(home: &Path, provider: &HermesProvider) {
-    fs::create_dir_all(home).expect("create isolated Hermes home");
-    fs::set_permissions(home, fs::Permissions::from_mode(0o700)).expect("private Hermes home");
-    let config = format!(
-        "model:\n  default: {MODEL}\n  provider: custom:pohunek-compat\n  api_mode: chat_completions\n  context_length: 64000\nmodel_catalog:\n  enabled: false\nproviders:\n  pohunek-compat:\n    name: pohunek-compat\n    api: {}\n    api_key: {}\n    transport: chat_completions\n    default_model: {MODEL}\n    discover_models: false\n    models:\n      {MODEL}:\n        context_length: 64000\nfallback_providers: []\ntoolsets:\n  - terminal\napprovals:\n  mode: manual\n  timeout: 300\nsecurity:\n  tirith_enabled: false\n  allow_lazy_installs: false\nauxiliary:\n  title_generation:\n    enabled: false\ntelemetry:\n  shared_metrics:\n    enabled: false\n",
-        provider.api_url(),
-        API_KEY,
-    );
-    write_private(home.join("config.yaml"), config.as_bytes());
-    write_private(
-        home.join("models_dev_cache.json"),
-        br#"{"pohunek-offline":{"name":"Pohunek offline compatibility cache","env":[],"api":"","doc":"","models":{}}}
-"#,
-    );
-    fs::create_dir_all(home.join("cache")).expect("create model catalog cache");
-    fs::set_permissions(home.join("cache"), fs::Permissions::from_mode(0o700))
-        .expect("private model catalog cache");
-    write_private(
-        home.join("cache/model_catalog.json"),
-        br#"{"version":1,"providers":{}}
-"#,
-    );
-    write_private(
-        home.join("auth.json"),
-        br#"{"version":1,"providers":{},"suppressed_sources":{"copilot":["gh_cli","env:COPILOT_GITHUB_TOKEN","env:GH_TOKEN","env:GITHUB_TOKEN"]}}
-"#,
-    );
-    write_private(
-        home.join(".update_check"),
-        br#"{"ts":4102444800,"behind":null,"rev":null,"ver":"0.20.0"}
-"#,
-    );
-}
-
-fn write_private(path: PathBuf, contents: &[u8]) {
-    fs::write(&path, contents).expect("write isolated Hermes configuration");
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .expect("private Hermes configuration");
-}
-
-/// Profile `[env]` lines that send every proxied Hermes request to `provider`.
-fn proxy_profile_env(provider: &HermesProvider) -> String {
-    let proxy = provider.proxy_url();
-    PROXY_VARIABLES
-        .iter()
-        .map(|variable| format!("{variable} = \"{proxy}\"\n"))
-        .chain(
-            ["NO_PROXY", "no_proxy"]
-                .iter()
-                .map(|variable| format!("{variable} = \"{LOOPBACK_NO_PROXY}\"\n")),
-        )
-        .collect()
-}
-
 /// A pinned Hermes CLI command against the private Hermes home, with the
 /// scenario's PATH and the loopback provider as its fail-closed proxy.
 fn hermes_cli(
@@ -488,12 +420,7 @@ fn hermes_cli(
 ) -> tokio::process::Command {
     let mut command = harness.env.tokio_command(hermes_bin);
     command.env("HERMES_HOME", hermes_home).env("PATH", path);
-    for variable in PROXY_VARIABLES {
-        command.env(variable, provider.proxy_url());
-    }
-    command
-        .env("NO_PROXY", LOOPBACK_NO_PROXY)
-        .env("no_proxy", LOOPBACK_NO_PROXY);
+    command.envs(provider.proxy_env());
     command
 }
 
@@ -1143,7 +1070,7 @@ async fn a_real_hermes_turn_uses_the_selected_package_and_public_session_screen(
 
     let hermes_home = harness.env.root().join("hermes-home");
     let provider = HermesProvider::start(REAL_TURN_RESPONSE);
-    configure_real_hermes(&hermes_home, &provider);
+    write_home(&hermes_home, &provider);
     let probe_dir = harness.env.root().join("python-probe");
     fs::create_dir_all(&probe_dir).expect("create private Python probe directory");
     let hermes_operator_root = hermes_home.join("plugins/operators");
@@ -1278,6 +1205,10 @@ if os.environ.get('HERMES_TEST_CHILD_PROBE') == '1' and not any(arg in ('--versi
         "{}:/usr/bin:/bin",
         hermes_bin.parent().expect("Hermes bin directory").display()
     );
+    let mut proxy_env = String::new();
+    for (name, value) in provider.proxy_env() {
+        writeln!(proxy_env, "{name} = \"{value}\"").expect("write to a string");
+    }
     harness.profile(
         PROFILE,
         &format!(
@@ -1290,7 +1221,7 @@ if os.environ.get('HERMES_TEST_CHILD_PROBE') == '1' and not any(arg in ('--versi
             path_str(&hermes_operator_root),
             path_str(&python_site_packages),
             path_str(harness.env.root()),
-            proxy_profile_env(&provider),
+            proxy_env,
         ),
     );
 

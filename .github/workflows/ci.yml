@@ -810,9 +810,10 @@ jobs:
               - '.github/actions/setup-rust/**'
             # Linux Hermes compatibility keeps the broader source filter: Linux
             # runner capacity is not the constrained macOS budget. It also
-            # drives a real pinned Hermes session through the package, so the
-            # daemon, the session worker and its launch rule, and that test's
-            # support code are inputs too.
+            # drives a real pinned Hermes session through the package and runs
+            # the release consumer suite for Hermes, so the daemon, the session
+            # worker and its launch rule, those tests' support code and the
+            # consumer build script are inputs too.
             hermes:
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -833,6 +834,7 @@ jobs:
               - 'scripts/tests/provision-hermes-compat.sh'
               - 'packaging/**'
               - 'scripts/build-hermes-package'
+              - 'scripts/release-workflow/build-consumer'
               - 'scripts/smoke-hermes-plugin-release'
               - 'scripts/tests/smoke-hermes-plugin-release.sh'
               - 'scripts/tests/fixtures/smoke-*'
@@ -1381,6 +1383,18 @@ jobs:
           name: pohunek-bins
           path: target/debug
 
+      # Later cargo steps rebuild binaries in target/debug (the session worker,
+      # and `pohunek` with test-only features for the integration tests), so
+      # the release consumer gets this copy of the `build-bins` set.
+      - name: Keep the built binaries for the release consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          bins="$RUNNER_TEMP/pohunek-bins"
+          mkdir -p "$bins"
+          cp target/debug/pohunek target/debug/pohunekd target/debug/pohunek-sessiond "$bins/"
+          chmod 0755 "$bins/pohunek" "$bins/pohunekd" "$bins/pohunek-sessiond"
+
       # The gate installs the operator plugin from the Hermes runtime package
       # through the downloaded daemon, so the archive is built from
       # compat/hermes in this job.
@@ -1431,6 +1445,65 @@ jobs:
           POHUNEK_HERMES_BIN: ${{ steps.hermes.outputs.bin }}
           POHUNEK_PYTHON_BIN: ${{ steps.hermes.outputs.python }}
         run: cargo test --locked -p pohunek-cli --test hermes_package -- --include-ignored --test-threads 1
+
+      # The session test wrote into the stage it used; the release consumer
+      # runs on another fresh restore of the untouched copy at the same
+      # absolute path.
+      - name: Restore the pristine Hermes stage for the release consumer
+        shell: bash
+        env:
+          CACHE_DIR: ${{ steps.hermes.outputs.cache }}
+          STAGE_ROOT: ${{ steps.hermes.outputs.stage_root }}
+        run: |
+          set -euo pipefail
+          rm -rf "$STAGE_ROOT/hermes"
+          cp -a "$CACHE_DIR" "$STAGE_ROOT/hermes"
+          cargo xtask compat verify-stage --runtime hermes --dir "$STAGE_ROOT"
+
+      # The release consumer suite in row mode on the package built above, as
+      # scripts/release-workflow/run-row calls it: a throwaway catalog for the
+      # archive, a scrubbed environment, the stage's bin directory first on
+      # PATH, a short root outside any Git checkout (socket path length; the
+      # CLI refuses a Hermes home inside a Git workspace), and the unchanged
+      # `build-bins` binaries kept before any cargo step of this job. It
+      # installs the package, installs the operator plugin from it, and drives
+      # one turn, stop and resume against the loopback model
+      # (docs/development.md, "Release consumer suite"). The report must name
+      # the archive's digest.
+      - name: Run the release consumer suite for Hermes (row mode)
+        shell: bash
+        env:
+          STAGE_ROOT: ${{ steps.hermes.outputs.stage_root }}
+          PACKAGE: ${{ steps.package.outputs.archive }}
+        run: |
+          set -euo pipefail
+          scripts/release-workflow/build-consumer "$RUNNER_TEMP/consumer"
+          work=$(mktemp -d /tmp/pkrow.XXXXXX)
+          trap 'rm -rf -- "$work"' EXIT
+          mkdir -p "$work/bin" "$work/cwd" "$work/home" "$work/t"
+          cp "$RUNNER_TEMP/pohunek-bins/pohunek" "$RUNNER_TEMP/pohunek-bins/pohunekd" \
+            "$RUNNER_TEMP/pohunek-bins/pohunek-sessiond" "$work/bin/"
+          (
+            cd "$work/cwd"
+            exec env -i \
+              PATH="$STAGE_ROOT/hermes/bin:/usr/bin:/bin" \
+              HOME="$work/home" \
+              XDG_CONFIG_HOME="$work/home/.config" \
+              XDG_DATA_HOME="$work/home/.local/share" \
+              XDG_STATE_HOME="$work/home/.local/state" \
+              XDG_CACHE_HOME="$work/home/.cache" \
+              TMPDIR="$work/t" \
+              LANG=C.UTF-8 \
+              POHUNEK_CONSUMER_BIN_DIR="$work/bin" \
+              POHUNEK_CONSUMER_RUNTIME=hermes \
+              POHUNEK_CONSUMER_PACKAGE="$PACKAGE" \
+              POHUNEK_CONSUMER_REPORT="$work/report.json" \
+              "$RUNNER_TEMP/consumer/release_consumer" \
+              --exact the_release_binaries_serve_the_runtime_out_of_process --nocapture
+          )
+          digest="sha256:$(sha256sum "$PACKAGE" | cut -d' ' -f1)"
+          jq -e --arg digest "$digest" \
+            '.runtime == "hermes" and .package_digest == $digest' "$work/report.json"
 
       # Persist the staged runtime only after the compatibility gate passed:
       # `if: success()` plus this position (after the check) means a broken

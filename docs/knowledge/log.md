@@ -103,6 +103,18 @@
   `concepts/agent-profiles`, `concepts/sessions`, the
   `debug-session-runtime` runbook and `docs/public-api.md`.
 
+## Unreleased (2026-10-12, Hermes release consumer driver, #147)
+
+- The release consumer suite has a `hermes` driver. It installs the Hermes
+  package from the catalog, runs `integration install --agent hermes` into a
+  private Hermes home and requires the install and status results to report
+  `provenance` `source=package` with the archive's package id and digest, then
+  drives a real pinned Hermes through one turn against a loopback provider,
+  stops it and resumes it by the conversation id the plugin hook reported. The
+  `hermes-compatibility` CI job runs it in row mode on the archive built from
+  `compat/hermes`, after restoring and verifying a pristine stage. Documented
+  in `docs/development.md` ("Release consumer suite") and the source map.
+
 ## Unreleased (2026-10-12, release baseline in CI package selection, #149)
 
 - The `package-selection` CI job downloads release `v<workspace version>`'s

@@ -23,6 +23,8 @@
 use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::wait::poll_until;
 
+#[path = "support/hermes_provider.rs"]
+mod hermes_provider;
 #[path = "support/messages_stub.rs"]
 mod messages_stub;
 #[path = "support/model_stub.rs"]
