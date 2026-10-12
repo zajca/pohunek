@@ -589,7 +589,13 @@ the upgrade is not what ends it.
   not installed. Resume and fork resolve exactly the pinned source, so nothing
   else stands in and no command rebinds the session. Finish the work in the
   live session, then continue in a new one with `pohunek session new --agent
-  <runtime>` (the `detail` names the runtime), or accept the loss.
+  <runtime>` (the `detail` names the runtime), or accept the loss. When the
+  session's runtime resolves nowhere on the new binary (the built-in Codex
+  without the official package, or a package that is not installed), the
+  session is reported this way even if it cannot resume, because every
+  interaction with it (input, attach, resize, rename, metadata) would be
+  refused too: install the runtime first (the `detail` names the official
+  package install), then finish the work.
 - `would not be adopted`: the new daemon would not manage the worker
   (`record_unreadable`, `worker_without_session_record`, `store_unusable`,
   `worker_generation_missing`,
@@ -649,6 +655,17 @@ upgrading:
 3. Start new sessions for the work. They are pinned to the package digest.
    Sessions launched from the built-in keep running; finish their work before
    the upgrade, or accept losing their native recovery.
+
+   A release that compiles no Codex in (every release after 0.34.x) serves
+   `codex` only from its package. A live Codex session launched from the
+   built-in is adopted, but resume and fork are refused, and without an
+   installed Codex package every interaction with it (input, attach, resize,
+   rename, metadata) is refused too, whether or not it could resume
+   (`runtime_builtin_removed`; the preflight reports it at risk and its detail
+   says so). Installing the package in step 1 keeps such a session usable after
+   the upgrade. On a host that keeps no Codex (macOS has no package yet), the
+   hooks pohunek installed into `~/.codex` stay removable after the upgrade
+   with `pohunek integration uninstall --agent codex`, which needs no package.
 4. Run `pohunek service check` with the new release's binaries: the sessions
    launched from the package are `adoptable`.
 

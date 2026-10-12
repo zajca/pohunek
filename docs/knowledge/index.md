@@ -37,7 +37,8 @@ Start here:
   `pohunek plugin`; the [Pi runtime package](guides/pi-package.md) documents
   the official Pi package, what was verified against a real Pi, and its limits;
   the [Codex runtime package](guides/codex-package.md) documents the Codex
-  package source, its parity with the built-in Codex runtime, and the gaps found
+  package source (the only source of `codex`), its parity with the built-in
+  Codex runtime of release 0.34.2, and the gaps found
   against a real Codex; the [Claude Code runtime
   package](guides/claude-package.md) does the same for Claude Code.
   [Environment and executable resolution](guides/environment-resolution.md)

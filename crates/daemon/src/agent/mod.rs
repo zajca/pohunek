@@ -36,7 +36,7 @@ pub use native_reference::{
 pub(crate) use profile::MAX_PROFILE_BYTES;
 pub(crate) use profile::{
     agent_profile_not_found, apply_pin, parse_head, BindError, DoctorManifestError,
-    DoctorProfileError, Pin, ProfileRegistry, ResolvedAgent,
+    DoctorProfileError, Pin, ProfileEnv, ProfileRegistry, ResolvedAgent,
 };
 
 /// Shell launched when the host reports no usable login shell.

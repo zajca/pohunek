@@ -175,9 +175,14 @@ A fresh launch rechecks that its package is enabled and that its root verifies
 (`verify_launchable` and `resolve_pinned` in
 `crates/daemon/src/agent/host/handle.rs`). Nothing falls back to another
 package, another version, or `shell`. The one designed hand-back is the
-reserved `codex` and `claude` ids: while no official package serves them, a
-bare launch of the id uses the built-in runtime, but a session or profile
-pinned to the package never does.
+reserved `claude` id: while no official package serves it, a bare launch of
+the id uses the built-in runtime, but a session or profile pinned to the
+package never does. The daemon compiles no Codex in, so while no official
+package serves `codex` nothing does: a bare `codex` launch fails with
+`agent_profile_not_found`, an unpinned `base = "codex"` profile with
+`runtime_not_installed`, and both hints name
+`pohunek plugin install runtime/packages/codex.tar.zst --catalog runtime/runtime-catalog.json`
+from the current release's archive.
 
 - A fresh launch of a disabled package, or of a package that is no longer
   installed, fails with `runtime_not_installed`. Run `pohunek plugin list`;
@@ -192,9 +197,19 @@ pinned to the package never does.
   catalog authorized it; after a daemon upgrade, release the lost digest and
   install the current release's package as section 1 step 4 describes.
 - `runtime_served_by_package`: the session was launched from the built-in
-  Codex or Claude runtime, and an official package serves that id now. Disable
-  or uninstall the official package to resume it from the built-in, or start
-  a new session on the package.
+  Codex or Claude runtime, and an official package serves that id now. For
+  Claude, disable or uninstall the official package to resume it from the
+  built-in, or start a new session on the package. For Codex there is no
+  built-in to return to: start a new session on the package.
+- `runtime_builtin_removed`: the session was launched from the built-in Codex
+  runtime of an earlier release, which this daemon does not compile in, and no
+  package serves `codex`. Resume, fork and every interaction (input, attach,
+  resize, rename, metadata) are refused; only stop and remove work. Install the
+  official Codex package from the release archive (the hint names the command):
+  a live session can then be used again to finish its work, but it is never
+  resumed or forked, so continue in a new session with
+  `pohunek session new --agent codex`. Install the package on the earlier
+  release before upgrading to keep live Codex sessions usable.
 
 ## 5. A host profile pin fails
 
@@ -215,10 +230,13 @@ Run `pohunek plugin profile list` (implemented in
 - `unreadable`: fix the file's ownership, mode, or TOML; the state list in the
   runtime packages guide names every cause.
 
-A profile pin on `codex` or `claude` whose official package was disabled or
-uninstalled points at a base the built-in serves again, so launches fail with
+A profile pin on `claude` whose official package was disabled or uninstalled
+points at a base the built-in serves again, so launches fail with
 `invalid_profile`. Enable the package again, or remove the `package` and
-`digest` lines from the profile to run it on the built-in;
+`digest` lines from the profile to run it on the built-in. A profile pin on
+`codex` has no built-in to fall back to: a disabled or uninstalled package
+fails its launches with `runtime_not_installed` until the package is enabled
+or installed again;
 `pohunek plugin profile migrate <name>` refuses a built-in base
 (`package_profile_base_builtin`). A migration changes the profile revision, so
 a relay approval of the previous revision goes stale and must be approved

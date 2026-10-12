@@ -2,7 +2,7 @@
 type: Guide
 id: guide/codex-package
 title: Codex runtime package
-description: The official Codex runtime package source (Codex 0.160.x), what it declares and keeps equal to the built-in Codex runtime, what was verified against a real Codex, and the gaps found.
+description: The official Codex runtime package source (Codex 0.160.x), the only source of the codex runtime, what it declares and keeps equal to the built-in Codex runtime of release 0.34.2, what was verified against a real Codex, and the gaps found.
 source_kind: manual
 intents: [setup, update, debug, help]
 ---
@@ -10,12 +10,13 @@ intents: [setup, update, debug, help]
 # Codex runtime package
 
 The Codex package (`runtime-packages/codex`: `runtime.toml` and `detect.toml`,
-nothing else) is the package form of the Codex runtime that is compiled into the
-daemon today. Its compatibility lock and the screens captured from a real Codex
+nothing else) is the only source of the Codex runtime: the daemon compiles no
+Codex in. It is the package form of the built-in Codex runtime that releases up
+to 0.34.x compiled in. Its compatibility lock and the screens captured from a real Codex
 are in `compat/codex/`. See [runtime packages](runtime-packages.md) for the
 generic commands and [Pi](pi-package.md) for the package this one mirrors.
 
-## Status: official package in the release catalog; built-in still present
+## Status: official package in the release catalog; no built-in
 
 `codex` is a reserved runtime id. A package serves it only with official trust:
 a `--catalog` install whose signed catalog entry binds the package id, runtime
@@ -25,9 +26,46 @@ with `package_runtime_not_claimable`. Since release 0.34.2 every Linux daemon
 archive ships the package as `runtime/packages/codex.tar.zst` with a signed
 `runtime/runtime-catalog.json` whose signer matches the shipped trust anchor;
 [installing official packages](runtime-packages.md#install-official-packages-from-a-release)
-has the procedure. Until the built-in is removed (#145), the built-in
-descriptor, detection manifest and Codex handler serve `codex` on a host that
-has not installed the package.
+has the procedure. The Codex hook handler (`codex-hook-v1`) and its reporter
+template stay compiled into core; the descriptor and detection manifest come
+only from the package.
+
+The release catalog lists the package for the Linux x86_64 glibc and musl
+targets only; the Apple Silicon archive carries no package, so a macOS daemon
+has no source of Codex until darwin packages are attested (#929).
+
+On a host without the package nothing serves `codex`:
+
+- `pohunek session new --agent codex` fails with `agent_profile_not_found`, and
+  `pohunek integration install --agent codex` with `runtime_not_installed`; both
+  hints name `pohunek plugin install runtime/packages/codex.tar.zst --catalog
+  runtime/runtime-catalog.json` (run from the extracted release archive).
+- `pohunek integration status|doctor|uninstall --agent codex` still work: the
+  core-owned Codex hook handler keeps the config home of the earlier built-in
+  (`CODEX_HOME`, else `~/.codex`), so hooks pohunek installed there are reported
+  and removed (only pohunek-owned entries) without the package, also on macOS,
+  where no package exists yet (#929). `--profile <name>` and `--all-profiles`
+  reach the homes of host profiles over `codex` too, each through the
+  profile's own `[env]` (`CODEX_HOME`), although such a profile does not
+  resolve without the package. A bare `integration status` or `doctor`
+  without `--agent` covers only served runtimes, so name `--agent codex` to see
+  leftover Codex hooks.
+- A host profile with `base = "codex"` and no `package`/`digest` keys fails with
+  `runtime_not_installed`; its hint names the install and then `pohunek plugin
+  profile migrate <name>`, which pins the profile to the installed package.
+- A `codex` in the foreground of a shell session, or started outside pohunek, is
+  not attributed to Codex: process recognition and transcript observation read
+  the package's `detect.toml` and `[transcripts]` table.
+- A session the built-in Codex of an earlier release launched is refused on
+  resume, fork and every interaction (input, attach, resize, rename, metadata)
+  with `runtime_builtin_removed`, whose hint names the install and a new
+  session; only stop and remove still work. With the package installed, the
+  live session can be used again, and resume and fork answer
+  `runtime_served_by_package`: a session is never rebound to another runtime
+  source. `pohunekd upgrade-preflight` reports such a session as
+  `would_lose_recovery` (`runtime_source_not_served`) whether or not it could
+  resume, and without the package its detail says every interaction is refused
+  until the package is installed.
 
 ## What the package declares
 
@@ -35,11 +73,7 @@ Every fact below equals the built-in Codex descriptor release 0.34.2 shipped,
 except the version probe and the transcript tree (`[transcripts]`), which that
 descriptor does not declare. The package tests compare the package with golden
 copies of that descriptor and its detection manifest in
-`compat/codex/builtin-v0.34/` (`runtime.toml`, `detect.toml`). While the daemon
-embeds the built-in (`crates/daemon/src/agent/builtin/codex.toml` and
-`crates/daemon/src/detect/manifests/codex.toml`), they also check that the
-built-in manifest is the golden byte for byte and the built-in descriptor is
-the golden followed by the package's transcript tree.
+`compat/codex/builtin-v0.34/` (`runtime.toml`, `detect.toml`).
 
 - Launch: `codex` with the first prompt as a trailing positional argument;
   bracketed paste followed by a separate Enter 150 ms later for later input.
@@ -179,7 +213,19 @@ absence of egress), and the older folder-dialog wording the rule still names.
   executable the profile names. An always-running test drives that probe with
   throwaway `codex` scripts: the older minor, the next minor, a pre-release, a
   different banner wording and unreadable output are refused with
-  `agent_runtime_unsupported`, and the supported banner launches.
+  `agent_runtime_unsupported`, and the supported banner launches. Two more
+  always-running tests start from a host without the package and a fake `codex`
+  of the locked release on `PATH`: the bare runtime, its integration and an
+  unpinned `base = "codex"` profile are refused with the install hint (and the
+  migration for the profile), and after the catalog install the bare runtime
+  launches pinned to the package and the migrated profile launches. A third
+  installs the hooks into the hermetic `~/.codex` through the package,
+  uninstalls the package, and checks that `integration status`, `doctor` and
+  `uninstall --agent codex` still report and remove them while `integration
+  install` is refused. A fourth does the same for two host profiles over
+  `codex` with their own `CODEX_HOME`, first pinned and then rewritten
+  without a pin as an earlier release wrote them: `--profile` removes one
+  profile's hooks and `--all-profiles` the rest, with no home left behind.
 - The fixture owns a process guard: on success and on unwind it kills every
   process whose executable, working directory or environment value lies below
   the fixture's root (the session worker, Codex and the detached app-server)

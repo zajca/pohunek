@@ -1,7 +1,7 @@
 //! Per-host agent profiles (Part C).
 //!
 //! A **profile** is a host-authored `~/.config/pohunek/agents/<name>.toml` that
-//! *extends* a compiled **base kind** (`shell`/`codex`/`claude`/`hermes`) with overrides for
+//! *extends* a **base kind** (`shell` or any installed runtime id) with overrides for
 //! the launch program/args, the PTY env, and the input rules (resume + manifest
 //! overrides land in C2). The wire/in-repo `agent` is a **name**: it resolves —
 //! charset-guarded, fail-closed — to a host profile or a bare base kind, never to a
@@ -27,7 +27,8 @@ use serde::Deserialize;
 use tracing::warn;
 
 use super::host::{
-    LaunchProgram, ProfileInputs, RevisionKeys, RuntimeDefinition, RuntimeHost, ServedBy, Spawn,
+    is_reserved, LaunchProgram, ProfileInputs, RevisionKeys, RuntimeDefinition, RuntimeHost,
+    ServedBy, Spawn,
 };
 use super::{InputRules, LaunchEnv, NativeArgs, NativeSessionLaunch, SessionRefKind};
 use crate::detect::{Manifest, MAX_MANIFEST_SOURCE_BYTES};
@@ -38,7 +39,7 @@ use crate::project::config::validate_name;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawProfile {
-    /// Base kind to extend: `shell` | `codex` | `claude` | `hermes`.
+    /// Base kind to extend: `shell` or an installed runtime id.
     base: String,
     /// Package serving `base`; set together with `digest` exactly when a
     /// package, not a built-in, serves the base runtime.
@@ -517,7 +518,14 @@ impl ProfileRegistry {
                 profile: None,
             });
         }
-        Err(agent_profile_not_found(name))
+        // `name` is neither a profile nor a served runtime; an official alias
+        // is served only by its package, which the hint names.
+        Err(match RuntimeId::parse(name) {
+            Ok(runtime_id) if is_reserved(&runtime_id) => {
+                official_runtime_not_installed(&runtime_id)
+            }
+            _ => agent_profile_not_found(name),
+        })
     }
 
     /// Enumerate the resolvable host profiles, for `host.inspect`. Lists every
@@ -637,6 +645,98 @@ impl ProfileRegistry {
         }
         Ok(pinned)
     }
+}
+
+impl ProfileRegistry {
+    /// The base and `[env]` of the host profile `name`, read without resolving
+    /// its base runtime.
+    ///
+    /// It serves only the config home of a retired built-in nothing serves
+    /// (integration status, doctor and removal of hooks that already exist): a
+    /// profile over such a runtime never resolves, but the directory its agent
+    /// was told is still the declared home under the profile's environment.
+    /// The file passes the containment and owner-security checks of a load;
+    /// every `POHUNEK_`-prefixed key is dropped as a load drops it. `Ok(None)`
+    /// when no profile file has that name.
+    ///
+    /// # Errors
+    ///
+    /// The `invalid_name` or `invalid_profile` error of a load for an unsafe,
+    /// unreadable or malformed file, or one whose `base` is no runtime id.
+    pub(crate) fn unresolved_base_env(
+        &self,
+        name: &str,
+    ) -> Result<Option<(RuntimeId, ProfileEnv)>, ProtocolError> {
+        validate_name("agent", name)?;
+        let Some(dir) = &self.dir else {
+            return Ok(None);
+        };
+        let path = dir.join(format!("{name}.toml"));
+        if !path.is_file() {
+            return Ok(None);
+        }
+        read_base_env(dir, name, &path).map(Some)
+    }
+
+    /// [`Self::unresolved_base_env`] of every host profile whose `base` is
+    /// `runtime_id`, sorted by name.
+    ///
+    /// A file that cannot be read or parsed names no base that can be trusted,
+    /// so it is skipped with a warning, as [`Self::enumerate`] skips it.
+    pub(crate) fn unresolved_profiles_on(
+        &self,
+        runtime_id: &RuntimeId,
+    ) -> Vec<(String, ProfileEnv)> {
+        let Some(dir) = &self.dir else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        for (stem, path) in profile_files(dir) {
+            match validate_name("agent", &stem).and_then(|()| read_base_env(dir, &stem, &path)) {
+                Ok((base, env)) if base == *runtime_id => found.push((stem, env)),
+                Ok(_) => {}
+                Err(err) => {
+                    warn!(profile = %stem, error = %err, "skipping unreadable agent profile while listing the profiles of a runtime");
+                }
+            }
+        }
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        found
+    }
+}
+
+/// The `[env]` pairs of a host profile, every `POHUNEK_`-prefixed key dropped.
+/// Secret-bearing: never logged or stored.
+pub(crate) type ProfileEnv = Vec<(String, String)>;
+
+/// Read the base and environment of the profile `name` at `path`, under the
+/// containment and owner-security checks of a profile load.
+///
+/// The file is parsed as a load parses it (unknown keys refused) and its
+/// `package`/`digest` pair and manifest override are validated as a load
+/// validates them, so a file a launch would refuse as malformed is refused
+/// here too instead of yielding a partial environment. The checks that need
+/// the base runtime's definition (`[resume]`) are not applied: no definition
+/// exists for a base nothing serves.
+fn read_base_env(
+    dir: &Path,
+    name: &str,
+    path: &Path,
+) -> Result<(RuntimeId, ProfileEnv), ProtocolError> {
+    let content = read_profile_text(dir, name, path)?;
+    let raw: RawProfile = toml::from_str(&content)
+        .map_err(|err| invalid_profile(name, &toml_diagnostic(&content, &err)))?;
+    let base = RuntimeId::parse(&raw.base)
+        .map_err(|_error| invalid_profile(name, &format!("unknown base kind '{}'", raw.base)))?;
+    parse_package_pin(name, raw.package.as_deref(), raw.digest.as_deref())?;
+    resolve_manifest(name, dir, raw.manifest.as_deref())?;
+    let env = raw
+        .env
+        .into_iter()
+        .filter(|(key, _)| !key.starts_with("POHUNEK_"))
+        .map(|(key, value)| (key, value.0))
+        .collect();
+    Ok((base, env))
 }
 
 /// A host profile whose pinned package version cannot be served right now.
@@ -1054,7 +1154,9 @@ fn parse_package_pin(
 ///
 /// A built-in base takes no binding. A package-served base requires one and is
 /// then resolved from exactly the bound digest; an unbound profile naming a
-/// package-served base is refused with the migration command.
+/// package-served base is refused with the migration command, and so is one
+/// naming an official alias nothing serves, after the install of the official
+/// package it needs first.
 fn resolve_base(
     name: &str,
     runtimes: &RuntimeHost,
@@ -1073,8 +1175,21 @@ fn resolve_base(
                 "base '{base}' is served by the installed package '{package}' and the profile does not pin it; run `pohunek plugin profile migrate {name}`"
             ),
         )),
+        (None, None) if is_reserved(base) => Err(official_base_not_installed(name, base)),
         (None, _) => runtimes.resolve_id(base),
     }
+}
+
+/// `runtime/runtime_not_installed` for the profile `name`, whose unpinned
+/// `base` is an official alias nothing serves: the recovery is the install of
+/// the official package, then the migration that pins the profile to it.
+fn official_base_not_installed(name: &str, base: &RuntimeId) -> ProtocolError {
+    let mut error = ProtocolError::runtime_not_installed(base);
+    error.recover = Some(format!(
+        "{}, then pin the profile to it with `pohunek plugin profile migrate {name}`",
+        protocol::official_package_install_step(base)
+    ));
+    error
 }
 
 /// Resolve a profile's effective native-session launch spec.
@@ -1240,10 +1355,18 @@ pub(crate) fn agent_profile_not_found(name: &str) -> ProtocolError {
         "agent_profile_not_found",
         format!("no agent profile or base kind named '{name}' on this host"),
         Some(
-            "use shell|codex|claude|hermes, or add ~/.config/pohunek/agents/<name>.toml on the target host"
+            "use `shell` or an installed runtime (`pohunek plugin list`), or add ~/.config/pohunek/agents/<name>.toml on the target host"
                 .to_owned(),
         ),
     )
+}
+
+/// [`agent_profile_not_found`] for `runtime_id`, an official alias nothing
+/// serves: the recovery is the install of its official package.
+fn official_runtime_not_installed(runtime_id: &RuntimeId) -> ProtocolError {
+    let mut error = agent_profile_not_found(runtime_id.as_str());
+    error.recover = Some(protocol::official_package_install_step(runtime_id));
+    error
 }
 
 /// `runtime/invalid_profile`: a profile file failed to parse, named an unknown base

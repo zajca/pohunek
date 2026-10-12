@@ -660,7 +660,7 @@ pub(super) fn doctor_in_with(
         all_profiles,
     } = params;
     let selection = HomeSelection::from_params(profile, all_profiles)?;
-    let selected = homes.targets(agent.as_ref(), &selection)?;
+    let selected = homes.existing_targets(agent.as_ref(), &selection)?;
     let runtime: Vec<IntegrationFinding> = python.iter().chain(socket).cloned().collect();
     let agents: Vec<IntegrationAgentDoctor> = selected
         .iter()

@@ -20,9 +20,10 @@ carries them under `runtime/packages/`, with the signed
 `runtime/runtime-catalog.json` that authorizes them (see
 [Install official packages from a release](#install-official-packages-from-a-release)).
 The Codex and Claude Code packages serve the reserved `codex` and `claude` ids
-only through that catalog. The built-in Codex, Claude and Hermes runtimes stay
-in the daemon and serve their ids whenever no official package is installed,
-enabled and selected for them. Recovery steps for verification, trust and
+only through that catalog. The daemon compiles no Codex in: `codex` is served
+by its official package or by nothing. The built-in Claude and Hermes runtimes
+stay in the daemon and serve their ids whenever no official package is
+installed, enabled and selected for them. Recovery steps for verification, trust and
 profile pin failures are in the
 [runtime package recovery runbook](../runbooks/runtime-package-recovery.md).
 
@@ -321,6 +322,24 @@ built-in runtime as soon as it is installed, enabled and selected;
 `plugin disable` or `plugin uninstall` returns the alias to the built-in.
 `plugin list` shows the serving package: the selected, enabled `official`
 package whose runtime is the alias; without one the built-in serves it.
+
+`codex` has no built-in. Without its package, `session new --agent codex` is
+`agent_profile_not_found`, a host profile with `base = "codex"` and no
+`package`/`digest` keys is `runtime_not_installed`, and `integration install
+--agent codex` is `runtime_not_installed`; each recovery hint names
+`pohunek plugin install runtime/packages/codex.tar.zst --catalog
+runtime/runtime-catalog.json` (the profile hint then names `plugin profile
+migrate <name>`). `integration status`, `doctor` and `uninstall --agent codex`
+still reach the config home of the earlier built-in Codex, so hooks pohunek
+installed there can be reported and removed without the package. A foreground
+`codex` in a shell session and a `codex` started
+outside pohunek are recognized only through the package's detection manifest
+and `[transcripts]` table, so without the package they are not observed as
+Codex. A session launched from the built-in Codex of an earlier release is
+refused with `runtime_builtin_removed` on resume, fork and every interaction
+(input, attach, resize, rename, metadata) while nothing serves `codex`; once
+the package is installed, the live session can be used again and resume and
+fork answer `runtime_served_by_package` as below.
 A session launched from the built-in runtime keeps its binding but cannot be
 resumed or forked while the package serves the alias: the request fails with
 `runtime_served_by_package`. The migration is a new session:

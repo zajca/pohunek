@@ -565,7 +565,6 @@ Agent runtime and profile resolution:
 - `crates/daemon/src/detect/mod.rs`
 - `crates/daemon/src/detect/osc.rs`
 - `crates/daemon/src/detect/manifest/mod.rs`
-- `crates/daemon/src/detect/manifests/codex.toml`
 - `crates/daemon/src/detect/manifests/claude.toml`
 - `crates/daemon/src/detect/manifests/hermes.toml`
 - `crates/daemon/src/detect/manifests/shell.toml`
@@ -616,11 +615,11 @@ Runtime package archive format:
 - `scripts/pi-detect-regex` — generates the Pi frame, dialog and overlay regexes and checks their line classes.
 - `crates/cli/tests/pi_package.rs` — pure package tests and the opt-in real-Pi tests.
 - `runtime-packages/codex/runtime.toml` — Codex runtime descriptor (hook native reference, `semver-line-v1` version probe).
-- `runtime-packages/codex/detect.toml` — Codex detection manifest, equal to the built-in one.
+- `runtime-packages/codex/detect.toml` — Codex detection manifest, equal to the v0.34.2 built-in one; the daemon compiles no Codex in, so this package is the only source of `codex`.
 - `compat/codex/compatibility-lock.json` — pinned Codex release and supported range.
 - `compat/codex/screens/` — screens and terminal titles captured from a real Codex that the manifest test classifies.
 - `compat/codex/builtin-v0.34/` — golden copies of the built-in Codex descriptor and detection manifest of release 0.34.2.
-- `crates/cli/tests/codex_package.rs` — pure package tests (descriptor and manifest parity with the v0.34.2 built-in goldens), catalog-installed package launch and version-probe tests, and the opt-in real-Codex tests.
+- `crates/cli/tests/codex_package.rs` — pure package tests (descriptor and manifest parity with the v0.34.2 built-in goldens), catalog-installed package launch and version-probe tests, the clean-host scenarios (bare `codex`, its integration and an unpinned `base = "codex"` profile refused with the install hint until the package is installed), and the opt-in real-Codex tests.
 - `crates/cli/tests/support/responses_stub.rs` — loopback Responses-API stub used instead of a model provider.
 - `runtime-packages/claude/runtime.toml` — Claude Code runtime descriptor (hook native reference, resume and fork argv, `semver-line-v1` version probe).
 - `runtime-packages/claude/detect.toml` — Claude Code detection manifest: the built-in one plus the #613 rules (running-turn title and footer, wrapped selection forms, first-run and trust dialogs, the `done <time>` completed-turn line, the npm `claude.exe` process).

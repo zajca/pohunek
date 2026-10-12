@@ -222,9 +222,16 @@ impl Fixture {
     /// Shutdown cancels reconnect watchers before this daemon releases worker
     /// controller leases for another instance to adopt.
     pub(super) async fn reopen_with_workers(&self) -> Self {
-        self.registry.begin_daemon_shutdown();
-        let workers: Vec<_> = self
-            .registry
+        self.reopen_with_workers_of(&self.registry).await
+    }
+
+    /// Like [`Self::reopen_with_workers`], adopting the workers `previous`
+    /// started instead: `previous` stands for an earlier daemon over this
+    /// fixture's directories and session store, such as one that compiles
+    /// other runtimes in.
+    pub(super) async fn reopen_with_workers_of(&self, previous: &SessionRegistry) -> Self {
+        previous.begin_daemon_shutdown();
+        let workers: Vec<_> = previous
             .inner
             .sessions
             .lock()
@@ -241,7 +248,7 @@ impl Fixture {
                 .await
                 .expect("hand the worker over");
         }
-        let config = &self.registry.inner.config;
+        let config = &previous.inner.config;
         let roots = config
             .worker_runtime_root
             .clone()

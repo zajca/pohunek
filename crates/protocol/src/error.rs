@@ -242,6 +242,32 @@ impl ProtocolError {
         )
     }
 
+    /// The canonical `runtime/runtime_builtin_removed` error.
+    ///
+    /// The session was launched from the built-in runtime of the official
+    /// alias `runtime`, which this daemon does not compile in, and no package
+    /// serves the alias. Nothing is launched and the stored session keeps its
+    /// binding. Installing the official package does not make the session
+    /// resumable: a session is never rebound to another runtime source, and
+    /// the package then answers resume and fork with
+    /// [`Self::runtime_served_by_package`]. The recovery hint therefore names
+    /// the install and a new session. The identity is a validated
+    /// [`RuntimeId`], so echoing it is safe.
+    #[must_use]
+    pub fn runtime_builtin_removed(runtime: &RuntimeId) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "runtime_builtin_removed",
+            format!(
+                "runtime `{runtime}` is not built into this daemon, and the session was launched from that built-in runtime"
+            ),
+            Some(format!(
+                "{}; a live session accepts input again once the package serves `{runtime}`, but a session cannot be rebound to another runtime source, so continue the work in a new session with `pohunek session new --agent {runtime}`",
+                official_package_install_step(runtime)
+            )),
+        )
+    }
+
     /// The canonical `runtime/runtime_package_changed` error.
     ///
     /// The package version a launch resolved is no longer the one selected for
@@ -1213,6 +1239,33 @@ impl ProtocolError {
             Some("inspect the occupying task with task.inspect; the worktree stays occupied until its check processes are gone"),
         )
     }
+}
+
+/// Directory of an extracted release archive that holds the official runtime
+/// packages, one `<runtime>.tar.zst` per official runtime.
+///
+/// Mirrors the daemon archive layout `cargo xtask release` writes
+/// (`BUNDLE_DIR`/`PACKAGES_DIR` in `crates/xtask/src/release.rs`) and
+/// `docs/install.md` documents; a hint naming another path would send the
+/// operator to a file the archive does not have.
+const RELEASE_PACKAGES_DIR: &str = "runtime/packages";
+
+/// Signed runtime catalog of an extracted release archive, which authorizes
+/// the packages in [`RELEASE_PACKAGES_DIR`] as official.
+const RELEASE_CATALOG: &str = "runtime/runtime-catalog.json";
+
+/// The recovery step that installs the official package of `runtime` from an
+/// extracted release archive with official trust.
+///
+/// Recovery hints name it where an official runtime id is wanted and nothing
+/// serves it. Only archives of the targets the release catalog lists carry the
+/// package, so the step names that condition instead of promising the file.
+/// The identity is a validated [`RuntimeId`], so echoing it is safe.
+#[must_use]
+pub fn official_package_install_step(runtime: &RuntimeId) -> String {
+    format!(
+        "install the official `{runtime}` package with `pohunek plugin install {RELEASE_PACKAGES_DIR}/{runtime}.tar.zst --catalog {RELEASE_CATALOG}` from an extracted release archive whose catalog lists this platform (or enable it with `pohunek plugin enable <package>` when it is installed but disabled)"
+    )
 }
 
 /// Names the daemon an error is about: a remote host route or the local daemon.

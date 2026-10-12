@@ -533,7 +533,7 @@ describe("@pohunek/testkit fixture daemon", () => {
         class: "runtime",
         code: "agent_profile_not_found",
         msg: "no agent profile or base kind named 'hermes-work' on this host",
-        recover: "use shell|codex|claude|hermes, or add ~/.config/pohunek/agents/<name>.toml on the target host",
+        recover: "use `shell` or an installed runtime (`pohunek plugin list`), or add ~/.config/pohunek/agents/<name>.toml on the target host",
       });
       expect(await client.call("session.list", {})).toEqual([]);
       await client.close();

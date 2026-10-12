@@ -1,7 +1,7 @@
 //! `integration.install`, `integration.uninstall`, `integration.status`, and
 //! `integration.doctor` agent hook RPC handlers.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 use protocol::{
     ErrorClass, IntegrationDoctorParams, IntegrationDoctorResult, IntegrationInstallParams,
@@ -11,7 +11,7 @@ use protocol::{
 
 use super::util::{error_value, parse_optional_params, parse_params};
 use super::{ControlTransport, DaemonState};
-use crate::agent::host::RuntimeHost;
+use crate::agent::host::{is_reserved, RuntimeHost};
 use crate::integration::{ConfigHomes, HomeSelection};
 
 /// Error code of a profile-aware integration request on a remote connection.
@@ -21,12 +21,36 @@ pub(crate) const PROFILE_LOCAL_ONLY_CODE: &str = "local_only_method";
 ///
 /// A historical label is `agent_kind_unsupported` and a valid id no enabled
 /// runtime backs is `runtime_not_installed`; the integration operations only see
-/// installed runtimes.
+/// installed runtimes. For an official alias nothing serves, the recovery hint
+/// names the install of its official package.
 fn check_agent(runtimes: &RuntimeHost, agent: Option<&RuntimeRef>) -> Result<(), ProtocolError> {
     agent.map_or(Ok(()), |agent| {
-        let definition = runtimes.resolve_ref(agent)?;
+        let definition = runtimes.resolve_ref(agent).map_err(|mut error| {
+            if let Ok(runtime_id) = agent.launchable() {
+                if error.code == "runtime_not_installed" && is_reserved(runtime_id) {
+                    error.recover = Some(protocol::official_package_install_step(runtime_id));
+                }
+            }
+            error
+        })?;
         runtimes.verify_launchable(&definition)
     })
+}
+
+/// [`check_agent`] for a request that inspects or removes hooks that already
+/// exist (status, doctor, uninstall).
+///
+/// Removing pohunek's own hook entries must not depend on a package serving the
+/// runtime: an official alias nothing serves whose built-in a handler retired
+/// passes, and the request addresses that built-in's config home.
+fn check_existing_agent(
+    runtimes: &RuntimeHost,
+    agent: Option<&RuntimeRef>,
+) -> Result<(), ProtocolError> {
+    match agent {
+        Some(agent) if crate::integration::serves_retired(runtimes, agent) => Ok(()),
+        _ => check_agent(runtimes, agent),
+    }
 }
 
 /// Refuses a profile-aware request that did not arrive on the local control
@@ -111,7 +135,7 @@ pub(super) async fn handle_integration_uninstall(
         return response;
     }
     let runtimes = state.sessions.profiles().runtimes().clone();
-    if let Err(err) = check_agent(&runtimes, Some(&params.agent)) {
+    if let Err(err) = check_existing_agent(&runtimes, Some(&params.agent)) {
         return error_value(request, err);
     }
     let selection = match HomeSelection::from_params(params.profile, params.all_profiles) {
@@ -139,7 +163,7 @@ pub(super) async fn handle_integration_doctor(request: &Request, state: &DaemonS
         return response;
     }
     let runtimes = state.sessions.profiles().runtimes().clone();
-    if let Err(err) = check_agent(&runtimes, params.agent.as_ref()) {
+    if let Err(err) = check_existing_agent(&runtimes, params.agent.as_ref()) {
         return error_value(request, err);
     }
     let homes = match homes_of(request, state) {
@@ -162,7 +186,7 @@ pub(super) async fn handle_integration_status(request: &Request, state: &DaemonS
         return response;
     }
     let runtimes = state.sessions.profiles().runtimes().clone();
-    if let Err(err) = check_agent(&runtimes, params.agent.as_ref()) {
+    if let Err(err) = check_existing_agent(&runtimes, params.agent.as_ref()) {
         return error_value(request, err);
     }
     let homes = match homes_of(request, state) {

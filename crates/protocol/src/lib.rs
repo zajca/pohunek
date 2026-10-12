@@ -59,7 +59,7 @@ pub use doctor::{DaemonDoctorResult, DaemonHealthResult, DoctorCheck, DoctorRepo
 #[doc(inline)]
 pub use envelope::{EnvelopeError, Event, Request, Response, StateSource};
 #[doc(inline)]
-pub use error::{ErrorClass, ProtocolError};
+pub use error::{official_package_install_step, ErrorClass, ProtocolError};
 #[doc(inline)]
 pub use governance::{
     ApprovalKeyReference, EnrollmentInfo, EnrollmentRevision, EnrollmentStatus,

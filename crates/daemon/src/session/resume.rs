@@ -689,14 +689,18 @@ impl SessionRegistry {
     /// now, whatever the registry currently selects. A runtime that is not
     /// installed, or that no longer matches the pin, refuses the relaunch; the
     /// stored binding is left untouched so it resumes once the runtime is
-    /// available again.
+    /// available again. A built-in pin of an official alias this daemon does
+    /// not compile in never resumes: no built-in comes back, and the package
+    /// that serves the alias is no stand-in for it.
     ///
     /// # Errors
     ///
     /// Returns `agent_kind_unsupported` for a value that is not a runtime id,
-    /// `runtime_not_installed` for an unresolvable or mismatching runtime and
-    /// `runtime_incompatible` for a pinned package whose root fails
-    /// verification.
+    /// `runtime_builtin_removed` for a built-in or unpinned snapshot of an
+    /// official alias nothing serves, `runtime_served_by_package` for one an
+    /// official package serves, `runtime_not_installed` for any other
+    /// unresolvable or mismatching runtime and `runtime_incompatible` for a
+    /// pinned package whose root fails verification.
     fn binding_definition(
         &self,
         binding: &ResumeBinding,

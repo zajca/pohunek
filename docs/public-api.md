@@ -453,7 +453,7 @@ All params and result type names below refer to structs exported by
 | Method | Params | `ok` result | Notes |
 |---|---|---|---|
 | `daemon.health` | `null` | `{status, daemon_version, protocol_version}` | Liveness and version probe. |
-| `daemon.doctor` | `null` | `DaemonDoctorResult` | Runs daemon-local checks. Non-null params are `daemon/bad_request`. Each check is `{name, status, detail}`: `name` is the stable code and `detail` carries the remediation. Both platforms report `worker_executable` for the active supervision's worker, including a bounded capability probe of its readable journal schema and overlapping private protocol range; an older worker without capability reporting is `warn` (unverified), while a missing, unsafe, malformed or incompatible required worker is `fail`. Linux also reports `bin:git`, `bin:codex`, `bin:claude`, the socket, state and log directory writability checks, `netbird_cli` and `schema_version`; macOS adds `runtime_dir_private`, `socket_path_length`, `filesystem_access`, `login_shell`, `launchd_domain`, `desktop_notifications` and `keychain`. It also reports configured profile checks as `agent_profile_<name>`, optional provider checks as `agent_runtime_codex`, `agent_runtime_claude` and `agent_runtime_hermes`, embedded manifest checks as `agent_manifest_embedded_<runtime>`, and host override checks as `agent_manifest_override_<name>`. Configured profiles fail when they cannot resolve securely, their package runtime is unavailable, their executable is missing, or the provider's existing pinned version rule rejects it. An absent unconfigured optional provider warns. Embedded manifests are parsed from the daemon's canonical sources; host overrides use the same bounded, contained loader and precedence as launch. An invalid referenced override fails, an invalid unreferenced override warns, and an empty override is valid and disables detection. Details are fixed and redacted. The daemon also reports Codex and Claude hook readiness as `agent_integration_<provider>` for runtime homes and `agent_integration_<provider>_profile_<name>` for configured profile homes. Current hooks are `ok`; missing or outdated hooks and an active install lock are `warn`; malformed or unsafe provider state is `fail`. A local request checks each distinct launch home using the same integration inspector as `integration.doctor`; a remote request checks runtime homes only, preserving the local-only boundary for profile-derived homes. Configured Hermes profiles receive `agent_integration_hermes_profile_<name>` with `warn` and an explicit unverified detail because their hook lifecycle is CLI-managed and the daemon has no config-home inspection policy. No home path, profile environment value, provider config text or parser output is returned. `catalog_trust_anchor` is `ok` when the release's catalog trust anchor is loaded, `warn` when the installation ships none, and `fail` when it cannot be trusted. Hook interpreter readiness (`python3`) is reported by `integration.doctor`, not here. `overall` is `fail` only for required failures. |
+| `daemon.doctor` | `null` | `DaemonDoctorResult` | Runs daemon-local checks. Non-null params are `daemon/bad_request`. Each check is `{name, status, detail}`: `name` is the stable code and `detail` carries the remediation. Both platforms report `worker_executable` for the active supervision's worker, including a bounded capability probe of its readable journal schema and overlapping private protocol range; an older worker without capability reporting is `warn` (unverified), while a missing, unsafe, malformed or incompatible required worker is `fail`. Linux also reports `bin:git`, `bin:codex`, `bin:claude`, the socket, state and log directory writability checks, `netbird_cli` and `schema_version`; macOS adds `runtime_dir_private`, `socket_path_length`, `filesystem_access`, `login_shell`, `launchd_domain`, `desktop_notifications` and `keychain`. It also reports configured profile checks as `agent_profile_<name>`, optional provider checks as `agent_runtime_codex`, `agent_runtime_claude` and `agent_runtime_hermes`, embedded manifest checks as `agent_manifest_embedded_<runtime>` for the runtimes compiled in (`shell`, `claude`, `hermes`; Codex ships only as a package, so no embedded Codex manifest is checked), and host override checks as `agent_manifest_override_<name>`. Configured profiles fail when they cannot resolve securely, their package runtime is unavailable, their executable is missing, or the provider's existing pinned version rule rejects it. An absent unconfigured optional provider warns. Embedded manifests are parsed from the daemon's canonical sources; host overrides use the same bounded, contained loader and precedence as launch. An invalid referenced override fails, an invalid unreferenced override warns, and an empty override is valid and disables detection. Details are fixed and redacted. The daemon also reports Codex and Claude hook readiness as `agent_integration_<provider>` for runtime homes and `agent_integration_<provider>_profile_<name>` for configured profile homes. Current hooks are `ok`; missing or outdated hooks and an active install lock are `warn`; malformed or unsafe provider state is `fail`. A local request checks each distinct launch home using the same integration inspector as `integration.doctor`; a remote request checks runtime homes only, preserving the local-only boundary for profile-derived homes. Configured Hermes profiles receive `agent_integration_hermes_profile_<name>` with `warn` and an explicit unverified detail because their hook lifecycle is CLI-managed and the daemon has no config-home inspection policy. No home path, profile environment value, provider config text or parser output is returned. `catalog_trust_anchor` is `ok` when the release's catalog trust anchor is loaded, `warn` when the installation ships none, and `fail` when it cannot be trusted. Hook interpreter readiness (`python3`) is reported by `integration.doctor`, not here. `overall` is `fail` only for required failures. |
 | `host.inspect` | `null` | `HostCapabilities` | Live capability snapshot for the daemon's host. |
 | `host.discover` | `HostDiscoverParams` or `null` | `Vec<HostRecord>` | Enumerates peers from configured overlay transports and classifies daemon reachability. |
 | `host.governance.inspect` | `null` | `HostGovernanceStatus` | Owner-safe, read-only snapshot of the daemon's stable host identity and local governance state. Explicit `null` and omitted params both succeed; every non-null JSON value returns `daemon/bad_request`. The method never changes enrollment, ownership, or sessions. On unavailable governance it returns the fixed redacted `daemon/host_governance_unavailable` error; reload or restart the daemon, then retry. |
@@ -662,23 +662,46 @@ official aliases (the reserved runtime ids other than `shell`) are served only
 by a package the signed catalog authorizes as official for that exact package
 id, runtime id and archive digest; such a package takes the alias over from the
 built-in runtime while it is installed, enabled and selected, and disabling or
-uninstalling it returns the alias to the built-in. A runtime id served by a
+uninstalling it returns the alias to the built-in. The daemon compiles no Codex
+in, so `codex` is served by its official package or not at all: a host without
+it answers a bare `codex` with `agent_profile_not_found`, an unpinned host
+profile over `codex` with `runtime_not_installed`, and `integration.install`
+for `codex` with `runtime_not_installed`, each with a recovery hint naming
+`pohunek plugin install runtime/packages/codex.tar.zst --catalog
+runtime/runtime-catalog.json` from the extracted release archive (and, for the
+profile, `pohunek plugin profile migrate <name>` after it). `integration.status`,
+`integration.doctor` and `integration.uninstall` that name `codex` work without
+the package: the core-owned Codex handler keeps the config home of the earlier
+built-in (`CODEX_HOME`, else `~/.codex`), so hooks pohunek installed there are
+reported and removed (only the entries it owns); `profile` and `all_profiles`
+reach the homes of host profiles over `codex` through each profile's own
+`[env]`, although such a profile does not resolve; without `agent`, status and
+doctor cover only served runtimes. A runtime id served by a
 loaded package of a different package id is a conflict. A claim of an alias by
 an explicit-digest or linked package is answered with
 `package_runtime_not_claimable`, and so is a descriptor that names `shell`; a
 catalog that does not authorize the alias for the archive is
 `package_untrusted`. The package that serves an alias is the selected, enabled
 official package whose `runtime_id` is that alias in `package.list` and
-`package.inspect`; no such package means the built-in serves it.
+`package.inspect`; no such package means the built-in serves it, or nothing
+does for `codex`.
 
 A session launched from the built-in runtime of an alias that a package serves
 now cannot be resumed or forked: the request is refused with
 `runtime/runtime_served_by_package`, whose recovery hint names the one
 migration (start a new session with `pohunek session new --agent <runtime>`,
 which the official package serves; a session is never rebound to another
-runtime source), and the stored binding is kept unchanged. A session pinned to a
-runtime source the daemon does not serve otherwise (a built-in it does not ship,
-a package digest that is not installed) is refused with
+runtime source), and the stored binding is kept unchanged. A session launched
+from the built-in runtime of an official alias this daemon does not compile in
+(the built-in Codex of an earlier release, pinned or from a record without a
+launch binding) while nothing serves the alias is refused with
+`runtime/runtime_builtin_removed` on resume, fork and every mutation (input,
+attach, resize, rename, metadata); only stop and remove still work. Its
+recovery hint names the official package install and a new session. Once the
+package is installed, a live session can be used again, while resume and fork
+answer `runtime/runtime_served_by_package`. A session pinned to a runtime
+source the daemon does not serve otherwise (a built-in of a runtime id that is
+not an official alias, a package digest that is not installed) is refused with
 `runtime/runtime_not_installed`. Stop and remove still work. A session the
 daemon launched keeps the definition it was launched from while that daemon
 runs; a session adopted at startup whose pin the daemon does not serve is
@@ -866,8 +889,8 @@ session reference that resume and fork consume. The table is required.
 | `hook` | a validated integration report (process-bound, ancestry, sequence and expiry checked) | on once a report arrived; requires a supported resume; may declare `[native_reference.existence]` for an id-kind reference |
 | `assigned` | generated by core and passed to the agent at launch (and at fork with `assign_fork = true`) | on from the first moment; requires a supported resume |
 
-The built-in runtimes declare `shell` = `none` and `codex`, `claude`, `hermes`
-= `hook`, so their behavior is unchanged.
+The built-in runtimes declare `shell` = `none` and `claude`, `hermes` = `hook`;
+the official Codex package declares `codex` = `hook`.
 
 ### Config home
 
@@ -887,8 +910,8 @@ user's home used while the variable is unset or empty (a relative path of plain
 components: no `..`, no absolute path, no glob or shell characters, bounded).
 Both keys are required and unknown keys are refused (`descriptor_invalid`). The
 daemon-run integration handlers install into this home, so a runtime that names
-one needs the table. The built-in `claude` and `codex` declare it; a package may
-too. Pi keeps declaring its conversation root under `[native_reference.existence]`.
+one needs the table. The built-in `claude` and the official Codex package
+declare it; any package may too. Pi keeps declaring its conversation root under `[native_reference.existence]`.
 
 ### Transcripts
 
@@ -909,8 +932,8 @@ id, transcript path and absolute working directory in the first 32 records or
 `conversationId`). `dir` follows the `[config_home]` `default` rule (relative,
 plain components, no `.` or `..`, no empty segment, bounded). The table requires
 `[config_home]`; an unknown parser, an unsafe `dir`, a missing or unknown key,
-or a missing `[config_home]` is `descriptor_invalid`. The built-in `codex`
-declares `sessions` and `claude` declares `projects`; a runtime without the
+or a missing `[config_home]` is `descriptor_invalid`. The official Codex
+package declares `sessions` and the built-in `claude` declares `projects`; a runtime without the
 table contributes no transcript root. Trees of two different runtimes that are
 the same directory or nested in each other are attributed to neither; the
 daemon logs the warning `external.transcript_roots.ambiguous` with code
@@ -935,9 +958,9 @@ Both keys are required. The schemas are a closed set compiled into core:
 parsing a descriptor refuses an unknown schema id, an unknown handler id, and a
 handler/schema pair the handler does not drive (`descriptor_invalid`). A
 runtime without `[integration]`, such as Pi, has no schema, so its sessions
-admit no hook report. The built-in `codex` and `claude` runtimes use
-`identity-subagent-v1`, `hermes` uses `identity-v1`, and the shell, which hosts
-Codex and Claude in the foreground, uses `identity-subagent-v1`.
+admit no hook report. The official Codex package and the built-in `claude`
+runtime use `identity-subagent-v1`, `hermes` uses `identity-v1`, and the shell,
+which hosts Codex and Claude in the foreground, uses `identity-subagent-v1`.
 
 A schema declares the provider ids that may report, the admitted actions, the
 native-reference kinds (`id`, `path`), the process-ancestry matcher, the
@@ -1390,7 +1413,12 @@ silently become a supported launch, resume, or fork runtime. A session or
 recovery record whose runtime is not installed is kept inert: it stays listed
 with its stored recovery binding, refuses resume, fork, input and every other
 mutation with `runtime_not_installed` (or `agent_kind_unsupported` for a
-historical label), and resumes again once the runtime is installed.
+historical label), and resumes again once the runtime is installed. The
+exception is a session launched from the built-in runtime of an official alias
+this daemon does not compile in (the built-in Codex of an earlier release): it
+is refused with `runtime/runtime_builtin_removed`, and installing the official
+package restores interaction with a live session only, never resume or fork
+(`runtime/runtime_served_by_package`).
 `session.stop` and `session.remove` (also
 `session.remove_accepting_unconfirmed`) are the exceptions: they only release
 what the session owns and need no runtime definition, so the owner can end the
@@ -2019,7 +2047,14 @@ binary does not serve (resolved as resume resolves it, against that binary's
 built-in runtimes and the installed packages: a built-in it does not ship, a
 built-in an official package serves in place of, or a package digest that is
 not installed) is `would_lose_recovery` with code `runtime_source_not_served`;
-its `detail` names the resume error and the migration to a new session. See
+its `detail` names the resume error and the migration to a new session. Every
+live session, whether or not it can resume, is also judged with the mutation
+guard: one whose runtime resolves nowhere on the new binary (a built-in it does
+not compile in while no package serves the alias, `runtime_builtin_removed`, or
+a runtime that is not installed) is `would_lose_recovery` with the same code,
+and its `detail` says every interaction (input, attach, resize, rename,
+metadata) is refused until the runtime is installed, naming the official
+package install for a removed built-in. See
 [update after release](knowledge/runbooks/update-after-release.md).
 
 Identity hooks prefer the owner-private worker endpoint so an accepted launch
@@ -2732,7 +2767,14 @@ id resolves to no enabled runtime: a host profile whose `base` names an
 uninstalled runtime, and resume, fork or mutation of a session whose runtime is
 not installed or no longer matches its recorded launch binding. A bare
 `session.new` agent name that is neither a profile nor an installed runtime
-stays `agent_profile_not_found`. `runtime_incompatible` is emitted when a
+stays `agent_profile_not_found`. For an official alias nothing serves (`codex`
+without its package), that `agent_profile_not_found` and the
+`runtime_not_installed` of an unpinned host profile over the alias carry a
+recovery hint naming the catalog install of the official package.
+`runtime_builtin_removed` is emitted by resume, fork and mutation of a session
+launched from the built-in runtime of an official alias this daemon does not
+compile in while no package serves the alias; once the official package serves
+it, resume and fork answer `runtime_served_by_package`. `runtime_incompatible` is emitted when a
 runtime package is installed but its root is missing, modified or contradicts
 the session's pin, for fresh launch, resume, fork and integration changes (the
 message names only the runtime id). `agent_profile_revision_stale` and `agent_profile_revision_invalid` are emitted only by the relay-selected launch

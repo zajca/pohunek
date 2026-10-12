@@ -51,24 +51,22 @@ const HOME_ENVIRONMENT_VARIABLE: &str = "HOME";
 
 /// Agent selector accepted by `integration --agent`.
 ///
-/// The built-in names keep their meaning; any other value is a runtime id the
-/// daemon resolves to the integration handler its definition names, so a
-/// runtime id that no installed runtime backs is refused by the daemon with its
-/// typed error.
+/// The built-in names keep their meaning; any other value, `codex` included,
+/// is a runtime id the daemon resolves to the integration handler its
+/// definition names, so a runtime id that no installed runtime backs is
+/// refused by the daemon with its typed error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HookAgentArg {
     /// Install or manage the Hermes operator plugin locally.
     Hermes,
     /// Install the Claude Code hook.
     Claude,
-    /// Install the Codex hook.
-    Codex,
     /// A runtime the daemon resolves through its definition's handler.
     Runtime(RuntimeId),
 }
 
 /// Wire names of the built-in agents, offered to help and completion.
-const BUILTIN_AGENT_NAMES: [&str; 3] = ["claude", "codex", "hermes"];
+const BUILTIN_AGENT_NAMES: [&str; 2] = ["claude", "hermes"];
 
 impl std::str::FromStr for HookAgentArg {
     type Err = String;
@@ -77,7 +75,6 @@ impl std::str::FromStr for HookAgentArg {
         match value {
             "hermes" => Ok(Self::Hermes),
             "claude" => Ok(Self::Claude),
-            "codex" => Ok(Self::Codex),
             other => RuntimeId::parse(other)
                 .map(Self::Runtime)
                 .map_err(|error| format!("`{other}` is not a runtime id ({error})")),
@@ -131,7 +128,6 @@ impl From<HookAgentArg> for RuntimeRef {
     fn from(value: HookAgentArg) -> Self {
         match value {
             HookAgentArg::Claude => RuntimeRef::claude(),
-            HookAgentArg::Codex => RuntimeRef::codex(),
             HookAgentArg::Hermes => RuntimeRef::hermes(),
             HookAgentArg::Runtime(id) => RuntimeRef::from_wire(id.as_str()),
         }
