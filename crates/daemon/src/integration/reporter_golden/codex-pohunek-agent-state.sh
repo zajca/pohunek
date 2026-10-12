@@ -3,13 +3,14 @@
 # managed by pohunek; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # POHUNEK_INTEGRATION_ID=codex
-# POHUNEK_INTEGRATION_VERSION=12
+# POHUNEK_INTEGRATION_VERSION=13
 #
 # Session and subagent lifecycle hook: report active-agent identity, capture the
 # native session id for direct-session resume, and journal sanitized child state.
-# Fire-and-forget: any missing
-# handshake env, missing python3, or socket failure is a silent no-op (exit 0)
-# so the hook can never break the agent.
+# Fire-and-forget: every failure exits 0 without output so the hook can never
+# break the agent. Inside a pohunek session with python3 available, a run that
+# does not deliver its report appends one bounded line per reason to the hook
+# trace named by POHUNEK_HOOK_TRACE_PATH, when the worker provides one.
 
 set -eu
 
@@ -20,7 +21,6 @@ case "$action" in
 esac
 
 [ "${POHUNEK_ENV:-}" = "1" ] || exit 0
-[ -n "${POHUNEK_WORKER_SOCKET_PATH:-}" ] || [ -n "${POHUNEK_SOCKET_PATH:-}" ] || exit 0
 [ -n "${POHUNEK_SESSION_ID:-}" ] || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
 agent_pid="$PPID"
@@ -32,16 +32,22 @@ agent_pid="$PPID"
 POHUNEK_HOOK_ACTION="$action" \
 POHUNEK_AGENT_PID="$agent_pid" \
 python3 -I - 3<&0 <<'PY' || exit 0
+import atexit
+import errno
+import fcntl
 import json
 import os
 import socket
+import stat
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 
 agent = "codex"
+ACTION_SESSION = "session"
 ACTION_SUBAGENT_START = "subagent-start"
 ACTION_SUBAGENT_STOP = "subagent-stop"
+ACTIONS = (ACTION_SESSION, ACTION_SUBAGENT_START, ACTION_SUBAGENT_STOP)
 TIMESTAMP_MS_FACTOR = 1000
 SOCKET_TIMEOUT_SECS = 0.5
 RESPONSE_BYTES = 4096
@@ -52,6 +58,33 @@ IDENTITY_TTL_SECS = 30
 WORKER_INSTANCE_KEY_RENAMED_AT = 4
 # Bounds provider JSON before decoding; oversized payloads are rejected whole.
 MAX_HOOK_INPUT_BYTES = 65536
+# Bounds one trace line in bytes, enough for every field at its longest fixed
+# code and a session id; a longer line is dropped. Lines of concurrent hooks
+# stay apart because each is one write under the exclusive trace lock.
+MAX_TRACE_LINE_BYTES = 512
+# The trace is appended without following a symlink and created owner-private.
+# O_NONBLOCK makes a FIFO at the path fail the open instead of blocking the hook.
+TRACE_OPEN_FLAGS = (
+    os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+)
+TRACE_FILE_MODE = 0o600
+# Group and other permission bits; a trace carrying any of them is not written.
+TRACE_SHARED_MODE_BITS = 0o077
+# The single rotated copy; the trace and this copy together hold at most twice
+# the configured bound.
+TRACE_ROTATED_SUFFIX = ".1"
+# One open that finds the trace already rotated by another hook, one open
+# after this hook's own rotation, and one spare for a rotation racing both.
+TRACE_OPEN_ATTEMPTS = 3
+# Digits accepted in POHUNEK_HOOK_TRACE_MAX_BYTES. Fifteen digits exceed any
+# real trace bound and stay far below the length at which int() raises.
+MAX_TRACE_BYTES_DIGITS = 15
+# Non-blocking lock attempts before a contended trace is given up for this run.
+# A hook holds the lock for one fstat, rename and write, so a free lock shows
+# up within a few retries, while a holder that never lets go costs a run at most
+# (TRACE_LOCK_ATTEMPTS - 1) * TRACE_LOCK_RETRY_SECONDS, 20 ms.
+TRACE_LOCK_ATTEMPTS = 5
+TRACE_LOCK_RETRY_SECONDS = 0.005
 
 session_id = os.environ.get("POHUNEK_SESSION_ID")
 action = os.environ.get("POHUNEK_HOOK_ACTION")
@@ -60,8 +93,128 @@ worker_socket_path = os.environ.get("POHUNEK_WORKER_SOCKET_PATH")
 protocol_raw = os.environ.get("POHUNEK_PROTOCOL_VERSION")
 worker_instance_id = os.environ.get("POHUNEK_WORKER_INSTANCE_ID")
 agent_pid_raw = os.environ.get("POHUNEK_AGENT_PID")
+trace_path = os.environ.get("POHUNEK_HOOK_TRACE_PATH")
+trace_max_raw = os.environ.get("POHUNEK_HOOK_TRACE_MAX_BYTES")
 
-if not session_id or (not worker_socket_path and (not socket_path or not protocol_raw)):
+
+def positive_int(raw):
+    # ASCII digits without a leading zero, the form the worker writes; any
+    # other value, including an overlong one, disables the trace.
+    if (
+        raw
+        and len(raw) <= MAX_TRACE_BYTES_DIGITS
+        and raw.isascii()
+        and raw.isdigit()
+        and raw[0] != "0"
+    ):
+        return int(raw)
+    return None
+
+
+trace_max_bytes = positive_int(trace_max_raw)
+trace_enabled = bool(trace_path) and os.path.isabs(trace_path) and trace_max_bytes is not None
+trace_lines = []
+
+
+def trace(reason, detail=None):
+    # Queues one line naming why a report was not delivered. A line holds only
+    # fixed codes, the pohunek session id and the time; the queue is written
+    # at exit, so tracing never delays an exchange.
+    if not trace_enabled:
+        return
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        "session": session_id,
+        "provider": agent,
+        "action": action if action in ACTIONS else None,
+        "reason": reason,
+    }
+    if detail:
+        entry["detail"] = detail
+    line = (json.dumps(entry, separators=(",", ":")) + "\n").encode("ascii")
+    if len(line) <= MAX_TRACE_LINE_BYTES and len(line) <= trace_max_bytes:
+        trace_lines.append(line)
+
+
+def errno_name(error):
+    return errno.errorcode.get(error.errno) if error.errno else None
+
+
+def lock_trace(descriptor):
+    # Takes the exclusive trace lock without ever blocking the hook on it.
+    for attempt in range(TRACE_LOCK_ATTEMPTS):
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if attempt + 1 < TRACE_LOCK_ATTEMPTS:
+                time.sleep(TRACE_LOCK_RETRY_SECONDS)
+    return False
+
+
+def append_trace_line(line):
+    # Writes `line` with one O_APPEND write under an exclusive lock, so the size
+    # check, the single rotation and the write of concurrent hooks never mix.
+    # Returns False when the lock stays contended or the write came up short,
+    # and the line is dropped.
+    rotated = False
+    for _ in range(TRACE_OPEN_ATTEMPTS):
+        descriptor = os.open(trace_path, TRACE_OPEN_FLAGS, TRACE_FILE_MODE)
+        try:
+            if not lock_trace(descriptor):
+                return False
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.getuid()
+                or opened.st_nlink != 1
+                or opened.st_mode & TRACE_SHARED_MODE_BITS
+            ):
+                return True
+            try:
+                current = os.lstat(trace_path)
+            except FileNotFoundError:
+                continue
+            if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                # Another hook rotated the trace while this one waited for the lock.
+                continue
+            if opened.st_size + len(line) <= trace_max_bytes:
+                if os.write(descriptor, line) != len(line):
+                    # A short write (full disk, quota, file size limit) leaves
+                    # a line without its newline; it is cut off again under
+                    # the lock so the next line never fuses with it.
+                    os.ftruncate(descriptor, opened.st_size)
+                    return False
+                return True
+            if rotated:
+                return True
+            os.replace(trace_path, trace_path + TRACE_ROTATED_SUFFIX)
+            rotated = True
+        finally:
+            os.close(descriptor)
+    return True
+
+
+def flush_trace():
+    # Any trace failure drops the remaining lines: the trace never changes the
+    # exit or output, and a contended lock costs a run its retry budget once.
+    for line in trace_lines:
+        try:
+            if not append_trace_line(line):
+                return
+        except OSError:
+            return
+
+
+if not session_id:
+    raise SystemExit(0)
+atexit.register(flush_trace)
+
+if not worker_socket_path and not socket_path:
+    trace("worker_socket_missing", "unset")
+    raise SystemExit(0)
+if action not in ACTIONS:
+    trace("action_invalid")
     raise SystemExit(0)
 
 protocol_version = None
@@ -77,26 +230,55 @@ except ValueError:
     parsed_agent_pid = None
 agent_pid = parsed_agent_pid if parsed_agent_pid and parsed_agent_pid >= MIN_AGENT_PID else None
 
+
+def worker_route_problem():
+    # The trace reason that keeps a request from the worker, or None.
+    if not worker_socket_path:
+        return ("worker_socket_missing", "unset")
+    if not worker_instance_id:
+        return ("worker_instance_missing", None)
+    if agent_pid is None:
+        return ("agent_pid_invalid", None)
+    return None
+
+
 def read_hook_input():
+    # The fields this action needs and None, or {} and the trace reason and
+    # detail that voided the input.
     try:
         with os.fdopen(3, "rb") as handle:
             content = handle.read(MAX_HOOK_INPUT_BYTES + 1)
-        if len(content) > MAX_HOOK_INPUT_BYTES or not content.strip():
-            return {}
+    except OSError as error:
+        return {}, ("input_invalid", errno_name(error))
+    if len(content) > MAX_HOOK_INPUT_BYTES:
+        return {}, ("input_too_large", None)
+    if not content.strip():
+        return {}, ("input_invalid", "empty")
+    try:
         parsed = json.loads(content)
-        if not isinstance(parsed, dict):
-            return {}
-        fields = (
-            ("agent_id", "agent_type", "parent_agent_id")
-            if action in (ACTION_SUBAGENT_START, ACTION_SUBAGENT_STOP)
-            else ("session_id", "transcript_path")
-        )
-        return {field: parsed.get(field) for field in fields}
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return {}
+    except RecursionError:
+        return {}, ("input_invalid", "too_deep")
+    except UnicodeDecodeError:
+        return {}, ("input_invalid", "not_utf8")
+    except json.JSONDecodeError:
+        return {}, ("input_invalid", "not_json")
+    if not isinstance(parsed, dict):
+        return {}, ("input_invalid", "not_object")
+    fields = (
+        ("agent_id", "agent_type", "parent_agent_id")
+        if action in (ACTION_SUBAGENT_START, ACTION_SUBAGENT_STOP)
+        else ("session_id", "transcript_path")
+    )
+    return {field: parsed.get(field) for field in fields}, None
 
 
-hook_input = read_hook_input()
+hook_input, input_problem = read_hook_input()
+
+
+def missing_input(detail):
+    # The input's own problem when it was voided, else the missing field.
+    return input_problem if input_problem is not None else ("input_invalid", detail)
+
 
 native = hook_input.get("session_id")
 native_session_id = native if isinstance(native, str) and native else None
@@ -147,6 +329,22 @@ def darwin_process_start_identity(pid):
     return seconds * MICROSECONDS_PER_SECOND + microseconds
 
 
+start_identity_read = False
+start_identity_value = None
+
+
+def agent_start_identity():
+    # The agent's start identity, read once per run so a missing identity is
+    # traced once whichever report needed it first.
+    global start_identity_read, start_identity_value
+    if not start_identity_read:
+        start_identity_value = process_start_identity(agent_pid)
+        start_identity_read = True
+        if start_identity_value is None:
+            trace("agent_identity_unavailable")
+    return start_identity_value
+
+
 def process_start_identity(pid):
     try:
         if sys.platform == "darwin":
@@ -159,10 +357,68 @@ def process_start_identity(pid):
         return None
 
 
-def send_worker_identity():
-    if not worker_socket_path or not worker_instance_id or agent_pid is None:
+def exchange(path, request, route):
+    # Sends one request line and returns the answer object, or traces why there
+    # is none with a reason prefixed by `route`.
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    except OSError as error:
+        trace(route + "_unreachable", errno_name(error))
+        return None
+    try:
+        client.settimeout(SOCKET_TIMEOUT_SECS)
+        try:
+            client.connect(path)
+        except socket.timeout:
+            trace(route + "_timeout")
+            return None
+        except FileNotFoundError as error:
+            trace(route + "_socket_missing", errno_name(error))
+            return None
+        except OSError as error:
+            trace(route + "_unreachable", errno_name(error))
+            return None
+        try:
+            client.sendall((json.dumps(request) + "\n").encode())
+            response = client.recv(RESPONSE_BYTES)
+        except socket.timeout:
+            trace(route + "_timeout")
+            return None
+        except OSError as error:
+            trace(route + "_closed", errno_name(error))
+            return None
+    finally:
+        client.close()
+    lines = response.splitlines()
+    if not lines:
+        trace(route + "_closed", "empty")
+        return None
+    try:
+        answer = json.loads(lines[0])
+    except (ValueError, RecursionError):
+        answer = None
+    if not isinstance(answer, dict):
+        trace(route + "_closed", "malformed")
+        return None
+    return answer
+
+
+def send_worker(request):
+    answer = exchange(worker_socket_path, request, "worker")
+    if answer is None:
         return False
-    start_identity = process_start_identity(agent_pid)
+    if answer.get("ok") is True:
+        return True
+    trace("worker_refused")
+    return False
+
+
+def send_worker_identity():
+    problem = worker_route_problem()
+    if problem is not None:
+        trace(*problem)
+        return False
+    start_identity = agent_start_identity()
     if start_identity is None:
         return False
     reference_kind = os.environ.get("POHUNEK_NATIVE_REFERENCE_KIND")
@@ -180,27 +436,22 @@ def send_worker_identity():
         "reference_kind": reference_kind,
         "native_reference": native_reference if reference_kind in ("id", "path") else None,
     }
-    try:
-        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        client.settimeout(SOCKET_TIMEOUT_SECS)
-        client.connect(worker_socket_path)
-        client.sendall((json.dumps(request) + "\n").encode())
-        response = client.recv(RESPONSE_BYTES)
-        client.close()
-        result = json.loads(response.splitlines()[0])
-        # Pending launch verification is durably owned and retried by the worker.
-        return result.get("ok") is True
-    except Exception:
-        return False
+    # Pending launch verification is durably owned and retried by the worker.
+    return send_worker(request)
 
 
 def send_worker_subagent(request_type):
-    if not worker_socket_path or not worker_instance_id or agent_pid is None:
-        return False
-    start_identity = process_start_identity(agent_pid)
+    problem = worker_route_problem()
+    if problem is not None:
+        trace(*problem)
+        return
     subagent_id = hook_input.get("agent_id")
-    if start_identity is None or not isinstance(subagent_id, str) or not subagent_id:
-        return False
+    if not isinstance(subagent_id, str) or not subagent_id:
+        trace(*missing_input("agent_id_missing"))
+        return
+    start_identity = agent_start_identity()
+    if start_identity is None:
+        return
     agent_type = hook_input.get("agent_type")
     parent_id = hook_input.get("parent_agent_id")
     request = {
@@ -217,17 +468,7 @@ def send_worker_subagent(request_type):
         request["parent_id"] = parent_id if isinstance(parent_id, str) else None
     else:
         request["outcome"] = "completed"
-    try:
-        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        client.settimeout(SOCKET_TIMEOUT_SECS)
-        client.connect(worker_socket_path)
-        client.sendall((json.dumps(request) + "\n").encode())
-        response = client.recv(RESPONSE_BYTES)
-        client.close()
-        result = json.loads(response.splitlines()[0])
-        return result.get("ok") is True
-    except Exception:
-        return False
+    send_worker(request)
 
 
 def send_request(method, params, suffix):
@@ -237,18 +478,20 @@ def send_request(method, params, suffix):
         "method": method,
         "params": params,
     }
-    try:
-        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        client.settimeout(SOCKET_TIMEOUT_SECS)
-        client.connect(socket_path)
-        client.sendall((json.dumps(request) + "\n").encode())
-        try:
-            client.recv(RESPONSE_BYTES)
-        except Exception:
-            pass
-        client.close()
-    except Exception:
-        pass
+    answer = exchange(socket_path, request, "daemon")
+    if answer is not None and "error" in answer:
+        trace("daemon_refused")
+
+
+def daemon_unusable():
+    # True when the daemon fallback cannot run. With no worker configured the
+    # daemon route is the only one, so its invalid protocol version is the
+    # reason; a configured worker has already traced its own failure.
+    if socket_path and protocol_version is not None:
+        return False
+    if not worker_socket_path:
+        trace("daemon_protocol_invalid")
+    return True
 
 
 if action == ACTION_SUBAGENT_START:
@@ -260,12 +503,13 @@ if action == ACTION_SUBAGENT_STOP:
     raise SystemExit(0)
 
 if not native_session_id:
+    trace(*missing_input("session_id_missing"))
     raise SystemExit(0)
 
 if worker_socket_path and send_worker_identity():
     raise SystemExit(0)
 
-if not socket_path or protocol_version is None:
+if daemon_unusable():
     raise SystemExit(0)
 
 report_agent_params = {
@@ -283,26 +527,27 @@ if transcript_path:
 send_request("session.report_agent", report_agent_params, "agent")
 
 if worker_instance_id and agent_pid is not None:
-    start_identity = process_start_identity(agent_pid)
-    if start_identity is not None:
-        worker_instance_key = (
-            "worker_instance_id"
-            if protocol_version >= WORKER_INSTANCE_KEY_RENAMED_AT
-            else "runtime_id"
-        )
-        native_id_params = {
-            "session_id": session_id,
-            worker_instance_key: worker_instance_id,
-            "agent": agent,
-            "pid": agent_pid,
-            "pid_start_identity": str(start_identity),
-            "sequence": str(timestamp_ms),
-            "expires_at": (
-                datetime.now(timezone.utc) + timedelta(seconds=IDENTITY_TTL_SECS)
-            ).isoformat().replace("+00:00", "Z"),
-            "native_session_id": native_session_id,
-        }
-        if transcript_path:
-            native_id_params["transcript_path"] = transcript_path
-        send_request("session.report_native_id", native_id_params, "native")
+    start_identity = agent_start_identity()
+    if start_identity is None:
+        raise SystemExit(0)
+    worker_instance_key = (
+        "worker_instance_id"
+        if protocol_version >= WORKER_INSTANCE_KEY_RENAMED_AT
+        else "runtime_id"
+    )
+    native_id_params = {
+        "session_id": session_id,
+        worker_instance_key: worker_instance_id,
+        "agent": agent,
+        "pid": agent_pid,
+        "pid_start_identity": str(start_identity),
+        "sequence": str(timestamp_ms),
+        "expires_at": (
+            datetime.now(timezone.utc) + timedelta(seconds=IDENTITY_TTL_SECS)
+        ).isoformat().replace("+00:00", "Z"),
+        "native_session_id": native_session_id,
+    }
+    if transcript_path:
+        native_id_params["transcript_path"] = transcript_path
+    send_request("session.report_native_id", native_id_params, "native")
 PY

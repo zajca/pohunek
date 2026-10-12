@@ -275,7 +275,7 @@ daemon more than one release apart are refused.
 Notification hooks deliver through the worker socket when
 `POHUNEK_WORKER_SOCKET_PATH` is set and fall back to the daemon socket otherwise;
 the worker's `notification_create` hook request is additive to the private
-worker protocol, so a worker that predates it simply refuses it. Managed hook assets carry `POHUNEK_INTEGRATION_VERSION=12`; an asset of
+worker protocol, so a worker that predates it simply refuses it. Managed hook assets carry `POHUNEK_INTEGRATION_VERSION=13`; an asset of
 an earlier version still sends the old key, which the daemon accepts only from a
 session whose launch baked protocol 3 (and an earlier notification hook still
 sends a bare integer `v` instead of the `{minimum, maximum}` range, so the daemon
@@ -1917,6 +1917,11 @@ nothing else can shadow them:
   the provider hooks)
 - `POHUNEK_NATIVE_REFERENCE_KIND` when, and only when, the launch carries a
   native reference kind
+- `POHUNEK_HOOK_TRACE_PATH` (absolute path of the hook failure trace,
+  `pohunek-hooks.jsonl` in the pohunek log directory; see "Hook failure trace"
+  under Provider Notification Hooks)
+- `POHUNEK_HOOK_TRACE_MAX_BYTES` (size in bytes at which the state hooks rotate
+  that trace)
 
 A managed child does not inherit the daemon's or the worker's process
 environment. Its environment is built from an empty base: the allowlisted
@@ -2055,7 +2060,7 @@ worker instance key `runtime_id` in `session.report_native_id`, which the
 daemon serves through the protocol 3 adapter. `pid` is the OS process id for the active nested agent. When present, the daemon
 binds the active claim to that process and clears the claim when procwatch sees
 the process exit. The shipped integration state hooks use
-`POHUNEK_INTEGRATION_VERSION=12`, run their interpreter in isolated mode (`-I`,
+`POHUNEK_INTEGRATION_VERSION=13`, run their interpreter in isolated mode (`-I`,
 so the session working directory never shadows the standard library), read the
 worker instance from `POHUNEK_WORKER_INSTANCE_ID`, read
 provider JSON through a bounded direct pipe without staging it on disk, and send the hook process's parent PID on
@@ -2327,8 +2332,9 @@ current Codex and Claude builds only. There is no fallback for older provider
 hook APIs.
 
 The state adapter also registers `SubagentStart` and `SubagentStop` for both
-providers. These callbacks target only the owner-private worker endpoint and
-silently no-op when it is unavailable or refuses the claim. They copy only
+providers. These callbacks target only the owner-private worker endpoint; when
+it is unavailable or refuses the claim they exit 0 with no output and record
+the failure in the hook failure trace (see "Hook failure trace" below). They copy only
 lifecycle identifiers and agent type. A Claude `SubagentStop` with no recorded
 start is not a subagent and adds no row, while a Codex one records a completed
 child; see `subagents` under `SessionInfo`. For Claude the state adapter also
@@ -2360,6 +2366,102 @@ never supplies installer logic. Bare `integration.install`, `status`, and
 same handler on the same canonical directory is one home), in runtime-id order
 of the first runtime naming it, and reports carry the runtime the request
 addressed.
+
+#### Hook failure trace
+
+The Codex and Claude state hooks never break the provider: every path exits 0
+and writes nothing to the provider. Once a state hook has established that it
+runs inside a Pohunek session (`POHUNEK_ENV=1` and a non-empty
+`POHUNEK_SESSION_ID`) and has started its Python body, every reason it fails to
+deliver a report on a route is recorded as one line in a hook failure trace, so
+a lost claim, snapshot or identity report leaves evidence. An exit before that
+point writes no line; in particular a hook without `python3` on its `PATH`
+writes no trace, because a POSIX shell cannot open the trace without following
+a symlink.
+
+The worker sets two reserved variables on every managed child (see
+Active-Agent Hook Payloads): `POHUNEK_HOOK_TRACE_PATH`, the absolute path of
+`pohunek-hooks.jsonl` in the pohunek log directory (by default
+`~/.local/state/pohunek/logs/`), one file shared by every session of the host,
+and `POHUNEK_HOOK_TRACE_MAX_BYTES`, the size at which the hooks rotate it
+(1 MiB). A hook traces only when the path is absolute and the size is a
+positive decimal integer without a leading zero; otherwise it writes no trace
+and still exits 0.
+
+Each line is one JSON object of at most 512 bytes; a line that would be longer
+is dropped, never truncated. Fields:
+
+- `ts`: the time of the line, RFC 3339 in UTC with milliseconds;
+- `session`: the Pohunek session id from `POHUNEK_SESSION_ID`;
+- `provider`: the runtime id the hook asset was rendered for, such as `codex`
+  or `claude`;
+- `action`: the hook action (`session`, `release`, `subagent-start`,
+  `subagent-stop`, or `stop` for Claude);
+- `reason`: a stable snake_case code, listed below;
+- `detail` (optional): a short fixed code, an errno name such as `ECONNREFUSED`
+  or one of the codes listed below, never text taken from the input or an
+  error message.
+
+Reason codes, with their `detail` values:
+
+- `input_too_large`: the provider input exceeded the hook's read bound
+  (64 KiB, 1 MiB for the Claude `stop` action);
+- `input_invalid`: the input could not be used; `detail` is `empty`,
+  `not_json`, `not_utf8`, `too_deep`, `not_object`, an errno name when reading
+  it failed, `agent_id_missing` (a subagent action without a non-empty
+  `agent_id`) or `session_id_missing` (a `session` action without a native
+  session id);
+- `no_snapshot`: the Claude `stop` action sends no snapshot; `detail` is
+  `subagent_stop` (a `Stop` with a non-empty `agent_id`), `tasks_missing` (no
+  `background_tasks`), `tasks_invalid` (not a list, or an entry without a
+  non-empty string `id`, `type` or `status`) or `tasks_over_bound` (more than
+  256 entries);
+- `action_invalid`: a defensive code for an action the Python body does not
+  handle; the managed entry point exits on an unknown action before the session
+  handshake, so it never writes this line;
+- `worker_socket_missing`: `detail` `unset` when `POHUNEK_WORKER_SOCKET_PATH`
+  is not set for a report that needs the worker, or `ENOENT` when no socket
+  exists at that path;
+- `worker_instance_missing`: `POHUNEK_WORKER_INSTANCE_ID` is not set;
+- `agent_pid_invalid`: the hook could not determine the agent's process id;
+- `agent_identity_unavailable`: the start identity of the agent process could
+  not be read;
+- `worker_unreachable`: connecting to the worker socket failed (`detail` is
+  the errno name);
+- `worker_timeout`: the worker did not accept or answer within the 0.5 s socket
+  timeout;
+- `worker_closed`: no usable answer line; `detail` is an errno name, `empty`
+  or `malformed`;
+- `worker_refused`: the worker answered without `ok: true`;
+- `daemon_socket_missing`, `daemon_unreachable`, `daemon_timeout`,
+  `daemon_closed`: the same failures on the daemon-socket fallback that the
+  `session` action (and the Claude `release` action) uses;
+- `daemon_refused`: the daemon answered with an error;
+- `daemon_protocol_invalid`: no worker socket is set and
+  `POHUNEK_PROTOCOL_VERSION` is not a usable integer, so the daemon fallback
+  cannot run.
+
+A line never carries provider payload content, ids taken from the input
+(agent, task or native session ids), task data, paths, or environment values;
+the only identifier is the Pohunek session id. One hook run can write more than
+one line: a `session` or `release` report that the worker does not accept and
+the daemon fallback then delivers keeps the worker's line, and a run whose
+first route succeeds writes none.
+
+The hook queues its lines and writes them when it exits, after every exchange
+with the worker or the daemon, so tracing adds no delay to a report. It opens
+the trace with `O_APPEND`, `O_CREAT`, `O_NOFOLLOW` and `O_NONBLOCK` and mode
+`0600`, so a symlink at the path is never followed and a new file is
+owner-private, and takes an exclusive lock on the opened file for each line
+without blocking: it tries the lock at most 5 times, 5 ms apart, and when the
+lock stays contended it drops the run's remaining lines, so a held lock never
+stalls the hook. It writes nothing unless the file is a regular file owned by
+the current user, with a single link and no group or other permission bits. Each line is one
+`write`, so lines of concurrent hooks never interleave. When a line would take
+the file past `POHUNEK_HOOK_TRACE_MAX_BYTES`, the hook renames it to
+`pohunek-hooks.jsonl.1` (replacing an earlier rotated file) and writes to a new
+`pohunek-hooks.jsonl`, so the trace holds at most twice the bound across the
+two files. A failure to write the trace is ignored: tracing never changes the hook's exit code or output.
 
 #### Config homes and host profiles
 
@@ -2549,7 +2651,8 @@ state hook's main-agent `Stop`, whose input carries the final assistant message
 and the task list), validate action and
 environment before reading input, silently drop an invalid `POHUNEK_SESSION_ID`,
 and exit successfully without output on local failures so agent sessions are not
-disrupted. Reinstalling hooks removes only exact command shapes managed by
+disrupted; the state hooks also record each such failure inside a Pohunek
+session in the hook failure trace (see "Hook failure trace"). Reinstalling hooks removes only exact command shapes managed by
 Pohunek; user hooks that merely reference the managed script path are preserved.
 
 ### `SessionDiffResult`

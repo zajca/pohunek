@@ -1,6 +1,6 @@
 # Knowledge Bundle Log
 
-## Unreleased (2026-10-12, subagent restart, Claude helper stop and main-turn snapshot, #883)
+## Unreleased (2026-10-12, subagent restart, Claude helper stop, main-turn snapshot and hook failure trace, #883)
 
 - A `SubagentStart` with a newer sequence for a terminal subagent reopens its
   record: `running` with a new revision, `finished_at_ms` cleared,
@@ -48,14 +48,38 @@
 - The sequence contract names the clock the Codex and Claude hooks read:
   `time.clock_gettime_ns(time.CLOCK_MONOTONIC)`, system-wide, because
   `time.monotonic_ns()` is defined only within one process.
-- `POHUNEK_INTEGRATION_VERSION` is 12. `SubagentInfo` and the public wire
+- Once a Codex or Claude state hook has seen `POHUNEK_ENV=1` and a session
+  id and started `python3`, it records every reason it fails to deliver a
+  report as one line in the hook failure trace `pohunek-hooks.jsonl` in the
+  pohunek log directory: `input_too_large`, `input_invalid`, `no_snapshot` (with
+  `detail` `subagent_stop`, `tasks_missing`, `tasks_invalid` or
+  `tasks_over_bound`), `worker_socket_missing`,
+  `worker_instance_missing`, `agent_pid_invalid`, `agent_identity_unavailable`,
+  `worker_unreachable`, `worker_timeout`, `worker_closed`, `worker_refused`,
+  and `daemon_socket_missing`, `daemon_unreachable`, `daemon_timeout`,
+  `daemon_closed`, `daemon_refused` and `daemon_protocol_invalid` for the
+  daemon fallback. A line is one JSON object of at most 512 bytes with `ts`,
+  `session`, `provider`, `action`, `reason` and an optional fixed `detail`
+  code, and never carries payload content, input ids, task data, paths or
+  environment values. The worker injects the reserved `POHUNEK_HOOK_TRACE_PATH`
+  and `POHUNEK_HOOK_TRACE_MAX_BYTES` (1 MiB); the hook traces only when both
+  are valid, writes its lines at exit under an exclusive lock that it tries
+  without blocking (at most 5 attempts, 5 ms apart, else the run's lines are
+  dropped), opens the file
+  with `O_NOFOLLOW` and mode `0600`, writes only to an owner-private regular
+  file of the user with one link, and rotates it once into
+  `pohunek-hooks.jsonl.1`, so the trace holds at most 2 MiB. Tracing never
+  changes the hook's exit code or output, a report delivered on its first
+  route writes no line, and a hook without `python3` writes no trace.
+- `POHUNEK_INTEGRATION_VERSION` is 13. `SubagentInfo` and the public wire
   protocol are unchanged; the private worker hook protocol carries
   `subagent_snapshot`. Documented in `concepts/sessions`, the `claude-package`
   and `codex-package` guides, the `debug-session-runtime` and
   `update-after-release` runbooks, the `runtime-packages` guide,
   `docs/architecture.md` and
   `docs/public-api.md` (hook schemas, `SessionInfo.subagents`,
-  `subagent_state`, Provider Notification Hooks, Claude notification hooks,
+  `subagent_state`, Provider Notification Hooks, Hook failure trace,
+  Active-Agent Hook Payloads reserved environment, Claude notification hooks,
   integration version).
 
 ## Unreleased (2026-10-12, release baseline in CI package selection, #149)

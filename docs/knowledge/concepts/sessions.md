@@ -438,7 +438,16 @@ answers the hook with success when it admitted the claim and either applied it
 or ignored it for one of the INFO reasons, and an admitted, valid snapshot
 whether or not it changed a row; it answers with failure when the claim was
 refused, was inadmissible, or its journal write failed. In every case the hook exits quietly, because subagent
-claims have no daemon fallback.
+claims have no daemon fallback. Inside a Pohunek session a state hook records
+each reason it fails to deliver a report (input over the bound or invalid, no
+snapshot to send, worker or daemon socket missing, unreachable, timed out,
+closed or refusing) as one line with `ts`, `session`, `provider`, `action`,
+`reason` and an optional fixed `detail` code, and never payload content, input
+ids, paths or environment values, in the owner-private `pohunek-hooks.jsonl`
+of the pohunek log directory (path from `POHUNEK_HOOK_TRACE_PATH`, rotated
+once into `.1` at `POHUNEK_HOOK_TRACE_MAX_BYTES`, so at most twice that in
+total), and still exits 0; the reason codes are in the
+[debug-session-runtime](../runbooks/debug-session-runtime.md) runbook.
 
 This collection does not change the parent session's
 `activity`, launch identity, or recovery binding. The hook validates its action

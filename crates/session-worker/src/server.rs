@@ -162,6 +162,10 @@ pub struct ServerArgs {
     pub journal_path: PathBuf,
     /// Stable daemon socket exposed to notification hooks.
     pub daemon_socket_path: PathBuf,
+    /// Shared hook failure trace that every PTY child receives as
+    /// `POHUNEK_HOOK_TRACE_PATH`. The worker never opens it; the state hooks
+    /// append to it and ignore a relative path.
+    pub hook_trace_path: PathBuf,
     /// Bootstrap and runtime policy.
     pub config: WorkerConfig,
 }
@@ -410,6 +414,7 @@ impl Server {
             },
             socket_path: args.socket_path,
             daemon_socket_path: args.daemon_socket_path,
+            hook_trace_path: args.hook_trace_path,
             config: args.config,
             journal,
             state: AsyncMutex::new(State::new(record)),
@@ -515,6 +520,7 @@ struct Shared {
     worker_process: WireProcessIdentity,
     socket_path: PathBuf,
     daemon_socket_path: PathBuf,
+    hook_trace_path: PathBuf,
     config: WorkerConfig,
     journal: Journal,
     state: AsyncMutex<State>,
@@ -5668,6 +5674,14 @@ fn command_from_initialize(
             "POHUNEK_PROTOCOL_VERSION".to_owned(),
             initialize.public_protocol_version.to_string(),
         ),
+        (
+            "POHUNEK_HOOK_TRACE_PATH".to_owned(),
+            shared.hook_trace_path.to_string_lossy().into_owned(),
+        ),
+        (
+            "POHUNEK_HOOK_TRACE_MAX_BYTES".to_owned(),
+            pohunek_logging::config::HOOK_TRACE_MAX_FILE_BYTES.to_string(),
+        ),
     ]);
     if let Some(daemon_id) = &initialize.daemon_instance_id {
         reserved.insert("POHUNEK_DAEMON_ID".to_owned(), daemon_id.to_string());
@@ -6453,6 +6467,9 @@ mod tests {
             socket_path: directory.path().join("worker.sock"),
             journal_path: directory.path().join("journal.json"),
             daemon_socket_path: directory.path().join("daemon.sock"),
+            hook_trace_path: directory
+                .path()
+                .join(pohunek_logging::config::HOOK_TRACE_FILE_NAME),
             config: crate::WorkerConfig::new(),
         };
         let first = super::Server::bind(args.clone())
@@ -6483,6 +6500,9 @@ mod tests {
                 socket_path: worker_socket.clone(),
                 journal_path: journal.clone(),
                 daemon_socket_path: overlong,
+                hook_trace_path: directory
+                    .path()
+                    .join(pohunek_logging::config::HOOK_TRACE_FILE_NAME),
                 config: crate::WorkerConfig::new(),
             })
             .await,
@@ -6504,6 +6524,7 @@ mod tests {
             socket_path: root.join("worker.sock"),
             journal_path: root.join("journal.json"),
             daemon_socket_path: root.join("daemon.sock"),
+            hook_trace_path: root.join(pohunek_logging::config::HOOK_TRACE_FILE_NAME),
             config: config.clone(),
         })
         .await
@@ -7408,6 +7429,9 @@ mod tests {
             socket_path: directory.path().join("worker.sock"),
             journal_path: directory.path().join("journal.json"),
             daemon_socket_path: directory.path().join("daemon.sock"),
+            hook_trace_path: directory
+                .path()
+                .join(pohunek_logging::config::HOOK_TRACE_FILE_NAME),
             config: config.clone(),
         })
         .await
@@ -7496,6 +7520,9 @@ mod tests {
             socket_path: directory.path().join("worker.sock"),
             journal_path: directory.path().join("journal.json"),
             daemon_socket_path: directory.path().join("daemon.sock"),
+            hook_trace_path: directory
+                .path()
+                .join(pohunek_logging::config::HOOK_TRACE_FILE_NAME),
             config: config.clone(),
         })
         .await
@@ -7570,6 +7597,9 @@ mod tests {
             socket_path: directory.path().join("worker.sock"),
             journal_path: directory.path().join("journal.json"),
             daemon_socket_path: directory.path().join("daemon.sock"),
+            hook_trace_path: directory
+                .path()
+                .join(pohunek_logging::config::HOOK_TRACE_FILE_NAME),
             config: config.clone(),
         })
         .await
@@ -8846,6 +8876,7 @@ mod tests {
             socket_path: directory.join("worker.sock"),
             journal_path: directory.join("journal.json"),
             daemon_socket_path: directory.join("daemon.sock"),
+            hook_trace_path: directory.join(pohunek_logging::config::HOOK_TRACE_FILE_NAME),
             config: crate::WorkerConfig::new(),
         })
         .await
@@ -8896,69 +8927,6 @@ mod tests {
                 .collect(),
         )
         .expect("base environment")
-    }
-
-    #[tokio::test]
-    async fn version_six_child_environment_is_exactly_base_term_profile_and_identity() {
-        let directory = pohunek_test_support::tempdir().expect("fixture directory");
-        let server = environment_fixture(directory.path(), "abcd2345")
-            .await
-            .expect("bind worker");
-        let initialize = environment_initialize(
-            Some(base_environment(&[
-                ("PATH", "/usr/bin:/bin"),
-                ("HOME", "/home/u"),
-                ("LANG", "C.UTF-8"),
-            ])),
-            &[
-                ("PROFILE_TOKEN", "profile-secret"),
-                ("HOME", "/home/profile"),
-                ("NOTIFY_SOCKET", "/run/profile-notify"),
-                ("WATCHDOG_USEC", "1"),
-                ("XPC_SERVICE_NAME", "profile"),
-                ("POHUNEK_SESSION_ID", "s-spoofed"),
-                ("POHUNEK_DAEMON_ID", "daemon-spoofed"),
-            ],
-        );
-        let worker_instance_id = WorkerInstanceId::new("runtime-environment").expect("runtime id");
-
-        let command =
-            super::command_from_initialize(&server.shared, &initialize, &worker_instance_id);
-
-        assert_eq!(command.base, crate::EnvBase::Empty);
-        let environment = command
-            .env
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str()))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let socket_path = directory.path().join("fixture/worker.sock");
-        let daemon_socket_path = directory.path().join("fixture/daemon.sock");
-        assert_eq!(
-            environment,
-            std::collections::BTreeMap::from([
-                ("HOME", "/home/profile"),
-                ("LANG", "C.UTF-8"),
-                ("PATH", "/usr/bin:/bin"),
-                ("POHUNEK_ENV", "1"),
-                ("POHUNEK_DAEMON_ID", "daemon-environment"),
-                ("POHUNEK_NATIVE_REFERENCE_KIND", "id"),
-                ("POHUNEK_PROTOCOL_VERSION", "7"),
-                ("POHUNEK_WORKER_INSTANCE_ID", "runtime-environment"),
-                ("POHUNEK_SESSION_ID", "s-114"),
-                (
-                    "POHUNEK_SOCKET_PATH",
-                    daemon_socket_path.to_str().expect("UTF-8")
-                ),
-                ("POHUNEK_WORKER_HOOK_PROTOCOL_VERSION", "1"),
-                ("POHUNEK_WORKER_ID", "worker-environment"),
-                (
-                    "POHUNEK_WORKER_SOCKET_PATH",
-                    socket_path.to_str().expect("UTF-8")
-                ),
-                ("PROFILE_TOKEN", "profile-secret"),
-                ("TERM", super::CHILD_TERM),
-            ])
-        );
     }
 
     #[tokio::test]

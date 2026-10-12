@@ -133,7 +133,12 @@ classifies every one of them through the package manifest.
   advances its recorded ordering and leaves it completed (the Codex-specific
   gaps are tracked in [#916](https://github.com/zajca/pohunek/issues/916)). The app-server also outlives the TUI when it is
   detached; the fixture's process guard stops every process of the fixture,
-  including after a failed assertion.
+  including after a failed assertion. A Codex state hook action (`session`,
+  `subagent-start`, `subagent-stop`) that fails to deliver its report still
+  exits 0 and appends one payload-free line per reason (`provider` `codex`, the
+  action and a reason code) to the hook failure trace `pohunek-hooks.jsonl` in
+  the pohunek log directory (see the
+  [debug-session-runtime](../runbooks/debug-session-runtime.md) runbook).
 - **Process forms.** The helper process has kernel name `codex` too, so the
   matchers accept it. An npm install (`@openai/codex@0.160.0`) launches the tree
   `node …/@openai/codex/bin/codex.js` (the launched process), the native

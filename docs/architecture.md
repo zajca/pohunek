@@ -932,7 +932,12 @@ Hooks have two separate roles:
   Pohunek handshake before
   reading, reject oversized JSON through a bounded direct pipe, and never stage
   provider payloads on disk. Prompt text, results, transcript paths, and raw
-  hook payloads never cross this boundary. Running children become `lost` when
+  hook payloads never cross this boundary. A state hook that fails to deliver
+  a report still exits 0 and appends one payload-free line per reason to the
+  owner-private, size-bounded `pohunek-hooks.jsonl` in the log directory
+  (path and bound from the worker-injected `POHUNEK_HOOK_TRACE_PATH` and
+  `POHUNEK_HOOK_TRACE_MAX_BYTES`; see "Hook failure trace" in
+  `docs/public-api.md`). Running children become `lost` when
   their PTY runtime terminates. This state is independent of the parent
   session's coarse `activity` and survives daemon and client reconnects.
 

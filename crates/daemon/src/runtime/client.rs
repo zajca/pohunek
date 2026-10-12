@@ -1606,6 +1606,7 @@ mod tests {
             socket_path: socket_path.clone(),
             journal_path: root.join("journal/worker.json"),
             daemon_socket_path: root.join("daemon.sock"),
+            hook_trace_path: root.join(pohunek_logging::config::HOOK_TRACE_FILE_NAME),
             config: WorkerConfig::new(),
         })
         .await
@@ -2080,6 +2081,7 @@ mod tests {
             socket_path: socket_path.clone(),
             journal_path: root.join("journal/worker.json"),
             daemon_socket_path: root.join("daemon.sock"),
+            hook_trace_path: root.join(pohunek_logging::config::HOOK_TRACE_FILE_NAME),
             config: WorkerConfig {
                 data_payload_bytes: 1_024,
                 ..WorkerConfig::new()

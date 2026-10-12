@@ -7467,6 +7467,7 @@ while os.getppid() == parent:
             socket_path: socket.clone(),
             journal_path: journal,
             daemon_socket_path: root.join("runtime/daemon.sock"),
+            hook_trace_path: root.join(pohunek_logging::config::HOOK_TRACE_FILE_NAME),
             config: worker_config,
         })
         .await
@@ -7885,6 +7886,7 @@ while os.getppid() == parent:
             socket_path: socket.clone(),
             journal_path: journal,
             daemon_socket_path: root.join("runtime/daemon.sock"),
+            hook_trace_path: root.join(pohunek_logging::config::HOOK_TRACE_FILE_NAME),
             config: worker_config,
         })
         .await
@@ -8620,6 +8622,7 @@ while os.getppid() == parent:
                 .join(claimed_session)
                 .join(format!("{worker_id}.json")),
             daemon_socket_path: root.join("runtime/daemon.sock"),
+            hook_trace_path: root.join(pohunek_logging::config::HOOK_TRACE_FILE_NAME),
             config: WorkerConfig::new(),
         })
         .await

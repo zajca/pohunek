@@ -36,6 +36,8 @@ Start with public, non-destructive inspection:
    content into reports. `pohunekd.jsonl` plus seven rotations retain at most
    256 MiB; `pohunek-session-<session-id>.jsonl` plus three rotations retain at
    most 16 MiB across all worker generations for that session.
+   `pohunek-hooks.jsonl` plus one rotation (at most 2 MiB) is the hook failure
+   trace of every session on the host (see below).
 
 A `session.new` or fork that fails before any runtime exists reports one of
 these codes instead of a runtime state:
@@ -134,10 +136,76 @@ order: a `worker.identity.rejected` warning with `identity.operation`
 `subagent_snapshot` (the worker refused the snapshot, for example a task list
 over a bound); the hook-side cases in which no snapshot is sent (a missing or
 invalid task list, more than 256 tasks, an input over 1 MiB, or a `Stop` with a
-non-empty `agent_id`); a Claude hook asset older than integration version 12,
+non-empty `agent_id`; each is a `no_snapshot` or `input_*` line in the hook
+failure trace described below); a Claude hook asset older than integration version 12,
 which has no `Stop` state hook (`pohunek integration status --agent claude`
 reports it `outdated`; reinstall it); and a session worker started by a release
 without the snapshot claim, which refuses it.
+
+A claim, snapshot or identity report that never reached the worker log (no
+`claim.ignored`, `claim.refused`, `snapshot.applied` or `identity.rejected`
+line) was dropped by the state hook itself, which always exits 0 so it never
+breaks the provider. The hook records why in the hook failure trace,
+`~/.local/state/pohunek/logs/pohunek-hooks.jsonl` (the pohunek log directory;
+the worker passes the path to every managed child as `POHUNEK_HOOK_TRACE_PATH`
+and the rotation size as `POHUNEK_HOOK_TRACE_MAX_BYTES`). One file serves
+every session of the host: filter it by `session`, for example
+`jq -c 'select(.session == "<session-id>")' ~/.local/state/pohunek/logs/pohunek-hooks.jsonl`,
+and match `ts` against the worker log. The file is owner-private (`0600`) and
+rotates at 1 MiB into a single `pohunek-hooks.jsonl.1`, so the trace holds at
+most 2 MiB; read both files for the full window. Each line is one JSON object
+of at most 512 bytes with `ts` (RFC 3339, UTC), `session` (the Pohunek session
+id), `provider`, `action` (the hook action, such as `subagent-start` or
+`stop`), `reason` and an optional `detail` (a fixed short code, often an errno
+name). A line never carries the provider payload, ids taken from the input
+(agent, task or native session ids), task data, paths or environment values.
+The `reason` codes:
+
+- `input_too_large`: the input exceeded 64 KiB (1 MiB for the Claude `stop`
+  action);
+- `input_invalid`: `detail` `empty`, `not_json`, `not_utf8`, `too_deep`,
+  `not_object`, a read errno, `agent_id_missing` (a subagent action without an
+  agent id) or `session_id_missing` (a `session` action without a native
+  session id);
+- `no_snapshot`: the Claude `stop` action sent no snapshot, with `detail`
+  `subagent_stop` (a `Stop` with a non-empty `agent_id`), `tasks_missing`,
+  `tasks_invalid` or `tasks_over_bound` (more than 256 tasks);
+- `action_invalid`: a defensive code the managed hook never writes, because
+  its shell part exits on an unknown action before the session handshake;
+- `worker_socket_missing` (`detail` `unset`: no worker socket in the
+  environment; `ENOENT`: no socket at `POHUNEK_WORKER_SOCKET_PATH`),
+  `worker_instance_missing`,
+  `agent_pid_invalid` and `agent_identity_unavailable` (the agent's process
+  start identity could not be read): the hook could not build or route the
+  claim;
+- `worker_unreachable` (connect failed, `detail` the errno),
+  `worker_timeout` (no answer within the 0.5 s socket timeout),
+  `worker_closed` (no usable answer line; `detail` an errno, `empty` or
+  `malformed`);
+- `worker_refused`: the worker answered without `ok: true`; match it with the
+  `worker.identity.rejected` or `worker.subagent.claim.refused` line of the
+  same moment in the worker log;
+- `daemon_socket_missing`, `daemon_unreachable`, `daemon_timeout`,
+  `daemon_closed`, `daemon_refused` (the daemon answered an error) and
+  `daemon_protocol_invalid` (no worker socket and no usable
+  `POHUNEK_PROTOCOL_VERSION`): the daemon-socket fallback of the `session`
+  action (and the Claude `release` action) failed; match them in
+  `pohunekd.jsonl`.
+
+Lines carry no run id: a `session` or `release` report the worker did not
+accept and the daemon fallback then delivered leaves only the `worker_*` line,
+and so does one for which no daemon route was configured, so check
+`pohunekd.jsonl` around the same `ts` before concluding either. Only exits
+after the hook established that it runs in a Pohunek session (`POHUNEK_ENV=1`
+and a session id) and started `python3` are traced. An empty trace for a
+session whose claims are missing therefore means the hook did not run there,
+`python3` is not on the hook's `PATH` (no state hook of that session reports
+anything then), the trace lock stayed contended (the hook tries it at most
+5 times, 5 ms apart, then drops that run's lines), the trace variables were
+missing (a session worker of a release without the trace sets neither), or the
+installed hook is older than integration version 13 (`pohunek integration
+status` reports it `outdated`). Tracing never changes a hook's exit code or
+output, and a report delivered on its first route writes no line.
 
 Interpret runtime states as follows:
 
