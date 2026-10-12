@@ -13,6 +13,7 @@ mod hermes_mock;
 mod hermes_skill;
 mod package_affected;
 mod package_baseline;
+mod package_evidence;
 mod release;
 mod release_inventory;
 mod release_policy;
@@ -606,12 +607,25 @@ enum CatalogAction {
 #[derive(Debug, Subcommand)]
 enum PackageAction {
     /// Build the canonical `tar.zst` archive of a package directory.
+    ///
+    /// With `--evidence-dir`, also write `<archive>.sha256`,
+    /// `<runtime>.manifest.json`, `<runtime>.provenance-input.json` and
+    /// `<runtime>.compat-vector.json` there. The directory must then be
+    /// `runtime-packages/<runtime>` of a Git work tree, and its archived bytes,
+    /// its compatibility lock and `compat/matrix.json` must equal the blobs of
+    /// the commit `HEAD` names. A refusal or a failure while staging the five
+    /// files writes nothing; they are renamed into place one by one only after
+    /// all were written, so a failed rename can leave partial output.
     Build {
         /// Package directory holding `runtime.toml` and the package files.
         dir: PathBuf,
         /// Archive file to write.
         #[arg(short, long, value_name = "FILE")]
         output: PathBuf,
+        /// Directory for the builder evidence; must lie outside the package
+        /// directory and is created when missing (its parent must exist).
+        #[arg(long, value_name = "DIR")]
+        evidence_dir: Option<PathBuf>,
     },
     /// Build a package directory twice and require byte-identical archives.
     Verify {
@@ -687,9 +701,24 @@ enum AgentSkillAction {
 
 fn run_package(action: PackageAction) -> Result<(), XtaskError> {
     match action {
-        PackageAction::Build { dir, output } => {
+        PackageAction::Build {
+            dir,
+            output,
+            evidence_dir: None,
+        } => {
             let digest = runtime_package::build(&dir, &output)?;
             println!("package build ok: {digest}");
+        }
+        PackageAction::Build {
+            dir,
+            output,
+            evidence_dir: Some(evidence_dir),
+        } => {
+            let digest = package_evidence::build(&dir, &output, &evidence_dir)?;
+            println!(
+                "package build ok: {digest}, evidence in {}",
+                evidence_dir.display()
+            );
         }
         PackageAction::Verify { dir } => {
             let digest = runtime_package::verify(&dir)?;

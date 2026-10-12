@@ -301,13 +301,23 @@ jobs:
         run: |
           set -euo pipefail
           XTASK="$PWD/target/debug/xtask" scripts/release-workflow/build-packages \
-            "$VERSION" "$RUNNER_TEMP/package-archives"
+            "$VERSION" "$RUNNER_TEMP/package-archives" "$RUNNER_TEMP/package-evidence"
 
       - name: Upload the package archives
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: package-archives
           path: ${{ runner.temp }}/package-archives
+          if-no-files-found: error
+
+      # The builder evidence (manifest, provenance input, compatibility vector)
+      # is a workflow artifact only: no release job downloads it, so it never
+      # reaches the assembler's inputs or the published bundle.
+      - name: Upload the package evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: package-evidence
+          path: ${{ runner.temp }}/package-evidence
           if-no-files-found: error
 
   # The SDK tarballs are built with a read-only token and no persisted git

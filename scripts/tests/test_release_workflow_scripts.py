@@ -2,9 +2,10 @@
 
 They cover the scripts that need neither the network nor a built xtask:
 version resolution, the row matrix, the policy filter, input collection, the
-refusals of the assembler wrapper, and run-row's own steps around the consumer
-(checksums, extraction, the timed consumer run and its JUnit report) with a
-stand-in xtask and consumer. Staging the real upstreams, the real consumer and
+refusals of the assembler wrapper, build-packages' own steps around the
+builder (where the evidence goes, the checksum cross-check), and run-row's own
+steps around the consumer (checksums, extraction, the timed consumer run and
+its JUnit report), with a stand-in xtask and consumer. Staging the real upstreams, the real consumer and
 signing are exercised by the release rehearsal job of ci.yml.
 """
 
@@ -360,6 +361,152 @@ class PreparePolicyTests(unittest.TestCase):
         output.write_text("x")
         self.assertNotEqual(run("prepare-policy", self.policy, str(output)).returncode, 0)
         self.assertEqual(output.read_text(), "x")
+
+
+class BuildPackagesFixture:
+    """A checkout with two package directories and a stand-in xtask.
+
+    The stand-in records its calls, writes placeholder archive bytes and,
+    like the real builder, the four evidence files into `--evidence-dir`,
+    with a `sha256sum`-format checksum unless `BAD_CHECKSUM` is set. Every
+    other step is build-packages' own.
+    """
+
+    RUNTIMES = ("alpha", "beta")
+    VERSION = "1.0.0"
+    EVIDENCE_SUFFIXES = (".manifest.json", ".provenance-input.json", ".compat-vector.json")
+
+    def __init__(self, directory: Path):
+        self.directory = directory
+        self.checkout = directory / "checkout"
+        for runtime in self.RUNTIMES:
+            (self.checkout / "runtime-packages" / runtime).mkdir(parents=True)
+        self.calls = directory / "calls"
+        self.xtask = directory / "tools" / "xtask"
+        self.xtask.parent.mkdir()
+        self.xtask.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            'printf \'%s\\n\' "$*" >> "$CALLS"\n'
+            'case "$1 $2" in\n'
+            '    "package verify") exit 0 ;;\n'
+            '    "package build") ;;\n'
+            '    *) echo "unexpected xtask call: $*" >&2; exit 2 ;;\n'
+            "esac\n"
+            'dir=$3\n'
+            '[ "$4" = --output ] && [ "$6" = --evidence-dir ] || { echo "bad arguments: $*" >&2; exit 2; }\n'
+            'archive=$5\n'
+            'evidence=$7\n'
+            'runtime=$(basename -- "$dir")\n'
+            'name=$(basename -- "$archive")\n'
+            'printf \'archive of %s\\n\' "$runtime" > "$archive"\n'
+            'mkdir -p "$evidence"\n'
+            'if [ -n "${BAD_CHECKSUM:-}" ]; then\n'
+            '    printf \'%064d  %s\\n\' 0 "$name" > "$evidence/$name.sha256"\n'
+            "else\n"
+            '    (cd "$(dirname -- "$archive")" && sha256sum -- "$name") > "$evidence/$name.sha256"\n'
+            "fi\n"
+            'for suffix in .manifest.json .provenance-input.json .compat-vector.json; do\n'
+            "    printf '{}\\n' > \"$evidence/$runtime$suffix\"\n"
+            "done\n"
+        )
+        self.xtask.chmod(0o755)
+
+    def run(self, *args: str, **env: str) -> subprocess.CompletedProcess:
+        return run(
+            "build-packages",
+            *args,
+            cwd=self.checkout,
+            env={"XTASK": str(self.xtask), "CALLS": str(self.calls), **env},
+        )
+
+    def archive(self, runtime: str) -> str:
+        return f"pohunek-runtime-{runtime}-{self.VERSION}.tar.zst"
+
+
+class BuildPackagesTests(unittest.TestCase):
+    def setUp(self):
+        self.fixture = BuildPackagesFixture(Path(self.enterContext(tempfile.TemporaryDirectory())))
+        self.output = self.fixture.directory / "package-archives"
+        self.evidence = self.fixture.directory / "package-evidence"
+
+    def test_evidence_goes_outside_the_archives_which_hold_only_archives_and_checksums(self):
+        result = self.fixture.run(self.fixture.VERSION, str(self.output), str(self.evidence))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        archives = [self.fixture.archive(runtime) for runtime in self.fixture.RUNTIMES]
+        self.assertEqual(
+            sorted(path.name for path in self.output.iterdir()),
+            sorted([*archives, *(f"{name}.sha256" for name in archives)]),
+        )
+        self.assertEqual(
+            sorted(path.name for path in self.evidence.iterdir()),
+            sorted(
+                [
+                    *(f"{name}.sha256" for name in archives),
+                    *(
+                        f"{runtime}{suffix}"
+                        for runtime in self.fixture.RUNTIMES
+                        for suffix in BuildPackagesFixture.EVIDENCE_SUFFIXES
+                    ),
+                ]
+            ),
+        )
+        for name in archives:
+            with self.subTest(archive=name):
+                digest = hashlib.sha256((self.output / name).read_bytes()).hexdigest()
+                self.assertEqual((self.output / f"{name}.sha256").read_text(), f"{digest}  {name}\n")
+        builds = [line for line in self.fixture.calls.read_text().splitlines() if line.startswith("package build")]
+        self.assertEqual(
+            builds,
+            [
+                f"package build runtime-packages/{runtime} --output {self.output}/{self.fixture.archive(runtime)} "
+                f"--evidence-dir {self.evidence}"
+                for runtime in self.fixture.RUNTIMES
+            ],
+        )
+
+    def assert_nothing_created(self, *paths: Path) -> None:
+        self.assertFalse(self.fixture.calls.exists(), "nothing may be built")
+        for path in paths:
+            self.assertFalse(path.exists(), f"a refused run created {path}")
+
+    def test_an_evidence_directory_inside_or_equal_to_the_output_is_refused(self):
+        for evidence in (self.output, self.output / "evidence"):
+            with self.subTest(evidence=evidence):
+                result = self.fixture.run(self.fixture.VERSION, str(self.output), str(evidence))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("must lie outside the output directory", result.stderr)
+                self.assert_nothing_created(self.output, evidence)
+
+    def test_an_output_directory_inside_the_evidence_is_refused(self):
+        output = self.evidence / "archives"
+        result = self.fixture.run(self.fixture.VERSION, str(output), str(self.evidence))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must lie outside the evidence directory", result.stderr)
+        self.assert_nothing_created(output, self.evidence)
+
+    def test_an_overlap_through_a_symbolic_link_is_refused(self):
+        # `links/out` resolves into the output directory although its spelling
+        # does not start with it.
+        self.output.mkdir()
+        links = self.fixture.directory / "links"
+        links.mkdir()
+        (links / "out").symlink_to(self.output)
+        evidence = links / "out" / "evidence"
+        result = self.fixture.run(self.fixture.VERSION, str(self.output), str(evidence))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must lie outside the output directory", result.stderr)
+        self.assert_nothing_created(self.output / "evidence")
+
+    def test_a_builder_checksum_that_differs_from_sha256sum_fails(self):
+        result = self.fixture.run(self.fixture.VERSION, str(self.output), str(self.evidence), BAD_CHECKSUM="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("builder checksum differs from sha256sum", result.stderr)
+
+    def test_the_evidence_directory_is_required(self):
+        result = self.fixture.run(self.fixture.VERSION, str(self.output))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("usage: build-packages <version> <output-dir> <evidence-dir>", result.stderr)
 
 
 class CollectInputsTests(unittest.TestCase):

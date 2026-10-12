@@ -906,6 +906,25 @@ class AssetNameTests(ReleaseWorkflowFiles):
         # `release-bundle` must stay outside every `release-*` download pattern.
         self.assertNotRegex(self.release + self.evidence + self.build, r"pattern: release-")
 
+    def test_the_package_evidence_is_uploaded_and_never_consumed(self):
+        # Builder evidence is in-house JSON outside the release policy: it is
+        # a workflow artifact of the package job, kept apart from the archives
+        # the assembler reads, and no release job downloads it.
+        packages = self.build_jobs["packages"]
+        self.assertIn(
+            'scripts/release-workflow/build-packages \\\n'
+            '            "$VERSION" "$RUNNER_TEMP/package-archives" "$RUNNER_TEMP/package-evidence"\n',
+            packages,
+        )
+        self.assertIn("          name: package-evidence\n", packages)
+        self.assertIn("          path: ${{ runner.temp }}/package-evidence\n", packages)
+        for text in (self.release, self.evidence):
+            for name, block in jobs(text).items():
+                with self.subTest(job=name):
+                    self.assertNotIn("package-evidence", block)
+                    for pattern in re.findall(r"(?m)^\s+pattern: (\S+)$", block):
+                        self.assertFalse(fnmatch.fnmatchcase("package-evidence", pattern), pattern)
+
     def test_the_bundle_is_the_only_published_set(self):
         publish = self.release_jobs[WRITER]
         self.assertEqual(publish.count("download-artifact"), 1)

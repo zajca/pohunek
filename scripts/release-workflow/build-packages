@@ -1,7 +1,8 @@
 #!/bin/sh
 # Build every official runtime package archive of the checkout.
 #
-# usage: build-packages <version> <output-dir>     (run from the repository root)
+# usage: build-packages <version> <output-dir> <evidence-dir>
+#        (run from the repository root)
 # env:   XTASK  path of the built xtask binary
 #
 # The official packages are the directories of `runtime-packages/`; no runtime
@@ -9,6 +10,13 @@
 # written as `pohunek-runtime-<runtime>-<version>.tar.zst` with a `.sha256`
 # file in `sha256sum -c` format. The name carries the core release version, as
 # `cargo xtask release assemble` expects.
+#
+# The builder evidence (`<archive>.sha256`, `<runtime>.manifest.json`,
+# `<runtime>.provenance-input.json`, `<runtime>.compat-vector.json`) goes to
+# the evidence directory, which must lie outside the output directory:
+# `collect-inputs` copies every file of the output directory into the
+# assembler's inputs. The checksum the builder wrote must equal the one
+# `sha256sum` writes here.
 
 set -eu
 
@@ -17,14 +25,44 @@ fail() {
     exit 1
 }
 
-[ "$#" -eq 2 ] || fail "usage: build-packages <version> <output-dir>"
+[ "$#" -eq 3 ] || fail "usage: build-packages <version> <output-dir> <evidence-dir>"
 version=$1
 output=$2
+evidence=$3
 [ -n "${XTASK:-}" ] && [ -x "$XTASK" ] || fail "XTASK must name the built xtask binary"
+[ -n "$output" ] && [ -n "$evidence" ] || fail "empty output or evidence directory"
 case $version in
     '' | *[!0-9.]*) fail "invalid version: $version" ;;
 esac
-mkdir -p "$output"
+
+# Prints the physical path of directory $1, which need not exist yet: the
+# nearest existing ancestor is resolved with `pwd -P` and the missing names are
+# appended. A missing `.` or `..` name, or an existing non-directory, fails.
+resolve() {
+    path=$1
+    rest=
+    while [ ! -d "$path" ]; do
+        [ ! -e "$path" ] && [ ! -L "$path" ] || fail "not a directory: $path"
+        name=$(basename -- "$path")
+        case $name in
+            . | .. | /) fail "cannot resolve directory: $1" ;;
+        esac
+        rest=/$name$rest
+        path=$(dirname -- "$path")
+    done
+    printf '%s%s\n' "$(cd -- "$path" && pwd -P)" "$rest"
+}
+
+# Checked before anything is created, so a refused run leaves nothing behind.
+output_real=$(resolve "$output")
+evidence_real=$(resolve "$evidence")
+case $evidence_real/ in
+    "$output_real"/*) fail "the evidence directory must lie outside the output directory" ;;
+esac
+case $output_real/ in
+    "$evidence_real"/*) fail "the output directory must lie outside the evidence directory" ;;
+esac
+mkdir -p "$output" "$evidence"
 
 count=0
 for dir in runtime-packages/*/; do
@@ -35,8 +73,11 @@ for dir in runtime-packages/*/; do
     esac
     archive="pohunek-runtime-$runtime-$version.tar.zst"
     "$XTASK" package verify "runtime-packages/$runtime"
-    "$XTASK" package build "runtime-packages/$runtime" --output "$output/$archive"
+    "$XTASK" package build "runtime-packages/$runtime" --output "$output/$archive" \
+        --evidence-dir "$evidence"
     (cd "$output" && sha256sum -- "$archive" > "$archive.sha256")
+    cmp -s -- "$output/$archive.sha256" "$evidence/$archive.sha256" \
+        || fail "builder checksum differs from sha256sum: $archive"
     count=$((count + 1))
 done
 [ "$count" -gt 0 ] || fail "runtime-packages/ holds no package directory"

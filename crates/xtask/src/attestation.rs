@@ -72,7 +72,7 @@ const COMMIT_HEX_LEN: usize = 40;
 pub(crate) const MATRIX_PATH: &str = "compat/matrix.json";
 
 /// Directory of the official runtime packages relative to the repository root.
-const PACKAGES_DIR: &str = "runtime-packages";
+pub(crate) const PACKAGES_DIR: &str = "runtime-packages";
 
 /// Lock location of a runtime relative to the repository root.
 const LOCK_FILE: &str = "compatibility-lock.json";
@@ -141,7 +141,7 @@ impl fmt::Display for AttestationError {
 
 impl std::error::Error for AttestationError {}
 
-fn refuse(field: impl Into<String>, fault: Fault) -> XtaskError {
+pub(crate) fn refuse(field: impl Into<String>, fault: Fault) -> XtaskError {
     XtaskError::Attestation(AttestationError {
         field: field.into(),
         fault,
@@ -197,23 +197,23 @@ pub(crate) struct Row {
 /// The fields of `compat/<runtime>/compatibility-lock.json` the attestation
 /// reads; other fields belong to the runtime's own checks.
 #[derive(Debug, Deserialize)]
-struct Lock {
+pub(crate) struct Lock {
     schema: u32,
-    package: String,
-    runtime: String,
-    upstream: LockUpstream,
-    supported: LockRange,
+    pub(crate) package: String,
+    pub(crate) runtime: String,
+    pub(crate) upstream: LockUpstream,
+    pub(crate) supported: LockRange,
 }
 
 #[derive(Debug, Deserialize)]
-struct LockUpstream {
-    release: String,
+pub(crate) struct LockUpstream {
+    pub(crate) release: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct LockRange {
-    min: String,
-    below: String,
+pub(crate) struct LockRange {
+    pub(crate) min: String,
+    pub(crate) below: String,
 }
 
 /// Arguments that select the bytes an attestation is recomputed from.
@@ -323,7 +323,7 @@ fn hex_digest(hasher: Sha256) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn sha256_prefixed(bytes: &[u8]) -> String {
+pub(crate) fn sha256_prefixed(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("sha256:{}", hex_digest(hasher))
@@ -464,7 +464,12 @@ pub(crate) fn binary_set_digest(by_name: &BTreeMap<String, String>) -> Result<St
 
 /// Reads and validates a matrix file.
 pub(crate) fn read_matrix(path: &Path) -> Result<Matrix, XtaskError> {
-    let matrix: Matrix = parse_json(&read_input(path, MAX_DOCUMENT_BYTES)?, "matrix")?;
+    parse_matrix(&read_input(path, MAX_DOCUMENT_BYTES)?)
+}
+
+/// Parses and validates the matrix `bytes`.
+pub(crate) fn parse_matrix(bytes: &[u8]) -> Result<Matrix, XtaskError> {
+    let matrix: Matrix = parse_json(bytes, "matrix")?;
     if matrix.schema != SCHEMA_VERSION {
         return Err(refuse("matrix.schema", Fault::Mismatch));
     }
@@ -496,11 +501,16 @@ pub(crate) fn lock_digest(path: &Path) -> Result<String, XtaskError> {
 /// Reads a lock; returns it with the digest of its exact bytes.
 fn read_lock(path: &Path) -> Result<(Lock, String), XtaskError> {
     let bytes = read_input(path, MAX_DOCUMENT_BYTES)?;
-    let lock: Lock = parse_json(&bytes, "upstream_lock")?;
+    Ok((parse_lock(&bytes)?, sha256_prefixed(&bytes)))
+}
+
+/// Parses the lock `bytes`, requiring the lock schema version.
+pub(crate) fn parse_lock(bytes: &[u8]) -> Result<Lock, XtaskError> {
+    let lock: Lock = parse_json(bytes, "upstream_lock")?;
     if lock.schema != SCHEMA_VERSION {
         return Err(refuse("upstream_lock", Fault::Malformed));
     }
-    Ok((lock, sha256_prefixed(&bytes)))
+    Ok(lock)
 }
 
 /// Package digest, package id and runtime id of an archive, read from its bytes.
@@ -597,7 +607,7 @@ fn recompute(inputs: &RecomputeArgs) -> Result<Recomputed, XtaskError> {
 }
 
 /// Requires the lock's pinned release to lie in `[min, below)`.
-fn check_supported(lock: &Lock) -> Result<(), XtaskError> {
+pub(crate) fn check_supported(lock: &Lock) -> Result<(), XtaskError> {
     let parse = |text: &str| {
         Version::parse(text).map_err(|_cause| refuse("upstream_lock", Fault::Malformed))
     };

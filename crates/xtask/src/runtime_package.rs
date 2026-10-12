@@ -58,7 +58,7 @@ fn io_error(path: &Path) -> impl FnOnce(std::io::Error) -> XtaskError {
 ///
 /// A symlink is rejected outright, dangling or not: the write would follow it
 /// to a destination this check cannot vouch for.
-fn reject_output_inside(dir: &Path, output: &Path) -> Result<(), XtaskError> {
+pub(crate) fn reject_output_inside(dir: &Path, output: &Path) -> Result<(), XtaskError> {
     let root = fs::canonicalize(dir).map_err(io_error(dir))?;
     let resolved = match fs::symlink_metadata(output) {
         Ok(metadata) if metadata.file_type().is_symlink() => {

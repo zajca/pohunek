@@ -829,7 +829,7 @@ pub(crate) const GIT: &str = "git";
 /// (`GIT_DEFAULT_HASH`, `GIT_DEFAULT_REF_FORMAT`, `GIT_INDEX_VERSION`) stay
 /// because the commands start at the workspace root itself, and the developer's
 /// configuration and identity variables stay because they are legitimate input.
-const REPOSITORY_REDIRECTING_VARS: &[&str] = &[
+pub(crate) const REPOSITORY_REDIRECTING_VARS: &[&str] = &[
     "GIT_DIR",
     "GIT_COMMON_DIR",
     "GIT_WORK_TREE",

@@ -138,6 +138,9 @@ by `scripts/tests/test_release_workflow.py`.
 
 Producers upload workflow artifacts only: `build-<component>-<target>`,
 `package-archives`, `sdk-release-assets` and the macOS `macos-signed-<component>`.
+The package job also uploads `package-evidence`, the builder evidence of every
+archive (`cargo xtask package build --evidence-dir`); no release job downloads
+it, so it is never a release input or asset.
 The evidence workflow plans the rows from `compat/matrix.json` with `jq`; every
 row extracts the binaries from the daemon ARCHIVE of its target, stages the pinned
 upstream and runs the consumer suite, then `compat attest` writes
