@@ -41,12 +41,14 @@ JSON log under `~/.local/state/pohunek/logs/` (see the
      `root_restored`. A `--catalog` reinstall restores the root only while the
      daemon still runs the release whose catalog authorized the package and no
      newer catalog has been accepted; otherwise it is refused with
-     `package_incompatible` or `package_untrusted`. In that case install the
-     current release's package with `pohunek plugin update <package>
-     runtime/packages/<runtime>.tar.zst --catalog runtime/runtime-catalog.json`,
-     then migrate the profiles and remove the sessions that pin the lost
-     digest. An uninstall without `--remove-modified` also clears the record
-     when nothing pins it.
+     `package_incompatible` or `package_untrusted`. In that case release the
+     lost digest first, as step 4 describes, then install the current
+     release's package with `pohunek plugin install
+     runtime/packages/<runtime>.tar.zst --catalog runtime/runtime-catalog.json
+     --yes` (use `pohunek plugin update <package>` with the same archive and
+     catalog when another version of the package is still installed) and
+     re-pin each profile with `pohunek plugin profile migrate <name> --yes`. An uninstall without `--remove-modified` also clears the
+     record when nothing pins it.
    - `root modified` or `root unsafe`: content, a mode, an owner or a link
      count changed after install. Enable, select and uninstall fail with
      `package_root_invalid`, launches with `runtime_incompatible`, and
@@ -81,12 +83,14 @@ JSON log under `~/.local/state/pohunek/logs/` (see the
 4. If that removal is refused with `package_referenced`, a session or a host
    profile pins the damaged digest. There is no in-place repair: sessions
    pinned to it fail to launch or resume with `runtime_incompatible`, and
-   nothing falls back to another package. Remove each pinning session with
-   `pohunek session rm <id>`. For each pinning profile, either install
-   another version of the package and pin the profile to it with
-   `pohunek plugin profile migrate <name> --digest <digest> --yes`, or delete
-   the profile's `package` and `digest` lines when no installed package serves
-   its base any more. Then repeat step 3.
+   nothing falls back to another package. While anything pins the damaged
+   digest, `plugin update` cannot select another version
+   (`package_integration_incompatible`) and `plugin profile migrate` refuses
+   it, so release the digest first: remove each pinning session with
+   `pohunek session rm <id>`, and delete the `package` and `digest` lines from
+   each pinning profile. Then repeat step 3, install a working version of the
+   package, and re-pin each profile with
+   `pohunek plugin profile migrate <name> --yes`.
 
 ## 2. An install fails verification
 
@@ -99,8 +103,8 @@ The install is refused before anything is recorded; the registry is unchanged.
   mismatch. Never adjust `--sha256` to match a file you cannot vouch for.
 - `plugin_source_invalid`: the archive or catalog path does not exist or is not
   a file; the CLI refuses it before contacting the daemon.
-- `package_source_unreadable`: the daemon cannot open the path as a regular
-  file, for example a symbolic link or a file its user cannot read.
+- `package_source_unreadable`: the daemon cannot open the resolved path as a
+  regular file, for example a file its user cannot read.
 - `package_descriptor_invalid`: the archive is intact but its runtime
   descriptor is not a valid runtime definition for this daemon, for example an
   integration handler or hook schema this core does not provide.
@@ -158,8 +162,8 @@ The checks are in `crates/daemon/src/session/package_lifecycle/trust.rs` and
    canonical bytes.
 4. `package_incompatible` means the entry does not support this daemon: every
    official entry pins exactly the core version of its release
-   (`core = "=<version>"`), and current releases list only the Linux glibc and
-   musl targets. Install the catalog and packages from the daemon archive of
+   (`core = "=<version>"`), and current releases list only the Linux x86_64
+   glibc and musl targets. Install the catalog and packages from the daemon archive of
    the version the daemon runs (`pohunek health` reports it); the Apple Silicon
    archive currently carries no package.
 
@@ -183,8 +187,8 @@ pinned to the package never does.
   digest is shown by `pohunek plugin doctor` as `pinned but not installed`);
   a newer version does not stand in for it. A `--catalog` reinstall of an
   official archive succeeds only while the daemon still runs the release whose
-  catalog authorized it; after a daemon upgrade, migrate or remove what pins
-  the lost digest instead.
+  catalog authorized it; after a daemon upgrade, release the lost digest and
+  install the current release's package as section 1 step 4 describes.
 - `runtime_served_by_package`: the session was launched from the built-in
   Codex or Claude runtime, and an official package serves that id now. Disable
   or uninstall the official package to resume it from the built-in, or start
