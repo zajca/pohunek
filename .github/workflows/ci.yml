@@ -1542,8 +1542,18 @@ jobs:
         run: |
           set -euo pipefail
           cargo xtask package verify runtime-packages/pi
-          cargo xtask package build runtime-packages/pi --output "$RUNNER_TEMP/pi.tar.zst"
+          cargo xtask package build runtime-packages/pi --output "$RUNNER_TEMP/pi.tar.zst" \
+            --evidence-dir "$RUNNER_TEMP/package-evidence-pi"
           echo "POHUNEK_PI_PACKAGE_ARCHIVE=$RUNNER_TEMP/pi.tar.zst" >> "$GITHUB_ENV"
+
+      # Uploaded right after the build, so the evidence of the archive under
+      # test survives a failing test run.
+      - name: Upload the package evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-evidence-pi
+          path: ${{ runner.temp }}/package-evidence-pi
+          if-no-files-found: error
 
       - name: Build the session worker
         run: cargo build --locked -p pohunek-session-worker --bin pohunek-sessiond
@@ -1642,8 +1652,18 @@ jobs:
         run: |
           set -euo pipefail
           cargo xtask package verify runtime-packages/codex
-          cargo xtask package build runtime-packages/codex --output "$RUNNER_TEMP/codex.tar.zst"
+          cargo xtask package build runtime-packages/codex --output "$RUNNER_TEMP/codex.tar.zst" \
+            --evidence-dir "$RUNNER_TEMP/package-evidence-codex"
           echo "POHUNEK_CODEX_PACKAGE_ARCHIVE=$RUNNER_TEMP/codex.tar.zst" >> "$GITHUB_ENV"
+
+      # Uploaded right after the build, so the evidence of the archive under
+      # test survives a failing test run.
+      - name: Upload the package evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-evidence-codex
+          path: ${{ runner.temp }}/package-evidence-codex
+          if-no-files-found: error
 
       - name: Build the session worker
         run: cargo build --locked -p pohunek-session-worker --bin pohunek-sessiond
@@ -1753,8 +1773,18 @@ jobs:
         run: |
           set -euo pipefail
           cargo xtask package verify runtime-packages/claude
-          cargo xtask package build runtime-packages/claude --output "$RUNNER_TEMP/claude.tar.zst"
+          cargo xtask package build runtime-packages/claude --output "$RUNNER_TEMP/claude.tar.zst" \
+            --evidence-dir "$RUNNER_TEMP/package-evidence-claude"
           echo "POHUNEK_CLAUDE_PACKAGE_ARCHIVE=$RUNNER_TEMP/claude.tar.zst" >> "$GITHUB_ENV"
+
+      # Uploaded right after the build, so the evidence of the archive under
+      # test survives a failing test run.
+      - name: Upload the package evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-evidence-claude
+          path: ${{ runner.temp }}/package-evidence-claude
+          if-no-files-found: error
 
       - name: Build the session worker
         run: cargo build --locked -p pohunek-session-worker --bin pohunek-sessiond

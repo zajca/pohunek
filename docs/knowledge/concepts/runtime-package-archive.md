@@ -80,7 +80,7 @@ the reader accepts.
 ## Build and verify
 
 ```sh
-cargo xtask package build <dir> -o <archive.tar.zst>
+cargo xtask package build <dir> -o <archive.tar.zst> [--evidence-dir <D>]
 cargo xtask package verify <dir>
 cargo xtask package affected [--base REF] [--json]
 cargo xtask package baseline --catalog FILE --anchor FILE --release-dir DIR --version X.Y.Z [--json]
@@ -94,6 +94,56 @@ per-PR package jobs; any core change selects all of them. The release pipeline
 uses `verify` semantics to require byte-for-byte reproducibility from
 independent clean roots. `baseline` decides which packages the signed release
 proves unchanged; see "Release baseline".
+
+`build --evidence-dir <D>` also writes the builder evidence of an official
+package into `D`, as deterministic JSON (sorted keys at every level, two-space
+indentation, one trailing newline, no timestamps, no absolute paths, `schema`
+1), so two clean clones of one commit give byte-identical files:
+
+- `<archive>.sha256`: the archive digest in `sha256sum -c` format, naming the
+  archive file.
+- `<rt>.manifest.json`: `digest`, `package_id`, `runtime_id`, `version`,
+  `runtime_api` and `entries` (`path`, `size`, `sha256` hex, `executable` per
+  file).
+- `<rt>.provenance-input.json`: `subject` (archive `name`, `digest`),
+  `builder` (`command`, `xtask_version`), `source` (`commit`, `path`
+  `runtime-packages/<rt>`, Git `tree` of that path) and `materials` (`entries`
+  and the lock's whole `upstream` object).
+- `<rt>.compat-vector.json`: the package half of a compatibility attestation
+  with its field names (`package_digest`, `package_id`, `runtime`,
+  `upstream_lock_digest`, `upstream_version`, `suite_version`), plus
+  `upstream` (the lock's whole `upstream` object), `supported` (`min`,
+  `below`) and `targets` (the runtime's `compat/matrix.json` rows).
+
+The directory must be `runtime-packages/<rt>` of a Git work tree whose
+descriptor declares runtime `<rt>`. `git status` must report no modified,
+untracked or ignored file in it, in `compat/<rt>/compatibility-lock.json` or in
+`compat/matrix.json`. A clean status does not prove equal bytes
+(skip-worktree and assume-unchanged entries, `core.autocrlf`,
+`core.fileMode=false` and filters hide differences), so the bytes are compared
+with the commit `HEAD` names, resolved once with replace refs ignored: the
+archive entries must be exactly the blobs of that commit's tree (same paths,
+mode `100755` exactly for executable entries, the Git blob id of each entry's
+bytes, SHA-1 or SHA-256 per the repository's object format), and the lock and
+matrix bytes must be the blobs that commit stores.
+
+The lock's `upstream` object is copied whatever its kind (an npm package, a
+provisioned runtime) with its keys sorted; only `upstream.release` is
+required. A missing lock, a lock of another runtime or package, a lock without
+`upstream.release` or with a fractional number in `upstream`, a pinned release
+outside the lock's range, a runtime without matrix rows, an evidence directory
+inside the package directory, an archive output that is not a regular file or
+whose directory does not exist, an evidence path that is not a directory, a
+missing evidence directory whose parent does not exist, and an evidence file
+that is a symbolic link are refused too. Every refusal happens before anything
+is written. The archive and the four files are written as temporary files
+next to their targets (mode `0644`) and renamed into place one by one, archive
+first, only after all five were written: a refusal or a failure while staging
+writes nothing, while a rename that fails midway can leave the new archive
+next to a mix of new and old evidence. An evidence directory the build created
+is removed again on failure while it is still empty. The evidence is CI and release workflow output only
+(`package-evidence-<rt>` per pull request, `package-evidence` in the release
+build); it is not a release asset.
 
 `build` and `verify` call `package::directory::build_directory_archive(dir, limits)`
 (Unix), which the CLI's `plugin link` also uses. It walks regular files only

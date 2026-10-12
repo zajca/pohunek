@@ -166,6 +166,13 @@ prints `{"core_changed": bool, "packages": [...]}` on stdout and the per-file
 reasons on stderr; any Git or file-system failure exits non-zero with nothing on
 stdout. A package job skips only when the selector succeeded and reported its
 package as `false`; push, schedule and dispatch runs run every package job.
+Each package job builds its archive with `cargo xtask package build
+--evidence-dir` and uploads the builder evidence (checksum, manifest projection,
+provenance input, compatibility vector; see
+[runtime package archive](knowledge/concepts/runtime-package-archive.md)) as
+`package-evidence-<runtime>` right after the build, so it survives a failing
+test run. The release build passes `build-packages` a separate evidence
+directory and uploads it as `package-evidence`, which no release job downloads.
 
 The target is fast feedback in about two minutes for routine changes, not a
 promise for cold builds or the complete required CI suite. Review JUnit execution
@@ -412,7 +419,8 @@ assembles and publishes the release in one fixed flow:
    builds the glibc and MUSL x86_64 CLI and daemon archives, the glibc relay
    archive, the official runtime package archives (every `runtime-packages/*`
    directory: `package verify`, then `package build`, named
-   `pohunek-runtime-<runtime>-<version>.tar.zst` with a `.sha256`) and the SDK
+   `pohunek-runtime-<runtime>-<version>.tar.zst` with a `.sha256`; the builder
+   evidence goes to the separate `package-evidence` artifact) and the SDK
    tarballs; the macOS jobs build, ad-hoc sign and verify the Apple Silicon
    archives. No macOS job uses secrets or a protected environment.
 2. **Evidence** (`release-evidence.yml`, reusable): one job per
@@ -484,9 +492,12 @@ draft/publish semantics of the `publish` job.
 
 Add `runtime-packages/<runtime>/`, `compat/<runtime>/` (lock and npm project) and
 the rows to `compat/matrix.json` (`cargo xtask compat matrix-check`), and a driver
-entry for the consumer suite. Nothing in `release.yml`, `release-build.yml` or
-`release-evidence.yml` names a runtime: the package job, the row matrix and the
-smoke derive them from those directories and files. A new target needs a runner
+entry for the consumer suite. The builder evidence that `build-packages` and the
+package job write copies the lock's `upstream` object whole, whatever its kind
+(npm package, provisioned runtime), and needs only `upstream.release` in it.
+Nothing in `release.yml`, `release-build.yml` or `release-evidence.yml` names a
+runtime: the package job, the row matrix and the smoke derive them from those
+directories and files. A new target needs a runner
 mapping in `scripts/release-workflow/row-matrix`, a build leg in
 `release-build.yml` and the policy entries in `packaging/release-policy.json`.
 The per-pull-request package job in `ci.yml` needs a `package-selection` output

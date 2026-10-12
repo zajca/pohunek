@@ -559,5 +559,37 @@ class RuntimePackageReportTests(unittest.TestCase):
                 self.assertNotIn("nextest-junit-", upload)
 
 
+
+class RuntimePackageEvidenceTests(unittest.TestCase):
+    """Package jobs keep the builder evidence of the archive they test."""
+
+    def test_package_jobs_build_with_evidence_and_upload_it_before_the_tests(self):
+        for job, package in PACKAGE_JOBS.items():
+            with self.subTest(job=job):
+                steps = job_steps(workflow_jobs()[job])
+                names = list(steps)
+                build = steps["Build the package deterministically"]
+                evidence_dir = f'"$RUNNER_TEMP/package-evidence-{package}"'
+                self.assertIn(
+                    f'cargo xtask package build runtime-packages/{package} --output "$RUNNER_TEMP/{package}.tar.zst" \\\n'
+                    f"            --evidence-dir {evidence_dir}\n",
+                    build,
+                )
+                upload = steps["Upload the package evidence"]
+                self.assertIn("uses: actions/upload-artifact@", upload)
+                self.assertIn(f"          name: package-evidence-{package}\n", upload)
+                self.assertIn(f"          path: ${{{{ runner.temp }}}}/package-evidence-{package}\n", upload)
+                self.assertIn("          if-no-files-found: error\n", upload)
+                # Right after the build and with no condition of its own, so a
+                # failing test run still leaves the evidence of its archive.
+                self.assertNotRegex(upload, r"(?m)^        if: ")
+                self.assertEqual(
+                    names.index("Upload the package evidence"),
+                    names.index("Build the package deterministically") + 1,
+                )
+                runs = [name for name, step in steps.items() if f"--test {package}_package" in step]
+                self.assertEqual(len(runs), 1)
+                self.assertLess(names.index("Upload the package evidence"), names.index(runs[0]))
+
 if __name__ == "__main__":
     unittest.main()

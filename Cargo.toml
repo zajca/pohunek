@@ -79,6 +79,9 @@ serde_yaml = "0.9"
 httparse = "1.10"
 include_dir = "0.7"
 sha2 = "0.10"
+# Git blob ids of SHA-1 repositories (`package build --evidence-dir` compares the
+# archived bytes with the blobs `HEAD` stores); already in the lock through axum.
+sha1 = "0.10"
 # Pure-Rust zstd codec: the package archive builder and reader stay C-free so MUSL
 # release builds need no C toolchain, and the encoder output is pinned by the
 # exact version so the canonical archive bytes stay reproducible.

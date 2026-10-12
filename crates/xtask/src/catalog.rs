@@ -46,7 +46,7 @@ const MAX_SPEC_BYTES: usize = MAX_CATALOG_BYTES;
 const OUTPUT_MODE: u32 = 0o644;
 
 /// Archive member that holds the package descriptor.
-const DESCRIPTOR_PATH: &str = "runtime.toml";
+pub(crate) const DESCRIPTOR_PATH: &str = "runtime.toml";
 
 /// Window of the throwaway anchor a catalog is verified against right after
 /// signing: the signer's own key, valid for all time.
@@ -158,7 +158,8 @@ pub(crate) struct Identity {
     pub(crate) runtime_api: u32,
 }
 
-fn descriptor_identity(descriptor: &[u8]) -> Result<Identity, XtaskError> {
+/// Reads the identity and runtime API from the `runtime.toml` bytes `descriptor`.
+pub(crate) fn descriptor_identity(descriptor: &[u8]) -> Result<Identity, XtaskError> {
     let invalid = |reason: &str| {
         XtaskError::Usage(format!("package descriptor `{DESCRIPTOR_PATH}` {reason}"))
     };
