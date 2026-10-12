@@ -7,7 +7,7 @@
 //! the package in a dry run, the CLI prints what it declares, and nothing
 //! changes until the owner repeats the command with `--yes`.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -1110,6 +1110,11 @@ fn render_runtime_details(output: &mut String, runtime: &PackageRuntimeInfo) {
     );
     let _ = writeln!(
         output,
+        "  then adds: {}",
+        template_text(runtime.fork_launch_args.as_deref())
+    );
+    let _ = writeln!(
+        output,
         "First prompt: {}",
         if runtime.prompt_argument {
             "appended to the arguments"
@@ -1654,6 +1659,7 @@ mod tests {
             ]),
             resume_args: Some(vec!["--session".to_owned(), "{reference}".to_owned()]),
             fork_args: None,
+            fork_launch_args: None,
             prompt_argument: true,
             version_probe: Some("probe".to_owned()),
             resumable: true,

@@ -15,7 +15,7 @@
 use protocol::{ErrorClass, ProtocolError};
 use serde::{Deserialize, Serialize};
 
-use super::{AssignedReference, SessionRef, SessionRefKind};
+use super::{generate_assigned_reference, AssignedReference, SessionRef, SessionRefKind};
 
 /// Whole-token sentinel that marks the reference slot in a profile template.
 pub const REFERENCE_PLACEHOLDER: &str = "{reference}";
@@ -70,6 +70,9 @@ pub enum NativeLaunchError {
     /// not a path.
     #[error("an assigned reference requires an id reference kind")]
     AssignedRequiresId,
+    /// An assignment that also covers forks needs a spec that forks.
+    #[error("an assigned fork reference requires fork arguments")]
+    AssignedForkRequiresFork,
 }
 
 /// A validated argv fragment with exactly one reference slot.
@@ -172,6 +175,18 @@ impl From<NativeArgs> for Vec<NativeArg> {
     }
 }
 
+/// The argv fragment of a fork and the reference core assigned to the forked
+/// conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkArgv {
+    /// The fork arguments, followed by the assignment's launch arguments when
+    /// [`Self::reference`] is present.
+    pub argv: Vec<String>,
+    /// The forked conversation's own generated reference; `None` when the
+    /// spec assigns forks no reference.
+    pub reference: Option<SessionRef>,
+}
+
 /// How an agent resumes and optionally forks its native conversations.
 ///
 /// Resume is mandatory: a fork is only expressible alongside the resume that
@@ -241,10 +256,15 @@ impl NativeSessionLaunch {
     /// # Errors
     ///
     /// Returns [`NativeLaunchError::AssignedRequiresId`] unless the spec's
-    /// reference kind is [`SessionRefKind::Id`].
+    /// reference kind is [`SessionRefKind::Id`], and
+    /// [`NativeLaunchError::AssignedForkRequiresFork`] when the assignment
+    /// covers forks but the spec declares no fork.
     pub fn with_assigned(mut self, assigned: AssignedReference) -> Result<Self, NativeLaunchError> {
         if self.reference_kind != SessionRefKind::Id {
             return Err(NativeLaunchError::AssignedRequiresId);
+        }
+        if assigned.assigns_fork() && self.fork_args.is_none() {
+            return Err(NativeLaunchError::AssignedForkRequiresFork);
         }
         self.assigned = Some(Box::new(assigned));
         Ok(self)
@@ -309,19 +329,37 @@ impl NativeSessionLaunch {
         Ok(self.resume_args.render(reference.value()))
     }
 
-    /// Build the fork argv fragment for `reference`.
+    /// Build the fork argv fragment that forks the conversation `reference`
+    /// names.
+    ///
+    /// When the assignment covers forks, a fresh reference is generated for
+    /// the forked conversation and its launch arguments follow the fork
+    /// arguments; [`ForkArgv::reference`] carries it.
     ///
     /// # Errors
     ///
-    /// Returns `agent_fork_unsupported` when the spec declares no fork, or
-    /// `native_reference_kind_mismatch` when `reference` is of another kind.
-    pub fn fork_argv(&self, reference: &SessionRef) -> Result<Vec<String>, ProtocolError> {
+    /// Returns `agent_fork_unsupported` when the spec declares no fork,
+    /// `native_reference_kind_mismatch` when `reference` is of another kind,
+    /// or `invalid_session_ref` if the generated reference is refused.
+    pub fn fork_argv(&self, reference: &SessionRef) -> Result<ForkArgv, ProtocolError> {
         let fork_args = self
             .fork_args
             .as_ref()
             .ok_or_else(ProtocolError::agent_fork_unsupported)?;
         self.ensure_kind(reference)?;
-        Ok(fork_args.render(reference.value()))
+        let mut argv = fork_args.render(reference.value());
+        let assigned = match self.assigned().filter(|assigned| assigned.assigns_fork()) {
+            Some(assigned) => {
+                let fork_reference = generate_assigned_reference()?;
+                argv.extend(assigned.launch_argv(&fork_reference));
+                Some(fork_reference)
+            }
+            None => None,
+        };
+        Ok(ForkArgv {
+            argv,
+            reference: assigned,
+        })
     }
 
     fn ensure_kind(&self, reference: &SessionRef) -> Result<(), ProtocolError> {

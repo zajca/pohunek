@@ -1574,7 +1574,7 @@ mod tests {
             vec!["--session", "/work/a b/$(x);.jsonl"]
         );
         assert_eq!(
-            native.fork_argv(&path).expect("fork"),
+            native.fork_argv(&path).expect("fork").argv,
             vec!["--fork", "/work/a b/$(x);.jsonl"]
         );
     }

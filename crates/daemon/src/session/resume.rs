@@ -1,6 +1,6 @@
 //! Native recovery metadata and explicit provider-native relaunch.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 use super::{
     agent_fork_unsupported, agent_not_resumable, fork_pty_command_from_launch, host,
@@ -729,6 +729,9 @@ impl SessionRegistry {
     /// The fork launches under the source session's host profile only while
     /// the profile still has the revision frozen into the source (see
     /// [`ProfileChange`]); the fork freezes the revision it launched under.
+    /// A runtime whose assigned reference covers forks launches the fork under
+    /// a freshly generated reference, which the fork holds with provenance
+    /// `assigned` from its creation on, so the fork is resumable at once.
     ///
     /// # Errors
     ///
@@ -799,7 +802,7 @@ impl SessionRegistry {
             env_extra,
             validated_program,
         };
-        let command = fork_pty_command_from_launch(
+        let (command, fork_reference) = fork_pty_command_from_launch(
             &program,
             binding.args.clone(),
             &launch,
@@ -807,13 +810,19 @@ impl SessionRegistry {
             &opts,
         )?;
         // A fork reads the source reference but starts a distinct conversation.
-        // Only a verified report from the child process may set its own target.
+        // Its own target is the reference core assigned to it at launch, when
+        // the runtime assigns forks one, and otherwise only a verified report
+        // from the child process may set it.
         let snapshot = ResumeSnapshot {
             program,
             args: binding.args.clone(),
             native: Some(launch),
             launch_binding: binding.launch_binding.clone(),
-            reference_provenance: NativeReferenceProvenance::Reported,
+            reference_provenance: if fork_reference.is_some() {
+                NativeReferenceProvenance::Assigned
+            } else {
+                NativeReferenceProvenance::Reported
+            },
             profile_revision: revision,
         };
         let guard = self.lock_lifecycle(&id).await;
@@ -832,7 +841,7 @@ impl SessionRegistry {
                     cols: params.cols,
                     rows: params.rows,
                     command,
-                    native_session_id: None,
+                    native_session_id: fork_reference.map(|reference| reference.value().to_owned()),
                     native_session_path: None,
                     project_id: binding.project_id,
                     is_linked_worktree: binding.is_linked_worktree,

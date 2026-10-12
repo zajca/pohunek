@@ -292,12 +292,18 @@ pohunek session new --agent pi --name "refactor-parser" --input "Refactor the pa
 
 - Pi chooses its own conversation file from the session id the daemon passes
   at launch (`pi --session-id <id>`), so `pohunek session resume` runs
-  `pi --session <id>` and `pohunek session fork` runs `pi --fork <id>`.
+  `pi --session <id>` and `pohunek session fork` runs
+  `pi --fork <id> --session-id <fork id>` under a second id the daemon
+  generates for the fork.
 - Pi writes its session file only after the first model reply. A session that
   never got one has nothing to resume, and resume is refused with
   `agent_native_reference_missing` before anything launches. The same code
   answers a session file that was deleted.
-- A forked session holds no reference of its own, so it is not resumable.
+- A forked session holds its own reference from the start: Pi writes the
+  fork's session file `<time>_<fork id>.jsonl` at once, before any model
+  reply, so `pohunek session resume` reopens the fork with
+  `pi --session <fork id>`. Forks get their own reference from Pi package
+  1.0.1 on; a session launched from package 1.0.0 keeps forks without one.
 - Recovery looks for the session file below `PI_CODING_AGENT_DIR` (default
   `~/.pi/agent`) in `sessions/`. A Pi configured with `--session-dir`,
   `PI_CODING_AGENT_SESSION_DIR`, or the `sessionDir` setting stores elsewhere,

@@ -476,10 +476,34 @@ async fn install_with_tables<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let (bytes, digest) = archive_of(&entries_of(&format!("{}{tables}", descriptor("/bin/sh"))));
+    install_descriptor(
+        framed,
+        plugins,
+        name,
+        &format!("{}{tables}", descriptor("/bin/sh")),
+        false,
+    )
+    .await
+    .1
+}
+
+/// Installs a package whose descriptor is `document` through
+/// `package.install`, only validating it when `dry_run`, and returns its
+/// archive digest with the wire result.
+async fn install_descriptor<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    plugins: &Path,
+    name: &str,
+    document: &str,
+    dry_run: bool,
+) -> (PackageDigest, Result<Value, protocol::ProtocolError>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (bytes, digest) = archive_of(&entries_of(document));
     let archive_path = plugins.with_file_name(format!("{name}.tar.zst"));
     std::fs::write(&archive_path, &bytes).expect("write the archive");
-    exchange(
+    let result = exchange(
         framed,
         method::PACKAGE_INSTALL,
         json!({
@@ -487,11 +511,12 @@ where
             "trust": { "kind": "explicit_digest", "digest": digest },
             "enable": true,
             "select": true,
-            "dry_run": false
+            "dry_run": dry_run
         }),
     )
     .await
-    .into_result()
+    .into_result();
+    (digest, result)
 }
 
 #[tokio::test]
@@ -560,6 +585,79 @@ async fn a_descriptor_with_an_invalid_transcript_declaration_is_refused() {
     assert!(supported_agents(&mut local)
         .await
         .contains(&RUNTIME.to_owned()));
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn a_fork_assignment_installs_only_next_to_an_assigned_fork_and_is_shown_for_review() {
+    let servers = spawn_servers("pkg-assign-fork").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let plain = descriptor("/bin/sh");
+    let launch_args = "launch_args = [\"--session-id\", \"{reference}\"]\n";
+    let fork = "[fork]\nsupported = true\nargs = [\"--fork\", \"{reference}\"]\n";
+    let assigned = format!("strategy = \"assigned\"\n{launch_args}");
+    assert!(plain.contains(fork) && plain.contains(&assigned));
+    let assign_fork = |value: &str| {
+        plain.replace(
+            launch_args,
+            &format!("{launch_args}assign_fork = {value}\n"),
+        )
+    };
+    let assigning = assign_fork("true");
+    let without_fork = |document: &str| document.replace(fork, "[fork]\nsupported = false\n");
+    let hook = |line: &str| plain.replace(&assigned, &format!("strategy = \"hook\"\n{line}"));
+    // Each refused descriptor next to the same descriptor without the
+    // offending `assign_fork`, which a dry run accepts.
+    let refused = [
+        (
+            "without-fork",
+            without_fork(&assigning),
+            without_fork(&plain),
+        ),
+        ("hook-strategy", hook("assign_fork = false\n"), hook("")),
+        ("not-a-boolean", assign_fork("\"yes\""), plain.clone()),
+    ];
+    for (name, document, control) in &refused {
+        let (_digest, result) =
+            install_descriptor(&mut local, &servers.plugins, name, document, false).await;
+        let error = result.expect_err(name);
+        assert_eq!(error.code, "package_descriptor_invalid", "{name}");
+        let (_digest, result) =
+            install_descriptor(&mut local, &servers.plugins, name, control, true).await;
+        result.unwrap_or_else(|error| panic!("{name} without assign_fork is valid: {error:?}"));
+    }
+    let listed: PackageListResult = call(&mut local, method::PACKAGE_LIST, Value::Null).await;
+    assert!(
+        listed.packages.is_empty(),
+        "a refused descriptor or a dry run records nothing"
+    );
+
+    // Review shows what a fork appends after its own arguments.
+    let (digest, installed) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "assign-fork",
+        &assigning,
+        false,
+    )
+    .await;
+    installed.expect("a fork assignment next to an assigned fork installs");
+    let inspected: PackageInspectResult = call(
+        &mut local,
+        method::PACKAGE_INSPECT,
+        json!({ "digest": digest }),
+    )
+    .await;
+    let runtime = inspected.runtime.expect("descriptor");
+    let tokens = |tokens: &[&str]| Some(tokens.iter().map(|token| (*token).to_owned()).collect());
+    assert_eq!(runtime.fork_args, tokens(&["--fork", "{reference}"]));
+    assert_eq!(
+        runtime.fork_launch_args,
+        tokens(&["--session-id", "{reference}"])
+    );
+    assert_eq!(runtime.launch_args, runtime.fork_launch_args);
 
     drop(local);
     servers.stop().await;

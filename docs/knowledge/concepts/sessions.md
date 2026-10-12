@@ -800,7 +800,11 @@ an empty conversation; a runtime that declares `check = "none"` is relaunched
 unchecked. Recovery never falls back to another runtime, the shell or
 "continue latest". A fork holds no reference of its own until its launch
 process reports one, regardless of the source reference's provenance; it
-cannot resume its parent's conversation. A later validated report always supersedes an
+cannot resume its parent's conversation. A runtime whose `assigned` strategy
+declares `assign_fork = true` (the official Pi package) instead launches each
+fork under a reference core generates for it (`--fork <source> --session-id
+<fork>` for Pi), so the fork holds its own `assigned` reference from creation
+and resumes into its own conversation after a stop or a daemon restart. A later validated report always supersedes an
 assigned reference: an assigned runtime that declares an integration handler and
 hook schema may report, and the report replaces the stored value and its
 provenance (`reported`) in the session, its durable record and its resume
@@ -877,7 +881,9 @@ The official Pi package is the worked example: see the [Pi runtime package](../g
 native agent conversation. The source may still be live; fork does not require a
 terminal state. With `cwd_mode: "same"`, the new session starts in the source
 cwd/worktree. The child begins without its own native recovery reference;
-only its own verified launch-agent report can set one. The fork argv comes
+only its own verified launch-agent report can set one, except for a runtime
+whose assigned reference covers forks (`assign_fork`), where the child starts
+with the reference core assigned to it. The fork argv comes
 from the session's frozen native-session
 launch spec: Claude forks as `claude --resume <native_session_id>
 --fork-session`, and a host profile that declares `fork_args` forks with exactly

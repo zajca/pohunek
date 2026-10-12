@@ -16,7 +16,7 @@
 //! Reads take no guard: the registry record is replaced atomically, so a read
 //! sees one committed state.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 mod bind;
 mod error;
@@ -623,6 +623,11 @@ fn runtime_info(definition: &RuntimeDefinition) -> PackageRuntimeInfo {
             .native()
             .and_then(NativeSessionLaunch::fork_args)
             .map(template_tokens),
+        fork_launch_args: definition
+            .native()
+            .and_then(NativeSessionLaunch::assigned)
+            .filter(|assigned| assigned.assigns_fork())
+            .map(|assigned| template_tokens(assigned.launch_args())),
         prompt_argument: definition.prompt_arg(),
         version_probe: definition
             .version_probe_parser()

@@ -212,8 +212,8 @@ fork_args = ["--fork", "{reference}"]   # optional; absent means no fork
 
 A runtime that declares `[native_reference] strategy = "assigned"` passes a
 core-generated reference to the agent at launch, so a profile on that base
-inherits the assignment (launch template and existence check) without a
-`[resume]` table. A profile that restates `[resume]` on such a base is rejected
+inherits the assignment (launch template, existence check and whether forks
+get a reference of their own) without a `[resume]` table. A profile that restates `[resume]` on such a base is rejected
 with `invalid_profile`; `resumable = false` switches recovery off and no
 reference is generated. See the sessions concept page for the strategy and its
 limits.
