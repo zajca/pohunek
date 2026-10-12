@@ -1288,13 +1288,13 @@ jobs:
           version: "0.9.28"
           enable-cache: true
 
-      # Cache the provisioned pinned Hermes runtime. Inputs that drive
-      # provisioning: the lock file, the provisioner script (which also pins
-      # the standalone CPython the venv is built from, inside the install
-      # root), its test, and the workflow itself (see
-      # scripts/provision-hermes-compat); uv itself is already cached via
-      # `enable-cache` above, so this is just the resolved runtime. Key on all
-      # of them so a provisioner change re-provisions.
+      # Cache the staged pinned Hermes runtime. Inputs that drive staging:
+      # the lock file, the provisioner script (which also pins the standalone
+      # CPython the venv is built from, inside the install root), its test,
+      # the stage layout and manifests of `cargo xtask compat stage-upstream`
+      # (crates/xtask/src/upstream_stage.rs), and the workflow itself; uv
+      # itself is already cached via `enable-cache` above, so this is just
+      # the resolved runtime. Key on all of them so any change restages.
       - name: Cache Hermes runtime
         uses: actions/cache@v4
         with:
@@ -1304,6 +1304,7 @@ jobs:
             ${{ hashFiles('compat/hermes/compatibility-lock.json') }}-
             ${{ hashFiles('scripts/provision-hermes-compat') }}-
             ${{ hashFiles('scripts/tests/provision-hermes-compat.sh') }}-
+            ${{ hashFiles('crates/xtask/src/upstream_stage.rs') }}-
             ${{ hashFiles('.github/workflows/ci.yml') }}
 
       # The compatibility gate itself is driven by `cargo xtask`, which is built
@@ -1327,32 +1328,42 @@ jobs:
       - name: Check fail-closed Hermes provisioning
         run: scripts/tests/provision-hermes-compat.sh
 
+      # `compat stage-upstream` runs the provisioner in place at
+      # `<stage_root>/hermes` and records every byte in STAGE.sha256 and
+      # STAGE.links. The stage is only ever used at that path, because its
+      # console scripts name the venv interpreter by absolute path, so a cache
+      # hit restores it there. `compat verify-stage` then detects drift and
+      # consumer writes against the manifests and the committed lock and
+      # provisioner; the manifests travel inside the cached tree, so trust in
+      # a restored cache rests on the cache key and the cache's branch
+      # scoping, not on the manifests. The cache is a copy taken before any
+      # consumer ran: Hermes, its sessions and the CLI's isolated-mode Python
+      # probes write into the stage they use, so each later consumer step
+      # gets a fresh restore of that copy
+      # (docs/knowledge/concepts/upstream-staging.md).
       - name: Provision locked Hermes runtime
         id: hermes
         shell: bash
         run: |
           set -euo pipefail
           cache_dir="${{ runner.temp }}/hermes-compat-cache"
-          install_dir="$RUNNER_TEMP/hermes-compat"
+          stage_root="$RUNNER_TEMP/hermes-compat"
+          stage="$stage_root/hermes"
+          rm -rf "$stage_root"
+          mkdir -p "$stage_root"
           if [[ -d "$cache_dir" ]]; then
-            # Cache hit: restore the previously provisioned runtime. The
-            # provisioner emits the executable at `venv/bin/hermes` inside the
-            # install root; fail closed if the restored cache lacks it.
-            rm -rf "$install_dir"
-            cp -a "$cache_dir" "$install_dir"
-            hermes_bin="$install_dir/venv/bin/hermes"
+            cp -a "$cache_dir" "$stage"
+            cargo xtask compat verify-stage --runtime hermes --dir "$stage_root"
           else
-            hermes_bin="$(scripts/provision-hermes-compat "$install_dir")"
-            # Stage the fresh runtime for caching. Copy errors fail the step
-            # (no `|| true`): a partial cache_dir under an immutable key
-            # would poison every later run until the key changes. The staged
-            # copy must contain the executable too — the post-check below only
-            # verifies install_dir, not the copy.
+            cargo xtask compat stage-upstream --runtime hermes --out "$stage_root"
+            # Copy errors fail the step (no `|| true`): a partial cache_dir
+            # under an immutable key would poison every later run until the
+            # key changes, and the restored copy is verified on the next hit.
             rm -rf "$cache_dir"
-            cp -a "$install_dir" "$cache_dir"
-            [[ -f "$cache_dir/venv/bin/hermes" && -x "$cache_dir/venv/bin/hermes" ]] \
-              || { echo "cached Hermes copy incomplete at $cache_dir/venv/bin/hermes" >&2; exit 1; }
+            cp -a "$stage" "$cache_dir"
           fi
+          hermes_bin="$stage/venv/bin/hermes"
+          printf 'cache=%s\nstage_root=%s\n' "$cache_dir" "$stage_root" >> "$GITHUB_OUTPUT"
           [[ -f "$hermes_bin" && -x "$hermes_bin" ]] \
             || { echo "provisioned Hermes executable missing at $hermes_bin" >&2; exit 1; }
           printf 'bin=%s\n' "$hermes_bin" >> "$GITHUB_OUTPUT"
@@ -1382,6 +1393,19 @@ jobs:
       - name: Build the session worker
         run: cargo build --locked -p pohunek-session-worker --bin pohunek-sessiond
 
+      # The gate wrote into the stage it used; the session runs on a fresh
+      # restore of the untouched copy at the same absolute path.
+      - name: Restore the pristine Hermes stage
+        shell: bash
+        env:
+          CACHE_DIR: ${{ steps.hermes.outputs.cache }}
+          STAGE_ROOT: ${{ steps.hermes.outputs.stage_root }}
+        run: |
+          set -euo pipefail
+          rm -rf "$STAGE_ROOT/hermes"
+          cp -a "$CACHE_DIR" "$STAGE_ROOT/hermes"
+          cargo xtask compat verify-stage --runtime hermes --dir "$STAGE_ROOT"
+
       # One real pinned Hermes turn through the selected package and the public
       # session commands against a loopback model. Only the test receives the
       # provisioned executable path; PATH stays the runner's.
@@ -1405,6 +1429,7 @@ jobs:
             ${{ hashFiles('compat/hermes/compatibility-lock.json') }}-
             ${{ hashFiles('scripts/provision-hermes-compat') }}-
             ${{ hashFiles('scripts/tests/provision-hermes-compat.sh') }}-
+            ${{ hashFiles('crates/xtask/src/upstream_stage.rs') }}-
             ${{ hashFiles('.github/workflows/ci.yml') }}
 
   # Runtime package selection for pull requests (issue #149). `cargo xtask
@@ -2034,6 +2059,7 @@ jobs:
             ${{ hashFiles('compat/hermes/compatibility-lock.json') }}-
             ${{ hashFiles('scripts/provision-hermes-compat') }}-
             ${{ hashFiles('scripts/tests/provision-hermes-compat.sh') }}-
+            ${{ hashFiles('crates/xtask/src/upstream_stage.rs') }}-
             ${{ hashFiles('.github/workflows/ci.yml') }}
 
       - name: Install Rust toolchain
@@ -2054,29 +2080,31 @@ jobs:
           PATH="/bin:$PATH" /bin/bash scripts/tests/provision-hermes-compat.sh
           PATH="/bin:$PATH" /bin/bash scripts/tests/smoke-hermes-plugin-release.sh
 
+      # Staged and verified as in the Linux job. /bin (bash 3.2) comes first
+      # on the PATH the provisioner inherits through `compat stage-upstream`.
       - name: Provision locked Hermes runtime
         id: hermes
         shell: /bin/bash {0}
         run: |
           set -euo pipefail
           cache_dir="${{ runner.temp }}/hermes-compat-cache"
-          install_dir="$RUNNER_TEMP/hermes-compat"
+          stage_root="$RUNNER_TEMP/hermes-compat"
+          stage="$stage_root/hermes"
+          rm -rf "$stage_root"
+          mkdir -p "$stage_root"
           if [[ -d "$cache_dir" ]]; then
-            # Cache hit: restore the previously provisioned runtime; fail
-            # closed if the restored cache lacks the executable.
-            rm -rf "$install_dir"
-            cp -a "$cache_dir" "$install_dir"
-            hermes_bin="$install_dir/venv/bin/hermes"
+            cp -a "$cache_dir" "$stage"
+            cargo xtask compat verify-stage --runtime hermes --dir "$stage_root"
           else
-            hermes_bin="$(scripts/provision-hermes-compat "$install_dir")"
+            PATH="/bin:$PATH" cargo xtask compat stage-upstream --runtime hermes --out "$stage_root"
             # A partial cache_dir under an immutable key would poison later
-            # runs, so a copy error fails the step and the staged copy is
-            # verified.
+            # runs, so a copy error fails the step; the restored copy is
+            # verified on the next hit.
             rm -rf "$cache_dir"
-            cp -a "$install_dir" "$cache_dir"
-            [[ -f "$cache_dir/venv/bin/hermes" && -x "$cache_dir/venv/bin/hermes" ]] \
-              || { echo "cached Hermes copy incomplete at $cache_dir/venv/bin/hermes" >&2; exit 1; }
+            cp -a "$stage" "$cache_dir"
           fi
+          hermes_bin="$stage/venv/bin/hermes"
+          printf 'cache=%s\nstage_root=%s\n' "$cache_dir" "$stage_root" >> "$GITHUB_OUTPUT"
           [[ -f "$hermes_bin" && -x "$hermes_bin" ]] \
             || { echo "provisioned Hermes executable missing at $hermes_bin" >&2; exit 1; }
           printf 'bin=%s\n' "$hermes_bin" >> "$GITHUB_OUTPUT"
@@ -2127,6 +2155,19 @@ jobs:
             --hermes-bin "${{ steps.hermes.outputs.bin }}" \
             --pohunek-bin "${{ steps.packaged.outputs.dir }}/pohunek"
 
+      # The previous step wrote into the stage it used; the next one runs on
+      # a fresh restore of the untouched copy at the same absolute path.
+      - name: Restore the pristine Hermes stage
+        shell: /bin/bash {0}
+        env:
+          CACHE_DIR: ${{ steps.hermes.outputs.cache }}
+          STAGE_ROOT: ${{ steps.hermes.outputs.stage_root }}
+        run: |
+          set -euo pipefail
+          rm -rf "$STAGE_ROOT/hermes"
+          cp -a "$CACHE_DIR" "$STAGE_ROOT/hermes"
+          cargo xtask compat verify-stage --runtime hermes --dir "$STAGE_ROOT"
+
       - name: Smoke packaged plugin installation against pinned Hermes
         shell: /bin/bash {0}
         run: |
@@ -2139,6 +2180,19 @@ jobs:
       # profile, so it is built from this checkout before the real session.
       - name: Build the session worker
         run: cargo build --locked -p pohunek-session-worker --bin pohunek-sessiond
+
+      # The previous step wrote into the stage it used; the next one runs on
+      # a fresh restore of the untouched copy at the same absolute path.
+      - name: Restore the pristine Hermes stage
+        shell: /bin/bash {0}
+        env:
+          CACHE_DIR: ${{ steps.hermes.outputs.cache }}
+          STAGE_ROOT: ${{ steps.hermes.outputs.stage_root }}
+        run: |
+          set -euo pipefail
+          rm -rf "$STAGE_ROOT/hermes"
+          cp -a "$CACHE_DIR" "$STAGE_ROOT/hermes"
+          cargo xtask compat verify-stage --runtime hermes --dir "$STAGE_ROOT"
 
       # One real pinned Hermes turn through the selected package and the public
       # session commands against a loopback model, natively on arm64. Only the
@@ -2161,6 +2215,7 @@ jobs:
             ${{ hashFiles('compat/hermes/compatibility-lock.json') }}-
             ${{ hashFiles('scripts/provision-hermes-compat') }}-
             ${{ hashFiles('scripts/tests/provision-hermes-compat.sh') }}-
+            ${{ hashFiles('crates/xtask/src/upstream_stage.rs') }}-
             ${{ hashFiles('.github/workflows/ci.yml') }}
 
   # Build the three runnable binaries exactly once. The SDK e2e and pinned

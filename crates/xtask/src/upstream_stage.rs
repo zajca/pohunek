@@ -2,25 +2,34 @@
 //!
 //! `compat stage-upstream` installs the release a runtime's
 //! `compat/<runtime>/compatibility-lock.json` pins into `<out>/<runtime>/`
-//! with network access, from the committed npm lockfile
-//! `compat/<runtime>/npm/package-lock.json` (every dependency carries an
-//! integrity, so `npm ci` refuses any other bytes). The result is an npm
-//! prefix: `bin/<binary>` and `lib/node_modules/...`, plus two manifests,
-//! `STAGE.sha256` (`sha256sum -c` format, one line per regular file) and
-//! `STAGE.links` (symbolic links and executable bits), that pin every byte.
-//! `compat verify-stage` recomputes both from disk without network access.
+//! with network access. The lock's `upstream` object selects how:
 //!
-//! The command is data driven: it knows no runtime by name. A lock that does
-//! not describe an npm release (another `schema`, no `upstream.npm`) is
-//! refused instead of guessed at.
+//! - an npm release (`upstream.npm`, no `kind`) is installed from the
+//!   committed npm lockfile `compat/<runtime>/npm/package-lock.json` (every
+//!   dependency carries an integrity, so `npm ci` refuses any other bytes)
+//!   into an npm prefix, `bin/<binary>` and `lib/node_modules/...`;
+//! - a provisioned runtime (`upstream.kind = "provisioner"`) is installed by
+//!   the repository script `upstream.provisioner` in place at
+//!   `<out>/<runtime>/`, which it fills with its own layout; `bin/<binary>`
+//!   links the entrypoint the script reports and `inputs/` holds copies of the
+//!   lock and the script.
+//!
+//! Either stage gets two manifests, `STAGE.sha256` (`sha256sum -c` format, one
+//! line per regular file) and `STAGE.links` (symbolic links and executable
+//! bits), that pin every byte. `compat verify-stage` recomputes both from disk
+//! without network access.
+//!
+//! The command is data driven: it knows no runtime by name. A lock of another
+//! `schema` or `upstream.kind` is refused instead of guessed at.
 
-// Rust guideline compliant 2026-10-08
+// Rust guideline compliant 2026-10-12
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{symlink, OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Component, Path, PathBuf};
@@ -89,6 +98,54 @@ const OWNER_EXEC: u32 = 0o100;
 
 /// Placeholder of the release in `upstream.version_output`.
 const RELEASE_PLACEHOLDER: &str = "{release}";
+
+/// `upstream.kind` of a runtime installed by a repository provisioner script.
+const PROVISIONER_KIND: &str = "provisioner";
+
+/// Repository directory that holds the provisioner scripts. A lock may name
+/// only a file directly inside it, so a lock edit selects a reviewed
+/// repository script and never a file elsewhere in or outside the checkout.
+const PROVISIONER_DIR: &str = "scripts";
+
+/// Directory of a provisioned stage that holds copies of the lock and the
+/// provisioner it was built from, compared with the committed files by
+/// `verify-stage`.
+const INPUTS_DIR: &str = "inputs";
+
+/// Name of the lock copy inside [`INPUTS_DIR`].
+const LOCK_COPY: &str = "compatibility-lock.json";
+
+/// Wall-clock limit of a provisioner run. The Hermes provisioner fetches a Git
+/// tag, a `CPython` archive and the locked wheels in about a minute; a run that
+/// takes half an hour is hung on the network, not slow.
+const PROVISION_TIMEOUT: Duration = Duration::from_mins(30);
+
+/// Interpreters a console script of a provisioned stage may name, relative
+/// to the stage root. The `provisioner` kind stages a Python virtual
+/// environment at `venv/` (`scripts/provision-hermes-compat` creates it there
+/// with `--copies`, so both are copies of the pinned interpreter), and uv
+/// writes `#!<stage>/venv/bin/<name>` into every console script, naming the
+/// interpreter as its `sys.executable` reports it: `python` on Linux and
+/// `python3` on macOS (uv 0.9.28 with the pinned `CPython` 3.12.13). The shebang
+/// check after provisioning requires exactly one of these paths, and the
+/// up-front path bound holds for each. A provisioned runtime that is not a Python
+/// virtual environment needs its interpreter declared by the lock before this
+/// kind can stage it.
+const VENV_INTERPRETERS: [&str; 2] = ["venv/bin/python", "venv/bin/python3"];
+
+/// Longest shebang line, `#!`, the interpreter path and the newline, that uv
+/// writes as a direct `#!<python>` line. A longer line, or an interpreter path
+/// with a space, makes uv write a `#!/bin/sh` exec trampoline instead
+/// (`format_shebang` in uv-install-wheel, after pip's distlib), and the worker's
+/// frozen launch rule refuses a trampoline root.
+const SHEBANG_LINE_LIMIT: usize = 127;
+
+/// Bytes of a shebang line besides the interpreter path: `#!` and `\n`.
+const SHEBANG_OVERHEAD: usize = 3;
+
+/// First bytes of an entrypoint read to find its shebang line; a direct
+/// shebang fits in [`SHEBANG_LINE_LIMIT`].
+const SHEBANG_READ_BYTES: u64 = 4096;
 
 /// POSIX `sh` verifier of a staged tree, run as `sh -c "$SCRIPT" sh <stage>`.
 ///
@@ -283,6 +340,9 @@ pub enum Fault {
     AlreadyExists,
     /// The platform has no pinned digest in the lock.
     Unpinned,
+    /// The entrypoint does not, or at this path would not, start the stage's
+    /// venv interpreter through a direct `#!<path>` line.
+    IndirectShebang,
 }
 
 impl fmt::Display for Fault {
@@ -303,6 +363,11 @@ impl fmt::Display for Fault {
             Self::SpecialFile => "is not a regular file, directory or symbolic link",
             Self::AlreadyExists => "already exists and is not empty",
             Self::Unpinned => "has no pinned digest for this platform",
+            Self::IndirectShebang => {
+                "does not start the stage's venv interpreter through a direct \
+                 `#!<path>` line (a `/bin/sh` trampoline, another interpreter, a path \
+                 too long or with a space, or a stage moved after staging)"
+            }
         })
     }
 }
@@ -393,10 +458,14 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> XtaskError {
 pub(crate) enum UpstreamAction {
     /// Install a runtime's locked upstream release into `<out>/<runtime>/`.
     ///
-    /// Needs network access. Installs from `compat/<runtime>/npm` with
-    /// `npm ci`, checks the release, the root tarball integrity, a pinned
-    /// native digest and the `--version` banner against the lock, then writes
-    /// `STAGE.sha256` and `STAGE.links`. Refuses a non-empty destination.
+    /// Needs network access. An npm lock installs from
+    /// `compat/<runtime>/npm` with `npm ci` and checks the release, the root
+    /// tarball integrity and a pinned native digest; a provisioner lock runs
+    /// its repository script in place and checks the entrypoint's direct
+    /// interpreter shebang. Both check the `--version` banner against the
+    /// lock and write `STAGE.sha256` and `STAGE.links`. Refuses a non-empty
+    /// destination. A provisioned stage must stay where it was staged: its
+    /// scripts name the interpreter by absolute path.
     StageUpstream {
         /// Runtime id, a directory name below `compat/`.
         #[arg(long)]
@@ -404,7 +473,8 @@ pub(crate) enum UpstreamAction {
         /// Directory that receives `<runtime>/`.
         #[arg(long, value_name = "DIR")]
         out: PathBuf,
-        /// `npm` executable; defaults to the first `npm` on `PATH`.
+        /// `npm` executable for an npm lock; defaults to the first `npm` on
+        /// `PATH`.
         #[arg(long, value_name = "FILE")]
         npm: Option<PathBuf>,
         /// Repository root; defaults to the checkout this xtask belongs to.
@@ -413,9 +483,11 @@ pub(crate) enum UpstreamAction {
     },
     /// Recompute a staged tree from disk and compare it with its manifests.
     ///
-    /// Offline. Refuses any added, removed or modified file, retargeted link
-    /// or changed executable bit, a stage whose npm project differs from the
-    /// committed one, and an unpinned installed release.
+    /// Offline. Refuses any added, removed or modified file (a `.pyc` written
+    /// by a consumer included), retargeted link or changed executable bit, a
+    /// stage whose npm project or provisioner inputs differ from the committed
+    /// ones, an unpinned installed release, and a provisioned entrypoint that
+    /// does not start its interpreter through a direct shebang.
     VerifyStage {
         /// Runtime id, a directory name below `compat/`.
         #[arg(long)]
@@ -440,10 +512,6 @@ pub(crate) fn run(action: UpstreamAction, default_root: &Path) -> Result<(), Xta
         } => {
             let root = root.unwrap_or_else(|| default_root.to_path_buf());
             let path = std::env::var_os("PATH").ok_or_else(|| refuse("PATH", Fault::Missing))?;
-            let npm = match npm {
-                Some(npm) => npm,
-                None => find_in_path("npm", &path)?,
-            };
             let summary = stage_upstream(&root, &runtime, &out, &Tools { npm, path })?;
             println!(
                 "compat stage-upstream ok: {runtime} {} ({} files, {} links) -> {}",
@@ -468,9 +536,10 @@ pub(crate) fn run(action: UpstreamAction, default_root: &Path) -> Result<(), Xta
 /// Host tools the staging shells out to.
 #[derive(Debug)]
 pub(crate) struct Tools {
-    /// The `npm` executable.
-    pub(crate) npm: PathBuf,
-    /// `PATH` handed to npm and to the probe: it must reach `node`.
+    /// The `npm` executable of an npm lock; `None` looks it up on `path`.
+    pub(crate) npm: Option<PathBuf>,
+    /// `PATH` handed to npm, the provisioner and the probe: it must reach
+    /// `node` for an npm runtime and the provisioner's own tools otherwise.
     pub(crate) path: OsString,
 }
 
@@ -509,6 +578,8 @@ struct RawLock {
 
 #[derive(Debug, Deserialize)]
 struct RawUpstream {
+    kind: Option<String>,
+    provisioner: Option<String>,
     npm: Option<String>,
     release: Option<String>,
     integrity: Option<String>,
@@ -521,13 +592,52 @@ struct RawUpstream {
 /// A validated runtime lock.
 #[derive(Debug)]
 pub(crate) struct Lock {
-    npm: String,
     release: String,
-    integrity: String,
     binary: String,
     banner: String,
+    source: Source,
+}
+
+/// How a lock's release is installed.
+#[derive(Debug)]
+enum Source {
+    /// An npm release installed from the committed npm project.
+    Npm(NpmPins),
+    /// A runtime installed by the repository script at this relative path.
+    Provisioner(String),
+}
+
+/// The npm-specific pins of a lock.
+#[derive(Debug)]
+struct NpmPins {
+    package: String,
+    integrity: String,
     scripts: bool,
     sha256: Option<BTreeMap<String, String>>,
+}
+
+/// The committed provisioner of a runtime, validated against its lock.
+#[derive(Debug)]
+struct Provisioner {
+    /// Canonical path of the script inside the repository.
+    script: PathBuf,
+    /// File name of the script; its copy in [`INPUTS_DIR`] has this name.
+    name: String,
+    /// The script's bytes.
+    script_bytes: Vec<u8>,
+    /// The lock's bytes.
+    lock_bytes: Vec<u8>,
+}
+
+/// How much of the `--version` output must equal the lock's banner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BannerMatch {
+    /// The whole output, without trailing newlines: an npm CLI prints only
+    /// its banner.
+    Whole,
+    /// The first line: a provisioned runtime may print diagnostics after its
+    /// banner (Hermes prints its install directory and Python version).
+    FirstLine,
 }
 
 /// The committed npm project of a runtime, validated against its lock.
@@ -610,19 +720,55 @@ pub(crate) fn read_lock(root: &Path, runtime: &str) -> Result<Lock, XtaskError> 
     let upstream = raw
         .upstream
         .ok_or_else(|| refuse("lock.upstream", Fault::Missing))?;
-    let npm = upstream
-        .npm
-        .ok_or_else(|| refuse("upstream.npm", Fault::Unsupported))?;
     let required = |value: Option<String>, name: &str| {
         value.ok_or_else(|| refuse(format!("upstream.{name}"), Fault::Missing))
     };
-    let release = required(upstream.release, "release")?;
-    let integrity = required(upstream.integrity, "integrity")?;
-    let binary = required(upstream.binary, "binary")?;
-    let template = required(upstream.version_output, "version_output")?;
-    if !is_sha512_sri(&integrity) {
-        return Err(refuse("upstream.integrity", Fault::Malformed));
-    }
+    let (release, binary, template, source) = match upstream.kind.as_deref() {
+        None => {
+            let package = upstream
+                .npm
+                .ok_or_else(|| refuse("upstream.npm", Fault::Unsupported))?;
+            let release = required(upstream.release, "release")?;
+            let integrity = required(upstream.integrity, "integrity")?;
+            let binary = required(upstream.binary, "binary")?;
+            let template = required(upstream.version_output, "version_output")?;
+            if !is_sha512_sri(&integrity) {
+                return Err(refuse("upstream.integrity", Fault::Malformed));
+            }
+            if let Some(pins) = &upstream.sha256 {
+                if pins.values().any(|digest| !is_hex_digest(digest)) {
+                    return Err(refuse("upstream.sha256", Fault::Malformed));
+                }
+            }
+            let pins = NpmPins {
+                package,
+                integrity,
+                scripts: upstream.scripts.unwrap_or(false),
+                sha256: upstream.sha256,
+            };
+            (release, binary, template, Source::Npm(pins))
+        }
+        Some(PROVISIONER_KIND) => {
+            // npm fields beside a provisioner would leave two install recipes
+            // in one lock; neither is guessed at.
+            if upstream.npm.is_some() || upstream.integrity.is_some() || upstream.sha256.is_some() {
+                return Err(refuse("upstream.kind", Fault::Malformed));
+            }
+            let script = required(upstream.provisioner, "provisioner")?;
+            let in_dir = script
+                .strip_prefix(PROVISIONER_DIR)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .is_some_and(safe_component);
+            if !in_dir {
+                return Err(refuse("upstream.provisioner", Fault::Unsupported));
+            }
+            let release = required(upstream.release, "release")?;
+            let binary = required(upstream.binary, "binary")?;
+            let template = required(upstream.version_output, "version_output")?;
+            (release, binary, template, Source::Provisioner(script))
+        }
+        Some(_) => return Err(refuse("upstream.kind", Fault::Unsupported)),
+    };
     if semver::Version::parse(&release).is_err() {
         return Err(refuse("upstream.release", Fault::Malformed));
     }
@@ -632,25 +778,65 @@ pub(crate) fn read_lock(root: &Path, runtime: &str) -> Result<Lock, XtaskError> 
     if template.matches(RELEASE_PLACEHOLDER).count() != 1 {
         return Err(refuse("upstream.version_output", Fault::Malformed));
     }
-    if let Some(pins) = &upstream.sha256 {
-        if pins.values().any(|digest| !is_hex_digest(digest)) {
-            return Err(refuse("upstream.sha256", Fault::Malformed));
-        }
-    }
     Ok(Lock {
         banner: template.replace(RELEASE_PLACEHOLDER, &release),
-        npm,
         release,
-        integrity,
         binary,
-        scripts: upstream.scripts.unwrap_or(false),
-        sha256: upstream.sha256,
+        source,
     })
 }
 
-fn exact_dependency(section: Option<&Value>, lock: &Lock) -> bool {
+/// Checks the committed install inputs a lock refers to (the npm project or
+/// the provisioner script) without installing anything.
+#[cfg(test)]
+pub(crate) fn check_inputs(root: &Path, runtime: &str, lock: &Lock) -> Result<(), XtaskError> {
+    read_inputs(root, runtime, lock).map(|_inputs| ())
+}
+
+/// Reads the provisioner script `relative` of the lock: a regular,
+/// owner-executable file directly inside [`PROVISIONER_DIR`] of `root`, never
+/// a link.
+fn read_provisioner(root: &Path, runtime: &str, relative: &str) -> Result<Provisioner, XtaskError> {
+    let subject = "upstream.provisioner";
+    let path = root.join(relative);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(refuse(subject, Fault::Missing));
+        }
+        Err(source) => return Err(io_error(&path)(source)),
+    };
+    if !metadata.is_file() {
+        return Err(refuse(subject, Fault::TypeChanged));
+    }
+    if metadata.permissions().mode() & OWNER_EXEC == 0 {
+        return Err(refuse(subject, Fault::ModeChanged));
+    }
+    let script = fs::canonicalize(&path).map_err(io_error(&path))?;
+    let scripts_dir = root.join(PROVISIONER_DIR);
+    let scripts_dir = fs::canonicalize(&scripts_dir).map_err(io_error(&scripts_dir))?;
+    if script.parent() != Some(scripts_dir.as_path()) {
+        return Err(refuse(subject, Fault::EscapingLink));
+    }
+    let name = script
+        .file_name()
+        .and_then(OsStr::to_str)
+        .filter(|name| *name != LOCK_COPY)
+        .ok_or_else(|| refuse(subject, Fault::UnsafeName))?
+        .to_owned();
+    let script_bytes = read_bounded(&script)?;
+    let lock_bytes = read_bounded(&crate::attestation::lock_path(root, runtime))?;
+    Ok(Provisioner {
+        script,
+        name,
+        script_bytes,
+        lock_bytes,
+    })
+}
+
+fn exact_dependency(section: Option<&Value>, lock: &Lock, pins: &NpmPins) -> bool {
     section.and_then(Value::as_object).is_some_and(|map| {
-        map.len() == 1 && map.get(&lock.npm).and_then(Value::as_str) == Some(&lock.release)
+        map.len() == 1 && map.get(&pins.package).and_then(Value::as_str) == Some(&lock.release)
     })
 }
 
@@ -675,12 +861,17 @@ fn origin_of(resolved: &str) -> Option<String> {
     clean.then(|| format!("https://{host}/"))
 }
 
-pub(crate) fn read_project(root: &Path, runtime: &str, lock: &Lock) -> Result<Project, XtaskError> {
+fn read_project(
+    root: &Path,
+    runtime: &str,
+    lock: &Lock,
+    pins: &NpmPins,
+) -> Result<Project, XtaskError> {
     let dir = root.join("compat").join(runtime).join(NPM_DIR);
     let (manifest_json, manifest) = read_json(&dir.join("package.json"), "npm/package.json")?;
     let (lock_json, lockfile) = read_json(&dir.join("package-lock.json"), "npm/package-lock.json")?;
 
-    if !exact_dependency(manifest_json.get("dependencies"), lock)
+    if !exact_dependency(manifest_json.get("dependencies"), lock, pins)
         || !no_other_dependency_kinds(&manifest_json)
     {
         return Err(refuse("npm/package.json", Fault::Mismatch));
@@ -692,8 +883,8 @@ pub(crate) fn read_project(root: &Path, runtime: &str, lock: &Lock) -> Result<Pr
         .and_then(Value::as_object)
         .map(|map| map.keys().map(String::as_str).collect())
         .unwrap_or_default();
-    let wanted = format!("{}@{}", lock.npm, lock.release);
-    let expected_allowed: BTreeSet<&str> = if lock.scripts {
+    let wanted = format!("{}@{}", pins.package, lock.release);
+    let expected_allowed: BTreeSet<&str> = if pins.scripts {
         BTreeSet::from([wanted.as_str()])
     } else {
         BTreeSet::new()
@@ -715,7 +906,7 @@ pub(crate) fn read_project(root: &Path, runtime: &str, lock: &Lock) -> Result<Pr
     let root_entry = packages
         .get("")
         .ok_or_else(|| refuse("npm/package-lock.json root", Fault::Missing))?;
-    if !exact_dependency(root_entry.get("dependencies"), lock)
+    if !exact_dependency(root_entry.get("dependencies"), lock, pins)
         || !no_other_dependency_kinds(root_entry)
     {
         return Err(refuse("npm/package-lock.json root", Fault::Mismatch));
@@ -750,19 +941,19 @@ pub(crate) fn read_project(root: &Path, runtime: &str, lock: &Lock) -> Result<Pr
         _ => return Err(refuse("npm/package-lock.json resolved", Fault::Unsupported)),
     };
 
-    let root_key = format!("node_modules/{}", lock.npm);
+    let root_key = format!("node_modules/{}", pins.package);
     let package = packages
         .get(&root_key)
         .ok_or_else(|| refuse(format!("npm/package-lock.json {root_key}"), Fault::Missing))?;
     if package.get("version").and_then(Value::as_str) != Some(&lock.release) {
         return Err(refuse("npm/package-lock.json release", Fault::Mismatch));
     }
-    if package.get("integrity").and_then(Value::as_str) != Some(&lock.integrity) {
+    if package.get("integrity").and_then(Value::as_str) != Some(&pins.integrity) {
         return Err(refuse("upstream.integrity", Fault::Mismatch));
     }
     // With scripts enabled only the locked package may run one: a dependency
     // that gained an install script would execute unreviewed code.
-    if lock.scripts && script_packages != BTreeSet::from([root_key.as_str()]) {
+    if pins.scripts && script_packages != BTreeSet::from([root_key.as_str()]) {
         return Err(refuse(
             "npm/package-lock.json hasInstallScript",
             Fault::Mismatch,
@@ -952,9 +1143,9 @@ fn render_manifests(tree: &Tree) -> (String, String) {
     (sha256, links)
 }
 
-fn write_manifest(path: &Path, content: &str) -> Result<(), XtaskError> {
+fn write_manifest(path: &Path, content: impl AsRef<[u8]>) -> Result<(), XtaskError> {
     let mut file = File::create(path).map_err(io_error(path))?;
-    file.write_all(content.as_bytes()).map_err(io_error(path))?;
+    file.write_all(content.as_ref()).map_err(io_error(path))?;
     fs::set_permissions(path, fs::Permissions::from_mode(MANIFEST_MODE)).map_err(io_error(path))
 }
 
@@ -1107,7 +1298,12 @@ fn json_file(path: &Path, subject: &str) -> Result<Value, XtaskError> {
 }
 
 /// Checks a stage's bytes against the lock and the committed npm project.
-fn check_pins(stage: &Path, lock: &Lock, project: &Project) -> Result<(), XtaskError> {
+fn check_pins(
+    stage: &Path,
+    lock: &Lock,
+    pins: &NpmPins,
+    project: &Project,
+) -> Result<(), XtaskError> {
     let lib = stage.join(PROJECT_DIR);
     for (name, committed) in [
         ("package.json", &project.manifest),
@@ -1124,7 +1320,7 @@ fn check_pins(stage: &Path, lock: &Lock, project: &Project) -> Result<(), XtaskE
         }
     }
 
-    let package_dir = lib.join("node_modules").join(&lock.npm);
+    let package_dir = lib.join("node_modules").join(&pins.package);
     let installed = json_file(&package_dir.join("package.json"), "installed package.json")?;
     if installed.get("version").and_then(Value::as_str) != Some(&lock.release) {
         return Err(refuse("installed release", Fault::Mismatch));
@@ -1133,7 +1329,7 @@ fn check_pins(stage: &Path, lock: &Lock, project: &Project) -> Result<(), XtaskE
         &lib.join("node_modules").join(".package-lock.json"),
         "installed lockfile",
     )?;
-    let root_key = format!("node_modules/{}", lock.npm);
+    let root_key = format!("node_modules/{}", pins.package);
     let entry = hidden
         .get("packages")
         .and_then(|packages| packages.get(&root_key));
@@ -1141,7 +1337,7 @@ fn check_pins(stage: &Path, lock: &Lock, project: &Project) -> Result<(), XtaskE
         || entry
             .and_then(|e| e.get("integrity"))
             .and_then(Value::as_str)
-            != Some(&lock.integrity)
+            != Some(&pins.integrity)
     {
         return Err(refuse("installed integrity", Fault::Mismatch));
     }
@@ -1149,7 +1345,7 @@ fn check_pins(stage: &Path, lock: &Lock, project: &Project) -> Result<(), XtaskE
     let bin = stage.join(BIN_DIR).join(&lock.binary);
     let expected_target = format!(
         "../{PROJECT_DIR}/node_modules/{}/{}",
-        lock.npm, project.bin_path
+        pins.package, project.bin_path
     );
     let target = fs::read_link(&bin)
         .map_err(|_cause| refuse(format!("{BIN_DIR}/{}", lock.binary), Fault::Missing))?;
@@ -1160,9 +1356,9 @@ fn check_pins(stage: &Path, lock: &Lock, project: &Project) -> Result<(), XtaskE
         ));
     }
 
-    if let Some(pins) = &lock.sha256 {
+    if let Some(digests) = &pins.sha256 {
         let key = host_key().ok_or_else(|| refuse("upstream.sha256", Fault::Unpinned))?;
-        let pinned = pins
+        let pinned = digests
             .get(key)
             .ok_or_else(|| refuse(format!("upstream.sha256.{key}"), Fault::Unpinned))?;
         let resolved = fs::canonicalize(&bin).map_err(io_error(&bin))?;
@@ -1178,6 +1374,99 @@ fn check_pins(stage: &Path, lock: &Lock, project: &Project) -> Result<(), XtaskE
         }
     }
     Ok(())
+}
+
+/// Checks a provisioned stage against the lock and the committed provisioner:
+/// the copies in [`INPUTS_DIR`] equal the committed lock and script, and
+/// `bin/<binary>` links an entrypoint of that name inside the stage that
+/// starts its interpreter through a direct shebang.
+fn check_provisioned(
+    stage: &Path,
+    lock: &Lock,
+    provisioner: &Provisioner,
+) -> Result<(), XtaskError> {
+    let inputs = stage.join(INPUTS_DIR);
+    for (name, committed) in [
+        (LOCK_COPY, &provisioner.lock_bytes),
+        (provisioner.name.as_str(), &provisioner.script_bytes),
+    ] {
+        let subject = format!("{INPUTS_DIR}/{name}");
+        let bytes = read_bounded(&inputs.join(name)).map_err(|error| match error {
+            XtaskError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => {
+                refuse(subject.clone(), Fault::Missing)
+            }
+            other => other,
+        })?;
+        if &bytes != committed {
+            return Err(refuse(subject, Fault::Mismatch));
+        }
+    }
+
+    let subject = format!("{BIN_DIR}/{}", lock.binary);
+    let bin = stage.join(BIN_DIR).join(&lock.binary);
+    if !fs::symlink_metadata(&bin).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(refuse(subject, Fault::Missing));
+    }
+    let inside = fs::canonicalize(stage).map_err(io_error(stage))?;
+    let entrypoint =
+        fs::canonicalize(&bin).map_err(|_cause| refuse(subject.clone(), Fault::Missing))?;
+    if !entrypoint.starts_with(&inside) {
+        return Err(refuse(subject, Fault::EscapingLink));
+    }
+    if entrypoint.file_name() != Some(OsStr::new(&lock.binary)) {
+        return Err(refuse(subject, Fault::Retargeted));
+    }
+    check_direct_shebang(&entrypoint, &inside, &subject)
+}
+
+/// Requires the first line of `script` to be exactly `#!<stage>/<path>` for
+/// one of the [`VENV_INTERPRETERS`], with the canonical `stage` path, and that
+/// interpreter to be a regular owner-executable file: the line uv writes when
+/// the path is short enough and has no space. A `/bin/sh` trampoline, another
+/// interpreter (`python3.12` beside them included), and a stage moved after
+/// staging (its shebangs keep the old absolute path) fail.
+fn check_direct_shebang(script: &Path, stage: &Path, subject: &str) -> Result<(), XtaskError> {
+    let indirect = || refuse(subject, Fault::IndirectShebang);
+    let mut head = Vec::new();
+    File::open(script)
+        .map_err(io_error(script))?
+        .take(SHEBANG_READ_BYTES)
+        .read_to_end(&mut head)
+        .map_err(io_error(script))?;
+    let line = head.split(|byte| *byte == b'\n').next().unwrap_or_default();
+    let interpreter = VENV_INTERPRETERS
+        .iter()
+        .map(|relative| stage.join(relative))
+        .find(|candidate| line.strip_prefix(b"#!") == Some(candidate.as_os_str().as_bytes()))
+        .ok_or_else(indirect)?;
+    let executable = fs::symlink_metadata(&interpreter).is_ok_and(|metadata| {
+        metadata.is_file() && metadata.permissions().mode() & OWNER_EXEC != 0
+    });
+    if !executable {
+        return Err(indirect());
+    }
+    Ok(())
+}
+
+/// The committed install inputs of a lock.
+enum Inputs<'lock> {
+    /// The npm pins of the lock and the committed npm project.
+    Npm(&'lock NpmPins, Project),
+    /// The committed provisioner script.
+    Provisioner(Provisioner),
+}
+
+fn read_inputs<'lock>(
+    root: &Path,
+    runtime: &str,
+    lock: &'lock Lock,
+) -> Result<Inputs<'lock>, XtaskError> {
+    match &lock.source {
+        Source::Npm(pins) => Ok(Inputs::Npm(pins, read_project(root, runtime, lock, pins)?)),
+        Source::Provisioner(script) => Ok(Inputs::Provisioner(read_provisioner(
+            root, runtime, script,
+        )?)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1198,14 +1487,15 @@ fn summarize(lock: &Lock, tree: &Tree, stage: &Path) -> StageSummary {
 }
 
 /// Recomputes the stage at `<dir>/<runtime>` and compares it with its
-/// manifests, the committed npm project and the lock's pins. Offline.
+/// manifests, the committed npm project or provisioner and the lock's pins.
+/// Offline.
 pub(crate) fn verify_stage(
     root: &Path,
     runtime: &str,
     dir: &Path,
 ) -> Result<StageSummary, XtaskError> {
     let lock = read_lock(root, runtime)?;
-    let project = read_project(root, runtime, &lock)?;
+    let inputs = read_inputs(root, runtime, &lock)?;
     let stage = dir.join(runtime);
     match fs::symlink_metadata(&stage) {
         Ok(metadata) if metadata.is_dir() => {}
@@ -1216,7 +1506,10 @@ pub(crate) fn verify_stage(
         Err(source) => return Err(io_error(&stage)(source)),
     }
     let tree = check_manifests(&stage)?;
-    check_pins(&stage, &lock, &project)?;
+    match &inputs {
+        Inputs::Npm(pins, project) => check_pins(&stage, &lock, pins, project)?,
+        Inputs::Provisioner(provisioner) => check_provisioned(&stage, &lock, provisioner)?,
+    }
     Ok(summarize(&lock, &tree, &stage))
 }
 
@@ -1391,7 +1684,9 @@ fn install(
     stage: &Path,
     scratch: &Path,
     lock: &Lock,
+    pins: &NpmPins,
     project: &Project,
+    npm: &Path,
     tools: &Tools,
 ) -> Result<(), XtaskError> {
     let lib = stage.join(PROJECT_DIR);
@@ -1418,14 +1713,14 @@ fn install(
         File::create(rc).map_err(io_error(rc))?;
     }
 
-    let scripts_flag = if lock.scripts {
+    let scripts_flag = if pins.scripts {
         "--ignore-scripts=false"
     } else {
         "--ignore-scripts"
     };
     // Only PATH (npm and its scripts need `node`) comes from the caller; no
     // token, npmrc or registry setting of the host reaches npm.
-    let mut command = Command::new(&tools.npm);
+    let mut command = Command::new(npm);
     command
         .args(["ci", scripts_flag, "--no-audit", "--no-fund"])
         .current_dir(&lib)
@@ -1445,16 +1740,23 @@ fn install(
     let link = bin_dir.join(&lock.binary);
     let target = format!(
         "../{PROJECT_DIR}/node_modules/{}/{}",
-        lock.npm, project.bin_path
+        pins.package, project.bin_path
     );
     symlink(&target, &link).map_err(io_error(&link))
 }
 
+/// Runs `<stage>/bin/<binary> --version` in a private `HOME` and compares the
+/// output with the lock's banner.
+///
+/// `PYTHONDONTWRITEBYTECODE=1` keeps a Python runtime from writing `.pyc`
+/// files into the stage it imports from; the manifests are re-checked after
+/// the probe, so a runtime that writes into its install anyway is refused.
 fn probe_banner(
     stage: &Path,
     scratch: &Path,
     lock: &Lock,
     tools: &Tools,
+    matching: BannerMatch,
 ) -> Result<(), XtaskError> {
     let home = scratch.join("probe-home");
     private_dir(&home)?;
@@ -1467,7 +1769,8 @@ fn probe_banner(
         .current_dir(&home)
         .env_clear()
         .env("PATH", path)
-        .env("HOME", &home);
+        .env("HOME", &home)
+        .env("PYTHONDONTWRITEBYTECODE", "1");
     let stdout = run_bounded(
         &mut command,
         PROBE_TIMEOUT,
@@ -1476,7 +1779,10 @@ fn probe_banner(
         "--version probe",
     )?;
     let printed = String::from_utf8_lossy(&stdout);
-    let printed = printed.trim_end_matches('\n');
+    let printed = match matching {
+        BannerMatch::Whole => printed.trim_end_matches('\n'),
+        BannerMatch::FirstLine => printed.split('\n').next().unwrap_or_default(),
+    };
     if printed == lock.banner {
         return Ok(());
     }
@@ -1487,11 +1793,8 @@ fn probe_banner(
     }))
 }
 
-/// Installs the locked release of `runtime` into `<out>/<runtime>/`.
-///
-/// Every check runs on the final tree: the pins, then the manifests, then
-/// the `--version` probe, then the manifests again, so a runtime that writes
-/// into its own install is caught here and not in the isolated run.
+/// Installs the locked release of `runtime` into `<out>/<runtime>/`, the way
+/// the lock's `upstream` object selects.
 pub(crate) fn stage_upstream(
     root: &Path,
     runtime: &str,
@@ -1499,30 +1802,205 @@ pub(crate) fn stage_upstream(
     tools: &Tools,
 ) -> Result<StageSummary, XtaskError> {
     let lock = read_lock(root, runtime)?;
-    let project = read_project(root, runtime, &lock)?;
+    let inputs = read_inputs(root, runtime, &lock)?;
     fs::create_dir_all(out).map_err(io_error(out))?;
     let out = fs::canonicalize(out).map_err(io_error(out))?;
     let destination = out.join(runtime);
     check_destination(&destination, runtime)?;
+    match &inputs {
+        Inputs::Npm(pins, project) => {
+            stage_npm(&out, &destination, runtime, &lock, pins, project, tools)
+        }
+        Inputs::Provisioner(provisioner) => {
+            stage_provisioned(&out, &destination, runtime, &lock, provisioner, tools)
+        }
+    }
+}
 
+/// Installs an npm release in a scratch directory and moves it to
+/// `destination` once every check passed.
+///
+/// Every check runs on the final tree: the pins, then the manifests, then
+/// the `--version` probe, then the manifests again, so a runtime that writes
+/// into its own install is caught here and not in the isolated run.
+fn stage_npm(
+    out: &Path,
+    destination: &Path,
+    runtime: &str,
+    lock: &Lock,
+    pins: &NpmPins,
+    project: &Project,
+    tools: &Tools,
+) -> Result<StageSummary, XtaskError> {
+    let npm = match &tools.npm {
+        Some(npm) => npm.clone(),
+        None => find_in_path("npm", &tools.path)?,
+    };
     let scratch_dir = out.join(format!(".stage-{runtime}-{}", std::process::id()));
     private_dir(&scratch_dir)?;
     let scratch = Scratch(scratch_dir);
     let stage = scratch.0.join("stage");
     fs::create_dir(&stage).map_err(io_error(&stage))?;
 
-    install(&stage, &scratch.0, &lock, &project, tools)?;
-    check_pins(&stage, &lock, &project)?;
+    install(&stage, &scratch.0, lock, pins, project, &npm, tools)?;
+    check_pins(&stage, lock, pins, project)?;
     let tree = scan_tree(&stage)?;
     let (sha256, links) = render_manifests(&tree);
     write_manifest(&stage.join(SHA256_MANIFEST), &sha256)?;
     write_manifest(&stage.join(LINKS_MANIFEST), &links)?;
-    probe_banner(&stage, &scratch.0, &lock, tools)?;
+    probe_banner(&stage, &scratch.0, lock, tools, BannerMatch::Whole)?;
     check_manifests(&stage)?;
 
     if destination.is_dir() {
-        fs::remove_dir(&destination).map_err(io_error(&destination))?;
+        fs::remove_dir(destination).map_err(io_error(destination))?;
     }
-    fs::rename(&stage, &destination).map_err(io_error(&destination))?;
-    Ok(summarize(&lock, &tree, &destination))
+    fs::rename(&stage, destination).map_err(io_error(destination))?;
+    Ok(summarize(lock, &tree, destination))
+}
+
+/// Removes a stage built in place unless staging completed.
+struct Partial {
+    stage: PathBuf,
+    complete: bool,
+}
+
+impl Drop for Partial {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+        if let Err(error) = fs::remove_dir_all(&self.stage) {
+            if error.kind() != io::ErrorKind::NotFound {
+                eprintln!(
+                    "warning: could not remove the partial stage `{}`: {error}",
+                    self.stage.display()
+                );
+            }
+        }
+    }
+}
+
+/// Refuses a stage path at which uv would write a `#!/bin/sh` trampoline
+/// instead of a direct interpreter shebang, before anything is installed.
+fn check_stage_path(destination: &Path) -> Result<(), XtaskError> {
+    for relative in VENV_INTERPRETERS {
+        let interpreter = destination.join(relative);
+        let bytes = interpreter.as_os_str().as_bytes();
+        if bytes.len() + SHEBANG_OVERHEAD > SHEBANG_LINE_LIMIT
+            || bytes.iter().any(u8::is_ascii_whitespace)
+        {
+            return Err(refuse("out", Fault::IndirectShebang));
+        }
+    }
+    Ok(())
+}
+
+/// Runs the provisioner with `destination` as its install root and returns
+/// the entrypoint it prints, relative to `destination`.
+///
+/// Only `PATH` comes from the caller, as for npm: the script finds its own
+/// tools there and pins everything it downloads, and no credential or index
+/// setting of the host reaches it.
+fn provision(
+    destination: &Path,
+    scratch: &Path,
+    lock: &Lock,
+    provisioner: &Provisioner,
+    tools: &Tools,
+) -> Result<String, XtaskError> {
+    let (home, tmp) = (scratch.join("home"), scratch.join("tmp"));
+    for dir in [&home, &tmp] {
+        private_dir(dir)?;
+    }
+    let mut command = Command::new(&provisioner.script);
+    command
+        .arg(destination)
+        .current_dir(&home)
+        .env_clear()
+        .env("PATH", &tools.path)
+        .env("HOME", &home)
+        .env("TMPDIR", &tmp);
+    let stdout = run_bounded(
+        &mut command,
+        PROVISION_TIMEOUT,
+        true,
+        PROBE_OUTPUT_LIMIT,
+        "provisioner",
+    )?;
+    let subject = "provisioner output";
+    let printed = std::str::from_utf8(&stdout)
+        .ok()
+        .and_then(|text| text.strip_suffix('\n'))
+        .ok_or_else(|| refuse(subject, Fault::Malformed))?;
+    let relative = Path::new(printed)
+        .strip_prefix(destination)
+        .ok()
+        .and_then(Path::to_str)
+        .filter(|relative| safe_relative(relative))
+        .ok_or_else(|| refuse(subject, Fault::EscapingLink))?
+        .to_owned();
+    if Path::new(&relative).file_name() != Some(OsStr::new(&lock.binary)) {
+        return Err(refuse(subject, Fault::Mismatch));
+    }
+    let entrypoint = destination.join(&relative);
+    if !fs::symlink_metadata(&entrypoint).is_ok_and(|metadata| metadata.is_file()) {
+        return Err(refuse(subject, Fault::TypeChanged));
+    }
+    Ok(relative)
+}
+
+/// Provisions a runtime in place at `destination` and records it.
+///
+/// The stage is built where it will be used and never moved, because the
+/// console scripts of a virtual environment name their interpreter by
+/// absolute path. The checks run on the final tree as for npm: inputs and
+/// entrypoint, manifests, the `--version` probe, then the manifests again.
+fn stage_provisioned(
+    out: &Path,
+    destination: &Path,
+    runtime: &str,
+    lock: &Lock,
+    provisioner: &Provisioner,
+    tools: &Tools,
+) -> Result<StageSummary, XtaskError> {
+    check_stage_path(destination)?;
+    let scratch_dir = out.join(format!(".stage-{runtime}-{}", std::process::id()));
+    private_dir(&scratch_dir)?;
+    let scratch = Scratch(scratch_dir);
+    // The provisioner refuses an existing install root; check_destination
+    // left only an empty directory or nothing.
+    if destination.is_dir() {
+        fs::remove_dir(destination).map_err(io_error(destination))?;
+    }
+    let mut partial = Partial {
+        stage: destination.to_path_buf(),
+        complete: false,
+    };
+
+    let entrypoint = provision(destination, &scratch.0, lock, provisioner, tools)?;
+    for dir in [BIN_DIR, INPUTS_DIR] {
+        let path = destination.join(dir);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Err(refuse(dir, Fault::AlreadyExists)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(io_error(&path)(source)),
+        }
+        fs::create_dir(&path).map_err(io_error(&path))?;
+    }
+    let link = destination.join(BIN_DIR).join(&lock.binary);
+    symlink(format!("../{entrypoint}"), &link).map_err(io_error(&link))?;
+    let inputs = destination.join(INPUTS_DIR);
+    // Plain, non-executable copies: they are compared, never run.
+    write_manifest(&inputs.join(LOCK_COPY), &provisioner.lock_bytes)?;
+    write_manifest(&inputs.join(&provisioner.name), &provisioner.script_bytes)?;
+
+    check_provisioned(destination, lock, provisioner)?;
+    let tree = scan_tree(destination)?;
+    let (sha256, links) = render_manifests(&tree);
+    write_manifest(&destination.join(SHA256_MANIFEST), &sha256)?;
+    write_manifest(&destination.join(LINKS_MANIFEST), &links)?;
+    probe_banner(destination, &scratch.0, lock, tools, BannerMatch::FirstLine)?;
+    check_manifests(destination)?;
+    partial.complete = true;
+    Ok(summarize(lock, &tree, destination))
 }
