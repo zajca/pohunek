@@ -224,6 +224,24 @@ The core never learns about Linear, GitHub, or work items. It knows sessions,
 worktrees, projects, events, notifications, and opaque metadata, and leaves
 everything domain-specific to clients like these.
 
+## Use, extend, contribute
+
+- **Use Pohunek** to keep agent terminals durable across daemon restarts,
+  operate sessions directly across your NetBird hosts, or drive the public
+  `--json` interface from scripts. Start with the
+  [manual installation](docs/install.md) and [CLI guide](docs/cli.md).
+- **Extend Pohunek** with a Rust or TypeScript client, scripts over the CLI,
+  or runtime packages. The [SDK guide](docs/sdk.md),
+  [versioned public API](docs/public-api.md), and
+  [runtime package guide](docs/knowledge/guides/runtime-packages.md) describe
+  those shipped extension points. UI and workflow products are separate
+  clients, not core components.
+- **Contribute** through [public issues](https://github.com/zajca/pohunek/issues),
+  including the [maintainer-managed ready queue](https://github.com/zajca/pohunek/issues?q=is%3Aissue%20is%3Aopen%20label%3Areadiness%3Aready).
+  Read the [contribution workflow](.agents/skills/contribute/SKILL.md) before
+  choosing work. `readiness:ready` marks eligibility, not a reservation or
+  merge promise; contributors do not need private Project access.
+
 ## Roadmap
 
 A sketch of the main tracks. The
@@ -257,7 +275,7 @@ The longer narrative and the shipped foundations are in
 | [Public API](docs/public-api.md) | The versioned wire protocol |
 | [Architecture](docs/architecture.md) | The authoritative design |
 
-Contributors start with [AGENTS.md](AGENTS.md).
+Repository implementation rules start at [AGENTS.md](AGENTS.md).
 
 ## License
 
