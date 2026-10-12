@@ -540,6 +540,7 @@ mod test_support {
                     socket_path,
                     journal_path: state_dir.join(format!("{worker_id}.json")),
                     daemon_socket_path: self.daemon_socket.clone(),
+                    hook_trace_path: state_dir.join(pohunek_logging::config::HOOK_TRACE_FILE_NAME),
                     config: WorkerConfig::new(),
                 };
                 let deadline = tokio::time::Instant::now() + FORKED_LOCK_RELEASE_BOUND;

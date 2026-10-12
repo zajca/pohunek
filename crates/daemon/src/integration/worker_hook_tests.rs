@@ -184,6 +184,15 @@ async fn start_worker_with_schema(
     .await
 }
 
+/// Hook failure trace of the worker started under `root`, which the worker
+/// hands to its PTY child as `POHUNEK_HOOK_TRACE_PATH`.
+///
+/// It sits directly in the scenario's directory: the hooks create the file,
+/// never its directory.
+fn hook_trace_path(root: &Path) -> PathBuf {
+    root.join(pohunek_logging::config::HOOK_TRACE_FILE_NAME)
+}
+
 /// Starts a real worker and initializes its runtime with `initialize`.
 async fn start_worker_initialized(
     root: &Path,
@@ -201,6 +210,7 @@ async fn start_worker_initialized(
         socket_path: socket_path.clone(),
         journal_path: root.join("journal/worker.json"),
         daemon_socket_path: root.join("daemon.sock"),
+        hook_trace_path: hook_trace_path(root),
         config: WorkerConfig::new(),
     })
     .await
@@ -2612,6 +2622,861 @@ for claim in plan:
             expected.push(snapshot_answer(VALID, true));
             assert_eq!(client.answers(), expected);
             run.finish().await;
+        }
+    }
+
+    /// Hook failure trace scenarios: the real state hooks run inside a real
+    /// worker's PTY and append to the trace file the worker hands them as
+    /// `POHUNEK_HOOK_TRACE_PATH`.
+    ///
+    /// Expected lines come from the trace decided on #883 (intake comment,
+    /// "D5 diagnostics") and its S3 slice: one JSON line per traced failure
+    /// exit, holding `ts`, `session`, `provider`, `action` and `reason` and at
+    /// most a short `detail` code, never payload content; the file is
+    /// owner-private, never written through a symlink, and rotated once at
+    /// `POHUNEK_HOOK_TRACE_MAX_BYTES`. A hook exits 0 without output either
+    /// way.
+    ///
+    /// Two points the decision leaves open are fixed here: a line's `action`
+    /// is the hook's action argument, and the `no_snapshot` sub-reason is its
+    /// `detail`.
+    mod hook_trace {
+        use std::collections::BTreeSet;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::path::{Path, PathBuf};
+
+        use pohunek_worker_protocol::SubagentPhase;
+        use serde_json::{json, Value};
+
+        use super::{
+            claude_rows, quoted, recorded, replay, state_asset, stop_tasks, Row, Rows, Step,
+            CLAUDE, CODEX, OTHER_INPUT_BOUND, SESSION_ID,
+        };
+
+        /// Hook action of a subagent start, named as the line's `action`.
+        const SUBAGENT_START: &str = "subagent-start";
+
+        /// Hook action of a subagent stop.
+        const SUBAGENT_STOP: &str = "subagent-stop";
+
+        /// Hook action of the main agent's `Stop`, named as the line's
+        /// `action`.
+        const STOP: &str = "stop";
+
+        /// Reason of a claim the worker answered `ok: false`.
+        const WORKER_REFUSED: &str = "worker_refused";
+
+        /// Reason of an input over the action's input bound.
+        const INPUT_TOO_LARGE: &str = "input_too_large";
+
+        /// Reason of an input that is not a JSON object.
+        const INPUT_INVALID: &str = "input_invalid";
+
+        /// Reason of a main `Stop` the hook sends no snapshot for.
+        const NO_SNAPSHOT: &str = "no_snapshot";
+
+        /// `no_snapshot` detail of a task list with an invalid entry.
+        const TASKS_INVALID: &str = "tasks_invalid";
+
+        /// Reasons the decision allows for a worker socket path that does not
+        /// exist: the hook either finds the path missing or fails to connect.
+        const SOCKET_ABSENT: &[&str] = &["worker_socket_missing", "worker_unreachable"];
+
+        /// Fields every trace line carries.
+        const LINE_FIELDS: [&str; 5] = ["ts", "session", "provider", "action", "reason"];
+
+        /// The one optional field: a short fixed code, never input text.
+        const DETAIL: &str = "detail";
+
+        /// Longest trace line with its newline, the bound the hook enforces.
+        /// Lines of concurrent hooks stay apart because each is one write
+        /// under the hook's exclusive trace lock.
+        const LINE_BOUND: usize = 512;
+
+        /// Rotation bound the rotation scenario hands the hook: a longest line
+        /// still fits an empty file, and a few real lines fill it.
+        const SMALL_MAX_BYTES: usize = LINE_BOUND;
+
+        /// Failures of the rotation scenario: several times the lines that
+        /// fit [`SMALL_MAX_BYTES`] twice, so the trace rotates repeatedly and
+        /// drops its oldest lines.
+        const ROTATION_FAILURES: usize = 20;
+
+        /// Hook input that is not JSON.
+        const NOT_JSON: &[u8] = b"{";
+
+        /// A subagent id longer than the worker's `MAX_SUBAGENT_ID_BYTES`
+        /// (256). The hooks forward any non-empty id, so the worker refuses
+        /// the claim.
+        fn overlong_id() -> String {
+            format!("a{}", "7f3c9e1b".repeat(33))
+        }
+
+        /// What one trace line says.
+        struct Expected {
+            provider: &'static str,
+            action: &'static str,
+            /// The line's reason is one of these.
+            reasons: &'static [&'static str],
+            /// The line's `detail`, when the decision fixes one.
+            detail: Option<&'static str>,
+        }
+
+        impl Expected {
+            const fn new(
+                provider: &'static str,
+                action: &'static str,
+                reasons: &'static [&'static str],
+            ) -> Self {
+                Self {
+                    provider,
+                    action,
+                    reasons,
+                    detail: None,
+                }
+            }
+        }
+
+        /// A step running the state hook `asset` with `action`, `input` on its
+        /// stdin, in a subshell that runs `prelude` first. The hook's output
+        /// goes to `<name>.out` and its exit status to `<name>.status`.
+        ///
+        /// The subshell execs the hook, so the hook's parent is still the PTY
+        /// root.
+        fn traced(
+            root: &Path,
+            name: &str,
+            prelude: &str,
+            asset: &Path,
+            action: &str,
+            input: &[u8],
+        ) -> Step {
+            let input_path = root.join(format!("{name}.input"));
+            std::fs::write(&input_path, input).expect("write the hook input");
+            Step::Command(format!(
+                "({prelude} exec /bin/sh {asset} {action} < {input} > {out} 2>&1); echo \"$?\" > {status}",
+                asset = quoted(asset),
+                input = quoted(&input_path),
+                out = quoted(&root.join(format!("{name}.out"))),
+                status = quoted(&root.join(format!("{name}.status"))),
+            ))
+        }
+
+        /// Asserts that the hook run `name` exited 0 and printed nothing.
+        fn assert_silent(root: &Path, name: &str) {
+            let status = std::fs::read_to_string(root.join(format!("{name}.status")))
+                .expect("the hook's exit status");
+            assert_eq!(status.trim(), "0", "{name}: the hook exits 0");
+            let output =
+                std::fs::read(root.join(format!("{name}.out"))).expect("the hook's output");
+            assert!(
+                output.is_empty(),
+                "{name}: the hook prints nothing: {:?}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+
+        /// The trace lines of `path`, none when it does not exist. Every line
+        /// is complete, within [`LINE_BOUND`], and a JSON value.
+        fn trace_lines(path: &Path) -> Vec<Value> {
+            let text = match std::fs::read_to_string(path) {
+                Ok(text) => text,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+                Err(error) => panic!("read {}: {error}", path.display()),
+            };
+            assert!(
+                text.is_empty() || text.ends_with('\n'),
+                "every trace line is complete: {text:?}"
+            );
+            text.lines()
+                .map(|line| {
+                    assert!(
+                        line.len() < LINE_BOUND,
+                        "a trace line with its newline stays within the line bound: {line}"
+                    );
+                    serde_json::from_str(line)
+                        .unwrap_or_else(|error| panic!("a trace line is JSON ({error}): {line}"))
+                })
+                .collect()
+        }
+
+        /// Asserts that `line` says what `expected` says, for this session.
+        fn assert_line(line: &Value, expected: &Expected) {
+            let fields = line
+                .as_object()
+                .unwrap_or_else(|| panic!("a trace line is an object: {line}"));
+            let keys: BTreeSet<&str> = fields.keys().map(String::as_str).collect();
+            let required = BTreeSet::from(LINE_FIELDS);
+            assert!(keys.is_superset(&required), "{line}");
+            assert!(
+                keys.difference(&required).all(|key| *key == DETAIL),
+                "a line carries no other field: {line}"
+            );
+            assert_eq!(line["session"], json!(SESSION_ID), "{line}");
+            assert_eq!(line["provider"], json!(expected.provider), "{line}");
+            assert_eq!(line["action"], json!(expected.action), "{line}");
+            let reason = line["reason"].as_str().unwrap_or_default();
+            assert!(
+                expected.reasons.contains(&reason),
+                "reason is one of {:?}: {line}",
+                expected.reasons
+            );
+            let ts = line["ts"]
+                .as_str()
+                .unwrap_or_else(|| panic!("ts is text: {line}"));
+            let at =
+                ::time::OffsetDateTime::parse(ts, &::time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|error| panic!("ts is RFC 3339 ({error}): {line}"));
+            assert!(at.offset().is_utc(), "ts is UTC: {line}");
+            match (expected.detail, line.get(DETAIL)) {
+                (Some(detail), found) => assert_eq!(found, Some(&json!(detail)), "{line}"),
+                (None, None) => {}
+                (None, Some(found)) => assert!(
+                    found.as_str().is_some_and(|code| !code.is_empty()
+                        && code.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')),
+                    "detail is a short fixed code: {line}"
+                ),
+            }
+        }
+
+        /// Asserts that `path` is a regular file of the current user with mode
+        /// 0600.
+        fn assert_private(path: &Path) {
+            let metadata = std::fs::symlink_metadata(path)
+                .unwrap_or_else(|error| panic!("stat {}: {error}", path.display()));
+            assert!(
+                metadata.file_type().is_file(),
+                "{} is a regular file",
+                path.display()
+            );
+            assert_eq!(
+                metadata.permissions().mode() & 0o777,
+                0o600,
+                "{} is owner-private",
+                path.display()
+            );
+            assert_eq!(
+                metadata.uid(),
+                nix::unistd::getuid().as_raw(),
+                "{} is ours",
+                path.display()
+            );
+        }
+
+        /// Whether nothing, not even a dangling symlink, exists at `path`.
+        fn absent(path: &Path) -> bool {
+            matches!(
+                std::fs::symlink_metadata(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        }
+
+        /// Asserts that the trace text at `path` holds none of `canaries`.
+        fn assert_no_leak(path: &Path, canaries: &[String]) {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            for canary in canaries.iter().filter(|canary| !canary.is_empty()) {
+                assert!(
+                    !text.contains(canary.as_str()),
+                    "{canary:?} leaks into the trace: {text}"
+                );
+            }
+        }
+
+        /// The string values of `payload`, nested ones included, except the
+        /// event name, the permission mode and a task's type and status: a
+        /// trace line holds none of them. Those fields hold short generic
+        /// words that are no evidence of a leak.
+        fn payload_text(payload: &Value) -> Vec<String> {
+            const GENERIC: [&str; 4] = ["hook_event_name", "permission_mode", "type", "status"];
+            match payload {
+                Value::String(text) => vec![text.clone()],
+                Value::Array(items) => items.iter().flat_map(payload_text).collect(),
+                Value::Object(fields) => fields
+                    .iter()
+                    .filter(|(key, _)| !GENERIC.contains(&key.as_str()))
+                    .flat_map(|(_, value)| payload_text(value))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        }
+
+        /// A Claude `SubagentStart` input naming `agent_id`.
+        fn claude_start(agent_id: &str) -> Value {
+            json!({
+                "hook_event_name": "SubagentStart",
+                "agent_id": agent_id,
+                "agent_type": "general-purpose",
+            })
+        }
+
+        /// The recorded Codex hook input `event` (`start` or `stop`).
+        fn codex_input(event: &str) -> Value {
+            let fixture: Value =
+                serde_json::from_str(crate::integration::CODEX_SUBAGENT_COMPATIBILITY_FIXTURE)
+                    .expect("the Codex hook fixture parses");
+            fixture[event].clone()
+        }
+
+        /// `payload` padded past the subagent actions' input bound,
+        /// `MAX_HOOK_INPUT_BYTES` of both state hooks.
+        fn oversized(mut payload: Value) -> Value {
+            payload["padding"] = json!("x".repeat(OTHER_INPUT_BOUND));
+            payload
+        }
+
+        /// One failure exit and the line it must leave.
+        struct Failure {
+            name: &'static str,
+            prelude: String,
+            asset: PathBuf,
+            action: &'static str,
+            payload: Value,
+            expected: Expected,
+        }
+
+        /// The failure exits of test item 1, in the order the PTY runs them:
+        /// a claim the worker refuses and an input over the bound for both
+        /// providers, a main `Stop` with an invalid task list, and a worker
+        /// socket that does not exist under `root`.
+        fn item_one_failures(root: &Path) -> [Failure; 6] {
+            let shell = stop_tasks(&recorded("never_listed_agent_with_only_shells"), 1)[0].clone();
+            let mut empty_id = shell.clone();
+            empty_id["id"] = json!("");
+            let mut codex_refused = codex_input("start");
+            codex_refused["agent_id"] = json!(overlong_id());
+            let absent_socket = root.join("absent-worker.sock");
+            [
+                Failure {
+                    name: "claude-refused",
+                    prelude: String::new(),
+                    asset: state_asset(CLAUDE),
+                    action: SUBAGENT_START,
+                    payload: claude_start(&overlong_id()),
+                    expected: Expected::new(CLAUDE, SUBAGENT_START, &[WORKER_REFUSED]),
+                },
+                Failure {
+                    name: "codex-refused",
+                    prelude: String::new(),
+                    asset: state_asset(CODEX),
+                    action: SUBAGENT_START,
+                    payload: codex_refused,
+                    expected: Expected::new(CODEX, SUBAGENT_START, &[WORKER_REFUSED]),
+                },
+                Failure {
+                    name: "claude-too-large",
+                    prelude: String::new(),
+                    asset: state_asset(CLAUDE),
+                    action: SUBAGENT_START,
+                    payload: oversized(claude_start("a5e9c3f7b1d4a8e2c")),
+                    expected: Expected::new(CLAUDE, SUBAGENT_START, &[INPUT_TOO_LARGE]),
+                },
+                Failure {
+                    name: "codex-too-large",
+                    prelude: String::new(),
+                    asset: state_asset(CODEX),
+                    action: SUBAGENT_STOP,
+                    payload: oversized(codex_input("stop")),
+                    expected: Expected::new(CODEX, SUBAGENT_STOP, &[INPUT_TOO_LARGE]),
+                },
+                Failure {
+                    name: "tasks-invalid",
+                    prelude: String::new(),
+                    asset: state_asset(CLAUDE),
+                    action: STOP,
+                    payload: json!({
+                        "hook_event_name": "Stop",
+                        "last_assistant_message": "The build watcher is still running.",
+                        "background_tasks": [shell, empty_id],
+                    }),
+                    expected: Expected {
+                        detail: Some(TASKS_INVALID),
+                        ..Expected::new(CLAUDE, STOP, &[NO_SNAPSHOT])
+                    },
+                },
+                Failure {
+                    name: "socket-absent",
+                    prelude: format!(
+                        "export {}={};",
+                        protocol::ENV_WORKER_SOCKET_PATH,
+                        quoted(&absent_socket)
+                    ),
+                    asset: state_asset(CLAUDE),
+                    action: SUBAGENT_START,
+                    payload: claude_start("a1f5d9b3e7c2a6f0d"),
+                    expected: Expected::new(CLAUDE, SUBAGENT_START, SOCKET_ABSENT),
+                },
+            ]
+        }
+
+        /// Each failure exit of test item 1 writes exactly one line, in the
+        /// order the hooks ran. The file is owner-private and holds no input
+        /// text, path or environment value.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn each_failure_exit_writes_one_trace_line() {
+            let root = crate::test_support::scoped_dir("ph-trace-failures-");
+            let failures = item_one_failures(&root);
+            let steps = failures
+                .iter()
+                .map(|failure| {
+                    traced(
+                        &root,
+                        failure.name,
+                        &failure.prelude,
+                        &failure.asset,
+                        failure.action,
+                        failure.payload.to_string().as_bytes(),
+                    )
+                })
+                .collect();
+            let run = replay(&root, steps, &Rows::new()).await;
+            let instance = run
+                .worker
+                .worker_instance_id()
+                .await
+                .expect("worker instance")
+                .to_string();
+            run.finish().await;
+
+            let trace = super::super::hook_trace_path(&root);
+            let lines = trace_lines(&trace);
+            assert_eq!(
+                lines.len(),
+                failures.len(),
+                "one line per failure exit: {lines:?}"
+            );
+            for (line, failure) in lines.iter().zip(&failures) {
+                assert_silent(&root, failure.name);
+                assert_line(line, &failure.expected);
+            }
+            assert_private(&trace);
+            let mut canaries: Vec<String> = failures
+                .iter()
+                .flat_map(|failure| payload_text(&failure.payload))
+                .collect();
+            canaries.extend([root.display().to_string(), instance]);
+            assert_no_leak(&trace, &canaries);
+        }
+
+        /// Test item 2: claims the worker acknowledges write no line. Claude
+        /// and Codex subagent starts and stops and a valid main `Stop`
+        /// snapshot run first; one failure exit after them leaves the only
+        /// line.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn acknowledged_claims_write_no_trace_line() {
+            let root = crate::test_support::scoped_dir("ph-trace-success-");
+            let sequence = recorded("spawn_handback_resume");
+            let started = sequence.events[0].subagent();
+            let claude_payload = json!({
+                "hook_event_name": "SubagentStart",
+                "agent_id": started.agent_id,
+                "agent_type": started.agent_type,
+            });
+            let mut claude_stop = claude_payload.clone();
+            claude_stop["hook_event_name"] = json!("SubagentStop");
+            let codex_id = codex_input("start")["agent_id"]
+                .as_str()
+                .expect("the Codex start names its agent")
+                .to_owned();
+            let claude = state_asset(CLAUDE);
+            let codex = state_asset(CODEX);
+            let steps = vec![
+                traced(
+                    &root,
+                    "claude-start",
+                    "",
+                    &claude,
+                    SUBAGENT_START,
+                    claude_payload.to_string().as_bytes(),
+                ),
+                traced(
+                    &root,
+                    "claude-stop",
+                    "",
+                    &claude,
+                    SUBAGENT_STOP,
+                    claude_stop.to_string().as_bytes(),
+                ),
+                traced(
+                    &root,
+                    "codex-start",
+                    "",
+                    &codex,
+                    SUBAGENT_START,
+                    codex_input("start").to_string().as_bytes(),
+                ),
+                traced(
+                    &root,
+                    "codex-stop",
+                    "",
+                    &codex,
+                    SUBAGENT_STOP,
+                    codex_input("stop").to_string().as_bytes(),
+                ),
+                traced(
+                    &root,
+                    "main-stop",
+                    "",
+                    &claude,
+                    STOP,
+                    json!({"hook_event_name": "Stop", "background_tasks": []})
+                        .to_string()
+                        .as_bytes(),
+                ),
+                traced(&root, "control", "", &claude, SUBAGENT_START, NOT_JSON),
+            ];
+            let mut completed = claude_rows(&[Row {
+                agent_id: started.agent_id.clone(),
+                lifecycle: SubagentPhase::Completed,
+            }]);
+            completed.insert((CODEX.to_owned(), codex_id), SubagentPhase::Completed);
+            replay(&root, steps, &completed).await.finish().await;
+
+            for name in [
+                "claude-start",
+                "claude-stop",
+                "codex-start",
+                "codex-stop",
+                "main-stop",
+                "control",
+            ] {
+                assert_silent(&root, name);
+            }
+            let lines = trace_lines(&super::super::hook_trace_path(&root));
+            let [line] = lines.as_slice() else {
+                panic!("only the failure exit writes a line: {lines:?}");
+            };
+            assert_line(
+                line,
+                &Expected::new(CLAUDE, SUBAGENT_START, &[INPUT_INVALID]),
+            );
+        }
+
+        /// Test item 3: a symlink at the trace path is never followed, whether
+        /// it points at a file or at nothing: the target stays as it was, the
+        /// hook exits 0 without output, and nothing rotates. Once the symlink
+        /// is gone, the next failure exit writes its line to a regular file.
+        ///
+        /// The existing target is an owner-private regular file, a valid
+        /// trace in every respect but the link to it.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_symlink_at_the_trace_path_is_never_followed() {
+            /// Content of the symlink's existing target.
+            const KEPT: &str = "kept\n";
+            for existing in [true, false] {
+                let root = crate::test_support::scoped_dir("ph-trace-symlink-");
+                let trace = super::super::hook_trace_path(&root);
+                let target = root.join("symlink-target.jsonl");
+                if existing {
+                    std::fs::write(&target, KEPT).expect("write the symlink target");
+                    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+                        .expect("make the symlink target owner-private");
+                }
+                std::os::unix::fs::symlink(&target, &trace).expect("link the trace path");
+                let claude = state_asset(CLAUDE);
+                let steps = vec![
+                    traced(&root, "through-link", "", &claude, SUBAGENT_START, NOT_JSON),
+                    Step::Command(format!("rm -f {}", quoted(&trace))),
+                    traced(&root, "after-unlink", "", &claude, SUBAGENT_START, NOT_JSON),
+                ];
+                replay(&root, steps, &Rows::new()).await.finish().await;
+
+                assert_silent(&root, "through-link");
+                assert_silent(&root, "after-unlink");
+                if existing {
+                    assert_eq!(
+                        std::fs::read_to_string(&target).expect("read the symlink target"),
+                        KEPT,
+                        "the existing target is unchanged"
+                    );
+                } else {
+                    assert!(absent(&target), "the dangling target is never created");
+                }
+                assert!(
+                    absent(Path::new(&format!("{}.1", trace.display()))),
+                    "nothing rotates through the symlink"
+                );
+                let lines = trace_lines(&trace);
+                let [line] = lines.as_slice() else {
+                    panic!("only the failure after the unlink writes a line: {lines:?}");
+                };
+                assert_line(
+                    line,
+                    &Expected::new(CLAUDE, SUBAGENT_START, &[INPUT_INVALID]),
+                );
+                assert_private(&trace);
+            }
+        }
+
+        /// Test item 4: with a small rotation bound, neither the trace nor its
+        /// one rotated file ever exceeds the bound across many failure exits,
+        /// the oldest lines are dropped, and exactly one rotated file exists.
+        ///
+        /// After each failure the PTY script appends the sizes of the trace
+        /// and of its rotated file, so the bound is checked at every step.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_trace_rotates_once_within_its_bound() {
+            let root = crate::test_support::scoped_dir("ph-trace-rotation-");
+            let trace = super::super::hook_trace_path(&root);
+            let rotated = PathBuf::from(format!("{}.1", trace.display()));
+            let sizes = root.join("trace-sizes");
+            let prelude = format!(
+                "export {}={SMALL_MAX_BYTES};",
+                protocol::ENV_HOOK_TRACE_MAX_BYTES
+            );
+            let measure = format!(
+                "c=0; r=0; [ -f {trace} ] && c=$(wc -c < {trace}); [ -f {rotated} ] && r=$(wc -c < {rotated}); echo \"$c $r\" >> {sizes}",
+                trace = quoted(&trace),
+                rotated = quoted(&rotated),
+                sizes = quoted(&sizes),
+            );
+            let claude = state_asset(CLAUDE);
+            let names: Vec<String> = (0..ROTATION_FAILURES)
+                .map(|index| format!("rotate-{index}"))
+                .collect();
+            let steps = names
+                .iter()
+                .flat_map(|name| {
+                    [
+                        traced(&root, name, &prelude, &claude, SUBAGENT_START, NOT_JSON),
+                        Step::Command(measure.clone()),
+                    ]
+                })
+                .collect();
+            replay(&root, steps, &Rows::new()).await.finish().await;
+
+            for name in &names {
+                assert_silent(&root, name);
+            }
+            let measured: Vec<(usize, usize)> = std::fs::read_to_string(&sizes)
+                .expect("the measured sizes")
+                .lines()
+                .map(|line| {
+                    let mut sizes = line
+                        .split_whitespace()
+                        .map(|size| size.parse::<usize>().expect("a measured size"));
+                    (
+                        sizes.next().expect("the trace size"),
+                        sizes.next().expect("the rotated size"),
+                    )
+                })
+                .collect();
+            assert_eq!(measured.len(), ROTATION_FAILURES, "{measured:?}");
+            assert!(
+                measured
+                    .iter()
+                    .all(|(current, old)| (1..=SMALL_MAX_BYTES).contains(current) && *old <= SMALL_MAX_BYTES),
+                "after every failure the trace holds its line and both files keep the bound: {measured:?}"
+            );
+
+            let family: BTreeSet<String> = std::fs::read_dir(&root)
+                .expect("list the scenario directory")
+                .map(|entry| {
+                    entry
+                        .expect("a directory entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .filter(|name| name.starts_with(pohunek_logging::config::HOOK_TRACE_FILE_NAME))
+                .collect();
+            let file_name = pohunek_logging::config::HOOK_TRACE_FILE_NAME;
+            assert_eq!(
+                family,
+                BTreeSet::from([file_name.to_owned(), format!("{file_name}.1")]),
+                "the trace and exactly one rotated file"
+            );
+            let (current, old) = (trace_lines(&trace), trace_lines(&rotated));
+            assert!(!old.is_empty(), "the trace rotated");
+            assert!(
+                current.len() + old.len() < ROTATION_FAILURES,
+                "the oldest lines are dropped: {} + {}",
+                current.len(),
+                old.len()
+            );
+            for line in current.iter().chain(&old) {
+                assert_line(
+                    line,
+                    &Expected::new(CLAUDE, SUBAGENT_START, &[INPUT_INVALID]),
+                );
+            }
+            assert_private(&trace);
+            assert_private(&rotated);
+        }
+
+        /// Lock holder: `<trace> <ready fifo> <release fifo>`.
+        ///
+        /// It creates the trace owner-private, holds an exclusive `flock` on
+        /// it, writes `locked` to the ready FIFO, and keeps the lock until it
+        /// reads a line from the release FIFO. A failure is written to the
+        /// ready FIFO instead, so the PTY script never waits on a dead holder.
+        const LOCK_HOLDER: &str = r#"
+import fcntl
+import os
+import sys
+
+trace, ready, release = sys.argv[1:4]
+try:
+    descriptor = os.open(trace, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+except BaseException as error:
+    with open(ready, "w", encoding="ascii") as handle:
+        handle.write(f"failed:{type(error).__name__}\n")
+    raise
+with open(ready, "w", encoding="ascii") as handle:
+    handle.write("locked\n")
+with open(release, encoding="ascii") as handle:
+    handle.readline()
+"#;
+
+        /// A trace another process holds an exclusive lock on is left alone:
+        /// a failing Claude or Codex hook exits 0 without output and writes
+        /// no line, and once the lock is released the next failure writes
+        /// exactly one line.
+        ///
+        /// The PTY script starts the holder, waits on the ready FIFO until it
+        /// holds the lock, runs the failing hooks, then releases the holder
+        /// through the release FIFO and waits for it to exit. Each hook must
+        /// give up on the lock for the script to reach the next barrier
+        /// within the hang guard.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_locked_trace_is_skipped_without_blocking_the_hook() {
+            let root = crate::test_support::scoped_dir("ph-trace-locked-");
+            let trace = super::super::hook_trace_path(&root);
+            let holder = root.join("lock-holder.py");
+            std::fs::write(&holder, LOCK_HOLDER).expect("write the lock holder");
+            let (ready, release) = (root.join("lock-ready.fifo"), root.join("lock-release.fifo"));
+            for fifo in [&ready, &release] {
+                nix::unistd::mkfifo(fifo, nix::sys::stat::Mode::S_IRWXU)
+                    .expect("create a lock FIFO");
+            }
+            let (held, holder_status) = (root.join("lock-held"), root.join("lock-holder.status"));
+            let start_holder = format!(
+                "python3 -I {holder} {trace} {ready} {release} & holder=$!; read -r held < {ready}; echo \"$held\" > {held}",
+                holder = quoted(&holder),
+                trace = quoted(&trace),
+                ready = quoted(&ready),
+                release = quoted(&release),
+                held = quoted(&held),
+            );
+            let release_holder = format!(
+                "[ \"$held\" = locked ] && echo release > {release}; wait \"$holder\"; echo \"$?\" > {status}",
+                release = quoted(&release),
+                status = quoted(&holder_status),
+            );
+            let steps = vec![
+                Step::Command(start_holder),
+                traced(
+                    &root,
+                    "claude-locked",
+                    "",
+                    &state_asset(CLAUDE),
+                    SUBAGENT_START,
+                    NOT_JSON,
+                ),
+                traced(
+                    &root,
+                    "codex-locked",
+                    "",
+                    &state_asset(CODEX),
+                    SUBAGENT_START,
+                    NOT_JSON,
+                ),
+                Step::Command(release_holder),
+                traced(
+                    &root,
+                    "unlocked",
+                    "",
+                    &state_asset(CLAUDE),
+                    SUBAGENT_START,
+                    NOT_JSON,
+                ),
+            ];
+            replay(&root, steps, &Rows::new()).await.finish().await;
+
+            assert_eq!(
+                std::fs::read_to_string(&held)
+                    .expect("the holder's report")
+                    .trim(),
+                "locked",
+                "the holder held the lock while the hooks ran"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&holder_status)
+                    .expect("the holder's exit status")
+                    .trim(),
+                "0"
+            );
+            for name in ["claude-locked", "codex-locked", "unlocked"] {
+                assert_silent(&root, name);
+            }
+            let lines = trace_lines(&trace);
+            let [line] = lines.as_slice() else {
+                panic!("only the failure after the release writes a line: {lines:?}");
+            };
+            assert_line(
+                line,
+                &Expected::new(CLAUDE, SUBAGENT_START, &[INPUT_INVALID]),
+            );
+            assert_private(&trace);
+        }
+
+        /// Test item 5 and the enabling rule: a failure exit writes nothing
+        /// when either trace variable is absent, when the path is relative, or
+        /// when the bound is not a positive integer, nor outside a pohunek
+        /// session; the hook still exits 0 without output. The same failure
+        /// with the worker's variables writes the only line.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_failure_without_valid_trace_variables_writes_nothing() {
+            /// Relative trace path, resolved against the PTY's working
+            /// directory, which is the scenario's directory.
+            const RELATIVE: &str = "relative-hooks.jsonl";
+            let root = crate::test_support::scoped_dir("ph-trace-disabled-");
+            let (path, max) = (
+                protocol::ENV_HOOK_TRACE_PATH,
+                protocol::ENV_HOOK_TRACE_MAX_BYTES,
+            );
+            let untraced = [
+                ("both-absent", format!("unset {path} {max};")),
+                ("path-absent", format!("unset {path};")),
+                ("max-absent", format!("unset {max};")),
+                ("path-relative", format!("export {path}={RELATIVE};")),
+                ("max-zero", format!("export {max}=0;")),
+                ("max-not-a-number", format!("export {max}=many;")),
+                ("outside-session", format!("unset {};", protocol::ENV_FLAG)),
+            ];
+            let claude = state_asset(CLAUDE);
+            let mut steps: Vec<Step> = untraced
+                .iter()
+                .map(|(name, prelude)| {
+                    traced(&root, name, prelude, &claude, SUBAGENT_START, NOT_JSON)
+                })
+                .collect();
+            steps.push(traced(
+                &root,
+                "control",
+                "",
+                &claude,
+                SUBAGENT_START,
+                NOT_JSON,
+            ));
+            replay(&root, steps, &Rows::new()).await.finish().await;
+
+            for (name, _) in &untraced {
+                assert_silent(&root, name);
+            }
+            assert_silent(&root, "control");
+            assert!(
+                absent(&root.join(RELATIVE)),
+                "a relative trace path is never written"
+            );
+            let lines = trace_lines(&super::super::hook_trace_path(&root));
+            let [line] = lines.as_slice() else {
+                panic!("only the failure with the worker's variables writes a line: {lines:?}");
+            };
+            assert_line(
+                line,
+                &Expected::new(CLAUDE, SUBAGENT_START, &[INPUT_INVALID]),
+            );
         }
     }
 }

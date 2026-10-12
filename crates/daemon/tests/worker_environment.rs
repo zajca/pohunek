@@ -3,7 +3,9 @@
 //! A real `pohunek-sessiond` runs with the variables systemd and launchd give a
 //! supervised job plus an unrelated variable, and a real PTY child prints its
 //! environment. Protocol version six must hand the child exactly the base
-//! environment, the worker's `TERM`, the profile, and the worker identity. A
+//! environment, the worker's `TERM`, the profile, and the worker's reserved
+//! `POHUNEK_*` values. A profile value overrides the base one, while a profile
+//! can neither shadow a reserved value nor pass a service-manager variable. A
 //! version-five session keeps inheriting the worker environment, but without
 //! service-manager variables.
 //!
@@ -194,7 +196,21 @@ impl Fixture {
             dimensions: Dimensions::new(1000, 50).expect("dimensions"),
             environment: SecretEnv::new(BTreeMap::from([
                 ("PROFILE_TOKEN".to_owned(), "profile-value".to_owned()),
+                ("LANG".to_owned(), "C".to_owned()),
                 ("NOTIFY_SOCKET".to_owned(), "/run/profile-notify".to_owned()),
+                ("WATCHDOG_USEC".to_owned(), "1".to_owned()),
+                ("XPC_SERVICE_NAME".to_owned(), "profile".to_owned()),
+                ("POHUNEK_SESSION_ID".to_owned(), "s-spoofed".to_owned()),
+                ("POHUNEK_DAEMON_ID".to_owned(), "daemon-spoofed".to_owned()),
+                (
+                    "POHUNEK_HOOK_TRACE_PATH".to_owned(),
+                    self.root
+                        .join("spoofed-trace.jsonl")
+                        .to_str()
+                        .expect("UTF-8 fixture path")
+                        .to_owned(),
+                ),
+                ("POHUNEK_HOOK_TRACE_MAX_BYTES".to_owned(), "1".to_owned()),
             ]))
             .expect("profile environment"),
             base_environment: Some(
@@ -284,15 +300,27 @@ async fn current_worker_child_gets_only_base_term_profile_and_identity() {
         .to_string();
     let socket_path = fixture.socket_path();
     let daemon_socket = fixture.root.join("runtime/pohunek/daemon.sock");
+    // The shared hook failure trace lives in the pohunek log directory,
+    // `$XDG_STATE_HOME/pohunek/logs`.
+    let hook_trace = fixture.root.join("state/pohunek/logs/pohunek-hooks.jsonl");
+    let hook_trace_max_bytes = pohunek_logging::config::HOOK_TRACE_MAX_FILE_BYTES.to_string();
     let expected = BTreeMap::from([
         ("HOME", "/home/base"),
-        ("LANG", "C.UTF-8"),
+        ("LANG", "C"),
         ("PATH", "/usr/bin:/bin"),
         ("SHELL", "/bin/sh"),
         ("TERM", "xterm-256color"),
         ("PROFILE_TOKEN", "profile-value"),
         ("POHUNEK_ENV", "1"),
         ("POHUNEK_DAEMON_ID", DAEMON_ID),
+        (
+            "POHUNEK_HOOK_TRACE_PATH",
+            hook_trace.to_str().expect("UTF-8 fixture path"),
+        ),
+        (
+            "POHUNEK_HOOK_TRACE_MAX_BYTES",
+            hook_trace_max_bytes.as_str(),
+        ),
         ("POHUNEK_NATIVE_REFERENCE_KIND", "id"),
         ("POHUNEK_PROTOCOL_VERSION", "7"),
         ("POHUNEK_WORKER_INSTANCE_ID", worker_instance_id.as_str()),

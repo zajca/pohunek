@@ -175,6 +175,12 @@ captured screen through the package manifest.
   process and reopens listed terminal ones (see
   [sessions](../concepts/sessions.md); evidence in
   [#883](https://github.com/zajca/pohunek/issues/883)).
+- A Claude state hook action (`session`, `release`, `subagent-start`,
+  `subagent-stop`, `stop`) that fails to deliver its report, including a `stop`
+  that sends no snapshot, still exits 0 and appends one payload-free line per
+  reason (`provider` `claude`, the action and a reason code) to the hook failure trace
+  `pohunek-hooks.jsonl` in the pohunek log directory (see the
+  [debug-session-runtime](../runbooks/debug-session-runtime.md) runbook).
 - `claude --version` prints `2.1.289 (Claude Code)`; the inventory shows the
   package's probe accepted the real release.
 - Environment that keeps a real Claude away from host state and services:

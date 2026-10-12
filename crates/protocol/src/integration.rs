@@ -44,13 +44,24 @@ pub const ENV_WORKER_PROTOCOL_VERSION: &str = "POHUNEK_WORKER_PROTOCOL_VERSION";
 /// protocol version: [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION) is the single
 /// source of truth.
 pub const ENV_PROTOCOL_VERSION: &str = "POHUNEK_PROTOCOL_VERSION";
+/// Absolute path of the shared hook failure trace in the pohunek log directory.
+///
+/// The worker injects it into every managed PTY; the state hooks append one
+/// bounded line per traced failure exit there, and write nothing when it is
+/// absent or not absolute.
+pub const ENV_HOOK_TRACE_PATH: &str = "POHUNEK_HOOK_TRACE_PATH";
+/// Size in bytes at which the state hooks rotate the hook failure trace.
+///
+/// Injected beside [`ENV_HOOK_TRACE_PATH`] so the hooks never hardcode the
+/// bound; the hooks write no trace unless it is a positive integer.
+pub const ENV_HOOK_TRACE_MAX_BYTES: &str = "POHUNEK_HOOK_TRACE_MAX_BYTES";
 
 /// Expected integration asset version reported by `integration.status`.
 ///
 /// Every managed daemon hook asset carries this version marker. It is exposed
 /// through `protocol` because CLI and SDK consumers need the same expected value
 /// without linking the daemon implementation.
-pub const EXPECTED_INTEGRATION_VERSION: u32 = 12;
+pub const EXPECTED_INTEGRATION_VERSION: u32 = 13;
 
 /// Parameters for `integration.install`.
 ///

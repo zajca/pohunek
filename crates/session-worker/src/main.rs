@@ -142,6 +142,9 @@ async fn run() -> Result<(), WorkerError> {
         SocketKind::Daemon,
     )?;
     let _log_guard = init_logging(&paths.log_dir, &cli.session_id)?;
+    let hook_trace_path = paths
+        .log_dir
+        .join(pohunek_logging::config::HOOK_TRACE_FILE_NAME);
 
     let server = Server::bind(ServerArgs {
         session_id: cli.session_id.clone(),
@@ -150,6 +153,7 @@ async fn run() -> Result<(), WorkerError> {
         socket_path,
         journal_path,
         daemon_socket_path,
+        hook_trace_path,
         config: worker_config(service.as_ref()),
     })
     .await?;

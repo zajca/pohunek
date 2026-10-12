@@ -1,6 +1,7 @@
-//! Defines the application log-retention policies and owned file families.
+//! Defines the application log-retention policies, the owned file families,
+//! and the hook failure trace name and size bound.
 
-// Rust guideline compliant 2026-07-28
+// Rust guideline compliant 2026-10-12
 
 use crate::{Error, Files, Legacy, Policy};
 
@@ -26,6 +27,25 @@ pub const WORKER_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 /// Four files cap every session-owned worker log family at 16 MiB across all
 /// worker generations.
 pub const WORKER_MAX_FILES: usize = 4;
+
+/// File name of the shared hook failure trace in the log directory.
+///
+/// The managed provider state hooks append one bounded JSON line per traced
+/// failure exit to this file; the session worker hands them its full path
+/// through the reserved `POHUNEK_HOOK_TRACE_PATH` variable. Every session and
+/// provider shares the one file, so a lost hook report is found in a single
+/// place. The hooks rotate it themselves, so the name stays outside every
+/// [`Files`] family of the log writers.
+pub const HOOK_TRACE_FILE_NAME: &str = "pohunek-hooks.jsonl";
+
+/// Maximum bytes in the active hook failure trace before the hooks rotate it.
+///
+/// A trace line is a few hundred bytes, so 1 MiB holds thousands of failure
+/// exits. The hooks keep a single rotated `.1` file, so the trace never uses
+/// more than twice this value. The session worker hands the value to the hooks
+/// through the reserved `POHUNEK_HOOK_TRACE_MAX_BYTES` variable; a larger
+/// value only grows that bound.
+pub const HOOK_TRACE_MAX_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Builds the daemon log policy.
 ///
