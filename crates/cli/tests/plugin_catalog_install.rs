@@ -30,10 +30,7 @@ use protocol::{PackageId, PackageVersion, RuntimeId};
 use serde_json::{json, Value};
 use tokio::net::UnixStream;
 
-#[path = "support/catalog_fixture.rs"]
-mod catalog_fixture;
-
-use catalog_fixture::{
+use pohunek_test_support::catalog::{
     anchor_for, anchor_with, attestations_for, catalog_of, host_platform, key_id, root_of, signed,
     test_key, ANY_CORE, RUNTIME_API, WINDOW_END, WINDOW_START,
 };

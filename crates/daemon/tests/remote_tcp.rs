@@ -11,6 +11,8 @@
 //! over TCP, `host.inspect` over TCP, cross-transport payload parity, and the
 //! fail-closed bind.
 
+#[path = "support/official_runtimes.rs"]
+mod official_runtimes;
 mod support;
 
 use std::net::{IpAddr, SocketAddr};
@@ -96,7 +98,37 @@ fn shell_config() -> SessionRegistryConfig {
 async fn spawn_dual_servers(
     tag: &str,
     version: &str,
+    config: SessionRegistryConfig,
+) -> (
+    SocketAddr,
+    PathBuf,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    spawn_dual_servers_with(tag, version, config, false).await
+}
+
+/// [`spawn_dual_servers`] whose registry is the production one over a plugin
+/// root next to the socket, holding the official Codex and Claude packages
+/// installed through a catalog its throwaway trust anchor authorizes.
+async fn spawn_dual_servers_serving_official_runtimes(
+    tag: &str,
+    version: &str,
+    config: SessionRegistryConfig,
+) -> (
+    SocketAddr,
+    PathBuf,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    spawn_dual_servers_with(tag, version, config, true).await
+}
+
+async fn spawn_dual_servers_with(
+    tag: &str,
+    version: &str,
     mut config: SessionRegistryConfig,
+    official_runtimes: bool,
 ) -> (
     SocketAddr,
     PathBuf,
@@ -128,11 +160,24 @@ async fn spawn_dual_servers(
             .supervision(worker_binary())
             .with_environment_source(support::hermetic_environment_source()),
     );
-    let registry = SessionRegistry::new_with_launcher_and_inspector(
-        config,
-        Arc::new(SubprocessWorkerLauncher::new()),
-        Arc::new(HostInspector::new()),
-    );
+    let registry = if official_runtimes {
+        let catalog = official_runtimes::OfficialCatalog::new();
+        let config = catalog.configure(config, socket_dir.path().join("plugins"));
+        let registry = SessionRegistry::new_production_with_inspector(
+            config,
+            Arc::new(SubprocessWorkerLauncher::new()),
+            Arc::new(HostInspector::new()),
+        )
+        .expect("the production registry opens the plugin root");
+        catalog.install(&registry, socket_dir.path()).await;
+        registry
+    } else {
+        SessionRegistry::new_with_launcher_and_inspector(
+            config,
+            Arc::new(SubprocessWorkerLauncher::new()),
+            Arc::new(HostInspector::new()),
+        )
+    };
     let state = DaemonState::new(
         HealthInfo::new(version),
         registry,
@@ -572,8 +617,12 @@ async fn attach_over_tcp_round_trips_and_detach_keeps_session_running() {
 
 #[tokio::test]
 async fn host_inspect_over_tcp_returns_capabilities() {
-    let (addr, _socket, shutdown, handle) =
-        spawn_dual_servers("remote-inspect", "7.7.7-test", shell_config()).await;
+    let (addr, _socket, shutdown, handle) = spawn_dual_servers_serving_official_runtimes(
+        "remote-inspect",
+        "7.7.7-test",
+        shell_config(),
+    )
+    .await;
 
     let mut client = connect_tcp(addr).await;
     let req = Request::make("host-inspect", method::HOST_INSPECT, Value::Null);
@@ -725,8 +774,11 @@ async fn daemon_doctor_reports_profile_readiness_and_redacts_profile_content() {
         agents_dir: Some(agents),
         ..shell_config()
     };
+    // Codex is served, so its optional runtime check warns about the executable
+    // missing from `PATH`.
     let (_addr, socket, shutdown, handle) =
-        spawn_dual_servers("doctor-profile-readiness", "0.0.0", config).await;
+        spawn_dual_servers_serving_official_runtimes("doctor-profile-readiness", "0.0.0", config)
+            .await;
     let mut client = connect_unix(&socket).await;
     let response = exchange(
         &mut client,
@@ -756,6 +808,9 @@ async fn daemon_doctor_reports_profile_readiness_and_redacts_profile_content() {
         .expect("pinned runtime detail")
         .contains("pinned runtime is unavailable"));
     assert_eq!(find("agent_runtime_codex")["status"], "warn");
+    assert!(find("agent_runtime_codex")["detail"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("executable is missing")));
     let rendered = serde_json::to_string(&payload).expect("serialize doctor payload");
     assert!(!rendered.contains("PROFILE_SECRET_CANARY"));
     assert!(!rendered.contains("pohunek-missing-executable-canary"));
@@ -806,7 +861,8 @@ async fn daemon_doctor_reports_redacted_provider_integration_readiness() {
         std::fs::write(
             agents.join(format!("{name}.toml")),
             format!(
-                "base = \"codex\"\n[env]\nCODEX_HOME = \"{}\"\nAPI_KEY = \"DOCTOR_INTEGRATION_SECRET_CANARY\"\n",
+                "base = \"codex\"\n{}[env]\nCODEX_HOME = \"{}\"\nAPI_KEY = \"DOCTOR_INTEGRATION_SECRET_CANARY\"\n",
+                official_runtimes::profile_pin("codex"),
                 home.display()
             ),
         )
@@ -822,8 +878,12 @@ async fn daemon_doctor_reports_redacted_provider_integration_readiness() {
         agents_dir: Some(agents),
         ..shell_config()
     };
-    let (addr, socket, shutdown, handle) =
-        spawn_dual_servers("doctor-provider-integrations", "0.0.0", config).await;
+    let (addr, socket, shutdown, handle) = spawn_dual_servers_serving_official_runtimes(
+        "doctor-provider-integrations",
+        "0.0.0",
+        config,
+    )
+    .await;
     let mut local = connect_unix(&socket).await;
     let params = protocol::IntegrationInstallParams {
         agent: Some(protocol::RuntimeRef::codex()),
@@ -1071,19 +1131,23 @@ async fn daemon_doctor_bounds_oversized_profile_home_inspection() {
     process_env.set("PATH", root.path());
     let agents = root.path().join("agents");
     std::fs::create_dir(&agents).expect("create agents directory");
-    for index in 0..=PROFILE_SCAN_LIMIT {
-        std::fs::write(
-            agents.join(format!("profile-{index:04}.toml")),
-            "base = \"codex\"\n",
-        )
-        .expect("write profile entry");
-    }
     let config = SessionRegistryConfig {
-        agents_dir: Some(agents),
+        agents_dir: Some(agents.clone()),
         ..shell_config()
     };
     let (_addr, socket, shutdown, handle) =
-        spawn_dual_servers("doctor-oversized-profiles", "0.0.0", config).await;
+        spawn_dual_servers_serving_official_runtimes("doctor-oversized-profiles", "0.0.0", config)
+            .await;
+    // Written once the packages are installed: a package install reads the
+    // profile directory, which is past its scan limit from here on.
+    let profile = format!(
+        "base = \"codex\"\n{}",
+        official_runtimes::profile_pin("codex")
+    );
+    for index in 0..=PROFILE_SCAN_LIMIT {
+        std::fs::write(agents.join(format!("profile-{index:04}.toml")), &profile)
+            .expect("write profile entry");
+    }
     let mut client = connect_unix(&socket).await;
     let payload = ok_payload(
         exchange(
@@ -1186,9 +1250,10 @@ async fn daemon_doctor_uses_daemon_path_for_executable_and_profile_path_for_prob
     std::fs::create_dir(&agents).expect("create agents directory");
     process_env.set("PATH", &daemon_path);
 
+    let banner = official_runtimes::supported_banner("codex");
     std::fs::write(
         profile_path.join("profile-only-runtime"),
-        "#!/bin/sh\nprintf 'codex-cli 0.160.0\\n'\n",
+        format!("#!/bin/sh\nprintf '%s\\n' '{banner}'\n"),
     )
     .expect("write executable present only on profile PATH");
     std::fs::set_permissions(
@@ -1199,7 +1264,8 @@ async fn daemon_doctor_uses_daemon_path_for_executable_and_profile_path_for_prob
     std::fs::write(
         agents.join("profile-only.toml"),
         format!(
-            "base = \"codex\"\nprogram = \"profile-only-runtime\"\n[env]\nPATH = \"{}\"\n",
+            "base = \"codex\"\n{}program = \"profile-only-runtime\"\n[env]\nPATH = \"{}\"\n",
+            official_runtimes::profile_pin("codex"),
             profile_path.display()
         ),
     )
@@ -1208,7 +1274,7 @@ async fn daemon_doctor_uses_daemon_path_for_executable_and_profile_path_for_prob
     let runtime_script = daemon_path.join("runtime-script");
     std::fs::write(
         &runtime_script,
-        "#!/usr/bin/env sh\nprintf 'codex-cli 0.160.0\\n'\n",
+        format!("#!/usr/bin/env sh\nprintf '%s\\n' '{banner}'\n"),
     )
     .expect("write runtime script with PATH-resolved interpreter");
     std::fs::set_permissions(&runtime_script, std::fs::Permissions::from_mode(0o755))
@@ -1216,7 +1282,8 @@ async fn daemon_doctor_uses_daemon_path_for_executable_and_profile_path_for_prob
     std::fs::write(
         agents.join("profile-path-probe.toml"),
         format!(
-            "base = \"codex\"\nprogram = \"{}\"\n[env]\nPATH = \"/bin\"\n",
+            "base = \"codex\"\n{}program = \"{}\"\n[env]\nPATH = \"/bin\"\n",
+            official_runtimes::profile_pin("codex"),
             runtime_script.display()
         ),
     )
@@ -1227,7 +1294,8 @@ async fn daemon_doctor_uses_daemon_path_for_executable_and_profile_path_for_prob
         ..shell_config()
     };
     let (_addr, socket, shutdown, handle) =
-        spawn_dual_servers("doctor-path-readiness", "0.0.0", config).await;
+        spawn_dual_servers_serving_official_runtimes("doctor-path-readiness", "0.0.0", config)
+            .await;
     let mut client = connect_unix(&socket).await;
     let payload = ok_payload(
         exchange(

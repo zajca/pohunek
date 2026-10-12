@@ -34,8 +34,6 @@ use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-#[path = "support/catalog_fixture.rs"]
-mod catalog_fixture;
 #[path = "support/hermes_provider.rs"]
 mod hermes_provider;
 #[path = "support/interpreter.rs"]
@@ -43,12 +41,12 @@ mod interpreter;
 #[path = "support/plugin_harness.rs"]
 mod plugin_harness;
 
-use catalog_fixture::{
+use hermes_provider::{HermesProvider, API_KEY, MODEL};
+use plugin_harness::{path_str, Harness};
+use pohunek_test_support::catalog::{
     attestations_for, catalog_of, host_platform, root_of, signed, test_key, ANY_CORE, RUNTIME_API,
     WINDOW_END, WINDOW_START,
 };
-use hermes_provider::{HermesProvider, API_KEY, MODEL};
-use plugin_harness::{path_str, Harness};
 
 /// Directory of the package fixture, relative to the workspace root.
 const PACKAGE_DIR: &str = "compat/hermes/package";

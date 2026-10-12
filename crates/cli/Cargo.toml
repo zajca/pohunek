@@ -67,7 +67,7 @@ tempfile.workspace = true
 portable-pty = { workspace = true }
 overlay = { workspace = true }
 pohunek-logging = { workspace = true }
-pohunek-test-support = { workspace = true }
+pohunek-test-support = { workspace = true, features = ["catalog"] }
 # `plugin_daemon.rs` serves the real package lifecycle from an in-process daemon.
 pohunek-daemon = { path = "../daemon" }
 # `session_process_api.rs` asserts the real remote-port contract through the

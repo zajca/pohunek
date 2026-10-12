@@ -19,6 +19,8 @@
 
 // Rust guideline compliant 2026-09-22
 
+#[path = "support/official_runtimes.rs"]
+mod official_runtimes;
 mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -265,12 +267,32 @@ async fn wait_for_dir_containing(dir: &Path, marker: &[u8]) -> Vec<u8> {
 async fn spawn_worker_backed_server(
     socket: &Path,
     version: &str,
-    mut config: SessionRegistryConfig,
+    config: SessionRegistryConfig,
 ) -> (
     oneshot::Sender<()>,
     tokio::task::JoinHandle<()>,
     tempfile::TempDir,
 ) {
+    spawn_worker_backed_server_with(socket, version, config, None).await
+}
+
+/// [`spawn_worker_backed_server`] whose registry is the production one over a
+/// plugin root next to `socket`, holding the official Codex and Claude
+/// packages that `catalog` authorizes.
+async fn spawn_worker_backed_server_with(
+    socket: &Path,
+    version: &str,
+    mut config: SessionRegistryConfig,
+    official: Option<&official_runtimes::OfficialCatalog>,
+) -> (
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+    tempfile::TempDir,
+) {
+    let socket_dir = socket.parent().expect("test socket has a parent");
+    if let Some(catalog) = official {
+        config = catalog.configure(config, socket_dir.join("plugins"));
+    }
     let event_log_dir = config.event_log_dir.clone();
     // Short prefix: the worker's own control socket nests several directories
     // below this home (`<runtime_home>/pohunek/workers/<session>/control.sock`),
@@ -296,11 +318,23 @@ async fn spawn_worker_backed_server(
             .with_environment_source(support::hermetic_environment_source()),
     );
     let launcher = Arc::new(SubprocessWorkerLauncher::new());
-    let registry = SessionRegistry::new_with_launcher_and_inspector(
-        config,
-        launcher,
-        Arc::new(HostInspector::new()),
-    );
+    let registry = match official {
+        Some(catalog) => {
+            let registry = SessionRegistry::new_production_with_inspector(
+                config,
+                launcher,
+                Arc::new(HostInspector::new()),
+            )
+            .expect("the production registry opens the plugin root");
+            catalog.install(&registry, socket_dir).await;
+            registry
+        }
+        None => SessionRegistry::new_with_launcher_and_inspector(
+            config,
+            launcher,
+            Arc::new(HostInspector::new()),
+        ),
+    };
     if let Some(event_log_dir) = event_log_dir {
         let log = Arc::new(EventLog::open(&event_log_dir).expect("event log opens"));
         let _drain = spawn_drain(
@@ -747,25 +781,31 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
         .expect("make data directory private");
     std::fs::create_dir_all(&agents_dir).expect("create agents dir");
 
-    // Stub sentinel agent: prints a terminal-output sentinel unrelated to any
-    // input, then echoes back whatever the daemon injects as the initial
-    // prompt, exactly as a real agent's terminal echo would. The managed
+    // Stub sentinel agent: answers the official package's version probe, or
+    // prints a terminal-output sentinel unrelated to any input, then echoes
+    // back whatever the daemon injects as the initial prompt, exactly as a
+    // real agent's terminal echo would. The managed
     // child's environment carries only the profile's `env` plus the reserved
     // `POHUNEK_*` handshake keys (RFC §22) — no `PATH` — so `cat` is invoked
     // by absolute path rather than relying on `execvp` path resolution.
     let script = agents_dir.join("stub-agent.sh");
     write_executable(
         &script,
-        &format!("#!/bin/sh\nset -eu\nprintf '{OUTPUT}\\n'\nexec /bin/cat\n"),
+        &format!(
+            "#!/bin/sh\n{}set -eu\nprintf '{OUTPUT}\\n'\nexec /bin/cat\n",
+            official_runtimes::sh_version_answer("claude")
+        ),
     );
-    // A host agent profile (Part C): `base = "claude"` makes the session
-    // resumable (required for `session.report_native_id` below) while
-    // `program`/`args` override the launch entirely with our stub. `env` is a
-    // non-`POHUNEK_`-prefixed key so the loader does not strip it.
+    // A host agent profile (Part C): `base = "claude"`, pinned to the installed
+    // official package, makes the session resumable (required for
+    // `session.report_native_id` below) while `program`/`args` override the
+    // launch entirely with our stub. `env` is a non-`POHUNEK_`-prefixed key so
+    // the loader does not strip it.
     std::fs::write(
         agents_dir.join("sentinelclaude.toml"),
         format!(
-            "base = \"claude\"\nprogram = \"{}\"\nargs = [\"--sentinel-argv\", \"{ARGV}\"]\n\n[env]\nAPI_TOKEN = \"{ENV_VALUE}\"\n",
+            "base = \"claude\"\n{}program = \"{}\"\nargs = [\"--sentinel-argv\", \"{ARGV}\"]\n\n[env]\nAPI_TOKEN = \"{ENV_VALUE}\"\n",
+            official_runtimes::profile_pin("claude"),
             script.display()
         ),
     )
@@ -788,8 +828,9 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
         host_state_dir: Some(root.join("host-state")),
         ..SessionRegistryConfig::default()
     };
+    let catalog = official_runtimes::OfficialCatalog::new();
     let (shutdown, handle, worker_home) =
-        spawn_worker_backed_server(&socket, "0.0.0", config).await;
+        spawn_worker_backed_server_with(&socket, "0.0.0", config, Some(&catalog)).await;
     let worker_state_root = worker_home.path().join("state/pohunek/workers");
     let worker_log_dir = worker_home.path().join("state/pohunek/logs");
 

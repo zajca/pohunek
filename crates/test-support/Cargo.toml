@@ -4,8 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Test-only helpers: fixture roots that satisfy the trusted filesystem and Unix socket limits, a hermetic per-test environment, runtime resolution of test binaries, manifests and the session worker, and readiness waits bounded by one hang-guard ceiling."
+description = "Test-only helpers: fixture roots that satisfy the trusted filesystem and Unix socket limits, a hermetic per-test environment, runtime resolution of test binaries, manifests and the session worker, readiness waits bounded by one hang-guard ceiling, and (feature `catalog`) throwaway runtime catalog trust."
 publish = false
+
+[features]
+# `catalog`: a throwaway signing key, trust anchor and signed runtime catalog
+# for tests that install an official package (M-TEST-UTIL).
+catalog = ["dep:pohunek-package", "dep:ed25519-dalek", "dep:getrandom"]
 
 [dependencies]
 tempfile.workspace = true
@@ -15,6 +20,9 @@ rustix = { workspace = true, features = ["process"] }
 # `tokio::process::Command`; the workspace spec already enables every
 # feature the other crates use, so this adds no build weight to a workspace build.
 tokio.workspace = true
+pohunek-package = { workspace = true, optional = true }
+ed25519-dalek = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
 
 [dev-dependencies]
 # `test-util` provides the paused clock the async wait tests run under.

@@ -22,7 +22,7 @@ use pohunek_daemon::agent::host::{
 };
 use protocol::{BindingProvenance, PackageId, PackageVersion, RuntimeId};
 
-use crate::catalog_fixture::{anchor_for, signed, test_key, WINDOW_END};
+use pohunek_test_support::catalog::{anchor_for, signed, test_key, WINDOW_END};
 
 /// Source commit of a row-mode release block. A placeholder: 40 hex digits
 /// are the only property the daemon checks.

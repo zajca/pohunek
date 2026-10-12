@@ -2,6 +2,9 @@
 
 #![cfg(target_os = "linux")]
 
+#[path = "support/official_runtimes.rs"]
+mod official_runtimes;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -282,25 +285,43 @@ impl ProcessInspector for PollBlindInspector {
 ///
 /// The worker's directories are the private ones of `env`, whose short root
 /// leaves room for the worker's nested control socket.
-fn worker_backed_registry(
+///
+/// The registry is the production one over the plugin root of `env`, which
+/// holds the official Codex and Claude packages, so a foreground `codex` or
+/// `claude` is attributed through their detection manifests.
+async fn worker_backed_registry(
     env: &TestEnv,
     config: SessionRegistryConfig,
     inspector: Arc<dyn ProcessInspector>,
 ) -> SessionRegistry {
-    worker_backed_registry_with_launcher(
+    let catalog = official_runtimes::OfficialCatalog::new();
+    let registry = worker_backed_registry_with_launcher(
         env,
         config,
         inspector,
         Arc::new(SubprocessWorkerLauncher::new()),
-    )
+        &catalog,
+    );
+    catalog.install(&registry, env.root()).await;
+    registry
 }
 
+/// The plugin root of the registries this file builds over `env`.
+fn official_plugins_dir(env: &TestEnv) -> PathBuf {
+    env.state_home().join("pohunek/plugins")
+}
+
+/// The production registry over the plugin root of `env`, trusting
+/// `catalog`'s key, with the worker backend of [`worker_backed_registry`]; it
+/// installs nothing.
 fn worker_backed_registry_with_launcher(
     env: &TestEnv,
-    mut config: SessionRegistryConfig,
+    config: SessionRegistryConfig,
     inspector: Arc<dyn ProcessInspector>,
     launcher: Arc<SubprocessWorkerLauncher>,
+    catalog: &official_runtimes::OfficialCatalog,
 ) -> SessionRegistry {
+    let mut config = catalog.configure(config, official_plugins_dir(env));
     let worker_environment = SubprocessWorkerEnvironment {
         runtime_home: env.runtime_dir().to_path_buf(),
         state_home: env.state_home().to_path_buf(),
@@ -317,7 +338,8 @@ fn worker_backed_registry_with_launcher(
             .supervision(worker_binary())
             .with_environment_source(EnvironmentSource::fixed(env.environment().clone())),
     );
-    SessionRegistry::new_with_launcher_and_inspector(config, launcher, inspector)
+    SessionRegistry::new_production_with_inspector(config, launcher, inspector)
+        .expect("the production registry opens the plugin root")
 }
 
 #[tokio::test]
@@ -345,7 +367,8 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
             ..SessionRegistryConfig::default()
         },
         Arc::clone(&poll_blind) as Arc<dyn ProcessInspector>,
-    );
+    )
+    .await;
     let created = {
         let _process_env = without_pohunek_markers();
         registry
@@ -423,6 +446,7 @@ async fn procwatch_keeps_worker_agent_after_daemon_restart() {
         ..SessionRegistryConfig::default()
     };
     let launcher = Arc::new(SubprocessWorkerLauncher::new());
+    let catalog = official_runtimes::OfficialCatalog::new();
     let (created, child_pid, first_daemon_id) = std::thread::scope(|scope| {
         scope
             .spawn(|| {
@@ -436,7 +460,9 @@ async fn procwatch_keeps_worker_agent_after_daemon_restart() {
                         config.clone(),
                         Arc::new(HostInspector::new()),
                         Arc::clone(&launcher),
+                        &catalog,
                     );
+                    catalog.install(&first, env.root()).await;
                     let created = {
                         let _process_env = without_pohunek_markers();
                         first
@@ -474,6 +500,7 @@ async fn procwatch_keeps_worker_agent_after_daemon_restart() {
         config,
         Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
         launcher,
+        &catalog,
     );
     assert_ne!(second.daemon_instance_id(), first_daemon_id);
     second.reconcile_workers().await.expect("adopt live worker");
@@ -584,7 +611,8 @@ async fn procwatch_skips_nested_worker_agent_with_same_session_marker() {
             ..SessionRegistryConfig::default()
         },
         Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
-    );
+    )
+    .await;
     let created = {
         let _process_env = without_pohunek_markers();
         registry
@@ -666,7 +694,8 @@ async fn procwatch_updates_cwd_after_shell_cd() {
             ..SessionRegistryConfig::default()
         },
         Arc::new(HostInspector::new()),
-    );
+    )
+    .await;
     let created = registry
         .create(SessionNewParams {
             name: Some("procwatch-cwd".to_owned()),
@@ -728,13 +757,22 @@ async fn external_observer_reports_fake_agent_and_pidfd_removes_it() {
     let fake_claude = bin_dir.join("claude");
     symlink_sleep_as(&fake_claude);
     let inspector = PollBlindInspector::new();
-    let registry = SessionRegistry::new_with_inspector(
+    // The packages are installed before the observer starts, so its first pass
+    // already watches the Claude transcript root.
+    let catalog = official_runtimes::OfficialCatalog::new();
+    catalog
+        .preinstall(&official_plugins_dir(&env), env.root())
+        .await;
+    let registry = worker_backed_registry_with_launcher(
+        &env,
         SessionRegistryConfig {
             observe_external_agents: true,
             procwatch_poll: EXTERNAL_PROCWATCH_POLL,
             ..SessionRegistryConfig::default()
         },
         Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
+        Arc::new(SubprocessWorkerLauncher::new()),
+        &catalog,
     );
     let mut child = spawn_fake_agent(&env, &fake_claude);
     let child_pid = child.id();

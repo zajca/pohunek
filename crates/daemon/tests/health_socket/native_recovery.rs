@@ -172,12 +172,27 @@ impl ClaudeRig {
                 ack = ack_log.display().to_string(),
             ),
         );
+        // The agent process is a Bash image named `claude`; the program the
+        // profile names answers the official package's version probe and
+        // execs that image in place, so the session child keeps its pid.
+        let image_dir = bin.join("image");
+        std::fs::create_dir(&image_dir).expect("create the fixture agent image directory");
+        let image = image_dir.join("claude");
+        install_fixture_agent_image(&image);
         let program = bin.join("claude");
-        install_fixture_agent_image(&program);
+        write_executable(
+            &program,
+            &format!(
+                "#!/bin/sh\n{}exec {:?} \"$@\"\n",
+                official_runtimes::sh_version_answer("claude"),
+                image.display().to_string(),
+            ),
+        );
         std::fs::write(
             agents.join("claude-fixture.toml"),
             format!(
-                "base = \"claude\"\nprogram = \"{}\"\nargs = [\"{}\"]\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+                "base = \"claude\"\n{}program = \"{}\"\nargs = [\"{}\"]\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+                official_runtimes::profile_pin("claude"),
                 program.display(),
                 script.display(),
                 config_home.display(),
@@ -194,7 +209,7 @@ impl ClaudeRig {
             ..SessionRegistryConfig::default()
         };
         let (shutdown, server, worker_home) =
-            spawn_server_with_config(&socket, "0.0.0", registry_config).await;
+            spawn_server_serving_official_runtimes(&socket, "0.0.0", registry_config).await;
         let worker_state_root = worker_home.join("state/pohunek/workers");
         let mut control = connect(&socket).await;
         let mut params = session_params_in(cwd.to_path_buf());

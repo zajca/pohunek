@@ -3200,6 +3200,9 @@ dependencies = [
 name = "pohunek-test-support"
 version = "0.34.2"
 dependencies = [
+ "ed25519-dalek",
+ "getrandom 0.2.17",
+ "pohunek-package",
  "rustix",
  "tempfile",
  "tokio",

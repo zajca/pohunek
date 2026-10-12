@@ -2,7 +2,9 @@
 //!
 //! Every host is a hermetic environment holding a store written by the
 //! v0.33.0 daemon (schema 1) and worker journals of the current schema whose
-//! worker is this test process, so the process table proves it running.
+//! worker is this test process, so the process table proves it running. A
+//! test whose verdict needs the session's runtime served by this binary
+//! rebinds the fixture's Claude session to a runtime it ships built in.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -45,6 +47,14 @@ const LEGACY_MARKER_RELEASE: &str = "0.33.0";
 /// First release whose worker marks its children with
 /// `POHUNEK_WORKER_INSTANCE_ID`.
 const INSTANCE_MARKER_RELEASE: &str = "0.33.1";
+
+/// A hook runtime this binary ships built in; [`served_session_line`] rebinds
+/// a fixture session to it so its recovery stays served by the binary under
+/// test.
+const SERVED_BUILTIN: &str = "hermes";
+
+/// The hook schema the [`SERVED_BUILTIN`] descriptor declares.
+const SERVED_BUILTIN_HOOK_SCHEMA: &str = "identity-v1";
 
 /// Edits a journal into one the preflight must refuse.
 type Mutation = fn(&mut Value);
@@ -182,6 +192,14 @@ fn session_line(session: &str, worker: &str) -> Value {
     line
 }
 
+/// [`session_line`] rebound to [`SERVED_BUILTIN`], for a judgement that needs
+/// the session's runtime served by the binary under test.
+fn served_session_line(session: &str, worker: &str) -> Value {
+    let mut line = session_line(session, worker);
+    rebind_agent(&mut line, SERVED_BUILTIN);
+    line
+}
+
 /// A live journal of this test process, which is provably running.
 fn journal(session: &str, worker: &str) -> Value {
     let identity = HostInspector::new()
@@ -225,8 +243,8 @@ fn verdict_of<'a>(report: &'a PreflightReport, session: &str) -> (&'a Verdict, &
 fn clean_sessions_of_an_old_store_are_adoptable_and_nothing_is_written() {
     let host = Host::new();
     host.write_store(&[
-        session_line("s-1", "w-fixture"),
-        session_line("s-2", "w-two"),
+        served_session_line("s-1", "w-fixture"),
+        served_session_line("s-2", "w-two"),
     ]);
     host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
     host.write_journal("s-2", "w-two", &journal("s-2", "w-two"));
@@ -259,12 +277,12 @@ fn clean_sessions_of_an_old_store_are_adoptable_and_nothing_is_written() {
 #[test]
 fn a_session_record_that_cannot_be_loaded_is_named_and_not_adopted() {
     let host = Host::new();
-    let mut broken = session_line("s-1", "w-fixture");
+    let mut broken = served_session_line("s-1", "w-fixture");
     broken
         .as_object_mut()
         .expect("record object")
         .remove("runtime");
-    host.write_store(&[broken, session_line("s-2", "w-two")]);
+    host.write_store(&[broken, served_session_line("s-2", "w-two")]);
     host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
     host.write_journal("s-2", "w-two", &journal("s-2", "w-two"));
 
@@ -319,7 +337,7 @@ fn broken_resume_line() -> Value {
 #[test]
 fn an_unreadable_resume_line_loses_recovery_only_when_the_record_depends_on_it() {
     let host = Host::new();
-    let mut dependent = session_line("s-1", "w-fixture");
+    let mut dependent = served_session_line("s-1", "w-fixture");
     dependent["recovery"] = Value::Null;
     host.write_store(&[dependent, broken_resume_line()]);
     host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
@@ -333,7 +351,10 @@ fn an_unreadable_resume_line_loses_recovery_only_when_the_record_depends_on_it()
 
     // The record keeps its own complete recovery, which startup adopts with.
     let host = Host::new();
-    host.write_store(&[session_line("s-1", "w-fixture"), broken_resume_line()]);
+    host.write_store(&[
+        served_session_line("s-1", "w-fixture"),
+        broken_resume_line(),
+    ]);
     host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
 
     let report = host.report();
@@ -506,8 +527,8 @@ impl Drop for LegacyMarkedChild {
 fn a_live_worker_older_than_the_instance_marker_is_not_adopted() {
     let host = Host::new();
     host.write_store(&[
-        session_line("s-1", "w-fixture"),
-        session_line("s-2", "w-two"),
+        served_session_line("s-1", "w-fixture"),
+        served_session_line("s-2", "w-two"),
     ]);
     let mut legacy = journal("s-1", "w-fixture");
     legacy["version"] = json!(LEGACY_MARKER_RELEASE);
@@ -587,7 +608,7 @@ fn a_launch_identity_that_contradicts_the_record_is_not_adopted() {
 #[test]
 fn a_live_worker_without_a_record_is_unmanaged_and_a_dead_journal_is_not_listed() {
     let host = Host::new();
-    host.write_store(&[session_line("s-1", "w-fixture")]);
+    host.write_store(&[served_session_line("s-1", "w-fixture")]);
     host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
     host.write_journal("s-2", "w-orphan", &journal("s-2", "w-orphan"));
     let mut ended = journal("s-3", "w-ended");
@@ -649,7 +670,7 @@ fn a_store_the_daemon_would_refuse_is_reported_and_left_untouched() {
 #[test]
 fn a_store_at_the_current_schema_is_up_to_date() {
     let host = Host::new();
-    host.write_store(&[session_line("s-1", "w-fixture")]);
+    host.write_store(&[served_session_line("s-1", "w-fixture")]);
     pohunek_daemon::store::migrate_at_startup(&host.store).expect("migrate fixture store");
     host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
 
@@ -662,7 +683,7 @@ fn a_store_at_the_current_schema_is_up_to_date() {
 #[test]
 fn the_binary_prints_the_report_without_creating_or_changing_anything() {
     let host = Host::new();
-    host.write_store(&[session_line("s-1", "w-fixture")]);
+    host.write_store(&[served_session_line("s-1", "w-fixture")]);
     host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
     let before = host.snapshot();
 
@@ -843,11 +864,11 @@ fn rebind_agent(line: &mut Value, agent: &str) {
 fn a_built_in_runtime_that_reported_its_identity_is_adoptable_with_or_without_a_journaled_schema() {
     for journaled_schema in [false, true] {
         let host = Host::new();
-        host.write_store(&[session_line("s-1", "w-fixture")]);
+        host.write_store(&[served_session_line("s-1", "w-fixture")]);
         let mut reported = journal("s-1", "w-fixture");
-        with_active_identity(&mut reported, "claude");
+        with_active_identity(&mut reported, SERVED_BUILTIN);
         if journaled_schema {
-            reported["hook_schema"] = json!("identity-subagent-v1");
+            reported["hook_schema"] = json!(SERVED_BUILTIN_HOOK_SCHEMA);
         }
         host.write_journal("s-1", "w-fixture", &reported);
 
@@ -883,9 +904,9 @@ fn a_runtime_whose_definition_cannot_be_read_stays_unverified() {
 #[test]
 fn reading_runtime_definitions_creates_nothing_even_in_an_existing_plugin_root() {
     let host = Host::new();
-    host.write_store(&[session_line("s-1", "w-fixture")]);
+    host.write_store(&[served_session_line("s-1", "w-fixture")]);
     let mut reported = journal("s-1", "w-fixture");
-    with_active_identity(&mut reported, "claude");
+    with_active_identity(&mut reported, SERVED_BUILTIN);
     host.write_journal("s-1", "w-fixture", &reported);
     let plugins = host.env.state_home().join("pohunek").join("plugins");
     fs::DirBuilder::new()
@@ -950,10 +971,10 @@ fn a_session_pinned_to_a_runtime_source_this_binary_does_not_serve_loses_recover
     ];
     for (case, binding) in unserved {
         let host = Host::new();
-        let mut line = session_line("s-1", "w-fixture");
+        let mut line = served_session_line("s-1", "w-fixture");
         rebind_agent(&mut line, "pi");
         pin_recovery(&mut line, binding);
-        host.write_store(&[line, session_line("s-2", "w-two")]);
+        host.write_store(&[line, served_session_line("s-2", "w-two")]);
         host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
         host.write_journal("s-2", "w-two", &journal("s-2", "w-two"));
         let before = host.snapshot();

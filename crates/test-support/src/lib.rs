@@ -41,6 +41,10 @@
 //! which write fixture files through a child process so that no write
 //! descriptor in this process can make a later `exec` fail with `ETXTBSY`.
 //!
+//! The `catalog` module, compiled with the `catalog` feature, holds a
+//! throwaway signing key, trust anchor and signed runtime catalog for tests
+//! that install an official package.
+//!
 //! The [`workers`] module holds [`workers::WorkerGuard`], which terminates the
 //! `pohunek-sessiond` workers a fixture root owns when it drops and fails the
 //! test that left them running; [`env::TestEnv`] carries one for its root.
@@ -58,6 +62,8 @@
 
 // Rust guideline compliant 2026-10-02
 
+#[cfg(feature = "catalog")]
+pub mod catalog;
 pub mod env;
 pub mod fs;
 pub mod process_env;

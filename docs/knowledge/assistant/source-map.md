@@ -629,7 +629,8 @@ Runtime package archive format:
 - `crates/cli/tests/support/messages_stub.rs` — loopback Messages-API stub used instead of a model provider.
 - `crates/cli/tests/support/process_guard.rs` — process cleanup shared by the real-agent package tests.
 - `crates/cli/tests/support/plugin_harness.rs` — real-daemon harness shared by the package tests.
-- `crates/cli/tests/support/catalog_fixture.rs` — throwaway signing key, trust anchor and signed catalog helpers shared by the catalog install tests.
+- `crates/test-support/src/catalog.rs` — throwaway signing key, trust anchor and signed catalog helpers (feature `catalog`) shared by the catalog install tests of the CLI and the daemon.
+- `crates/daemon/tests/support/official_runtimes.rs` — installs the official Codex and Claude packages through a throwaway catalog for the daemon integration tests, and the `--version` answer their fake agents give.
 - `crates/cli/tests/support/model_stub.rs` — loopback chat-completions stub used instead of a model provider.
 - `crates/package/src/registry.rs` — owner-private registry record, transactions, retention and uninstall.
 - `crates/package/tests/archive.rs`

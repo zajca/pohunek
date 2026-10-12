@@ -2,13 +2,10 @@
 //!
 //! The signing key is generated from random bytes inside the test process and
 //! never leaves it; the anchor and catalog built here exist only for one test.
+//! The module is compiled with the `catalog` feature, which only test builds
+//! enable.
 
-#![allow(
-    dead_code,
-    reason = "each test binary uses a different subset of these helpers"
-)]
-
-// Rust guideline compliant 2026-10-06
+// Rust guideline compliant 2026-10-12
 
 use ed25519_dalek::SigningKey;
 use package::{
@@ -17,48 +14,73 @@ use package::{
 };
 
 /// Start of every signing window.
-pub(crate) const WINDOW_START: u64 = 1;
+pub const WINDOW_START: u64 = 1;
 
 /// End of every signing window and of a fresh catalog: 2100-01-01.
-pub(crate) const WINDOW_END: u64 = 4_102_444_800;
+pub const WINDOW_END: u64 = 4_102_444_800;
 
 /// A core range every released version satisfies.
-pub(crate) const ANY_CORE: &str = ">=0.0.0";
+pub const ANY_CORE: &str = ">=0.0.0";
 
 /// Core version of every fixture catalog's release block.
 ///
 /// Far above any real core version so that an entry range such as
 /// `>=999.0.0` admits the release while the daemon under test still judges it
 /// incompatible with its own version.
-pub(crate) const RELEASE_VERSION: &str = "999.0.0";
+pub const RELEASE_VERSION: &str = "999.0.0";
 
 /// Source commit of every fixture catalog's release block.
 const RELEASE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
 /// Runtime API version of every fixture entry.
-pub(crate) const RUNTIME_API: u32 = 1;
+pub const RUNTIME_API: u32 = 1;
 
 /// A fresh test keypair; the seed is random and exists only in this process.
-pub(crate) fn test_key() -> SigningKey {
+///
+/// # Panics
+///
+/// Panics when the operating system has no randomness to offer.
+#[must_use]
+pub fn test_key() -> SigningKey {
     let mut seed = [0_u8; 32];
     getrandom::getrandom(&mut seed).expect("operating system randomness");
     SigningKey::from_bytes(&seed)
 }
 
-pub(crate) fn key_id(key: &SigningKey) -> KeyId {
+/// The key id of `key`'s verifying key.
+#[must_use]
+pub fn key_id(key: &SigningKey) -> KeyId {
     KeyId::derive(&key.verifying_key())
 }
 
-pub(crate) fn root_of(key: &SigningKey, not_before: u64, not_after: u64) -> RootKey {
+/// A root key trusting `key` from `not_before` to `not_after` (Unix seconds).
+///
+/// # Panics
+///
+/// Panics when the window is empty, which would be a defect of the test.
+#[must_use]
+pub fn root_of(key: &SigningKey, not_before: u64, not_after: u64) -> RootKey {
     RootKey::new(key.verifying_key().to_bytes(), not_before, not_after).expect("root key")
 }
 
 /// The anchor file bytes trusting `key` for the whole signing window.
-pub(crate) fn anchor_for(key: &SigningKey) -> Vec<u8> {
+///
+/// # Panics
+///
+/// Panics when the anchor is invalid, which would be a defect of the test.
+#[must_use]
+pub fn anchor_for(key: &SigningKey) -> Vec<u8> {
     anchor_with(key, WINDOW_START, WINDOW_END, Vec::new())
 }
 
-pub(crate) fn anchor_with(
+/// The anchor file bytes trusting `key` from `not_before` to `not_after`
+/// (Unix seconds), with `revoked` key ids.
+///
+/// # Panics
+///
+/// Panics when the anchor is invalid, which would be a defect of the test.
+#[must_use]
+pub fn anchor_with(
     key: &SigningKey,
     not_before: u64,
     not_after: u64,
@@ -71,7 +93,8 @@ pub(crate) fn anchor_with(
 }
 
 /// The platform name the daemon matches catalog entries against.
-pub(crate) fn host_platform() -> String {
+#[must_use]
+pub fn host_platform() -> String {
     let arch = std::env::consts::ARCH;
     if cfg!(target_os = "macos") {
         format!("{arch}-apple-darwin")
@@ -88,7 +111,8 @@ fn fixture_digest(byte: u8) -> Sha256Digest {
 }
 
 /// One attestation per platform, as a catalog entry requires.
-pub(crate) fn attestations_for(platforms: &[String]) -> Vec<Attestation> {
+#[must_use]
+pub fn attestations_for(platforms: &[String]) -> Vec<Attestation> {
     platforms
         .iter()
         .map(|platform| Attestation {
@@ -121,7 +145,11 @@ fn release_for(entries: &[CatalogEntry]) -> Release {
     }
 }
 
-pub(crate) fn catalog_of(sequence: u64, expires_at: u64, entries: Vec<CatalogEntry>) -> Catalog {
+/// An unsigned catalog of `entries` with `sequence`, expiring at `expires_at`
+/// (Unix seconds), whose release block covers the host platform and every
+/// platform an entry lists.
+#[must_use]
+pub fn catalog_of(sequence: u64, expires_at: u64, entries: Vec<CatalogEntry>) -> Catalog {
     Catalog {
         schema_version: CATALOG_SCHEMA_VERSION,
         sequence,
@@ -134,6 +162,12 @@ pub(crate) fn catalog_of(sequence: u64, expires_at: u64, entries: Vec<CatalogEnt
 }
 
 /// The signed catalog document bytes for `catalog`.
-pub(crate) fn signed(key: &SigningKey, catalog: Catalog) -> Vec<u8> {
+///
+/// # Panics
+///
+/// Panics when the catalog cannot be signed or serialized, which would be a
+/// defect of the test.
+#[must_use]
+pub fn signed(key: &SigningKey, catalog: Catalog) -> Vec<u8> {
     catalog_document_bytes(&sign_catalog(catalog, key).expect("sign")).expect("document")
 }
