@@ -36,20 +36,6 @@ pub struct RuntimeHost {
     state: Arc<RwLock<Arc<HostState>>>,
     shell_command: Arc<ShellLaunch>,
     packages: Option<Arc<Packages>>,
-    #[cfg(test)]
-    snapshot_hook: Arc<SnapshotHook>,
-}
-
-#[cfg(test)]
-impl RuntimeHost {
-    /// Runs `hook` after `definition_for_pin` took its registry snapshot.
-    pub(crate) fn set_snapshot_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
-        *self
-            .snapshot_hook
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(hook));
-    }
 }
 
 /// One consistent view of the host: the registry and what the package layer
@@ -153,8 +139,6 @@ impl RuntimeHost {
                 args: Vec::new(),
             }),
             packages,
-            #[cfg(test)]
-            snapshot_hook: Arc::default(),
         }
     }
 
@@ -354,9 +338,11 @@ impl RuntimeHost {
     /// # Errors
     ///
     /// Returns `agent_kind_unsupported` for a value that is not a runtime id,
-    /// `runtime_not_installed` for a runtime or package that is not
-    /// installed or does not match the pin, and `runtime_incompatible` for a
-    /// pinned package whose root fails verification.
+    /// `runtime_served_by_package` for a built-in or unpinned snapshot of an
+    /// official alias a package serves, `runtime_not_installed` for any other
+    /// runtime or package that is not installed or does not match the pin, and
+    /// `runtime_incompatible` for a pinned package whose root fails
+    /// verification.
     pub fn resolve_pinned(
         &self,
         reference: &RuntimeRef,
@@ -464,67 +450,44 @@ impl RuntimeHost {
     }
 
     /// The definition that describes a session launched with `pin` for
-    /// observation: detection rules and input framing.
+    /// observation: detection rules, input framing and hook schema.
     ///
-    /// A package pin resolves from exactly its digest, verified again, so a
-    /// disabled package or another selected version never changes how a
-    /// session is observed. Every other pin resolves through the registry,
-    /// except that a built-in or unpinned session of a runtime an official
-    /// package serves is observed with the shadowed built-in definition.
+    /// It is the definition [`Self::resolve_pinned`] resumes the session from,
+    /// so a session is observed only through the runtime source its pin
+    /// names. A package pin resolves from exactly its digest, verified again;
+    /// a built-in or unpinned snapshot resolves only to a built-in of the same
+    /// package identity the registry serves now. A pin this daemon does not
+    /// serve (a built-in it does not ship, a built-in an official package
+    /// replaced, or a package digest that is not installed) is an error, and
+    /// callers fall back to the launch-time facts the session persisted and
+    /// the generic shell manifest, never to whatever serves the runtime id now.
     ///
     /// # Errors
     ///
-    /// Returns the stable protocol error of [`Self::resolve_pinned`] or
-    /// [`Self::resolve_ref`].
+    /// Returns the stable protocol error of [`Self::resolve_pinned`].
     pub fn definition_for_pin(
         &self,
         reference: &RuntimeRef,
         pin: &LaunchPin,
     ) -> Result<Arc<RuntimeDefinition>, ProtocolError> {
-        let packaged = matches!(
-            pin.binding().map(|binding| &binding.provenance),
-            Some(BindingProvenance::Package { .. })
-        );
-        if packaged && self.package_store().is_some() {
-            return self.resolve_pinned(reference, pin);
-        }
-        // One registry snapshot decides both the served and the shadowed
-        // definition, so a reload between two reads cannot mix them.
-        let registry = self.registry();
-        #[cfg(test)]
-        self.snapshot_hook.run();
-        launch_definition(&registry, reference.launchable()?)
+        self.resolve_pinned(reference, pin)
     }
 
     /// The verified definition the launch provenance of `pin` names for a
-    /// live session: the package of a package pin, the built-in runtime of a
-    /// built-in or unpinned snapshot (also while an official package serves
-    /// its id). `None` for a runtime no definition of that provenance backs
-    /// and for a package that cannot be resolved from its digest now.
+    /// live session, or `None` when this daemon does not serve that runtime
+    /// source (see [`Self::definition_for_pin`]).
     ///
     /// Callbacks, process recognition and detection of the session use it
     /// instead of resolving its runtime id against whatever the registry
-    /// serves now.
+    /// serves now; without it, nothing is attributed to the session's own
+    /// runtime through the registry.
     #[must_use]
     pub fn pinned_definition(
         &self,
         reference: &RuntimeRef,
         pin: &LaunchPin,
     ) -> Option<Arc<RuntimeDefinition>> {
-        let packaged = matches!(
-            pin.binding().map(|binding| &binding.provenance),
-            Some(BindingProvenance::Package { .. })
-        );
-        if packaged {
-            return self.definition_for_pin(reference, pin).ok();
-        }
-        let registry = self.registry();
-        let definition = launch_definition(&registry, reference.launchable().ok()?).ok()?;
-        matches!(
-            definition.binding().provenance,
-            BindingProvenance::Builtin { .. }
-        )
-        .then_some(definition)
+        self.definition_for_pin(reference, pin).ok()
     }
 
     /// The hook schema of a session pinned to a package whose descriptor
@@ -556,51 +519,6 @@ impl RuntimeHost {
 
     fn snapshot(&self) -> Arc<HostState> {
         Arc::clone(&self.state.read().unwrap_or_else(PoisonError::into_inner))
-    }
-}
-
-/// The definition a built-in or unpinned snapshot of `runtime_id` is described
-/// by in `registry`: the served definition, or the built-in an official
-/// package replaced.
-fn launch_definition(
-    registry: &RuntimeRegistry,
-    runtime_id: &RuntimeId,
-) -> Result<Arc<RuntimeDefinition>, ProtocolError> {
-    let current = registry.resolve(runtime_id)?;
-    if matches!(
-        current.binding().provenance,
-        BindingProvenance::Package { .. }
-    ) {
-        if let Some(builtin) = registry.shadowed_builtin(runtime_id) {
-            return Ok(Arc::clone(builtin));
-        }
-    }
-    Ok(Arc::clone(current))
-}
-
-/// Test hook run after a method took its registry snapshot.
-#[cfg(test)]
-#[derive(Default)]
-pub(crate) struct SnapshotHook(Mutex<Option<Arc<dyn Fn() + Send + Sync>>>);
-
-#[cfg(test)]
-impl SnapshotHook {
-    fn run(&self) {
-        let hook = self
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        if let Some(hook) = hook {
-            hook();
-        }
-    }
-}
-
-#[cfg(test)]
-impl std::fmt::Debug for SnapshotHook {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SnapshotHook")
     }
 }
 

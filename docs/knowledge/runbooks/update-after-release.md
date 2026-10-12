@@ -569,9 +569,16 @@ the upgrade is not what ends it.
 - `adoptable`: the new daemon adopts the worker and keeps its native recovery.
 - `would lose recovery`: the worker is adopted but the session cannot resume
   natively (`native_recovery_unmappable`, `resume_record_unreadable`,
-  `native_recovery_unverified`). A binding that needs the runtime registry to
-  complete its launch spec is `native_recovery_unverified`, because the
-  preflight cannot build the registry.
+  `native_recovery_unverified`, `runtime_source_not_served`). A binding that
+  needs the runtime registry to complete its launch spec is
+  `native_recovery_unverified`, because the store migration cannot consult the
+  registry. `runtime_source_not_served` means the session's launch pin names a
+  runtime source the new binary does not serve: a built-in runtime it does not
+  ship or an official package serves in place of, or a package digest that is
+  not installed. Resume and fork resolve exactly the pinned source, so nothing
+  else stands in and no command rebinds the session. Finish the work in the
+  live session, then continue in a new one with `pohunek session new --agent
+  <runtime>` (the `detail` names the runtime), or accept the loss.
 - `would not be adopted`: the new daemon would not manage the worker
   (`record_unreadable`, `worker_without_session_record`, `store_unusable`,
   `worker_generation_missing`,

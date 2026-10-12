@@ -665,16 +665,19 @@ pub(super) fn input_rules_for_definition(
 
 /// [`input_rules_for_definition`] for the runtime `agent` names; a kind
 /// without an installed definition gets unrestricted, unframed input.
+///
+/// Used for a record without a recovery binding, which carries neither a
+/// launch pin nor its launch-time framing, so the definition serving the
+/// runtime id now is the only framing and safety contract there is.
 pub(super) fn input_rules_for_agent(
     host: &RuntimeHost,
     agent: &RuntimeRef,
     config: &SessionRegistryConfig,
 ) -> InputRules {
-    host.definition_for_pin(agent, &crate::agent::host::LaunchPin::Unpinned)
-        .map_or_else(
-            |_unresolved| crate::agent::input_rules_for_kind(host, agent),
-            |definition| input_rules_for_definition(&definition, config),
-        )
+    host.resolve_ref(agent).map_or_else(
+        |_unresolved| crate::agent::input_rules_for_kind(host, agent),
+        |definition| input_rules_for_definition(&definition, config),
+    )
 }
 
 pub(super) fn build_input_writes(

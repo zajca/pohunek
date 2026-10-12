@@ -269,8 +269,23 @@ built-in runtime as soon as it is installed, enabled and selected;
 package whose runtime is the alias; without one the built-in serves it.
 A session launched from the built-in runtime keeps its binding but cannot be
 resumed or forked while the package serves the alias: the request fails with
-`runtime_served_by_package`. Disable or uninstall the official package to resume
-it from the built-in, or start a new session on the package. A host profile on
+`runtime_served_by_package`. The migration is a new session:
+`pohunek session new --agent <alias>`, which the package serves; no command
+rebinds a session to another runtime source. Stop and remove still work. After
+a daemon restart such a live session is adopted but observed only through its
+launch-time facts (generic shell manifest or the host profile's manifest
+override, persisted input framing, the hook schema its worker journaled); hook
+reports and processes naming its runtime are never attributed through the
+package, and stay unattributed until the next restart even when the package is
+uninstalled in between. `pohunekd upgrade-preflight` reports it as
+`would_lose_recovery` with code `runtime_source_not_served`, so `pohunek service
+upgrade` refuses until `--accept-runtime-loss` is given. A session whose worker
+runs a release before 0.34.0 journals no hook schema; if that worker journaled
+an active identity, the identity cannot be verified, so the session is not
+adopted: the preflight reports `would_not_be_adopted` with
+`worker_identity_unverified`, and startup reports the runtime as a `conflict`
+(`active_identity_provider_invalid`). Stop such a session with the running
+release before the upgrade, or accept losing its runtime. A host profile on
 that base can be pinned with `plugin profile migrate` once the package serves
 the base (`package_profile_base_builtin` before). A migrated schema-1 binding
 stays unpinned, so it is refused the same way.

@@ -631,12 +631,16 @@ struct SessionEntry {
     detector_preview: mpsc::Sender<DetectionPreviewRequest>,
     input_ready: watch::Receiver<bool>,
     default_detector_config: DetectorConfig,
-    /// Definition this session was launched from: the verified installed
-    /// package, or the built-in runtime (also once an official package serves
-    /// its id). Callbacks and observation of the session's own runtime use it
-    /// instead of whatever the registry serves now. `None` for a runtime no
-    /// definition of its provenance backs and for a package that did not
-    /// verify.
+    /// Definition of the session's launch pin, fixed when this daemon
+    /// launched or adopted the session: the verified installed package, or the
+    /// built-in runtime of the same package identity. A session launched by
+    /// this daemon keeps it while an official package takes its id over.
+    /// Callbacks and observation of the session's own runtime use it instead
+    /// of whatever the registry serves now, and without it nothing is
+    /// attributed to that runtime until a restart adopts the session again.
+    /// `None` when the pin was not served at adoption: a built-in an official
+    /// package served in place of, a built-in this daemon does not ship, a
+    /// package digest that is not installed, or a package that did not verify.
     pinned: Option<Arc<RuntimeDefinition>>,
     procwatch_cancel: CancellationToken,
     runtime_watch_cancel: CancellationToken,
@@ -2781,24 +2785,75 @@ impl SessionRegistry {
     }
 
     /// Resolves the agent a callback of session `id` names. A name that is the
-    /// session's own package runtime, bare or through a profile based on it,
-    /// resolves against the definition the session was launched from, not the
+    /// session's own runtime, bare or through a profile based on it, resolves
+    /// against the definition the session was launched from, not the
     /// registry's current selection; every other name resolves normally.
+    ///
+    /// The definition comes from [`SessionEntry::pinned`], fixed at launch or
+    /// adoption, so callbacks and process recognition of one session follow
+    /// one rule until a daemon restart adopts it again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallbackRefusal::UnservedPin`] for a name of the session's
+    /// own runtime while the session holds no definition of its launch pin:
+    /// whatever serves that runtime id now never stands in for the pinned
+    /// source. Returns [`CallbackRefusal::Unresolved`] for a name that
+    /// resolves to no agent.
     async fn resolve_session_agent(
         &self,
         id: &SessionId,
         agent: &str,
-    ) -> Result<ResolvedAgent, ProtocolError> {
-        let pinned = self
+    ) -> Result<ResolvedAgent, CallbackRefusal> {
+        let (pinned, agent_base) = {
+            let sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get(id) else {
+                return self
+                    .inner
+                    .profiles
+                    .resolve_agent(agent)
+                    .map_err(CallbackRefusal::Unresolved);
+            };
+            (entry.pinned.clone(), entry.info.agent_base.clone())
+        };
+        if let Some(pinned) = pinned {
+            return self
+                .inner
+                .profiles
+                .resolve_agent_pinned(agent, &pinned)
+                .map_err(CallbackRefusal::Unresolved);
+        }
+        let resolved = self
             .inner
-            .sessions
-            .lock()
-            .await
-            .get(id)
-            .and_then(|entry| entry.pinned.clone());
-        match pinned {
-            Some(pinned) => self.inner.profiles.resolve_agent_pinned(agent, &pinned),
-            None => self.inner.profiles.resolve_agent(agent),
+            .profiles
+            .resolve_agent(agent)
+            .map_err(CallbackRefusal::Unresolved)?;
+        if RuntimeRef::from(resolved.base.clone()) == agent_base {
+            return Err(CallbackRefusal::UnservedPin(agent_base));
+        }
+        Ok(resolved)
+    }
+
+    /// Logs why a callback `report` of session `id` naming `agent` is ignored.
+    ///
+    /// A callback refused because the session's runtime source is not served
+    /// is logged at INFO: it is an operator-visible consequence of a package
+    /// takeover, not a malformed report.
+    fn log_callback_refusal(id: &SessionId, agent: &str, report: &str, refusal: &CallbackRefusal) {
+        match refusal {
+            CallbackRefusal::Unresolved(error) => debug!(
+                session_id = %id.0,
+                agent = %agent,
+                error = %error,
+                "{report} for an unknown agent; ignoring"
+            ),
+            CallbackRefusal::UnservedPin(runtime) => info!(
+                name: "session.callback.unserved_pin",
+                session_id = %id.0,
+                agent = %agent,
+                runtime = %agent_kind_label(runtime),
+                "{report} names the session's runtime, whose launch source was not served when this daemon adopted the session (replaced, missing or failing verification); ignoring until a daemon restart adopts it from a served source"
+            ),
         }
     }
 
@@ -2815,12 +2870,12 @@ impl SessionRegistry {
             .await
         {
             Ok(resolved) => resolved,
-            Err(err) => {
-                debug!(
-                    session_id = %params.session_id.0,
-                    agent = %params.agent,
-                    error = %err,
-                    "active-agent report for an unknown agent; ignoring"
+            Err(refusal) => {
+                Self::log_callback_refusal(
+                    &params.session_id,
+                    &params.agent,
+                    "active-agent report",
+                    &refusal,
                 );
                 return not_recorded;
             }
@@ -2932,12 +2987,12 @@ impl SessionRegistry {
             .await
         {
             Ok(resolved) => resolved,
-            Err(err) => {
-                debug!(
-                    session_id = %params.session_id.0,
-                    agent = %params.agent,
-                    error = %err,
-                    "active-agent release for an unknown agent; ignoring"
+            Err(refusal) => {
+                Self::log_callback_refusal(
+                    &params.session_id,
+                    &params.agent,
+                    "active-agent release",
+                    &refusal,
                 );
                 return not_released;
             }
@@ -5572,6 +5627,15 @@ impl SessionRegistry {
     /// A session this registry does not hold is admitted here: the callers
     /// already ignore a report for an unknown session.
     ///
+    /// The schema resolves through the session's launch pin: the schema of
+    /// [`SessionEntry::pinned`]. A session without one (this daemon did not
+    /// serve its pin at adoption) is checked with the schema its live worker
+    /// journaled, the rule the worker applies on its own socket, so the
+    /// definition serving the runtime id now never decides. A worker that
+    /// journaled none, or cannot be asked, falls back to the schema the pin
+    /// resolves to now ([`Self::session_hook_schema`]), which for an unserved
+    /// built-in pin is none, so the report is refused.
+    ///
     /// # Errors
     ///
     /// Returns the [`pohunek_worker_protocol::HookDenial`] when the session's
@@ -5583,20 +5647,28 @@ impl SessionRegistry {
         action: pohunek_worker_protocol::HookAction,
         provider: &str,
     ) -> Result<(), pohunek_worker_protocol::HookDenial> {
-        let (agent_base, pinned, pin) = {
+        let (agent_base, pinned, pin, worker) = {
             let sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get(id) else {
                 return Ok(());
+            };
+            let worker = match &entry.runtime {
+                RuntimeHandle::Worker(worker) => Some(worker.clone()),
+                RuntimeHandle::Unavailable(_) => None,
             };
             (
                 entry.info.agent_base.clone(),
                 entry.pinned.clone(),
                 entry.snapshot.launch_binding.clone(),
+                worker,
             )
         };
         let schema = match pinned {
             Some(definition) => definition.hook_schema(),
-            None => self.session_hook_schema(&agent_base, &pin),
+            None => match self.journaled_hook_schema(id, worker.as_ref()).await {
+                Some(schema) => Some(schema),
+                None => self.session_hook_schema(&agent_base, &pin),
+            },
         };
         pohunek_worker_protocol::admit_hook(
             schema,
@@ -5625,6 +5697,32 @@ impl SessionRegistry {
         }
     }
 
+    /// The hook schema the live `worker` of session `id` journaled, when it
+    /// can be asked and names a schema this daemon knows.
+    ///
+    /// A worker that cannot be asked is logged at WARN: admission then falls
+    /// back to the schema the pin resolves to, which refuses every report of a
+    /// session whose pin is not served until the worker answers again.
+    async fn journaled_hook_schema(
+        &self,
+        id: &SessionId,
+        worker: Option<&Worker>,
+    ) -> Option<&'static pohunek_worker_protocol::HookSchema> {
+        let snapshot = match worker?.inspect().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                warn!(
+                    name: "session.hook.journaled_schema_unavailable",
+                    session_id = %id.0,
+                    error = %error,
+                    "the worker cannot report its journaled hook schema; hook admission falls back to the session's pin"
+                );
+                return None;
+            }
+        };
+        pohunek_worker_protocol::hook_schema(snapshot.hook_schema.as_deref()?)
+    }
+
     /// The hook schema of the runtime a session of `agent_base` launched with
     /// `pin`, resolved through the runtime's integration.
     ///
@@ -5645,6 +5743,17 @@ impl SessionRegistry {
         }
         lookup.schema()
     }
+}
+
+/// Why a callback of a session is not attributed to an agent.
+#[derive(Debug)]
+enum CallbackRefusal {
+    /// The name resolves to no agent.
+    Unresolved(ProtocolError),
+    /// The name is the session's own runtime, and the session holds no
+    /// definition of its launch pin because this daemon did not serve that
+    /// source when it launched or adopted the session.
+    UnservedPin(RuntimeRef),
 }
 
 /// What the runtime definitions say about a session's hook schema.

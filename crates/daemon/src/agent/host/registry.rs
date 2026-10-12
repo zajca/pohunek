@@ -85,8 +85,6 @@ pub struct InventoryEntry {
 #[derive(Debug, Clone)]
 pub struct RuntimeRegistry {
     definitions: BTreeMap<RuntimeId, Arc<RuntimeDefinition>>,
-    /// Built-in definitions an official package serves in place of, by id.
-    shadowed: BTreeMap<RuntimeId, Arc<RuntimeDefinition>>,
 }
 
 impl RuntimeRegistry {
@@ -95,7 +93,9 @@ impl RuntimeRegistry {
     ///
     /// An [`SourceTrust::Official`] definition of an official agent id
     /// replaces the built-in definition of that id, whichever source comes
-    /// first; the replaced built-in is kept for [`Self::shadowed_builtin`].
+    /// first. The replaced built-in is not served: a session launched from it
+    /// is refused by the launch-pin check rather than observed or resumed
+    /// through another definition.
     ///
     /// # Errors
     ///
@@ -139,7 +139,6 @@ impl RuntimeRegistry {
                 }
             }
         }
-        let mut shadowed = BTreeMap::new();
         for definition in official {
             let runtime_id = definition.runtime_id().clone();
             let reserved = RESERVED_RUNTIME_IDS.contains(&runtime_id.as_str());
@@ -153,21 +152,9 @@ impl RuntimeRegistry {
                     return Err(RegistryError::Duplicate { runtime_id });
                 }
             }
-            if let Some(builtin) = definitions.insert(runtime_id.clone(), Arc::new(definition)) {
-                shadowed.insert(runtime_id, builtin);
-            }
+            definitions.insert(runtime_id, Arc::new(definition));
         }
-        Ok(Self {
-            definitions,
-            shadowed,
-        })
-    }
-
-    /// The built-in definition of `runtime_id` when an official package
-    /// serves the id instead.
-    #[must_use]
-    pub fn shadowed_builtin(&self, runtime_id: &RuntimeId) -> Option<&Arc<RuntimeDefinition>> {
-        self.shadowed.get(runtime_id)
+        Ok(Self { definitions })
     }
 
     /// Resolves an installed runtime.

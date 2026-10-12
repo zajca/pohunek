@@ -69,6 +69,12 @@ pub const CODE_WORKER_MARKER_LEGACY: &str = "worker_marker_legacy";
 pub const CODE_RECOVERY_UNMAPPABLE: &str = "native_recovery_unmappable";
 /// The native recovery binding needs the runtime registry to be completed.
 pub const CODE_RECOVERY_UNVERIFIED: &str = "native_recovery_unverified";
+/// The session's launch pin names a runtime source the new daemon does not
+/// serve: a built-in runtime it does not ship or an official package serves
+/// in its place, or a package digest that is not installed. The worker is
+/// adopted, but resume and fork are refused, because no other source stands
+/// in for the pinned one.
+pub const CODE_RUNTIME_SOURCE_NOT_SERVED: &str = "runtime_source_not_served";
 /// The metadata store is unusable, so the new daemon cannot start.
 pub const CODE_STORE_UNUSABLE: &str = "store_unusable";
 /// The separately stored resume record of the session is skipped when the

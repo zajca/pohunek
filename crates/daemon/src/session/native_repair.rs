@@ -3,12 +3,13 @@
 //!
 //! The migration marks a binding that lost its launch spec and belongs to a
 //! non-built-in agent ([`ResumeBinding::native_launch_unresolved`]). When the
-//! record is loaded, the spec is resolved by agent name, the same rule
+//! record is loaded, the spec is resolved by agent name against the
+//! definition the binding's launch pin names, the same rule
 //! `binding_native_launch` applies to a binding without a snapshot program. A
 //! binding that cannot be resolved stays loadable: it logs a WARN, carries a
 //! [`SessionWarningKind::NativeRecovery`] warning and is never resumed.
 
-// Rust guideline compliant 2026-06-26
+// Rust guideline compliant 2026-10-12
 
 use protocol::{RuntimeRef, SessionCapabilities, SessionWarning, SessionWarningKind};
 use tracing::warn;
@@ -28,7 +29,8 @@ pub(super) enum NativeRepair {
 }
 
 impl SessionRegistry {
-    /// Resolves the launch spec of a marked binding by agent name.
+    /// Resolves the launch spec of a marked binding by agent name, against
+    /// the definition its launch pin names.
     ///
     /// The flag is cleared only when the spec was set or was already present,
     /// so an unresolved binding is retried on the next load.
@@ -40,7 +42,30 @@ impl SessionRegistry {
             binding.native_launch_unresolved = false;
             return NativeRepair::NotNeeded;
         }
-        let resolved = match self.inner.profiles.resolve_agent(&binding.agent) {
+        // The spec comes only from the runtime source the binding's pin names,
+        // so a package serving the runtime id now never writes its spec into
+        // a binding of another source; the binding stays marked and is
+        // retried on the next load.
+        let pinned = match self
+            .inner
+            .profiles
+            .runtimes()
+            .definition_for_pin(&binding.agent_base, &binding.launch_binding)
+        {
+            Ok(pinned) => pinned,
+            Err(error) => {
+                return NativeRepair::Unrepairable(format!(
+                    "the runtime source session agent `{}` was started from is not served by \
+                     this daemon ({})",
+                    binding.agent, error.code
+                ));
+            }
+        };
+        let resolved = match self
+            .inner
+            .profiles
+            .resolve_agent_pinned(&binding.agent, &pinned)
+        {
             Ok(resolved) => resolved,
             Err(error) => {
                 return NativeRepair::Unrepairable(format!(

@@ -24,6 +24,29 @@ use super::{
 const PROCWATCH_SOURCE: &str = "pohunek:procwatch";
 type ObservedIdentity = (Pid, u64);
 
+/// How process recognition treats a session's own runtime.
+#[derive(Debug, Clone)]
+pub(super) enum OwnRuntime {
+    /// The definition the session's launch pin names; its process matchers
+    /// recognize the session's runtime also when the registry serves another
+    /// source for the runtime id.
+    Pinned(Arc<RuntimeDefinition>),
+    /// This daemon serves no definition of the session's launch pin. A
+    /// process the registry identifies as this runtime is not attributed to
+    /// the session, so another source's detection rules never stand in.
+    Unserved(RuntimeRef),
+}
+
+impl OwnRuntime {
+    /// The own-runtime rule of `entry`.
+    pub(super) fn of(entry: &SessionEntry) -> Self {
+        entry.pinned.clone().map_or_else(
+            || Self::Unserved(entry.info.agent_base.clone()),
+            Self::Pinned,
+        )
+    }
+}
+
 /// Result of one terminal-foreground probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForegroundProbe {
@@ -158,18 +181,12 @@ impl SessionRegistry {
         let root_pid = root.pid;
         let observed_refresh = match self.inner.inspector.descendants(root_pid) {
             Ok(facts) => {
-                let pinned = self
-                    .inner
-                    .sessions
-                    .lock()
-                    .await
-                    .get(id)
-                    .and_then(|entry| entry.pinned.clone());
+                let own = self.inner.sessions.lock().await.get(id).map(OwnRuntime::of);
                 Some(self.observed_agents_from_facts_for_runtime(
                     id,
                     facts,
                     now,
-                    pinned.as_ref(),
+                    own.as_ref(),
                     Some(&expected.worker_instance_id),
                 ))
             }
@@ -373,9 +390,9 @@ impl SessionRegistry {
         id: &SessionId,
         facts: Vec<ProcessFact>,
         now: Instant,
-        pinned: Option<&Arc<RuntimeDefinition>>,
+        own: Option<&OwnRuntime>,
     ) -> HashMap<Pid, ObservedAgent> {
-        self.observed_agents_from_facts_for_runtime(id, facts, now, pinned, None)
+        self.observed_agents_from_facts_for_runtime(id, facts, now, own, None)
     }
 
     fn observed_agents_from_facts_for_runtime(
@@ -383,15 +400,20 @@ impl SessionRegistry {
         id: &SessionId,
         facts: Vec<ProcessFact>,
         now: Instant,
-        pinned: Option<&Arc<RuntimeDefinition>>,
+        own: Option<&OwnRuntime>,
         worker_instance_id: Option<&str>,
     ) -> HashMap<Pid, ObservedAgent> {
+        let (pinned, unserved) = match own {
+            Some(OwnRuntime::Pinned(definition)) => (Some(definition), None),
+            Some(OwnRuntime::Unserved(base)) => (None, Some(base)),
+            None => (None, None),
+        };
         facts
             .into_iter()
             .filter_map(|fact| {
-                // The session's own package runtime is recognized by the
-                // process matchers it was launched with, also when the
-                // registry no longer serves that package.
+                // The session's own runtime is recognized by the process
+                // matchers it was launched with, also when the registry serves
+                // another source for its runtime id.
                 let own = pinned.filter(|definition| {
                     definition
                         .manifest()
@@ -403,6 +425,9 @@ impl SessionRegistry {
                     None => identify_definition(self.inner.profiles.runtimes(), &fact)?,
                 };
                 let agent_base = RuntimeRef::from(definition.runtime_id().clone());
+                if unserved == Some(&agent_base) {
+                    return None;
+                }
                 if self.is_foreign_owned_agent(id, fact.pid, worker_instance_id) {
                     return None;
                 }

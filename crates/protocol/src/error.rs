@@ -224,8 +224,10 @@ impl ProtocolError {
     /// The session was launched from the built-in runtime of `runtime`, which
     /// an official runtime package serves now. Nothing is launched and the
     /// stored session keeps its binding: no other provenance stands in for
-    /// the one it was launched from. The identity is a validated
-    /// [`RuntimeId`], so echoing it is safe.
+    /// the one it was launched from, and no operation rebinds a session to
+    /// another runtime source. The recovery hint names the one migration: a
+    /// new session of the runtime, which the package serves. The identity is
+    /// a validated [`RuntimeId`], so echoing it is safe.
     #[must_use]
     pub fn runtime_served_by_package(runtime: &RuntimeId) -> Self {
         Self::new(
@@ -234,10 +236,9 @@ impl ProtocolError {
             format!(
                 "runtime `{runtime}` is served by an official package now, but the session was launched from the built-in runtime"
             ),
-            Some(
-                "disable or uninstall the official package to resume the session from the built-in runtime, or start a new session on the package"
-                    .to_owned(),
-            ),
+            Some(format!(
+                "start a new session with `pohunek session new --agent {runtime}`, which the official package serves; a session cannot be rebound to another runtime source"
+            )),
         )
     }
 
