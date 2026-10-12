@@ -629,6 +629,7 @@ Signed runtime catalog:
 - `crates/package/src/release.rs` — the catalog release block, binary-set digests and per-entry attestation rules.
 - `crates/package/src/release.rs` — the catalog release block, binary-set digests and per-entry attestation rules.
 - `crates/xtask/src/runtime_package.rs` — `cargo xtask package build|verify`.
+- `crates/xtask/src/package_baseline.rs` — `cargo xtask package baseline`: which official packages the signed release `v<version>` proves unchanged, with stable reason codes for the missing ones.
 - `crates/package/src/anchor.rs` — the catalog trust anchor file format and its strict parser.
 - `crates/package/src/sign.rs` — catalog signing for release tooling.
 - `crates/daemon/src/catalog_anchor.rs` — reading the anchor beside the daemon executable and its file-safety policy.

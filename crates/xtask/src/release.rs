@@ -341,7 +341,7 @@ pub(crate) struct AssembleSummary {
 }
 
 /// Parses `X.Y.Z` into its components, each below `2^SEQUENCE_COMPONENT_BITS`.
-fn parse_version(text: &str) -> Result<[u64; 3], XtaskError> {
+pub(crate) fn parse_version(text: &str) -> Result<[u64; 3], XtaskError> {
     let malformed = || refuse(InputClass::Version, Fault::Malformed, "version");
     let mut parts = text.split('.');
     let mut components = [0_u64; 3];
@@ -365,7 +365,7 @@ fn parse_version(text: &str) -> Result<[u64; 3], XtaskError> {
 }
 
 /// The catalog sequence of a version: it orders like the version.
-fn sequence_of(version: [u64; 3]) -> u64 {
+pub(crate) fn sequence_of(version: [u64; 3]) -> u64 {
     (version[0] << (2 * SEQUENCE_COMPONENT_BITS))
         | (version[1] << SEQUENCE_COMPONENT_BITS)
         | version[2]

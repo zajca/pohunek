@@ -36,10 +36,10 @@ use crate::affected::{
 use crate::XtaskError;
 
 /// Directory of the official runtime packages; each subdirectory is one package.
-const PACKAGES_DIR: &str = "runtime-packages";
+pub(crate) const PACKAGES_DIR: &str = "runtime-packages";
 
 /// Directory of the per-runtime compatibility locks, captured screens and npm projects.
-const LOCKS_DIR: &str = "compat";
+pub(crate) const LOCKS_DIR: &str = "compat";
 
 /// Directories whose `<dir>/<package>/` subtrees belong to one package.
 const PACKAGE_ROOTS: [&str; 2] = [PACKAGES_DIR, LOCKS_DIR];
@@ -156,7 +156,7 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
 }
 
 /// Returns the top level of the Git work tree containing `dir`.
-fn git_toplevel(dir: &Path) -> Result<PathBuf, XtaskError> {
+pub(crate) fn git_toplevel(dir: &Path) -> Result<PathBuf, XtaskError> {
     let mut output = command_output(dir, GIT, &["rev-parse", "--show-toplevel"])?;
     if output.last() == Some(&b'\n') {
         output.pop();
@@ -169,7 +169,7 @@ fn git_toplevel(dir: &Path) -> Result<PathBuf, XtaskError> {
 /// A symbolic link, a name that is not UTF-8, or an empty listing fails: none
 /// of them occurs in a sound checkout, and selecting from a partial listing
 /// could skip a package.
-fn official_packages(root: &Path) -> Result<BTreeSet<String>, XtaskError> {
+pub(crate) fn official_packages(root: &Path) -> Result<BTreeSet<String>, XtaskError> {
     let dir = root.join(PACKAGES_DIR);
     let io_error = |source| XtaskError::Io {
         path: dir.clone(),

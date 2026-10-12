@@ -87,7 +87,7 @@ fn reject_output_inside(dir: &Path, output: &Path) -> Result<(), XtaskError> {
 
 /// Builds the canonical archive bytes of `dir`, mapping directory failures to
 /// [`XtaskError`] values that name `dir`.
-fn build_bytes(dir: &Path, limits: &Limits) -> Result<Vec<u8>, XtaskError> {
+pub(crate) fn build_bytes(dir: &Path, limits: &Limits) -> Result<Vec<u8>, XtaskError> {
     build_directory_archive(dir, limits).map_err(|error| match error {
         DirectoryError::UnsupportedFileType => XtaskError::UnsupportedFileType(dir.to_path_buf()),
         DirectoryError::InvalidPath => XtaskError::InvalidPath(dir.to_path_buf()),

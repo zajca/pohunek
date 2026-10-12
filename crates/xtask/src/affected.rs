@@ -836,7 +836,7 @@ const REPOSITORY_REDIRECTING_VARS: &[&str] = &[
 
 /// Builds a command for `program` that runs in `dir`; a Git command also drops
 /// the [`REPOSITORY_REDIRECTING_VARS`] it would inherit.
-fn command_in(dir: &Path, program: &str) -> Command {
+pub(crate) fn command_in(dir: &Path, program: &str) -> Command {
     let mut command = Command::new(program);
     command.current_dir(dir);
     if program == GIT {
