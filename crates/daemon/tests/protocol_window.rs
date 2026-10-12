@@ -980,7 +980,7 @@ async fn run_prebump_hook(
         .env("POHUNEK_SOCKET_PATH", &relay.path)
         .env("POHUNEK_PROTOCOL_VERSION", version.to_string())
         .env("POHUNEK_SESSION_ID", &live.session_id)
-        .env("POHUNEK_RUNTIME_ID", &live.worker_instance_id)
+        .env("POHUNEK_WORKER_INSTANCE_ID", &live.worker_instance_id)
         .stdin(std::process::Stdio::piped());
     let mut child = command.spawn().expect("spawn managed hook");
     let mut pipe = child.stdin.take().expect("hook stdin");

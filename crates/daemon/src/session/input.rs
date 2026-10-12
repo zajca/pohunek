@@ -8,11 +8,12 @@ use crate::agent::host::{RuntimeDefinition, RuntimeHost};
 use crate::runtime::WriteReservation;
 
 use super::{
-    broadcast, session_not_found, session_not_running, unavailable_runtime_error, warn,
-    worker_error_to_protocol, ActivityEvidence, AgentActivity, Duration, ErrorClass, InputRules,
-    LaunchCommand, LaunchCommandPlan, ProtocolError, ResolvedAgent, RuntimeHandle, RuntimeRef,
-    SessionEntry, SessionId, SessionInputParams, SessionInputResult, SessionInputWait,
-    SessionRegistry, SessionRegistryConfig, SessionState, Worker,
+    broadcast, runtime_loss_reason, session_not_found, session_not_running,
+    unavailable_runtime_error, warn, worker_error_to_protocol, ActivityEvidence, AgentActivity,
+    Duration, ErrorClass, InputRules, LaunchCommand, LaunchCommandPlan, ProtocolError,
+    ResolvedAgent, RuntimeHandle, RuntimeRef, SessionEntry, SessionId, SessionInputParams,
+    SessionInputResult, SessionInputWait, SessionRegistry, SessionRegistryConfig, SessionState,
+    Worker,
 };
 
 pub(super) const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
@@ -126,7 +127,7 @@ impl SessionRegistry {
                     .map_err(worker_error_to_protocol)?;
             }
             RuntimeHandle::Unavailable(state) => {
-                return Err(unavailable_runtime_error(session_id, state));
+                return Err(unavailable_runtime_error(session_id, state, None));
             }
         }
 
@@ -216,7 +217,11 @@ impl SessionRegistry {
             let worker = match &entry.runtime {
                 RuntimeHandle::Worker(worker) => worker.clone(),
                 RuntimeHandle::Unavailable(state) => {
-                    return Err(unavailable_runtime_error(session_id, *state));
+                    return Err(unavailable_runtime_error(
+                        session_id,
+                        *state,
+                        runtime_loss_reason(entry).as_deref(),
+                    ));
                 }
             };
             (worker, entry.input_rules, runtime)
@@ -553,7 +558,11 @@ fn input_runtime_identity(
         .as_ref()
         .ok_or_else(ProtocolError::session_terminal_unavailable)?;
     if runtime.state != protocol::RuntimeState::Live {
-        return Err(unavailable_runtime_error(session_id, runtime.state));
+        return Err(unavailable_runtime_error(
+            session_id,
+            runtime.state,
+            runtime.loss_reason.as_deref(),
+        ));
     }
     let worker_instance_id = runtime
         .worker_instance_id

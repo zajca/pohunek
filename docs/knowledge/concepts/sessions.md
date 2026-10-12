@@ -354,8 +354,11 @@ refused with `session_runtime_lost`, `session_runtime_reconnecting`, or
 `worker_protocol_incompatible`. Each classification as `conflict`, `lost`,
 `reconnecting`, or `incompatible` logs one WARN, `session runtime is
 {runtime.state}: {reason}`, to `pohunekd.jsonl`.
-`incompatible` means the worker is alive but has no compatible private protocol
-version, so the daemon leaves it running. Attach, input, and resize are not
+`incompatible` means the worker is alive but the daemon does not manage it, so
+it leaves the worker running: `worker_protocol_incompatible` when the worker
+has no compatible private protocol version, `worker_marker_legacy` when its
+journal names a worker release before 0.33.1 (or none), whose children carry
+no `POHUNEK_WORKER_INSTANCE_ID` marker any sweep could attribute. Attach, input, and resize are not
 available in these degraded states, but list and inspect retain the logical
 record and diagnostic `loss_reason`. After preserving diagnostic evidence, the
 operator can remove a degraded logical record with `session rm`. A `lost` runtime

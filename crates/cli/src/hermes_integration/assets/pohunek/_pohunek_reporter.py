@@ -61,7 +61,7 @@ class Reporter:
         self._provider = provider
         self._provider_label = _PROVIDER_LABELS[provider]
         self._session_id = env.get("POHUNEK_SESSION_ID", "") if env.get("POHUNEK_ENV") == "1" else ""
-        self._worker_instance_id = env.get("POHUNEK_WORKER_INSTANCE_ID") or env.get("POHUNEK_RUNTIME_ID", "")
+        self._worker_instance_id = env.get("POHUNEK_WORKER_INSTANCE_ID", "")
         self._worker_socket = _local_socket(env.get("POHUNEK_WORKER_SOCKET_PATH", ""))
         self._daemon_socket = _local_socket(env.get("POHUNEK_SOCKET_PATH", ""))
         self._protocol = _positive_int(env.get("POHUNEK_PROTOCOL_VERSION"))

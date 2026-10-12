@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use pohunek_platform::{filesystem::TrustedDir, process::BootIdentity, supervisor::WorkerKey};
+use pohunek_service_config::preflight::CODE_WORKER_MARKER_LEGACY;
 use pohunek_worker_protocol::{
     AncestryMatcher, ControlCode, InspectSnapshot, PtyRelation, ReleasedIdentityClaim,
     RuntimePhase, SubagentField,
@@ -44,7 +45,7 @@ use crate::runtime::lifecycle::{
 use crate::session::target::open_detector_output;
 use crate::store::{ResumeBinding, SessionWriteOutcome};
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 pub mod upgrade_preflight;
 
@@ -168,6 +169,10 @@ pub(super) struct JournalEvidence {
     worker_spawn_id: Option<String>,
     #[serde(rename = "runtime_id")]
     worker_instance_id: Option<String>,
+    /// Package release of the worker that wrote the journal; every journal of
+    /// a readable schema carries it.
+    #[serde(default)]
+    version: Option<String>,
     child: Option<JournalChild>,
     cols: Option<u16>,
     rows: Option<u16>,
@@ -218,7 +223,34 @@ pub(super) struct JournalLaunchIdentity {
     process: Option<JournalProcess>,
 }
 
+/// First worker release that marks its PTY children with
+/// `POHUNEK_WORKER_INSTANCE_ID`.
+///
+/// Earlier workers mark them only with `POHUNEK_RUNTIME_ID`, which no sweep,
+/// hook or process inspector reads, so a runtime they own could never be
+/// cleaned up or reported on; such a worker is not adopted
+/// ([`CODE_WORKER_MARKER_LEGACY`]). Lowering the bound lets startup adopt a
+/// runtime whose processes no sweep can attribute.
+const FIRST_INSTANCE_MARKER_RELEASE: semver::Version = semver::Version::new(0, 33, 1);
+
 impl JournalEvidence {
+    /// Whether the journaled worker release marks its children with
+    /// `POHUNEK_WORKER_INSTANCE_ID`.
+    ///
+    /// A journal whose release is missing or not a semantic version proves
+    /// nothing and counts as not marking them.
+    pub(super) fn marks_worker_instance(&self) -> bool {
+        self.version
+            .as_deref()
+            .and_then(|version| semver::Version::parse(version).ok())
+            .is_some_and(|version| version >= FIRST_INSTANCE_MARKER_RELEASE)
+    }
+
+    /// The journaled worker release, for operator-facing text.
+    pub(super) fn release(&self) -> &str {
+        self.version.as_deref().unwrap_or("unknown")
+    }
+
     /// Returns the worker process facts this journal records.
     pub(super) fn worker(&self) -> JournalWorker<'_> {
         JournalWorker {
@@ -1113,6 +1145,37 @@ impl SessionRegistry {
                         .await;
                     return true;
                 };
+                // A worker older than the worker-instance marker leaves children
+                // no sweep can attribute, so its live runtime is refused and left
+                // alone. A stop or removal intent and an ended worker are settled
+                // through the worker below.
+                if record.desired_state == DesiredState::Running
+                    && matches!(
+                        candidate.snapshot.phase,
+                        RuntimePhase::Running | RuntimePhase::Starting
+                    )
+                    && !journal.marks_worker_instance()
+                {
+                    tracing::warn!(
+                        name: "session.runtime.legacy_worker",
+                        session_id = %record.session_id,
+                        worker_id = %journal.worker_id,
+                        worker.release = journal.release(),
+                        "live worker of release {{worker.release}} predates the worker-instance \
+                         marker and is not adopted; removing the session retires it and loses \
+                         its runtime"
+                    );
+                    self.mark_inventory_unmanaged(&record.session_id, CODE_WORKER_MARKER_LEGACY)
+                        .await;
+                    self.mark_pending(
+                        record,
+                        RuntimeState::Incompatible,
+                        CODE_WORKER_MARKER_LEGACY,
+                        retry,
+                    )
+                    .await;
+                    return false;
+                }
                 match observe(lifecycle, generation).await {
                     JobEvidence::Present(observation) => {
                         if let Some(detail) =
@@ -1645,6 +1708,30 @@ impl SessionRegistry {
             }
         }
         let _persisted = self.insert_unavailable_record(record, state, reason).await;
+    }
+
+    /// Shows the discovered worker of `session_id` as `incompatible` with
+    /// `reason` in the runtime inventory and announces the entry.
+    ///
+    /// Discovery lists every answering worker as managed; a worker startup
+    /// refuses to adopt is not, so its entry says why.
+    async fn mark_inventory_unmanaged(&self, session_id: &str, reason: &str) {
+        let entry = {
+            let mut inventory = self.inner.runtime_inventory.lock().await;
+            let Some(entry) = inventory.iter_mut().find(|entry| {
+                entry.runtime_slot == session_id && entry.status == RuntimeInventoryStatus::Managed
+            }) else {
+                return;
+            };
+            entry.status = RuntimeInventoryStatus::Incompatible;
+            entry.reason = Some(reason.to_owned());
+            entry.clone()
+        };
+        let event = crate::events::event(
+            event::SESSION_RUNTIME_DISCOVERED,
+            event_payload(RuntimeInventoryEvent { entry }),
+        );
+        let _ = self.inner.events.send(event);
     }
 
     /// Records that a live worker was adopted while its job is proven absent.
@@ -6558,6 +6645,7 @@ while os.getppid() == parent:
             boot_identity: "boot-test".to_owned(),
             worker_spawn_id: None,
             worker_instance_id: record.runtime.worker_instance_id.clone(),
+            version: Some("0.0.0-test".to_owned()),
             child: Some(super::JournalChild {
                 pid: 50,
                 start_identity: "500".to_owned(),
@@ -6744,6 +6832,7 @@ while os.getppid() == parent:
             boot_identity: "boot-test".to_owned(),
             worker_spawn_id: None,
             worker_instance_id: record.runtime.worker_instance_id.clone(),
+            version: Some("0.0.0-test".to_owned()),
             child: Some(super::JournalChild {
                 pid: 50,
                 start_identity: "500".to_owned(),
@@ -11176,6 +11265,10 @@ handler = "codex-hook-v1"
         use time::format_description::well_known::Rfc3339;
         use time::OffsetDateTime;
 
+        /// Bound on the parked hook of the hook scenario; the scenario kills
+        /// the hook long before it, so only a hung test ever reaches it.
+        const HOOK_RUN_BOUND: Duration = Duration::from_secs(60);
+
         /// Sweep grace of the fixtures; short so a `SIGKILL` fallback stays fast.
         const SWEEP_GRACE: Duration = Duration::from_millis(300);
         use super::hermetic_shell;
@@ -11634,13 +11727,92 @@ handler = "codex-hook-v1"
             .await;
         }
 
-        /// A daemon upgraded while a worker kept running sees descendants that
-        /// carry only `POHUNEK_RUNTIME_ID`; after a crash the sweep reaps them
-        /// and the runtime is lost with a confirmed cleanup.
+        /// A lifecycle hook the daemon runs for a session carries the
+        /// session's `POHUNEK_SESSION_ID` but no worker marker. A crash sweep
+        /// of the session's runtime while the hook runs leaves it alone and
+        /// still confirms the cleanup.
         #[tokio::test]
-        async fn crash_sweeps_a_descendant_that_carries_only_the_runtime_id_marker() {
+        async fn crash_sweep_leaves_a_running_daemon_hook_of_the_session_alone() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
-            let lost = Marked::spawn_with(&[("POHUNEK_RUNTIME_ID", "runtime-s-310")]);
+            let config_dir = fixture.root.join("hook-config");
+            std::fs::create_dir_all(config_dir.join("hooks")).expect("create hook directory");
+            let pid_file = fixture.root.join("hook.pid");
+            std::fs::write(
+                config_dir.join("hooks/session-start"),
+                format!(
+                    "echo $$ > '{}'\nexec sleep {}\n",
+                    pid_file.display(),
+                    HOOK_RUN_BOUND.as_secs()
+                ),
+            )
+            .expect("write session-start hook");
+            let cwd = fixture.root.clone();
+            let context = crate::worktree::HookContext {
+                session_id: "s-312".to_owned(),
+                agent: "shell".to_owned(),
+                ..crate::worktree::HookContext::default()
+            };
+            let runner = tokio::task::spawn_blocking(move || {
+                let mut warnings = Vec::new();
+                crate::worktree::run_hook(
+                    crate::worktree::HookEvent::SessionStart,
+                    &cwd,
+                    &context,
+                    HOOK_RUN_BOUND,
+                    Some(&config_dir),
+                    &mut warnings,
+                );
+                warnings
+            });
+            let hook_pid = super::wait_for_pid_file(&pid_file).await;
+            persist_record(&fixture.root, "s-312", Some("runtime-s-312"));
+            write_live_journal(
+                &fixture.root,
+                "s-312",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-312"),
+            );
+            let id = service_id("s-312", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-312").await;
+            let hook_alive = HostInspector::new()
+                .identity(hook_pid)
+                .is_ok_and(|identity| identity.is_some());
+            let _ = pohunek_test_support::process_env::command("kill")
+                .args(["-KILL", &hook_pid.to_string()])
+                .status();
+            let _warnings = runner.await.expect("hook runner joins");
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
+            assert!(hook_alive, "a daemon-run hook is never signalled");
+            assert_eq!(fixture.supervisor.retired(), vec![id]);
+        }
+
+        /// A crashed worker released before `POHUNEK_WORKER_INSTANCE_ID`
+        /// leaves descendants marked with its session but no worker instance
+        /// this daemon reads. The sweep cannot attribute them, so it signals
+        /// none of them and the runtime is lost with its cleanup unconfirmed.
+        #[tokio::test]
+        async fn crash_next_to_a_descendant_without_an_instance_marker_keeps_the_cleanup_unconfirmed(
+        ) {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let legacy = Marked::spawn_with(&[
+                ("POHUNEK_SESSION_ID", "s-310"),
+                ("POHUNEK_WORKER_ID", "worker-s-310"),
+                ("POHUNEK_RUNTIME_ID", "runtime-s-310"),
+            ]);
+            let other_session = Marked::spawn_with(&[
+                ("POHUNEK_SESSION_ID", "s-310-other"),
+                ("POHUNEK_WORKER_ID", "worker-s-310-other"),
+                ("POHUNEK_RUNTIME_ID", "runtime-s-310"),
+            ]);
             persist_record(&fixture.root, "s-310", Some("runtime-s-310"));
             write_live_journal(
                 &fixture.root,
@@ -11659,44 +11831,17 @@ handler = "codex-hook-v1"
 
             let runtime = runtime_of(&fixture.registry, "s-310").await;
             assert_eq!(runtime.state, RuntimeState::Lost);
-            assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
-            lost.wait_gone().await;
-        }
-
-        /// A process claiming two worker instances is neither signalled nor
-        /// allowed to make the cleanup look complete.
-        #[tokio::test]
-        async fn crash_next_to_a_process_with_conflicting_markers_keeps_the_cleanup_unconfirmed() {
-            let fixture = fixture(Arc::new(RetryInspector::default()));
-            let conflicting = Marked::spawn_with(&[
-                ("POHUNEK_WORKER_INSTANCE_ID", "runtime-s-311"),
-                ("POHUNEK_RUNTIME_ID", "runtime-s-311-other"),
-            ]);
-            persist_record(&fixture.root, "s-311", Some("runtime-s-311"));
-            write_live_journal(
-                &fixture.root,
-                "s-311",
-                dead_worker_with_realistic_start(),
-                Some("runtime-s-311"),
-            );
-            fixture.supervisor.script_job(
-                service_id("s-311", TEST_GENERATION),
-                present(ServiceState::Failed, None),
-            );
-
-            Box::pin(fixture.registry.reconcile_workers())
-                .await
-                .expect("reconcile");
-
-            let runtime = runtime_of(&fixture.registry, "s-311").await;
-            assert_eq!(runtime.state, RuntimeState::Lost);
             assert_eq!(
                 runtime.loss_reason.as_deref(),
                 Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED)
             );
             assert!(
-                conflicting.alive(),
-                "an ambiguous process is never signalled"
+                legacy.alive(),
+                "an unattributable descendant is never signalled"
+            );
+            assert!(
+                other_session.alive(),
+                "a process of another session is never signalled"
             );
         }
 
@@ -11852,6 +11997,107 @@ handler = "codex-hook-v1"
                 .stop(&SessionId("s-306".to_owned()))
                 .await
                 .expect("stop adopted worker");
+            server_task.abort();
+        }
+
+        /// A live worker released before `POHUNEK_WORKER_INSTANCE_ID` marks its
+        /// children with a name no sweep reads, so startup refuses to adopt
+        /// it: the session is shown incompatible with a typed reason and
+        /// announced, and neither the worker, its job nor its children are
+        /// signalled or retired.
+        #[tokio::test]
+        async fn live_worker_older_than_the_instance_marker_is_reported_and_not_adopted() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let runtime_root = fixture.root.join("runtime/workers");
+            let (controller, worker_instance_id, _child_pid, server_task) =
+                spawn_initialized_worker(&fixture.root, &runtime_root, "s-320", "worker-s-320")
+                    .await;
+            persist_record(&fixture.root, "s-320", Some(worker_instance_id.as_str()));
+            drop(controller);
+            let legacy_child = Marked::spawn_with(&[
+                ("POHUNEK_SESSION_ID", "s-320"),
+                ("POHUNEK_WORKER_ID", "worker-s-320"),
+                ("POHUNEK_RUNTIME_ID", worker_instance_id.as_str()),
+            ]);
+            rewrite_journal(&fixture.root, "s-320", "worker-s-320", |journal| {
+                journal.insert("version".to_owned(), "0.33.0".into());
+            });
+            let mut events = fixture.registry.subscribe();
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let journal: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(fixture.root.join("state/workers/s-320/worker-s-320.json"))
+                    .expect("read journal"),
+            )
+            .expect("journal json");
+            assert_eq!(
+                journal["version"], "0.33.0",
+                "the worker kept the journaled release the daemon judged"
+            );
+            let runtime = runtime_of(&fixture.registry, "s-320").await;
+            assert_eq!(runtime.state, RuntimeState::Incompatible);
+            assert_eq!(runtime.loss_reason.as_deref(), Some("worker_marker_legacy"));
+            let durable = durable_record(&fixture.root, "s-320");
+            assert_eq!(
+                durable.runtime.reason.as_deref(),
+                Some("worker_marker_legacy")
+            );
+            let mut announced = false;
+            while let Ok(event) = events.try_recv() {
+                if event.event() == protocol::event::SESSION_RUNTIME_LOST {
+                    announced |= event.payload()["session"]["runtime"]["loss_reason"].as_str()
+                        == Some("worker_marker_legacy");
+                }
+            }
+            assert!(announced, "the refusal is announced to subscribers");
+            let inventory = fixture.registry.runtime_inventory().await;
+            let entry = inventory
+                .entries
+                .iter()
+                .find(|entry| entry.runtime_slot == "s-320")
+                .expect("the refused worker is inventoried");
+            assert_eq!(entry.status, RuntimeInventoryStatus::Incompatible);
+            assert_eq!(entry.reason.as_deref(), Some("worker_marker_legacy"));
+            let id = SessionId("s-320".to_owned());
+            let stop = fixture
+                .registry
+                .stop(&id)
+                .await
+                .expect_err("a refused worker is not stopped by this daemon");
+            let resize = fixture
+                .registry
+                .resize(&id, 100, 30)
+                .await
+                .expect_err("a refused worker is not resized");
+            for (operation, error) in [("stop", stop), ("resize", resize)] {
+                assert_eq!(error.code, "worker_protocol_incompatible", "{operation}");
+                assert!(
+                    error.msg.contains("worker_marker_legacy"),
+                    "{operation} names the reason: {error:?}"
+                );
+                assert!(
+                    error
+                        .recover
+                        .as_deref()
+                        .is_some_and(|recover| recover.contains("0.33.1")
+                            && recover.contains("pohunek session rm")),
+                    "{operation} carries the recovery: {error:?}"
+                );
+            }
+            assert!(fixture.supervisor.retired().is_empty(), "no job is retired");
+            assert!(legacy_child.alive(), "no child is signalled");
+            crate::runtime::Worker::connect(
+                &runtime_root
+                    .join("s-320")
+                    .join(pohunek_paths::WORKER_SOCKET_NAME),
+                "s-320",
+                "legacy-probe",
+            )
+            .await
+            .expect("the refused worker stays alive");
             server_task.abort();
         }
 
@@ -15282,9 +15528,11 @@ handler = "codex-hook-v1"
         async fn a_sweep_failure_after_the_job_was_retired_keeps_the_stop_intent() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
             let conflicted = conflicted_session(&fixture, "s-5236").await;
-            let conflicting = Marked::spawn_with(&[
-                ("POHUNEK_WORKER_INSTANCE_ID", "runtime-s-5236"),
-                ("POHUNEK_RUNTIME_ID", "runtime-s-5236-other"),
+            // A worker child of the session without a worker-instance marker
+            // cannot be attributed, so the sweep leaves it unconfirmed.
+            let unmarked = Marked::spawn_with(&[
+                ("POHUNEK_SESSION_ID", "s-5236"),
+                ("POHUNEK_WORKER_ID", "worker-s-5236"),
             ]);
 
             let error = fixture
@@ -15312,7 +15560,7 @@ handler = "codex-hook-v1"
                 "the stop is not committed"
             );
 
-            drop(conflicting);
+            drop(unmarked);
             assert!(
                 fixture
                     .registry
@@ -15440,9 +15688,11 @@ handler = "codex-hook-v1"
         #[tokio::test]
         async fn a_pending_stop_with_a_terminal_journal_waits_for_confirmed_cleanup() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
-            let conflicting = Marked::spawn_with(&[
-                ("POHUNEK_WORKER_INSTANCE_ID", "runtime-s-5270"),
-                ("POHUNEK_RUNTIME_ID", "runtime-s-5270-other"),
+            // A worker child of the session without a worker-instance marker
+            // cannot be attributed, so the sweep leaves it unconfirmed.
+            let unmarked = Marked::spawn_with(&[
+                ("POHUNEK_SESSION_ID", "s-5270"),
+                ("POHUNEK_WORKER_ID", "worker-s-5270"),
             ]);
             persist_stop_intent(&fixture.root, "s-5270", Some("runtime-s-5270"));
             write_terminal_journal(&fixture.root, "s-5270", "runtime-s-5270");
@@ -15454,15 +15704,12 @@ handler = "codex-hook-v1"
             let runtime = runtime_of(&fixture.registry, "s-5270").await;
             assert_eq!(runtime.state, RuntimeState::Conflict);
             assert_eq!(runtime.loss_reason.as_deref(), Some(SUPERVISION_AMBIGUOUS));
-            assert!(
-                conflicting.alive(),
-                "an ambiguous process is never signalled"
-            );
+            assert!(unmarked.alive(), "an ambiguous process is never signalled");
             let durable = durable_record(&fixture.root, "s-5270");
             assert!(durable.transaction.is_some(), "the stop intent is kept");
             assert_ne!(durable.info.state, protocol::SessionState::Stopped);
 
-            drop(conflicting);
+            drop(unmarked);
             assert!(
                 fixture
                     .registry
@@ -15791,9 +16038,11 @@ handler = "codex-hook-v1"
         #[tokio::test]
         async fn an_interrupted_stop_with_unconfirmed_cleanup_stays_pending() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
-            let conflicting = Marked::spawn_with(&[
-                ("POHUNEK_WORKER_INSTANCE_ID", "runtime-s-5233"),
-                ("POHUNEK_RUNTIME_ID", "runtime-s-5233-other"),
+            // A worker child of the session without a worker-instance marker
+            // cannot be attributed, so the sweep leaves it unconfirmed.
+            let unmarked = Marked::spawn_with(&[
+                ("POHUNEK_SESSION_ID", "s-5233"),
+                ("POHUNEK_WORKER_ID", "worker-s-5233"),
             ]);
             let conflicted = interrupted_stop(&fixture, "s-5233").await;
 
@@ -15804,10 +16053,7 @@ handler = "codex-hook-v1"
             let runtime = runtime_of(&fixture.registry, "s-5233").await;
             assert_eq!(runtime.state, RuntimeState::Conflict);
             assert_eq!(runtime.loss_reason.as_deref(), Some(SUPERVISION_AMBIGUOUS));
-            assert!(
-                conflicting.alive(),
-                "an ambiguous process is never signalled"
-            );
+            assert!(unmarked.alive(), "an ambiguous process is never signalled");
             assert_eq!(
                 durable_record(&fixture.root, "s-5233").info.state,
                 protocol::SessionState::Running,

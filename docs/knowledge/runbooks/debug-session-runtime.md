@@ -99,7 +99,13 @@ Interpret runtime states as follows:
   recovery reference. Reason `runtime_lost` means the worker job ended while its
   journal still said live, and the ownership-marker sweep removed that
   generation's leftover processes. `runtime_lost_cleanup_unconfirmed` means the
-  same, but the sweep could not confirm that every marked process ended;
+  same, but the sweep could not confirm that every marked process ended,
+  for example because a worker child carries the session's `POHUNEK_SESSION_ID`
+  and `POHUNEK_WORKER_ID` but no `POHUNEK_WORKER_INSTANCE_ID` (a child of a
+  worker before 0.33.1; a daemon-run lifecycle hook has no worker marker and
+  is ignored; the
+  sweep never signals it, and the `session.runtime.sweep_unmarked` WARN in
+  `pohunekd.jsonl` names it by pid);
   `session.resume` retries the marker sweep against the exact journaled runtime;
   it refuses with `runtime_supervision_ambiguous` and a recovery hint until
   cleanup is confirmed. Inspect and end any remaining marked processes, then
@@ -289,11 +295,21 @@ before retrying; the refused operation creates no new worker or fork child.
   consent. A removal finished by
   reconciliation after a daemon restart shows this `conflict` reason while it
   retries on its own.
-- `incompatible`: the worker is alive but private protocol negotiation failed.
-  Leave it alive and use a compatible daemon release. `pohunek session rm <id>`
+- `incompatible`: the worker is alive but the daemon does not manage it.
+  `worker_protocol_incompatible` means private protocol negotiation failed;
+  `worker_marker_legacy` means its journal names a worker release before
+  0.33.1 (or none), whose children carry no `POHUNEK_WORKER_INSTANCE_ID`, so
+  no sweep could attribute them. A `worker_protocol_incompatible` worker can
+  be left alive for a daemon release that manages it; a `worker_marker_legacy`
+  worker comes from a release outside the supported upgrade window and its end
+  is not noticed, so remove it. `pohunek session rm <id>`
   retires such a worker through the service manager the same way as an
   ambiguous `conflict` one (refused with `worker_protocol_incompatible` when the
-  record names no worker generation).
+  record names no worker generation). For `worker_marker_legacy`, `session
+  stop`, input, resize and attach are refused with `worker_protocol_incompatible`,
+  a `msg` naming the reason and a `recover` hint; on removal the runtime is
+  lost, and a child that left the worker's job keeps the removal refused until
+  it is ended by hand.
 
 Workers live only as long as the login session. Closing a terminal or locking
 the screen is safe. Logging out or rebooting ends every worker job; after the

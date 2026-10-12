@@ -991,7 +991,7 @@ impl SessionRegistry {
                 // The session is committed; its runtime stays for
                 // reconciliation.
                 return Err(LaunchFailure::Unavailable(
-                    super::unavailable_runtime_error(&id, state),
+                    super::unavailable_runtime_error(&id, state, None),
                 ));
             }
         }

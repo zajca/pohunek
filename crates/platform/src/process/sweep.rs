@@ -8,6 +8,13 @@
 //! so a reused PID is never signalled, and any inspection failure other than a
 //! process disappearing aborts the sweep before further signals are sent.
 //!
+//! A worker child that carries the runtime's session marker but no
+//! worker-instance marker, as the children of a worker released before that
+//! marker do, cannot be attributed to this runtime or another: it is never
+//! signalled and is reported as skipped, so the caller's cleanup stays
+//! unconfirmed. A process the daemon runs for the session itself, such as a
+//! lifecycle hook, carries no worker marker and is not part of the sweep.
+//!
 //! A process whose environment cannot be read carries no readable marker. When
 //! the caller names the lost worker's [`SpawnId`], the sweep decides such a
 //! process by its fork lineage instead: a process created, through any chain of
@@ -18,7 +25,7 @@
 //! worker, excludes a process: a launchd parent number is rewritten when an
 //! orphan re-executes, so it never excludes one.
 
-// Rust guideline compliant 2026-10-10
+// Rust guideline compliant 2026-10-12
 
 use std::cell::OnceCell;
 use std::collections::HashMap;
@@ -30,7 +37,6 @@ use tokio::time::Instant;
 
 use super::{
     Error, ProcessFact, ProcessIdentity, ProcessInspector, ProcessLineage, SpawnId, StartIdentity,
-    WorkerInstanceMarker,
 };
 
 /// Largest accepted worker instance ID, in bytes.
@@ -59,6 +65,9 @@ const MAX_LINEAGE_STEPS: usize = 65_536;
 pub struct SweepRequest {
     worker_instance_id: String,
     session_id: Option<String>,
+    /// Session the runtime belonged to, when the caller names it; see
+    /// [`Self::with_runtime_session`].
+    runtime_session: Option<String>,
     owner_uid: u32,
     grace: Duration,
     poll: Duration,
@@ -103,6 +112,7 @@ impl SweepRequest {
         Ok(Self {
             worker_instance_id,
             session_id: None,
+            runtime_session: None,
             owner_uid,
             grace,
             poll,
@@ -161,6 +171,19 @@ impl SweepRequest {
     #[must_use]
     pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
+        self
+    }
+
+    /// Names the session the runtime belonged to.
+    ///
+    /// A same-user process that carries this session's marker and a worker
+    /// marker (`POHUNEK_WORKER_ID`) but no worker-instance marker is never
+    /// signalled and is reported as [`SkipReason::InstanceUnmarked`], which
+    /// keeps the cleanup unconfirmed. Without the session, such a process is
+    /// not part of the sweep.
+    #[must_use]
+    pub fn with_runtime_session(mut self, session_id: impl Into<String>) -> Self {
+        self.runtime_session = Some(session_id.into());
         self
     }
 
@@ -225,9 +248,11 @@ pub enum SkipReason {
     /// a restricted platform binary), and neither its start time nor its fork
     /// lineage proves whether it belongs to the runtime.
     MarkersUnreadable,
-    /// `POHUNEK_WORKER_INSTANCE_ID` and `POHUNEK_RUNTIME_ID` carry different
-    /// values, so the process cannot be proven to belong to the runtime or not.
-    MarkersConflicting,
+    /// The process carries the runtime's session marker and a worker marker
+    /// but no `POHUNEK_WORKER_INSTANCE_ID`, as the children of a worker
+    /// released before that marker do, so it cannot be proven to belong to the
+    /// runtime or not.
+    InstanceUnmarked,
     /// The target runtime marker has no matching session marker.
     SessionUnverified,
     /// The sweep aborted before signalling the selected process.
@@ -525,24 +550,20 @@ fn classify(
         }
         Err(error) => return Err(error),
     };
-    match markers.worker_instance() {
-        WorkerInstanceMarker::Instance(id) if id == request.worker_instance_id() => {}
-        // A process claiming two instances, one of them the requested one, is
-        // attributed to neither, so it is never signalled, and the skip keeps
-        // the caller's cleanup unconfirmed. A conflicting pair that names
-        // other instances only is foreign to this sweep.
-        WorkerInstanceMarker::Conflicting
-            if [&markers.worker_instance_id, &markers.runtime_id]
-                .into_iter()
-                .any(|marker| marker.as_deref() == Some(request.worker_instance_id())) =>
+    match markers.worker_instance_id.as_deref() {
+        Some(id) if id == request.worker_instance_id() => {}
+        // A worker child of the runtime's session without an instance marker
+        // may be a child of a worker that predates the marker, so it is never
+        // signalled, and the skip keeps the caller's cleanup unconfirmed. Only
+        // a worker sets `POHUNEK_WORKER_ID`; a process the daemon runs for the
+        // session, such as a lifecycle hook, lacks it and is foreign.
+        None if request.runtime_session.is_some()
+            && markers.session_id == request.runtime_session
+            && markers.worker_id.is_some() =>
         {
-            return Ok(Selection::Skip(SkipReason::MarkersConflicting));
+            return Ok(Selection::Skip(SkipReason::InstanceUnmarked));
         }
-        WorkerInstanceMarker::Conflicting
-        | WorkerInstanceMarker::Absent
-        | WorkerInstanceMarker::Instance(_) => {
-            return Ok(Selection::Foreign);
-        }
+        Some(_) | None => return Ok(Selection::Foreign),
     }
     if let Some(session_id) = request.session_id.as_deref() {
         match markers.session_id.as_deref() {

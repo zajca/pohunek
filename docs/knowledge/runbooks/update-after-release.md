@@ -580,8 +580,13 @@ the upgrade is not what ends it.
   `worker_already_ended`, `worker_not_running`, `worker_process_unverifiable`,
   `runtime_identity_mismatch`, `worker_generation_not_advanced`,
   `worker_child_missing`, `worker_not_initialized`,
-  `worker_protocol_incompatible`). Evidence the
+  `worker_protocol_incompatible`, `worker_marker_legacy`). Evidence the
   preflight cannot read counts against the session.
+  `worker_marker_legacy` means the worker journal names a release before
+  0.33.1, or none: that worker marks its children without
+  `POHUNEK_WORKER_INSTANCE_ID`, so the new daemon could never sweep or report
+  them and refuses to adopt the worker. Stop the session with the running
+  release before upgrading, or accept losing its runtime.
   `worker_without_session_record` applies to a live worker journal with no
   store record only while a store line that names no session cannot be read,
   because that line may be the worker's own record.

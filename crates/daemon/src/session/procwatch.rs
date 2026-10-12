@@ -1,12 +1,11 @@
 //! Per-session process watcher and active-agent reconciliation.
 
-// Rust guideline compliant 2026-09-14
+// Rust guideline compliant 2026-10-12
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use pohunek_platform::process::WorkerInstanceMarker;
 use protocol::{event, CwdSource, RuntimeRef, SessionInfo};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, warn};
@@ -457,15 +456,12 @@ impl SessionRegistry {
             return true;
         }
         if let Some(expected) = worker_instance_id {
-            match markers.worker_instance() {
-                WorkerInstanceMarker::Instance(actual) if actual != expected => return true,
-                WorkerInstanceMarker::Instance(_)
-                    if markers.session_id.as_deref() == Some(id.0.as_str()) =>
-                {
+            match markers.worker_instance_id.as_deref() {
+                Some(actual) if actual != expected => return true,
+                Some(_) if markers.session_id.as_deref() == Some(id.0.as_str()) => {
                     return false;
                 }
-                WorkerInstanceMarker::Conflicting => return true,
-                WorkerInstanceMarker::Instance(_) | WorkerInstanceMarker::Absent => {}
+                Some(_) | None => {}
             }
         }
         markers

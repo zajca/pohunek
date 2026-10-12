@@ -90,7 +90,7 @@ Interpret the runtime independently from the agent lifecycle:
 | `terminal` | The worker observed child exit | Inspect the terminal result; acknowledge or recover explicitly when eligible |
 | `lost` | The PTY generation no longer exists; `runtime_lost` after its journaled worker ended and the ownership-marker sweep was confirmed, `runtime_lost_cleanup_unconfirmed` when that sweep could not be confirmed, or `worker_unavailable` when no worker journal exists for the generation | Preserve the logical record; use explicit native recovery only when available. After `runtime_lost_cleanup_unconfirmed`, check `ps` for that session's processes first |
 | `conflict` | More than one or mismatched runtime identity is present: `runtime_supervision_ambiguous` (job present, worker socket silent, journal not terminal) or `runtime_identity_mismatch` (job definition or process does not match the record) | Preserve evidence; the daemon never kills a worker automatically and re-checks the conflict in the background (1 s doubling to 60 s) until it adopts the worker `live` (only while no other socket claims the session) or the session becomes `lost`. `session stop` ends a conflict whose recorded identity the journal proves; `session rm` removes the logical record. |
-| `incompatible` | A live worker has no compatible private protocol | Run a compatible daemon; leave the worker alive |
+| `incompatible` | A live worker has no compatible private protocol (`worker_protocol_incompatible`), or its journal names a release before 0.33.1, whose children carry no worker-instance marker (`worker_marker_legacy`) | Run a compatible daemon; leave the worker alive |
 
 `pohunek session runtime-inventory --json` lists worker endpoints and jobs
 outside that table: `worker_job_absent` marks a live, adopted worker whose
@@ -222,8 +222,7 @@ another generation still runs (`runtime_identity_mismatch`), and when the
 session's journals cannot be read or a journaled worker of the generation still
 runs after the retirement (`runtime_supervision_ambiguous`). Every removal,
 including that of a live, terminal, or `lost` session, then sweeps the
-processes carrying the session's `POHUNEK_WORKER_INSTANCE_ID` (or the
-read-only alternate `POHUNEK_RUNTIME_ID`) markers, because on macOS
+processes carrying the session's `POHUNEK_WORKER_INSTANCE_ID` markers, because on macOS
 a descendant that left the worker's process group survives both the stop and
 the job retirement. A sweep that cannot confirm every marked process exited
 (for example a process whose environment cannot be read) fails the removal
@@ -242,11 +241,16 @@ during reconciliation. When the worker's job ended while its journal still said
 live and the journal's worker process is proven gone, reconciliation first
 sends `SIGTERM`, then after the configured `[sweep] grace_ms` `SIGKILL`, to every
 same-user process that carries exactly that generation's `POHUNEK_WORKER_INSTANCE_ID`
-(or `POHUNEK_RUNTIME_ID`) ownership marker, checking each process's start identity before each signal.
+ownership marker, checking each process's start identity before each signal.
 It retires the ended job and its definition, then reports `runtime_lost`.
-A process whose two markers name different instances, one of them this
-generation's, is ambiguous: it is not
-signalled and the loss is reported with `runtime_lost_cleanup_unconfirmed`.
+A process that carries the session's `POHUNEK_SESSION_ID` and
+`POHUNEK_WORKER_ID` but no `POHUNEK_WORKER_INSTANCE_ID`, as the children of a
+worker released before 0.33.1 do, cannot be attributed (a lifecycle hook the
+daemon runs carries no `POHUNEK_WORKER_ID` and is ignored): it is not signalled, the
+`session.runtime.sweep_unmarked` WARN names it by pid (`sweep.unmarked_pids`,
+at most eight), and the loss is reported with
+`runtime_lost_cleanup_unconfirmed`; end such a process by hand once it is
+confirmed to be the session's.
 Uncertain evidence kills nothing.
 
 If the immutable launch agent has a valid native recovery reference, the

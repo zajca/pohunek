@@ -581,29 +581,31 @@ fn expected_version_marker() -> String {
     format!("VERSION={}", protocol::EXPECTED_INTEGRATION_VERSION)
 }
 
-/// The shipped state hook rewritten to the previous asset's single-name read
-/// of the worker instance (`POHUNEK_RUNTIME_ID` only).
-fn state_asset_reading_only_runtime_id(asset: &str) -> String {
-    let shipped =
-        "os.environ.get(\"POHUNEK_WORKER_INSTANCE_ID\") or os.environ.get(\"POHUNEK_RUNTIME_ID\")";
+/// The shipped state hook rewritten to read the worker instance from
+/// `POHUNEK_RUNTIME_ID` as well, as the hooks of releases 0.33.1 to 0.34.2 do.
+fn state_asset_reading_the_runtime_id_name(asset: &str) -> String {
+    let shipped = "worker_instance_id = os.environ.get(\"POHUNEK_WORKER_INSTANCE_ID\")\n";
     assert!(asset.contains(shipped));
-    asset.replace(shipped, "os.environ.get(\"POHUNEK_RUNTIME_ID\")")
+    asset.replace(
+        shipped,
+        "worker_instance_id = os.environ.get(\"POHUNEK_WORKER_INSTANCE_ID\") or os.environ.get(\"POHUNEK_RUNTIME_ID\")\n",
+    )
 }
 
-/// An installed script from the previous asset version differs from the
-/// shipped one, so the doctor reports it for reinstall whether or not its
-/// version marker was kept.
+/// An installed script that still reads the old environment name differs
+/// from the shipped one, so the doctor reports it for reinstall whether or
+/// not its version marker was kept.
 #[test]
-fn doctor_flags_a_stale_hook_that_reads_only_the_old_environment_name() {
+fn doctor_flags_a_stale_hook_that_reads_the_old_environment_name() {
     let stale_version = format!("VERSION={}", protocol::EXPECTED_INTEGRATION_VERSION - 1);
     let variants = [
         (
             "same version marker",
-            state_asset_reading_only_runtime_id(CLAUDE_HOOK_ASSET),
+            state_asset_reading_the_runtime_id_name(CLAUDE_HOOK_ASSET),
         ),
         (
             "previous version marker",
-            state_asset_reading_only_runtime_id(CLAUDE_HOOK_ASSET)
+            state_asset_reading_the_runtime_id_name(CLAUDE_HOOK_ASSET)
                 .replace(&expected_version_marker(), &stale_version),
         ),
     ];

@@ -15,7 +15,7 @@
 //! The runtime registry is not built, so a binding that needs it to complete
 //! its launch spec is reported as unverified.
 
-// Rust guideline compliant 2026-06-26
+// Rust guideline compliant 2026-10-12
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
@@ -28,8 +28,9 @@ use pohunek_service_config::preflight::{
     CODE_JOURNAL_SCHEMA_UNSUPPORTED, CODE_JOURNAL_UNREADABLE, CODE_NO_SESSION_RECORD,
     CODE_PROTOCOL_INCOMPATIBLE, CODE_RECORD_UNREADABLE, CODE_RECOVERY_UNMAPPABLE,
     CODE_RECOVERY_UNVERIFIED, CODE_RESUME_RECORD_UNREADABLE, CODE_RUNTIME_IDENTITY_MISMATCH,
-    CODE_STORE_UNUSABLE, CODE_WORKER_CHILD_MISSING, CODE_WORKER_ENDED, CODE_WORKER_NOT_ADVANCED,
-    CODE_WORKER_NOT_INITIALIZED, CODE_WORKER_NOT_RUNNING, CODE_WORKER_UNVERIFIABLE, REPORT_VERSION,
+    CODE_STORE_UNUSABLE, CODE_WORKER_CHILD_MISSING, CODE_WORKER_ENDED, CODE_WORKER_MARKER_LEGACY,
+    CODE_WORKER_NOT_ADVANCED, CODE_WORKER_NOT_INITIALIZED, CODE_WORKER_NOT_RUNNING,
+    CODE_WORKER_UNVERIFIABLE, REPORT_VERSION,
 };
 use pohunek_worker_protocol::{negotiate, Version, VersionRange, SUPPORTED_RANGE};
 
@@ -528,6 +529,9 @@ fn judge(
     if let Some(judgement) = judge_process(journal, inspector) {
         return judgement;
     }
+    if let Some(judgement) = judge_marker(journal) {
+        return judgement;
+    }
     if let Some(judgement) = judge_protocol(journal) {
         return judgement;
     }
@@ -616,6 +620,23 @@ fn judge_process(journal: &JournalEvidence, inspector: &dyn ProcessInspector) ->
             ),
         )),
     }
+}
+
+/// The journaled worker release must mark its children with the
+/// worker-instance marker; startup refuses any other live worker.
+fn judge_marker(journal: &JournalEvidence) -> Option<Judgement> {
+    (!journal.marks_worker_instance()).then(|| {
+        not_adopted(
+            CODE_WORKER_MARKER_LEGACY,
+            format!(
+                "the worker journal names release {}, which predates the worker-instance marker, \
+                 so the new daemon cannot attribute the runtime's processes and does not adopt \
+                 it; stop the session with the running release first, or upgrade with \
+                 --accept-runtime-loss",
+                journal.release()
+            ),
+        )
+    })
 }
 
 /// The worker's identity claims and subagent state, judged as adoption

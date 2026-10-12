@@ -2076,8 +2076,8 @@ async fn foreign_foreground_process_does_not_hijack_reconciliation() {
         OwnershipMarkers {
             daemon_id: Some("foreign-daemon".to_owned()),
             session_id: Some("foreign-session".to_owned()),
+            worker_id: None,
             worker_instance_id: None,
-            runtime_id: None,
         },
     );
     let root_cwd = temp_dir("foreign-foreground-root");
@@ -9456,8 +9456,8 @@ async fn procwatch_skips_agents_owned_by_another_daemon_or_session() {
         OwnershipMarkers {
             daemon_id: Some("d-foreign".to_owned()),
             session_id: Some("s-1".to_owned()),
+            worker_id: None,
             worker_instance_id: None,
-            runtime_id: None,
         },
     );
     registry
@@ -9484,8 +9484,8 @@ async fn procwatch_skips_agents_owned_by_another_daemon_or_session() {
         OwnershipMarkers {
             daemon_id: Some(registry.daemon_instance_id().to_owned()),
             session_id: Some(format!("{}-other", created.id.0)),
+            worker_id: None,
             worker_instance_id: None,
-            runtime_id: None,
         },
     );
     registry
@@ -9503,8 +9503,8 @@ async fn procwatch_skips_agents_owned_by_another_daemon_or_session() {
         OwnershipMarkers {
             daemon_id: Some(registry.daemon_instance_id().to_owned()),
             session_id: Some(created.id.0.clone()),
+            worker_id: None,
             worker_instance_id: None,
-            runtime_id: None,
         },
     );
     registry
@@ -9540,8 +9540,8 @@ async fn external_rescan_skips_processes_marked_by_any_pohunek_daemon() {
         OwnershipMarkers {
             daemon_id: Some("d-foreign".to_owned()),
             session_id: None,
+            worker_id: None,
             worker_instance_id: None,
-            runtime_id: None,
         },
     );
 
@@ -14130,7 +14130,6 @@ impl RemovalMarkedProcess {
         command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
-            .env_remove("POHUNEK_RUNTIME_ID")
             .env_remove("POHUNEK_SESSION_ID")
             .env("POHUNEK_WORKER_INSTANCE_ID", worker_instance_id);
         if let Some(session_id) = session_id {

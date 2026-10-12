@@ -36,6 +36,16 @@ const GENERATION: &str = "abcd2345";
 /// Journal schema the daemon reads.
 const JOURNAL_SCHEMA: u64 = 4;
 
+/// Package version a worker of this build journals.
+const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Last release whose worker marks its children with `POHUNEK_RUNTIME_ID` only.
+const LEGACY_MARKER_RELEASE: &str = "0.33.0";
+
+/// First release whose worker marks its children with
+/// `POHUNEK_WORKER_INSTANCE_ID`.
+const INSTANCE_MARKER_RELEASE: &str = "0.33.1";
+
 /// Edits a journal into one the preflight must refuse.
 type Mutation = fn(&mut Value);
 
@@ -184,6 +194,7 @@ fn journal(session: &str, worker: &str) -> Value {
         "worker_id": worker,
         "generation": GENERATION,
         "executable": WORKER_EXECUTABLE,
+        "version": WORKER_VERSION,
         "worker_pid": identity.pid,
         "worker_start_identity": identity.start_identity.get().to_string(),
         "boot_identity": "boot-test",
@@ -388,7 +399,7 @@ fn a_migrated_store_over_the_durable_read_limit_is_refused() {
 
 #[test]
 fn journal_evidence_failures_each_name_their_reason() {
-    let cases: [(&str, Mutation, &str); 6] = [
+    let cases: [(&str, Mutation, &str); 7] = [
         (
             "an unsupported journal schema",
             |journal| journal["schema_version"] = json!(3),
@@ -428,6 +439,16 @@ fn journal_evidence_failures_each_name_their_reason() {
             |journal| journal["generation"] = json!("bcde2345"),
             CODE_JOURNAL_MISSING,
         ),
+        (
+            "a journal that names no worker release",
+            |journal| {
+                journal
+                    .as_object_mut()
+                    .expect("journal object")
+                    .remove("version");
+            },
+            "worker_marker_legacy",
+        ),
     ];
     for (name, mutate, code) in cases {
         let host = Host::new();
@@ -444,6 +465,82 @@ fn journal_evidence_failures_each_name_their_reason() {
             "{name}"
         );
     }
+}
+
+/// A live process carrying the session marker and only the worker marker of
+/// a pre-v0.33.1 worker; killed and reaped on drop.
+struct LegacyMarkedChild(std::process::Child);
+
+impl LegacyMarkedChild {
+    fn spawn(session: &str) -> Self {
+        let child = pohunek_test_support::process_env::command("sleep")
+            .arg("60")
+            .env_remove("POHUNEK_WORKER_INSTANCE_ID")
+            .env("POHUNEK_SESSION_ID", session)
+            .env("POHUNEK_WORKER_ID", "w-fixture")
+            .env("POHUNEK_RUNTIME_ID", "r-fixture")
+            .spawn()
+            .expect("spawn legacy-marked child");
+        Self(child)
+    }
+
+    fn running(&mut self) -> bool {
+        self.0
+            .try_wait()
+            .expect("poll legacy-marked child")
+            .is_none()
+    }
+}
+
+impl Drop for LegacyMarkedChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A worker released before `POHUNEK_WORKER_INSTANCE_ID` marks its children
+/// with a name this daemon does not read, so its live runtime is refused
+/// rather than adopted unsweepable; the first marking release is adoptable.
+#[test]
+fn a_live_worker_older_than_the_instance_marker_is_not_adopted() {
+    let host = Host::new();
+    host.write_store(&[
+        session_line("s-1", "w-fixture"),
+        session_line("s-2", "w-two"),
+    ]);
+    let mut legacy = journal("s-1", "w-fixture");
+    legacy["version"] = json!(LEGACY_MARKER_RELEASE);
+    host.write_journal("s-1", "w-fixture", &legacy);
+    let mut first_marking = journal("s-2", "w-two");
+    first_marking["version"] = json!(INSTANCE_MARKER_RELEASE);
+    host.write_journal("s-2", "w-two", &first_marking);
+    let mut child = LegacyMarkedChild::spawn("s-1");
+    let before = host.snapshot();
+
+    let report = host.report();
+
+    assert_eq!(
+        verdict_of(&report, "s-1"),
+        (&Verdict::WouldNotBeAdopted, "worker_marker_legacy")
+    );
+    let detail = &report
+        .sessions
+        .iter()
+        .find(|session| session.session_id == "s-1")
+        .expect("verdict of s-1")
+        .detail;
+    assert!(
+        detail.contains(LEGACY_MARKER_RELEASE) && detail.contains("--accept-runtime-loss"),
+        "the detail names the worker release and the recovery: {detail}"
+    );
+    assert_eq!(
+        verdict_of(&report, "s-2"),
+        (&Verdict::Adoptable, CODE_ADOPTABLE)
+    );
+    assert_eq!(report.at_risk().count(), 1);
+    assert!(child.running(), "the preflight signals nothing");
+    assert_eq!(host.snapshot(), before, "the preflight changes nothing");
 }
 
 #[test]

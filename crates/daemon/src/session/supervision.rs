@@ -33,7 +33,7 @@ use crate::runtime::lifecycle::{
     SUPERVISION_UNAVAILABLE,
 };
 
-// Rust guideline compliant 2026-09-29
+// Rust guideline compliant 2026-10-12
 
 /// Reason recorded when a generation's worker is proven crashed and the
 /// marker sweep confirmed that no process of its runtime is left.
@@ -75,6 +75,13 @@ const MAX_SWEEP_PASSES: usize = 3;
 /// stays short; the rest is reported as a count. Eight covers the handful of
 /// non-dumpable helpers (agents, keyrings) a desktop session typically has.
 pub(super) const MAX_LISTED_UNREADABLE_CANDIDATES: usize = 8;
+
+/// Most unmarked processes the sweep warning names by pid.
+///
+/// The warning is one log line, so the list stays bounded; the count covers
+/// the rest. A runtime of a worker that predates the worker-instance marker
+/// rarely leaves more than a few escaped descendants.
+const MAX_LOGGED_UNMARKED_PROCESSES: usize = 8;
 
 /// Most unreadable-marker processes one removal may accept.
 ///
@@ -629,6 +636,7 @@ impl SessionRegistry {
         ) {
             Ok(request) => {
                 let request = request
+                    .with_runtime_session(session_id)
                     .with_worker_start_identity(bounds.start_identity)
                     .with_worker_spawn_id(bounds.spawn_id);
                 match expected_session_id {
@@ -656,21 +664,7 @@ impl SessionRegistry {
                     return SweepOutcome::blocked_by_other();
                 }
             };
-            let unreadable = report
-                .skipped
-                .iter()
-                .filter(|skipped| skipped.reason == SkipReason::MarkersUnreadable)
-                .count();
-            tracing::info!(
-                session_id,
-                worker_instance_id,
-                sweep.pass = pass,
-                sweep.terminated = report.terminated.len(),
-                sweep.killed = report.killed.len(),
-                sweep.unconfirmed = report.unconfirmed.len(),
-                sweep.unreadable = unreadable,
-                "swept processes of a lost runtime"
-            );
+            log_sweep_pass(session_id, worker_instance_id, pass, &report);
             // An unreadable-marker process that could still belong to the
             // runtime counts as selected, so the sweep is retried: a process
             // caught between images reads its markers on a later pass, while
@@ -1416,6 +1410,53 @@ fn stale_orphan(id: &ServiceId) -> RuntimeInventoryEntry {
         worker_instance_id: None,
         status: RuntimeInventoryStatus::Orphaned,
         reason: Some(STALE_GENERATION.to_owned()),
+    }
+}
+
+/// Logs what one pass of a lost-runtime sweep did, and on the deciding last
+/// pass warns about session processes it could not attribute.
+fn log_sweep_pass(session_id: &str, worker_instance_id: &str, pass: usize, report: &SweepReport) {
+    let unreadable = report
+        .skipped
+        .iter()
+        .filter(|skipped| skipped.reason == SkipReason::MarkersUnreadable)
+        .count();
+    let unmarked = report
+        .skipped
+        .iter()
+        .filter(|skipped| skipped.reason == SkipReason::InstanceUnmarked)
+        .count();
+    tracing::info!(
+        session_id,
+        worker_instance_id,
+        sweep.pass = pass,
+        sweep.terminated = report.terminated.len(),
+        sweep.killed = report.killed.len(),
+        sweep.unconfirmed = report.unconfirmed.len(),
+        sweep.unreadable = unreadable,
+        sweep.unmarked = unmarked,
+        "swept processes of a lost runtime"
+    );
+    // The last pass decides the outcome, so it alone names the cause.
+    if unmarked > 0 && pass == MAX_SWEEP_PASSES {
+        let pids = report
+            .skipped
+            .iter()
+            .filter(|skipped| skipped.reason == SkipReason::InstanceUnmarked)
+            .take(MAX_LOGGED_UNMARKED_PROCESSES)
+            .map(|skipped| skipped.identity.pid.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        tracing::warn!(
+            name: "session.runtime.sweep_unmarked",
+            session_id,
+            worker_instance_id,
+            sweep.unmarked = unmarked,
+            sweep.unmarked_pids = %pids,
+            "{{sweep.unmarked}} processes of the session ({{sweep.unmarked_pids}}) carry no \
+             worker-instance marker, as the children of a worker released before it do; they \
+             are left running and the cleanup stays unconfirmed"
+        );
     }
 }
 

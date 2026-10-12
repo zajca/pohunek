@@ -2414,14 +2414,13 @@ mod tests {
         assert_eq!(listing, expected);
     }
 
-    /// A worker started inside an older session still holds that session's
-    /// `POHUNEK_RUNTIME_ID`; its PTY child must not carry it, or the child
-    /// would claim two worker instances.
+    /// A worker started inside another session still holds that session's
+    /// `POHUNEK_WORKER_INSTANCE_ID`; its PTY child must not carry it, or the
+    /// child would be attributed to that session's worker instance.
     #[tokio::test]
-    async fn inherited_base_child_does_not_carry_the_ambient_runtime_id_marker() {
+    async fn inherited_base_child_does_not_carry_the_ambient_worker_instance_marker() {
         let mut ambient = pohunek_test_support::process_env::ProcessEnv::lock();
-        ambient.set("POHUNEK_RUNTIME_ID", "ambient-instance");
-        ambient.set("POHUNEK_WORKER_INSTANCE_ID", "ambient-new-instance");
+        ambient.set("POHUNEK_WORKER_INSTANCE_ID", "ambient-instance");
         let cwd = pohunek_test_support::tempdir().expect("child working directory");
         let pty = spawn(Command {
             program: std::env::current_exe()
@@ -2464,9 +2463,8 @@ mod tests {
             "the listing child printed nothing: {observed}"
         );
         assert!(
-            !observed.contains("POHUNEK_RUNTIME_ID")
-                && !observed.contains("POHUNEK_WORKER_INSTANCE_ID"),
-            "ambient worker instance markers reached the child"
+            !observed.contains("POHUNEK_WORKER_INSTANCE_ID"),
+            "the ambient worker instance marker reached the child"
         );
     }
 
