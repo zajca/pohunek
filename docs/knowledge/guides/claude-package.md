@@ -2,7 +2,7 @@
 type: Guide
 id: guide/claude-package
 title: Claude Code runtime package
-description: The official Claude Code runtime package source (Claude Code 2.1.x from 2.1.289), what it declares and keeps equal to the built-in Claude runtime, what was verified against a real Claude Code, and the gaps found.
+description: The official Claude Code runtime package source (Claude Code 2.1.x from 2.1.289), what it declares, how its detection differs from the built-in Claude runtime, what was verified against a real Claude Code, and the detection limits that remain.
 source_kind: manual
 intents: [setup, update, debug, help]
 ---
@@ -32,12 +32,17 @@ has not installed the package.
 
 ## What the package declares
 
-Every fact below equals the built-in Claude descriptor release 0.34.2 shipped,
+The package is version `1.0.1`. Every descriptor fact below equals the
+built-in Claude descriptor release 0.34.2 shipped (package version `1.0.0`),
 except the version probe and the transcript tree (`[transcripts]`), which that
-descriptor does not declare. The package tests compare the package with golden
-copies of that descriptor and its detection manifest in
-`compat/claude/builtin-v0.34/` (`runtime.toml`, `detect.toml`). While the daemon
-embeds the built-in (`crates/daemon/src/agent/builtin/claude.toml` and
+descriptor does not declare. The detection manifest is the built-in one plus the
+rules of #613 ([below](#detection-beyond-the-built-in-manifest)); the built-in
+manifest keeps the 0.34.2 rules until the cutover deletes it. The package tests
+compare the package with golden copies of that descriptor and its detection
+manifest in `compat/claude/builtin-v0.34/` (`runtime.toml`, `detect.toml`):
+the manifest may differ only by the enumerated #613 changes, and only the
+enumerated captured frames may read differently. While the daemon embeds the
+built-in (`crates/daemon/src/agent/builtin/claude.toml` and
 `crates/daemon/src/detect/manifests/claude.toml`), they also check that the
 built-in manifest is the golden byte for byte and the built-in descriptor is
 the golden followed by the package's transcript tree.
@@ -61,15 +66,23 @@ the golden followed by the package's transcript tree.
   `identity-subagent-v1`. The package names the compiled handler and schema; the
   hook reporter scripts stay core-owned, so the archive carries no asset.
 - Config home: `CLAUDE_CONFIG_DIR`, else `~/.claude`.
-- Detection (`detect.toml`, the built-in manifest as a file): process matchers
-  are the kernel name `claude` or a command line whose program is `claude`
-  (also through `node` or `bun`). Rules read the screen: a status line above the
-  prompt box (`✶ Billowing… (3s · ↓ 2 tokens)`) means `working` and outranks the
-  visible prompt box; a visible prompt box means `idle`; the tool approval
-  dialog (`Do you want to proceed?` with its options), the selection forms
-  (`Enter to select · ↑/↓ to navigate · Esc to cancel`) and the first-run API-key
-  approval mean `blocked`; a title that starts with a braille spinner means
-  `working`, a title that starts with `✳` means `idle`.
+- Detection (`detect.toml`): process matchers are the kernel name `claude` or
+  `claude.exe`, a command line whose first argument is `claude` or
+  `claude.exe` (with or without a directory), or a command line whose first
+  argument is `node` or `bun` followed by flag options (`-…`, no separate
+  values) and a script named `claude` (also `.js`, `.mjs`, `.cjs`) or lying in
+  the `@anthropic-ai/claude-code` package. A command that only names a Claude
+  executable as a later argument (`ls -l …/claude.exe`, `tail -f /work/claude`)
+  does not match. Rules read the
+  screen: a status line above the prompt box (`✶ Billowing… (3s · ↓ 2 tokens)`)
+  or the footer `esc to interrupt` below it means `working` and outranks the
+  visible prompt box; a visible prompt box or a completed-turn line
+  (`✻ Brewed for 7s · done 3:34 PM`) means `idle`; the tool approval dialog
+  (`Do you want to proceed?` with its options), the selection forms
+  (`Enter to select · ↑/↓ to navigate · Esc to cancel`, also wrapped), the
+  first-run theme picker, API-key approval and login method list, and the
+  folder trust dialog mean `blocked`. A title that starts with `◐` or `◑` (or a
+  braille spinner) means `working`, a title that starts with `✳` means `idle`.
 
 ## First-run state of a Claude home
 
@@ -112,9 +125,11 @@ native executable of 2.1.289 from the distribution package, byte-identical
 also ran against the npm install. `crates/cli/tests/claude_package.rs` classifies every
 captured screen through the package manifest.
 
-- The idle, working and blocked states are read from the screen. Claude keeps
-  its idle title (`✳ Claude Code`) while an approval or question dialog is open,
-  and the screen rules (`blocked`, priority 840 and above) win over it.
+- The idle, working and blocked states are read from the screen and the title.
+  Claude keeps its idle title (`✳ Claude Code`) while an approval or question
+  dialog is open, and the screen rules (`blocked`, priority 840 and above) win
+  over it. While a turn runs the title alternates `◐ Claude Code` and
+  `◑ Claude Code` every 960 ms (the title component of the 2.1.289 binary).
 - Claude runs a hook command as `/bin/sh -c <command>`. Where `/bin/sh` is dash
   (Debian, Ubuntu, so the hosted CI runner) the shell stays between Claude and
   the reporter script, so the script's `$PPID` is that shell and the worker
@@ -148,39 +163,67 @@ captured screen through the package manifest.
   `CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL` (without the last one a
   first interactive launch registers the official plugin marketplace).
 
-## Gaps found
+## Detection beyond the built-in manifest
 
-- **The working title is not a rule.** Claude 2.1.289 sets a rotating
-  circle-quadrant glyph (`◐ Claude Code`, `◑ …`) while a turn runs. The
-  manifest's `osc_title_working` names braille spinners, so the title speaks for
-  idle only. A running turn is working because the status line is on screen; a
-  streaming reply without a status line (the captured `working_stream`) reads
-  idle through the visible prompt box although the title says a turn is running.
-  Tests pin both (`the_idle_title_is_a_rule_and_the_working_circle_title_is_not`,
-  `a_streaming_reply_without_a_status_line_reads_idle_from_the_screen`). A title
-  rule for the circle glyphs is a change to both manifests, decided by the owner.
-- **Narrow question forms.** At 30 and 40 columns the footer of the question form
-  wraps between its hints, so no rule matches and the screen reads idle; at 20
-  columns every hint has its own line and the form is blocked again.
-- **First-run and trust dialogs.** The API-key approval is blocked; the theme
-  picker, the login method list and the folder trust dialog (`Quick safety check:
-  Is this a project you created or one you trust?`) match no rule, so those
-  sessions keep the byte-activity fallback.
-- **The completed-turn line carries a suffix.** Claude 2.1.289 prints
-  `✻ Brewed for 7s · done 3:34 PM`; `completed_turn_status` expects the line to
-  end after the seconds. The visible prompt box still reads idle.
-- **The npm install is not matched by process.** The npm package's executable
-  is `bin/claude.exe`; a session launched from it runs as kernel name
-  `claude.exe` with a command line ending in `claude.exe`, and neither process
-  pattern matches it (`^claude$`, `(^|/)claude($| )`). The distribution package
-  names the binary `claude` and matches (the native installer was not run).
-  Launch, detection from the screen and the hook-reported reference behave the
-  same with both, and the real-Claude tests passed with both installs; a test pins the forms (`the_process_matchers_accept_the_observed_claude_process_forms`
-  and the real launch test). Accepting `claude.exe` is a change to both
-  manifests, decided by the owner.
-- **Process matcher looseness.** The command-line pattern `node|bun … \bclaude\b`
-  also matches a script whose name contains `claude` as a word
-  (`node /opt/claude-companion.mjs`); a test pins it.
+The package manifest adds these rules to the built-in one (#613). Each is
+backed by screens or process forms captured from 2.1.289 and by a package test
+that fails without the rule.
+
+- **Running-turn title.** `osc_title_working` also takes `◐` and `◑`, the
+  glyphs 2.1.289 alternates before its title while a turn runs
+  (`the_title_reads_idle_for_the_asterisk_and_working_for_the_turn_glyphs`).
+  The title outranks the screen whenever it changes.
+- **Running-turn footer.** A streaming reply hides the status line, and the
+  daemon evaluates the title only when it changes, so a reply re-rendered
+  between two title changes would read idle through the visible prompt box.
+  The footer below the prompt box reads `esc to interrupt` while a turn runs
+  (`? for shortcuts` while Claude waits); `live_turn_footer` reads it as
+  `working` at the priority and with the dialog exclusions of the status-line
+  rule (`a_streaming_reply_reads_working_from_its_title_and_turn_footer`,
+  `a_real_claude_reply_held_mid_stream_reads_working`).
+- **Wrapped selection forms.** `live_blocked_form` separates the words of its
+  hints by any whitespace, so the question form reads `blocked` at 30 and 40
+  columns, where its footer wraps (`Enter to select · ↑/↓ to` /
+  `navigate · Esc to cancel`).
+- **First-run and trust dialogs.** `theme_picker` (`Choose the text style…`
+  with the dark and light modes), `login_method_list` (`Select login method`
+  with the subscription and Console options) and `folder_trust_dialog`
+  (`Yes, I trust this folder`, `No, exit`, `Enter to confirm`) read `blocked`;
+  the trust dialog at every captured width, its heading scrolled away at 20
+  columns. These are the dialogs Claude waits on before it opens its prompt.
+  The rules read only the text below the last horizontal rule on screen, where
+  Claude draws these dialogs; a transcript that quotes them sits above the
+  prompt box's rules, so the screen keeps reading idle or working
+  (`quoted_dialog_text_in_the_transcript_is_not_a_dialog`).
+- **Completed-turn line.** `completed_turn_status` takes the ` · done <time>`
+  2.1.289 appends (`✻ Brewed for 7s · done 3:34 PM`; the clock follows the host
+  locale).
+- **Process forms.** The npm package's executable `bin/claude.exe` runs as kernel
+  name `claude.exe` with a command line ending in `claude.exe`; both matchers
+  accept it, and the real launch test requires the launched process to match
+  with either install. Through `node` or `bun` the script must be named
+  `claude` or lie in the `@anthropic-ai/claude-code` package, so a script that
+  merely carries the word (`node /opt/claude-companion.mjs`) is not Claude,
+  and a node option with a separate value (`node -r ./preload.js …/claude`)
+  hides the script that follows it.
+  A launcher that only names the package (`npx @anthropic-ai/claude-code`,
+  `bun x @anthropic-ai/claude-code`) is not matched itself; the `claude.exe` it
+  starts is (`the_process_matchers_accept_the_observed_claude_process_forms`).
+
+Limits that remain:
+
+- At 30 columns and fewer the footer is cut before `esc to interrupt` (`⏸ manual
+  mode on · esc to…`), so a streaming reply re-rendered there reads idle until
+  the next title change.
+- Under a terminal multiplexer (`TMUX`, `STY` or `ZELLIJ` in Claude's
+  environment) 2.1.289 keeps the static `✳` title during a turn (its
+  `tengu_static_title_under_mux` switch, on by default); the screen rules are
+  then the only working evidence. Not exercised in a real run.
+- At 20 and 30 columns the completed-turn line wraps before ` · done`, so the
+  prompt box alone reads idle there.
+- The theme picker and the login method list were captured at 100 columns
+  only; the rules separate their words by any whitespace for narrower
+  terminals, which no capture confirms.
 
 ## Not verified
 
@@ -200,7 +243,8 @@ established by the network namespace, not by Claude's own switches.
   parser, compares every descriptor fact and the whole manifest with the
   v0.34.2 built-in Claude goldens in `compat/claude/builtin-v0.34/` (as parsed
   definitions, as TOML data, and by feeding both manifests every captured frame,
-  title and synthetic dialog), checks resume and
+  title and synthetic dialog; the manifest differences and the frames they
+  reclassify are enumerated, each with what the package reads), checks resume and
   fork argv, requires the supported range to equal
   `compat/claude/compatibility-lock.json`, reads the version banner, runs the
   title, screen and process rules, and asserts the `--sha256` install refusal
@@ -235,8 +279,9 @@ established by the network namespace, not by Claude's own switches.
   throwaway Claude home and the loopback Messages stub: the banner against the
   probe template, launch and detection (input framing, the held turn, the
   process matchers on the real process; the stub sends no text until its start
-  gate opens, so the working screen is stable), a reply held mid-stream (the
-  pinned idle-by-screen gap), the SessionStart reference and its transcript,
+  gate opens, so the working screen is stable), a reply held mid-stream (it
+  must not read idle for longer than two title changes), the SessionStart
+  reference and its transcript,
   resume and fork argv, the subagent hooks (the same subagent must reach
   `completed` while the parent runtime is live), and the approval dialog.
   Hooks come from `pohunek integration install --agent claude --profile …`,

@@ -6,7 +6,7 @@
 
 schema = 1
 id = "pohunek.runtime.claude"
-version = "1.0.0"
+version = "1.0.1"
 runtime_api = 1
 
 [runtime]

@@ -3,7 +3,8 @@
 //! Pure tests always run: they build the package directory, parse it through
 //! the same path `plugin install` uses, compare it with the built-in Claude
 //! descriptor and detection manifest release v0.34.2 shipped (golden copies in
-//! `compat/claude/builtin-v0.34`), and check it against the compatibility lock
+//! `compat/claude/builtin-v0.34`; the manifest differs by the enumerated #613
+//! rules), and check it against the compatibility lock
 //! and the screens captured from a real Claude Code (`compat/claude/screens`).
 //! The daemon-backed tests install the built archive through `pohunek plugin
 //! install --catalog` against a throwaway signing key and trust anchor, so the
@@ -31,7 +32,8 @@ use pohunek_daemon::agent::host::{
 use pohunek_daemon::agent::{NativeReferenceStrategy, SessionRef};
 use pohunek_daemon::catalog_anchor::CatalogTrust;
 use pohunek_daemon::detect::{
-    ActivityTransition, DetectionConfig, Detector, DetectorConfig, Manifest,
+    ActivityTransition, DetectionConfig, Detector, DetectorConfig, Manifest, ManifestRegion,
+    MatchContext,
 };
 use pohunek_daemon::procwatch::{ProcessFact, StartIdentity};
 use pohunek_daemon::session::HostTrustAnchor;
@@ -93,7 +95,10 @@ const GOLDEN_MANIFEST_NAME: &str = "claude";
 const PACKAGE_ID: &str = "pohunek.runtime.claude";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.0.0";
+const PACKAGE_VERSION: &str = "1.0.1";
+
+/// Package version the golden built-in descriptor declares.
+const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
 
 fn package_dir() -> PathBuf {
     workspace_root().join(PACKAGE_DIR)
@@ -251,14 +256,14 @@ fn rows_of(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// What a captured screen means.
+/// What a captured screen means: Claude waits for a prompt, runs a turn, or
+/// waits for an answer to a dialog (tool approval, question, first-run and
+/// folder trust dialogs).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Meaning {
     Idle,
     Working,
     Blocked,
-    /// A screen no rule speaks for: only the byte-activity fallback applies.
-    Silent,
 }
 
 impl Meaning {
@@ -266,21 +271,23 @@ impl Meaning {
         match state {
             "idle" | "idle_after_turn" => Self::Idle,
             "working_early" | "working_stream" => Self::Working,
-            "approval" | "askuser" | "apikey" => Self::Blocked,
-            "theme" | "login" | "trust" => Self::Silent,
+            "approval" | "askuser" | "apikey" | "theme" | "login" | "trust" => Self::Blocked,
             other => panic!("unknown fixture state {other}"),
         }
     }
 
-    fn activity(self) -> Option<AgentActivity> {
+    fn activity(self) -> AgentActivity {
         match self {
-            Self::Idle => Some(AgentActivity::Idle),
-            Self::Working => Some(AgentActivity::Working),
-            Self::Blocked => Some(AgentActivity::Blocked),
-            Self::Silent => None,
+            Self::Idle => AgentActivity::Idle,
+            Self::Working => AgentActivity::Working,
+            Self::Blocked => AgentActivity::Blocked,
         }
     }
 }
+
+/// First-run and folder trust dialogs: Claude shows them before it opens its
+/// prompt and sets no title while they are on screen.
+const FIRST_RUN_STATES: [&str; 4] = ["apikey", "theme", "login", "trust"];
 
 /// One screen captured from a real Claude Code: `<state>.txt` at 100 columns, or
 /// `widths/<state>_w<columns>.txt`, with the OSC title Claude had set in
@@ -526,11 +533,21 @@ fn the_package_descriptor_preserves_every_builtin_claude_fact() {
 }
 
 /// The same facts as data: the package descriptor and the golden built-in
-/// descriptor are equal tables once the manifest reference, the version probe
-/// and the transcript tree, the fields that differ by design, are removed.
+/// descriptor are equal tables once the package version, the manifest
+/// reference, the version probe and the transcript tree, the fields that differ
+/// by design, are removed. The package version is above the golden's because
+/// the package manifest carries the #613 rules (see
+/// [`the_package_manifest_file_is_the_golden_manifest_with_the_613_rules`]).
 #[test]
 fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
-    let strip = |mut table: toml::Table| {
+    let strip = |mut table: toml::Table, version: &str| {
+        assert_eq!(
+            table
+                .remove("version")
+                .as_ref()
+                .and_then(toml::Value::as_str),
+            Some(version)
+        );
         let runtime = table
             .get_mut("runtime")
             .and_then(toml::Value::as_table_mut)
@@ -539,7 +556,10 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
         runtime.remove("version_probe");
         table
     };
-    let mut package = strip(read_toml(&format!("{PACKAGE_DIR}/runtime.toml")));
+    let mut package = strip(
+        read_toml(&format!("{PACKAGE_DIR}/runtime.toml")),
+        PACKAGE_VERSION,
+    );
     for section in [
         "input",
         "resume",
@@ -558,7 +578,7 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
         !golden.contains_key("transcripts"),
         "v0.34.2 declares no transcript tree"
     );
-    assert_eq!(package, strip(golden));
+    assert_eq!(package, strip(golden, GOLDEN_PACKAGE_VERSION));
 
     // Holds while the daemon embeds the built-in descriptor: its bytes are the
     // golden bytes followed by the transcript tree the package declares.
@@ -575,14 +595,52 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
     );
 }
 
-/// The manifest file is the golden built-in manifest of release v0.34.2: same
-/// process matchers, same rules in the same order with the same fields.
+/// Rules of the golden manifest the package changes for #613, each with the
+/// matcher fields the change replaces; every other field stays equal.
+const CHANGED_613_RULES: [(&str, &[&str]); 3] = [
+    // The `◐`/`◑` running-turn title.
+    ("osc_title_working", &["regex"]),
+    // The selection form footer wrapped at narrow widths.
+    ("live_blocked_form", &["contains", "regex", "any"]),
+    // The ` · done <time>` suffix of the completed-turn line.
+    ("completed_turn_status", &["line_regex"]),
+];
+
+/// Rules the package adds for #613, each with the rule it follows.
+const ADDED_613_RULES: [(&str, &str); 4] = [
+    // The `esc to interrupt` footer of a running turn.
+    ("live_turn_footer", "live_status_spinner"),
+    // The first-run and folder trust dialogs.
+    ("theme_picker", "dynamic_workflow_prompt"),
+    ("login_method_list", "theme_picker"),
+    ("folder_trust_dialog", "login_method_list"),
+];
+
+/// The id of a manifest rule table.
+fn rule_id(rule: &toml::Value) -> &str {
+    rule["id"].as_str().expect("rule id")
+}
+
+/// A rule table without `fields`.
+fn without(rule: &toml::Value, fields: &[&str]) -> toml::Table {
+    let mut table = rule.as_table().expect("a rule table").clone();
+    for field in fields {
+        table.remove(*field);
+    }
+    table
+}
+
+/// The manifest file is the golden built-in manifest of release v0.34.2 with
+/// exactly the #613 changes: the `[process]` matchers (the npm `claude.exe`
+/// accepted, a script that merely names `claude` refused), the matcher fields
+/// of [`CHANGED_613_RULES`] and the rules of [`ADDED_613_RULES`] at their
+/// places. Every other rule keeps its golden fields and order, so drift beyond
+/// the enumerated changes fails here.
 #[test]
-fn the_package_manifest_file_equals_the_builtin_manifest_file() {
+fn the_package_manifest_file_is_the_golden_manifest_with_the_613_rules() {
     let package = read_toml(&format!("{PACKAGE_DIR}/detect.toml"));
     let golden_text = golden_body(GOLDEN_MANIFEST, BUILTIN_MANIFEST);
     let golden: toml::Table = golden_text.parse().expect("the golden is TOML");
-    assert_eq!(package, golden);
     // Holds while the daemon embeds the built-in manifest: its bytes are the
     // golden bytes.
     assert_eq!(
@@ -590,28 +648,54 @@ fn the_package_manifest_file_equals_the_builtin_manifest_file() {
             .expect("read the built-in manifest"),
         golden_text
     );
-    let ids: Vec<&str> = package["rules"]
-        .as_array()
-        .expect("rules")
-        .iter()
-        .map(|rule| rule["id"].as_str().expect("rule id"))
-        .collect();
+
     assert_eq!(
-        ids,
-        [
-            "osc_title_working",
-            "live_status_spinner",
-            "live_blocked_form",
-            "dynamic_workflow_prompt",
-            "live_prompt_box",
-            "completed_turn_status",
-            "bash_permission_prompt",
-            "generic_permission_prompt",
-            "legacy_no_prompt_blocker",
-            "osc_title_idle",
-            "osc_progress_idle",
-        ]
+        package.keys().collect::<Vec<_>>(),
+        golden.keys().collect::<Vec<_>>()
     );
+    assert_ne!(package["process"], golden["process"], "[process] changes");
+    assert_eq!(
+        package["process"]
+            .as_table()
+            .expect("[process]")
+            .keys()
+            .collect::<Vec<_>>(),
+        ["cmdline", "comm"]
+    );
+
+    let golden_rules = golden["rules"].as_array().expect("golden rules");
+    let package_rules = package["rules"].as_array().expect("package rules");
+    let mut expected_ids: Vec<&str> = golden_rules.iter().map(rule_id).collect();
+    for (added, after) in ADDED_613_RULES {
+        let place = expected_ids
+            .iter()
+            .position(|id| *id == after)
+            .unwrap_or_else(|| panic!("{added} follows the rule {after}"));
+        expected_ids.insert(place + 1, added);
+    }
+    assert_eq!(
+        package_rules.iter().map(rule_id).collect::<Vec<_>>(),
+        expected_ids
+    );
+
+    for golden_rule in golden_rules {
+        let id = rule_id(golden_rule);
+        let package_rule = package_rules
+            .iter()
+            .find(|rule| rule_id(rule) == id)
+            .expect("the golden rule is kept");
+        match CHANGED_613_RULES.iter().find(|(changed, _)| *changed == id) {
+            Some((_, fields)) => {
+                assert_ne!(package_rule, golden_rule, "{id} carries its #613 change");
+                assert_eq!(
+                    without(package_rule, fields),
+                    without(golden_rule, fields),
+                    "{id} changes only {fields:?}"
+                );
+            }
+            None => assert_eq!(package_rule, golden_rule, "{id} equals the golden rule"),
+        }
+    }
 }
 
 #[test]
@@ -729,34 +813,58 @@ fn the_top_level_screens_cover_every_state() {
     );
 }
 
-/// What the package manifest reads from every captured screen, with the screen
-/// and the title Claude set. The screen text carries the idle, working and
-/// blocked evidence; the exceptions are the pinned gaps of the tests below.
+/// What the package manifest reads from every captured screen: from the screen
+/// text alone, and with the title Claude had set. The screen reads the state of
+/// every capture except a streaming reply too narrow for its turn footer
+/// ([`TURN_FOOTER_UNREAD_WIDTHS`]); the running-turn title outranks the screen,
+/// so with its title every capture reads its state.
 #[test]
-fn every_captured_screen_is_classified_by_its_screen_text() {
+fn every_captured_screen_is_classified_by_its_screen_text_and_title() {
     let definition = installed_definition();
     for frame in top_level_frames().into_iter().chain(width_frames()) {
-        let expected = match (frame.meaning(), frame.state.as_str(), frame.columns) {
-            // Pinned gaps: see the tests below.
-            (Meaning::Working, "working_stream", _) => {
-                Some((AgentActivity::Idle, StateSource::Screen))
-            }
-            (Meaning::Blocked, "askuser", columns) if QUESTION_UNREAD_WIDTHS.contains(&columns) => {
-                Some((AgentActivity::Idle, StateSource::Screen))
-            }
-            (meaning, _, _) => meaning
-                .activity()
-                .map(|activity| (activity, StateSource::Screen)),
+        let meant = frame.meaning().activity();
+        let from_screen = if frame.state == "working_stream"
+            && TURN_FOOTER_UNREAD_WIDTHS.contains(&frame.columns)
+        {
+            AgentActivity::Idle
+        } else {
+            meant
         };
-        assert_eq!(frame.evidence(&definition), expected, "{}", frame.name);
+        assert_eq!(
+            screen_activity(&definition, &frame.rows, frame.columns),
+            Some(from_screen),
+            "{} from the screen",
+            frame.name
+        );
+        let source = if frame
+            .title
+            .as_deref()
+            .is_some_and(|title| title.starts_with(TURN_GLYPHS))
+        {
+            StateSource::OscTitle
+        } else {
+            StateSource::Screen
+        };
+        assert_eq!(
+            frame.evidence(&definition),
+            Some((meant, source)),
+            "{} with title {:?}",
+            frame.name,
+            frame.title
+        );
     }
 }
 
-/// Captured widths at which the question form's footer wraps between its hints
-/// ("Enter to select · ↑/↓ to" / "navigate · Esc to cancel"), so no rule
-/// matches and the screen reads as the idle prompt box. At 20 columns every hint
-/// has its own line and the rules match again.
-const QUESTION_UNREAD_WIDTHS: [u16; 2] = [30, 40];
+/// Captured widths at which the footer of a running turn is cut before its
+/// `esc to interrupt` hint (`⏸ manual mode on · esc to…` at 30 columns, the
+/// mode alone at 20). A streaming reply hides the status line, so at these
+/// widths its screen reads as the idle prompt box and only the running-turn
+/// title says the turn runs.
+const TURN_FOOTER_UNREAD_WIDTHS: [u16; 2] = [20, 30];
+
+/// The glyphs Claude Code 2.1.289 alternates before its title while a turn
+/// runs.
+const TURN_GLYPHS: [char; 2] = ['\u{25d0}', '\u{25d1}'];
 
 #[test]
 fn the_captured_screens_span_the_supported_terminal_widths() {
@@ -783,7 +891,7 @@ fn the_captured_screens_span_the_supported_terminal_widths() {
     assert!(
         frames
             .iter()
-            .filter(|frame| frame.meaning() == Meaning::Silent || frame.state == "apikey")
+            .filter(|frame| FIRST_RUN_STATES.contains(&frame.state.as_str()))
             .all(|frame| frame.title.is_none()),
         "no title was emitted for the first-run and trust dialogs"
     );
@@ -810,20 +918,21 @@ fn the_captured_titles_are_the_idle_asterisk_and_the_working_circle() {
     assert!(titles.iter().all(|title| title.ends_with(" Claude Code")));
 }
 
-/// The title alone reads idle for the asterisk and, because the manifest's
-/// working-title rule names braille spinners only, nothing for the circle
-/// glyphs of 2.1.289. The working state of 2.1.289 is read from the status
-/// line on screen instead; this test pins the gap so a rule change that
-/// closes it must update the expectations.
+/// The title alone reads idle for the asterisk and working for the two glyphs
+/// Claude 2.1.289 alternates while a turn runs, as well as for a braille
+/// spinner. The other circle quadrants, a bare name and an empty title are not
+/// a Claude state.
 #[test]
-fn the_idle_title_is_a_rule_and_the_working_circle_title_is_not() {
+fn the_title_reads_idle_for_the_asterisk_and_working_for_the_turn_glyphs() {
     let definition = installed_definition();
     for (title, expected) in [
         ("\u{2733} Claude Code", Some(AgentActivity::Idle)),
         ("\u{280b} Claude Code", Some(AgentActivity::Working)),
-        ("\u{25d0} Claude Code", None),
-        ("\u{25d1} Claude Code", None),
+        ("\u{25d0} Claude Code", Some(AgentActivity::Working)),
+        ("\u{25d1} Claude Code", Some(AgentActivity::Working)),
+        ("\u{25d2} Claude Code", None),
         ("\u{25d3} Claude Code", None),
+        ("\u{25d0}Claude Code", None),
         ("Claude Code", None),
         ("", None),
     ] {
@@ -831,12 +940,15 @@ fn the_idle_title_is_a_rule_and_the_working_circle_title_is_not() {
     }
 }
 
-/// The streaming turn of 2.1.289 shows its reply above the prompt box with no
-/// status line, so the screen reads idle (the prompt box) while the title says a
-/// turn is running. The daemon reports idle for such a frame; this test pins the
-/// gap between the screen rules and the circle title.
+/// A streaming reply of 2.1.289 shows its text above the prompt box with no
+/// status line, while the title shows a running-turn glyph and the footer reads
+/// `esc to interrupt`. Drawn with its title, every captured streaming screen
+/// reads working. A daemon sees the reply re-rendered between title changes
+/// (the title alternates every 960 ms), so the screen alone must say working
+/// too: it does through the turn footer, except at the widths that cut the
+/// footer, where the re-render reads idle until the next title change.
 #[test]
-fn a_streaming_reply_without_a_status_line_reads_idle_from_the_screen() {
+fn a_streaming_reply_reads_working_from_its_title_and_turn_footer() {
     let definition = installed_definition();
     for frame in top_level_frames()
         .into_iter()
@@ -844,13 +956,32 @@ fn a_streaming_reply_without_a_status_line_reads_idle_from_the_screen() {
         .filter(|frame| frame.state == "working_stream")
     {
         let title = frame.title.as_deref().expect("a working title");
-        assert!(title.starts_with(['\u{25d0}', '\u{25d1}']), "{title}");
+        assert!(title.starts_with(TURN_GLYPHS), "{title}");
         assert_eq!(
             live_activity(&definition, title, &frame.rows, frame.columns),
-            Some(AgentActivity::Idle),
+            Some(AgentActivity::Working),
             "{}",
             frame.name
         );
+
+        // The next token re-renders the reply without a new title.
+        let mut rerendered = frame.rows.clone();
+        let reply = rerendered
+            .iter_mut()
+            .rfind(|row| row.starts_with("\u{25cf} "))
+            .unwrap_or_else(|| panic!("{} shows the reply", frame.name));
+        reply.push('.');
+        let started = Instant::now();
+        let mut detector = detector_for(definition.manifest(), started, frame.columns);
+        let mut seen = detector.feed(started, &frame_bytes(Some(title), &frame.rows));
+        seen.extend(detector.feed(started, &frame_bytes(None, &rerendered)));
+        let published = seen.last().map(|transition| transition.activity);
+        let expected = if TURN_FOOTER_UNREAD_WIDTHS.contains(&frame.columns) {
+            AgentActivity::Idle
+        } else {
+            AgentActivity::Working
+        };
+        assert_eq!(published, Some(expected), "{} re-rendered", frame.name);
     }
 }
 
@@ -859,8 +990,9 @@ const STATUS_GLYPHS: [char; 7] = [
     '\u{b7}', '\u{2722}', '\u{2733}', '\u{2736}', '\u{273b}', '\u{273d}', '*',
 ];
 
-/// While a turn runs, the status line (`✶ Billowing… (0s · ↓ 2 tokens)`) is
-/// what makes the screen working, outranking the visible prompt box.
+/// While a turn runs, the status line (`✶ Billowing… (0s · ↓ 2 tokens)`) makes
+/// the screen working on its own, outranking the visible prompt box; the turn
+/// footer below the prompt box says the same.
 #[test]
 fn the_status_spinner_line_makes_a_running_turn_working() {
     let definition = installed_definition();
@@ -889,12 +1021,23 @@ fn the_status_spinner_line_makes_a_running_turn_working() {
         screen_activity(&definition, &early.rows, early.columns),
         Some(AgentActivity::Working)
     );
-    let mut without = early.rows.clone();
+    let mut without_footer = early.rows.clone();
+    without_footer.retain(|row| !row.contains("esc to interrupt"));
+    assert_ne!(
+        without_footer, early.rows,
+        "the capture shows the turn footer"
+    );
+    assert_eq!(
+        screen_activity(&definition, &without_footer, early.columns),
+        Some(AgentActivity::Working),
+        "the status line alone reads working"
+    );
+    let mut without = without_footer;
     without.retain(|row| !row.contains('\u{2026}'));
     assert_eq!(
         screen_activity(&definition, &without, early.columns),
         Some(AgentActivity::Idle),
-        "without the status line the visible prompt box reads idle"
+        "without the status line and the turn footer the visible prompt box reads idle"
     );
 }
 
@@ -905,9 +1048,7 @@ fn a_tool_approval_or_question_is_blocked_although_the_title_says_idle() {
     let definition = installed_definition();
     let mut checked = 0_usize;
     for frame in top_level_frames().into_iter().chain(width_frames()) {
-        let reads_blocked = frame.state == "approval"
-            || (frame.state == "askuser" && !QUESTION_UNREAD_WIDTHS.contains(&frame.columns));
-        if !reads_blocked {
+        if !["approval", "askuser"].contains(&frame.state.as_str()) {
             continue;
         }
         let title = frame.title.as_deref().expect("a title");
@@ -920,29 +1061,30 @@ fn a_tool_approval_or_question_is_blocked_although_the_title_says_idle() {
         );
         checked += 1;
     }
-    assert!(checked >= 15, "approval and question screens: {checked}");
+    assert_eq!(checked, 20, "approval and question screens at every width");
 }
 
-/// The first-run API-key approval is a blocked screen at every width; the theme
-/// picker, the login method list and the folder trust dialog are not
-/// classified. Pinned so a rule change that closes the gap updates the
-/// fixtures.
+/// The first-run dialogs (theme picker, API-key approval, login method list)
+/// and the folder trust dialog wait for a choice: each reads blocked from the
+/// screen, the trust dialog at every captured width, its heading scrolled away
+/// and its option wrapped at 20 columns.
 #[test]
-fn the_first_run_and_trust_dialogs_are_pinned_as_the_manifest_reads_them() {
+fn the_first_run_and_trust_dialogs_are_blocked() {
     let definition = installed_definition();
+    let mut checked = 0_usize;
     for frame in top_level_frames().into_iter().chain(width_frames()) {
-        let expected = match frame.state.as_str() {
-            "apikey" => Some(AgentActivity::Blocked),
-            "theme" | "login" | "trust" => None,
-            _ => continue,
-        };
+        if !FIRST_RUN_STATES.contains(&frame.state.as_str()) {
+            continue;
+        }
         assert_eq!(
             screen_activity(&definition, &frame.rows, frame.columns),
-            expected,
+            Some(AgentActivity::Blocked),
             "{}",
             frame.name
         );
+        checked += 1;
     }
+    assert_eq!(checked, 22, "theme, login and every apikey and trust width");
     let trust = load_frame(
         &workspace_root().join(SCREENS_DIR),
         "trust",
@@ -956,6 +1098,64 @@ fn the_first_run_and_trust_dialogs_are_pinned_as_the_manifest_reads_them() {
             .any(|row| row.contains("Yes, I trust this folder")),
         "the trust capture shows the real dialog"
     );
+}
+
+/// A reply that quotes the first-run and trust dialogs, the way this package's
+/// guide or an explanation of `/theme` does.
+const QUOTED_DIALOGS: [&str; 4] = [
+    "\u{25cf} The trust dialog offers \"Yes, I trust this folder\" and \"No, exit\";",
+    "  press Enter to confirm. /theme asks you to choose the text style:",
+    "  Dark mode or Light mode. Select login method: Claude account with",
+    "  subscription or Anthropic Console account.",
+];
+
+/// `frame` with [`QUOTED_DIALOGS`] in its transcript above the prompt box, in
+/// the first run of blank rows that holds them with a blank row on each side,
+/// so the screen keeps its height and its other lines.
+fn with_quoted_dialogs(frame: &Frame) -> Vec<String> {
+    let rules: Vec<usize> = frame
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.starts_with("\u{2500}\u{2500}\u{2500}"))
+        .map(|(index, _)| index)
+        .collect();
+    let top_border = rules[rules.len() - 2];
+    let span = QUOTED_DIALOGS.len() + 2;
+    let start = (0..=top_border.saturating_sub(span))
+        .find(|start| {
+            frame.rows[*start..*start + span]
+                .iter()
+                .all(String::is_empty)
+        })
+        .unwrap_or_else(|| panic!("{} has room above its prompt box", frame.name));
+    let mut rows = frame.rows.clone();
+    for (offset, line) in QUOTED_DIALOGS.iter().enumerate() {
+        (*line).clone_into(&mut rows[start + 1 + offset]);
+    }
+    rows
+}
+
+/// Dialog text quoted in the transcript is not a dialog: with the prompt box
+/// below it, an idle screen stays idle and a running turn stays working.
+#[test]
+fn quoted_dialog_text_in_the_transcript_is_not_a_dialog() {
+    let definition = installed_definition();
+    let directory = workspace_root().join(SCREENS_DIR);
+    for (name, expected) in [
+        ("idle", AgentActivity::Idle),
+        ("idle_after_turn", AgentActivity::Idle),
+        ("working_early", AgentActivity::Working),
+        ("working_stream", AgentActivity::Working),
+    ] {
+        let frame = load_frame(&directory, name, name, DEFAULT_COLUMNS);
+        let rows = with_quoted_dialogs(&frame);
+        assert_eq!(
+            screen_activity(&definition, &rows, frame.columns),
+            Some(expected),
+            "{name} quoting the dialogs: {rows:#?}"
+        );
+    }
 }
 
 fn dialog(lines: &[&str]) -> Vec<String> {
@@ -1004,34 +1204,96 @@ fn the_permission_rules_read_the_options_of_a_visible_dialog() {
     );
 }
 
+/// The id of the manifest rule the daemon's detector reads from `rows` drawn
+/// without a title, built from the regions the detector renders for it.
+fn screen_rule(definition: &RuntimeDefinition, rows: &[String], columns: u16) -> Option<String> {
+    let started = Instant::now();
+    let mut detector = detector_for(definition.manifest(), started, columns);
+    detector.feed(started, &frame_bytes(None, rows));
+    let context = detector
+        .region_previews()
+        .into_iter()
+        .map(|preview| {
+            let region: ManifestRegion = preview.region.parse().expect("a manifest region");
+            (region, preview.text)
+        })
+        .filter(|(region, _)| {
+            !matches!(
+                region,
+                ManifestRegion::OscTitle | ManifestRegion::OscProgress
+            )
+        })
+        .fold(MatchContext::default(), |context, (region, text)| {
+            context.with_region_text(region, text)
+        });
+    definition
+        .manifest()
+        .match_context(&context)
+        .map(|matched| matched.rule_id)
+}
+
+/// Captured widths at which the completed-turn line wraps (`✻ Sautéed for 7s ·`
+/// / `done 3:37 PM`), so the line above the prompt box is its tail and only the
+/// prompt box reads idle.
+const COMPLETED_LINE_WRAPPED_WIDTHS: [u16; 2] = [20, 30];
+
+/// The line a completed turn leaves above the prompt box, with or without the
+/// ` · done <time>` 2.1.289 appends, is what reads idle: the precise
+/// completed-turn rule, not the prompt box alone.
 #[test]
-fn the_completed_turn_status_line_needs_no_trailing_text() {
+fn the_completed_turn_line_with_its_done_time_reads_idle_through_its_rule() {
     let definition = installed_definition();
     let prompt = [
         "\u{2500}\u{2500}\u{2500}\u{2500}",
         "\u{276f} ",
         "\u{2500}\u{2500}\u{2500}\u{2500}",
     ];
-    let with_status = |status: &str| {
+    for status in [
+        "\u{273b} Cogitated for 26s",
+        "\u{273b} Brewed for 7s \u{b7} done 3:34 PM",
+        "\u{273b} Brewed for 7s \u{b7} done 15:34",
+    ] {
         let mut rows = vec![status.to_owned()];
         rows.extend(dialog(&prompt));
-        rows
-    };
-    // Both read idle through the prompt box; the completed-turn rule is the
-    // precise one, and 2.1.289 appends ` · done <time>` which it does not
-    // match.
-    assert_eq!(
-        screen_activity(&definition, &with_status("\u{273b} Cogitated for 26s"), 80),
-        Some(AgentActivity::Idle)
-    );
-    assert_eq!(
-        screen_activity(
-            &definition,
-            &with_status("\u{273b} Brewed for 7s \u{b7} done 3:34 PM"),
-            80
-        ),
-        Some(AgentActivity::Idle)
-    );
+        assert_eq!(
+            screen_rule(&definition, &rows, 80).as_deref(),
+            Some("completed_turn_status"),
+            "{status:?}"
+        );
+        assert_eq!(
+            screen_activity(&definition, &rows, 80),
+            Some(AgentActivity::Idle)
+        );
+    }
+
+    let mut checked = 0_usize;
+    for frame in top_level_frames()
+        .into_iter()
+        .chain(width_frames())
+        .filter(|frame| frame.state == "idle_after_turn")
+    {
+        let expected = if COMPLETED_LINE_WRAPPED_WIDTHS.contains(&frame.columns) {
+            "live_prompt_box"
+        } else {
+            assert!(
+                frame
+                    .rows
+                    .iter()
+                    .any(|row| row.ends_with(" \u{b7} done 3:37 PM")),
+                "{} shows the done time",
+                frame.name
+            );
+            "completed_turn_status"
+        };
+        assert_eq!(
+            screen_rule(&definition, &frame.rows, frame.columns).as_deref(),
+            Some(expected),
+            "{}",
+            frame.name
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 10, "idle_after_turn at every width");
 }
 
 fn process(comm: &str, cmdline: &[&str]) -> ProcessFact {
@@ -1063,6 +1325,15 @@ fn the_process_matchers_accept_the_observed_claude_process_forms() {
         &["node", "/opt/claude-code/bin/claude.js"]
     )));
     assert!(matchers.matches(&process("bun", &["bun", "/opt/claude-code/cli/claude"])));
+    assert!(matchers.matches(&process(
+        "node",
+        &[
+            "node",
+            "--no-warnings",
+            "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"
+        ]
+    )));
+    assert!(matchers.matches(&process("node", &["node", "/usr/local/bin/claude"])));
     for cmdline in [
         &["/home/user/.local/bin/claude"][..],
         &["claude", "--resume", "0197aaaa", "--fork-session"],
@@ -1074,18 +1345,45 @@ fn the_process_matchers_accept_the_observed_claude_process_forms() {
     }
 
     // The npm package installs its executable as `bin/claude.exe`: the kernel
-    // name is `claude.exe` and the command line ends in `claude.exe`, which
-    // neither pattern accepts. Pinned; accepting it is a manifest change.
-    assert!(!matchers.matches(&process(
-        "claude.exe",
-        &["/opt/npm/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"]
-    )));
+    // name is `claude.exe` and the command line ends in `claude.exe`. Each
+    // matcher accepts it on its own.
+    let npm = "/opt/npm/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe";
+    assert!(matchers.matches(&process("claude.exe", &[npm])));
+    assert!(matchers.matches(&process("claude.exe", &["other"])));
+    assert!(matchers.matches(&process("sh", &[npm, "--resume", "abc"])));
 
-    // The command-line pattern `node|bun … \bclaude\b` also takes a script whose
-    // name merely contains `claude` as a word; the matcher is that loose.
-    assert!(matchers.matches(&process("node", &["node", "/opt/claude-companion.mjs"])));
-
+    // A script that merely carries `claude` in its name is not Claude.
     for (comm, cmdline) in [
+        ("node", vec!["node", "/opt/claude-companion.mjs"]),
+        (
+            "node",
+            vec!["node", "/home/user/claude-companion.mjs", "claude"],
+        ),
+        ("bun", vec!["bun", "/home/user/claude-helper/index.ts"]),
+        ("claude.exe.bak", vec!["/work/claude.exe.bak"]),
+        // Commands that only name a Claude executable as an argument.
+        ("ls", vec!["ls", "-l", "/x/bin/claude.exe"]),
+        (
+            "sha256sum",
+            vec![
+                "sha256sum",
+                "/opt/npm/@anthropic-ai/claude-code/bin/claude.exe",
+            ],
+        ),
+        ("tail", vec!["tail", "-f", "/work/claude"]),
+        // A node option with a separate value is indistinguishable from a
+        // script followed by arguments, so the script after it is not read.
+        (
+            "node",
+            vec!["node", "-r", "./preload.js", "/usr/local/bin/claude"],
+        ),
+        // Launchers that name the package but run no Claude script themselves:
+        // the `claude.exe` they start is matched on its own.
+        (
+            "node",
+            vec!["node", "/usr/bin/npx", "@anthropic-ai/claude-code"],
+        ),
+        ("bun", vec!["bun", "x", "@anthropic-ai/claude-code"]),
         ("zsh", vec!["zsh", "-c", "claude"]),
         ("python3", vec!["python3", "claude.py"]),
         ("claudebar", vec!["/usr/lib/claudebar/claudebar", "usage"]),
@@ -1098,25 +1396,259 @@ fn the_process_matchers_accept_the_observed_claude_process_forms() {
     }
 }
 
+/// Captured frames the #613 rules read differently from the golden manifest:
+/// the frame, whether its captured title is fed with it, and the one
+/// transition the package manifest emits for it.
+const RECLASSIFIED_613: [(&str, bool, AgentActivity, StateSource); 35] = [
+    // The running-turn title outranks the status line.
+    (
+        "working_early",
+        true,
+        AgentActivity::Working,
+        StateSource::OscTitle,
+    ),
+    // A streaming reply reads working from its title, ...
+    (
+        "working_stream",
+        true,
+        AgentActivity::Working,
+        StateSource::OscTitle,
+    ),
+    (
+        "working_stream_w20",
+        true,
+        AgentActivity::Working,
+        StateSource::OscTitle,
+    ),
+    (
+        "working_stream_w30",
+        true,
+        AgentActivity::Working,
+        StateSource::OscTitle,
+    ),
+    (
+        "working_stream_w40",
+        true,
+        AgentActivity::Working,
+        StateSource::OscTitle,
+    ),
+    (
+        "working_stream_w60",
+        true,
+        AgentActivity::Working,
+        StateSource::OscTitle,
+    ),
+    (
+        "working_stream_w80",
+        true,
+        AgentActivity::Working,
+        StateSource::OscTitle,
+    ),
+    (
+        "working_stream_w100",
+        true,
+        AgentActivity::Working,
+        StateSource::OscTitle,
+    ),
+    (
+        "working_stream_w120",
+        true,
+        AgentActivity::Working,
+        StateSource::OscTitle,
+    ),
+    (
+        "working_stream_w160",
+        true,
+        AgentActivity::Working,
+        StateSource::OscTitle,
+    ),
+    (
+        "working_stream_w200",
+        true,
+        AgentActivity::Working,
+        StateSource::OscTitle,
+    ),
+    // ... and from its turn footer wherever the footer shows the hint.
+    (
+        "working_stream",
+        false,
+        AgentActivity::Working,
+        StateSource::Screen,
+    ),
+    (
+        "working_stream_w40",
+        false,
+        AgentActivity::Working,
+        StateSource::Screen,
+    ),
+    (
+        "working_stream_w60",
+        false,
+        AgentActivity::Working,
+        StateSource::Screen,
+    ),
+    (
+        "working_stream_w80",
+        false,
+        AgentActivity::Working,
+        StateSource::Screen,
+    ),
+    (
+        "working_stream_w100",
+        false,
+        AgentActivity::Working,
+        StateSource::Screen,
+    ),
+    (
+        "working_stream_w120",
+        false,
+        AgentActivity::Working,
+        StateSource::Screen,
+    ),
+    (
+        "working_stream_w160",
+        false,
+        AgentActivity::Working,
+        StateSource::Screen,
+    ),
+    (
+        "working_stream_w200",
+        false,
+        AgentActivity::Working,
+        StateSource::Screen,
+    ),
+    // The question form whose footer wraps.
+    (
+        "askuser_w30",
+        true,
+        AgentActivity::Blocked,
+        StateSource::Screen,
+    ),
+    (
+        "askuser_w30",
+        false,
+        AgentActivity::Blocked,
+        StateSource::Screen,
+    ),
+    (
+        "askuser_w40",
+        true,
+        AgentActivity::Blocked,
+        StateSource::Screen,
+    ),
+    (
+        "askuser_w40",
+        false,
+        AgentActivity::Blocked,
+        StateSource::Screen,
+    ),
+    // The first-run and folder trust dialogs, captured without a title.
+    ("theme", false, AgentActivity::Blocked, StateSource::Screen),
+    ("login", false, AgentActivity::Blocked, StateSource::Screen),
+    ("trust", false, AgentActivity::Blocked, StateSource::Screen),
+    (
+        "trust_w20",
+        false,
+        AgentActivity::Blocked,
+        StateSource::Screen,
+    ),
+    (
+        "trust_w30",
+        false,
+        AgentActivity::Blocked,
+        StateSource::Screen,
+    ),
+    (
+        "trust_w40",
+        false,
+        AgentActivity::Blocked,
+        StateSource::Screen,
+    ),
+    (
+        "trust_w60",
+        false,
+        AgentActivity::Blocked,
+        StateSource::Screen,
+    ),
+    (
+        "trust_w80",
+        false,
+        AgentActivity::Blocked,
+        StateSource::Screen,
+    ),
+    (
+        "trust_w100",
+        false,
+        AgentActivity::Blocked,
+        StateSource::Screen,
+    ),
+    (
+        "trust_w120",
+        false,
+        AgentActivity::Blocked,
+        StateSource::Screen,
+    ),
+    (
+        "trust_w160",
+        false,
+        AgentActivity::Blocked,
+        StateSource::Screen,
+    ),
+    (
+        "trust_w200",
+        false,
+        AgentActivity::Blocked,
+        StateSource::Screen,
+    ),
+];
+
 /// Everything the golden built-in manifest of release v0.34.2 classifies, the
-/// package manifest classifies the same way: the captured frames with and
-/// without their titles, and the synthetic dialogs of the rule tests.
+/// package manifest classifies the same way, except the frames and titles the
+/// #613 rules read differently: the captured frames with and without their
+/// titles, the synthetic dialogs of the rule tests and the titles. Each
+/// exception is listed with what the package reads and must differ from the
+/// golden, so the list can neither hide drift nor go stale.
 #[test]
 fn the_package_manifest_behaves_like_the_builtin_manifest_on_every_frame() {
     let package = installed_definition();
     let golden = golden_definition();
     let mut compared = 0_usize;
+    let mut reclassified = BTreeSet::new();
     for frame in top_level_frames().into_iter().chain(width_frames()) {
-        for title in [frame.title.as_deref(), None] {
-            assert_eq!(
-                transitions(&package, title, &frame.rows, frame.columns),
-                transitions(&golden, title, &frame.rows, frame.columns),
-                "{} with title {title:?}",
-                frame.name
-            );
+        let fed_titles = if frame.title.is_some() {
+            vec![frame.title.as_deref(), None]
+        } else {
+            vec![None]
+        };
+        for title in fed_titles {
+            let seen = transitions(&package, title, &frame.rows, frame.columns);
+            let golden_seen = transitions(&golden, title, &frame.rows, frame.columns);
+            let exception = RECLASSIFIED_613
+                .iter()
+                .find(|(name, titled, _, _)| *name == frame.name && *titled == title.is_some());
+            match exception {
+                Some(&(name, titled, activity, source)) => {
+                    assert_eq!(
+                        seen,
+                        [ActivityTransition { activity, source }],
+                        "{name} with title {title:?}"
+                    );
+                    assert_ne!(
+                        seen, golden_seen,
+                        "{name} with title {title:?} differs from the golden"
+                    );
+                    reclassified.insert((name, titled));
+                }
+                None => assert_eq!(seen, golden_seen, "{} with title {title:?}", frame.name),
+            }
             compared += 1;
         }
     }
+    assert_eq!(
+        reclassified.len(),
+        RECLASSIFIED_613.len(),
+        "every listed exception names a captured frame"
+    );
     let synthetic: [&[&str]; 7] = [
         &["Bash command", "Do you want to proceed?", "\u{276f} 1. Yes"],
         &[
@@ -1145,13 +1677,23 @@ fn the_package_manifest_behaves_like_the_builtin_manifest_on_every_frame() {
     for title in [
         "\u{280b} x",
         "\u{2733} Claude Code",
-        "\u{25d0} Claude Code",
+        "\u{25d2} Claude Code",
         "x",
         "",
     ] {
         assert_eq!(
             title_activity(&package, title),
             title_activity(&golden, title),
+            "{title:?}"
+        );
+        compared += 1;
+    }
+    // The #613 running-turn title glyphs.
+    for title in ["\u{25d0} Claude Code", "\u{25d1} Claude Code"] {
+        assert_eq!(title_activity(&golden, title), None, "{title:?}");
+        assert_eq!(
+            title_activity(&package, title),
+            Some(AgentActivity::Working),
             "{title:?}"
         );
         compared += 1;
@@ -1184,6 +1726,19 @@ const PROMPT: &str = "say hi";
 /// How long one `session wait` polls before the caller retries, in
 /// milliseconds.
 const WAIT_SLICE_MS: &str = "8000";
+
+/// Text that ends the verb of Claude's status line and opens its counters, e.g.
+/// `✶ Billowing… (3s · ↓ 2 tokens)`.
+const STATUS_LINE_MARK: &str = "\u{2026} (";
+
+/// State sources of what Claude shows: the screen and the terminal title.
+const VISIBLE_SOURCES: [&str; 2] = ["screen", "osc_title"];
+
+/// How long the held-stream test watches for an idle reading, in milliseconds:
+/// longer than two of the 960 ms title changes of a running turn plus the
+/// daemon's 700 ms debounce cap, so a screen that read idle between title
+/// changes would publish.
+const HELD_STREAM_WATCH_MS: &str = "3000";
 
 /// Looks `name` up on `PATH` the way the daemon resolves a program.
 fn find_on_path(name: &str) -> Option<PathBuf> {
@@ -1507,14 +2062,21 @@ impl Fixture {
         .await
     }
 
-    /// Waits until the session reports `activity` on the strength of `source`.
-    async fn wait_evidence(&self, id: &str, activity: &str, source: &str) -> Value {
-        wait_until(&format!("{activity} from {source} of {id}"), || async {
-            let (code, inspected) = self.harness.json(&["session", "inspect", id]).await;
-            assert_eq!(code, 0, "{inspected}");
-            (inspected["ok"]["activity"] == activity && inspected["ok"]["state_source"] == source)
+    /// Waits until the session reports `working` on the strength of what Claude
+    /// shows, the screen or the running-turn title, not the byte-activity
+    /// fallback.
+    async fn wait_visible_working(&self, id: &str) -> Value {
+        wait_until(
+            &format!("working from the screen or title of {id}"),
+            || async {
+                let (code, inspected) = self.harness.json(&["session", "inspect", id]).await;
+                assert_eq!(code, 0, "{inspected}");
+                (inspected["ok"]["activity"] == "working"
+                    && VISIBLE_SOURCES
+                        .contains(&inspected["ok"]["state_source"].as_str().unwrap_or("")))
                 .then(|| inspected["ok"].clone())
-        })
+            },
+        )
         .await
     }
 
@@ -1814,6 +2376,30 @@ async fn assert_package_agrees(
     );
 }
 
+/// The package manifest reads the live screen of a real session as `expected`
+/// from the screen alone, without the title Claude has set.
+async fn assert_screen_alone_reads(
+    fixture: &Fixture,
+    definition: &RuntimeDefinition,
+    id: &str,
+    expected: AgentActivity,
+) {
+    let (_title, rows) = fixture.screen(id).await;
+    let columns = u16::try_from(
+        rows.iter()
+            .map(|row| row.chars().count())
+            .max()
+            .unwrap_or(0),
+    )
+    .unwrap_or(u16::MAX)
+    .max(DEFAULT_COLUMNS);
+    assert_eq!(
+        screen_activity(definition, &rows, columns),
+        Some(expected),
+        "the package manifest on the live screen alone: {rows:#?}"
+    );
+}
+
 /// The command line of `pid`, read from `/proc`.
 fn command_line(pid: u64) -> Vec<String> {
     let bytes = fs::read(format!("/proc/{pid}/cmdline")).expect("read the command line");
@@ -1883,9 +2469,8 @@ async fn a_real_claude_session_launches_and_is_detected_through_package_facts() 
     assert_eq!(launched["capabilities"]["fork"], true);
 
     // The launched process is what the package's process matchers describe:
-    // the distribution and native-installer binary is named `claude`; the npm
-    // package's executable is `bin/claude.exe`, which neither matcher accepts
-    // (a pinned gap, see the process-form test).
+    // the distribution and native-installer binary is named `claude`, the npm
+    // package's executable `bin/claude.exe`.
     let launch_pid = fixture.inspect(&id).await["pid"]
         .as_u64()
         .expect("the launch process id");
@@ -1894,17 +2479,14 @@ async fn a_real_claude_session_launches_and_is_detected_through_package_facts() 
         .process_matchers()
         .expect("the manifest declares process matchers");
     let fact = process_fact_of(launch_pid);
-    match fact.comm.as_str() {
-        "claude" => assert!(
-            matchers.matches(&fact),
-            "the real process {fact:?} is matched"
-        ),
-        "claude.exe" => assert!(
-            !matchers.matches(&fact),
-            "the npm launch form {fact:?} is not matched"
-        ),
-        other => panic!("an unexpected Claude process name {other:?}: {fact:?}"),
-    }
+    assert!(
+        ["claude", "claude.exe"].contains(&fact.comm.as_str()),
+        "an unexpected Claude process name: {fact:?}"
+    );
+    assert!(
+        matchers.matches(&fact),
+        "the real process {fact:?} is matched"
+    );
 
     // Idle: the prompt box and the `✳` title.
     fixture.wait_activity(&id, "idle").await;
@@ -1916,8 +2498,10 @@ async fn a_real_claude_session_launches_and_is_detected_through_package_facts() 
     // line stays on screen and the working screen is stable.
     let prompt = format!("{} {PROMPT}", messages_stub::HOLD_MARKER);
     fixture.input(&id, &prompt).await;
-    fixture.wait_evidence(&id, "working", "screen").await;
+    fixture.wait_visible_working(&id).await;
+    fixture.wait_screen_line(&id, STATUS_LINE_MARK).await;
     assert_package_agrees(&fixture, &package, &id, AgentActivity::Working).await;
+    assert_screen_alone_reads(&fixture, &package, &id, AgentActivity::Working).await;
     let (_title, rows) = fixture.screen(&id).await;
     assert!(
         !rows
@@ -1943,12 +2527,13 @@ async fn a_real_claude_session_launches_and_is_detected_through_package_facts() 
 }
 
 /// A reply held mid-stream: Claude draws the first paragraph and removes the
-/// status line while the title still shows the running-turn glyph, so the
-/// daemon and the package manifest read the screen as idle (the pinned
-/// streaming gap). The turn finishes once the stream gate opens.
+/// status line, while the title keeps alternating its running-turn glyphs and
+/// the footer reads `esc to interrupt`. The daemon keeps the session working
+/// for longer than two title changes and the package manifest reads the live
+/// screen as working. The turn finishes once the stream gate opens.
 #[tokio::test]
 #[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
-async fn a_real_claude_reply_held_mid_stream_reads_idle_from_the_screen() {
+async fn a_real_claude_reply_held_mid_stream_reads_working() {
     require_real_claude();
     let package = installed_definition();
     let fixture = Fixture::start(Seed::Trusted).await;
@@ -1962,7 +2547,7 @@ async fn a_real_claude_reply_held_mid_stream_reads_idle_from_the_screen() {
         messages_stub::STREAM_HOLD_MARKER
     );
     fixture.input(&id, &prompt).await;
-    fixture.wait_evidence(&id, "working", "screen").await;
+    fixture.wait_visible_working(&id).await;
     fixture.stub.open_gate();
     let rows = fixture
         .wait_screen_line(&id, messages_stub::FIRST_CHUNK)
@@ -1975,13 +2560,31 @@ async fn a_real_claude_reply_held_mid_stream_reads_idle_from_the_screen() {
     );
     let (title, _rows) = fixture.screen(&id).await;
     assert!(
-        title.is_some_and(
-            |title| title.starts_with(['\u{25d0}', '\u{25d1}', '\u{25d2}', '\u{25d3}'])
-        ),
+        title.is_some_and(|title| title.starts_with(TURN_GLYPHS)),
         "the title still shows a running turn"
     );
-    fixture.wait_evidence(&id, "idle", "screen").await;
-    assert_package_agrees(&fixture, &package, &id, AgentActivity::Idle).await;
+    let (code, waited) = fixture
+        .harness
+        .json(&[
+            "session",
+            "wait",
+            &id,
+            "--activity",
+            "idle",
+            "--timeout-ms",
+            HELD_STREAM_WATCH_MS,
+        ])
+        .await;
+    assert_eq!(code, 0, "{waited}");
+    assert_eq!(
+        waited["ok"]["reason"], "timeout",
+        "the held reply never reads idle: {waited}"
+    );
+    assert_eq!(fixture.inspect(&id).await["activity"], "working");
+    assert_package_agrees(&fixture, &package, &id, AgentActivity::Working).await;
+    // The turn footer, not the title, makes the re-rendered reply working.
+    fixture.wait_screen_line(&id, "esc to interrupt").await;
+    assert_screen_alone_reads(&fixture, &package, &id, AgentActivity::Working).await;
 
     fixture.stub.open_stream_gate();
     fixture
@@ -2615,7 +3218,8 @@ async fn capture_the_real_claude_screens() {
             ),
         )
         .await;
-    fixture.wait_evidence(&id, "working", "screen").await;
+    fixture.wait_visible_working(&id).await;
+    fixture.wait_screen_line(&id, STATUS_LINE_MARK).await;
     fixture.capture(&directory, &id, "working_early").await;
     fixture.stub.open_gate();
     fixture

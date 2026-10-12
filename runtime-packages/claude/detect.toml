@@ -4,16 +4,30 @@
 # herdr fields (`visible_working`, `visible_idle`, `skip_state_update`) and
 # `unknown` menu/transcript rules are intentionally omitted.
 
+# The distribution and native-installer binary is `claude`; the npm package
+# installs the same executable as `bin/claude.exe`. The command line is argv
+# joined with spaces, so each pattern names the program at its start. Through
+# `node` or `bun` the script follows the flag options and is named `claude`
+# (also `.js`, `.mjs`, `.cjs`) or lies inside the `@anthropic-ai/claude-code`
+# package; another script whose name merely contains the word `claude` is not
+# Claude.
 [process]
-comm = ["^claude$"]
-cmdline = ['(^|/)claude($| )', '(^|/)(node|bun)\b.*\bclaude\b']
+comm = ['^claude(\.exe)?$']
+cmdline = [
+  '^(\S*/)?claude(\.exe)?($| )',
+  '^(\S*/)?(node|bun)( -\S+)* (\S*/)?claude(\.[cm]?js)?($| )',
+  '^(\S*/)?(node|bun)( -\S+)* \S*/@anthropic-ai/claude-code/\S',
+]
 
+# Claude Code 2.1.x leads its title with `◐`/`◑`, alternating every 960 ms
+# while a turn runs, and with `✳` while it waits. The braille range is the
+# working title of the herdr manifest this one is ported from.
 [[rules]]
 id = "osc_title_working"
 state = "working"
 priority = 1100
 region = "osc_title"
-regex = ['^[\x{2800}-\x{28FF}] ']
+regex = ['^[\x{2800}-\x{28FF}\x{25D0}\x{25D1}] ']
 
 # Live status spinner rendered above the prompt box while a turn runs, e.g.
 # "✻ Noodling… (12s · ↓ 1.2k tokens)" or "✻ Herding… (3s · thinking with high
@@ -34,19 +48,36 @@ not = { any = [
   { contains = ["esc to cancel"] },
 ] }
 
+# The footer below a running turn's prompt box reads `esc to interrupt`; a
+# waiting prompt's footer reads `? for shortcuts`. A streaming reply hides the
+# status line, so this footer is the screen's working evidence then. At 30
+# columns and fewer the footer is cut before the hint and only the title
+# speaks for the turn. Same priority and dialog exclusions as
+# `live_status_spinner`.
+[[rules]]
+id = "live_turn_footer"
+state = "working"
+priority = 960
+region = "after_last_horizontal_rule"
+contains = ["esc to interrupt"]
+not = { any = [
+  { contains = ["do you want to proceed?"] },
+  { contains = ["esc to cancel"] },
+] }
+
+# Selection form footer, e.g. `Enter to select · ↑/↓ to navigate · Esc to
+# cancel`. Narrow terminals wrap it between any two words, so words are
+# separated by any whitespace, line breaks included.
 [[rules]]
 id = "live_blocked_form"
 state = "blocked"
 priority = 980
 region = "after_last_horizontal_rule"
 visible_blocker = true
-contains = ["enter to select", "esc to cancel"]
-any = [
-  { contains = ["tab/arrow keys to navigate"] },
-  { contains = ["arrow keys to navigate"] },
-  { contains = ["arrows to navigate"] },
-  { contains = ["↑/↓ to navigate"] },
-  { contains = ["↑↓ to navigate"] },
+regex = [
+  '(?i)enter\s+to\s+select',
+  '(?i)esc\s+to\s+cancel',
+  '(?i)(arrow\s+keys|arrows|↑/↓|↑↓)\s+to\s+navigate',
 ]
 
 [[rules]]
@@ -56,6 +87,47 @@ priority = 980
 region = "whole_recent"
 visible_blocker = true
 contains = ["run a dynamic workflow?", "esc to cancel"]
+
+# First-run and folder trust dialogs wait for a choice before Claude opens its
+# prompt. Each rule requires the dialog's heading and its options; words are
+# separated by any whitespace because narrow terminals wrap them. Claude draws
+# these dialogs below every horizontal rule on screen (or with none visible),
+# while a transcript that quotes them sits above the prompt box's rules.
+[[rules]]
+id = "theme_picker"
+state = "blocked"
+priority = 980
+region = "after_last_horizontal_rule"
+visible_blocker = true
+regex = [
+  '(?i)choose\s+the\s+text\s+style',
+  '(?i)\bdark\s+mode\b',
+  '(?i)\blight\s+mode\b',
+]
+
+[[rules]]
+id = "login_method_list"
+state = "blocked"
+priority = 980
+region = "after_last_horizontal_rule"
+visible_blocker = true
+regex = [
+  '(?i)select\s+login\s+method',
+  '(?i)claude\s+account\s+with\s+subscription',
+  '(?i)anthropic\s+console\s+account',
+]
+
+[[rules]]
+id = "folder_trust_dialog"
+state = "blocked"
+priority = 980
+region = "after_last_horizontal_rule"
+visible_blocker = true
+regex = [
+  '(?i)yes,\s+i\s+trust\s+this\s+folder',
+  '(?i)no,\s+exit',
+  '(?i)enter\s+to\s+confirm',
+]
 
 [[rules]]
 id = "live_prompt_box"
@@ -73,12 +145,14 @@ not = { any = [
 
 # A completed turn leaves a status line immediately above the restored prompt
 # box. This precise region confirms idle without scanning transcript history.
+# Claude 2.1.x appends the local clock time the turn ended, e.g.
+# `✻ Brewed for 7s · done 3:34 PM`; its format follows the host locale.
 [[rules]]
 id = "completed_turn_status"
 state = "idle"
 priority = 955
 region = "last_non_empty_above_prompt_box"
-line_regex = ['^[·✢✳✶✻✽*] \S.* for [0-9]+(?:\.[0-9]+)?s$']
+line_regex = ['^[·✢✳✶✻✽*] \S.* for [0-9]+(?:\.[0-9]+)?s(?: · done [^·]+)?$']
 
 [[rules]]
 id = "bash_permission_prompt"
