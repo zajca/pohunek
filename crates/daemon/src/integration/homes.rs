@@ -14,7 +14,7 @@
 
 // Rust guideline compliant 2026-10-12
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
@@ -252,6 +252,37 @@ impl ConfigHomes {
         Ok(Some((resolved, env)))
     }
 
+    /// Adds a target for each host profile over the served runtime of
+    /// `resolved` that does not resolve and is not in `resolvable`: an unpinned
+    /// profile over a package-served alias, or one pinned to a package version
+    /// that is not installed.
+    ///
+    /// Such a profile's agent may still have hooks in the home its own `[env]`
+    /// names, so inspection and removal ([`Reach::Existing`]) address that home
+    /// as the retired path does, and an install ([`Reach::Served`]) reports it
+    /// failing with the profile's resolution error instead of skipping it. A
+    /// file that cannot be read strictly names no runtime and stays skipped.
+    fn push_unresolved_profiles(
+        &self,
+        targets: &mut Vec<Target>,
+        resolved: &Resolved,
+        resolvable: &BTreeSet<String>,
+        reach: Reach,
+    ) {
+        for (name, env) in self.profiles.unresolved_profiles_on(&resolved.runtime_id) {
+            if resolvable.contains(&name) {
+                continue;
+            }
+            let mut target = self.target(resolved.clone(), Some((&name, &env)), true);
+            if reach == Reach::Served {
+                if let Err(error) = self.profiles.resolve_agent(&name) {
+                    target.home = Err(error);
+                }
+            }
+            targets.push(target);
+        }
+    }
+
     /// The host profiles that extend `runtime_id`, sorted by name.
     fn profiles_of(&self, runtime_id: &str) -> Vec<ResolvedAgent> {
         self.profiles
@@ -328,6 +359,10 @@ impl ConfigHomes {
                         continue;
                     }
                     let profiles = self.profiles_of(resolved.runtime_id.as_str());
+                    let resolvable: BTreeSet<String> = profiles
+                        .iter()
+                        .map(|profile| profile.name.clone())
+                        .collect();
                     for profile in profiles {
                         let Some(env) = profile.profile.as_ref().map(|launch| launch.env.clone())
                         else {
@@ -345,6 +380,10 @@ impl ConfigHomes {
                         }
                         targets.push(target);
                     }
+                    // After the resolvable profiles, so a home both reach is
+                    // attributed to a resolvable profile and its recovery
+                    // commands name a selector an install accepts.
+                    self.push_unresolved_profiles(&mut targets, &resolved, &resolvable, reach);
                 }
                 targets
             }
@@ -494,21 +533,37 @@ impl Target {
 /// label. When the first target's directory is a symlink the handler refuses,
 /// the first one that is not takes over the directory, so the real home is
 /// still written.
+///
+/// A directory that targets of several runtimes reach through one handler has
+/// no owner: the hooks in it do not say which runtime they serve, and keeping
+/// the first runtime would let request order decide which runtime acts on
+/// another's home. Each of those runtimes keeps one target whose home is the
+/// [`AMBIGUOUS_OWNER_CODE`] error instead, so nothing is installed into the
+/// directory and status and doctor report it as unresolved.
 fn merge_shared(targets: Vec<Target>) -> Vec<Target> {
+    let mut owners: BTreeMap<SharedKey, Vec<String>> = BTreeMap::new();
+    for target in &targets {
+        if let Some(key) = shared_key(target) {
+            let runtimes = owners.entry(key).or_default();
+            let runtime = target.resolved.runtime_id.as_str();
+            if !runtimes.iter().any(|known| known == runtime) {
+                runtimes.push(runtime.to_owned());
+            }
+        }
+    }
     let mut merged: Vec<Target> = Vec::new();
-    let mut seen: BTreeMap<(&'static str, PathBuf), usize> = BTreeMap::new();
+    let mut seen: BTreeMap<(SharedKey, Option<String>), usize> = BTreeMap::new();
     for target in targets {
-        let key = target
-            .home
-            .as_ref()
-            .ok()
-            .map(|home| (target.resolved.handler.id(), home.identity()));
-        let Some(key) = key else {
+        let Some(key) = shared_key(&target) else {
             merged.push(target);
             continue;
         };
-        let Some(&index) = seen.get(&key) else {
-            seen.insert(key, merged.len());
+        // An ambiguous directory is still merged within one runtime, so each
+        // runtime reports it once.
+        let ambiguous = owners.get(&key).is_some_and(|runtimes| runtimes.len() > 1);
+        let owner = ambiguous.then(|| target.resolved.runtime_id.as_str().to_owned());
+        let Some(&index) = seen.get(&(key.clone(), owner.clone())) else {
+            seen.insert((key, owner), merged.len());
             merged.push(target);
             continue;
         };
@@ -526,7 +581,48 @@ fn merge_shared(targets: Vec<Target>) -> Vec<Target> {
             kept.scope = target.scope;
         }
     }
+    for target in &mut merged {
+        let Some(key) = shared_key(target) else {
+            continue;
+        };
+        if let Some(runtimes) = owners.get(&key).filter(|runtimes| runtimes.len() > 1) {
+            target.home = Err(ambiguous_owner(key.0, runtimes));
+        }
+    }
     merged
+}
+
+/// The handler and canonical directory a target acts on.
+type SharedKey = (&'static str, PathBuf);
+
+/// The [`SharedKey`] of `target`; `None` while its home does not resolve.
+fn shared_key(target: &Target) -> Option<SharedKey> {
+    target
+        .home
+        .as_ref()
+        .ok()
+        .map(|home| (target.resolved.handler.id(), home.identity()))
+}
+
+/// Error code of a config home that several runtimes reach through one
+/// handler, which [`merge_shared`] attributes to none of them.
+pub(crate) const AMBIGUOUS_OWNER_CODE: &str = "integration_home_ambiguous_owner";
+
+/// `integration_home_ambiguous_owner`: `runtimes` (in request order) reach one
+/// config home through the handler `handler`.
+fn ambiguous_owner(handler: &str, runtimes: &[String]) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Configuration,
+        AMBIGUOUS_OWNER_CODE,
+        format!(
+            "the runtimes `{}` reach one config home through the integration handler `{handler}`, so the home is attributed to none of them",
+            runtimes.join("`, `")
+        ),
+        Some(
+            "name one runtime with `--agent <runtime>`, or give the runtimes different config homes"
+                .to_owned(),
+        ),
+    )
 }
 
 /// `path` with every `.` component removed, without touching the filesystem.

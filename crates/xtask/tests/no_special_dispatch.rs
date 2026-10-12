@@ -12,9 +12,9 @@
 //! implementation of a compiled integration handler (which runtime uses a
 //! handler is decided by its descriptor, never by a name here). The one
 //! exception is the frozen descriptor data of a retired built-in that a handler
-//! keeps (`RetiredBuiltin`, the 0.34 built-in Codex): it binds the official
-//! alias to the handler by name, but only to inspect and remove hooks that
-//! built-in installed while nothing serves the alias, never to install. Each
+//! keeps (`RetiredBuiltin`, the 0.34 built-in Codex and Claude): it binds the
+//! official alias to the handler by name, but only to inspect and remove hooks
+//! that built-in installed while nothing serves the alias, never to install. Each
 //! allow-list entry pins the exact trimmed text of every source line that still
 //! names an agent in one file (a SHA-256 over those lines for the large
 //! integration files owned wholesale by one issue) and states which issue
@@ -42,8 +42,8 @@ const AGENT_NAMES: [&str; 3] = ["codex", "claude", "hermes"];
 /// Who removes an allow-listed occurrence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Owner {
-    /// Compiled descriptor data of the built-in Claude and Hermes runtimes,
-    /// which their official packages replace.
+    /// Compiled descriptor data of the built-in Hermes runtime, which its
+    /// official package replaces.
     Packages,
     /// Compiled integration handler implementations. A handler is selected by
     /// the id a runtime descriptor names; the Claude and Codex handlers still
@@ -62,7 +62,7 @@ enum Owner {
 impl Owner {
     fn issue(self) -> &'static str {
         match self {
-            Self::Packages => "#146 #147",
+            Self::Packages => "#147",
             Self::Handlers => "handlers",
             Self::Doctor => "#68",
             Self::Data => "data",
@@ -94,10 +94,8 @@ const ALLOW_LIST: &[Entry] = &[
     (
         "crates/daemon/src/agent/host/builtin.rs",
         Approved::Lines(&[
-    "\"claude\" => detect::claude_manifest(),",
     "\"hermes\" => detect::hermes_manifest(),",
-    "include_str!(\"../builtin/claude.toml\"),",
-    "include_str!(\"../builtin/hermes.toml\"),",
+    "const EMBEDDED_DESCRIPTORS: [&str; 1] = [include_str!(\"../builtin/hermes.toml\")];",
 ]),
         Owner::Packages,
         "embedded built-in descriptors and their manifest name table",
@@ -167,13 +165,9 @@ const ALLOW_LIST: &[Entry] = &[
     (
         "crates/daemon/src/detect/mod.rs",
         Approved::Lines(&[
-    "(protocol::RuntimeId::CLAUDE, CLAUDE_MANIFEST),",
     "(protocol::RuntimeId::HERMES, HERMES_MANIFEST),",
-    ".get_or_init(|| Manifest::parse_str(CLAUDE_MANIFEST).expect(\"claude manifest must parse\"))",
     ".get_or_init(|| Manifest::parse_str(HERMES_MANIFEST).expect(\"Hermes manifest must parse\"))",
-    "const CLAUDE_MANIFEST: &str = include_str!(\"manifests/claude.toml\");",
     "const HERMES_MANIFEST: &str = include_str!(\"manifests/hermes.toml\");",
-    "pub fn claude_manifest() -> &'static Manifest {",
     "pub fn hermes_manifest() -> &'static Manifest {",
 ]),
         Owner::Packages,
@@ -221,12 +215,16 @@ const ALLOW_LIST: &[Entry] = &[
     "Handler::Daemon(&CodexHook),",
     "Ok(Box::new(stage_claude(dir)?))",
     "Ok(Box::new(stage_codex(dir)?))",
+    "Some(&CLAUDE_RETIRED)",
     "Some(&CODEX_RETIRED)",
     "StagedCodex, StatusAgent, CLAUDE_REPORTED_ACTIONS, CODEX_REPORTED_ACTIONS,",
     "actions: HERMES_REPORTED_ACTIONS,",
+    "config_default: \".claude\",",
     "config_default: \".codex\",",
+    "config_env: \"CLAUDE_CONFIG_DIR\",",
     "config_env: \"CODEX_HOME\",",
     "const HERMES_REPORTED_ACTIONS: &[HookAction] = &[",
+    "display_name: \"Claude Code\",",
     "display_name: \"Codex\",",
     "id: \"hermes-hook-v1\",",
     "impl DaemonHandler for ClaudeHook {",
@@ -238,14 +236,16 @@ const ALLOW_LIST: &[Entry] = &[
     "reported_agent_status(StatusAgent::Claude, home)",
     "reported_agent_status(StatusAgent::Codex, home)",
     "reported_agent_status, stage_claude, stage_codex, AssetManifest, InstallPaths, StagedClaude,",
+    "runtime_id: \"claude\",",
     "runtime_id: \"codex\",",
+    "static CLAUDE_RETIRED: RetiredBuiltin = RetiredBuiltin {",
     "static CODEX_RETIRED: RetiredBuiltin = RetiredBuiltin {",
     "static HERMES_HOOK: CliRunHandler = CliRunHandler {",
     "struct ClaudeHook;",
     "struct CodexHook;",
 ]),
         Owner::Handlers,
-        "compiled Claude and Codex handler implementations: they own their provider ids, paths and asset code; CODEX_RETIRED is the frozen descriptor data of the retired 0.34 built-in Codex, which binds the alias to the handler by name for inspecting and removing existing hooks only, never for an install",
+        "compiled Claude and Codex handler implementations: they own their provider ids, paths and asset code; CODEX_RETIRED and CLAUDE_RETIRED are the frozen descriptor data of the retired 0.34 built-in Codex and Claude, which bind each alias to its handler by name for inspecting and removing existing hooks only, never for an install",
     ),
     (
         "crates/daemon/src/integration/uninstall.rs",

@@ -5,10 +5,9 @@
 //!
 //! The fixture daemon serves Hermes as a built-in runtime, so the scenarios
 //! that take a built-in over inside one daemon use `hermes`. It compiles no
-//! Codex in, and whether it serves Claude as a built-in depends on the binary,
-//! so the `claude` cases assert only what holds either way; a Codex or Claude
-//! session launched from a built-in runtime is written by a daemon that
-//! compiles them in ([`compiled_in_host`]), as a previous release did.
+//! Codex or Claude in; a Codex or Claude session launched from a built-in
+//! runtime is written by a daemon that compiles them in
+//! ([`compiled_in_host`]), as a previous release did.
 //!
 //! The catalog is signed with a test key derived from a fixed label.
 
@@ -602,24 +601,27 @@ async fn a_built_in_claude_session_is_neither_resumed_nor_forked_after_the_takeo
         .expect("a refused session is still removable");
 }
 
-/// A Codex session a previous release launched from its built-in runtime, on
-/// a daemon that serves no `codex`: resume is refused as a removed built-in
-/// whose recovery is the official package and a new session, and once the
-/// package is installed, as a session the package does not serve. Neither
-/// refusal touches the stored session.
-#[tokio::test]
-async fn a_built_in_codex_session_is_refused_as_removed_until_the_package_serves_codex() {
+/// A session of the official alias `alias` a previous release launched from
+/// its built-in runtime, on a daemon that serves no `alias`: resume, and fork
+/// when the built-in forks, are refused as a removed built-in whose recovery
+/// is the official package and a new session, and once the package is
+/// installed, as a session the package does not serve. No refusal touches the
+/// stored session.
+async fn assert_built_in_session_is_refused_as_removed_until_the_package_serves(
+    alias: &'static str,
+) {
+    let tag = format!("alias-{alias}-removed");
     let key = signing_key("root");
-    let dir = temp_dir("alias-codex-removed");
-    let store_path = temp_store_path("alias-codex-removed");
+    let dir = temp_dir(&tag);
+    let store_path = temp_store_path(&tag);
     let fixture = Fixture::with_anchor_and_store(
-        "alias-codex-removed-plugins",
+        &format!("{tag}-plugins"),
         anchor(&[&key], Vec::new()),
         store_path.clone(),
     );
     fixture.write_profile(
         PROFILE,
-        "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n",
+        &format!("base = \"{alias}\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n"),
     );
     let created = launch_on_a_compiled_in_daemon(&fixture, &store_path, dir).await;
     assert!(matches!(
@@ -629,44 +631,62 @@ async fn a_built_in_codex_session_is_refused_as_removed_until_the_package_serves
             .map(|binding| &binding.provenance),
         Some(protocol::BindingProvenance::Builtin { .. })
     ));
+    let forks = created.capabilities.fork;
     let restarted = fixture.reopen();
     Box::pin(restarted.registry.reconcile_workers())
         .await
         .expect("startup reconciliation");
     assert_eq!(
-        served_by(&restarted, RuntimeId::CODEX),
+        served_by(&restarted, alias),
         None,
-        "the daemon ships no Codex"
+        "the daemon ships no built-in {alias}"
     );
     let before = fs::read(&store_path).expect("read the store");
 
-    let removed = restarted
+    let resumed = restarted
         .registry
         .resume(&created.id)
         .await
         .expect_err("nothing serves the built-in the session was launched from");
-    assert_eq!(removed.code, "runtime_builtin_removed", "{removed:?}");
-    let hint = removed.recover.as_deref().expect("a recovery hint");
-    assert!(
-        hint.contains(
-            "`pohunek plugin install runtime/packages/codex.tar.zst --catalog runtime/runtime-catalog.json`"
-        ),
-        "{hint}"
-    );
-    assert!(
-        hint.contains("`pohunek session new --agent codex`"),
-        "{hint}"
-    );
-    assert!(hint.contains("cannot be rebound"), "{hint}");
+    let mut refusals = vec![("resume", resumed)];
+    if forks {
+        let forked = restarted
+            .registry
+            .fork(fork_params(&created.id))
+            .await
+            .expect_err("nothing serves the built-in the session was launched from");
+        refusals.push(("fork", forked));
+    }
+    for (operation, removed) in &refusals {
+        assert_eq!(
+            removed.code, "runtime_builtin_removed",
+            "{alias} {operation}: {removed:?}"
+        );
+        let hint = removed.recover.as_deref().expect("a recovery hint");
+        assert!(
+            hint.contains(&format!(
+                "`pohunek plugin install runtime/packages/{alias}.tar.zst --catalog runtime/runtime-catalog.json`"
+            )),
+            "{alias} {operation}: {hint}"
+        );
+        assert!(
+            hint.contains(&format!("`pohunek session new --agent {alias}`")),
+            "{alias} {operation}: {hint}"
+        );
+        assert!(
+            hint.contains("cannot be rebound"),
+            "{alias} {operation}: {hint}"
+        );
+    }
     assert_eq!(
         fs::read(&store_path).expect("read the store"),
         before,
-        "the refusal leaves the stored session untouched"
+        "the refusals leave the stored session untouched"
     );
 
     drop(restarted);
 
-    install_official(&fixture, &official(RuntimeId::CODEX), RuntimeId::CODEX, 5).await;
+    install_official(&fixture, &official(alias), alias, 5).await;
     let served = fixture.reopen();
     Box::pin(served.registry.reconcile_workers())
         .await
@@ -676,7 +696,15 @@ async fn a_built_in_codex_session_is_refused_as_removed_until_the_package_serves
         .resume(&created.id)
         .await
         .expect_err("the package serves the runtime now");
-    assert_migration_refusal(&refused, RuntimeId::CODEX);
+    assert_migration_refusal(&refused, alias);
+    if forks {
+        let refused = served
+            .registry
+            .fork(fork_params(&created.id))
+            .await
+            .expect_err("a fork never launches the package for a built-in session");
+        assert_migration_refusal(&refused, alias);
+    }
 
     served
         .registry
@@ -685,23 +713,36 @@ async fn a_built_in_codex_session_is_refused_as_removed_until_the_package_serves
         .expect("a refused session is still removable");
 }
 
-/// A live Codex session a previous release launched from its built-in runtime,
-/// adopted by a daemon that serves no `codex`: input is refused as a removed
-/// built-in, and once the official package serves `codex` the live session
-/// takes input again.
 #[tokio::test]
-async fn an_adopted_built_in_codex_session_takes_input_only_once_the_package_serves_codex() {
+async fn a_built_in_codex_session_is_refused_as_removed_until_the_package_serves_codex() {
+    assert_built_in_session_is_refused_as_removed_until_the_package_serves(RuntimeId::CODEX).await;
+}
+
+/// The built-in Claude runtime forks, so its fork is refused like its resume.
+#[tokio::test]
+async fn a_built_in_claude_session_is_refused_as_removed_until_the_package_serves_claude() {
+    assert_built_in_session_is_refused_as_removed_until_the_package_serves(RuntimeId::CLAUDE).await;
+}
+
+/// A live session of the official alias `alias` a previous release launched
+/// from its built-in runtime, adopted by a daemon that serves no `alias`:
+/// input is refused as a removed built-in, and once the official package
+/// serves `alias` the live session takes input again.
+async fn assert_adopted_built_in_session_takes_input_only_once_the_package_serves(
+    alias: &'static str,
+) {
+    let tag = format!("alias-{alias}-live");
     let key = signing_key("root");
-    let dir = temp_dir("alias-codex-live");
-    let store_path = temp_store_path("alias-codex-live");
+    let dir = temp_dir(&tag);
+    let store_path = temp_store_path(&tag);
     let fixture = Fixture::with_anchor_and_store(
-        "alias-codex-live-plugins",
+        &format!("{tag}-plugins"),
         anchor(&[&key], Vec::new()),
         store_path.clone(),
     );
     fixture.write_profile(
         PROFILE,
-        "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 600\"]\n",
+        &format!("base = \"{alias}\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 600\"]\n"),
     );
     let previous = compiled_in_daemon(&fixture, &store_path);
     let created = previous
@@ -738,15 +779,20 @@ async fn an_adopted_built_in_codex_session_takes_input_only_once_the_package_ser
         .input(input())
         .await
         .expect_err("nothing serves the runtime the session was launched from");
-    assert_eq!(refused.code, "runtime_builtin_removed", "{refused:?}");
+    assert_eq!(
+        refused.code, "runtime_builtin_removed",
+        "{alias}: {refused:?}"
+    );
 
-    install_official(&fixture, &official(RuntimeId::CODEX), RuntimeId::CODEX, 5).await;
+    install_official(&fixture, &official(alias), alias, 5).await;
     adopted.host.reload().expect("load the installed package");
     adopted
         .registry
         .input(input())
         .await
-        .expect("the package serves codex, so the live session takes input");
+        .unwrap_or_else(|error| {
+            panic!("the package serves {alias}, so the live session takes input: {error:?}")
+        });
 
     adopted
         .registry
@@ -758,6 +804,18 @@ async fn an_adopted_built_in_codex_session_takes_input_only_once_the_package_ser
         .remove(&created.id)
         .await
         .expect("remove the adopted session");
+}
+
+#[tokio::test]
+async fn an_adopted_built_in_codex_session_takes_input_only_once_the_package_serves_codex() {
+    assert_adopted_built_in_session_takes_input_only_once_the_package_serves(RuntimeId::CODEX)
+        .await;
+}
+
+#[tokio::test]
+async fn an_adopted_built_in_claude_session_takes_input_only_once_the_package_serves_claude() {
+    assert_adopted_built_in_session_takes_input_only_once_the_package_serves(RuntimeId::CLAUDE)
+        .await;
 }
 
 /// A live session of the built-in Hermes runtime, launched through the

@@ -1546,20 +1546,21 @@ async fn daemon_doctor_reports_embedded_and_override_manifest_health_redacted() 
             .find(|check| check["name"] == name)
             .unwrap_or_else(|| panic!("doctor reports {name}: {payload}"))
     };
-    for runtime in ["shell", "claude", "hermes"] {
+    for runtime in ["shell", "hermes"] {
         assert_eq!(
             find(&format!("agent_manifest_embedded_{runtime}"))["status"],
             "ok"
         );
     }
-    // Codex is served only by its official package, so the daemon embeds no
-    // Codex manifest to check.
-    assert!(
-        checks
-            .iter()
-            .all(|check| check["name"] != "agent_manifest_embedded_codex"),
-        "{payload}"
-    );
+    // Codex and Claude are served only by their official packages, so the
+    // daemon embeds no manifest of theirs to check.
+    for runtime in ["codex", "claude"] {
+        let name = format!("agent_manifest_embedded_{runtime}");
+        assert!(
+            checks.iter().all(|check| check["name"] != name.as_str()),
+            "{payload}"
+        );
+    }
     assert_eq!(find("agent_manifest_override_empty")["status"], "ok");
     assert!(find("agent_manifest_override_empty")["detail"]
         .as_str()

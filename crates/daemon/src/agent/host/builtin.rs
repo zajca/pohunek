@@ -1,9 +1,9 @@
 //! The runtimes compiled into the daemon.
 //!
-//! Claude and Hermes are parsed from embedded `runtime.toml` descriptors. Codex
-//! is not compiled in; only its official runtime package serves it. The shell
-//! has no package identity and no native resume, so it is assembled from
-//! explicit parts around the host's login shell.
+//! Hermes is parsed from an embedded `runtime.toml` descriptor. Codex and
+//! Claude are not compiled in; only their official runtime packages serve
+//! them. The shell has no package identity and no native resume, so it is
+//! assembled from explicit parts around the host's login shell.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,22 +19,20 @@ use crate::agent::InputRules;
 use crate::detect::{self, Manifest};
 
 /// Embedded descriptors of the built-in agent runtimes.
-const EMBEDDED_DESCRIPTORS: [&str; 2] = [
-    include_str!("../builtin/claude.toml"),
-    include_str!("../builtin/hermes.toml"),
-];
+const EMBEDDED_DESCRIPTORS: [&str; 1] = [include_str!("../builtin/hermes.toml")];
 
 /// Display name of the shell runtime.
 const SHELL_DISPLAY_NAME: &str = "Shell";
 
 /// Hook schema of the shell runtime.
 ///
-/// A shell session hosts Codex and Claude in the foreground, so it admits
-/// their identity, notification, and subagent reports. The shell has no
+/// A shell session can host an agent in the foreground whose runtime reports
+/// through this schema (the official Codex and Claude packages do), so it
+/// admits identity, notification, and subagent reports. The shell has no
 /// integration handler of its own.
 const SHELL_HOOK_SCHEMA: &str = "identity-subagent-v1";
 
-/// Supplies the shell, Claude and Hermes definitions.
+/// Supplies the shell and Hermes definitions.
 #[derive(Debug, Clone)]
 pub struct BuiltinSource {
     shell_program: String,
@@ -111,7 +109,6 @@ impl RuntimeSource for BuiltinSource {
 fn embedded_manifest(name: &str) -> Result<Arc<Manifest>, DefinitionError> {
     let manifest = match name {
         "shell" => detect::generic_shell_manifest(),
-        "claude" => detect::claude_manifest(),
         "hermes" => detect::hermes_manifest(),
         _ => return Err(DefinitionError::UnknownManifest),
     };

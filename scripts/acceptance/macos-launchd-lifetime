@@ -72,8 +72,9 @@ Options:
 
 start options:
   --agent NAME          Resumable agent profile to start in every session set
-                        (repeatable, at least one; e.g. claude or codex). Its
-                        native session reference proves explicit recovery.
+                        (repeatable, at least one; e.g. hermes, or claude or
+                        codex where their official packages are installed).
+                        Its native session reference proves explicit recovery.
   --shell-sessions N    Shell sessions per set (default: $default_shell_sessions)
 EOF
 }
@@ -215,7 +216,7 @@ wait_for_references() {
       printf "'%s attach <id>' in another window and send one short message:\n" "$pohunek_bin"
       # shellcheck disable=SC2086 # one line per session id
       printf '  %s\n' $missing
-      printf "The agent's session-capture hook must be installed ('pohunek integration install').\n"
+      printf "The agent's session-capture hook must be installed in its config home: 'pohunek integration install --agent <runtime>', adding '--profile <name>' when the agent is a host profile; Hermes instead takes exactly one of '--hermes-profile <name>' or '--hermes-home <dir>', plus '--access-mode' and at least one '--allow-host', and no '--profile'.\n"
       prompted=yes
     fi
     [ "$waited" -lt "$reference_timeout_s" ] || die "no native session reference after ${reference_timeout_s}s: $missing"
@@ -434,7 +435,7 @@ preflight() {
 
 start_run() {
   [ ! -e "$state_dir/run.json" ] || die "a run already exists in $state_dir; use 'continue', or move the directory away to start over"
-  [ -s "$agents_file" ] || die "start needs at least one --agent with native resume (e.g. claude or codex)"
+  [ -s "$agents_file" ] || die "start needs at least one --agent with native resume (e.g. hermes, or claude or codex with their official packages installed)"
   preflight
   mkdir -p "$state_dir"
   chmod 700 "$state_dir"

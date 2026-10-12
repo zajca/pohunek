@@ -2,7 +2,7 @@
 type: Guide
 id: guide/claude-package
 title: Claude Code runtime package
-description: The official Claude Code runtime package source (Claude Code 2.1.x from 2.1.289), what it declares, how its detection differs from the built-in Claude runtime, what was verified against a real Claude Code, and the detection limits that remain.
+description: The official Claude Code runtime package source (Claude Code 2.1.x from 2.1.289), the only source of the claude runtime, what it declares, how its detection differs from the built-in Claude runtime of release 0.34.2, what was verified against a real Claude Code, and the detection limits that remain.
 source_kind: manual
 intents: [setup, update, debug, help]
 ---
@@ -10,13 +10,14 @@ intents: [setup, update, debug, help]
 # Claude Code runtime package
 
 The Claude package (`runtime-packages/claude`: `runtime.toml` and `detect.toml`,
-nothing else) is the package form of the Claude Code runtime that is compiled
-into the daemon today. Its compatibility lock and the screens captured from a
+nothing else) is the only source of the Claude Code runtime: the daemon compiles
+no Claude in. It is the package form of the built-in Claude runtime that
+releases up to 0.34.x compiled in. Its compatibility lock and the screens captured from a
 real Claude Code are in `compat/claude/`. See [runtime
 packages](runtime-packages.md) for the generic commands and the [Codex
 package](codex-package.md) for the package this one mirrors.
 
-## Status: official package in the release catalog; built-in still present
+## Status: official package in the release catalog; no built-in
 
 `claude` is a reserved runtime id. A package serves it only with official trust:
 a `--catalog` install whose signed catalog entry binds the package id, runtime
@@ -26,26 +27,72 @@ with `package_runtime_not_claimable`. Since release 0.34.2 every Linux daemon
 archive ships the package as `runtime/packages/claude.tar.zst` with a signed
 `runtime/runtime-catalog.json` whose signer matches the shipped trust anchor;
 [installing official packages](runtime-packages.md#install-official-packages-from-a-release)
-has the procedure. Until the built-in is removed (#146), the built-in
-descriptor, detection manifest and Claude handler serve `claude` on a host that
-has not installed the package.
+has the procedure. The Claude hook handler (`claude-hook-v1`) and its reporter
+template stay compiled into core; the descriptor and detection manifest come
+only from the package.
+
+The release catalog lists the package for the Linux x86_64 glibc and musl
+targets only; the Apple Silicon archive carries no package, so a macOS daemon
+has no source of Claude Code until darwin packages are attested (#929).
+
+On a host without the package nothing serves `claude`:
+
+- `pohunek session new --agent claude` fails with `agent_profile_not_found`,
+  and `pohunek integration install --agent claude` with `runtime_not_installed`;
+  both hints name `pohunek plugin install runtime/packages/claude.tar.zst
+  --catalog runtime/runtime-catalog.json` (run from the extracted release
+  archive). Install the package first, then the hooks with `pohunek integration
+  install --agent claude`; the package takes the native session id from them.
+- `pohunek integration status|doctor|uninstall --agent claude` still work: the
+  core-owned Claude hook handler keeps the config home of the earlier built-in
+  (`CLAUDE_CONFIG_DIR`, else `~/.claude`), so hooks pohunek installed there are
+  reported and removed (only pohunek-owned entries) without the package, also
+  on macOS, where no package exists yet (#929). `--profile <name>` and
+  `--all-profiles` reach the homes of host profiles over `claude` too, each
+  through the profile's own `[env]` (`CLAUDE_CONFIG_DIR`), although such a
+  profile does not resolve without the package. A bare `integration status` or
+  `doctor` without `--agent` covers only served runtimes, so name `--agent
+  claude` to see leftover Claude hooks.
+- A host profile with `base = "claude"` and no `package`/`digest` keys fails
+  with `runtime_not_installed`; its hint names the install and then `pohunek
+  plugin profile migrate <name>`, which pins the profile to the installed
+  package.
+- A `claude` in the foreground of a shell session, or started outside pohunek,
+  is not attributed to Claude Code: process recognition and transcript
+  observation read the package's `detect.toml` and `[transcripts]` table.
+- A session the built-in Claude of an earlier release launched is refused on
+  resume, fork and every interaction (input, attach, resize, rename, metadata)
+  with `runtime_builtin_removed`, whose hint names the install and a new
+  session; only stop and remove still work. With the package installed, the
+  live session can be used again, and resume and fork answer
+  `runtime_served_by_package`: a session is never rebound to another runtime
+  source. `pohunekd upgrade-preflight` reports such a session as
+  `would_lose_recovery` (`runtime_source_not_served`) whether or not it could
+  resume, and without the package its detail says every interaction is refused
+  until the package is installed.
+- A package that declares `claude-hook-v1` and Claude's `[config_home]` under
+  another runtime id reaches the same `~/.claude`. Requests that name no runtime
+  attribute that home to neither runtime (`integration_home_ambiguous_owner`)
+  and a bare install writes nothing; name the runtime with `--agent`.
+- A bare `pohunek integration install` on a host without the package fails with
+  `integration_no_managed_runtime`; its hint names the package install and then
+  `pohunek integration install --agent claude`.
+- A shell session hosting `claude` stays interactive without the package:
+  input, attach and resize act on the shell, so a Claude identity its hooks
+  report does not need to resolve.
 
 ## What the package declares
 
 The package is version `1.0.1`. Every descriptor fact below equals the
 built-in Claude descriptor release 0.34.2 shipped (package version `1.0.0`),
 except the version probe and the transcript tree (`[transcripts]`), which that
-descriptor does not declare. The detection manifest is the built-in one plus the
-rules of #613 ([below](#detection-beyond-the-built-in-manifest)); the built-in
-manifest keeps the 0.34.2 rules until the cutover deletes it. The package tests
+descriptor does not declare. The detection manifest is the v0.34.2 built-in one
+plus the rules of #613 ([below](#detection-beyond-the-built-in-manifest)). The
+package tests
 compare the package with golden copies of that descriptor and its detection
 manifest in `compat/claude/builtin-v0.34/` (`runtime.toml`, `detect.toml`):
 the manifest may differ only by the enumerated #613 changes, and only the
-enumerated captured frames may read differently. While the daemon embeds the
-built-in (`crates/daemon/src/agent/builtin/claude.toml` and
-`crates/daemon/src/detect/manifests/claude.toml`), they also check that the
-built-in manifest is the golden byte for byte and the built-in descriptor is
-the golden followed by the package's transcript tree.
+enumerated captured frames may read differently.
 
 - Launch: `claude` with the first prompt as a trailing positional argument.
   Claude's Ink input takes text without bracketed paste; the submit key is a
@@ -224,7 +271,7 @@ captured screen through the package manifest.
 
 ## Detection beyond the built-in manifest
 
-The package manifest adds these rules to the built-in one (#613). Each is
+The package manifest adds these rules to the v0.34.2 built-in one (#613). Each is
 backed by screens or process forms captured from 2.1.289 and by a package test
 that fails without the rule.
 
@@ -321,6 +368,21 @@ established by the network namespace, not by Claude's own switches.
   throwaway `claude` scripts: the older release, the next minor, a pre-release,
   a different banner wording and unreadable output are refused with
   `agent_runtime_unsupported`, and the supported banner launches.
+- Always-running clean-host tests start from a daemon without the package and
+  a fake `claude` of the locked release on `PATH`: the bare runtime, its
+  integration and an unpinned `base = "claude"` profile are refused with the
+  install hint (and the migration for the profile), and after the catalog
+  install the bare runtime launches pinned to the package and the migrated
+  profile launches. Others install the hooks into the hermetic `~/.claude` (and
+  into two host profiles' own `CLAUDE_CONFIG_DIR`) through the package,
+  uninstall the package, and check that `integration status`, `doctor` and
+  `uninstall --agent claude` (with `--profile` and `--all-profiles`) still
+  report and remove them while `integration install` is refused, that a
+  malformed profile is refused instead of being read with an empty
+  environment, and that the assistant answers `no_capable_agent` on such a
+  host. One more installs the hooks and checks that the installed reporter
+  scripts equal the recorded renderings
+  (`crates/daemon/src/integration/reporter_golden/claude-*.sh`) byte for byte.
 - The test daemon observes the host through the test-host process view
   (`crates/daemon/src/procwatch/readable_host.rs`, via
   `SessionRegistry::new_production_with_inspector`), so a same-user process of

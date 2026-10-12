@@ -51,6 +51,17 @@ static CODEX_RETIRED: RetiredBuiltin = RetiredBuiltin {
 #[derive(Debug)]
 struct ClaudeHook;
 
+/// The built-in Claude runtime release 0.34.2 compiled in, as its descriptor
+/// declared it (`compat/claude/builtin-v0.34/runtime.toml`), so the hooks it
+/// installed into `~/.claude` stay removable on a host without the package.
+static CLAUDE_RETIRED: RetiredBuiltin = RetiredBuiltin {
+    runtime_id: "claude",
+    display_name: "Claude Code",
+    config_env: "CLAUDE_CONFIG_DIR",
+    config_default: ".claude",
+    hook_schema: "identity-subagent-v1",
+};
+
 /// Registration of the Hermes hook handler, whose lifecycle the CLI runs.
 static HERMES_HOOK: CliRunHandler = CliRunHandler {
     id: "hermes-hook-v1",
@@ -142,5 +153,9 @@ impl DaemonHandler for ClaudeHook {
         let mut report = super::uninstall::uninstall_claude(dir)?;
         report.agent = runtime.clone();
         Ok(report)
+    }
+
+    fn retired_builtin(&self) -> Option<&'static RetiredBuiltin> {
+        Some(&CLAUDE_RETIRED)
     }
 }

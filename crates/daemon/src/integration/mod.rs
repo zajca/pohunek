@@ -50,6 +50,8 @@ mod uninstall;
 pub use doctor::doctor;
 #[cfg(unix)]
 pub use doctor::doctor_in;
+#[cfg(unix)]
+pub(crate) use doctor::is_ambiguous_owner;
 pub use handler::{
     install_in, serves_retired, status_in, AssetManifest, DaemonHandler, Handler, RetainedSchemas,
     RetiredBuiltin, StagedUpdate,
@@ -401,6 +403,22 @@ pub fn outdated_assets_warning(
     })
 }
 
+/// Start of the status warning of a config home that does not resolve; the
+/// error code follows in parentheses.
+const UNRESOLVED_HOME_WARNING: &str = "agent config directory could not be resolved";
+
+/// Whether `warning` is the status warning of a config home that several
+/// runtimes reach through one handler.
+///
+/// The warning starts with the fixed text and the error code, so a user's home
+/// path or hint that merely contains the code never matches.
+pub(crate) fn is_ambiguous_owner_warning(warning: &str) -> bool {
+    warning
+        .strip_prefix(UNRESOLVED_HOME_WARNING)
+        .and_then(|rest| rest.strip_prefix(" ("))
+        .is_some_and(|rest| rest.starts_with(homes::AMBIGUOUS_OWNER_CODE))
+}
+
 /// Degrade one supported agent's config-resolution failure into a warning.
 fn reported_agent_status(
     agent: StatusAgent,
@@ -418,10 +436,10 @@ fn reported_agent_status(
             expected_version: EXPECTED_INTEGRATION_VERSION,
             state: IntegrationInstallState::Outdated,
             recovery: IntegrationRecovery::RepairConfiguration,
-            warnings: vec![format!(
-                "agent config directory could not be resolved ({})",
-                error.code
-            )],
+            warnings: vec![match &error.recover {
+                Some(recover) => format!("{UNRESOLVED_HOME_WARNING} ({}; {recover})", error.code),
+                None => format!("{UNRESOLVED_HOME_WARNING} ({})", error.code),
+            }],
             home: None,
         },
     }

@@ -651,10 +651,12 @@ impl ProfileRegistry {
     /// The base and `[env]` of the host profile `name`, read without resolving
     /// its base runtime.
     ///
-    /// It serves only the config home of a retired built-in nothing serves
-    /// (integration status, doctor and removal of hooks that already exist): a
-    /// profile over such a runtime never resolves, but the directory its agent
-    /// was told is still the declared home under the profile's environment.
+    /// It serves only the config home of a profile that does not resolve (a
+    /// profile over a retired built-in nothing serves, an unpinned profile over
+    /// a package-served alias, or one pinned to a version that is not
+    /// installed) for the integration requests that address existing hooks:
+    /// the directory its agent was told is still the declared home under the
+    /// profile's environment.
     /// The file passes the containment and owner-security checks of a load;
     /// every `POHUNEK_`-prefixed key is dropped as a load drops it. `Ok(None)`
     /// when no profile file has that name.

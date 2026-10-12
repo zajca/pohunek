@@ -1,8 +1,14 @@
 //! Real-systemd durability of worker generations across daemon restarts.
 //!
-//! Linux-only: it drives transient user units of the systemd backend.
+//! Linux-only: it drives transient user units of the systemd backend. The
+//! sessions are Claude sessions launched from the official Claude package,
+//! which the fixture installs into the daemon's plugin root, because only
+//! that package serves `claude`.
 
 #![cfg(target_os = "linux")]
+
+#[path = "support/official_runtimes.rs"]
+mod official_runtimes;
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -78,6 +84,7 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
     let daemon_bin = required_binary("POHUNEK_DAEMON_BIN");
     let worker_bin = required_binary("POHUNEK_WORKER_BIN");
     let fixture = Fixture::new(&worker_bin);
+    fixture.install_claude_package().await;
 
     fixture.start_worker(&fixture.worker_key).await;
     fixture.start_worker(&fixture.isolation_worker_key).await;
@@ -416,6 +423,10 @@ struct Fixture {
     namespace: Namespace,
     service_config: PathBuf,
     worker_executable: PathBuf,
+    /// The program the persisted sessions were launched with: a fake `claude`
+    /// that answers the official package's version probe and otherwise runs
+    /// its arguments with `/bin/sh`.
+    claude_program: PathBuf,
 }
 
 /// Creates a private Claude transcript for a seeded native reference.
@@ -430,6 +441,26 @@ fn seed_transcript(home: &Path, reference: &str) {
     std::fs::write(&transcript, "{}\n").expect("write fixture Claude transcript");
     std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o600))
         .expect("private Claude transcript");
+}
+
+/// Writes a fake `claude` below `root` that answers the official Claude
+/// package's version probe and otherwise runs its arguments with `/bin/sh`,
+/// and returns its path.
+fn write_fake_claude(root: &Path) -> PathBuf {
+    let program = root.join("bin").join("claude");
+    std::fs::create_dir_all(program.parent().expect("the fake claude directory"))
+        .expect("create the fake claude directory");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\n{}exec /bin/sh \"$@\"\n",
+            official_runtimes::sh_version_answer("claude")
+        ),
+    )
+    .expect("write the fake claude");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+        .expect("make the fake claude executable");
+    program
 }
 
 impl Fixture {
@@ -514,6 +545,7 @@ impl Fixture {
         let worker_key = WorkerKey::new(session_id.clone(), WORKER_GENERATION).expect("worker key");
         let isolation_worker_key = WorkerKey::new(isolation_session_id.clone(), WORKER_GENERATION)
             .expect("isolation worker key");
+        let claude_program = write_fake_claude(&root);
         Self {
             socket: runtime_home.join("pohunek/daemon.sock"),
             worker_unit: namespace.worker_unit(&worker_key),
@@ -531,7 +563,16 @@ impl Fixture {
             namespace,
             service_config,
             worker_executable,
+            claude_program,
         }
+    }
+
+    /// Installs the official Claude package into the daemon's plugin root
+    /// before the daemon starts, so the daemon serves `claude` from it.
+    async fn install_claude_package(&self) {
+        official_runtimes::OfficialCatalog::new()
+            .preinstall(&self.state_home.join("pohunek/plugins"), &self.root)
+            .await;
     }
 
     /// Registers one worker generation through the transient-unit backend,
@@ -778,7 +819,7 @@ impl Fixture {
                     project_id: None,
                     is_linked_worktree: None,
                     metadata: BTreeMap::new(),
-                    program: "/bin/sh".to_owned(),
+                    program: path_string(&self.claude_program),
                     args: vec!["-c".to_owned(), "while :; do sleep 1; done".to_owned()],
                     input_rules: StoredInputRules::from(InputRules::unrestricted(
                         false,
@@ -792,7 +833,9 @@ impl Fixture {
                         )
                         .expect("valid launch templates"),
                     ),
-                    launch_binding: pohunek_daemon::agent::host::LaunchPin::Unpinned,
+                    launch_binding: pohunek_daemon::agent::host::LaunchPin::Pinned(Box::new(
+                        official_runtimes::package_binding("claude"),
+                    )),
                     native_reference_provenance:
                         pohunek_daemon::agent::NativeReferenceProvenance::default(),
                     profile_revision: None,

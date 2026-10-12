@@ -225,12 +225,18 @@ impl Harness {
     /// Starts a daemon whose session records are durable under the root, so a
     /// daemon started later on the same root can adopt the workers still running.
     pub(crate) async fn start_durable() -> Self {
+        Self::start_durable_with_trust(CatalogTrust::Absent).await
+    }
+
+    /// [`Self::start_durable`] with `catalog_trust` as the host's catalog trust
+    /// anchor, so an official package can be installed into it.
+    pub(crate) async fn start_durable_with_trust(catalog_trust: CatalogTrust) -> Self {
         let env = TestEnv::new().expect("create the hermetic test environment");
         Self::serve(
             env,
             Arc::new(SubprocessWorkerLauncher::new()),
             DaemonSpec {
-                catalog_trust: CatalogTrust::Absent,
+                catalog_trust,
                 worker_executable: worker_binary(),
                 inbox: Inbox::Absent,
                 durable: true,

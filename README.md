@@ -31,9 +31,10 @@ attention.
 pohunek host discover
 
 # Start Codex on the build box, in a fresh worktree, with its first prompt.
-# Codex is served only by its official package: install it on buildbox first,
-# then its hooks with `pohunek integration install --agent codex` (docs/install.md,
-# "Install official runtime packages from the release archive").
+# Codex (like Claude Code) is served only by its official package: install it
+# on buildbox first, then its hooks with `pohunek integration install --agent
+# codex` (docs/install.md, "Install official runtime packages from the release
+# archive").
 # The project name resolves on buildbox; no filesystem path crosses the wire.
 pohunek session new --host buildbox --project myapp --agent codex \
   --branch feat/parser --input "Fix the parser fuzz failures." --yes
@@ -161,10 +162,12 @@ Rules:
 4. Verify with `pohunek doctor --json`, `pohunek service status --json`,
    `pohunek health --json`, and `pohunek host inspect local --json`. Report
    every warning; fix only what I approve.
-5. Ask me before running `pohunek integration install`: it has no dry run and
-   installs a SessionStart hook into the Claude Code and Codex configuration of
-   every agent present (`--agent` limits it to one). Tell me which agents and
-   configuration files it will touch and wait for my approval.
+5. Ask me before running `pohunek integration install --agent <runtime>`: it
+   has no dry run and installs a SessionStart hook into that runtime's config
+   home (for Claude Code `~/.claude`, for Codex `~/.codex`). Claude Code and
+   Codex are served only by their official packages, so their hooks install
+   only after the package does. Tell me which runtimes and configuration files
+   it will touch and wait for my approval.
 6. Run `pohunek agent-skill` and save its output as a skill or instruction file
    in your own harness, so later sessions know how to drive pohunek. Tell me
    where you saved it.
@@ -196,7 +199,11 @@ projects, agent profiles, and remote hosts.
 ```bash
 pohunek doctor                              # environment check
 pohunek service status && pohunek health    # daemon installed and answering
-pohunek integration install                 # Codex/Claude hooks: session ids + notifications
+# Claude Code is served only by its official package: install it from the
+# extracted Linux daemon archive, then its hooks (session ids + notifications).
+# The macOS archive carries no runtime package yet (#929).
+pohunek plugin install runtime/packages/claude.tar.zst --catalog runtime/runtime-catalog.json --yes
+pohunek integration install --agent claude
 pohunek session new --agent claude --name "fix-login-bug"
 pohunek attach <session-id>                 # Ctrl-] detaches, the agent keeps running
 ```
@@ -256,7 +263,7 @@ public source of truth for scope, order, and status.
 
 | Track | Where it is heading | Status |
 |---|---|---|
-| **Runtime plugin packages** — [#139](https://github.com/zajca/pohunek/issues/139) | Codex, Claude Code, and Hermes become signed, content-addressed runtime packages installed per host, with their own CI and compatibility matrix. Only `shell` stays built in. | In progress (15/28): the registry, package format, signed catalog, CLI lifecycle, and the Pi package have landed; the Codex, Claude Code, and Hermes extractions are in progress. |
+| **Runtime plugin packages** — [#139](https://github.com/zajca/pohunek/issues/139) | Codex, Claude Code, and Hermes become signed, content-addressed runtime packages installed per host, with their own CI and compatibility matrix. Only `shell` stays built in. | In progress (17/28): the registry, package format, signed catalog, CLI lifecycle, and the Pi, Codex, and Claude Code packages have landed, with the compiled-in Codex and Claude Code removed; the Hermes extraction is in progress. |
 | **Workflow plugins** — [#148](https://github.com/zajca/pohunek/issues/148), [#325](https://github.com/zajca/pohunek/issues/325), [#326](https://github.com/zajca/pohunek/issues/326) | Bounded out-of-process plugins with declared actions and event reactions, invoked from the CLI. This is the packaging path for `pohunek-work`-style tooling. They are separate from runtime packages and run as the owner over the public CLI or SDK; v1 adds no core channel for plugin data and no launch-time policy hook ([#480](https://github.com/zajca/pohunek/issues/480)). | In progress (2/4): the metadata filter and display decision are done; CLI actions and periodic jobs are open. |
 | **More agents** — [#50](https://github.com/zajca/pohunek/issues/50), [#227](https://github.com/zajca/pohunek/issues/227) | Pi and OpenCode 2.x as further first-class runtimes. | Pi ships as an official runtime package; its end-to-end acceptance and OpenCode are open. |
 | **Delegated task runs** — [#182](https://github.com/zajca/pohunek/issues/182), [WS1–WS8](https://github.com/zajca/pohunek/issues/219) | Tasks and turns over ordinary sessions: causal turn settlement, a blocking `task.wait`, typed results with repository evidence and checks, and an optional MCP adapter. Agents can then delegate work to other agents reliably. | RFC accepted; implementation started with the WS1 protocol |

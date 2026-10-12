@@ -590,17 +590,18 @@ impl ProtocolError {
     /// The canonical `runtime/no_capable_agent` error for assistant launch.
     ///
     /// Raised when no available runtime can satisfy the assistant's requirement
-    /// for a capable coding agent. Code is stable: `no_capable_agent`.
+    /// for a capable coding agent. Codex and Claude are served only by their
+    /// official packages, so the hint names their install from a release
+    /// archive. Code is stable: `no_capable_agent`.
     #[must_use]
     pub fn no_capable_agent() -> Self {
         Self::new(
             ErrorClass::Runtime,
             "no_capable_agent",
             "no capable assistant agent runtime is available",
-            Some(
-                "install or configure a codex/claude runtime, or pass --agent with a capable host profile"
-                    .to_owned(),
-            ),
+            Some(format!(
+                "install the official `codex` or `claude` package with `pohunek plugin install {RELEASE_PACKAGES_DIR}/<runtime>.tar.zst --catalog {RELEASE_CATALOG}` from an extracted release archive whose catalog lists this platform, put a supported `hermes` on the daemon's PATH, or pass --agent with a capable host profile"
+            )),
         )
     }
 

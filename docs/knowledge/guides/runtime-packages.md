@@ -20,10 +20,10 @@ daemon archive of a release carries them under `runtime/packages/`, with the
 signed `runtime/runtime-catalog.json` that authorizes them (see
 [Install official packages from a release](#install-official-packages-from-a-release)).
 The Codex, Claude Code and Hermes packages serve the reserved `codex`, `claude`
-and `hermes` ids only through that catalog. The daemon compiles no Codex in:
-`codex` is served by its official package or by nothing. The built-in Claude
-and Hermes runtimes stay in the daemon and serve their ids whenever no official
-package is installed, enabled and selected for them. Recovery steps for verification, trust and
+and `hermes` ids only through that catalog. The daemon compiles neither Codex
+nor Claude Code in: `codex` and `claude` are each served by the official package
+or by nothing. The built-in Hermes runtime stays in the daemon and serves
+`hermes` whenever no official package is installed, enabled and selected for it. Recovery steps for verification, trust and
 profile pin failures are in the
 [runtime package recovery runbook](../runbooks/runtime-package-recovery.md).
 
@@ -58,11 +58,12 @@ pohunek plugin install runtime/packages/pi.tar.zst --catalog runtime/runtime-cat
 
 Current releases list only the Linux x86_64 glibc and musl targets; the Apple Silicon
 archive carries the catalog and no package. `pohunek doctor` must report the
-`catalog_trust_anchor` check as `ok` first. Installing `codex.tar.zst`,
-`claude.tar.zst` or `hermes.tar.zst` takes the alias over from the built-in at
-once (see
-[Official aliases](#official-aliases)); `--no-enable` stages the package until
-`plugin enable`. `docs/install.md` has the complete procedure.
+`catalog_trust_anchor` check as `ok` first. Installing `codex.tar.zst` or
+`claude.tar.zst` makes the package the only source of that runtime (see
+[Official aliases](#official-aliases)); install its hooks afterwards with
+`pohunek integration install --agent codex` or `--agent claude`. Installing
+`hermes.tar.zst` takes the `hermes` alias over from the built-in at once.
+`--no-enable` stages a package until `plugin enable`. `docs/install.md` has the complete procedure.
 
 ## Config home
 
@@ -118,7 +119,7 @@ home with the same or a nested `dir`, or a symlink into another runtime's
 tree), the observer attributes both trees to neither and logs a warning
 `external.transcript_roots.ambiguous` with code `transcripts_ambiguous_owner`
 for each home; the other roots stay watched. The official `codex` package
-declares `sessions` and `claude` declares `projects`.
+declares `sessions` and the official `claude` package declares `projects`.
 
 ## Hook schemas and integration handlers
 
@@ -191,7 +192,18 @@ package never supplies script bytes.
 in the CLI; the daemon answers `agent_not_installable` for it.
 `pohunek integration --agent` takes the runtime id of a package runtime that
 names a daemon-run handler, and the recovery commands in status and doctor name
-that id.
+that id. Several runtimes may name one handler; a home that several of them reach
+through that handler (a package declaring `claude-hook-v1` with Claude's
+`[config_home]`, say) is attributed to none of them by an `integration`
+request that names no runtime: each reports `integration_home_ambiguous_owner`
+for it (the doctor as a `config_root_invalid` finding naming `--agent`), a bare
+`install` fails before writing any home, and `--agent <runtime>` addresses one
+of them explicitly. A bare `install` on a host where no served runtime has
+daemon-managed hooks fails with `integration_no_managed_runtime`, whose hint
+names the official package install and then `--agent <runtime>`.
+`--all-profiles` covers the host profiles over a runtime that do not resolve as
+well: status, doctor and uninstall reach the home their own `[env]` names, and
+install lists them as failing.
 
 ## Local only
 
@@ -319,29 +331,31 @@ read counts as incompatible.
 
 ## Official aliases
 
-An official package serves `codex`, `claude` or `hermes` in place of the
-built-in runtime as soon as it is installed, enabled and selected;
-`plugin disable` or `plugin uninstall` returns the alias to the built-in.
-`plugin list` shows the serving package: the selected, enabled `official`
-package whose runtime is the alias; without one the built-in serves it.
+An official package serves `hermes` in place of the built-in runtime as soon
+as it is installed, enabled and selected; `plugin disable` or `plugin
+uninstall` returns the alias to the built-in. `plugin list` shows the serving
+package: the selected, enabled `official` package whose runtime is the alias;
+without one the built-in serves `hermes`, and nothing serves `codex` or
+`claude`.
 
-`codex` has no built-in. Without its package, `session new --agent codex` is
-`agent_profile_not_found`, a host profile with `base = "codex"` and no
-`package`/`digest` keys is `runtime_not_installed`, and `integration install
---agent codex` is `runtime_not_installed`; each recovery hint names
-`pohunek plugin install runtime/packages/codex.tar.zst --catalog
+`codex` and `claude` have no built-in. Without its package, `session new
+--agent codex` (or `claude`) is `agent_profile_not_found`, a host profile with
+`base = "codex"` (or `"claude"`) and no `package`/`digest` keys is
+`runtime_not_installed`, and `integration install --agent codex` (or `claude`)
+is `runtime_not_installed`; each recovery hint names
+`pohunek plugin install runtime/packages/<runtime>.tar.zst --catalog
 runtime/runtime-catalog.json` (the profile hint then names `plugin profile
 migrate <name>`). `integration status`, `doctor` and `uninstall --agent codex`
-still reach the config home of the earlier built-in Codex, so hooks pohunek
-installed there can be reported and removed without the package. A foreground
-`codex` in a shell session and a `codex` started
-outside pohunek are recognized only through the package's detection manifest
-and `[transcripts]` table, so without the package they are not observed as
-Codex. A session launched from the built-in Codex of an earlier release is
-refused with `runtime_builtin_removed` on resume, fork and every interaction
-(input, attach, resize, rename, metadata) while nothing serves `codex`; once
-the package is installed, the live session can be used again and resume and
-fork answer `runtime_served_by_package` as below.
+(or `claude`) still reach the config home of the earlier built-in, so hooks
+pohunek installed there can be reported and removed without the package. A
+foreground `codex` or `claude` in a shell session and one started outside
+pohunek are recognized only through the package's detection manifest and
+`[transcripts]` table, so without the package they are not observed as that
+agent. A session launched from the built-in Codex or Claude of an earlier
+release is refused with `runtime_builtin_removed` on resume, fork and every
+interaction (input, attach, resize, rename, metadata) while nothing serves its
+runtime id; once the package is installed, the live session can be used again
+and resume and fork answer `runtime_served_by_package` as below.
 A session launched from the built-in runtime keeps its binding but cannot be
 resumed or forked while the package serves the alias: the request fails with
 `runtime_served_by_package`. The migration is a new session:

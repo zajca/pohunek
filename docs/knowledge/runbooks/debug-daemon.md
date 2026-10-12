@@ -123,9 +123,12 @@ For durable notification issues:
    not enough. Claude requires `Notification`, `Stop`, and `StopFailure` hooks.
    Reinstall preserves user hooks unless their command exactly matches a
    Pohunek-managed hook command.
-   First inspect both agents with `pohunek integration status --json`, or select
-   one with `pohunek --host <name> integration status --agent
-   <codex-or-claude> --json`; daemon-backed status honors the effective host.
+   First inspect every served runtime with daemon-managed hooks with
+   `pohunek integration status --json` (Codex and Claude appear there only
+   while their packages are installed), or select one with `pohunek --host
+   <name> integration status --agent <codex-or-claude> --json`, which also
+   reports hooks an earlier release left after the package is gone;
+   daemon-backed status honors the effective host.
    For human output, remote recovery commands explicitly name the daemon host;
    run the local-only installer on that machine rather than adding `--host` to
    `integration install`.
@@ -307,7 +310,18 @@ For durable notification issues:
    and nothing was overwritten (rerun the install); `configuration/integration_path_untrusted`
    means an unsafe path shape (symlinked config root, directory, FIFO, wrong
    owner, or group/world-writable parent), and the foreign entry is left as it
-   was; `runtime/integration_update_incompatible` means the runtime's hook
+   was; `configuration/integration_home_ambiguous_owner` means a request without
+   `--agent` reached a config home that several runtimes reach through one
+   handler (a package declaring `claude-hook-v1` and Claude's `[config_home]`,
+   say), so the home belongs to none of them and nothing was written to any
+   home: name the runtime (`pohunek integration install --agent <runtime>`) or
+   give the runtimes different config homes. Status reports such a home with
+   that code and hint, the integration doctor as a `config_root_invalid` finding
+   whose remediation names `--agent`, and `pohunek doctor` as a warning, not as
+   malformed state; `runtime/integration_no_managed_runtime` means a bare
+   `integration install` found no served runtime with daemon-managed hooks (a
+   clean host), and its hint names the official package install and then
+   `integration install --agent <runtime>`; `runtime/integration_update_incompatible` means the runtime's hook
    schema does not admit the new asset set, and nothing was written (the
    descriptor and the installed release disagree, so update or reinstall the
    runtime package). Every file already committed is restored from a snapshot when a later

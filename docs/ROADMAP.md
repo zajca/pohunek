@@ -78,18 +78,14 @@ instead of competing with them.
 ### Runtime plugin packages — [#139](https://github.com/zajca/pohunek/issues/139) (milestone C, project 5)
 
 Runtimes become signed, content-addressed packages installed per host; only
-`shell` stays built in. **15/28.** Landed: the accepted RFC (#152), the
+`shell` stays built in. **17/28.** Landed: the accepted RFC (#152), the
 `RuntimeId` protocol and generic runtime host (#140), the authenticated package
 registry (#141), the CLI lifecycle and profile migration (#143), generic hook
 schemas and integration activation (#144), digest-bound package releases with
-catalog signing (#150), the official Pi package (#538), and the decision that
-core consumes no plugin data in v1 (#480). Open:
+catalog signing (#150), the official Pi package (#538), the official Codex
+(#145) and Claude Code (#146) packages with their compiled-in runtimes removed,
+and the decision that core consumes no plugin data in v1 (#480). Open:
 
-- Codex package [#145](https://github.com/zajca/pohunek/issues/145) — in
-  progress, 2/3 (open: #592).
-- Claude Code package [#146](https://github.com/zajca/pohunek/issues/146) — in
-  progress; slices 1–2 merged, clean-host catalog install and built-in cutover
-  open (#613 related).
 - Hermes package [#147](https://github.com/zajca/pohunek/issues/147) — in
   progress (PR #839 merged 2026-10-11; issue open).
 - Package CI and compatibility matrix

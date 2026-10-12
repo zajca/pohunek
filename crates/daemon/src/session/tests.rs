@@ -19067,8 +19067,10 @@ async fn assert_migrated_binding_argv(generation: &str, case: &MigratedAgentCase
 /// Returns the script and the marker path.
 #[cfg(unix)]
 fn adapter_script(dir: &std::path::Path, public_only: bool) -> (PathBuf, PathBuf) {
-    let assets = pohunek_test_support::manifest_dir().join("src/integration/assets");
-    let a = assets.display();
+    let claude_state = crate::integration::runnable_script("claude", "pohunek-agent-state.sh");
+    let claude_state = claude_state.display();
+    let claude_notify = crate::integration::runnable_script("claude", "pohunek-agent-notify.sh");
+    let claude_notify = claude_notify.display();
     let codex_state = crate::integration::runnable_script("codex", "pohunek-agent-state.sh");
     let codex_state = codex_state.display();
     let codex_notify = crate::integration::runnable_script("codex", "pohunek-agent-notify.sh");
@@ -19083,11 +19085,11 @@ fn adapter_script(dir: &std::path::Path, public_only: bool) -> (PathBuf, PathBuf
         &format!(
             "#!/bin/sh\n\
              printf '%s' '{{\"session_id\":\"native-codex\",\"transcript_path\":\"/t/codex.jsonl\"}}' | {first} sh '{codex_state}' session\n\
-             printf '%s' '{{\"session_id\":\"native-claude\",\"transcript_path\":\"/t/claude.jsonl\"}}' | {first} sh '{a}/claude/pohunek-agent-state.sh' session\n\
+             printf '%s' '{{\"session_id\":\"native-claude\",\"transcript_path\":\"/t/claude.jsonl\"}}' | {first} sh '{claude_state}' session\n\
              printf '%s' '{{\"agent_id\":\"child-1\",\"agent_type\":\"explore\"}}' | {first} sh '{codex_state}' subagent-start\n\
              printf '%s' '{{\"session_id\":\"native-public\",\"transcript_path\":\"/t/public.jsonl\"}}' | {hide} sh '{codex_state}' session\n\
              printf '%s' '{{}}' | {first} sh '{codex_notify}' stop\n\
-             printf '%s' '{{}}' | {hide} sh '{a}/claude/pohunek-agent-notify.sh' stop\n\
+             printf '%s' '{{}}' | {hide} sh '{claude_notify}' stop\n\
              command -v python3 > '{done}.python'\n\
              : > '{done}'\n\
              exec sleep 30\n",
@@ -19209,7 +19211,16 @@ async fn wait_for_adapters(done: &std::path::Path) {
 async fn assert_worker_state_imported(registry: &SessionRegistry, id: &SessionId) {
     let (worker, _identity) = live_worker_and_identity(registry, id).await;
     let snapshot = worker.inspect().await.expect("inspect worker");
-    assert!(snapshot.active_identity.is_some(), "identity journaled");
+    // The Claude state adapter reports last through the worker socket, so a
+    // Claude adapter that does not report as `claude` leaves another identity.
+    assert_eq!(
+        snapshot
+            .active_identity
+            .as_ref()
+            .map(|identity| identity.provider.as_str()),
+        Some("claude"),
+        "the Claude adapter's identity is journaled"
+    );
     assert_eq!(snapshot.subagents.len(), 1, "subagent journaled");
     let outcome = wait_until("the daemon to settle the worker snapshot", || async {
         match Box::pin(registry.apply_worker_metadata_snapshot(id, &snapshot)).await {
@@ -19422,6 +19433,72 @@ async fn a_shell_session_accepts_the_adapter_reports_of_the_agents_it_hosts() {
         let result = response.into_result();
         assert!(result.is_ok(), "{provider}: {result:?}");
     }
+
+    rig.finish(&created.id).await;
+}
+
+/// A shell session whose foreground agent reported a Claude identity through
+/// the worker stays interactive on a host that serves no `claude` (the leftover
+/// hooks of an earlier install, or a host without the package): input, resize
+/// and attach act on the shell, which the host serves.
+#[tokio::test]
+#[cfg(unix)]
+async fn a_shell_session_hosting_an_unserved_agent_takes_input() {
+    let dir = temp_dir("hook-schema-unserved");
+    let (script, done) = adapter_script(&dir, false);
+    let command = ShellCommand::new("/bin/sh", [script.to_str().expect("utf-8 path")]);
+    let builtin_only = crate::agent::host::RuntimeHost::new(
+        crate::agent::host::RuntimeRegistry::from_sources(&[
+            &crate::agent::host::BuiltinSource::new("/bin/sh"),
+        ])
+        .expect("the built-in registry builds"),
+    );
+    assert!(
+        builtin_only.resolve_ref(&RuntimeRef::claude()).is_err(),
+        "the host serves no claude"
+    );
+    let rig = HookRig::start(&dir, Some(builtin_only), command).await;
+    let created = rig
+        .registry
+        .create(SessionNewParams {
+            cwd: Some(dir.clone()),
+            ..params()
+        })
+        .await
+        .expect("create session");
+    wait_for_adapters(&done).await;
+    Box::pin(assert_worker_state_imported(&rig.registry, &created.id)).await;
+    let info = rig.registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(info.agent_base, RuntimeRef::shell());
+    // The claim's process is the session's own root shell, which runs on, so
+    // the projected identity holds.
+    assert_eq!(
+        info.active_agent_base,
+        Some(RuntimeRef::claude()),
+        "{info:?}"
+    );
+
+    rig.registry
+        .input(protocol::SessionInputParams {
+            session_id: created.id.clone(),
+            text: "echo still-interactive".to_owned(),
+            wait: None,
+        })
+        .await
+        .expect("the shell session takes input");
+    rig.registry
+        .resize(&created.id, 100, 30)
+        .await
+        .expect("the shell session resizes");
+    rig.registry
+        .attach(&attach_params(&created.id))
+        .await
+        .expect("the shell session opens an attach");
+    rig.state
+        .sessions
+        .ensure_known_agent(&created.id.0)
+        .await
+        .expect("the public mutation guard admits the shell session");
 
     rig.finish(&created.id).await;
 }

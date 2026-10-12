@@ -164,8 +164,11 @@ pohunek service status
 pohunek health
 pohunek host governance inspect local --json
 
-# 3. Install agent hooks (native session-id capture + notifications)
-pohunek integration install
+# 3. Install the official Claude Code package from the extracted daemon
+#    archive, then its hooks (native session-id capture + notifications); see
+#    "Install official runtime packages from the release archive" below.
+pohunek plugin install runtime/packages/claude.tar.zst --catalog runtime/runtime-catalog.json --yes
+pohunek integration install --agent claude
 
 # 4. Start an agent session and attach to it
 pohunek session new --agent claude --name "fix-login-bug"
@@ -173,14 +176,19 @@ pohunek session list
 pohunek attach <session-id>        # Ctrl-] detaches, the agent keeps running
 ```
 
-For an isolated feature branch, let the daemon create a dedicated worktree. Codex
-is served only by its official package, so install it first as
-[Install official runtime packages from the release archive](#install-official-runtime-packages-from-the-release-archive)
-describes, and then its hooks: step 3 ran before Codex was served, and a bare
-`integration install` covers only the runtimes the daemon serves. The Codex
-package captures the native session id through those hooks, so without them a
-Codex session cannot be resumed. `--agent codex` needs Codex's config home
-(`CODEX_HOME`, else `~/.codex`) to exist, which Codex creates on its first run:
+Claude Code and Codex are served only by their official packages, so step 3
+installs the Claude Code package before its hooks: a bare `integration install`
+covers only the runtimes the daemon serves. The packages capture the native
+session id through those hooks, so without them a session cannot be resumed.
+`--agent claude` needs Claude Code's config home (`CLAUDE_CONFIG_DIR`, else
+`~/.claude`) to exist, which Claude Code creates on its first run. The Apple
+Silicon archive carries no runtime package yet (#929), so on macOS steps 3 and 4
+need another agent (`--agent hermes` or a package runtime you install).
+
+For an isolated feature branch, let the daemon create a dedicated worktree. To
+run Codex there, install its package and then its hooks the same way;
+`--agent codex` needs Codex's config home (`CODEX_HOME`, else `~/.codex`) to
+exist, which Codex creates on its first run:
 
 ```bash
 pohunek plugin install runtime/packages/codex.tar.zst --catalog runtime/runtime-catalog.json --yes
@@ -255,53 +263,58 @@ must be on the daemon's `PATH` in the range the package declares (see the
 runtime reports itself unsupported.
 
 `codex`, `claude` and `hermes` are reserved runtime ids that only a
-catalog-authorized package may serve. The daemon compiles no Codex in, so Codex is available only
-once its package is installed:
+catalog-authorized package may serve. The daemon compiles neither Codex nor
+Claude Code in, so each is available only once its package is installed:
 
 ```bash
+pohunek plugin install runtime/packages/claude.tar.zst --catalog runtime/runtime-catalog.json --yes
+pohunek integration install --agent claude
 pohunek plugin install runtime/packages/codex.tar.zst --catalog runtime/runtime-catalog.json --yes
 pohunek integration install --agent codex
 ```
 
-The second command installs the Codex hooks into Codex's config home
-(`CODEX_HOME`, else `~/.codex`, which must exist); the package takes the native
-session id from them, so a Codex session without them cannot be resumed. A bare
-`pohunek integration install` run before the package was installed did not
-cover Codex. Until the package is installed `pohunek session new --agent codex` fails with
-`agent_profile_not_found`, a host profile with `base = "codex"` fails with
-`runtime_not_installed`, and `pohunek integration install --agent codex` fails
-with `runtime_not_installed`; each recovery hint names this command. Codex hooks
-pohunek installed earlier stay visible and removable without the package
-(`pohunek integration status|uninstall --agent codex`). The catalog
-lists the Codex package for the Linux x86_64 targets only and the Apple Silicon
-archive carries no package, so a macOS daemon has no source of Codex until
-darwin packages are attested (#929). A `codex`
-started in a shell session or outside pohunek is not recognized as Codex
-without the package. A session launched from the built-in Codex of an earlier
-release is not resumed or forked by this daemon. Without the package every
-interaction with it (input, attach, resize, rename, metadata) is refused too
+Each `integration install` installs that runtime's hooks into its config home
+(`CLAUDE_CONFIG_DIR`, else `~/.claude`; `CODEX_HOME`, else `~/.codex`; the
+directory must exist); the package takes the native session id from them, so a
+session without them cannot be resumed. A bare `pohunek integration install`
+run before a package was installed did not cover its runtime. Until the package
+is installed `pohunek session new --agent claude` (or `codex`) fails with
+`agent_profile_not_found`, a host profile with `base = "claude"` (or `codex`)
+and no package pin fails with `runtime_not_installed`, and `pohunek integration
+install --agent claude` (or `codex`) fails with `runtime_not_installed`; each
+recovery hint names the matching install command. Hooks pohunek installed
+earlier stay visible and removable without the package (`pohunek integration
+status|uninstall --agent claude`, or `--agent codex`). The catalog lists both
+packages for the Linux x86_64 targets only and the Apple Silicon archive carries
+no package, so a macOS daemon has no source of Codex or Claude Code until
+darwin packages are attested (#929). A `claude` or `codex` started in a shell
+session or outside pohunek is not recognized as that agent without its package.
+
+A session launched from the built-in Claude Code or Codex of an earlier release
+is not resumed or forked by this daemon. Without the package every interaction
+with it (input, attach, resize, rename, metadata) is refused too
 (`runtime_builtin_removed`; only stop and remove work), so its work cannot be
 finished until the package is installed. With the package it can be used again
 but still not resumed or forked (`runtime_served_by_package`), so finish its
-work and continue in a new session. Install the Codex package on the earlier
-release before upgrading so that live Codex sessions stay usable.
+work and continue in a new session. Install the packages on the earlier release
+before upgrading so that live sessions stay usable. On the earlier release the
+first installed version of a package is enabled, selected and takes the id
+over from that release's built-in runtime at once, and a host agent profile on
+that base must be pinned to the package with `pohunek plugin profile migrate
+<name> --yes` (without `--yes` it only previews the change); until then its
+launches fail with `invalid_profile`. The same migration pins a profile over
+`claude` or `codex` on this release once its package is installed.
 
-The first installed version of a package is enabled and selected, so
-installing `claude.tar.zst` or `hermes.tar.zst` takes the id over from the
-built-in runtime at once:
-
-- an existing session launched from the built-in runtime can no longer be
-  resumed or forked (`runtime_served_by_package`) until the package is disabled
-  or uninstalled again;
-- a host agent profile on that base must be pinned to the package with
-  `pohunek plugin profile migrate <name> --yes` (without `--yes` it only
-  previews the change); until then its launches fail with `invalid_profile`.
-  The same migration pins a profile over `codex` once its package is installed.
+Installing `hermes.tar.zst` takes the `hermes` id over from the built-in Hermes
+runtime at once: an existing session launched from the built-in Hermes can no
+longer be resumed or forked (`runtime_served_by_package`) until the package is
+disabled or uninstalled again, and a host agent profile over `hermes` must be
+pinned to the package with `pohunek plugin profile migrate <name> --yes`.
 
 To prepare first, install with `--no-enable` and run
 `pohunek plugin enable <package-id>` when you are ready to switch. `pohunek
-plugin disable` or `pohunek plugin uninstall` hands the id back to the built-in
-runtime, or, for `codex`, leaves it unserved. A daemon upgrade does not change installed packages; they keep
+plugin disable` or `pohunek plugin uninstall` leaves `claude` or `codex`
+unserved and returns `hermes` to the built-in. A daemon upgrade does not change installed packages; they keep
 serving until you run `pohunek plugin update <package> runtime/packages/<runtime>.tar.zst
 --catalog runtime/runtime-catalog.json` from the new release's archive. A plain
 `install` of another version leaves it installed but unselected.

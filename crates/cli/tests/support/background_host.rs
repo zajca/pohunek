@@ -1,6 +1,11 @@
 //! A real `pohunekd` subprocess, the real CLI and a fake Claude agent, for the
 //! #890 background-work scenarios.
 //!
+//! The daemon serves `claude` from the official Claude package, its only
+//! source, which is installed into the daemon's plugin root before the daemon
+//! starts (`crate::official_runtimes`, the daemon tests' catalog fixture); the
+//! agent profile is pinned to it and the fake agent answers its version probe.
+//!
 //! The fake agent is the PTY child of its session. It runs the installed
 //! Claude state hook as its direct child for every `hook:<action> <file>` line
 //! the test sends through `session input`, so each hook reports the agent's own
@@ -57,8 +62,9 @@ const LOG_TAIL_BYTES: usize = 4096;
 /// The fake agent: runs one installed state hook per `hook:<action> <file>` line
 /// and exits on `quit`. Hook inputs are read from the test's input directory,
 /// not from the terminal, so the terminal never carries a payload.
-const FAKE_AGENT: &str = r#"#!/bin/sh
-# Fake Claude agent for the #890 background-work scenarios.
+///
+/// [`fake_agent`] puts the answer to the package's version probe before it.
+const FAKE_AGENT: &str = r#"# Fake Claude agent for the #890 background-work scenarios.
 set -u
 : "${FAKE_AGENT_HOOKS:?}" "${FAKE_AGENT_INPUTS:?}"
 printf 'fake-agent ready\n'
@@ -77,6 +83,31 @@ while IFS= read -r line; do
     esac
 done
 "#;
+
+/// The fake agent script: a shell script that answers the official Claude
+/// package's version probe, then runs [`FAKE_AGENT`].
+fn fake_agent() -> String {
+    format!(
+        "#!/bin/sh\n{}{FAKE_AGENT}",
+        crate::official_runtimes::sh_version_answer("claude")
+    )
+}
+
+/// Installs the official Codex and Claude packages into the plugin root the
+/// daemon of `env` opens, before it starts.
+fn install_official_packages(env: &TestEnv) {
+    let scratch = env.root().join("official-packages");
+    fs::create_dir_all(&scratch).expect("create the package scratch directory");
+    let plugins = env
+        .state_home()
+        .join("pohunek")
+        .join(pohunek_paths::PLUGINS_SUBDIR);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime for the package install")
+        .block_on(crate::official_runtimes::OfficialCatalog::new().preinstall(&plugins, &scratch));
+}
 
 /// A running daemon with its hermetic environment, the CLI and the captured
 /// output of every CLI call.
@@ -101,7 +132,7 @@ impl Host {
     pub(crate) fn start(env: TestEnv, inputs: &Path) -> Self {
         let agent = env.root().join("agents").join("fake-claude.sh");
         fs::create_dir_all(agent.parent().expect("agent parent")).expect("create agents dir");
-        write_executable(&agent, FAKE_AGENT).expect("write the fake agent");
+        write_executable(&agent, fake_agent()).expect("write the fake agent");
         let claude_home = env.home().join(".claude");
         let path = env
             .environment()
@@ -112,10 +143,11 @@ impl Host {
         // The profile names only the fake agent and the hook location; the
         // hook finds python3 through PATH, which the agent environment needs.
         let profile = format!(
-            "base = \"claude\"\nprogram = \"{}\"\nargs = []\n\n[env]\n\
+            "base = \"claude\"\n{}program = \"{}\"\nargs = []\n\n[env]\n\
              CLAUDE_CONFIG_DIR = \"{}\"\nFAKE_AGENT_HOOKS = \"{}\"\n\
              FAKE_AGENT_INPUTS = \"{}\"\nPATH = \"{path}\"\n\n\
              [input_rules]\nbracketed_paste = false\n",
+            crate::official_runtimes::profile_pin("claude"),
             agent.display(),
             claude_home.display(),
             claude_home.join(HOOKS_DIR).display(),
@@ -130,6 +162,8 @@ impl Host {
             .expect("create the agent profile directory");
         fs::write(agents_dir.join(format!("{PROFILE}.toml")), profile)
             .expect("write the agent profile");
+
+        install_official_packages(&env);
 
         let workers = WorkerGuard::watch(env.root().to_path_buf());
         let out = File::create(env.root().join("daemon.out")).expect("create the daemon log");

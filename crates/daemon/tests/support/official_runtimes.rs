@@ -35,7 +35,8 @@ use pohunek_test_support::catalog::{
 };
 use pohunek_test_support::{worker_binary, workspace_root};
 use protocol::{
-    BindingProvenance, PackageInstallParams, PackageInstallStatus, PackageTrust, RuntimeId,
+    BindingProvenance, LaunchBinding, PackageInstallParams, PackageInstallStatus, PackageTrust,
+    RuntimeId,
 };
 
 /// The runtimes the official packages serve, each built from
@@ -217,6 +218,17 @@ pub(crate) fn profile_pin(runtime: &str) -> String {
         entry.package_id.as_str(),
         digest.as_str()
     )
+}
+
+/// The launch binding a session launched from the official `runtime` package
+/// [`OfficialCatalog::install`] installs records.
+pub(crate) fn package_binding(runtime: &str) -> LaunchBinding {
+    let (bytes, digest) = built_archive(runtime);
+    let archive = read_archive(&bytes, &Limits::DEFAULT).expect("the official archive reads");
+    definition_from_archive(archive.entries(), &digest)
+        .unwrap_or_else(|error| panic!("the {runtime} package parses: {error:?}"))
+        .binding()
+        .clone()
 }
 
 /// The canonical archive of `runtime-packages/<runtime>` and its digest.

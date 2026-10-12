@@ -784,29 +784,45 @@ fn install_dispatches_through_the_package_runtime_definition() {
     assert!(!claude.join("hooks").join(STATE_HOOK_INSTALL_NAME).exists());
 }
 
+/// A config home that two runtimes reach through one handler (the official
+/// `claude` and a package runtime naming the Claude handler with the same
+/// config home) belongs to neither: a request without `--agent` reports it
+/// unresolved for both and installs nothing into it, while the home only one
+/// runtime reaches is acted on once.
 #[test]
-fn a_handler_is_reached_once_when_several_runtimes_name_it() {
-    let claude = scoped_dir("dispatch-once-claude");
-    let codex = scoped_dir("dispatch-once-codex");
+fn a_home_several_runtimes_reach_through_one_handler_is_attributed_to_none() {
+    let claude = scoped_dir("dispatch-shared-claude");
+    let codex = scoped_dir("dispatch-shared-codex");
     let host = pi_shaped_integration_host(Path::new("/bin/sh"), CLAUDE_ID, "identity-subagent-v1");
 
-    let ids: Vec<String> = with_config_dirs(&claude, &codex, || {
+    let targets: Vec<(String, String, Option<String>)> = with_config_dirs(&claude, &codex, || {
         super::config_homes_for_tests(&host).targets(None, &super::HomeSelection::Runtime)
     })
     .expect("targets")
     .iter()
-    .map(|target| target.resolved.handler.id().to_owned())
+    .map(|target| {
+        (
+            target.resolved.runtime_id.as_str().to_owned(),
+            target.resolved.handler.id().to_owned(),
+            target.home.as_ref().err().map(|error| error.code.clone()),
+        )
+    })
     .collect();
-    assert_eq!(ids, [CLAUDE_ID, CODEX_ID]);
+    let ambiguous = Some("integration_home_ambiguous_owner".to_owned());
+    assert_eq!(
+        targets,
+        [
+            ("claude".to_owned(), CLAUDE_ID.to_owned(), ambiguous.clone()),
+            ("codex".to_owned(), CODEX_ID.to_owned(), None),
+            ("pi".to_owned(), CLAUDE_ID.to_owned(), ambiguous),
+        ]
+    );
 
-    let installed = with_config_dirs(&claude, &codex, || install_for(&host, None))
-        .expect("install every present handler once");
-    let agents: Vec<&RuntimeRef> = installed
-        .installed
-        .iter()
-        .map(|report| &report.agent)
-        .collect();
-    assert_eq!(agents, [&RuntimeRef::claude(), &RuntimeRef::codex()]);
+    let refused = with_config_dirs(&claude, &codex, || install_for(&host, None))
+        .expect_err("the shared home has no owner");
+    assert_eq!(refused.code, "integration_home_ambiguous_owner");
+    assert!(refused.msg.contains("`claude`, `pi`"), "{refused:?}");
+    assert!(content_snapshot(&claude).is_empty(), "nothing is installed");
 }
 
 #[test]
