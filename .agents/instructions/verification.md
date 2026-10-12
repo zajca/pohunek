@@ -5,6 +5,7 @@ considering work done; they mirror CI exactly:
 
 ```bash
 cargo fmt --all --check
+scripts/check-rust-toolchain-pin                        # no floating Rust channel in CI
 cargo clippy --workspace --all-targets --all-features   # must be clean under -D warnings
 cargo build -p pohunek-session-worker --bin pohunek-sessiond  # daemon tests spawn it by path
 cargo nextest run --profile ci --test-threads 4 --workspace --all-features
