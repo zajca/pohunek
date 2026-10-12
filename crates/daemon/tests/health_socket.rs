@@ -61,7 +61,7 @@ use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellComma
 use pohunek_daemon::store::{ResumeBinding, Store, WorktreeBinding};
 use pohunek_paths::{
     APP_DIR, HOST_APPROVAL_KEY_NAME, HOST_GOVERNANCE_NAME, HOST_IDENTITY_NAME,
-    HOST_STATE_LOCK_NAME, HOST_STATE_SUBDIR, LOGS_SUBDIR, WORKERS_SUBDIR,
+    HOST_STATE_LOCK_NAME, HOST_STATE_SUBDIR, LOGS_SUBDIR, PLUGINS_SUBDIR, WORKERS_SUBDIR,
 };
 use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::process_env::ProcessEnv;
@@ -2094,10 +2094,34 @@ fn agentless_path_dir(env: &TestEnv) -> PathBuf {
 
 #[tokio::test]
 async fn session_new_for_missing_agent_binary_returns_typed_error() {
+    assert_session_new_reports_missing_binary(RuntimeRef::claude(), "claude").await;
+}
+
+/// A runtime that declares a version probe reports a missing executable with
+/// the same typed error as one that does not: the probe only judges an
+/// executable that exists.
+#[tokio::test]
+async fn session_new_for_missing_probed_agent_binary_returns_typed_error() {
+    assert_session_new_reports_missing_binary(RuntimeRef::hermes(), "hermes").await;
+}
+
+/// Starts a real daemon whose `PATH` holds no agent, asks it for an `agent`
+/// session and asserts the typed, recoverable `agent_binary_missing` refusal
+/// naming `binary`, with no session left behind.
+///
+/// The daemon serves `codex` and `claude` from the official packages, whose
+/// descriptors declare a version probe.
+async fn assert_session_new_reports_missing_binary(agent: RuntimeRef, binary: &str) {
     // The daemon runs as a child with a `PATH` of its own, so no agent binary
     // is resolvable whatever the host has installed and no process-wide
     // variable changes.
     let env = TestEnv::new().expect("create the daemon child environment");
+    official_runtimes::OfficialCatalog::new()
+        .preinstall(
+            &env.state_home().join(APP_DIR).join(PLUGINS_SUBDIR),
+            env.root(),
+        )
+        .await;
     let path_dir = agentless_path_dir(&env);
     let mut child = env
         .tokio_command(bin_exe("pohunekd"))
@@ -2114,26 +2138,42 @@ async fn session_new_for_missing_agent_binary_returns_typed_error() {
     let socket = env.runtime_dir().join(APP_DIR).join("daemon.sock");
     let mut client = wait_for_daemon_socket(&mut child, &socket).await;
 
-    // `session.new --agent claude` must fail with the typed, recoverable
+    // `session.new` must fail with the typed, recoverable
     // `agent_binary_missing` error (stable code a script can branch on)
-    // rather than a generic spawn failure.
+    // rather than a generic spawn failure or a version-probe verdict.
     let resp = tokio::time::timeout(
         DAEMON_CONTROL_REQUEST_TIMEOUT,
-        create_session_with_agent(&mut client, RuntimeRef::claude(), env.cwd().to_path_buf()),
+        create_session_with_agent(&mut client, agent.clone(), env.cwd().to_path_buf()),
     )
     .await
     .expect("session.new returns before control timeout");
 
     let err = err_payload(resp);
-    assert_eq!(err.class, ErrorClass::Runtime);
-    assert_eq!(err.code, "agent_binary_missing");
+    assert_eq!(err.class, ErrorClass::Runtime, "{agent}: {err:?}");
+    assert_eq!(err.code, "agent_binary_missing", "{agent}: {err:?}");
     assert!(
-        err.msg.contains("claude"),
+        err.msg.contains(binary),
         "error must name the missing binary: {err:?}"
     );
     assert!(
         err.recover.is_some(),
         "missing-binary error must carry a recover hint: {err:?}"
+    );
+
+    let list = Request::make(
+        "missing-binary-session-list",
+        method::SESSION_LIST,
+        serde_json::to_value(SessionListParams::default()).expect("serialize session list request"),
+    );
+    let sessions: Vec<SessionInfo> = serde_json::from_value(ok_payload(
+        tokio::time::timeout(DAEMON_CONTROL_REQUEST_TIMEOUT, exchange(&mut client, &list))
+            .await
+            .expect("session.list returns before control timeout"),
+    ))
+    .expect("session list");
+    assert!(
+        sessions.is_empty(),
+        "{agent}: no session is created: {sessions:?}"
     );
 
     // The child is reaped before `env` drops and removes the PATH directory.

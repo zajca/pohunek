@@ -2121,7 +2121,7 @@ impl SessionRegistry {
         let launch_path = self.probe_search_path(&resolved.definition, profile_env)?;
         let validated_program = host::validate_launch_runtime(
             &resolved.definition,
-            resolved.program(),
+            resolved.spawn(),
             launch_path.as_deref(),
         )?;
         // Fallback launch dir for a no-project (plain shell) session: the CLI's

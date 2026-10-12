@@ -522,11 +522,12 @@ fn profile_runtime_check(
     }
     crate::agent::host::validate_launch_runtime_with_timeout_detailed(
         &agent.definition,
-        agent.program(),
+        agent.spawn(),
         launch_path.as_deref(),
         probe_timeout,
     )
     .map_err(|error| match error {
+        crate::capabilities::LaunchValidationFailure::Missing => RuntimeFailure::Executable,
         crate::capabilities::LaunchValidationFailure::ProbeTimedOut => RuntimeFailure::ProbeBudget,
         crate::capabilities::LaunchValidationFailure::Unsupported => RuntimeFailure::Version,
     })?;

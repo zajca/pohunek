@@ -26,7 +26,9 @@ use protocol::{ErrorClass, PackageId, ProtocolError, RuntimeId};
 use serde::Deserialize;
 use tracing::warn;
 
-use super::host::{ProfileInputs, RevisionKeys, RuntimeDefinition, RuntimeHost, ServedBy};
+use super::host::{
+    LaunchProgram, ProfileInputs, RevisionKeys, RuntimeDefinition, RuntimeHost, ServedBy, Spawn,
+};
 use super::{InputRules, LaunchEnv, NativeArgs, NativeSessionLaunch, SessionRefKind};
 use crate::detect::{Manifest, MAX_MANIFEST_SOURCE_BYTES};
 use crate::project::config::validate_name;
@@ -218,6 +220,20 @@ impl ResolvedAgent {
     #[must_use]
     pub(crate) fn profile_inputs(&self) -> Option<&ProfileInputs> {
         self.profile.as_ref().map(|profile| &profile.inputs)
+    }
+
+    /// What a launch of this agent spawns: the configured shell command for a
+    /// bare host-shell runtime, else [`Self::program`]. A profile over the
+    /// shell spawns its own program, which defaults to the login shell.
+    #[must_use]
+    pub(crate) fn spawn(&self) -> Spawn<'_> {
+        if self.profile.is_none()
+            && matches!(self.definition.program(), LaunchProgram::HostShell(_))
+        {
+            Spawn::HostShell
+        } else {
+            Spawn::Program(self.program())
+        }
     }
 
     /// The program the agent launches: the profile's, else the base runtime's.

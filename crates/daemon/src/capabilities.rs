@@ -22,8 +22,8 @@ use serde::Deserialize;
 use tracing::debug;
 
 use crate::agent::host::{
-    LaunchProgram, RuntimeDefinition, RuntimeRegistry, VersionProbePolicy, RESERVED_RUNTIME_IDS,
-    SEMVER_LINE_PARSER_ID, SEMVER_PARSER_ID,
+    LaunchProgram, RuntimeDefinition, RuntimeRegistry, Spawn, VersionProbePolicy,
+    RESERVED_RUNTIME_IDS, SEMVER_LINE_PARSER_ID, SEMVER_PARSER_ID,
 };
 use crate::agent::{which_executable, ProfileRegistry, ValidatedLaunchProgram};
 use crate::integration::Home;
@@ -414,52 +414,95 @@ fn probe_versioned_runtime(
 ///
 /// # Errors
 ///
-/// Returns `agent_runtime_unsupported` when the probe rejects the executable
-/// or the definition names a parser this daemon does not provide.
+/// Returns `agent_binary_missing`, naming only the program's file name, when
+/// the program does not resolve to an executable, and
+/// `agent_runtime_unsupported` when the probe rejects an executable that
+/// exists or the definition names a parser this daemon does not provide.
 ///
 /// `launch_path` is the `PATH` the launched agent will see; the probe runs
 /// under it.
 pub(crate) fn validate_definition_launch(
     definition: &RuntimeDefinition,
-    binary: &str,
+    spawn: Spawn<'_>,
     launch_path: Option<&OsStr>,
 ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
-    validate_definition_launch_with_timeout(definition, binary, launch_path, VERSION_PROBE_TIMEOUT)
+    validate_definition_launch_with_timeout(definition, spawn, launch_path, VERSION_PROBE_TIMEOUT)
 }
 
 /// Validate a launch definition using the caller's remaining version-probe budget.
 pub(crate) fn validate_definition_launch_with_timeout(
     definition: &RuntimeDefinition,
-    binary: &str,
+    spawn: Spawn<'_>,
     launch_path: Option<&OsStr>,
     timeout: Duration,
 ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
-    validate_definition_launch_with_timeout_detailed(definition, binary, launch_path, timeout)
-        .map_err(|_failure| ProtocolError::agent_runtime_unsupported())
+    validate_definition_launch_with_timeout_detailed(definition, spawn, launch_path, timeout)
+        .map_err(|failure| match failure {
+            LaunchValidationFailure::Missing => {
+                ProtocolError::agent_binary_missing(reported_program(definition, spawn))
+            }
+            LaunchValidationFailure::Unsupported | LaunchValidationFailure::ProbeTimedOut => {
+                ProtocolError::agent_runtime_unsupported()
+            }
+        })
 }
 
-/// Why a launch-time version validation failed, retaining a shortened-budget timeout.
+/// The program name a missing-executable refusal reports: the file name of
+/// the spawned program, so a configured absolute path never reaches the
+/// error, else the runtime id.
+fn reported_program<'a>(definition: &'a RuntimeDefinition, spawn: Spawn<'a>) -> &'a str {
+    match spawn {
+        Spawn::Program(binary) => Path::new(binary).file_name().and_then(OsStr::to_str),
+        Spawn::HostShell => None,
+    }
+    .unwrap_or_else(|| definition.runtime_id().as_str())
+}
+
+/// Why a launch-time validation failed, retaining a shortened-budget timeout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LaunchValidationFailure {
+    /// The program does not resolve to an executable; no probe ran.
+    Missing,
+    /// The probe rejected an executable that exists, or the definition names
+    /// a parser this daemon does not provide.
     Unsupported,
+    /// The probe outran a budget shorter than [`VERSION_PROBE_TIMEOUT`].
     ProbeTimedOut,
 }
 
 /// Validate a launch definition and preserve whether its version probe timed out.
+///
+/// The spawned program is resolved first for every launch, so a missing
+/// executable is told apart from one the probe rejects. A bare host-shell
+/// launch ([`Spawn::HostShell`]) is the exception: it spawns the configured
+/// shell command, which its launch resolves. A runtime with a version probe
+/// is never a host shell, so such a launch is refused rather than unprobed.
 pub(crate) fn validate_definition_launch_with_timeout_detailed(
     definition: &RuntimeDefinition,
-    binary: &str,
+    spawn: Spawn<'_>,
     launch_path: Option<&OsStr>,
     timeout: Duration,
 ) -> Result<Option<ValidatedLaunchProgram>, LaunchValidationFailure> {
-    if definition.version_probe_parser().is_none() {
-        return Ok(None);
+    let probed = definition.version_probe_parser().is_some();
+    let binary = match spawn {
+        Spawn::HostShell if probed => return Err(LaunchValidationFailure::Unsupported),
+        Spawn::HostShell => return Ok(None),
+        Spawn::Program(binary) => binary,
+    };
+    if !probed {
+        // The same resolution the launch applies to a program it spawns by
+        // name: an executable on the daemon's `PATH` with a UTF-8 path.
+        return if which_executable(binary).is_some_and(|path| path.to_str().is_some()) {
+            Ok(None)
+        } else {
+            Err(LaunchValidationFailure::Missing)
+        };
     }
     let shortened_budget = timeout < VERSION_PROBE_TIMEOUT;
     let timeout = timeout.min(VERSION_PROBE_TIMEOUT);
 
     let program =
-        ValidatedLaunchProgram::resolve(binary).ok_or(LaunchValidationFailure::Unsupported)?;
+        ValidatedLaunchProgram::resolve(binary).ok_or(LaunchValidationFailure::Missing)?;
     let Some(probe) = VersionProbe::for_definition(definition) else {
         return Err(LaunchValidationFailure::Unsupported);
     };
@@ -1249,7 +1292,11 @@ strategy = "none"
         let binary = hermes.display().to_string();
         let definition = hermes_definition();
         let validate = |binary: &str| {
-            validate_definition_launch(&definition, binary, process_path().as_deref())
+            validate_definition_launch(
+                &definition,
+                Spawn::Program(binary),
+                process_path().as_deref(),
+            )
         };
 
         write_test_executable(&hermes, "#!/bin/sh\necho 'Hermes Agent v0.20.0'\n");
@@ -1274,18 +1321,8 @@ strategy = "none"
 
         let missing = dir.join("missing").display().to_string();
         let error = validate(&missing).expect_err("missing Hermes runtime");
-        assert_eq!(error.code, "agent_runtime_unsupported");
+        assert_eq!(error.code, "agent_binary_missing");
         assert!(!error.msg.contains(&missing));
-
-        let registry = test_registry();
-        let claude = registry
-            .resolve(&RuntimeId::parse("claude").expect("id"))
-            .expect("claude registered");
-        assert_eq!(
-            validate_definition_launch(claude, &missing, process_path().as_deref())
-                .expect("non-Hermes behavior remains deferred to launch"),
-            None
-        );
     }
 
     #[test]
@@ -1663,9 +1700,13 @@ strategy = "none"
         assert!(supported.available);
         assert_eq!(supported.version.as_deref(), Some("1.0.2"));
         assert_eq!(supported.supported, Some(true));
-        let validated = validate_definition_launch(&definition, &binary, process_path().as_deref())
-            .expect("a release inside the range launches")
-            .expect("the probed executable is pinned");
+        let validated = validate_definition_launch(
+            &definition,
+            Spawn::Program(&binary),
+            process_path().as_deref(),
+        )
+        .expect("a release inside the range launches")
+        .expect("the probed executable is pinned");
         assert_eq!(validated.as_path(), tool.canonicalize().expect("canonical"));
 
         for (output, version) in [
@@ -1686,8 +1727,12 @@ strategy = "none"
             assert!(runtime.available, "{output:?}");
             assert_eq!(runtime.version.as_deref(), version, "{output:?}");
             assert_eq!(runtime.supported, Some(false), "{output:?}");
-            let error = validate_definition_launch(&definition, &binary, process_path().as_deref())
-                .expect_err("a release outside the range is refused");
+            let error = validate_definition_launch(
+                &definition,
+                Spawn::Program(&binary),
+                process_path().as_deref(),
+            )
+            .expect_err("a release outside the range is refused");
             assert_eq!(error.code, "agent_runtime_unsupported");
             assert!(!error.msg.contains(output) || output.is_empty());
         }
@@ -1775,13 +1820,17 @@ strategy = "none"
         );
         let binary = fixture.tool.display().to_string();
         assert!(
-            validate_definition_launch(&definition, &binary, Some(fixture.in_range.as_os_str()))
-                .is_ok(),
+            validate_definition_launch(
+                &definition,
+                Spawn::Program(&binary),
+                Some(fixture.in_range.as_os_str())
+            )
+            .is_ok(),
             "an interpreter inside the range launches"
         );
         let error = validate_definition_launch(
             &definition,
-            &binary,
+            Spawn::Program(&binary),
             Some(fixture.out_of_range.as_os_str()),
         )
         .expect_err("an interpreter outside the range is refused");
@@ -1927,7 +1976,12 @@ strategy = "none"
             assert_eq!(runtime.version.as_deref(), Some(version), "{line}");
             assert_eq!(runtime.supported, Some(true), "{line}");
             assert!(
-                validate_definition_launch(&definition, &binary, process_path().as_deref()).is_ok(),
+                validate_definition_launch(
+                    &definition,
+                    Spawn::Program(&binary),
+                    process_path().as_deref()
+                )
+                .is_ok(),
                 "{line}"
             );
 
@@ -1959,8 +2013,12 @@ strategy = "none"
             );
             assert_eq!(runtime.version, None, "{banner:?}");
             assert_eq!(runtime.supported, Some(false), "{banner:?}");
-            let error = validate_definition_launch(&definition, &binary, process_path().as_deref())
-                .expect_err("an unreadable banner is refused");
+            let error = validate_definition_launch(
+                &definition,
+                Spawn::Program(&binary),
+                process_path().as_deref(),
+            )
+            .expect_err("an unreadable banner is refused");
             assert_eq!(error.code, "agent_runtime_unsupported");
         }
     }

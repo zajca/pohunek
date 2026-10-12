@@ -1000,8 +1000,10 @@ impl SessionRegistry {
     /// # Errors
     ///
     /// Returns the [`Self::resolve_recovery_profile`] errors, the reference
-    /// error of a binding without the native reference `launch` consumes, and
-    /// the version-probe error of a runtime that no longer validates.
+    /// error of a binding without the native reference `launch` consumes,
+    /// `agent_binary_missing` when the frozen program no longer resolves to an
+    /// executable, and `agent_runtime_unsupported` when the version probe
+    /// rejects the executable that does.
     fn plan_relaunch(
         &self,
         binding: &ResumeBinding,
@@ -1017,8 +1019,11 @@ impl SessionRegistry {
         let base_environment = self.launch_base_environment()?;
         let program = binding_program(binding, &definition);
         let launch_path = self.probe_search_path(&definition, profile.env.as_slice())?;
-        let validated_program =
-            host::validate_launch_runtime(&definition, &program, launch_path.as_deref())?;
+        let validated_program = host::validate_launch_runtime(
+            &definition,
+            host::Spawn::Program(&program),
+            launch_path.as_deref(),
+        )?;
         Ok(RelaunchPlan {
             definition,
             launch,

@@ -331,12 +331,15 @@ impl ProtocolError {
         )
     }
 
-    /// The canonical rejection for a missing or incompatible managed runtime.
+    /// The canonical rejection for an agent executable that exists but fails
+    /// its runtime's version probe: another release, unparseable output, a
+    /// failing or timed-out probe, or a probe parser this daemon does not
+    /// provide. A program that does not resolve is `agent_binary_missing`.
     #[must_use]
     pub fn agent_runtime_unsupported() -> Self {
         Self::observation(
             "agent_runtime_unsupported",
-            "the selected agent runtime is unavailable or incompatible with this daemon",
+            "the selected agent executable did not pass this daemon's version check",
         )
     }
 

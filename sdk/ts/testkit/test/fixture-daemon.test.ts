@@ -485,16 +485,60 @@ describe("@pohunek/testkit fixture daemon", () => {
           cols: TEST_COLS,
           rows: TEST_ROWS,
         }));
-        expect(error.toProtocolError()).toEqual({
-          class: "runtime",
-          code: "agent_runtime_unsupported",
-          msg: "the selected agent runtime is unavailable or incompatible with this daemon",
-        });
+        expect(error.toProtocolError()).toEqual(testCase.available
+          ? {
+            class: "runtime",
+            code: "agent_runtime_unsupported",
+            msg: "the selected agent executable did not pass this daemon's version check",
+          }
+          : {
+            class: "runtime",
+            code: "agent_binary_missing",
+            msg: "agent binary not found on PATH: hermes",
+            recover: "install the hermes CLI and ensure it is on PATH; run `pohunek doctor` to verify",
+          });
         expect(await client.call("session.list", {})).toEqual([]);
         await client.close();
       } finally {
         await daemon.close();
       }
+    }
+  });
+
+  test("rejects a supported agent without a runtime row as an unknown profile", async () => {
+    const daemon = await startFixtureDaemon({
+      listen: { unixSocketPath: testSocketPath("agent-without-runtime") },
+      host: {
+        capabilities: {
+          daemon_version: "0.0.0-testkit-agent-without-runtime",
+          protocol_version: PROTOCOL_VERSION,
+          supported_agents: ["hermes-work"],
+          runtimes: [],
+          git_available: true,
+          worktree_supported: true,
+          terminal_read_supported: true,
+          output_read_supported: true,
+          session_wait_supported: true,
+        },
+      },
+    });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const error = await expectClientError(client.call("session.new", {
+        agent: "hermes-work",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+      }));
+      expect(error.toProtocolError()).toEqual({
+        class: "runtime",
+        code: "agent_profile_not_found",
+        msg: "no agent profile or base kind named 'hermes-work' on this host",
+        recover: "use shell|codex|claude|hermes, or add ~/.config/pohunek/agents/<name>.toml on the target host",
+      });
+      expect(await client.call("session.list", {})).toEqual([]);
+      await client.close();
+    } finally {
+      await daemon.close();
     }
   });
 
