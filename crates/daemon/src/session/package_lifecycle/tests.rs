@@ -1,7 +1,7 @@
 //! Behavioural tests of the package lifecycle over a real plugin root, real
 //! archives and a real session registry.
 
-// Rust guideline compliant 2026-10-04
+// Rust guideline compliant 2026-10-12
 
 use std::fs;
 use std::io::Write as _;
@@ -909,9 +909,9 @@ async fn the_reported_runtime_accounts_for_every_argument_of_a_fresh_launch() {
 
     // A resume launches the fixed arguments and the resume template only.
     fixture.registry.resume(&created.id).await.expect("resume");
-    let resumed = wait_for_launch(&dir.join("argv.txt"), 1).await;
     let mut predicted = runtime.args.clone();
     predicted.extend(runtime.resume_args.clone().expect("resumable"));
+    let resumed = wait_for_launch(&dir.join("argv.txt"), 1, predicted.len()).await;
     assert_eq!(
         resumed.len(),
         predicted.len(),
@@ -924,11 +924,12 @@ async fn the_reported_runtime_accounts_for_every_argument_of_a_fresh_launch() {
     let _ = fixture.registry.stop(&created.id).await;
 }
 
-/// The recorded argv of launch `index`, once the launch has written it.
-async fn wait_for_launch(marker: &std::path::Path, index: usize) -> Vec<String> {
+/// The recorded argv of launch `index`, once it holds at least `lines`
+/// complete lines.
+async fn wait_for_launch(marker: &std::path::Path, index: usize, lines: usize) -> Vec<String> {
     pohunek_test_support::wait::wait_until("the launch recorded its arguments", || async {
         let launch = recorded_launch(marker, index);
-        (!launch.is_empty()).then_some(launch)
+        (launch.len() >= lines).then_some(launch)
     })
     .await
 }

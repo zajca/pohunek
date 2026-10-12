@@ -6,7 +6,7 @@
 //! script records the profile variable the launched child received, so what a
 //! relaunch ran under is read from the child, never inferred.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,8 +19,8 @@ use protocol::{
 };
 
 use super::tests::{
-    durable_recovery, hermetic_shell, hook_gate, params, temp_dir, temp_store_path,
-    wait_for_file_contains, write_executable,
+    append_launch_record, complete_lines, durable_recovery, hermetic_shell, hook_gate, params,
+    temp_dir, temp_store_path, wait_for_file_contains, write_executable,
 };
 use super::{ProfileChange, SessionRegistry, SessionRegistryConfig};
 use crate::agent::host::fixture::{pi_shaped_host, pi_shaped_profile_pin, PI_SHAPED_NO_CHECK};
@@ -63,8 +63,13 @@ impl Frozen {
         write_executable(
             &script,
             &format!(
-                "#!/bin/sh\nprintf 'launch\\n' >> '{marker}'\nprintf 'mark=%s\\n' \"${{{MARK_VAR}-unset}}\" >> '{marker}'\nprintf '%s\\n' \"$@\" >> '{marker}'\ncase \" $* \" in *\" --session-id \"*) read _ < '{gate}'; exit 0 ;; *) sleep 30 ;; esac\n",
-                marker = marker.display(),
+                "#!/bin/sh\n{record}case \" $* \" in *\" --session-id \"*) read _ < '{gate}'; exit 0 ;; *) sleep 30 ;; esac\n",
+                record = append_launch_record(
+                    &marker,
+                    &format!(
+                        "printf 'launch\\n'; printf 'mark=%s\\n' \"${{{MARK_VAR}-unset}}\"; printf '%s\\n' \"$@\""
+                    ),
+                ),
                 gate = gate_path.display(),
             ),
         );
@@ -150,9 +155,7 @@ impl Frozen {
 
     /// The marks the launches so far received, in launch order.
     fn marks(&self) -> Vec<String> {
-        fs::read_to_string(&self.marker)
-            .unwrap_or_default()
-            .lines()
+        complete_lines(&fs::read_to_string(&self.marker).unwrap_or_default())
             .filter_map(|line| line.strip_prefix("mark=").map(str::to_owned))
             .collect()
     }
