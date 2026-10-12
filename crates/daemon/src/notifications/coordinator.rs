@@ -466,8 +466,9 @@ fn turn_kind(kind: NotificationKind) -> Option<SessionTurnEventKind> {
 
 /// Whether `existing` should be kept over `incoming` for the same pending key.
 ///
-/// Provider reports outrank projector reports; equal priority takes the incoming
-/// record so a fresh report refreshes the pending payload.
+/// Provider hook reports outrank user reports, which outrank projector reports;
+/// equal priority takes the incoming record so a fresh report refreshes the
+/// pending payload.
 fn outranks(existing: &NotificationRecord, incoming: &NotificationRecord) -> bool {
     priority_rank(&existing.source) > priority_rank(&incoming.source)
 }

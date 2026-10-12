@@ -924,7 +924,7 @@ impl NotificationService {
 
 fn normalize_params(mut params: NotificationCreateParams) -> NotificationCreateParams {
     params.source = NotificationSource {
-        provider: normalize_user_string(&params.source.provider, MAX_SOURCE_FIELD_CHARS),
+        provider: stored_provider(&params.source.provider),
         provider_event: normalize_user_string(
             &params.source.provider_event,
             MAX_SOURCE_FIELD_CHARS,
@@ -1155,17 +1155,39 @@ pub(crate) fn is_turn_dedupe_key(dedupe_key: &str) -> bool {
         .is_some_and(|(prefix, suffix)| prefix == TURN_DEDUPE_KEY_PREFIX && !suffix.is_empty())
 }
 
+/// The provider name a create stores and ranks for the `raw` name it reports.
+///
+/// Control characters are dropped, whitespace runs collapse, and the name is
+/// bounded, like every other source field.
+pub(crate) fn stored_provider(raw: &str) -> String {
+    normalize_user_string(raw, MAX_SOURCE_FIELD_CHARS)
+}
+
+/// Whether `provider` names a runtime whose hooks report notifications.
+///
+/// A provider is a hook provider exactly when some registered hook schema
+/// lists it as an identity provider. `notification.create` checks a session
+/// report from such a provider against the session's hook schema, and the
+/// source ranking places its records above user and projector records.
+pub(crate) fn is_hook_provider(provider: &str) -> bool {
+    pohunek_worker_protocol::hook_schemas()
+        .iter()
+        .any(|schema| schema.identity_providers.contains(&provider))
+}
+
+/// Rank of a notification source when reports of one session moment conflict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourcePriority {
+    /// The daemon's own projector (`pohunek` or `daemon`).
     Projector,
+    /// Any other producer: a user, script, or external tool.
     User,
+    /// A hook provider (see [`is_hook_provider`]).
     Provider,
 }
 
 fn source_priority(source: &NotificationSource) -> SourcePriority {
-    if source.provider.eq_ignore_ascii_case("codex")
-        || source.provider.eq_ignore_ascii_case("claude")
-    {
+    if is_hook_provider(&source.provider) {
         SourcePriority::Provider
     } else if source.provider.eq_ignore_ascii_case("pohunek")
         || source.provider.eq_ignore_ascii_case("daemon")
@@ -2090,7 +2112,6 @@ mod tests {
         policy
             .providers
             .insert("codex".to_owned(), all_kinds_enabled_policy());
-        policy.providers.remove("claude");
         service.set_policy(policy).expect("set policy");
 
         let codex_result = service

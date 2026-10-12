@@ -58,7 +58,7 @@ port is retained.
 | `pohunek completions <bash\|zsh\|fish>` | Print static shell completion; add `--dynamic` for bounded host/session candidates. |
 | `pohunek notifications list / watch` | Inspect or stream the durable inbox; `--all-hosts` fans out. |
 | `pohunek notifications read / ack / archive / delete` | Drive one record's lifecycle (`host/id` targets a specific host). |
-| `pohunek notifications policy / retention` | Per-kind/provider policy (including `hermes`), retention pruning (`--dry-run` / `--apply`). |
+| `pohunek notifications policy / retention` | Per-kind policy for the default flags or any runtime id (`--provider default\|<runtime-id>`; `default` is always the base flags, even if a runtime is named `default`), retention pruning (`--dry-run` / `--apply`). |
 | `pohunek integration install` | Install Codex/Claude hooks into the runtime's own config home, one host profile's home (`--profile NAME`) or every distinct home (`--all-profiles`), or install a selected Hermes profile's managed plugin with explicit access mode and host allowlist. |
 | `pohunek integration status` | Inspect daemon-managed Codex/Claude hooks on the effective `--host` (`--profile` and `--all-profiles` select profile config homes and are local-only), or one explicitly selected local Hermes target. |
 | `pohunek integration doctor / uninstall` | Diagnose or remove daemon-managed Codex/Claude hooks (`doctor` follows `--host`; `uninstall` targets the local daemon; both accept `--profile NAME` and `--all-profiles`, local-only), or, with `--agent hermes`, one explicitly selected local Hermes plugin target. |
@@ -208,8 +208,8 @@ const client = await connectLocal(socketPath, {
 ```bash
 pohunek notifications list --unread
 pohunek notifications ack buildbox/n-42
-pohunek notifications policy set --provider claude --kind turn_completed --enabled
-pohunek notifications policy set --provider hermes --kind agent_blocked --enabled
+pohunek notifications policy set --provider default --kind turn_completed --enabled
+pohunek notifications policy set --provider pi --kind agent_blocked --disabled
 pohunek notifications retention prune --status archived --before 2026-06-01T00:00:00Z --apply
 
 # follow new finished turns of one session

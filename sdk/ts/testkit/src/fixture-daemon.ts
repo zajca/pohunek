@@ -2116,11 +2116,6 @@ function defaultNotificationPolicy(): NotificationPolicy {
     attention_dedupe_window_secs: 30,
     attention_debounce_secs: 5,
     enabled: enabledNotificationKinds(),
-    providers: {
-      codex: enabledNotificationKinds(),
-      claude: enabledNotificationKinds(),
-      hermes: enabledNotificationKinds(),
-    },
     retention: {
       sweep_interval_secs: 21_600,
       info_ttl_secs: 259_200,

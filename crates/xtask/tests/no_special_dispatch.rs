@@ -311,25 +311,6 @@ const ALLOW_LIST: &[Entry] = &[
         "compiled Claude and Codex handler implementations: they own their provider ids, paths and asset code",
     ),
     (
-        "crates/daemon/src/notifications/mod.rs",
-        Approved::Lines(&[
-    "if source.provider.eq_ignore_ascii_case(\"codex\")",
-    "|| source.provider.eq_ignore_ascii_case(\"claude\")",
-]),
-        Owner::Packages,
-        "provider names that select notification sources",
-    ),
-    (
-        "crates/daemon/src/notifications/policy.rs",
-        Approved::Lines(&[
-    "(\"claude\".to_owned(), provider_policy.clone()),",
-    "(\"codex\".to_owned(), provider_policy.clone()),",
-    "(\"hermes\".to_owned(), provider_policy),",
-]),
-        Owner::Packages,
-        "default per-provider notification policy",
-    ),
-    (
         "crates/daemon/src/store/legacy_binding.rs",
         Approved::Lines(&[
     "id: \"claude\",",

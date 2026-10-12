@@ -582,7 +582,9 @@ enum NotificationPolicyAction {
             .args(["enabled", "disabled"])
     ))]
     Set {
-        /// Provider policy namespace to update.
+        /// Provider policy namespace to update: `default` for the base flags,
+        /// or a runtime id (for example `pi`) for that provider's override.
+        /// `default` is always the base flags, never a runtime named `default`.
         #[arg(long, value_parser = commands::notifications::parse_policy_provider)]
         provider: commands::notifications::PolicyProvider,
         /// Notification kind to update.

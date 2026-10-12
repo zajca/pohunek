@@ -28,7 +28,9 @@ use package::{Limits, PackageDigest};
 use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo};
 use pohunek_daemon::catalog_anchor::CatalogTrust;
 use pohunek_daemon::governance::HostGovernanceService;
-use pohunek_daemon::notifications::NotificationService;
+use pohunek_daemon::notifications::{
+    AttentionCoordinator, AttentionCoordinatorTask, NotificationService,
+};
 use pohunek_daemon::runtime::{
     EnvironmentSource, SubprocessWorkerEnvironment, SubprocessWorkerLauncher,
 };
@@ -120,6 +122,20 @@ pub(crate) struct Harness {
     pub(crate) agents: PathBuf,
     pub(crate) shutdown: oneshot::Sender<()>,
     pub(crate) task: tokio::task::JoinHandle<()>,
+    /// The attention debounce coordinator, when the daemon has one.
+    attention: Option<AttentionCoordinatorTask>,
+}
+
+/// Which notification components the daemon is built with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Inbox {
+    /// No notification inbox.
+    Absent,
+    /// A durable inbox without the attention debounce coordinator.
+    Immediate,
+    /// A durable inbox with the attention debounce coordinator the daemon
+    /// binary attaches.
+    Debounced,
 }
 
 impl Harness {
@@ -145,20 +161,28 @@ impl Harness {
     /// `turn:<id>` or `attention:<id>` dedupe key is refused with
     /// `notifications_not_configured`, and every other create persists at once.
     pub(crate) async fn start_with_notifications() -> Self {
-        Self::start_with(CatalogTrust::Absent, worker_binary(), true).await
+        Self::start_with(CatalogTrust::Absent, worker_binary(), Inbox::Immediate).await
+    }
+
+    /// Starts the daemon with a durable notification inbox and the attention
+    /// debounce coordinator, so a create with a `turn:<id>` or `attention:<id>`
+    /// dedupe key is held pending for the policy debounce window and then
+    /// committed, as in the daemon binary.
+    pub(crate) async fn start_with_debounced_notifications() -> Self {
+        Self::start_with(CatalogTrust::Absent, worker_binary(), Inbox::Debounced).await
     }
 
     async fn start_with_trust_and_worker(
         catalog_trust: CatalogTrust,
         worker_executable: PathBuf,
     ) -> Self {
-        Self::start_with(catalog_trust, worker_executable, false).await
+        Self::start_with(catalog_trust, worker_executable, Inbox::Absent).await
     }
 
     async fn start_with(
         catalog_trust: CatalogTrust,
         worker_executable: PathBuf,
-        notifications: bool,
+        inbox: Inbox,
     ) -> Self {
         let env = TestEnv::new().expect("create the hermetic test environment");
         let runtime = env.runtime_dir().join("pohunek");
@@ -211,16 +235,29 @@ impl Harness {
                 .await
                 .expect("open the host-governance service"),
         );
+        let notifications = (inbox != Inbox::Absent).then(|| {
+            NotificationService::open(&env.root().join("daemon-data"))
+                .expect("open the notification inbox")
+        });
+        let (coordinator, attention) = match (&notifications, inbox) {
+            (Some(notifications), Inbox::Debounced) => {
+                let (coordinator, task) =
+                    AttentionCoordinator::spawn(notifications.clone(), &registry);
+                (Some(coordinator), Some(task))
+            }
+            _ => (None, None),
+        };
         let mut state = DaemonState::new(
             HealthInfo::new("0.0.0-test"),
             registry,
             governance,
             overlay_registry(),
         );
-        if notifications {
-            let inbox = NotificationService::open(&env.root().join("daemon-data"))
-                .expect("open the notification inbox");
-            state = state.with_notifications(inbox);
+        if let Some(notifications) = notifications {
+            state = state.with_notifications(notifications);
+        }
+        if let Some(coordinator) = coordinator {
+            state = state.with_attention_coordinator(coordinator);
         }
         let server = ControlServer::bind_with_state(&socket, state)
             .await
@@ -239,6 +276,7 @@ impl Harness {
             agents,
             shutdown,
             task,
+            attention,
         }
     }
 
@@ -259,6 +297,9 @@ impl Harness {
         }
         let _ = self.shutdown.send(());
         self.task.await.expect("the server stops");
+        if let Some(attention) = self.attention {
+            attention.shutdown().await;
+        }
     }
 
     /// Runs `pohunek` with the hermetic environment.

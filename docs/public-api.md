@@ -995,8 +995,11 @@ hooks use when the worker refuses a report. `session.report_agent`,
 does not admit the action, or whose provider is not admitted, and
 `notification.create` answers `hook_not_admitted` for a create that
 names a session and a hooked provider (`shell`, `codex`, `claude`, `hermes`) on
-such a session. A session's own runtime is always an admitted provider for
-identity reports. No other public wire shape changes.
+such a session. The provider is judged by the name the record would be stored
+and ranked under (control characters dropped, whitespace collapsed), and a
+create whose raw provider only normalizes to a hooked provider (for example
+`" codex"`) is refused with `hook_not_admitted` whatever the session's schema.
+A session's own runtime is always an admitted provider for identity reports. No other public wire shape changes.
 
 Rule for runtime packages without an integration handler: such a package gets
 terminal launch and activity detection. It gets resume and fork only when its
@@ -2093,10 +2096,12 @@ Important fields:
 - `enabled`: base per-kind flags used when a provider has no explicit entry.
 - `providers`: optional deterministically ordered object mapping provider wire
   names to complete per-kind overrides. Missing keys fall back to `enabled`.
+  The default policy has no overrides, and an empty map is omitted on the wire.
 - `retention`: automatic daemon-owned cleanup and physical-compaction settings.
   Persisted policies without this additive field receive the defaults.
 
-For example:
+For example, a policy with one operator-set override that enables
+`turn_completed` for the `pi` runtime:
 
 ```json
 {
@@ -2111,18 +2116,10 @@ For example:
     "system": false
   },
   "providers": {
-    "claude": {
+    "pi": {
       "agent_blocked": true,
       "approval_required": true,
       "turn_completed": true,
-      "session_finished": false,
-      "error": true,
-      "system": false
-    },
-    "hermes": {
-      "agent_blocked": true,
-      "approval_required": true,
-      "turn_completed": false,
       "session_finished": false,
       "error": true,
       "system": false
@@ -2146,8 +2143,12 @@ compatibility shim.
 
 Default policy enables `agent_blocked`, `approval_required`, and `error`.
 `turn_completed`, `session_finished`, and `system` are implemented but disabled
-by default. The daemon materializes complete default entries for `codex`,
-`claude`, and `hermes`; a missing provider key still falls back to `enabled`.
+by default. The default policy has no per-provider entries, so every provider,
+whatever runtime it names, uses `enabled` until an override is set for it. A
+policy file the daemon already persisted is loaded as written, including any
+per-provider entries it holds; those overrides keep shadowing `enabled` for
+their providers, so change them with `policy set --provider <runtime-id>` to
+the wanted value.
 
 Every retention duration and `compaction_min_actions` must be greater than zero.
 The daemon runs one sweep at startup and then every `sweep_interval_secs` using
@@ -2162,14 +2163,33 @@ Policy is enforced daemon-side for all notification producers. If a producer
 creates a disabled kind, `notification.create` returns
 `runtime/notification_kind_disabled`.
 
+A source ranks as a provider hook exactly when its `provider` is an identity
+provider of a registered hook schema (today `shell`, `codex`, `claude`, and
+`hermes`, matched case-sensitively). These are the providers whose
+session-scoped `notification.create` reports are checked against the session's
+hook schema; that admission additionally admits a session's own runtime, which
+does not change its rank. `pohunek` and `daemon` rank as daemon projectors.
+Every other producer, including a runtime that no hook schema lists, ranks as a
+user/external source.
+
 Provider hooks have higher source priority than daemon projectors for the same
-`attention:<session_id>` key inside `attention_dedupe_window_secs`. A Codex or
-Claude hook can upgrade an existing projector attention record in place; the
-daemon returns `created: false` and emits `notification_updated`. A later
-projector create for an existing provider-backed attention record is suppressed
-and returns `created: false` with the existing record. Producers other than
-Codex, Claude, `pohunek`, or `daemon` are treated as user/external sources and
-do not automatically supersede provider records.
+`attention:<session_id>` key inside `attention_dedupe_window_secs`. Every
+`notification.create` on an `attention:<session_id>` key is deferred, so it
+answers `created: true` with a minted id; the dedupe happens when the debounce
+flush commits the record. A provider hook record then upgrades an existing
+projector attention record in place and emits `notification_updated`. A
+projector record for a key that already has a provider-backed record is
+dropped. Provider hooks of equal rank dedupe against each other: a `hermes` or
+`shell` record for a key that already has a provider-backed record inside the
+window (from the same or another hook provider) is dropped. A dropped record
+never persists and emits no event, so its minted id is never listed,
+`notification.update` on it returns `notification_not_found`, and
+`notification.delete` returns `deleted: false`.
+User/external sources do not automatically supersede provider records. While
+records for one session key are held pending in the debounce window, the
+higher-ranked record is kept and an equal-ranked later record replaces the
+earlier one, so a provider hook report pending beside a user report is the one
+committed.
 
 `turn:<session_id>` has different semantics: it is not time-window deduped. A
 new unread `turn_completed` for the same session acknowledges any older unread
@@ -2820,8 +2840,12 @@ The CLI exposes durable notifications through `pohunek notifications`:
   Targets accept bare `id` or `host/id`; an explicit target host overrides
   `--host`.
 - `pohunek notifications policy get|set`: read policy or toggle one
-  provider/kind flag. `set` accepts `--provider default|codex|claude|hermes`,
-  `--kind <kind>`, and exactly one of `--enabled` or `--disabled`.
+  provider/kind flag. `set` accepts `--provider default|<runtime-id>`, where
+  `default` selects the base `enabled` flags and any valid runtime id, installed
+  or not, selects that provider's override (seeded from `enabled`). `default`
+  is a keyword, so it shadows a runtime literally named `default`, whose
+  override can be set only through `notification.policy.set`. `set` also takes
+  `--kind <kind>` and exactly one of `--enabled` or `--disabled`.
 - `pohunek notifications retention prune`: explicitly prune records selected by
   `--status`, `--before`, and `--limit`, with exactly one of `--dry-run` or
   `--apply`. Automatic age-based retention runs independently in the daemon
