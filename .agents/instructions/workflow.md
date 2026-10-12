@@ -79,6 +79,17 @@ issue before changing Git state. Its executable checks run with
   done; iterate on affected checks in between (see the [testing policy](verification.md#testing-policy)). Report
   failures honestly with output; never claim green without running it.
 - When a task spans 3+ steps, plan first and verify after each major step.
+- Delegate milestone implementation and post-review fixes to parallel
+  subagents or another coding agent by default; this is the standing mode of
+  work here, not something to wait for permission on. Brief every worker with
+  concrete `path:line` context, because it starts with a clean context. Good
+  fits: a pre-PR review split into security (secret handling, the `sh -c`
+  attach surface, the NetBird trust boundary), silent-failure (swallowed errors
+  in the daemon and state machines), and performance passes, then synthesized;
+  one implementer per affected crate for a protocol change (`protocol` →
+  `client`/`daemon`/`cli`/`sdk/ts`, plus `docs/public-api.md` and
+  `docs/knowledge/`); competing-hypothesis investigation for state-machine bugs
+  across `client`/`daemon` session detection.
 
 ## Accepted harness trade-offs (operator decisions)
 

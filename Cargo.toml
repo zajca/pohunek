@@ -212,7 +212,8 @@ assert_is_empty = "allow"
 # Line tables keep file:line panic and RUST_BACKTRACE frames for workspace
 # crates while skipping the variable/type DWARF that dominates dev codegen,
 # link time and target/ size. `test` inherits this profile. For a step
-# debugger, opt in per invocation (see AGENTS.md "Full debuginfo").
+# debugger, opt in per invocation (see .agents/instructions/verification.md,
+# "Full debuginfo").
 [profile.dev]
 debug = "line-tables-only"
 
@@ -226,7 +227,8 @@ debug = false
 # determinization (regex-automata) and ed25519/SHA-256 signing and verification.
 # At opt-level 0 those loops dominate test CPU time. Each override sets only
 # opt-level, so `"*"` still disables their debuginfo. A bare name matches every
-# version in the lockfile. See AGENTS.md "Fast loops" for when to add a crate.
+# version in the lockfile. See .agents/instructions/verification.md, "Fast
+# loops", for when to add a crate.
 [profile.dev.package.regex-automata]
 opt-level = 3
 

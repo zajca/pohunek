@@ -136,7 +136,7 @@ def render(label, paths):
             "",
             "FLAKY tests passed only on a retry. Open a bug issue with the root "
             "cause; a `flaky-result = \"pass\"` override needs a linked issue "
-            "and a reason (AGENTS.md, \"Flaky tests\").",
+            "and a reason (.agents/instructions/verification.md, \"Flaky tests\").",
             "",
             "| Flaky test | Passed on attempt | Counted as | First failure |",
             "| --- | --- | --- | --- |",
