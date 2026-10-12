@@ -13,7 +13,7 @@
 //! the system's first process ([`SpawnId::LAUNCHD`]), so a parent number equal
 //! to that proves no ancestry and can never exclude a process.
 
-// Rust guideline compliant 2026-10-10
+// Rust guideline compliant 2026-10-12
 
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
@@ -264,29 +264,16 @@ pub struct OwnershipMarkers {
     pub daemon_id: Option<String>,
     /// Value of `POHUNEK_SESSION_ID`, when present.
     pub session_id: Option<String>,
+    /// Value of `POHUNEK_WORKER_ID`, when present.
+    ///
+    /// Every session worker sets it on the children it launches; the daemon
+    /// never sets it on a process it runs itself, such as a lifecycle hook.
+    pub worker_id: Option<String>,
     /// Value of `POHUNEK_WORKER_INSTANCE_ID`, when present.
     ///
     /// A session worker injects it into every child it launches, so it names
     /// exactly one worker runtime generation.
     pub worker_instance_id: Option<String>,
-    /// Value of `POHUNEK_RUNTIME_ID`, when present.
-    ///
-    /// Workers that predate `POHUNEK_WORKER_INSTANCE_ID` mark their children
-    /// with this name only. It is read as the same worker instance marker and
-    /// never written; see [`Self::worker_instance`].
-    pub runtime_id: Option<String>,
-}
-
-/// The worker instance a process claims through its ownership markers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkerInstanceMarker<'a> {
-    /// Neither worker instance marker is present.
-    Absent,
-    /// The present markers agree on one worker instance id.
-    Instance(&'a str),
-    /// `POHUNEK_WORKER_INSTANCE_ID` and `POHUNEK_RUNTIME_ID` carry different
-    /// values, so the process cannot be attributed to either instance.
-    Conflicting,
 }
 
 impl OwnershipMarkers {
@@ -295,24 +282,8 @@ impl OwnershipMarkers {
     pub fn is_marked(&self) -> bool {
         self.daemon_id.is_some()
             || self.session_id.is_some()
+            || self.worker_id.is_some()
             || self.worker_instance_id.is_some()
-            || self.runtime_id.is_some()
-    }
-
-    /// Resolves the worker instance marker from both accepted spellings.
-    #[must_use]
-    pub fn worker_instance(&self) -> WorkerInstanceMarker<'_> {
-        match (
-            self.worker_instance_id.as_deref(),
-            self.runtime_id.as_deref(),
-        ) {
-            (None, None) => WorkerInstanceMarker::Absent,
-            (Some(id), None) | (None, Some(id)) => WorkerInstanceMarker::Instance(id),
-            (Some(current), Some(other)) if current == other => {
-                WorkerInstanceMarker::Instance(current)
-            }
-            (Some(_), Some(_)) => WorkerInstanceMarker::Conflicting,
-        }
     }
 }
 

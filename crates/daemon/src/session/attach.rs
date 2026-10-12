@@ -117,7 +117,7 @@ impl SessionRegistry {
             return Err(attach_token_error("attach_expired", stream_id));
         }
 
-        let runtime = {
+        let (runtime, loss_reason) = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions
                 .get(&pending.session_id)
@@ -125,7 +125,7 @@ impl SessionRegistry {
             if entry.info.state != SessionState::Running {
                 return Err(session_not_running(&pending.session_id));
             }
-            entry.runtime.clone()
+            (entry.runtime.clone(), super::runtime_loss_reason(entry))
         };
         let runtime = match runtime {
             RuntimeHandle::Worker(worker) => {
@@ -149,7 +149,11 @@ impl SessionRegistry {
                 RedeemedRuntime::Worker(data)
             }
             RuntimeHandle::Unavailable(state) => {
-                return Err(super::unavailable_runtime_error(&pending.session_id, state));
+                return Err(super::unavailable_runtime_error(
+                    &pending.session_id,
+                    state,
+                    loss_reason.as_deref(),
+                ));
             }
         };
 

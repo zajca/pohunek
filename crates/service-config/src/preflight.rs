@@ -8,7 +8,7 @@
 //! the ones the daemon's reconciliation already uses keep their spelling, the
 //! rest are the `CODE_*` constants below.
 
-// Rust guideline compliant 2026-06-26
+// Rust guideline compliant 2026-10-12
 
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
@@ -61,6 +61,10 @@ pub const CODE_IDENTITY_UNVERIFIED: &str = "worker_identity_unverified";
 pub const CODE_WORKER_CHILD_MISSING: &str = "worker_child_missing";
 /// The worker's protocol range shares no version with the new daemon.
 pub const CODE_PROTOCOL_INCOMPATIBLE: &str = "worker_protocol_incompatible";
+/// The worker's journaled release predates `POHUNEK_WORKER_INSTANCE_ID`, or
+/// the journal names no release, so its children carry no worker-instance
+/// marker the new daemon reads. Startup reports it with the same reason.
+pub const CODE_WORKER_MARKER_LEGACY: &str = "worker_marker_legacy";
 /// The native recovery binding cannot be mapped to the current launch shape.
 pub const CODE_RECOVERY_UNMAPPABLE: &str = "native_recovery_unmappable";
 /// The native recovery binding needs the runtime registry to be completed.

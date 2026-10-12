@@ -9,9 +9,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use pohunek_platform::process::WorkerInstanceMarker;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
+use pohunek_service_config::preflight::CODE_WORKER_MARKER_LEGACY;
 use protocol::{
     event, ActivityRevision, AgentActivity, AgentStateEvent, AttachEvent, CwdSource, ErrorClass,
     Event, ProjectRemoveResult, ProtocolError, RuntimeId, RuntimeInventoryEntry,
@@ -1054,7 +1054,7 @@ impl SessionRegistry {
             return true;
         };
         let matching_runtime = markers.session_id.as_deref() == Some(target)
-            && matches!(markers.worker_instance(), WorkerInstanceMarker::Instance(id) if id == worker_instance_id);
+            && markers.worker_instance_id.as_deref() == Some(worker_instance_id.as_str());
         if !matching_runtime {
             return true;
         }
@@ -3305,13 +3305,13 @@ impl SessionRegistry {
             ));
         }
 
-        let runtime = {
+        let (runtime, loss_reason) = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
             if entry.info.state != SessionState::Running {
                 return Err(session_not_running(id));
             }
-            entry.runtime.clone()
+            (entry.runtime.clone(), runtime_loss_reason(entry))
         };
 
         let update = match runtime {
@@ -3330,7 +3330,7 @@ impl SessionRegistry {
                     .map_err(worker_error_to_protocol)?
             }
             RuntimeHandle::Unavailable(state) => {
-                return Err(unavailable_runtime_error(id, state));
+                return Err(unavailable_runtime_error(id, state, loss_reason.as_deref()));
             }
         };
 
@@ -3512,7 +3512,7 @@ impl SessionRegistry {
             RuntimeHandle::Unavailable(state) => {
                 self.clear_stopping(id, &transaction_id, stop_runtime.as_ref())
                     .await;
-                return Err(unavailable_runtime_error(id, state));
+                return Err(unavailable_runtime_error(id, state, None));
             }
         };
         self.commit_user_stop_exit(id, exit, &terminal_base).await?;
@@ -5898,11 +5898,44 @@ fn worker_error_to_protocol(err: WorkerError) -> ProtocolError {
     }
 }
 
-fn unavailable_runtime_error(id: &SessionId, state: RuntimeState) -> ProtocolError {
-    runtime_error(
-        unavailable_runtime_code(state),
-        format!("session {} runtime is {}", id.0, runtime_state_label(state)),
-    )
+/// Recovery of an operation refused because the session's worker predates the
+/// worker-instance marker (`worker_marker_legacy`).
+const LEGACY_WORKER_RECOVERY: &str = "the session's worker was started by a release before \
+0.33.1, whose processes this daemon cannot attribute, so it is not managed and its end is not \
+noticed; remove it with `pohunek session rm` and accept losing its runtime";
+
+/// Refuses an operation on a runtime in `state`.
+///
+/// `reason` is the runtime's recorded loss reason. A worker refused for
+/// `worker_marker_legacy` keeps the state's code; the message names the
+/// reason and the error carries its recovery.
+fn unavailable_runtime_error(
+    id: &SessionId,
+    state: RuntimeState,
+    reason: Option<&str>,
+) -> ProtocolError {
+    let label = runtime_state_label(state);
+    match reason {
+        Some(reason) if reason == CODE_WORKER_MARKER_LEGACY => ProtocolError::new(
+            ErrorClass::Runtime,
+            unavailable_runtime_code(state),
+            format!("session {} runtime is {label}: {reason}", id.0),
+            Some(LEGACY_WORKER_RECOVERY.to_owned()),
+        ),
+        Some(_) | None => runtime_error(
+            unavailable_runtime_code(state),
+            format!("session {} runtime is {label}", id.0),
+        ),
+    }
+}
+
+/// The loss reason the entry's runtime records, if any.
+fn runtime_loss_reason(entry: &SessionEntry) -> Option<String> {
+    entry
+        .info
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.loss_reason.clone())
 }
 
 fn unavailable_runtime_code(state: RuntimeState) -> &'static str {

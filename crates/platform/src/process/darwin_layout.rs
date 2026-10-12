@@ -4,7 +4,7 @@
 //! buffer. Keeping the decoding here makes region separation, bounds, and
 //! integer conversions testable on every host, not only on macOS.
 
-// Rust guideline compliant 2026-10-10
+// Rust guideline compliant 2026-10-12
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
@@ -17,10 +17,10 @@ use super::{OwnershipMarkers, Pid, StartIdentity};
 pub(super) const ENV_DAEMON_ID: &str = "POHUNEK_DAEMON_ID";
 /// Allowlisted session ownership marker.
 pub(super) const ENV_SESSION_ID: &str = "POHUNEK_SESSION_ID";
+/// Allowlisted session-worker ownership marker.
+pub(super) const ENV_WORKER_ID: &str = "POHUNEK_WORKER_ID";
 /// Allowlisted worker runtime-generation ownership marker.
 pub(super) const ENV_WORKER_INSTANCE_ID: &str = "POHUNEK_WORKER_INSTANCE_ID";
-/// Read-only alternate spelling of the worker instance marker.
-pub(super) const ENV_RUNTIME_ID: &str = "POHUNEK_RUNTIME_ID";
 
 /// Width of the leading `KERN_PROCARGS2` argument count, written as a C `int`.
 const ARGUMENT_COUNT_BYTES: usize = 4;
@@ -195,10 +195,10 @@ fn collect_ownership_markers(mut region: &[u8]) -> Result<OwnershipMarkers, Layo
             &mut markers.daemon_id
         } else if key == ENV_SESSION_ID.as_bytes() {
             &mut markers.session_id
+        } else if key == ENV_WORKER_ID.as_bytes() {
+            &mut markers.worker_id
         } else if key == ENV_WORKER_INSTANCE_ID.as_bytes() {
             &mut markers.worker_instance_id
-        } else if key == ENV_RUNTIME_ID.as_bytes() {
-            &mut markers.runtime_id
         } else {
             continue;
         };
@@ -211,8 +211,8 @@ fn collect_ownership_markers(mut region: &[u8]) -> Result<OwnershipMarkers, Layo
         }
         if markers.daemon_id.is_some()
             && markers.session_id.is_some()
+            && markers.worker_id.is_some()
             && markers.worker_instance_id.is_some()
-            && markers.runtime_id.is_some()
         {
             break;
         }
@@ -587,47 +587,6 @@ mod tests {
         assert_eq!(parsed.markers.session_id, None);
         assert_eq!(parsed.markers.daemon_id, None);
         assert!(parsed.markers.is_marked());
-    }
-
-    #[test]
-    fn a_runtime_id_marker_is_read_as_the_alternate_worker_instance_marker() {
-        let buffer = procargs(
-            1,
-            b"/bin/sh",
-            1,
-            &[b"sh"],
-            &[b"POHUNEK_RUNTIME_ID=runtime-a"],
-        );
-
-        let parsed = parse_process_arguments(&buffer).expect("kernel layout");
-
-        assert_eq!(parsed.markers.worker_instance_id, None);
-        assert_eq!(
-            parsed.markers.worker_instance(),
-            super::super::WorkerInstanceMarker::Instance("runtime-a")
-        );
-        assert!(parsed.markers.is_marked());
-    }
-
-    #[test]
-    fn disagreeing_worker_instance_spellings_conflict() {
-        let buffer = procargs(
-            1,
-            b"/bin/sh",
-            1,
-            &[b"sh"],
-            &[
-                b"POHUNEK_RUNTIME_ID=runtime-a",
-                b"POHUNEK_WORKER_INSTANCE_ID=runtime-b",
-            ],
-        );
-
-        let parsed = parse_process_arguments(&buffer).expect("kernel layout");
-
-        assert_eq!(
-            parsed.markers.worker_instance(),
-            super::super::WorkerInstanceMarker::Conflicting
-        );
     }
 
     /// Builds an environment of `filler` unrelated entries followed by the

@@ -4250,51 +4250,24 @@ mod tests {
         );
     }
 
-    /// A worker that sets only `POHUNEK_WORKER_INSTANCE_ID` and a worker that
-    /// sets only `POHUNEK_RUNTIME_ID` both identify the same instance to the
-    /// state hooks.
+    /// The state hooks identify the worker instance by
+    /// `POHUNEK_WORKER_INSTANCE_ID`.
     #[test]
-    fn state_hooks_accept_either_worker_instance_environment_name() {
+    fn state_hooks_report_the_worker_instance_environment_name() {
         let input = json!({"session_id": "native-1", "transcript_path": "/work/t.jsonl"});
         for agent in ["claude", "codex"] {
-            for (name, instance_env) in [
-                ("current", [("POHUNEK_WORKER_INSTANCE_ID", "runtime-123")]),
-                ("runtime id only", [("POHUNEK_RUNTIME_ID", "runtime-123")]),
-            ] {
-                let (report, public_requests) = run_worker_state_asset_with_env(
-                    agent,
-                    STATE_SESSION_ACTION,
-                    &input,
-                    WORKER_HOOK_SUCCESS_RESPONSE,
-                    0,
-                    &instance_env,
-                );
-
-                assert_eq!(report["type"], "identity_report", "{agent} {name}");
-                assert_eq!(report["runtime_id"], "runtime-123", "{agent} {name}");
-                assert!(public_requests.is_empty(), "{agent} {name}");
-            }
-        }
-    }
-
-    /// With both names set, `POHUNEK_WORKER_INSTANCE_ID` wins.
-    #[test]
-    fn state_hooks_prefer_the_worker_instance_environment_name() {
-        let input = json!({"session_id": "native-1", "transcript_path": "/work/t.jsonl"});
-        for agent in ["claude", "codex"] {
-            let (report, _public) = run_worker_state_asset_with_env(
+            let (report, public_requests) = run_worker_state_asset_with_env(
                 agent,
                 STATE_SESSION_ACTION,
                 &input,
                 WORKER_HOOK_SUCCESS_RESPONSE,
                 0,
-                &[
-                    ("POHUNEK_RUNTIME_ID", "runtime-other"),
-                    ("POHUNEK_WORKER_INSTANCE_ID", "runtime-123"),
-                ],
+                &[("POHUNEK_WORKER_INSTANCE_ID", "runtime-123")],
             );
 
+            assert_eq!(report["type"], "identity_report", "{agent}");
             assert_eq!(report["runtime_id"], "runtime-123", "{agent}");
+            assert!(public_requests.is_empty(), "{agent}");
         }
     }
 

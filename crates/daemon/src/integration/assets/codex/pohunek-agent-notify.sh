@@ -193,7 +193,7 @@ def process_start_identity(pid):
 def send_worker_notification(params, sequence):
     """Delivers through the worker, which attests the caller and forwards to the daemon."""
     worker_socket_path = os.environ.get("POHUNEK_WORKER_SOCKET_PATH")
-    worker_instance_id = os.environ.get("POHUNEK_WORKER_INSTANCE_ID") or os.environ.get("POHUNEK_RUNTIME_ID")
+    worker_instance_id = os.environ.get("POHUNEK_WORKER_INSTANCE_ID")
     agent_pid_raw = os.environ.get("POHUNEK_AGENT_PID")
     if not worker_socket_path or not worker_instance_id or not agent_pid_raw:
         return False

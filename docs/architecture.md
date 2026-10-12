@@ -404,12 +404,16 @@ Every live logical session has one opaque `worker_id` and one worker instance id
 private worker control wire, data-frame headers, hook messages, the worker
 journal and the persisted runtime record spell the worker instance id
 `runtime_id`, so a live durable worker keeps talking to a newer daemon. The environment marker is
-`POHUNEK_WORKER_INSTANCE_ID`; `POHUNEK_RUNTIME_ID` is accepted as a read-only
-alternate spelling of it by the process inspectors, the sweep and the state
-hooks, and no worker writes it or passes an inherited value to its children. A
-process whose two markers name different instances, one of them the swept
-instance, is ambiguous: the sweep never signals it and the cleanup stays
-unconfirmed; a conflicting pair naming other instances only is ignored. The CLI flag is
+`POHUNEK_WORKER_INSTANCE_ID`, the only name the process inspectors, the sweep
+and the hooks read. Workers of releases before 0.33.1 mark their children with
+another name, so startup does not adopt such a live worker (`incompatible`,
+`worker_marker_legacy`, judged from the journal's `version`; the upgrade
+preflight reports the same code), and a sweep never signals a worker child
+(`POHUNEK_WORKER_ID`, which only a worker sets) that carries the swept session's
+`POHUNEK_SESSION_ID` but no worker-instance marker: it reports the process as
+skipped and the cleanup stays unconfirmed. A lifecycle hook the daemon runs for
+the session carries the session marker but no worker marker and is not part of
+the sweep. The CLI flag is
 `--worker-instance-id`.
 The worker owns the PTY master, root child handle, reader and reaper, bounded raw
 output ring, terminal tracker, input deduplication, resize sequencing, and final

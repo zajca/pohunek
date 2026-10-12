@@ -1,6 +1,6 @@
 //! Linux `/proc` and pidfd process inspection.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-10-12
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
@@ -25,9 +25,8 @@ const PROC_ROOT: &str = "/proc";
 const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 const ENV_DAEMON_ID: &str = "POHUNEK_DAEMON_ID";
 const ENV_SESSION_ID: &str = "POHUNEK_SESSION_ID";
+const ENV_WORKER_ID: &str = "POHUNEK_WORKER_ID";
 const ENV_WORKER_INSTANCE_ID: &str = "POHUNEK_WORKER_INSTANCE_ID";
-/// Read-only alternate spelling of the worker instance marker.
-const ENV_RUNTIME_ID: &str = "POHUNEK_RUNTIME_ID";
 /// `/proc/<pid>/stat` process-group field number (`pgrp`).
 const STAT_PGRP_FIELD: usize = 5;
 /// `/proc/<pid>/stat` parent-process field number (`ppid`).
@@ -449,10 +448,10 @@ fn parse_ownership_markers(environ: &[u8]) -> OwnershipMarkers {
             &mut markers.daemon_id
         } else if key == ENV_SESSION_ID.as_bytes() {
             &mut markers.session_id
+        } else if key == ENV_WORKER_ID.as_bytes() {
+            &mut markers.worker_id
         } else if key == ENV_WORKER_INSTANCE_ID.as_bytes() {
             &mut markers.worker_instance_id
-        } else if key == ENV_RUNTIME_ID.as_bytes() {
-            &mut markers.runtime_id
         } else {
             continue;
         };
@@ -461,8 +460,8 @@ fn parse_ownership_markers(environ: &[u8]) -> OwnershipMarkers {
         }
         if markers.daemon_id.is_some()
             && markers.session_id.is_some()
+            && markers.worker_id.is_some()
             && markers.worker_instance_id.is_some()
-            && markers.runtime_id.is_some()
         {
             break;
         }
@@ -1170,7 +1169,8 @@ mod tests {
     #[test]
     fn environ_parser_retains_only_allowlisted_markers() {
         let environ = b"AWS_SECRET_ACCESS_KEY=super-secret\0POHUNEK_DAEMON_ID=d-1\0\
-POHUNEK_SESSION_ID=s-1\0POHUNEK_WORKER_INSTANCE_ID=r-1\0POHUNEK_WORKER_INSTANCE_IDX=r-2\0HOME=/home/u\0";
+POHUNEK_RUNTIME_ID=r-legacy\0POHUNEK_SESSION_ID=s-1\0POHUNEK_WORKER_INSTANCE_ID=r-1\0\
+POHUNEK_WORKER_INSTANCE_IDX=r-2\0HOME=/home/u\0";
 
         let markers = parse_ownership_markers(environ);
 
@@ -1179,36 +1179,11 @@ POHUNEK_SESSION_ID=s-1\0POHUNEK_WORKER_INSTANCE_ID=r-1\0POHUNEK_WORKER_INSTANCE_
             OwnershipMarkers {
                 daemon_id: Some("d-1".to_owned()),
                 session_id: Some("s-1".to_owned()),
+                worker_id: None,
                 worker_instance_id: Some("r-1".to_owned()),
-                runtime_id: None,
             }
         );
         assert!(!format!("{markers:?}").contains("super-secret"));
-    }
-
-    #[test]
-    fn environ_parser_reads_a_runtime_id_marker_as_the_alternate_spelling() {
-        let markers = parse_ownership_markers(b"POHUNEK_RUNTIME_ID=r-1\0");
-
-        assert_eq!(markers.runtime_id.as_deref(), Some("r-1"));
-        assert_eq!(markers.worker_instance_id, None);
-        assert_eq!(
-            markers.worker_instance(),
-            crate::process::WorkerInstanceMarker::Instance("r-1")
-        );
-        assert!(markers.is_marked());
-    }
-
-    #[test]
-    fn environ_parser_keeps_both_spellings_when_they_disagree() {
-        let markers = parse_ownership_markers(
-            b"POHUNEK_RUNTIME_ID=r-old\0POHUNEK_WORKER_INSTANCE_ID=r-new\0",
-        );
-
-        assert_eq!(
-            markers.worker_instance(),
-            crate::process::WorkerInstanceMarker::Conflicting
-        );
     }
 
     #[test]

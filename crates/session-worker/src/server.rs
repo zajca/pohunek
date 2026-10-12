@@ -7485,7 +7485,6 @@ mod tests {
                 ("XPC_SERVICE_NAME", "profile"),
                 ("POHUNEK_SESSION_ID", "s-spoofed"),
                 ("POHUNEK_DAEMON_ID", "daemon-spoofed"),
-                ("POHUNEK_RUNTIME_ID", "runtime-spoofed"),
             ],
         );
         let worker_instance_id = WorkerInstanceId::new("runtime-environment").expect("runtime id");

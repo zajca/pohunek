@@ -12,17 +12,17 @@
 //! by reconciliation from the persisted stop intent, and a removal
 //! interrupted the same way by the persisted Remove intent.
 
-// Rust guideline compliant 2026-06-26
+// Rust guideline compliant 2026-10-12
 
 use protocol::{RuntimeState, SessionId, SessionRemoveResult, SessionStopResult};
 use tracing::warn;
 
 use super::supervision::UNREADABLE_CANDIDATES_RECOVER;
 use super::{
-    is_terminal, runtime_error, runtime_state_label, session_not_found, unavailable_runtime_code,
-    unavailable_runtime_error, DesiredState, ProtocolError, RuntimeExit, RuntimeHandle,
-    RuntimeWatchIdentity, SessionEntry, SessionRegistry, SessionTransaction, TransactionKind,
-    UnconfirmedCleanup,
+    is_terminal, runtime_error, runtime_loss_reason, runtime_state_label, session_not_found,
+    unavailable_runtime_code, unavailable_runtime_error, DesiredState, ProtocolError, RuntimeExit,
+    RuntimeHandle, RuntimeWatchIdentity, SessionEntry, SessionRegistry, SessionTransaction,
+    TransactionKind, UnconfirmedCleanup,
 };
 use crate::procwatch::ProcessIdentity;
 use crate::runtime::lifecycle::{observation_live, Generation, Lifecycle, PreviousLive};
@@ -125,7 +125,11 @@ impl SessionRegistry {
                 return Ok(None);
             };
             if state != RuntimeState::Conflict {
-                return Err(unavailable_runtime_error(id, state));
+                return Err(unavailable_runtime_error(
+                    id,
+                    state,
+                    runtime_loss_reason(entry).as_deref(),
+                ));
             }
             ConflictedRuntime::of(id, entry)?
         };

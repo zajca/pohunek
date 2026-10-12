@@ -1670,7 +1670,9 @@ which the flag overrides. The `--json` success reports of both commands carry
 `preflight` (the report, or `null` when no preflight ran) and
 `accepted_runtime_loss` (boolean, true only when sessions were at risk and the
 flag accepted them). The preflight reads the store, the worker
-journals and the process table only; it never connects to a worker socket. See
+journals and the process table only; it never connects to a worker socket. A
+live session whose worker journal names a release before 0.33.1, or no release,
+is `would_not_be_adopted` with code `worker_marker_legacy`. See
 [update after release](knowledge/runbooks/update-after-release.md).
 
 Identity hooks prefer the owner-private worker endpoint so an accepted launch
@@ -1721,19 +1723,28 @@ binds the active claim to that process and clears the claim when procwatch sees
 the process exit. The shipped integration state hooks use
 `POHUNEK_INTEGRATION_VERSION=11`, run their interpreter in isolated mode (`-I`,
 so the session working directory never shadows the standard library), read the
-worker instance from `POHUNEK_WORKER_INSTANCE_ID` (falling back to
-`POHUNEK_RUNTIME_ID`), read
+worker instance from `POHUNEK_WORKER_INSTANCE_ID`, read
 provider JSON through a bounded direct pipe without staging it on disk, and send the hook process's parent PID on
-`SessionStart`. An installed hook from an earlier asset version reads only
-`POHUNEK_RUNTIME_ID`, which current workers do not set, so it cannot report identity; `integration.status` reports it as
-`outdated` with `reinstall` recovery, and `integration.doctor` as an asset
-finding, until it is reinstalled. A worker sets only
-`POHUNEK_WORKER_INSTANCE_ID` and strips an inherited `POHUNEK_RUNTIME_ID` from its
-children. The hooks and the process sweep also read `POHUNEK_RUNTIME_ID` as the
-same worker instance marker, so descendants of a worker that set only that name
-are still reaped and still report identity; a process whose two markers name
-different instances, one of them the swept instance, is never signalled and
-leaves the cleanup unconfirmed (a pair naming other instances only is ignored).
+`SessionStart`. An installed hook whose content differs from the shipped asset,
+for example one of an earlier release that reads another environment name,
+is reported by `integration.status` as
+`outdated` with `reinstall` recovery, and by `integration.doctor` as an asset
+finding, until it is reinstalled. `POHUNEK_WORKER_INSTANCE_ID` is the only
+worker-instance marker: a worker sets it on every child and strips every
+inherited `POHUNEK_*` variable from them, and the hooks, the process inspectors
+and the process sweep read no other name. Workers of releases before 0.33.1
+mark their children with another name, so the daemon does not adopt such a
+live worker (`incompatible`, `worker_marker_legacy`), and a sweep of a
+session's runtime never signals a process that carries that session's
+`POHUNEK_SESSION_ID` and `POHUNEK_WORKER_ID` (set only by a worker) but no
+worker-instance marker: it leaves the process running and the cleanup
+unconfirmed. A lifecycle hook the daemon runs for the session carries no
+`POHUNEK_WORKER_ID` and is ignored by the sweep. An operation refused on such a
+session (`session.stop`, `session.resize`, input, attach) keeps the state's code
+`worker_protocol_incompatible`, names `worker_marker_legacy` in `msg`, and its
+`recover` says to remove the session with `pohunek session rm` and accept
+losing its runtime: the release that started such a worker is outside the
+supported upgrade window, and the daemon does not notice when it ends.
 
 `session.release_agent` accepts the same `source`/`agent` identity plus an
 optional `seq`. A release clears only the current matching active-agent claim;
