@@ -1,8 +1,12 @@
 """Contract checks for the PR, main, and nightly CI tiers."""
 
 from pathlib import Path
+import hashlib
 import json
 import re
+import subprocess
+import tempfile
+import time
 import tomllib
 import unittest
 
@@ -404,6 +408,10 @@ class RuntimePackageSelectionTests(unittest.TestCase):
         outputs = block(workflow_jobs()[PACKAGE_SELECTOR], "outputs", indent=4)
         for package in official:
             self.assertIn(f"      {package}: ${{{{ steps.select.outputs.{package} }}}}\n", outputs)
+            self.assertIn(
+                f"      {package}_baseline_digest: ${{{{ steps.select.outputs.{package}_baseline_digest }}}}\n",
+                outputs,
+            )
         select = workflow_jobs()[PACKAGE_SELECTOR].split("      - name: Select the runtime packages\n", 1)[1]
         self.assertIn(f"for package in {' '.join(PACKAGE_JOBS.values())}; do", select)
 
@@ -414,9 +422,13 @@ class RuntimePackageSelectionTests(unittest.TestCase):
         self.assertIn("          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n", selector)
         self.assertIn("set -euo pipefail", selector)
         self.assertIn("fetch-depth: 0", selector)
-        # The base commit reaches the script only through the environment.
-        script = selector.split("        run: |\n", 1)[1]
-        self.assertNotIn("${{", script)
+        # The base commit, the token and every step output reach the scripts
+        # only through the environment.
+        for name, step in job_steps(selector).items():
+            if "        run: |\n" in step:
+                with self.subTest(step=name):
+                    self.assertNotIn("${{", step_script(step))
+                    self.assertIn("set -euo pipefail", step_script(step))
 
     def test_package_jobs_depend_on_the_selector_and_carry_no_path_lists(self):
         jobs = workflow_jobs()
@@ -479,6 +491,14 @@ def job_steps(job: str) -> dict[str, str]:
         if match:
             named[match.group(1)] = step
     return named
+
+
+def step_script(step: str) -> str:
+    """The `run: |` body of one step block, dedented."""
+    match = re.search(r"(?m)^        run: \|\n((?: {10}[^\n]*\n|\n)+)", step)
+    if match is None:
+        raise AssertionError(f"step has no run block: {step!r}")
+    return "".join(line[10:] if line.strip() else line for line in match.group(1).splitlines(True))
 
 
 # The nextest profile the package jobs run their test binary under.
@@ -590,6 +610,439 @@ class RuntimePackageEvidenceTests(unittest.TestCase):
                 runs = [name for name, step in steps.items() if f"--test {package}_package" in step]
                 self.assertEqual(len(runs), 1)
                 self.assertLess(names.index("Upload the package evidence"), names.index(runs[0]))
+
+
+# Upper bound for one simulated workflow step; each runs a few `jq` and shell
+# builtins against fake `cargo` and `gh`, so a hang is a broken script.
+STEP_TIMEOUT_SECONDS = 30
+
+# The selector steps after the toolchain setup, in the order the runner
+# executes them, and the step outputs each later step may read.
+SELECTOR_STEPS = (
+    "Classify the changed files",
+    "Read the workspace version",
+    "Fetch the release baseline",
+    "Verify the release baseline",
+    "Select the runtime packages",
+)
+
+# Verdicts of `cargo xtask package baseline --json` captured from the real
+# release v0.34.2: a checkout of the tag verifies every package with the
+# digests of the released archives, and a checkout whose packages changed after
+# the release reports `digest_mismatch`.
+RELEASED_DIGESTS = {
+    "claude": "sha256:bc3c11cfee1ab3807996e1053e5898438abac5c9561f2beb577aaddf3cabcbab",
+    "codex": "sha256:371c19be10a35d4a424a65376769f9bc5ae13f1039c40e5f2c53336c1d256d66",
+    "pi": "sha256:446451ead20ef978c19b406949eb01a7d29c9a498b4de8eb76c2b3e5e3c1fd53",
+}
+
+
+def verified(package: str) -> dict:
+    return {"verdict": "verified", "reason": None, "digest": RELEASED_DIGESTS[package], "version_not_bumped": False}
+
+
+def missing(reason: str, version_not_bumped: bool = False) -> dict:
+    return {"verdict": "missing", "reason": reason, "digest": None, "version_not_bumped": version_not_bumped}
+
+
+FAKE_CARGO = """#!/bin/sh
+printf '%s\\n' "$*" >> "$FAKE_LOG"
+case "$*" in
+    "xtask package affected "*) cat "$FAKE_AFFECTED" ;;
+    "xtask package baseline "*)
+        [ "$FAKE_BASELINE_EXIT" = 0 ] || { echo "package baseline: unreadable checkout" >&2; exit "$FAKE_BASELINE_EXIT"; }
+        cat "$FAKE_BASELINE" ;;
+    *) echo "unexpected cargo $*" >&2; exit 97 ;;
+esac
+"""
+
+FAKE_GH = """#!/bin/sh
+printf '%s\\n' "$*" >> "$FAKE_LOG"
+[ -n "$GH_TOKEN" ] || { echo "gh: no token" >&2; exit 4; }
+dir=""
+previous=""
+for argument in "$@"; do
+    [ "$previous" = "--dir" ] && dir=$argument
+    previous=$argument
+done
+[ -d "$dir" ] || { echo "gh: no directory" >&2; exit 5; }
+printf 'partial' > "$dir/runtime-catalog.json"
+[ "$FAKE_GH_MODE" = fail ] && { echo "release not found" >&2; exit 1; }
+# A stalled connection: `exec` keeps the sleeper the process `timeout` kills.
+[ "$FAKE_GH_MODE" = hang ] && exec sleep "$FAKE_GH_HANG_SECONDS"
+printf 'archive' > "$dir/pohunek-runtime-pi-0.0.0.tar.zst"
+exit 0
+"""
+
+
+# Seconds a hanging fake `gh` sleeps, and the download limit the hang scenario
+# sets: far apart, so only the limit can end the download in time.
+FAKE_GH_HANG_SECONDS = 20
+HANG_FETCH_TIMEOUT = "1s"
+
+
+def workflow_env(name: str) -> str:
+    """One value of the workflow-level `env:` block."""
+    match = re.search(rf"(?m)^  {re.escape(name)}: (\S+)$", CI.split("\njobs:\n", 1)[0])
+    if match is None:
+        raise AssertionError(f"workflow env {name!r} not found")
+    return match.group(1)
+
+
+def workspace_version() -> str:
+    with (ROOT / "Cargo.toml").open("rb") as manifest:
+        return tomllib.load(manifest)["workspace"]["package"]["version"]
+
+
+def step_env(step: str) -> dict[str, str]:
+    """The `env:` mapping of one step block, values unresolved."""
+    match = re.search(r"(?m)^        env:\n((?:          [A-Z_]+: .+\n)+)", step)
+    if match is None:
+        return {}
+    return dict(re.findall(r"(?m)^          ([A-Z_]+): (.+)$", match.group(1)))
+
+
+class SelectorRun:
+    """Runs the selector steps like the runner does, with fake `cargo` and `gh`."""
+
+    def __init__(
+        self,
+        test: unittest.TestCase,
+        affected: dict,
+        baseline,
+        baseline_exit: int = 0,
+        gh_mode: str = "ok",
+        fetch_timeout: str | None = None,
+    ):
+        tmp = tempfile.TemporaryDirectory()
+        test.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        self.runner_temp = self.home / "runner-temp"
+        self.runner_temp.mkdir()
+        bin_dir = self.home / "bin"
+        bin_dir.mkdir()
+        for name, body in (("cargo", FAKE_CARGO), ("gh", FAKE_GH)):
+            (bin_dir / name).write_text(body)
+            (bin_dir / name).chmod(0o755)
+        self.log = self.home / "calls.log"
+        self.log.write_text("")
+        (self.home / "affected.json").write_text(json.dumps(affected))
+        (self.home / "baseline.json").write_text(baseline if isinstance(baseline, str) else json.dumps(baseline))
+        self.base_env = {
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "RUNNER_TEMP": str(self.runner_temp),
+            "GITHUB_REPOSITORY": "zajca/pohunek",
+            "FAKE_LOG": str(self.log),
+            "FAKE_AFFECTED": str(self.home / "affected.json"),
+            "FAKE_BASELINE": str(self.home / "baseline.json"),
+            "FAKE_BASELINE_EXIT": str(baseline_exit),
+            "FAKE_GH_MODE": gh_mode,
+            "FAKE_GH_HANG_SECONDS": str(FAKE_GH_HANG_SECONDS),
+            # The runner exports workflow-level `env:` to every step.
+            "PACKAGE_BASELINE_FETCH_TIMEOUT": fetch_timeout or workflow_env("PACKAGE_BASELINE_FETCH_TIMEOUT"),
+        }
+        self.step_outputs: dict[str, dict[str, str]] = {}
+        self.stderr = ""
+        self.result = self.run()
+        self.outputs = self.job_outputs()
+
+    def resolve(self, value: str) -> str:
+        literal = {
+            "${{ github.token }}": "ghs_fake-token",
+            "${{ github.event.pull_request.base.sha }}": "0123456789abcdef0123456789abcdef01234567",
+        }
+        if value in literal:
+            return literal[value]
+        match = re.fullmatch(r"\$\{\{ steps\.([a-z]+)\.outputs\.([a-z_]+) \}\}", value)
+        if match is None:
+            raise AssertionError(f"unsupported step environment value {value!r}")
+        return self.step_outputs.get(match.group(1), {}).get(match.group(2), "")
+
+    def run(self) -> str:
+        selector = workflow_jobs()[PACKAGE_SELECTOR]
+        steps = job_steps(selector)
+        names = list(steps)
+        if tuple(names[-len(SELECTOR_STEPS):]) != SELECTOR_STEPS:
+            raise AssertionError(f"selector steps changed: {names}")
+        for name in SELECTOR_STEPS:
+            step = steps[name]
+            output = self.home / f"output-{len(self.step_outputs)}-{name.replace(' ', '-')}"
+            output.write_text("")
+            env = dict(self.base_env, GITHUB_OUTPUT=str(output))
+            env.update({key: self.resolve(value) for key, value in step_env(step).items()})
+            completed = subprocess.run(
+                ["bash", "-c", step_script(step)],
+                env=env,
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=STEP_TIMEOUT_SECONDS,
+            )
+            self.stderr += completed.stdout + completed.stderr
+            step_id = re.search(r"(?m)^        id: ([a-z]+)$", step)
+            if step_id:
+                self.step_outputs[step_id.group(1)] = dict(
+                    line.split("=", 1) for line in output.read_text().splitlines() if "=" in line
+                )
+            if completed.returncode != 0:
+                return "failure"
+        return "success"
+
+    def job_outputs(self) -> dict[str, str]:
+        block_text = block(workflow_jobs()[PACKAGE_SELECTOR], "outputs", indent=4)
+        return {
+            name: self.step_outputs.get(step, {}).get(key, "")
+            for name, step, key in re.findall(
+                r"(?m)^      ([a-z_]+): \$\{\{ steps\.([a-z]+)\.outputs\.([a-z_]+) \}\}$", block_text
+            )
+        }
+
+    def runs(self, job: str) -> bool:
+        match = re.search(r"(?m)^    if: \$\{\{ (.+) \}\}$", workflow_jobs()[job])
+        assert match is not None
+        return evaluate_package_condition(match.group(1), "pull_request", False, self.result, self.outputs)
+
+    def calls(self) -> list[str]:
+        return self.log.read_text().splitlines()
+
+
+class RuntimePackageBaselineTests(unittest.TestCase):
+    """A pull request skips a package only on a signed release baseline (issue #149)."""
+
+    def verdicts(self, packages: dict) -> dict:
+        return {"version": workspace_version(), "packages": packages}
+
+    def test_the_selector_reads_the_baseline_only_from_the_release_of_the_workspace_version(self):
+        selector = workflow_jobs()[PACKAGE_SELECTOR]
+        self.assertRegex(selector, r"(?m)^    permissions:\n      contents: read\n")
+        for forbidden in ("actions/download-artifact", "actions/cache", "gh run download", "--run-id", "--latest"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, selector)
+        steps = job_steps(selector)
+        self.assertIn(
+            'echo "version=$(scripts/release-workflow/version rehearsal "")" >> "$GITHUB_OUTPUT"',
+            step_script(steps["Read the workspace version"]),
+        )
+        fetch = steps["Fetch the release baseline"]
+        self.assertEqual(
+            step_env(fetch),
+            {"GH_TOKEN": "${{ github.token }}", "VERSION": "${{ steps.version.outputs.version }}"},
+        )
+        script = step_script(fetch)
+        self.assertIn(
+            'timeout "$PACKAGE_BASELINE_FETCH_TIMEOUT" gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" --dir "$dir"',
+            script,
+        )
+        # The step holding the token runs `gh` and system tools only, never
+        # checkout code: every command is from this list and no path names a
+        # file of the work tree.
+        allowed = {"set", "mkdir", "timeout", "echo", "rm", "fi"}
+        for line in script.splitlines():
+            words = line.strip().removeprefix("if ! ").split()
+            if not words or words[0] == "--pattern" or re.fullmatch(r"[a-z_]+=\S+", words[0]):
+                continue
+            with self.subTest(line=line):
+                self.assertIn(words[0], allowed)
+                if words[0] == "timeout":
+                    self.assertEqual(words[2], "gh")
+        self.assertNotRegex(script, r"scripts/|cargo|\./|\$GITHUB_WORKSPACE|source |\beval\b")
+        # No other step sees the token.
+        for name, step in steps.items():
+            if name != "Fetch the release baseline":
+                with self.subTest(step=name):
+                    self.assertNotIn("GH_TOKEN", step)
+                    self.assertNotIn("github.token", step)
+        # The download limit is a workflow constant, not a step timeout that
+        # would turn a stalled download into a failed job.
+        self.assertRegex(workflow_env("PACKAGE_BASELINE_FETCH_TIMEOUT"), r"^[0-9]+s$")
+        self.assertNotIn("timeout-minutes", selector)
+
+        run = SelectorRun(self, {"core_changed": True, "packages": []}, self.verdicts({p: verified(p) for p in RELEASED_DIGESTS}))
+        self.assertEqual(run.result, "success", run.stderr)
+        version = workspace_version()
+        release_dir = run.runner_temp / "package-baseline"
+        self.assertEqual(
+            run.calls(),
+            [
+                "xtask package affected --base 0123456789abcdef0123456789abcdef01234567 --json",
+                f"release download v{version} --repo zajca/pohunek --dir {release_dir} "
+                "--pattern runtime-catalog.json --pattern attestation-*.json --pattern pohunek-runtime-*.tar.zst",
+                f"xtask package baseline --catalog {release_dir}/runtime-catalog.json "
+                f"--anchor packaging/runtime-catalog-anchor.json --release-dir {release_dir} "
+                f"--version {version} --json",
+            ],
+        )
+        # The assets stay outside the checkout, where they would count as a change.
+        self.assertFalse(release_dir.resolve().is_relative_to(ROOT))
+
+    def test_a_package_skips_only_when_unchanged_with_core_unchanged_and_a_verified_baseline(self):
+        packages = list(PACKAGE_JOBS.values())
+        combinations = [(changed, is_verified) for changed in (False, True) for is_verified in (False, True)]
+        for core_changed in (False, True):
+            # Each run gives every package a different (changed, verified)
+            # pair; four runs give every package every pair.
+            for shift in range(len(combinations)):
+                state = {
+                    package: combinations[(shift + index) % len(combinations)]
+                    for index, package in enumerate(packages)
+                }
+                affected = {
+                    "core_changed": core_changed,
+                    "packages": [package for package, (changed, _) in state.items() if changed],
+                }
+                baseline = self.verdicts({
+                    package: verified(package) if is_verified else missing("digest_mismatch", package != "pi")
+                    for package, (_, is_verified) in state.items()
+                })
+                run = SelectorRun(self, affected, baseline)
+                self.assertEqual(run.result, "success", run.stderr)
+                for job, package in PACKAGE_JOBS.items():
+                    changed, is_verified = state[package]
+                    with self.subTest(core_changed=core_changed, package=package, changed=changed, verified=is_verified):
+                        self.assertEqual(run.runs(job), core_changed or changed or not is_verified)
+                        self.assertEqual(run.outputs[package], "true" if run.runs(job) else "false")
+                        self.assertEqual(
+                            run.outputs[f"{package}_baseline_digest"],
+                            RELEASED_DIGESTS[package] if is_verified else "",
+                        )
+
+    def test_a_failed_download_runs_every_package_without_failing_the_job(self):
+        run = SelectorRun(
+            self,
+            {"core_changed": False, "packages": []},
+            self.verdicts({p: missing("catalog_absent") for p in RELEASED_DIGESTS}),
+            gh_mode="fail",
+        )
+        self.assert_no_baseline(run)
+
+    def test_a_stalled_download_is_cut_off_and_runs_every_package_without_failing_the_job(self):
+        started = time.monotonic()
+        run = SelectorRun(
+            self,
+            {"core_changed": False, "packages": []},
+            self.verdicts({p: missing("catalog_absent") for p in RELEASED_DIGESTS}),
+            gh_mode="hang",
+            fetch_timeout=HANG_FETCH_TIMEOUT,
+        )
+        self.assertLess(time.monotonic() - started, FAKE_GH_HANG_SECONDS)
+        self.assert_no_baseline(run)
+
+    def assert_no_baseline(self, run: "SelectorRun") -> None:
+        self.assertEqual(run.result, "success", run.stderr)
+        self.assertIn("::warning::", run.stderr)
+        # The partial download is removed, so the verifier sees no release.
+        self.assertEqual(list((run.runner_temp / "package-baseline").iterdir()), [])
+        for job, package in PACKAGE_JOBS.items():
+            with self.subTest(job=job):
+                self.assertTrue(run.runs(job))
+                self.assertEqual(run.outputs[f"{package}_baseline_digest"], "")
+
+    def test_an_unreadable_checkout_fails_the_selection_and_runs_every_package(self):
+        run = SelectorRun(
+            self,
+            {"core_changed": False, "packages": []},
+            "",
+            baseline_exit=1,
+        )
+        self.assertEqual(run.result, "failure")
+        self.assertNotIn("select", run.step_outputs)
+        for job in PACKAGE_JOBS:
+            with self.subTest(job=job):
+                self.assertTrue(run.runs(job))
+
+    def test_verdicts_the_selector_cannot_trust_run_the_package(self):
+        version = workspace_version()
+        unchanged = {"core_changed": False, "packages": []}
+        failing = {
+            "not json": "verified",
+            "another release": {"version": f"{version}.1", "packages": {p: verified(p) for p in RELEASED_DIGESTS}},
+            "unknown verdict": self.verdicts({**{p: verified(p) for p in RELEASED_DIGESTS}, "pi": {"verdict": "maybe"}}),
+            "no packages": {"version": version},
+        }
+        for label, baseline in failing.items():
+            with self.subTest(label=label):
+                run = SelectorRun(self, unchanged, baseline)
+                self.assertEqual(run.result, "failure", run.stderr)
+                for job in PACKAGE_JOBS:
+                    self.assertTrue(run.runs(job))
+        # Verdicts that parse but prove nothing for a package select it.
+        degraded = {
+            "absent package": self.verdicts({p: verified(p) for p in RELEASED_DIGESTS if p != "pi"}),
+            "verified without digest": self.verdicts({**{p: verified(p) for p in RELEASED_DIGESTS}, "pi": {"verdict": "verified", "digest": None}}),
+            "verified with a malformed digest": self.verdicts(
+                {**{p: verified(p) for p in RELEASED_DIGESTS}, "pi": {"verdict": "verified", "digest": "sha256:XYZ"}}
+            ),
+        }
+        for label, baseline in degraded.items():
+            with self.subTest(label=label):
+                run = SelectorRun(self, unchanged, baseline)
+                self.assertEqual(run.result, "success", run.stderr)
+                self.assertTrue(run.runs("pi-package"))
+                self.assertEqual(run.outputs["pi_baseline_digest"], "")
+                self.assertFalse(run.runs("codex-package"))
+                self.assertFalse(run.runs("claude-package"))
+
+    def test_package_conditions_read_only_the_selection_result_and_their_own_output(self):
+        for job, package in PACKAGE_JOBS.items():
+            with self.subTest(job=job):
+                text = workflow_jobs()[job]
+                condition = re.search(r"(?m)^    if: \$\{\{ (.+) \}\}$", text)
+                assert condition is not None
+                references = set(re.findall(r"needs\.[A-Za-z0-9_.-]+", condition.group(1)))
+                self.assertEqual(
+                    references,
+                    {f"needs.{PACKAGE_SELECTOR}.result", f"needs.{PACKAGE_SELECTOR}.outputs.{package}"},
+                )
+                # Cache state changes cost only: no job or step condition reads it.
+                for line in re.findall(r"(?m)^\s+if: (.+)$", text):
+                    self.assertNotRegex(line, r"(?i)cache|hashFiles|steps\.")
+
+    def test_package_jobs_require_the_rebuilt_archive_to_be_the_verified_baseline(self):
+        for job, package in PACKAGE_JOBS.items():
+            with self.subTest(job=job):
+                steps = job_steps(workflow_jobs()[job])
+                names = list(steps)
+                match = steps["Match the release baseline"]
+                # After the evidence upload, so a mismatching archive keeps its
+                # evidence, and before anything is tested.
+                self.assertEqual(names.index("Match the release baseline"), names.index("Upload the package evidence") + 1)
+                runs = [name for name, step in steps.items() if f"--test {package}_package" in step]
+                self.assertLess(names.index("Match the release baseline"), names.index(runs[0]))
+                self.assertNotRegex(match, r"(?m)^        if: ")
+                self.assertEqual(
+                    step_env(match),
+                    {
+                        "BASELINE_DIGEST": f"${{{{ needs.{PACKAGE_SELECTOR}.result == 'success' && "
+                        f"needs.{PACKAGE_SELECTOR}.outputs.{package}_baseline_digest || '' }}}}"
+                    },
+                )
+                script = step_script(match)
+                self.assertNotIn("${{", script)
+
+                with tempfile.TemporaryDirectory() as tmp:
+                    runner_temp = Path(tmp)
+                    archive = runner_temp / f"{package}.tar.zst"
+                    archive.write_bytes(b"rebuilt package archive bytes")
+                    rebuilt = "sha256:" + hashlib.sha256(archive.read_bytes()).hexdigest()
+
+                    def check(digest: str) -> subprocess.CompletedProcess:
+                        return subprocess.run(
+                            ["bash", "-c", script],
+                            env={"PATH": "/usr/bin:/bin", "RUNNER_TEMP": str(runner_temp), "BASELINE_DIGEST": digest},
+                            capture_output=True,
+                            text=True,
+                            timeout=STEP_TIMEOUT_SECONDS,
+                        )
+
+                    # No verified baseline: nothing to compare.
+                    self.assertEqual(check("").returncode, 0)
+                    self.assertEqual(check(rebuilt).returncode, 0)
+                    mismatch = check(RELEASED_DIGESTS[package])
+                    self.assertEqual(mismatch.returncode, 1)
+                    self.assertIn("::error::", mismatch.stdout)
+                    self.assertIn("not reproducible", mismatch.stdout)
+                    self.assertIn(rebuilt, mismatch.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -164,14 +164,36 @@ embeds with `include_str!`/`include_bytes!` (for example
 The official packages are the directories under `runtime-packages/`. `--json`
 prints `{"core_changed": bool, "packages": [...]}` on stdout and the per-file
 reasons on stderr; any Git or file-system failure exits non-zero with nothing on
-stdout. A package job skips only when the selector succeeded and reported its
-package as `false`; push, schedule and dispatch runs run every package job.
+stdout. The selector then downloads the signed runtime catalog, the
+attestations and the package archives of the GitHub Release `v<workspace
+version>` (never "latest") with `gh release download` and the run's read-only
+token into `$RUNNER_TEMP`, outside the checkout (the step holding the token runs
+no checkout code; the workspace version is read in the step before), and runs `cargo xtask package
+baseline --anchor packaging/runtime-catalog-anchor.json --json` on them (see
+"Release baseline" in
+[runtime package archive](knowledge/concepts/runtime-package-archive.md)). A
+package is selected when the core changed, the package changed, or its
+baseline is not `verified`; so a pull request skips a package only when the
+package and the core are unchanged and the signed release proves the package's
+bytes, lock and fixtures. A failed download, or one that runs longer than
+the workflow's `PACKAGE_BASELINE_FETCH_TIMEOUT`, leaves the directory empty, every
+package is `missing` and every package job runs, while the selector stays
+green; only an unreadable checkout (the verifier exits non-zero, or verdicts of
+another release or of an unknown shape) fails the selector. Between a version
+bump and its release no baseline exists, so every package job runs. A package
+job skips only when the selector succeeded and reported its package as `false`;
+a failed selection, and push, schedule and dispatch runs, run every package
+job. Cache state never enters a package job's condition.
 Each package job builds its archive with `cargo xtask package build
 --evidence-dir` and uploads the builder evidence (checksum, manifest projection,
 provenance input, compatibility vector; see
 [runtime package archive](knowledge/concepts/runtime-package-archive.md)) as
 `package-evidence-<runtime>` right after the build, so it survives a failing
-test run. The release build passes `build-packages` a separate evidence
+test run. When the selector verified the package's baseline, the job then
+requires the SHA-256 of the archive it rebuilt to equal the baseline digest
+(`<p>_baseline_digest`); the selector rebuilt the same commit with the same
+builder and found the released digest, so a difference means the package build
+is not reproducible and fails the job. The release build passes `build-packages` a separate evidence
 directory and uploads it as `package-evidence`, which no release job downloads.
 
 The target is fast feedback in about two minutes for routine changes, not a
@@ -486,7 +508,10 @@ never published, and no provenance is created. It does not run for fork or
 Dependabot pull requests. The rehearsal cannot prove what needs the real tag:
 signing with the production key against `packaging/runtime-catalog-anchor.json`,
 `gh attestation verify` against real attestations, the macOS archives, and the
-draft/publish semantics of the `publish` job.
+draft/publish semantics of the `publish` job. The rehearsal, like a release,
+builds and tests every official package from its own commit: no release
+workflow or script reads the per-pull-request selection or a release baseline
+(`scripts/tests/test_release_workflow.py` pins this).
 
 ### Adding a runtime package or row
 
@@ -500,9 +525,12 @@ runtime: the package job, the row matrix and the smoke derive them from those
 directories and files. A new target needs a runner
 mapping in `scripts/release-workflow/row-matrix`, a build leg in
 `release-build.yml` and the policy entries in `packaging/release-policy.json`.
-The per-pull-request package job in `ci.yml` needs a `package-selection` output
-for the runtime and an entry in `PACKAGE_JOBS` of `scripts/tests/test_ci_tiers.py`,
-which fails until every `runtime-packages/` directory has both.
+The per-pull-request package job in `ci.yml` needs the runtime in the
+`package-selection` loop, the selector outputs `<runtime>` and
+`<runtime>_baseline_digest`, a "Match the release baseline" step after its
+evidence upload, and an entry in `PACKAGE_JOBS` of
+`scripts/tests/test_ci_tiers.py`, which fails until every `runtime-packages/`
+directory has all of them.
 
 The structure of the workflows (one writer, the OIDC jobs, the secret, pinned
 actions, asset names against the policy) is pinned by

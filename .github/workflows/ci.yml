@@ -93,6 +93,12 @@ env:
   # Bump both together.
   ZIG_VERSION: "0.17.0"
   ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+  # Time limit of the release baseline download in `package-selection`. The
+  # assets it selects are small (release v0.34.2: 10 files, 15 KB in all), so
+  # a healthy download is one API listing plus a request per file, done in
+  # seconds; two minutes leaves room for slow requests and larger packages. A
+  # download that runs out of time counts as failed: every package job runs.
+  PACKAGE_BASELINE_FETCH_TIMEOUT: 120s
 
 jobs:
   platform-contracts:
@@ -1407,14 +1413,22 @@ jobs:
   # package <p>, reviewed prose selects nothing, and every other file (any
   # crate, manifest, lockfile, Cargo or toolchain configuration, workflow,
   # script, packaging, or a file a crate embeds) is a core change that selects
-  # every official package. The package jobs below skip only when this job
-  # succeeded and reported their package as `false`; a failed or skipped
-  # selection runs every package job. Push, schedule and dispatch runs skip
-  # this job and run every package job.
+  # every official package. `cargo xtask package baseline` then checks each
+  # package against the signed release of the workspace version: a package
+  # whose bytes, lock and fixtures the release `v<version>` built and attested
+  # is `verified`, any other is `missing`. A package job is selected (`true`)
+  # when the core changed, its package changed, or its baseline is not
+  # verified, so a pull request skips a package only when it is unchanged, the
+  # core is unchanged and the signed release proves the package. The package
+  # jobs below skip only when this job succeeded and reported their package as
+  # `false`; a failed or skipped selection runs every package job. Push,
+  # schedule and dispatch runs skip this job and run every package job.
   package-selection:
     name: runtime package selection
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: read
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     outputs:
@@ -1423,6 +1437,9 @@ jobs:
       pi: ${{ steps.select.outputs.pi }}
       codex: ${{ steps.select.outputs.codex }}
       claude: ${{ steps.select.outputs.claude }}
+      pi_baseline_digest: ${{ steps.select.outputs.pi_baseline_digest }}
+      codex_baseline_digest: ${{ steps.select.outputs.codex_baseline_digest }}
+      claude_baseline_digest: ${{ steps.select.outputs.claude_baseline_digest }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1447,20 +1464,93 @@ jobs:
 
       # The base commit comes through the environment, never interpolated into
       # the script. Any failure fails the job, which runs every package job.
-      - name: Select the runtime packages
-        id: select
+      - name: Classify the changed files
         shell: bash
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          selection="$(cargo xtask package affected --base "$BASE_SHA" --json)"
+          cargo xtask package affected --base "$BASE_SHA" --json > "$RUNNER_TEMP/package-affected.json"
+
+      # The workspace version names the baseline release. Read here, without
+      # the token: the version script is checkout code. A workspace version
+      # that is not X.Y.Z fails the job, which runs every package job.
+      - name: Read the workspace version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "version=$(scripts/release-workflow/version rehearsal "")" >> "$GITHUB_OUTPUT"
+
+      # The baseline is the GitHub Release `v<workspace version>` of this
+      # repository, never "latest", read with the run's read-only token. This
+      # step runs only `gh` and system tools, never checkout code. The assets
+      # land outside the checkout: an untracked file in the work tree would
+      # count as a change. A download that fails or exceeds
+      # PACKAGE_BASELINE_FETCH_TIMEOUT leaves the directory empty, so the
+      # verifier reports every package missing and every package job runs; the
+      # download never fails the job.
+      - name: Fetch the release baseline
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/package-baseline"
+          mkdir -p "$dir"
+          if ! timeout "$PACKAGE_BASELINE_FETCH_TIMEOUT" gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" --dir "$dir" \
+            --pattern runtime-catalog.json --pattern 'attestation-*.json' --pattern 'pohunek-runtime-*.tar.zst'; then
+            echo "::warning::release v$VERSION assets could not be downloaded within $PACKAGE_BASELINE_FETCH_TIMEOUT; every package job runs"
+            rm -rf "$dir"
+            mkdir -p "$dir"
+          fi
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      # Anything read from the release only ever makes a package missing. The
+      # verifier exits non-zero only when the checkout itself is unreadable;
+      # that fails the job, which runs every package job.
+      - name: Verify the release baseline
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_DIR: ${{ steps.release.outputs.dir }}
+        run: |
+          set -euo pipefail
+          cargo xtask package baseline --catalog "$RELEASE_DIR/runtime-catalog.json" \
+            --anchor packaging/runtime-catalog-anchor.json --release-dir "$RELEASE_DIR" \
+            --version "$VERSION" --json > "$RUNNER_TEMP/package-baseline.json"
+
+      # A package runs when the core changed, the package changed, or its
+      # baseline is not verified; a package absent from the verdicts is not
+      # verified. `<p>_baseline_digest` carries a verified baseline digest for
+      # the package job to compare its rebuilt archive with, empty otherwise.
+      # Verdicts of another release or of an unknown shape fail the job.
+      - name: Select the runtime packages
+        id: select
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          selection="$(cat "$RUNNER_TEMP/package-affected.json")"
+          baseline="$(cat "$RUNNER_TEMP/package-baseline.json")"
           jq -e '(.core_changed | type == "boolean") and (.packages | type == "array") and all(.packages[]; type == "string")' <<<"$selection" >/dev/null
+          jq -e --arg version "$VERSION" '(.version == $version) and (.packages | type == "object") and all(.packages[]; .verdict == "verified" or .verdict == "missing")' <<<"$baseline" >/dev/null
+          core_changed="$(jq -r '.core_changed' <<<"$selection")"
           {
             echo "packages=$(jq -c '.packages' <<<"$selection")"
-            echo "core_changed=$(jq -r '.core_changed' <<<"$selection")"
+            echo "core_changed=$core_changed"
             for package in pi codex claude; do
-              echo "$package=$(jq -r --arg package "$package" '.packages | index($package) != null' <<<"$selection")"
+              changed="$(jq -r --arg package "$package" '.packages | index($package) != null' <<<"$selection")"
+              digest="$(jq -r --arg package "$package" '.packages[$package] // {} | if .verdict == "verified" and ((.digest // "") | test("^sha256:[0-9a-f]{64}$")) then .digest else "" end' <<<"$baseline")"
+              if [ "$core_changed" = true ] || [ "$changed" = true ] || [ -z "$digest" ]; then
+                echo "$package=true"
+              else
+                echo "$package=false"
+              fi
+              echo "${package}_baseline_digest=$digest"
             done
           } >> "$GITHUB_OUTPUT"
 
@@ -1554,6 +1644,29 @@ jobs:
           name: package-evidence-pi
           path: ${{ runner.temp }}/package-evidence-pi
           if-no-files-found: error
+
+      # A verified baseline means the selector rebuilt this package from this
+      # commit and got the digest of the released archive, so the archive
+      # under test must be the released one. A different digest means two
+      # builds of identical inputs disagree: the package build is not
+      # reproducible, and the job fails. The digest is read only from a
+      # successful selection.
+      - name: Match the release baseline
+        shell: bash
+        env:
+          BASELINE_DIGEST: ${{ needs.package-selection.result == 'success' && needs.package-selection.outputs.pi_baseline_digest || '' }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BASELINE_DIGEST" ]; then
+            echo "No verified release baseline for pi; the rebuilt archive has nothing to match."
+            exit 0
+          fi
+          actual="sha256:$(sha256sum "$RUNNER_TEMP/pi.tar.zst" | cut -d' ' -f1)"
+          if [ "$actual" != "$BASELINE_DIGEST" ]; then
+            echo "::error::the rebuilt pi archive is $actual but the verified release baseline is $BASELINE_DIGEST: the package build is not reproducible"
+            exit 1
+          fi
+          echo "The rebuilt pi archive is the released baseline $actual."
 
       - name: Build the session worker
         run: cargo build --locked -p pohunek-session-worker --bin pohunek-sessiond
@@ -1664,6 +1777,29 @@ jobs:
           name: package-evidence-codex
           path: ${{ runner.temp }}/package-evidence-codex
           if-no-files-found: error
+
+      # A verified baseline means the selector rebuilt this package from this
+      # commit and got the digest of the released archive, so the archive
+      # under test must be the released one. A different digest means two
+      # builds of identical inputs disagree: the package build is not
+      # reproducible, and the job fails. The digest is read only from a
+      # successful selection.
+      - name: Match the release baseline
+        shell: bash
+        env:
+          BASELINE_DIGEST: ${{ needs.package-selection.result == 'success' && needs.package-selection.outputs.codex_baseline_digest || '' }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BASELINE_DIGEST" ]; then
+            echo "No verified release baseline for codex; the rebuilt archive has nothing to match."
+            exit 0
+          fi
+          actual="sha256:$(sha256sum "$RUNNER_TEMP/codex.tar.zst" | cut -d' ' -f1)"
+          if [ "$actual" != "$BASELINE_DIGEST" ]; then
+            echo "::error::the rebuilt codex archive is $actual but the verified release baseline is $BASELINE_DIGEST: the package build is not reproducible"
+            exit 1
+          fi
+          echo "The rebuilt codex archive is the released baseline $actual."
 
       - name: Build the session worker
         run: cargo build --locked -p pohunek-session-worker --bin pohunek-sessiond
@@ -1785,6 +1921,29 @@ jobs:
           name: package-evidence-claude
           path: ${{ runner.temp }}/package-evidence-claude
           if-no-files-found: error
+
+      # A verified baseline means the selector rebuilt this package from this
+      # commit and got the digest of the released archive, so the archive
+      # under test must be the released one. A different digest means two
+      # builds of identical inputs disagree: the package build is not
+      # reproducible, and the job fails. The digest is read only from a
+      # successful selection.
+      - name: Match the release baseline
+        shell: bash
+        env:
+          BASELINE_DIGEST: ${{ needs.package-selection.result == 'success' && needs.package-selection.outputs.claude_baseline_digest || '' }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BASELINE_DIGEST" ]; then
+            echo "No verified release baseline for claude; the rebuilt archive has nothing to match."
+            exit 0
+          fi
+          actual="sha256:$(sha256sum "$RUNNER_TEMP/claude.tar.zst" | cut -d' ' -f1)"
+          if [ "$actual" != "$BASELINE_DIGEST" ]; then
+            echo "::error::the rebuilt claude archive is $actual but the verified release baseline is $BASELINE_DIGEST: the package build is not reproducible"
+            exit 1
+          fi
+          echo "The rebuilt claude archive is the released baseline $actual."
 
       - name: Build the session worker
         run: cargo build --locked -p pohunek-session-worker --bin pohunek-sessiond
