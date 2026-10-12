@@ -521,6 +521,1070 @@ async fn a_report_of_a_newer_asset_set_is_refused_by_a_session_on_an_older_schem
     );
 }
 
+/// Subagent lifecycle scenarios: real state hooks run inside a real worker's
+/// PTY, report provider subagent events through the worker socket, and
+/// `Worker::inspect` shows the journaled rows.
+///
+/// Expected rows come from the Claude Code hook sequences recorded on #883
+/// (`compat/claude/subagent-hook-sequences.json`), from the Codex hook schema
+/// fixture, and from the subagent rules decided on #883, never from the
+/// worker's own output.
+mod subagent_sequences {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use pohunek_test_support::wait::wait_until;
+    use pohunek_worker_protocol::{
+        InspectSnapshot, SubagentPhase, SubagentSnapshot, TransactionId,
+    };
+    use serde::Deserialize;
+    use serde_json::{json, Value};
+
+    use super::{start_worker_with_schema, state_asset};
+    use crate::runtime::Worker;
+
+    /// Claude Code subagent hook sequences recorded on #883.
+    const RECORDED: &str = include_str!("../../../../compat/claude/subagent-hook-sequences.json");
+
+    /// Hook schema of a session whose hooks report subagents.
+    const SCHEMA: &str = "identity-subagent-v1";
+
+    /// Provider id the Claude state hook reports.
+    const CLAUDE: &str = "claude";
+
+    /// Provider id the Codex state hook reports.
+    const CODEX: &str = "codex";
+
+    /// Terminal rows the worker keeps: `TERMINAL_SUBAGENT_CAPACITY` in
+    /// `crates/session-worker/src/server.rs`, which is private to the worker.
+    const TERMINAL_HISTORY: usize = 32;
+
+    /// One more helper stop than the terminal history holds: if every helper
+    /// stop became a terminal row, the oldest real row would be evicted.
+    const HELPER_STOPS: usize = TERMINAL_HISTORY + 1;
+
+    /// Rows keyed by provider and subagent id.
+    type Rows = BTreeMap<(String, String), SubagentPhase>;
+
+    /// The recorded sequences file.
+    #[derive(Debug, Deserialize)]
+    struct Recording {
+        sequences: BTreeMap<String, Sequence>,
+    }
+
+    /// One recorded sequence: hook events in order and the rows they leave.
+    #[derive(Debug, Deserialize)]
+    struct Sequence {
+        events: Vec<Event>,
+        checkpoints: Vec<Checkpoint>,
+        final_rows: Vec<Row>,
+    }
+
+    /// A sanitized provider hook input.
+    #[derive(Debug, Deserialize)]
+    struct Event {
+        hook_event_name: String,
+        agent_id: String,
+        agent_type: String,
+    }
+
+    /// Rows expected after the first `after_events` events.
+    #[derive(Debug, Deserialize)]
+    struct Checkpoint {
+        after_events: usize,
+        rows: Vec<Row>,
+    }
+
+    /// One expected Claude subagent row.
+    #[derive(Debug, Deserialize)]
+    struct Row {
+        agent_id: String,
+        lifecycle: SubagentPhase,
+    }
+
+    /// One step of the PTY script.
+    enum Step {
+        /// Runs a state hook `asset` with `action`, `payload` on its stdin.
+        Hook {
+            asset: PathBuf,
+            action: &'static str,
+            payload: Value,
+        },
+        /// Runs a shell command, such as the crafted-claim client, which
+        /// only Linux runs.
+        #[cfg(target_os = "linux")]
+        Command(String),
+        /// Reports an identity barrier and waits on the gate; the test checks
+        /// these rows before it releases the gate.
+        Checkpoint(Rows),
+    }
+
+    /// A real worker whose PTY script waits on a gate after its last step.
+    struct HookRun {
+        worker: Worker,
+        task: tokio::task::JoinHandle<Result<(), pohunek_session_worker::WorkerError>>,
+        /// Write end of the FIFO the PTY script reads one line from per pause.
+        gate: std::fs::File,
+        /// Sequence of the last identity barrier the worker recorded.
+        barrier: Option<u64>,
+        /// The worker's snapshot at each checkpoint, then after the last step.
+        snapshots: Vec<InspectSnapshot>,
+    }
+
+    impl HookRun {
+        /// Waits until the worker records an identity barrier newer than the
+        /// last one and returns the snapshot at that point.
+        ///
+        /// The PTY script runs every hook to completion before it reports the
+        /// barrier, so every earlier claim has been decided by then.
+        async fn pass_barrier(&mut self) -> InspectSnapshot {
+            let worker = &self.worker;
+            let previous = self.barrier;
+            let snapshot = Box::pin(wait_until(
+                "the worker records the identity barrier",
+                || async move {
+                    let snapshot = worker.inspect().await.expect("inspect");
+                    let sequence = snapshot.active_identity.as_ref()?.sequence;
+                    previous
+                        .is_none_or(|previous| sequence > previous)
+                        .then_some(snapshot)
+                },
+            ))
+            .await;
+            self.barrier = snapshot
+                .active_identity
+                .as_ref()
+                .map(|identity| identity.sequence);
+            snapshot
+        }
+
+        /// Lets the PTY script continue past its current pause.
+        ///
+        /// Waits first until the wall clock is past every row timestamp in
+        /// `snapshot`, so a transition after the pause is stamped later than
+        /// every transition before it.
+        async fn release(&mut self, snapshot: &InspectSnapshot) {
+            let latest = snapshot
+                .subagents
+                .iter()
+                .map(|row| row.updated_at_ms)
+                .max()
+                .unwrap_or_default();
+            Box::pin(wait_until(
+                "the wall clock passes the checkpoint's timestamps",
+                || async move { (unix_ms() > u128::from(latest)).then_some(()) },
+            ))
+            .await;
+            std::io::Write::write_all(&mut self.gate, b"next\n").expect("release the PTY script");
+        }
+
+        /// Stops the PTY, which ends the runtime.
+        async fn stop_runtime(&self) {
+            self.worker
+                .stop(TransactionId::new("transaction-subagent-stop").expect("transaction id"))
+                .await
+                .expect("stop the PTY");
+        }
+
+        /// Disconnects from the worker and ends its task.
+        fn close(self) {
+            drop(self.worker);
+            self.task.abort();
+        }
+
+        /// Stops the PTY, then the worker.
+        async fn finish(self) {
+            self.stop_runtime().await;
+            self.close();
+        }
+    }
+
+    fn unix_ms() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_millis()
+    }
+
+    /// `path` as one single-quoted shell word.
+    fn quoted(path: &Path) -> String {
+        let text = path.display().to_string();
+        assert!(!text.contains('\''), "a test path holds no quote: {text}");
+        format!("'{text}'")
+    }
+
+    /// Starts a real worker whose PTY runs `steps` with the real hooks, checks
+    /// the rows at every checkpoint, and checks `final_rows` after the last
+    /// step. The PTY stays up until [`HookRun::finish`].
+    async fn replay(root: &Path, steps: Vec<Step>, final_rows: &Rows) -> HookRun {
+        let gate_path = root.join("replay.gate");
+        nix::unistd::mkfifo(&gate_path, nix::sys::stat::Mode::S_IRWXU).expect("create the gate");
+        // Opened read-write so the test never blocks on a reader and the
+        // script's read waits for a line rather than for end of file.
+        let gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&gate_path)
+            .expect("open the gate");
+        let barrier_input = root.join("barrier.json");
+        std::fs::write(&barrier_input, br#"{"session_id":"barrier"}"#)
+            .expect("write the barrier input");
+        // The identity hook runs under an intermediate shell, so it reports that
+        // shell rather than the PTY root, as in `report_through_worker`.
+        let barrier = format!(
+            "/bin/sh -c '/bin/sh \"$0\" session; true' {} < {}",
+            quoted(&state_asset(CLAUDE)),
+            quoted(&barrier_input)
+        );
+        let pause = format!("read -r step < {}", quoted(&gate_path));
+
+        // Every hook runs before the script's last command, so the shell never
+        // execs it and the hook's parent is the PTY root the worker attests.
+        let mut lines = Vec::new();
+        let mut checkpoints = Vec::new();
+        for (index, step) in steps.into_iter().enumerate() {
+            match step {
+                Step::Hook {
+                    asset,
+                    action,
+                    payload,
+                } => {
+                    let input = root.join(format!("hook-{index}.json"));
+                    std::fs::write(&input, payload.to_string()).expect("write the hook input");
+                    lines.push(format!(
+                        "/bin/sh {} {action} < {}",
+                        quoted(&asset),
+                        quoted(&input)
+                    ));
+                }
+                #[cfg(target_os = "linux")]
+                Step::Command(command) => lines.push(command),
+                Step::Checkpoint(rows) => {
+                    lines.extend([barrier.clone(), pause.clone()]);
+                    checkpoints.push(rows);
+                }
+            }
+        }
+        lines.extend([barrier, pause]);
+
+        let (worker, task, _socket) = start_worker_with_schema(
+            root,
+            &lines.join("\n"),
+            protocol::PROTOCOL_VERSION.get(),
+            SCHEMA,
+        )
+        .await;
+        let mut run = HookRun {
+            worker,
+            task,
+            gate,
+            barrier: None,
+            snapshots: Vec::new(),
+        };
+        for (index, rows) in checkpoints.iter().enumerate() {
+            let snapshot = run.pass_barrier().await;
+            assert_eq!(
+                &journaled_rows(&snapshot),
+                rows,
+                "rows at checkpoint {index}: {:?}",
+                snapshot.subagents
+            );
+            run.release(&snapshot).await;
+            run.snapshots.push(snapshot);
+        }
+        let snapshot = run.pass_barrier().await;
+        assert_eq!(
+            &journaled_rows(&snapshot),
+            final_rows,
+            "rows after the last step: {:?}",
+            snapshot.subagents
+        );
+        run.snapshots.push(snapshot);
+        run
+    }
+
+    /// The journaled rows of `snapshot`, which holds one row per subagent.
+    fn journaled_rows(snapshot: &InspectSnapshot) -> Rows {
+        let rows: Rows = snapshot
+            .subagents
+            .iter()
+            .map(|row| ((row.provider.clone(), row.id.clone()), row.phase))
+            .collect();
+        assert_eq!(
+            rows.len(),
+            snapshot.subagents.len(),
+            "one row per subagent: {:?}",
+            snapshot.subagents
+        );
+        rows
+    }
+
+    /// The row of subagent `id` in `snapshot`.
+    fn row<'a>(snapshot: &'a InspectSnapshot, id: &str) -> &'a SubagentSnapshot {
+        snapshot
+            .subagents
+            .iter()
+            .find(|row| row.id == id)
+            .unwrap_or_else(|| panic!("no row {id}: {:?}", snapshot.subagents))
+    }
+
+    /// The recorded sequence `name`.
+    fn recorded(name: &str) -> Sequence {
+        let mut recording: Recording =
+            serde_json::from_str(RECORDED).expect("the recorded sequences parse");
+        recording
+            .sequences
+            .remove(name)
+            .unwrap_or_else(|| panic!("no recorded sequence {name}"))
+    }
+
+    /// Recorded Claude rows.
+    fn claude_rows(rows: &[Row]) -> Rows {
+        rows.iter()
+            .map(|row| ((CLAUDE.to_owned(), row.agent_id.clone()), row.lifecycle))
+            .collect()
+    }
+
+    /// `event` delivered through the real Claude state hook.
+    fn claude_hook(event: &Event) -> Step {
+        let action = match event.hook_event_name.as_str() {
+            "SubagentStart" => "subagent-start",
+            "SubagentStop" => "subagent-stop",
+            other => panic!("the replay has no state hook action for recorded {other}"),
+        };
+        Step::Hook {
+            asset: state_asset(CLAUDE),
+            action,
+            payload: json!({
+                "hook_event_name": event.hook_event_name,
+                "agent_id": event.agent_id,
+                "agent_type": event.agent_type,
+            }),
+        }
+    }
+
+    /// `sequence` replayed through the real Claude state hook, with a
+    /// checkpoint wherever the recording expects rows between two events.
+    fn recorded_steps(sequence: &Sequence) -> Vec<Step> {
+        assert!(
+            sequence
+                .checkpoints
+                .iter()
+                .all(|checkpoint| (1..sequence.events.len()).contains(&checkpoint.after_events)),
+            "every checkpoint sits between two events: {sequence:?}"
+        );
+        let mut steps = Vec::new();
+        for (index, event) in sequence.events.iter().enumerate() {
+            steps.extend(
+                sequence
+                    .checkpoints
+                    .iter()
+                    .filter(|checkpoint| checkpoint.after_events == index)
+                    .map(|checkpoint| Step::Checkpoint(claude_rows(&checkpoint.rows))),
+            );
+            steps.push(claude_hook(event));
+        }
+        steps
+    }
+
+    /// Replays the recorded sequence `name` and checks every row it expects.
+    async fn replay_recorded(prefix: &str, name: &str) -> HookRun {
+        let root = crate::test_support::scoped_dir(prefix);
+        let sequence = recorded(name);
+        replay(
+            &root,
+            recorded_steps(&sequence),
+            &claude_rows(&sequence.final_rows),
+        )
+        .await
+    }
+
+    /// R1: a `SendMessage` resume fires `SubagentStart` again for a
+    /// handed-back agent. Its terminal row reopens with a newer revision, keeps
+    /// its first start time and clears its finish time, and the resumed run's
+    /// stop completes it again (#883 D1, D6).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resumed_subagent_reopens_its_row_and_completes_again() {
+        let sequence = recorded("spawn_handback_resume");
+        // The recording resumes the first agent it spawned.
+        let resumed = sequence.events[0].agent_id.clone();
+        let run = replay_recorded("ph-subagent-resume-", "spawn_handback_resume").await;
+
+        let [handed_back, reopened, completed] = run.snapshots.as_slice() else {
+            panic!("two checkpoints and the final rows: {:?}", run.snapshots);
+        };
+        let (handed_back, reopened, completed) = (
+            row(handed_back, &resumed),
+            row(reopened, &resumed),
+            row(completed, &resumed),
+        );
+        assert!(
+            reopened.revision > handed_back.revision,
+            "{handed_back:?} {reopened:?}"
+        );
+        assert_eq!(
+            reopened.started_at_ms, handed_back.started_at_ms,
+            "the reopened row keeps its first start"
+        );
+        assert_eq!(reopened.finished_at_ms, None, "{reopened:?}");
+        assert!(
+            reopened.updated_at_ms > handed_back.updated_at_ms,
+            "the reopen is a later transition: {handed_back:?} {reopened:?}"
+        );
+        assert!(
+            completed.revision > reopened.revision,
+            "{reopened:?} {completed:?}"
+        );
+        assert!(completed.finished_at_ms.is_some(), "{completed:?}");
+        assert_eq!(completed.started_at_ms, handed_back.started_at_ms);
+        run.finish().await;
+    }
+
+    /// R2: an agent that handed back while its own background shell still ran
+    /// is woken by Claude when the shell finishes, with the same id; the row
+    /// is running again and completes at the woken run's stop (#883 D1, D6).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_self_woken_subagent_reopens_its_row() {
+        let woken_id = recorded("self_wake").events[0].agent_id.clone();
+        let run = replay_recorded("ph-subagent-wake-", "self_wake").await;
+        let [handed_back, woken, completed] = run.snapshots.as_slice() else {
+            panic!("two checkpoints and the final rows: {:?}", run.snapshots);
+        };
+        let [handed_back, woken, completed] =
+            [handed_back, woken, completed].map(|snapshot| row(snapshot, &woken_id));
+        assert!(
+            handed_back.revision < woken.revision && woken.revision < completed.revision,
+            "{handed_back:?} {woken:?} {completed:?}"
+        );
+        assert_eq!(woken.started_at_ms, handed_back.started_at_ms);
+        run.finish().await;
+    }
+
+    /// The live session's `ab6095d32d09fd8cd`: three resumes after four
+    /// completions, with a prompt-suggestion helper stop during the last run.
+    /// Every resumed run is tracked as running and every completion applies
+    /// (#883 D1, D2, D6).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_run_of_a_repeatedly_resumed_subagent_is_tracked() {
+        replay_recorded("ph-subagent-live-", "live_resumed_background_agent")
+            .await
+            .finish()
+            .await;
+    }
+
+    /// R3: the stop-only helper after every main turn creates no row and does
+    /// not change the row count around a real background agent (#883 D2, D6).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn helper_stops_after_each_turn_create_no_row() {
+        replay_recorded("ph-subagent-helper-", "helper_stop_after_each_turn")
+            .await
+            .finish()
+            .await;
+    }
+
+    /// More helper stops than the terminal history holds, after a real
+    /// subagent completed, leave that real row in place (#883 D2: helper stops
+    /// do not evict terminal history). The recorded R3 sequence has three
+    /// helper stops, too few for any eviction to show.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn helper_stops_do_not_evict_terminal_history() {
+        let root = crate::test_support::scoped_dir("ph-subagent-evict-");
+        let sequence = recorded("helper_stop_after_each_turn");
+        let final_rows = claude_rows(&sequence.final_rows);
+        // The recorded real agent's start and stop, without the recorded
+        // helper stops, so the real row is the only terminal row before the
+        // generated helper stops.
+        let mut steps: Vec<Step> = sequence
+            .events
+            .iter()
+            .filter(|event| !event.agent_type.is_empty())
+            .map(claude_hook)
+            .collect();
+        steps.push(Step::Checkpoint(final_rows.clone()));
+        // Fresh ids of the recorded helper shape: `a` and 16 hex digits.
+        steps.extend((0..HELPER_STOPS).map(|index| {
+            claude_hook(&Event {
+                hook_event_name: "SubagentStop".to_owned(),
+                agent_id: format!("af{index:015x}"),
+                agent_type: String::new(),
+            })
+        }));
+        replay(&root, steps, &final_rows).await.finish().await;
+    }
+
+    /// A start for a subagent that is already running is idempotent: one row,
+    /// its revision unchanged (#883 D1).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_repeated_start_of_a_running_subagent_is_idempotent() {
+        let root = crate::test_support::scoped_dir("ph-subagent-repeat-");
+        let sequence = recorded("spawn_handback_resume");
+        let start = &sequence.events[0];
+        let running = claude_rows(&[Row {
+            agent_id: start.agent_id.clone(),
+            lifecycle: SubagentPhase::Running,
+        }]);
+        let steps = vec![
+            claude_hook(start),
+            Step::Checkpoint(running.clone()),
+            claude_hook(start),
+        ];
+        let run = replay(&root, steps, &running).await;
+        let [first, repeated] = run.snapshots.as_slice() else {
+            panic!("one checkpoint and the final rows: {:?}", run.snapshots);
+        };
+        assert_eq!(
+            row(repeated, &start.agent_id).revision,
+            row(first, &start.agent_id).revision
+        );
+        run.finish().await;
+    }
+
+    /// A Codex `SubagentStop` without a recorded start is a resumed Codex
+    /// child, so it records a completed row (#883 D2 Codex rule, #916).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_codex_stop_without_a_recorded_start_records_a_completed_row() {
+        let root = crate::test_support::scoped_dir("ph-subagent-codex-");
+        let fixture: Value =
+            serde_json::from_str(crate::integration::CODEX_SUBAGENT_COMPATIBILITY_FIXTURE)
+                .expect("the Codex hook fixture parses");
+        let stop = fixture["stop"].clone();
+        let id = stop["agent_id"]
+            .as_str()
+            .expect("the Codex stop names its agent")
+            .to_owned();
+        let steps = vec![Step::Hook {
+            asset: state_asset(CODEX),
+            action: "subagent-stop",
+            payload: stop,
+        }];
+        let completed = Rows::from([((CODEX.to_owned(), id), SubagentPhase::Completed)]);
+        replay(&root, steps, &completed).await.finish().await;
+    }
+
+    /// The end of the runtime retires a running row as lost.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_running_subagent_is_lost_when_its_runtime_ends() {
+        let root = crate::test_support::scoped_dir("ph-subagent-lost-");
+        let sequence = recorded("spawn_handback_resume");
+        let start = &sequence.events[0];
+        let running = claude_rows(&[Row {
+            agent_id: start.agent_id.clone(),
+            lifecycle: SubagentPhase::Running,
+        }]);
+        let run = replay(&root, vec![claude_hook(start)], &running).await;
+
+        run.stop_runtime().await;
+        let worker = &run.worker;
+        let snapshot = Box::pin(wait_until(
+            "the runtime end settles every running row",
+            || async move {
+                let snapshot = worker.inspect().await.expect("inspect");
+                snapshot
+                    .subagents
+                    .iter()
+                    .all(|row| row.phase != SubagentPhase::Running)
+                    .then_some(snapshot)
+            },
+        ))
+        .await;
+        let lost = claude_rows(&[Row {
+            agent_id: start.agent_id.clone(),
+            lifecycle: SubagentPhase::Lost,
+        }]);
+        assert_eq!(journaled_rows(&snapshot), lost, "{:?}", snapshot.subagents);
+        run.close();
+    }
+
+    /// Ordering scenarios driven by crafted subagent claims with explicit
+    /// sequences, so that a claim can reach the worker before a claim it
+    /// follows, as hooks of separate processes can.
+    ///
+    /// Expected rows follow the ordering invariant decided on #883: a record's
+    /// phase is the phase implied by the highest-sequence claim the worker has
+    /// admitted for that id.
+    ///
+    /// Linux only: the crafted client reads its start identity from `/proc`.
+    #[cfg(target_os = "linux")]
+    mod crafted {
+        use std::path::{Path, PathBuf};
+        use std::sync::{Arc, Mutex, OnceLock};
+
+        use pohunek_worker_protocol::SubagentPhase;
+        use serde_json::Value;
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+
+        use super::{claude_rows, quoted, replay, row, Row, Rows, Step, CLAUDE, CODEX};
+
+        /// Claim type of a subagent start.
+        const START: &str = "subagent_start";
+
+        /// Claim type of a subagent stop.
+        const STOP: &str = "subagent_stop";
+
+        /// Synthetic subagent id of the recorded Claude shape.
+        const REORDERED: &str = "a1b3d5f7c9e0a2b4d";
+
+        /// Subagents the worker runs at once: `ACTIVE_SUBAGENT_CAPACITY` in
+        /// `crates/session-worker/src/server.rs`, which is private to the worker.
+        const ACTIVE_CAPACITY: usize = 64;
+
+        /// Name of the worker event for a claim that changed no phase.
+        const IGNORED_EVENT: &str = "worker.subagent.claim.ignored";
+
+        /// Name of the worker event for a claim that hit a bound.
+        const REFUSED_EVENT: &str = "worker.subagent.claim.refused";
+
+        /// Crafted-claim client: `<results file> <provider>` and then claims
+        /// as `<claim type>:<sequence>:<subagent id>`, sent one after the other
+        /// by the process that runs the client, which reports itself.
+        ///
+        /// Each answered claim appends `{"action", "sequence", "id",
+        /// "response"}` to the results file; any failure goes to
+        /// `<results file>.failure`, which the test reads.
+        const CLIENT: &str = r#"
+import json
+import os
+import socket
+import sys
+
+results_path, provider = sys.argv[1], sys.argv[2]
+
+def record_failure(kind, value, trace):
+    # The test reads this file, so a claim never fails without a reason.
+    import traceback
+    with open(results_path + ".failure", "a", encoding="utf-8") as handle:
+        handle.write("".join(traceback.format_exception(kind, value, trace)))
+
+sys.excepthook = record_failure
+
+def start_identity(pid):
+    with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
+        return int(handle.read().rsplit(")", 1)[1].split()[19])
+
+pid = os.getpid()
+for claim in sys.argv[3:]:
+    action, sequence, subagent_id = claim.split(":")
+    request = {
+        "type": action,
+        "runtime_id": os.environ["POHUNEK_WORKER_INSTANCE_ID"],
+        "provider": provider,
+        "pid": pid,
+        "start_identity": start_identity(pid),
+        "sequence": int(sequence),
+        "subagent_id": subagent_id,
+    }
+    if action == "subagent_start":
+        request.update({"agent_type": "general-purpose", "parent_id": None})
+    else:
+        request["outcome"] = "completed"
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(os.environ["POHUNEK_WORKER_SOCKET_PATH"])
+    client.sendall((json.dumps(request) + "\n").encode())
+    received = b""
+    while b"\n" not in received:
+        chunk = client.recv(4096)
+        if not chunk:
+            raise RuntimeError(f"worker closed the socket before a full response line: {received!r}")
+        received += chunk
+    client.close()
+    response = json.loads(received.split(b"\n", 1)[0])
+    with open(results_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({
+            "action": action,
+            "sequence": int(sequence),
+            "id": subagent_id,
+            "response": response,
+        }) + "\n")
+"#;
+
+        /// One crafted claim and whether the worker acknowledged it.
+        #[derive(Debug, PartialEq, Eq)]
+        struct Answer {
+            action: String,
+            sequence: u64,
+            id: String,
+            ok: bool,
+        }
+
+        impl Answer {
+            fn new(action: &str, sequence: u64, id: &str, ok: bool) -> Self {
+                Self {
+                    action: action.to_owned(),
+                    sequence,
+                    id: id.to_owned(),
+                    ok,
+                }
+            }
+        }
+
+        /// The crafted-claim client written into a scenario's directory.
+        struct Client {
+            script: PathBuf,
+            results: PathBuf,
+        }
+
+        impl Client {
+            fn new(root: &Path) -> Self {
+                let script = root.join("crafted-claim.py");
+                std::fs::write(&script, CLIENT).expect("write the crafted-claim client");
+                Self {
+                    script,
+                    results: root.join("crafted-claim.results"),
+                }
+            }
+
+            /// A step sending `claims` (claim type, sequence, subagent id) as
+            /// `provider` from one process, in order.
+            fn step(&self, provider: &str, claims: &[(&str, u64, &str)]) -> Step {
+                let claims = claims
+                    .iter()
+                    .map(|(action, sequence, id)| format!("{action}:{sequence}:{id}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                Step::Command(format!(
+                    "python3 -I {} {} {provider} {claims}",
+                    quoted(&self.script),
+                    quoted(&self.results)
+                ))
+            }
+
+            /// Every answered claim, in the order the worker answered them.
+            fn answers(&self) -> Vec<Answer> {
+                if let Ok(failure) =
+                    std::fs::read_to_string(format!("{}.failure", self.results.display()))
+                {
+                    panic!("a crafted claim failed: {failure}");
+                }
+                std::fs::read_to_string(&self.results)
+                    .expect("the crafted claims recorded their answers")
+                    .lines()
+                    .map(|line| {
+                        let entry: Value = serde_json::from_str(line).expect("result line is JSON");
+                        Answer {
+                            action: entry["action"].as_str().expect("claim type").to_owned(),
+                            sequence: entry["sequence"].as_u64().expect("sequence"),
+                            id: entry["id"].as_str().expect("subagent id").to_owned(),
+                            ok: entry["response"]["ok"]
+                                .as_bool()
+                                .unwrap_or_else(|| panic!("the answer carries ok: {entry}")),
+                        }
+                    })
+                    .collect()
+            }
+        }
+
+        /// One subagent claim event the worker logged.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct Logged {
+            name: String,
+            action: String,
+            id: String,
+            reason: String,
+        }
+
+        impl Logged {
+            fn new(name: &str, action: &str, id: &str, reason: &str) -> Self {
+                Self {
+                    name: name.to_owned(),
+                    action: action.to_owned(),
+                    id: id.to_owned(),
+                    reason: reason.to_owned(),
+                }
+            }
+        }
+
+        /// The worker's subagent claim events, captured on the test thread.
+        ///
+        /// These scenarios serve the worker in process on a current-thread
+        /// runtime, so the worker logs on the thread whose default subscriber
+        /// this installs.
+        #[derive(Clone, Default)]
+        struct ClaimLog(Arc<Mutex<Vec<Logged>>>);
+
+        impl ClaimLog {
+            /// Installs this capture as the thread's default subscriber.
+            ///
+            /// A process-wide anchor dispatcher is registered first, for the
+            /// reason `crate::runtime::lifecycle::tests::LogCapture` gives: with
+            /// two registered dispatchers a callsite's interest is combined
+            /// over both and each event consults the emitting thread's default.
+            fn install(&self) -> tracing::subscriber::DefaultGuard {
+                static ANCHOR: OnceLock<tracing::Dispatch> = OnceLock::new();
+                ANCHOR.get_or_init(|| {
+                    tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new())
+                });
+                tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+            }
+
+            fn events(&self) -> Vec<Logged> {
+                self.0.lock().expect("claim log").clone()
+            }
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ClaimLog {
+            fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
+                let name = event.metadata().name();
+                if name != IGNORED_EVENT && name != REFUSED_EVENT {
+                    return;
+                }
+                let mut fields = ClaimFields::default();
+                event.record(&mut fields);
+                self.0.lock().expect("claim log").push(Logged {
+                    name: name.to_owned(),
+                    action: fields.action,
+                    id: fields.id,
+                    reason: fields.reason,
+                });
+            }
+        }
+
+        /// The string fields of a subagent claim event.
+        #[derive(Default)]
+        struct ClaimFields {
+            action: String,
+            id: String,
+            reason: String,
+        }
+
+        impl tracing::field::Visit for ClaimFields {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                let slot = match field.name() {
+                    "subagent.action" => &mut self.action,
+                    "subagent.id" => &mut self.id,
+                    "subagent.reason" => &mut self.reason,
+                    _ => return,
+                };
+                value.clone_into(slot);
+            }
+
+            fn record_debug(
+                &mut self,
+                _field: &tracing::field::Field,
+                _value: &dyn std::fmt::Debug,
+            ) {
+            }
+        }
+
+        /// Rows of one Claude subagent `id` in `lifecycle`.
+        fn one(id: &str, lifecycle: SubagentPhase) -> Rows {
+            claude_rows(&[Row {
+                agent_id: id.to_owned(),
+                lifecycle,
+            }])
+        }
+
+        /// Claude delivers hooks from separate processes, so a stop can reach
+        /// the worker before the start it follows. A Claude stop for an unknown
+        /// id at sequence 20, then the start for that id at sequence 10,
+        /// leaves no row; a later start at sequence 30 creates a running row.
+        /// Every claim is acknowledged.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_claude_start_older_than_an_ignored_stop_creates_no_row() {
+            let root = crate::test_support::scoped_dir("ph-subagent-reorder-");
+            let client = Client::new(&root);
+            let steps = vec![
+                client.step(CLAUDE, &[(STOP, 20, REORDERED), (START, 10, REORDERED)]),
+                Step::Checkpoint(Rows::new()),
+                client.step(CLAUDE, &[(START, 30, REORDERED)]),
+            ];
+            let run = replay(&root, steps, &one(REORDERED, SubagentPhase::Running)).await;
+            assert_eq!(
+                client.answers(),
+                [
+                    Answer::new(STOP, 20, REORDERED, true),
+                    Answer::new(START, 10, REORDERED, true),
+                    Answer::new(START, 30, REORDERED, true),
+                ]
+            );
+            run.finish().await;
+        }
+
+        /// Run 1 is 10..20. The stop of run 2 (40) reaches the worker before
+        /// its start (30): the row stays completed, because the highest
+        /// admitted claim is the stop at 40.
+        #[tokio::test]
+        async fn a_stop_ahead_of_its_start_keeps_the_next_run_completed() {
+            let log = ClaimLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-subagent-stop-ahead-");
+            let client = Client::new(&root);
+            let completed = one(REORDERED, SubagentPhase::Completed);
+            let steps = vec![
+                client.step(CLAUDE, &[(START, 10, REORDERED), (STOP, 20, REORDERED)]),
+                Step::Checkpoint(completed.clone()),
+                client.step(CLAUDE, &[(STOP, 40, REORDERED)]),
+                Step::Checkpoint(completed.clone()),
+                client.step(CLAUDE, &[(START, 30, REORDERED)]),
+            ];
+            let run = replay(&root, steps, &completed).await;
+            assert_eq!(
+                client.answers(),
+                [
+                    Answer::new(START, 10, REORDERED, true),
+                    Answer::new(STOP, 20, REORDERED, true),
+                    Answer::new(STOP, 40, REORDERED, true),
+                    Answer::new(START, 30, REORDERED, true),
+                ]
+            );
+            assert_eq!(
+                log.events(),
+                [
+                    Logged::new(IGNORED_EVENT, "stop", REORDERED, "not_running"),
+                    Logged::new(IGNORED_EVENT, "start", REORDERED, "stale_sequence"),
+                ],
+                "the newer stop on the terminal row and the older start are ignored"
+            );
+            // The stop at 40 advances only the record's sequence, which is not
+            // public: the row keeps its revision and transition time.
+            let [after_first_stop, after_newer_stop, _] = run.snapshots.as_slice() else {
+                panic!("two checkpoints and the final rows: {:?}", run.snapshots);
+            };
+            let (before, after) = (
+                row(after_first_stop, REORDERED),
+                row(after_newer_stop, REORDERED),
+            );
+            assert_eq!(
+                (after.revision, after.updated_at_ms),
+                (before.revision, before.updated_at_ms),
+                "{before:?} {after:?}"
+            );
+            run.finish().await;
+        }
+
+        /// Run 1 starts at 10. The start of run 2 (30) reaches the worker
+        /// before the stop of run 1 (20): the row stays running, because the
+        /// highest admitted claim is the start at 30; the stop of run 2 (40)
+        /// completes it.
+        #[tokio::test]
+        async fn a_start_ahead_of_the_previous_stop_keeps_the_row_running() {
+            let log = ClaimLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-subagent-start-ahead-");
+            let client = Client::new(&root);
+            let steps = vec![
+                client.step(
+                    CLAUDE,
+                    &[
+                        (START, 10, REORDERED),
+                        (START, 30, REORDERED),
+                        (STOP, 20, REORDERED),
+                    ],
+                ),
+                Step::Checkpoint(one(REORDERED, SubagentPhase::Running)),
+                client.step(CLAUDE, &[(STOP, 40, REORDERED)]),
+            ];
+            let run = replay(&root, steps, &one(REORDERED, SubagentPhase::Completed)).await;
+            assert_eq!(
+                client.answers(),
+                [
+                    Answer::new(START, 10, REORDERED, true),
+                    Answer::new(START, 30, REORDERED, true),
+                    Answer::new(STOP, 20, REORDERED, true),
+                    Answer::new(STOP, 40, REORDERED, true),
+                ]
+            );
+            assert_eq!(
+                log.events(),
+                [
+                    Logged::new(IGNORED_EVENT, "start", REORDERED, "duplicate_start"),
+                    Logged::new(IGNORED_EVENT, "stop", REORDERED, "stale_sequence"),
+                ],
+                "the newer start on the running row and the older stop are ignored"
+            );
+            run.finish().await;
+        }
+
+        /// A Codex stop-only row at sequence 20 is journaled as completed; a
+        /// Codex start at sequence 10 for it is older, so it is ignored and the
+        /// row neither reopens nor changes revision.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_older_start_does_not_reopen_a_journaled_terminal_row() {
+            /// Synthetic Codex child thread id.
+            const CHILD: &str = "agent-child-reordered";
+            let root = crate::test_support::scoped_dir("ph-subagent-stale-start-");
+            let client = Client::new(&root);
+            let completed = Rows::from([(
+                (CODEX.to_owned(), CHILD.to_owned()),
+                SubagentPhase::Completed,
+            )]);
+            let steps = vec![
+                client.step(CODEX, &[(STOP, 20, CHILD)]),
+                Step::Checkpoint(completed.clone()),
+                client.step(CODEX, &[(START, 10, CHILD)]),
+            ];
+            let run = replay(&root, steps, &completed).await;
+            assert_eq!(
+                client.answers(),
+                [
+                    Answer::new(STOP, 20, CHILD, true),
+                    Answer::new(START, 10, CHILD, true),
+                ]
+            );
+            let [journaled, after] = run.snapshots.as_slice() else {
+                panic!("one checkpoint and the final rows: {:?}", run.snapshots);
+            };
+            assert_eq!(row(after, CHILD).revision, row(journaled, CHILD).revision);
+            run.finish().await;
+        }
+
+        /// With the active capacity of running subagents reached, one more
+        /// start is refused: the hook is answered `ok: false`, no row is
+        /// created, and the worker logs the refusal with reason `capacity`.
+        #[tokio::test]
+        async fn a_start_beyond_the_active_capacity_is_refused() {
+            let log = ClaimLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-subagent-capacity-");
+            let client = Client::new(&root);
+            // Fresh ids of the recorded Claude shape: `a` and 16 hex digits.
+            let ids: Vec<String> = (0..=ACTIVE_CAPACITY)
+                .map(|index| format!("ac{index:015x}"))
+                .collect();
+            let (running_ids, overflow) = ids.split_at(ACTIVE_CAPACITY);
+            let overflow = overflow[0].as_str();
+            let sequence = |index: usize| u64::try_from(index).expect("index fits u64") + 1;
+            let starts: Vec<(&str, u64, &str)> = running_ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| (START, sequence(index), id.as_str()))
+                .collect();
+            let running: Rows = claude_rows(
+                &running_ids
+                    .iter()
+                    .map(|id| Row {
+                        agent_id: id.clone(),
+                        lifecycle: SubagentPhase::Running,
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let steps = vec![
+                client.step(CLAUDE, &starts),
+                Step::Checkpoint(running.clone()),
+                client.step(CLAUDE, &[(START, sequence(ACTIVE_CAPACITY), overflow)]),
+            ];
+            let run = replay(&root, steps, &running).await;
+            let answers = client.answers();
+            let (accepted, refused) = answers.split_at(ACTIVE_CAPACITY);
+            assert!(accepted.iter().all(|answer| answer.ok), "{accepted:?}");
+            assert_eq!(
+                refused,
+                [Answer::new(
+                    START,
+                    sequence(ACTIVE_CAPACITY),
+                    overflow,
+                    false
+                )]
+            );
+            assert_eq!(
+                log.events(),
+                [Logged::new(REFUSED_EVENT, "start", overflow, "capacity")]
+            );
+            run.finish().await;
+        }
+    }
+}
+
 /// Launch-identity scenarios of the frozen-root launch rule.
 ///
 /// Linux only: on macOS `python3` is an `xcrun` shim or a framework stub that

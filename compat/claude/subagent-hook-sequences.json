@@ -1,0 +1,138 @@
+{
+  "source": "zajca/pohunek#883 (2026-10-12): live session on Claude Code 2.1.288 (macOS, auto mode) and controlled reproduction R1-R3 on Claude Code 2.1.295 (Linux)",
+  "format": {
+    "events": "Ordered SubagentStart/SubagentStop hook inputs, sanitized to hook_event_name, agent_id and agent_type. `at` is the UTC time the issue records, where it records one. Main-agent Stop events (with background_tasks) are left out; they belong in `events` at the turn ends the descriptions name.",
+    "checkpoints": "Rows expected after the first `after_events` events.",
+    "final_rows": "Rows expected after every event: one row per subagent, with its lifecycle."
+  },
+  "ids": "Ids the issue records in full are kept. The reproduction logged ids only in truncated form, so R1-R3 and every prompt-suggestion helper use synthetic ids of the same shape (`a` plus 16 hex digits).",
+  "sequences": {
+    "spawn_handback_resume": {
+      "recording": "R1",
+      "description": "Two unnamed run_in_background general-purpose agents are spawned in one turn, both hand back, then SendMessage resumes the first one: SubagentStart fires again with the same agent_id and agent_type, and SubagentStop ends the resumed run.",
+      "events": [
+        {"hook_event_name": "SubagentStart", "agent_id": "a3c5e7f9b1d2a4c6e", "agent_type": "general-purpose"},
+        {"hook_event_name": "SubagentStart", "agent_id": "a7d1f3b5c9e2a6d8f", "agent_type": "general-purpose"},
+        {"hook_event_name": "SubagentStop", "agent_id": "a3c5e7f9b1d2a4c6e", "agent_type": "general-purpose"},
+        {"hook_event_name": "SubagentStop", "agent_id": "a7d1f3b5c9e2a6d8f", "agent_type": "general-purpose"},
+        {"hook_event_name": "SubagentStart", "agent_id": "a3c5e7f9b1d2a4c6e", "agent_type": "general-purpose"},
+        {"hook_event_name": "SubagentStop", "agent_id": "a3c5e7f9b1d2a4c6e", "agent_type": "general-purpose"}
+      ],
+      "checkpoints": [
+        {
+          "after_events": 4,
+          "rows": [
+            {"agent_id": "a3c5e7f9b1d2a4c6e", "lifecycle": "completed"},
+            {"agent_id": "a7d1f3b5c9e2a6d8f", "lifecycle": "completed"}
+          ]
+        },
+        {
+          "after_events": 5,
+          "rows": [
+            {"agent_id": "a3c5e7f9b1d2a4c6e", "lifecycle": "running"},
+            {"agent_id": "a7d1f3b5c9e2a6d8f", "lifecycle": "completed"}
+          ]
+        }
+      ],
+      "final_rows": [
+        {"agent_id": "a3c5e7f9b1d2a4c6e", "lifecycle": "completed"},
+        {"agent_id": "a7d1f3b5c9e2a6d8f", "lifecycle": "completed"}
+      ]
+    },
+    "self_wake": {
+      "recording": "R2",
+      "description": "A background agent starts its own run_in_background shell and hands back at once (SubagentStop). When the shell finishes, Claude resumes the agent by itself: SubagentStart and SubagentStop fire again with the same agent_id.",
+      "events": [
+        {"hook_event_name": "SubagentStart", "agent_id": "a5f2c8e1d7b3a9c4e", "agent_type": "general-purpose"},
+        {"hook_event_name": "SubagentStop", "agent_id": "a5f2c8e1d7b3a9c4e", "agent_type": "general-purpose"},
+        {"hook_event_name": "SubagentStart", "agent_id": "a5f2c8e1d7b3a9c4e", "agent_type": "general-purpose"},
+        {"hook_event_name": "SubagentStop", "agent_id": "a5f2c8e1d7b3a9c4e", "agent_type": "general-purpose"}
+      ],
+      "checkpoints": [
+        {
+          "after_events": 2,
+          "rows": [{"agent_id": "a5f2c8e1d7b3a9c4e", "lifecycle": "completed"}]
+        },
+        {
+          "after_events": 3,
+          "rows": [{"agent_id": "a5f2c8e1d7b3a9c4e", "lifecycle": "running"}]
+        }
+      ],
+      "final_rows": [
+        {"agent_id": "a5f2c8e1d7b3a9c4e", "lifecycle": "completed"}
+      ]
+    },
+    "helper_stop_after_each_turn": {
+      "recording": "R3",
+      "description": "About 1-3 s after every main-agent Stop, the prompt-suggestion helper sends a SubagentStop with a fresh agent_id, agent_type \"\" and no preceding SubagentStart. Turn 1 spawns a background agent, turn 2 handles its hand-back notification, turn 3 is a plain turn.",
+      "events": [
+        {"hook_event_name": "SubagentStart", "agent_id": "a6c0d4e8f2b7a1c5d", "agent_type": "general-purpose"},
+        {"hook_event_name": "SubagentStop", "agent_id": "a0e4b8c2d6f1a3e5b", "agent_type": ""},
+        {"hook_event_name": "SubagentStop", "agent_id": "a6c0d4e8f2b7a1c5d", "agent_type": "general-purpose"},
+        {"hook_event_name": "SubagentStop", "agent_id": "a2d6f0b4c8e3a7d1c", "agent_type": ""},
+        {"hook_event_name": "SubagentStop", "agent_id": "a4b8e2f6c0d5a9b3e", "agent_type": ""}
+      ],
+      "checkpoints": [
+        {
+          "after_events": 2,
+          "rows": [{"agent_id": "a6c0d4e8f2b7a1c5d", "lifecycle": "running"}]
+        }
+      ],
+      "final_rows": [
+        {"agent_id": "a6c0d4e8f2b7a1c5d", "lifecycle": "completed"}
+      ]
+    },
+    "live_resumed_background_agent": {
+      "recording": "live session s-01M4QC188PWBKPAMVYVZ5CGNQT, subagent ab6095d32d09fd8cd",
+      "description": "One background general-purpose agent that ends every run through SubagentHandback and is resumed three times with SendMessage: four completions and three resumes. The issue records no spawn time. One prompt-suggestion helper stop arrives while the third resumed run is working (the helper stops of that session started at 10:35:57).",
+      "events": [
+        {"hook_event_name": "SubagentStart", "agent_id": "ab6095d32d09fd8cd", "agent_type": "general-purpose"},
+        {"hook_event_name": "SubagentStop", "agent_id": "ab6095d32d09fd8cd", "agent_type": "general-purpose", "at": "07:09:34"},
+        {"hook_event_name": "SubagentStart", "agent_id": "ab6095d32d09fd8cd", "agent_type": "general-purpose", "at": "07:09:54"},
+        {"hook_event_name": "SubagentStop", "agent_id": "ab6095d32d09fd8cd", "agent_type": "general-purpose", "at": "07:19:46"},
+        {"hook_event_name": "SubagentStart", "agent_id": "ab6095d32d09fd8cd", "agent_type": "general-purpose", "at": "10:00:55"},
+        {"hook_event_name": "SubagentStop", "agent_id": "ab6095d32d09fd8cd", "agent_type": "general-purpose", "at": "10:02:35"},
+        {"hook_event_name": "SubagentStart", "agent_id": "ab6095d32d09fd8cd", "agent_type": "general-purpose", "at": "10:35:24"},
+        {"hook_event_name": "SubagentStop", "agent_id": "a8e2c6f0d4b9a3e7c", "agent_type": "", "at": "10:35:57"},
+        {"hook_event_name": "SubagentStop", "agent_id": "ab6095d32d09fd8cd", "agent_type": "general-purpose", "at": "10:44:19"}
+      ],
+      "checkpoints": [
+        {
+          "after_events": 1,
+          "rows": [{"agent_id": "ab6095d32d09fd8cd", "lifecycle": "running"}]
+        },
+        {
+          "after_events": 2,
+          "rows": [{"agent_id": "ab6095d32d09fd8cd", "lifecycle": "completed"}]
+        },
+        {
+          "after_events": 3,
+          "rows": [{"agent_id": "ab6095d32d09fd8cd", "lifecycle": "running"}]
+        },
+        {
+          "after_events": 4,
+          "rows": [{"agent_id": "ab6095d32d09fd8cd", "lifecycle": "completed"}]
+        },
+        {
+          "after_events": 5,
+          "rows": [{"agent_id": "ab6095d32d09fd8cd", "lifecycle": "running"}]
+        },
+        {
+          "after_events": 6,
+          "rows": [{"agent_id": "ab6095d32d09fd8cd", "lifecycle": "completed"}]
+        },
+        {
+          "after_events": 7,
+          "rows": [{"agent_id": "ab6095d32d09fd8cd", "lifecycle": "running"}]
+        },
+        {
+          "after_events": 8,
+          "rows": [{"agent_id": "ab6095d32d09fd8cd", "lifecycle": "running"}]
+        }
+      ],
+      "final_rows": [
+        {"agent_id": "ab6095d32d09fd8cd", "lifecycle": "completed"}
+      ]
+    }
+  }
+}

@@ -1,5 +1,35 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-12, subagent restart and Claude helper stop, #883)
+
+- A `SubagentStart` with a newer sequence for a terminal subagent reopens its
+  record: `running` with a new revision, `finished_at_ms` cleared,
+  `started_at_ms` kept; the next `SubagentStop` completes it. This tracks
+  Claude background agents resumed with `SendMessage` or woken by their own
+  background shell. A start for a running subagent is idempotent.
+- A subagent record's phase is the phase implied by the highest-sequence
+  claim the worker admitted for its id, for every provider. A newer start for
+  a running record or a newer stop for a terminal one is ignored but its
+  sequence is persisted in the journal, so a delayed older claim cannot reopen
+  or complete the record; a repeated Codex per-turn stop on a finished child
+  only advances that sequence.
+- `identity-subagent-v1` lists `claude` as a provider whose stop is admitted
+  only after a recorded start. Claude's prompt-suggestion helper stop after
+  every main turn creates no row, changes no count and evicts no history. The
+  worker remembers its sequence in an in-memory set of at most 64 stops, drops
+  an entry once a start for that id applies, and ignores (`stale_sequence`) a
+  delayed start that is not newer than the remembered stop. A Codex stop
+  without a start records a completed subagent (#916).
+- The worker logs every ignored subagent claim as
+  `worker.subagent.claim.ignored` (`duplicate_start`, `stop_without_start`,
+  `stale_sequence`, `not_running`; INFO, hook answer `ok: true`) and every
+  refused one as `worker.subagent.claim.refused` (`capacity`; WARN, hook
+  answer `ok: false`). `SubagentInfo` and the wire protocol are
+  unchanged. Documented in `concepts/sessions`, the `claude-package` and
+  `codex-package` guides, the `debug-session-runtime` runbook and
+  `docs/public-api.md` (hook schemas, `SessionInfo.subagents`,
+  `subagent_state`, Provider Notification Hooks).
+
 ## Unreleased (2026-10-12, release baseline in CI package selection, #149)
 
 - The `package-selection` CI job downloads release `v<workspace version>`'s

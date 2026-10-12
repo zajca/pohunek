@@ -153,6 +153,15 @@ captured screen through the package manifest.
 - A subagent the model starts through the `Task` tool is reported by the
   SubagentStart and SubagentStop hooks (`identity-subagent-v1`) as a Claude
   subagent that runs and then completes.
+- Claude Code 2.1.295 fires SubagentStart again with the same `agent_id` when a
+  finished background agent is resumed with `SendMessage` or wakes itself after
+  its own background shell ends, and a SubagentStop at the end of that run; the
+  worker reopens the terminal record as `running` and completes it again.
+  About 1 to 3 seconds after every main-agent Stop, Claude fires a
+  SubagentStop with a fresh `agent_id`, an empty `agent_type` and no preceding
+  start for its prompt-suggestion helper; `identity-subagent-v1` admits a
+  Claude stop only after a recorded start, so the helper adds no subagent row
+  (evidence in [#883](https://github.com/zajca/pohunek/issues/883)).
 - `claude --version` prints `2.1.289 (Claude Code)`; the inventory shows the
   package's probe accepted the real release.
 - Environment that keeps a real Claude away from host state and services:
