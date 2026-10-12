@@ -12,6 +12,7 @@ mod hermes;
 mod hermes_mock;
 mod hermes_skill;
 mod package_affected;
+mod package_baseline;
 mod release;
 mod release_inventory;
 mod release_policy;
@@ -625,6 +626,16 @@ enum PackageAction {
     /// every package under `runtime-packages/`. Fails without printing a
     /// selection when Git or the file system fails.
     Affected(package_affected::Options),
+    /// Print which official packages the signed release `v<version>` proves unchanged.
+    ///
+    /// A package is `verified` only when the catalog verifies against the
+    /// anchor now and names that release, its entry has the digest of the
+    /// package rebuilt from the work tree, the released archive and every
+    /// referenced attestation hash to their catalog digests and bind the
+    /// current lock and matrix, and the package and compatibility
+    /// directories equal the release commit. Anything else is `missing` with
+    /// a reason code and exits 0; only an unreadable checkout fails.
+    Baseline(package_baseline::Options),
 }
 
 #[derive(Debug, Subcommand)]
@@ -685,6 +696,7 @@ fn run_package(action: PackageAction) -> Result<(), XtaskError> {
             println!("package verify ok: reproducible build, {digest}");
         }
         PackageAction::Affected(options) => package_affected::run(&options)?,
+        PackageAction::Baseline(options) => package_baseline::run(&options)?,
     }
     Ok(())
 }

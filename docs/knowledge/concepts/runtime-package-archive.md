@@ -2,7 +2,7 @@
 type: Concept
 id: concept/runtime-package-archive
 title: Runtime package archive
-description: The canonical deterministic tar.zst format of a runtime package, its strict reader, the size limits, safe extraction into a verified package root, the registry store, and how to build and verify one.
+description: The canonical deterministic tar.zst format of a runtime package, its strict reader, the size limits, safe extraction into a verified package root, the registry store, how to build and verify one, and the signed release baseline.
 source_kind: manual
 intents: [debug, help, project]
 ---
@@ -83,6 +83,7 @@ the reader accepts.
 cargo xtask package build <dir> -o <archive.tar.zst>
 cargo xtask package verify <dir>
 cargo xtask package affected [--base REF] [--json]
+cargo xtask package baseline --catalog FILE --anchor FILE --release-dir DIR --version X.Y.Z [--json]
 ```
 
 `build` writes the canonical archive of a package directory (regular files
@@ -91,7 +92,8 @@ prints its digest. `verify` builds the directory twice and requires identical
 bytes. `affected` prints which official packages a change selects for the
 per-PR package jobs; any core change selects all of them. The release pipeline
 uses `verify` semantics to require byte-for-byte reproducibility from
-independent clean roots.
+independent clean roots. `baseline` decides which packages the signed release
+proves unchanged; see "Release baseline".
 
 `build` and `verify` call `package::directory::build_directory_archive(dir, limits)`
 (Unix), which the CLI's `plugin link` also uses. It walks regular files only
@@ -100,6 +102,70 @@ independent clean roots.
 read, and compares the opened file's device, inode and type with the listing so
 a file swapped for a symlink during the walk is `Changed` instead of followed.
 `DirectoryError` carries no path or content.
+
+## Release baseline
+
+`cargo xtask package baseline` decides, per official package, whether the
+package published with release `v<version>` is a trusted baseline for the
+checkout: proof that the package, its compatibility lock and its fixtures are
+byte-identical to what that release built and attested. The baseline release
+is exactly the given version (the workspace version), never "latest". Run it in
+the checkout; `--catalog` is the release's `runtime-catalog.json`, `--anchor`
+the trust anchor (`packaging/runtime-catalog-anchor.json`) and `--release-dir`
+the directory holding the release's `pohunek-runtime-<p>-<version>.tar.zst`
+archives and `attestation-<p>-<target>.json` files. It reads no network.
+
+Checks, in order; the first failure makes the package `missing` with that
+reason code:
+
+1. The catalog verifies against the anchor at the current time (signature,
+   signer window, revocation, expiry), its release version equals `--version`
+   and its sequence equals the one that version implies
+   (`major << 40 | minor << 20 | patch`). A failure makes every package
+   missing: `catalog_absent`, `catalog_unreadable`, `catalog_unverified`,
+   `release_mismatch`.
+2. The package is rebuilt in memory from `runtime-packages/<p>`, and the
+   catalog has an entry with runtime id `<p>` and exactly that digest. Entries
+   are matched by digest, never by version: `not_in_catalog` (no entry for the
+   runtime, such as a package added after the release), `digest_mismatch`.
+3. The released archive hashes to that digest: `archive_absent`,
+   `archive_unreadable`, `archive_mismatch`.
+4. The entry's attestations cover every row of `<p>` in `compat/matrix.json`
+   (`platforms_uncovered`), and each referenced attestation file hashes to its
+   catalog digest and names `<p>`, its platform, the package id, the release
+   commit and binary set (`attestation_absent`, `attestation_unreadable`,
+   `attestation_digest_mismatch`, `attestation_invalid`), the rebuilt package
+   digest (`attestation_package_mismatch`), the digest of
+   `compat/<p>/compatibility-lock.json` (`attestation_lock_mismatch`) and the
+   matrix suite version (`attestation_suite_mismatch`).
+5. `runtime-packages/<p>` and `compat/<p>` in the work tree equal the release
+   commit: no tracked difference and no untracked file, ignored ones included,
+   so captured screens and the npm lock count (`changed_since_release`). A
+   local `node_modules` or log below `compat/<p>` therefore reports the
+   package missing; CI runs on a clean checkout. A release commit the
+   repository does not contain, as in a shallow clone, is
+   `release_commit_unreachable`.
+
+The command exits 0 with a verdict for every package. Inputs from the release
+side (catalog, archives, attestations, commit) only ever make a package
+missing, so the caller rebuilds and tests it; fail closed means "treat as
+changed", never "skip". Only an unreadable checkout (a package directory that
+does not build, a lock or the matrix that does not parse, an invalid anchor or
+`--version`, a Git failure) exits non-zero with nothing on stdout. `--json`
+prints one object on stdout and the human report on stderr:
+
+```json
+{"version":"0.34.2","packages":{"codex":{"verdict":"missing","reason":"digest_mismatch","digest":null,"version_not_bumped":true},"pi":{"verdict":"verified","reason":null,"digest":"sha256:...","version_not_bumped":false}}}
+```
+
+`digest` is the verified baseline digest (`null` when missing).
+`version_not_bumped` is `true` when the catalog lists another digest of the
+runtime under the version the checkout's `runtime.toml` declares: the content
+changed without a version bump. It is reported, not refused.
+
+A verified baseline proves the package inputs only. The attestations bind the
+release's own binary sets, not the candidate core, so a baseline never replaces
+running the package job when the core changed.
 
 ## Install and verify a package root
 

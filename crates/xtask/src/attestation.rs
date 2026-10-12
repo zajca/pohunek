@@ -32,7 +32,7 @@ use sha2::{Digest as _, Sha256};
 use crate::XtaskError;
 
 /// Schema version of the attestation, the consumer report and the matrix.
-const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 1;
 
 /// Domain separator that starts the binary-set digest input; the trailing
 /// newline and the version suffix keep it distinct from any future layout.
@@ -50,7 +50,7 @@ const DECLARED_TARGETS: [&str; 2] = ["x86_64-unknown-linux-gnu", "x86_64-unknown
 
 /// Largest accepted JSON input (report, lock, matrix, attestation): all are
 /// a few hundred bytes, so this only bounds a hostile file.
-const MAX_DOCUMENT_BYTES: u64 = 64 * 1024;
+pub(crate) const MAX_DOCUMENT_BYTES: u64 = 64 * 1024;
 
 /// Largest accepted executable. The release binaries are tens of MiB; the cap
 /// only bounds a hostile or runaway file.
@@ -69,7 +69,7 @@ const DESCRIPTOR_PATH: &str = "runtime.toml";
 const COMMIT_HEX_LEN: usize = 40;
 
 /// Matrix location relative to the repository root.
-const MATRIX_PATH: &str = "compat/matrix.json";
+pub(crate) const MATRIX_PATH: &str = "compat/matrix.json";
 
 /// Directory of the official runtime packages relative to the repository root.
 const PACKAGES_DIR: &str = "runtime-packages";
@@ -153,17 +153,17 @@ fn refuse(field: impl Into<String>, fault: Fault) -> XtaskError {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Attestation {
-    binary_set_digest: String,
-    commit: String,
+    pub(crate) binary_set_digest: String,
+    pub(crate) commit: String,
     pub(crate) package_digest: String,
-    package_id: String,
-    platform: String,
+    pub(crate) package_id: String,
+    pub(crate) platform: String,
     pub(crate) runtime: String,
-    schema: u32,
-    suite_version: u32,
+    pub(crate) schema: u32,
+    pub(crate) suite_version: u32,
     pub(crate) target: String,
-    upstream_lock_digest: String,
-    upstream_version: String,
+    pub(crate) upstream_lock_digest: String,
+    pub(crate) upstream_version: String,
 }
 
 /// What the consumer suite writes after a successful run.
@@ -181,10 +181,10 @@ struct ConsumerReport {
 /// `compat/matrix.json`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Matrix {
+pub(crate) struct Matrix {
     schema: u32,
-    suite_version: u32,
-    rows: Vec<Row>,
+    pub(crate) suite_version: u32,
+    pub(crate) rows: Vec<Row>,
 }
 
 #[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
@@ -463,7 +463,7 @@ pub(crate) fn binary_set_digest(by_name: &BTreeMap<String, String>) -> Result<St
 }
 
 /// Reads and validates a matrix file.
-fn read_matrix(path: &Path) -> Result<Matrix, XtaskError> {
+pub(crate) fn read_matrix(path: &Path) -> Result<Matrix, XtaskError> {
     let matrix: Matrix = parse_json(&read_input(path, MAX_DOCUMENT_BYTES)?, "matrix")?;
     if matrix.schema != SCHEMA_VERSION {
         return Err(refuse("matrix.schema", Fault::Mismatch));
@@ -486,6 +486,11 @@ fn read_matrix(path: &Path) -> Result<Matrix, XtaskError> {
         }
     }
     Ok(matrix)
+}
+
+/// The `sha256:<hex>` digest of the lock at `path`, which must parse as a lock.
+pub(crate) fn lock_digest(path: &Path) -> Result<String, XtaskError> {
+    read_lock(path).map(|(_lock, digest)| digest)
 }
 
 /// Reads a lock; returns it with the digest of its exact bytes.

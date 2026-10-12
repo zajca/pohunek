@@ -27,7 +27,8 @@ use nix::fcntl::OFlag;
 use package::{
     catalog_document_bytes, check_catalog, parse_anchor, read_archive, sign_catalog,
     verify_catalog, AnchorFile, AnchorFileError, Attestation, Catalog, CatalogEntry, KeyId, Limits,
-    PackageDigest, Release, RootKey, VerifiedCatalog, CATALOG_SCHEMA_VERSION, MAX_CATALOG_BYTES,
+    PackageDigest, Release, RootKey, TrustAnchor, VerifiedArchive, VerifiedCatalog,
+    CATALOG_SCHEMA_VERSION, MAX_CATALOG_BYTES,
 };
 use protocol::{PackageId, PackageVersion, RuntimeId};
 use serde::Deserialize;
@@ -150,11 +151,11 @@ fn pretty_with_newline<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, XtaskE
 }
 
 /// Identity and runtime API a package descriptor declares.
-struct Identity {
-    package_id: PackageId,
-    version: PackageVersion,
-    runtime_id: RuntimeId,
-    runtime_api: u32,
+pub(crate) struct Identity {
+    pub(crate) package_id: PackageId,
+    pub(crate) version: PackageVersion,
+    pub(crate) runtime_id: RuntimeId,
+    pub(crate) runtime_api: u32,
 }
 
 fn descriptor_identity(descriptor: &[u8]) -> Result<Identity, XtaskError> {
@@ -195,12 +196,12 @@ fn descriptor_identity(descriptor: &[u8]) -> Result<Identity, XtaskError> {
     })
 }
 
-/// The catalog entry of the package archive at `archive`, listed for
-/// `platforms` with their `attestations` and the core range `core`.
-fn entry_from_archive(archive: &Path, package: &PackageSpec) -> Result<CatalogEntry, XtaskError> {
-    let limits = Limits::DEFAULT;
-    let bytes = read_input(archive, limits.max_compressed_bytes)?;
-    let verified = read_archive(&bytes, &limits).map_err(XtaskError::Package)?;
+/// The identity the `runtime.toml` of the verified archive read from
+/// `archive` declares.
+pub(crate) fn archive_identity(
+    verified: &VerifiedArchive,
+    archive: &Path,
+) -> Result<Identity, XtaskError> {
     let descriptor = verified
         .entries()
         .iter()
@@ -211,7 +212,16 @@ fn entry_from_archive(archive: &Path, package: &PackageSpec) -> Result<CatalogEn
                 archive.display()
             ))
         })?;
-    let identity = descriptor_identity(&descriptor.contents)?;
+    descriptor_identity(&descriptor.contents)
+}
+
+/// The catalog entry of the package archive at `archive`, listed for
+/// `platforms` with their `attestations` and the core range `core`.
+fn entry_from_archive(archive: &Path, package: &PackageSpec) -> Result<CatalogEntry, XtaskError> {
+    let limits = Limits::DEFAULT;
+    let bytes = read_input(archive, limits.max_compressed_bytes)?;
+    let verified = read_archive(&bytes, &limits).map_err(XtaskError::Package)?;
+    let identity = archive_identity(&verified, archive)?;
     let mut platforms = package.platforms.clone();
     platforms.sort();
     let mut attestations = package.attestations.clone();
@@ -355,11 +365,16 @@ pub(crate) fn verify_bytes(
     high_water: Option<u64>,
     now: u64,
 ) -> Result<VerifiedCatalog, XtaskError> {
-    let anchor = parse_anchor(anchor_bytes)
+    let anchor = trust_anchor(anchor_bytes)?;
+    verify_catalog(document, &anchor, now, high_water).map_err(XtaskError::Catalog)
+}
+
+/// The trust anchor the anchor file bytes `anchor_bytes` describe.
+pub(crate) fn trust_anchor(anchor_bytes: &[u8]) -> Result<TrustAnchor, XtaskError> {
+    parse_anchor(anchor_bytes)
         .map_err(XtaskError::Anchor)?
         .trust_anchor()
-        .map_err(|error| XtaskError::Anchor(AnchorFileError::Anchor(error)))?;
-    verify_catalog(document, &anchor, now, high_water).map_err(XtaskError::Catalog)
+        .map_err(|error| XtaskError::Anchor(AnchorFileError::Anchor(error)))
 }
 
 /// Verifies the catalog at `catalog_path` against the anchor file at
