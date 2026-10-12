@@ -241,6 +241,16 @@ const RULES: &[Rule] = &[
         Effect::Packages(&["pohunek-cli"]),
         "official runtime package sources built and parsed by pohunek-cli's pi_package, pi_frame_properties, codex_package and claude_package tests; the Codex and Claude tests also read the built-in Codex and Claude files the daemon embeds",
     ),
+    rule(
+        Pattern::Dir("runtime-packages/codex"),
+        Effect::Packages(&["pohunek-daemon"]),
+        "Codex package descriptor and detection manifest embedded by the daemon's in-crate official package fixture",
+    ),
+    rule(
+        Pattern::Dir("runtime-packages/claude"),
+        Effect::Packages(&["pohunek-daemon"]),
+        "Claude Code package descriptor and detection manifest embedded by the daemon's in-crate official package fixture",
+    ),
     reminding(
         Pattern::Dir("scripts"),
         Effect::Packages(&["pohunek-cli"]),
@@ -1018,7 +1028,7 @@ mod tests {
 
     #[test]
     fn embedded_paths_map_to_their_embedding_packages() {
-        let cases: [(&str, &[&str]); 16] = [
+        let cases: [(&str, &[&str]); 17] = [
             (
                 "docs/knowledge/guides/agent-skill.md",
                 &["pohunek-knowledge", "xtask"],
@@ -1041,8 +1051,15 @@ mod tests {
             ),
             ("compat/pi/npm/package-lock.json", &["pohunek-cli", "xtask"]),
             ("compat/claude/screens/idle.txt", &["pohunek-cli", "xtask"]),
-            ("runtime-packages/codex/detect.toml", &["pohunek-cli"]),
-            ("runtime-packages/claude/runtime.toml", &["pohunek-cli"]),
+            (
+                "runtime-packages/codex/detect.toml",
+                &["pohunek-cli", "pohunek-daemon"],
+            ),
+            (
+                "runtime-packages/claude/runtime.toml",
+                &["pohunek-cli", "pohunek-daemon"],
+            ),
+            ("runtime-packages/pi/runtime.toml", &["pohunek-cli"]),
             ("runtime-packages/README.md", &["pohunek-cli"]),
             (
                 "scripts/tests/smoke-hermes-plugin-release.sh",

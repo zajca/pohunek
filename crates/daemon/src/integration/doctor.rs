@@ -590,10 +590,10 @@ pub fn doctor_in(
     )
 }
 
-/// [`doctor_in`] against the built-in runtimes.
+/// [`doctor_in`] against the runtimes of the official fixture host.
 #[cfg(test)]
 pub fn doctor(params: IntegrationDoctorParams) -> Result<IntegrationDoctorResult, ProtocolError> {
-    doctor_for(&crate::agent::host::fixture::builtin_host(), params)
+    doctor_for(&crate::agent::host::fixture::official_host(), params)
 }
 
 /// [`doctor_in`] over `host`, resolving homes against this test process's
@@ -606,7 +606,7 @@ pub(super) fn doctor_for(
     doctor_in(&super::config_homes_for_tests(host), params)
 }
 
-/// [`doctor_for_with`] against the built-in runtimes.
+/// [`doctor_for_with`] against the runtimes of the official fixture host.
 #[cfg(test)]
 pub(super) fn doctor_with(
     params: IntegrationDoctorParams,
@@ -614,7 +614,7 @@ pub(super) fn doctor_with(
     socket: &[IntegrationFinding],
 ) -> Result<IntegrationDoctorResult, ProtocolError> {
     doctor_for_with(
-        &crate::agent::host::fixture::builtin_host(),
+        &crate::agent::host::fixture::official_host(),
         params,
         python,
         socket,
@@ -622,14 +622,14 @@ pub(super) fn doctor_with(
 }
 
 /// Quarantine entries left in `dir` by the handler `agent` resolves to in the
-/// built-in runtimes.
+/// official fixture host.
 #[cfg(test)]
 pub(super) fn quarantine_findings(
     dir: &std::path::Path,
     agent: &RuntimeRef,
     limit: usize,
 ) -> Vec<IntegrationFinding> {
-    let subdirs = handler::resolve(&crate::agent::host::fixture::builtin_host(), agent)
+    let subdirs = handler::resolve(&crate::agent::host::fixture::official_host(), agent)
         .map(|resolved| resolved.handler.quarantine_subdirs())
         .unwrap_or_default();
     quarantine_findings_in(dir, subdirs, limit)

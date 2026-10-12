@@ -892,6 +892,7 @@ mod tests {
     use pohunek_test_support::wait::{poll_until, HANG_GUARD};
 
     use super::*;
+    use crate::agent::host::fixture::{official_host, official_profile_pin, OfficialFixtureSource};
     use crate::agent::host::{BuiltinSource, DefinitionOrigin};
     use crate::procwatch::{HostInspector, Pid, ProcessFact, ProcessIdentity, ProcessInspector};
 
@@ -944,12 +945,15 @@ mod tests {
         // A profile whose program is a real executable so availability is true.
         std::fs::write(
             dir.join("my-claude.toml"),
-            "base = \"claude\"\nprogram = \"/bin/sh\"\n",
+            format!(
+                "base = \"claude\"\n{}program = \"/bin/sh\"\n",
+                official_profile_pin("claude")
+            ),
         )
         .expect("write profile");
         let caps = host_capabilities(
             "0.0.0",
-            &ProfileRegistry::new(Some(dir.clone())),
+            &ProfileRegistry::with_runtimes(Some(dir.clone()), official_host()),
             &process_base(),
         );
 
@@ -1050,11 +1054,12 @@ strategy = "none"
     const SEMVER_PROBE: &str =
         r#"{ parser = "semver-v1", args = ["--version"], min = "1.0.0", below = "1.1.0" }"#;
 
-    /// Registry whose shell runtime launches a fixed program, so the
+    /// Registry of the built-in runtimes and the official Codex and Claude
+    /// packages, whose shell runtime launches a fixed program, so the
     /// inventory does not depend on the host's `$SHELL`.
     fn test_registry() -> RuntimeRegistry {
-        RuntimeRegistry::from_sources(&[&BuiltinSource::new("/bin/sh")])
-            .expect("built-in registry builds")
+        RuntimeRegistry::from_sources(&[&BuiltinSource::new("/bin/sh"), &OfficialFixtureSource])
+            .expect("the fixture registry builds")
     }
 
     #[test]
@@ -1067,9 +1072,11 @@ strategy = "none"
             Some("/bin/s\u{7f}h".to_owned()),
             None,
         ] {
-            let registry =
-                RuntimeRegistry::from_sources(&[&BuiltinSource::from_login_shell(shell)])
-                    .expect("an invalid login shell must not fail the registry");
+            let registry = RuntimeRegistry::from_sources(&[
+                &BuiltinSource::from_login_shell(shell),
+                &OfficialFixtureSource,
+            ])
+            .expect("an invalid login shell must not fail the registry");
             let caps = host_capabilities_for("0.0.0", &no_profiles(), &registry, &process_base());
             let names: Vec<&str> = caps.runtimes.iter().map(|r| r.agent.as_str()).collect();
             assert_eq!(names, RESERVED_RUNTIME_IDS);
@@ -1090,7 +1097,7 @@ strategy = "none"
     }
 
     #[test]
-    fn inventory_lists_builtins_in_reserved_order_with_their_wire_shape() {
+    fn inventory_lists_reserved_runtimes_in_reserved_order_with_their_wire_shape() {
         let caps =
             host_capabilities_for("0.0.0", &no_profiles(), &test_registry(), &process_base());
         let order: Vec<&str> = caps.runtimes.iter().map(|r| r.agent.as_str()).collect();
@@ -1111,7 +1118,8 @@ strategy = "none"
                 RuntimeRef::hermes()
             ]
         );
-        // Only the runtime with a version-probe parser reports a policy.
+        // Only the runtime with a version-probe parser reports a policy; the
+        // official fixture packages drop their probes, so that is Hermes.
         for runtime in &caps.runtimes {
             assert_eq!(
                 runtime.supported.is_some(),

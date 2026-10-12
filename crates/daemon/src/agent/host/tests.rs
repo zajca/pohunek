@@ -18,9 +18,7 @@ use crate::agent::{
     InputRules, NativeLaunchError, NativeReferenceError, NativeReferenceStrategy,
     NativeSessionLaunch, SessionRef,
 };
-use crate::detect::{
-    claude_manifest, codex_manifest, generic_shell_manifest, hermes_manifest, Manifest,
-};
+use crate::detect::{generic_shell_manifest, hermes_manifest, Manifest};
 
 const DIGEST: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
@@ -30,6 +28,16 @@ fn shell_manifest() -> Arc<Manifest> {
 
 fn builtin_registry(shell: &str) -> RuntimeRegistry {
     RuntimeRegistry::from_sources(&[&BuiltinSource::new(shell)]).expect("built-in registry builds")
+}
+
+/// Registry of the built-in runtimes and the official Codex and Claude
+/// packages of the in-crate fixture.
+fn served_registry() -> RuntimeRegistry {
+    RuntimeRegistry::from_sources(&[
+        &BuiltinSource::new("/bin/sh"),
+        &super::fixture::OfficialFixtureSource,
+    ])
+    .expect("the fixture registry builds")
 }
 
 fn id(value: &str) -> RuntimeId {
@@ -164,24 +172,6 @@ fn builtin_definitions_match_the_compiled_behavior() {
             manifest: generic_shell_manifest,
         },
         Expected {
-            kind: RuntimeRef::codex(),
-            program: "codex",
-            args: &[],
-            input: InputRules::unrestricted(true, delay),
-            resume: &["resume", "{reference}"],
-            fork: None,
-            manifest: codex_manifest,
-        },
-        Expected {
-            kind: RuntimeRef::claude(),
-            program: "claude",
-            args: &[],
-            input: InputRules::unrestricted(false, delay),
-            resume: &["--resume", "{reference}"],
-            fork: Some(&["--resume", "{reference}", "--fork-session"]),
-            manifest: claude_manifest,
-        },
-        Expected {
             kind: RuntimeRef::hermes(),
             program: "hermes",
             args: &["chat"],
@@ -239,12 +229,10 @@ fn builtin_session_behavior_flags_match_the_compiled_dispatch() {
                 .map(|parser| parser.as_str().to_owned()),
         )
     };
-    // The initial prompt is a launch argument for Codex and Claude only, the
-    // configured submit delay applies to Claude only, and Claude is the only
-    // native fork. Hermes is the only runtime with a version probe.
+    // Neither shell nor Hermes takes the initial prompt as a launch argument,
+    // uses the configured submit delay or forks natively; Hermes has a version
+    // probe.
     assert_eq!(flags("shell"), (false, false, false, None));
-    assert_eq!(flags("codex"), (true, false, false, None));
-    assert_eq!(flags("claude"), (true, true, true, None));
     assert_eq!(
         flags("hermes"),
         (false, false, false, Some("hermes-v1".to_owned()))
@@ -283,11 +271,11 @@ fn descriptor_digest_tracks_structural_launch_fields_only() {
     };
     let first = builtin_registry("/bin/sh");
     let second = builtin_registry("/usr/bin/fish");
-    for name in ["shell", "codex", "claude", "hermes"] {
+    for name in ["shell", "hermes"] {
         // The host login shell is not part of the descriptor.
         assert_eq!(digest(&first, name), digest(&second, name), "{name}");
     }
-    assert_ne!(digest(&first, "codex"), digest(&first, "claude"));
+    assert_ne!(digest(&first, "shell"), digest(&first, "hermes"));
 }
 
 #[test]
@@ -509,10 +497,10 @@ fn registry_resolves_installed_runtimes_and_reports_missing_ones() {
     let registry = builtin_registry("/bin/sh");
     assert_eq!(
         registry
-            .resolve(&id("claude"))
+            .resolve(&id("hermes"))
             .expect("installed")
             .display_name(),
-        "Claude Code"
+        "Hermes Agent"
     );
     let error = registry.resolve(&id("absent")).expect_err("not installed");
     assert_eq!(
@@ -523,7 +511,7 @@ fn registry_resolves_installed_runtimes_and_reports_missing_ones() {
 
 #[test]
 fn inventory_is_ordered_and_complete() {
-    let inventory = builtin_registry("/bin/sh").inventory();
+    let inventory = served_registry().inventory();
     let ids: Vec<_> = inventory
         .iter()
         .map(|entry| entry.runtime_id.as_str())
@@ -559,16 +547,19 @@ fn reserved_ids_cannot_be_claimed_by_other_sources() {
     let registry = RuntimeRegistry::from_sources(&[&BuiltinSource::new("/bin/sh"), &source])
         .expect("a non-reserved id registers");
     registry.resolve(&id("acme")).expect("acme is registered");
-    registry.resolve(&id("codex")).expect("codex is registered");
+    registry
+        .resolve(&id("hermes"))
+        .expect("hermes is registered");
 }
 
 #[test]
 fn an_official_source_takes_an_official_alias_over_from_the_built_in_in_any_order() {
     let official = || FixedSource {
         trust: SourceTrust::Official,
-        definitions: vec![package_definition("codex")],
+        definitions: vec![package_definition("hermes")],
     };
     let builtin = BuiltinSource::new("/bin/sh");
+    let builtins = builtin_registry("/bin/sh").inventory();
     for sources in [
         [&builtin as &dyn RuntimeSource, &official()],
         [&official() as &dyn RuntimeSource, &builtin],
@@ -576,23 +567,30 @@ fn an_official_source_takes_an_official_alias_over_from_the_built_in_in_any_orde
         let registry = RuntimeRegistry::from_sources(&sources).expect("official takeover");
         assert!(matches!(
             registry
-                .resolve(&id("codex"))
-                .expect("codex")
+                .resolve(&id("hermes"))
+                .expect("hermes")
                 .binding()
                 .provenance,
             BindingProvenance::Package { .. }
         ));
-        for untouched in ["claude", "hermes", "shell"] {
-            assert!(matches!(
-                registry
-                    .resolve(&id(untouched))
-                    .expect("kept")
-                    .binding()
-                    .provenance,
-                BindingProvenance::Builtin { .. }
-            ));
+        for untouched in builtins
+            .iter()
+            .filter(|entry| entry.runtime_id.as_str() != "hermes")
+        {
+            assert!(
+                matches!(
+                    registry
+                        .resolve(&untouched.runtime_id)
+                        .expect("kept")
+                        .binding()
+                        .provenance,
+                    BindingProvenance::Builtin { .. }
+                ),
+                "{}",
+                untouched.runtime_id
+            );
         }
-        assert_eq!(registry.inventory().len(), 4);
+        assert_eq!(registry.inventory().len(), builtins.len());
     }
 }
 
@@ -976,14 +974,14 @@ fn builtin_definition(name: &str) -> Arc<RuntimeDefinition> {
 
 #[test]
 fn the_host_answers_unlaunchable_kinds_with_stable_distinct_errors() {
-    let host = RuntimeHost::from_host_environment();
+    let host = super::fixture::official_host();
     for kind in [
         RuntimeRef::shell(),
         RuntimeRef::codex(),
         RuntimeRef::claude(),
         RuntimeRef::hermes(),
     ] {
-        host.resolve_ref(&kind).expect("built-in kind resolves");
+        host.resolve_ref(&kind).expect("a served kind resolves");
     }
     // A valid runtime id nothing backs is not installed; a value outside the
     // grammar is presentation-only.
@@ -1005,7 +1003,8 @@ fn the_host_answers_unlaunchable_kinds_with_stable_distinct_errors() {
 fn only_a_host_shell_runtime_launches_with_the_host_shell_arguments() {
     let args = vec!["-c".to_owned(), "exit 0".to_owned()];
     let host = RuntimeHost::from_host_environment().with_shell_command("/bin/sh", args.clone());
-    let launch_args = |name: &str| host.launch_args(&builtin_definition(name));
+    let registry = served_registry();
+    let launch_args = |name: &str| host.launch_args(registry.resolve(&id(name)).expect("served"));
     assert_eq!(launch_args("shell"), args);
     assert_eq!(launch_args("hermes"), vec!["chat".to_owned()]);
     assert!(launch_args("codex").is_empty());
@@ -1023,7 +1022,7 @@ fn a_launch_pin_round_trips_and_a_missing_pin_is_unpinned() {
     assert_eq!(serde_json::to_string(&unpinned).expect("serialize"), "{}");
 
     let pinned = Holder {
-        pin: LaunchPin::of(&builtin_definition("claude")),
+        pin: LaunchPin::of(&builtin_definition("hermes")),
     };
     let json = serde_json::to_string(&pinned).expect("serialize");
     let back: Holder = serde_json::from_str(&json).expect("round trip");
@@ -1032,13 +1031,13 @@ fn a_launch_pin_round_trips_and_a_missing_pin_is_unpinned() {
         back.pin
             .binding()
             .map(|binding| binding.runtime_id.as_str()),
-        Some("claude")
+        Some("hermes")
     );
 }
 
 #[test]
 fn an_unpinned_snapshot_resumes_only_through_a_builtin_definition() {
-    check_pin(&LaunchPin::Unpinned, &builtin_definition("claude")).expect("built-in serves");
+    check_pin(&LaunchPin::Unpinned, &builtin_definition("hermes")).expect("built-in serves");
     let error = check_pin(&LaunchPin::Unpinned, &package_definition("acme"))
         .expect_err("a package definition cannot vouch for an unpinned snapshot");
     assert_eq!(error.code, "runtime_not_installed");
@@ -1046,22 +1045,22 @@ fn an_unpinned_snapshot_resumes_only_through_a_builtin_definition() {
 
 #[test]
 fn a_pin_needs_the_same_runtime_from_the_same_origin() {
-    let claude = builtin_definition("claude");
-    let codex = builtin_definition("codex");
-    let pin = LaunchPin::of(&claude);
-    check_pin(&pin, &claude).expect("the frozen definition serves its pin");
+    let hermes = builtin_definition("hermes");
+    let shell = builtin_definition("shell");
+    let pin = LaunchPin::of(&hermes);
+    check_pin(&pin, &hermes).expect("the frozen definition serves its pin");
     assert_eq!(
-        check_pin(&pin, &codex).expect_err("another runtime").code,
+        check_pin(&pin, &shell).expect_err("another runtime").code,
         "runtime_not_installed"
     );
     let takeover =
-        check_pin(&pin, &package_definition("claude")).expect_err("a package replacing a built-in");
+        check_pin(&pin, &package_definition("hermes")).expect_err("a package replacing a built-in");
     assert_eq!(takeover.code, "runtime_served_by_package");
     assert!(takeover
         .recover
-        .is_some_and(|hint| hint.contains("pohunek session new --agent claude")));
+        .is_some_and(|hint| hint.contains("pohunek session new --agent hermes")));
     assert_eq!(
-        check_pin(&LaunchPin::Unpinned, &package_definition("claude"))
+        check_pin(&LaunchPin::Unpinned, &package_definition("hermes"))
             .expect_err("a package serving the id of an unpinned snapshot")
             .code,
         "runtime_served_by_package"
@@ -1071,7 +1070,7 @@ fn a_pin_needs_the_same_runtime_from_the_same_origin() {
     let package_pin = LaunchPin::of(&package);
     check_pin(&package_pin, &package).expect("same package serves");
     assert_eq!(
-        check_pin(&package_pin, &builtin_definition("claude"))
+        check_pin(&package_pin, &builtin_definition("hermes"))
             .expect_err("a built-in replacing a package")
             .code,
         "runtime_not_installed"
@@ -1129,10 +1128,13 @@ mod launch_validation {
     #[test]
     fn a_runtime_without_a_version_probe_launches_without_validation() {
         let missing = "/nonexistent/pohunek/agent";
-        for name in ["shell", "codex", "claude"] {
-            let validated = validate_launch_runtime(&builtin_definition(name), missing, None)
+        for definition in [
+            builtin_definition("shell"),
+            Arc::new(package_definition("acme")),
+        ] {
+            let validated = validate_launch_runtime(&definition, missing, None)
                 .expect("no probe, no validation");
-            assert!(validated.is_none(), "{name}");
+            assert!(validated.is_none(), "{}", definition.runtime_id());
         }
     }
 
@@ -1210,15 +1212,15 @@ fn native_reference_error(
 }
 
 #[test]
-fn builtin_runtimes_declare_their_native_reference_strategy() {
-    let registry = builtin_registry("/bin/sh");
+fn reserved_runtimes_declare_their_native_reference_strategy() {
+    let registry = served_registry();
     for (runtime, strategy) in [
         ("shell", NativeReferenceStrategy::None),
         ("codex", NativeReferenceStrategy::Hook),
         ("claude", NativeReferenceStrategy::Hook),
         ("hermes", NativeReferenceStrategy::Hook),
     ] {
-        let definition = registry.resolve(&id(runtime)).expect("built in");
+        let definition = registry.resolve(&id(runtime)).expect("served");
         assert_eq!(
             definition.native_reference_strategy(),
             strategy,
@@ -1569,15 +1571,15 @@ fn only_the_builtin_shell_may_name_a_schema_without_a_handler() {
 }
 
 #[test]
-fn builtin_runtimes_resolve_their_hook_schema() {
-    let registry = builtin_registry("/bin/sh");
+fn reserved_runtimes_resolve_their_hook_schema() {
+    let registry = served_registry();
     for (runtime, schema) in [
         ("shell", "identity-subagent-v1"),
         ("codex", "identity-subagent-v1"),
         ("claude", "identity-subagent-v1"),
         ("hermes", "identity-v1"),
     ] {
-        let definition = registry.resolve(&id(runtime)).expect("built in");
+        let definition = registry.resolve(&id(runtime)).expect("served");
         assert_eq!(
             definition.hook_schema().map(|schema| schema.id),
             Some(schema),
@@ -1588,11 +1590,11 @@ fn builtin_runtimes_resolve_their_hook_schema() {
 }
 
 #[test]
-fn the_builtin_runtimes_declare_their_config_homes() {
-    let host = super::fixture::builtin_host();
+fn the_reserved_runtimes_declare_their_config_homes() {
+    let host = super::fixture::official_host();
     let declared = |id: &str| {
         host.resolve_ref(&protocol::RuntimeRef::from_wire(id))
-            .expect("a built-in runtime")
+            .expect("a served runtime")
             .config_home()
             .map(|home| (home.env().to_owned(), home.default_relative().to_owned()))
     };

@@ -88,10 +88,10 @@ fn uninstall_target(target: &Target) -> Result<IntegrationUninstallReport, Proto
     Ok(report)
 }
 
-/// [`uninstall_in`] against the built-in runtimes.
+/// [`uninstall_in`] against the runtimes of the official fixture host.
 #[cfg(test)]
 pub fn uninstall(agent: &RuntimeRef) -> Result<IntegrationUninstallResult, ProtocolError> {
-    super::uninstall_for(&crate::agent::host::fixture::builtin_host(), agent)
+    super::uninstall_for(&crate::agent::host::fixture::official_host(), agent)
 }
 
 /// Remove the managed Claude hooks from `claude_dir`.

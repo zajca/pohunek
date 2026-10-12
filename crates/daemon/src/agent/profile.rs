@@ -1250,15 +1250,33 @@ mod pin_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{NativeArg, SessionRef};
+    use crate::agent::host::fixture::{official_host, official_profile_pin};
+    use crate::agent::{served_native_launch, NativeArg, SessionRef};
 
     fn tmp_agents_dir(tag: &str) -> crate::test_support::ScopedDir {
         crate::test_support::scoped_dir(&format!("pohunek-agents-{tag}-"))
     }
 
+    /// A registry over the profiles in `dir`, with the runtimes of the
+    /// official fixture host as bases.
+    fn registry(dir: Option<PathBuf>) -> ProfileRegistry {
+        ProfileRegistry::with_runtimes(dir, official_host())
+    }
+
+    /// `body` with the package binding of its base inserted after its first
+    /// line when that line names the official Codex or Claude package base.
+    fn pinned(body: &str) -> String {
+        for base in ["codex", "claude"] {
+            if let Some(rest) = body.strip_prefix(&format!("base = \"{base}\"\n")) {
+                return format!("base = \"{base}\"\n{}{rest}", official_profile_pin(base));
+            }
+        }
+        body.to_owned()
+    }
+
     #[test]
     fn bare_base_kinds_resolve_without_a_profile() {
-        let reg = ProfileRegistry::new(None);
+        let reg = registry(None);
         for (name, base) in [
             ("shell", RuntimeId::shell()),
             ("codex", RuntimeId::codex()),
@@ -1278,7 +1296,7 @@ mod tests {
     #[test]
     fn unknown_name_is_agent_profile_not_found() {
         let dir = tmp_agents_dir("missing");
-        let reg = ProfileRegistry::new(Some(dir.clone()));
+        let reg = registry(Some(dir.clone()));
         let err = reg.resolve_agent("nope").expect_err("no such agent");
         assert_eq!(err.code, "agent_profile_not_found");
     }
@@ -1286,7 +1304,7 @@ mod tests {
     #[test]
     fn bad_names_are_invalid_name() {
         let dir = tmp_agents_dir("bad");
-        let reg = ProfileRegistry::new(Some(dir.clone()));
+        let reg = registry(Some(dir.clone()));
         for bad in ["../etc", "a/b", "a\\b", "-x", ".hidden", "", "a\u{7}b"] {
             let err = reg.resolve_agent(bad).expect_err("must reject");
             assert_eq!(err.code, "invalid_name", "name {bad:?}");
@@ -1298,7 +1316,8 @@ mod tests {
         let dir = tmp_agents_dir("override");
         std::fs::write(
             dir.join("claude-sonnet.toml"),
-            "base = \"claude\"\n\
+            pinned(
+                "base = \"claude\"\n\
              program = \"claude\"\n\
              args = [\"--model\", \"claude-sonnet-4\"]\n\
              [env]\n\
@@ -1307,9 +1326,10 @@ mod tests {
              [input_rules]\n\
              bracketed_paste = false\n\
              submit_delay_ms = 150\n",
+            ),
         )
         .expect("write profile");
-        let reg = ProfileRegistry::new(Some(dir.clone()));
+        let reg = registry(Some(dir.clone()));
         let resolved = reg.resolve_agent("claude-sonnet").expect("resolves");
         assert_eq!(resolved.base, RuntimeId::claude());
         assert_eq!(resolved.name, "claude-sonnet");
@@ -1336,10 +1356,10 @@ mod tests {
         let dir = tmp_agents_dir("debug-redaction");
         std::fs::write(
             dir.join("secret.toml"),
-            "base = \"claude\"\n[env]\nCLAUDE_CONFIG_DIR = \"/home/me/.claude-work\"\nANTHROPIC_API_KEY = \"sk-ant-never-print\"\n",
+            pinned("base = \"claude\"\n[env]\nCLAUDE_CONFIG_DIR = \"/home/me/.claude-work\"\nANTHROPIC_API_KEY = \"sk-ant-never-print\"\n"),
         )
         .expect("write profile");
-        let reg = ProfileRegistry::new(Some(dir.clone()));
+        let reg = registry(Some(dir.clone()));
         let resolved = reg.resolve_agent("secret").expect("resolves");
         assert_eq!(resolved.profile.as_ref().expect("profile").env.len(), 2);
 
@@ -1362,7 +1382,7 @@ mod tests {
             "base = \"shell\"\n[resume]\nresumable = true\n",
         )
         .expect("write profile");
-        let reg = ProfileRegistry::new(Some(dir.clone()));
+        let reg = registry(Some(dir.clone()));
         let err = reg
             .resolve_agent("myshell")
             .expect_err("shell+resumable rejected");
@@ -1377,7 +1397,7 @@ mod tests {
             "hermes-work",
             "base = \"hermes\"\nprogram = \"hermes-wrapper\"\nargs = [\"-p\", \"work\", \"chat\"]\n[input_rules]\nbracketed_paste = false\nsubmit_delay_ms = 25\n",
         );
-        let resolved = ProfileRegistry::new(Some(dir.clone()))
+        let resolved = registry(Some(dir.clone()))
             .resolve_agent("hermes-work")
             .expect("Hermes profile resolves");
 
@@ -1392,7 +1412,7 @@ mod tests {
         assert!(!input_rules.allows_while_blocked());
         assert_eq!(
             profile.native,
-            crate::agent::builtin_native_launch(&protocol::RuntimeId::hermes())
+            served_native_launch(&protocol::RuntimeId::hermes())
         );
         assert!(!profile.native.expect("Hermes recovers").supports_fork());
     }
@@ -1401,7 +1421,7 @@ mod tests {
     fn an_uninstalled_base_runtime_is_runtime_not_installed() {
         let dir = tmp_agents_dir("bad-base");
         std::fs::write(dir.join("weird.toml"), "base = \"emacs\"\n").expect("write profile");
-        let reg = ProfileRegistry::new(Some(dir.clone()));
+        let reg = registry(Some(dir.clone()));
         let err = reg
             .resolve_agent("weird")
             .expect_err("uninstalled base rejected");
@@ -1417,7 +1437,7 @@ mod tests {
                 format!("base = \"{base}\"\n"),
             )
             .expect("write profile");
-            let err = ProfileRegistry::new(Some(dir.clone()))
+            let err = registry(Some(dir.clone()))
                 .resolve_agent(name)
                 .expect_err("grammar-invalid base rejected");
             assert_eq!(err.code, "invalid_profile", "{base:?}");
@@ -1429,10 +1449,10 @@ mod tests {
         let dir = tmp_agents_dir("bad-key");
         std::fs::write(
             dir.join("p.toml"),
-            "base = \"claude\"\nflags = [\"--danger\"]\n",
+            pinned("base = \"claude\"\nflags = [\"--danger\"]\n"),
         )
         .expect("write profile");
-        let reg = ProfileRegistry::new(Some(dir.clone()));
+        let reg = registry(Some(dir.clone()));
         let err = reg.resolve_agent("p").expect_err("unknown key rejected");
         assert_eq!(err.code, "invalid_profile");
     }
@@ -1444,14 +1464,15 @@ mod tests {
 
         let dir = tmp_agents_dir("bad-file-mode");
         let path = dir.join("unsafe.toml");
-        std::fs::write(&path, "base = \"claude\"\nprogram = \"/bin/sh\"\n").expect("write profile");
+        std::fs::write(&path, pinned("base = \"claude\"\nprogram = \"/bin/sh\"\n"))
+            .expect("write profile");
         let mut perms = std::fs::metadata(&path)
             .expect("profile metadata")
             .permissions();
         perms.set_mode(0o660);
         std::fs::set_permissions(&path, perms).expect("set profile mode");
 
-        let reg = ProfileRegistry::new(Some(dir.clone()));
+        let reg = registry(Some(dir.clone()));
         let err = reg
             .resolve_agent("unsafe")
             .expect_err("group-writable profile file rejected");
@@ -1467,7 +1488,7 @@ mod tests {
          contains = \"custom blocker\"\n";
 
     fn write_profile(dir: &Path, name: &str, body: &str) {
-        std::fs::write(dir.join(format!("{name}.toml")), body).expect("write profile");
+        std::fs::write(dir.join(format!("{name}.toml")), pinned(body)).expect("write profile");
     }
 
     fn write_manifest(dir: &Path, name: &str, body: &str) {
@@ -1477,7 +1498,7 @@ mod tests {
     }
 
     fn resolve(dir: &Path, name: &str) -> Result<ResolvedProfile, ProtocolError> {
-        ProfileRegistry::new(Some(dir.to_path_buf()))
+        registry(Some(dir.to_path_buf()))
             .resolve_agent(name)
             .map(|agent| agent.profile.expect("profile overrides"))
     }
@@ -1500,17 +1521,13 @@ mod tests {
             ("x", RuntimeId::codex()),
             ("h", RuntimeId::hermes()),
         ] {
-            let agent = ProfileRegistry::new(Some(dir.clone()))
+            let agent = registry(Some(dir.clone()))
                 .resolve_agent(name)
                 .expect("resolves");
-            assert_eq!(
-                agent.native_launch(),
-                crate::agent::builtin_native_launch(&base),
-                "{name}"
-            );
+            assert_eq!(agent.native_launch(), served_native_launch(&base), "{name}");
             assert_eq!(
                 agent.profile.expect("profile").native,
-                crate::agent::builtin_native_launch(&base)
+                served_native_launch(&base)
             );
         }
     }
@@ -1577,7 +1594,7 @@ mod tests {
         );
         assert_eq!(
             resolve(&dir, "with-fork").expect("resolves").native,
-            crate::agent::builtin_native_launch(&protocol::RuntimeId::claude())
+            served_native_launch(&protocol::RuntimeId::claude())
         );
         let no_fork = resolve(&dir, "no-fork")
             .expect("resolves")
@@ -1594,7 +1611,7 @@ mod tests {
             "noresume",
             "base = \"claude\"\n[resume]\nresumable = false\n",
         );
-        let agent = ProfileRegistry::new(Some(dir.clone()))
+        let agent = registry(Some(dir.clone()))
             .resolve_agent("noresume")
             .expect("resolves");
         assert_eq!(agent.native_launch(), None);
@@ -1780,7 +1797,7 @@ mod tests {
         let dir = tmp_agents_dir("manifest-ok");
         write_profile(&dir, "p", "base = \"codex\"\nmanifest = \"mine\"\n");
         write_manifest(&dir, "mine", VALID_MANIFEST);
-        let reg = ProfileRegistry::new(Some(dir.clone()));
+        let reg = registry(Some(dir.clone()));
         let manifest = reg
             .resolve_agent("p")
             .expect("resolves")
@@ -1800,7 +1817,7 @@ mod tests {
         let dir = tmp_agents_dir("manifest-empty");
         write_profile(&dir, "p", "base = \"codex\"\nmanifest = \"empty\"\n");
         write_manifest(&dir, "empty", "");
-        let reg = ProfileRegistry::new(Some(dir.clone()));
+        let reg = registry(Some(dir.clone()));
         let manifest = reg
             .resolve_agent("p")
             .expect("resolves")
@@ -1826,7 +1843,7 @@ mod tests {
         // A second, healthy profile must still resolve — one bad manifest does not
         // poison the registry, and the daemon does not panic.
         write_profile(&dir, "good", "base = \"claude\"\n");
-        let reg = ProfileRegistry::new(Some(dir.clone()));
+        let reg = registry(Some(dir.clone()));
         assert_eq!(
             reg.resolve_agent("broken")
                 .expect_err("malformed manifest")
@@ -1844,7 +1861,7 @@ mod tests {
         let dir = tmp_agents_dir("manifest-missing");
         write_profile(&dir, "p", "base = \"codex\"\nmanifest = \"ghost\"\n");
         write_profile(&dir, "q", "base = \"codex\"\nmanifest = \"../escape\"\n");
-        let reg = ProfileRegistry::new(Some(dir.clone()));
+        let reg = registry(Some(dir.clone()));
         assert_eq!(
             reg.resolve_agent("p").expect_err("missing manifest").code,
             "invalid_profile"
@@ -1862,7 +1879,7 @@ mod tests {
         write_profile(&dir, "alpha", "base = \"claude\"\n");
         write_profile(&dir, "beta", "base = \"codex\"\n");
         write_profile(&dir, "broken", "base = \"emacs\"\n"); // unknown base → skipped
-        let reg = ProfileRegistry::new(Some(dir.clone()));
+        let reg = registry(Some(dir.clone()));
         let names: Vec<String> = reg.enumerate().into_iter().map(|a| a.name).collect();
         assert_eq!(names, vec!["alpha".to_owned(), "beta".to_owned()]);
     }
@@ -1875,7 +1892,7 @@ mod tests {
         write_profile(&dir, "p", "base = \"claude\"\n");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))
             .expect("chmod world-writable");
-        let reg = ProfileRegistry::new(Some(dir.clone()));
+        let reg = registry(Some(dir.clone()));
         // The whole host layer is disabled: the profile name is now unresolvable.
         assert_eq!(
             reg.resolve_agent("p")
@@ -1898,7 +1915,7 @@ mod tests {
             std::fs::Permissions::from_mode(0o777),
         )
         .expect("chmod world-writable manifests");
-        let reg = ProfileRegistry::new(Some(dir.clone()));
+        let reg = registry(Some(dir.clone()));
         // An untrusted manifests/ dir fails the whole tree closed.
         assert_eq!(
             reg.resolve_agent("p")
@@ -1913,10 +1930,11 @@ mod tests {
     fn symlinked_profile_escaping_the_tree_is_rejected() {
         let dir = tmp_agents_dir("symlink-profile");
         let outside = tmp_agents_dir("symlink-outside");
-        std::fs::write(outside.join("evil.toml"), "base = \"claude\"\n").expect("write outside");
+        std::fs::write(outside.join("evil.toml"), pinned("base = \"claude\"\n"))
+            .expect("write outside");
         std::os::unix::fs::symlink(outside.join("evil.toml"), dir.join("evil.toml"))
             .expect("symlink into tree");
-        let reg = ProfileRegistry::new(Some(dir.clone()));
+        let reg = registry(Some(dir.clone()));
         assert_eq!(
             reg.resolve_agent("evil").expect_err("symlink escape").code,
             "invalid_profile"
@@ -1934,7 +1952,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.join("evil.toml"), manifests.join("m.toml"))
             .expect("symlink manifest into tree");
         write_profile(&dir, "p", "base = \"codex\"\nmanifest = \"m\"\n");
-        let reg = ProfileRegistry::new(Some(dir.clone()));
+        let reg = registry(Some(dir.clone()));
         assert_eq!(
             reg.resolve_agent("p")
                 .expect_err("manifest symlink escape")

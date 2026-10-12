@@ -4,7 +4,7 @@
 //! a private agents directory, so none reads or changes the process
 //! environment.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -20,7 +20,7 @@ use protocol::{
 };
 
 use super::{ConfigHomes, HomeSelection};
-use crate::agent::host::fixture::builtin_host;
+use crate::agent::host::fixture::{official_host, official_profile_pin};
 use crate::agent::ProfileRegistry;
 use crate::integration::doctor::doctor_in_with;
 use crate::integration::handler::{install_in, install_in_gated, status_in, RetainedSchemas};
@@ -75,7 +75,7 @@ impl Rig {
             .collect();
         let base = base_environment(&allowlist, &EnvironmentSource::fixed(variables))
             .expect("a base environment");
-        let registry = ProfileRegistry::with_runtimes(Some(agents), builtin_host());
+        let registry = ProfileRegistry::with_runtimes(Some(agents), official_host());
         Self {
             root,
             homes: ConfigHomes::new(registry, base),
@@ -93,7 +93,8 @@ impl Rig {
 /// The profile text of a Claude profile whose config home is `dir`.
 fn claude_profile(dir: &Path) -> String {
     format!(
-        "base = \"claude\"\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+        "base = \"claude\"\n{}[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+        official_profile_pin("claude"),
         dir.display()
     )
 }
@@ -101,7 +102,8 @@ fn claude_profile(dir: &Path) -> String {
 /// The profile text of a Codex profile whose config home is `dir`.
 fn codex_profile(dir: &Path) -> String {
     format!(
-        "base = \"codex\"\n[env]\nCODEX_HOME = \"{}\"\n",
+        "base = \"codex\"\n{}[env]\nCODEX_HOME = \"{}\"\n",
+        official_profile_pin("codex"),
         dir.display()
     )
 }
@@ -371,7 +373,10 @@ fn a_tilde_in_a_profile_variable_is_refused_and_never_expanded() {
     let rig = Rig::new(
         &[(
             "tilde",
-            "base = \"claude\"\n[env]\nCLAUDE_CONFIG_DIR = \"~/tilde-home\"\n".to_owned(),
+            format!(
+                "base = \"claude\"\n{}[env]\nCLAUDE_CONFIG_DIR = \"~/tilde-home\"\n",
+                official_profile_pin("claude")
+            ),
         )],
         &[],
     );
@@ -698,7 +703,10 @@ fn an_unresolvable_profile_value_is_a_failure_of_its_home_not_of_the_request() {
     let (rig, _personal, work) = two_profile_rig();
     fs::write(
         rig.root.join("agents/relative.toml"),
-        "base = \"claude\"\n[env]\nCLAUDE_CONFIG_DIR = \"relative/home\"\n",
+        format!(
+            "base = \"claude\"\n{}[env]\nCLAUDE_CONFIG_DIR = \"relative/home\"\n",
+            official_profile_pin("claude")
+        ),
     )
     .expect("write a profile");
 
@@ -766,7 +774,10 @@ fn status_all_profiles_labels_every_home_and_degrades_an_unresolvable_one() {
     let (rig, _personal, _work) = two_profile_rig();
     fs::write(
         rig.root.join("agents/relative.toml"),
-        "base = \"claude\"\n[env]\nCLAUDE_CONFIG_DIR = \"relative/home\"\n",
+        format!(
+            "base = \"claude\"\n{}[env]\nCLAUDE_CONFIG_DIR = \"relative/home\"\n",
+            official_profile_pin("claude")
+        ),
     )
     .expect("write a profile");
 
@@ -822,7 +833,7 @@ async fn the_registry_resolves_homes_from_its_own_launch_environment() {
                 agents_dir: Some(agents.clone()),
                 ..SessionRegistryConfig::default()
             },
-            builtin_host(),
+            official_host(),
             EnvironmentSource::fixed([
                 (OsString::from("HOME"), home.as_os_str().to_owned()),
                 (

@@ -1,7 +1,7 @@
 //! Tests of the integration handler registry, staging, compatibility,
 //! activation rollback, update, and runtime-definition dispatch.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 use std::ffi::OsStr;
 use std::fs;
@@ -26,7 +26,7 @@ use super::{
     NOTIFY_HOOK_INSTALL_NAME, STATE_HOOK_INSTALL_NAME,
 };
 use crate::agent::host::fixture::{
-    builtin_host, pi_shaped_integration_host, pi_shaped_integration_host_as,
+    official_host, pi_shaped_integration_host, pi_shaped_integration_host_as,
 };
 use crate::agent::host::RuntimeHost;
 
@@ -71,8 +71,9 @@ fn entry_snapshot(root: &Path) -> Vec<(PathBuf, u32, Vec<u8>)> {
         .collect()
 }
 
-fn builtin(agent: &RuntimeRef) -> Resolved {
-    resolve(&builtin_host(), agent).expect("a daemon-run handler")
+/// The daemon-run handler `agent` resolves to in the official fixture host.
+fn official(agent: &RuntimeRef) -> Resolved {
+    resolve(&official_host(), agent).expect("a daemon-run handler")
 }
 
 fn agents() -> [RuntimeRef; 2] {
@@ -179,12 +180,20 @@ fn handlers_and_hook_schemas_pair_exactly() {
 }
 
 #[test]
-fn builtin_runtimes_resolve_through_their_definitions() {
-    let host = builtin_host();
+fn the_official_runtimes_resolve_through_their_package_definitions() {
+    let host = official_host();
     for (agent, id) in [
         (RuntimeRef::claude(), CLAUDE_ID),
         (RuntimeRef::codex(), CODEX_ID),
     ] {
+        let definition = host.resolve_ref(&agent).expect("the runtime is served");
+        assert!(
+            matches!(
+                definition.binding().provenance,
+                protocol::BindingProvenance::Package { .. }
+            ),
+            "{agent:?} is served by its official package"
+        );
         let resolved = resolve(&host, &agent).expect("daemon-run handler");
         assert_eq!(resolved.handler.id(), id);
         assert!(resolved.schema.supports_handler(id));
@@ -217,7 +226,7 @@ fn staging_changes_nothing_and_holds_the_installer_lock() {
                 install_current(&agent, &dir);
             }
             let before = entry_snapshot(&dir);
-            let resolved = builtin(&agent);
+            let resolved = official(&agent);
 
             let staged = resolved.handler.stage(&dir).expect("stage");
             assert_eq!(
@@ -252,7 +261,7 @@ fn a_schema_that_does_not_admit_the_asset_set_keeps_the_old_set_active() {
         write_user_config(&agent, &dir);
         install_current(&agent, &dir);
         let before = content_snapshot(&dir);
-        let resolved = builtin(&agent);
+        let resolved = official(&agent);
 
         let staged = resolved.handler.stage(&dir).expect("stage");
         let not_driven = resolved
@@ -294,7 +303,7 @@ fn the_staged_registration_reports_exactly_the_declared_operations() {
             if configured {
                 write_user_config(&agent, &dir);
             }
-            let resolved = builtin(&agent);
+            let resolved = official(&agent);
 
             let staged = resolved.handler.stage(&dir).expect("stage");
 
@@ -439,7 +448,7 @@ fn a_retained_schema_that_does_not_admit_the_asset_set_keeps_the_old_set_active(
         write_user_config(&agent, &dir);
         install_current(&agent, &dir);
         let before = content_snapshot(&dir);
-        let resolved = builtin(&agent);
+        let resolved = official(&agent);
         let handler_id = resolved.handler.id();
 
         let mut retained = RetainedSchemas::default();
@@ -476,7 +485,7 @@ fn an_undetermined_retained_version_refuses_every_handler_update() {
         write_user_config(&agent, &dir);
         install_current(&agent, &dir);
         let before = content_snapshot(&dir);
-        let resolved = builtin(&agent);
+        let resolved = official(&agent);
         let refused = update(&resolved, &dir, &undetermined, &mut ok_gate)
             .expect_err("the unknown version may drive this handler");
         assert_eq!(refused.code, UPDATE_INCOMPATIBLE_CODE, "{agent:?}");
@@ -487,8 +496,8 @@ fn an_undetermined_retained_version_refuses_every_handler_update() {
     let codex = scoped_dir("retained-unresolvable-codex");
     for (host, agent) in [
         (&pi_host, Some(&pi)),
-        (&builtin_host(), Some(&RuntimeRef::claude())),
-        (&builtin_host(), None),
+        (&official_host(), Some(&RuntimeRef::claude())),
+        (&official_host(), None),
     ] {
         let refused = with_config_dirs(&claude, &codex, || {
             install_for_retained(host, agent, &undetermined)
@@ -506,7 +515,7 @@ fn an_active_set_newer_than_the_update_is_replaced_by_it() {
         write_user_config(&agent, &dir);
         let state_hook = install_current(&agent, &dir);
         set_script_version(&state_hook, EXPECTED_INTEGRATION_VERSION + 1);
-        let resolved = builtin(&agent);
+        let resolved = official(&agent);
 
         let staged = resolved.handler.stage(&dir).expect("stage");
         assert_eq!(
@@ -537,7 +546,7 @@ fn a_failing_activation_restores_the_exact_prior_tree() {
                     install_current(&agent, &dir);
                 }
                 let before = entry_snapshot(&dir);
-                let resolved = builtin(&agent);
+                let resolved = official(&agent);
                 let mut gate = |index: usize, _name: &str| {
                     if index == fail_at {
                         Err(injected())
@@ -581,7 +590,7 @@ fn a_script_body_that_differs_at_the_current_version_is_outdated_and_the_doctor_
             .expect("drift the script body");
 
         let status = with_config_dirs(&dir, &dir, || {
-            builtin(&agent).handler.inspect(&agent, Ok(&dir))
+            official(&agent).handler.inspect(&agent, Ok(&dir))
         });
         assert_eq!(status.state, IntegrationInstallState::Outdated, "{agent:?}");
         assert_eq!(
@@ -592,7 +601,7 @@ fn a_script_body_that_differs_at_the_current_version_is_outdated_and_the_doctor_
 
         let doctor = with_config_dirs(&dir, &dir, || {
             doctor_for_with(
-                &builtin_host(),
+                &official_host(),
                 IntegrationDoctorParams {
                     agent: Some(agent.clone()),
                     ..Default::default()
@@ -627,7 +636,7 @@ fn updating_from_the_previous_asset_set_activates_atomically() {
         let state_hook = install_current(&agent, &dir);
         set_script_version(&state_hook, EXPECTED_INTEGRATION_VERSION - 1);
         let previous = content_snapshot(&dir);
-        let resolved = builtin(&agent);
+        let resolved = official(&agent);
         let outdated = with_config_dirs(&dir, &dir, || resolved.handler.inspect(&agent, Ok(&dir)));
         assert_eq!(outdated.state, IntegrationInstallState::Outdated);
         assert_eq!(
@@ -944,7 +953,7 @@ fn a_runtime_id_never_changes_how_the_doctor_classifies_a_warning() {
         let dir = scoped_dir("classify");
         install_claude(&dir).expect("install");
         break_claude_state(&dir, state);
-        let expected = doctor_findings(&builtin_host(), &RuntimeRef::claude(), &dir, &other);
+        let expected = doctor_findings(&official_host(), &RuntimeRef::claude(), &dir, &other);
         assert!(!expected.is_empty(), "state {state} produces findings");
 
         for id in KEYWORD_RUNTIME_IDS {
@@ -968,7 +977,7 @@ fn a_runtime_id_never_changes_how_the_doctor_classifies_a_warning() {
 fn a_runtime_id_never_changes_the_not_installed_filter() {
     let other = scoped_dir("not-installed-other");
     let dir = scoped_dir("not-installed");
-    let expected = doctor_findings(&builtin_host(), &RuntimeRef::claude(), &dir, &other);
+    let expected = doctor_findings(&official_host(), &RuntimeRef::claude(), &dir, &other);
     for id in KEYWORD_RUNTIME_IDS {
         let host = pi_shaped_integration_host_as(
             Path::new("/bin/sh"),
@@ -990,7 +999,7 @@ fn the_codex_scripts_are_the_templates_rendered_from_the_descriptor_values() {
     use super::{
         CODEX_HOOK_ASSET, CODEX_HOOK_TEMPLATE, CODEX_NOTIFY_HOOK_ASSET, CODEX_NOTIFY_HOOK_TEMPLATE,
     };
-    let resolved = builtin(&RuntimeRef::codex());
+    let resolved = official(&RuntimeRef::codex());
     let identity = ReporterIdentity::new(resolved.runtime_id.as_str(), &resolved.display_name)
         .expect("the descriptor values are a valid identity");
 
@@ -1018,7 +1027,7 @@ fn installed_codex_scripts_are_the_rendered_bytes_and_an_unrendered_template_is_
     fs::write(&state_hook, CODEX_HOOK_TEMPLATE).expect("install the raw template");
     let drifted = with_config_dirs(&dir, &dir, || {
         status_for(
-            &builtin_host(),
+            &official_host(),
             IntegrationStatusParams {
                 agent: Some(RuntimeRef::codex()),
                 ..Default::default()
