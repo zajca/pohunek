@@ -778,6 +778,15 @@ mod tests {
         );
     }
 
+    /// Whether the host's network stack leaves a connect to a bound,
+    /// non-listening socket pending instead of resetting it.
+    ///
+    /// Only macOS drops the SYN; a function rather than a constant keeps the
+    /// assertion that uses it a runtime check on every host.
+    fn host_drops_syn_to_unlistened_socket() -> bool {
+        cfg!(target_os = "macos")
+    }
+
     #[tokio::test]
     async fn refused_endpoint_refuses_connects_and_cannot_be_claimed() {
         let closed = RefusedEndpoint::reserve();
@@ -790,14 +799,10 @@ mod tests {
             }
             // Only the macOS network stack silently drops a SYN sent to a
             // bound socket; on any other host a pending connect is a defect.
-            #[cfg(target_os = "macos")]
-            Err(_pending) => {}
-            #[cfg(not(target_os = "macos"))]
-            Err(_pending) => {
-                panic!(
-                    "a reserved, non-listening port must refuse connects, not leave them pending"
-                )
-            }
+            Err(elapsed) => assert!(
+                host_drops_syn_to_unlistened_socket(),
+                "a reserved, non-listening port must refuse connects, not leave them pending: {elapsed}"
+            ),
         }
 
         let claim_error = TcpListener::bind(closed.addr)
