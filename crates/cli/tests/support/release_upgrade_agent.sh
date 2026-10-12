@@ -1,10 +1,20 @@
 #!/bin/sh
 # Fake `claude` agent for the release upgrade test.
 #
-# It is the PTY child of the session and runs the managed hook scripts the
-# installed release wrote, as its direct children, so each hook reports the
-# PID of this process as the agent. Configuration comes from the host profile
-# environment:
+# The test writes this file with its first line replaced by an interpreter
+# line naming a copy of the shell called `fake-claude-sh`, and with a
+# `FAKE_CLAUDE_VERSION_LINE` assignment after it. The process image is then
+# that copy, whose name the worker accepts as a claude launch, and the profile
+# launches this script directly, so the package's version probe runs it too.
+#
+# `--version` prints the version line the installed package's probe accepts.
+# It is answered before anything else: the probe runs with an empty
+# environment, a throwaway HOME and no profile variables.
+#
+# Otherwise it is the PTY child of the session and runs the managed hook
+# scripts the installed release wrote, as its direct children, so each hook
+# reports the PID of this process as the agent. Configuration comes from the
+# host profile environment:
 #   FAKE_AGENT_LOG        file receiving one line per launch
 #   FAKE_AGENT_HOOKS      directory holding the installed hook scripts
 #   FAKE_AGENT_NATIVE_ID  native id reported by a fresh launch
@@ -15,6 +25,11 @@
 #   report:<id>      reports <id> as the native session id through the state hook
 #   stopfail:<event> sends an error notification with hook event id <event>
 #   quit             exits
+
+if [ "${1:-}" = --version ]; then
+    printf '%s\n' "$FAKE_CLAUDE_VERSION_LINE"
+    exit 0
+fi
 
 set -u
 

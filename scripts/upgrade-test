@@ -50,6 +50,13 @@
 # directories, or systemd manager is read or written. It needs passwordless
 # sudo, systemd, and a Linux x86_64 host.
 #
+# Runtime package: the test installs the official Claude package from the
+# previous release's own daemon archive (`runtime/packages/claude.tar.zst`,
+# authorized by `runtime/runtime-catalog.json`) and starts its session from
+# it, so the previous release must ship both: v0.34.2 or later. An older
+# release, or one whose signed catalog has expired, is refused right after the
+# download, before anything is built and before any account is created.
+#
 # Stages: resolve and download the previous release (checksum verified) ->
 # build the test binary from this checkout -> build the target binaries from
 # --head-dir -> run the test in the throwaway account. When the target's
@@ -69,6 +76,9 @@ readonly BINARIES=(pohunek pohunekd pohunek-sessiond)
 readonly ACCOUNT_PREFIX="phkupg"
 # Lines of each journal kept in the failure diagnostics.
 readonly JOURNAL_LINES=400
+# Files of the previous daemon archive's `runtime/` the test installs the
+# official Claude package from.
+readonly PREVIOUS_RUNTIME_FILES=(packages/claude.tar.zst runtime-catalog.json)
 # Upper bound, in half-second polls, on the throwaway account's session bus
 # socket appearing after its user manager is started. A hang guard, not a
 # tuned value: a healthy manager creates the socket within a few seconds.
@@ -164,6 +174,25 @@ greatest_below() {
 list_release_tags() {
   gh release list --repo "$repo" --exclude-drafts --exclude-pre-releases \
     --limit 100 --json tagName --jq '.[].tagName'
+}
+
+# Fails unless the extracted previous archive at $1 ships the official Claude
+# package and a signed catalog that has not expired. The daemon refuses an
+# expired catalog on its own; checking `expires_at` here names the cause
+# before anything is built. A catalog without a numeric `expires_at` is left to
+# the daemon to judge.
+require_previous_runtime() {
+  local root=$1 file expires now
+  for file in "${PREVIOUS_RUNTIME_FILES[@]}"; do
+    [ -f "$root/runtime/$file" ] ||
+      fail "$previous ships no runtime/$file; the upgrade test installs the official Claude package from the previous release, which needs v0.34.2 or later"
+  done
+  expires=$(jq -r '.catalog.expires_at | numbers' "$root/runtime/runtime-catalog.json") ||
+    fail "$previous ships an unreadable runtime/runtime-catalog.json"
+  now=$(date +%s)
+  if [ -n "$expires" ] && [ "$expires" -le "$now" ]; then
+    fail "the runtime catalog of $previous expired at $(date -u -d "@$expires" '+%Y-%m-%dT%H:%M:%SZ'); its packages cannot be installed, so choose a newer previous release"
+  fi
 }
 
 # Whether the account database already knows $1.
@@ -378,7 +407,7 @@ if [ "$current_user" = true ]; then
   [ -n "${HOME:-}" ] || fail "HOME is not set"
 fi
 
-for tool in sha256sum tar cargo jq loginctl systemctl awk sed uname; do
+for tool in sha256sum tar cargo jq loginctl systemctl awk sed uname date; do
   need_cmd "$tool"
 done
 if [ "$create_account" = true ]; then
@@ -437,6 +466,11 @@ for binary in "${BINARIES[@]}"; do
 done
 [ "$("$staging/previous/pohunek" --version)" = "pohunek $previous_version" ] ||
   fail "the previous pohunek does not report $previous_version"
+# The archive's `runtime/` stays where it was extracted: the staging directory
+# is made readable to the test account below, and the test passes the absolute
+# package and catalog paths to the previous daemon, which reads them as that
+# account.
+require_previous_runtime "$staging/previous"
 
 # ------------------------------------------------------------- test binary
 
@@ -537,6 +571,7 @@ status=0
 as_user \
   POHUNEK_SYSTEMD_E2E=1 \
   "POHUNEK_PREVIOUS_BIN_DIR=$staging/previous" \
+  "POHUNEK_PREVIOUS_RUNTIME_DIR=$staging/previous/runtime" \
   "POHUNEK_HEAD_BIN_DIR=$staging/head" \
   "POHUNEK_UPGRADE_ARTIFACTS_DIR=$out_dir" \
   "$staging/release_upgrade" --ignored --exact "$TEST_NAME" --nocapture --test-threads 1 || status=$?

@@ -46,15 +46,28 @@ way (`POHUNEK_DAEMON_BIN`, `POHUNEK_WORKER_BIN`, and `POHUNEK_CLI_BIN` point the
 suites at the built binaries). The `upgrade from the previous release` CI job (`.github/workflows/upgrade.yml`,
 called by `ci.yml` when the daemon, worker, protocol, or CLI crates change, and
 by `release.yml` before any publishable binary is built) installs the previous
-release's published Linux binaries (checksum verified, never rebuilt), starts a
-session with a fake agent running that release's managed hooks, upgrades the
-service to this build with `pohunek service check` and `service upgrade`, and
-asserts the session stays live on the same worker, `screen`, `input`, hooks and
-notifications work, `stop` then `resume` relaunch with the native reference, and
-the previous release's CLI still talks to the new daemon
-(`crates/cli/tests/release_upgrade.rs`). It uploads the previous release's store
+release's published Linux binaries (checksum verified, never rebuilt), installs
+the official Claude package from that release's own archive
+(`plugin install runtime/packages/claude.tar.zst --catalog
+runtime/runtime-catalog.json --yes`), pins the two fake-agent host profiles to it
+with `plugin profile migrate`, starts a session from the package with a fake
+agent running that release's managed hooks, upgrades the service to this build
+with `pohunek service check` and `service upgrade`, and asserts both preflights
+judge the session `adoptable`, the session stays live on the same worker,
+`screen`, `input`, hooks and notifications work, the metadata store keeps the
+session pinned to the same package digest after the adoption and after the
+resume, `stop` then `resume` relaunch from that digest with the native
+reference, and the previous release's CLI still talks to the new daemon
+(`crates/cli/tests/release_upgrade.rs`). The previous release must ship
+`runtime/packages/claude.tar.zst` and a signed catalog that has not expired, so
+v0.34.2 is the oldest usable previous release; `scripts/upgrade-test` refuses an
+older one, or an expired catalog, before building anything. The fake agents are
+scripts whose interpreter is a copy of `/bin/sh` named `fake-claude-sh` (the
+worker accepts a claude launch process only by an executable name containing
+`claude`), and they answer `--version` with the lowest release the installed
+package's descriptor accepts. It uploads the previous release's store
 and protocol outputs as the `upgrade-goldens-<tag>` artifact. Run it on any pair
-with `gh workflow run upgrade.yml -f previous_tag=v0.33.0 -f head_ref=v0.33.1`
+with `gh workflow run upgrade.yml -f previous_tag=v0.34.2 -f head_ref=<ref>`
 (the harness comes from the dispatched ref; `head_ref` is only the source built
 as the target). Run it locally on a Linux x86_64 host with systemd, passwordless
 sudo, `gh`, and `jq`:

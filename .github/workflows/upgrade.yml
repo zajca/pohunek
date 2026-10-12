@@ -3,12 +3,16 @@ name: Upgrade test
 # A session started on the previous release's published binaries must survive
 # `pohunek service upgrade` to this build (issue #525). The job installs the
 # previous release from its GitHub Release assets (checksum verified, never
-# rebuilt), starts a session with a fake agent that runs the managed hooks,
-# upgrades through the operator path, and asserts the session stays live, its
-# screen, input, hooks and notifications work, stop/resume relaunch with the
-# native reference, and the previous release's own CLI still talks to the new
-# daemon. scripts/upgrade-test does the work; crates/cli/tests/release_upgrade.rs
-# holds the assertions.
+# rebuilt), installs the official Claude runtime package from that release's
+# archive under its signed catalog and pins the host profiles to it, starts a
+# session from the package with a fake agent that runs the managed hooks,
+# upgrades through the operator path, and asserts the preflight judges the
+# session adoptable, the session stays live, its screen, input, hooks and
+# notifications work, stop/resume relaunch from the same package digest with
+# the native reference, and the previous release's own CLI still talks to the
+# new daemon. The previous release must ship runtime/packages/claude.tar.zst
+# (v0.34.2 or later). scripts/upgrade-test does the work;
+# crates/cli/tests/release_upgrade.rs holds the assertions.
 #
 # Callers:
 # - ci.yml runs it on pull requests that touch the daemon, worker, protocol or
@@ -16,7 +20,7 @@ name: Upgrade test
 # - release.yml runs it on a release tag, before any binary is built for
 #   publishing, with the tagged commit as the target and the newest earlier
 #   release as the previous one;
-# - `gh workflow run upgrade.yml -f previous_tag=v0.33.0 -f head_ref=v0.33.1`
+# - `gh workflow run upgrade.yml -f previous_tag=v0.34.2 -f head_ref=<ref>`
 #   runs it on any pair. The harness (script and test) always comes from the
 #   ref the workflow is dispatched on; `head_ref` selects only the source built
 #   as the upgrade target, so an older tree without the harness can be tested.

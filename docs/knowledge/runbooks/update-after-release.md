@@ -611,6 +611,44 @@ proceeds, and the `--json` report carries the full `preflight` object and
 failing `pohunekd`, an unparsable report) fails with
 `service_upgrade_preflight_failed`, which the flag does not override.
 
+## Move Claude and Codex sessions to the official package before upgrading
+
+A session records the runtime source it was launched from: a built-in runtime
+compiled into the daemon, or the digest of an installed runtime package.
+Resume and fork relaunch exactly that source, so a release that does not serve
+it adopts the live worker but reports the session as `would lose recovery`
+with `runtime_source_not_served`. To keep native recovery across an upgrade to
+a release that does not serve the built-in Claude or Codex runtime, move the
+work onto the official package with the release that is running now, before
+upgrading:
+
+1. Install the official package from the running release's daemon archive
+   (v0.34.2 or later ships it under `runtime/`), authorized by the archive's
+   signed catalog:
+
+   ```bash
+   pohunek plugin install runtime/packages/claude.tar.zst --catalog runtime/runtime-catalog.json --yes
+   ```
+
+   Use `runtime/packages/codex.tar.zst` for Codex. A catalog past its
+   `expires_at` is refused; install from a newer archive instead.
+2. Pin every host profile with that base: `pohunek plugin profile list` shows
+   the ones in `needs_migration`, and `pohunek plugin profile migrate <name>
+   --yes` pins each to the selected package digest.
+3. Start new sessions for the work. They are pinned to the package digest.
+   Sessions launched from the built-in keep running; finish their work before
+   the upgrade, or accept losing their native recovery.
+4. Run `pohunek service check` with the new release's binaries: the sessions
+   launched from the package are `adoptable`.
+
+After the upgrade the package version the previous release installed keeps
+serving the sessions and profiles pinned to it. `pohunek plugin update
+<package> <archive> --catalog <catalog> --yes` with the new release's archive
+installs and selects its version for new launches; a profile moves to it only
+through `plugin profile migrate`. The release upgrade test
+(`scripts/upgrade-test`, `crates/cli/tests/release_upgrade.rs`) runs this path
+for Claude from the previous release to the build under test.
+
 ## Configuration migration from schemas 2 and 3
 
 When the installed `service.toml` was written by release 0.33.x (schema 2, no
