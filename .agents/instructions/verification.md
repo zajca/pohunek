@@ -273,7 +273,9 @@ Flaky tests: `.config/nextest.toml` sets `flaky-result = "fail"` in
 `profile.default`, so every profile inherits it. Only `heavy` and `relay-db`
 retry (`count = 2`, fixed 1s delay): PTY, socket, worker-process, and
 PostgreSQL fixtures. `ci`/`fast` never retry, because a fast test that fails
-intermittently is a bug. A test that passes only on a retry is reported as
+intermittently is a bug; `package` (the runtime package jobs' real-upstream
+tests) never retries either, because a failure there is a behavior change of
+the locked release or a bug. A test that passes only on a retry is reported as
 `FLKY-FL` in the log and stays a `<failure>` in `junit.xml`, and the run still
 fails. Retries only tell "fails every time" apart from "fails sometimes". Each
 CI test job runs `scripts/junit-flaky-summary` with `if: always()`, which lists

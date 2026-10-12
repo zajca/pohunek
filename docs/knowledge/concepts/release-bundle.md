@@ -141,7 +141,10 @@ Producers upload workflow artifacts only: `build-<component>-<target>`,
 The evidence workflow plans the rows from `compat/matrix.json` with `jq`; every
 row extracts the binaries from the daemon ARCHIVE of its target, stages the pinned
 upstream and runs the consumer suite, then `compat attest` writes
-`attestation-<runtime>-<target>.json`. `attest` attests every producer artifact;
+`attestation-<runtime>-<target>.json`. The row also writes the wall clock and
+outcome of the consumer run as a one-testcase JUnit report
+(`matrix-junit-<runtime>-<target>` artifact, uploaded also when the run fails);
+it is timing evidence only, never a release input. `attest` attests every producer artifact;
 `assemble` verifies every input with `gh attestation verify` (signer workflow
 `release-evidence.yml`, signer and source digest equal to the release commit,
 source ref equal to the tag, GitHub-hosted runners only), collects the flat input

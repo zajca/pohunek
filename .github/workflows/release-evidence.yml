@@ -213,6 +213,18 @@ jobs:
           path: ${{ runner.temp }}/row/attestation-${{ matrix.runtime }}-${{ matrix.target }}.json
           if-no-files-found: error
 
+      # Wall clock and outcome of the consumer run as a one-testcase JUnit
+      # report. run-row writes it also when the consumer fails, so it is
+      # uploaded whatever the row's result; a row that stopped before the
+      # consumer started has none.
+      - name: Upload the row test report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: matrix-junit-${{ matrix.runtime }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/row/junit-${{ matrix.runtime }}-${{ matrix.target }}.xml
+          if-no-files-found: warn
+
   # Build provenance for every producer artifact, so that the assembler can
   # require it. No checkout and no repository code: only artifacts are
   # downloaded, checked against their checksum files and attested.

@@ -159,8 +159,9 @@ Shipped host-local identity and governance:
 Release packaging and contributor verification:
 
 - `.config/nextest.toml` — shared fast cost boundary, bounded heavy profile,
-  and the flaky-test policy (`flaky-result = "fail"`; retries on `heavy` and
-  `relay-db` only).
+  the serial `package` profile of the runtime package jobs (no retries, a
+  per-test timeout, JUnit report), and the flaky-test policy
+  (`flaky-result = "fail"`; retries on `heavy` and `relay-db` only).
 - `.cargo/config.toml` — `cargo t`/`cargo ti` select fast unit and integration
   tests; `cargo tw` keeps the full suite; `cargo ta` runs `cargo xtask
   affected`. Fast loops do not replace full gates.

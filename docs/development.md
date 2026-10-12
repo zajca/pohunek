@@ -140,7 +140,14 @@ the Postgres service — when no relay-relevant file (`crates/relay*/**`,
 `migrations/**`, `Cargo.lock`, the CI workflow) changed. The full `ci`/`local` profiles remain unfiltered. Existing ignored tests retain
 their opt-in status. Each CI shard uploads a uniquely named JUnit artifact;
 sequential local fast shards overwrite `target/nextest/ci/junit.xml`, while heavy
-writes `target/nextest/heavy/junit.xml`.
+writes `target/nextest/heavy/junit.xml`. The runtime package jobs run their
+`<runtime>_package` binary with `--run-ignored all` under the `package` profile
+(one test at a time, no retries, no fail-fast, a hung test killed after two
+minutes) and upload `target/nextest/package/junit.xml` as
+`package-junit-<runtime>`, also when the tests fail. Each release evidence row
+writes the wall clock and outcome of its consumer run as a one-testcase JUnit
+report, uploaded as `matrix-junit-<runtime>-<target>`. `scripts/ci-timings junit`
+reads all of them.
 
 The official runtime package jobs (`pi-package`, `codex-package`,
 `claude-package`) take their pull-request selection from
@@ -411,7 +418,10 @@ assembles and publishes the release in one fixed flow:
 2. **Evidence** (`release-evidence.yml`, reusable): one job per
    (runtime x target) row of `compat/matrix.json` extracts the binaries from the
    daemon ARCHIVE, stages the pinned upstream, runs the out-of-process consumer
-   suite and emits `attestation-<runtime>-<target>.json`; the download-only
+   suite and emits `attestation-<runtime>-<target>.json`, plus
+   `junit-<runtime>-<target>.xml` with the timed consumer run (written also when
+   the consumer fails, uploaded as `matrix-junit-<runtime>-<target>`, never a
+   release input); the download-only
    `attest` job creates build provenance for every producer artifact;
    `assemble` (environment `release`) verifies that provenance with `gh
    attestation verify`, then `cargo xtask release assemble` signs the catalog

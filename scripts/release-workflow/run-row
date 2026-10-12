@@ -10,6 +10,7 @@
 #        PACKAGES_DIR directory holding the package archives and their .sha256
 #        CONSUMER     the prebuilt release_consumer executable
 #        OUT_DIR      directory that receives attestation-<runtime>-<target>.json
+#                     and junit-<runtime>-<target>.xml
 #        XTASK        path of the built xtask binary
 #
 # The binaries under test are extracted from the daemon ARCHIVE of the target,
@@ -17,6 +18,10 @@
 # The pinned upstream is staged from its lockfile (network), the consumer runs
 # once out of process with a scrubbed environment, and `compat attest`
 # recomputes every digest from the files.
+#
+# Once the consumer has run, its wall-clock time and outcome are written as a
+# JUnit report with one testcase, a failed run as a <failure>, before the row
+# fails. A row that stops before the consumer starts writes no report.
 
 set -eu
 
@@ -27,6 +32,41 @@ consumer_test=the_release_binaries_serve_the_runtime_out_of_process
 fail() {
     printf 'run-row: %s\n' "$*" >&2
     exit 1
+}
+
+# Seconds since the epoch with a fraction (GNU date). The rows run on Linux
+# runners only (row-matrix); another date fails the row before the consumer.
+clock() {
+    now=$(date +%s.%N)
+    case $now in
+        '' | *[!0-9.]* | *.*.*) fail "date +%s.%N is not supported here: $now" ;;
+    esac
+    printf '%s\n' "$now"
+}
+
+# write_junit <seconds> [<failure message>]: the consumer run as a JUnit
+# report. Every interpolated value is a validated word, a number or a fixed
+# message, so no XML escaping is needed.
+write_junit() {
+    elapsed=$1
+    message=${2:-}
+    failures=0
+    [ -z "$message" ] || failures=1
+    {
+        printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+        printf '<testsuites name="release-row" tests="1" failures="%s" errors="0" time="%s">\n' "$failures" "$elapsed"
+        printf '  <testsuite name="row-%s-%s" tests="1" failures="%s" errors="0" skipped="0" time="%s">\n' \
+            "$RUNTIME" "$TARGET" "$failures" "$elapsed"
+        if [ -z "$message" ]; then
+            printf '    <testcase name="%s" classname="release_consumer" time="%s"/>\n' "$consumer_test" "$elapsed"
+        else
+            printf '    <testcase name="%s" classname="release_consumer" time="%s">\n' "$consumer_test" "$elapsed"
+            printf '      <failure type="consumer run failed" message="%s"/>\n' "$message"
+            printf '    </testcase>\n'
+        fi
+        printf '  </testsuite>\n'
+        printf '</testsuites>\n'
+    } > "$junit"
 }
 
 need() {
@@ -43,6 +83,10 @@ case $TARGET in *[!a-z0-9_-]*) fail "invalid target" ;; esac
 [ -d runtime-packages/"$RUNTIME" ] || fail "no package directory for runtime $RUNTIME"
 lock=compat/$RUNTIME/compatibility-lock.json
 [ -f "$lock" ] || fail "no compatibility lock for runtime $RUNTIME"
+
+# A report left in OUT_DIR by an earlier run never stands in for this one.
+junit=$OUT_DIR/junit-$RUNTIME-$TARGET.xml
+rm -f -- "$junit"
 
 stem=pohunek-daemon-$VERSION-$TARGET
 archive=$DAEMON_DIR/$stem.tar.gz
@@ -68,6 +112,8 @@ node_dir=$(cd "$(dirname -- "$node_bin")" && pwd -P)
 cp -- "$CONSUMER" "$work/consumer"
 chmod 0755 "$work/consumer"
 report=$work/report.json
+started=$(clock)
+status=0
 (
     cd "$work/cwd"
     exec env -i \
@@ -84,8 +130,18 @@ report=$work/report.json
         POHUNEK_CONSUMER_PACKAGE="$package" \
         POHUNEK_CONSUMER_REPORT="$report" \
         "$work/consumer" --exact "$consumer_test" --nocapture
-) || fail "the consumer run failed for $RUNTIME on $TARGET"
-[ -f "$report" ] || fail "the consumer wrote no report"
+) || status=$?
+finished=$(clock)
+elapsed=$(awk -v start="$started" -v end="$finished" 'BEGIN { printf "%.3f", end - start }')
+if [ "$status" -ne 0 ]; then
+    write_junit "$elapsed" "the consumer exited with status $status"
+    fail "the consumer run failed for $RUNTIME on $TARGET"
+fi
+if [ ! -f "$report" ]; then
+    write_junit "$elapsed" "the consumer wrote no report"
+    fail "the consumer wrote no report"
+fi
+write_junit "$elapsed"
 
 "$XTASK" compat attest \
     --report "$report" \

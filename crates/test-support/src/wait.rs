@@ -47,8 +47,8 @@ use std::time::{Duration, Instant};
 /// on a loaded CI runner, so this value is two orders of magnitude above them
 /// and a wait that reaches it is a hang. It is also below the nextest
 /// `terminate-after` of every profile in `.config/nextest.toml` (`default`,
-/// `ci`, `fast`, `heavy` and `relay-db` terminate a test after 3 periods of
-/// 60 s, 180 s in total), so the panic naming the awaited condition is what the
+/// `ci`, `fast`, `heavy`, `relay-db` and `package` terminate a test after 3
+/// periods of 60 s, 180 s in total), so the panic naming the awaited condition is what the
 /// developer sees rather than a nextest termination. The `local` profile
 /// only marks tests slow after 30 s and never terminates them.
 ///

@@ -3,6 +3,7 @@
 from pathlib import Path
 import json
 import re
+import tomllib
 import unittest
 
 
@@ -463,6 +464,96 @@ class RuntimePackageSelectionTests(unittest.TestCase):
                     self.assertFalse(
                         evaluate_package_condition(expression, "pull_request", False, "success", only_other)
                     )
+
+
+
+def job_steps(job: str) -> dict[str, str]:
+    """Map each named step of a job to its block (the `- name:` line onward)."""
+    steps = re.split(r"(?m)^(?=      - )", job.split("    steps:\n", 1)[1])
+    named = {}
+    for step in steps:
+        match = re.match(r"      - name: (.+)\n", step)
+        if match:
+            named[match.group(1)] = step
+    return named
+
+
+# The nextest profile the package jobs run their test binary under.
+PACKAGE_PROFILE = "package"
+
+
+class RuntimePackageReportTests(unittest.TestCase):
+    """Package jobs run under the nextest `package` profile and keep its JUnit report."""
+
+    def profile(self) -> dict:
+        with (ROOT / ".config" / "nextest.toml").open("rb") as config:
+            return tomllib.load(config)["profile"][PACKAGE_PROFILE]
+
+    def report_path(self) -> str:
+        return f"target/nextest/{PACKAGE_PROFILE}/{self.profile()['junit']['path']}"
+
+    def test_the_profile_runs_serially_without_retries_and_writes_junit(self):
+        profile = self.profile()
+        # `ci` is tuned for deterministic tests; the real-upstream tests own
+        # their timeout here.
+        self.assertEqual(profile.get("inherits"), "default")
+        self.assertEqual(profile["test-threads"], 1)
+        self.assertIs(profile["fail-fast"], False)
+        self.assertEqual(profile["retries"], 0)
+        self.assertIn("slow-timeout", profile)
+        self.assertTrue(profile["junit"]["path"])
+
+    def test_every_real_upstream_test_timing_out_still_ends_inside_the_job_timeout(self):
+        # The job timeout cancels the job before nextest writes the report, so
+        # even a run where every real-upstream test hangs must end first.
+        timeout = self.profile()["slow-timeout"]
+        period = re.fullmatch(r"([0-9]+)s", timeout["period"])
+        self.assertIsNotNone(period, timeout)
+        assert period is not None
+        per_test = int(period.group(1)) * timeout["terminate-after"]
+        for job, package in PACKAGE_JOBS.items():
+            with self.subTest(job=job):
+                source = (ROOT / "crates" / "cli" / "tests" / f"{package}_package.rs").read_text()
+                real_upstream = len(re.findall(r'#\[ignore = "needs a real `', source))
+                self.assertGreater(real_upstream, 0)
+                minutes = re.search(r"(?m)^    timeout-minutes: ([0-9]+)$", workflow_jobs()[job])
+                self.assertIsNotNone(minutes)
+                assert minutes is not None
+                self.assertLess(real_upstream * per_test, int(minutes.group(1)) * 60)
+
+    def test_package_jobs_run_their_binary_under_the_package_profile(self):
+        for job, package in PACKAGE_JOBS.items():
+            with self.subTest(job=job):
+                text = workflow_jobs()[job]
+                steps = job_steps(text)
+                names = list(steps)
+                command = (
+                    f"cargo nextest run --locked --profile {PACKAGE_PROFILE} -p pohunek-cli "
+                    f"--test {package}_package --run-ignored all --test-threads 1"
+                )
+                runs = [name for name, step in steps.items() if command in step]
+                self.assertEqual(len(runs), 1, f"{job} runs {command!r} once")
+                test_step = steps[runs[0]]
+                self.assertNotIn("cargo test", text)
+                self.assertLess(names.index("Install cargo-nextest"), names.index(runs[0]))
+                self.assertIn("tool: cargo-nextest", steps["Install cargo-nextest"])
+                # A report the build cache restored never stands in for this run.
+                self.assertLess(test_step.index(f"rm -f {self.report_path()}"), test_step.index(command))
+
+    def test_package_jobs_summarize_and_upload_the_report_whatever_the_result(self):
+        for job, package in PACKAGE_JOBS.items():
+            with self.subTest(job=job):
+                steps = job_steps(workflow_jobs()[job])
+                summary = steps["Summarize flaky tests"]
+                self.assertIn("        if: always()\n", summary)
+                self.assertIn(f"scripts/junit-flaky-summary --label \"{package} package\" {self.report_path()}", summary)
+                upload = steps["Upload the package test report"]
+                self.assertIn("        if: always()\n", upload)
+                self.assertIn("uses: actions/upload-artifact@", upload)
+                self.assertIn(f"          name: package-junit-{package}\n", upload)
+                self.assertIn(f"          path: {self.report_path()}\n", upload)
+                # Distinct from the `nextest-junit-<shard>` reports of the test jobs.
+                self.assertNotIn("nextest-junit-", upload)
 
 
 if __name__ == "__main__":

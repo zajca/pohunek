@@ -15,8 +15,9 @@ Every number printed by this tool comes from one of three sources:
 * `tiers` -- total workflow wall clock from run creation through completion,
   including queue time, plus the queue/execution split and per-job timing.
 * `junit` -- nextest JUnit XML (`target/nextest/<profile>/junit.xml` or an
-  uploaded CI artifact). JUnit has test execution time only; compilation and
-  setup are deliberately *not* part of it.
+  uploaded CI artifact) and the one-testcase reports of the release evidence
+  rows (`scripts/release-workflow/run-row`). JUnit has test execution time
+  only; compilation and setup are deliberately *not* part of it.
 * `cache` -- the raw run log, which contains the sccache JSON statistics
   printed by the post-run `sccache-action` step and the `Swatinem/rust-cache`
   restore outcome lines.
