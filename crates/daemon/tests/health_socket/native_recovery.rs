@@ -1,12 +1,13 @@
 //! Claude recovery through the public control socket and a real worker.
 
-// Rust guideline compliant 2026-10-09
+// Rust guideline compliant 2026-10-12
 
 use super::*;
 
 const LAUNCH: &str = "fixture-claude-launch";
 const CLEAR: &str = "fixture-claude-clear";
 const SELECTED: &str = "fixture-claude-selected";
+const FORKED: &str = "fixture-claude-forked";
 
 async fn listed_sessions(control: &mut Framed<UnixStream, LinesCodec>) -> Vec<SessionInfo> {
     serde_json::from_value(ok_payload(
@@ -227,9 +228,17 @@ impl ClaudeRig {
     }
 
     async fn report(&mut self, source: &str, reference: &str) {
+        let id = self.session.id.clone();
+        self.report_for(&id, source, reference).await;
+    }
+
+    /// Has the fixture agent of session `id` send the real `SessionStart` hook
+    /// for conversation `reference` with `source`, and waits until
+    /// `session.inspect` shows it.
+    async fn report_for(&mut self, id: &SessionId, source: &str, reference: &str) {
         let submitted = input_session(
             &mut self.control,
-            &self.session.id,
+            id,
             &format!("report {source} {reference}"),
         )
         .await;
@@ -238,7 +247,7 @@ impl ClaudeRig {
         let control = tokio::sync::Mutex::new(&mut self.control);
         wait_until("Claude hook report to reach session.inspect", || async {
             let mut control = control.lock().await;
-            let session = inspect_session(&mut control, &self.session.id).await;
+            let session = inspect_session(&mut control, id).await;
             (session.active_agent_session_id.as_deref() == Some(reference)).then_some(())
         })
         .await;
@@ -291,10 +300,15 @@ impl ClaudeRig {
     }
 
     async fn resume(&mut self) -> Response {
+        let id = self.session.id.clone();
+        self.resume_session(&id).await
+    }
+
+    async fn resume_session(&mut self, id: &SessionId) -> Response {
         let request = Request::make(
             "claude-recovery-resume",
             method::SESSION_RESUME,
-            serde_json::to_value(&self.session.id).expect("serialize session id"),
+            serde_json::to_value(id).expect("serialize session id"),
         );
         exchange(&mut self.control, &request).await
     }
@@ -915,6 +929,73 @@ async fn claude_fork_child_does_not_inherit_the_source_recovery_target() {
     assert_eq!(
         forked.session.native_session_id, None,
         "a fork cannot resume its source conversation as its own"
+    );
+}
+
+/// `claude --resume <id> --fork-session` starts a new conversation and reports
+/// it with `SessionStart` `source: fork`. The fork child holds no reference of
+/// its own, so that first verified report becomes its recovery target, and
+/// resuming the child relaunches its own conversation, never the source's.
+#[tokio::test]
+async fn claude_fork_child_records_its_own_conversation_and_resumes_it() {
+    let mut rig = ClaudeRig::new("claude-fork-own-target").await;
+    rig.transcript(LAUNCH);
+    rig.report("startup", LAUNCH).await;
+    let request = Request::make(
+        "claude-recovery-fork",
+        method::SESSION_FORK,
+        serde_json::json!({
+            "session_id": rig.session.id,
+            "cwd_mode": "same",
+            "cols": 80,
+            "rows": 24
+        }),
+    );
+    let forked: protocol::SessionForkResult =
+        serde_json::from_value(ok_payload(exchange(&mut rig.control, &request).await))
+            .expect("fork Claude conversation");
+    let child = forked.session.id.clone();
+    let fork_argv = read_file_until(&rig.argv_log, b"--fork-session").await;
+    rig.transcript(FORKED);
+    rig.report_for(&child, "fork", FORKED).await;
+    let child_after_report = inspect_session(&mut rig.control, &child).await;
+    let source_after_report = inspect_session(&mut rig.control, &rig.session.id).await;
+    rig.stop(&child).await;
+    let resumed = rig.resume_session(&child).await;
+    let resume_marker = format!("--resume {FORKED}\n");
+    let argv = read_file_until(&rig.argv_log, resume_marker.as_bytes()).await;
+    let child_after_resume = inspect_session(&mut rig.control, &child).await;
+    rig.finish(Some(child)).await;
+
+    assert!(
+        String::from_utf8_lossy(&fork_argv).contains(&format!("--resume {LAUNCH} --fork-session")),
+        "the fork reads the source's conversation"
+    );
+    assert_eq!(
+        child_after_report.native_session_id.as_deref(),
+        Some(FORKED),
+        "the fork's first verified report is its own recovery target"
+    );
+    assert_eq!(
+        source_after_report.native_session_id.as_deref(),
+        Some(LAUNCH),
+        "the fork's report never changes its source's target"
+    );
+    assert!(resumed.is_ok(), "the fork's own conversation is resumable");
+    let resume_line = String::from_utf8_lossy(&argv)
+        .lines()
+        .last()
+        .map(str::to_owned)
+        .expect("the resumed fork recorded its argv");
+    assert_eq!(
+        resume_line,
+        format!("--resume {FORKED}"),
+        "resuming the fork relaunches its own conversation, not a fork of the source"
+    );
+    assert_eq!(
+        child_after_resume.native_session_id.as_deref(),
+        Some(FORKED),
+        "the resumed fork keeps its own target"
     );
 }
 

@@ -124,6 +124,12 @@ captured screen through the package manifest.
   (`projects/<folder>/<id>.jsonl`). Unlike Codex there is no nested reporter.
 - Resume starts `claude --resume <id>` and fork starts `claude --resume <id>
   --fork-session`; both were checked on the process command line of a real run.
+- A fork is a new conversation: Claude fires SessionStart for it (`source:
+  fork`) with the fork's own conversation id. The forked session holds no
+  reference until its launch process reports one, so that id becomes the fork's
+  native reference while the source keeps its own, and resuming the fork starts
+  `claude --resume <fork id>` without `--fork-session`
+  (`a_real_claude_resumes_and_forks_with_the_descriptor_arguments`).
 - A subagent the model starts through the `Task` tool is reported by the
   SubagentStart and SubagentStop hooks (`identity-subagent-v1`) as a Claude
   subagent that runs and then completes.
@@ -158,16 +164,6 @@ captured screen through the package manifest.
 - **The completed-turn line carries a suffix.** Claude 2.1.289 prints
   `✻ Brewed for 7s · done 3:34 PM`; `completed_turn_status` expects the line to
   end after the seconds. The visible prompt box still reads idle.
-- **A fork keeps its source's reference.** Claude fires SessionStart for the
-  fork (`source: fork`) with the fork's own conversation id, but the forked
-  session already holds the reference it inherited from its source, and the
-  daemon rejects the worker's identity snapshot as
-  `launch_identity_reference_mismatch` (`crates/daemon/src/session/reconcile.rs`).
-  The fork therefore records no conversation id of its own, and resuming it later
-  would resume the source conversation. The built-in Claude runtime behaves the
-  same. A real-Claude test pins this
-  (`a_real_claude_resumes_and_forks_with_the_descriptor_arguments`) and fails when
-  the daemon adopts the fork's id.
 - **The npm install is not matched by process.** The npm package's executable
   is `bin/claude.exe`; a session launched from it runs as kernel name
   `claude.exe` with a command line ending in `claude.exe`, and neither process

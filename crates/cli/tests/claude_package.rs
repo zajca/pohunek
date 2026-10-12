@@ -1975,6 +1975,7 @@ async fn a_real_claude_session_start_hook_reports_the_native_reference() {
 /// Resume and fork launch Claude with the descriptor's arguments and the
 /// hook-reported conversation id: `--resume <id>`, and `--resume <id>
 /// --fork-session` for a fork, which is a new conversation with its own id.
+/// Resuming the fork runs `--resume` with the fork's own id.
 #[tokio::test]
 #[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
 async fn a_real_claude_resumes_and_forks_with_the_descriptor_arguments() {
@@ -2073,10 +2074,48 @@ async fn a_real_claude_resumes_and_forks_with_the_descriptor_arguments() {
         fork_record["native_session_id"], fork_reference,
         "the fork adopts only its own verified conversation: {fork_record}"
     );
+    assert_eq!(
+        fixture.inspect(&id).await["native_session_id"],
+        reference.as_str(),
+        "the fork's report never changes its source's conversation"
+    );
+
+    resume_the_fork(&fixture, &fork_id, fork_reference, &reference).await;
 
     fixture.stop(&fork_id).await;
     fixture.stop(&id).await;
     fixture.finish().await;
+}
+
+/// Stops the fork `fork_id` and resumes it: Claude relaunches the fork's own
+/// conversation `fork_reference` with `--resume`, neither forking again nor
+/// naming the `source` conversation, and the session keeps that reference.
+async fn resume_the_fork(fixture: &Fixture, fork_id: &str, fork_reference: &str, source: &str) {
+    fixture.stop(fork_id).await;
+    let (code, resumed_fork) = fixture.harness.json(&["session", "resume", fork_id]).await;
+    assert_eq!(code, 0, "{resumed_fork}");
+    fixture.wait_activity(fork_id, "idle").await;
+    let resumed_fork_process = fixture.inspect(fork_id).await["pid"]
+        .as_u64()
+        .expect("the resumed fork process id");
+    let resumed_fork_argv = command_line(resumed_fork_process);
+    assert!(
+        resumed_fork_argv
+            .windows(2)
+            .any(|pair| pair[0] == "--resume" && pair[1] == fork_reference),
+        "the resumed fork runs `--resume {fork_reference}`: {resumed_fork_argv:?}"
+    );
+    assert!(
+        !resumed_fork_argv
+            .iter()
+            .any(|argument| argument == "--fork-session" || argument == source),
+        "the resumed fork neither forks again nor names its source: {resumed_fork_argv:?}"
+    );
+    let resumed_fork_record = fixture.wait_reported_conversation(fork_id).await;
+    assert_eq!(
+        resumed_fork_record["native_session_id"], fork_reference,
+        "the resumed fork keeps its own conversation: {resumed_fork_record}"
+    );
 }
 
 /// A subagent the model starts is reported by the `SubagentStart` and
