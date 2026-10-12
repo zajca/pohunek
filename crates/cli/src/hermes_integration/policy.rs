@@ -24,7 +24,7 @@ use sha2::{Digest as _, Sha256};
 use super::error::Error;
 use super::target::ResolvedTarget;
 
-/// The only policy schema understood by the embedded Hermes plugin.
+/// The only policy schema understood by the managed Hermes plugin.
 const SCHEMA_VERSION: u32 = 1;
 /// Plugin invocations must not occupy a delegated tool slot for longer than one minute.
 pub(crate) const MAX_TIMEOUT_MS: u32 = 60_000;
@@ -40,7 +40,7 @@ pub(crate) const MAX_SCREEN_BYTES: u32 = 262_144;
 pub(crate) const MAX_CONCURRENCY: u8 = 8;
 /// Policy files live in a Pohunek-owned namespace, never in a Hermes plugin tree.
 const POLICY_DIR: [&str; 2] = ["policies", "hermes"];
-/// Policy files are JSON because the embedded plugin validates this exact serde schema.
+/// Policy files are JSON because the managed plugin validates this exact serde schema.
 const POLICY_EXTENSION: &str = "json";
 /// A persisted policy is small configuration; this prevents replacement-file abuse.
 const MAX_PRIVATE_POLICY_BYTES: usize = 64 * 1024;
@@ -106,7 +106,7 @@ pub(crate) struct PolicyInput {
     pub(crate) wildcard_confirmation: WildcardConfirmation,
 }
 
-/// Versioned policy serialized for the embedded Hermes plugin.
+/// Versioned policy serialized for the managed Hermes plugin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct Policy {
     schema_version: u32,
@@ -248,7 +248,7 @@ impl Policy {
         self.max_concurrency
     }
 
-    /// Serializes the validated policy for the embedded Python bootstrap.
+    /// Serializes the validated policy for the managed plugin's Python bootstrap.
     pub(crate) fn to_json(&self) -> Result<Vec<u8>, Error> {
         serde_json::to_vec(self).map_err(|_| Error::InvalidPolicy)
     }

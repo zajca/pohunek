@@ -855,6 +855,8 @@ struct PohunekIntegrationResult {
     outdated: bool,
     stale_stage: bool,
     stale_backup: bool,
+    package_source_missing: bool,
+    package_source_error: Option<String>,
     access_mode: Option<String>,
     allowed_host_count: Option<usize>,
     doctor: Option<PohunekDoctorReport>,
@@ -862,7 +864,7 @@ struct PohunekIntegrationResult {
 
 /// Checks in the Hermes doctor report of the CLI under test; it matches the
 /// `CHECK_CODES` inventory of `crates/cli/src/hermes_integration/doctor.rs`.
-const POHUNEK_DOCTOR_CHECK_COUNT: usize = 16;
+const POHUNEK_DOCTOR_CHECK_COUNT: usize = 17;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2029,6 +2031,8 @@ fn validate_pohunek_envelope(
         || result.outdated
         || result.stale_stage
         || result.stale_backup
+        || result.package_source_missing
+        || result.package_source_error.is_some()
     {
         return Err(fail(format!(
             "Pohunek integration action `{}` returned an invalid envelope",
@@ -5213,6 +5217,8 @@ PY
                     "outdated": false,
                     "stale_stage": false,
                     "stale_backup": false,
+                    "package_source_missing": false,
+                    "package_source_error": null,
                     "access_mode": access_mode,
                     "allowed_host_count": access_mode.map(|_| 1),
                     "doctor": doctor,
@@ -5343,6 +5349,8 @@ PY
             "outdated": false,
             "stale_stage": false,
             "stale_backup": false,
+            "package_source_missing": false,
+            "package_source_error": null,
             "access_mode": "read_only",
             "allowed_host_count": 1,
             "doctor": null,

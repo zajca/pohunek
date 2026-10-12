@@ -439,9 +439,12 @@ fn hermes_error_class(error: &crate::hermes_integration::error::Error) -> ErrorC
         | Error::InvalidHermesExecutable
         | Error::InvalidHermesRuntime
         | Error::UnsupportedHermes
-        | Error::ConfirmationRequired => ErrorClass::Configuration,
+        | Error::ConfirmationRequired
+        | Error::PackageNotSelected
+        | Error::PackageSourceMissing => ErrorClass::Configuration,
         Error::Io { .. }
         | Error::InvalidAsset
+        | Error::PackageRegistryUnreadable
         | Error::Collision
         | Error::InvalidMarker
         | Error::HermesCommand
@@ -455,7 +458,8 @@ fn hermes_error_class(error: &crate::hermes_integration::error::Error) -> ErrorC
     }
 }
 
-fn hermes_error_code(error: &crate::hermes_integration::error::Error) -> &'static str {
+/// Returns the stable machine-readable code of one Hermes integration failure.
+pub(crate) fn hermes_error_code(error: &crate::hermes_integration::error::Error) -> &'static str {
     use crate::hermes_integration::error::Error;
 
     match error {
@@ -471,6 +475,9 @@ fn hermes_error_code(error: &crate::hermes_integration::error::Error) -> &'stati
         Error::WildcardConfirmationRequired => "hermes_wildcard_confirmation_required",
         Error::UnsafePolicyPath => "hermes_unsafe_policy_path",
         Error::InvalidAsset => "hermes_invalid_asset",
+        Error::PackageRegistryUnreadable => "hermes_package_registry_unreadable",
+        Error::PackageNotSelected => "hermes_package_not_selected",
+        Error::PackageSourceMissing => "hermes_package_source_missing",
         Error::Collision => "hermes_plugin_collision",
         Error::InvalidMarker => "hermes_invalid_marker",
         Error::HermesCommand => "hermes_command_failed",

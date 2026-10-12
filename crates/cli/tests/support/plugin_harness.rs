@@ -147,7 +147,7 @@ impl Harness {
             .expect("private runtime directory");
         let socket = runtime.join("daemon.sock");
         check_socket_path(&socket).expect("the socket path fits sun_path");
-        let plugins = env.data_home().join("plugins");
+        let plugins = env.state_home().join("pohunek/plugins");
         let agents = env.config_home().join("pohunek/agents");
         fs::create_dir_all(&agents).expect("create the agents directory");
         fs::set_permissions(&agents, fs::Permissions::from_mode(PRIVATE_MODE))

@@ -51,6 +51,16 @@ impl Paths {
         pohunek_paths::data_home().map_err(path_error)
     }
 
+    /// Resolve the owner-private package registry root without runtime paths.
+    pub(crate) fn plugins_dir() -> Result<PathBuf, CliError> {
+        pohunek_paths::state_home()
+            .map(|path| {
+                path.join(pohunek_paths::APP_DIR)
+                    .join(pohunek_paths::PLUGINS_SUBDIR)
+            })
+            .map_err(path_error)
+    }
+
     /// Resolve only the pohunek cache directory.
     ///
     /// Standalone host discovery deliberately does not need a runtime directory
@@ -88,7 +98,6 @@ impl Paths {
         let effective_uid = nix::unistd::Uid::effective().as_raw();
         let base = pohunek_paths::BasePaths::resolve_for(platform, effective_uid, env)
             .map_err(path_error)?;
-
         Ok(Self {
             runtime_dir: base.runtime_dir,
             socket: base.socket,

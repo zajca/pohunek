@@ -174,10 +174,18 @@ for relative in PYTHON_FILES:
     compile(parsed, relative, "exec")
 
 marker = json.loads(managed_file(".pohunek-owned.json").read_text(encoding="utf-8"))
-if not isinstance(marker, dict) or set(marker) != {"version", "hermes_home", "policy_path", "operator_sha256", "assets"}:
+base_marker_keys = {"version", "hermes_home", "policy_path", "operator_sha256", "source", "assets"}
+package_marker_keys = base_marker_keys | {"package_id", "package_digest"}
+if not isinstance(marker, dict) or set(marker) not in (base_marker_keys, package_marker_keys):
     raise ValueError("ownership marker is invalid")
-if marker.get("version") != 2 or not isinstance(marker.get("policy_path"), str):
+if marker.get("version") != 3 or not isinstance(marker.get("policy_path"), str):
     raise ValueError("ownership marker policy is invalid")
+if marker.get("source") not in ("embedded", "package"):
+    raise ValueError("ownership marker source is invalid")
+if (marker["source"] == "package") != ("package_id" in marker and "package_digest" in marker):
+    raise ValueError("ownership marker package provenance is invalid")
+if "package_digest" in marker and (not isinstance(marker["package_digest"], str) or len(marker["package_digest"]) != 64 or any(character not in "0123456789abcdef" for character in marker["package_digest"])):
+    raise ValueError("ownership marker package digest is invalid")
 operator_digest = marker.get("operator_sha256")
 if not isinstance(operator_digest, str) or len(operator_digest) != 64 or any(character not in "0123456789abcdef" for character in operator_digest):
     raise ValueError("ownership marker provenance is invalid")
