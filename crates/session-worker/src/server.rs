@@ -4617,8 +4617,9 @@ impl OrphanStops {
 /// reopens it as running, keeping its start time and any field the claim
 /// omits. A start not ordered after the recorded claim changes nothing. A
 /// start for an unknown subagent opens a new run unless `orphan_stop`, the
-/// sequence of a remembered stop without a start, is not ordered before it. Opening or reopening a run is refused once
-/// [`ACTIVE_SUBAGENT_CAPACITY`] subagents are running.
+/// sequence of a remembered stop without a start, is not ordered before it.
+/// Opening or reopening a run is refused once [`ACTIVE_SUBAGENT_CAPACITY`]
+/// subagents are running.
 fn start_subagent(
     journal: &mut JournalRecord,
     rule: SubagentSequence,

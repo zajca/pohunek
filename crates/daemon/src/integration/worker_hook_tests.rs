@@ -1435,6 +1435,20 @@ for claim in sys.argv[3:]:
                 ],
                 "the newer stop on the terminal row and the older start are ignored"
             );
+            // The stop at 40 advances only the record's sequence, which is not
+            // public: the row keeps its revision and transition time.
+            let [after_first_stop, after_newer_stop, _] = run.snapshots.as_slice() else {
+                panic!("two checkpoints and the final rows: {:?}", run.snapshots);
+            };
+            let (before, after) = (
+                row(after_first_stop, REORDERED),
+                row(after_newer_stop, REORDERED),
+            );
+            assert_eq!(
+                (after.revision, after.updated_at_ms),
+                (before.revision, before.updated_at_ms),
+                "{before:?} {after:?}"
+            );
             run.finish().await;
         }
 
