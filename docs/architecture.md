@@ -925,10 +925,16 @@ Hooks have two separate roles:
   sequences, journals concurrent subagents, and retains bounded terminal
   history. At every Claude main-agent `Stop` the Claude state hook also sends
   a `subagent_snapshot` of Claude's running background tasks (only each task's
-  `id`, `type` and `status`); the worker completes or reopens the rows of the
-  same reporting process that the snapshot proves, never a row with a newer
-  claim, advances the journaled sequence of each running row it lists, and logs
-  the reason only in the worker log. The state hooks validate their action and
+  `id`, `type` and `status`); the worker completes only the running rows of
+  the same reporting process whose end the snapshot proves, never a row with a
+  newer claim, never reopens or re-sequences a row, and logs the reason only in
+  the worker log. An unlisted row is completed when the reporter's newest
+  listing of it falls within its run and is older than this snapshot; any
+  other unlisted row is completed only when no listed task can host an agent
+  and the reporter's newest snapshot is older than this one and newer than
+  the row, because Claude builds the listing before the hook reads its clock.
+  Only that newest evidence is kept, so a snapshot older than it, delivered
+  out of order, settles nothing from it. A completed row keeps its own claim sequence. The state hooks validate their action and
   Pohunek handshake before
   reading, reject oversized JSON through a bounded direct pipe, and never stage
   provider payloads on disk. Prompt text, results, transcript paths, and raw

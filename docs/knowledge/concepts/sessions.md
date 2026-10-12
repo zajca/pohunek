@@ -382,44 +382,58 @@ the `Stop` carries a non-empty `agent_id` (it is not the main agent's), when
 `background_tasks` is missing or not a list, when the list has more than 256
 entries, or when any entry lacks a non-empty string `id`, `type` or `status`;
 the hook never truncates the list, and a missing list never means that nothing
-runs. An empty list is a valid snapshot: it lists no hosting task, so it
-settles every running row of that process with an older sequence. The worker
-reconciles only the rows the same Claude process started or reopened, and only
-rows whose recorded sequence is older than the snapshot's, so a later start or
-stop always wins over the snapshot:
+runs. A snapshot is evidence, not a claim on a row's phase: it settles only
+rows whose end it proves. Claude builds the listing before the hook reads its
+clock, so the snapshot's sequence is only an upper bound on when the listing
+was taken; the lower bound is the same reporting process's previous snapshot,
+because Claude's main turns run one after another and each listing is built
+after the previous `Stop` hook started. The worker considers only the rows the
+same Claude process started or reopened whose recorded sequence is older than
+the snapshot's, so a later start or stop always wins over the snapshot. Of the
+reporter's earlier snapshots the worker keeps only the newest evidence: the
+newest snapshot that listed each row and the reporter's newest snapshot. A
+snapshot older than that evidence, delivered out of order, settles nothing
+from it, even when a still older snapshot listed the row or preceded it:
 
-- a running row whose id is listed stays running, and its recorded sequence
-  advances to the snapshot's (persisted with no new revision), so a delayed
-  stop older than the snapshot cannot complete a row the snapshot proved live;
-- a running row that a snapshot listed during its current run and that this
-  snapshot omits is a background agent that finished, and becomes `completed`;
-- a running row that no snapshot listed during its current run becomes
-  `completed` only when the snapshot lists no task that can host an unlisted
-  agent (any task type except `shell`, `monitor` and `MCP task`); otherwise it
+- a running row whose id is listed stays running; the worker remembers the
+  listing in memory and changes neither its sequence nor its journal record,
+  so the agent's own `SubagentStop` still completes it;
+- a running row that this snapshot omits and whose newest listing by the
+  reporter falls within its current run and is older than this snapshot is a
+  background agent that finished, and becomes `completed`;
+- any other running row this snapshot omits becomes `completed` only when the
+  snapshot lists no task that can host an unlisted agent (any task type except
+  `shell`, `monitor` and `MCP task`) and the reporter's newest snapshot is
+  older than this one and newer than the row, which proves the agent started
+  before this listing was built; otherwise it is deferred and
   stays running, because Claude does not list teammates, synchronous children
-  of a background agent, or workflow agents by their agent id, and such a row
-  waits for its own stop or a later snapshot without a hosting task;
-- a terminal row whose id is listed is `running` again with a new revision and
-  its terminal time cleared (a self-woken agent whose start raced the main
-  `Stop`), unless the running-child limit is full.
+  of a background agent, or workflow agents by their agent id, and an agent
+  that started while the listing was being built is missing from it;
+- a terminal row whose id is listed is left as it is: Claude can still list an
+  agent whose own `SubagentStop` already arrived, and a self-woken agent
+  reopens its row through its own `SubagentStart`, which is newer than the
+  recorded stop.
 
-Each main turn therefore settles the Claude rows it can prove: a background
-agent that a main `Stop` listed and whose own stop never arrived holds a
-running-child slot only until the next main-turn end after it finished. A
-reconciled row looks like any other completed or reopened row; the reason is
-recorded only in the worker log.
-
-The listing is Claude's view at the moment of the main `Stop`, so two races
-settle one main turn later. A snapshot can still list an agent whose own
-`SubagentStop` is ordered before it: the row is reopened, or the delayed stop
-is ignored as stale, and the next main-turn end completes it. A background
-agent whose start is ordered before the snapshot but is missing from a listing
-Claude built before it started can be completed early when no hosting task is
-listed; a later listing of its id reopens it. Rows of another reporting
-process, such as a second Claude in a shell session, are outside a snapshot's
-scope. The reporting process and the last listing of each row are kept in
-worker memory only. Codex `Stop` carries no task list, so Codex rows are never
-reconciled this way ([#916](https://github.com/zajca/pohunek/issues/916)).
+A row the snapshot completes keeps its own recorded sequence, so a resume
+`SubagentStart` ordered between that sequence and the snapshot's still reopens
+it with a new revision. Each main turn therefore settles the Claude rows it can
+prove: a background agent that a main `Stop` listed and whose own stop never
+arrived holds a running-child slot only until the next main-turn end after it
+finished. A reconciled row looks like any other completed row; the reason is
+recorded only in the worker log. Two limits remain. A row that no snapshot
+listed settles at the earliest at the second main-turn end after its start,
+because the reporter's previous snapshot must be newer than the row.
+A row whose reporter never ends another main turn stays `running` until its
+own stop arrives or the runtime ends, when it becomes `lost`. Rows of another
+reporting process, such as a second Claude in a shell session, are outside a
+snapshot's scope. The reporting process and last listing of each row, and the
+last snapshot sequence of each reporting process, are kept in worker memory
+only. The worker remembers the last snapshot of at most
+`SNAPSHOT_REPORTER_CAPACITY` (16) reporting processes and forgets the least
+recently reporting one first; a forgotten process's never-listed rows stay
+deferred through the reporter's next snapshot, which only records itself, and
+settle at the earliest on the one after it. Codex `Stop` carries no task list, so Codex
+rows are never reconciled this way ([#916](https://github.com/zajca/pohunek/issues/916)).
 
 Every admitted subagent claim the worker ignores or refuses is logged in the
 session's worker log with a reason code: `duplicate_start`,
@@ -428,12 +442,10 @@ session's worker log with a reason code: `duplicate_start`,
 a snapshot whose task list breaks a bound, is logged as the
 `worker.identity.rejected` warning. A snapshot logs one
 `worker.subagent.reconciled` at INFO for each row it completes (reason
-`snapshot_absent`) or reopens (reason `snapshot_listed`), and one
-`worker.subagent.snapshot.applied` at INFO with the number of `tasks` in the
-snapshot, the `hosts` flag, and the row counts `listed` (running rows kept
-because the snapshot listed them), `terminalized`, `reopened` and `deferred`;
-a reopen the running-child limit prevents is logged as a refused `snapshot`
-claim with reason `capacity` at WARN. The worker
+`snapshot_absent`), and one `worker.subagent.snapshot.applied` at INFO with the
+number of `tasks` in the snapshot, the `hosts` flag, and the row counts
+`listed` (running rows the snapshot listed), `terminalized` and `deferred`.
+The worker
 answers the hook with success when it admitted the claim and either applied it
 or ignored it for one of the INFO reasons, and an admitted, valid snapshot
 whether or not it changed a row; it answers with failure when the claim was

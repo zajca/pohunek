@@ -81,8 +81,8 @@ reported and recorded sequences, and a `subagent.reason` code:
 prompt-suggestion helper after every main turn), `stale_sequence` (a claim not
 newer than the recorded one, or a start not newer than a remembered Claude
 stop without a start) and `not_running` (a newer stop for a terminal child) at INFO,
-and `capacity` (a start, or a snapshot reopen with `subagent.action`
-`snapshot`, refused because the running-child limit is full) at WARN. A child's phase follows the highest-sequence claim the worker admitted
+and `capacity` (a start refused because the running-child limit is full) at
+WARN. A child's phase follows the highest-sequence claim the worker admitted
 for it, for every provider: an ignored `duplicate_start` or `not_running`
 claim newer than the record still advances the record's journaled sequence,
 so a later `stale_sequence` line for an older claim of the same child is the
@@ -98,38 +98,43 @@ Claude's running background tasks. The worker logs one
 fields `tasks` (tasks in the snapshot), `hosts` (whether the snapshot listed a
 task that can host an unlisted agent, any type except `shell`, `monitor` and
 `MCP task`), and the counts of the reporting process's rows: `listed` (running
-rows the snapshot listed and kept running), `terminalized`, `reopened` and
-`deferred`. Each row it
-changes is a `worker.subagent.reconciled` INFO event with `subagent.provider`,
+rows the snapshot listed), `terminalized` and `deferred`. Each row it completes
+is a `worker.subagent.reconciled` INFO event with `subagent.provider`,
 `subagent.id`, `subagent.sequence.reported` (the snapshot's),
-`subagent.sequence.recorded`, and `subagent.reason`:
-`snapshot_absent` (a running row completed because the snapshot omitted it)
-or `snapshot_listed` (a terminal row reopened because the snapshot listed it).
-A reopen refused by the running-child limit is a
-`worker.subagent.claim.refused` WARN with `subagent.action` `snapshot` and
-reason `capacity`.
-A listed running row stays `running` with no `reconciled` event, but its
-journaled sequence advances to the snapshot's, so a delayed stop older than the
-snapshot is then logged as `stale_sequence` and leaves the row running; its
-next newer stop completes it. A non-zero `deferred` count names running rows of the reporting Claude process
-that the snapshot neither listed nor could settle: never listed during their
-current run while `hosts` is true. They are typically teammates, synchronous
-children of a listed background agent, or workflow agents, which Claude does
-not list by agent id; they stay `running` until their own `SubagentStop` or a
-later snapshot with `hosts` false. A deferred count that persists across many
-turns is either such a child that is still alive or one whose stop was missed;
-check the agent in Claude first. A row whose stop was missed stays `running`
-until a snapshot lists no hosting task or the runtime ends, when it becomes
-`lost`. Rows started by another process, such as a second Claude in a shell
-session, are not counted.
+`subagent.sequence.recorded` (the row's own sequence, which the completed row
+keeps), and `subagent.reason` `snapshot_absent`: the snapshot omitted a running
+row whose newest listing by the same reporter falls within its current run and
+is older than this snapshot, or another omitted row while no hosting task was
+listed and the reporter's newest snapshot was older than this one and newer
+than the row. The worker keeps only the reporter's newest listing of each row
+and its newest snapshot, so a snapshot older than that evidence, delivered out
+of order, settles nothing from it. A snapshot never reopens a row and never changes a listed row's
+sequence: a listed running row stays `running` with no event and its own
+`SubagentStop` completes it, and a listed terminal row stays terminal (Claude
+often still lists a fast background agent whose stop already arrived; a
+self-woken agent reopens through its own `SubagentStart`).
 
-Two races settle one main turn later and need no action. A `snapshot_listed`
-reopen of an agent whose `SubagentStop` was logged just before it (or a
-`stale_sequence` stop just after it) means Claude still listed a stopping
-agent; the next main-turn end completes it with `snapshot_absent`. A
-`snapshot_absent` for an agent whose start was logged just before the snapshot
-means Claude built its listing before that agent started while no hosting task
-was listed; the next listing of its id reopens it with `snapshot_listed`.
+A non-zero `deferred` count names running rows of the reporting Claude process,
+older than the snapshot, that it neither lists nor proves absent: rows whose
+newest listing by this reporter is missing, outside their current run or not
+older than this snapshot, while `hosts` is true or the reporter's newest
+snapshot is not both older than this one and newer than the row. For example,
+a row started at 10 and listed by snapshot 30, then listed again by a late
+snapshot 20, is deferred by a late empty snapshot 25: the newest listing (30)
+and the newest snapshot (30) are not older than 25. The worker remembers the last snapshot of at most
+`SNAPSHOT_REPORTER_CAPACITY` (16) reporting processes and forgets the least
+recently reporting one first, so a forgotten process's never-listed rows stay
+deferred through the reporter's next snapshot, which only records itself, and
+settle at the earliest on the one after it. They are typically teammates, synchronous
+children of a listed background agent, workflow agents, which Claude does not
+list by agent id, or an agent that started in the main turn that just ended;
+they stay `running` until their own `SubagentStop` or a later snapshot that
+can settle them. A deferred count that persists across many turns is either
+such a child that is still alive or one whose stop was missed; check the agent
+in Claude first. A row whose stop was missed stays `running` until a snapshot
+settles it, and a row whose reporter never ends another main turn stays
+`running` until the runtime ends, when it becomes `lost`. Rows started by
+another process, such as a second Claude in a shell session, are not counted.
 
 When a Claude main turn ends without a `snapshot.applied` event, check in this
 order: a `worker.identity.rejected` warning with `identity.operation`
