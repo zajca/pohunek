@@ -7,21 +7,23 @@
 //!   translation needs nothing but the record.
 //! - v0.33.1 dropped those fields without writing a `native_launch`, leaving a
 //!   binding with a native reference, a snapshot program and no launch spec.
-//!   A built-in agent has exactly one spec, so it is restored here. Any other
-//!   runtime can only be resolved through the runtime registry, which does not
-//!   exist yet while the store migrates; such a binding is marked with
-//!   [`UNRESOLVED_KEY`] and repaired when the registry loads it.
+//!   A runtime compiled into v0.33.1 had exactly one spec, so it is restored
+//!   here from [`V0_33_RUNTIMES`]. Any other runtime can only be resolved
+//!   through the runtime registry, which does not exist yet while the store
+//!   migrates; such a binding is marked with [`UNRESOLVED_KEY`] and repaired
+//!   when the registry loads it.
 //!
-//! The mapping is a pure function of the record, so the migrated bytes are
-//! reproducible (see `Store::is_schema_migration_of`).
+//! The mapping is a pure function of the record and of frozen facts about the
+//! releases that wrote it, so the migrated bytes are reproducible (see
+//! `Store::is_schema_migration_of`) and independent of the runtimes the
+//! running daemon ships.
 
-// Rust guideline compliant 2026-06-26
+// Rust guideline compliant 2026-10-12
 
-use protocol::{RuntimeId, SessionCapabilities};
+use protocol::SessionCapabilities;
 use serde_json::{Map, Value};
 
-use crate::agent::host::{BuiltinSource, RuntimeSource};
-use crate::agent::{NativeArg, NativeSessionLaunch, SessionRefKind, REFERENCE_PLACEHOLDER};
+use crate::agent::{NativeSessionLaunch, SessionRefKind, REFERENCE_PLACEHOLDER};
 
 /// Key of the marker on a binding whose runtime must supply its launch spec.
 pub(super) const UNRESOLVED_KEY: &str = "native_launch_unresolved";
@@ -39,9 +41,70 @@ const LEGACY_KEYS: [&str; 7] = [
     "forkable",
 ];
 
-/// Shell program the built-in source is constructed with; the migration reads
-/// only the native launch specs, which do not depend on it.
-const BUILTIN_SOURCE_SHELL: &str = "/bin/sh";
+/// The literal arguments v0.33.0 appended to the resume operation of a binding
+/// it forked natively.
+///
+/// A historical store-format fact: v0.33.0 knew one fork mode
+/// (`ForkMode::ClaudeSession`), which appended `CLAUDE_FORK_SESSION_ARG` in
+/// `crates/daemon/src/agent/mod.rs` at tag `v0.33.0`. It must never follow a
+/// current runtime descriptor, because a stored fork means what the release
+/// that wrote it launched.
+const V0_33_0_FORK_EXTENSION: [&str; 1] = ["--fork-session"];
+
+/// The runtimes compiled into v0.33.1 and the native launch each recovered
+/// with.
+///
+/// A historical store-format fact: the resume and fork arguments are verbatim
+/// from `crates/daemon/src/agent/builtin/{codex,claude,hermes}.toml` at tag
+/// `v0.33.1`, and that release assembled the shell without native recovery.
+/// A damaged v0.33.1 binding means what that release launched, so this table
+/// must never follow the current runtime descriptors, which may change or be
+/// removed without changing what a stored binding recovers.
+const V0_33_RUNTIMES: [FrozenRuntime; 4] = [
+    FrozenRuntime {
+        id: "shell",
+        launch: None,
+    },
+    FrozenRuntime {
+        id: "codex",
+        launch: Some(FrozenLaunch {
+            reference_kind: SessionRefKind::Id,
+            resume: &["resume", REFERENCE_PLACEHOLDER],
+            fork: None,
+        }),
+    },
+    FrozenRuntime {
+        id: "claude",
+        launch: Some(FrozenLaunch {
+            reference_kind: SessionRefKind::Id,
+            resume: &["--resume", REFERENCE_PLACEHOLDER],
+            fork: Some(&["--resume", REFERENCE_PLACEHOLDER, "--fork-session"]),
+        }),
+    },
+    FrozenRuntime {
+        id: "hermes",
+        launch: Some(FrozenLaunch {
+            reference_kind: SessionRefKind::Id,
+            resume: &["--resume", REFERENCE_PLACEHOLDER],
+            fork: None,
+        }),
+    },
+];
+
+/// One runtime a released daemon compiled in.
+struct FrozenRuntime {
+    /// The runtime id the release stored as `agent` and `agent_base`.
+    id: &'static str,
+    /// The native launch, or `None` when the runtime had no native recovery.
+    launch: Option<FrozenLaunch>,
+}
+
+/// The native launch templates of one released runtime.
+struct FrozenLaunch {
+    reference_kind: SessionRefKind,
+    resume: &'static [&'static str],
+    fork: Option<&'static [&'static str]>,
+}
 
 /// What the mapping did to one binding.
 enum Outcome {
@@ -183,7 +246,7 @@ fn legacy_launch(binding: &Map<String, Value>) -> Legacy {
 }
 
 /// The fork operation of the flat fields: the frozen resume mode followed by
-/// the one fork extension v0.33.0 knew, which the built-in definitions carry.
+/// [`V0_33_0_FORK_EXTENSION`].
 fn legacy_fork(binding: &Map<String, Value>, kind: SessionRefKind) -> Option<Vec<String>> {
     if !flag(binding, "forkable") || text(binding, "fork_mode").is_none() {
         return None;
@@ -194,26 +257,8 @@ fn legacy_fork(binding: &Map<String, Value>, kind: SessionRefKind) -> Option<Vec
         return None;
     }
     let mut fork = mode.template().map(str::to_owned).to_vec();
-    fork.extend(builtin_fork_extension()?);
+    fork.extend(V0_33_0_FORK_EXTENSION.map(str::to_owned));
     Some(fork)
-}
-
-/// The literal arguments a built-in fork operation appends to its resume
-/// operation.
-fn builtin_fork_extension() -> Option<Vec<String>> {
-    let definitions = BuiltinSource::new(BUILTIN_SOURCE_SHELL).load().ok()?;
-    definitions.iter().find_map(|definition| {
-        let launch = definition.native()?;
-        let resume = launch.resume_args().as_slice();
-        let fork = launch.fork_args()?.as_slice();
-        fork.strip_prefix(resume)?
-            .iter()
-            .map(|arg| match arg {
-                NativeArg::Literal(literal) => Some(literal.clone()),
-                NativeArg::Reference => None,
-            })
-            .collect()
-    })
 }
 
 /// How v0.33.0 shaped a resume argv.
@@ -274,40 +319,36 @@ fn damaged_outcome(binding: &Map<String, Value>) -> Outcome {
     let agent = text(binding, "agent");
     let base = text(binding, "agent_base").or(agent);
     match (agent, base) {
-        // A bare built-in runtime always launched with its own spec; a shell
-        // has none and so recovers nothing.
-        (Some(agent), Some(base)) if agent == base => match builtin_native_launch(base) {
-            BuiltinSpec::Spec(launch) => Outcome::Mapped(launch),
-            BuiltinSpec::NoNativeRecovery => Outcome::Unchanged,
-            BuiltinSpec::NotBuiltin => Outcome::Unresolved,
+        // A bare runtime compiled into v0.33.1 always launched with its own
+        // spec; the shell has none and so recovers nothing.
+        (Some(agent), Some(base)) if agent == base => match v0_33_native_launch(base) {
+            FrozenSpec::Spec(launch) => Outcome::Mapped(launch),
+            FrozenSpec::NoNativeRecovery => Outcome::Unchanged,
+            FrozenSpec::NotCompiledIn => Outcome::Unresolved,
         },
         _ => Outcome::Unresolved,
     }
 }
 
-enum BuiltinSpec {
+/// What v0.33.1 knew about the native launch of one runtime id.
+enum FrozenSpec {
     Spec(NativeSessionLaunch),
     NoNativeRecovery,
-    NotBuiltin,
+    /// The release did not compile the runtime in, or its frozen templates do
+    /// not form a valid spec; either way only the registry can resolve it.
+    NotCompiledIn,
 }
 
-/// The compiled native launch spec of the built-in runtime `id`.
-fn builtin_native_launch(id: &str) -> BuiltinSpec {
-    let Ok(runtime_id) = RuntimeId::parse(id) else {
-        return BuiltinSpec::NotBuiltin;
+/// The native launch spec the runtime `id` had when v0.33.1 compiled it in.
+fn v0_33_native_launch(id: &str) -> FrozenSpec {
+    let Some(runtime) = V0_33_RUNTIMES.iter().find(|runtime| runtime.id == id) else {
+        return FrozenSpec::NotCompiledIn;
     };
-    let Ok(definitions) = BuiltinSource::new(BUILTIN_SOURCE_SHELL).load() else {
-        return BuiltinSpec::NotBuiltin;
+    let Some(launch) = &runtime.launch else {
+        return FrozenSpec::NoNativeRecovery;
     };
-    definitions
-        .iter()
-        .find(|definition| *definition.runtime_id() == runtime_id)
-        .map_or(BuiltinSpec::NotBuiltin, |definition| {
-            definition
-                .native()
-                .cloned()
-                .map_or(BuiltinSpec::NoNativeRecovery, BuiltinSpec::Spec)
-        })
+    NativeSessionLaunch::from_templates(launch.reference_kind, launch.resume, launch.fork)
+        .map_or(FrozenSpec::NotCompiledIn, FrozenSpec::Spec)
 }
 
 fn text<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a str> {

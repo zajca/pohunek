@@ -796,8 +796,9 @@ starts, so an upgrade does not strand a resumable session. The metadata store
 migration maps the flat `resume_mode`/`ref_kind`/`resumable`/`fork_*` fields of
 v0.33.0 onto the session's native-session launch spec with the argv they
 already produced. A v0.33.1 record that kept its native reference but lost its
-launch spec is restored with the built-in spec for Claude, Codex and Hermes
-(Claude regains fork); for a profile or package runtime the spec is resolved by
+launch spec is restored with the spec v0.33.1 compiled in for Claude, Codex
+and Hermes, which the migration keeps frozen and never reads from a current
+descriptor (Claude regains fork); for a profile or package runtime the spec is resolved by
 agent name when the record is loaded. The migration never launches anything: a
 restored session stays `lost` until an explicit `session.resume`. A record that
 cannot be completed (the profile was deleted, no longer runs on the same

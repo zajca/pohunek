@@ -2,7 +2,7 @@
 //! spec existed, tested against stores written by the v0.33.0 and v0.33.1
 //! daemons through their own code.
 
-// Rust guideline compliant 2026-06-26
+// Rust guideline compliant 2026-10-12
 
 use std::fmt::Write as _;
 use std::fs;
@@ -309,7 +309,7 @@ fn the_v0_33_1_damaged_fixture_binding_is_repaired_for_a_built_in_agent() {
     assert_eq!(
         fork_argv(binding, "native-fixture-1"),
         Some(strings(&["--resume", "native-fixture-1", "--fork-session"])),
-        "fork is restored where the built-in spec supports it"
+        "fork is restored where the v0.33.1 claude spec supports it"
     );
 
     let sessions = store.load_sessions().expect("load sessions");
@@ -324,28 +324,51 @@ fn the_v0_33_1_damaged_fixture_binding_is_repaired_for_a_built_in_agent() {
     );
 }
 
-#[test]
-fn a_damaged_codex_binding_is_repaired_without_fork() {
-    let content = V0_33_1_DAMAGED_STORE
-        .replace("\"agent\":\"claude\"", "\"agent\":\"codex\"")
-        .replace("\"agent_base\":\"claude\"", "\"agent_base\":\"codex\"")
-        .replace("\"program\":\"claude\"", "\"program\":\"codex\"");
-    let (store, _path) = migrated("damaged-codex", &content);
+/// The v0.33.1 damaged fixture rewritten as written for another runtime.
+fn damaged_store_of(agent: &str) -> String {
+    V0_33_1_DAMAGED_STORE
+        .replace("\"agent\":\"claude\"", &format!("\"agent\":\"{agent}\""))
+        .replace(
+            "\"agent_base\":\"claude\"",
+            &format!("\"agent_base\":\"{agent}\""),
+        )
+        .replace(
+            "\"program\":\"claude\"",
+            &format!("\"program\":\"{agent}\""),
+        )
+}
 
-    let binding = &store.load_resume().expect("load resume")[0];
-    assert_eq!(
-        argv(binding, "native-fixture-1"),
-        strings(&["resume", "native-fixture-1"])
-    );
-    assert!(!binding.forkable());
-    let sessions = store.load_sessions().expect("load sessions");
-    assert_eq!(
-        sessions[0].info.capabilities,
-        SessionCapabilities {
-            resume: true,
-            fork: false
-        }
-    );
+#[test]
+fn damaged_codex_and_hermes_bindings_are_repaired_without_fork() {
+    // The resume arguments of `codex.toml` and `hermes.toml` at tag v0.33.1;
+    // neither supported fork.
+    for (agent, resume) in [
+        ("codex", ["resume", "native-fixture-1"]),
+        ("hermes", ["--resume", "native-fixture-1"]),
+    ] {
+        let (store, path) = migrated(&format!("damaged-{agent}"), &damaged_store_of(agent));
+
+        assert!(
+            raw_lines(&path)[0].get(UNRESOLVED_KEY).is_none(),
+            "{agent} is resolved without the registry"
+        );
+        let binding = &store.load_resume().expect("load resume")[0];
+        assert_eq!(
+            argv(binding, "native-fixture-1"),
+            strings(&resume),
+            "{agent}"
+        );
+        assert!(!binding.forkable(), "{agent}");
+        let sessions = store.load_sessions().expect("load sessions");
+        assert_eq!(
+            sessions[0].info.capabilities,
+            SessionCapabilities {
+                resume: true,
+                fork: false
+            },
+            "{agent}"
+        );
+    }
 }
 
 #[test]
@@ -384,11 +407,15 @@ fn bindings_that_are_non_recoverable_by_design_are_left_alone() {
         .replace("\"agent_base\":\"claude\"", "\"agent_base\":\"shell\"")
         .replace(",\"native_session_id\":\"native-fixture-1\"", "")
         .replace(",\"native_session_id\":\"native-fixture-2\"", "");
+    // v0.33.1 assembled the shell without native recovery, so a shell binding
+    // that recorded a reference still recovers nothing natively.
+    let shell_with_reference = damaged_store_of("shell");
     let no_snapshot_program =
         V0_33_1_DAMAGED_STORE.replace("\"program\":\"claude\"", "\"program\":\"\"");
     for (tag, content) in [
         ("pinned", pinned.as_str()),
         ("shell", shell_without_reference.as_str()),
+        ("shell-with-reference", shell_with_reference.as_str()),
         ("no-program", no_snapshot_program.as_str()),
     ] {
         let (_store, path) = migrated(tag, content);

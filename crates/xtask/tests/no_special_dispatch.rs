@@ -345,6 +345,16 @@ const ALLOW_LIST: &[Entry] = &[
         Owner::Packages,
         "default per-provider notification policy",
     ),
+    (
+        "crates/daemon/src/store/legacy_binding.rs",
+        Approved::Lines(&[
+    "id: \"claude\",",
+    "id: \"codex\",",
+    "id: \"hermes\",",
+]),
+        Owner::Data,
+        "launch specs v0.33 compiled in, frozen for the store migration of v0.33 records",
+    ),
 ];
 
 /// Trimmed text of every line of `file` that names a built-in agent outside
