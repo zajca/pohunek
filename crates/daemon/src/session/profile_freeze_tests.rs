@@ -19,8 +19,8 @@ use protocol::{
 };
 
 use super::tests::{
-    append_launch_record, complete_lines, durable_recovery, hermetic_shell, hook_gate, params,
-    temp_dir, temp_store_path, wait_for_file_contains, write_executable,
+    append_launch_record, complete_lines, drop_settled, durable_recovery, hermetic_shell,
+    hook_gate, params, temp_dir, temp_store_path, wait_for_file_contains, write_executable,
 };
 use super::{ProfileChange, SessionRegistry, SessionRegistryConfig};
 use crate::agent::host::fixture::{pi_shaped_host, pi_shaped_profile_pin, PI_SHAPED_NO_CHECK};
@@ -128,6 +128,16 @@ impl Frozen {
             .await
             .expect("startup reconciliation");
         registry
+    }
+
+    /// Creates the profile session, lets its first run exit, and drops
+    /// `registry` once that exit made its last write, so a registry or store
+    /// opened next never races the dropped one.
+    async fn created_and_settled(&self, registry: SessionRegistry) -> SessionId {
+        let mut events = registry.subscribe();
+        let id = self.created_and_exited(&registry).await;
+        drop_settled(registry, &mut events, &id).await;
+        id
     }
 
     fn new_params(&self) -> SessionNewParams {
@@ -280,9 +290,8 @@ async fn a_session_without_a_profile_freezes_no_revision_and_resumes_uncondition
 async fn resume_of_an_unchanged_profile_relaunches_under_it_after_a_restart() {
     let frozen = Frozen::new("resume-same");
     let registry = frozen.registry();
-    let id = frozen.created_and_exited(&registry).await;
+    let id = frozen.created_and_settled(registry).await;
     let revision = frozen.frozen_revision(&id);
-    drop(registry);
 
     let restarted = frozen.restarted().await;
     restarted.resume(&id).await.expect("resume");
@@ -299,9 +308,8 @@ async fn resume_of_an_unchanged_profile_relaunches_under_it_after_a_restart() {
 async fn resume_of_an_edited_profile_is_refused_until_the_owner_accepts_it() {
     let frozen = Frozen::new("resume-edit");
     let registry = frozen.registry();
-    let id = frozen.created_and_exited(&registry).await;
+    let id = frozen.created_and_settled(registry).await;
     let before = frozen.frozen_revision(&id).expect("frozen at creation");
-    drop(registry);
 
     frozen.write_profile("second-account");
     let restarted = frozen.restarted().await;
@@ -310,7 +318,7 @@ async fn resume_of_an_edited_profile_is_refused_until_the_owner_accepts_it() {
         .await
         .expect_err("an edited profile is not relaunched silently");
 
-    assert_eq!(refused.code, "agent_profile_changed");
+    assert_eq!(refused.code, "agent_profile_changed", "{refused:?}");
     assert!(
         refused
             .recover
@@ -348,8 +356,9 @@ async fn resume_of_an_edited_profile_is_refused_until_the_owner_accepts_it() {
     assert_eq!(after, current_revision(&restarted));
 
     // The re-frozen revision is durable: a restart resumes without the override.
+    let mut events = restarted.subscribe();
     restarted.stop(&id).await.expect("stop");
-    drop(restarted);
+    drop_settled(restarted, &mut events, &id).await;
     let again = frozen.restarted().await;
     again
         .resume(&id)
@@ -366,8 +375,7 @@ async fn resume_of_an_edited_profile_is_refused_until_the_owner_accepts_it() {
 async fn resume_of_a_deleted_profile_is_refused_even_with_the_override() {
     let frozen = Frozen::new("resume-deleted");
     let registry = frozen.registry();
-    let id = frozen.created_and_exited(&registry).await;
-    drop(registry);
+    let id = frozen.created_and_settled(registry).await;
 
     frozen.delete_profile();
     let restarted = frozen.restarted().await;
@@ -376,7 +384,10 @@ async fn resume_of_a_deleted_profile_is_refused_even_with_the_override() {
             .resume_with(&id, change)
             .await
             .expect_err("a deleted profile cannot be relaunched under");
-        assert_eq!(refused.code, "agent_profile_missing", "{change:?}");
+        assert_eq!(
+            refused.code, "agent_profile_missing",
+            "{change:?} {refused:?}"
+        );
     }
     assert_eq!(launch_count(&frozen.marker), 1, "nothing launched");
 
@@ -393,8 +404,7 @@ async fn resume_of_a_deleted_profile_is_refused_even_with_the_override() {
 async fn a_legacy_binding_without_a_revision_needs_the_override_and_then_freezes() {
     let frozen = Frozen::new("resume-legacy");
     let registry = frozen.registry();
-    let id = frozen.created_and_exited(&registry).await;
-    drop(registry);
+    let id = frozen.created_and_settled(registry).await;
 
     // The record as an older daemon wrote it: no frozen revision.
     let store = crate::store::Store::new(frozen.store_path.clone());
@@ -413,7 +423,7 @@ async fn a_legacy_binding_without_a_revision_needs_the_override_and_then_freezes
         .resume(&id)
         .await
         .expect_err("a legacy profile session is never relaunched silently");
-    assert_eq!(refused.code, "agent_profile_changed");
+    assert_eq!(refused.code, "agent_profile_changed", "{refused:?}");
     assert!(refused.msg.contains("no recorded revision"), "{refused:?}");
     assert_eq!(launch_count(&frozen.marker), 1);
 
@@ -433,8 +443,7 @@ async fn a_legacy_binding_without_a_revision_needs_the_override_and_then_freezes
 async fn an_unavailable_revision_key_fails_closed_for_profile_sessions_only() {
     let frozen = Frozen::new("key-unavailable");
     let registry = frozen.registry();
-    let id = frozen.created_and_exited(&registry).await;
-    drop(registry);
+    let id = frozen.created_and_settled(registry).await;
     let not_a_directory = frozen.dir.join("not-a-state-dir");
     fs::write(&not_a_directory, "").expect("write a plain file");
 
@@ -455,7 +464,7 @@ async fn an_unavailable_revision_key_fails_closed_for_profile_sessions_only() {
                 .expect_err("no key, no relaunch");
             assert_eq!(
                 refused.code, "agent_profile_revision_unavailable",
-                "{host_state_dir:?} {change:?}"
+                "{host_state_dir:?} {change:?} {refused:?}"
             );
         }
         let records_before = crate::store::Store::new(frozen.store_path.clone())
@@ -466,7 +475,10 @@ async fn an_unavailable_revision_key_fails_closed_for_profile_sessions_only() {
             .create(frozen.new_params())
             .await
             .expect_err("a profile session cannot be frozen without the key");
-        assert_eq!(created.code, "agent_profile_revision_unavailable");
+        assert_eq!(
+            created.code, "agent_profile_revision_unavailable",
+            "{created:?}"
+        );
         assert_eq!(
             crate::store::Store::new(frozen.store_path.clone())
                 .load_sessions()
@@ -484,7 +496,12 @@ async fn an_unavailable_revision_key_fails_closed_for_profile_sessions_only() {
             })
             .await
             .expect("a session without a profile needs no key");
-        let _ = broken.stop(&bare.id).await;
+        // The next configuration reconciles the same store, so this registry
+        // goes only after the bare session's exit made its last write.
+        let mut events = broken.subscribe();
+        let stopped = broken.stop(&bare.id).await.expect("stop the bare session");
+        assert!(stopped.stopped, "the bare session was live until stopped");
+        drop_settled(broken, &mut events, &bare.id).await;
     }
     assert_eq!(
         frozen.marks(),
@@ -497,9 +514,8 @@ async fn an_unavailable_revision_key_fails_closed_for_profile_sessions_only() {
 async fn fork_of_an_unchanged_profile_freezes_the_same_revision() {
     let frozen = Frozen::new("fork-same");
     let registry = frozen.registry();
-    let id = frozen.created_and_exited(&registry).await;
+    let id = frozen.created_and_settled(registry).await;
     let revision = frozen.frozen_revision(&id);
-    drop(registry);
 
     let restarted = frozen.restarted().await;
     let forked = restarted.fork(fork_params(&id, false)).await.expect("fork");
@@ -517,8 +533,7 @@ async fn fork_of_an_edited_or_deleted_profile_is_refused_and_the_override_forks_
 ) {
     let frozen = Frozen::new("fork-edit");
     let registry = frozen.registry();
-    let id = frozen.created_and_exited(&registry).await;
-    drop(registry);
+    let id = frozen.created_and_settled(registry).await;
 
     frozen.write_profile("second-account");
     let restarted = frozen.restarted().await;
@@ -526,7 +541,7 @@ async fn fork_of_an_edited_or_deleted_profile_is_refused_and_the_override_forks_
         .fork(fork_params(&id, false))
         .await
         .expect_err("an edited profile is not forked under silently");
-    assert_eq!(refused.code, "agent_profile_changed");
+    assert_eq!(refused.code, "agent_profile_changed", "{refused:?}");
     assert_eq!(launch_count(&frozen.marker), 1);
     assert_eq!(
         restarted.list().await.len(),
@@ -560,7 +575,10 @@ async fn fork_of_an_edited_or_deleted_profile_is_refused_and_the_override_forks_
             .fork(fork_params(&id, accept))
             .await
             .expect_err("a deleted profile cannot be forked under");
-        assert_eq!(missing.code, "agent_profile_missing", "accept={accept}");
+        assert_eq!(
+            missing.code, "agent_profile_missing",
+            "accept={accept} {missing:?}"
+        );
     }
 }
 
@@ -568,7 +586,7 @@ async fn fork_of_an_edited_or_deleted_profile_is_refused_and_the_override_forks_
 async fn resume_resolves_the_profile_once_so_an_edit_during_the_operation_cannot_launch() {
     let frozen = Frozen::new("resume-once");
     let registry = frozen.registry();
-    let id = frozen.created_and_exited(&registry).await;
+    let id = frozen.created_and_settled(registry).await;
     let before = frozen.frozen_revision(&id).expect("frozen");
     let restarted = frozen.restarted().await;
 
@@ -600,14 +618,14 @@ async fn resume_resolves_the_profile_once_so_an_edit_during_the_operation_cannot
         .resume(&id)
         .await
         .expect_err("the in-flight edit is caught by the next resume");
-    assert_eq!(refused.code, "agent_profile_changed");
+    assert_eq!(refused.code, "agent_profile_changed", "{refused:?}");
 }
 
 #[tokio::test]
 async fn fork_resolves_the_profile_once_so_an_edit_during_the_operation_cannot_launch() {
     let frozen = Frozen::new("fork-once");
     let registry = frozen.registry();
-    let id = frozen.created_and_exited(&registry).await;
+    let id = frozen.created_and_settled(registry).await;
     let restarted = frozen.restarted().await;
 
     let gate = hold_recovery(&restarted);
@@ -667,8 +685,7 @@ fn fork_with_override(id: &SessionId) -> serde_json::Value {
 async fn a_remote_connection_cannot_accept_a_changed_profile() {
     let frozen = Frozen::new("remote-override");
     let registry = frozen.registry();
-    let id = frozen.created_and_exited(&registry).await;
-    drop(registry);
+    let id = frozen.created_and_settled(registry).await;
     frozen.write_profile("second-account");
     let restarted = frozen.restarted().await;
     let remote = daemon_state(&restarted, ControlTransport::Remote);
@@ -681,7 +698,10 @@ async fn a_remote_connection_cannot_accept_a_changed_profile() {
         let refused = call(&remote, name, params)
             .await
             .expect_err("a remote caller cannot hold the owner's decision");
-        assert_eq!(refused.code, "agent_profile_change_local_only", "{name}");
+        assert_eq!(
+            refused.code, "agent_profile_change_local_only",
+            "{name} {refused:?}"
+        );
     }
     assert_eq!(launch_count(&frozen.marker), 1, "nothing launched");
     assert_eq!(frozen.frozen_revision(&id), before);
@@ -692,15 +712,14 @@ async fn a_remote_connection_cannot_accept_a_changed_profile() {
     let plain = call(&remote, method::SESSION_RESUME, serde_json::json!(id))
         .await
         .expect_err("an edited profile is refused");
-    assert_eq!(plain.code, "agent_profile_changed");
+    assert_eq!(plain.code, "agent_profile_changed", "{plain:?}");
 }
 
 #[tokio::test]
 async fn a_local_connection_accepts_a_changed_profile_and_the_bare_id_shape_still_resumes() {
     let frozen = Frozen::new("local-override");
     let registry = frozen.registry();
-    let id = frozen.created_and_exited(&registry).await;
-    drop(registry);
+    let id = frozen.created_and_settled(registry).await;
     frozen.write_profile("second-account");
     let restarted = frozen.restarted().await;
     let local = daemon_state(&restarted, ControlTransport::Local);
@@ -708,7 +727,7 @@ async fn a_local_connection_accepts_a_changed_profile_and_the_bare_id_shape_stil
     let bare = call(&local, method::SESSION_RESUME, serde_json::json!(id))
         .await
         .expect_err("the bare id shape is the refusing shape");
-    assert_eq!(bare.code, "agent_profile_changed");
+    assert_eq!(bare.code, "agent_profile_changed", "{bare:?}");
 
     call(&local, method::SESSION_RESUME, resume_with_override(&id))
         .await
@@ -741,9 +760,8 @@ async fn a_profile_that_shadowed_a_runtime_id_is_missing_once_it_is_deleted() {
     // the session was frozen under.
     let frozen = Frozen::named("shadow-deleted", "pi");
     let registry = frozen.registry();
-    let id = frozen.created_and_exited(&registry).await;
+    let id = frozen.created_and_settled(registry).await;
     assert!(frozen.frozen_revision(&id).is_some());
-    drop(registry);
 
     frozen.delete_profile();
     let restarted = frozen.restarted().await;
@@ -752,7 +770,10 @@ async fn a_profile_that_shadowed_a_runtime_id_is_missing_once_it_is_deleted() {
             .resume_with(&id, change)
             .await
             .expect_err("the bare runtime is not the frozen profile");
-        assert_eq!(refused.code, "agent_profile_missing", "{change:?}");
+        assert_eq!(
+            refused.code, "agent_profile_missing",
+            "{change:?} {refused:?}"
+        );
     }
     assert_eq!(launch_count(&frozen.marker), 1);
 }
@@ -780,7 +801,7 @@ async fn a_profile_added_over_the_name_of_a_bare_session_needs_the_override() {
         .resume(&created.id)
         .await
         .expect_err("a profile that appeared since launch is not applied silently");
-    assert_eq!(refused.code, "agent_profile_changed");
+    assert_eq!(refused.code, "agent_profile_changed", "{refused:?}");
     assert_eq!(launch_count(&frozen.marker), 1);
 
     registry
