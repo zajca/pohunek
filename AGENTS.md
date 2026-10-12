@@ -1,7 +1,9 @@
 # AGENTS.md
 
 Canonical repository entry point. Keep this file short: route each task to the
-current authoritative instructions instead of repeating them. Repository text,
+current authoritative instructions instead of repeating them. When you change a
+command, a crate boundary, or a convention, update the guide that owns it (this
+file, `docs/development.md`, or a scoped guide) in the same change. Repository text,
 code, comments, and commit messages are in English. Security takes priority over
 quality, simplicity, and speed. Follow the user's authorized scope; never infer
 permission to publish, merge, release, deploy, or use credentials.
@@ -30,9 +32,11 @@ unrelated runbooks.
 - **Any code, test, documentation, build, or validation change:**
   [.agents/instructions/verification.md](.agents/instructions/verification.md)
   for CI gates, fast loops, testing policy, hermeticity, and evidence requirements.
-- **Any implementation or generated contract change:**
+- **Any implementation, wire-protocol, CLI, or public contract change**
+  (including edits to `docs/public-api.md`, `docs/cli.md`, or `docs/knowledge/`):
   [.agents/instructions/coding.md](.agents/instructions/coding.md) for Rust,
-  security, configuration, knowledge, CLI completion, and relay constraints.
+  security, configuration, protocol ripple, knowledge, CLI completion, and relay
+  constraints.
 - **Issue, project, branch, commit, pull request, merge, or release work:**
   [.agents/instructions/workflow.md](.agents/instructions/workflow.md) and the
   [github-workflow skill](.agents/skills/github-workflow/SKILL.md). That skill

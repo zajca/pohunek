@@ -66,15 +66,6 @@ issue before changing Git state. Its executable checks run with
   and review before merge; see `pr-handoff` and `deliver-issue` for the steps.
 - **Commits are never signed.** Use clean, concise, English messages. Do not add
   a `Co-Authored-By` trailer or any "generated with" footer.
-- Keep changes scoped. If you touch the wire protocol (`crates/protocol`), expect
-  ripples in `client`, `daemon`, and `cli`, and into `docs/public-api.md` and the
-  `docs/knowledge/` bundle — update all of them and run their checks. A non-additive wire change
-  (rename, moved field) bumps `PROTOCOL_VERSION`, adds the edge adapter for the
-  version it leaves behind in `crates/protocol/src/compat/` with golden fixtures
-  and consumer recordings produced by that release's own code, and deletes the
-  oldest adapter in the same change. A semantic change (new required parameter,
-  removed method or event, changed error code or meaning) cannot be adapted: it
-  also raises `MIN_PROTOCOL_VERSION` and is announced as a break. A method added after the previous release is listed in the adapter's `INTRODUCED_METHODS` so older connections get `method_not_found`.
 - Run the applicable full gate set once on the final revision before declaring
   done; iterate on affected checks in between (see the [testing policy](verification.md#testing-policy)). Report
   failures honestly with output; never claim green without running it.

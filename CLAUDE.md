@@ -18,4 +18,6 @@ scoped instructions; do not maintain a second copy of repository policy here.
   canonical files; edit only `.agents/skills/`.
 
 Host-level instructions may add constraints. They do not replace this
-repository's security, compatibility, testing, and authorization requirements.
+repository's security, compatibility, testing, and authorization requirements,
+and the testing policy in `.agents/instructions/verification.md` takes
+precedence over a host rule that asks for tests for all new code.

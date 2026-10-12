@@ -1,4 +1,4 @@
-# Project is
+# Project
 
 `pohunek` is an **owner-first control plane for durable coding-agent sessions**
 across the operator's own machines. A Rust daemon (`pohunekd`) owns the logical

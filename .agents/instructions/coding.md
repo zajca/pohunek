@@ -32,6 +32,18 @@
   option for behavior they own, but an added scenario must itself meet the
   integration/E2E boundary — appending to an existing suite does not exempt a
   test from it, and never adds unit-tier tests to those suites.
+- **Wire protocol changes ripple.** Keep changes scoped. If you touch the wire
+  protocol (`crates/protocol`), expect ripples in `client`, `daemon`, and `cli`,
+  and into `docs/public-api.md` and the `docs/knowledge/` bundle — update all of
+  them and run their checks. A non-additive wire change (rename, moved field)
+  bumps `PROTOCOL_VERSION`, adds the edge adapter for the version it leaves
+  behind in `crates/protocol/src/compat/` with golden fixtures and consumer
+  recordings produced by that release's own code, and deletes the oldest adapter
+  in the same change. A semantic change (new required parameter, removed method
+  or event, changed error code or meaning) cannot be adapted: it also raises
+  `MIN_PROTOCOL_VERSION` and is announced as a break. A method added after the
+  previous release is listed in the adapter's `INTRODUCED_METHODS` so older
+  connections get `method_not_found`.
 - **Keep the assistant knowledge bundle current.** `docs/knowledge/` is the
   hand-authored source for the Universal Pohunek Assistant (materialized via
   `assistant.materialize`). Whenever a change alters something the bundle
@@ -40,7 +52,9 @@
   rule, the public-API surface in `docs/public-api.md`, or a path listed in
   `docs/knowledge/assistant/source-map.md` — update the matching knowledge
   file(s) in the *same* change and re-run `cargo xtask docs check`. A stale
-  bundle is treated like stale code, not a follow-up.
+  bundle is treated like stale code, not a follow-up. If unsure whether a change
+  is assistant-visible, check whether any file under `docs/knowledge/` mentions
+  the surface you changed.
 - **Keep shell completion synchronized with the CLI.** The clap command tree is
   the source of truth for generated Bash, Zsh, and Fish completion; never
   hand-maintain generated shell scripts. Every command, subcommand, flag, or

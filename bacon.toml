@@ -1,6 +1,7 @@
 #:schema https://dystroy.org/bacon/.bacon.schema.json
 #
-# Watcher configuration for the narrow local loops documented in AGENTS.md
+# Watcher configuration for the narrow local loops documented in
+# .agents/instructions/verification.md ("Fast loops")
 # (issue #127). Bacon is an optional developer tool: no CI gate and no
 # `cargo xtask` target depends on this file, and every job below only re-runs a
 # command that is already documented and usable on its own.

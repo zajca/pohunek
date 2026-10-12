@@ -65,7 +65,7 @@ change can affect daemon/worker behavior.
    workspace-wide inputs (`Cargo.toml`, `Cargo.lock`, `.config/nextest.toml`,
    the CI workflow) re-runs the whole set. The reported set must hold for the
    final revision: every step's evidence was produced on inputs identical to
-   it ([testing policy](../../instructions/verification.md#testing-policy)).
+   it (testing policy (`.agents/instructions/verification.md#testing-policy`)).
 3. Report a compact status per gate (pass / fail + first failing lines, or
    explicitly skipped with why). Say plainly what actually ran. If all pass,
    say so plainly; if any fail or were skipped, say which and why, with output.

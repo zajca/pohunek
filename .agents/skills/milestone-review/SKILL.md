@@ -40,7 +40,7 @@ issue via the `github-workflow` skill.
    verdict (met / partial / missing) with concrete `path:line` evidence. Read the
    applicable `.agents/rust-guidelines/` files so review comments match the
    repo's conventions (typed errors, no silent defaults, documented magic values,
-   `M-CANONICAL-DOCS`, and the [testing policy](../../instructions/verification.md#testing-policy)
+   `M-CANONICAL-DOCS`, and the testing policy (`.agents/instructions/verification.md#testing-policy`)
    — a missing regression scenario for a bug or lifecycle fix is a
    gap, and a new unit test (an isolated component or per-function scenario,
    whatever file it lives in) is itself a finding; a missing unit test is

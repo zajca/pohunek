@@ -4,7 +4,7 @@
 # coding agents; a daemon controls them and serves a local newline-delimited
 # JSON API to clients.
 #
-# Layout and crate choices are summarized in AGENTS.md and the architecture
+# Layout and crate choices are summarized in docs/development.md and the architecture
 # documents under docs/.
 [workspace]
 resolver = "2"

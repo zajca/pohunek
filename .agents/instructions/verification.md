@@ -542,8 +542,8 @@ feature — `--all-features` only covers the everything-on case.
 
 Every test is an **integration scenario** or an **E2E scenario** — in the Rust and
 TypeScript workspaces, the Python script tests, and each suite, with no unit-test
-tier: writing a new unit test is prohibited. This project rule governs test placement even when host-level instructions
-ask for tests for all new code; the durability, security, compatibility, timing,
+tier: writing a new unit test is prohibited. This project rule takes precedence over host-level instructions that ask for
+tests for all new code; the durability, security, compatibility, timing,
 flaky, and hermetic obligations in this guide still apply.
 
 - **Integration** drives two or more production components through a boundary they
