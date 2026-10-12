@@ -1517,6 +1517,117 @@ pub(super) async fn wait_for_file_contains(path: &std::path::Path, needle: &str)
     .await
 }
 
+/// Waits for the terminal event of session `id`.
+///
+/// A session reads as terminal as soon as `record_exit` commits the exit, but
+/// that call still writes the store afterwards. The terminal `session_updated`
+/// or `session_stopped` event is its last step, so once the event arrives the
+/// `record_exit` that committed the exit has made its last write. After a
+/// `stop`, the wait must follow its return: the stop makes its own last write
+/// after the commit that may emit the event.
+///
+/// After a natural exit the exit watcher is the only committer, so this
+/// registry writes nothing more for the exit. After a `stop`, the watcher
+/// that lost the commit to the stop can still be inside its own
+/// `record_exit`, whose conditional write lands after the event and emits
+/// nothing, and it loads its write base separately, so neither the event nor
+/// the store lock orders it before a later write. After a stop a test uses
+/// [`drop_settled`] to open another registry or `Store` over the same file,
+/// or [`stop_settled`] to keep writing through this registry.
+///
+/// `events` must be subscribed before the exit commits, or its terminal event
+/// is never received.
+///
+/// # Panics
+///
+/// Panics when the receiver lagged past the terminal event or no terminal
+/// event arrives within [`HANG_GUARD`].
+pub(super) async fn exit_settled(
+    events: &mut tokio::sync::broadcast::Receiver<Event>,
+    id: &SessionId,
+) {
+    guard(&format!("the terminal event of session {}", id.0), async {
+        loop {
+            let event = events
+                .recv()
+                .await
+                .expect("the event receiver keeps up with the registry");
+            if !matches!(
+                event.event(),
+                protocol::event::SESSION_UPDATED | protocol::event::SESSION_STOPPED
+            ) {
+                continue;
+            }
+            let info: SessionInfo = serde_json::from_value(event.payload()["session"].clone())
+                .expect("session info payload");
+            if info.id == *id && info.state.is_terminal() {
+                return;
+            }
+        }
+    })
+    .await;
+}
+
+/// Waits after a `stop` of session `id` until no task of `registry` but the
+/// caller's handle remains, so an exit watcher that lost the commit to the
+/// stop has made its last write.
+///
+/// `registry` must run no other session, and the caller must hold no other
+/// handle to it, or the wait never ends.
+///
+/// # Panics
+///
+/// Panics as [`exit_settled`] does, and when another handle remains after
+/// [`HANG_GUARD`].
+pub(super) async fn stop_settled(
+    registry: &SessionRegistry,
+    events: &mut tokio::sync::broadcast::Receiver<Event>,
+    id: &SessionId,
+) {
+    exit_settled(events, id).await;
+    wait_until(
+        &format!("the tasks of the registry of session {} to end", id.0),
+        || {
+            let quiet = Arc::strong_count(&registry.inner) == 1;
+            async move { quiet.then_some(()) }
+        },
+    )
+    .await;
+}
+
+/// Drops `registry` once nothing of it can write the store any more.
+///
+/// Waits for the terminal event of session `id` as [`exit_settled`] does, then
+/// drops `registry` and waits until every task holding a handle to it has
+/// ended, which includes an exit watcher that lost the commit to a stop. A
+/// registry or `Store` opened next over the same file then races no write of
+/// this one.
+///
+/// Every session of `registry` must have ended and the caller must hold no
+/// other handle to it, or its tasks never let it go.
+///
+/// # Panics
+///
+/// Panics as [`exit_settled`] does, and when the registry is still held after
+/// [`HANG_GUARD`].
+pub(super) async fn drop_settled(
+    registry: SessionRegistry,
+    events: &mut tokio::sync::broadcast::Receiver<Event>,
+    id: &SessionId,
+) {
+    exit_settled(events, id).await;
+    let state = Arc::downgrade(&registry.inner);
+    drop(registry);
+    wait_until(
+        &format!("the tasks of the registry of session {} to end", id.0),
+        || {
+            let released = state.upgrade().is_none();
+            async move { released.then_some(()) }
+        },
+    )
+    .await;
+}
+
 async fn wait_for_line_count(path: &std::path::Path, expected: usize) -> String {
     wait_until(
         &format!(
@@ -10239,14 +10350,18 @@ async fn concurrent_equal_generation_commits_publish_only_the_durable_winner() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
-        store_path: Some(store_path.clone()),
+        store_path: Some(store_path),
         ..SessionRegistryConfig::default()
     });
     let created = registry
         .create(params())
         .await
         .expect("create base session");
+    // The stop's exit settles before the entry is taken over, so its terminal
+    // event never reaches the subscription whose first event is asserted.
+    let mut exit_events = registry.subscribe();
     registry.stop(&created.id).await.expect("stop base session");
+    stop_settled(&registry, &mut exit_events, &created.id).await;
     let base = registry
         .inner
         .sessions
@@ -10270,7 +10385,9 @@ async fn concurrent_equal_generation_commits_publish_only_the_durable_winner() {
         .expect("preparing runtime")
         .worker_instance_id = None;
     preparing.runtime.worker_instance_id = None;
-    let store = crate::store::Store::new(store_path);
+    // The registry's own store: its write lock serializes this write against
+    // the late conditional write of an exit watcher that lost to the stop.
+    let store = registry.inner.store.clone().expect("registry store");
     assert_eq!(
         store.record_session(&preparing).expect("persist preparing"),
         crate::store::SessionWriteOutcome::Applied
@@ -10328,7 +10445,11 @@ async fn stale_runtime_watchers_emit_nothing_during_new_runtime_commit() {
         .create(params())
         .await
         .expect("create base session");
+    // The stop's exit settles before the entry is taken over, so its terminal
+    // event never reaches the subscription below.
+    let mut exit_events = registry.subscribe();
     registry.stop(&created.id).await.expect("stop base session");
+    stop_settled(&registry, &mut exit_events, &created.id).await;
     let base = registry
         .inner
         .sessions
@@ -12871,10 +12992,12 @@ async fn resume_after_profile_edit_and_resize_uses_original_snapshot() {
         .expect("resume binding exists");
     assert_eq!((binding.cols, binding.rows), (123, 55));
 
+    let mut events = registry.subscribe();
     registry
         .stop(&created.id)
         .await
         .expect("stop original session after snapshot capture");
+    drop_settled(registry, &mut events, &created.id).await;
     fs::write(&marker_v1, "").expect("clear v1 marker");
     fs::write(
         agents_dir.join("editable.toml"),
@@ -15952,10 +16075,11 @@ async fn reconciled_create_whose_worker_ended_is_retired_then_compensated() {
         .await
         .expect("create session");
     let launched = stored_record(&daemon.store_path, &created.id).runtime;
+    let mut events = registry.subscribe();
     registry.stop(&created.id).await.expect("stop session");
     let worktree = created.worktree_path.clone().expect("bound worktree");
     registry.begin_daemon_shutdown();
-    drop(registry);
+    drop_settled(registry, &mut events, &created.id).await;
     // The daemon died after the worker ran, before it committed the create:
     // the worker still serves the final output of the ended runtime.
     let mut record = stored_record(&daemon.store_path, &created.id);
@@ -17822,12 +17946,13 @@ async fn durable_bindings_without_a_live_session_still_retain_the_package() {
         .create(packaged_params(&dir))
         .await
         .expect("create a package session");
+    let mut events = first.subscribe();
     gate.write_all(b"go\n").expect("release the exit gate");
     first
         .wait_for_exit(&created.id, HANG_GUARD)
         .await
         .expect("session exits");
-    drop(first);
+    drop_settled(first, &mut events, &created.id).await;
 
     // A registry that holds no session in memory reads the same durable store.
     let second = packaged.registry(&store_path);

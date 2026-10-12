@@ -1,6 +1,6 @@
 //! Helpers shared by the real supervisor backend tests.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-10-12
 
 use std::sync::{Arc, Mutex};
 
@@ -30,7 +30,17 @@ impl LogCapture {
     ///
     /// Only valid on a current-thread runtime, where every `.await` of the
     /// test resumes on the thread that installed it.
+    ///
+    /// A process-wide anchor dispatcher is registered first. With a single
+    /// registered dispatcher, `tracing` computes a callsite's interest from
+    /// the dispatcher of whichever thread reaches the callsite first, and a
+    /// thread without a default turns that into a cached "never" for every
+    /// other thread. With the anchor present at least two dispatchers are
+    /// registered, so interest is combined over all of them and the
+    /// per-event check consults the emitting thread's own default.
     pub(crate) fn install(&self) -> tracing::subscriber::DefaultGuard {
+        static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new()));
         let writer = self.clone();
         tracing::subscriber::set_default(
             tracing_subscriber::fmt()

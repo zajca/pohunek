@@ -1,7 +1,7 @@
 //! Behavioural tests of compatibility-gated selection over a real plugin root,
 //! real archives, real agent processes and a real session registry.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 use std::fs;
 use std::io::Write as _;
@@ -18,7 +18,9 @@ use protocol::{
 
 use super::selection::{Declared, Integration, Integrations};
 use super::test_fixture::{explicit, Fixture, Package, INERT_PROGRAM, PACKAGE, RUNTIME};
-use crate::session::tests::{assigned_agent_script, params, temp_dir, temp_store_path};
+use crate::session::tests::{
+    assigned_agent_script, exit_settled, params, temp_dir, temp_store_path,
+};
 
 /// Handler and schema of an integration that reports subagents.
 const SUBAGENT: (&str, &str) = ("codex-hook-v1", "identity-subagent-v1");
@@ -611,12 +613,18 @@ async fn the_verdict_is_recomputed_from_the_registry_and_the_sessions_after_a_re
         .create(new_params(&v.dir))
         .await
         .expect("create");
+    let mut events = v.fixture.registry.subscribe();
     v.gate.write_all(b"go\n").expect("release the exit gate");
     v.fixture
         .registry
         .wait_for_exit(&created.id, HANG_GUARD)
         .await
         .expect("the session exits");
+    // The restarted daemon and the direct store writes below share the store
+    // of this registry, which stays alive in the fixture. The exit is natural,
+    // so its watcher is the only committer and its terminal event is its last
+    // write.
+    exit_settled(&mut events, &created.id).await;
     let new = update("2.0.0", Some(IDENTITY));
     install(&v.fixture, &new, true).await;
 
