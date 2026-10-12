@@ -2456,11 +2456,10 @@ async fn initial_input_waits_for_reader(warning_first: bool, stale_mode_first: b
     let reader_socket = socket.dir.join("reader.sock");
     let reader = UnixListener::bind(&reader_socket).expect("bind fake reader gate");
     let received = socket.dir.join("received.bin");
-    let fake = agents_dir.join("reader.py");
+    let script = agents_dir.join("reader.py");
+    let fake = agents_dir.join("reader");
     let fake_source = format!(
-        r#"#!/usr/bin/python3
-{version}
-import os
+        r#"import os
 import select
 import socket
 import termios
@@ -2505,13 +2504,16 @@ gate.sendall(b"f")
 while True:
     os.read(0, 1)
 "#,
-        version = official_runtimes::python_version_answer("claude"),
         reader_socket = reader_socket.display().to_string(),
         received = received.display().to_string(),
         warning_first = if warning_first { "True" } else { "False" },
         stale_mode_first = if stale_mode_first { "True" } else { "False" },
     );
-    write_executable(&fake, &fake_source);
+    std::fs::write(&script, fake_source).expect("write Claude reader script");
+    write_executable(
+        &fake,
+        &official_runtimes::python_agent_launcher("claude", &script),
+    );
     std::fs::write(
         agents_dir.join("readerclaude.toml"),
         format!(
@@ -2542,8 +2544,14 @@ while True:
     "readerclaude".clone_into(&mut params.agent);
     params.input = Some("hello reader".to_owned());
     params.extended_input_ready_wait = Some(true);
-    let create = tokio::spawn(async move { create_session_with_params(&mut client, params).await });
-    let (mut gate, _) = reader.accept().await.expect("fake agent connects to gate");
+    let mut create =
+        tokio::spawn(async move { create_session_with_params(&mut client, params).await });
+    // A refused `session.new` never starts the fake agent, so its answer ends
+    // the wait for the gate instead of leaving it pending.
+    let (mut gate, _) = tokio::select! {
+        accepted = reader.accept() => accepted.expect("fake agent connects to gate"),
+        refused = &mut create => panic!("session.new answered before the fake agent started: {refused:?}"),
+    };
     let mut started = [0];
     gate.read_exact(&mut started)
         .await
@@ -2700,13 +2708,12 @@ async fn default_sdk_client_waits_for_initial_input_without_reader_signal() {
     let agents_dir = socket.dir.join("agents");
     std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
     let received = socket.dir.join("received.bin");
-    let fake = agents_dir.join("silent-reader.py");
-    write_executable(
-        &fake,
-        &format!(
-            r#"#!/usr/bin/python3
-{version}
-import os
+    let script = agents_dir.join("silent-reader.py");
+    let fake = agents_dir.join("silent-reader");
+    std::fs::write(
+        &script,
+        format!(
+            r#"import os
 import tty
 
 tty.setraw(0)
@@ -2718,9 +2725,13 @@ with open({received:?}, "wb") as capture:
 while True:
     os.read(0, 1)
 "#,
-            version = official_runtimes::python_version_answer("claude"),
             received = received.display().to_string(),
         ),
+    )
+    .expect("write silent reader script");
+    write_executable(
+        &fake,
+        &official_runtimes::python_agent_launcher("claude", &script),
     );
     std::fs::write(
         agents_dir.join("silentreader.toml"),
@@ -2948,12 +2959,11 @@ async fn waited_input_with_host_submit_delay(
     };
     let received = socket.dir.join("waited-input.bin");
     let ready = socket.dir.join("waited-input-ready");
-    write_executable(
-        &bin_dir.join(agent_name),
-        &format!(
-            r#"#!/usr/bin/python3
-{version}
-import os
+    let script = socket.dir.join("waited-input.py");
+    std::fs::write(
+        &script,
+        format!(
+            r#"import os
 import tty
 
 tty.setraw(0)
@@ -2970,10 +2980,14 @@ os.write(1, b"\x1b]2;Action Required\x07")
 while True:
     os.read(0, 1)
 "#,
-            version = official_runtimes::python_version_answer(agent_name),
             received = received.display().to_string(),
             ready = ready.display().to_string()
         ),
+    )
+    .expect("write waited-input script");
+    write_executable(
+        &bin_dir.join(agent_name),
+        &official_runtimes::python_agent_launcher(agent_name, &script),
     );
     let mut config = support::hermetic_registry_config();
     config.host_submit_delay = Some(host_delay);

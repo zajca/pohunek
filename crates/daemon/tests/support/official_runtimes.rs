@@ -8,7 +8,8 @@
 //!
 //! The installed descriptors keep their version probe, so every fake agent a
 //! test launches as `codex` or `claude` answers `--version` with
-//! [`supported_banner`] before it does anything else.
+//! [`supported_banner`] before it does anything else; a fake written in Python
+//! runs behind [`python_agent_launcher`].
 
 #![allow(
     dead_code,
@@ -191,12 +192,18 @@ pub(crate) fn sh_version_answer(runtime: &str) -> String {
     )
 }
 
-/// Python lines that answer the version probe of the official `runtime`
-/// package with [`supported_banner`] and exit, for the top of a fake agent.
-pub(crate) fn python_version_answer(runtime: &str) -> String {
+/// A POSIX shell launcher for a fake `runtime` agent written in Python: it
+/// answers the version probe of the official package with
+/// [`supported_banner`] and otherwise runs `script` with its arguments.
+///
+/// The probe runs under a short budget in an empty environment with a fresh
+/// home and temporary directory, where an interpreter start (the macOS
+/// `/usr/bin/python3` shim) can be slow or fail; the shell answers within it.
+pub(crate) fn python_agent_launcher(runtime: &str, script: &Path) -> String {
     format!(
-        "import sys\nif sys.argv[1:] == [\"--version\"]:\n    print({:?})\n    sys.exit(0)\n",
-        supported_banner(runtime)
+        "#!/bin/sh\n{}exec /usr/bin/python3 '{}' \"$@\"\n",
+        sh_version_answer(runtime),
+        script.display()
     )
 }
 
