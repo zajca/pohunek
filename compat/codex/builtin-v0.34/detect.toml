@@ -1,0 +1,78 @@
+# Golden copy of crates/daemon/src/detect/manifests/codex.toml at tag v0.34.2.
+# Do not edit: the parity tests compare the runtime package with these bytes.
+
+# Codex activity manifest.
+#
+# Ported from herdr's Codex manifest into the daemon's M5 schema. Unsupported
+# herdr fields (`visible_working`, `visible_idle`, `skip_state_update`) and the
+# `unknown` transcript-viewer rule are intentionally omitted.
+
+[process]
+comm = ["^codex$"]
+cmdline = ['(^|/)codex($| )']
+
+[[rules]]
+id = "osc_title_blocked"
+state = "blocked"
+priority = 1100
+region = "osc_title"
+visible_blocker = true
+contains = ["Action Required"]
+
+[[rules]]
+id = "osc_title_working"
+state = "working"
+priority = 1050
+region = "osc_title"
+regex = ['^[\x{2800}-\x{28FF}] ']
+
+# The first-run workspace trust dialog is pinned at the top of the visible
+# screen. Require the exact question and both numbered choices so transcript
+# prose that merely discusses trusting a repository cannot trigger the rule.
+[[rules]]
+id = "workspace_trust_prompt"
+state = "blocked"
+priority = 1000
+region = "top_non_empty_lines(8)"
+visible_blocker = true
+all = [
+  { line_regex = ['(?i)^\s*(?:do you )?trust (?:the contents of this directory|this repository)\?\s*$'] },
+  { line_regex = ['(?i)^\s*(?:›|❯)?\s*1\.\s*yes\b'] },
+  { line_regex = ['(?i)^\s*2\.\s*no\b'] },
+]
+
+[[rules]]
+id = "live_strong_blocker"
+state = "blocked"
+priority = 900
+region = "after_last_prompt_marker"
+visible_blocker = true
+any = [
+  { contains = ["press enter to confirm or esc to cancel"] },
+  { contains = ["enter to submit answer"] },
+  { contains = ["enter to submit all"] },
+  { contains = ["allow command?"] },
+]
+
+[[rules]]
+id = "weak_blocker"
+state = "blocked"
+priority = 600
+region = "whole_recent"
+any = [
+  { contains = ["[y/n]"] },
+  { contains = ["yes (y)"] },
+  { contains = ["do you want to"], any = [{ contains = ["yes"] }, { contains = ["❯"] }] },
+  { contains = ["would you like to"], any = [{ contains = ["yes"] }, { contains = ["❯"] }] },
+]
+
+[[rules]]
+id = "osc_title_idle"
+state = "idle"
+priority = 100
+region = "osc_title"
+regex = ['\S']
+not = { any = [
+  { regex = ['^[\x{2800}-\x{28FF}]'] },
+  { contains = ["Action Required"] },
+] }

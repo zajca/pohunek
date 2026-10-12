@@ -2,14 +2,14 @@
 //!
 //! Pure tests always run: they build the package directory, parse it through
 //! the same path `plugin install` uses, compare it with the built-in Claude
-//! descriptor and detection manifest, and check it against the compatibility
-//! lock and the screens captured from a real Claude Code
-//! (`compat/claude/screens`). The daemon-backed tests install the built archive
-//! through `pohunek plugin install --catalog` against a throwaway signing key
-//! and trust anchor, so the package serves `claude` with official trust. The
-//! real-Claude tests additionally drive an actual `claude` binary against a
-//! loopback Messages stub with a throwaway home; see their documentation for
-//! the opt-in.
+//! descriptor and detection manifest release v0.34.2 shipped (golden copies in
+//! `compat/claude/builtin-v0.34`), and check it against the compatibility lock
+//! and the screens captured from a real Claude Code (`compat/claude/screens`).
+//! The daemon-backed tests install the built archive through `pohunek plugin
+//! install --catalog` against a throwaway signing key and trust anchor, so the
+//! package serves `claude` with official trust. The real-Claude tests
+//! additionally drive an actual `claude` binary against a loopback Messages
+//! stub with a throwaway home; see their documentation for the opt-in.
 
 // Rust guideline compliant 2026-10-12
 
@@ -19,13 +19,14 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use package::directory::build_directory_archive;
 use package::{read_archive, CatalogEntry, Limits, PackageDigest};
 use pohunek_daemon::agent::host::{
-    definition_from_archive, BuiltinSource, HandlerId, LaunchProgram, ProbeVersion,
-    RuntimeDefinition, RuntimeSource, TranscriptParser,
+    definition_from_archive, DefinitionError, DefinitionOrigin, HandlerId, LaunchProgram,
+    ProbeVersion, RuntimeDefinition, TranscriptParser,
 };
 use pohunek_daemon::agent::{NativeReferenceStrategy, SessionRef};
 use pohunek_daemon::catalog_anchor::CatalogTrust;
@@ -74,15 +75,25 @@ const BUILTIN_DESCRIPTOR: &str = "crates/daemon/src/agent/builtin/claude.toml";
 /// Built-in Claude detection manifest, relative to the workspace root.
 const BUILTIN_MANIFEST: &str = "crates/daemon/src/detect/manifests/claude.toml";
 
+/// Release whose built-in Claude descriptor and manifest the goldens copy.
+const GOLDEN_TAG: &str = "v0.34.2";
+
+/// Golden copy of [`BUILTIN_DESCRIPTOR`] at [`GOLDEN_TAG`], relative to the
+/// workspace root.
+const GOLDEN_DESCRIPTOR: &str = "compat/claude/builtin-v0.34/runtime.toml";
+
+/// Golden copy of [`BUILTIN_MANIFEST`] at [`GOLDEN_TAG`], relative to the
+/// workspace root.
+const GOLDEN_MANIFEST: &str = "compat/claude/builtin-v0.34/detect.toml";
+
+/// Name the golden descriptor's `detect_manifest` gives the built-in manifest.
+const GOLDEN_MANIFEST_NAME: &str = "claude";
+
 /// Package id the descriptor declares.
 const PACKAGE_ID: &str = "pohunek.runtime.claude";
 
 /// Version of the package the descriptor declares.
 const PACKAGE_VERSION: &str = "1.0.0";
-
-/// Shell program of the built-in source the parity tests load; Claude does not
-/// use it.
-const BUILTIN_SHELL: &str = "/bin/sh";
 
 fn package_dir() -> PathBuf {
     workspace_root().join(PACKAGE_DIR)
@@ -107,14 +118,40 @@ fn installed_definition() -> RuntimeDefinition {
         .expect("the daemon accepts the package descriptor")
 }
 
-/// The Claude definition compiled into the daemon.
-fn builtin_definition() -> RuntimeDefinition {
-    BuiltinSource::new(BUILTIN_SHELL)
-        .load()
-        .expect("the built-in definitions load")
-        .into_iter()
-        .find(|definition| definition.runtime_id().as_str() == "claude")
-        .expect("the daemon embeds a Claude definition")
+/// Contents of the golden file `golden` below its header.
+///
+/// The header names `source`, the file the golden copies, and [`GOLDEN_TAG`];
+/// the rest of the file is that source's bytes at the tag.
+fn golden_body(golden: &str, source: &str) -> String {
+    let text = fs::read_to_string(workspace_root().join(golden)).expect("read the golden");
+    let header = format!(
+        "# Golden copy of {source} at tag {GOLDEN_TAG}.\n\
+         # Do not edit: the parity tests compare the runtime package with these bytes.\n\n"
+    );
+    text.strip_prefix(&header)
+        .unwrap_or_else(|| panic!("{golden} starts with its header naming {source}"))
+        .to_owned()
+}
+
+/// The built-in Claude definition release v0.34.2 shipped, parsed from the
+/// goldens the way the daemon parses its embedded descriptors.
+fn golden_definition() -> RuntimeDefinition {
+    let manifest = Manifest::parse_str(&golden_body(GOLDEN_MANIFEST, BUILTIN_MANIFEST))
+        .expect("the golden manifest parses");
+    RuntimeDefinition::from_toml(
+        &golden_body(GOLDEN_DESCRIPTOR, BUILTIN_DESCRIPTOR),
+        |package| DefinitionOrigin::Builtin {
+            package: Some(package),
+        },
+        |name| {
+            if name == GOLDEN_MANIFEST_NAME {
+                Ok(Arc::new(manifest))
+            } else {
+                Err(DefinitionError::UnknownManifest)
+            }
+        },
+    )
+    .expect("the golden descriptor parses")
 }
 
 fn read_lock() -> Value {
@@ -449,43 +486,48 @@ fn the_descriptor_declares_the_verified_claude_launch_contract() {
     );
 }
 
-/// The package keeps every fact the built-in Claude descriptor carries; only
-/// the manifest source and the version probe differ.
+/// The package keeps every fact the built-in Claude descriptor of release
+/// v0.34.2 carries; only the manifest source, the version probe and the
+/// transcript tree, which that descriptor does not declare, differ.
 #[test]
 fn the_package_descriptor_preserves_every_builtin_claude_fact() {
     let package = installed_definition();
-    let builtin = builtin_definition();
+    let golden = golden_definition();
 
-    assert_eq!(package.runtime_id(), builtin.runtime_id());
-    assert_eq!(package.display_name(), builtin.display_name());
-    assert_eq!(package.program(), builtin.program());
-    assert_eq!(package.default_args(), builtin.default_args());
-    assert_eq!(package.input_rules(), builtin.input_rules());
+    assert_eq!(package.runtime_id(), golden.runtime_id());
+    assert_eq!(package.display_name(), golden.display_name());
+    assert_eq!(package.program(), golden.program());
+    assert_eq!(package.default_args(), golden.default_args());
+    assert_eq!(package.input_rules(), golden.input_rules());
     assert_eq!(
         package.submit_delay_configurable(),
-        builtin.submit_delay_configurable()
+        golden.submit_delay_configurable()
     );
-    assert_eq!(package.prompt_arg(), builtin.prompt_arg());
-    assert_eq!(package.native(), builtin.native());
+    assert_eq!(package.prompt_arg(), golden.prompt_arg());
+    assert_eq!(package.native(), golden.native());
     assert_eq!(
         package.native_reference_strategy(),
-        builtin.native_reference_strategy()
+        golden.native_reference_strategy()
     );
-    assert_eq!(package.integration_handler(), builtin.integration_handler());
-    assert_eq!(package.hook_schema(), builtin.hook_schema());
-    assert_eq!(package.config_home(), builtin.config_home());
-    assert_eq!(package.transcripts(), builtin.transcripts());
+    assert_eq!(package.integration_handler(), golden.integration_handler());
+    assert_eq!(package.hook_schema(), golden.hook_schema());
+    assert_eq!(package.config_home(), golden.config_home());
+    assert!(
+        golden.transcripts().is_none(),
+        "v0.34.2 declares no transcript tree"
+    );
+    assert!(package.transcripts().is_some());
 
     assert!(
-        builtin.version_probe_policy().is_none(),
-        "the built-in declares no probe"
+        golden.version_probe_policy().is_none(),
+        "v0.34.2 declares no probe"
     );
     assert!(package.version_probe_policy().is_some());
 }
 
-/// The same facts as data: the two descriptor files are equal tables once the
-/// manifest reference and the version probe, the two fields that differ by
-/// design, are removed.
+/// The same facts as data: the package descriptor and the golden built-in
+/// descriptor are equal tables once the manifest reference, the version probe
+/// and the transcript tree, the fields that differ by design, are removed.
 #[test]
 fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
     let strip = |mut table: toml::Table| {
@@ -497,9 +539,7 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
         runtime.remove("version_probe");
         table
     };
-    let package = strip(read_toml(&format!("{PACKAGE_DIR}/runtime.toml")));
-    let builtin = strip(read_toml(BUILTIN_DESCRIPTOR));
-    assert_eq!(package, builtin);
+    let mut package = strip(read_toml(&format!("{PACKAGE_DIR}/runtime.toml")));
     for section in [
         "input",
         "resume",
@@ -511,15 +551,45 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
     ] {
         assert!(package.contains_key(section), "[{section}] is declared");
     }
+    let transcripts = package.remove("transcripts").expect("[transcripts]");
+    let golden_text = golden_body(GOLDEN_DESCRIPTOR, BUILTIN_DESCRIPTOR);
+    let golden: toml::Table = golden_text.parse().expect("the golden is TOML");
+    assert!(
+        !golden.contains_key("transcripts"),
+        "v0.34.2 declares no transcript tree"
+    );
+    assert_eq!(package, strip(golden));
+
+    // Holds while the daemon embeds the built-in descriptor: its bytes are the
+    // golden bytes followed by the transcript tree the package declares.
+    let builtin_text = fs::read_to_string(workspace_root().join(BUILTIN_DESCRIPTOR))
+        .expect("read the built-in descriptor");
+    let tail: toml::Table = builtin_text
+        .strip_prefix(&golden_text)
+        .expect("the built-in descriptor starts with the golden bytes")
+        .parse()
+        .expect("the rest of the built-in descriptor is TOML");
+    assert_eq!(
+        tail,
+        toml::Table::from_iter([("transcripts".to_owned(), transcripts)])
+    );
 }
 
-/// The manifest file is the built-in manifest: same process matchers, same
-/// rules in the same order with the same fields.
+/// The manifest file is the golden built-in manifest of release v0.34.2: same
+/// process matchers, same rules in the same order with the same fields.
 #[test]
 fn the_package_manifest_file_equals_the_builtin_manifest_file() {
     let package = read_toml(&format!("{PACKAGE_DIR}/detect.toml"));
-    let builtin = read_toml(BUILTIN_MANIFEST);
-    assert_eq!(package, builtin);
+    let golden_text = golden_body(GOLDEN_MANIFEST, BUILTIN_MANIFEST);
+    let golden: toml::Table = golden_text.parse().expect("the golden is TOML");
+    assert_eq!(package, golden);
+    // Holds while the daemon embeds the built-in manifest: its bytes are the
+    // golden bytes.
+    assert_eq!(
+        fs::read_to_string(workspace_root().join(BUILTIN_MANIFEST))
+            .expect("read the built-in manifest"),
+        golden_text
+    );
     let ids: Vec<&str> = package["rules"]
         .as_array()
         .expect("rules")
@@ -1028,19 +1098,19 @@ fn the_process_matchers_accept_the_observed_claude_process_forms() {
     }
 }
 
-/// Everything the built-in manifest classifies, the package manifest
-/// classifies the same way: the captured frames with and without their titles,
-/// and the synthetic dialogs of the rule tests.
+/// Everything the golden built-in manifest of release v0.34.2 classifies, the
+/// package manifest classifies the same way: the captured frames with and
+/// without their titles, and the synthetic dialogs of the rule tests.
 #[test]
 fn the_package_manifest_behaves_like_the_builtin_manifest_on_every_frame() {
     let package = installed_definition();
-    let builtin = builtin_definition();
+    let golden = golden_definition();
     let mut compared = 0_usize;
     for frame in top_level_frames().into_iter().chain(width_frames()) {
         for title in [frame.title.as_deref(), None] {
             assert_eq!(
                 transitions(&package, title, &frame.rows, frame.columns),
-                transitions(&builtin, title, &frame.rows, frame.columns),
+                transitions(&golden, title, &frame.rows, frame.columns),
                 "{} with title {title:?}",
                 frame.name
             );
@@ -1067,7 +1137,7 @@ fn the_package_manifest_behaves_like_the_builtin_manifest_on_every_frame() {
     for lines in synthetic {
         assert_eq!(
             transitions(&package, None, &dialog(lines), 80),
-            transitions(&builtin, None, &dialog(lines), 80),
+            transitions(&golden, None, &dialog(lines), 80),
             "{lines:?}"
         );
         compared += 1;
@@ -1081,7 +1151,7 @@ fn the_package_manifest_behaves_like_the_builtin_manifest_on_every_frame() {
     ] {
         assert_eq!(
             title_activity(&package, title),
-            title_activity(&builtin, title),
+            title_activity(&golden, title),
             "{title:?}"
         );
         compared += 1;

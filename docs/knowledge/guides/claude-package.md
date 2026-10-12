@@ -28,14 +28,19 @@ archive ships the package as `runtime/packages/claude.tar.zst` with a signed
 [installing official packages](runtime-packages.md#install-official-packages-from-a-release)
 has the procedure. Until the built-in is removed (#146), the built-in
 descriptor, detection manifest and Claude handler serve `claude` on a host that
-has not installed the package, and the package tests keep the package equal to
-the built-in.
+has not installed the package.
 
 ## What the package declares
 
-Every fact below equals the built-in Claude descriptor
-(`crates/daemon/src/agent/builtin/claude.toml`), except the version probe, which
-only the package declares.
+Every fact below equals the built-in Claude descriptor release 0.34.2 shipped,
+except the version probe and the transcript tree (`[transcripts]`), which that
+descriptor does not declare. The package tests compare the package with golden
+copies of that descriptor and its detection manifest in
+`compat/claude/builtin-v0.34/` (`runtime.toml`, `detect.toml`). While the daemon
+embeds the built-in (`crates/daemon/src/agent/builtin/claude.toml` and
+`crates/daemon/src/detect/manifests/claude.toml`), they also check that the
+built-in manifest is the golden byte for byte and the built-in descriptor is
+the golden followed by the package's transcript tree.
 
 - Launch: `claude` with the first prompt as a trailing positional argument.
   Claude's Ink input takes text without bracketed paste; the submit key is a
@@ -193,8 +198,9 @@ established by the network namespace, not by Claude's own switches.
 - `crates/cli/tests/claude_package.rs` always runs: it builds the directory
   twice and requires identical bytes, parses it with the daemon's install
   parser, compares every descriptor fact and the whole manifest with the
-  built-in Claude files (as parsed definitions, as TOML data, and by feeding both
-  manifests every captured frame, title and synthetic dialog), checks resume and
+  v0.34.2 built-in Claude goldens in `compat/claude/builtin-v0.34/` (as parsed
+  definitions, as TOML data, and by feeding both manifests every captured frame,
+  title and synthetic dialog), checks resume and
   fork argv, requires the supported range to equal
   `compat/claude/compatibility-lock.json`, reads the version banner, runs the
   title, screen and process rules, and asserts the `--sha256` install refusal
