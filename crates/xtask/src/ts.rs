@@ -30,7 +30,8 @@ use protocol::{
     SessionWarning, SessionWarningKind, StateSource, SubagentInfo, SubagentLifecycle,
     SubagentRevision, TerminalCursor, TerminalDimensions, TerminalWatermark,
     CLIENT_PROTOCOL_VERSIONS, MAX_CONTROL_LINE_BYTES, MAX_SESSION_INPUT_BYTES,
-    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_WAIT_MS, MAX_WORKER_INSTANCE_ID_BYTES,
+    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_TURN_CURSOR_BYTES, MAX_SESSION_WAIT_MS,
+    MAX_SESSION_WAIT_TURN_MS, MAX_SESSION_WAIT_TURN_TARGETS, MAX_WORKER_INSTANCE_ID_BYTES,
     MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
 };
 use serde::Serialize;
@@ -344,7 +345,22 @@ fn emit_constants(dir: &Path) -> Result<(), XtaskError> {
     .expect("writing to a String cannot fail");
     writeln!(
         body,
-        "export const MAX_SESSION_WAIT_MS = {MAX_SESSION_WAIT_MS} as const;\n"
+        "export const MAX_SESSION_WAIT_MS = {MAX_SESSION_WAIT_MS} as const;"
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        body,
+        "export const MAX_SESSION_WAIT_TURN_MS = {MAX_SESSION_WAIT_TURN_MS} as const;"
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        body,
+        "export const MAX_SESSION_WAIT_TURN_TARGETS = {MAX_SESSION_WAIT_TURN_TARGETS} as const;"
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        body,
+        "export const MAX_SESSION_TURN_CURSOR_BYTES = {MAX_SESSION_TURN_CURSOR_BYTES} as const;\n"
     )
     .expect("writing to a String cannot fail");
 

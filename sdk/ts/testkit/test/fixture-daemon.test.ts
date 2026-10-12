@@ -12,7 +12,10 @@ import {
   type HostRecord,
   type ProtocolEvent,
   type SessionOutputParams,
+  type SessionTurnEventKind,
   type SessionWaitParams,
+  type SessionWaitTurnParams,
+  type SessionWaitTurnResult,
 } from "@pohunek/protocol";
 import {
   ClientError,
@@ -20,6 +23,7 @@ import {
   attachRawTcp,
   connectLocal,
   connectTcp,
+  type Client,
   type RawStream,
   type Request,
   type Subscription,
@@ -39,6 +43,16 @@ const RESIZED_ROWS = 30;
 const MISMATCHED_PROTOCOL_VERSION = PROTOCOL_VERSION + 1;
 const SOCKET_END_TIMEOUT_MS = 5_000;
 const INPUT_WAITER_POLL_INTERVAL_MS = 1;
+const ALL_TURN_KINDS: SessionTurnEventKind[] = ["turn_completed", "agent_blocked", "approval_required", "exited"];
+// Long enough that a wait expected to complete on an event never times out first.
+const TURN_EVENT_GUARD_MS = 30_000;
+// Short fixture-side waits whose expected outcome is a timeout; the test
+// asserts only the reason and progress, never the elapsed time.
+const SHORT_TURN_WAIT_MS = 20;
+// A client response deadline far below the turn waits it must not cut short.
+const SHORT_REQUEST_TIMEOUT_MS = 200;
+const LONG_TURN_WAIT_MS = SHORT_REQUEST_TIMEOUT_MS * 3;
+const TURN_WAIT_CEILING_MS = LONG_TURN_WAIT_MS * 2;
 const NON_UTF8_PAYLOAD = Uint8Array.of(0x00, 0xff, 0x80, 0x61, 0xc3, 0x28);
 const ABOVE_MAX_SAFE_U64 = "9007199254740993";
 const U64_MAX_WIRE = "18446744073709551615";
@@ -1000,6 +1014,422 @@ describe("@pohunek/testkit fixture daemon", () => {
     }
   });
 });
+
+describe("session.wait_turn through the SDK client against the fixture daemon", () => {
+  test("host inspection advertises turn waits", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("turn-caps") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      expect((await client.call("host.inspect", null)).session_wait_turn_supported).toBe(true);
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("chained waits return every event recorded between them and name its session", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("turn-chain") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const first = await newShellSession(client);
+      const second = await newShellSession(client);
+      const targets = [first, second];
+
+      // Edge-triggered: a turn that ended before the call is never returned.
+      daemon.scenario.recordTurnEvent(first, "turn_completed");
+      const initial = await client.sessionWaitTurn({
+        session_ids: targets,
+        until: ALL_TURN_KINDS,
+        timeout_ms: SHORT_TURN_WAIT_MS,
+      });
+      expect(initial.reason).toBe("timeout");
+      expect(initial.event).toBeUndefined();
+
+      // An event recorded while the wait is pending completes it.
+      const pending = client.sessionWaitTurn({
+        session_ids: targets,
+        until: ALL_TURN_KINDS,
+        after: initial.cursor,
+        timeout_ms: TURN_EVENT_GUARD_MS,
+      });
+      await waitForTurnWaiters(daemon, 1);
+      daemon.scenario.recordTurnEvent(second, "agent_blocked", "n-kept");
+      const blocked = await pending;
+      expect(blocked.reason).toBe("event");
+      expect(eventOf(blocked)).toEqual({ session_id: second, kind: "agent_blocked", notification_id: "n-kept" });
+      expect(blocked.progress.map((entry) => entry.session_id)).toEqual(targets);
+      expect(daemon.activeTurnWaiterCount).toBe(0);
+
+      // Events recorded between two chained waits come back oldest first.
+      daemon.scenario.recordTurnEvent(first, "turn_completed");
+      daemon.scenario.recordTurnEvent(second, "approval_required");
+      const next = await client.sessionWaitTurn({
+        session_ids: targets,
+        until: ALL_TURN_KINDS,
+        after: blocked.cursor,
+        timeout_ms: TURN_EVENT_GUARD_MS,
+      });
+      expect(next.reason).toBe("event");
+      expect(eventOf(next)).toEqual({ session_id: first, kind: "turn_completed", notification_id: undefined });
+      const last = await client.sessionWaitTurn({
+        session_ids: targets,
+        until: ALL_TURN_KINDS,
+        after: next.cursor,
+        timeout_ms: TURN_EVENT_GUARD_MS,
+      });
+      expect(last.reason).toBe("event");
+      expect(eventOf(last)).toEqual({ session_id: second, kind: "approval_required", notification_id: undefined });
+
+      // A kind outside `until` does not complete the wait, and the timeout
+      // cursor covers it so the next wait does not see it again.
+      daemon.scenario.recordTurnEvent(first, "agent_blocked");
+      const unselected = await client.sessionWaitTurn({
+        session_ids: targets,
+        until: ["turn_completed"],
+        after: last.cursor,
+        timeout_ms: SHORT_TURN_WAIT_MS,
+      });
+      expect(unselected.reason).toBe("timeout");
+      const after = await client.sessionWaitTurn({
+        session_ids: targets,
+        until: ALL_TURN_KINDS,
+        after: unselected.cursor,
+        timeout_ms: SHORT_TURN_WAIT_MS,
+      });
+      expect(after.reason).toBe("timeout");
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("a timeout returns progress for every target", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("turn-progress") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const working = await newShellSession(client);
+      const quiet = await newShellSession(client);
+      daemon.scenario.setAgentState(working, "working");
+      const first = await client.sessionWaitTurn({
+        session_ids: [working, quiet],
+        until: ["turn_completed"],
+        timeout_ms: SHORT_TURN_WAIT_MS,
+      });
+      expect(first.reason).toBe("timeout");
+
+      daemon.scenario.queuePtyOutput(working, Buffer.from("still compiling\n"));
+      const timedOut = await client.sessionWaitTurn({
+        session_ids: [working, quiet],
+        until: ["turn_completed"],
+        after: first.cursor,
+        timeout_ms: SHORT_TURN_WAIT_MS,
+      });
+      expect(timedOut.reason).toBe("timeout");
+      expect(timedOut.event).toBeUndefined();
+      expect(timedOut.progress.length).toBe(2);
+      const [workingProgress, quietProgress] = timedOut.progress;
+      expect({
+        session_id: workingProgress?.session_id,
+        state: workingProgress?.state,
+        activity: workingProgress?.activity,
+        output_advanced: workingProgress?.output_advanced,
+      }).toEqual({
+        session_id: working,
+        state: "running",
+        activity: "working",
+        output_advanced: true,
+      });
+      expectRfc3339(workingProgress?.last_output_at);
+      expectRfc3339(workingProgress?.turn_started_at);
+      expect(quietProgress).toEqual({
+        session_id: quiet,
+        state: "running",
+        activity: "idle",
+        output_advanced: false,
+      });
+
+      // Output is "advanced" relative to the cursor, so no new output reads false.
+      const again = await client.sessionWaitTurn({
+        session_ids: [working, quiet],
+        until: ["turn_completed"],
+        after: timedOut.cursor,
+        timeout_ms: SHORT_TURN_WAIT_MS,
+      });
+      expect(again.progress[0]?.output_advanced).toBe(false);
+      expect(again.progress[0]?.last_output_at).toBe(workingProgress?.last_output_at);
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("exit, ended targets, and unknown or removed targets follow the contract", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("turn-exit") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const exiting = await newShellSession(client);
+      const removed = await newShellSession(client);
+
+      const pendingExit = client.sessionWaitTurn({
+        session_ids: [exiting],
+        until: ["exited"],
+        timeout_ms: TURN_EVENT_GUARD_MS,
+      });
+      await waitForTurnWaiters(daemon, 1);
+      expect((await client.call("session.stop", exiting)).stopped).toBe(true);
+      const exited = await pendingExit;
+      expect(exited.reason).toBe("event");
+      expect(eventOf(exited)).toEqual({ session_id: exiting, kind: "exited", notification_id: undefined });
+      expect(exited.progress[0]?.state).toBe("stopped");
+
+      // Every target terminal and nothing newer selected: the call returns at once.
+      const ended = await client.sessionWaitTurn({
+        session_ids: [exiting],
+        until: ["turn_completed"],
+        after: exited.cursor,
+        timeout_ms: TURN_EVENT_GUARD_MS,
+      });
+      expect(ended.reason).toBe("targets_ended");
+      expect(ended.event).toBeUndefined();
+
+      const unknown = await expectClientError(client.sessionWaitTurn({
+        session_ids: [removed, "s-testkit-missing"],
+        until: ALL_TURN_KINDS,
+        after: "t1.1.1.d-other-daemon",
+      }));
+      expect(unknown.toProtocolError().code).toBe("session_not_found");
+      expect(daemon.activeTurnWaiterCount).toBe(0);
+
+      const pendingRemoval = client.sessionWaitTurn({
+        session_ids: [removed],
+        until: ALL_TURN_KINDS,
+        timeout_ms: TURN_EVENT_GUARD_MS,
+      });
+      await waitForTurnWaiters(daemon, 1);
+      daemon.scenario.removeSession(removed);
+      const removal = await expectClientError(pendingRemoval);
+      expect(removal.toProtocolError().code).toBe("session_not_found");
+      expect(daemon.activeTurnWaiterCount).toBe(0);
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("a cursor the daemon cannot place resets with a fresh cursor", async () => {
+    const other = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("turn-other") } });
+    const daemon = await startFixtureDaemon({
+      listen: { unixSocketPath: testSocketPath("turn-reset") },
+      turnWait: { journalCapacity: 1 },
+    });
+    try {
+      const otherClient = await connectLocal(requireUnixSocket(other));
+      const otherSession = await newShellSession(otherClient);
+      const foreign = (await otherClient.sessionWaitTurn({
+        session_ids: [otherSession],
+        until: ALL_TURN_KINDS,
+        timeout_ms: SHORT_TURN_WAIT_MS,
+      })).cursor;
+      await otherClient.close();
+
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const session = await newShellSession(client);
+      const reset = await client.sessionWaitTurn({
+        session_ids: [session],
+        until: ALL_TURN_KINDS,
+        after: foreign,
+        timeout_ms: TURN_EVENT_GUARD_MS,
+      });
+      expect(reset.reason).toBe("cursor_reset");
+      expect(reset.event).toBeUndefined();
+      expect(reset.cursor === foreign).toBe(false);
+      expect(reset.progress.map((entry) => entry.session_id)).toEqual([session]);
+
+      // The fresh cursor chains: the next event after it is returned.
+      daemon.scenario.recordTurnEvent(session, "turn_completed");
+      const chained = await client.sessionWaitTurn({
+        session_ids: [session],
+        until: ALL_TURN_KINDS,
+        after: reset.cursor,
+        timeout_ms: TURN_EVENT_GUARD_MS,
+      });
+      expect(chained.reason).toBe("event");
+      expect(eventOf(chained)).toEqual({ session_id: session, kind: "turn_completed", notification_id: undefined });
+
+      // A cursor older than the retained journal window resets too.
+      daemon.scenario.recordTurnEvent(session, "agent_blocked");
+      daemon.scenario.recordTurnEvent(session, "approval_required");
+      const evicted = await client.sessionWaitTurn({
+        session_ids: [session],
+        until: ALL_TURN_KINDS,
+        after: chained.cursor,
+        timeout_ms: TURN_EVENT_GUARD_MS,
+      });
+      expect(evicted.reason).toBe("cursor_reset");
+
+      // A parked wait whose following events are evicted resets too, even when
+      // a selected event is still retained after the eviction.
+      const parked = client.sessionWaitTurn({
+        session_ids: [session],
+        until: ["turn_completed"],
+        after: evicted.cursor,
+        timeout_ms: TURN_EVENT_GUARD_MS,
+      });
+      await waitForTurnWaiters(daemon, 1);
+      daemon.scenario.recordTurnEvent(session, "agent_blocked");
+      daemon.scenario.recordTurnEvent(session, "agent_blocked");
+      daemon.scenario.recordTurnEvent(session, "turn_completed");
+      const parkedReset = await parked;
+      expect(parkedReset.reason).toBe("cursor_reset");
+      expect(parkedReset.event).toBeUndefined();
+      expect(daemon.activeTurnWaiterCount).toBe(0);
+      // The fresh cursor sits at the current end, after the retained event.
+      const afterReset = await client.sessionWaitTurn({
+        session_ids: [session],
+        until: ["turn_completed"],
+        after: parkedReset.cursor,
+        timeout_ms: SHORT_TURN_WAIT_MS,
+      });
+      expect(afterReset.reason).toBe("timeout");
+      await client.close();
+    } finally {
+      await daemon.close();
+      await other.close();
+    }
+  });
+
+  test("invalid requests fail with the documented errors", async () => {
+    const daemon = await startFixtureDaemon({
+      listen: { unixSocketPath: testSocketPath("turn-invalid") },
+      turnWait: { defaultTimeoutMs: LONG_TURN_WAIT_MS, maxTimeoutMs: TURN_WAIT_CEILING_MS },
+    });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const session = await newShellSession(client);
+      const invalid: unknown[] = [
+        { session_ids: [], until: ["exited"] },
+        { session_ids: [session, session], until: ["exited"] },
+        { session_ids: [session], until: [] },
+        { session_ids: [session], until: ["exited", "exited"] },
+        { session_ids: [session], until: ["session_finished"] },
+        { session_ids: [session], until: ["exited"], after: "" },
+        { session_ids: [session], until: ["exited"], after: "has space" },
+        { session_ids: [session], until: ["exited"], after: "x".repeat(257) },
+        { session_ids: [session], until: ["exited"], heartbeat: true },
+      ];
+      for (const params of invalid) {
+        const error = await expectClientError(client.sessionWaitTurn(params as SessionWaitTurnParams));
+        expect(error.toProtocolError().code).toBe("bad_request");
+      }
+      for (const timeoutMs of [0, Number.NaN, Number.POSITIVE_INFINITY, 1.5, 4_294_967_296]) {
+        const error = await expectClientError(client.sessionWaitTurn({
+          session_ids: [session],
+          until: ["exited"],
+          timeout_ms: timeoutMs,
+        }));
+        expect(error.toProtocolError().code).toBe("bad_request");
+      }
+      const tooLong = await expectClientError(client.sessionWaitTurn({
+        session_ids: ["s-testkit-missing"],
+        until: ["exited"],
+        timeout_ms: TURN_WAIT_CEILING_MS + 1,
+      }));
+      expect(tooLong.toProtocolError().code).toBe("session_wait_limit_exceeded");
+      expect(daemon.activeTurnWaiterCount).toBe(0);
+      // Refused requests leave the parent connection usable.
+      expect((await client.call("session.inspect", session)).id).toBe(session);
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("the client response deadline never cuts a turn wait short", async () => {
+    const daemon = await startFixtureDaemon({
+      listen: { unixSocketPath: testSocketPath("turn-deadline") },
+      turnWait: { defaultTimeoutMs: LONG_TURN_WAIT_MS, maxTimeoutMs: TURN_WAIT_CEILING_MS },
+    });
+    try {
+      // Setup and the usability check run on a client with the default deadline,
+      // so only the turn waits depend on the short one.
+      const setup = await connectLocal(requireUnixSocket(daemon));
+      const session = await newShellSession(setup);
+      const client = await connectLocal(requireUnixSocket(daemon), { requestTimeoutMs: SHORT_REQUEST_TIMEOUT_MS });
+      const requested: SessionWaitTurnParams = {
+        session_ids: [session],
+        until: ["turn_completed"],
+        timeout_ms: LONG_TURN_WAIT_MS,
+      };
+      const defaulted: SessionWaitTurnParams = { session_ids: [session], until: ["turn_completed"] };
+      const results: SessionWaitTurnResult[] = [
+        await client.sessionWaitTurn(requested),
+        // An omitted timeout takes the daemon default, which the client cannot know.
+        await client.sessionWaitTurn(defaulted),
+        // Generic typed calls take the same dedicated path.
+        await client.call("session.wait_turn", requested),
+      ];
+      for (const result of results) {
+        expect(result.reason).toBe("timeout");
+        expect(result.progress.map((entry) => entry.session_id)).toEqual([session]);
+      }
+      // The waits ran on dedicated connections and left this one usable.
+      expect((await client.call("session.inspect", session)).id).toBe(session);
+      await client.close();
+      await setup.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("fixture shutdown cancels active turn waiters", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("turn-shutdown") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const session = await newShellSession(client);
+      const waiting = client.sessionWaitTurn({ session_ids: [session], until: ALL_TURN_KINDS })
+        .catch((error: unknown) => error);
+      await waitForTurnWaiters(daemon, 1);
+
+      await daemon.close();
+
+      expect(daemon.activeTurnWaiterCount).toBe(0);
+      expect(await waiting).toBeInstanceOf(ClientError);
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+});
+
+async function newShellSession(client: Client): Promise<string> {
+  const created = await client.call("session.new", { agent: "shell", cols: TEST_COLS, rows: TEST_ROWS });
+  return created.id;
+}
+
+async function waitForTurnWaiters(daemon: FixtureDaemonHandle, count: number): Promise<void> {
+  await withTimeout(
+    (async (): Promise<void> => {
+      while (daemon.activeTurnWaiterCount < count) {
+        await new Promise((resolve) => setTimeout(resolve, INPUT_WAITER_POLL_INTERVAL_MS));
+      }
+    })(),
+    SOCKET_END_TIMEOUT_MS,
+    "fixture turn waiter registration",
+  );
+}
+
+function expectRfc3339(value: string | undefined): void {
+  expect(typeof value).toBe("string");
+  expect(Number.isNaN(Date.parse(value ?? ""))).toBe(false);
+}
+
+function eventOf(result: SessionWaitTurnResult): Record<string, unknown> | undefined {
+  const event = result.event;
+  if (event === undefined) {
+    return undefined;
+  }
+  return { session_id: event.session_id, kind: event.kind, notification_id: event.notification_id };
+}
 
 async function expectProtocolError(promise: Promise<unknown>, code: string): Promise<void> {
   const error = await promise.catch((caught: unknown) => caught);

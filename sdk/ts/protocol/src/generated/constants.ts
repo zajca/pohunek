@@ -35,6 +35,9 @@ export const MAX_WORKER_INSTANCE_ID_BYTES = 128 as const;
 export const MAX_SESSION_INPUT_BYTES = 262144 as const;
 export const MAX_SESSION_OUTPUT_BYTES = 783240 as const;
 export const MAX_SESSION_WAIT_MS = 8000 as const;
+export const MAX_SESSION_WAIT_TURN_MS = 86400000 as const;
+export const MAX_SESSION_WAIT_TURN_TARGETS = 32 as const;
+export const MAX_SESSION_TURN_CURSOR_BYTES = 256 as const;
 
 export const EVENT_AGENT_STATE = "agent_state" as const;
 export const EVENT_ATTACH_CLOSED = "attach_closed" as const;

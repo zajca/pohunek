@@ -5,6 +5,8 @@ import type {
   NotificationId,
   NotificationRecord,
   SessionId,
+  SessionTurnEvent,
+  SessionTurnEventKind,
   StateSource,
   SubagentInfo,
   TerminalDimensions,
@@ -26,6 +28,12 @@ export type ScenarioNotificationInput =
     >
   >;
 
+/**
+ * A turn event a scenario can signal; `exited` follows a session's transition
+ * into a terminal state instead.
+ */
+export type ScenarioTurnEventKind = Exclude<SessionTurnEventKind, "exited">;
+
 /** A terminal size delivered to the fixture daemon over `session.resize`. */
 export interface ScenarioResize {
   readonly cols: number;
@@ -36,6 +44,11 @@ export interface ScenarioBackend {
   setAgentState(sessionId: SessionId, activity: AgentActivity, source: StateSource): void;
   setSubagentState(sessionId: SessionId, subagent: SubagentInfo): void;
   removeSession(sessionId: SessionId): void;
+  recordTurnEvent(
+    sessionId: SessionId,
+    kind: ScenarioTurnEventKind,
+    notificationId?: NotificationId,
+  ): SessionTurnEvent;
   createScenarioNotification(input: ScenarioNotificationInput): NotificationRecord;
   deleteNotification(id: NotificationId): void;
   initialAttachDimensions(sessionId: SessionId): ReadonlyArray<TerminalDimensions>;
@@ -78,6 +91,24 @@ export class FixtureScenario {
   /** Removes a fixture session and emits `session_removed` to subscribers. */
   public removeSession(sessionId: SessionId): void {
     this.backend.removeSession(sessionId);
+  }
+
+  /**
+   * Records a turn event for `session.wait_turn` waiters and wakes them.
+   *
+   * It stands for a signal the daemon has already accepted and debounced (an
+   * admitted provider hook report for a held session, or the projector's
+   * blocked agent), so it is recorded at once and independently of the
+   * notification inbox. The fixture applies no drop rule; record only signals
+   * the daemon would keep. Pass `notificationId` to model an event whose inbox
+   * record the policy kept.
+   */
+  public recordTurnEvent(
+    sessionId: SessionId,
+    kind: ScenarioTurnEventKind,
+    notificationId?: NotificationId,
+  ): SessionTurnEvent {
+    return this.backend.recordTurnEvent(sessionId, kind, notificationId);
   }
 
   public createNotification(input: ScenarioNotificationInput): NotificationRecord {

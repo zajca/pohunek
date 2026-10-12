@@ -3234,6 +3234,14 @@ Request APIs:
   present, budgets the wire timeout as the daemon's overall delivery-and-wait
   deadline plus fixed response headroom, and rejects successful responses that
   omit epoch- and runtime-scoped activity evidence.
+- `client.sessionWaitTurn(params)` and generic typed
+  `client.call("session.wait_turn", params)`: open a dedicated connection whose
+  response deadline is `timeout_ms` plus fixed headroom, or
+  `MAX_SESSION_WAIT_TURN_MS` plus headroom when `timeout_ms` is omitted, so
+  `requestTimeoutMs` never cuts a valid turn wait short. A `timeout_ms` that is
+  not a nonzero `u32` fails with `daemon/bad_request` before sending, because
+  JSON would serialize `NaN` or `Infinity` as `null`, which the daemon reads as
+  "use the default".
 - `client.handshake()`: calls `daemon.health` and enforces strict protocol
   version equality.
 - `client.request(request)`: validates the optional atomic wire origin, applies
@@ -3268,7 +3276,10 @@ SDK error mapping:
   and `recover` fields, except for the local TypeScript decoder's
   `daemon/host_governance_inspect_contract_mismatch` result. That redacted
   contract-mismatch error is SDK-originated even though it uses the normal
-  structured protocol shape.
+  structured protocol shape, as are the pre-send parameter refusals of the
+  waiting helpers (`runtime/session_input_invalid_wait` and
+  `runtime/session_wait_limit_exceeded` from `sessionInput`,
+  `daemon/bad_request` from `sessionWaitTurn`).
 - Most SDK-originated errors map into the public protocol taxonomy through
   `ClientErrorClass` and `ClientErrorCode`: `daemon_unreachable`, `framing`,
   `host_unreachable`, `remote_daemon_unavailable`, `request_timeout`, `io_error`,

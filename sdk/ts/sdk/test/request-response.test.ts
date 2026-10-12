@@ -519,11 +519,17 @@ describe("Client request/response", () => {
       activity_epoch: "d-epoch-1",
       activity_revision: "2",
     } as const;
+    const turn = {
+      reason: "timeout",
+      cursor: "t1.0.0.d-epoch-1",
+      progress: [{ session_id: "s-target", state: "running", output_advanced: false }],
+    } as const;
     const daemon = await startUnixDaemon([
       { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), screen) },
       { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), input) },
       { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), output) },
       { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), wait) },
+      { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), turn) },
     ]);
     try {
       const client = await connectClient(daemon, undefined, {
@@ -547,8 +553,9 @@ describe("Client request/response", () => {
         after_updated_at: "2026-08-04T00:00:00Z",
         timeout_ms: 25,
       });
+      await client.sessionWaitTurn({ session_ids: ["s-target"], until: ["turn_completed"], timeout_ms: 25 });
 
-      for (const method of ["session.screen", "session.input", "session.output", "session.wait"]) {
+      for (const method of ["session.screen", "session.input", "session.output", "session.wait", "session.wait_turn"]) {
         const sent = parseRequestLine(await daemon.nextRequest());
         expect(sent["method"]).toBe(method);
         expect(sent["origin_session_id"]).toBe("s-origin");

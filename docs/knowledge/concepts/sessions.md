@@ -37,7 +37,8 @@ connection releases the waiter slots of an in-flight `session.wait`, waited
 guaranteed release bound for a client that vanishes without closing it.
 
 To follow agents across turns, a client calls the protocol method
-`session.wait_turn` (Rust SDK `Client::session_wait_turn`). It waits for the
+`session.wait_turn` (Rust SDK `Client::session_wait_turn`, TypeScript SDK
+`client.sessionWaitTurn`). It waits for the
 next turn event of one or more sessions, `turn_completed`, `agent_blocked`,
 `approval_required`, or `exited`, newer than an opaque cursor (or newer than
 the call when no cursor is given), bounded by an agent-chosen `timeout_ms`

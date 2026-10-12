@@ -136,3 +136,19 @@ for (let ev = await subscription.nextEvent(); ev !== null; ev = await subscripti
   console.log(ev.event, ev);
 }
 ```
+
+To follow agents across turns without polling, wait for the next turn event of
+one or more sessions and chain the returned cursor (Rust
+`Client::session_wait_turn`, TypeScript `client.sessionWaitTurn`). A timeout
+still returns per-session progress, so the caller can tell "still working" from
+"stuck"; see [Turn Waits](public-api.md#turn-waits).
+
+```ts
+// TypeScript — one bounded wait; pass `result.cursor` as `after` next time.
+const result = await client.sessionWaitTurn({
+  session_ids: ["s-41"],
+  until: ["turn_completed", "agent_blocked", "approval_required", "exited"],
+  timeout_ms: 300_000,
+});
+console.log(result.reason, result.event, result.progress);
+```

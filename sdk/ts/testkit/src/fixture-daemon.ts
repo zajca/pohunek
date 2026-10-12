@@ -15,7 +15,10 @@ import {
   EVENT_SUBAGENT_STATE,
   MAX_CONTROL_LINE_BYTES,
   MAX_SESSION_OUTPUT_BYTES,
+  MAX_SESSION_TURN_CURSOR_BYTES,
   MAX_SESSION_WAIT_MS,
+  MAX_SESSION_WAIT_TURN_MS,
+  MAX_SESSION_WAIT_TURN_TARGETS,
   MAX_WORKER_INSTANCE_ID_BYTES,
   PROTOCOL_VERSION,
   type AgentActivity,
@@ -74,6 +77,11 @@ import {
   type SessionStopResult,
   type SessionWaitParams,
   type SessionWaitResult,
+  type SessionTurnEvent,
+  type SessionTurnEventKind,
+  type SessionTurnProgress,
+  type SessionWaitTurnReason,
+  type SessionWaitTurnResult,
   type WorktreeRemoveParams,
   type StateSource,
   type SubagentInfo,
@@ -85,6 +93,7 @@ import {
   type ScenarioBackend,
   type ScenarioNotificationInput,
   type ScenarioResize,
+  type ScenarioTurnEventKind,
 } from "./scenario";
 
 export type FixtureDaemonEndpoint =
@@ -104,6 +113,41 @@ export interface FixtureHostOptions {
   readonly discoveredHosts?: readonly HostRecord[];
 }
 
+/**
+ * Turn-wait settings of the fixture daemon, the counterpart of the daemon's
+ * operator-configured turn-wait default and ceiling.
+ *
+ * Omitted values take the daemon's direct-mode defaults: a 5-minute default
+ * wait, a 30-minute ceiling, and a 1,024-event journal. Construction fails when
+ * the default exceeds the ceiling, the ceiling exceeds
+ * `MAX_SESSION_WAIT_TURN_MS`, or a value is not a positive integer.
+ *
+ * The fixture serves `session.wait_turn` with the documented contract, within
+ * these fidelity limits:
+ * - Turn signals come only from `scenario.recordTurnEvent`. It stands for a
+ *   signal the daemon has already accepted and debounced (an admitted hook
+ *   report for a held session, or the projector's `agent_blocked`) and records
+ *   it at once. The fixture applies no debounce and no drop rule, so it never
+ *   drops a `turn_completed` for a session that is `working`; a scenario
+ *   records only the signals the daemon would keep. `notification.create`, the
+ *   notification policy, and `scenario.setAgentState` record no turn event.
+ * - `exited` is recorded only by `session.stop`, when the stopped state is
+ *   committed, matching the daemon's record at the terminal commit.
+ * - There is no waiter pool, so `session_waiter_limit_reached` never occurs,
+ *   and a waiter whose client hung up stays until its timeout or fixture
+ *   shutdown instead of being released at once.
+ * - Only PTY output (`writeToPty`, `queuePtyOutput`) counts as output for
+ *   progress, not `setRetainedOutput`.
+ */
+export interface FixtureTurnWaitOptions {
+  /** Wait duration in milliseconds when a request omits `timeout_ms`. */
+  readonly defaultTimeoutMs?: number;
+  /** Largest accepted `timeout_ms`; a longer request fails with `session_wait_limit_exceeded`. */
+  readonly maxTimeoutMs?: number;
+  /** Turn events kept in the journal; a cursor before the retained window resets. */
+  readonly journalCapacity?: number;
+}
+
 export interface StartFixtureDaemonOptions {
   readonly listen: FixtureDaemonListenOptions;
   readonly daemonVersion?: string;
@@ -115,6 +159,7 @@ export interface StartFixtureDaemonOptions {
   readonly notificationPolicy?: NotificationPolicy;
   readonly initialProjects?: readonly FixtureProject[];
   readonly pty?: FixturePtyOptions;
+  readonly turnWait?: FixtureTurnWaitOptions;
 }
 
 export interface FixtureProject {
@@ -127,6 +172,8 @@ export interface FixtureDaemonHandle {
   readonly unixSocketPath: string | undefined;
   readonly tcpAddress: { readonly host: string; readonly port: number } | undefined;
   readonly activeInputWaiterCount: number;
+  /** Number of `session.wait_turn` requests currently waiting for an event. */
+  readonly activeTurnWaiterCount: number;
   readonly scenario: FixtureScenario;
   close(): Promise<void>;
   stopAbruptly(): Promise<void>;
@@ -170,6 +217,37 @@ interface FixtureActivityEvidence {
   readonly revision: bigint;
 }
 
+/** One recorded turn event; `seq` is the fixture-global journal sequence. */
+interface FixtureTurnEntry {
+  readonly seq: number;
+  readonly event: SessionTurnEvent;
+}
+
+/** Per-session progress the fixture tracks for turn-wait results. */
+interface FixtureTurnProgress {
+  lastOutputAt?: string;
+  /** Output tick of the last output; compared with a cursor's tick. */
+  lastOutputTick: number;
+  turnStartedAt?: string;
+}
+
+/** A cursor this fixture instance placed in its journal. */
+interface FixtureTurnPosition {
+  readonly seq: number;
+  /** Output tick when the cursor was issued. */
+  readonly outputTick: number;
+}
+
+type FixtureTurnSignal = "changed" | "deadline" | "shutdown";
+
+/** How one check of a turn wait came out. */
+type FixtureTurnOutcome =
+  | { readonly kind: "event"; readonly entry: FixtureTurnEntry }
+  | { readonly kind: "ended"; readonly latest: number }
+  | { readonly kind: "pending"; readonly latest: number }
+  | { readonly kind: "reset"; readonly latest: number }
+  | { readonly kind: "missing"; readonly sessionId: string };
+
 type FixtureInputWaitEvent =
   | { readonly kind: "activity"; readonly evidence: FixtureActivityEvidence }
   | { readonly kind: "removed" }
@@ -181,6 +259,18 @@ const U64_MAX = 18_446_744_073_709_551_615n;
 const U64_DECIMAL_DIGITS = U64_MAX.toString().length;
 
 const DEFAULT_DAEMON_VERSION = "0.0.0-testkit";
+// The turn-wait defaults mirror the daemon's direct-mode constants
+// (`crates/daemon/src/session/mod.rs`), so a fixture without `turnWait`
+// options answers like a daemon without a `service.toml` override.
+const DEFAULT_TURN_WAIT_MS = 5 * 60 * 1_000;
+const DEFAULT_TURN_WAIT_MAX_MS = 30 * 60 * 1_000;
+const DEFAULT_TURN_JOURNAL_CAPACITY = 1_024;
+// Fixture cursors carry their own tag, so a daemon cursor never places here.
+const TURN_CURSOR_TAG = "tk1";
+const TURN_CURSOR_SEPARATOR = ".";
+const TURN_CURSOR_PATTERN = /^[\x21-\x7e]+$/u;
+const TURN_EVENT_KINDS = ["turn_completed", "agent_blocked", "approval_required", "exited"] as const;
+const MAX_U32 = 4_294_967_295;
 const DEFAULT_CWD = "/tmp/pohunek-testkit";
 const FIRST_FIXTURE_PID = 42_000;
 const SESSION_ID_PREFIX = "s-testkit-";
@@ -240,6 +330,14 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     Set<(event: FixtureInputWaitEvent) => void>
   >();
   private readonly activityEpoch: string;
+  private readonly turnWaitDefaultMs: number;
+  private readonly turnWaitMaxMs: number;
+  private readonly turnJournalCapacity: number;
+  private readonly turnJournal: FixtureTurnEntry[] = [];
+  private readonly turnProgress = new Map<string, FixtureTurnProgress>();
+  private readonly turnWaiters = new Set<(signal: FixtureTurnSignal) => void>();
+  private latestTurnSeq = 0;
+  private outputTick = 0;
   private endpointsValue: FixtureDaemonEndpoint[] = [];
   private discoveredHosts: HostRecord[];
   private nextSessionId = 1;
@@ -254,6 +352,10 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     this.activityEpoch = `d-testkit-${nextActivityEpoch}`;
     nextActivityEpoch += 1;
     this.protocolVersion = options.protocolVersion ?? PROTOCOL_VERSION;
+    this.turnWaitDefaultMs = options.turnWait?.defaultTimeoutMs ?? DEFAULT_TURN_WAIT_MS;
+    this.turnWaitMaxMs = options.turnWait?.maxTimeoutMs ?? DEFAULT_TURN_WAIT_MAX_MS;
+    this.turnJournalCapacity = options.turnWait?.journalCapacity ?? DEFAULT_TURN_JOURNAL_CAPACITY;
+    assertTurnWaitOptions(this.turnWaitDefaultMs, this.turnWaitMaxMs, this.turnJournalCapacity);
     this.hostCapabilities = cloneValue(options.host?.capabilities ?? defaultHostCapabilities(this.daemonVersion));
     this.discoveredHosts = cloneValue([...(options.host?.discoveredHosts ?? [])]);
     this.notificationPolicy = cloneValue(options.notificationPolicy ?? defaultNotificationPolicy());
@@ -301,6 +403,10 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     return count;
   }
 
+  public get activeTurnWaiterCount(): number {
+    return this.turnWaiters.size;
+  }
+
   public async start(): Promise<FixtureDaemonHandle> {
     if (this.listenOptions.unixSocketPath !== undefined) {
       await this.listenUnix(this.listenOptions.unixSocketPath);
@@ -342,6 +448,9 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     const observation = this.observation(sessionId);
     const revision = (this.activityRevisions.get(sessionId) ?? 0n) + 1n;
     this.activityRevisions.set(sessionId, revision);
+    if (activity === "working" && session.activity !== "working") {
+      this.progressOf(sessionId).turnStartedAt = timestamp();
+    }
     session.activity = activity;
     session.state_source = source;
     session.updated_at = timestamp();
@@ -402,12 +511,26 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     this.notifyInputWaiters(sessionId, { kind: "removed" });
     this.sessions.delete(sessionId);
     this.activityRevisions.delete(sessionId);
+    this.turnProgress.delete(sessionId);
     this.pty.closeSession(sessionId);
+    this.wakeTurnWaiters("changed");
     this.emitEvent({
       v: PROTOCOL_VERSION,
       event: EVENT_SESSION_REMOVED,
       session: cloneValue(session),
     });
+  }
+
+  public recordTurnEvent(
+    sessionId: string,
+    kind: ScenarioTurnEventKind,
+    notificationId?: NotificationId,
+  ): SessionTurnEvent {
+    this.requireSession(sessionId);
+    if (!isScenarioTurnEventKind(kind)) {
+      throw new Error("fixture turn signals are turn_completed, agent_blocked, or approval_required; exited follows session.stop");
+    }
+    return cloneValue(this.appendTurnEvent(sessionId, kind, notificationId).event);
   }
 
   public createScenarioNotification(input: ScenarioNotificationInput): NotificationRecord {
@@ -705,6 +828,8 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
         return this.handleSessionOutput(request);
       case "session.wait":
         return this.handleSessionWait(request);
+      case "session.wait_turn":
+        return this.handleSessionWaitTurn(request);
       case "notification.list":
         return this.handleNotificationList(request);
       case "notification.update":
@@ -813,6 +938,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     this.notifyInputWaiters(session.id, { kind: "stopped" });
     this.pty.closeSession(session.id);
     this.emitSessionEvent(EVENT_SESSION_STOPPED, session);
+    this.appendTurnEvent(session.id, "exited");
     return okResponse(request.id, { stopped: true } satisfies SessionStopResult);
   }
 
@@ -927,8 +1053,10 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     const stopped = session.state === "running" || session.state === "starting";
     this.notifyInputWaiters(session.id, { kind: "removed" });
     this.sessions.delete(session.id);
+    this.turnProgress.delete(session.id);
     this.pty.closeSession(session.id);
     this.emitEvent({ v: PROTOCOL_VERSION, event: EVENT_SESSION_REMOVED, session: cloneValue(session) });
+    this.wakeTurnWaiters("changed");
     return okResponse(request.id, { removed: true, stopped, worktrees_removed: 0, worktrees_failed: 0 } satisfies SessionRemoveResult);
   }
 
@@ -1302,6 +1430,250 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     return okResponse(request.id, result);
   }
 
+  /**
+   * Serves `session.wait_turn` with the daemon's documented contract.
+   *
+   * Checks run in the daemon's order: parameter shape (`bad_request`), the
+   * ceiling (`session_wait_limit_exceeded`), every target exists
+   * (`session_not_found`), cursor placement (`cursor_reset`), then an
+   * immediate event or `targets_ended` check before waiting. The fidelity
+   * limits are listed on `FixtureTurnWaitOptions`.
+   */
+  private async handleSessionWaitTurn(request: ControlRequest): Promise<ControlResponse> {
+    const params = readTurnWaitParams(request.params);
+    if (params === undefined) {
+      return errResponse(request.id, invalidParams(request.method));
+    }
+    const timeoutMs = params.timeout_ms ?? this.turnWaitDefaultMs;
+    if (timeoutMs > this.turnWaitMaxMs) {
+      return errResponse(request.id, sessionWaitLimitExceeded());
+    }
+    const missing = params.session_ids.find((sessionId) => !this.sessions.has(sessionId));
+    if (missing !== undefined) {
+      return errResponse(request.id, sessionNotFound(missing));
+    }
+    const callTick = this.outputTick;
+    let position: FixtureTurnPosition = { seq: this.latestTurnSeq, outputTick: callTick };
+    if (params.after !== undefined) {
+      const placed = this.placeTurnCursor(params.after);
+      if (placed === undefined) {
+        return okResponse(
+          request.id,
+          this.turnResult("cursor_reset", undefined, this.latestTurnSeq, params.session_ids, callTick),
+        );
+      }
+      position = placed;
+    }
+
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const outcome = this.turnOutcome(params.session_ids, params.until, position.seq);
+      const completed = this.completedTurnResult(request.id, outcome, params.session_ids, position.outputTick);
+      if (completed !== undefined) {
+        return completed;
+      }
+      const signal = await this.nextTurnSignal(deadline - Date.now());
+      if (signal === "shutdown") {
+        return errResponse(request.id, turnWaitShuttingDown());
+      }
+      if (signal === "deadline") {
+        const last = this.turnOutcome(params.session_ids, params.until, position.seq);
+        if (last.kind === "pending") {
+          return okResponse(
+            request.id,
+            this.turnResult("timeout", undefined, last.latest, params.session_ids, position.outputTick),
+          );
+        }
+        const completed = this.completedTurnResult(request.id, last, params.session_ids, position.outputTick);
+        if (completed !== undefined) {
+          return completed;
+        }
+      }
+    }
+  }
+
+  /** Builds the response of an outcome that completes the wait, if it does. */
+  private completedTurnResult(
+    requestId: string,
+    outcome: FixtureTurnOutcome,
+    targets: readonly string[],
+    sinceTick: number,
+  ): ControlResponse | undefined {
+    switch (outcome.kind) {
+      case "missing":
+        return errResponse(requestId, sessionNotFound(outcome.sessionId));
+      case "event":
+        return okResponse(
+          requestId,
+          this.turnResult("event", outcome.entry, outcome.entry.seq, targets, sinceTick),
+        );
+      case "ended":
+        return okResponse(requestId, this.turnResult("targets_ended", undefined, outcome.latest, targets, sinceTick));
+      case "reset":
+        return okResponse(requestId, this.turnResult("cursor_reset", undefined, outcome.latest, targets, sinceTick));
+      case "pending":
+        return undefined;
+    }
+  }
+
+  /**
+   * Finds the oldest selected event after `afterSeq`, else reports whether
+   * every target ended.
+   *
+   * A position whose following events were evicted, also while the wait was
+   * parked, resets: those events cannot be reported.
+   */
+  private turnOutcome(
+    targets: readonly string[],
+    until: readonly SessionTurnEventKind[],
+    afterSeq: number,
+  ): FixtureTurnOutcome {
+    let allTerminal = true;
+    for (const sessionId of targets) {
+      const session = this.sessions.get(sessionId);
+      if (session === undefined) {
+        return { kind: "missing", sessionId };
+      }
+      allTerminal &&= isTerminalState(session.state);
+    }
+    if (this.positionEvicted(afterSeq)) {
+      return { kind: "reset", latest: this.latestTurnSeq };
+    }
+    const entry = this.turnJournal.find((candidate) =>
+      candidate.seq > afterSeq
+      && targets.includes(candidate.event.session_id)
+      && until.includes(candidate.event.kind));
+    if (entry !== undefined) {
+      return { kind: "event", entry };
+    }
+    return allTerminal
+      ? { kind: "ended", latest: this.latestTurnSeq }
+      : { kind: "pending", latest: this.latestTurnSeq };
+  }
+
+  private turnResult(
+    reason: SessionWaitTurnReason,
+    entry: FixtureTurnEntry | undefined,
+    cursorSeq: number,
+    targets: readonly string[],
+    sinceTick: number,
+  ): SessionWaitTurnResult {
+    const result: SessionWaitTurnResult = {
+      reason,
+      cursor: this.turnCursor(cursorSeq),
+      progress: targets.map((sessionId) => this.turnProgressOf(sessionId, sinceTick)),
+    };
+    if (entry !== undefined) {
+      result.event = cloneValue(entry.event);
+    }
+    return result;
+  }
+
+  private turnProgressOf(sessionId: string, sinceTick: number): SessionTurnProgress {
+    const session = this.requireSession(sessionId);
+    const progress = this.turnProgress.get(sessionId);
+    const result: SessionTurnProgress = {
+      session_id: sessionId,
+      state: session.state,
+      output_advanced: progress !== undefined && progress.lastOutputTick > sinceTick,
+    };
+    if (session.activity !== undefined) {
+      result.activity = session.activity;
+    }
+    if (progress?.lastOutputAt !== undefined) {
+      result.last_output_at = progress.lastOutputAt;
+    }
+    if (progress?.turnStartedAt !== undefined) {
+      result.turn_started_at = progress.turnStartedAt;
+    }
+    return result;
+  }
+
+  private turnCursor(seq: number): string {
+    return [TURN_CURSOR_TAG, seq, this.outputTick, this.activityEpoch].join(TURN_CURSOR_SEPARATOR);
+  }
+
+  /**
+   * Places a cursor this fixture instance issued.
+   *
+   * Returns `undefined` for a cursor of another instance or layout, one ahead
+   * of the journal, or one before the retained window.
+   */
+  private placeTurnCursor(cursor: string): FixtureTurnPosition | undefined {
+    const fields = cursor.split(TURN_CURSOR_SEPARATOR);
+    if (fields.length < 4 || fields[0] !== TURN_CURSOR_TAG) {
+      return undefined;
+    }
+    const seq = parseCursorInteger(fields[1]);
+    const outputTick = parseCursorInteger(fields[2]);
+    if (seq === undefined || outputTick === undefined || fields.slice(3).join(TURN_CURSOR_SEPARATOR) !== this.activityEpoch) {
+      return undefined;
+    }
+    if (seq > this.latestTurnSeq || outputTick > this.outputTick || this.positionEvicted(seq)) {
+      return undefined;
+    }
+    return { seq, outputTick };
+  }
+
+  /** Whether events right after `seq` were evicted from the journal. */
+  private positionEvicted(seq: number): boolean {
+    const oldest = this.turnJournal[0];
+    return oldest !== undefined && seq + 1 < oldest.seq;
+  }
+
+  private appendTurnEvent(
+    sessionId: string,
+    kind: SessionTurnEventKind,
+    notificationId?: NotificationId,
+  ): FixtureTurnEntry {
+    this.latestTurnSeq += 1;
+    const event: SessionTurnEvent = { session_id: sessionId, kind, at: timestamp() };
+    if (notificationId !== undefined) {
+      event.notification_id = notificationId;
+    }
+    const entry: FixtureTurnEntry = { seq: this.latestTurnSeq, event };
+    this.turnJournal.push(entry);
+    while (this.turnJournal.length > this.turnJournalCapacity) {
+      this.turnJournal.shift();
+    }
+    this.wakeTurnWaiters("changed");
+    return entry;
+  }
+
+  private progressOf(sessionId: string): FixtureTurnProgress {
+    const existing = this.turnProgress.get(sessionId);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const created: FixtureTurnProgress = { lastOutputTick: 0 };
+    this.turnProgress.set(sessionId, created);
+    return created;
+  }
+
+  /** Resolves on the next journal or target change, the deadline, or shutdown. */
+  private nextTurnSignal(remainingMs: number): Promise<FixtureTurnSignal> {
+    if (this.closed) {
+      return Promise.resolve("shutdown");
+    }
+    return new Promise((resolve) => {
+      const finish = (signal: FixtureTurnSignal): void => {
+        clearTimeout(timer);
+        this.turnWaiters.delete(finish);
+        resolve(signal);
+      };
+      const timer = setTimeout(() => {
+        finish("deadline");
+      }, Math.max(remainingMs, 0));
+      this.turnWaiters.add(finish);
+    });
+  }
+
+  private wakeTurnWaiters(signal: FixtureTurnSignal): void {
+    for (const waiter of [...this.turnWaiters]) {
+      waiter(signal);
+    }
+  }
+
   private handleNotificationCreate(request: ControlRequest): ControlResponse {
     const params = readObjectParams<NotificationCreateParams>(request);
     if (params === undefined || !isNotificationCreateParams(params)) {
@@ -1660,6 +2032,10 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     const output = new Uint8Array(current.output.byteLength + bytes.byteLength);
     output.set(current.output);
     output.set(bytes, current.output.byteLength);
+    this.outputTick += 1;
+    const progress = this.progressOf(sessionId);
+    progress.lastOutputAt = timestamp();
+    progress.lastOutputTick = this.outputTick;
     this.observations.set(sessionId, {
       ...current,
       output,
@@ -1676,6 +2052,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     for (const sessionId of [...this.activityWaiters.keys()]) {
       this.notifyInputWaiters(sessionId, { kind: "shutdown" });
     }
+    this.wakeTurnWaiters("shutdown");
     this.subscribers.clear();
     this.pty.closeAll();
     for (const socket of this.sockets) {
@@ -1730,6 +2107,7 @@ function defaultHostCapabilities(daemonVersion: string): HostCapabilities {
     terminal_read_supported: true,
     output_read_supported: true,
     session_wait_supported: true,
+    session_wait_turn_supported: true,
   };
 }
 
@@ -2364,6 +2742,99 @@ function sessionWaitLimitExceeded(): ProtocolError {
     "runtime",
     "session_wait_limit_exceeded",
     "the requested wait exceeds the configured maximum",
+  );
+}
+
+interface FixtureTurnWaitParams {
+  readonly session_ids: readonly string[];
+  readonly until: readonly SessionTurnEventKind[];
+  readonly after?: string;
+  readonly timeout_ms?: number;
+}
+
+/** Validates `session.wait_turn` params as the protocol's deserializer does. */
+function readTurnWaitParams(value: unknown): FixtureTurnWaitParams | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["session_ids", "until", "after", "timeout_ms"])) {
+    return undefined;
+  }
+  const sessionIds = value["session_ids"];
+  const until = value["until"];
+  const after = value["after"];
+  const timeoutMs = value["timeout_ms"];
+  if (
+    !Array.isArray(sessionIds)
+    || sessionIds.length === 0
+    || sessionIds.length > MAX_SESSION_WAIT_TURN_TARGETS
+    || sessionIds.some((sessionId) => typeof sessionId !== "string")
+    || new Set(sessionIds).size !== sessionIds.length
+    || !Array.isArray(until)
+    || until.length === 0
+    || until.some((kind) => !isTurnEventKind(kind))
+    || new Set(until).size !== until.length
+    || (after !== undefined && after !== null && !isTurnCursorShape(after))
+    || (timeoutMs !== undefined && timeoutMs !== null
+      && !(isPositiveInteger(timeoutMs) && timeoutMs <= MAX_U32))
+  ) {
+    return undefined;
+  }
+  const params: {
+    session_ids: readonly string[];
+    until: readonly SessionTurnEventKind[];
+    after?: string;
+    timeout_ms?: number;
+  } = { session_ids: sessionIds as string[], until: until as SessionTurnEventKind[] };
+  if (typeof after === "string") {
+    params.after = after;
+  }
+  if (typeof timeoutMs === "number") {
+    params.timeout_ms = timeoutMs;
+  }
+  return params;
+}
+
+function isTurnEventKind(value: unknown): value is SessionTurnEventKind {
+  return (TURN_EVENT_KINDS as readonly unknown[]).includes(value);
+}
+
+function isScenarioTurnEventKind(value: unknown): value is ScenarioTurnEventKind {
+  return isTurnEventKind(value) && value !== "exited";
+}
+
+function isTurnCursorShape(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length <= MAX_SESSION_TURN_CURSOR_BYTES
+    && TURN_CURSOR_PATTERN.test(value);
+}
+
+function parseCursorInteger(value: string | undefined): number | undefined {
+  if (value === undefined || !/^(0|[1-9][0-9]*)$/u.test(value)) {
+    return undefined;
+  }
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
+}
+
+function isTerminalState(state: SessionInfo["state"]): boolean {
+  return state === "stopped" || state === "done" || state === "failed";
+}
+
+function assertTurnWaitOptions(defaultMs: number, maxMs: number, journalCapacity: number): void {
+  if (!isPositiveInteger(defaultMs) || !isPositiveInteger(maxMs) || !isPositiveInteger(journalCapacity)) {
+    throw new Error("fixture turn-wait options must be positive integers");
+  }
+  if (maxMs > MAX_SESSION_WAIT_TURN_MS) {
+    throw new Error("fixture turn-wait ceiling must not exceed MAX_SESSION_WAIT_TURN_MS");
+  }
+  if (defaultMs > maxMs) {
+    throw new Error("fixture turn-wait default must not exceed its ceiling");
+  }
+}
+
+function turnWaitShuttingDown(): ProtocolError {
+  return protocolError(
+    "daemon",
+    "daemon_shutting_down",
+    "daemon shutdown cancelled the bounded session turn wait",
   );
 }
 
