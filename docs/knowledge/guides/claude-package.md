@@ -16,17 +16,20 @@ real Claude Code are in `compat/claude/`. See [runtime
 packages](runtime-packages.md) for the generic commands and the [Codex
 package](codex-package.md) for the package this one mirrors.
 
-## Status: official source, no release catalog yet
+## Status: official package in the release catalog; built-in still present
 
 `claude` is a reserved runtime id. A package serves it only with official trust:
 a `--catalog` install whose signed catalog entry binds the package id, runtime
 id and digest, verified against the host's catalog trust anchor (see [runtime
 packages](runtime-packages.md)). An install trusted by `--sha256` is refused
-with `package_runtime_not_claimable`. The repository ships no signing key and no
-release catalog, so no real host can authorize the package yet; the built-in
-descriptor, detection manifest and Claude handler keep serving `claude`, and
-removing them waits for the production catalog key. The package tests keep the
-package equal to the built-in until the built-in is removed.
+with `package_runtime_not_claimable`. Since release 0.34.2 every Linux daemon
+archive ships the package as `runtime/packages/claude.tar.zst` with a signed
+`runtime/runtime-catalog.json` whose signer matches the shipped trust anchor;
+[installing official packages](runtime-packages.md#install-official-packages-from-a-release)
+has the procedure. Until the built-in is removed (#146), the built-in
+descriptor, detection manifest and Claude handler serve `claude` on a host that
+has not installed the package, and the package tests keep the package equal to
+the built-in.
 
 ## What the package declares
 

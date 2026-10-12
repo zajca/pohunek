@@ -72,7 +72,11 @@ attribute. After an upgrade macOS may ask again whether `pohunek` may access its
 designated requirement.
 
 On Linux, download from [Releases](https://github.com/zajca/pohunek/releases),
-unpack, and put the binaries on your `PATH`.
+unpack, and install the daemon archive with `packaging/install-daemon.sh` (see
+below). If you copy the binaries onto your `PATH` by hand instead, copy
+`runtime-catalog-anchor.json` next to `pohunekd` as well: the daemon reads the
+anchor only from the directory of its own executable, and without it official
+runtime packages are refused with `official_trust_unavailable`.
 
 Protocol v2 was a one-time coordinated pre-1.0 boundary. Before that M1
 transition, every CLI, SDK, custom client, and local or remote
@@ -177,14 +181,98 @@ pohunek session new --agent codex \
   --input "Add retry logic to the API client, then run the tests."
 ```
 
-## Install the Pi runtime package
+## Install official runtime packages from the release archive
+
+Each Linux daemon archive carries the official runtime packages of its release
+and the signed catalog that authorizes them:
+
+```text
+pohunek-daemon-<version>-<target>/
+  runtime-catalog-anchor.json        trust anchor, installed beside pohunekd
+  runtime/runtime-catalog.json       signed catalog of this release
+  runtime/packages/pi.tar.zst        official Pi package
+  runtime/packages/codex.tar.zst     official Codex package
+  runtime/packages/claude.tar.zst    official Claude Code package
+  runtime/attestations/<runtime>-<target>.json
+```
+
+The same catalog and package archives are also published as separate release
+assets (`runtime-catalog.json`, `pohunek-runtime-<runtime>-<version>.tar.zst`).
+Every catalog entry pins its package to exactly the core version of its release
+(`core = "=<version>"`). Current releases list only the Linux glibc and musl
+targets; the Apple Silicon archive carries the catalog and no package.
+
+1. Install or upgrade the daemon from this same archive with
+   `./packaging/install-daemon.sh`. A catalog from a release other than the
+   running daemon's is refused with `package_incompatible`, or with
+   `package_untrusted` when it is older than a catalog this host has already
+   accepted.
+2. Run `pohunek doctor` and check that `catalog_trust_anchor` is `ok`. `warn`
+   means the daemon has no anchor (`official_trust_unavailable`), `fail` means
+   the anchor cannot be trusted (`official_trust_anchor_invalid`); see the
+   [runtime package recovery runbook](knowledge/runbooks/runtime-package-recovery.md).
+3. From the extracted archive directory, review what a package declares. The
+   command prints the package id, version, digest, trust origin and the program
+   and arguments the daemon will launch as you, then fails with
+   `consent_required`; nothing is installed:
+
+   ```bash
+   cd pohunek-daemon-<version>-<target>
+   pohunek plugin install runtime/packages/pi.tar.zst --catalog runtime/runtime-catalog.json
+   ```
+
+4. Install it by repeating the command with `--yes`, and check the result:
+
+   ```bash
+   pohunek plugin install runtime/packages/pi.tar.zst --catalog runtime/runtime-catalog.json --yes
+   pohunek plugin list
+   pohunek host inspect local --json
+   ```
+
+The CLI resolves both paths and the daemon on this machine reads them; the
+command is local only and refuses a remote `--host`. The daemon verifies the
+catalog signature against its anchor, refuses a catalog older than the newest
+one it has accepted, and requires an entry that binds this package id, runtime
+id, version and digest for this core version and platform. The package is
+extracted into the owner-private package store and launches never read the
+archive again; keep the archive and catalog (or the release assets), because
+restoring a damaged installation needs the same files. The upstream agent itself is not part of the package: it
+must be on the daemon's `PATH` in the range the package declares (see the
+[Pi](knowledge/guides/pi-package.md), [Codex](knowledge/guides/codex-package.md)
+and [Claude Code](knowledge/guides/claude-package.md) package guides), or the
+runtime reports itself unsupported.
+
+`codex` and `claude` are reserved runtime ids that only a catalog-authorized
+package may serve. The first installed version of a package is enabled and
+selected, so installing `codex.tar.zst` or `claude.tar.zst` takes the id over
+from the built-in runtime at once:
+
+- an existing session launched from the built-in runtime can no longer be
+  resumed or forked (`runtime_served_by_package`) until the package is disabled
+  or uninstalled again;
+- a host agent profile on that base must be pinned to the package with
+  `pohunek plugin profile migrate <name>`; until then its launches fail with
+  `invalid_profile`.
+
+To prepare first, install with `--no-enable` and run
+`pohunek plugin enable <package-id>` when you are ready to switch. `pohunek
+plugin disable` or `pohunek plugin uninstall` hands the id back to the built-in
+runtime. A daemon upgrade does not change installed packages; they keep
+serving until you install or update another version with `pohunek plugin`.
+The trust model and the package classes are described
+in [the architecture](architecture.md#runtime-packages-and-trust) and the
+[runtime packages guide](knowledge/guides/runtime-packages.md).
+
+## Install the Pi runtime package from a checkout
 
 Pi (`pi`, the Pi coding agent) is an optional runtime delivered as a runtime
 package, not compiled into the daemon. The package declares launch, native
 resume and fork, input framing, and detection for Pi `1.0.x`; the supported range
 and the verified release are in `compat/pi/compatibility-lock.json`. It needs a
 Pi on the daemon's `PATH` (`npm install --global
-@earendil-works/pi-coding-agent@1.0.2`, Node 22.19 or newer).
+@earendil-works/pi-coding-agent@1.0.2`, Node 22.19 or newer). A release install
+takes the official package from the daemon archive as above; a checkout builds
+the archive and trusts it by its digest instead.
 
 ```bash
 # From a checkout: build the archive and note the digest it prints.

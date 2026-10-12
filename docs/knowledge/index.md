@@ -55,8 +55,10 @@ Start here:
   the WebSocket relay transport contract, the test relay, and runtime paths.
 - [Debug daemon](runbooks/debug-daemon.md),
   [debug session runtime](runbooks/debug-session-runtime.md),
-  [update after release](runbooks/update-after-release.md), and
-  [install on macOS](runbooks/install-on-macos.md) are operational runbooks.
+  [update after release](runbooks/update-after-release.md),
+  [install on macOS](runbooks/install-on-macos.md), and
+  [runtime package recovery](runbooks/runtime-package-recovery.md) are
+  operational runbooks.
 - [Trust model](safety/trust-model.md), [secrets](safety/secrets.md), and
   [repo `.pohunek/`](safety/repo-pohunek.md) are safety rules.
 - [Assistant system prompt](assistant/system.md) and

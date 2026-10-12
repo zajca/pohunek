@@ -19,8 +19,14 @@ selection commands.
 ## Install
 
 Pi must be on the daemon's `PATH` (`npm install --global
-@earendil-works/pi-coding-agent@<release>`, Node 22.19 or newer). Build the
-archive from a checkout and install it with the digest it prints:
+@earendil-works/pi-coding-agent@<release>`, Node 22.19 or newer).
+
+Since release 0.34.2 every Linux daemon archive ships the Pi package as
+`runtime/packages/pi.tar.zst` with the signed `runtime/runtime-catalog.json`.
+Installing it with `--catalog` makes it an official package; see [installing
+official packages](runtime-packages.md#install-official-packages-from-a-release).
+
+From a checkout, build the archive and install it with the digest it prints:
 
 ```bash
 cargo xtask package build runtime-packages/pi --output pi.tar.zst
@@ -29,9 +35,9 @@ pohunek host inspect local --json
 pohunek session new --agent pi --input "Refactor the parser."
 ```
 
-The trust is local and explicit: the digest you supply authorizes those exact
-bytes, and the package is never official. The runtime id `pi` is not reserved,
-so no catalog is needed.
+That trust is local and explicit: the digest you supply authorizes those exact
+bytes, and such an install is never official. The runtime id `pi` is not
+reserved, so either way of installing serves it.
 
 ## What the package declares
 
