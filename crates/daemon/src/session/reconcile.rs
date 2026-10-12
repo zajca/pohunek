@@ -168,6 +168,11 @@ pub(super) struct JournalEvidence {
     /// of the previous release.
     #[serde(default)]
     worker_spawn_id: Option<String>,
+    /// Kernel coalitions of the worker as `<resource>:<jetsam>`, valid within
+    /// `boot_identity`; absent for a worker on a host without coalitions and
+    /// for a worker of the previous release.
+    #[serde(default)]
+    worker_coalitions: Option<String>,
     #[serde(rename = "runtime_id")]
     worker_instance_id: Option<String>,
     /// Package release of the worker that wrote the journal; every journal of
@@ -261,6 +266,7 @@ impl JournalEvidence {
             start_identity: &self.worker_start_identity,
             boot_identity: &self.boot_identity,
             spawn_id: self.worker_spawn_id.as_deref(),
+            coalitions: self.worker_coalitions.as_deref(),
             worker_instance_id: self.worker_instance_id.as_deref(),
         }
     }
@@ -6876,6 +6882,7 @@ while os.getppid() == parent:
             worker_start_identity: "410".to_owned(),
             boot_identity: "boot-test".to_owned(),
             worker_spawn_id: None,
+            worker_coalitions: None,
             worker_instance_id: record.runtime.worker_instance_id.clone(),
             version: Some("0.0.0-test".to_owned()),
             child: Some(super::JournalChild {
@@ -7064,6 +7071,7 @@ while os.getppid() == parent:
             worker_start_identity: "410".to_owned(),
             boot_identity: "boot-test".to_owned(),
             worker_spawn_id: None,
+            worker_coalitions: None,
             worker_instance_id: record.runtime.worker_instance_id.clone(),
             version: Some("0.0.0-test".to_owned()),
             child: Some(super::JournalChild {

@@ -66,8 +66,11 @@ launchd's number, so a launchd creator proves nothing. When the sweep knows the
 lost worker's creation number, that lineage decides a process whose environment
 the kernel withholds: a descendant of the worker is reaped, a process created
 before the worker or under an older non-launchd creator is ignored, and every
-other one (created after the worker by launchd, re-executed orphan, creator
-gone) stays skipped as unreadable.
+other one (a re-executed orphan, creator gone) stays skipped as unreadable. When
+the sweep also knows the worker's coalitions, a skipped process that the kernel
+puts in a resource and a jetsam coalition that both differ from the worker's,
+such as a job launchd started after the worker, is ignored as well: a descendant
+keeps the worker's coalitions through every fork, exec and reparenting.
 
 Darwin adds a privilege boundary Linux does not have: the kernel serves most
 process records only to the owner of the target process and refuses everyone

@@ -166,6 +166,97 @@ impl FromStr for SpawnId {
     }
 }
 
+/// Kernel-assigned coalition number within one boot.
+///
+/// A coalition groups the processes of one launchd job (or app) for resource
+/// accounting. The kernel numbers coalitions from a boot-wide counter and never
+/// reuses a number within a boot, so a persisted number is valid only together
+/// with the [`BootIdentity`] it was recorded under. The number is neither a
+/// process id nor portable across operating systems; see
+/// [`ProcessInspector::coalitions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CoalitionId(u64);
+
+impl CoalitionId {
+    /// Creates a coalition number from its canonical integer representation.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the canonical integer representation.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for CoalitionId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+/// The resource and jetsam coalitions one process belongs to.
+///
+/// A process joins its creator's coalitions when it is created and keeps them
+/// across `exec`, `setsid` and reparenting; an unprivileged process cannot move
+/// itself or a child into another job's coalition. Two processes that were
+/// created through any chain of `fork` or spawn calls therefore share
+/// coalitions with their common ancestor, while a process that launchd started
+/// as a job of its own does not.
+///
+/// Sharing proves nothing about descent: a coalition can hold several
+/// processes that are not each other's descendants, so only a difference is
+/// evidence, and only of non-membership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProcessCoalitions {
+    /// Resource coalition, which launchd allocates once per job.
+    pub resource: CoalitionId,
+    /// Jetsam coalition.
+    pub jetsam: CoalitionId,
+}
+
+impl ProcessCoalitions {
+    /// Whether both coalitions of `other` differ from this process's.
+    ///
+    /// This is the only comparison a caller may act on: it attests that
+    /// `other` did not descend from a process holding these coalitions. Equal
+    /// coalitions, or one equal and one different, attest nothing.
+    #[must_use]
+    pub fn excludes(&self, other: &Self) -> bool {
+        self.resource != other.resource && self.jetsam != other.jetsam
+    }
+}
+
+impl std::fmt::Display for ProcessCoalitions {
+    /// Writes `<resource>:<jetsam>` in decimal, the journal representation.
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.resource, self.jetsam)
+    }
+}
+
+impl FromStr for ProcessCoalitions {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (resource, jetsam) = value
+            .split_once(':')
+            .ok_or(Error::InvalidCoalitions { source: None })?;
+        let parse = |text: &str| {
+            text.parse::<u64>()
+                .map(CoalitionId)
+                .map_err(|source| Error::InvalidCoalitions {
+                    source: Some(source),
+                })
+        };
+        Ok(Self {
+            resource: parse(resource)?,
+            jetsam: parse(jetsam)?,
+        })
+    }
+}
+
 /// Opaque operating-system boot identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BootIdentity(String);
@@ -339,6 +430,13 @@ pub enum Error {
         #[source]
         source: std::num::ParseIntError,
     },
+    /// A coalition pair was not `<resource>:<jetsam>` in unsigned decimals.
+    #[error("process coalitions are not two colon-separated unsigned decimal integers")]
+    InvalidCoalitions {
+        /// Decimal parser failure, absent when the separator is missing.
+        #[source]
+        source: Option<std::num::ParseIntError>,
+    },
     /// A decimal start identity was invalid.
     #[error("process start identity is not an unsigned decimal integer")]
     InvalidStartIdentity {
@@ -456,6 +554,27 @@ pub trait ProcessInspector: Debug + Send + Sync + 'static {
     fn lineage(&self, _pid: Pid) -> Result<Option<ProcessLineage>, Error> {
         Err(Error::Unavailable {
             operation: "inspect_process_lineage",
+        })
+    }
+
+    /// Returns the coalitions of one same-user process, or `None` if it exited.
+    ///
+    /// A host with coalitions serves them for every same-user process,
+    /// including one whose environment the kernel withholds. See
+    /// [`ProcessCoalitions`] for what a comparison can attest. The result
+    /// describes the process that holds `pid` when the call returns; callers
+    /// that bind it to a [`ProcessIdentity`] recheck the identity afterwards.
+    ///
+    /// The default reports [`Error::Unavailable`], so a host without
+    /// coalitions needs no implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unavailable`] when the host has no coalitions, or
+    /// another typed failure when the process record cannot be inspected.
+    fn coalitions(&self, _pid: Pid) -> Result<Option<ProcessCoalitions>, Error> {
+        Err(Error::Unavailable {
+            operation: "inspect_process_coalitions",
         })
     }
 

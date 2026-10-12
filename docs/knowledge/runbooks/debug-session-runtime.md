@@ -477,13 +477,15 @@ and the daemon log has the panic.
   journaled creation number (`worker_spawn_id`, used only when the journal was
   written in the current boot). A descendant of the worker (a `/bin/zsh`
   session root and its helpers) is reaped, and a process created before the
-  worker is ignored. A hidden process created after the worker by launchd (a
-  launchd job or agent started later), an orphan that re-executed after its
-  creator died, and a process whose creator exited after the worker started stay
+  worker is ignored. A hidden process the kernel puts in other coalitions than the
+  worker's (the worker's journaled `worker_coalitions`, same boot rule), such as a
+  launchd job, a system helper or another session's agent started after the
+  worker, is ignored too. An orphan that re-executed after its creator died, and a
+  process whose creator exited after the worker started, stay
   unreadable candidates, so `session rm` may still need
   `--accept-unconfirmed-cleanup` after you judge the listed processes. A runtime
   whose worker journaled no creation number (a worker started by the previous
-  release) has no lineage proof, so every hidden process is a candidate. When
+  release) has no lineage or coalition proof, so every hidden process is a candidate. When
   unreadable same-user
   processes are the only obstacle, the error message names each as
   `pid N (start S, command `name`)` (at most eight, then `and N more`) and

@@ -759,9 +759,18 @@ therefore ambiguous and never excludes a process. A descendant of the worker is
 reaped like a marked process. A process created before the worker, or whose
 chain reaches a non-launchd creator older than the worker, is ignored and not
 reported. Every other hidden process stays an unreadable candidate and keeps
-cleanup unconfirmed: one created after the worker by launchd, an orphan that
-re-executed after its creator died, and one whose creator exited after the
-worker started. Those processes are not reported at once: while only such
+cleanup unconfirmed: an orphan that re-executed after its creator died, and one
+whose creator exited after the worker started. A process created after the worker
+by launchd is decided by coalition instead: the kernel puts every process
+created from the worker, through any number of forks, execs, `setsid` calls and
+reparentings, in the worker's resource and jetsam coalitions, and an
+unprivileged process cannot move into another job's coalition. The worker
+journals its own pair as the optional `worker_coalitions` (`<resource>:<jetsam>`
+decimal, no schema bump, used only in the boot it was recorded in). A hidden
+process whose lineage is open and whose both coalitions differ from the
+worker's is ignored and not reported; equal or unreadable coalitions prove
+nothing and keep it a candidate, and a lineage descendant whose coalitions
+differ is skipped, never selected. Those processes are not reported at once: while only such
 unreadable processes remain, the sweep re-reads the process table for up to the
 sweep grace (`sweep.grace_ms`), so one that is caught between images or about to
 exit does not leave the cleanup unconfirmed; a candidate that outlives the grace
@@ -787,9 +796,10 @@ A refusal for any other reason lists no processes.
 method; plain `session rm` uses `session.remove`, which always refuses) is the operator's way out when
 those unreadable processes are the only obstacle. After a lost runtime on macOS
 27 the runtime's own platform-binary processes are reaped without it, but it may
-still be needed for hidden processes created after the worker by launchd, which
-the refusal lists by pid and command name for you to judge, and for every hidden
-process when the worker journaled no creation number. The flag is per call: nothing
+still be needed for a re-executed orphan or a process whose creator exited after
+the worker started, which the refusal lists by pid and command name for you to
+judge, and for every hidden process when the worker journaled neither a creation
+number nor coalitions (`worker_coalitions`). The flag is per call: nothing
 stores it, a retried removal needs it again, and neither the reconciliation that
 finishes an interrupted removal nor the retention sweep ever has it. With it the
 removal proceeds past the unreadable candidates without signalling them,

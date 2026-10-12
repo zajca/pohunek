@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid as NativePid;
 use pohunek_platform::process::{
-    Error, ExitWatch, HostInspector, OwnershipMarkers, Pid, ProcessFact, ProcessIdentity,
-    ProcessInspector, ProcessLineage,
+    Error, ExitWatch, HostInspector, OwnershipMarkers, Pid, ProcessCoalitions, ProcessFact,
+    ProcessIdentity, ProcessInspector, ProcessLineage,
 };
 
 /// The real host in which a scenario sees only the processes working in its own
@@ -113,6 +113,10 @@ impl ProcessInspector for ScopedHost {
 
     fn lineage(&self, pid: Pid) -> Result<Option<ProcessLineage>, Error> {
         self.host.lineage(pid)
+    }
+
+    fn coalitions(&self, pid: Pid) -> Result<Option<ProcessCoalitions>, Error> {
+        self.host.coalitions(pid)
     }
 
     fn foreground_process_group(&self, root_pid: Pid) -> Result<Option<Pid>, Error> {

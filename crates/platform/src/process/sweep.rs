@@ -22,8 +22,16 @@
 //! cannot have created is left out, and a process whose ancestry is not
 //! established stays skipped and reported. Only a process created before the
 //! worker, or a creator link that is not [`SpawnId::LAUNCHD`] and precedes the
-//! worker, excludes a process: a launchd parent number is rewritten when an
-//! orphan re-executes, so it never excludes one.
+//! worker, excludes a process by lineage: a launchd parent number is rewritten
+//! when an orphan re-executes, so it never excludes one.
+//!
+//! When the caller also names the worker's coalitions, a process whose
+//! ancestry the lineage leaves open is left out if the kernel puts it in a
+//! resource and a jetsam coalition that both differ from the worker's: a
+//! process descended from the worker, however many creators have exited and
+//! however it re-executed, shares the worker's coalitions, so one that does not
+//! is, for example, a helper launchd started as a job of its own. Equal
+//! coalitions prove nothing and keep the process skipped.
 
 // Rust guideline compliant 2026-10-12
 
@@ -36,7 +44,8 @@ use rustix::process::{Pid as NativePid, Signal};
 use tokio::time::Instant;
 
 use super::{
-    Error, ProcessFact, ProcessIdentity, ProcessInspector, ProcessLineage, SpawnId, StartIdentity,
+    Error, ProcessCoalitions, ProcessFact, ProcessIdentity, ProcessInspector, ProcessLineage,
+    SpawnId, StartIdentity,
 };
 
 /// Largest accepted worker instance ID, in bytes.
@@ -77,6 +86,9 @@ pub struct SweepRequest {
     /// Spawn id of the worker process instance that owned the runtime, when the
     /// caller knows it; see [`Self::with_worker_spawn_id`].
     worker_spawn_id: Option<SpawnId>,
+    /// Coalitions of the worker that owned the runtime, when the caller knows
+    /// them; see [`Self::with_worker_coalitions`].
+    worker_coalitions: Option<ProcessCoalitions>,
 }
 
 impl SweepRequest {
@@ -118,6 +130,7 @@ impl SweepRequest {
             poll,
             worker_start_identity: None,
             worker_spawn_id: None,
+            worker_coalitions: None,
         })
     }
 
@@ -127,8 +140,8 @@ impl SweepRequest {
     /// a same-user process whose markers cannot be read is still provably not
     /// a descendant of the worker when its own start identity strictly
     /// precedes the worker's, on a host whose start identities order process
-    /// starts. Without the bound, and without
-    /// [`Self::with_worker_spawn_id`], every unreadable-marker process stays
+    /// starts. Without the bound, and without [`Self::with_worker_spawn_id`] or
+    /// [`Self::with_worker_coalitions`], every unreadable-marker process stays
     /// skipped and the sweep is reported unconfirmed.
     #[must_use]
     pub fn with_worker_start_identity(
@@ -161,6 +174,27 @@ impl SweepRequest {
     #[must_use]
     pub fn with_worker_spawn_id(mut self, worker_spawn_id: Option<SpawnId>) -> Self {
         self.worker_spawn_id = worker_spawn_id;
+        self
+    }
+
+    /// Names the coalitions of the worker process instance that owned the
+    /// runtime.
+    ///
+    /// The daemon takes them from the dead worker's journal. With them, a
+    /// same-user process whose markers cannot be read and whose ancestry the
+    /// fork lineage leaves open is left out of the sweep when the host reports
+    /// coalitions (see [`ProcessInspector::coalitions`]) and both of its
+    /// coalitions differ from the worker's: it cannot have descended from the
+    /// worker. A match, an unreadable record, or a process the lineage already
+    /// proved a descendant is never dismissed this way; a proven descendant
+    /// whose coalitions differ contradicts the kernel and is skipped as
+    /// unreadable instead of selected.
+    ///
+    /// Coalition numbers restart at every boot, so the caller must pass them
+    /// only when they were recorded in the current boot.
+    #[must_use]
+    pub fn with_worker_coalitions(mut self, worker_coalitions: Option<ProcessCoalitions>) -> Self {
+        self.worker_coalitions = worker_coalitions;
         self
     }
 
@@ -221,6 +255,12 @@ impl SweepRequest {
     #[must_use]
     pub const fn worker_spawn_id(&self) -> Option<SpawnId> {
         self.worker_spawn_id
+    }
+
+    /// Returns the worker coalitions, when the caller knows them.
+    #[must_use]
+    pub const fn worker_coalitions(&self) -> Option<ProcessCoalitions> {
+        self.worker_coalitions
     }
 }
 
@@ -339,7 +379,8 @@ pub enum SweepError {
 /// byte for byte; unmarked processes and other worker instance IDs are never
 /// selected. A process whose markers cannot be read is selected only through
 /// its fork lineage, when the request names the worker's creation number and
-/// the process is proven to descend from that worker. Selection finishes
+/// the process is proven to descend from that worker; the worker's coalitions
+/// can only leave such a process out. Selection finishes
 /// before the first signal, so an inspection failure during selection signals
 /// nothing. Each selected process then gets
 /// `SIGTERM`; those still running after the grace period get `SIGKILL`; and
@@ -592,7 +633,7 @@ pub(super) const START_IDENTITY_ORDERS_PROCESS_STARTS: bool = cfg!(target_os = "
 /// A process inherits its environment only when it is forked or execs, and
 /// only the worker and its descendants ever carry this runtime's marker, so
 /// a process carrying the marker must have started at or after the worker
-/// that owns the runtime, and must descend from it. Two bounds, each named by
+/// that owns the runtime, and must descend from it. Three bounds, each named by
 /// the request, decide such a process without its markers.
 ///
 /// The worker's start identity bounds the start time: a process whose start
@@ -610,10 +651,18 @@ pub(super) const START_IDENTITY_ORDERS_PROCESS_STARTS: bool = cfg!(target_os = "
 /// decided is not provably foreign, because an orphan that re-executed carries
 /// that number whoever created it.
 ///
+/// The worker's coalitions bound the process when the lineage leaves its
+/// ancestry open: a process created from the worker keeps the worker's
+/// coalitions, so one whose resource and jetsam coalition both differ from the
+/// worker's is foreign (see [`outside_worker_coalitions`]). The bound is never
+/// used to select, and a lineage descendant whose coalitions differ contradicts
+/// the kernel, so it is skipped unreadable instead.
+///
 /// Without a bound, when the process exited between the two reads, or when its
 /// start identity cannot be read, the process is not provably foreign: it stays
 /// skipped unreadable, which makes the caller's cleanup unconfirmed. The same
-/// holds for a process whose ancestry the lineage does not establish.
+/// holds for a process whose ancestry neither the lineage nor the coalitions
+/// establish.
 fn classify_unreadable_markers(
     inspector: &dyn ProcessInspector,
     identity: ProcessIdentity,
@@ -631,7 +680,7 @@ fn classify_unreadable_markers(
     }
     let worker_start = request.worker_start_identity();
     let worker_spawn = request.worker_spawn_id();
-    if worker_start.is_none() && worker_spawn.is_none() {
+    if worker_start.is_none() && worker_spawn.is_none() && request.worker_coalitions().is_none() {
         return Ok(Selection::Skip(SkipReason::MarkersUnreadable));
     }
     match inspector.identity(identity.pid) {
@@ -649,10 +698,17 @@ fn classify_unreadable_markers(
         // unreadable.
         Err(_) => return Ok(Selection::Skip(SkipReason::MarkersUnreadable)),
     }
-    let Some(worker) = worker_spawn else {
-        return Ok(Selection::Skip(SkipReason::MarkersUnreadable));
+    let ancestry = match worker_spawn {
+        Some(worker) => lineage.ancestry(identity, worker)?,
+        None => Ancestry::Unproven,
     };
-    Ok(match lineage.ancestry(identity, worker)? {
+    Ok(match ancestry {
+        // The kernel puts a process created by the worker in the worker's
+        // coalitions, so a lineage descendant outside them contradicts one of
+        // the two proofs; neither is trusted over the other.
+        Ancestry::Descendant if outside_worker_coalitions(inspector, identity, request) => {
+            Selection::Skip(SkipReason::MarkersUnreadable)
+        }
         // A session marker cannot be read from this process, so a request
         // that requires one never selects it through the lineage.
         Ancestry::Descendant if request.session_id.is_some() => {
@@ -664,8 +720,61 @@ fn classify_unreadable_markers(
             Some(Delivery::Vanished | Delivery::Sent) => Selection::Skip(SkipReason::Vanished),
         },
         Ancestry::Unrelated => Selection::Foreign,
+        Ancestry::Unproven if outside_worker_coalitions(inspector, identity, request) => {
+            Selection::Foreign
+        }
         Ancestry::Unproven => Selection::Skip(SkipReason::MarkersUnreadable),
     })
+}
+
+/// Whether the kernel attests that `identity` is outside the worker's coalitions.
+///
+/// True only when the request names the worker's coalitions, the host reports
+/// the process's, the read is bracketed by the enumerated identity, and both its
+/// resource and jetsam coalition differ from the worker's (see
+/// [`ProcessCoalitions::excludes`]). Every other outcome is `false`, which
+/// leaves the caller's decision as it was: no coalitions named, a host that
+/// reports none, a process that exited or changed meanwhile, a record the
+/// kernel denies or withholds, an identity recheck that fails, and any other
+/// read failure (a malformed or short record, an operating-system error). The
+/// coalitions are an optional extra proof, so no failure of theirs aborts the
+/// selection; an unexpected one is logged by process id and error class.
+fn outside_worker_coalitions(
+    inspector: &dyn ProcessInspector,
+    identity: ProcessIdentity,
+    request: &SweepRequest,
+) -> bool {
+    let Some(worker) = request.worker_coalitions() else {
+        return false;
+    };
+    let candidate = match inspector.coalitions(identity.pid) {
+        Ok(Some(candidate)) => candidate,
+        Ok(None)
+        | Err(
+            Error::Unavailable { .. } | Error::PermissionDenied { .. } | Error::Unobservable { .. },
+        ) => return false,
+        Err(error) if error.is_race() => return false,
+        Err(error) => {
+            tracing::event!(
+                name: "process.coalitions.unreadable",
+                tracing::Level::WARN,
+                process.pid = identity.pid,
+                error.type = coalition_error_class(&error),
+                "process coalitions could not be read; the lineage decision stands: {{error.type}}",
+            );
+            return false;
+        }
+    };
+    matches!(verify(inspector, identity), Ok(None)) && worker.excludes(&candidate)
+}
+
+/// Stable label of a coalition read failure for the log.
+fn coalition_error_class(error: &Error) -> &'static str {
+    match error {
+        Error::InvalidData { .. } => "invalid_data",
+        Error::Io { .. } => "io",
+        _ => "other",
+    }
 }
 
 /// What the fork lineage proves about a process relative to one worker.
