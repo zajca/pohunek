@@ -1,0 +1,24 @@
+
+
+────────────────────────
+
+◉ Current Folder | ○ All
+tab scope · re:<pattern…
+ctrl+s sort · ctrl+n na…
+
+>
+
+› please run the…  5 12m
+  please run the…  5 12m
+  please run the…  5 12m
+  please run the…  5 12m
+  please run the…  5 12m
+  please run the…  5 12m
+  please run the…  5 13m
+  please run the…  5 13m
+  please run the…  5 13m
+  please run the…  5 13m
+  (1/13)
+
+~/work
+0.0%/128k (auto)  stub-m

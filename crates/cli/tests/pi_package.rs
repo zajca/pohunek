@@ -3,11 +3,11 @@
 //! Pure tests always run: they build the package directory, parse it through
 //! the same path `plugin install` uses, and check it against the compatibility
 //! lock, the fixture screens captured from a real Pi, and the session-file
-//! layout the existence check searches. The real-Pi test drives an actual
-//! `pi` binary through the installed package; see its documentation for the
+//! layouts the existence check searches. The real-Pi tests drive an actual
+//! `pi` binary through the installed package; see their documentation for the
 //! opt-in.
 
-// Rust guideline compliant 2026-10-04
+// Rust guideline compliant 2026-10-12
 
 #![cfg(unix)]
 
@@ -19,7 +19,10 @@ use std::time::{Duration, Instant};
 use package::directory::build_directory_archive;
 use package::{read_archive, Limits, PackageDigest};
 use pohunek_daemon::agent::host::{definition_from_archive, LaunchProgram, RuntimeDefinition};
-use pohunek_daemon::agent::{NativeReferenceStrategy, ReferenceCheckFailure, SessionRef};
+use pohunek_daemon::agent::{
+    LaunchView, NativeReferenceStrategy, ReferenceCheckFailure, ReferenceExistence, RefusalPhase,
+    SessionRef,
+};
 use pohunek_daemon::detect::{DetectionConfig, Detector, DetectorConfig};
 use pohunek_daemon::procwatch::{ProcessFact, StartIdentity};
 use pohunek_test_support::wait::wait_until;
@@ -44,7 +47,7 @@ const LOCK_PATH: &str = "compat/pi/compatibility-lock.json";
 /// Package id the descriptor declares.
 const PACKAGE_ID: &str = "pohunek.runtime.pi";
 
-/// Profile the real-Pi test launches through.
+/// Profile the real-Pi tests launch through by default.
 const PROFILE: &str = "pi-test";
 
 fn package_dir() -> PathBuf {
@@ -108,7 +111,7 @@ fn the_descriptor_declares_the_verified_pi_launch_contract() {
     match &definition.binding().provenance {
         BindingProvenance::Package { package, .. } => {
             assert_eq!(package.id.as_str(), PACKAGE_ID);
-            assert_eq!(package.version.as_str(), "1.0.1");
+            assert_eq!(package.version.as_str(), "1.0.2");
         }
         other @ BindingProvenance::Builtin { .. } => {
             panic!("a package-served runtime, got {other:?}")
@@ -287,6 +290,286 @@ fn the_existence_check_refuses_a_symlinked_project_directory() {
     assert!(
         existence_check(&definition, REAL_REFERENCE, &env).is_err(),
         "a conversation behind a symlink is never accepted"
+    );
+}
+
+/// The existence check Pi's package declares, as recovery and a first launch
+/// run it.
+fn pi_existence(definition: &RuntimeDefinition) -> ReferenceExistence {
+    definition
+        .native()
+        .and_then(|native| native.assigned())
+        .expect("assigned reference")
+        .existence()
+        .clone()
+}
+
+/// A `--session-dir` directory the way Pi 1.0.2 fills it: the session files
+/// sit directly in it, as a PTY run with `PI_CODING_AGENT_SESSION_DIR` showed.
+fn pi_session_dir(file: &str) -> tempfile::TempDir {
+    let dir = pohunek_test_support::tempdir().expect("tempdir");
+    fs::write(dir.path().join(file), b"{}\n").expect("write the session file");
+    dir
+}
+
+#[test]
+fn the_existence_check_follows_the_session_dir_variable() {
+    let definition = installed_definition();
+    let agent = pi_agent_dir(REAL_PROJECT_DIR, "unrelated.jsonl");
+    let store = pi_session_dir(REAL_FILE_NAME);
+    let (agent_dir, store_dir) = (agent.path().to_owned(), store.path().to_owned());
+    let env = move |name: &str| match name {
+        "PI_CODING_AGENT_DIR" => Some(agent_dir.clone().into_os_string()),
+        "PI_CODING_AGENT_SESSION_DIR" => Some(store_dir.clone().into_os_string()),
+        _ => None,
+    };
+    existence_check(&definition, REAL_REFERENCE, &env)
+        .expect("the session file is found in the variable's directory");
+
+    // Pi keeps the files directly in that directory and never looks below it.
+    let nested = pohunek_test_support::tempdir().expect("tempdir");
+    fs::create_dir(nested.path().join(REAL_PROJECT_DIR)).expect("create a subdirectory");
+    fs::write(
+        nested.path().join(REAL_PROJECT_DIR).join(REAL_FILE_NAME),
+        b"{}\n",
+    )
+    .expect("write a nested session file");
+    let nested_dir = nested.path().to_owned();
+    let below = move |name: &str| {
+        (name == "PI_CODING_AGENT_SESSION_DIR").then(|| nested_dir.clone().into_os_string())
+    };
+    assert_eq!(
+        existence_check(&definition, REAL_REFERENCE, &below),
+        Err(ReferenceCheckFailure::Missing)
+    );
+
+    // An empty variable is unset, as for Pi; a relative one is refused.
+    let agent_dir = agent.path().to_owned();
+    let empty = move |name: &str| match name {
+        "PI_CODING_AGENT_DIR" => Some(agent_dir.clone().into_os_string()),
+        "PI_CODING_AGENT_SESSION_DIR" => Some(std::ffi::OsString::new()),
+        _ => None,
+    };
+    assert_eq!(
+        existence_check(&definition, REAL_REFERENCE, &empty),
+        Err(ReferenceCheckFailure::Missing),
+        "the agent directory's store holds no such session"
+    );
+    let relative = |name: &str| {
+        (name == "PI_CODING_AGENT_SESSION_DIR").then(|| std::ffi::OsString::from("pi-sessions"))
+    };
+    assert_eq!(
+        existence_check(&definition, REAL_REFERENCE, &relative),
+        Err(ReferenceCheckFailure::StoreEnvRelative)
+    );
+}
+
+/// Runs the relocation check of the Pi package against a launch of `args` in
+/// `cwd` whose environment is `vars`.
+fn relocation(
+    definition: &RuntimeDefinition,
+    vars: &[(&str, &Path)],
+    args: &[&str],
+    cwd: &Path,
+) -> Result<(), ReferenceCheckFailure> {
+    let vars: Vec<(String, std::ffi::OsString)> = vars
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), value.as_os_str().to_owned()))
+        .collect();
+    let env = move |name: &str| {
+        vars.iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+    };
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+    pi_existence(definition).check_relocation(&LaunchView {
+        env: &env,
+        args: &args,
+        cwd,
+    })
+}
+
+#[test]
+fn a_launch_whose_pi_keeps_its_sessions_elsewhere_is_refused() {
+    let definition = installed_definition();
+    let agent = pohunek_test_support::tempdir().expect("agent dir");
+    let project = pohunek_test_support::tempdir().expect("project");
+    let store = pohunek_test_support::tempdir().expect("session dir");
+    let agent_only = [("PI_CODING_AGENT_DIR", agent.path())];
+    let with_store = [
+        ("PI_CODING_AGENT_DIR", agent.path()),
+        ("PI_CODING_AGENT_SESSION_DIR", store.path()),
+    ];
+    let cwd = project.path();
+    assert_eq!(relocation(&definition, &agent_only, &[], cwd), Ok(()));
+
+    // The flag wins over everything in Pi, in both spellings Pi's parser and
+    // a careless profile could produce.
+    for args in [&["--session-dir", "/x"][..], &["--session-dir=/x"][..]] {
+        assert_eq!(
+            relocation(&definition, &with_store, args, cwd),
+            Err(ReferenceCheckFailure::RelocatedByArgument),
+            "{args:?}"
+        );
+    }
+    assert_eq!(
+        relocation(&definition, &agent_only, &["--session-directory"], cwd),
+        Ok(()),
+        "another option is not the flag"
+    );
+
+    // `sessionDir` in the agent directory's or the project's settings.
+    let global = agent.path().join("settings.json");
+    let local = project.path().join(".pi/settings.json");
+    fs::create_dir_all(project.path().join(".pi")).expect("create the project settings dir");
+    for (settings, file) in [(&global, "agent"), (&local, "project")] {
+        fs::write(settings, "\u{feff}{\"sessionDir\": \"~/pi-sessions\"}")
+            .expect("write the settings");
+        assert_eq!(
+            relocation(&definition, &agent_only, &[], cwd),
+            Err(ReferenceCheckFailure::RelocatedBySetting),
+            "{file} settings"
+        );
+        // The variable wins over the settings in Pi, and the check follows it.
+        assert_eq!(relocation(&definition, &with_store, &[], cwd), Ok(()));
+        fs::remove_file(settings).expect("remove the settings");
+    }
+
+    // Values Pi treats as unset, and a file it cannot parse.
+    for (contents, expected) in [
+        (r#"{"sessionDir": ""}"#, Ok(())),
+        (r#"{"sessionDir": null, "theme": "dark"}"#, Ok(())),
+        ("", Ok(())),
+        ("{not json", Err(ReferenceCheckFailure::SettingsUnreadable)),
+    ] {
+        fs::write(&global, contents).expect("write the settings");
+        assert_eq!(
+            relocation(&definition, &agent_only, &[], cwd),
+            expected,
+            "{contents:?}"
+        );
+    }
+}
+
+#[test]
+fn a_refused_launch_names_the_session_dir_variable() {
+    let definition = installed_definition();
+    let existence = pi_existence(&definition);
+    for failure in [
+        ReferenceCheckFailure::RelocatedByArgument,
+        ReferenceCheckFailure::RelocatedBySetting,
+        ReferenceCheckFailure::SettingsUnreadable,
+        ReferenceCheckFailure::StoreEnvRelative,
+    ] {
+        let error = existence.refusal(failure, RefusalPhase::Launch);
+        assert_eq!(error.code, "agent_native_store_relocated", "{failure}");
+        assert!(
+            error
+                .recover
+                .as_deref()
+                .is_some_and(|hint| hint.contains("PI_CODING_AGENT_SESSION_DIR")),
+            "{failure}: {error:?}"
+        );
+    }
+    // The flag wins over the variable in Pi, so the hint removes it first.
+    let flag = existence.refusal(
+        ReferenceCheckFailure::RelocatedByArgument,
+        RefusalPhase::Launch,
+    );
+    assert!(
+        flag.recover.as_deref().is_some_and(
+            |hint| hint.starts_with("remove --session-dir from the agent profile args")
+        ),
+        "{flag:?}"
+    );
+    assert_eq!(
+        existence
+            .refusal(ReferenceCheckFailure::Missing, RefusalPhase::Launch)
+            .code,
+        "agent_native_reference_missing"
+    );
+}
+
+#[test]
+fn a_refused_recovery_says_to_undo_the_move_instead() {
+    let definition = installed_definition();
+    let existence = pi_existence(&definition);
+    // The launch passed the refusal, so something changed since: a setting
+    // appeared or the variable the launch had is gone. The hint undoes the
+    // change; pointing the variable at a new directory would not find the
+    // conversation.
+    let setting = existence.refusal(
+        ReferenceCheckFailure::RelocatedBySetting,
+        RefusalPhase::Recovery,
+    );
+    assert_eq!(setting.code, "agent_native_store_relocated");
+    let hint = setting.recover.expect("a recovery hint");
+    assert!(hint.contains("remove the setting"), "{hint}");
+    assert!(
+        hint.contains("restore PI_CODING_AGENT_SESSION_DIR to the absolute path the session was launched with"),
+        "{hint}"
+    );
+    assert!(!hint.contains("added after"), "{hint}");
+    let relative = existence.refusal(
+        ReferenceCheckFailure::StoreEnvRelative,
+        RefusalPhase::Recovery,
+    );
+    assert!(
+        relative
+            .recover
+            .as_deref()
+            .is_some_and(|hint| hint.contains("--accept-profile-change")),
+        "{relative:?}"
+    );
+}
+
+/// How long the relocation check of a settings path may take; a check that
+/// blocks on the path never returns, so any bound far above a file read
+/// separates the two.
+const SETTINGS_CHECK_BOUND: Duration = Duration::from_secs(10);
+
+#[test]
+fn a_settings_path_that_is_not_a_file_refuses_without_blocking() {
+    let definition = installed_definition();
+    let agent = pohunek_test_support::tempdir().expect("agent dir");
+    let project = pohunek_test_support::tempdir().expect("project");
+    fs::create_dir(project.path().join(".pi")).expect("create the project settings dir");
+    // A repository can carry a FIFO, or a symlink to one, where Pi reads its
+    // project settings.
+    nix::unistd::mkfifo(
+        &project.path().join(".pi/settings.json"),
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .expect("create the FIFO");
+    let (agent_dir, cwd) = (agent.path().to_owned(), project.path().to_owned());
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = relocation(
+            &definition,
+            &[("PI_CODING_AGENT_DIR", agent_dir.as_path())],
+            &[],
+            &cwd,
+        );
+        let _ = sender.send(outcome);
+    });
+    assert_eq!(
+        receiver.recv_timeout(SETTINGS_CHECK_BOUND),
+        Ok(Err(ReferenceCheckFailure::SettingsUnreadable)),
+        "the check refuses the FIFO instead of waiting for a writer"
+    );
+
+    // A directory where the file belongs is refused the same way.
+    fs::remove_file(project.path().join(".pi/settings.json")).expect("remove the FIFO");
+    fs::create_dir(project.path().join(".pi/settings.json")).expect("create a directory");
+    let definition = installed_definition();
+    assert_eq!(
+        relocation(
+            &definition,
+            &[("PI_CODING_AGENT_DIR", agent.path())],
+            &[],
+            project.path()
+        ),
+        Err(ReferenceCheckFailure::SettingsUnreadable)
     );
 }
 
@@ -646,6 +929,10 @@ fn a_column_zero_rule_in_the_transcript_never_stands_in_for_the_upper_border() {
     }
 }
 
+/// Border-like text (rules, scroll markers, status lookalikes) in the
+/// transcript or the draft never changes the classification of a captured
+/// editor screen. Text that starts like a selector line is the documented
+/// exception: see [`a_draft_reads_idle_unless_it_reproduces_a_selector_list_or_a_dialog_hint`].
 #[test]
 fn hostile_text_in_the_transcript_or_the_draft_never_changes_the_classification() {
     let definition = installed_definition();
@@ -669,6 +956,314 @@ fn hostile_text_in_the_transcript_or_the_draft_never_changes_the_classification(
         );
     }
     assert!(checked > 3500, "the sweep covers every row: {checked}");
+}
+
+/// What an overlay screen of `compat/pi/screens/overlays/` waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayKind {
+    /// A prompt that waits for an answer: an extension dialog (also raised by
+    /// a permission check mid-turn), the project trust or missing session cwd
+    /// prompt, or a login step.
+    Dialog,
+    /// A selector the owner opened (model, session, tree, fork, settings).
+    Selector,
+    /// A question Pi prints before its interface starts, outside any frame.
+    Unframed,
+}
+
+/// A screen a real Pi 1.0.2 drew in place of its editor, named
+/// `<blocked|selector|unframed>_<what>_w<columns>.txt`.
+struct OverlayFixture {
+    name: String,
+    kind: OverlayKind,
+    columns: u16,
+    rows: Vec<String>,
+}
+
+/// Every overlay screen, captured by driving a real Pi in a terminal of each
+/// width with real key presses (model calls answered by a loopback stub).
+fn overlay_fixtures() -> Vec<OverlayFixture> {
+    let mut names: Vec<String> = fs::read_dir(workspace_root().join("compat/pi/screens/overlays"))
+        .expect("read the overlay fixtures")
+        .map(|entry| {
+            entry
+                .expect("directory entry")
+                .file_name()
+                .into_string()
+                .expect("UTF-8 file name")
+        })
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            let stem = name.strip_suffix(".txt").expect("a .txt fixture");
+            let (state, columns) = stem.rsplit_once("_w").expect("a `_w<columns>` suffix");
+            let kind = match state.split_once('_').expect("a `<kind>_` prefix").0 {
+                "blocked" => OverlayKind::Dialog,
+                "selector" => OverlayKind::Selector,
+                "unframed" => OverlayKind::Unframed,
+                other => panic!("unknown overlay kind {other} in {name}"),
+            };
+            OverlayFixture {
+                kind,
+                columns: columns.parse().expect("a column count"),
+                rows: screen_rows(&format!("overlays/{name}")),
+                name,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn no_overlay_reads_idle_at_any_terminal_width() {
+    let definition = installed_definition();
+    let fixtures = overlay_fixtures();
+    let widths: std::collections::BTreeSet<u16> =
+        fixtures.iter().map(|fixture| fixture.columns).collect();
+    assert!(
+        widths.contains(&20) && widths.contains(&200) && widths.len() >= 10,
+        "the overlays span the supported widths: {widths:?}"
+    );
+    assert!(
+        fixtures.len() >= 140,
+        "overlays captured: {}",
+        fixtures.len()
+    );
+    for fixture in &fixtures {
+        assert_ne!(
+            activity_at(&definition, &fixture.rows, fixture.columns),
+            Some(AgentActivity::Idle),
+            "{}",
+            fixture.name
+        );
+    }
+}
+
+#[test]
+fn a_prompt_that_waits_for_an_answer_reads_blocked_at_every_width() {
+    let definition = installed_definition();
+    let dialogs: Vec<OverlayFixture> = overlay_fixtures()
+        .into_iter()
+        .filter(|fixture| fixture.kind == OverlayKind::Dialog)
+        .collect();
+    assert!(dialogs.len() >= 120, "dialogs captured: {}", dialogs.len());
+    let mut clipped = 0_usize;
+    for fixture in &dialogs {
+        // A prompt taller than the terminal can lose its bottom rows: its
+        // lower border, and in some cases its key hint; Pi drew no frame to
+        // read then.
+        let expected = if frame_closes_the_screen(&fixture.rows) {
+            Some(AgentActivity::Blocked)
+        } else {
+            clipped += 1;
+            None
+        };
+        assert_eq!(
+            activity_at(&definition, &fixture.rows, fixture.columns),
+            expected,
+            "{}",
+            fixture.name
+        );
+    }
+    assert!(clipped <= 10, "dialogs without a frame: {clipped}");
+}
+
+/// Whether the last plain border of `rows` is followed by at most four
+/// lines: the frame (and its footer, if any) ends the screen.
+fn frame_closes_the_screen(rows: &[String]) -> bool {
+    let mut rows = rows.to_vec();
+    while rows.last().is_some_and(String::is_empty) {
+        rows.pop();
+    }
+    rows.iter()
+        .rposition(|row| row.chars().count() >= 20 && row.chars().all(|ch| ch == '\u{2500}'))
+        .is_some_and(|lower| rows.len() - lower - 1 <= 4)
+}
+
+#[test]
+fn a_selector_the_owner_opened_and_an_unframed_question_match_no_rule() {
+    let definition = installed_definition();
+    for fixture in overlay_fixtures()
+        .iter()
+        .filter(|fixture| fixture.kind != OverlayKind::Dialog)
+    {
+        assert_eq!(
+            activity_at(&definition, &fixture.rows, fixture.columns),
+            None,
+            "{}",
+            fixture.name
+        );
+    }
+}
+
+#[test]
+fn a_dialog_opened_from_the_idle_editor_is_published_as_blocked_and_closes_to_idle() {
+    let definition = installed_definition();
+    let started = Instant::now();
+    let mut detector = detector(&definition, started);
+    let mut now = started;
+    for (screen, expected) in [
+        ("idle_after_turn.txt", AgentActivity::Idle),
+        (
+            "overlays/blocked_permission_midturn_w100.txt",
+            AgentActivity::Blocked,
+        ),
+        ("idle_after_turn.txt", AgentActivity::Idle),
+        (
+            "overlays/blocked_project_trust_w100.txt",
+            AgentActivity::Blocked,
+        ),
+        ("working.txt", AgentActivity::Working),
+        (
+            "overlays/blocked_login_api_key_w100.txt",
+            AgentActivity::Blocked,
+        ),
+    ] {
+        now += Duration::from_secs(1);
+        let transitions = detector.feed(now, &screen_bytes(screen));
+        assert_eq!(
+            transitions
+                .last()
+                .map(|transition| (transition.activity, transition.source)),
+            Some((expected, StateSource::Screen)),
+            "{screen}"
+        );
+    }
+}
+
+#[test]
+fn transcript_text_never_changes_a_dialog_or_a_selector() {
+    let definition = installed_definition();
+    let mut checked = 0_usize;
+    // Screens whose frame shows both borders; a taller overlay has no
+    // transcript rows above it.
+    let framed = |fixture: &&OverlayFixture| {
+        fixture
+            .rows
+            .iter()
+            .filter(|row| row.starts_with("\u{2500}\u{2500}"))
+            .count()
+            >= 2
+    };
+    for fixture in overlay_fixtures()
+        .iter()
+        .filter(|fixture| fixture.columns == 100)
+        .filter(framed)
+    {
+        let expected = activity_at(&definition, &fixture.rows, fixture.columns);
+        let (upper, _) = frame_borders(&fixture.rows);
+        let mut hostile: Vec<String> = HOSTILE_TEXT.iter().map(|text| (*text).to_owned()).collect();
+        hostile.extend(STATUS_LOOKALIKES.iter().map(|text| (*text).to_owned()));
+        hostile.extend(forged_borders());
+        hostile.extend(
+            [
+                "> quoted",
+                " \u{2192} Yes",
+                " \u{2191}\u{2193} navigate  enter select  escape/ctrl+c cancel",
+            ]
+            .map(str::to_owned),
+        );
+        for row in 0..upper {
+            for text in &hostile {
+                let mut changed = fixture.rows.clone();
+                changed[row].clone_from(text);
+                assert_eq!(
+                    activity_at(&definition, &changed, fixture.columns),
+                    expected,
+                    "{} row {row} replaced by {text:?}",
+                    fixture.name
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(
+        checked > 2000,
+        "the sweep covers every transcript row: {checked}"
+    );
+}
+
+/// `rows` with the first draft line of its editor frame replaced by `text`.
+fn with_draft(rows: &[String], text: &str) -> Vec<String> {
+    let (upper, lower) = frame_borders(rows);
+    assert!(upper + 1 < lower, "the draft has a line");
+    let mut changed = rows.to_vec();
+    text.clone_into(&mut changed[upper + 1]);
+    changed
+}
+
+#[test]
+fn a_draft_reads_idle_unless_it_reproduces_a_selector_list_or_a_dialog_hint() {
+    let definition = installed_definition();
+    let rows = screen_rows("idle_draft6.txt");
+    // A quote, a lone cursor or a line that only mentions the markers is
+    // draft text: Pi is idle.
+    for text in [
+        "> quoted reply",
+        ">",
+        "\u{2192} next",
+        " \u{2192} Yes",
+        "\u{203a} item",
+        "see > below",
+        "a \u{2192} b",
+        "press enter to submit",
+    ] {
+        assert_eq!(
+            activity_of(&definition, &with_draft(&rows, text)),
+            Some(AgentActivity::Idle),
+            "{text:?}"
+        );
+    }
+    // A cursor row together with a row indented by two spaces is what a
+    // selector list draws; such a draft withholds idle.
+    let mut list = with_draft(&rows, "\u{2192} first");
+    let (upper, _) = frame_borders(&list);
+    list[upper + 2] = "  second".to_owned();
+    assert_eq!(activity_of(&definition, &list), None);
+    // A draft that reproduces a dialog's key hint reads as the dialog.
+    assert_eq!(
+        activity_of(
+            &definition,
+            &with_draft(&rows, " enter submit  escape/ctrl+c cancel")
+        ),
+        Some(AgentActivity::Blocked)
+    );
+}
+
+#[test]
+fn a_turn_that_ends_with_a_quoted_draft_is_published_idle() {
+    let definition = installed_definition();
+    let started = Instant::now();
+    let mut detector = detector(&definition, started);
+    let mut now = started;
+    let quote = "> quoted reply";
+    for (rows, expected) in [
+        (
+            with_draft(&screen_rows("idle_draft6.txt"), quote),
+            AgentActivity::Idle,
+        ),
+        (
+            with_draft(&screen_rows("working_draft6.txt"), quote),
+            AgentActivity::Working,
+        ),
+        (
+            with_draft(&screen_rows("idle_draft6.txt"), quote),
+            AgentActivity::Idle,
+        ),
+    ] {
+        now += Duration::from_secs(1);
+        let mut bytes = b"\x1b[2J\x1b[H".to_vec();
+        bytes.extend_from_slice(rows.join("\r\n").as_bytes());
+        let transitions = detector.feed(now, &bytes);
+        assert_eq!(
+            transitions
+                .last()
+                .map(|transition| (transition.activity, transition.source)),
+            Some((expected, StateSource::Screen)),
+            "{rows:#?}"
+        );
+    }
 }
 
 #[test]
@@ -792,7 +1387,7 @@ fn the_process_matchers_accept_only_the_observed_pi_process_forms() {
     }
 }
 
-/// Opt-in variable of the real-Pi test.
+/// Opt-in variable of the real-Pi tests.
 const E2E_VARIABLE: &str = "POHUNEK_PI_E2E";
 
 /// Optional variable naming an archive built by `cargo xtask package build`.
@@ -936,10 +1531,15 @@ impl Fixture {
     /// Writes the profile the sessions launch through: it pins the installed
     /// digest and keeps Pi off the network.
     fn write_profile(&self) {
+        self.write_named_profile(PROFILE, "", "");
+    }
+
+    /// Writes profile `name` with extra top-level `args` and `[env]` lines.
+    fn write_named_profile(&self, name: &str, args: &str, env: &str) {
         self.harness.profile(
-            PROFILE,
+            name,
             &format!(
-                "base = \"pi\"\npackage = \"{PACKAGE_ID}\"\ndigest = \"{}\"\n\n[env]\nPI_OFFLINE = \"1\"\nPI_SKIP_VERSION_CHECK = \"1\"\nPI_TELEMETRY = \"0\"\n",
+                "base = \"pi\"\npackage = \"{PACKAGE_ID}\"\ndigest = \"{}\"\n{args}\n[env]\nPI_OFFLINE = \"1\"\nPI_SKIP_VERSION_CHECK = \"1\"\nPI_TELEMETRY = \"0\"\n{env}",
                 self.digest
             ),
         );
@@ -947,21 +1547,26 @@ impl Fixture {
 
     async fn new_session(&self, name: &str) -> Value {
         let cwd = self.harness.env.cwd().to_path_buf();
-        let (code, launched) = self
-            .harness
+        let (code, launched) = self.launch(PROFILE, name, &cwd).await;
+        assert_eq!(code, 0, "{launched}");
+        launched["ok"].clone()
+    }
+
+    /// Runs `session new` of `profile` in `cwd` and returns its exit code and
+    /// JSON document.
+    async fn launch(&self, profile: &str, name: &str, cwd: &Path) -> (i32, Value) {
+        self.harness
             .json(&[
                 "session",
                 "new",
                 "--agent",
-                PROFILE,
+                profile,
                 "--cwd",
-                path_str(&cwd),
+                path_str(cwd),
                 "--name",
                 name,
             ])
-            .await;
-        assert_eq!(code, 0, "{launched}");
-        launched["ok"].clone()
+            .await
     }
 
     /// Waits until the session's detected activity is `activity` and returns
@@ -1292,5 +1897,247 @@ async fn a_real_pi_session_without_a_turn_has_nothing_to_resume() {
         refused["err"]["code"], "agent_native_reference_missing",
         "{refused}"
     );
+    fixture.harness.stop().await;
+}
+
+/// Name of the extension command that opens a confirm dialog.
+const CONFIRM_COMMAND: &str = "pohunek-confirm";
+
+/// Writes an agent-directory extension whose command opens a confirm dialog
+/// and writes `marker` only when the dialog is answered Yes.
+fn write_confirm_extension(fixture: &Fixture, marker: &Path) {
+    let extensions = fixture.harness.env.home().join(".pi/agent/extensions");
+    fs::create_dir_all(&extensions).expect("create the extensions directory");
+    fs::write(
+        extensions.join("confirm.ts"),
+        format!(
+            "import {{ writeFileSync }} from \"node:fs\";\n\
+             export default function (pi) {{\n\
+               pi.registerCommand({CONFIRM_COMMAND:?}, {{\n\
+                 description: \"Ask before writing the marker\",\n\
+                 handler: async (_args, ctx) => {{\n\
+                   if (await ctx.ui.confirm(\"Allow tool call?\", \"bash: touch marker\")) {{\n\
+                     writeFileSync({marker:?}, \"approved\\n\");\n\
+                   }}\n\
+                 }},\n\
+               }});\n\
+             }}\n",
+            marker = marker.to_str().expect("UTF-8 marker path"),
+        ),
+    )
+    .expect("write the confirm extension");
+}
+
+/// Asks once, for `activity`, and returns whether it matched within the wait.
+async fn activity_matches(fixture: &Fixture, id: &str, activity: &str) -> bool {
+    let (code, waited) = fixture
+        .harness
+        .json(&[
+            "session",
+            "wait",
+            id,
+            "--activity",
+            activity,
+            "--timeout-ms",
+            "3000",
+        ])
+        .await;
+    assert_eq!(code, 0, "{waited}");
+    waited["ok"]["reason"] == "activity_matched"
+}
+
+/// A dialog of a real Pi extension waits for the owner: the session reads
+/// `blocked` from the screen (and never `idle`) until the editor returns, and
+/// a project with its own extensions reads `blocked` at startup while Pi asks
+/// whether to trust it. Neither prompt is answered, so neither marker exists.
+///
+/// Needs a `pi` on `PATH` and `POHUNEK_PI_E2E=1`; no model is involved.
+#[tokio::test]
+#[ignore = "needs a real `pi` on PATH; run with POHUNEK_PI_E2E=1 and --ignored"]
+async fn a_real_pi_dialog_or_trust_prompt_reads_blocked_never_idle() {
+    require_real_pi();
+    let fixture = Fixture::start().await;
+    fixture.install().await;
+    fixture.write_profile();
+    let marker = fixture.harness.env.root().join("approved");
+    write_confirm_extension(&fixture, &marker);
+
+    let launched = fixture.new_session("dialog").await;
+    let id = launched["id"].as_str().expect("session id").to_owned();
+    fixture.wait_activity(&id, "idle").await;
+    let (code, sent) = fixture
+        .harness
+        .json(&["session", "input", &id, &format!("/{CONFIRM_COMMAND}")])
+        .await;
+    assert_eq!(code, 0, "{sent}");
+    let blocked = fixture.wait_activity(&id, "blocked").await;
+    assert_eq!(blocked["state_source"], "screen", "{blocked}");
+    let lines = fixture.wait_screen_line(&id, "Allow tool call?").await;
+    assert!(
+        !activity_matches(&fixture, &id, "idle").await,
+        "the open dialog is never idle: {lines:#?}"
+    );
+    fixture.stop(&id).await;
+
+    // A project with its own extension makes Pi ask for trust before it
+    // starts; the extension would write the marker when it loads.
+    let project = fixture.harness.env.root().join("project");
+    fs::create_dir_all(project.join(".pi/extensions")).expect("create the project extensions");
+    fs::write(
+        project.join(".pi/extensions/project.ts"),
+        format!(
+            "import {{ writeFileSync }} from \"node:fs\";\n\
+             writeFileSync({marker:?}, \"loaded\\n\");\n\
+             export default function () {{}}\n",
+            marker = marker.to_str().expect("UTF-8 marker path"),
+        ),
+    )
+    .expect("write the project extension");
+    let (code, launched) = fixture.launch(PROFILE, "trust", &project).await;
+    assert_eq!(code, 0, "{launched}");
+    let trust = launched["ok"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let blocked = fixture.wait_activity(&trust, "blocked").await;
+    assert_eq!(blocked["state_source"], "screen", "{blocked}");
+    fixture
+        .wait_screen_line(&trust, "Trust project folder?")
+        .await;
+    assert!(!activity_matches(&fixture, &trust, "idle").await);
+    fixture.stop(&trust).await;
+
+    assert!(!marker.exists(), "no prompt was answered");
+    fixture.harness.stop().await;
+}
+
+/// A Pi told to keep its sessions in `PI_CODING_AGENT_SESSION_DIR` writes
+/// them directly in that directory, and the existence check follows it, so the
+/// session resumes from there.
+#[tokio::test]
+#[ignore = "needs a real `pi` on PATH; run with POHUNEK_PI_E2E=1 and --ignored"]
+async fn a_real_pi_session_in_the_session_dir_variable_resumes() {
+    require_real_pi();
+    let fixture = Fixture::start().await;
+    fixture.install().await;
+    let store = fixture.harness.env.root().join("pi-sessions");
+    fs::create_dir_all(&store).expect("create the session directory");
+    fixture.write_named_profile(
+        PROFILE,
+        "",
+        &format!(
+            "PI_CODING_AGENT_SESSION_DIR = \"{}\"\n",
+            store.to_str().expect("UTF-8 path")
+        ),
+    );
+
+    let launched = fixture.new_session("session-dir").await;
+    let id = launched["id"].as_str().expect("session id").to_owned();
+    let reference = launched["native_session_id"]
+        .as_str()
+        .expect("assigned reference")
+        .to_owned();
+    fixture.wait_activity(&id, "idle").await;
+    let (code, sent) = fixture
+        .harness
+        .json(&["session", "input", &id, PROMPT])
+        .await;
+    assert_eq!(code, 0, "{sent}");
+    fixture.wait_activity(&id, "working").await;
+    fixture.stub.open_gate();
+    fixture.wait_activity(&id, "idle").await;
+    fixture
+        .wait_screen_line(
+            &id,
+            &format!("{}{}", model_stub::FIRST_CHUNK, model_stub::SECOND_CHUNK),
+        )
+        .await;
+    let suffix = format!("_{reference}.jsonl");
+    let written: Vec<PathBuf> = fs::read_dir(&store)
+        .expect("read the session directory")
+        .map(|entry| entry.expect("entry").path())
+        .collect();
+    assert!(
+        written.iter().any(|path| path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(&suffix))),
+        "Pi wrote the session directly in the variable's directory: {written:?}"
+    );
+    assert!(
+        fixture.session_files().is_empty(),
+        "nothing in the agent directory's store"
+    );
+
+    check_resume(&fixture, &id).await;
+    fixture.stop(&id).await;
+    fixture.harness.stop().await;
+}
+
+/// A launch whose Pi would keep its sessions where the existence check cannot
+/// follow (a `sessionDir` setting, the `--session-dir` flag) is refused before
+/// Pi starts, with the variable that resolves it; the variable wins over the
+/// setting, so setting it launches.
+#[tokio::test]
+#[ignore = "needs a real `pi` on PATH; run with POHUNEK_PI_E2E=1 and --ignored"]
+async fn a_real_pi_with_its_sessions_elsewhere_is_refused_at_launch() {
+    require_real_pi();
+    let fixture = Fixture::start().await;
+    fixture.install().await;
+    let store = fixture.harness.env.root().join("pi-sessions");
+    fs::create_dir_all(&store).expect("create the session directory");
+    let store_path = store.to_str().expect("UTF-8 path");
+    let settings = fixture.harness.env.home().join(".pi/agent/settings.json");
+    let mut configured: Value =
+        serde_json::from_str(&fs::read_to_string(&settings).expect("read settings"))
+            .expect("settings JSON");
+    configured["sessionDir"] = Value::String(store_path.to_owned());
+    fs::write(&settings, configured.to_string()).expect("write settings");
+    fixture.write_profile();
+    fixture.write_named_profile(
+        "pi-flag",
+        &format!("args = [\"--session-dir\", \"{store_path}\"]\n"),
+        "",
+    );
+    fixture.write_named_profile(
+        "pi-variable",
+        "",
+        &format!("PI_CODING_AGENT_SESSION_DIR = \"{store_path}\"\n"),
+    );
+    let cwd = fixture.harness.env.cwd().to_path_buf();
+
+    for (profile, case) in [
+        (PROFILE, "sessionDir setting"),
+        ("pi-flag", "--session-dir"),
+    ] {
+        let (code, refused) = fixture.launch(profile, "refused", &cwd).await;
+        assert_eq!(code, 1, "{case}: {refused}");
+        assert_eq!(
+            refused["err"]["code"], "agent_native_store_relocated",
+            "{case}: {refused}"
+        );
+        assert!(
+            refused["err"]["recover"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("PI_CODING_AGENT_SESSION_DIR")),
+            "{case}: {refused}"
+        );
+    }
+    let (code, listed) = fixture.harness.json(&["session", "list"]).await;
+    assert_eq!(code, 0, "{listed}");
+    assert_eq!(
+        listed["ok"].as_array().map(Vec::len),
+        Some(0),
+        "a refused launch leaves no session: {listed}"
+    );
+
+    let (code, launched) = fixture.launch("pi-variable", "variable", &cwd).await;
+    assert_eq!(code, 0, "{launched}");
+    let id = launched["ok"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    fixture.wait_activity(&id, "idle").await;
+    fixture.stop(&id).await;
     fixture.harness.stop().await;
 }

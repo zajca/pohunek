@@ -305,9 +305,14 @@ pohunek session new --agent pi --name "refactor-parser" --input "Refactor the pa
   `pi --session <fork id>`. Forks get their own reference from Pi package
   1.0.1 on; a session launched from package 1.0.0 keeps forks without one.
 - Recovery looks for the session file below `PI_CODING_AGENT_DIR` (default
-  `~/.pi/agent`) in `sessions/`. A Pi configured with `--session-dir`,
-  `PI_CODING_AGENT_SESSION_DIR`, or the `sessionDir` setting stores elsewhere,
-  and recovery then fails closed.
+  `~/.pi/agent`) in `sessions/`, or directly in `PI_CODING_AGENT_SESSION_DIR`
+  when the profile `[env]` (or the daemon's environment) sets it to an absolute
+  path. From Pi package 1.0.2 on, a launch whose Pi would keep its sessions
+  elsewhere (`--session-dir` in the profile `args`, or a `sessionDir` setting
+  while that variable is unset) is refused with `agent_native_store_relocated`;
+  set `PI_CODING_AGENT_SESSION_DIR` to that directory instead.
+- A Pi extension dialog, the project trust prompt and the login steps read as
+  `blocked`; the model, session and other selectors are never read as `idle`.
 - A Pi outside the supported range refuses to launch with
   `agent_runtime_unsupported`; update the package (`pohunek plugin update`) when
   a new Pi range is verified.

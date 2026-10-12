@@ -39,6 +39,7 @@ const SHAPE_SNAPSHOTS: &[(u32, &str)] = &[
     (4, include_str!("fixtures/shape/schema-4.txt")),
     (5, include_str!("fixtures/shape/schema-5.txt")),
     (6, include_str!("fixtures/shape/schema-6.txt")),
+    (7, include_str!("fixtures/shape/schema-7.txt")),
 ];
 
 /// A profile revision: 64 lowercase hex digits.
@@ -100,7 +101,11 @@ fn resume_package_json() -> Value {
         "dir": "sessions",
         "file_name": "_{reference}.jsonl",
         "name_match": "ends_with",
-        "max_depth": 1
+        "max_depth": 1,
+        "store_env": "AGENT_STORE_DIR",
+        "store_max_depth": 0,
+        "relocating_args": ["--store-dir"],
+        "relocating_settings": [{"base": "root", "path": "settings.json", "key": "storeDir"}]
     });
     value["launch_binding"]["provenance"] = json!({
         "kind": "package",

@@ -572,7 +572,31 @@ async fn assert_invalid_pi_descriptors_are_refused(
     assert!(!path_hook.contains("launch_args"));
     let deep_scan = valid.replace("max_depth = 1", "max_depth = 9");
     assert_ne!(deep_scan, valid, "invalid scan depth differs");
-    for (name, descriptor) in [("path-hook", path_hook), ("deep-scan", deep_scan)] {
+    let store_env_without_depth = valid.replace(
+        "max_depth = 1\n",
+        "max_depth = 1\nstore_env = \"PI_CODING_AGENT_SESSION_DIR\"\n",
+    );
+    assert_ne!(store_env_without_depth, valid, "store variable added");
+    let positional_relocating_arg = valid.replace(
+        "max_depth = 1\n",
+        "max_depth = 1\nrelocating_args = [\"sessions\"]\n",
+    );
+    assert_ne!(
+        positional_relocating_arg, valid,
+        "relocating argument added"
+    );
+    let escaping_setting = valid.replace(
+        "max_depth = 1\n",
+        "max_depth = 1\nrelocating_settings = [{ base = \"cwd\", path = \"../settings.json\", key = \"sessionDir\" }]\n",
+    );
+    assert_ne!(escaping_setting, valid, "relocating setting added");
+    for (name, descriptor) in [
+        ("path-hook", path_hook),
+        ("deep-scan", deep_scan),
+        ("store-env-without-depth", store_env_without_depth),
+        ("positional-relocating-arg", positional_relocating_arg),
+        ("escaping-setting", escaping_setting),
+    ] {
         let (archive, digest) = pi_archive_from_descriptor(descriptor);
         let archive_path = state.join(format!("invalid-{name}.tar.zst"));
         std::fs::write(&archive_path, archive).expect("write invalid fixture package");
@@ -813,6 +837,397 @@ async fn pi_package_list_batches_suffix_matches_and_ignores_symlinks() {
         activity_for(&sessions[0].id, &listed).map(str::to_owned)
     );
     assert_eq!(activity_for(&sessions[1].id, &listed_missing), None);
+}
+
+/// [`pi_descriptor`] whose existence check also declares Pi's session-dir
+/// variable, flag and settings.
+fn pi_relocating_descriptor(program: &std::path::Path) -> String {
+    pi_descriptor(program).replace(
+        "max_depth = 1\n",
+        "max_depth = 1\nstore_env = \"PI_CODING_AGENT_SESSION_DIR\"\nstore_max_depth = 0\n\
+         relocating_args = [\"--session-dir\"]\n\
+         relocating_settings = [\n  { base = \"root\", path = \"settings.json\", key = \"sessionDir\" },\n  \
+         { base = \"cwd\", path = \".pi/settings.json\", key = \"sessionDir\" },\n]\n",
+    )
+}
+
+/// Creates a session of `profile` in `cwd` and returns the response.
+async fn new_pi_session(
+    control: &mut Framed<UnixStream, LinesCodec>,
+    profile: &str,
+    cwd: &std::path::Path,
+) -> Response {
+    let mut params = session_params_in(cwd.to_path_buf());
+    profile.clone_into(&mut params.agent);
+    create_session_with_params(control, params).await
+}
+
+/// Asserts that `response` refuses a launch whose Pi keeps its sessions
+/// elsewhere, naming the variable that would resolve it.
+fn assert_store_relocated(response: Response, case: &str) {
+    let error = err_payload(response);
+    assert_eq!(
+        error.code, "agent_native_store_relocated",
+        "{case}: {error:?}"
+    );
+    assert!(
+        error
+            .recover
+            .as_deref()
+            .is_some_and(|hint| hint.contains("PI_CODING_AGENT_SESSION_DIR")),
+        "{case}: the hint names the store variable: {error:?}"
+    );
+}
+
+/// Writes the Pi profiles of the relocation scenario: `pi-settings` (agent
+/// settings name another session dir), `pi-flag` (the profile passes
+/// `--session-dir`) and `pi-store` (the variable names `store`).
+fn write_relocation_profiles(
+    agents: &std::path::Path,
+    digest: &package::PackageDigest,
+    config_home: &std::path::Path,
+    store: &std::path::Path,
+) {
+    let profile = |args: &str, session_dir: bool| {
+        let variable = if session_dir {
+            format!("PI_CODING_AGENT_SESSION_DIR = \"{}\"\n", store.display())
+        } else {
+            String::new()
+        };
+        format!(
+            "base = \"pi\"\npackage = \"acme.runtime.pi\"\ndigest = \"{digest}\"\n{args}\
+             [env]\nPI_CODING_AGENT_DIR = \"{}\"\n{variable}",
+            config_home.display()
+        )
+    };
+    let flag = format!("args = [\"--session-dir\", \"{}\"]\n", store.display());
+    for (name, contents) in [
+        ("pi-settings", profile("", false)),
+        ("pi-flag", profile(&flag, true)),
+        ("pi-store", profile("", true)),
+    ] {
+        std::fs::write(agents.join(format!("{name}.toml")), contents)
+            .expect("write pinned Pi profile");
+    }
+}
+
+/// Writes the session file of `reference` directly in `store`, with a fixed
+/// modification time.
+fn write_flat_transcript(store: &std::path::Path, reference: &str) {
+    let transcript = store.join(format!("2026-10-12T00-00-00-000Z_{reference}.jsonl"));
+    std::fs::write(&transcript, "{}\n").expect("write Pi transcript");
+    std::fs::File::options()
+        .write(true)
+        .open(&transcript)
+        .expect("open Pi transcript")
+        .set_times(
+            std::fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            ),
+        )
+        .expect("set Pi transcript activity");
+}
+
+/// Stops `id`, resumes it, then stops and removes it; returns the resume
+/// outcome.
+async fn resume_and_remove(
+    control: &mut Framed<UnixStream, LinesCodec>,
+    id: &SessionId,
+) -> Result<Value, protocol::ProtocolError> {
+    let request = |name: &str, method: &str| {
+        Request::make(
+            name,
+            method,
+            serde_json::to_value(id).expect("serialize session id"),
+        )
+    };
+    ok_payload(exchange(control, &request("pi-store-stop", method::SESSION_STOP)).await);
+    let resumed = exchange(control, &request("pi-store-resume", method::SESSION_RESUME))
+        .await
+        .into_result();
+    ok_payload(exchange(control, &request("pi-store-stop", method::SESSION_STOP)).await);
+    ok_payload(exchange(control, &request("pi-store-remove", method::SESSION_REMOVE)).await);
+    resumed
+}
+
+#[tokio::test]
+async fn pi_package_store_relocation_is_refused_at_launch_and_followed_through_the_variable() {
+    let bin = temp_dir("pi-store-bin");
+    let state = temp_dir("pi-store-state");
+    let cwd = temp_dir("pi-store-cwd");
+    let agents = temp_dir("pi-store-agents");
+    let config = temp_dir("pi-store-config");
+    let program = bin.join("pi-fixture.sh");
+    write_executable(
+        &program,
+        "#!/bin/sh\nprintf '\\033[?2004h'\nwhile IFS= read -r line; do :; done\n",
+    );
+    let (archive, digest) = pi_archive_from_descriptor(pi_relocating_descriptor(&program));
+    let archive_path = state.join("pi.tar.zst");
+    std::fs::write(&archive_path, archive).expect("write fixture Pi archive");
+    let config_home = config.join("pi");
+    let store = config.join("pi-sessions");
+    std::fs::create_dir(&config_home).expect("create Pi agent dir");
+    std::fs::create_dir(&store).expect("create Pi session dir");
+    std::fs::write(
+        config_home.join("settings.json"),
+        "\u{feff}{\"sessionDir\": \"/elsewhere\"}",
+    )
+    .expect("write settings naming another session dir");
+    write_relocation_profiles(&agents, &digest, &config_home, &store);
+    let socket = temp_socket("pi-store-relocation");
+    let registry_config = SessionRegistryConfig {
+        shell_command: support::hermetic_shell(),
+        store_path: Some(state.join("metadata.jsonl")),
+        agents_dir: Some(agents.to_path_buf()),
+        plugins_dir: Some(state.join("plugins")),
+        host_state_dir: Some(state.join("host-state")),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, server, _worker_home) =
+        spawn_server_with_config(&socket, "0.0.0", registry_config).await;
+    let mut control = connect(&socket).await;
+    install_pi_archive(&mut control, &archive_path, &digest).await;
+
+    // Pi would keep the sessions in the settings' directory, or in the flag's.
+    let refused_by_settings = new_pi_session(&mut control, "pi-settings", &cwd).await;
+    let refused_by_flag = new_pi_session(&mut control, "pi-flag", &cwd).await;
+    let left_by_refusals = listed_sessions(&mut control).await;
+
+    // The variable wins over the settings in Pi, and the check follows it.
+    let session: SessionInfo = serde_json::from_value(ok_payload(
+        new_pi_session(&mut control, "pi-store", &cwd).await,
+    ))
+    .expect("create Pi session with a session dir");
+    write_flat_transcript(
+        &store,
+        session
+            .native_session_id
+            .as_deref()
+            .expect("Pi gets an assigned ID"),
+    );
+    let listed = listed_sessions(&mut control).await;
+    let resumed = resume_and_remove(&mut control, &session.id).await;
+    let _ = shutdown.send(());
+    server.await.expect("Pi control server stops");
+
+    assert_store_relocated(refused_by_settings, "sessionDir in the agent settings");
+    assert_store_relocated(refused_by_flag, "--session-dir in the profile args");
+    assert!(
+        left_by_refusals.is_empty(),
+        "a refused launch leaves no session: {left_by_refusals:?}"
+    );
+    assert_eq!(
+        activity_for(&session.id, &listed),
+        Some("2023-11-14T22:13:20Z"),
+        "the activity lookup reads the variable's directory"
+    );
+    resumed.expect("the session resumes from the variable's directory");
+}
+
+#[tokio::test]
+async fn pi_package_settings_written_after_launch_refuse_resume_and_fork() {
+    let bin = temp_dir("pi-moved-bin");
+    let state = temp_dir("pi-moved-state");
+    let cwd = temp_dir("pi-moved-cwd");
+    let agents = temp_dir("pi-moved-agents");
+    let config = temp_dir("pi-moved-config");
+    let program = bin.join("pi-fixture.sh");
+    write_executable(
+        &program,
+        "#!/bin/sh\nprintf '\\033[?2004h'\nwhile IFS= read -r line; do :; done\n",
+    );
+    let (archive, digest) = pi_archive_from_descriptor(pi_relocating_descriptor(&program));
+    let archive_path = state.join("pi.tar.zst");
+    std::fs::write(&archive_path, archive).expect("write fixture Pi archive");
+    let config_home = config.join("pi");
+    std::fs::create_dir(&config_home).expect("create Pi agent dir");
+    std::fs::write(
+        agents.join("pi-plain.toml"),
+        format!(
+            "base = \"pi\"\npackage = \"acme.runtime.pi\"\ndigest = \"{digest}\"\n\
+             [env]\nPI_CODING_AGENT_DIR = \"{}\"\n",
+            config_home.display()
+        ),
+    )
+    .expect("write pinned Pi profile");
+    let socket = temp_socket("pi-moved-store");
+    let registry_config = SessionRegistryConfig {
+        shell_command: support::hermetic_shell(),
+        store_path: Some(state.join("metadata.jsonl")),
+        agents_dir: Some(agents.to_path_buf()),
+        plugins_dir: Some(state.join("plugins")),
+        host_state_dir: Some(state.join("host-state")),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, server, _worker_home) =
+        spawn_server_with_config(&socket, "0.0.0", registry_config).await;
+    let mut control = connect(&socket).await;
+    install_pi_archive(&mut control, &archive_path, &digest).await;
+    let session: SessionInfo = serde_json::from_value(ok_payload(
+        new_pi_session(&mut control, "pi-plain", &cwd).await,
+    ))
+    .expect("create Pi session in the default store");
+    let project = config_home.join("sessions/--project--");
+    std::fs::create_dir_all(&project).expect("create the default store");
+    std::fs::write(
+        project.join(format!(
+            "2026-10-12T00-00-00-000Z_{}.jsonl",
+            session
+                .native_session_id
+                .as_deref()
+                .expect("Pi gets an assigned ID")
+        )),
+        "{}\n",
+    )
+    .expect("write Pi transcript");
+    // The project now tells Pi to keep its sessions somewhere else.
+    std::fs::create_dir(cwd.join(".pi")).expect("create project settings dir");
+    std::fs::write(
+        cwd.join(".pi/settings.json"),
+        r#"{"sessionDir": "/elsewhere"}"#,
+    )
+    .expect("write project settings");
+    let forked = exchange(
+        &mut control,
+        &Request::make(
+            "pi-moved-fork",
+            method::SESSION_FORK,
+            serde_json::json!({
+                "session_id": session.id,
+                "cwd_mode": "same",
+                "cols": 80,
+                "rows": 24
+            }),
+        ),
+    )
+    .await;
+    let left_by_fork = listed_sessions(&mut control).await;
+    let resumed = resume_and_remove(&mut control, &session.id).await;
+    let _ = shutdown.send(());
+    server.await.expect("Pi control server stops");
+
+    assert_recovery_refused(&err_payload(forked), "fork after a project sessionDir");
+    assert_eq!(
+        left_by_fork.len(),
+        1,
+        "a refused fork creates no child: {left_by_fork:?}"
+    );
+    assert_recovery_refused(
+        &resumed.expect_err("resume after a project sessionDir is refused"),
+        "resume after a project sessionDir",
+    );
+}
+
+/// Asserts that a resume or fork was refused because a setting moves the
+/// store, with a hint to undo what changed since the launch: remove the
+/// setting, or restore the variable the launch had.
+fn assert_recovery_refused(error: &protocol::ProtocolError, case: &str) {
+    assert_eq!(
+        error.code, "agent_native_store_relocated",
+        "{case}: {error:?}"
+    );
+    let hint = error.recover.as_deref().unwrap_or_default();
+    assert!(
+        hint.contains("remove the setting")
+            && hint.contains("restore PI_CODING_AGENT_SESSION_DIR to the absolute path")
+            && !hint.contains("added after"),
+        "{case}: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn pi_package_session_dir_variable_removed_before_resume_is_named_in_the_refusal() {
+    let bin = temp_dir("pi-unset-bin");
+    let state = temp_dir("pi-unset-state");
+    let cwd = temp_dir("pi-unset-cwd");
+    let agents = temp_dir("pi-unset-agents");
+    let config = temp_dir("pi-unset-config");
+    let program = bin.join("pi-fixture.sh");
+    write_executable(
+        &program,
+        "#!/bin/sh\nprintf '\\033[?2004h'\nwhile IFS= read -r line; do :; done\n",
+    );
+    let (archive, digest) = pi_archive_from_descriptor(pi_relocating_descriptor(&program));
+    let archive_path = state.join("pi.tar.zst");
+    std::fs::write(&archive_path, archive).expect("write fixture Pi archive");
+    let config_home = config.join("pi");
+    let store = config.join("pi-sessions");
+    std::fs::create_dir(&config_home).expect("create Pi agent dir");
+    std::fs::create_dir(&store).expect("create Pi session dir");
+    // The settings name another directory; the variable wins at launch.
+    std::fs::write(
+        config_home.join("settings.json"),
+        r#"{"sessionDir": "/elsewhere"}"#,
+    )
+    .expect("write settings naming another session dir");
+    write_relocation_profiles(&agents, &digest, &config_home, &store);
+    let socket = temp_socket("pi-unset-variable");
+    let registry_config = SessionRegistryConfig {
+        shell_command: support::hermetic_shell(),
+        store_path: Some(state.join("metadata.jsonl")),
+        agents_dir: Some(agents.to_path_buf()),
+        plugins_dir: Some(state.join("plugins")),
+        host_state_dir: Some(state.join("host-state")),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, server, _worker_home) =
+        spawn_server_with_config(&socket, "0.0.0", registry_config).await;
+    let mut control = connect(&socket).await;
+    install_pi_archive(&mut control, &archive_path, &digest).await;
+    let session: SessionInfo = serde_json::from_value(ok_payload(
+        new_pi_session(&mut control, "pi-store", &cwd).await,
+    ))
+    .expect("create Pi session with a session dir");
+    write_flat_transcript(
+        &store,
+        session
+            .native_session_id
+            .as_deref()
+            .expect("Pi gets an assigned ID"),
+    );
+    let request = |name: &str, method: &str, params: Value| Request::make(name, method, params);
+    let id = serde_json::to_value(&session.id).expect("serialize session id");
+    ok_payload(
+        exchange(
+            &mut control,
+            &request("pi-unset-stop", method::SESSION_STOP, id.clone()),
+        )
+        .await,
+    );
+    // The profile loses the variable; the owner accepts the edited profile.
+    std::fs::write(
+        agents.join("pi-store.toml"),
+        format!(
+            "base = \"pi\"\npackage = \"acme.runtime.pi\"\ndigest = \"{digest}\"\n\
+             [env]\nPI_CODING_AGENT_DIR = \"{}\"\n",
+            config_home.display()
+        ),
+    )
+    .expect("rewrite the profile without the variable");
+    let resumed = exchange(
+        &mut control,
+        &request(
+            "pi-unset-resume",
+            method::SESSION_RESUME,
+            serde_json::json!({ "session_id": session.id, "accept_profile_change": true }),
+        ),
+    )
+    .await;
+    ok_payload(
+        exchange(
+            &mut control,
+            &request("pi-unset-remove", method::SESSION_REMOVE, id),
+        )
+        .await,
+    );
+    let _ = shutdown.send(());
+    server.await.expect("Pi control server stops");
+
+    assert_recovery_refused(
+        &err_payload(resumed),
+        "resume after the variable left the profile",
+    );
 }
 
 #[tokio::test]

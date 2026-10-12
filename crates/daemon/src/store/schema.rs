@@ -36,7 +36,7 @@ use super::{
 ///
 /// Bump it, and add a [`MIGRATIONS`] step, whenever the serialized shape of a
 /// persisted record kind changes.
-pub const STORE_SCHEMA_VERSION: u32 = 6;
+pub const STORE_SCHEMA_VERSION: u32 = 7;
 
 /// Schema assumed for a line that has no `schema_version` field.
 pub(super) const UNVERSIONED_LINE_SCHEMA: u32 = 1;
@@ -74,6 +74,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
     Migration {
         from: 5,
         apply: migrate_v5_to_v6,
+    },
+    Migration {
+        from: 6,
+        apply: migrate_v6_to_v7,
     },
 ];
 
@@ -115,6 +119,15 @@ fn migrate_v4_to_v5(_record: &mut Map<String, Value>) {}
 /// every schema 5 session was launched and forked, so no record needs
 /// rewriting.
 fn migrate_v5_to_v6(_record: &mut Map<String, Value>) {}
+
+/// Schema 6 to 7: a file existence check may follow a store variable
+/// (`store_env`, `store_max_depth`) and refuse store-moving arguments and
+/// settings (`relocating_args`, `relocating_settings`).
+///
+/// A check written without the fields searches only the declared store and
+/// refuses nothing at launch, which is how every schema 6 session was
+/// launched, so no record needs rewriting.
+fn migrate_v6_to_v7(_record: &mut Map<String, Value>) {}
 
 /// A metadata store whose schema this daemon cannot use as is.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

@@ -153,6 +153,22 @@ For Claude, `runtime/agent_native_reference_missing` on resume or fork means
 the selected conversation's regular transcript file could not be verified
 under the effective Claude config home. Restore or inspect the transcript tree
 before retrying; the refused operation creates no new worker or fork child.
+`runtime/agent_native_store_relocated` means the agent would keep its
+conversations outside the store its recovery checks (for Pi: `--session-dir`
+in the profile `args`, a `sessionDir` setting, or a relative
+`PI_CODING_AGENT_SESSION_DIR`); nothing was launched. On `session new`, follow
+the `recover` hint: set the named variable in the profile `[env]` to the
+absolute directory, or remove the argument. On resume or fork the launch had
+passed the same refusal, so something changed since: a setting appeared, or
+the variable the launch had is gone (a daemon restart without it, an accepted
+profile edit). Undo that change: remove the setting (or make the settings file
+readable JSON again), or restore the variable to the absolute path the session
+was launched with and pass `--accept-profile-change`; pointing the variable at
+a new directory does not find the conversation.
+`daemon/native_store_check_task_panicked` on `session new`, resume or fork
+means the native reference check itself crashed (on resume and fork it covers
+the whole check, Claude's transcript check included); nothing was launched,
+and the daemon log has the panic.
 
 - `conflict`: multiple or mismatched identities claim the session. Never stop,
   unlink, or kill either candidate by hand, and the daemon never kills one

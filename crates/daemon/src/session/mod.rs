@@ -2366,22 +2366,29 @@ impl SessionRegistry {
             Ok(mut target) => {
                 #[cfg(test)]
                 self.hold_bound_create(&id).await;
-                let profile = resolved.profile.as_ref().map(|_| resolved.name.clone());
-                target.warnings.extend(
-                    self.outdated_integration_warning(
-                        RuntimeRef::from(resolved.base.clone()),
-                        profile,
+                if let Err(error) = self
+                    .check_store_relocation(&resolved, &target.launch_cwd)
+                    .await
+                {
+                    Err(error)
+                } else {
+                    let profile = resolved.profile.as_ref().map(|_| resolved.name.clone());
+                    target.warnings.extend(
+                        self.outdated_integration_warning(
+                            RuntimeRef::from(resolved.base.clone()),
+                            profile,
+                        )
+                        .await,
+                    );
+                    self.create_spec(
+                        &id,
+                        &params,
+                        &resolved,
+                        profile_revision,
+                        validated_program,
+                        target,
                     )
-                    .await,
-                );
-                self.create_spec(
-                    &id,
-                    &params,
-                    &resolved,
-                    profile_revision,
-                    validated_program,
-                    target,
-                )
+                }
             }
             Err(error) => Err(error),
         };
@@ -2505,6 +2512,75 @@ impl SessionRegistry {
             gate.entered.notify_one();
             gate.release.notified().await;
         }
+    }
+
+    /// Refuses a first launch whose agent would keep its conversations where
+    /// the existence check of its recovery cannot find them.
+    ///
+    /// Runs the relocation part of the check recovery will run (the assigned
+    /// reference's, else the hook runtime's) against the launch environment,
+    /// program arguments and working directory, off the async runtime because
+    /// it reads settings files. A runtime without native recovery launches
+    /// unchecked.
+    ///
+    /// # Errors
+    ///
+    /// Returns `agent_native_store_relocated` with the store variable to set.
+    async fn check_store_relocation(
+        &self,
+        resolved: &ResolvedAgent,
+        cwd: &std::path::Path,
+    ) -> Result<(), ProtocolError> {
+        let Some(native) = resolved.native_launch() else {
+            return Ok(());
+        };
+        let existence = match native.assigned() {
+            Some(assigned) => assigned.existence().clone(),
+            None => match resolved.definition.hook_existence() {
+                Some(existence) => existence.clone(),
+                None => return Ok(()),
+            },
+        };
+        let base_environment = self.launch_base_environment()?;
+        let profile_env = resolved
+            .profile
+            .as_ref()
+            .map(|profile| profile.env.clone())
+            .unwrap_or_default();
+        let args = resolved.snapshot_args();
+        let cwd = cwd.to_path_buf();
+        let checked = existence.clone();
+        let verdict = tokio::task::spawn_blocking(move || {
+            let lookup = |name: &str| {
+                crate::runtime::environment::effective_variable(
+                    &base_environment,
+                    profile_env.as_slice(),
+                    name,
+                )
+            };
+            checked.check_relocation(&crate::agent::LaunchView {
+                env: &lookup,
+                args: &args,
+                cwd: &cwd,
+            })
+        })
+        .await
+        .map_err(|_join_error| {
+            ProtocolError::new(
+                ErrorClass::Daemon,
+                "native_store_check_task_panicked",
+                "the native session store check of the launch panicked; nothing was launched",
+                None,
+            )
+        })?;
+        verdict.map_err(|failure| {
+            warn!(
+                name: "session.create.store_relocated",
+                failure = %failure,
+                "the agent would keep its sessions outside its declared store; launch refused"
+            );
+            existence.refusal(failure, crate::agent::RefusalPhase::Launch)
+        })
     }
 
     /// Builds the first-launch registration of a `session.new` in `target`,

@@ -603,10 +603,11 @@ Runtime package archive format:
 - `docs/knowledge/guides/codex-package.md`
 - `docs/knowledge/guides/claude-package.md`
 - `runtime-packages/README.md` — layout convention of the official package sources.
-- `runtime-packages/pi/runtime.toml` — Pi runtime descriptor (assigned reference for launches and forks, existence check, version probe).
+- `runtime-packages/pi/runtime.toml` — Pi runtime descriptor (assigned reference for launches and forks, existence check with the session-dir variable and the refused flag and settings, version probe).
 - `runtime-packages/pi/detect.toml` — Pi detection manifest verified against real screens.
 - `compat/pi/compatibility-lock.json` — pinned Pi release, supported range and Node requirement.
-- `compat/pi/screens/` — screens captured from a real Pi that the manifest test classifies.
+- `compat/pi/screens/` — screens captured from a real Pi that the manifest test classifies; `overlays/` holds the dialog, login and selector screens.
+- `scripts/pi-detect-regex` — generates the Pi frame, dialog and overlay regexes and checks their line classes.
 - `crates/cli/tests/pi_package.rs` — pure package tests and the opt-in real-Pi tests.
 - `runtime-packages/codex/runtime.toml` — Codex runtime descriptor (hook native reference, `semver-line-v1` version probe).
 - `runtime-packages/codex/detect.toml` — Codex detection manifest, equal to the built-in one.

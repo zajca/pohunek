@@ -32,18 +32,45 @@
 # line that starts "── <spinner>" or is itself a complete plain border cannot be
 # told from the frame in plain text. Transcript lines are never consulted, so a
 # column-zero rule above the editor cannot stand in for the upper border of a
-# busy frame. The regexes are generated, and the complement property is checked
-# exhaustively, by scripts/pi-detect-regex.
+# busy frame.
 #
+# Dialogs and selectors replace the editor between two plain borders (Pi then
+# draws no busy border, even while a turn waits on the dialog), so their frame
+# has the idle editor's shape and only its body tells them apart:
+#
+# blocked: the body holds the key hint or title of a prompt that waits for an
+#          answer, whoever opened it: an extension select, confirm, input or
+#          editor dialog (which also covers a permission prompt raised
+#          mid-turn), Pi's own confirms drawn the same way (project trust at
+#          startup, missing session cwd, "Summarize branch?" in /tree, "Import
+#          session"), the /trust selector, and every login step (method,
+#          provider, API key, browser or pasted code). Hint words wrap onto
+#          padded continuation lines at narrow widths. The startup prompts draw
+#          no footer, so zero to four footer lines are accepted, and a prompt
+#          taller than the terminal pushes its upper border off the screen, so
+#          the frame may start at the first screen line.
 # working: the upper border is a busy border.
-# idle:    the upper border is a plain border. A screen that is not the editor
-#          frame matches neither rule.
+# idle:    the upper border is a plain border, and the body does not hold the
+#          two rows a selector list draws: a cursor row ("→ ", " → ", "› ") and
+#          a row indented by exactly two spaces (another item, the "(n/m)"
+#          counter or the selected item's details). That keeps the model,
+#          session, tree, fork and settings selectors (which wait for the owner
+#          but ask nothing) from reading idle; they match no rule.
+#
+# The regexes are generated, and the complement property and the dialog and
+# selector lines are checked, by scripts/pi-detect-regex. A screen that is not
+# the editor frame matches no rule and keeps the byte-activity fallback. A draft
+# that holds both selector rows withholds idle (Pi then stays at the
+# byte-activity fallback until the draft no longer holds both), and one that
+# reproduces a dialog's key hint reads as blocked; a quote ("> ...") or a lone
+# cursor-like line is draft text.
 #
 # Not covered: a replacement editor that does not embed the status in its border
-# or an extension that swaps the braille spinner. No blocked signal was verified
-# (extension dialogs and login overlays were not exercised), so no blocked state
-# is declared; a screen no rule matches (overlays, selectors) keeps the
-# byte-activity fallback.
+# or an extension that swaps the braille spinner; a dialog an extension draws
+# with ctx.ui.custom(); and Pi's plain-text "Fork this session into current
+# directory? [y/N]" question before the interface starts, which is not drawn in
+# a frame (pohunek relaunches a session in its own working directory, where Pi
+# does not ask it).
 
 [process]
 # Pi retitles its process to `pi` shortly after start (kernel name and argv),
@@ -53,6 +80,14 @@ cmdline = [
   '^pi(?: .*)?$',
   '^(?:[^ ]*/)?node [^ ]*coding-agent/dist/bundle/cli\.js(?: .*)?$',
 ]
+
+[[rules]]
+id = "dialog_rule"
+state = "blocked"
+priority = 800
+region = "whole_recent"
+visible_blocker = true
+regex = ['(?m)(?:\A|^(?:─{20,}|─{4,} [↑↓] [^\n]*─{4,})\n)(?:(?:(?:[^─\n][^\n]*)?|─(?:[^─\n][^\n]*)?|──(?:[^─ \n][^\n]*| (?:[^⠀-⣿\n][^\n]*)?)?|─{3,3}(?:[^─\n][^\n]*)?|─{4,19}|─{4,}[^─ \n][^\n]*|─{4,} (?:[^↑↓\n][^\n]*|[↑↓](?:[^ \n][^\n]*| (?:[^\n]*[^─\n])?─{0,3})?)?)\n)*(?: ↑↓(?: +|\n +)navigate(?: +|\n +)\S+(?: +|\n +)(?:select|save)(?: +|\n +)\S+(?: +|\n +)cancel| \S+(?: +|\n +)submit(?: +|\n +)\S+(?: +|\n +)cancel| \S+(?: +|\n +)submit(?: +|\n +)\S+(?: +|\n +)newline(?: +|\n +)\S+(?: +|\n +)cancel(?: +|\n +)\S+(?: +|\n +)external(?: +|\n +)editor| \(\S+(?: +|\n +)to(?: +|\n +)(?:cancel\)|cancel,(?: +|\n +)\S+(?: +|\n +)to(?: +|\n +)submit\))| Select provider(?: to (?:configure|logout):|[^\n]*\.\.\.))\n(?:(?:(?:[^─\n][^\n]*)?|─(?:[^─\n][^\n]*)?|──(?:[^─ \n][^\n]*| (?:[^⠀-⣿\n][^\n]*)?)?|─{3,3}(?:[^─\n][^\n]*)?|─{4,19}|─{4,}[^─ \n][^\n]*|─{4,} (?:[^↑↓\n][^\n]*|[↑↓](?:[^ \n][^\n]*| (?:[^\n]*[^─\n])?─{0,3})?)?)\n)*(?:─{20,}|─{4,} [↑↓] [^\n]*─{4,})(?:\n(?:[^─\n][^\n]*|─(?:[^─\n][^\n]*)?|──(?:[^─ \n][^\n]*| (?:[^⠀-⣿\n][^\n]*)?)?|─{3,3}(?:[^─\n][^\n]*)?|─{4,19}|─{4,}[^─ \n][^\n]*|─{4,} (?:[^↑↓\n][^\n]*|[↑↓](?:[^ \n][^\n]*| (?:[^\n]*[^─\n])?─{0,3})?)?)){0,4}\z']
 
 [[rules]]
 id = "working_rule"
@@ -67,3 +102,4 @@ state = "idle"
 priority = 300
 region = "whole_recent"
 regex = ['(?m)^(?:─{20,}|─{4,} [↑↓] [^\n]*─{4,})\n(?:(?:(?:[^─\n][^\n]*)?|─(?:[^─\n][^\n]*)?|──(?:[^─ \n][^\n]*| (?:[^⠀-⣿\n][^\n]*)?)?|─{3,3}(?:[^─\n][^\n]*)?|─{4,19}|─{4,}[^─ \n][^\n]*|─{4,} (?:[^↑↓\n][^\n]*|[↑↓](?:[^ \n][^\n]*| (?:[^\n]*[^─\n])?─{0,3})?)?)\n)*(?:─{20,}|─{4,} [↑↓] [^\n]*─{4,})(?:\n(?:[^─\n][^\n]*|─(?:[^─\n][^\n]*)?|──(?:[^─ \n][^\n]*| (?:[^⠀-⣿\n][^\n]*)?)?|─{3,3}(?:[^─\n][^\n]*)?|─{4,19}|─{4,}[^─ \n][^\n]*|─{4,} (?:[^↑↓\n][^\n]*|[↑↓](?:[^ \n][^\n]*| (?:[^\n]*[^─\n])?─{0,3})?)?)){1,4}\z']
+not = { regex = ['(?m)^(?:─{20,}|─{4,} [↑↓] [^\n]*─{4,})\n(?:(?:(?:[^─\n][^\n]*)?|─(?:[^─\n][^\n]*)?|──(?:[^─ \n][^\n]*| (?:[^⠀-⣿\n][^\n]*)?)?|─{3,3}(?:[^─\n][^\n]*)?|─{4,19}|─{4,}[^─ \n][^\n]*|─{4,} (?:[^↑↓\n][^\n]*|[↑↓](?:[^ \n][^\n]*| (?:[^\n]*[^─\n])?─{0,3})?)?)\n)*(?:(?: ?→ |› )[^\n]*\n(?:(?:(?:[^─\n][^\n]*)?|─(?:[^─\n][^\n]*)?|──(?:[^─ \n][^\n]*| (?:[^⠀-⣿\n][^\n]*)?)?|─{3,3}(?:[^─\n][^\n]*)?|─{4,19}|─{4,}[^─ \n][^\n]*|─{4,} (?:[^↑↓\n][^\n]*|[↑↓](?:[^ \n][^\n]*| (?:[^\n]*[^─\n])?─{0,3})?)?)\n)*  [^ \n][^\n]*|  [^ \n][^\n]*\n(?:(?:(?:[^─\n][^\n]*)?|─(?:[^─\n][^\n]*)?|──(?:[^─ \n][^\n]*| (?:[^⠀-⣿\n][^\n]*)?)?|─{3,3}(?:[^─\n][^\n]*)?|─{4,19}|─{4,}[^─ \n][^\n]*|─{4,} (?:[^↑↓\n][^\n]*|[↑↓](?:[^ \n][^\n]*| (?:[^\n]*[^─\n])?─{0,3})?)?)\n)*(?: ?→ |› )[^\n]*)\n(?:(?:(?:[^─\n][^\n]*)?|─(?:[^─\n][^\n]*)?|──(?:[^─ \n][^\n]*| (?:[^⠀-⣿\n][^\n]*)?)?|─{3,3}(?:[^─\n][^\n]*)?|─{4,19}|─{4,}[^─ \n][^\n]*|─{4,} (?:[^↑↓\n][^\n]*|[↑↓](?:[^ \n][^\n]*| (?:[^\n]*[^─\n])?─{0,3})?)?)\n)*(?:─{20,}|─{4,} [↑↓] [^\n]*─{4,})(?:\n(?:[^─\n][^\n]*|─(?:[^─\n][^\n]*)?|──(?:[^─ \n][^\n]*| (?:[^⠀-⣿\n][^\n]*)?)?|─{3,3}(?:[^─\n][^\n]*)?|─{4,19}|─{4,}[^─ \n][^\n]*|─{4,} (?:[^↑↓\n][^\n]*|[↑↓](?:[^ \n][^\n]*| (?:[^\n]*[^─\n])?─{0,3})?)?)){1,4}\z'] }
