@@ -12,7 +12,10 @@ use protocol::{
 };
 
 use super::util::{error_value, ok_value, parse_optional_params, parse_params};
-use crate::notifications::{is_debounced_create, AttentionCoordinator, NotificationService};
+use crate::notifications::{
+    is_debounced_create, is_hook_provider, stored_provider, AttentionCoordinator,
+    NotificationService,
+};
 use crate::session::SessionRegistry;
 
 /// Resolve the notification service, or a typed error response when this daemon
@@ -151,6 +154,10 @@ pub(super) async fn handle_notification_create(
 /// claim, so the public socket enforces the same admission as the worker
 /// socket and a refusal there cannot be bypassed by retrying here. Creates
 /// from other producers and creates without a session are not hook claims.
+/// The claim is judged by the provider name the record would be stored and
+/// ranked under, and a hook claim must report that name verbatim: a spelling
+/// that only normalizes to a hook provider (surrounding whitespace, control
+/// characters) is refused, since shipped reporters send the canonical name.
 /// Returns whether the create is an admitted hook claim.
 async fn admit_hook_notification(
     request: &Request,
@@ -160,32 +167,35 @@ async fn admit_hook_notification(
     let Some(session_id) = params.session_id.as_ref() else {
         return Ok(false);
     };
-    let provider = params.source.provider.as_str();
-    let hook_provider = pohunek_worker_protocol::hook_schemas()
-        .iter()
-        .any(|schema| schema.identity_providers.contains(&provider));
-    if !hook_provider {
+    let provider = stored_provider(&params.source.provider);
+    if !is_hook_provider(&provider) {
         return Ok(false);
+    }
+    let refuse = |msg: &str| {
+        error_value(
+            request,
+            ProtocolError::new(
+                protocol::ErrorClass::Daemon,
+                "hook_not_admitted",
+                msg.to_owned(),
+                None,
+            ),
+        )
+    };
+    if provider != params.source.provider {
+        return Err(refuse(
+            "a hook report must name its provider exactly as the hook schema lists it",
+        ));
     }
     sessions
         .admit_session_hook(
             session_id,
             pohunek_worker_protocol::HookAction::Notification,
-            provider,
+            &provider,
         )
         .await
         .map(|()| true)
-        .map_err(|_denial| {
-            error_value(
-                request,
-                ProtocolError::new(
-                    protocol::ErrorClass::Daemon,
-                    "hook_not_admitted",
-                    "the session runtime does not admit this hook report".to_owned(),
-                    None,
-                ),
-            )
-        })
+        .map_err(|_denial| refuse("the session runtime does not admit this hook report"))
 }
 
 /// Enrich producer params with live session context without making a missing

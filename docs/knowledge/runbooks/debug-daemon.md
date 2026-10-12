@@ -101,7 +101,10 @@ For durable notification issues:
    kind is enabled for the producer provider. Policy is enforced by the daemon
    for hooks, projectors, and any direct `notification.create` caller.
 5. Run `pohunek notifications policy set --provider default --kind turn_completed --enabled --json`
-   only when intentionally enabling noisy turn-completion records.
+   only when intentionally enabling noisy turn-completion records. A policy
+   saved by an earlier release can still hold `codex`, `claude`, and `hermes`
+   overrides that shadow the default flags; set each kind of such an override
+   to the wanted value with the same command and `--provider <runtime-id>`.
 6. Run `pohunek notifications retention prune --dry-run --status archived --json`
    before applying retention cleanup. Use `--apply` only after reviewing the
    dry-run ids.

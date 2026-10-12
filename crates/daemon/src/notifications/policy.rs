@@ -32,18 +32,17 @@ pub const DEFAULT_ATTENTION_DEDUPE_WINDOW_SECS: u32 = 120;
 pub const DEFAULT_ATTENTION_DEBOUNCE_SECS: u32 = 5;
 
 /// Default policy for daemon notification creation.
+///
+/// It has no per-provider overrides: every provider, whatever runtime it
+/// names, is governed by the base `enabled` flags until an operator sets an
+/// override for it.
 #[must_use]
 pub fn default_policy() -> NotificationPolicy {
-    let provider_policy = default_enabled_kinds();
     NotificationPolicy {
         attention_dedupe_window_secs: DEFAULT_ATTENTION_DEDUPE_WINDOW_SECS,
         attention_debounce_secs: DEFAULT_ATTENTION_DEBOUNCE_SECS,
         enabled: default_enabled_kinds(),
-        providers: BTreeMap::from([
-            ("claude".to_owned(), provider_policy.clone()),
-            ("codex".to_owned(), provider_policy.clone()),
-            ("hermes".to_owned(), provider_policy),
-        ]),
+        providers: BTreeMap::new(),
         retention: NotificationRetentionPolicy::default(),
     }
 }

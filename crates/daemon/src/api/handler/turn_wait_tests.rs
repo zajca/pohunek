@@ -504,11 +504,11 @@ async fn a_blocked_agent_fires_through_the_projector_whatever_the_policy() {
 #[tokio::test]
 async fn a_dropped_provider_report_keeps_the_inbox_record_and_its_deadline() {
     let mut policy = default_policy();
-    policy
-        .providers
-        .get_mut("claude")
-        .expect("the default policy has a claude entry")
-        .approval_required = false;
+    let claude = NotificationKindPolicy {
+        approval_required: false,
+        ..policy.enabled.clone()
+    };
+    policy.providers.insert("claude".to_owned(), claude);
     let fixture = Fixture::with_policy(SessionRegistryConfig::default(), Some(policy));
     let session = fixture.session("outranked").await;
     fixture.activity(&session, "working").await;

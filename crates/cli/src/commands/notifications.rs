@@ -138,16 +138,12 @@ pub(crate) enum WatchOutputMode {
 }
 
 /// Provider policy namespace selected by `policy set`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PolicyProvider {
     /// Default policy used when no provider override applies.
     Default,
-    /// Codex provider override.
-    Codex,
-    /// Claude provider override.
-    Claude,
-    /// Hermes provider override.
-    Hermes,
+    /// The override of one runtime's provider name, installed or not.
+    Runtime(protocol::RuntimeId),
 }
 
 /// Arguments accepted by `retention prune`.
@@ -292,15 +288,22 @@ pub(crate) fn parse_agent_kind(value: &str) -> Result<protocol::RuntimeRef, Stri
         .map_err(|_error| format!("invalid agent kind '{value}'"))
 }
 
-/// Parse a policy provider selector.
+/// Parse a policy provider selector: `default`, or any grammar-valid runtime
+/// id, installed or not, since an override keys on the provider name records
+/// carry.
+///
+/// `default` is a keyword for the base flags and is matched first, so it shadows
+/// a runtime literally named `default`; that runtime's override is reachable
+/// only through `notification.policy.set`.
 pub(crate) fn parse_policy_provider(value: &str) -> Result<PolicyProvider, String> {
-    match value {
-        "default" => Ok(PolicyProvider::Default),
-        "codex" => Ok(PolicyProvider::Codex),
-        "claude" => Ok(PolicyProvider::Claude),
-        "hermes" => Ok(PolicyProvider::Hermes),
-        other => Err(format!("invalid notification policy provider '{other}'")),
+    if value == "default" {
+        return Ok(PolicyProvider::Default);
     }
+    protocol::RuntimeId::parse(value)
+        .map(PolicyProvider::Runtime)
+        .map_err(|_error| {
+            format!("invalid notification policy provider '{value}': expected `default` or a runtime id")
+        })
 }
 
 /// Run `notifications list`.
@@ -516,8 +519,9 @@ pub(crate) async fn run_policy_set(
 ) -> Result<(), CliError> {
     if all_hosts {
         let targets = resolve_targets(paths, FanOutMode::AllHosts).await?;
-        let results = fan_out(targets, |target| async move {
-            policy_set_on_target(paths, target, provider, kind, enabled).await
+        let results = fan_out(targets, |target| {
+            let provider = provider.clone();
+            async move { policy_set_on_target(paths, target, provider, kind, enabled).await }
         })
         .await;
         if json {
@@ -771,24 +775,12 @@ fn apply_policy_toggle(
 ) {
     match provider {
         PolicyProvider::Default => set_kind_enabled(&mut policy.enabled, kind, enabled),
-        PolicyProvider::Codex => {
+        // A provider without an override is governed by the base flags, so a
+        // new override starts from them and changes only `kind`.
+        PolicyProvider::Runtime(runtime) => {
             let kinds = policy
                 .providers
-                .entry("codex".to_owned())
-                .or_insert_with(|| policy.enabled.clone());
-            set_kind_enabled(kinds, kind, enabled);
-        }
-        PolicyProvider::Claude => {
-            let kinds = policy
-                .providers
-                .entry("claude".to_owned())
-                .or_insert_with(|| policy.enabled.clone());
-            set_kind_enabled(kinds, kind, enabled);
-        }
-        PolicyProvider::Hermes => {
-            let kinds = policy
-                .providers
-                .entry("hermes".to_owned())
+                .entry(runtime.as_str().to_owned())
                 .or_insert_with(|| policy.enabled.clone());
             set_kind_enabled(kinds, kind, enabled);
         }
@@ -1162,7 +1154,7 @@ fn sort_notifications(records: &mut [NotificationRecord]) {
 mod tests {
     use std::collections::BTreeMap;
 
-    use protocol::{NotificationKindPolicy, NotificationSource};
+    use protocol::NotificationSource;
     use serde_json::json;
 
     use super::*;
@@ -1192,27 +1184,6 @@ mod tests {
             archived_at: None,
             deleted_at: None,
             superseded_by: None,
-        }
-    }
-
-    fn policy() -> NotificationPolicy {
-        let enabled = NotificationKindPolicy {
-            agent_blocked: true,
-            approval_required: true,
-            turn_completed: false,
-            session_finished: false,
-            error: true,
-            system: false,
-        };
-        NotificationPolicy {
-            attention_dedupe_window_secs: 120,
-            attention_debounce_secs: 5,
-            enabled: enabled.clone(),
-            providers: std::collections::BTreeMap::from([
-                ("claude".to_owned(), enabled.clone()),
-                ("codex".to_owned(), enabled),
-            ]),
-            retention: protocol::NotificationRetentionPolicy::default(),
         }
     }
 
@@ -1349,49 +1320,6 @@ mod tests {
         assert_eq!(doc["host_id"], "host-b");
         assert_eq!(doc["event"], "notification_deleted");
         assert_eq!(doc["notification_id"], "n-1");
-    }
-
-    /// A toggle changes one kind for one provider; a provider without its own
-    /// entry is seeded from the default kinds before the change.
-    #[test]
-    fn policy_toggle_updates_one_provider_and_seeds_missing_entries_from_defaults() {
-        let mut policy = policy();
-
-        apply_policy_toggle(
-            &mut policy,
-            PolicyProvider::Codex,
-            NotificationKind::TurnCompleted,
-            true,
-        );
-        assert!(policy.providers["codex"].turn_completed);
-        assert!(
-            !policy.providers["claude"].turn_completed,
-            "other providers"
-        );
-        assert!(!policy.enabled.turn_completed, "default kinds");
-
-        apply_policy_toggle(
-            &mut policy,
-            PolicyProvider::Codex,
-            NotificationKind::TurnCompleted,
-            false,
-        );
-        assert!(!policy.providers["codex"].turn_completed);
-
-        assert!(!policy.providers.contains_key("hermes"));
-        apply_policy_toggle(
-            &mut policy,
-            PolicyProvider::Hermes,
-            NotificationKind::TurnCompleted,
-            true,
-        );
-        assert_eq!(
-            policy.providers["hermes"],
-            NotificationKindPolicy {
-                turn_completed: true,
-                ..policy.enabled.clone()
-            }
-        );
     }
 
     #[test]

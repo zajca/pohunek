@@ -213,8 +213,11 @@ Session attention notifications use the source-independent dedupe key
 `attention:<session_id>`. That lets a daemon projector `agent_blocked` record
 and a provider-hook approval record refer to the same waiting-for-input moment
 without sharing a producer-specific source id. Within the policy's attention
-dedupe window, Codex and Claude provider records outrank daemon projector
-records for the same session attention key.
+dedupe window, provider hook records outrank daemon projector records for the
+same session attention key, and while reports are held pending in the debounce
+window a provider hook record outranks a user or external record. A provider
+ranks as a hook provider exactly when a registered hook schema lists it as an
+identity provider (today `shell`, `codex`, `claude`, and `hermes`).
 
 Session notifications self-resolve. When the daemon observes a session enter
 `working`, or the session reaches a terminal lifecycle state, the projector
