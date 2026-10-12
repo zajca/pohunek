@@ -64,6 +64,10 @@ fn user_settings() -> Value {
             ],
             "SessionStart": [
                 { "matcher": "*", "hooks": [{ "type": "command", "command": "echo start" }] }
+            ],
+            // Claude's `Stop` carries two managed entries; removal keeps this one.
+            "Stop": [
+                { "matcher": "*", "hooks": [{ "type": "command", "command": "echo stop" }] }
             ]
         }
     })

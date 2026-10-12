@@ -3,11 +3,12 @@
 # managed by pohunek; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # POHUNEK_INTEGRATION_ID=claude
-# POHUNEK_INTEGRATION_VERSION=11
+# POHUNEK_INTEGRATION_VERSION=12
 #
 # Session and subagent lifecycle hook: report active-agent identity, capture the
 # agent's native session id for direct-session resume, release active-agent
-# state on clean session exit, and journal sanitized child state.
+# state on clean session exit, journal sanitized child state, and report the
+# main agent's background task list at the end of each turn.
 # Fire-and-forget: any missing handshake env,
 # missing python3, or socket failure is a silent no-op (exit 0) so the hook can
 # never break the agent.
@@ -16,7 +17,7 @@ set -eu
 
 action="${1:-}"
 case "$action" in
-  session|release|subagent-start|subagent-stop) ;;
+  session|release|subagent-start|subagent-stop|stop) ;;
   *) exit 0 ;;
 esac
 
@@ -61,11 +62,19 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
+# Every hook event is its own short-lived interpreter, and the worker orders the
+# reports of one agent by this value. `time.monotonic_ns()` is only defined
+# within one process (Apple's Python 3.9 on macOS 27 counts from its own
+# start), so the system-wide monotonic clock is read instead. It is read before
+# stdin, so a large provider input never delays the moment it records.
+sequence = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+
 agent = "claude"
 ACTION_SESSION = "session"
 ACTION_RELEASE = "release"
 ACTION_SUBAGENT_START = "subagent-start"
 ACTION_SUBAGENT_STOP = "subagent-stop"
+ACTION_STOP = "stop"
 TIMESTAMP_MS_FACTOR = 1000
 SOCKET_TIMEOUT_SECS = 0.5
 RESPONSE_BYTES = 4096
@@ -76,6 +85,14 @@ IDENTITY_TTL_SECS = 30
 WORKER_INSTANCE_KEY_RENAMED_AT = 4
 # Bounds provider JSON before decoding; oversized payloads are rejected whole.
 MAX_HOOK_INPUT_BYTES = 65536
+# The main `Stop` input carries the final assistant message and, per background
+# task, a description and command of up to 1000 characters each, so 64 KiB is
+# too small. 1 MiB holds a long final message plus MAX_SNAPSHOT_TASKS tasks.
+MAX_STOP_HOOK_INPUT_BYTES = 1048576
+# Mirrors the worker's snapshot task bound; a longer list is not sent at all.
+MAX_SNAPSHOT_TASKS = 256
+# The only task fields a snapshot forwards; descriptions and commands stay local.
+SNAPSHOT_TASK_FIELDS = ("id", "type", "status")
 
 action = os.environ.get("POHUNEK_HOOK_ACTION")
 session_id = os.environ.get("POHUNEK_SESSION_ID")
@@ -87,7 +104,13 @@ agent_pid_raw = os.environ.get("POHUNEK_AGENT_PID")
 
 if not session_id or (not worker_socket_path and (not socket_path or not protocol_raw)):
     raise SystemExit(0)
-if action not in (ACTION_SESSION, ACTION_RELEASE, ACTION_SUBAGENT_START, ACTION_SUBAGENT_STOP):
+if action not in (
+    ACTION_SESSION,
+    ACTION_RELEASE,
+    ACTION_SUBAGENT_START,
+    ACTION_SUBAGENT_STOP,
+    ACTION_STOP,
+):
     raise SystemExit(0)
 
 protocol_version = None
@@ -103,22 +126,51 @@ except ValueError:
     parsed_agent_pid = None
 agent_pid = parsed_agent_pid if parsed_agent_pid and parsed_agent_pid >= MIN_AGENT_PID else None
 
+# A snapshot goes to the worker only; without a worker claim stdin is not read.
+if action == ACTION_STOP and (not worker_socket_path or not worker_instance_id or agent_pid is None):
+    raise SystemExit(0)
+
+
+def snapshot_tasks(parsed):
+    # The main agent's background tasks reduced to SNAPSHOT_TASK_FIELDS, or
+    # None. A missing or malformed list means "no snapshot", never "nothing
+    # running", so one bad entry voids the whole list instead of being skipped.
+    agent_id = parsed.get("agent_id")
+    if isinstance(agent_id, str) and agent_id:
+        return None
+    entries = parsed.get("background_tasks")
+    if not isinstance(entries, list) or len(entries) > MAX_SNAPSHOT_TASKS:
+        return None
+    tasks = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return None
+        task = {field: entry.get(field) for field in SNAPSHOT_TASK_FIELDS}
+        if not all(isinstance(value, str) and value for value in task.values()):
+            return None
+        tasks.append(task)
+    return tasks
+
+
 def read_hook_input():
+    limit = MAX_STOP_HOOK_INPUT_BYTES if action == ACTION_STOP else MAX_HOOK_INPUT_BYTES
     try:
         with os.fdopen(3, "rb") as handle:
-            content = handle.read(MAX_HOOK_INPUT_BYTES + 1)
-        if len(content) > MAX_HOOK_INPUT_BYTES or not content.strip():
+            content = handle.read(limit + 1)
+        if len(content) > limit or not content.strip():
             return {}
         parsed = json.loads(content)
         if not isinstance(parsed, dict):
             return {}
+        if action == ACTION_STOP:
+            return {"tasks": snapshot_tasks(parsed)}
         fields = (
             ("agent_id", "agent_type", "parent_agent_id")
             if action in (ACTION_SUBAGENT_START, ACTION_SUBAGENT_STOP)
             else ("session_id", "transcript_path")
         )
         return {field: parsed.get(field) for field in fields}
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, RecursionError, json.JSONDecodeError):
         return {}
 
 
@@ -130,11 +182,6 @@ transcript = hook_input.get("transcript_path")
 transcript_path = transcript if isinstance(transcript, str) and transcript else None
 
 timestamp_ms = int(time.time() * TIMESTAMP_MS_FACTOR)
-# Every hook event is its own short-lived interpreter, and the worker orders the
-# reports of one agent by this value. `time.monotonic_ns()` is only defined
-# within one process (Apple's Python 3.9 on macOS 27 counts from its own
-# start), so the system-wide monotonic clock is read instead.
-sequence = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
 
 
 # Darwin `proc_pidinfo(PROC_PIDTBSDINFO)` layout of `struct proc_bsdinfo`: the
@@ -259,6 +306,37 @@ def send_worker_subagent(request_type):
         return False
 
 
+def send_worker_snapshot(tasks):
+    # No daemon fallback exists for a snapshot, so the worker's answer is read
+    # only to let it finish writing and is then discarded.
+    if tasks is None:
+        return
+    start_identity = process_start_identity(agent_pid)
+    if start_identity is None:
+        return
+    request = {
+        "type": "subagent_snapshot",
+        "runtime_id": worker_instance_id,
+        "provider": agent,
+        "pid": agent_pid,
+        "start_identity": start_identity,
+        "sequence": sequence,
+        "tasks": tasks,
+    }
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(SOCKET_TIMEOUT_SECS)
+        client.connect(worker_socket_path)
+        client.sendall((json.dumps(request) + "\n").encode())
+        try:
+            client.recv(RESPONSE_BYTES)
+        except Exception:
+            pass
+        client.close()
+    except Exception:
+        pass
+
+
 def send_request(method, params, suffix):
     request = {
         "v": {"minimum": protocol_version, "maximum": protocol_version},
@@ -286,6 +364,10 @@ if action == ACTION_SUBAGENT_START:
 
 if action == ACTION_SUBAGENT_STOP:
     send_worker_subagent("subagent_stop")
+    raise SystemExit(0)
+
+if action == ACTION_STOP:
+    send_worker_snapshot(hook_input.get("tasks"))
     raise SystemExit(0)
 
 if action == ACTION_RELEASE:

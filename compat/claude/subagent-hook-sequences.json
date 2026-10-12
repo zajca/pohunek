@@ -1,11 +1,11 @@
 {
-  "source": "zajca/pohunek#883 (2026-10-12): live session on Claude Code 2.1.288 (macOS, auto mode) and controlled reproduction R1-R3 on Claude Code 2.1.295 (Linux)",
+  "source": "zajca/pohunek#883 (2026-10-12): live session on Claude Code 2.1.288 (macOS, auto mode), controlled reproduction R1-R4 on Claude Code 2.1.295 (Linux), and the background_tasks construction read from the Claude Code 2.1.296 binary (issue intake comment)",
   "format": {
-    "events": "Ordered SubagentStart/SubagentStop hook inputs, sanitized to hook_event_name, agent_id and agent_type. `at` is the UTC time the issue records, where it records one. Main-agent Stop events (with background_tasks) are left out; they belong in `events` at the turn ends the descriptions name.",
+    "events": "Ordered SubagentStart, SubagentStop and main-agent Stop hook inputs. A SubagentStart or SubagentStop is sanitized to hook_event_name, agent_id and agent_type. A main-agent Stop carries no agent_id; it is sanitized to hook_event_name and background_tasks, whose entries keep id, type and status plus the description, agent_type and command fields Claude sends beside them, so a replay can show that the state hook drops them. `at` is the UTC time the issue records, where it records one. The R1-R3 and live sequences leave their main-agent Stop events out; the R4 sequences carry them at the turn ends their descriptions name.",
     "checkpoints": "Rows expected after the first `after_events` events.",
     "final_rows": "Rows expected after every event: one row per subagent, with its lifecycle."
   },
-  "ids": "Ids the issue records in full are kept. The reproduction logged ids only in truncated form, so R1-R3 and every prompt-suggestion helper use synthetic ids of the same shape (`a` plus 16 hex digits).",
+  "ids": "Ids the issue records in full are kept. The reproduction logged ids only in truncated form, so R1-R4 and every prompt-suggestion helper use synthetic ids of the same shape (`a` plus 16 hex digits). Shell and teammate task ids are synthetic too; a teammate's agent id has Claude's `name@team` form and differs from its task id.",
   "sequences": {
     "spawn_handback_resume": {
       "recording": "R1",
@@ -132,6 +132,124 @@
       ],
       "final_rows": [
         {"agent_id": "ab6095d32d09fd8cd", "lifecycle": "completed"}
+      ]
+    },
+    "lost_stop_corrected_by_snapshot": {
+      "recording": "R4; live session s-01M4QC188PWBKPAMVYVZ5CGNQT (stops that never reached the worker)",
+      "description": "Turn 1 spawns a background agent and a background shell; the main Stop lists both. The agent finishes, but its SubagentStop never reaches the worker, as in the live session. Turn 2 spawns a second background agent; its main Stop lists only that agent, because a finished subagent disappears from the next main Stop. The first agent was listed during its run, so its absence settles it as completed while the listed agent stays running.",
+      "events": [
+        {"hook_event_name": "SubagentStart", "agent_id": "a1f4c7e0b3d6a9c2f", "agent_type": "general-purpose"},
+        {"hook_event_name": "Stop", "background_tasks": [{"id": "a1f4c7e0b3d6a9c2f", "type": "subagent", "status": "running", "description": "Audit the session journal for stale rows", "agent_type": "general-purpose"}, {"id": "b4q8w2e6r", "type": "shell", "status": "running", "description": "Run the workspace tests", "command": "cargo nextest run --workspace --no-fail-fast"}]},
+        {"hook_event_name": "SubagentStart", "agent_id": "a9d3b7f1c5e8a2d6b", "agent_type": "general-purpose"},
+        {"hook_event_name": "Stop", "background_tasks": [{"id": "a9d3b7f1c5e8a2d6b", "type": "subagent", "status": "running", "description": "Summarize the worker log", "agent_type": "general-purpose"}]}
+      ],
+      "checkpoints": [
+        {
+          "after_events": 2,
+          "rows": [{"agent_id": "a1f4c7e0b3d6a9c2f", "lifecycle": "running"}]
+        },
+        {
+          "after_events": 3,
+          "rows": [
+            {"agent_id": "a1f4c7e0b3d6a9c2f", "lifecycle": "running"},
+            {"agent_id": "a9d3b7f1c5e8a2d6b", "lifecycle": "running"}
+          ]
+        }
+      ],
+      "final_rows": [
+        {"agent_id": "a1f4c7e0b3d6a9c2f", "lifecycle": "completed"},
+        {"agent_id": "a9d3b7f1c5e8a2d6b", "lifecycle": "running"}
+      ]
+    },
+    "never_listed_agent_with_only_shells": {
+      "recording": "R4",
+      "description": "A subagent whose stop never reached the worker is never listed, and the main Stop lists only a background shell. A shell runs no agent, so no live task can hold an unlisted subagent, and the subagent settles as completed.",
+      "events": [
+        {"hook_event_name": "SubagentStart", "agent_id": "a2e5b8d1f4c7a0e3b", "agent_type": "general-purpose"},
+        {"hook_event_name": "Stop", "background_tasks": [{"id": "b7t1y5u9i", "type": "shell", "status": "running", "description": "Watch the build", "command": "cargo build --workspace 2>&1 | tail -n 40"}]}
+      ],
+      "checkpoints": [
+        {
+          "after_events": 1,
+          "rows": [{"agent_id": "a2e5b8d1f4c7a0e3b", "lifecycle": "running"}]
+        }
+      ],
+      "final_rows": [
+        {"agent_id": "a2e5b8d1f4c7a0e3b", "lifecycle": "completed"}
+      ]
+    },
+    "teammate_keeps_unlisted_agents": {
+      "recording": "R4; Claude Code 2.1.296 binary (in-process teammate task ids differ from their agent ids)",
+      "description": "An in-process teammate reports SubagentStart with its `name@team` agent id, while the main Stop lists it as a teammate task under a different task id. Its record is never listed by its own id, and a teammate can host unlisted agents, so it stays running. Once no teammate is live, the next main Stop lists nothing and the record settles as completed.",
+      "events": [
+        {"hook_event_name": "SubagentStart", "agent_id": "researcher@review-team", "agent_type": "researcher"},
+        {"hook_event_name": "Stop", "background_tasks": [{"id": "t3k7p1s5v", "type": "teammate", "status": "running", "description": "researcher: review the subagent rules"}]},
+        {"hook_event_name": "Stop", "background_tasks": []}
+      ],
+      "checkpoints": [
+        {
+          "after_events": 2,
+          "rows": [{"agent_id": "researcher@review-team", "lifecycle": "running"}]
+        }
+      ],
+      "final_rows": [
+        {"agent_id": "researcher@review-team", "lifecycle": "completed"}
+      ]
+    },
+    "sync_child_of_background_agent": {
+      "recording": "R4; Claude Code 2.1.296 binary (synchronous children are registered with isBackgrounded false)",
+      "description": "A background agent spawns a synchronous child, which Claude never lists. The main Stop lists the background agent, which can host unlisted agents, so the child stays running beside it. The child's SubagentStop and then its parent's complete both.",
+      "events": [
+        {"hook_event_name": "SubagentStart", "agent_id": "a3b6e9c2f5d8a1b4e", "agent_type": "general-purpose"},
+        {"hook_event_name": "SubagentStart", "agent_id": "a6d9c2f5b8e1a4d7c", "agent_type": "Explore"},
+        {"hook_event_name": "Stop", "background_tasks": [{"id": "a3b6e9c2f5d8a1b4e", "type": "subagent", "status": "running", "description": "Map the integration installers", "agent_type": "general-purpose"}]},
+        {"hook_event_name": "SubagentStop", "agent_id": "a6d9c2f5b8e1a4d7c", "agent_type": "Explore"},
+        {"hook_event_name": "SubagentStop", "agent_id": "a3b6e9c2f5d8a1b4e", "agent_type": "general-purpose"}
+      ],
+      "checkpoints": [
+        {
+          "after_events": 3,
+          "rows": [
+            {"agent_id": "a3b6e9c2f5d8a1b4e", "lifecycle": "running"},
+            {"agent_id": "a6d9c2f5b8e1a4d7c", "lifecycle": "running"}
+          ]
+        },
+        {
+          "after_events": 4,
+          "rows": [
+            {"agent_id": "a3b6e9c2f5d8a1b4e", "lifecycle": "running"},
+            {"agent_id": "a6d9c2f5b8e1a4d7c", "lifecycle": "completed"}
+          ]
+        }
+      ],
+      "final_rows": [
+        {"agent_id": "a3b6e9c2f5d8a1b4e", "lifecycle": "completed"},
+        {"agent_id": "a6d9c2f5b8e1a4d7c", "lifecycle": "completed"}
+      ]
+    },
+    "helper_and_snapshot": {
+      "recording": "R3, R4",
+      "description": "Turn 1 spawns a background agent; its main Stop lists that agent and a second background agent whose SubagentStart never reached the worker, and the prompt-suggestion helper stop follows. Turn 2 handles the hand-back: the agent's SubagentStop, a main Stop that lists nothing, and another helper stop. Helper stops and the listing of an agent without a record create no row.",
+      "events": [
+        {"hook_event_name": "SubagentStart", "agent_id": "a7e0d3c6f9b2a5e8d", "agent_type": "general-purpose"},
+        {"hook_event_name": "Stop", "background_tasks": [{"id": "a7e0d3c6f9b2a5e8d", "type": "subagent", "status": "running", "description": "Collect the helper-stop timings", "agent_type": "general-purpose"}, {"id": "a8f1c4b7e0d3a6f9c", "type": "subagent", "status": "running", "description": "Cross-check the transcript counter", "agent_type": "general-purpose"}]},
+        {"hook_event_name": "SubagentStop", "agent_id": "a0c3f6b9e2d5a8c1f", "agent_type": ""},
+        {"hook_event_name": "SubagentStop", "agent_id": "a7e0d3c6f9b2a5e8d", "agent_type": "general-purpose"},
+        {"hook_event_name": "Stop", "background_tasks": []},
+        {"hook_event_name": "SubagentStop", "agent_id": "a5b8e1d4c7f0a3b6e", "agent_type": ""}
+      ],
+      "checkpoints": [
+        {
+          "after_events": 3,
+          "rows": [{"agent_id": "a7e0d3c6f9b2a5e8d", "lifecycle": "running"}]
+        },
+        {
+          "after_events": 4,
+          "rows": [{"agent_id": "a7e0d3c6f9b2a5e8d", "lifecycle": "completed"}]
+        }
+      ],
+      "final_rows": [
+        {"agent_id": "a7e0d3c6f9b2a5e8d", "lifecycle": "completed"}
       ]
     }
   }

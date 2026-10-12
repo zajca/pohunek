@@ -372,22 +372,83 @@ row. A Codex `SubagentStop` without a recorded start records a completed
 child, because Codex reports resumed children with stops and no start
 ([#916](https://github.com/zajca/pohunek/issues/916)).
 
+At the end of every main-agent turn, Claude's `Stop` hook input lists the
+backgrounded tasks that are still running or pending (`background_tasks`). The
+Claude state hook forwards only each task's `id`, `type` and `status` to the
+worker as one `subagent_snapshot` claim, identified by the reporting process
+like a start and stamped with a sequence taken before the hook reads its input.
+It sends no snapshot when the input exceeds 1 MiB or is not a JSON object, when
+the `Stop` carries a non-empty `agent_id` (it is not the main agent's), when
+`background_tasks` is missing or not a list, when the list has more than 256
+entries, or when any entry lacks a non-empty string `id`, `type` or `status`;
+the hook never truncates the list, and a missing list never means that nothing
+runs. An empty list is a valid snapshot: it lists no hosting task, so it
+settles every running row of that process with an older sequence. The worker
+reconciles only the rows the same Claude process started or reopened, and only
+rows whose recorded sequence is older than the snapshot's, so a later start or
+stop always wins over the snapshot:
+
+- a running row whose id is listed stays running, and its recorded sequence
+  advances to the snapshot's (persisted with no new revision), so a delayed
+  stop older than the snapshot cannot complete a row the snapshot proved live;
+- a running row that a snapshot listed during its current run and that this
+  snapshot omits is a background agent that finished, and becomes `completed`;
+- a running row that no snapshot listed during its current run becomes
+  `completed` only when the snapshot lists no task that can host an unlisted
+  agent (any task type except `shell`, `monitor` and `MCP task`); otherwise it
+  stays running, because Claude does not list teammates, synchronous children
+  of a background agent, or workflow agents by their agent id, and such a row
+  waits for its own stop or a later snapshot without a hosting task;
+- a terminal row whose id is listed is `running` again with a new revision and
+  its terminal time cleared (a self-woken agent whose start raced the main
+  `Stop`), unless the running-child limit is full.
+
+Each main turn therefore settles the Claude rows it can prove: a background
+agent that a main `Stop` listed and whose own stop never arrived holds a
+running-child slot only until the next main-turn end after it finished. A
+reconciled row looks like any other completed or reopened row; the reason is
+recorded only in the worker log.
+
+The listing is Claude's view at the moment of the main `Stop`, so two races
+settle one main turn later. A snapshot can still list an agent whose own
+`SubagentStop` is ordered before it: the row is reopened, or the delayed stop
+is ignored as stale, and the next main-turn end completes it. A background
+agent whose start is ordered before the snapshot but is missing from a listing
+Claude built before it started can be completed early when no hosting task is
+listed; a later listing of its id reopens it. Rows of another reporting
+process, such as a second Claude in a shell session, are outside a snapshot's
+scope. The reporting process and the last listing of each row are kept in
+worker memory only. Codex `Stop` carries no task list, so Codex rows are never
+reconciled this way ([#916](https://github.com/zajca/pohunek/issues/916)).
+
 Every admitted subagent claim the worker ignores or refuses is logged in the
 session's worker log with a reason code: `duplicate_start`,
 `stop_without_start`, `stale_sequence` and `not_running` at INFO, and
-`capacity` (the running-child limit) at WARN; an inadmissible claim is logged
-as the `worker.identity.rejected` warning. The worker answers the hook with
-success when it admitted the claim and either applied it or ignored it for one
-of the INFO reasons, and with failure when the claim was refused, was
-inadmissible, or its journal write failed; in every case the hook exits
-quietly, because subagent claims have no daemon fallback.
+`capacity` (the running-child limit) at WARN; an inadmissible claim, including
+a snapshot whose task list breaks a bound, is logged as the
+`worker.identity.rejected` warning. A snapshot logs one
+`worker.subagent.reconciled` at INFO for each row it completes (reason
+`snapshot_absent`) or reopens (reason `snapshot_listed`), and one
+`worker.subagent.snapshot.applied` at INFO with the number of `tasks` in the
+snapshot, the `hosts` flag, and the row counts `listed` (running rows kept
+because the snapshot listed them), `terminalized`, `reopened` and `deferred`;
+a reopen the running-child limit prevents is logged as a refused `snapshot`
+claim with reason `capacity` at WARN. The worker
+answers the hook with success when it admitted the claim and either applied it
+or ignored it for one of the INFO reasons, and an admitted, valid snapshot
+whether or not it changed a row; it answers with failure when the claim was
+refused, was inadmissible, or its journal write failed. In every case the hook exits quietly, because subagent
+claims have no daemon fallback.
 
 This collection does not change the parent session's
 `activity`, launch identity, or recovery binding. The hook validates its action
-and Pohunek handshake before reading a bounded payload directly from stdin; it
-does not create a payload file. Only the lifecycle fields are retained, so the
-collection never contains prompts, results, messages, transcript paths, or raw
-hook payloads.
+and Pohunek handshake before reading a bounded payload directly from stdin (at
+most 64 KiB, or 1 MiB for the main `Stop`, whose input also carries the final
+assistant message and each task's description); it does not create a payload
+file. Only the lifecycle fields are retained: a snapshot's task `type` and
+`status` decide the reconciliation and are never stored, so the collection
+never contains prompts, results, messages, task descriptions or commands,
+transcript paths, or raw hook payloads.
 
 Human-readable `pohunek session list` shows the running/recent child count, and
 `pohunek session inspect` includes the corresponding lifecycle rows. Streaming
@@ -871,9 +932,10 @@ refused one leaves the stored reference alone, and an assigned value never
 replaces a reported one, also across a daemon restart. Sequences are compared per
 transport (worker claim or public report) and per runtime generation, so one
 clock never makes the other stale. Inside the worker, the claims of every
-reporter in a session share one ordering, so every shipped reporter stamps its
-worker claims from the system-wide monotonic clock in nanoseconds and a nested
-agent's claim never makes the launch agent's later claim stale. A recovered
+reporter in a session share one ordering, so the shipped Codex and Claude hooks
+stamp their worker claims from the system-wide monotonic clock in nanoseconds
+(`CLOCK_MONOTONIC`) and a nested agent's claim never makes the launch agent's
+later claim stale. A recovered
 generation's first claim supersedes the reference it was relaunched with. The worker journals the latest
 reference of the verified launch process apart from the active claim's lease, so
 a switch made while the daemon was down survives the lease, and every
@@ -916,8 +978,9 @@ whose PID or start time no longer matches are refused, so an agent a tool comman
 first accepted claim is the initial reference. A later switch replaces it only
 when the launch agent reports a newer verified conversation. Only the
 `SessionStart` identity report carries a conversation
-id; a subagent's `SubagentStart` and `SubagentStop` reports are a separate
-claim type that never touches the reference. The worker's launch-process rule
+id; a subagent's `SubagentStart` and `SubagentStop` reports and Claude's
+main-`Stop` subagent snapshot are separate claim types that never touch the
+reference. The worker's launch-process rule
 does not cover the daemon's public `session.report_native_id` fallback, which
 keeps its own runtime, process-identity, ordering and expiry checks; that gap is
 tracked separately.

@@ -19,13 +19,13 @@ use toml_edit::{DocumentMut, Item};
 use super::commit::{self, Action, Committed, Expected, Operation, Outcome, Step, StepGate};
 use super::homes::{ConfigHomes, HomeSelection, Target};
 use super::{
-    apply_trust_moves, claude_notify_hook_commands, codex_managed_hooks,
-    codex_notify_hook_commands, config_dir_is_symlink, config_path_kind, hook_command,
-    is_owned_trust_record, json_pretty, owned_trust_hashes, parse_json_object_or_empty,
-    path_untrusted, remove_owned_command_hooks, settings_invalid, toml_error_summary, trust_rekeys,
-    validate_config_dir, CodexManagedHook, ConfigPath, LoadedFile, OwnedTrustHashes, TrustedDir,
-    HOOK_ACTION, HOOK_RELEASE_ACTION, NOTIFY_HOOK_INSTALL_NAME, STATE_HOOK_INSTALL_NAME,
-    SUBAGENT_START_ACTION, SUBAGENT_STOP_ACTION,
+    apply_trust_moves, claude_notify_hook_commands, claude_state_hook_commands,
+    codex_managed_hooks, codex_notify_hook_commands, config_dir_is_symlink, config_path_kind,
+    hook_command, is_owned_trust_record, json_pretty, owned_trust_hashes,
+    parse_json_object_or_empty, path_untrusted, remove_owned_command_hooks, settings_invalid,
+    toml_error_summary, trust_rekeys, validate_config_dir, CodexManagedHook, ConfigPath,
+    LoadedFile, OwnedTrustHashes, TrustedDir, HOOK_ACTION, NOTIFY_HOOK_INSTALL_NAME,
+    STATE_HOOK_INSTALL_NAME, SUBAGENT_START_ACTION, SUBAGENT_STOP_ACTION,
 };
 
 /// Marker line an installed Claude hook script carries.
@@ -325,12 +325,7 @@ pub(super) fn uninstall_claude_gated(
     let hooks = root.open_child("hooks", "Claude hooks directory")?;
     let hook_path = claude_dir.join("hooks").join(STATE_HOOK_INSTALL_NAME);
     let notify_path = claude_dir.join("hooks").join(NOTIFY_HOOK_INSTALL_NAME);
-    let mut owned = vec![
-        hook_command(&hook_path, HOOK_ACTION),
-        hook_command(&hook_path, HOOK_RELEASE_ACTION),
-        hook_command(&hook_path, SUBAGENT_START_ACTION),
-        hook_command(&hook_path, SUBAGENT_STOP_ACTION),
-    ];
+    let mut owned = claude_state_hook_commands(&hook_path);
     owned.extend(claude_notify_hook_commands(&notify_path));
 
     let settings_path = claude_dir.join("settings.json");
