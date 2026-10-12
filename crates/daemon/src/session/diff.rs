@@ -20,6 +20,21 @@ use crate::worktree::{
     GIT_COMMAND_TIMEOUT,
 };
 
+/// Flags that make `git diff` output independent of the ambient git config.
+///
+/// The `a/` and `b/` path prefixes are what clients parse out of the
+/// `diff --git a/<path> b/<path>` header; `diff.mnemonicprefix`,
+/// `diff.noprefix` and `diff.srcPrefix`/`diff.dstPrefix` in a user's global
+/// config would otherwise replace them (`c/`, `w/`, `1/`, `2/`, or none).
+/// `--no-ext-diff` keeps a configured `diff.external` tool from replacing the
+/// unified-diff text altogether.
+const DIFF_OUTPUT_FLAGS: [&str; 4] = [
+    "--no-color",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    "--no-ext-diff",
+];
+
 impl SessionRegistry {
     /// Diff a session's worktree against its resolved base ref.
     ///
@@ -157,16 +172,10 @@ fn merge_base(worktree: &Path, base: &str) -> Result<String, ProtocolError> {
 /// differences; only a non-zero status is an error (e.g. an unreadable
 /// object).
 fn tracked_diff(worktree: &Path, merge_base_sha: &str) -> Result<String, ProtocolError> {
-    let output = git_output(
-        worktree,
-        &[
-            "diff",
-            "--no-color",
-            "--find-renames",
-            "--end-of-options",
-            merge_base_sha,
-        ],
-    )?;
+    let mut args = vec!["diff"];
+    args.extend(DIFF_OUTPUT_FLAGS);
+    args.extend(["--find-renames", "--end-of-options", merge_base_sha]);
+    let output = git_output(worktree, &args)?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
@@ -231,17 +240,10 @@ fn untracked_files(worktree: &Path) -> Result<Vec<String>, ProtocolError> {
 /// Binary untracked files come back as git's own "Binary files ... differ"
 /// stanza, with no special-casing needed here.
 fn untracked_diff(worktree: &Path, relative_path: &str) -> Result<String, ProtocolError> {
-    let output = git_output(
-        worktree,
-        &[
-            "diff",
-            "--no-color",
-            "--no-index",
-            "--",
-            "/dev/null",
-            relative_path,
-        ],
-    )?;
+    let mut args = vec!["diff"];
+    args.extend(DIFF_OUTPUT_FLAGS);
+    args.extend(["--no-index", "--", "/dev/null", relative_path]);
+    let output = git_output(worktree, &args)?;
     match output.status.code() {
         Some(0 | 1) => Ok(String::from_utf8_lossy(&output.stdout).into_owned()),
         _ => Err(session_diff_failed(&format!(

@@ -380,7 +380,10 @@ if session_id and event["attention"]:
 elif session_id and event["kind"] == "turn_completed":
     params["dedupe_key"] = f"turn:{session_id}"
 
-if send_worker_notification(params, time.monotonic_ns()):
+# The worker forwards this value as the request sequence of a short-lived hook
+# process, so it comes from a system-wide clock (see `sequence` in the state
+# hook), not from `time.monotonic_ns()`, which is only defined per process.
+if send_worker_notification(params, time.clock_gettime_ns(time.CLOCK_MONOTONIC)):
     raise SystemExit(0)
 if socket_path and protocol_version is not None:
     send_request("notification.create", params, f"{source_id}:create")
