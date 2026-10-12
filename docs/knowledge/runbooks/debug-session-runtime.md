@@ -68,6 +68,20 @@ logs nothing more and emits no new event; a runtime whose worker connection
 dropped logs `worker_connection_lost` (`reconnecting`) once and a second WARN
 when it is classified again, for example `lost` with `runtime_lost`.
 
+When `pohunek session inspect <target>` shows a subagent row that disagrees with
+the provider, read the session's worker log
+(`pohunek-session-<session-id>.jsonl`). The worker logs every admitted subagent
+claim it ignores as `worker.subagent.claim.ignored` and every claim it refuses
+as `worker.subagent.claim.refused`, with `subagent.action`, `subagent.id`, the
+reported and recorded sequences, and a `subagent.reason` code: `duplicate_start` (a start for a child that is already running),
+`stop_without_start` (a Claude stop with no recorded start, such as Claude's
+prompt-suggestion helper after every main turn), `stale_sequence` (a claim
+ordered before the recorded one) and `not_running` (a stop for a terminal
+child) at INFO, and `capacity` (a start refused because the running-child
+limit is full) at WARN. An inadmissible claim, such as one from the wrong
+process or runtime, is the `worker.identity.rejected` warning with
+`identity.operation` `subagent_start` or `subagent_stop`.
+
 Interpret runtime states as follows:
 
 - `live`: the daemon has the current worker controller lease. Attach should use

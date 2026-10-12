@@ -2,7 +2,7 @@
 
 // Rust guideline compliant 2026-10-12
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
@@ -73,6 +73,14 @@ const EVENT_BUFFER: usize = 256;
 const ACTIVE_SUBAGENT_CAPACITY: usize = 64;
 /// Recent terminal subagents retained for reconnecting clients.
 const TERMINAL_SUBAGENT_CAPACITY: usize = 32;
+/// Stops without a recorded start remembered to order a late start.
+///
+/// A provider whose stop requires a start reports about one such stop per main
+/// turn, and a start delivered out of order arrives within seconds of its
+/// stop, so only the few most recent stops can still meet their start. The
+/// bound keeps the set at a few kilobytes of ids; an evicted stop only means a
+/// start arriving after it is taken for a new run.
+const ORPHAN_STOP_CAPACITY: usize = 64;
 /// Delay between terminal-journal retries after a transient storage failure.
 ///
 /// A quarter second keeps the runtime publicly draining without either a busy
@@ -551,6 +559,8 @@ struct State {
     exit: Option<ExitStatus>,
     stop_requested: bool,
     journal: JournalRecord,
+    /// Subagent stops kept out of the journal because no start preceded them.
+    orphan_stops: OrphanStops,
 }
 
 impl State {
@@ -568,6 +578,7 @@ impl State {
             exit: None,
             stop_requested: false,
             journal,
+            orphan_stops: OrphanStops::default(),
         }
     }
 }
@@ -3134,7 +3145,7 @@ where
     let request: HookRequest =
         serde_json::from_value(value).map_err(|error| WorkerError::Protocol(error.to_string()))?;
     let mut launch_identity_status = LaunchClaimStatus::NotApplicable;
-    let (accepted, launch_identity_accepted, worker_instance_id, subagent_changed) = match request {
+    let (accepted, launch_identity_accepted, worker_instance_id, subagent_outcome) = match request {
         HookRequest::IdentityReport {
             worker_instance_id,
             provider,
@@ -3172,7 +3183,7 @@ where
             });
             if let Some(reason) = inadmissible {
                 reject_identity(&shared, "identity_report", reason, peer);
-                (false, false, current_runtime, false)
+                (false, false, current_runtime, None)
             } else {
                 let ancestry = admitted_ancestry(admitted)?;
                 let pty = state.pty.as_ref().ok_or_else(|| {
@@ -3198,7 +3209,7 @@ where
                     );
                 }
                 if !process_valid || !sequence_valid {
-                    (false, false, current_runtime, false)
+                    (false, false, current_runtime, None)
                 } else {
                     let mut journal = state.journal.clone();
                     let process = ChildIdentity {
@@ -3258,7 +3269,7 @@ where
                         true,
                         launch_identity_status == LaunchClaimStatus::Accepted,
                         current_runtime,
-                        false,
+                        None,
                     )
                 }
             }
@@ -3285,7 +3296,7 @@ where
             );
             if let Some(reason) = inadmissible {
                 reject_identity(&shared, "identity_release", reason, peer);
-                (false, false, current_runtime, false)
+                (false, false, current_runtime, None)
             } else {
                 let ancestry = admitted_ancestry(admitted)?;
                 let pty = state.pty.as_ref().ok_or_else(|| {
@@ -3331,9 +3342,9 @@ where
                     journal.updated_at = timestamp();
                     persist(shared.journal.clone(), journal.clone()).await?;
                     state.journal = journal;
-                    (true, false, current_runtime, false)
+                    (true, false, current_runtime, None)
                 } else {
-                    (false, false, current_runtime, false)
+                    (false, false, current_runtime, None)
                 }
             }
         }
@@ -3397,24 +3408,40 @@ where
                 })
             });
             if !valid || !process_valid {
-                (false, false, current_runtime, false)
+                (false, false, current_runtime, None)
             } else {
-                let mut journal = state.journal.clone();
-                let accepted = start_subagent(
-                    &mut journal,
-                    provider,
-                    subagent_id,
-                    parent_id,
-                    agent_type,
+                let (_, rule) = admitted_subagent_rule(admitted)?;
+                let state = &mut *state;
+                let claim = SubagentClaim {
+                    action: "start",
+                    provider: &provider,
+                    id: &subagent_id,
                     sequence,
+                };
+                let mut journal = state.journal.clone();
+                let outcome = start_subagent(
+                    &mut journal,
+                    rule,
+                    claim,
+                    parent_id.as_deref(),
+                    agent_type.as_deref(),
+                    state.orphan_stops.sequence(&provider, &subagent_id),
                     occurred_at_ms,
                 );
-                if accepted {
+                if outcome == SubagentOutcome::Applied {
                     journal.updated_at = timestamp();
                     persist(shared.journal.clone(), journal.clone()).await?;
                     state.journal = journal;
+                    state.orphan_stops.forget(&provider, &subagent_id);
+                } else {
+                    log_subagent_outcome(&shared, claim, outcome);
                 }
-                (accepted, false, current_runtime, accepted)
+                (
+                    outcome.acknowledged(),
+                    false,
+                    current_runtime,
+                    Some(outcome),
+                )
             }
         }
         HookRequest::SubagentStop {
@@ -3469,28 +3496,36 @@ where
                 })
             });
             if !valid || !process_valid {
-                (false, false, current_runtime, false)
+                (false, false, current_runtime, None)
             } else {
+                let (schema, rule) = admitted_subagent_rule(admitted)?;
+                let state = &mut *state;
+                let claim = SubagentClaim {
+                    action: "stop",
+                    provider: &provider,
+                    id: &subagent_id,
+                    sequence,
+                };
                 let mut journal = state.journal.clone();
-                let accepted = admitted.is_ok_and(|schema| {
-                    schema.subagent_sequence.is_some_and(|rule| {
-                        stop_subagent(
-                            &mut journal,
-                            rule,
-                            &provider,
-                            &subagent_id,
-                            outcome.unwrap_or(JournalSubagentPhase::Completed),
-                            sequence,
-                            occurred_at_ms,
-                        )
-                    })
-                });
-                if accepted {
+                let effect = stop_subagent(
+                    &mut journal,
+                    rule,
+                    schema.stop_requires_start(&provider),
+                    claim,
+                    outcome.unwrap_or(JournalSubagentPhase::Completed),
+                    occurred_at_ms,
+                );
+                if effect == SubagentOutcome::Applied {
                     journal.updated_at = timestamp();
                     persist(shared.journal.clone(), journal.clone()).await?;
                     state.journal = journal;
+                } else {
+                    if effect.reason() == Some(SubagentReason::StopWithoutStart) {
+                        state.orphan_stops.record(&provider, &subagent_id, sequence);
+                    }
+                    log_subagent_outcome(&shared, claim, effect);
                 }
-                (accepted, false, current_runtime, accepted)
+                (effect.acknowledged(), false, current_runtime, Some(effect))
             }
         }
         HookRequest::NotificationCreate {
@@ -3574,11 +3609,14 @@ where
                 .map_err(|error| WorkerError::Protocol(error.to_string()));
         }
     };
-    if accepted {
+    // A subagent claim emits only when it changed the journal; an ignored claim
+    // still answers `ok` without an event.
+    let changed = subagent_outcome.map_or(accepted, |outcome| outcome == SubagentOutcome::Applied);
+    if changed {
         if let Some(worker_instance_id) =
             worker_instance_id.and_then(|value| WorkerInstanceId::new(value).ok())
         {
-            if subagent_changed {
+            if subagent_outcome.is_some() {
                 shared.emit(EventKind::SubagentsChanged { worker_instance_id });
             } else {
                 shared.emit(EventKind::IdentityChanged { worker_instance_id });
@@ -3635,6 +3673,25 @@ fn admitted_ancestry(
     admitted
         .map(|schema| schema.ancestry)
         .map_err(|reason| WorkerError::Protocol(format!("hook claim was not admitted: {reason}")))
+}
+
+/// The schema and subagent ordering rule of an admitted subagent claim.
+///
+/// # Errors
+///
+/// Returns a protocol error when the operation was not admitted or its schema
+/// declares no ordering rule, which the callers rule out through
+/// [`HookSchema::admits_subagents`] before asking.
+fn admitted_subagent_rule(
+    admitted: Result<&'static HookSchema, RejectReason>,
+) -> Result<(&'static HookSchema, SubagentSequence), WorkerError> {
+    let schema = admitted.map_err(|reason| {
+        WorkerError::Protocol(format!("hook claim was not admitted: {reason}"))
+    })?;
+    let rule = schema.subagent_sequence.ok_or_else(|| {
+        WorkerError::Protocol("hook schema declares no subagent ordering rule".to_owned())
+    })?;
+    Ok((schema, rule))
 }
 
 /// Launch-process rule of a session's hook schema, with the evidence it needs.
@@ -4400,21 +4457,173 @@ fn valid_subagent_text(value: &str, max_bytes: usize) -> bool {
     !value.is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
 }
 
-fn start_subagent(
-    journal: &mut JournalRecord,
+/// One admissible subagent claim, as the ordering rule and the logs see it.
+#[derive(Debug, Clone, Copy)]
+struct SubagentClaim<'a> {
+    /// `start` or `stop`, as logged in `subagent.action`.
+    action: &'static str,
+    provider: &'a str,
+    id: &'a str,
+    sequence: u64,
+}
+
+/// Why an admissible subagent claim left the journal unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubagentReason {
+    /// A start for a subagent that is already running.
+    DuplicateStart,
+    /// A stop with no recorded start from a provider whose stop requires one.
+    StopWithoutStart,
+    /// A claim not ordered after the claim recorded for the same subagent.
+    StaleSequence,
+    /// A stop for a subagent that is already terminal.
+    NotRunning,
+    /// A start that would exceed [`ACTIVE_SUBAGENT_CAPACITY`].
+    Capacity,
+}
+
+impl SubagentReason {
+    /// Stable reason code used in logs.
+    const fn code(self) -> &'static str {
+        match self {
+            Self::DuplicateStart => "duplicate_start",
+            Self::StopWithoutStart => "stop_without_start",
+            Self::StaleSequence => "stale_sequence",
+            Self::NotRunning => "not_running",
+            Self::Capacity => "capacity",
+        }
+    }
+}
+
+/// Effect of one admissible subagent claim on the journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubagentOutcome {
+    /// The claim changed the journal, which is persisted and announced.
+    Applied,
+    /// The claim changes nothing by its order or because it repeats the
+    /// recorded state; the hook still succeeds. `recorded` is the sequence the
+    /// claim was ordered against, when there is one.
+    Ignored {
+        reason: SubagentReason,
+        recorded: Option<u64>,
+    },
+    /// The claim would exceed a bound; the hook fails. `recorded` is as for
+    /// [`Self::Ignored`].
+    Refused {
+        reason: SubagentReason,
+        recorded: Option<u64>,
+    },
+}
+
+impl SubagentOutcome {
+    /// Whether the hook answers `ok`: the claim was applied or ignored.
+    const fn acknowledged(self) -> bool {
+        !matches!(self, Self::Refused { .. })
+    }
+
+    /// Why the journal is unchanged, or `None` for an applied claim.
+    const fn reason(self) -> Option<SubagentReason> {
+        match self {
+            Self::Applied => None,
+            Self::Ignored { reason, .. } | Self::Refused { reason, .. } => Some(reason),
+        }
+    }
+}
+
+/// One stop remembered by [`OrphanStops`].
+#[derive(Debug)]
+struct OrphanStop {
     provider: String,
     id: String,
-    parent_id: Option<String>,
-    agent_type: Option<String>,
     sequence: u64,
+}
+
+/// Subagent stops with no recorded start from providers whose stop requires
+/// one.
+///
+/// Such a stop creates no journal record. Its sequence is kept so that a start
+/// delivered after it, out of order, is not taken for a new run. The set is in
+/// memory only and evicts its oldest stop beyond [`ORPHAN_STOP_CAPACITY`].
+#[derive(Debug, Default)]
+struct OrphanStops {
+    entries: VecDeque<OrphanStop>,
+}
+
+impl OrphanStops {
+    /// Sequence of the remembered stop of `provider`'s subagent `id`.
+    fn sequence(&self, provider: &str, id: &str) -> Option<u64> {
+        self.entries
+            .iter()
+            .find(|entry| entry.provider == provider && entry.id == id)
+            .map(|entry| entry.sequence)
+    }
+
+    /// Remembers a stop, keeping the greatest sequence of a repeated one.
+    fn record(&mut self, provider: &str, id: &str, sequence: u64) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.provider == provider && entry.id == id)
+        {
+            entry.sequence = entry.sequence.max(sequence);
+            return;
+        }
+        if self.entries.len() >= ORPHAN_STOP_CAPACITY {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(OrphanStop {
+            provider: provider.to_owned(),
+            id: id.to_owned(),
+            sequence,
+        });
+    }
+
+    /// Drops the remembered stop of `provider`'s subagent `id`, if any.
+    fn forget(&mut self, provider: &str, id: &str) {
+        self.entries
+            .retain(|entry| entry.provider != provider || entry.id != id);
+    }
+}
+
+/// Applies a subagent start to `journal` under `rule`.
+///
+/// A start for a running subagent changes nothing. A start ordered after a
+/// terminal subagent's recorded claim reopens it as running, keeping its start
+/// time and any field the claim omits. A start for an unknown subagent opens a
+/// new run unless `orphan_stop`, the sequence of a remembered stop without a
+/// start, is not ordered before it. Opening or reopening a run is refused once
+/// [`ACTIVE_SUBAGENT_CAPACITY`] subagents are running.
+fn start_subagent(
+    journal: &mut JournalRecord,
+    rule: SubagentSequence,
+    claim: SubagentClaim<'_>,
+    parent_id: Option<&str>,
+    agent_type: Option<&str>,
+    orphan_stop: Option<u64>,
     occurred_at_ms: u64,
-) -> bool {
-    if journal
+) -> SubagentOutcome {
+    let index = journal
         .subagents
         .iter()
-        .any(|item| item.provider == provider && item.id == id)
-    {
-        return false;
+        .position(|item| item.provider == claim.provider && item.id == claim.id);
+    let recorded = match index {
+        Some(index) => {
+            let record = &journal.subagents[index];
+            if record.phase == JournalSubagentPhase::Running {
+                return SubagentOutcome::Ignored {
+                    reason: SubagentReason::DuplicateStart,
+                    recorded: Some(record.sequence),
+                };
+            }
+            Some(record.sequence)
+        }
+        None => orphan_stop,
+    };
+    if !rule.admits_start(recorded, claim.sequence) {
+        return SubagentOutcome::Ignored {
+            reason: SubagentReason::StaleSequence,
+            recorded,
+        };
     }
     if journal
         .subagents
@@ -4423,60 +4632,88 @@ fn start_subagent(
         .count()
         >= ACTIVE_SUBAGENT_CAPACITY
     {
-        return false;
+        return SubagentOutcome::Refused {
+            reason: SubagentReason::Capacity,
+            recorded,
+        };
     }
     journal.subagent_revision = journal.subagent_revision.saturating_add(1);
-    journal.subagents.push(SubagentRecord {
-        id,
-        parent_id,
-        provider,
-        agent_type,
-        phase: JournalSubagentPhase::Running,
-        sequence,
-        revision: journal.subagent_revision,
-        started_at_ms: occurred_at_ms,
-        updated_at_ms: occurred_at_ms,
-        finished_at_ms: None,
-    });
-    true
+    if let Some(index) = index {
+        let subagent = &mut journal.subagents[index];
+        subagent.phase = JournalSubagentPhase::Running;
+        subagent.sequence = claim.sequence;
+        subagent.revision = journal.subagent_revision;
+        subagent.updated_at_ms = occurred_at_ms;
+        subagent.finished_at_ms = None;
+        if let Some(parent_id) = parent_id {
+            subagent.parent_id = Some(parent_id.to_owned());
+        }
+        if let Some(agent_type) = agent_type {
+            subagent.agent_type = Some(agent_type.to_owned());
+        }
+    } else {
+        journal.subagents.push(SubagentRecord {
+            id: claim.id.to_owned(),
+            parent_id: parent_id.map(str::to_owned),
+            provider: claim.provider.to_owned(),
+            agent_type: agent_type.map(str::to_owned),
+            phase: JournalSubagentPhase::Running,
+            sequence: claim.sequence,
+            revision: journal.subagent_revision,
+            started_at_ms: occurred_at_ms,
+            updated_at_ms: occurred_at_ms,
+            finished_at_ms: None,
+        });
+    }
+    SubagentOutcome::Applied
 }
 
-/// Records a subagent stop when `rule` orders it after the recorded claim.
+/// Applies a subagent stop to `journal` under `rule`.
+///
+/// A stop ordered after a running subagent's recorded claim moves it to
+/// `phase`. A stop for a terminal subagent, or one not ordered after the
+/// recorded claim, changes nothing. A stop for an unknown subagent creates no
+/// record when `requires_start` holds for its provider, and otherwise records
+/// a subagent that is already terminal.
 fn stop_subagent(
     journal: &mut JournalRecord,
     rule: SubagentSequence,
-    provider: &str,
-    id: &str,
+    requires_start: bool,
+    claim: SubagentClaim<'_>,
     phase: JournalSubagentPhase,
-    sequence: u64,
     occurred_at_ms: u64,
-) -> bool {
-    let existing_index = journal
+) -> SubagentOutcome {
+    let index = journal
         .subagents
         .iter()
-        .position(|item| item.provider == provider && item.id == id);
-    if existing_index.is_some_and(|index| {
-        journal.subagents[index].phase != JournalSubagentPhase::Running
-            || !rule.admits_stop(Some(journal.subagents[index].sequence), sequence)
-    }) {
-        return false;
+        .position(|item| item.provider == claim.provider && item.id == claim.id);
+    let recorded = index.map(|index| journal.subagents[index].sequence);
+    let unchanged = match index {
+        Some(index) if journal.subagents[index].phase != JournalSubagentPhase::Running => {
+            Some(SubagentReason::NotRunning)
+        }
+        None if requires_start => Some(SubagentReason::StopWithoutStart),
+        _ => (!rule.admits_stop(recorded, claim.sequence)).then_some(SubagentReason::StaleSequence),
+    };
+    if let Some(reason) = unchanged {
+        return SubagentOutcome::Ignored { reason, recorded };
     }
     journal.subagent_revision = journal.subagent_revision.saturating_add(1);
-    if let Some(index) = existing_index {
+    if let Some(index) = index {
         let subagent = &mut journal.subagents[index];
         subagent.phase = phase;
-        subagent.sequence = sequence;
+        subagent.sequence = claim.sequence;
         subagent.revision = journal.subagent_revision;
         subagent.updated_at_ms = occurred_at_ms;
         subagent.finished_at_ms = Some(occurred_at_ms);
     } else {
         journal.subagents.push(SubagentRecord {
-            id: id.to_owned(),
+            id: claim.id.to_owned(),
             parent_id: None,
-            provider: provider.to_owned(),
+            provider: claim.provider.to_owned(),
             agent_type: None,
             phase,
-            sequence,
+            sequence: claim.sequence,
             revision: journal.subagent_revision,
             started_at_ms: occurred_at_ms,
             updated_at_ms: occurred_at_ms,
@@ -4484,7 +4721,45 @@ fn stop_subagent(
         });
     }
     prune_terminal_subagents(journal);
-    true
+    SubagentOutcome::Applied
+}
+
+/// Records one admissible subagent claim that left the journal unchanged.
+///
+/// The claim already passed schema admission and the process-ancestry check,
+/// so its provider, subagent id, and sequences are logged with the reason
+/// code. An ignored claim is routine provider ordering and logs at INFO; a
+/// refused claim hit a bound and logs at WARN. An applied claim logs nothing.
+fn log_subagent_outcome(shared: &Shared, claim: SubagentClaim<'_>, outcome: SubagentOutcome) {
+    match outcome {
+        SubagentOutcome::Applied => {}
+        SubagentOutcome::Ignored { reason, recorded } => event!(
+            name: "worker.subagent.claim.ignored",
+            Level::INFO,
+            worker.id = %shared.worker_id,
+            session.id = %shared.session_id,
+            subagent.action = claim.action,
+            subagent.provider = claim.provider,
+            subagent.id = claim.id,
+            subagent.reason = reason.code(),
+            subagent.sequence.reported = claim.sequence,
+            subagent.sequence.recorded = recorded,
+            "subagent {{subagent.action}} claim ignored: {{subagent.reason}}",
+        ),
+        SubagentOutcome::Refused { reason, recorded } => event!(
+            name: "worker.subagent.claim.refused",
+            Level::WARN,
+            worker.id = %shared.worker_id,
+            session.id = %shared.session_id,
+            subagent.action = claim.action,
+            subagent.provider = claim.provider,
+            subagent.id = claim.id,
+            subagent.reason = reason.code(),
+            subagent.sequence.reported = claim.sequence,
+            subagent.sequence.recorded = recorded,
+            "subagent {{subagent.action}} claim refused: {{subagent.reason}}",
+        ),
+    }
 }
 
 fn mark_running_subagents_lost(journal: &mut JournalRecord, occurred_at_ms: u64) {
@@ -5550,14 +5825,13 @@ mod tests {
     use super::{
         admit_hook, authorize_control_request, await_observation_page, capabilities,
         control_input_id, event_visible_to_connection, identity_sequence_is_fresh,
-        mark_running_subagents_lost, observation_timed_out, redeem_data_grant, serve_stream_data,
-        signal_number, start_subagent, stop_subagent, valid_identity_expiry,
-        validate_attach_write_id, validate_data_start, validate_observation_request,
-        validate_terminal_snapshot_dimensions, validate_terminal_snapshot_response,
-        write_data_error, write_observation_page, write_output_chunks, write_runtime_output_event,
-        write_terminal_chunks, Connection, ControlInputId, DataGrant, ObservationGrant,
-        ObservationWaitOutcome, PrefixStream, TokenState, WireTerminalSnapshot,
-        ATTACH_INPUT_PREFIX,
+        observation_timed_out, redeem_data_grant, serve_stream_data, signal_number,
+        valid_identity_expiry, validate_attach_write_id, validate_data_start,
+        validate_observation_request, validate_terminal_snapshot_dimensions,
+        validate_terminal_snapshot_response, write_data_error, write_observation_page,
+        write_output_chunks, write_runtime_output_event, write_terminal_chunks, Connection,
+        ControlInputId, DataGrant, ObservationGrant, ObservationWaitOutcome, PrefixStream,
+        TokenState, WireTerminalSnapshot, ATTACH_INPUT_PREFIX,
     };
     use pohunek_worker_protocol::{
         self as protocol, AttachStart, Capability, ControlCode, ControlError, ControlMessage,
@@ -6032,6 +6306,7 @@ mod tests {
             nested_active: true,
             subagent_fields: &[protocol::SubagentField::ParentId],
             subagent_sequence: Some(protocol::SubagentSequence::StopAfterStart),
+            stop_requires_start: &[],
         };
         let (server, pty, _directory) = launch_claim_fixture().await;
         server.shared.state.lock().await.hook_schema = Some(&NO_TYPE);
@@ -6064,6 +6339,7 @@ mod tests {
             nested_active: true,
             subagent_fields: &[protocol::SubagentField::Outcome],
             subagent_sequence: None,
+            stop_requires_start: &[],
         };
         let (server, pty, _directory) = launch_claim_fixture().await;
         server.shared.state.lock().await.hook_schema = Some(&UNORDERED);
@@ -6088,6 +6364,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_subagent_stop_is_ordered_by_the_declared_sequence_rule() {
+        async fn child(server: &super::Server) -> (SubagentPhase, u64) {
+            let state = server.shared.state.lock().await;
+            let record = state
+                .journal
+                .subagents
+                .iter()
+                .find(|record| record.id == "child-5")
+                .expect("child-5 is recorded");
+            (record.phase, record.sequence)
+        }
         let (server, pty, _directory) = launch_claim_fixture().await;
         server.shared.state.lock().await.hook_schema =
             protocol::hook_schema("identity-subagent-v1");
@@ -6099,10 +6385,16 @@ mod tests {
         };
         assert!(send_hook(&server, &pty, subagent_start_claim(5, None)).await);
         assert!(
-            !send_hook(&server, &pty, stop(5)).await,
-            "a stop that is not after its start is refused"
+            send_hook(&server, &pty, stop(5)).await,
+            "a stop that is not after its start is acknowledged"
+        );
+        assert_eq!(
+            child(&server).await,
+            (SubagentPhase::Running, 5),
+            "a stop that is not after its start leaves the subagent running"
         );
         assert!(send_hook(&server, &pty, stop(6)).await);
+        assert_eq!(child(&server).await, (SubagentPhase::Completed, 6));
         pty.stop("test-cleanup", server.shared.config.stop_grace)
             .await
             .unwrap();
@@ -6387,6 +6679,7 @@ mod tests {
             nested_active: false,
             subagent_fields: &[],
             subagent_sequence: None,
+            stop_requires_start: &[],
         };
         admit_hook(
             Some(&PINNED),
@@ -6453,131 +6746,6 @@ mod tests {
         assert!(!identity_sequence_is_fresh(&journal, 7));
         assert!(!identity_sequence_is_fresh(&journal, 8));
         assert!(identity_sequence_is_fresh(&journal, 9));
-    }
-
-    #[test]
-    fn subagent_lifecycle_is_ordered_and_runtime_exit_marks_running_entries_lost() {
-        let mut journal = JournalRecord::bootstrap(
-            "s-subagents".to_owned(),
-            "worker-subagents".to_owned(),
-            crate::test_support::test_origin(),
-            10,
-            "100".to_owned(),
-            "boot-test".to_owned(),
-            (4, 5),
-            "2026-09-11T00:00:00Z".to_owned(),
-        );
-
-        assert!(start_subagent(
-            &mut journal,
-            "claude".to_owned(),
-            "child-a".to_owned(),
-            None,
-            Some("Explore".to_owned()),
-            10,
-            100,
-        ));
-        assert!(!stop_subagent(
-            &mut journal,
-            protocol::SubagentSequence::StopAfterStart,
-            "claude",
-            "child-a",
-            SubagentPhase::Completed,
-            9,
-            101,
-        ));
-        assert!(start_subagent(
-            &mut journal,
-            "codex".to_owned(),
-            "child-b".to_owned(),
-            Some("child-a".to_owned()),
-            None,
-            20,
-            110,
-        ));
-        assert!(stop_subagent(
-            &mut journal,
-            protocol::SubagentSequence::StopAfterStart,
-            "claude",
-            "child-a",
-            SubagentPhase::Completed,
-            11,
-            120,
-        ));
-
-        mark_running_subagents_lost(&mut journal, 130);
-
-        assert_eq!(journal.subagents[0].phase, SubagentPhase::Completed);
-        assert_eq!(journal.subagents[1].phase, SubagentPhase::Lost);
-        assert_eq!(journal.subagents[1].finished_at_ms, Some(130));
-        assert!(journal.subagents[1].revision > journal.subagents[0].revision);
-        let lost_revision = journal.subagents[1].revision;
-        assert!(!stop_subagent(
-            &mut journal,
-            protocol::SubagentSequence::StopAfterStart,
-            "codex",
-            "child-b",
-            SubagentPhase::Completed,
-            21,
-            140,
-        ));
-        assert!(!start_subagent(
-            &mut journal,
-            "codex".to_owned(),
-            "child-b".to_owned(),
-            None,
-            None,
-            22,
-            150,
-        ));
-        assert_eq!(journal.subagents[1].phase, SubagentPhase::Lost);
-        assert_eq!(journal.subagents[1].revision, lost_revision);
-    }
-
-    #[test]
-    fn subagent_stop_tombstone_rejects_a_delayed_start() {
-        let mut journal = JournalRecord::bootstrap(
-            "s-subagents".to_owned(),
-            "worker-subagents".to_owned(),
-            crate::test_support::test_origin(),
-            10,
-            "100".to_owned(),
-            "boot-test".to_owned(),
-            (4, 5),
-            "2026-09-11T00:00:00Z".to_owned(),
-        );
-
-        assert!(stop_subagent(
-            &mut journal,
-            protocol::SubagentSequence::StopAfterStart,
-            "codex",
-            "child-a",
-            SubagentPhase::Completed,
-            20,
-            120,
-        ));
-        assert!(!start_subagent(
-            &mut journal,
-            "codex".to_owned(),
-            "child-a".to_owned(),
-            None,
-            Some("explore".to_owned()),
-            19,
-            100,
-        ));
-        assert!(!start_subagent(
-            &mut journal,
-            "codex".to_owned(),
-            "child-a".to_owned(),
-            None,
-            Some("explore".to_owned()),
-            21,
-            130,
-        ));
-
-        assert_eq!(journal.subagents.len(), 1);
-        assert_eq!(journal.subagents[0].phase, SubagentPhase::Completed);
-        assert_eq!(journal.subagents[0].sequence, 20);
     }
 
     // Needs a descendant that keeps the PTY open after the root exits. Darwin

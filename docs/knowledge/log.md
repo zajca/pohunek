@@ -1,5 +1,25 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-12, subagent restart and Claude helper stop, #883)
+
+- A `SubagentStart` with a newer sequence for a terminal subagent reopens its
+  record: `running` with a new revision, `finished_at_ms` cleared,
+  `started_at_ms` kept; the next `SubagentStop` completes it. This tracks
+  Claude background agents resumed with `SendMessage` or woken by their own
+  background shell. A start for a running subagent is idempotent.
+- `identity-subagent-v1` lists `claude` as a provider whose stop is admitted
+  only after a recorded start. Claude's prompt-suggestion helper stop after
+  every main turn creates no row, changes no count and evicts no history; a
+  bounded in-memory set still refuses a delayed start with an older sequence.
+  A Codex stop without a start records a completed subagent (#916).
+- The worker logs every ignored or refused subagent claim with a reason code:
+  `duplicate_start`, `stop_without_start`, `stale_sequence`, `not_running` at
+  INFO and `capacity` at WARN. `SubagentInfo` and the wire protocol are
+  unchanged. Documented in `concepts/sessions`, the `claude-package` and
+  `codex-package` guides, the `debug-session-runtime` runbook and
+  `docs/public-api.md` (hook schemas, `SessionInfo.subagents`,
+  `subagent_state`, Provider Notification Hooks).
+
 ## Unreleased (2026-10-12, release baseline in CI package selection, #149)
 
 - The `package-selection` CI job downloads release `v<workspace version>`'s

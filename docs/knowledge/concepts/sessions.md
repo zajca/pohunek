@@ -324,7 +324,10 @@ rule, the ancestry matcher and the subagent fields against it. The worker alone
 applies the schema's launch-process rule, which decides which process may set
 the launch identity (the daemon holds an imported launch identity to the core
 ancestry matcher only), and the schema's subagent sequence rule (a stop must be
-ordered after its start; a schema without one admits no subagent record), and the daemon refuses
+ordered after its start, a newer start reopens a terminal record, and the
+providers the schema lists, `claude` in `identity-subagent-v1`, have a stop
+admitted only after a recorded start; a schema without the rule admits no
+subagent record), and the daemon refuses
 imported subagents whose fields or outcome the schema does not admit. Peer
 binding and expiry checks are shared by every schema. The schema the worker
 journaled outranks the one the pinned runtime resolves to, and reports of a
@@ -342,7 +345,33 @@ metadata to the PTY-owning worker: provider, child id, optional parent id, and
 optional agent type. The worker journals multiple concurrent children, assigns
 monotonic decimal-string revisions, and retains bounded completed history across
 daemon and client reconnects. A running child is marked `lost` when its owning
-runtime terminates. This collection does not change the parent session's
+runtime terminates.
+
+A `SubagentStart` for a known child whose record is terminal and whose sequence
+is newer than the recorded one reopens that record: it is `running` again with
+a new revision, its terminal time is cleared, `started_at_ms` keeps the time of
+the first run, and the next `SubagentStop` completes it. Claude sends such a
+start when a finished background agent is resumed with `SendMessage` or wakes
+itself. A start for a child that is already running changes nothing. A Claude
+`SubagentStop` without a recorded start creates no row, leaves the running and
+recent counts and the retained history unchanged, and is remembered in a
+bounded in-memory set for the worker's lifetime, so a delayed start with an
+older sequence is still refused; Claude sends such a stop for its
+prompt-suggestion helper after every main turn, which is not a subagent. A
+Codex `SubagentStop` without a recorded start records a completed child,
+because Codex reports resumed children with stops and no start
+([#916](https://github.com/zajca/pohunek/issues/916)).
+
+Every admitted subagent claim the worker ignores or refuses is logged in the
+session's worker log with a reason code: `duplicate_start`,
+`stop_without_start`, `stale_sequence` and `not_running` at INFO, and
+`capacity` (the running-child limit) at WARN; an inadmissible claim is logged
+as the `worker.identity.rejected` warning. The worker answers the hook with success when it admitted the
+claim and either applied it or ignored it for one of the INFO reasons, and with
+failure when the claim was refused or inadmissible; in both cases the hook
+exits quietly, because subagent claims have no daemon fallback.
+
+This collection does not change the parent session's
 `activity`, launch identity, or recovery binding. The hook validates its action
 and Pohunek handshake before reading a bounded payload directly from stdin; it
 does not create a payload file. Only the lifecycle fields are retained, so the

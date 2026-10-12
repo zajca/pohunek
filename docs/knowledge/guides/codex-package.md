@@ -126,7 +126,10 @@ classifies every one of them through the package manifest.
   Codex reports a subagent through its own `SubagentStart` hook, which the
   reporter sends as a subagent claim and never as a reference, so a subagent id
   is not promoted; the first reference stays, and a later different id from the
-  app-server does not replace it. The app-server also outlives the TUI when it is
+  app-server does not replace it. A resumed or reloaded Codex child sends
+  `SubagentStop` without a preceding `SubagentStart`, so for Codex a stop with
+  no recorded start records a completed subagent (the Codex-specific gaps are
+  tracked in [#916](https://github.com/zajca/pohunek/issues/916)). The app-server also outlives the TUI when it is
   detached; the fixture's process guard stops every process of the fixture,
   including after a failed assertion.
 - **Process forms.** The helper process has kernel name `codex` too, so the

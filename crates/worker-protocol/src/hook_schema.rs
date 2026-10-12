@@ -170,14 +170,41 @@ impl LaunchProcess {
 /// Ordering a schema requires between the claims of one subagent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentSequence {
-    /// A start is admitted once per subagent. A stop is admitted when no start
-    /// was recorded or when its sequence is greater than the recorded one.
+    /// Claims of one subagent are ordered by their sequence.
+    ///
+    /// A start opens a run. A start for a subagent that is still running
+    /// changes nothing. A start whose sequence is greater than the recorded
+    /// claim reopens a terminal subagent, because a provider may resume a
+    /// finished subagent under the same id. A stop ends a running subagent
+    /// when its sequence is greater than the recorded claim. A stop with no
+    /// recorded claim is admitted only for a provider whose stop does not
+    /// require a start ([`HookSchema::stop_requires_start`]); such a stop
+    /// records a subagent that is already terminal.
     StopAfterStart,
 }
 
 impl SubagentSequence {
+    /// Whether a start claim carrying `reported` is ordered after the claim
+    /// recorded for the same subagent, if any.
+    ///
+    /// The recorded claim is the last start or stop the worker kept for the
+    /// subagent; with none recorded every start is ordered.
+    #[must_use]
+    pub const fn admits_start(self, recorded: Option<u64>, reported: u64) -> bool {
+        match self {
+            Self::StopAfterStart => match recorded {
+                Some(recorded) => reported > recorded,
+                None => true,
+            },
+        }
+    }
+
     /// Whether a stop claim carrying `reported` is ordered after the claim
     /// recorded for the same subagent, if any.
+    ///
+    /// This is the ordering half of the rule only. With no recorded claim the
+    /// stop is ordered, and the schema's [`HookSchema::stop_requires_start`]
+    /// decides whether its provider may record it at all.
     #[must_use]
     pub const fn admits_stop(self, recorded: Option<u64>, reported: u64) -> bool {
         match self {
@@ -272,6 +299,13 @@ pub struct HookSchema {
     /// Ordering rule of subagent claims. A schema that admits subagent
     /// operations declares one; a schema without one admits no subagent record.
     pub subagent_sequence: Option<SubagentSequence>,
+    /// Subagent providers whose stop is admitted only after a recorded start.
+    ///
+    /// Such a provider also reports stop-only events that are not subagents,
+    /// so a stop without a recorded start creates no record. A subagent
+    /// provider outside this list may report a stop without a start for a
+    /// real subagent, which is then recorded as terminal.
+    pub stop_requires_start: &'static [&'static str],
 }
 
 impl HookSchema {
@@ -312,6 +346,12 @@ impl HookSchema {
         self.subagent_sequence.is_some() && !self.subagent_providers.is_empty()
     }
 
+    /// Whether a stop of `provider` is admitted only after a recorded start.
+    #[must_use]
+    pub fn stop_requires_start(&self, provider: &str) -> bool {
+        self.stop_requires_start.contains(&provider)
+    }
+
     /// Whether the schema admits the optional subagent `field`.
     #[must_use]
     pub fn admits_subagent_field(&self, field: SubagentField) -> bool {
@@ -332,6 +372,13 @@ const HOOKED_PROVIDERS: &[&str] = &["shell", "codex", "claude", "hermes"];
 
 /// Provider ids whose hooks report provider-managed subagents.
 const SUBAGENT_PROVIDERS: &[&str] = &["codex", "claude"];
+
+/// Subagent providers whose stop is admitted only after a recorded start.
+///
+/// Claude Code fires `SubagentStop` without a preceding `SubagentStart` for its
+/// prompt-suggestion helper after every main-agent turn, which is not a
+/// subagent. Codex reports a resumed child with a stop alone, so it is absent.
+const STOP_REQUIRES_START_PROVIDERS: &[&str] = &["claude"];
 
 /// Hook operations of a runtime that reports identity and notifications only.
 const IDENTITY_ACTIONS: &[HookAction] = &[
@@ -365,6 +412,7 @@ const IDENTITY_V1: HookSchema = HookSchema {
     nested_active: true,
     subagent_fields: &[],
     subagent_sequence: None,
+    stop_requires_start: &[],
 };
 
 /// Identity, release, notification, and subagent lifecycle reports.
@@ -384,6 +432,7 @@ const IDENTITY_SUBAGENT_V1: HookSchema = HookSchema {
         SubagentField::Outcome,
     ],
     subagent_sequence: Some(SubagentSequence::StopAfterStart),
+    stop_requires_start: STOP_REQUIRES_START_PROVIDERS,
 };
 
 /// The closed set of hook schemas, in a stable order.

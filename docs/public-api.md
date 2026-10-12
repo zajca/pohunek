@@ -943,8 +943,12 @@ A schema declares the provider ids that may report, the admitted actions, the
 native-reference kinds (`id`, `path`), the process-ancestry matcher, the
 launch-process rule, whether a nested provider may become the active identity, the optional subagent claim
 fields (`parent_id`, `agent_type`, and the `outcome` of a stop), and the
-subagent sequence rule (a start is admitted once per subagent, a stop only
-when it is ordered after the recorded claim). A schema that admits subagent
+subagent sequence rule (a start for a running subagent is idempotent, a start
+newer than a terminal record reopens it, and a stop is admitted only when it is
+ordered after the recorded claim), and the subagent providers whose stop is
+admitted only after a recorded start (`claude` in `identity-subagent-v1`, keyed
+by the reporting provider, so it also covers a Claude in a shell session's
+foreground). A schema that admits subagent
 operations must declare the sequence rule; one without it admits no subagent
 record on either side. The worker applies the declared matcher, launch-process
 rule, field set and sequence rule when a hook reports, and the daemon applies
@@ -1234,8 +1238,13 @@ Important fields:
   decimal-string `revision`, worker timestamps, and optional terminal time.
   Multiple children may run concurrently. The bounded recent history survives
   daemon/client reconnects; running children become `lost` when the owning PTY
-  runtime ends. No prompt, result, transcript path, or raw hook payload is
-  exposed.
+  runtime ends. A terminal child returns to `running` with a new `revision` when
+  its provider starts it again (a resumed or self-woken Claude background
+  agent): `finished_at_ms` is cleared, `started_at_ms` keeps the first run's
+  time, and `updated_at_ms` marks the reopen. A Claude `SubagentStop` without a
+  recorded start (the prompt-suggestion helper Claude runs after every main
+  turn) produces no item; a Codex one records a completed child. No prompt,
+  result, transcript path, or raw hook payload is exposed.
 - `cwd`: current host-local working directory. It starts as the launch
   directory and can change while the session runs when procwatch observes the
   focus process in a new directory or the PTY emits an OSC 7 cwd hint.
@@ -2259,8 +2268,10 @@ hook APIs.
 
 The state adapter also registers `SubagentStart` and `SubagentStop` for both
 providers. These callbacks target only the owner-private worker endpoint and
-silently no-op when it is unavailable. They copy only lifecycle identifiers and
-agent type. The hook validates its action and Pohunek handshake before reading,
+silently no-op when it is unavailable or refuses the claim. They copy only
+lifecycle identifiers and agent type. A Claude `SubagentStop` with no recorded
+start is not a subagent and adds no row, while a Codex one records a completed
+child; see `subagents` under `SessionInfo`. The hook validates its action and Pohunek handshake before reading,
 rejects oversized JSON, and never stages the payload on disk; provider prompts,
 results, messages, and transcript paths are discarded.
 
@@ -2677,7 +2688,7 @@ The daemon then writes these events:
 | `session_runtime_discovered` | `{entry: RuntimeInventoryEntry}` | Startup reconciliation classified a discovered durable worker that is not a plainly managed runtime (orphaned, conflicting, incompatible, or identity-mismatched). Emitted once per non-managed discovery so operators can inspect quarantined runtimes. |
 | `session_native_recovered` | `{session: SessionInfo, previous_worker_instance_id?: string, worker_instance_id?: string}` | Explicit provider-native recovery created a new worker and runtime generation for the same logical session. `previous_worker_instance_id` can be absent for a one-time migrated legacy session; production worker recovery includes the new `worker_instance_id`. |
 | `agent_state` | `{session_id: SessionId, activity: AgentActivity, source: StateSource, runtime?: SessionRuntimeIdentity, activity_epoch?: string, revision?: ActivityRevision}` | Agent activity changed. `source` may be `report` when a hook report supplied explicit active-agent state. Current daemons emit `runtime`, `activity_epoch`, and decimal-string `revision`, making `(activity_epoch, runtime, revision)` exact reconnect-safe evidence rather than a hint to re-read only the latest snapshot; the fields remain additive for general v2 subscribers, while input-wait success requires them through `SessionInputResult`. |
-| `subagent_state` | `{session_id: SessionId, subagent: SubagentInfo, runtime?: SessionRuntimeIdentity}` | One provider-managed subagent changed. Current daemons emit `runtime`; clients ignore an event without a runtime identity or whose runtime id/generation does not match the session snapshot, then apply only a newer decimal-string `subagent.revision` for the same provider/id. `session.list` and `session.inspect` remain the reconnect seed through `SessionInfo.subagents`. |
+| `subagent_state` | `{session_id: SessionId, subagent: SubagentInfo, runtime?: SessionRuntimeIdentity}` | One provider-managed subagent changed. Current daemons emit `runtime`; clients ignore an event without a runtime identity or whose runtime id/generation does not match the session snapshot, then apply only a newer decimal-string `subagent.revision` for the same provider/id. A newer revision may move a terminal subagent back to `running`, so a terminal lifecycle is not final. `session.list` and `session.inspect` remain the reconnect seed through `SessionInfo.subagents`. |
 | `attach_opened` | `{session_id: SessionId, stream_id: string}` | A pending attach token was redeemed and a raw stream opened. |
 | `attach_closed` | `{session_id: SessionId, stream_id: string}` | A raw attach stream ended or was detached. |
 | `notification_created` | `{record: NotificationRecord}` | A durable notification record was created. |

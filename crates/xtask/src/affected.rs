@@ -223,8 +223,8 @@ const RULES: &[Rule] = &[
     ),
     rule(
         Pattern::Dir("compat/claude"),
-        Effect::Packages(&["pohunek-cli", "xtask"]),
-        "Claude Code compatibility lock and captured screens read by pohunek-cli's claude_package test; lock and npm project read by xtask's upstream staging scenarios",
+        Effect::Packages(&["pohunek-daemon", "pohunek-cli", "xtask"]),
+        "Claude Code subagent hook sequences embedded by the daemon's worker hook scenarios; compatibility lock and captured screens read by pohunek-cli's claude_package test; lock and npm project read by xtask's upstream staging scenarios",
     ),
     rule(
         Pattern::Dir("compat/codex/builtin-v0.34"),
@@ -1060,7 +1060,10 @@ mod tests {
                 &["pohunek-cli", "xtask"],
             ),
             ("compat/pi/npm/package-lock.json", &["pohunek-cli", "xtask"]),
-            ("compat/claude/screens/idle.txt", &["pohunek-cli", "xtask"]),
+            (
+                "compat/claude/screens/idle.txt",
+                &["pohunek-daemon", "pohunek-cli", "xtask"],
+            ),
             (
                 "compat/codex/builtin-v0.34/runtime.toml",
                 &["pohunek-daemon", "pohunek-cli", "xtask"],
