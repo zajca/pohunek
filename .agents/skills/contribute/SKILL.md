@@ -70,6 +70,8 @@ criteria. Read [AGENTS.md](../../../AGENTS.md) and the task-specific guides it
 routes to. For testing boundaries and repository gates, use the
 [verification guide](../../../.agents/instructions/verification.md); for issue/project
 operations, use the [github-workflow skill](../github-workflow/SKILL.md).
+To set up a fresh checkout and find your path's focused checks, follow
+[Contributor readiness](../../../docs/development.md#contributor-readiness).
 
 When a task involves operating Pohunek itself, reuse the shipped
 [Pohunek agent skill](../../../docs/knowledge/guides/agent-skill.md) for its

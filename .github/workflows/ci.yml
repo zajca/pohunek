@@ -115,6 +115,26 @@ jobs:
         shell: bash
         run: test "$(uname -m)" = "arm64"
 
+      # The documented macOS contributor path (issue #801): the dev-bootstrap
+      # scenarios under the runner's own python3, and the real host's native
+      # path, which must report the launchd gui/<uid> domain every launchd
+      # suite below needs. `shell: bash` adds pipefail, so a non-zero
+      # dev-bootstrap exit fails the step while tee still shows its document.
+      - name: Check the macOS contributor path
+        shell: bash
+        run: |
+          python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else "python3 " + sys.version.split()[0] + " is older than 3.11; scripts/dev-bootstrap needs tomllib")'
+          python3 -m unittest discover -s scripts/tests -p test_dev_bootstrap.py
+          report="$RUNNER_TEMP/dev-bootstrap-native.json"
+          scripts/dev-bootstrap --json --path native | tee "$report"
+          python3 -I - "$report" <<'PY'
+          import json, sys
+          doc = json.load(open(sys.argv[1]))
+          status = {row["name"]: row["status"] for row in doc["rows"]}.get("launchd-gui-domain")
+          if doc["os"] != "Darwin" or status != "ok":
+              sys.exit(f"dev-bootstrap --path native: os {doc['os']!r}, launchd-gui-domain {status!r}; expected Darwin and 'ok'")
+          PY
+
       # The Hermes integration tests in pohunek-cli stand in for the pinned
       # runtime with a canonical Python >= 3.10 that imports `yaml` and passes
       # the production runtime policy (crates/cli/src/hermes_integration/
@@ -689,7 +709,9 @@ jobs:
             # the Cargo configuration (.cargo/config.toml carries Apple-specific
             # linker/target flags that can break only the macOS build). The root
             # manifest is included because these crates inherit workspace
-            # package, dependency, and lint settings from it.
+            # package, dependency, and lint settings from it. The job also runs
+            # the macOS contributor path (scripts/dev-bootstrap and its
+            # scenarios, issue #801).
             macos:
               - 'Cargo.toml'
               - 'crates/platform/**'
@@ -710,6 +732,8 @@ jobs:
               - 'crates/overlay/**'
               - 'crates/prompt/**'
               - 'scripts/acceptance/**'
+              - 'scripts/dev-bootstrap'
+              - 'scripts/tests/test_dev_bootstrap.py'
               - 'crates/relay-client/**'
               - 'crates/relay-protocol/**'
               - 'docs/knowledge/**'

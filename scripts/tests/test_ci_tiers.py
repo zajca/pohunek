@@ -36,6 +36,8 @@ MACOS_PATH_OWNERSHIP = {
             "crates/overlay/**",
             "crates/prompt/**",
             "scripts/acceptance/**",
+            "scripts/dev-bootstrap",
+            "scripts/tests/test_dev_bootstrap.py",
             "crates/relay-client/**",
             "crates/relay-protocol/**",
             "docs/knowledge/**",

@@ -72,6 +72,9 @@ ROW_KEYS = {
     "path", "name", "category", "status", "version", "minimum", "location",
     "detail", "fix",
 }
+CHECK_KEYS = {"path", "kind", "command", "note"}
+GATES_SKILL = ".agents/skills/gates/SKILL.md"
+VERIFICATION_DOC = ".agents/instructions/verification.md"
 
 
 def sh_quote(text):
@@ -651,7 +654,9 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
             explicit,
         )
         rows = [line for line in default.splitlines() if line.startswith("  ")]
-        explicit_rows = [line for line in explicit.splitlines() if line.startswith("  ")]
+        # The explicit report adds the path's checks after its rows.
+        explicit_rows = explicit.split("\n  checks:\n", 1)[0].splitlines()
+        explicit_rows = [line for line in explicit_rows if line.startswith("  ")]
         self.assertEqual(rows, explicit_rows)
 
     # -- the --json contract -------------------------------------------
@@ -672,8 +677,8 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
         self.assertIsNone(doc["message"])
         self.assertEqual(
             set(doc),
-            {"schema", "version", "paths", "strict", "os", "rows", "failing",
-             "result", "error", "message"},
+            {"schema", "version", "paths", "strict", "os", "rows", "checks",
+             "failing", "result", "error", "message"},
         )
         names = ["rustc", "rustc-pin", "cargo-nextest", "python3", "bacon", "hyperfine"]
         if IS_LINUX:
@@ -1160,10 +1165,182 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
         status, output = self.run_script("--path", "native")
         self.assertEqual(status, 1, output)
         self.assertIn(
-            "ci-only  launchd-suite: the launchd suite (crates/platform/tests/launchd.rs) "
-            "runs only on macOS (ci-only)",
+            "ci-only  launchd-suite: the launchd suites (crates/platform/tests/launchd.rs, "
+            "crates/daemon/tests/supervised_lifecycle.rs, crates/cli/tests/service_launchd.rs "
+            "and crates/cli/tests/service_upgrade.rs) run only on macOS (ci-only)",
             output,
         )
+
+    # -- focused checks and final-gate pointers ---------------------------------
+
+    def checks_of(self, path):
+        """The `checks` of a `--json --path <path>` run, with the document."""
+        self.write_bun_config()
+        _, doc, _ = self.run_json("--path", path)
+        return doc["checks"], doc
+
+    def test_every_path_lists_focused_checks_and_points_to_the_final_gates(self):
+        # Commands copied from the verification guide and the gates skill;
+        # each path's list is complete on its own.
+        expected_focused = {
+            "rust": ["cargo xtask affected", "cargo t -p <crate>"],
+            "sdk": ["bun install --frozen-lockfile", "bun run typecheck",
+                    "bun run lint", "bun test", "bun test sdk/ts/scripts"],
+            "scripts": [
+                "python3 -m unittest discover -s scripts/tests -p 'test_*.py'",
+                "python3 -m unittest discover -s scripts/tests -p test_<name>.py",
+            ],
+            "macos-lint": ["scripts/darwin-check"],
+            "relay-db": ["python3 scripts/test-partitions run relay-db"],
+        }
+        for path in ("rust", "sdk", "scripts", "macos-lint", "relay-db", "native"):
+            with self.subTest(path):
+                checks, doc = self.checks_of(path)
+                self.assertEqual(doc["version"], 1)
+                for check in checks:
+                    self.assertEqual(set(check), CHECK_KEYS)
+                    self.assertEqual(check["path"], path)
+                    self.assertIn(check["kind"], ("focused", "final", "ci-only"))
+                    self.assertTrue(check["note"], check)
+                    # Only a focused check is a command; a pointer or a CI
+                    # job is named in the note.
+                    if check["kind"] == "focused":
+                        self.assertTrue(check["command"], check)
+                    else:
+                        self.assertIsNone(check["command"], check)
+                kinds = [check["kind"] for check in checks]
+                # Focused first, then the final pointers, then CI evidence.
+                self.assertEqual(kinds, sorted(kinds, key=["focused", "final", "ci-only"].index))
+                finals = [check["note"] for check in checks if check["kind"] == "final"]
+                self.assertIn("Core gate set", finals[0])
+                self.assertIn(GATES_SKILL, finals[0])
+                self.assertIn(VERIFICATION_DOC, finals[0])
+                focused = [check["command"] for check in checks if check["kind"] == "focused"]
+                if path in expected_focused:
+                    self.assertEqual(focused, expected_focused[path])
+                if path == "sdk":
+                    self.assertEqual(len(finals), 2)
+                    self.assertIn("When the change touches the SDK workspace", finals[1])
+                else:
+                    self.assertEqual(len(finals), 1)
+
+    def test_ci_only_checks_name_the_ci_job_that_is_the_evidence(self):
+        # The other OS's native suites are a `ci-only` row, never repeated
+        # as a check.
+        expected = {
+            "rust": [],
+            "scripts": [],
+            "macos-lint": ["platform contracts (arm64)"],
+            "relay-db": ["tests (relay DB, PostgreSQL)"],
+            "native": [],
+        }
+        if IS_LINUX:
+            expected["sdk"] = ["SDK workspace (macOS arm64)"]
+        elif IS_DARWIN:
+            expected["sdk"] = []
+        for path, jobs in expected.items():
+            with self.subTest(path):
+                checks, _ = self.checks_of(path)
+                ci = [check["note"] for check in checks if check["kind"] == "ci-only"]
+                self.assertEqual(len(ci), len(jobs), ci)
+                for note, job in zip(ci, jobs):
+                    self.assertTrue(note.startswith(f"CI job `{job}`"), note)
+
+    def test_native_focused_checks_are_the_suites_this_os_runs(self):
+        # Mirrors the CI job of this OS: build the binaries the suites spawn,
+        # then every suite that job runs against the real supervisor.
+        checks, doc = self.checks_of("native")
+        focused = [check for check in checks if check["kind"] == "focused"]
+        build = "cargo build --locked -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli --bins"
+        if IS_LINUX:
+            self.assertEqual(
+                [check["command"] for check in focused],
+                [build, "POHUNEK_SYSTEMD_E2E=1 cargo test <suite> -- --ignored --test-threads 1"],
+            )
+            # The note names each suite the way `real systemd supervision`
+            # selects it.
+            for suite in ("-p pohunek-platform --test systemd",
+                          "-p pohunek-daemon --test systemd_durable_worker",
+                          "-p pohunek-cli --test service_systemd",
+                          "-p pohunek-daemon --test supervised_lifecycle",
+                          "-p pohunek-cli --test service_upgrade"):
+                self.assertIn(f"`{suite}`", focused[1]["note"])
+            # The other OS's suites are reported once, as the ci-only row.
+            self.assertEqual(
+                [(row["name"], row["status"]) for row in doc["rows"] if row["category"] == "ci-only"],
+                [("launchd-suite", "ci-only")],
+            )
+        elif IS_DARWIN:
+            self.assertEqual(
+                [check["command"] for check in focused],
+                [build, "cargo test --locked -p pohunek-platform",
+                 "cargo test --locked -p pohunek-daemon", "cargo test --locked -p pohunek-cli"],
+            )
+            self.assertIn("crates/platform/tests/launchd.rs", focused[1]["note"])
+            self.assertIn("crates/daemon/tests/supervised_lifecycle.rs", focused[2]["note"])
+            self.assertIn("crates/cli/tests/service_launchd.rs", focused[3]["note"])
+            self.assertIn("crates/cli/tests/service_upgrade.rs", focused[3]["note"])
+        else:
+            self.assertEqual(focused, [])
+
+    def test_checks_are_listed_for_every_selected_path_whatever_the_result(self):
+        # Nothing but rustc and python3 on PATH: not ready, checks still listed,
+        # and a pointer shared by two paths appears under each.
+        status, doc, _ = self.run_json("--path", "rust", "--path", "relay-db")
+        self.assertEqual(status, 1, doc)
+        self.assertEqual(doc["result"], "not-ready")
+        self.assertEqual(
+            [check["path"] for check in doc["checks"]],
+            ["rust", "rust", "rust", "relay-db", "relay-db", "relay-db"],
+        )
+        finals = [check["path"] for check in doc["checks"] if check["kind"] == "final"]
+        self.assertEqual(finals, ["rust", "relay-db"])
+
+    def test_human_report_lists_checks_only_for_an_explicit_path(self):
+        self.write_all_tools()
+        status, default = self.run_script()
+        self.assertEqual(status, 0, default)
+        self.assertNotIn("checks:", default)
+        self.assertNotIn("cargo xtask affected", default)
+
+        status, explicit = self.run_script("--path", "rust", "--path", "relay-db")
+        self.assertEqual(status, 1, explicit)
+        # Each path: heading, rows, then its checks; the summary line stays last.
+        rust_block = explicit.split("path rust:\n", 1)[1].split("path relay-db:\n", 1)[0]
+        self.assertIn(
+            "  checks:\n"
+            "    focused  cargo xtask affected\n"
+            "             `cargo ta`: ",
+            rust_block,
+        )
+        self.assertIn("\n    focused  cargo t -p <crate>\n", rust_block)
+        self.assertIn(
+            '\n    final    the "Core gate set" in .agents/skills/gates/SKILL.md',
+            rust_block,
+        )
+        self.assertLess(rust_block.index("ok       cargo-nextest"),
+                        rust_block.index("  checks:"))
+        relay_block = explicit.split("path relay-db:\n", 1)[1]
+        self.assertIn(
+            "    focused  python3 scripts/test-partitions run relay-db\n", relay_block
+        )
+        self.assertIn(
+            "    ci-only  CI job `tests (relay DB, PostgreSQL)`: ", relay_block
+        )
+        self.assertTrue(
+            explicit.endswith("dev-bootstrap: failing: POHUNEK_RELAY_TEST_DATABASE_URL\n"),
+            explicit,
+        )
+
+    def test_error_documents_carry_no_checks(self):
+        status, doc, _ = self.run_json("--path", "rust", "--path", "gui")
+        self.assertEqual((status, doc["error"]), (2, "unsupported-path"), doc)
+        self.assertEqual(doc["checks"], [])
+
+        (self.root / ".config" / "nextest.toml").unlink()
+        status, doc, _ = self.run_json("--path", "rust")
+        self.assertEqual((status, doc["error"]), (2, "config-error"), doc)
+        self.assertEqual(doc["checks"], [])
 
 
 if __name__ == "__main__":

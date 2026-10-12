@@ -20,7 +20,10 @@ with `MACOSX_DEPLOYMENT_TARGET=14.0`: it checks, lints, and tests
 `pohunek-platform` (including the real-launchd suite `tests/launchd.rs`),
 `pohunek-paths`, `pohunek-session-worker`, `pohunek-service-config`,
 `pohunek-daemon`, and `pohunek-cli`, and fails hard when the runner's
-`gui/<uid>` launchd domain is absent. Linux clippy never compiles the
+`gui/<uid>` launchd domain is absent. It also runs the macOS contributor path
+first: the `scripts/tests/test_dev_bootstrap.py` scenarios under the runner's
+`python3` (>= 3.11, checked) and `scripts/dev-bootstrap --json --path native`,
+which must report `launchd-gui-domain` as `ok`. Linux clippy never compiles the
 launchd backend or any other `cfg(target_os = "macos")` code, so lint it from
 Linux with `scripts/darwin-check` before pushing (`scripts/darwin-check -p
 <crate>` narrows it; `bacon darwin-check` re-runs it on save). It runs
@@ -33,9 +36,11 @@ job `macOS lint from Linux (aarch64-apple-darwin clippy)` runs the same
 script on every pull request, and the native jobs stay the behavior evidence.
 The real-systemd suites (`crates/platform/tests/systemd.rs`,
 `crates/daemon/tests/systemd_durable_worker.rs`,
-`crates/cli/tests/service_systemd.rs`) are `#[ignore]`d and need
+`crates/cli/tests/service_systemd.rs`,
+`crates/daemon/tests/supervised_lifecycle.rs`,
+`crates/cli/tests/service_upgrade.rs`) are `#[ignore]`d on Linux and need
 `POHUNEK_SYSTEMD_E2E=1` plus a running user manager; the Linux CI job
-`real systemd supervision` runs all three with `--ignored --test-threads 1`
+`real systemd supervision` runs all five with `--ignored --test-threads 1`
 after building the daemon, worker, and CLI binaries. Run them locally the same
 way (`POHUNEK_DAEMON_BIN`, `POHUNEK_WORKER_BIN`, and `POHUNEK_CLI_BIN` point the
 suites at the built binaries). The `upgrade from the previous release` CI job (`.github/workflows/upgrade.yml`,
@@ -460,10 +465,27 @@ the script runs) and `native` (on Linux a systemd user manager in `running` or
 opt-in the suites run with; on macOS the launchd `gui/<uid>` domain; a suite
 the host cannot run is `unavailable`, or `ci-only` with the CI job that runs
 it, and never `ok`). A tool shared by two paths is
-reported once, under the first selected path. `--json` prints one document on
+reported once, under the first selected path. Each path also names its
+checks, which the script lists and never runs: `focused` commands for the
+inner loop (rust `cargo xtask affected` and `cargo t -p <crate>`; sdk the Bun
+gates; scripts the `scripts/tests` unittests; macos-lint
+`scripts/darwin-check`; relay-db `python3 scripts/test-partitions run
+relay-db`; native the binary build, then the five real-systemd suites on
+Linux, or the `pohunek-platform`, `pohunek-daemon` and `pohunek-cli` tests
+that drive launchd on macOS), a `final` pointer to the gate set in
+`.agents/skills/gates/SKILL.md` and this guide (never a copy), and `ci-only`
+CI jobs whose run is evidence those focused checks do not produce (the other
+OS's native suites stay a `ci-only` row). The report prints them under each
+path's rows only with an explicit `--path`; the default invocation prints the
+rows alone. `--json` prints one document on
 stdout (`schema` `pohunek.dev-bootstrap`, `version` 1, `paths`, `strict`, `os`,
 `rows` with `path`/`name`/`category`/`status`/`version`/`minimum`/`location`/
-`detail`/`fix`, `failing`, `result` `ready`/`not-ready`/`error`); the status
+`detail`/`fix`, `checks` with `path`/`kind`/`command`/`note` (`command` is null
+except for a `focused` check; `[]` in an error document), `failing`, `result`
+`ready`/`not-ready`/`error`; keys and new enumerated values (statuses,
+categories, check kinds, error codes) are only added within a version, a
+consumer treats an unknown value as not ok, and a removed or renamed key
+bumps the version); the status
 codes and the `unsupported-path` / `config-error` / `internal-error` error
 codes are stable and listed in the script's docstring; every outcome, an
 unexpected exception included, prints exactly one document. Exit status: 0

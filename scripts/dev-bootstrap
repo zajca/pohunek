@@ -41,6 +41,21 @@ tool shared by several paths (`python3` in rust and scripts) is the same
 requirement in each, so it is checked once and reported under the first
 selected path that lists it; row names are unique within a report.
 
+Each path also names its checks, which the script lists and never runs:
+
+* focused -- the inner-loop commands for that path, taken from the
+  verification guide and the gates skill (`PATH_CHECKS` below holds them).
+* final -- a pointer to the final gate set (`.agents/skills/gates/SKILL.md`
+  and `.agents/instructions/verification.md`), never a copy of it.
+* ci-only -- a CI job whose run is evidence the path's focused checks on
+  this host do not produce (the relay PostgreSQL job, the macOS SDK and
+  platform jobs). It is never reported as run or passed. The other OS's
+  native suites are not repeated here: their `ci-only` row names the job.
+
+The report prints a path's checks under its rows only when `--path` is given
+explicitly; the default invocation prints the rows alone. A check is listed
+under every selected path that names it.
+
 Categories:
 
 * required -- a documented loop or gate of the path cannot run without it.
@@ -95,9 +110,16 @@ pinned toolchain is absent reports it instead of downloading it.
 `--json` prints exactly one JSON document on stdout and nothing else there:
 `schema` (`pohunek.dev-bootstrap`), `version` (1), `paths`, `strict`, `os`
 (`platform.system()`), `rows` (each with `path`, `name`, `category`,
-`status`, `version`, `minimum`, `location`, `detail`, `fix`), `failing` (row
-names), `result` (`ready`, `not-ready` or `error`), and `error` / `message`
-(null unless `result` is `error`). `fix` is null for `ok` and
+`status`, `version`, `minimum`, `location`, `detail`, `fix`), `checks` (each
+with `path`, `kind` -- `focused`, `final` or `ci-only` -- `command` and
+`note`; `command` is the shell command of a `focused` check and null
+otherwise, when `note` names the document section or the CI job; `[]` in an
+error document), `failing` (row names), `result` (`ready`, `not-ready` or
+`error`), and `error` / `message` (null unless `result` is `error`). Within
+a version keys are only added; removing or renaming a key, or changing what
+a value means, bumps `version`. New values of an enumerated field (a row
+`status` or `category`, a check `kind`, an error code) may be added within a
+version, so a consumer treats any value it does not know as not ok. `fix` is null for `ok` and
 `not-applicable` rows; a `ci-only` row's fix names its CI job, and a
 `not-compared` row's fix points at the row it depends on. Error codes:
 `unsupported-path` (an unknown `--path`), `config-error` (a missing or
@@ -195,20 +217,61 @@ SYSTEMD_SUITE_COMMAND = (
 # `systemctl --user is-system-running` states the real-systemd CI job
 # accepts: `degraded` only means some unrelated user unit failed.
 SYSTEMD_USABLE_STATES = ("running", "degraded")
-SYSTEMD_SUITES = (
-    "crates/platform/tests/systemd.rs, "
-    "crates/daemon/tests/systemd_durable_worker.rs and "
-    "crates/cli/tests/service_systemd.rs"
+
+
+def word_list(items):
+    """`a`, `a and b`, `a, b and c`."""
+    items = list(items)
+    if len(items) < 2:
+        return "".join(items)
+    return f"{', '.join(items[:-1])} and {items[-1]}"
+
+
+# The real-systemd suites, `(package, test file)` in the order the CI job
+# `real systemd supervision` runs them, each as
+# `cargo test -p <package> --test <file stem>`.
+SYSTEMD_SUITE_FILES = (
+    ("pohunek-platform", "crates/platform/tests/systemd.rs"),
+    ("pohunek-daemon", "crates/daemon/tests/systemd_durable_worker.rs"),
+    ("pohunek-cli", "crates/cli/tests/service_systemd.rs"),
+    ("pohunek-daemon", "crates/daemon/tests/supervised_lifecycle.rs"),
+    ("pohunek-cli", "crates/cli/tests/service_upgrade.rs"),
 )
-LAUNCHD_SUITE = "crates/platform/tests/launchd.rs"
+SYSTEMD_SUITES = word_list(file for _, file in SYSTEMD_SUITE_FILES)
+# The `<suite>` of each real-systemd suite, as the CI job selects it.
+SYSTEMD_SUITE_SELECTORS = word_list(
+    f"`-p {package} --test {Path(file).stem}`" for package, file in SYSTEMD_SUITE_FILES
+)
+# The packages whose tests drive the real launchd `gui/<uid>` domain, with
+# those test files, in the order the CI job `platform contracts (arm64)` runs
+# them, each as `cargo test --locked -p <package>`.
+LAUNCHD_SUITE_FILES = (
+    ("pohunek-platform", ("crates/platform/tests/launchd.rs",)),
+    ("pohunek-daemon", ("crates/daemon/tests/supervised_lifecycle.rs",)),
+    ("pohunek-cli", ("crates/cli/tests/service_launchd.rs",
+                     "crates/cli/tests/service_upgrade.rs")),
+)
+LAUNCHD_SUITES = word_list(
+    file for _, files in LAUNCHD_SUITE_FILES for file in files
+)
+# Both native CI jobs build these before their suites, which spawn them by path.
+NATIVE_BUILD_COMMAND = (
+    "cargo build --locked -p pohunek-daemon -p pohunek-session-worker "
+    "-p pohunek-cli --bins"
+)
 # CI jobs (their `name:` in .github/workflows/ci.yml) that run what a host
 # cannot run locally.
 CI_JOB_SYSTEMD = "real systemd supervision"
 CI_JOB_LAUNCHD = "platform contracts (arm64)"
 CI_JOB_RELAY_DB = "tests (relay DB, PostgreSQL)"
+CI_JOB_SDK_MACOS = "SDK workspace (macOS arm64)"
 VERIFICATION_DOC = ".agents/instructions/verification.md"
+GATES_SKILL = ".agents/skills/gates/SKILL.md"
 
-# `--json` contract identity; bump the version on any incompatible change.
+# `--json` contract identity. Keys and new enumerated values (statuses,
+# categories, check kinds, error codes) are only added within a version, and
+# a consumer treats an unknown value as not ok; removing or renaming a key,
+# or changing what a value means, bumps the version.
 SCHEMA = "pohunek.dev-bootstrap"
 SCHEMA_VERSION = 1
 PATHS = ("rust", "sdk", "scripts", "macos-lint", "relay-db", "native")
@@ -246,6 +309,10 @@ ADD_DARWIN_TARGET = (
     f"run `rustup target add {DARWIN_TARGET}` in the repository root (it adds "
     "the target to the rust-toolchain.toml pin)"
 )
+
+# Check kinds (the `kind` of every `checks` entry in `--json`).
+FOCUSED = "focused"
+FINAL = "final"
 
 OK = "ok"
 MISSING = "missing"
@@ -327,6 +394,27 @@ class Tool:
         if self.ci_job is not None:
             return "ci-only"
         return "required" if self.required else "optional"
+
+
+@dataclasses.dataclass(frozen=True)
+class Check:
+    """One check a path names: a focused command, a final-gate pointer, or CI evidence."""
+
+    kind: str
+    # The shell command of a `focused` check; None for a pointer or a CI job,
+    # which `note` names.
+    command: Optional[str]
+    note: str
+    # The `platform.system()` values the check applies on (empty: every OS),
+    # and the one it does not apply on (None: none excluded).
+    on: tuple = ()
+    not_on: Optional[str] = None
+
+    def applies(self, system):
+        """Whether this check is listed on `system`."""
+        if self.on and system not in self.on:
+            return False
+        return self.not_on is None or system != self.not_on
 
 
 @dataclasses.dataclass(frozen=True)
@@ -720,7 +808,7 @@ def native_tools(root, system):
         required=False,
         probe=check_ci_only,
         ci_job=CI_JOB_LAUNCHD,
-        note=f"the launchd suite ({LAUNCHD_SUITE}) runs only on macOS",
+        note=f"the launchd suites ({LAUNCHD_SUITES}) run only on macOS",
     )
     if system == "Linux":
         return [
@@ -748,7 +836,7 @@ def native_tools(root, system):
                 required=True,
                 probe=check_launchd_domain,
                 manual=(
-                    "run the suite from the logged-in GUI session (an SSH-only "
+                    "run the suites from the logged-in GUI session (an SSH-only "
                     "session has no gui/<uid> launchd domain); otherwise it is "
                     f"CI-only evidence (CI job `{CI_JOB_LAUNCHD}`)"
                 ),
@@ -766,6 +854,139 @@ PATH_TOOLS = {
     "relay-db": relay_db_tools,
     "native": native_tools,
 }
+
+# The final gate set is pointed to, never restated here: a copy would drift
+# from the documents CI mirrors.
+FINAL_GATES = Check(
+    FINAL, None,
+    f'the "Core gate set" in {GATES_SKILL}, run once on the final revision; '
+    f"{VERIFICATION_DOC} is the full inventory and wins over that summary",
+)
+FINAL_SDK_GATES = Check(
+    FINAL, None,
+    f'the "When the change touches the SDK workspace" section of {GATES_SKILL}, '
+    "with the real-daemon suite when the change can affect daemon or worker "
+    "behavior",
+)
+
+# Per path, in report order: the focused commands for the inner loop (taken
+# from the verification guide and the gates skill), the final-gate pointers,
+# and the CI jobs whose runs are evidence this host's focused checks do not
+# produce. A native suite is a focused check on the OS that runs it; on other
+# OSes the `ci-only` row of the native path already names its CI job.
+PATH_CHECKS = {
+    "rust": (
+        Check(
+            FOCUSED, "cargo xtask affected",
+            "`cargo ta`: the fast tests of the crates the branch and working "
+            "tree touch, plus their dependents; `cargo ta --print` shows the "
+            "per-file reasons, and `cargo t` runs every fast test",
+        ),
+        Check(
+            FOCUSED, "cargo t -p <crate>",
+            "the fast tests of one crate (the `cargo t` alias takes -p)",
+        ),
+        FINAL_GATES,
+    ),
+    "sdk": (
+        Check(
+            FOCUSED, "bun install --frozen-lockfile",
+            "from the repository root: the workspace dependencies exactly as locked",
+        ),
+        Check(FOCUSED, "bun run typecheck", "type-check the SDK workspace"),
+        Check(FOCUSED, "bun run lint", "lint the SDK workspace"),
+        Check(FOCUSED, "bun test", "the SDK workspace tests"),
+        Check(FOCUSED, "bun test sdk/ts/scripts", "the SDK release pack contract"),
+        FINAL_GATES,
+        FINAL_SDK_GATES,
+        Check(
+            CI_ONLY, None,
+            f"CI job `{CI_JOB_SDK_MACOS}`: the SDK workspace and its e2e suite "
+            "against the real macOS daemon on Apple Silicon",
+            not_on="Darwin",
+        ),
+    ),
+    "scripts": (
+        Check(
+            FOCUSED, "python3 -m unittest discover -s scripts/tests -p 'test_*.py'",
+            "every script scenario, as CI's core test shard runs them",
+        ),
+        Check(
+            FOCUSED, "python3 -m unittest discover -s scripts/tests -p test_<name>.py",
+            "one scenario file",
+        ),
+        FINAL_GATES,
+    ),
+    "macos-lint": (
+        Check(
+            FOCUSED, "scripts/darwin-check",
+            "clippy for the macOS-only code over the workspace "
+            "(`scripts/darwin-check -p <crate>` narrows it); it compiles and "
+            "lints, it runs nothing",
+        ),
+        FINAL_GATES,
+        Check(
+            CI_ONLY, None,
+            f"CI job `{CI_JOB_LAUNCHD}`: the native behavior evidence for the "
+            "macOS code that scripts/darwin-check only lints",
+        ),
+    ),
+    "relay-db": (
+        Check(
+            FOCUSED, "python3 scripts/test-partitions run relay-db",
+            f"with {RELAY_DB_VARIABLE} exported to a disposable PostgreSQL "
+            "database; the shard also needs the built worker binary (see the "
+            f"`relay-db` shard in {VERIFICATION_DOC})",
+        ),
+        FINAL_GATES,
+        Check(
+            CI_ONLY, None,
+            f"CI job `{CI_JOB_RELAY_DB}`: the relay PostgreSQL tests, the "
+            "evidence on a host without a disposable database",
+        ),
+    ),
+    "native": (
+        Check(
+            FOCUSED, NATIVE_BUILD_COMMAND,
+            "the daemon, worker and CLI binaries the native suites spawn",
+            on=("Linux", "Darwin"),
+        ),
+        Check(
+            FOCUSED, SYSTEMD_SUITE_COMMAND,
+            f"<suite> is each of {SYSTEMD_SUITE_SELECTORS} ({SYSTEMD_SUITES}), "
+            "run inside a session with a systemd user manager, with "
+            "POHUNEK_DAEMON_BIN, POHUNEK_WORKER_BIN and "
+            "POHUNEK_CLI_BIN pointing at the built binaries (see "
+            f"{VERIFICATION_DOC})",
+            on=("Linux",),
+        ),
+        *(
+            Check(
+                FOCUSED, f"cargo test --locked -p {package}",
+                f"runs {word_list(files)} against this session's launchd "
+                f"gui/<uid> domain with the rest of {package}, as CI does; "
+                "from the logged-in GUI session",
+                on=("Darwin",),
+            )
+            for package, files in LAUNCHD_SUITE_FILES
+        ),
+        FINAL_GATES,
+    ),
+}
+
+
+def path_checks(paths, system):
+    """`(path, check)` for every check of the selected paths on `system`, in path order.
+
+    Unlike rows, a check is listed under every selected path that names it,
+    so each path's list is complete on its own.
+    """
+    return [
+        (path, check)
+        for path in paths
+        for check in PATH_CHECKS[path]
+        if check.applies(system)
+    ]
 
 
 def tools(root, system, paths=DEFAULT_PATHS):
@@ -1258,14 +1479,33 @@ def describe_pin(result, strict, cargo_bin):
     )
 
 
-def report(results, strict, cargo_bin, out, headings):
-    """Print every row, under a heading per path when asked; whether the run passes."""
-    current = None
-    for path, result in results:
-        if headings and path != current:
+def describe_check(check):
+    """The report lines of one check, indented under its path's `checks:` line."""
+    if check.command is None:
+        return f"    {check.kind:<8} {check.note}"
+    return f"    {check.kind:<8} {check.command}\n             {check.note}"
+
+
+def report(results, strict, cargo_bin, out, paths=None, checks=()):
+    """Print every row; whether the run passes.
+
+    With `paths` (an explicit `--path`), each path gets a heading, its rows
+    and its checks; without it the rows print alone.
+    """
+    if paths is None:
+        for _, result in results:
+            print(describe(result, strict, cargo_bin), file=out)
+    else:
+        for path in paths:
             print(f"path {path}:", file=out)
-            current = path
-        print(describe(result, strict, cargo_bin), file=out)
+            for row_path, result in results:
+                if row_path == path:
+                    print(describe(result, strict, cargo_bin), file=out)
+            listed = [check for check_path, check in checks if check_path == path]
+            if listed:
+                print("  checks:", file=out)
+                for check in listed:
+                    print(describe_check(check), file=out)
     failing = failing_names(results, strict)
     if failing:
         print(f"dev-bootstrap: failing: {', '.join(failing)}", file=out)
@@ -1279,8 +1519,12 @@ def failing_names(results, strict):
     return [result.tool.name for _, result in results if result.failed(strict)]
 
 
-def document(paths, strict, system, results=(), cargo_bin=None, error=None, message=None):
-    """The `--json` document; every key is present in every result."""
+def document(paths, strict, system, results=(), cargo_bin=None, error=None,
+             message=None, checks=()):
+    """The `--json` document; every key is present in every result.
+
+    An error document has no rows and no checks.
+    """
     failing = failing_names(results, strict)
     if error is not None:
         outcome = "error"
@@ -1310,6 +1554,11 @@ def document(paths, strict, system, results=(), cargo_bin=None, error=None, mess
         "strict": strict,
         "os": system,
         "rows": rows,
+        "checks": [
+            {"path": path, "kind": check.kind, "command": check.command,
+             "note": check.note}
+            for path, check in checks
+        ],
         "failing": failing,
         "result": outcome,
         "error": error,
@@ -1421,11 +1670,13 @@ def run(args, which, runner, root, environ, out, system):
             mode = f"paths: {', '.join(paths)}; {mode}"
         print(f"dev-bootstrap: local tool check ({mode})", file=out)
     results = check_all(rows, host)
+    checks = path_checks(paths, system)
     if args.json:
-        doc = document(paths, args.strict, system, results, cargo_bin)
+        doc = document(paths, args.strict, system, results, cargo_bin, checks=checks)
         emit(doc, out)
         return 0 if doc["result"] == "ready" else 1
-    passed = report(results, args.strict, cargo_bin, out, headings=bool(args.path))
+    passed = report(results, args.strict, cargo_bin, out,
+                    paths=paths if args.path else None, checks=checks)
     return 0 if passed else 1
 
 
