@@ -380,6 +380,17 @@ entry. `worker_feature_unavailable` means a previous-version worker remains
 usable for lifecycle/attach but cannot provide control-plane observation.
 `session_waiter_limit_reached` is temporary bounded resource pressure; wait no
 longer than eight seconds and retry instead of opening unbounded parallel waits.
+For `session.wait_turn` the same code means the separate turn waiter pool (one
+global slot plus one slot per target) is full; end an older turn wait before
+starting another. A `cursor_reset` result follows a daemon restart or a cursor
+outside what the in-memory turn journal retains, also during a wait: continue from
+the returned cursor and read the progress, because events in between were not
+reported. A turn event arrives no earlier than `attention_debounce_secs` (5
+seconds by default) after the last stop or attention report, and later when
+reports repeat. A `turn_completed` whose window ends while the session is
+`working` is a stale stop and never fires; a short turn still fires once after
+its stop. A `notification.create` from a producer without a hook schema, or for
+a session this daemon does not hold, never produces a turn event.
 
 Do not restart, stop, or boot out a worker job by hand. A worker job has no
 restart policy (systemd `Restart=no`, launchd without `KeepAlive`) because once

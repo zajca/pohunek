@@ -61,6 +61,29 @@ pub const ED25519_SIGNATURE_PAYLOAD_BYTES: usize = 86;
 /// amortizing automation round trips.
 pub const MAX_SESSION_WAIT_MS: u32 = 8_000;
 
+/// Absolute ceiling on a `session.wait_turn` duration, in milliseconds.
+///
+/// A daemon's configured turn-wait ceiling must not exceed it, so it bounds
+/// the lifetime of an abandoned turn-waiter slot under any operator setting.
+/// A client uses it as the dedicated-connection deadline when a request leaves
+/// the duration to the daemon default. One day is far above any interactive
+/// agent turn and still fits the `u32` wire field.
+pub const MAX_SESSION_WAIT_TURN_MS: u32 = 24 * 60 * 60 * 1_000;
+
+/// Maximum number of sessions one `session.wait_turn` request may target.
+///
+/// A manager agent follows a handful of sessions; 32 covers a large fleet on one
+/// host while bounding the per-request waiter slots, journal matching work, and
+/// the per-target progress list in the result.
+pub const MAX_SESSION_WAIT_TURN_TARGETS: usize = 32;
+
+/// Maximum UTF-8 bytes in an opaque `session.wait_turn` cursor.
+///
+/// A daemon cursor carries a daemon instance identifier plus two decimal
+/// integers, well under 128 bytes. The ceiling keeps a hostile cursor from
+/// inflating request parsing or log lines.
+pub const MAX_SESSION_TURN_CURSOR_BYTES: usize = 256;
+
 /// Maximum lifetime of a provider identity claim, measured from receipt.
 ///
 /// Hooks normally issue 30-second claims. A 60-second hard ceiling tolerates

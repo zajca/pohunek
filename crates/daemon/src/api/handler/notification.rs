@@ -76,8 +76,11 @@ where
 /// Session-scoped attention and turn-completion creates are routed to the
 /// debounce coordinator: the id is minted and `created: true` is returned, but
 /// the record is held pending and only becomes visible in `notification.list`
-/// after the debounce window (or never, if the session resumes first). Every
-/// other create persists immediately.
+/// after the debounce window (or never, if the session resumes first). A
+/// create that is an admitted provider hook claim for a session the registry
+/// holds is also a turn signal: the coordinator records the matching turn
+/// event, including for a kind the policy disables, which still answers
+/// `notification_kind_disabled`. Every other create persists immediately.
 pub(super) async fn handle_notification_create(
     request: &Request,
     notifications: Option<&NotificationService>,
@@ -92,9 +95,14 @@ pub(super) async fn handle_notification_create(
         Ok(notifications) => notifications,
         Err(resp) => return resp,
     };
-    if let Err(response) = admit_hook_notification(request, &params, sessions).await {
-        return response;
-    }
+    let hook_claim = match admit_hook_notification(request, &params, sessions).await {
+        Ok(admitted) => admitted,
+        Err(response) => return response,
+    };
+    let turn_signal = match (hook_claim, params.session_id.as_ref()) {
+        (true, Some(session_id)) => sessions.holds(session_id).await,
+        _ => false,
+    };
     let params = enrich_notification_session_context(params, sessions).await;
 
     if is_debounced_create(params.kind, params.dedupe_key.as_deref()) {
@@ -105,11 +113,21 @@ pub(super) async fn handle_notification_create(
         return run_notification_blocking(request, move || {
             // Preparing the record does no store I/O; the coordinator commits it
             // after the debounce window. The response still returns the minted
-            // record with `created: true`.
-            let record = notifications
+            // record with `created: true`. A turn signal whose kind the policy
+            // disables still reaches the coordinator for `session.wait_turn`,
+            // and the caller gets the policy refusal an immediate create reports.
+            let mut deferred = notifications
                 .prepare_deferred(params)
                 .map_err(|err| err.to_protocol_error())?;
-            attention.defer(record.clone());
+            deferred.signal = turn_signal;
+            let refusal = deferred.policy_refusal();
+            let record = deferred.record.clone();
+            if deferred.inbox || deferred.signal {
+                attention.defer(deferred);
+            }
+            if let Some(refusal) = refusal {
+                return Err(refusal.to_protocol_error());
+            }
             Ok(NotificationCreateResult {
                 created: true,
                 record,
@@ -133,20 +151,21 @@ pub(super) async fn handle_notification_create(
 /// claim, so the public socket enforces the same admission as the worker
 /// socket and a refusal there cannot be bypassed by retrying here. Creates
 /// from other producers and creates without a session are not hook claims.
+/// Returns whether the create is an admitted hook claim.
 async fn admit_hook_notification(
     request: &Request,
     params: &NotificationCreateParams,
     sessions: &SessionRegistry,
-) -> Result<(), Response> {
+) -> Result<bool, Response> {
     let Some(session_id) = params.session_id.as_ref() else {
-        return Ok(());
+        return Ok(false);
     };
     let provider = params.source.provider.as_str();
     let hook_provider = pohunek_worker_protocol::hook_schemas()
         .iter()
         .any(|schema| schema.identity_providers.contains(&provider));
     if !hook_provider {
-        return Ok(());
+        return Ok(false);
     }
     sessions
         .admit_session_hook(
@@ -155,6 +174,7 @@ async fn admit_hook_notification(
             provider,
         )
         .await
+        .map(|()| true)
         .map_err(|_denial| {
             error_value(
                 request,

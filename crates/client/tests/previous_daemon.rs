@@ -875,6 +875,45 @@ async fn a_method_the_previous_release_never_defined_fails_before_it_is_sent() {
 }
 
 #[tokio::test]
+async fn a_turn_wait_on_its_dedicated_connection_fails_before_it_is_sent() {
+    guard("the dedicated turn wait", async {
+        let daemon = PreviousDaemon::start().await;
+        let mut client = daemon.client().await;
+        let params = protocol::SessionWaitTurnParams::new(
+            vec![SessionId("s-1".to_owned())],
+            vec![protocol::SessionTurnEventKind::TurnCompleted],
+            None,
+            None,
+        )
+        .expect("valid turn wait params");
+        let error = client
+            .session_wait_turn(params)
+            .await
+            .expect_err("the previous daemon does not define session.wait_turn");
+        match &error {
+            ClientError::DaemonProtocolTooOld {
+                method,
+                daemon_version,
+                required_version,
+                ..
+            } => {
+                assert_eq!(method, method::SESSION_WAIT_TURN);
+                assert_eq!(*daemon_version, previous());
+                assert_eq!(*required_version, PROTOCOL_VERSION);
+            }
+            other => panic!("expected DaemonProtocolTooOld, got {other:?}"),
+        }
+        assert_eq!(
+            daemon.methods(),
+            [method::DAEMON_HEALTH],
+            "only the version probe reaches the previous daemon"
+        );
+        assert_eq!(daemon.violations(), Vec::<String>::new());
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn the_typed_error_names_the_host_the_versions_and_the_upgrade() {
     guard("the typed error", async {
         let daemon = PreviousDaemon::start().await;

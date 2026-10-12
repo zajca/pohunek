@@ -37,6 +37,7 @@ mod package;
 mod project;
 mod runtime_id;
 mod session;
+mod turn_wait;
 mod version;
 
 #[doc(inline)]
@@ -86,7 +87,8 @@ pub use limits::{
     MAX_CONTROL_LINE_BYTES, MAX_IDENTITY_CLAIM_TTL_SECS, MAX_REQUEST_ID_BYTES,
     MAX_SESSION_DIFF_BYTES, MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES,
     MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_READ_RESPONSE_BYTES,
-    MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_WAIT_MS, MAX_SUCCESS_RESPONSE_ENVELOPE_BYTES,
+    MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_TURN_CURSOR_BYTES, MAX_SESSION_WAIT_MS,
+    MAX_SESSION_WAIT_TURN_MS, MAX_SESSION_WAIT_TURN_TARGETS, MAX_SUCCESS_RESPONSE_ENVELOPE_BYTES,
     MAX_WORKER_INSTANCE_ID_BYTES, OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES,
     SESSION_OUTPUT_METADATA_HEADROOM_BYTES,
 };
@@ -148,6 +150,11 @@ pub use session::{
     SessionStopResult, SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning,
     SessionWarningKind, SubagentInfo, SubagentLifecycle, SubagentStateEvent, TerminalCursor,
     TerminalDimensions, TerminalDimensionsError, UnconfirmedProcess,
+};
+#[doc(inline)]
+pub use turn_wait::{
+    SessionTurnCursor, SessionTurnEvent, SessionTurnEventKind, SessionTurnProgress,
+    SessionWaitTurnParams, SessionWaitTurnReason, SessionWaitTurnResult, TurnWaitParamsError,
 };
 #[doc(inline)]
 pub use version::{

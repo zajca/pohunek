@@ -49,6 +49,10 @@ fn reply_to_preview(
 }
 
 impl SessionRegistry {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the detector task is one select loop over all of its inputs"
+    )]
     pub(super) fn spawn_detector(&self, inputs: DetectorInputs) {
         let DetectorInputs {
             scope,
@@ -61,6 +65,7 @@ impl SessionRegistry {
             input_ready,
         } = inputs;
         let registry = self.clone();
+        let progress = self.inner.turns.progress(&scope.id);
         tokio::spawn(async move {
             let DetectorScope { id, runtime } = scope;
             let initial_config = detector_config_rx.borrow().clone();
@@ -123,6 +128,7 @@ impl SessionRegistry {
                     received = output_rx.recv() => {
                         match received {
                             Ok(chunk) => {
+                                progress.note_output();
                                 let transitions = detector.feed(crate::time::now(), &chunk);
                                 input_ready.send_replace(detector.input_ready());
                                 for transition in transitions {
@@ -137,6 +143,8 @@ impl SessionRegistry {
                                 }
                             }
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                // Skipped chunks are output too.
+                                progress.note_output();
                                 // Always resync; only the logging is rate-limited
                                 // so a runaway session cannot flood the log.
                                 if let Some(warn_kind) = lag_warn.observe(crate::time::now(), skipped) {
@@ -248,6 +256,9 @@ impl SessionRegistry {
                 return;
             }
 
+            self.inner
+                .turns
+                .note_activity(id, entry.info.activity, transition.activity);
             entry.info.activity = Some(transition.activity);
             entry.info.state_source = transition.source;
             entry.info.updated_at = timestamp_now();

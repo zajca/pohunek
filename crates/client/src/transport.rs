@@ -18,8 +18,8 @@ use protocol::{
     SessionNewResult, SessionOutputParams, SessionOutputResult, SessionReadParams,
     SessionReadResult, SessionResizeParams, SessionResizeResult, SessionResumeParams,
     SessionResumeResult, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
-    SessionSetMetadataResult, SessionWaitParams, SessionWaitResult, ENV_DAEMON_ID, ENV_SESSION_ID,
-    MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION,
+    SessionSetMetadataResult, SessionWaitParams, SessionWaitResult, SessionWaitTurnParams,
+    SessionWaitTurnResult, ENV_DAEMON_ID, ENV_SESSION_ID, MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -530,9 +530,11 @@ impl Client {
 
     /// Send one typed control-method request and decode its success payload.
     ///
-    /// This is the public SDK path for normal request/response methods. The
-    /// lower-level [`Self::request`] remains available for callers that need raw
-    /// JSON envelopes or are testing framing behavior directly.
+    /// This is the public SDK path for normal request/response methods.
+    /// `session.input`, `session.new`, and `session.wait_turn` take the same
+    /// dedicated-connection budgets as their typed helpers. The lower-level
+    /// [`Self::request`] remains available for callers that need raw JSON
+    /// envelopes or are testing framing behavior directly.
     pub async fn call<M>(&mut self, params: M::Params) -> Result<M::Output, ClientError>
     where
         M: Method,
@@ -541,6 +543,12 @@ impl Client {
             let params =
                 serde_json::from_value::<SessionInputParams>(serde_json::to_value(params)?)?;
             let result = self.session_input(params).await?;
+            return Ok(serde_json::from_value(serde_json::to_value(result)?)?);
+        }
+        if M::NAME == protocol::method::SESSION_WAIT_TURN {
+            let params =
+                serde_json::from_value::<SessionWaitTurnParams>(serde_json::to_value(params)?)?;
+            let result = self.session_wait_turn(params).await?;
             return Ok(serde_json::from_value(serde_json::to_value(result)?)?);
         }
         if M::NAME == protocol::method::SESSION_NEW {
@@ -673,6 +681,32 @@ impl Client {
     ) -> Result<SessionWaitResult, ClientError> {
         let timeout_ms = params.timeout_ms();
         self.call_dedicated::<protocol::method::SessionWait>(params, timeout_ms)
+            .await
+    }
+
+    /// Wait for the next turn event of one or more sessions on a dedicated
+    /// connection.
+    ///
+    /// The connection deadline follows `timeout_ms` plus transport headroom.
+    /// When the request leaves the duration to the daemon default, the client
+    /// cannot know that default and bounds the connection by
+    /// [`protocol::MAX_SESSION_WAIT_TURN_MS`], the ceiling no daemon setting
+    /// may exceed. Against a daemon of the previous protocol version the call
+    /// fails with `daemon_protocol_too_old` before anything is sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the transport fails or the daemon reports
+    /// an error such as `session_wait_limit_exceeded`, `session_not_found`, or
+    /// `session_waiter_limit_reached`.
+    pub async fn session_wait_turn(
+        &mut self,
+        params: SessionWaitTurnParams,
+    ) -> Result<SessionWaitTurnResult, ClientError> {
+        let timeout_ms = params
+            .timeout_ms()
+            .unwrap_or(protocol::MAX_SESSION_WAIT_TURN_MS);
+        self.call_dedicated::<protocol::method::SessionWaitTurn>(params, timeout_ms)
             .await
     }
 

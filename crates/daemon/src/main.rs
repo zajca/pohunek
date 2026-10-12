@@ -322,11 +322,12 @@ async fn run() -> Result<(), DaemonError> {
     let session_retention = SessionRetentionTask::spawn(sessions.clone());
     // Spawn the debounce coordinator: it owns the lifecycle of session-scoped
     // agent_blocked/approval_required and turn_completed notifications, holding
-    // them for the policy debounce window so transient signals never surface.
+    // them for the policy debounce window so transient signals never surface,
+    // and records the surviving signals as turn events for session.wait_turn.
     // Both producers (the notification.create handler and the projector) route
     // debounced notifications through its clonable command handle.
     let (attention_coordinator, attention_task) =
-        AttentionCoordinator::spawn(notifications.clone());
+        AttentionCoordinator::spawn(notifications.clone(), &sessions);
     let notification_projector = NotificationProjector::spawn(
         &sessions,
         notifications.clone(),

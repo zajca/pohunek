@@ -11,24 +11,42 @@
 //! otherwise it is committed through the store and a `notification_created` event
 //! is emitted exactly as an immediate create would be.
 //!
+//! The same window decides when a session turn event is recorded for
+//! `session.wait_turn`. A pending entry therefore carries two candidates: the
+//! inbox record (only from a create the notification policy keeps) and the turn
+//! signal (only from a trusted producer: the projector, or a provider hook claim
+//! admitted for a session the registry holds). A flush commits the inbox record
+//! when there is one and records the turn event when there is a signal; a
+//! resolve inside the window drops both. A create that adds no inbox record
+//! never changes the inbox candidate or its timer, so the inbox behaves exactly
+//! as if that create never arrived. The stale-turn suppression after a resolve
+//! applies to the inbox only; a `turn_completed` signal is instead dropped at
+//! flush time while the session is working again.
+//!
 //! Pending entries are in-memory only. A daemon restart while an entry is pending
 //! (shorter than the debounce window) drops that transient signal, which is
 //! acceptable for a sub-10s window; pending state is deliberately not persisted.
 
-// Rust guideline compliant 2026-06-26
+// Rust guideline compliant 2026-10-12
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use futures::StreamExt;
-use protocol::{NotificationRecord, NotificationSource};
+use protocol::{
+    NotificationId, NotificationKind, NotificationRecord, NotificationSource, SessionTurnEventKind,
+};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::time::DelayQueue;
-use tracing::warn;
+use tracing::{debug, warn};
 
-use super::{is_turn_dedupe_key, source_priority, NotificationService, SourcePriority};
+use super::{
+    is_turn_dedupe_key, source_priority, DeferredNotification, NotificationService, SourcePriority,
+};
+use crate::session::{SessionRegistry, TurnEvents};
+use protocol::AgentActivity;
 
 /// Maximum time to wait for the coordinator task to stop on shutdown.
 ///
@@ -44,7 +62,7 @@ enum Command {
     ///
     /// Boxed so the enum's variants stay similarly sized despite the large
     /// [`NotificationRecord`].
-    Defer(Box<NotificationRecord>),
+    Defer(Box<DeferredNotification>),
     /// Cancel any pending entry for the dedupe key and acknowledge visible records.
     Resolve(String),
     /// Stop the task, dropping all pending entries without persisting them.
@@ -66,16 +84,20 @@ impl AttentionCoordinator {
     ///
     /// The returned [`AttentionCoordinator`] is the clonable producer handle; the
     /// [`AttentionCoordinatorTask`] owns the spawned task and drives its graceful
-    /// shutdown.
+    /// shutdown. Flushed session signals are recorded as turn events in the
+    /// journal of `sessions`.
     #[must_use]
-    pub fn spawn(notifications: NotificationService) -> (Self, AttentionCoordinatorTask) {
+    pub fn spawn(
+        notifications: NotificationService,
+        sessions: &SessionRegistry,
+    ) -> (Self, AttentionCoordinatorTask) {
         // Unbounded: session notification commands are produced at
         // human-interaction rate (an agent blocking, an owner resuming), so
         // growth is not a practical concern, and an unbounded sink lets both the
         // request handler and the projector enqueue without send-side
         // backpressure that could stall them.
         let (commands, receiver) = mpsc::unbounded_channel();
-        let handle = tokio::spawn(run(notifications, receiver));
+        let handle = tokio::spawn(run(notifications, sessions.clone(), receiver));
         (
             Self {
                 commands: commands.clone(),
@@ -90,8 +112,8 @@ impl AttentionCoordinator {
     /// [`NotificationService::prepare_deferred`]). A closed channel means the
     /// coordinator task already stopped (daemon shutdown), where dropping the
     /// record is the correct no-op.
-    pub fn defer(&self, record: NotificationRecord) {
-        let _ = self.commands.send(Command::Defer(Box::new(record)));
+    pub(crate) fn defer(&self, deferred: DeferredNotification) {
+        let _ = self.commands.send(Command::Defer(Box::new(deferred)));
     }
 
     /// Resolve pending and visible session notifications for a dedupe key.
@@ -146,7 +168,10 @@ impl AttentionCoordinatorTask {
 /// A session notification held until its debounce deadline.
 #[derive(Debug)]
 struct Pending {
-    record: NotificationRecord,
+    /// Best record the notification policy keeps, committed on flush.
+    inbox: Option<NotificationRecord>,
+    /// Best trusted record, recorded as a turn event on flush.
+    signal: Option<NotificationRecord>,
     /// Monotonic generation stamped when this entry was last (re)armed.
     ///
     /// A [`DelayQueue`] expiry only flushes when its token carries the current
@@ -166,7 +191,12 @@ struct FlushToken {
 ///
 /// Never panics: store errors on the resolve/flush paths are logged and the loop
 /// continues, so one failed append cannot take down session notification handling.
-async fn run(notifications: NotificationService, mut commands: mpsc::UnboundedReceiver<Command>) {
+async fn run(
+    notifications: NotificationService,
+    sessions: SessionRegistry,
+    mut commands: mpsc::UnboundedReceiver<Command>,
+) {
+    let turns = sessions.turn_events();
     let mut queue: DelayQueue<FlushToken> = DelayQueue::new();
     let mut pending: HashMap<String, Pending> = HashMap::new();
     let mut recently_resolved_turns: HashMap<String, Instant> = HashMap::new();
@@ -180,14 +210,14 @@ async fn run(notifications: NotificationService, mut commands: mpsc::UnboundedRe
             // applied before an already-armed timer is allowed to flush.
             biased;
             command = commands.recv() => match command {
-                Some(Command::Defer(record)) => {
+                Some(Command::Defer(deferred)) => {
                     defer(
                         &mut pending,
                         &mut queue,
                         &mut generation,
                         &mut recently_resolved_turns,
                         &notifications,
-                        *record,
+                        *deferred,
                     );
                 }
                 Some(Command::Resolve(dedupe_key)) => {
@@ -201,57 +231,114 @@ async fn run(notifications: NotificationService, mut commands: mpsc::UnboundedRe
                 Some(Command::Shutdown) | None => break,
             },
             Some(expired) = queue.next(), if !queue.is_empty() => {
-                flush(&mut pending, &notifications, &expired.into_inner());
+                flush(
+                    &mut pending,
+                    &notifications,
+                    (&sessions, &turns),
+                    &expired.into_inner(),
+                )
+                .await;
             }
         }
     }
 }
 
-/// Hold `record` pending, applying cross-producer priority and (re)arming the timer.
+/// Hold `deferred` pending, applying cross-producer priority and (re)arming the timer.
 fn defer(
     pending: &mut HashMap<String, Pending>,
     queue: &mut DelayQueue<FlushToken>,
     generation: &mut u64,
     recently_resolved_turns: &mut HashMap<String, Instant>,
     notifications: &NotificationService,
-    record: NotificationRecord,
+    deferred: DeferredNotification,
 ) {
+    let DeferredNotification {
+        record,
+        mut inbox,
+        signal,
+    } = deferred;
     let Some(dedupe_key) = record.dedupe_key.clone() else {
         // Debounced creates always carry a dedupe key; without one the record
         // cannot be cancelled by session activity, so surface it immediately
-        // rather than dropping it.
-        commit(notifications, record);
+        // rather than dropping it. Such a create is never a turn signal: the
+        // projector and hook claims always carry a session key.
+        if inbox {
+            commit(notifications, record);
+        }
         return;
     };
     let debounce = Duration::from_secs(u64::from(notifications.policy().attention_debounce_secs));
     prune_recently_resolved_turns(recently_resolved_turns, debounce);
-    if record.kind == protocol::NotificationKind::TurnCompleted
+    if inbox
+        && record.kind == protocol::NotificationKind::TurnCompleted
         && is_turn_dedupe_key(&dedupe_key)
         && recently_resolved_turns
             .remove(&dedupe_key)
             .is_some_and(|resolved_at| resolved_at.elapsed() <= debounce)
     {
+        // A turn report right after the session resumed is the stale stop of
+        // the previous turn for the inbox. The turn signal is judged at flush
+        // time by the session's activity instead.
+        inbox = false;
+    }
+    if !inbox && !signal {
         return;
     }
 
     // Provider reports outrank projector reports for the same session moment, so
     // keep the higher-priority record when one is already pending; the store's
-    // dedupe remains the final authority at flush time.
-    let record = match pending.get(&dedupe_key) {
-        Some(existing) if outranks(&existing.record, &record) => existing.record.clone(),
-        _ => record,
+    // dedupe remains the final authority at flush time. The inbox candidate
+    // only ever considers records the policy keeps, and a create that adds no
+    // inbox record re-arms the timer only while no inbox candidate is pending.
+    let existing = pending.remove(&dedupe_key);
+    let (existing_inbox, existing_signal, existing_generation) = match existing {
+        Some(entry) => (entry.inbox, entry.signal, Some(entry.generation)),
+        None => (None, None, None),
+    };
+    let signal_record = if signal {
+        Some(prefer(existing_signal, record.clone()))
+    } else {
+        existing_signal
+    };
+    let (inbox_record, kept_generation) = if inbox {
+        (Some(prefer(existing_inbox, record)), None)
+    } else if existing_inbox.is_some() {
+        (existing_inbox, existing_generation)
+    } else {
+        (None, None)
     };
 
-    *generation += 1;
-    let generation = *generation;
-    pending.insert(dedupe_key.clone(), Pending { record, generation });
-    queue.insert(
-        FlushToken {
-            dedupe_key,
+    let generation = kept_generation.unwrap_or_else(|| {
+        *generation += 1;
+        let current = *generation;
+        queue.insert(
+            FlushToken {
+                dedupe_key: dedupe_key.clone(),
+                generation: current,
+            },
+            debounce,
+        );
+        current
+    });
+    pending.insert(
+        dedupe_key,
+        Pending {
+            inbox: inbox_record,
+            signal: signal_record,
             generation,
         },
-        debounce,
     );
+}
+
+/// The pending record to keep when `incoming` arrives for the same key.
+fn prefer(
+    existing: Option<NotificationRecord>,
+    incoming: NotificationRecord,
+) -> NotificationRecord {
+    match existing {
+        Some(existing) if outranks(&existing, &incoming) => existing,
+        _ => incoming,
+    }
 }
 
 /// Cancel any pending entry for `dedupe_key` and acknowledge visible records.
@@ -264,8 +351,11 @@ fn resolve(
     // A pending entry that is cancelled never becomes visible. Its DelayQueue
     // timer may still fire, but the generation guard in `flush` makes that a
     // no-op, so the token is left to expire on its own rather than tracked.
-    let removed = pending.remove(dedupe_key);
-    if removed.is_none() && is_turn_dedupe_key(dedupe_key) {
+    // The stale-turn suppression belongs to the inbox: a cancelled entry that
+    // held only a turn signal counts as no pending inbox record, so the
+    // resolve still arms the suppression for the next turn report.
+    let removed_inbox = pending.remove(dedupe_key).and_then(|entry| entry.inbox);
+    if removed_inbox.is_none() && is_turn_dedupe_key(dedupe_key) {
         let debounce =
             Duration::from_secs(u64::from(notifications.policy().attention_debounce_secs));
         prune_recently_resolved_turns(recently_resolved_turns, debounce);
@@ -290,9 +380,13 @@ fn prune_recently_resolved_turns(
 }
 
 /// Commit a pending entry when its timer is still the current generation.
-fn flush(
+///
+/// The inbox record is committed first, so a waiter woken by the turn event
+/// already finds the inbox record its event names.
+async fn flush(
     pending: &mut HashMap<String, Pending>,
     notifications: &NotificationService,
+    (sessions, turns): (&SessionRegistry, &TurnEvents),
     token: &FlushToken,
 ) {
     let is_current = pending
@@ -304,14 +398,69 @@ fn flush(
         return;
     }
     if let Some(entry) = pending.remove(&token.dedupe_key) {
-        commit(notifications, entry.record);
+        let committed = entry.inbox.and_then(|record| commit(notifications, record));
+        if let Some(signal) = entry.signal {
+            record_turn((sessions, turns), &signal, committed.as_ref()).await;
+        }
     }
 }
 
 /// Persist a debounced record and emit its event, logging (not panicking) on error.
-fn commit(notifications: &NotificationService, record: NotificationRecord) {
-    if let Err(error) = notifications.commit_deferred(record) {
-        warn!(error = %error, "failed to commit debounced session notification");
+///
+/// Returns the visible record the commit produced or deduplicated into.
+fn commit(
+    notifications: &NotificationService,
+    record: NotificationRecord,
+) -> Option<NotificationRecord> {
+    match notifications.commit_deferred(record) {
+        Ok(result) => Some(result.record),
+        Err(error) => {
+            warn!(error = %error, "failed to commit debounced session notification");
+            None
+        }
+    }
+}
+
+/// Record the turn event a flushed session signal stands for.
+///
+/// A `turn_completed` signal is dropped while the session is working: it is
+/// the stale stop of an earlier turn, and the running turn reports its own
+/// stop. The event names the committed inbox record only when that record is
+/// of the same kind; a signal the policy dropped while another kind surfaced
+/// names no record.
+async fn record_turn(
+    (sessions, turns): (&SessionRegistry, &TurnEvents),
+    signal: &NotificationRecord,
+    committed: Option<&NotificationRecord>,
+) {
+    let (Some(session_id), Some(kind)) = (signal.session_id.as_ref(), turn_kind(signal.kind))
+    else {
+        return;
+    };
+    if kind == SessionTurnEventKind::TurnCompleted
+        && sessions.current_activity(session_id).await == Some(AgentActivity::Working)
+    {
+        debug!(
+            session_id = %session_id.0,
+            "stale turn_completed signal dropped while the session works"
+        );
+        return;
+    }
+    let notification_id: Option<NotificationId> = committed
+        .filter(|record| record.kind == signal.kind)
+        .map(|record| record.id.clone());
+    turns.record(session_id, kind, notification_id);
+}
+
+/// The turn event kind a debounced notification kind stands for.
+fn turn_kind(kind: NotificationKind) -> Option<SessionTurnEventKind> {
+    match kind {
+        NotificationKind::TurnCompleted => Some(SessionTurnEventKind::TurnCompleted),
+        NotificationKind::AgentBlocked => Some(SessionTurnEventKind::AgentBlocked),
+        NotificationKind::ApprovalRequired => Some(SessionTurnEventKind::ApprovalRequired),
+        NotificationKind::SessionFinished | NotificationKind::Error | NotificationKind::System => {
+            None
+        }
     }
 }
 
@@ -346,7 +495,8 @@ mod tests {
     use tokio::sync::broadcast;
 
     use super::AttentionCoordinator;
-    use crate::notifications::{default_policy, NotificationService};
+    use crate::notifications::{default_policy, DeferredNotification, NotificationService};
+    use crate::session::{SessionRegistry, SessionRegistryConfig};
 
     /// Debounce window used by the tests, advanced past to force a flush.
     const TEST_DEBOUNCE_SECS: u64 = 5;
@@ -440,10 +590,20 @@ mod tests {
     fn record(
         service: &NotificationService,
         params: NotificationCreateParams,
-    ) -> NotificationRecord {
+    ) -> DeferredNotification {
         service
             .prepare_deferred(params)
             .expect("prepare deferred record")
+    }
+
+    /// Spawns a coordinator over a registry that holds no session.
+    fn spawn(
+        service: &NotificationService,
+    ) -> (AttentionCoordinator, super::AttentionCoordinatorTask) {
+        AttentionCoordinator::spawn(
+            service.clone(),
+            &SessionRegistry::new(SessionRegistryConfig::default()),
+        )
     }
 
     fn list(service: &NotificationService) -> Vec<NotificationRecord> {
@@ -484,7 +644,7 @@ mod tests {
     async fn resolve_before_window_suppresses_entirely() {
         let service = service("suppress");
         let mut events = service.subscribe();
-        let (coordinator, _task) = AttentionCoordinator::spawn(service.clone());
+        let (coordinator, _task) = spawn(&service);
 
         coordinator.defer(record(&service, projector_params("s-1")));
         settle().await;
@@ -511,7 +671,7 @@ mod tests {
         let service = service("suppress-turn");
         enable_turn_completed(&service);
         let mut events = service.subscribe();
-        let (coordinator, _task) = AttentionCoordinator::spawn(service.clone());
+        let (coordinator, _task) = spawn(&service);
 
         coordinator.defer(record(&service, turn_params("s-1")));
         settle().await;
@@ -538,7 +698,7 @@ mod tests {
         let service = service("resolve-before-turn");
         enable_turn_completed(&service);
         let mut events = service.subscribe();
-        let (coordinator, _task) = AttentionCoordinator::spawn(service.clone());
+        let (coordinator, _task) = spawn(&service);
 
         coordinator.resolve("turn:s-1".to_owned());
         settle().await;
@@ -564,7 +724,7 @@ mod tests {
     async fn no_resolve_flushes_after_window() {
         let service = service("flush");
         let mut events = service.subscribe();
-        let (coordinator, _task) = AttentionCoordinator::spawn(service.clone());
+        let (coordinator, _task) = spawn(&service);
 
         coordinator.defer(record(&service, provider_params("s-1")));
         settle().await;
@@ -588,7 +748,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn resolve_cancels_pending_and_acks_visible() {
         let service = service("resolve-both");
-        let (coordinator, _task) = AttentionCoordinator::spawn(service.clone());
+        let (coordinator, _task) = spawn(&service);
 
         // A provider hook already surfaced a visible attention record for s-1.
         let visible = service
@@ -622,7 +782,7 @@ mod tests {
     async fn provider_defer_upgrades_pending_projector_record() {
         let service = service("upgrade");
         let mut events = service.subscribe();
-        let (coordinator, _task) = AttentionCoordinator::spawn(service.clone());
+        let (coordinator, _task) = spawn(&service);
 
         coordinator.defer(record(&service, projector_params("s-1")));
         settle().await;
@@ -652,7 +812,7 @@ mod tests {
         policy.attention_debounce_secs = 30;
         service.set_policy(policy).expect("set policy");
         let mut events = service.subscribe();
-        let (coordinator, _task) = AttentionCoordinator::spawn(service.clone());
+        let (coordinator, _task) = spawn(&service);
 
         coordinator.defer(record(&service, provider_params("s-1")));
         settle().await;

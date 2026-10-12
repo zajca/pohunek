@@ -40,6 +40,34 @@ pub use store::NOTIFICATIONS_SUBDIR;
 
 pub(crate) use store::NotificationStore;
 
+/// A session notification prepared for the debounce coordinator.
+///
+/// `inbox` says whether the notification policy keeps the record. `signal` says
+/// whether the record also stands for a session turn event for
+/// `session.wait_turn`, which is recorded regardless of the inbox; only the
+/// projector and admitted provider hook claims for a session the registry holds
+/// set it.
+#[derive(Debug, Clone)]
+pub(crate) struct DeferredNotification {
+    /// Validated record with its id minted.
+    pub(crate) record: NotificationRecord,
+    /// Whether the policy keeps the record in the inbox.
+    pub(crate) inbox: bool,
+    /// Whether the record comes from a producer trusted to report turn events.
+    pub(crate) signal: bool,
+}
+
+impl DeferredNotification {
+    /// The error an immediate create of this record reports, when the policy
+    /// drops it.
+    pub(crate) fn policy_refusal(&self) -> Option<NotificationError> {
+        (!self.inbox).then(|| NotificationError::KindDisabled {
+            provider: self.record.source.provider.clone(),
+            kind: self.record.kind,
+        })
+    }
+}
+
 /// Maximum title length stored for user-controlled notification titles.
 ///
 /// Native notification surfaces and compact inbox rows truncate aggressively, so
@@ -682,17 +710,20 @@ impl NotificationService {
     ///
     /// Mints the id now so the `notification.create` response can return it, but
     /// the caller (the debounce coordinator) holds the record pending and commits
-    /// it later via [`Self::commit_deferred`]. Performs no store I/O.
+    /// it later via [`Self::commit_deferred`]. Performs no store I/O. A kind the
+    /// policy disables is not an error here: the result says the inbox drops it
+    /// (see [`DeferredNotification::policy_refusal`]). The result is not a turn
+    /// signal until the caller marks it as one.
     ///
     /// # Errors
     ///
-    /// Returns a [`NotificationError`] when validation or the policy kind check
-    /// fails, exactly as an immediate create would.
+    /// Returns a [`NotificationError`] when validation fails, exactly as an
+    /// immediate create would.
     pub(crate) fn prepare_deferred(
         &self,
         params: NotificationCreateParams,
-    ) -> Result<NotificationRecord, NotificationError> {
-        self.build_record(params, timestamp_now())
+    ) -> Result<DeferredNotification, NotificationError> {
+        self.prepare_record(params, timestamp_now())
     }
 
     /// Commit a previously prepared deferred record and broadcast its event.
@@ -726,6 +757,24 @@ impl NotificationService {
         params: NotificationCreateParams,
         created_at: String,
     ) -> Result<NotificationRecord, NotificationError> {
+        let prepared = self.prepare_record(params, created_at)?;
+        match prepared.policy_refusal() {
+            Some(refusal) => Err(refusal),
+            None => Ok(prepared.record),
+        }
+    }
+
+    /// Validates and assembles a record, reporting whether the policy keeps it.
+    ///
+    /// Session id and reserved dedupe key validation fail for every record. A
+    /// record the policy drops never reaches the store, so its metadata is
+    /// validated only for a kept record and is otherwise left empty, and the
+    /// caller reports the policy refusal for it.
+    fn prepare_record(
+        &self,
+        params: NotificationCreateParams,
+        created_at: String,
+    ) -> Result<DeferredNotification, NotificationError> {
         let mut params = normalize_params(params);
         validate_session_id(params.session_id.as_ref())?;
         validate_reserved_dedupe_key(
@@ -734,15 +783,14 @@ impl NotificationService {
             params.dedupe_key.as_deref(),
         )?;
         let policy = self.policy();
-        if !policy_enables_kind(&policy, &params.source.provider, params.kind) {
-            return Err(NotificationError::KindDisabled {
-                provider: params.source.provider,
-                kind: params.kind,
-            });
-        }
-        params.metadata = validate_metadata(&params.metadata)?;
+        let inbox = policy_enables_kind(&policy, &params.source.provider, params.kind);
+        params.metadata = if inbox {
+            validate_metadata(&params.metadata)?
+        } else {
+            BTreeMap::new()
+        };
 
-        Ok(NotificationRecord {
+        let record = NotificationRecord {
             id: self.next_id(),
             source: params.source,
             kind: params.kind,
@@ -762,6 +810,11 @@ impl NotificationService {
             archived_at: None,
             deleted_at: None,
             superseded_by: None,
+        };
+        Ok(DeferredNotification {
+            record,
+            inbox,
+            signal: false,
         })
     }
 

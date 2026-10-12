@@ -48,4 +48,12 @@ export type HostCapabilities = {
    * Whether managed sessions support bounded `session.wait` long polls.
    */
   session_wait_supported: boolean;
+  /**
+   * Whether the daemon serves `session.wait_turn` turn-event waits.
+   *
+   * A daemon that predates the method omits the field, which decodes as
+   * `false`; `false` is likewise omitted on the wire, so a protocol 3
+   * snapshot round-trips unchanged.
+   */
+  session_wait_turn_supported?: boolean;
 };

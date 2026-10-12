@@ -267,6 +267,7 @@ fn host_capabilities_for(
         terminal_read_supported: true,
         output_read_supported: true,
         session_wait_supported: true,
+        session_wait_turn_supported: true,
     }
 }
 
