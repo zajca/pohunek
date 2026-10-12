@@ -209,8 +209,11 @@ archive, independently of lint/release jobs. The cost boundary is
 `profile.fast.default-filter`; update it when adding a PTY, DB, Hermes, or other
 costly fixture. The helper takes its exact complement for heavy and verifies
 all discovered tests, including ignored ones, are assigned exactly once. The
-`relay-db` shard needs the real worker binary and disposable PostgreSQL URL
-(`python3 scripts/test-partitions run relay-db`); `cargo t`/`cargo ti` do not.
+`relay-db` shard needs the real worker binary and a disposable PostgreSQL URL in
+`POHUNEK_RELAY_TEST_DATABASE_URL` (`python3 scripts/test-partitions run
+relay-db`); `cargo t`/`cargo ti` do not. Without that URL the relay
+PostgreSQL tests fail locally by design: they are CI-only evidence from the
+`tests (relay DB, PostgreSQL)` job, not regressions.
 `cargo tw` remains unfiltered at four test processes. Archive jobs install only
 `cargo-nextest` (no rust-cache; the heavy job adds a Clippy toolchain and
 `cargo fetch --locked` for `xtask::dependency_policy`) and call
@@ -439,11 +442,40 @@ after a bump), the `rustc` and `cargo-nextest` rows report
 root) as the fix, and the pin row is not compared. That fails the run without
 `--strict`: until the toolchain exists, every `cargo`/`rustc` call in the
 repository fails or downloads it first. It never
-installs anything; run the printed fixes yourself:
+installs anything and never changes host configuration; run the printed fixes
+yourself.
+
+Those rows are the `rust` contribution path, the default. `--path NAME`
+(repeatable) selects others: `sdk` (`bun` at or above the `.bun-version` pin,
+which must agree with `packageManager` in `package.json`, plus a `bun-pin` row
+that, like `rustc-pin`, fails only with `--strict`; the fix is the official
+installer for the pin), `scripts` (`python3`; optional `shellcheck` and, on
+Linux, `dash`, checked by presence only because it has no version flag),
+`macos-lint` (the `aarch64-apple-darwin` rustup target and `zig` for
+`scripts/darwin-check`; `not-applicable` on macOS, which lints natively),
+`relay-db` (`POHUNEK_RELAY_TEST_DATABASE_URL`, reported only as set or
+`unset`, never its value, and removed from the environment of every command
+the script runs) and `native` (on Linux a systemd user manager in `running` or
+`degraded` state, whose row names the per-command `POHUNEK_SYSTEMD_E2E=1`
+opt-in the suites run with; on macOS the launchd `gui/<uid>` domain; a suite
+the host cannot run is `unavailable`, or `ci-only` with the CI job that runs
+it, and never `ok`). A tool shared by two paths is
+reported once, under the first selected path. `--json` prints one document on
+stdout (`schema` `pohunek.dev-bootstrap`, `version` 1, `paths`, `strict`, `os`,
+`rows` with `path`/`name`/`category`/`status`/`version`/`minimum`/`location`/
+`detail`/`fix`, `failing`, `result` `ready`/`not-ready`/`error`); the status
+codes and the `unsupported-path` / `config-error` / `internal-error` error
+codes are stable and listed in the script's docstring; every outcome, an
+unexpected exception included, prints exactly one document. Exit status: 0
+ready, 1 not ready, 2 for an unknown `--path`, a configuration error, or an
+internal error under `--json` (without `--json`, the script's exit-2 messages
+go to stdout).
 
 ```bash
-scripts/dev-bootstrap            # report; non-zero if a required tool fails
-scripts/dev-bootstrap --strict   # optional tools and a pin mismatch fail the run too
+scripts/dev-bootstrap                          # rust path; non-zero if a required tool fails
+scripts/dev-bootstrap --strict                 # optional tools and a pin mismatch fail the run too
+scripts/dev-bootstrap --path rust --path sdk   # several contribution paths
+scripts/dev-bootstrap --json --path native     # machine-readable report on stdout
 ```
 
 Watcher (`bacon.toml` at the repo root; optional tool, no gate depends on it —

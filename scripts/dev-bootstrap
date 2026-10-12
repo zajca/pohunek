@@ -1,51 +1,127 @@
 #!/usr/bin/env python3
-"""Check the local tools the pohunek fast loops depend on (stdlib only).
+"""Check the local tools a pohunek contribution path depends on (stdlib only).
 
 Every tool is looked up on `PATH`, run with its version flag, and compared
 with a minimum version. Each row prints what is missing or too old and the
-exact command that fixes it. The script never installs anything: where a
-tool goes (CARGO_INSTALL_ROOT, `install.root`, a distribution package) is the
-developer's choice, so the fix is printed for them to run.
+exact command that fixes it. The script never installs anything and never
+changes host configuration: where a tool goes (CARGO_INSTALL_ROOT,
+`install.root`, a distribution package) is the developer's choice, so the fix
+is printed for them to run.
+
+Contribution paths (`--path NAME`, repeatable; `rust` when none is given):
+
+* rust -- the Rust fast loops: `rustc` at the workspace MSRV
+  (`[workspace.package] rust-version`), `rustc-pin`, `cargo-nextest` (every
+  `cargo t`/`cargo ta` alias and the test gates run through it) and `python3`
+  (`scripts/test-partitions` and this script import `tomllib`) are required;
+  `bacon` (the watcher over `bacon.toml`), `hyperfine`
+  (`scripts/measure-dev-loop`) and, on Linux only, `mold` (the CI linker, set
+  through CI `RUSTFLAGS` only; `.cargo/config.toml` configures no linker) are
+  optional.
+* sdk -- the TypeScript SDK workspace: `bun` at or above the pin in
+  `.bun-version` (required), which must agree with `packageManager` in the
+  root `package.json`, and a `bun-pin` row for the exact pin CI installs.
+* scripts -- the repository scripts: `python3` (required); on Linux `dash`
+  (optional; CI runs shell scripts under Ubuntu's dash `/bin/sh`, so they
+  must stay POSIX) and `shellcheck` (optional).
+* macos-lint -- `scripts/darwin-check` on a non-macOS host: the rustup target
+  `aarch64-apple-darwin` and `zig` (required). A macOS host lints natively
+  and needs neither, so there both rows are `not-applicable`.
+* relay-db -- the relay PostgreSQL tests: `POHUNEK_RELAY_TEST_DATABASE_URL`
+  (required), reported only as set or unset; its value is never read beyond
+  that and never printed.
+* native -- the real-supervisor E2E suites. On Linux the real-systemd suites
+  need a systemd user manager (the row's detail names the per-command
+  `POHUNEK_SYSTEMD_E2E=1` opt-in they are run with); on macOS the launchd
+  suite needs the `gui/<uid>` domain. The other platform's suites are
+  `ci-only` rows naming the CI job that runs them.
+
+Rows are reported per selected path, in the order the paths are given. A
+tool shared by several paths (`python3` in rust and scripts) is the same
+requirement in each, so it is checked once and reported under the first
+selected path that lists it; row names are unique within a report.
 
 Categories:
 
-* required -- a documented fast loop or gate cannot run without it:
-  `rustc` at the workspace MSRV (`[workspace.package] rust-version`),
-  `cargo-nextest` (every `cargo t`/`cargo ta` alias and the test gates) and
-  `python3` (`scripts/test-partitions` and this script import `tomllib`).
-  A missing or too-old required tool makes the run exit non-zero.
-* optional -- a convenience or measurement tool no gate depends on: `bacon`
-  (the watcher over `bacon.toml`), `hyperfine` (`scripts/measure-dev-loop`)
-  and, on Linux only, `mold` (the CI linker, set through CI `RUSTFLAGS` only;
-  `.cargo/config.toml` configures no linker; macOS jobs link with the
-  default linker). They are reported, and fail the run only under `--strict`.
-* pin -- the active `rustc` (the first on PATH) against the exact `channel`
-  of `rust-toolchain.toml`, the toolchain every CI job installs. Running
-  through the rustup proxies (`$CARGO_HOME/bin` first on PATH) makes rustup
-  select that toolchain. A mismatch is reported with the PATH and
-  `rustup toolchain install` fix, and fails the run only under `--strict`:
-  the workspace builds and tests on any `rustc` at or above the MSRV floor,
-  a mismatch changes only what clippy and rustfmt report (CI enforces those
-  on the pin), and a distribution `rustc` without rustup cannot follow the
-  pin at all. The row is not compared while the `rustc` row itself fails.
+* required -- a documented loop or gate of the path cannot run without it.
+  A failing required row makes the run exit non-zero.
+* optional -- a convenience or measurement tool no gate depends on. It is
+  reported, and fails the run only under `--strict`. An optional tool tied
+  to one OS (`mold`, `dash`) is not listed on other systems.
+* pin -- the active tool against the exact release CI installs: `rustc`
+  against the `channel` of `rust-toolchain.toml` and `bun` against
+  `.bun-version`. Running through the rustup proxies (`$CARGO_HOME/bin`
+  first on PATH) makes rustup select the Rust pin. A mismatch fails the run
+  only under `--strict`: the workspace builds and tests on any `rustc` at or
+  above the MSRV floor, and a mismatch changes only what clippy and rustfmt
+  report (CI enforces those on the pin), and a distribution `rustc` without
+  rustup cannot follow the pin at all; the same holds for a `bun` above its
+  pin. The row is not compared while the row it depends on fails.
+* ci-only -- a check this host cannot run; the row names the CI job whose
+  run is the evidence. It never fails the run and is never `ok`.
+
+Status codes (stable; the `status` of every row in `--json`):
+
+* ok -- present and at or above the minimum, or set, or available.
+* missing -- not found on PATH or in `$CARGO_HOME/bin`; for the rustup
+  target row, the target (or rustup itself) is absent.
+* too-old -- found, but below the minimum (a pre-release of the minimum is
+  older than the minimum).
+* off-path -- a passing copy exists only in `$CARGO_HOME/bin`, or is
+  shadowed by an older copy earlier on PATH.
+* unknown-version -- the tool runs but its version (or query) command failed
+  or printed nothing parseable.
+* no-cargo -- `cargo` is not on PATH, so a cargo subcommand cannot run.
+* pin-mismatch -- the active tool differs from the exact pin.
+* not-compared -- a pin row whose dependency row fails; it never fails.
+* toolchain-not-installed -- a rustup proxy's active toolchain is absent.
+* unset -- a required environment variable is unset or empty.
+* unavailable -- a native facility this host should provide is not usable
+  (no systemd user manager, no launchd `gui/<uid>` domain).
+* ci-only -- see the category above; it never fails.
+* not-applicable -- this OS does not need the row; it never fails.
 
 A rustup proxy whose active toolchain (the pin, unless an override wins) is
-not installed is reported as `toolchain-not-installed` on the `rustc` and
-cargo-subcommand rows, with `rustup toolchain install` in the repository
-root as the fix. It fails the run: until that toolchain exists, every
-`cargo`/`rustc` call in the repository either fails or downloads it first.
+not installed is reported as `toolchain-not-installed` on the `rustc`,
+cargo-subcommand and rustup-target rows, with `rustup toolchain install` in
+the repository root as the fix. It fails the run: until that toolchain
+exists, every `cargo`/`rustc` call in the repository either fails or
+downloads it first.
 
 Version commands run from the repository root, so a rustup proxy resolves
 `rust-toolchain.toml`, and with `RUSTUP_AUTO_INSTALL=0`, so a proxy whose
 pinned toolchain is absent reports it instead of downloading it.
 
-Exit status: 0 when every tool that counts passes, 1 otherwise, 2 on a
-configuration error (an unreadable `.config/nextest.toml`, or a missing or
-malformed `rust-toolchain.toml` channel).
+`--json` prints exactly one JSON document on stdout and nothing else there:
+`schema` (`pohunek.dev-bootstrap`), `version` (1), `paths`, `strict`, `os`
+(`platform.system()`), `rows` (each with `path`, `name`, `category`,
+`status`, `version`, `minimum`, `location`, `detail`, `fix`), `failing` (row
+names), `result` (`ready`, `not-ready` or `error`), and `error` / `message`
+(null unless `result` is `error`). `fix` is null for `ok` and
+`not-applicable` rows; a `ci-only` row's fix names its CI job, and a
+`not-compared` row's fix points at the row it depends on. Error codes:
+`unsupported-path` (an unknown `--path`), `config-error` (a missing or
+malformed repository input, or a Python without `tomllib`) and
+`internal-error` (an unexpected exception; `message` carries only its type,
+never values). Malformed flags keep argparse's own usage error on stderr.
+Without `--json`, the script's own exit-2 messages go to stdout.
+
+`POHUNEK_RELAY_TEST_DATABASE_URL` is removed from the environment of every
+command the script runs, so no child diagnostic quoted into a row can carry
+its value.
+
+Exit status: 0 when every row that counts passes, 1 otherwise, 2 on an
+unsupported `--path`, an internal error under `--json`, or a configuration
+error (Python without `tomllib`, a malformed `Cargo.toml` MSRV, an unreadable
+`.config/nextest.toml`, a missing or malformed `rust-toolchain.toml` channel,
+or for the sdk path a missing, malformed or disagreeing `.bun-version` /
+`package.json` pin). A path's repository inputs are read only when it is
+selected.
 """
 
 import argparse
 import dataclasses
+import json
 import os
 import platform
 from pathlib import Path
@@ -54,21 +130,26 @@ import shlex
 import shutil
 import subprocess
 import sys
+from typing import Optional
 
 try:
     import tomllib
 except ModuleNotFoundError:
-    sys.exit(
-        "dev-bootstrap: Python >= 3.11 is required (tomllib); install a newer "
-        "python3 with your distribution's package manager"
-    )
+    # Reported by `main` as a configuration error, so `--json` still prints
+    # its document.
+    tomllib = None
 
 ROOT = Path(__file__).resolve().parents[1]
 NEXTEST_CONFIG = Path(".config") / "nextest.toml"
 TOOLCHAIN_FILE = Path("rust-toolchain.toml")
+BUN_VERSION_FILE = Path(".bun-version")
+PACKAGE_JSON = Path("package.json")
 # The pin is one exact stable release (`1.99.0`); a floating channel
 # (`stable`, `1.99`) would let CI and local toolchains drift apart.
 PIN_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+# `packageManager` is `bun@X.Y.Z`, optionally followed by the `+<hash>`
+# integrity suffix the field allows.
+PACKAGE_MANAGER_RE = re.compile(r"bun@(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.:-]+)?")
 # rustup proxies install a missing active toolchain unless this is `0`; the
 # check reports the absence instead, because it never installs anything.
 VERSION_ENV = {"RUSTUP_AUTO_INSTALL": "0"}
@@ -76,6 +157,10 @@ VERSION_ENV = {"RUSTUP_AUTO_INSTALL": "0"}
 # `error: toolchain '1.99.0-x86_64-unknown-linux-gnu' is not installed`.
 NOT_INSTALLED_RE = re.compile(r"toolchain '([^'\n]+)' is not installed")
 
+NO_TOMLLIB = (
+    "Python >= 3.11 is required (tomllib); install a newer python3 with your "
+    "distribution's package manager"
+)
 # `scripts/test-partitions` and this script import `tomllib`, added in 3.11.
 PYTHON_MIN_VERSION = (3, 11, 0)
 # bacon 3.13.0 parses the nextest >= 0.9.95 output format; older releases
@@ -88,10 +173,49 @@ HYPERFINE_MIN_VERSION = (1, 9, 0)
 # has been linked with in CI; CI itself pins a newer release (`MOLD_VERSION`
 # in .github/workflows/ci.yml). A local mold is optional and only links.
 MOLD_MIN_VERSION = (2, 30, 0)
+# Marks a cargo-subcommand row's location: Cargo, not a PATH lookup, chose
+# the binary that ran.
+CARGO_RESOLUTION = " (Cargo's resolution)"
 # Longest diagnostic line quoted from a failing version command.
 DETAIL_LIMIT = 200
 # Upper bound for one `--version` call; a tool that hangs longer is broken.
 VERSION_TIMEOUT_SECONDS = 30
+
+# The Apple target `scripts/darwin-check` lints; it names the same target.
+DARWIN_TARGET = "aarch64-apple-darwin"
+# Variable the relay PostgreSQL tests read their disposable database from.
+RELAY_DB_VARIABLE = "POHUNEK_RELAY_TEST_DATABASE_URL"
+# Variables never passed to the commands the script runs: a failing
+# command's diagnostic is quoted into the report, and these hold secrets.
+CHILD_ENV_EXCLUDED = (RELAY_DB_VARIABLE,)
+# The real-systemd suites are `#[ignore]`d and opt in per command.
+SYSTEMD_SUITE_COMMAND = (
+    "POHUNEK_SYSTEMD_E2E=1 cargo test <suite> -- --ignored --test-threads 1"
+)
+# `systemctl --user is-system-running` states the real-systemd CI job
+# accepts: `degraded` only means some unrelated user unit failed.
+SYSTEMD_USABLE_STATES = ("running", "degraded")
+SYSTEMD_SUITES = (
+    "crates/platform/tests/systemd.rs, "
+    "crates/daemon/tests/systemd_durable_worker.rs and "
+    "crates/cli/tests/service_systemd.rs"
+)
+LAUNCHD_SUITE = "crates/platform/tests/launchd.rs"
+# CI jobs (their `name:` in .github/workflows/ci.yml) that run what a host
+# cannot run locally.
+CI_JOB_SYSTEMD = "real systemd supervision"
+CI_JOB_LAUNCHD = "platform contracts (arm64)"
+CI_JOB_RELAY_DB = "tests (relay DB, PostgreSQL)"
+VERIFICATION_DOC = ".agents/instructions/verification.md"
+
+# `--json` contract identity; bump the version on any incompatible change.
+SCHEMA = "pohunek.dev-bootstrap"
+SCHEMA_VERSION = 1
+PATHS = ("rust", "sdk", "scripts", "macos-lint", "relay-db", "native")
+DEFAULT_PATHS = ("rust",)
+ERROR_UNSUPPORTED_PATH = "unsupported-path"
+ERROR_CONFIG = "config-error"
+ERROR_INTERNAL = "internal-error"
 
 # `X.Y[.Z]` plus an optional SemVer pre-release suffix (`-rc.1`).
 VERSION_RE = re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?(-[0-9A-Za-z.-]+)?")
@@ -104,6 +228,24 @@ MANUAL_MOLD = (
     "install mold with your distribution's package manager, e.g. "
     "`sudo apt-get install mold` or `sudo pacman -S mold`"
 )
+MANUAL_DASH = (
+    "install dash with your distribution's package manager, e.g. "
+    "`sudo apt-get install dash` or `sudo pacman -S dash`, and run shell "
+    "scripts with it to catch non-POSIX syntax before CI does"
+)
+MANUAL_SHELLCHECK = (
+    "install ShellCheck with your package manager, e.g. "
+    "`sudo apt-get install shellcheck`, `sudo pacman -S shellcheck` or "
+    "`brew install shellcheck`"
+)
+MANUAL_ZIG = (
+    "install zig with your package manager, e.g. "
+    "`nix profile install nixpkgs#zig` or `sudo pacman -S zig`"
+)
+ADD_DARWIN_TARGET = (
+    f"run `rustup target add {DARWIN_TARGET}` in the repository root (it adds "
+    "the target to the rust-toolchain.toml pin)"
+)
 
 OK = "ok"
 MISSING = "missing"
@@ -114,6 +256,12 @@ NO_CARGO = "no-cargo"
 PIN_MISMATCH = "pin-mismatch"
 NOT_COMPARED = "not-compared"
 TOOLCHAIN_NOT_INSTALLED = "toolchain-not-installed"
+UNSET = "unset"
+UNAVAILABLE = "unavailable"
+CI_ONLY = "ci-only"
+NOT_APPLICABLE = "not-applicable"
+# Statuses that report without ever failing the run.
+NEVER_FAILS = (OK, NOT_COMPARED, CI_ONLY, NOT_APPLICABLE)
 INSTALL_ACTIVE_TOOLCHAIN = (
     "run `rustup toolchain install` in the repository root (it installs the "
     "active toolchain: the rust-toolchain.toml pin unless RUSTUP_TOOLCHAIN or "
@@ -141,11 +289,12 @@ class ConfigError(Exception):
 
 @dataclasses.dataclass(frozen=True)
 class Tool:
-    """One tool the check looks for."""
+    """One row the check reports: a tool, a pin, or a host prerequisite."""
 
     name: str
     version_args: tuple
-    min_version: tuple
+    # None: presence (or the probe) decides; no version is compared.
+    min_version: Optional[tuple]
     required: bool
     # Printed install command, or None when only a manual step fixes it.
     install: tuple = None
@@ -154,9 +303,40 @@ class Tool:
     # `$CARGO_HOME/bin/cargo-<sub>` over `PATH`, so only Cargo itself reports
     # the copy that `cargo t` runs.
     cargo_subcommand: bool = False
-    # The `rust-toolchain.toml` row: `min_version` is the exact pin, compared
-    # with the `rustc` row's result instead of running a command of its own.
+    # A pin row: `min_version` is the exact pin, compared with the result of
+    # the `pin_of` row instead of running a command of its own. Its fix is
+    # `manual`, or for the rustc pin the PATH- and rustup-aware `pin_fix`.
     pin: bool = False
+    pin_of: str = None
+    pin_source: str = None
+    # The output line carrying the version starts with this prefix; None
+    # reads the first non-empty line.
+    version_line: str = None
+    # Checks a row that is not a versioned binary: `probe(tool, host)`.
+    probe: object = None
+    # The CI job whose run is the evidence for a row this host cannot run.
+    ci_job: str = None
+    # Fixed explanation reported with a `ci-only` or `not-applicable` row.
+    note: str = None
+
+    @property
+    def category(self):
+        """`required`, `optional`, `pin` or `ci-only`."""
+        if self.pin:
+            return "pin"
+        if self.ci_job is not None:
+            return "ci-only"
+        return "required" if self.required else "optional"
+
+
+@dataclasses.dataclass(frozen=True)
+class Host:
+    """What the checks query: PATH lookup, command runner, environment."""
+
+    which: object
+    runner: object
+    environ: object
+    cargo_bin: Path
 
 
 @dataclasses.dataclass(frozen=True)
@@ -170,8 +350,10 @@ class Result:
     detail: str = None
     # The first copy on PATH, if any; it decides whether a fix must reorder PATH.
     on_path: str = None
-    # The version carried a `-pre` suffix (`1.99.0-beta.3`, `1.99.0-nightly`).
-    prerelease: bool = False
+    # The `-pre` suffix of the version (`-beta.3`, `-nightly`), or None.
+    prerelease: str = None
+    # A fix computed for this row; it wins over the tool's install/manual fix.
+    fix: str = None
 
     def counts(self, strict):
         """Whether this row decides the exit status."""
@@ -180,10 +362,11 @@ class Result:
     def failed(self, strict):
         """Whether this row fails the run.
 
-        A pin row that was not compared never fails: the `rustc` row it
-        depends on already reports, and counts for, the underlying problem.
+        A pin row that was not compared never fails: the row it depends on
+        already reports, and counts for, the underlying problem. `ci-only`
+        and `not-applicable` rows have nothing this host can fix.
         """
-        return self.status not in (OK, NOT_COMPARED) and self.counts(strict)
+        return self.status not in NEVER_FAILS and self.counts(strict)
 
 
 def format_version(version):
@@ -191,35 +374,42 @@ def format_version(version):
     return ".".join(str(part) for part in version)
 
 
-def parse_version(text):
-    """The first `X.Y[.Z]` of the first non-empty output line, or None.
+def version_match(text, line_prefix=None):
+    """The version match on the line that carries the version, or None.
 
     Tools print their name first (`cargo-nextest 0.9.145 (00af4550e
     2026-09-16)`, `mold 2.42.1 (hash; compatible with GNU ld)`), so the first
-    dotted number of that line is the release; later hashes and dates are
-    ignored.
+    dotted number of the first non-empty line is the release; later hashes
+    and dates are ignored. A tool that prints a banner first (`shellcheck`:
+    `version: 0.10.0` on its second line) names its line by `line_prefix`.
     """
     for line in text.splitlines():
-        if line.strip():
-            match = VERSION_RE.search(line)
-            if match is None:
-                return None
-            return tuple(int(part or 0) for part in match.groups()[:3])
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if line_prefix is not None and not stripped.startswith(line_prefix):
+            continue
+        return VERSION_RE.search(stripped)
     return None
 
 
-def is_prerelease(text):
-    """Whether the version `parse_version` reads from `text` has a `-pre` suffix."""
-    for line in text.splitlines():
-        if line.strip():
-            match = VERSION_RE.search(line)
-            return match is not None and match.group(4) is not None
-    return False
+def parse_version(text, line_prefix=None):
+    """The `X.Y[.Z]` that `version_match` finds, as a tuple, or None."""
+    match = version_match(text, line_prefix)
+    if match is None:
+        return None
+    return tuple(int(part or 0) for part in match.groups()[:3])
+
+
+def prerelease_suffix(text, line_prefix=None):
+    """The `-pre` suffix of the version `parse_version` reads, or None."""
+    match = version_match(text, line_prefix)
+    return match.group(4) if match is not None else None
 
 
 def below_minimum(version, prerelease, minimum):
     """SemVer order: a pre-release of the minimum is older than the minimum."""
-    return version < minimum or (version == minimum and prerelease)
+    return version < minimum or (version == minimum and bool(prerelease))
 
 
 def rust_min_version(root):
@@ -230,7 +420,9 @@ def rust_min_version(root):
             manifest = tomllib.load(handle)
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise ConfigError(f"cannot read {path}: {error}") from error
-    declared = manifest.get("workspace", {}).get("package", {}).get("rust-version")
+    workspace = manifest.get("workspace")
+    package = workspace.get("package") if isinstance(workspace, dict) else None
+    declared = package.get("rust-version") if isinstance(package, dict) else None
     version = parse_version(declared) if isinstance(declared, str) else None
     if version is None:
         raise ConfigError(f"{path} declares no [workspace.package] rust-version")
@@ -281,8 +473,66 @@ def nextest_min_version(root):
     return version
 
 
-def tools(root, system):
-    """Every tool checked on `system` (a `platform.system()` value), required first."""
+def bun_pin(root):
+    """The exact bun release `.bun-version` pins, checked against `package.json`.
+
+    CI installs the same release (setup-bun `bun-version`) and package
+    managers read `packageManager`; two different pins are a configuration
+    error.
+    """
+    version_path = Path(root) / BUN_VERSION_FILE
+    try:
+        declared = version_path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError) as error:
+        raise ConfigError(f"cannot read {version_path}: {error}") from error
+    match = PIN_RE.fullmatch(declared)
+    if match is None:
+        raise ConfigError(
+            f"{version_path}: {declared!r} is not an exact X.Y.Z bun release"
+        )
+    pin = tuple(int(part) for part in match.groups())
+    package_path = Path(root) / PACKAGE_JSON
+    try:
+        with package_path.open("rb") as handle:
+            package = json.load(handle)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ConfigError(f"cannot read {package_path}: {error}") from error
+    manager = package.get("packageManager") if isinstance(package, dict) else None
+    manager_match = (
+        PACKAGE_MANAGER_RE.fullmatch(manager) if isinstance(manager, str) else None
+    )
+    if manager_match is None:
+        raise ConfigError(
+            f"{package_path}: packageManager {manager!r} is not bun@X.Y.Z"
+        )
+    manager_pin = tuple(int(part) for part in manager_match.groups())
+    if manager_pin != pin:
+        raise ConfigError(
+            f"{version_path} pins bun {format_version(pin)} but {package_path} "
+            f"packageManager pins bun@{format_version(manager_pin)}; make them agree"
+        )
+    return pin
+
+
+def bun_installer(pin):
+    """The official installer command for exactly `pin` (printed, never run)."""
+    tag = shlex.quote(f"bun-v{format_version(pin)}")
+    return f"curl -fsSL https://bun.com/install | bash -s {tag}"
+
+
+def python_tool():
+    """The `python3` row; rust and scripts list the same requirement."""
+    return Tool(
+        name="python3",
+        version_args=("--version",),
+        min_version=PYTHON_MIN_VERSION,
+        required=True,
+        manual=MANUAL_PYTHON,
+    )
+
+
+def rust_tools(root, system):
+    """The rust path: the Rust fast loops, required first."""
     checked = [
         Tool(
             name="rustc",
@@ -297,6 +547,8 @@ def tools(root, system):
             min_version=rust_toolchain_pin(root),
             required=False,
             pin=True,
+            pin_of="rustc",
+            pin_source=str(TOOLCHAIN_FILE),
         ),
         Tool(
             name="cargo-nextest",
@@ -306,13 +558,7 @@ def tools(root, system):
             install=("cargo", "install", "--locked", "cargo-nextest"),
             cargo_subcommand=True,
         ),
-        Tool(
-            name="python3",
-            version_args=("--version",),
-            min_version=PYTHON_MIN_VERSION,
-            required=True,
-            manual=MANUAL_PYTHON,
-        ),
+        python_tool(),
         Tool(
             name="bacon",
             version_args=("--version",),
@@ -339,6 +585,206 @@ def tools(root, system):
     return [tool for tool in checked if tool.name != "mold" or system == "Linux"]
 
 
+def sdk_tools(root, system):
+    """The sdk path: bun at or above the pin, and the exact-pin row."""
+    pin = bun_pin(root)
+    installer = bun_installer(pin)
+    return [
+        Tool(
+            name="bun",
+            version_args=("--version",),
+            min_version=pin,
+            required=True,
+            manual=(
+                f"install the pinned bun with the official installer: "
+                f"`{installer}`; `bun upgrade` also lifts an older bun, to the "
+                "latest release rather than the pin"
+            ),
+        ),
+        Tool(
+            name="bun-pin",
+            version_args=(),
+            min_version=pin,
+            required=False,
+            pin=True,
+            pin_of="bun",
+            pin_source=str(BUN_VERSION_FILE),
+            manual=(
+                f"install exactly the pin with the official installer: "
+                f"`{installer}` (`bun upgrade` cannot select a release), and put "
+                "its directory ($BUN_INSTALL/bin, by default ~/.bun/bin) first "
+                "on PATH"
+            ),
+        ),
+    ]
+
+
+def scripts_tools(root, system):
+    """The scripts path: python3, plus the POSIX-shell helpers."""
+    checked = [
+        python_tool(),
+        # dash has no version flag (`dash --version` is an illegal option and
+        # an interactive dash waits for input), so it is never run: being on
+        # PATH is the whole check, and the row reports no version.
+        Tool(
+            name="dash",
+            version_args=(),
+            min_version=None,
+            required=False,
+            manual=MANUAL_DASH,
+        ),
+        # No repository file states a ShellCheck minimum; the version is
+        # reported, and any release passes.
+        Tool(
+            name="shellcheck",
+            version_args=("--version",),
+            min_version=None,
+            required=False,
+            manual=MANUAL_SHELLCHECK,
+            version_line="version:",
+        ),
+    ]
+    # Ubuntu's /bin/sh is dash, which is what CI runs shell scripts under.
+    return [tool for tool in checked if tool.name != "dash" or system == "Linux"]
+
+
+def macos_lint_tools(root, system):
+    """The macos-lint path: what `scripts/darwin-check` needs on this host."""
+    if system == "Darwin":
+        note = (
+            "a macOS host lints its own code with native clippy; "
+            "scripts/darwin-check needs neither the cross target nor zig here"
+        )
+        return [
+            Tool(name=DARWIN_TARGET, version_args=(), min_version=None,
+                 required=True, probe=check_not_applicable, note=note),
+            Tool(name="zig", version_args=(), min_version=None,
+                 required=True, probe=check_not_applicable, note=note),
+        ]
+    return [
+        Tool(
+            name=DARWIN_TARGET,
+            version_args=(),
+            min_version=None,
+            required=True,
+            manual=ADD_DARWIN_TARGET,
+            probe=check_rustup_target,
+        ),
+        # scripts/darwin-check states no zig minimum; `zig version` is the
+        # version command (zig has no `--version` flag).
+        Tool(
+            name="zig",
+            version_args=("version",),
+            min_version=None,
+            required=True,
+            manual=MANUAL_ZIG,
+        ),
+    ]
+
+
+def relay_db_tools(root, system):
+    """The relay-db path: the disposable PostgreSQL database variable."""
+    return [
+        Tool(
+            name=RELAY_DB_VARIABLE,
+            version_args=(),
+            min_version=None,
+            required=True,
+            probe=check_variable_set,
+            manual=(
+                f"export {RELAY_DB_VARIABLE} pointing at a disposable PostgreSQL "
+                "database, then run `python3 scripts/test-partitions run relay-db` "
+                f"(see the `relay-db` shard in {VERIFICATION_DOC}); "
+                "without it the relay PostgreSQL tests are CI-only evidence "
+                f"(CI job `{CI_JOB_RELAY_DB}`)"
+            ),
+        ),
+    ]
+
+
+def native_tools(root, system):
+    """The native path: the real-supervisor suites this host can run."""
+    systemd_ci = Tool(
+        name="systemd-suites",
+        version_args=(),
+        min_version=None,
+        required=False,
+        probe=check_ci_only,
+        ci_job=CI_JOB_SYSTEMD,
+        note=f"the real-systemd suites ({SYSTEMD_SUITES}) run only on Linux",
+    )
+    launchd_ci = Tool(
+        name="launchd-suite",
+        version_args=(),
+        min_version=None,
+        required=False,
+        probe=check_ci_only,
+        ci_job=CI_JOB_LAUNCHD,
+        note=f"the launchd suite ({LAUNCHD_SUITE}) runs only on macOS",
+    )
+    if system == "Linux":
+        return [
+            Tool(
+                name="systemd-user-manager",
+                version_args=(),
+                min_version=None,
+                required=True,
+                probe=check_systemd_user_manager,
+                manual=(
+                    "run the suites inside a login session with a systemd user "
+                    "manager (`systemctl --user is-system-running` must report "
+                    f"{' or '.join(SYSTEMD_USABLE_STATES)}); otherwise they are "
+                    f"CI-only evidence (CI job `{CI_JOB_SYSTEMD}`)"
+                ),
+            ),
+            launchd_ci,
+        ]
+    if system == "Darwin":
+        return [
+            Tool(
+                name="launchd-gui-domain",
+                version_args=(),
+                min_version=None,
+                required=True,
+                probe=check_launchd_domain,
+                manual=(
+                    "run the suite from the logged-in GUI session (an SSH-only "
+                    "session has no gui/<uid> launchd domain); otherwise it is "
+                    f"CI-only evidence (CI job `{CI_JOB_LAUNCHD}`)"
+                ),
+            ),
+            systemd_ci,
+        ]
+    return [systemd_ci, launchd_ci]
+
+
+PATH_TOOLS = {
+    "rust": rust_tools,
+    "sdk": sdk_tools,
+    "scripts": scripts_tools,
+    "macos-lint": macos_lint_tools,
+    "relay-db": relay_db_tools,
+    "native": native_tools,
+}
+
+
+def tools(root, system, paths=DEFAULT_PATHS):
+    """`(path, tool)` for every row of the selected paths, in path order.
+
+    A tool listed by an earlier selected path is not repeated: the same name
+    is the same requirement in every path that lists it.
+    """
+    rows = []
+    seen = set()
+    for path in paths:
+        for tool in PATH_TOOLS[path](root, system):
+            if tool.name in seen:
+                continue
+            seen.add(tool.name)
+            rows.append((path, tool))
+    return rows
+
+
 def cargo_bin_dir(environ):
     """`$CARGO_HOME/bin`, with cargo's own `~/.cargo` default for CARGO_HOME."""
     cargo_home = environ.get("CARGO_HOME")
@@ -347,16 +793,28 @@ def cargo_bin_dir(environ):
     return Path.home() / ".cargo" / "bin"
 
 
+def child_env(environ):
+    """The environment of every command the script runs."""
+    kept = {
+        name: value for name, value in environ.items()
+        if name not in CHILD_ENV_EXCLUDED
+    }
+    return {**kept, **VERSION_ENV}
+
+
 def run_version(argv, cwd, environ):
     """Output of one `--version` call in `cwd`; raises when the tool cannot run."""
     completed = subprocess.run(
         argv,
         capture_output=True,
         text=True,
+        # Tool output is quoted, never interpreted; undecodable bytes must
+        # not abort the report.
+        errors="replace",
         check=True,
         timeout=VERSION_TIMEOUT_SECONDS,
         cwd=cwd,
-        env={**environ, **VERSION_ENV},
+        env=child_env(environ),
     )
     return completed.stdout if completed.stdout.strip() else completed.stderr
 
@@ -368,6 +826,10 @@ def check_tool(tool, which, runner, cargo_bin):
     off PATH or shadowed on PATH is reported as a PATH problem only when it
     passes the minimum, otherwise the row keeps its install fix.
     """
+    if not tool.version_args:
+        # A presence-only tool: being on PATH is the whole check.
+        path = which(tool.name)
+        return Result(tool, OK, path=path) if path else Result(tool, MISSING)
     if tool.cargo_subcommand:
         # Cargo runs the subcommand, so it must exist first.
         cargo = which("cargo")
@@ -378,7 +840,7 @@ def check_tool(tool, which, runner, cargo_bin):
         subcommand = tool.name.removeprefix("cargo-")
         argv = [cargo, subcommand, *tool.version_args]
         result = version_result(
-            tool, argv, f"{shlex.join(argv[:2])} (Cargo's resolution)", runner
+            tool, argv, f"{shlex.join(argv[:2])}{CARGO_RESOLUTION}", runner
         )
         home = which(tool.name, path=str(cargo_bin))
         # Only a copy Cargo reports as too old can be a shadowing problem; any
@@ -456,31 +918,131 @@ def version_result(tool, argv, path, runner):
         if toolchain is not None:
             return Result(tool, TOOLCHAIN_NOT_INSTALLED, path=path, detail=toolchain)
         return Result(tool, UNKNOWN_VERSION, path=path, detail=failure_detail(error))
-    version = parse_version(output)
+    version = parse_version(output, tool.version_line)
     if version is None:
         first = output.strip().splitlines()[0] if output.strip() else ""
         return Result(
             tool, UNKNOWN_VERSION, path=path,
             detail=f"unparseable version output {first!r}",
         )
-    prerelease = is_prerelease(output)
-    if below_minimum(version, prerelease, tool.min_version):
+    prerelease = prerelease_suffix(output, tool.version_line)
+    if tool.min_version is not None and below_minimum(
+        version, prerelease, tool.min_version
+    ):
         return Result(tool, TOO_OLD, version=version, path=path, prerelease=prerelease)
     return Result(tool, OK, version=version, path=path, prerelease=prerelease)
 
 
-def check_pin(tool, rustc):
-    """Compare the active `rustc` (the `rustc` row's result) with the pin.
-
-    Only a passing `rustc` row is the copy first on PATH with a known
-    version, so any other row leaves the pin uncompared.
-    """
-    if rustc.status != OK:
-        return Result(tool, NOT_COMPARED)
-    status = OK if rustc.version == tool.min_version and not rustc.prerelease else PIN_MISMATCH
+def check_rustup_target(tool, host):
+    """Whether rustup lists the target as installed for the active toolchain."""
+    rustup = host.which("rustup")
+    if rustup is None:
+        return Result(
+            tool, MISSING, detail="rustup is not on PATH",
+            fix=f"{MANUAL_RUSTUP}; then {ADD_DARWIN_TARGET}",
+        )
+    try:
+        output = host.runner([rustup, "target", "list", "--installed"])
+    except (OSError, subprocess.SubprocessError) as error:
+        toolchain = missing_toolchain(error)
+        if toolchain is not None:
+            return Result(tool, TOOLCHAIN_NOT_INSTALLED, path=rustup, detail=toolchain)
+        return Result(
+            tool, UNKNOWN_VERSION, path=rustup, detail=failure_detail(error),
+            fix=(
+                "resolve the error above: `rustup target list --installed` "
+                "must succeed in the repository root"
+            ),
+        )
+    installed = {line.strip() for line in output.splitlines()}
+    if tool.name in installed:
+        return Result(tool, OK, path=rustup, detail="installed")
     return Result(
-        tool, status, version=rustc.version, path=rustc.path,
-        prerelease=rustc.prerelease,
+        tool, MISSING, path=rustup,
+        detail="rustup lists the target as not installed",
+    )
+
+
+def check_variable_set(tool, host):
+    """Set or unset only: the value is never read beyond being non-empty."""
+    if host.environ.get(tool.name):
+        return Result(tool, OK, detail="set")
+    return Result(tool, UNSET)
+
+
+def check_systemd_user_manager(tool, host):
+    """Whether a systemd user manager answers, without waiting for boot."""
+    systemctl = host.which("systemctl")
+    if systemctl is None:
+        return Result(tool, UNAVAILABLE, detail="systemctl is not on PATH")
+    argv = [systemctl, "--user", "is-system-running"]
+    try:
+        output = host.runner(argv)
+    except subprocess.CalledProcessError as error:
+        # Any state but `running` exits non-zero; the state is still printed.
+        output = error.stdout or ""
+        if not output.strip():
+            return Result(
+                tool, UNAVAILABLE, path=systemctl, detail=failure_detail(error)
+            )
+    except (OSError, subprocess.SubprocessError) as error:
+        return Result(tool, UNAVAILABLE, path=systemctl, detail=failure_detail(error))
+    state = output.strip().splitlines()[0].strip() if output.strip() else ""
+    if state in SYSTEMD_USABLE_STATES:
+        return Result(
+            tool, OK, path=systemctl,
+            detail=(
+                f"user manager {state}; run the suites as `{SYSTEMD_SUITE_COMMAND}` "
+                f"(see {VERIFICATION_DOC})"
+            ),
+        )
+    return Result(
+        tool, UNAVAILABLE, path=systemctl,
+        detail=f"`systemctl --user is-system-running` reports {state[:DETAIL_LIMIT]!r}",
+    )
+
+
+def check_launchd_domain(tool, host):
+    """Whether this session's `gui/<uid>` launchd domain exists."""
+    launchctl = host.which("launchctl")
+    if launchctl is None:
+        return Result(tool, UNAVAILABLE, detail="launchctl is not on PATH")
+    domain = f"gui/{os.getuid()}"
+    try:
+        host.runner([launchctl, "print", domain])
+    except (OSError, subprocess.SubprocessError) as error:
+        return Result(
+            tool, UNAVAILABLE, path=launchctl,
+            detail=f"no {domain} domain: {failure_detail(error)}",
+        )
+    return Result(tool, OK, path=launchctl, detail=domain)
+
+
+def check_ci_only(tool, host):
+    """A suite this host cannot run; its CI job is the evidence."""
+    return Result(
+        tool, CI_ONLY, detail=tool.note,
+        fix=f"no local run on this host; the CI job `{tool.ci_job}` is the evidence",
+    )
+
+
+def check_not_applicable(tool, host):
+    """A row this OS does not need."""
+    return Result(tool, NOT_APPLICABLE, detail=tool.note)
+
+
+def check_pin(tool, active):
+    """Compare the active tool (the `pin_of` row's result) with the pin.
+
+    Only a passing row is the copy first on PATH with a known version, so
+    any other row leaves the pin uncompared.
+    """
+    if active.status != OK:
+        return Result(tool, NOT_COMPARED)
+    status = OK if active.version == tool.min_version and not active.prerelease else PIN_MISMATCH
+    return Result(
+        tool, status, version=active.version, path=active.path,
+        prerelease=active.prerelease,
     )
 
 
@@ -511,21 +1073,27 @@ def pin_fix(active, which, cargo_bin, environ):
     return f"{active} is not the rustup proxy; {reorder}; then {install}"
 
 
-def check_all(tool_list, which, runner, cargo_bin, environ):
-    """One result per tool, in tool order; the pin row follows its `rustc` row."""
+def check_all(rows, host):
+    """`(path, result)` per row, in row order; a pin row follows its tool's row."""
     results = []
-    for tool in tool_list:
+    for path, tool in rows:
         if tool.pin:
-            rustc = next(result for result in results if result.tool.name == "rustc")
-            pin = dataclasses.replace(check_pin(tool, rustc), on_path=rustc.on_path)
+            active = next(
+                result for _, result in results if result.tool.name == tool.pin_of
+            )
+            pin = dataclasses.replace(check_pin(tool, active), on_path=active.on_path)
             if pin.status == PIN_MISMATCH:
-                pin = dataclasses.replace(
-                    pin, detail=pin_fix(pin.path, which, cargo_bin, environ)
+                fix = tool.manual or pin_fix(
+                    pin.path, host.which, host.cargo_bin, host.environ
                 )
-            results.append(pin)
+                pin = dataclasses.replace(pin, fix=fix)
+            results.append((path, pin))
             continue
-        result = check_tool(tool, which, runner, cargo_bin)
-        results.append(dataclasses.replace(result, on_path=which(tool.name)))
+        if tool.probe is not None:
+            results.append((path, tool.probe(tool, host)))
+            continue
+        result = check_tool(tool, host.which, host.runner, host.cargo_bin)
+        results.append((path, dataclasses.replace(result, on_path=host.which(tool.name))))
     return results
 
 
@@ -536,10 +1104,10 @@ def path_fix(cargo_bin):
 
 def fix_hint(result, cargo_bin):
     """The exact command or manual step that fixes one failing row."""
+    if result.fix is not None:
+        return result.fix
     if result.status == NO_CARGO:
         return MANUAL_CARGO
-    if result.status == PIN_MISMATCH:
-        return result.detail
     if result.status == TOOLCHAIN_NOT_INSTALLED:
         return INSTALL_ACTIVE_TOOLCHAIN
     if result.status == OFF_PATH:
@@ -557,6 +1125,17 @@ def fix_hint(result, cargo_bin):
     if result.tool.install is not None:
         return install_fix(result, cargo_bin)
     return result.tool.manual
+
+
+def row_fix(result, cargo_bin):
+    """The `fix` of one `--json` row: null when there is nothing to fix."""
+    if result.status in (OK, NOT_APPLICABLE):
+        return None
+    if result.status == NOT_COMPARED:
+        return (
+            f"fix the {result.tool.pin_of} row; the pin is compared once it passes"
+        )
+    return fix_hint(result, cargo_bin)
 
 
 def install_fix(result, cargo_bin):
@@ -578,21 +1157,58 @@ def install_fix(result, cargo_bin):
     return fix
 
 
+def json_location(result):
+    """`location` and `detail` of one `--json` row.
+
+    `location` is a filesystem path or null. A cargo subcommand run through
+    Cargo has no single path (Cargo picks the binary), so its location is
+    null and the detail names the command that ran.
+    """
+    if result.path is not None and result.path.endswith(CARGO_RESOLUTION):
+        command = result.path.removesuffix(CARGO_RESOLUTION)
+        return None, result.detail or f"run through `{command}`; Cargo resolves the binary"
+    return result.path, result.detail
+
+
+def version_text(result):
+    """The reported version including any pre-release suffix, or None."""
+    if result.version is None:
+        return None
+    return format_version(result.version) + (result.prerelease or "")
+
+
 def describe(result, strict, cargo_bin):
     """One report line."""
     tool = result.tool
     if tool.pin:
-        return describe_pin(result, strict)
-    kind = "required" if tool.required else "optional"
-    minimum = format_version(tool.min_version)
+        return describe_pin(result, strict, cargo_bin)
+    kind = tool.category
+    minimum = format_version(tool.min_version) if tool.min_version else None
     if result.status == OK:
+        if result.version is not None and minimum is not None:
+            what = f"{tool.name} {format_version(result.version)} >= {minimum}"
+        elif result.version is not None:
+            what = f"{tool.name} {format_version(result.version)}"
+        elif result.detail is not None:
+            what = f"{tool.name}: {result.detail}"
+        else:
+            what = f"{tool.name} at {result.path}"
+        return f"  ok       {what} ({kind})"
+    if result.status == CI_ONLY:
         return (
-            f"  ok       {tool.name} {format_version(result.version)} "
-            f">= {minimum} ({kind})"
+            f"  ci-only  {tool.name}: {result.detail} ({kind})\n"
+            f"           ci: {fix_hint(result, cargo_bin)}"
         )
+    if result.status == NOT_APPLICABLE:
+        return f"  n/a      {tool.name}: not needed on this OS: {result.detail} ({kind})"
     label = "FAIL" if result.failed(strict) else "warn"
     if result.status == MISSING:
-        what = f"{tool.name} is missing (needs >= {minimum})"
+        if minimum is not None:
+            what = f"{tool.name} is missing (needs >= {minimum})"
+        elif result.detail is not None:
+            what = f"{tool.name} is missing: {result.detail}"
+        else:
+            what = f"{tool.name} is missing"
     elif result.status == TOO_OLD:
         what = (
             f"{tool.name} {format_version(result.version)} is older than "
@@ -610,6 +1226,10 @@ def describe(result, strict, cargo_bin):
             f"{tool.name} {format_version(result.version)} is {result.detail}"
             if result.detail else f"{tool.name} is not on PATH"
         )
+    elif result.status == UNSET:
+        what = f"{tool.name} is unset" + (f" ({result.detail})" if result.detail else "")
+    elif result.status == UNAVAILABLE:
+        what = f"{tool.name} is unavailable: {result.detail}"
     else:
         what = f"{tool.name} version unknown: {result.detail}"
     return (
@@ -618,36 +1238,89 @@ def describe(result, strict, cargo_bin):
     )
 
 
-def describe_pin(result, strict):
-    """One report line for the `rust-toolchain.toml` pin row."""
-    pin = format_version(result.tool.min_version)
+def describe_pin(result, strict, cargo_bin):
+    """One report line for a pin row."""
+    tool = result.tool
+    pin = format_version(tool.min_version)
     if result.status == OK:
-        return f"  ok       rustc {pin} matches the {TOOLCHAIN_FILE} pin (pin)"
+        return f"  ok       {tool.pin_of} {pin} matches the {tool.pin_source} pin (pin)"
     if result.status == NOT_COMPARED:
         return (
-            f"  n/a      {TOOLCHAIN_FILE} pin {pin} not compared: the rustc "
-            "row above fails (pin)"
+            f"  n/a      {tool.pin_source} pin {pin} not compared: the "
+            f"{tool.pin_of} row above fails (pin)"
         )
     label = "FAIL" if result.failed(strict) else "warn"
     active = format_version(result.version) + (" (pre-release)" if result.prerelease else "")
     return (
-        f"  {label:<8} rustc {active} at {result.path} differs from the "
-        f"{TOOLCHAIN_FILE} pin {pin} (pin)\n"
-        f"           fix: {result.detail}"
+        f"  {label:<8} {tool.pin_of} {active} at {result.path} differs from the "
+        f"{tool.pin_source} pin {pin} (pin)\n"
+        f"           fix: {fix_hint(result, cargo_bin)}"
     )
 
 
-def report(results, strict, cargo_bin, out):
-    """Print every row and return whether the run passes."""
-    for result in results:
+def report(results, strict, cargo_bin, out, headings):
+    """Print every row, under a heading per path when asked; whether the run passes."""
+    current = None
+    for path, result in results:
+        if headings and path != current:
+            print(f"path {path}:", file=out)
+            current = path
         print(describe(result, strict, cargo_bin), file=out)
-    failing = [result for result in results if result.failed(strict)]
+    failing = failing_names(results, strict)
     if failing:
-        names = ", ".join(result.tool.name for result in failing)
-        print(f"dev-bootstrap: failing: {names}", file=out)
+        print(f"dev-bootstrap: failing: {', '.join(failing)}", file=out)
         return False
     print("dev-bootstrap: all checked tools that count are ready", file=out)
     return True
+
+
+def failing_names(results, strict):
+    """Names of the rows that fail the run, in row order."""
+    return [result.tool.name for _, result in results if result.failed(strict)]
+
+
+def document(paths, strict, system, results=(), cargo_bin=None, error=None, message=None):
+    """The `--json` document; every key is present in every result."""
+    failing = failing_names(results, strict)
+    if error is not None:
+        outcome = "error"
+    elif failing:
+        outcome = "not-ready"
+    else:
+        outcome = "ready"
+    rows = []
+    for path, result in results:
+        tool = result.tool
+        location, detail = json_location(result)
+        rows.append({
+            "path": path,
+            "name": tool.name,
+            "category": tool.category,
+            "status": result.status,
+            "version": version_text(result),
+            "minimum": format_version(tool.min_version) if tool.min_version else None,
+            "location": location,
+            "detail": detail,
+            "fix": row_fix(result, cargo_bin),
+        })
+    return {
+        "schema": SCHEMA,
+        "version": SCHEMA_VERSION,
+        "paths": list(paths),
+        "strict": strict,
+        "os": system,
+        "rows": rows,
+        "failing": failing,
+        "result": outcome,
+        "error": error,
+        "message": message,
+    }
+
+
+def emit(doc, out):
+    """Print the one `--json` document."""
+    json.dump(doc, out, indent=2)
+    print(file=out)
 
 
 def parse_args(argv):
@@ -655,16 +1328,39 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(
         prog="dev-bootstrap",
         description=(
-            "Check the local tools the pohunek fast loops depend on and print "
-            "the exact install command for anything missing or too old."
+            "Check the local tools a pohunek contribution path depends on and "
+            "print the exact fix for anything missing or too old."
         ),
     )
     parser.add_argument(
         "--strict",
         action="store_true",
-        help="fail on optional tools and a rust-toolchain.toml pin mismatch as well",
+        help="fail on optional tools and a pin mismatch as well",
+    )
+    # Validated by `selected_paths`, so an unknown name can still produce
+    # the `--json` error document.
+    parser.add_argument(
+        "--path",
+        action="append",
+        metavar="NAME",
+        help=(
+            "contribution path to check; repeatable; one of "
+            f"{', '.join(PATHS)} (default: {', '.join(DEFAULT_PATHS)})"
+        ),
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="print one versioned JSON document on stdout instead of the report",
     )
     return parser.parse_args(argv)
+
+
+def selected_paths(requested):
+    """The requested paths in order without repeats, and the unknown names."""
+    names = list(dict.fromkeys(requested or DEFAULT_PATHS))
+    unknown = [name for name in names if name not in PATHS]
+    return names, unknown
 
 
 def main(
@@ -674,24 +1370,72 @@ def main(
     root=ROOT,
     environ=os.environ,
     out=sys.stdout,
+    err=sys.stderr,
     system=platform.system(),
 ):
-    """Check every tool and print the fixes; the process exit status."""
+    """Check every row of the selected paths and print the fixes; the exit status.
+
+    Under `--json`, stdout must hold one document whatever happens, so an
+    unexpected exception becomes an `internal-error` document that names
+    only the exception type (its message could quote host values).
+    """
     args = parse_args(argv)
+    if not args.json:
+        return run(args, which, runner, root, environ, out, system)
     try:
-        tool_list = tools(root, system)
-    except ConfigError as error:
-        print(f"dev-bootstrap: {error}", file=out)
+        return run(args, which, runner, root, environ, out, system)
+    # The --json contract boundary: any failure still yields one document.
+    except Exception as error:
+        kind = type(error).__name__
+        paths, _ = selected_paths(args.path)
+        emit(document(paths, args.strict, system, error=ERROR_INTERNAL,
+                      message=f"unexpected {kind}"), out)
+        print(f"dev-bootstrap: internal error ({kind}); rerun without --json "
+              "for the traceback", file=err)
         return 2
+
+
+def run(args, which, runner, root, environ, out, system):
+    """One check run for parsed `args`; the exit status."""
+    paths, unknown = selected_paths(args.path)
+    if unknown:
+        message = (
+            f"unsupported --path {', '.join(map(repr, unknown))}; "
+            f"choose from: {', '.join(PATHS)}"
+        )
+        return usage_error(args, paths, system, ERROR_UNSUPPORTED_PATH, message, out)
+    try:
+        if tomllib is None:
+            raise ConfigError(NO_TOMLLIB)
+        rows = tools(root, system, paths)
+    except ConfigError as error:
+        return usage_error(args, paths, system, ERROR_CONFIG, str(error), out)
     if runner is None:
         def runner(argv):
             return run_version(argv, cwd=root, environ=environ)
     cargo_bin = cargo_bin_dir(environ)
-    mode = "strict" if args.strict else "required tools only fail the run"
-    print(f"dev-bootstrap: local tool check ({mode})", file=out)
-    results = check_all(tool_list, which, runner, cargo_bin, environ)
-    passed = report(results, args.strict, cargo_bin, out)
+    host = Host(which=which, runner=runner, environ=environ, cargo_bin=cargo_bin)
+    if not args.json:
+        mode = "strict" if args.strict else "required tools only fail the run"
+        if args.path:
+            mode = f"paths: {', '.join(paths)}; {mode}"
+        print(f"dev-bootstrap: local tool check ({mode})", file=out)
+    results = check_all(rows, host)
+    if args.json:
+        doc = document(paths, args.strict, system, results, cargo_bin)
+        emit(doc, out)
+        return 0 if doc["result"] == "ready" else 1
+    passed = report(results, args.strict, cargo_bin, out, headings=bool(args.path))
     return 0 if passed else 1
+
+
+def usage_error(args, paths, system, code, message, out):
+    """Report an exit-2 error: a JSON document, or one stdout line."""
+    if args.json:
+        emit(document(paths, args.strict, system, error=code, message=message), out)
+    else:
+        print(f"dev-bootstrap: {message}", file=out)
+    return 2
 
 
 if __name__ == "__main__":
