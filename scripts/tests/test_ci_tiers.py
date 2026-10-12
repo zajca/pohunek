@@ -223,7 +223,7 @@ def evaluate_package_condition(expression: str, event: str, cancelled: bool, res
     Only `!cancelled()`, `github.event_name`, the selector's `result` and
     `outputs.<name>`, string literals, `==`, `!=`, `&&`, `||` and parentheses
     are understood; anything else fails the translation. A missing output reads
-    as the empty string, as in GitHub Actions.
+    as the empty string and string comparison ignores case, as in GitHub Actions.
     """
     python = expression.replace("!cancelled()", "(not cancelled)")
     python = python.replace("github.event_name", "event")
@@ -234,10 +234,16 @@ def evaluate_package_condition(expression: str, event: str, cancelled: bool, res
         python,
     )
     python = python.replace("&&", " and ").replace("||", " or ")
+    python = re.sub(r"'[^']*'", lambda literal: literal.group(0).lower(), python)
     leftover = re.sub(r"'[^']*'|\b(?:not|and|or|event|result|cancelled|outputs\.get)\b|==|!=|[()\s,]", "", python)
     if leftover:
         raise AssertionError(f"untranslated condition syntax {leftover!r} in {expression!r}")
-    return bool(eval(python, {"__builtins__": {}}, {"event": event, "cancelled": cancelled, "result": result, "outputs": outputs}))
+    return bool(eval(python, {"__builtins__": {}}, {
+        "event": event.lower(),
+        "cancelled": cancelled,
+        "result": result.lower(),
+        "outputs": {name: value.lower() for name, value in outputs.items()},
+    }))
 
 
 class CiTierWorkflowTests(unittest.TestCase):
@@ -433,7 +439,9 @@ class RuntimePackageSelectionTests(unittest.TestCase):
             # A successful selection with a missing or malformed output runs the package.
             ("pull_request", False, "success", {}, True),
             ("pull_request", False, "success", {"pi": "", "codex": "", "claude": ""}, True),
-            ("pull_request", False, "success", {"pi": "False", "codex": "no", "claude": "0"}, True),
+            ("pull_request", False, "success", {"pi": "no", "codex": "0", "claude": "yes"}, True),
+            # GitHub compares strings case-insensitively, so any casing of false excludes.
+            ("pull_request", False, "success", {"pi": "False", "codex": "FALSE", "claude": "False"}, False),
             ("pull_request", True, "success", {"pi": "true", "codex": "true", "claude": "true"}, False),
         )
         for job, package in PACKAGE_JOBS.items():

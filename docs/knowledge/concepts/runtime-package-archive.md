@@ -88,11 +88,12 @@ cargo xtask package affected [--base REF] [--json]
 `build` writes the canonical archive of a package directory (regular files
 only; symlinks are rejected; any execute bit marks a file executable) and
 prints its digest. `verify` builds the directory twice and requires identical
-bytes. `affected` prints which official packages a change selects for
-the per-PR package jobs; any core change selects all of them. The release pipeline uses `verify` semantics to require byte-for-byte
-reproducibility from independent clean roots.
+bytes. `affected` prints which official packages a change selects for the
+per-PR package jobs; any core change selects all of them. The release pipeline
+uses `verify` semantics to require byte-for-byte reproducibility from
+independent clean roots.
 
-Both commands call `package::directory::build_directory_archive(dir, limits)`
+`build` and `verify` call `package::directory::build_directory_archive(dir, limits)`
 (Unix), which the CLI's `plugin link` also uses. It walks regular files only
 (a symlink or special file is `UnsupportedFileType`, a non-UTF-8 name is
 `InvalidPath`), charges every file against the limits from the bytes actually
