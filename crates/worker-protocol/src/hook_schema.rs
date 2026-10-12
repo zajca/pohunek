@@ -5,12 +5,15 @@
 //! accepts when it re-imports that state. A runtime descriptor names a schema
 //! by id and never carries its contents; the registry below is the closed set
 //! of ids. The schema only selects which core validators apply and with which
-//! finite enumeration: the ancestry matcher, the subagent sequence rule, and
-//! the optional subagent fields are declared by the schema and applied by the
-//! worker and the daemon through the types below. Expiry and self-target
-//! checks stay in the worker and the daemon and are never relaxed by a schema.
+//! finite enumeration: the ancestry matcher, the launch-process rule, the
+//! subagent sequence rule, and the optional subagent fields are declared by the
+//! schema through the types below. The worker applies all of them when a hook
+//! reports; the daemon re-applies the ancestry matcher and the subagent fields
+//! when it imports worker state, and leaves the launch-process rule and the
+//! subagent sequence rule to the worker. Expiry and self-target checks stay in
+//! the worker and the daemon and are never relaxed by a schema.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 use std::fmt::{Display, Formatter};
 
@@ -122,6 +125,48 @@ impl AncestryMatcher {
     }
 }
 
+/// Which process may establish a session's launch identity.
+///
+/// The worker accepts a hook-reported native reference as the session's
+/// recovery reference only from the process this rule designates. The worker
+/// alone applies the rule; the daemon holds an imported launch identity to
+/// [`AncestryMatcher::CORE`]. Every rule fails closed: when the evidence it
+/// needs is unavailable, no claim is accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchProcess {
+    /// The earliest-started process at or below the PTY root whose executable
+    /// file name contains the provider name, or the provider's hook-helper
+    /// child of it.
+    ///
+    /// An interpreter or an interpreter's script argument never qualifies, so
+    /// this rule fits a runtime whose running process image is named for the
+    /// provider (a native binary or a launcher named for it).
+    NamedForProvider,
+    /// Only the PTY root, and only while it still runs the entrypoint image the
+    /// worker froze when it started the runtime.
+    ///
+    /// At start the worker records the launched executable and, when that file
+    /// is a script with an absolute single-path shebang, the interpreter it
+    /// names. A claim is accepted only from the root process whose command
+    /// line is exactly the frozen argv, whose executable is the frozen image,
+    /// and whose frozen files are unchanged, and only when the root files it
+    /// in process: the kernel peer of the report must be the root itself. A
+    /// report naming the root from any other process, a descendant included,
+    /// is refused, and every later native reference of the root is verified
+    /// again before it is kept. This fits a runtime launched through an
+    /// interpreted entrypoint that reports from its own process, whose process
+    /// image is the interpreter rather than a file named for the provider.
+    FrozenRootEntrypoint,
+}
+
+impl LaunchProcess {
+    /// The rule the worker freezes for a session without a hook schema.
+    ///
+    /// It is never reached: [`admit_hook`] admits no report of a session
+    /// without a schema.
+    pub const CORE: Self = Self::NamedForProvider;
+}
+
 /// Ordering a schema requires between the claims of one subagent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentSequence {
@@ -217,6 +262,8 @@ pub struct HookSchema {
     pub reference_kinds: &'static [ReferenceKind],
     /// Ancestry rule for the reported process.
     pub ancestry: AncestryMatcher,
+    /// Which process may establish the session's launch identity.
+    pub launch_process: LaunchProcess,
     /// Whether a provider other than the session's launch runtime may become
     /// the active identity.
     pub nested_active: bool,
@@ -314,6 +361,7 @@ const IDENTITY_V1: HookSchema = HookSchema {
     actions: IDENTITY_ACTIONS,
     reference_kinds: REFERENCE_KINDS,
     ancestry: AncestryMatcher::ManagedPtyDescendant,
+    launch_process: LaunchProcess::FrozenRootEntrypoint,
     nested_active: true,
     subagent_fields: &[],
     subagent_sequence: None,
@@ -328,6 +376,7 @@ const IDENTITY_SUBAGENT_V1: HookSchema = HookSchema {
     actions: IDENTITY_SUBAGENT_ACTIONS,
     reference_kinds: REFERENCE_KINDS,
     ancestry: AncestryMatcher::ManagedPtyDescendant,
+    launch_process: LaunchProcess::NamedForProvider,
     nested_active: true,
     subagent_fields: &[
         SubagentField::ParentId,

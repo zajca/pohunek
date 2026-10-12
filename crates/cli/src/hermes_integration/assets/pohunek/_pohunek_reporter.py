@@ -107,7 +107,7 @@ class Reporter:
             return
         self._safe(self._send_public, "session.release_agent", {
             "session_id": self._session_id, "source": f"pohunek:{self._provider}", "agent": self._provider,
-            "seq": sequence,
+            "seq": str(sequence),
         })
 
     def _report_identity(self, native_id: str) -> None:
@@ -129,7 +129,7 @@ class Reporter:
     def _report_activity(self, state: str) -> None:
         self._safe(self._send_public, "session.report_agent", {
             "session_id": self._session_id, "source": f"pohunek:{self._provider}", "agent": self._provider,
-            "activity": state, "seq": self._next_sequence(), "pid": self._pid,
+            "activity": state, "seq": str(self._next_sequence()), "pid": self._pid,
         })
 
     def _report_attention(self, kind: str, severity: str) -> None:
@@ -207,7 +207,11 @@ class Reporter:
         return remaining
 
     def _next_sequence(self) -> int:
-        self._sequence += 1
+        # The worker orders the identity claims of every reporter in a session
+        # against each other, so claims carry the system-wide monotonic clock
+        # the shipped Claude and Codex hooks also use. The counter keeps two
+        # reports within one clock tick strictly increasing.
+        self._sequence = max(self._sequence + 1, time.monotonic_ns())
         return self._sequence
 
     def _safe(self, callback: Any, *args: Any) -> None:

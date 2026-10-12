@@ -87,12 +87,16 @@ The assistant must:
   cannot attest — including one with no process id — is rejected rather than
   downgraded. A private identity report is accepted only from the process it
   names or from a descendant of that process; a sibling in the same session is
-  not enough. This binds a report to its reporter, not to the account: an
+  not enough. In a session whose hook schema declares the frozen-root launch
+  rule (`identity-v1`), a report or release naming the PTY root is accepted
+  only from the root's own peer (its PID and kernel start time), because every
+  descendant inherits the worker socket path and instance id. This binds a report to its reporter, not to the account: an
   owner-private socket is still not a sandbox against arbitrary commands run
   under the same Unix account, and in a shell session most of what the operator
   runs is inside the managed process tree by construction. The public
-  `session.report_native_id` fallback has no peer binding at all and relies on
-  its runtime, ordering, expiry, and provider rules.
+  `session.report_native_id` fallback has no peer binding at all, is not
+  covered by the worker's launch-process rule, and relies on its runtime,
+  ordering, expiry, and provider rules.
 - Never copy worker journal or structured-log diagnostics into shared reports
   without review. Journals intentionally omit prompt, input, terminal, and
   environment bytes; preserve that boundary when adding diagnostics.

@@ -100,6 +100,9 @@ MACOS_PATH_OWNERSHIP = {
         "pr": {
             "compat/hermes/**",
             "crates/cli/src/hermes_integration/**",
+            "crates/cli/tests/hermes_package.rs",
+            "crates/cli/tests/support/hermes_provider.rs",
+            "crates/worker-protocol/src/hook_schema.rs",
             "crates/xtask/src/hermes*.rs",
             "crates/daemon/src/agent/hermes.rs",
             "scripts/provision-hermes-compat",

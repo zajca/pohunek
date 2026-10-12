@@ -16,9 +16,7 @@ mkdir -p "$copy_root/scripts" "$copy_root/compat/hermes" "$fake_bin"
 cp "$provision" "$copy_root/scripts/"
 cp "$script_root/compat/hermes/compatibility-lock.json" "$copy_root/compat/hermes/"
 
-# Absolute paths for the fakes are resolved here: their PATH is restricted and
-# macOS keeps `cat` in /bin while `python3` lives in /usr/bin.
-cat_bin="$(command -v cat)"
+# The real python3 path is resolved here because the fakes' PATH is restricted.
 real_python="$(command -v python3)"
 git_marker="$test_root/git-started"
 credential_marker="$test_root/credential-environment-leaked"
@@ -36,10 +34,6 @@ exit 99
 EOF
 cat >"$fake_bin/python3" <<EOF
 #!/usr/bin/env bash
-if [[ "\$#" -eq 3 && "\$1" == "-" ]]; then
-  "$cat_bin" >/dev/null
-  exit 0
-fi
 exec "$real_python" "\$@"
 EOF
 chmod 0755 "$fake_bin/git" "$fake_bin/python3" "$fake_bin/uv"
@@ -84,7 +78,7 @@ fi
 make_restricted_bin() {
   local dir="$1" tool
   mkdir -p "$dir"
-  for tool in bash dirname env mkdir touch; do
+  for tool in bash curl dirname env mkdir tar touch uname; do
     ln -s "$(command -v "$tool")" "$dir/$tool"
   done
   ln -s "$fake_bin/git" "$dir/git"
@@ -152,6 +146,31 @@ fi
 grep -Fq 'sha256sum or shasum' "$test_root/stderr"
 test ! -e "$git_marker"
 
+# A host without a pinned CPython runtime is refused before any upstream
+# command runs.
+unsupported_bin="$test_root/unsupported-bin"
+make_restricted_bin "$unsupported_bin"
+ln -s "$bsd_bin/shasum" "$unsupported_bin/shasum"
+rm "$unsupported_bin/uname"
+cat >"$unsupported_bin/uname" <<'UNAME'
+#!/usr/bin/env bash
+case "$1" in
+  -s) printf '%s\n' FreeBSD ;;
+  -m) printf '%s\n' amd64 ;;
+  *) exit 97 ;;
+esac
+UNAME
+chmod 0755 "$unsupported_bin/uname"
+rm -f "$git_marker"
+if PATH="$unsupported_bin" \
+  "$copy_root/scripts/provision-hermes-compat" "$test_root/unsupported-install" \
+  >"$test_root/stdout" 2>"$test_root/stderr"; then
+  printf '%s\n' 'provisioner unexpectedly ran on a host without a pinned CPython' >&2
+  exit 1
+fi
+grep -Fq 'no pinned CPython runtime for FreeBSD/amd64' "$test_root/stderr"
+test ! -e "$git_marker"
+
 # Bash 3.2 (macOS /bin/bash) has no readarray/mapfile and BSD userland has no
 # GNU `realpath -e`; code lines (comments excluded) must not use them.
 if grep -Ev '^[[:space:]]*#' "$provision" | grep -Eq 'readarray|mapfile|realpath -e'; then
@@ -168,6 +187,32 @@ if grep -Eq 'uv sync .*--locked' "$provision"; then
 fi
 grep -Fq -- '-m venv --copies --without-pip' "$provision"
 grep -Fq 'locked Python runtime escaped the isolated installation root' "$provision"
+grep -Fq 'os.path.realpath(sys.argv[1])' "$provision"
+# Only the interpreter's own shared libpython is copied: its soname on Linux,
+# its install name on macOS. A LIBDIR glob would also copy unrelated builds
+# such as another Python's library or the stable-ABI shim.
+grep -Fq 'key = "LDLIBRARY" if sys.platform == "darwin" else "INSTSONAME"' "$provision"
+grep -Fq 'sysconfig.get_config_var("Py_ENABLE_SHARED") != 1' "$provision"
+grep -Fq 'cp -p "$python_library" "$venv_root/lib/${python_library##*/}"' "$provision"
+if grep -Ev '^[[:space:]]*#' "$provision" | grep -Fq 'libpython*'; then
+  printf '%s\n' 'provisioner copies libpython builds by glob' >&2
+  exit 1
+fi
+# The venv runtime is the pinned, digest-verified standalone CPython; a macOS
+# framework build (whose bin/python re-executes Python.app) is refused.
+grep -Fq 'observed_python_archive_sha256' "$provision"
+grep -Fq 'if sysconfig.get_config_var("PYTHONFRAMEWORK"):' "$provision"
+grep -Fq '"$python_runtime" -I -c "$RUNTIME_CHECK_PROGRAM"' "$provision"
+grep -Fq '"$python_runtime" -I -m venv --copies --without-pip "$venv_root"' "$provision"
+grep -Fq 'pinned CPython runtime is unusable for the Hermes venv' "$provision"
+if grep -Ev '^[[:space:]]*#' "$provision" | grep -Fq '"$python_bin" -m venv'; then
+  printf '%s\n' 'provisioner builds the Hermes venv from the host Python' >&2
+  exit 1
+fi
+# A uv /bin/sh trampoline in place of a direct shebang fails provisioning.
+grep -Fq '"$python_bin" -c "$DIRECT_SHEBANG_PROGRAM" "$hermes_bin"' "$provision"
+grep -Fq 'instead of a direct #!<python> script' "$provision"
+grep -Fq 'choose a shorter install root without spaces' "$provision"
 if grep -Fq 'uv venv' "$provision"; then
   printf '%s\n' 'provisioner unexpectedly creates an external-runtime symlink' >&2
   exit 1

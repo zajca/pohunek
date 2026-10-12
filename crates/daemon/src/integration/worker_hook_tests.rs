@@ -177,6 +177,22 @@ async fn start_worker_with_schema(
     tokio::task::JoinHandle<Result<(), pohunek_session_worker::WorkerError>>,
     PathBuf,
 ) {
+    start_worker_initialized(
+        root,
+        initialize(root, script, public_protocol_version, hook_schema),
+    )
+    .await
+}
+
+/// Starts a real worker and initializes its runtime with `initialize`.
+async fn start_worker_initialized(
+    root: &Path,
+    initialize: Initialize,
+) -> (
+    Worker,
+    tokio::task::JoinHandle<Result<(), pohunek_session_worker::WorkerError>>,
+    PathBuf,
+) {
     let socket_path = root.join("socket/worker.sock");
     let server = Server::bind(ServerArgs {
         session_id: SESSION_ID.to_owned(),
@@ -194,12 +210,7 @@ async fn start_worker_with_schema(
         .await
         .expect("control handshake");
     worker
-        .initialize(initialize(
-            root,
-            script,
-            public_protocol_version,
-            hook_schema,
-        ))
+        .initialize(initialize)
         .await
         .expect("initialize runtime");
     (worker, task, socket_path)
@@ -438,13 +449,17 @@ fn state_asset(agent: &str) -> PathBuf {
 /// the hooks one after the other, so once the worker shows the identity the
 /// subagent start has been decided too. Returns the worker's snapshot at that
 /// point.
+///
+/// The identity hook runs under an intermediate shell, so the agent process it
+/// reports is that shell rather than the PTY root: `identity-v1` accepts a
+/// report naming the root only from the root itself, and this hook is a child.
 async fn report_through_worker(hook_schema: &str) -> pohunek_worker_protocol::InspectSnapshot {
     let root = crate::test_support::scoped_dir("ph-state-worker-");
     let asset = state_asset("claude");
     let script = format!(
         concat!(
             "printf '{{\"agent_id\":\"sub-1\",\"agent_type\":\"Explore\"}}' | /bin/sh {asset} subagent-start; ",
-            "printf '{{\"session_id\":\"native-1\"}}' | /bin/sh {asset} session; ",
+            "printf '{{\"session_id\":\"native-1\"}}' | /bin/sh -c '/bin/sh {asset} session; true'; ",
             "sleep 30"
         ),
         asset = asset.display()
@@ -504,4 +519,442 @@ async fn a_report_of_a_newer_asset_set_is_refused_by_a_session_on_an_older_schem
             .map(|identity| identity.provider.as_str()),
         Some("claude")
     );
+}
+
+/// Launch-identity scenarios of the frozen-root launch rule.
+///
+/// Linux only: on macOS `python3` is an `xcrun` shim or a framework stub that
+/// re-executes a different image, so no shebang names the image the root runs.
+#[cfg(target_os = "linux")]
+mod frozen_root {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    use pohunek_session_worker::WorkerConfig;
+    use pohunek_worker_protocol::{LaunchIdentity, TransactionId};
+    use serde_json::{json, Value};
+
+    use super::{initialize, start_worker_initialized};
+
+    /// Launch root of the frozen-root scenario: an in-process reporter whose
+    /// forked children report the root's own process identity.
+    ///
+    /// Its third argument is how many forked children first claim the launch
+    /// identity for their own process: one more than the worker's pending
+    /// launch-claim capacity.
+    ///
+    /// Each report appends `{"step", "response"}` to the results file. Before
+    /// its last report, and again before it exits, the reporter waits for one
+    /// line on the gate, which the test writes after it changed the entrypoint
+    /// file and once it is done. The test prepends the shebang line.
+    const FROZEN_ROOT_REPORTER: &str = r#"
+import datetime
+import json
+import os
+import socket
+import sys
+
+gate_path, results_path, own_claims = sys.argv[1], sys.argv[2], int(sys.argv[3])
+failure_path = results_path + ".failure"
+
+def record_failure(kind, value, trace):
+    # The test reads this file, so the reporter never dies without a reason.
+    import traceback
+    with open(failure_path, "w", encoding="utf-8") as handle:
+        handle.write("".join(traceback.format_exception(kind, value, trace)))
+
+sys.excepthook = record_failure
+
+def start_identity(pid):
+    with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
+        return int(handle.read().rsplit(")", 1)[1].split()[19])
+
+root_pid = os.getpid()
+root_start = start_identity(root_pid)
+
+def report(step, sequence, reference, own=False):
+    pid = os.getpid() if own else root_pid
+    expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=30)
+    request = {
+        "type": "identity_report",
+        "runtime_id": os.environ["POHUNEK_WORKER_INSTANCE_ID"],
+        "provider": "hermes",
+        "pid": pid,
+        "start_identity": start_identity(pid) if own else root_start,
+        "sequence": sequence,
+        "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
+        "reference_kind": "id",
+        "native_reference": reference,
+    }
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(os.environ["POHUNEK_WORKER_SOCKET_PATH"])
+    client.sendall((json.dumps(request) + "\n").encode())
+    received = b""
+    while b"\n" not in received:
+        chunk = client.recv(4096)
+        if not chunk:
+            raise RuntimeError(f"worker closed the socket before a full response line: {received!r}")
+        received += chunk
+    client.close()
+    response = json.loads(received.split(b"\n", 1)[0])
+    with open(results_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"step": step, "response": response}) + "\n")
+
+def from_descendant(step, sequence, reference, own=False):
+    # A forked child inherits the worker socket path and instance id, and its
+    # report names the root's pid and start identity, or with `own` its own.
+    child = os.fork()
+    if child == 0:
+        try:
+            report(step, sequence, reference, own)
+        except BaseException:
+            record_failure(*sys.exc_info())
+            os._exit(1)
+        os._exit(0)
+    _, status = os.waitpid(child, 0)
+    if os.waitstatus_to_exitcode(status) != 0:
+        raise RuntimeError(f"descendant step {step} failed")
+
+# Distinct descendants claim for themselves before the root, each with a
+# sequence below the root's, more of them than the pending capacity holds.
+for index in range(own_claims):
+    from_descendant(f"own_{index}", index + 1, f"own-{index}", own=True)
+# The descendant claims for the root first and with a far higher sequence than
+# the root's, so neither ordering nor arrival order can favor the root.
+from_descendant("descendant_first", 1_000_000, "descendant-first")
+report("root_first", 1_000, "root-first")
+from_descendant("descendant_update", 2_000_000, "descendant-update")
+report("root_update", 2_000, "root-update")
+with open(gate_path, encoding="ascii") as gate:
+    gate.readline()
+report("root_after_touch", 3_000, "root-after-touch")
+with open(gate_path, encoding="ascii") as gate:
+    gate.readline()
+"#;
+
+    /// The image the kernel runs for `python3`: the absolute interpreter a
+    /// frozen-root entrypoint's shebang must name.
+    fn python_image() -> String {
+        let output = std::process::Command::new("python3")
+            .args(["-c", "import os; print(os.path.realpath('/proc/self/exe'))"])
+            .output()
+            .expect("run python3");
+        assert!(output.status.success(), "python3 failed: {output:?}");
+        let image = String::from_utf8(output.stdout).expect("UTF-8 interpreter path");
+        let image = image.trim_end().to_owned();
+        assert!(
+            Path::new(&image).is_absolute() && !image.contains(char::is_whitespace),
+            "the interpreter cannot be named by a single-path shebang: {image:?}"
+        );
+        image
+    }
+
+    /// Reads the reporter's recorded responses by step name.
+    fn frozen_root_results(results: &Path) -> BTreeMap<String, Value> {
+        if let Ok(failure) = std::fs::read_to_string(format!("{}.failure", results.display())) {
+            panic!("the frozen-root reporter failed: {failure}");
+        }
+        std::fs::read_to_string(results)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                let mut entry: Value = serde_json::from_str(line).expect("result line is JSON");
+                let step = entry["step"].as_str().expect("step name").to_owned();
+                (step, entry["response"].take())
+            })
+            .collect()
+    }
+
+    /// Waits until the reporter recorded `count` responses and returns them.
+    async fn frozen_root_responses(results: &Path, count: usize) -> BTreeMap<String, Value> {
+        Box::pin(pohunek_test_support::wait::wait_until(
+            "the frozen-root reporter to record its responses",
+            || async {
+                let recorded = frozen_root_results(results);
+                (recorded.len() >= count).then_some(recorded)
+            },
+        ))
+        .await
+    }
+
+    /// A real worker whose PTY root is a reporter script under `identity-v1`.
+    struct FrozenRoot {
+        worker: crate::runtime::Worker,
+        task: tokio::task::JoinHandle<Result<(), pohunek_session_worker::WorkerError>>,
+        /// Write end of the FIFO the reporter reads one line from per pause.
+        gate: std::fs::File,
+        /// The frozen entrypoint script.
+        entrypoint: PathBuf,
+        /// File the reporter appends `{"step", "response"}` lines to.
+        results: PathBuf,
+    }
+
+    /// Starts a Hermes-launched `identity-v1` worker whose entrypoint is
+    /// `body` behind an absolute `python3` shebang, run as
+    /// `<entrypoint> <gate> <results> <arguments>...`.
+    async fn start_frozen_root(root: &Path, body: &str, arguments: &[String]) -> FrozenRoot {
+        let entrypoint = root.join("frozen-root-reporter");
+        std::fs::write(&entrypoint, format!("#!{}\n{body}", python_image()))
+            .expect("write the entrypoint script");
+        std::fs::set_permissions(
+            &entrypoint,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("make the entrypoint executable");
+        let gate_path = root.join("frozen-root.gate");
+        nix::unistd::mkfifo(&gate_path, nix::sys::stat::Mode::S_IRWXU).expect("create the gate");
+        // Opened read-write so the test never blocks on a reader and the reporter's
+        // read waits for a line rather than for end of file.
+        let gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&gate_path)
+            .expect("open the gate");
+        let results = root.join("frozen-root.results");
+
+        let mut launch = initialize(root, "", protocol::PROTOCOL_VERSION.get(), "identity-v1");
+        launch.launch = LaunchIdentity {
+            agent: "hermes".to_owned(),
+            agent_base: "hermes".to_owned(),
+            reference_kind: None,
+        };
+        launch.executable.clone_from(&entrypoint);
+        launch.arguments = [
+            gate_path.display().to_string(),
+            results.display().to_string(),
+        ]
+        .into_iter()
+        .chain(arguments.iter().cloned())
+        .collect();
+        let (worker, task, _socket) = start_worker_initialized(root, launch).await;
+        FrozenRoot {
+            worker,
+            task,
+            gate,
+            entrypoint,
+            results,
+        }
+    }
+
+    /// Under `identity-v1` only the PTY root itself, while it still runs the frozen
+    /// entrypoint, sets or updates the launch identity and its native reference.
+    ///
+    /// The root is a real script with an absolute shebang that reports in process
+    /// through the worker socket, as the pinned Hermes plugin does. Its forked
+    /// descendants inherit the socket and report the root's exact process
+    /// identity, which the kernel peer credentials expose as a different process.
+    /// Before that, more descendants than the worker keeps pending claims for
+    /// claim the launch identity for themselves, and none of them is kept.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_the_frozen_root_sets_or_updates_the_launch_identity() {
+        let root = crate::test_support::scoped_dir("ph-frozen-root-");
+        let own_claims = WorkerConfig::new().pending_launch_claims + 1;
+        let FrozenRoot {
+            worker,
+            task,
+            mut gate,
+            entrypoint,
+            results,
+        } = start_frozen_root(&root, FROZEN_ROOT_REPORTER, &[own_claims.to_string()]).await;
+
+        let responses = frozen_root_responses(&results, own_claims + 4).await;
+        // A descendant's own claim can never qualify under the frozen-root rule,
+        // so none of them occupies the bounded pending capacity.
+        for index in 0..own_claims {
+            assert_eq!(
+                responses[&format!("own_{index}")],
+                json!({"ok": true, "launch_identity_accepted": false, "launch_identity_status": "rejected"}),
+                "{responses:?}"
+            );
+        }
+        assert_eq!(
+            responses["descendant_first"]["ok"],
+            json!(false),
+            "a descendant cannot report the root's identity: {responses:?}"
+        );
+        assert_eq!(
+            responses["root_first"],
+            json!({"ok": true, "launch_identity_accepted": true, "launch_identity_status": "accepted"}),
+            "the root's own report establishes the launch identity: {responses:?}"
+        );
+        assert_eq!(
+            responses["descendant_update"]["ok"],
+            json!(false),
+            "a descendant cannot update the root's reference: {responses:?}"
+        );
+        // The launch identity is immutable: a later reference of the same root is
+        // journaled while its claim to establish the launch identity is rejected.
+        assert_eq!(
+            responses["root_update"],
+            json!({"ok": true, "launch_identity_accepted": false, "launch_identity_status": "rejected"}),
+            "{responses:?}"
+        );
+
+        let snapshot = worker.inspect().await.expect("inspect");
+        let root_process = snapshot.child_process.expect("the PTY root");
+        let launch_identity = snapshot.launch_identity.expect("the launch identity");
+        assert_eq!(launch_identity.process, root_process);
+        assert_eq!(launch_identity.native_reference, "root-first");
+        let reference = snapshot.native_reference.expect("the journaled reference");
+        assert_eq!(reference.process, root_process);
+        assert_eq!(
+            (reference.native_reference.as_str(), reference.sequence),
+            ("root-update", 2_000),
+            "the root's later reference is journaled"
+        );
+
+        // Any change to the frozen entrypoint advances its status-change time, so
+        // the root no longer runs the image the worker froze.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&entrypoint)
+            .expect("open the entrypoint")
+            .set_modified(std::time::SystemTime::now())
+            .expect("touch the entrypoint");
+        std::io::Write::write_all(&mut gate, b"touched\n").expect("release the reporter");
+        let responses = frozen_root_responses(&results, own_claims + 5).await;
+        assert_eq!(
+            responses["root_after_touch"]["launch_identity_status"],
+            json!("rejected"),
+            "{responses:?}"
+        );
+        let snapshot = worker.inspect().await.expect("inspect");
+        let reference = snapshot.native_reference.expect("the journaled reference");
+        assert_eq!(
+            reference.native_reference, "root-update",
+            "a report after the entrypoint changed is not journaled"
+        );
+        assert_eq!(
+            snapshot
+                .launch_identity
+                .map(|identity| identity.native_reference),
+            Some("root-first".to_owned())
+        );
+
+        std::io::Write::write_all(&mut gate, b"done\n").expect("release the reporter");
+        worker
+            .stop(TransactionId::new("transaction-frozen-stop").expect("transaction id"))
+            .await
+            .expect("stop the PTY");
+        drop(worker);
+        task.abort();
+    }
+
+    /// Launch root that reports through the core-owned Hermes reporter, with a
+    /// nested Claude identity hook between its two reports.
+    ///
+    /// Arguments after the gate and results paths: the reporter module and the
+    /// Claude state hook. The hook runs under an intermediate shell, so it
+    /// reports that shell as a nested agent rather than the root. Each step
+    /// appends `{"step", "response": {"failures"}}`, the reporter's count of
+    /// reports the worker did not accept.
+    const SHARED_CLOCK_REPORTER: &str = r#"
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+
+gate_path, results_path, reporter_path, claude_hook = sys.argv[1:5]
+failure_path = results_path + ".failure"
+
+def record_failure(kind, value, trace):
+    # The test reads this file, so the reporter never dies without a reason.
+    import traceback
+    with open(failure_path, "w", encoding="utf-8") as handle:
+        handle.write("".join(traceback.format_exception(kind, value, trace)))
+
+sys.excepthook = record_failure
+
+spec = importlib.util.spec_from_file_location("pohunek_reporter", reporter_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+# The reporter's longest hook deadline keeps a slow host from turning a worker
+# answer into a recorded failure.
+reporter = module.Reporter("hermes", {**os.environ, "POHUNEK_HOOK_TIMEOUT_MS": "1000"})
+
+def mark(step):
+    with open(results_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"step": step, "response": {"failures": reporter.failures}}) + "\n")
+
+reporter.identity("root-first")
+mark("root_first")
+subprocess.run(
+    ["/bin/sh", "-c", '/bin/sh "$0" session; true', claude_hook],
+    input=b'{"session_id":"nested-native"}',
+    check=True,
+)
+mark("nested")
+with open(gate_path, encoding="ascii") as gate:
+    gate.readline()
+reporter.identity("root-second")
+mark("root_second")
+with open(gate_path, encoding="ascii") as gate:
+    gate.readline()
+"#;
+
+    /// A nested agent's identity report does not make the root's later report
+    /// stale: every in-repo reporter stamps worker claims from the same
+    /// system-wide monotonic clock.
+    ///
+    /// The root reports through the core-owned Hermes reporter, and the real
+    /// Claude state hook reports a nested agent between its two reports.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_nested_agent_report_does_not_make_the_roots_later_report_stale() {
+        let root = crate::test_support::scoped_dir("ph-shared-clock-");
+        let reporter = pohunek_test_support::workspace_root()
+            .join("crates/cli/src/hermes_integration/assets/pohunek/_pohunek_reporter.py");
+        let FrozenRoot {
+            worker,
+            task,
+            mut gate,
+            results,
+            ..
+        } = start_frozen_root(
+            &root,
+            SHARED_CLOCK_REPORTER,
+            &[
+                reporter.display().to_string(),
+                super::state_asset("claude").display().to_string(),
+            ],
+        )
+        .await;
+
+        let responses = frozen_root_responses(&results, 2).await;
+        assert_eq!(
+            responses["root_first"]["failures"],
+            json!(0),
+            "{responses:?}"
+        );
+        let snapshot = worker.inspect().await.expect("inspect");
+        let first = snapshot.native_reference.expect("the root's reference");
+        assert_eq!(first.native_reference, "root-first");
+        let nested = snapshot.active_identity.expect("the nested agent's claim");
+        assert_eq!(nested.provider, "claude", "the nested agent is active");
+        assert_ne!(Some(nested.process), snapshot.child_process);
+        assert!(nested.sequence > first.sequence, "{nested:?} {first:?}");
+
+        std::io::Write::write_all(&mut gate, b"report\n").expect("release the reporter");
+        let responses = frozen_root_responses(&results, 3).await;
+        assert_eq!(
+            responses["root_second"]["failures"],
+            json!(0),
+            "the root's later report is accepted: {responses:?}"
+        );
+        let snapshot = worker.inspect().await.expect("inspect");
+        let reference = snapshot.native_reference.expect("the root's reference");
+        assert_eq!(reference.native_reference, "root-second");
+        assert_eq!(
+            snapshot.active_identity.map(|active| active.provider),
+            Some("hermes".to_owned())
+        );
+
+        std::io::Write::write_all(&mut gate, b"done\n").expect("release the reporter");
+        worker
+            .stop(TransactionId::new("transaction-clock-stop").expect("transaction id"))
+            .await
+            .expect("stop the PTY");
+        drop(worker);
+        task.abort();
+    }
 }

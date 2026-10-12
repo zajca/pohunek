@@ -11,6 +11,20 @@ readonly EXPECTED_ARCHIVE_FORMAT="git archive --format=tar"
 readonly PYTHON_MINIMUM_MINOR=11
 readonly PYTHON_MAXIMUM_MINOR=14
 
+# Pinned CPython runtime of the Hermes venv: a python-build-standalone
+# `install_only_stripped` build, downloaded and verified here rather than taken
+# from the host. Its macOS build is not a framework build, so the venv's
+# bin/python is the image that runs the Hermes script; a framework build's
+# bin/python3.x is a stub that re-executes Python.app, which the worker's
+# frozen launch rule refuses. The digests are those the release publishes in
+# its SHA256SUMS; changing the release or version needs both digests renewed.
+readonly PYTHON_STANDALONE_BASE_URL="https://github.com/astral-sh/python-build-standalone/releases/download"
+readonly PYTHON_STANDALONE_RELEASE="20260807"
+readonly PYTHON_STANDALONE_VERSION="3.12.13"
+readonly PYTHON_STANDALONE_FLAVOR="install_only_stripped"
+readonly PYTHON_STANDALONE_SHA256_X86_64_LINUX_GNU="506191be3ee7bd190a8834dcdc1b3bc70aab50608deccc711935aa007239cabd"
+readonly PYTHON_STANDALONE_SHA256_AARCH64_DARWIN="25baa97c65b3f0aa90e21131b4f9e80aef8899e8144006db8a9d2c1ab9e807e3"
+
 fail() {
   printf '%s: %s\n' "$SCRIPT_NAME" "$1" >&2
   exit 1
@@ -26,7 +40,7 @@ if [[ "$install_root" != /* || "$install_root" == "/" || -e "$install_root" ]]; 
   fail "install root must be an unused absolute path other than /"
 fi
 
-for executable in git python3 uv; do
+for executable in curl git python3 tar uv; do
   command -v "$executable" >/dev/null 2>&1 || fail "required executable is unavailable: $executable"
 done
 
@@ -52,19 +66,24 @@ observed_lock_sha256="$(sha256_of "$lock_path")"
 [[ "$observed_lock_sha256" == "$EXPECTED_LOCK_SHA256" ]] \
   || fail "compatibility lock SHA-256 does not match the reviewed digest"
 
+# The host python3 only runs the small helper programs below; the Hermes venv
+# uses the pinned CPython runtime.
 python_bin="$(command -v python3)"
-python_bin="$(cd -- "$(dirname -- "$python_bin")" && pwd -P)/${python_bin##*/}"
-"$python_bin" - "$PYTHON_MINIMUM_MINOR" "$PYTHON_MAXIMUM_MINOR" <<'PY'
-import sys
+python_bin="$("$python_bin" -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$python_bin")"
 
-minimum = int(sys.argv[1])
-maximum = int(sys.argv[2])
-if sys.version_info.major != 3 or not minimum <= sys.version_info.minor < maximum:
-    raise SystemExit(
-        f"Hermes compatibility requires Python 3.{minimum}-3.{maximum - 1}; "
-        f"got {sys.version_info.major}.{sys.version_info.minor}"
-    )
-PY
+case "$(uname -s)/$(uname -m)" in
+  Linux/x86_64)
+    python_target="x86_64-unknown-linux-gnu"
+    python_archive_sha256="$PYTHON_STANDALONE_SHA256_X86_64_LINUX_GNU"
+    ;;
+  Darwin/arm64)
+    python_target="aarch64-apple-darwin"
+    python_archive_sha256="$PYTHON_STANDALONE_SHA256_AARCH64_DARWIN"
+    ;;
+  *)
+    fail "no pinned CPython runtime for $(uname -s)/$(uname -m); supported: Linux/x86_64, Darwin/arm64"
+    ;;
+esac
 
 # The Python programs below are single-quoted `-c` strings rather than heredocs
 # inside `$(...)`, which bash 3.2 (macOS /bin/bash) mis-parses.
@@ -97,6 +116,84 @@ resolved = os.path.realpath(sys.argv[1])
 if not os.path.exists(resolved):
     raise SystemExit(1)
 sys.stdout.write(resolved)
+'
+# Prints the path of the shared libpython of the interpreter running it, or
+# nothing for a static or framework build. The dynamic loader resolves the
+# library by its soname (INSTSONAME) on Linux; on macOS the shared library file
+# is LDLIBRARY, and a framework build names a path inside the framework instead.
+# A relocatable build records its build-time prefix in sysconfig, so LIBDIR is
+# taken relative to that prefix and placed under the running one.
+readonly PYTHON_LIBRARY_PROGRAM='
+import os
+import sys
+import sysconfig
+
+if sysconfig.get_config_var("Py_ENABLE_SHARED") != 1:
+    raise SystemExit(0)
+key = "LDLIBRARY" if sys.platform == "darwin" else "INSTSONAME"
+name = sysconfig.get_config_var(key) or ""
+library_dir = sysconfig.get_config_var("LIBDIR") or ""
+build_prefix = sysconfig.get_config_var("prefix") or ""
+if not name or os.sep in name or not os.path.isabs(library_dir):
+    raise SystemExit(0)
+if os.path.isabs(build_prefix):
+    relative = os.path.relpath(library_dir, build_prefix)
+    if not relative.startswith(os.pardir):
+        library_dir = os.path.join(sys.base_prefix, relative)
+sys.stdout.write(os.path.join(library_dir, name))
+'
+# Validates the interpreter running it as the Hermes venv runtime: exactly the
+# pinned version argv[1], inside the supported minor range argv[2]..argv[3),
+# and not a macOS framework build.
+readonly RUNTIME_CHECK_PROGRAM='
+import sys
+import sysconfig
+
+expected = tuple(int(part) for part in sys.argv[1].split("."))
+minimum = int(sys.argv[2])
+maximum = int(sys.argv[3])
+if sysconfig.get_config_var("PYTHONFRAMEWORK"):
+    raise SystemExit(
+        "the Python runtime is a macOS framework build; its bin/python is a "
+        "stub that re-executes Python.app, so the frozen launch rule would "
+        "refuse every Hermes root"
+    )
+if sys.version_info[:3] != expected:
+    raise SystemExit(
+        "the Python runtime reports "
+        + ".".join(str(part) for part in sys.version_info[:3])
+        + ", not the pinned "
+        + sys.argv[1]
+    )
+if sys.version_info.major != 3 or not minimum <= sys.version_info.minor < maximum:
+    raise SystemExit(
+        f"Hermes compatibility requires Python 3.{minimum}-3.{maximum - 1}"
+    )
+'
+# Exits non-zero unless the first line of the script in argv[1] is a direct
+# `#!<absolute path>` shebang, without arguments, naming a Python executable
+# in the script's own directory. uv writes a `/bin/sh` exec trampoline instead
+# when the interpreter path is too long for a shebang or contains a space.
+readonly DIRECT_SHEBANG_PROGRAM='
+import os
+import sys
+
+script_path = os.path.realpath(sys.argv[1])
+with open(script_path, "rb") as script:
+    first_line = script.readline().rstrip(b"\n")
+if not first_line.startswith(b"#!/"):
+    raise SystemExit(1)
+interpreter = os.fsdecode(first_line[2:])
+if any(character.isspace() for character in interpreter):
+    raise SystemExit(1)
+resolved = os.path.realpath(interpreter)
+if (
+    os.path.dirname(resolved) != os.path.dirname(script_path)
+    or not os.path.basename(resolved).startswith("python")
+    or not os.path.isfile(resolved)
+    or not os.access(resolved, os.X_OK)
+):
+    raise SystemExit(1)
 '
 
 # `read -d ''` keeps this portable to bash 3.2, which has no readarray.
@@ -132,6 +229,7 @@ unset GIT_ASKPASS GIT_SSH GIT_SSH_COMMAND
 unset PIP_EXTRA_INDEX_URL PIP_INDEX_URL PIP_TRUSTED_HOST
 unset UV_DEFAULT_INDEX UV_EXTRA_INDEX_URL UV_INDEX UV_INDEX_URL
 unset UV_KEYRING_PROVIDER UV_NATIVE_TLS UV_NO_VERIFY_HOST
+unset UV_PYTHON UV_PYTHON_DOWNLOADS_JSON_URL UV_PYTHON_INSTALL_MIRROR
 unset ACTIONS_CACHE_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
 unset ACTIONS_RESULTS_URL ACTIONS_RUNTIME_TOKEN
 unset GITHUB_ENV GITHUB_OUTPUT GITHUB_PATH GITHUB_STEP_SUMMARY
@@ -144,6 +242,8 @@ source_root="$install_root/source"
 archive_path="$install_root/source.tar"
 venv_root="$install_root/venv"
 uv_cache_root="$install_root/uv-cache"
+python_archive_path="$install_root/python.tar.gz"
+python_root="$install_root/python"
 
 git init --quiet "$source_root" >&2
 git -C "$source_root" remote add origin "${repository}.git"
@@ -162,11 +262,43 @@ observed_archive_sha256="$(sha256_of "$archive_path")"
 
 git -C "$source_root" checkout --quiet --detach "$commit" >&2
 
-# Copy the selected interpreter into the venv so Pohunek's production runner
+# `-q` keeps a caller's curlrc out of the download; the digest check below is
+# what makes the archive trusted.
+python_archive_name="cpython-${PYTHON_STANDALONE_VERSION}+${PYTHON_STANDALONE_RELEASE}-${python_target}-${PYTHON_STANDALONE_FLAVOR}.tar.gz"
+curl -q --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+  --output "$python_archive_path" \
+  "$PYTHON_STANDALONE_BASE_URL/$PYTHON_STANDALONE_RELEASE/${python_archive_name//+/%2B}" \
+  || fail "cannot download the pinned CPython runtime $python_archive_name"
+observed_python_archive_sha256="$(sha256_of "$python_archive_path")"
+[[ "$observed_python_archive_sha256" == "$python_archive_sha256" ]] \
+  || fail "pinned CPython runtime archive SHA-256 does not match the reviewed digest"
+tar -xzf "$python_archive_path" -C "$install_root"
+python_runtime="$python_root/bin/python${PYTHON_STANDALONE_VERSION%.*}"
+[[ -f "$python_runtime" && -x "$python_runtime" && ! -L "$python_runtime" ]] \
+  || fail "pinned CPython archive did not provide $python_runtime"
+"$python_runtime" -I -c "$RUNTIME_CHECK_PROGRAM" \
+  "$PYTHON_STANDALONE_VERSION" "$PYTHON_MINIMUM_MINOR" "$PYTHON_MAXIMUM_MINOR" \
+  || fail "pinned CPython runtime is unusable for the Hermes venv"
+
+# Copy the pinned interpreter into the venv so Pohunek's production runner
 # can prove that the sibling Python runtime is contained by this install root.
 # `--without-pip` avoids an unnecessary installer; uv populates the environment
 # from the reviewed upstream lock in the next step.
-"$python_bin" -m venv --copies --without-pip "$venv_root" >&2
+"$python_runtime" -I -m venv --copies --without-pip "$venv_root" >&2
+
+# Some relocatable Python distributions link their copied executable to a
+# libpython beside the venv, rather than carrying it in the executable. Keep
+# exactly that runtime dependency inside the isolated installation root; other
+# libpython builds in the same LIBDIR (another Python, the stable-ABI shim)
+# are not loaded by this interpreter.
+python_library="$("$python_runtime" -I -c "$PYTHON_LIBRARY_PROGRAM")" \
+  || fail "cannot read the interpreter's shared library from sysconfig"
+if [[ -n "$python_library" ]]; then
+  [[ -f "$python_library" ]] \
+    || fail "the interpreter's shared libpython is missing: $python_library"
+  # A plain cp follows a symlinked library, so the copy is the library itself.
+  cp -p "$python_library" "$venv_root/lib/${python_library##*/}"
+fi
 
 # Use only the reviewed upstream lock. UV_PYTHON_DOWNLOADS=never prevents uv
 # from substituting a downloaded interpreter. --frozen is intentional: newer
@@ -188,6 +320,10 @@ runtime_bin="$("$python_bin" -c "$REALPATH_PROGRAM" "$venv_root/bin/python3")" \
 hermes_bin="$venv_root/bin/hermes"
 [[ -f "$hermes_bin" && -x "$hermes_bin" && ! -L "$hermes_bin" ]] \
   || fail "locked installation did not produce a regular Hermes executable"
+# Pohunek freezes the launched script and its shebang interpreter, so Hermes
+# must start the venv Python directly rather than through a shell trampoline.
+"$python_bin" -c "$DIRECT_SHEBANG_PROGRAM" "$hermes_bin" \
+  || fail "uv wrote $hermes_bin as a /bin/sh trampoline instead of a direct #!<python> script; the venv interpreter path is too long for a shebang or contains whitespace, so choose a shorter install root without spaces"
 mkdir -m 0700 -- "$install_root/home" "$install_root/hermes-home"
 version_output="$(
   env -i \

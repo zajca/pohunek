@@ -286,6 +286,18 @@ own process table (the `/proc` start time on Linux, the kernel start time from
 libproc on macOS), the same value the daemon observes, so a recycled PID is not
 mistaken for the reporting process.
 
+Only the PTY root, the Hermes process started from the `hermes` entrypoint, may
+set the session's native recovery reference, and only while it still runs the
+entrypoint script and shebang interpreter the worker froze at launch. This
+requires the entrypoint's shebang interpreter to run the script itself. An
+interpreter that re-executes another image, such as a macOS framework Python
+stub or an `xcrun` shim like `/usr/bin/python3`, leaves the session without a
+launch identity: every claim is refused as `image_mismatch` or
+`cmdline_mismatch` (a `worker.launch_identity.rejected` warning in the worker
+log). Hermes still runs, but native resume (`session.resume`) of that session
+is unavailable; install Hermes with an interpreter that runs scripts directly,
+such as the relocatable Python the compatibility provisioner uses.
+
 Hooks do not start subprocesses, use the network, open a Hermes database, or
 copy prompt, tool, or terminal payloads. They use local bounded reporting only;
 failures are swallowed, counted, payload-free, and must not fail a Hermes turn.

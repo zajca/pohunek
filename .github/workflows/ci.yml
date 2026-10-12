@@ -785,6 +785,9 @@ jobs:
             hermes_macos:
               - 'compat/hermes/**'
               - 'crates/cli/src/hermes_integration/**'
+              - 'crates/cli/tests/hermes_package.rs'
+              - 'crates/cli/tests/support/hermes_provider.rs'
+              - 'crates/worker-protocol/src/hook_schema.rs'
               - 'crates/xtask/src/hermes*.rs'
               - 'crates/daemon/src/agent/hermes.rs'
               - 'scripts/provision-hermes-compat'
@@ -798,13 +801,22 @@ jobs:
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
             # Linux Hermes compatibility keeps the broader source filter: Linux
-            # runner capacity is not the constrained macOS budget.
+            # runner capacity is not the constrained macOS budget. It also
+            # drives a real pinned Hermes session through the package, so the
+            # daemon, the session worker and its launch rule, and that test's
+            # support code are inputs too.
             hermes:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'compat/hermes/**'
-              - 'crates/cli/Cargo.toml'
-              - 'crates/cli/src/**'
+              - 'crates/cli/**'
+              - 'crates/daemon/**'
+              - 'crates/package/**'
+              - 'crates/session-worker/**'
+              - 'crates/worker-protocol/**'
+              - 'crates/terminal/**'
+              - 'crates/platform/**'
+              - 'crates/test-support/**'
               - 'crates/paths/**'
               - 'crates/protocol/**'
               - 'crates/xtask/Cargo.toml'
@@ -1246,14 +1258,20 @@ jobs:
     if: ${{ needs.build-bins.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.hermes == 'true') }}
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
-    timeout-minutes: 30
+    # The real Hermes session builds the CLI integration tests with the daemon
+    # and session worker on top of the xtask cache; the Pi and Codex package
+    # jobs need about the same build, so this keeps their 30 minutes plus room
+    # for the Hermes provisioning and compatibility gate.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
 
+      # Bootstrap python3 for the provisioner's helper programs and the shell
+      # tests. The Hermes venv itself runs the standalone CPython that the
+      # provisioner pins and verifies, never this interpreter.
       - name: Install Python
-        id: python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -1265,18 +1283,18 @@ jobs:
           enable-cache: true
 
       # Cache the provisioned pinned Hermes runtime. Inputs that drive
-      # provisioning: the lock file, the provisioner script, its test, the
-      # exact resolved Python interpreter (the venv's `pyvenv.cfg` hard-links
-      # to it, so a runner-image Python bump invalidates the runtime), and the
-      # workflow itself (see scripts/provision-hermes-compat); uv itself is
-      # already cached via `enable-cache` above, so this is just the resolved
-      # venv. Key on all of them so a provisioner change re-provisions.
+      # provisioning: the lock file, the provisioner script (which also pins
+      # the standalone CPython the venv is built from, inside the install
+      # root), its test, and the workflow itself (see
+      # scripts/provision-hermes-compat); uv itself is already cached via
+      # `enable-cache` above, so this is just the resolved runtime. Key on all
+      # of them so a provisioner change re-provisions.
       - name: Cache Hermes runtime
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/hermes-compat-cache
           key: >-
-            hermes-runtime-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-
+            hermes-runtime-${{ runner.os }}-
             ${{ hashFiles('compat/hermes/compatibility-lock.json') }}-
             ${{ hashFiles('scripts/provision-hermes-compat') }}-
             ${{ hashFiles('scripts/tests/provision-hermes-compat.sh') }}-
@@ -1332,6 +1350,10 @@ jobs:
           [[ -f "$hermes_bin" && -x "$hermes_bin" ]] \
             || { echo "provisioned Hermes executable missing at $hermes_bin" >&2; exit 1; }
           printf 'bin=%s\n' "$hermes_bin" >> "$GITHUB_OUTPUT"
+          # The pinned venv interpreter carries PyYAML; the package tests'
+          # plugin harness needs it, and runner Pythons lack it or are
+          # group-writable framework builds the harness refuses.
+          printf 'python=%s\n' "${hermes_bin%/*}/python" >> "$GITHUB_OUTPUT"
 
       - name: Download built CLI
         uses: actions/download-artifact@v4
@@ -1349,6 +1371,21 @@ jobs:
             --hermes-bin "${{ steps.hermes.outputs.bin }}" \
             --pohunek-bin "$pohunek_bin"
 
+      # The test daemon spawns the session worker found beside the test
+      # profile, so it is built from this checkout before the real session.
+      - name: Build the session worker
+        run: cargo build --locked -p pohunek-session-worker --bin pohunek-sessiond
+
+      # One real pinned Hermes turn through the selected package and the public
+      # session commands against a loopback model. Only the test receives the
+      # provisioned executable path; PATH stays the runner's.
+      - name: Drive a real pinned Hermes session through the package
+        env:
+          POHUNEK_HERMES_E2E: "1"
+          POHUNEK_HERMES_BIN: ${{ steps.hermes.outputs.bin }}
+          POHUNEK_PYTHON_BIN: ${{ steps.hermes.outputs.python }}
+        run: cargo test --locked -p pohunek-cli --test hermes_package -- --include-ignored --test-threads 1
+
       # Persist the staged runtime only after the compatibility gate passed:
       # `if: success()` plus this position (after the check) means a broken
       # or partial runtime is never uploaded under the immutable cache key.
@@ -1358,7 +1395,7 @@ jobs:
         with:
           path: ${{ runner.temp }}/hermes-compat-cache
           key: >-
-            hermes-runtime-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-
+            hermes-runtime-${{ runner.os }}-
             ${{ hashFiles('compat/hermes/compatibility-lock.json') }}-
             ${{ hashFiles('scripts/provision-hermes-compat') }}-
             ${{ hashFiles('scripts/tests/provision-hermes-compat.sh') }}-
@@ -1688,7 +1725,9 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
       # mold is Linux-only: keep the default linker on macOS runners.
       RUSTFLAGS: -D warnings
-    timeout-minutes: 45
+    # The release CLI build and the debug build of the CLI integration tests
+    # for the real Hermes session each take a large share of a cold run.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1698,8 +1737,11 @@ jobs:
         shell: bash
         run: test "$(uname -m)" = "arm64"
 
+      # Bootstrap python3 for the provisioner's helper programs and the shell
+      # tests. setup-python installs the python.org framework build here, whose
+      # bin/python3.x re-executes Python.app; the Hermes venv therefore runs
+      # the provisioner's pinned non-framework standalone CPython instead.
       - name: Install Python
-        id: python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -1711,12 +1753,13 @@ jobs:
           enable-cache: true
 
       # The runtime is provisioned by scripts/provision-hermes-compat, which
-      # needs git, python3, uv, and one SHA-256 tool (macOS ships shasum).
+      # needs curl, git, python3, tar, uv, and one SHA-256 tool (macOS ships
+      # shasum).
       - name: Require provisioning prerequisites
         shell: /bin/bash {0}
         run: |
           set -euo pipefail
-          for executable in git python3 uv shasum; do
+          for executable in curl git python3 tar uv shasum; do
             command -v "$executable" >/dev/null 2>&1 \
               || { echo "required executable is unavailable: $executable" >&2; exit 1; }
           done
@@ -1729,7 +1772,7 @@ jobs:
         with:
           path: ${{ runner.temp }}/hermes-compat-cache
           key: >-
-            hermes-runtime-${{ runner.os }}-${{ runner.arch }}-py${{ steps.python.outputs.python-version }}-
+            hermes-runtime-${{ runner.os }}-${{ runner.arch }}-
             ${{ hashFiles('compat/hermes/compatibility-lock.json') }}-
             ${{ hashFiles('scripts/provision-hermes-compat') }}-
             ${{ hashFiles('scripts/tests/provision-hermes-compat.sh') }}-
@@ -1779,6 +1822,10 @@ jobs:
           [[ -f "$hermes_bin" && -x "$hermes_bin" ]] \
             || { echo "provisioned Hermes executable missing at $hermes_bin" >&2; exit 1; }
           printf 'bin=%s\n' "$hermes_bin" >> "$GITHUB_OUTPUT"
+          # The pinned venv interpreter carries PyYAML; the package tests'
+          # plugin harness needs it, and runner Pythons lack it or are
+          # group-writable framework builds the harness refuses.
+          printf 'python=%s\n' "${hermes_bin%/*}/python" >> "$GITHUB_OUTPUT"
 
       - name: Test Hermes harness natively
         run: cargo test --locked -p xtask --lib hermes
@@ -1830,6 +1877,21 @@ jobs:
             "${{ steps.packaged.outputs.dir }}/pohunek" \
             "${{ steps.hermes.outputs.bin }}"
 
+      # The test daemon spawns the session worker found beside the test
+      # profile, so it is built from this checkout before the real session.
+      - name: Build the session worker
+        run: cargo build --locked -p pohunek-session-worker --bin pohunek-sessiond
+
+      # One real pinned Hermes turn through the selected package and the public
+      # session commands against a loopback model, natively on arm64. Only the
+      # test receives the provisioned executable path; PATH stays the runner's.
+      - name: Drive a real pinned Hermes session through the package
+        env:
+          POHUNEK_HERMES_E2E: "1"
+          POHUNEK_HERMES_BIN: ${{ steps.hermes.outputs.bin }}
+          POHUNEK_PYTHON_BIN: ${{ steps.hermes.outputs.python }}
+        run: cargo test --locked -p pohunek-cli --test hermes_package -- --include-ignored --test-threads 1
+
       # Persist the staged runtime only after the gate and smoke passed.
       - name: Persist Hermes runtime cache
         if: success()
@@ -1837,7 +1899,7 @@ jobs:
         with:
           path: ${{ runner.temp }}/hermes-compat-cache
           key: >-
-            hermes-runtime-${{ runner.os }}-${{ runner.arch }}-py${{ steps.python.outputs.python-version }}-
+            hermes-runtime-${{ runner.os }}-${{ runner.arch }}-
             ${{ hashFiles('compat/hermes/compatibility-lock.json') }}-
             ${{ hashFiles('scripts/provision-hermes-compat') }}-
             ${{ hashFiles('scripts/tests/provision-hermes-compat.sh') }}-

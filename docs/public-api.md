@@ -938,19 +938,41 @@ admit no hook report. The built-in `codex` and `claude` runtimes use
 Codex and Claude in the foreground, uses `identity-subagent-v1`.
 
 A schema declares the provider ids that may report, the admitted actions, the
-native-reference kinds (`id`, `path`), the process-ancestry matcher, whether a
-nested provider may become the active identity, the optional subagent claim
+native-reference kinds (`id`, `path`), the process-ancestry matcher, the
+launch-process rule, whether a nested provider may become the active identity, the optional subagent claim
 fields (`parent_id`, `agent_type`, and the `outcome` of a stop), and the
 subagent sequence rule (a start is admitted once per subagent, a stop only
 when it is ordered after the recorded claim). A schema that admits subagent
 operations must declare the sequence rule; one without it admits no subagent
-record on either side. The worker applies the declared matcher, field set and
-sequence rule when a hook reports, and the daemon applies the matcher to the
+record on either side. The worker applies the declared matcher, launch-process
+rule, field set and sequence rule when a hook reports, and the daemon applies
+the matcher to the
 imported identities, the provider set, the field set and the outcomes (a
 failed or cancelled subagent needs the `outcome` field) to the imported
 subagents, and the nested-provider rule to identities and releases. The
 sequence order itself is checked by the worker only, because the inspect
-snapshot carries no claim sequence for subagents. Core keeps peer binding,
+snapshot carries no claim sequence for subagents. The worker orders the
+identity claims and releases of all reporting processes of a session by one
+sequence: a claim or release must be newer than the session's latest accepted
+claim and release. The sequence contract of a worker claim is therefore the
+host's system-wide monotonic clock in nanoseconds (Python's
+`time.monotonic_ns()`: `CLOCK_MONOTONIC` on Linux, `mach_absolute_time` on
+macOS), strictly increasing within the reporting process; the shipped Codex,
+Claude and Hermes reporters all stamp worker claims from it, so a nested agent's
+claim never makes the launch agent's later claim stale. The launch-process rule decides which process may
+set the launch identity, and the worker alone applies it; the daemon holds an
+imported launch identity to the core ancestry matcher. `identity-subagent-v1`
+uses `NamedForProvider` (the earliest process at or below the PTY root whose
+executable is named for the provider, or its declared hook-helper child), which
+is also the core default for a session without a schema, never reached because
+such a session admits no hook report. `identity-v1` uses `FrozenRootEntrypoint`:
+only the PTY root, reporting in process, whose report's kernel peer must be the
+root's PID and start time, so a report naming the root from any other process,
+a descendant included, is refused; and only while its command line, executable
+and entrypoint files match what the worker froze before spawning it, which the
+worker rechecks for every later native reference of the root. The public
+`session.report_native_id` fallback is not covered by the worker's
+launch-process rule; that gap is tracked in [#868](https://github.com/zajca/pohunek/issues/868). Core keeps peer binding,
 expiry, and self-target validation for every schema; a schema only chooses
 which of the other rules applies and with which finite enumeration. The daemon
 sends the

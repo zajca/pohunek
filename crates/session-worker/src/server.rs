@@ -1,15 +1,16 @@
 //! Serves the private daemon-worker Unix protocol.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
-use std::fs;
-use std::io::Read;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -27,14 +28,15 @@ use protocol::{
     ControlError, ControlEvent, ControlMessage, ControlReader, ControlRequest, ControlResponse,
     ControlWriter, Cursor, DaemonId, DataFrame, DataToken, Dimensions, EventKind, ExitStatus,
     FrameError, FrameHeader, FrameKind, HookAction, HookSchema, Initialize, InspectSnapshot,
-    LeaseChallenge, LeaseId, OutputGap, ProcessIdentity as WireProcessIdentity, PtyRelation,
-    ReleasedIdentityClaim, ReportedLaunchIdentity, ReportedNativeReference, RequestKind,
-    ResponseKind, RuntimePhase as WireRuntimePhase, RuntimeScope, SessionId, StreamId, StreamMode,
-    SubagentField, SubagentPhase as WireSubagentPhase, SubagentSequence, SubagentSnapshot,
-    TerminalSnapshot as WireTerminalSnapshot, TransactionId, Version, WorkerId, WorkerInstanceId,
-    WriteAck, WriteId, ATTACH_SNAPSHOT_VERSION, SUPPORTED_RANGE,
+    LaunchProcess, LeaseChallenge, LeaseId, OutputGap, ProcessIdentity as WireProcessIdentity,
+    PtyRelation, ReleasedIdentityClaim, ReportedLaunchIdentity, ReportedNativeReference,
+    RequestKind, ResponseKind, RuntimePhase as WireRuntimePhase, RuntimeScope, SessionId, StreamId,
+    StreamMode, SubagentField, SubagentPhase as WireSubagentPhase, SubagentSequence,
+    SubagentSnapshot, TerminalSnapshot as WireTerminalSnapshot, TransactionId, Version, WorkerId,
+    WorkerInstanceId, WriteAck, WriteId, ATTACH_SNAPSHOT_VERSION, SUPPORTED_RANGE,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{UnixListener, UnixStream};
@@ -80,6 +82,13 @@ const TERMINAL_JOURNAL_RETRY_DELAY: Duration = Duration::from_millis(250);
 const MAX_SUBAGENT_ID_BYTES: usize = 256;
 /// Maximum accepted provider-defined subagent type length.
 const MAX_SUBAGENT_TYPE_BYTES: usize = 128;
+/// Maximum script bytes read and hashed while freezing and rechecking a launch
+/// entrypoint.
+///
+/// A launcher script is a few hundred bytes. The cap bounds the read and the
+/// digest that every launch-claim verification repeats; a larger script cannot
+/// be frozen, so its session accepts no launch identity claim.
+const MAX_ENTRYPOINT_SCRIPT_BYTES: usize = 1024 * 1024;
 /// Maximum outstanding one-use data tokens per worker.
 const DATA_TOKEN_CAPACITY: usize = 4_096;
 /// Entropy bytes used for opaque worker credentials and worker instance IDs.
@@ -368,6 +377,7 @@ impl Server {
             state: AsyncMutex::new(State::new(record)),
             lease: ControllerLease::new(),
             tokens: Mutex::new(TokenState::new()),
+            launch_rule: OnceLock::new(),
             events,
             next_event: AtomicU64::new(1),
             started: Instant::now(),
@@ -409,7 +419,9 @@ impl Server {
             tokio::select! {
                 () = self.shared.shutdown.cancelled() => return Ok(()),
                 _ = launch_retry.tick() => {
-                    if let Err(error) = retry_launch_claims(&self.shared, verify_launch_claim).await {
+                    if let Err(error) = retry_launch_claims(&self.shared, |claim| {
+                        verify_launch_claim(&self.shared, claim)
+                    }).await {
                         event!(name: "worker.launch_identity.retry.failed", Level::ERROR,
                             error.type = "journal", error.message = %error,
                             "launch identity retry commit failed: {{error.message}}");
@@ -470,6 +482,8 @@ struct Shared {
     state: AsyncMutex<State>,
     lease: ControllerLease,
     tokens: Mutex<TokenState>,
+    /// Launch-process rule frozen at `Initialize` from the session's schema.
+    launch_rule: OnceLock<LaunchRule>,
     events: broadcast::Sender<ControlEvent>,
     next_event: AtomicU64,
     started: Instant,
@@ -1147,6 +1161,7 @@ async fn initialize_request(
     #[cfg(test)]
     pause_after_starting(shared).await;
 
+    freeze_launch_rule(shared, hook_schema, &initialize)?;
     let command = command_from_initialize(shared, &initialize, &worker_instance_id);
     let history_bytes = usize::try_from(initialize.limits.output_history_bytes())
         .map_err(|error| control_error(ControlCode::InvalidRequest, error, false))?;
@@ -1187,6 +1202,29 @@ async fn initialize_request(
         worker_instance_id,
         child_process,
     })
+}
+
+/// Freezes the session's launch-process rule before its runtime is spawned.
+///
+/// # Errors
+///
+/// Returns a runtime fault when a rule was already frozen, which the
+/// `Uninitialized` phase check rules out.
+fn freeze_launch_rule(
+    shared: &Shared,
+    hook_schema: Option<&'static HookSchema>,
+    initialize: &Initialize,
+) -> Result<(), ControlError> {
+    shared
+        .launch_rule
+        .set(launch_rule(shared, hook_schema, initialize))
+        .map_err(|_rejected| {
+            control_error_message(
+                ControlCode::RuntimeFault,
+                "worker launch rule was already frozen",
+                false,
+            )
+        })
 }
 
 /// Spawns the runtime's child and commits `Running` in one state-lock hold.
@@ -3073,7 +3111,10 @@ async fn serve_identity_hook<W>(
 where
     W: AsyncWrite + Unpin + Send,
 {
-    serve_identity_hook_with_probe(shared, writer, value, peer, verify_launch_claim).await
+    serve_identity_hook_with_probe(Arc::clone(&shared), writer, value, peer, |claim| {
+        verify_launch_claim(&shared, claim)
+    })
+    .await
 }
 
 #[expect(
@@ -3146,7 +3187,7 @@ where
                     pid,
                     start_identity,
                     root_identity.pid,
-                );
+                ) && root_report_from_root(&shared, peer, pid, &root_identity);
                 let sequence_valid = identity_sequence_is_fresh(&state.journal, sequence);
                 if !sequence_valid {
                     reject_identity(
@@ -3201,29 +3242,13 @@ where
                                 sequence,
                                 latest_reference: None,
                             };
-                            launch_identity_status = launch::submit(
+                            launch_identity_status = apply_launch_report(
+                                &shared,
                                 &mut journal,
                                 claim,
-                                shared.config.pending_launch_claims,
-                                |claim| {
-                                    let result = verify(claim);
-                                    if let Err(error) = &result {
-                                        event!(name: "worker.launch_identity.inspect.deferred", Level::WARN,
-                                            process.pid = pid, error.type = "process_observation", error.message = %error,
-                                            "launch identity verification deferred: {{error.message}}");
-                                    }
-                                    result
-                                },
+                                reported,
+                                &mut verify,
                             )?;
-                            // The verified launch process's latest reference is
-                            // journaled apart from the lease-bound active claim.
-                            if journal
-                                .launch_identity
-                                .as_ref()
-                                .is_some_and(|launch| launch.process == reported.process)
-                            {
-                                journal.native_reference_claim = Some(reported);
-                            }
                         }
                     }
                     journal.updated_at = timestamp();
@@ -3274,7 +3299,7 @@ where
                     pid,
                     start_identity,
                     pty.identity().pid,
-                );
+                ) && root_report_from_root(&shared, peer, pid, pty.identity());
                 let released_process = if process_valid {
                     state
                         .journal
@@ -3612,14 +3637,610 @@ fn admitted_ancestry(
         .map_err(|reason| WorkerError::Protocol(format!("hook claim was not admitted: {reason}")))
 }
 
-fn verify_launch_claim(claim: &PendingLaunchClaim) -> Result<bool, WorkerError> {
-    verify_launch_claim_with(&HostInspector::new(), claim)
+/// Launch-process rule of a session's hook schema, with the evidence it needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LaunchRule {
+    /// [`LaunchProcess::NamedForProvider`].
+    NamedForProvider,
+    /// [`LaunchProcess::FrozenRootEntrypoint`] with the entrypoint frozen at
+    /// `Initialize`, or `None` when it could not be frozen, which accepts no
+    /// claim.
+    FrozenRoot(Option<Box<FrozenEntrypoint>>),
 }
 
+impl LaunchRule {
+    /// Stable code of the rule in structured logs.
+    const fn code(&self) -> &'static str {
+        match self {
+            Self::NamedForProvider => "named_for_provider",
+            Self::FrozenRoot(_) => "frozen_root_entrypoint",
+        }
+    }
+}
+
+/// Why a launch claim, or a later native reference of the launch process, was
+/// refused.
+///
+/// The codes are the only refusal detail that reaches a log: no path, command
+/// line, or native reference does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchRefusal {
+    /// The worker froze no launch rule, so no claim can be verified.
+    NoRuleFrozen,
+    /// A report naming the frozen root came from a different kernel peer.
+    NotRootPeer,
+    /// The claim names a process other than the PTY root.
+    NotRootProcess,
+    /// The launch entrypoint could not be frozen at `Initialize`.
+    NoFrozenEntrypoint,
+    /// The root or the claimed process no longer exists.
+    ProcessGone,
+    /// The root or the claimed process is a different generation than claimed.
+    GenerationChanged,
+    /// The root's command line is not the frozen argv.
+    CmdlineMismatch,
+    /// The root's executable is not the frozen image.
+    ImageMismatch,
+    /// A frozen file changed since `Initialize`.
+    EntrypointChanged,
+    /// No process at or below the root is named for the provider.
+    NoLaunchProcess,
+    /// The claimed process is neither the launch process nor its provider
+    /// hook-helper child.
+    NotLaunchProcess,
+    /// The process facts needed to verify a later reference could not be read.
+    InspectionFailed,
+    /// The launch identity is already set from another process.
+    LaunchFixed,
+    /// The same process's first claim was refused, and a later report never
+    /// replaces it.
+    RefusedBefore,
+}
+
+impl LaunchRefusal {
+    /// Stable code used in structured logs.
+    const fn code(self) -> &'static str {
+        match self {
+            Self::NoRuleFrozen => "no_rule_frozen",
+            Self::NotRootPeer => "not_root_peer",
+            Self::NotRootProcess => "not_root_process",
+            Self::NoFrozenEntrypoint => "no_frozen_entrypoint",
+            Self::ProcessGone => "process_gone",
+            Self::GenerationChanged => "generation_changed",
+            Self::CmdlineMismatch => "cmdline_mismatch",
+            Self::ImageMismatch => "image_mismatch",
+            Self::EntrypointChanged => "entrypoint_changed",
+            Self::NoLaunchProcess => "no_launch_process",
+            Self::NotLaunchProcess => "not_launch_process",
+            Self::InspectionFailed => "inspection_failed",
+            Self::LaunchFixed => "launch_fixed",
+            Self::RefusedBefore => "refused_before",
+        }
+    }
+}
+
+/// Outcome of verifying one launch claim against the session's rule.
+type LaunchVerdict = Result<(), LaunchRefusal>;
+
+/// Records one refused launch claim or native reference update.
+///
+/// A refusal without a frozen rule is a worker defect, not a hostile or stale
+/// report, so it is logged as an error.
+fn reject_launch(shared: &Shared, rule: Option<&LaunchRule>, reason: LaunchRefusal, pid: u32) {
+    if let Some(rule) = rule {
+        event!(
+            name: "worker.launch_identity.rejected",
+            Level::WARN,
+            worker.id = %shared.worker_id,
+            session.id = %shared.session_id,
+            launch.rule = rule.code(),
+            launch.reason = reason.code(),
+            process.pid = pid,
+            "launch identity claim refused: {{launch.reason}}",
+        );
+    } else {
+        event!(
+            name: "worker.launch_identity.rejected",
+            Level::ERROR,
+            worker.id = %shared.worker_id,
+            session.id = %shared.session_id,
+            launch.rule = "none",
+            launch.reason = reason.code(),
+            process.pid = pid,
+            "launch identity claim refused without a frozen launch rule: {{launch.reason}}",
+        );
+    }
+}
+
+/// Applies one identity report of the launch provider to the launch identity.
+///
+/// The report establishes the launch identity, keeps a pending claim, or
+/// journals the launch process's later reference; every refusal is logged.
+///
+/// # Errors
+///
+/// Returns an error when the bounded pending-claim capacity is exhausted.
+fn apply_launch_report(
+    shared: &Shared,
+    journal: &mut JournalRecord,
+    claim: PendingLaunchClaim,
+    reported: NativeReferenceClaim,
+    verify: &mut impl FnMut(&PendingLaunchClaim) -> Result<bool, WorkerError>,
+) -> Result<LaunchClaimStatus, WorkerError> {
+    let rule = shared.launch_rule.get();
+    let pid = claim.identity.process.pid;
+    let frozen_root = matches!(rule, Some(LaunchRule::FrozenRoot(_)));
+    if frozen_root && pid != claim.root.pid {
+        // Only the root can ever qualify, so a descendant's claim is refused
+        // without a pending entry that would use up the bounded capacity
+        // before the root reports.
+        reject_launch(shared, rule, LaunchRefusal::NotRootProcess, pid);
+        return Ok(LaunchClaimStatus::Rejected);
+    }
+    let established = journal.launch_identity.is_some();
+    let standing = standing_launch_refusal(journal, &claim);
+    let update = claim.clone();
+    let mut status = launch::submit(
+        journal,
+        claim,
+        shared.config.pending_launch_claims,
+        |claim| {
+            let result = verify(claim);
+            if let Err(error) = &result {
+                event!(name: "worker.launch_identity.inspect.deferred", Level::WARN,
+                    process.pid = pid, error.type = "process_observation", error.message = %error,
+                    "launch identity verification deferred: {{error.message}}");
+            }
+            result
+        },
+    )?;
+    if let Some(reason) = standing {
+        reject_launch(shared, rule, reason, pid);
+    }
+    // The verified launch process's latest reference is journaled apart from
+    // the lease-bound active claim. Under the frozen-root rule it is journaled
+    // only while the root still runs the frozen entrypoint, which an exec in
+    // place would otherwise escape. A claim that establishes the launch
+    // identity journals its own reference inside `submit`.
+    if established
+        && journal
+            .launch_identity
+            .as_ref()
+            .is_some_and(|launch| launch.process == reported.process)
+    {
+        let verdict = if frozen_root {
+            verify(&update)
+        } else {
+            Ok(true)
+        };
+        match verdict {
+            Ok(true) => journal.native_reference_claim = Some(reported),
+            Ok(false) => status = LaunchClaimStatus::Rejected,
+            // An update is never retried, so an unverifiable one is refused.
+            Err(_error) => {
+                reject_launch(shared, rule, LaunchRefusal::InspectionFailed, pid);
+                status = LaunchClaimStatus::Rejected;
+            }
+        }
+    }
+    Ok(status)
+}
+
+/// Why [`launch::submit`] refuses `claim` from the journal alone, without
+/// verifying it.
+///
+/// The launch identity is immutable once set, and a process's first claim is
+/// never replaced, so neither refusal depends on the process facts.
+fn standing_launch_refusal(
+    journal: &JournalRecord,
+    claim: &PendingLaunchClaim,
+) -> Option<LaunchRefusal> {
+    match journal.launch_identity.as_ref() {
+        Some(launch) => {
+            (launch.process != claim.identity.process).then_some(LaunchRefusal::LaunchFixed)
+        }
+        None => journal
+            .pending_launch_claims
+            .iter()
+            .any(|pending| {
+                !pending.retry_pending
+                    && pending.identity.process == claim.identity.process
+                    && pending.identity.provider == claim.identity.provider
+            })
+            .then_some(LaunchRefusal::RefusedBefore),
+    }
+}
+
+/// Whether a report naming the PTY root comes from the root itself, when the
+/// session's rule designates the frozen root.
+///
+/// Every descendant inherits the worker socket path and instance id, and the
+/// root reports in process, so under [`LaunchProcess::FrozenRootEntrypoint`]
+/// only a kernel peer that is the root may speak for it. Refusing the whole
+/// report keeps a descendant from setting the root's launch identity, its
+/// native reference, or the claim ordering the root's own reports must pass.
+fn root_report_from_root(
+    shared: &Shared,
+    peer: &PeerContext,
+    pid: u32,
+    root: &ProcessIdentity,
+) -> bool {
+    let rule = shared.launch_rule.get();
+    if pid != root.pid || !matches!(rule, Some(LaunchRule::FrozenRoot(_))) {
+        return true;
+    }
+    let peer = peer.identity();
+    if peer.pid == root.pid && peer.start_identity.to_string() == root.start_identity {
+        return true;
+    }
+    reject_launch(shared, rule, LaunchRefusal::NotRootPeer, pid);
+    false
+}
+
+/// Process image the worker launched, frozen at `Initialize`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FrozenEntrypoint {
+    /// Exact command line the root process runs with.
+    argv: Vec<String>,
+    /// The launched executable; a script when `interpreter` is set.
+    entrypoint: FileIdentity,
+    /// The absolute shebang interpreter the kernel runs the script with.
+    interpreter: Option<FileIdentity>,
+}
+
+impl FrozenEntrypoint {
+    /// The file the root process image must be.
+    fn image(&self) -> &FileIdentity {
+        self.interpreter.as_ref().unwrap_or(&self.entrypoint)
+    }
+
+    /// Whether every frozen file still has its frozen identity.
+    fn unchanged(&self) -> bool {
+        file_identity(&self.entrypoint.requested_path, true).as_ref() == Some(&self.entrypoint)
+            && self.interpreter.as_ref().is_none_or(|interpreter| {
+                file_identity(&interpreter.requested_path, false).as_ref() == Some(interpreter)
+            })
+    }
+}
+
+/// Identity of one file, taken so that a swap during the snapshot fails it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdentity {
+    /// The path as launched or named by the shebang.
+    requested_path: PathBuf,
+    /// The fully resolved path the kernel executes.
+    canonical_path: PathBuf,
+    /// Stamp and target of `requested_path` when it is a symbolic link.
+    link: Option<(FileStamp, PathBuf)>,
+    /// Stamp of the resolved regular file.
+    target: FileStamp,
+    /// SHA-256 of a script's contents; `None` for a file read as a binary.
+    content_digest: Option<[u8; 32]>,
+}
+
+/// Inode metadata that changes when a file is replaced or rewritten.
+///
+/// The modification time can be set by the file's owner, but the status-change
+/// time cannot: the kernel advances it on every content, metadata, or rename
+/// change, so an in-place rewrite never keeps an equal stamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    device: u64,
+    inode: u64,
+    len: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl FileStamp {
+    fn new(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            len: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
+/// Why a launch entrypoint file could not be frozen.
+///
+/// The codes, and the I/O error kind, are the only freeze detail that reaches
+/// a log: no path or file content does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreezeReason {
+    /// The launched executable path is not UTF-8, so no command line matches.
+    PathNotUtf8,
+    /// The file could not be inspected or read.
+    Unreadable,
+    /// The path does not resolve to a regular file.
+    NotRegularFile,
+    /// The script is larger than [`MAX_ENTRYPOINT_SCRIPT_BYTES`].
+    ScriptTooLarge,
+    /// The file or its link changed while it was snapshotted.
+    ChangedWhileReading,
+    /// The script's first line is not exactly `#!<absolute path>`.
+    UnsupportedShebang,
+}
+
+impl FreezeReason {
+    /// Stable code used in structured logs.
+    const fn code(self) -> &'static str {
+        match self {
+            Self::PathNotUtf8 => "path_not_utf8",
+            Self::Unreadable => "unreadable",
+            Self::NotRegularFile => "not_regular_file",
+            Self::ScriptTooLarge => "script_too_large",
+            Self::ChangedWhileReading => "changed_while_reading",
+            Self::UnsupportedShebang => "unsupported_shebang",
+        }
+    }
+}
+
+/// Why one file could not be frozen, with the I/O error kind when an
+/// operating-system call failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FreezeError {
+    reason: FreezeReason,
+    io_kind: Option<std::io::ErrorKind>,
+}
+
+impl FreezeError {
+    const fn new(reason: FreezeReason) -> Self {
+        Self {
+            reason,
+            io_kind: None,
+        }
+    }
+
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "consumes the error at the `map_err` call sites"
+    )]
+    fn io(error: std::io::Error) -> Self {
+        Self {
+            reason: FreezeReason::Unreadable,
+            io_kind: Some(error.kind()),
+        }
+    }
+}
+
+/// Why `initialize`'s entrypoint could not be frozen, naming which frozen file
+/// failed: `entrypoint` or `interpreter`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FreezeFailure {
+    file: &'static str,
+    error: FreezeError,
+}
+
+/// Snapshots the file at `path`, returning its identity and, when
+/// `read_script` is set and the file starts with `#!`, its contents.
+///
+/// # Errors
+///
+/// Fails when the file is not a regular file, cannot be read, is a script
+/// larger than [`MAX_ENTRYPOINT_SCRIPT_BYTES`], or changes while it is read.
+fn file_snapshot(
+    path: &Path,
+    read_script: bool,
+) -> Result<(FileIdentity, Option<Vec<u8>>), FreezeError> {
+    let changed = FreezeError::new(FreezeReason::ChangedWhileReading);
+    let link_before = fs::symlink_metadata(path).map_err(FreezeError::io)?;
+    let link_target_before = fs::read_link(path).ok();
+    let canonical_before = fs::canonicalize(path).map_err(FreezeError::io)?;
+    let target_before = fs::metadata(&canonical_before).map_err(FreezeError::io)?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&canonical_before)
+        .map_err(FreezeError::io)?;
+    let opened_before = file.metadata().map_err(FreezeError::io)?;
+    if !opened_before.file_type().is_file() {
+        return Err(FreezeError::new(FreezeReason::NotRegularFile));
+    }
+    if FileStamp::new(&target_before) != FileStamp::new(&opened_before) {
+        return Err(changed);
+    }
+    let mut script = None;
+    if read_script {
+        let too_large = FreezeError::new(FreezeReason::ScriptTooLarge);
+        let mut prefix = [0_u8; 2];
+        let prefix_len = file.read(&mut prefix).map_err(FreezeError::io)?;
+        if prefix_len == prefix.len() && &prefix == b"#!" {
+            if opened_before.len() > MAX_ENTRYPOINT_SCRIPT_BYTES as u64 {
+                return Err(too_large);
+            }
+            let mut contents = Vec::new();
+            file.seek(SeekFrom::Start(0)).map_err(FreezeError::io)?;
+            file.by_ref()
+                .take((MAX_ENTRYPOINT_SCRIPT_BYTES + 1) as u64)
+                .read_to_end(&mut contents)
+                .map_err(FreezeError::io)?;
+            if contents.len() > MAX_ENTRYPOINT_SCRIPT_BYTES {
+                return Err(too_large);
+            }
+            script = Some(contents);
+        }
+    }
+    let target_after = file.metadata().map_err(FreezeError::io)?;
+    let canonical_after = fs::canonicalize(path).map_err(FreezeError::io)?;
+    let link_after = fs::symlink_metadata(path).map_err(FreezeError::io)?;
+    let link_target_after = fs::read_link(path).ok();
+    if canonical_before != canonical_after
+        || FileStamp::new(&link_before) != FileStamp::new(&link_after)
+        || link_target_before != link_target_after
+        || FileStamp::new(&target_before) != FileStamp::new(&target_after)
+    {
+        return Err(changed);
+    }
+    let link = if link_before.file_type().is_symlink() {
+        // A link whose target cannot be read either time is unreadable.
+        let target = link_target_before.ok_or(FreezeError::new(FreezeReason::Unreadable))?;
+        Some((FileStamp::new(&link_before), target))
+    } else {
+        None
+    };
+    Ok((
+        FileIdentity {
+            requested_path: path.to_owned(),
+            canonical_path: canonical_before,
+            link,
+            target: FileStamp::new(&target_after),
+            content_digest: script
+                .as_deref()
+                .map(|contents| Sha256::digest(contents).into()),
+        },
+        script,
+    ))
+}
+
+fn file_identity(path: &Path, read_script: bool) -> Option<FileIdentity> {
+    file_snapshot(path, read_script)
+        .ok()
+        .map(|(identity, _script)| identity)
+}
+
+/// The absolute interpreter a script's shebang names, when the line is
+/// exactly `#!<absolute path>` with no argument.
+fn shebang_interpreter(script: &[u8]) -> Option<&str> {
+    let line = script.split(|byte| *byte == b'\n').next()?;
+    let line = std::str::from_utf8(line).ok()?.strip_prefix("#!")?;
+    let interpreter = line.strip_suffix('\r').unwrap_or(line);
+    (Path::new(interpreter).is_absolute() && !interpreter.contains(char::is_whitespace))
+        .then_some(interpreter)
+}
+
+/// Freezes the image `initialize` launches.
+///
+/// A native executable is frozen as itself. A script is frozen together with
+/// the absolute, argument-free shebang interpreter that runs it, and the root
+/// command line is the one the kernel builds for it: interpreter, script path,
+/// then the launch arguments.
+///
+/// # Errors
+///
+/// Fails, naming the file and the reason, when either file cannot be pinned.
+fn frozen_entrypoint(initialize: &Initialize) -> Result<FrozenEntrypoint, FreezeFailure> {
+    let entrypoint_failure = |error| FreezeFailure {
+        file: "entrypoint",
+        error,
+    };
+    let launched = initialize
+        .executable
+        .to_str()
+        .ok_or(entrypoint_failure(FreezeError::new(
+            FreezeReason::PathNotUtf8,
+        )))?;
+    let (entrypoint, script) =
+        file_snapshot(&initialize.executable, true).map_err(entrypoint_failure)?;
+    let (interpreter, argv) = match script {
+        None => {
+            let mut argv = Vec::with_capacity(initialize.arguments.len() + 1);
+            argv.push(launched.to_owned());
+            argv.extend(initialize.arguments.iter().cloned());
+            (None, argv)
+        }
+        Some(script) => {
+            let interpreter = shebang_interpreter(&script).ok_or(entrypoint_failure(
+                FreezeError::new(FreezeReason::UnsupportedShebang),
+            ))?;
+            let (identity, _) =
+                file_snapshot(Path::new(interpreter), false).map_err(|error| FreezeFailure {
+                    file: "interpreter",
+                    error,
+                })?;
+            let mut argv = Vec::with_capacity(initialize.arguments.len() + 2);
+            argv.push(interpreter.to_owned());
+            argv.push(launched.to_owned());
+            argv.extend(initialize.arguments.iter().cloned());
+            (Some(identity), argv)
+        }
+    };
+    Ok(FrozenEntrypoint {
+        argv,
+        entrypoint,
+        interpreter,
+    })
+}
+
+/// The launch rule `schema` declares, with the evidence it needs frozen from
+/// `initialize`.
+///
+/// A frozen-root rule whose entrypoint cannot be frozen accepts no claim, and
+/// the reason is logged once here.
+fn launch_rule(
+    shared: &Shared,
+    schema: Option<&HookSchema>,
+    initialize: &Initialize,
+) -> LaunchRule {
+    match schema.map_or(LaunchProcess::CORE, |schema| schema.launch_process) {
+        LaunchProcess::NamedForProvider => LaunchRule::NamedForProvider,
+        LaunchProcess::FrozenRootEntrypoint => match frozen_entrypoint(initialize) {
+            Ok(entrypoint) => LaunchRule::FrozenRoot(Some(Box::new(entrypoint))),
+            Err(failure) => {
+                event!(
+                    name: "worker.launch_identity.freeze.unavailable",
+                    Level::WARN,
+                    worker.id = %shared.worker_id,
+                    session.id = %shared.session_id,
+                    freeze.file = failure.file,
+                    freeze.reason = failure.error.reason.code(),
+                    io.kind = failure.error.io_kind.map_or_else(|| "none".to_owned(), |kind| format!("{kind:?}")),
+                    "launch entrypoint could not be frozen: {{freeze.reason}}; no launch identity claim will be accepted",
+                );
+                LaunchRule::FrozenRoot(None)
+            }
+        },
+    }
+}
+
+/// Verifies `claim` against the session's frozen launch rule and logs a
+/// refusal.
+///
+/// A worker that froze no rule refuses every claim rather than fall back to a
+/// looser rule.
+fn verify_launch_claim(shared: &Shared, claim: &PendingLaunchClaim) -> Result<bool, WorkerError> {
+    let pid = claim.identity.process.pid;
+    let Some(rule) = shared.launch_rule.get() else {
+        reject_launch(shared, None, LaunchRefusal::NoRuleFrozen, pid);
+        return Ok(false);
+    };
+    let verdict = verify_launch_claim_with_rule(&HostInspector::new(), claim, rule)?;
+    if let Err(reason) = verdict {
+        reject_launch(shared, Some(rule), reason, pid);
+    }
+    Ok(verdict.is_ok())
+}
+
+#[cfg(test)]
 fn verify_launch_claim_with(
     inspector: &dyn ProcessInspector,
     claim: &PendingLaunchClaim,
 ) -> Result<bool, WorkerError> {
+    verify_launch_claim_with_rule(inspector, claim, &LaunchRule::NamedForProvider)
+        .map(|verdict| verdict.is_ok())
+}
+
+fn verify_launch_claim_with_rule(
+    inspector: &dyn ProcessInspector,
+    claim: &PendingLaunchClaim,
+    rule: &LaunchRule,
+) -> Result<LaunchVerdict, WorkerError> {
+    match rule {
+        LaunchRule::NamedForProvider => verify_named_launch_claim(inspector, claim),
+        LaunchRule::FrozenRoot(entrypoint) => {
+            verify_frozen_root_claim(inspector, claim, entrypoint.as_deref())
+        }
+    }
+}
+
+/// The claim's root and reporting process, when both still have the exact
+/// generation the claim recorded.
+fn live_claim_processes(
+    inspector: &dyn ProcessInspector,
+    claim: &PendingLaunchClaim,
+) -> Result<Result<(OsProcessIdentity, OsProcessIdentity), LaunchRefusal>, WorkerError> {
     let exact_identity = |process: &ChildIdentity| -> Result<OsProcessIdentity, WorkerError> {
         Ok(OsProcessIdentity {
             pid: process.pid,
@@ -3634,22 +4255,96 @@ fn verify_launch_claim_with(
     for expected in [root, candidate] {
         match inspector.identity(expected.pid) {
             Ok(Some(current)) if current == expected => {}
-            Ok(_) | Err(pohunek_platform::process::Error::Race { .. }) => return Ok(false),
+            Ok(None) => return Ok(Err(LaunchRefusal::ProcessGone)),
+            Ok(Some(_)) | Err(pohunek_platform::process::Error::Race { .. }) => {
+                return Ok(Err(LaunchRefusal::GenerationChanged));
+            }
             Err(error) => return Err(WorkerError::Protocol(error.to_string())),
         }
     }
+    Ok(Ok((root, candidate)))
+}
+
+/// Verifies a claim under [`LaunchProcess::NamedForProvider`].
+fn verify_named_launch_claim(
+    inspector: &dyn ProcessInspector,
+    claim: &PendingLaunchClaim,
+) -> Result<LaunchVerdict, WorkerError> {
+    let (root, candidate) = match live_claim_processes(inspector, claim)? {
+        Ok(processes) => processes,
+        Err(reason) => return Ok(Err(reason)),
+    };
     // This probe also rechecks root/candidate generations after executable and
     // ancestry inspection. The stored PID alone never authorizes a retry.
     let provider = &claim.identity.provider;
     let Some(designated) = designated_launch_process_with(inspector, root, provider)? else {
-        return Ok(false);
+        return Ok(Err(LaunchRefusal::NoLaunchProcess));
     };
     if designated.pid == candidate.pid
         && designated.start_identity.to_string() == candidate.start_identity.to_string()
     {
-        return Ok(true);
+        return Ok(Ok(()));
     }
-    is_provider_child_of_launch(inspector, candidate, &designated, provider)
+    Ok(
+        if is_provider_child_of_launch(inspector, candidate, &designated, provider)? {
+            Ok(())
+        } else {
+            Err(LaunchRefusal::NotLaunchProcess)
+        },
+    )
+}
+
+/// Verifies a claim under [`LaunchProcess::FrozenRootEntrypoint`].
+///
+/// Only the PTY root qualifies, and only while its command line is the frozen
+/// argv, its executable is the frozen image, and the frozen files are
+/// unchanged. Without a frozen entrypoint no claim qualifies. That the kernel
+/// peer filing the report is the root itself is checked when the report is
+/// received, by [`root_report_from_root`].
+fn verify_frozen_root_claim(
+    inspector: &dyn ProcessInspector,
+    claim: &PendingLaunchClaim,
+    entrypoint: Option<&FrozenEntrypoint>,
+) -> Result<LaunchVerdict, WorkerError> {
+    let inspection =
+        |error: pohunek_platform::process::Error| WorkerError::Protocol(error.to_string());
+    // A non-root claim is refused before any process or file inspection.
+    if claim.identity.process.pid != claim.root.pid {
+        return Ok(Err(LaunchRefusal::NotRootProcess));
+    }
+    let Some(entrypoint) = entrypoint else {
+        return Ok(Err(LaunchRefusal::NoFrozenEntrypoint));
+    };
+    let (root, candidate) = match live_claim_processes(inspector, claim)? {
+        Ok(processes) => processes,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    if candidate != root {
+        return Ok(Err(LaunchRefusal::NotRootProcess));
+    }
+    let Some(fact) = inspector.process(root.pid).map_err(inspection)? else {
+        return Ok(Err(LaunchRefusal::ProcessGone));
+    };
+    if fact.identity() != root {
+        return Ok(Err(LaunchRefusal::GenerationChanged));
+    }
+    if fact.cmdline != entrypoint.argv {
+        return Ok(Err(LaunchRefusal::CmdlineMismatch));
+    }
+    let executable = inspector.executable(root.pid).map_err(inspection)?;
+    if executable.as_deref() != Some(entrypoint.image().canonical_path.as_path()) {
+        return Ok(Err(LaunchRefusal::ImageMismatch));
+    }
+    if !entrypoint.unchanged() {
+        return Ok(Err(LaunchRefusal::EntrypointChanged));
+    }
+    // The generation is rechecked last, so a root that exited and whose PID
+    // was reused during inspection fails closed.
+    Ok(match inspector.identity(root.pid).map_err(inspection)? {
+        Some(current) if current == root => Ok(()),
+        Some(_) => Err(LaunchRefusal::GenerationChanged),
+        None => Err(LaunchRefusal::ProcessGone),
+    })
 }
 
 async fn retry_launch_claims(
@@ -3892,7 +4587,9 @@ fn validate_hook_process(
 ///
 /// The stricter `peer == subject` binding belongs to the explicit in-process
 /// identity mode in <https://github.com/zajca/pohunek/issues/52>, which can
-/// demand it on a wire shape of its own without breaking child hooks.
+/// demand it on a wire shape of its own without breaking child hooks. A session
+/// whose launch rule is the frozen root already demands it for a report naming
+/// the PTY root, in [`root_report_from_root`].
 fn peer_vouches_for(peer: &PeerContext, subject: u32) -> Result<bool, WorkerError> {
     let peer_pid = peer.identity().pid;
     if peer_pid == subject {
@@ -4709,7 +5406,9 @@ fn is_provider_child_of_launch(
 /// does an interpreter's script argument: a wrapper install is accepted only
 /// when the process image that runs is itself named for the provider (a native
 /// binary or a launcher named for it). Anything else yields `None`, which
-/// leaves the claim unaccepted.
+/// leaves the claim unaccepted. This is the [`LaunchProcess::NamedForProvider`]
+/// rule; a schema declaring [`LaunchProcess::FrozenRootEntrypoint`] designates
+/// the frozen PTY root instead.
 fn designated_launch_process_with(
     inspector: &dyn ProcessInspector,
     root: OsProcessIdentity,
@@ -5329,6 +6028,7 @@ mod tests {
             actions: &[HookAction::SubagentStart],
             reference_kinds: &[],
             ancestry: protocol::AncestryMatcher::ManagedPtyDescendant,
+            launch_process: protocol::LaunchProcess::NamedForProvider,
             nested_active: true,
             subagent_fields: &[protocol::SubagentField::ParentId],
             subagent_sequence: Some(protocol::SubagentSequence::StopAfterStart),
@@ -5360,6 +6060,7 @@ mod tests {
             actions: &[HookAction::SubagentStart, HookAction::SubagentStop],
             reference_kinds: &[],
             ancestry: protocol::AncestryMatcher::ManagedPtyDescendant,
+            launch_process: protocol::LaunchProcess::NamedForProvider,
             nested_active: true,
             subagent_fields: &[protocol::SubagentField::Outcome],
             subagent_sequence: None,
@@ -5682,6 +6383,7 @@ mod tests {
             actions: &[HookAction::IdentityReport],
             reference_kinds: &[],
             ancestry: protocol::AncestryMatcher::ManagedPtyDescendant,
+            launch_process: protocol::LaunchProcess::NamedForProvider,
             nested_active: false,
             subagent_fields: &[],
             subagent_sequence: None,
