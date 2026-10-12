@@ -89,20 +89,20 @@ the required gates and independent review under existing authorization;
 product or authority changes require the applicable owner decision. An
 available independent reviewer examines the relevant code, contract, and
 evidence for the area, assesses the exact candidate against the issue
-criteria, and records findings without needing an implementation reservation. No permanently staffed area reviewer or response
-time commitment is promised. If an independent reviewer is unavailable, the
-candidate remains unaccepted; the maintainer records that state and retries
-routing when capacity exists. The submitter, author, executor, or manager
-cannot supply independent approval, including through another session. Automated review
-counts only after #700 resolves the reviewer-service defect and a completed
-review is verified against the exact pull request head under the corrected
-#700/#802 contract. An interrupted or stale-head run is not approval. The
-restricted broker of #817 may request `ai:review` only for a validated
-exact-head submission under its exact-candidate contract and the corrected
-#700/#802 contract; contributors, executors, and
-models never receive its credential, and its preliminary assessment is not
-independent review. Review grants no merge authority; release remains
-separately authorized.
+criteria, and records findings without needing an implementation reservation.
+No permanently staffed area reviewer or response time commitment is promised.
+If an independent reviewer is unavailable, the candidate remains unaccepted;
+the maintainer records that state and retries routing when capacity exists.
+The submitter, author, executor, or manager cannot supply independent
+approval, including through another session. Automated review counts only
+after #700 resolves the reviewer-service defect and a completed review is
+verified against the exact pull request head under the corrected #700/#802
+contract. An interrupted or stale-head run is not approval. The restricted
+broker of #817 may request `ai:review` only for a validated exact-head
+submission under its exact-candidate contract and the corrected #700/#802
+contract; contributors, executors, and models never receive its credential,
+and its preliminary assessment is not independent review. Review grants no
+merge authority; release remains separately authorized.
 
 Unsolicited competing pull requests remain welcome and use the same criteria.
 A reservation neither guarantees a merge nor prevents fork work; choosing a
