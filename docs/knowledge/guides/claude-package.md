@@ -147,6 +147,19 @@ captured screen through the package manifest.
   start for its prompt-suggestion helper; `identity-subagent-v1` admits a
   Claude stop only after a recorded start, so the helper adds no subagent row
   (evidence in [#883](https://github.com/zajca/pohunek/issues/883)).
+- The main-agent Stop input carries `background_tasks`, the backgrounded tasks
+  still running or pending (Claude Code 2.1.296). A background subagent's task
+  id is its `agent_id`; teammates, synchronous children and workflow agents are
+  not listed by agent id. The installer registers two Stop hooks in
+  `settings.json`: the notify hook (`turn_completed`) and the state hook
+  (`stop`), which forwards only each task's `id`, `type` and `status` as a
+  `subagent_snapshot` claim to the worker, reads at most 1 MiB, and sends
+  nothing for a Stop with a non-empty `agent_id` or a missing, invalid or
+  over-long list. The
+  worker completes listed-then-missing background agents of the same Claude
+  process and reopens listed terminal ones (see
+  [sessions](../concepts/sessions.md); evidence in
+  [#883](https://github.com/zajca/pohunek/issues/883)).
 - `claude --version` prints `2.1.289 (Claude Code)`; the inventory shows the
   package's probe accepted the real release.
 - Environment that keeps a real Claude away from host state and services:

@@ -1,6 +1,6 @@
 # Knowledge Bundle Log
 
-## Unreleased (2026-10-12, subagent restart and Claude helper stop, #883)
+## Unreleased (2026-10-12, subagent restart, Claude helper stop and main-turn snapshot, #883)
 
 - A `SubagentStart` with a newer sequence for a terminal subagent reopens its
   record: `running` with a new revision, `finished_at_ms` cleared,
@@ -24,11 +24,36 @@
   `worker.subagent.claim.ignored` (`duplicate_start`, `stop_without_start`,
   `stale_sequence`, `not_running`; INFO, hook answer `ok: true`) and every
   refused one as `worker.subagent.claim.refused` (`capacity`; WARN, hook
-  answer `ok: false`). `SubagentInfo` and the wire protocol are
-  unchanged. Documented in `concepts/sessions`, the `claude-package` and
-  `codex-package` guides, the `debug-session-runtime` runbook and
+  answer `ok: false`).
+- The Claude state hook runs on the main-agent `Stop` (a second managed `Stop`
+  entry beside the notify hook) and sends the worker a `subagent_snapshot`
+  claim with only the `id`, `type` and `status` of each `background_tasks`
+  entry. It reads at most 1 MiB for this action (64 KiB for the others) and
+  sends nothing for a `Stop` with a non-empty `agent_id` or a missing, invalid
+  or over-256-entry list. `identity-subagent-v1` admits the snapshot.
+- The worker reconciles the rows of the same reporting process with an older
+  sequence: a listed running row stays `running` and its journaled sequence
+  advances to the snapshot's, so a delayed older stop cannot complete it; a
+  running row listed earlier in its run and missing from the snapshot is
+  `completed`, a never-listed running row is `completed` only when
+  no task that can host an unlisted agent (any type except `shell`, `monitor`
+  and `MCP task`) is listed, and a listed terminal row is reopened within the
+  running-child limit. It logs `worker.subagent.reconciled` (`snapshot_absent`,
+  `snapshot_listed`) and `worker.subagent.snapshot.applied` with the counts
+  `listed`, `terminalized`, `reopened` and `deferred` and the `hosts` flag.
+  Codex has no snapshot (#916).
+- The sequence contract names the clock the Codex and Claude hooks read:
+  `time.clock_gettime_ns(time.CLOCK_MONOTONIC)`, system-wide, because
+  `time.monotonic_ns()` is defined only within one process.
+- `POHUNEK_INTEGRATION_VERSION` is 12. `SubagentInfo` and the public wire
+  protocol are unchanged; the private worker hook protocol carries
+  `subagent_snapshot`. Documented in `concepts/sessions`, the `claude-package`
+  and `codex-package` guides, the `debug-session-runtime` and
+  `update-after-release` runbooks, the `runtime-packages` guide,
+  `docs/architecture.md` and
   `docs/public-api.md` (hook schemas, `SessionInfo.subagents`,
-  `subagent_state`, Provider Notification Hooks).
+  `subagent_state`, Provider Notification Hooks, Claude notification hooks,
+  integration version).
 
 ## Unreleased (2026-10-12, release baseline in CI package selection, #149)
 

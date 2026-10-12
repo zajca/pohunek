@@ -28,6 +28,9 @@ pub enum HookAction {
     SubagentStart,
     /// Records the end of a provider-managed subagent.
     SubagentStop,
+    /// Reports the provider's own list of live background tasks at the end of
+    /// a main-agent turn, which settles subagents whose stop was missed.
+    SubagentSnapshot,
     /// Forwards a provider notification.
     Notification,
 }
@@ -41,6 +44,7 @@ impl HookAction {
             Self::IdentityRelease => "identity_release",
             Self::SubagentStart => "subagent_start",
             Self::SubagentStop => "subagent_stop",
+            Self::SubagentSnapshot => "subagent_snapshot",
             Self::Notification => "notification_create",
         }
     }
@@ -257,7 +261,7 @@ pub fn admit_hook(
         .filter(|schema| schema.allows(action))
         .ok_or(HookDenial::ActionNotAllowed)?;
     let admitted = match action {
-        HookAction::SubagentStart | HookAction::SubagentStop => {
+        HookAction::SubagentStart | HookAction::SubagentStop | HookAction::SubagentSnapshot => {
             schema.admits_subagent_provider(provider)
         }
         HookAction::IdentityReport | HookAction::IdentityRelease | HookAction::Notification => {
@@ -393,6 +397,7 @@ const IDENTITY_SUBAGENT_ACTIONS: &[HookAction] = &[
     HookAction::IdentityRelease,
     HookAction::SubagentStart,
     HookAction::SubagentStop,
+    HookAction::SubagentSnapshot,
     HookAction::Notification,
 ];
 

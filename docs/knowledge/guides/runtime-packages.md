@@ -148,11 +148,16 @@ or handler id core does not provide, or whose handler does not drive the schema
 `[integration]` (Pi) has no schema, and its sessions accept no hook report.
 The worker orders the identity claims and releases of every reporter in a
 session against each other: a claim must carry a sequence newer than the
-session's latest accepted claim and release. Every core-owned reporter
-therefore stamps its worker claims from the host's system-wide monotonic clock
-in nanoseconds (Python's `time.monotonic_ns()`: `CLOCK_MONOTONIC` on Linux,
-`mach_absolute_time` on macOS), strictly increasing within its process, so a
-nested agent's claim never makes the launch agent's later claim stale.
+session's latest accepted claim and release. A claim's sequence is therefore
+the host's system-wide monotonic clock in nanoseconds (`CLOCK_MONOTONIC`),
+strictly increasing within the reporting process. The core Codex and Claude
+hooks run a short-lived interpreter per event and read it with Python's
+`time.clock_gettime_ns(time.CLOCK_MONOTONIC)`, because `time.monotonic_ns()` is
+defined only within one process (Apple's Python 3.9 on macOS counts it from
+interpreter start), so a nested agent's claim never makes the launch agent's
+later claim stale. The Hermes reporter stamps its claims in its long-lived
+plugin process from `time.monotonic_ns()`, kept strictly increasing by a
+counter.
 A package whose reference is `assigned` and that also declares an integration can
 report its conversation: a validated report replaces the assigned reference and
 labels it `reported` (a `/clear` or in-session resume is followed), while a

@@ -275,7 +275,7 @@ daemon more than one release apart are refused.
 Notification hooks deliver through the worker socket when
 `POHUNEK_WORKER_SOCKET_PATH` is set and fall back to the daemon socket otherwise;
 the worker's `notification_create` hook request is additive to the private
-worker protocol, so a worker that predates it simply refuses it. Managed hook assets carry `POHUNEK_INTEGRATION_VERSION=11`; an asset of
+worker protocol, so a worker that predates it simply refuses it. Managed hook assets carry `POHUNEK_INTEGRATION_VERSION=12`; an asset of
 an earlier version still sends the old key, which the daemon accepts only from a
 session whose launch baked protocol 3 (and an earlier notification hook still
 sends a bare integer `v` instead of the `{minimum, maximum}` range, so the daemon
@@ -931,7 +931,7 @@ hook_schema = "identity-subagent-v1"
 
 Both keys are required. The schemas are a closed set compiled into core:
 `identity-v1` (identity report and release, notification) and
-`identity-subagent-v1` (the same plus subagent start and stop). Installing or
+`identity-subagent-v1` (the same plus subagent start, stop and snapshot). Installing or
 parsing a descriptor refuses an unknown schema id, an unknown handler id, and a
 handler/schema pair the handler does not drive (`descriptor_invalid`). A
 runtime without `[integration]`, such as Pi, has no schema, so its sessions
@@ -964,11 +964,15 @@ snapshot carries no claim sequence for subagents. The worker orders the
 identity claims and releases of all reporting processes of a session by one
 sequence: a claim or release must be newer than the session's latest accepted
 claim and release. The sequence contract of a worker claim is therefore the
-host's system-wide monotonic clock in nanoseconds (Python's
-`time.monotonic_ns()`: `CLOCK_MONOTONIC` on Linux, `mach_absolute_time` on
-macOS), strictly increasing within the reporting process; the shipped Codex,
-Claude and Hermes reporters all stamp worker claims from it, so a nested agent's
-claim never makes the launch agent's later claim stale. The launch-process rule decides which process may
+host's system-wide monotonic clock in nanoseconds (`CLOCK_MONOTONIC`), strictly
+increasing within the reporting process. Every hook event runs its own
+short-lived interpreter, so the shipped Codex and Claude hooks read the clock
+with Python's `time.clock_gettime_ns(time.CLOCK_MONOTONIC)` rather than
+`time.monotonic_ns()`, which is defined only within one process (Apple's
+Python 3.9 on macOS counts it from interpreter start); a nested agent's claim
+therefore never makes the launch agent's later claim stale. The Hermes reporter
+stamps its claims in its long-lived plugin process from `time.monotonic_ns()`,
+kept strictly increasing by a counter. The launch-process rule decides which process may
 set the launch identity, and the worker alone applies it; the daemon holds an
 imported launch identity to the core ancestry matcher. `identity-subagent-v1`
 uses `NamedForProvider` (the earliest process at or below the PTY root whose
@@ -1248,8 +1252,18 @@ Important fields:
   latest one the worker admitted for a child never changes that child. A
   Claude `SubagentStop` without a
   recorded start (the prompt-suggestion helper Claude runs after every main
-  turn) produces no item; a Codex one records a completed child. No prompt,
-  result, transcript path, or raw hook payload is exposed.
+  turn) produces no item; a Codex one records a completed child. At the end of
+  every Claude main-agent turn the rows of that Claude process are reconciled
+  against Claude's own list of running background tasks: a listed running row
+  stays `running` and the list counts as its latest claim, so a delayed stop
+  older than the list does not complete it; a running row whose background
+  agent was listed earlier and is missing from the list becomes `completed`; a
+  running row never listed during its current run becomes `completed` only
+  when the list holds no task that can host an unlisted agent; and a listed
+  terminal row returns to `running`. A row with a newer claim than the list is
+  never touched. A reconciled row has the same shape as any other; the reason is
+  only in the worker log. No prompt, result, task description, transcript path,
+  or raw hook payload is exposed.
 - `cwd`: current host-local working directory. It starts as the launch
   directory and can change while the session runs when procwatch observes the
   focus process in a new directory or the PTY emits an OSC 7 cwd hint.
@@ -2000,7 +2014,7 @@ worker instance key `runtime_id` in `session.report_native_id`, which the
 daemon serves through the protocol 3 adapter. `pid` is the OS process id for the active nested agent. When present, the daemon
 binds the active claim to that process and clears the claim when procwatch sees
 the process exit. The shipped integration state hooks use
-`POHUNEK_INTEGRATION_VERSION=11`, run their interpreter in isolated mode (`-I`,
+`POHUNEK_INTEGRATION_VERSION=12`, run their interpreter in isolated mode (`-I`,
 so the session working directory never shadows the standard library), read the
 worker instance from `POHUNEK_WORKER_INSTANCE_ID`, read
 provider JSON through a bounded direct pipe without staging it on disk, and send the hook process's parent PID on
@@ -2276,9 +2290,17 @@ providers. These callbacks target only the owner-private worker endpoint and
 silently no-op when it is unavailable or refuses the claim. They copy only
 lifecycle identifiers and agent type. A Claude `SubagentStop` with no recorded
 start is not a subagent and adds no row, while a Codex one records a completed
-child; see `subagents` under `SessionInfo`. The hook validates its action and Pohunek handshake before reading,
-rejects oversized JSON, and never stages the payload on disk; provider prompts,
-results, messages, and transcript paths are discarded.
+child; see `subagents` under `SessionInfo`. For Claude the state adapter also
+registers the main-agent `Stop` (action `stop`): it sends the worker one
+`subagent_snapshot` claim carrying only the `id`, `type` and `status` of each
+entry of `background_tasks`, and sends nothing for a `Stop` with a non-empty
+`agent_id`, a missing or invalid list, a list over 256 entries, or input over
+1 MiB. A worker
+that predates the claim refuses it and nothing is applied. Codex `Stop` carries
+no task list, so the Codex state adapter registers no `Stop`. The hook
+validates its action and Pohunek handshake before reading, rejects oversized
+JSON, and never stages the payload on disk; provider prompts, results,
+messages, task descriptions and commands, and transcript paths are discarded.
 
 The four integration methods classify an explicit `agent` before acting: a
 value outside the runtime-id grammar is `runtime/agent_kind_unsupported`, a
@@ -2471,15 +2493,19 @@ Claude notification support requires hook events for `Notification`, `Stop`,
 and `StopFailure`. `Notification` matcher values map as follows:
 `permission_prompt` and `elicitation_dialog` create `approval_required`,
 while the normal `idle_prompt` creates no notification. `auth_success`,
-`elicitation_complete`, and `elicitation_response` create `system`. `Stop`
-creates `turn_completed`; `StopFailure` creates `error`.
+`elicitation_complete`, and `elicitation_response` create `system`. The
+notification hook's `Stop` creates `turn_completed`; `StopFailure` creates
+`error`. The separate state hook entry on `Stop` creates no notification; it
+sends only the subagent snapshot to the worker and has no daemon fallback.
 
 When `POHUNEK_SESSION_ID` is valid, hook adapters add
 `attention:<session_id>` to attention events and `turn:<session_id>` to
 `Stop`/`turn_completed` events. Invalid session ids are dropped before either
 `session_id` or `dedupe_key` reaches the daemon.
 
-Hook adapters read at most 64 KiB from provider stdin, validate action and
+Hook adapters read at most 64 KiB from provider stdin (1 MiB for the Claude
+state hook's main-agent `Stop`, whose input carries the final assistant message
+and the task list), validate action and
 environment before reading input, silently drop an invalid `POHUNEK_SESSION_ID`,
 and exit successfully without output on local failures so agent sessions are not
 disrupted. Reinstalling hooks removes only exact command shapes managed by

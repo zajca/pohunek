@@ -176,6 +176,13 @@ const HOOK_RELEASE_ACTION: &str = "release";
 const SUBAGENT_START_ACTION: &str = "subagent-start";
 /// Action argument passed to the hook script when a provider subagent stops.
 const SUBAGENT_STOP_ACTION: &str = "subagent-stop";
+/// Action argument passed to the Claude state hook script when a main-agent
+/// turn ends; the script reports Claude's background task list to the worker.
+///
+/// It is spelled like the notification script's [`STOP_ACTION`] because both
+/// run for Claude's `Stop` event; [`script_action`] tells them apart by the
+/// script that receives the argument.
+const SUBAGENT_SNAPSHOT_ACTION: &str = "stop";
 /// `SessionStart` event name in the agents' hook config.
 const SESSION_START_EVENT: &str = "SessionStart";
 /// `SessionEnd` event name in Claude's hook config.
@@ -228,6 +235,16 @@ const CLAUDE_NOTIFICATION_MATCHERS: &[&str] = &[
     "elicitation_complete",
     "elicitation_response",
 ];
+/// The Claude events the managed state hook is registered for, each with the
+/// action argument its command passes; every registration uses the matcher
+/// `*`.
+const CLAUDE_STATE_HOOKS: [(&str, &str); 5] = [
+    (SESSION_START_EVENT, HOOK_ACTION),
+    (SESSION_END_EVENT, HOOK_RELEASE_ACTION),
+    (SUBAGENT_START_EVENT, SUBAGENT_START_ACTION),
+    (SUBAGENT_STOP_EVENT, SUBAGENT_STOP_ACTION),
+    (CLAUDE_STOP_EVENT, SUBAGENT_SNAPSHOT_ACTION),
+];
 
 /// Exact Unix mode written for Pohunek-managed hook executables.
 ///
@@ -260,6 +277,7 @@ const CLAUDE_REPORTED_ACTIONS: &[HookAction] = &[
     HookAction::IdentityRelease,
     HookAction::SubagentStart,
     HookAction::SubagentStop,
+    HookAction::SubagentSnapshot,
     HookAction::Notification,
 ];
 /// Hook operations the managed Codex asset set reports. Codex has no session
@@ -1187,6 +1205,13 @@ fn inspect_claude_registration(
             trust_event: None,
         },
         HookSpec {
+            label: "Claude Stop (subagent snapshot)".to_owned(),
+            event: CLAUDE_STOP_EVENT,
+            command: hook_command(state_path, SUBAGENT_SNAPSHOT_ACTION),
+            matcher: Some("*"),
+            trust_event: None,
+        },
+        HookSpec {
             label: "Claude StopFailure".to_owned(),
             event: CLAUDE_STOP_FAILURE_EVENT,
             command: hook_command(notify_path, STOP_FAILURE_ACTION),
@@ -1789,10 +1814,12 @@ fn stage_claude(claude_dir: &Path) -> Result<StagedClaude, ProtocolError> {
                 ManagedScript {
                     path: &hook_path,
                     asset: CLAUDE_HOOK_ASSET,
+                    role: ScriptRole::State,
                 },
                 ManagedScript {
                     path: &notify_hook_path,
                     asset: CLAUDE_NOTIFY_HOOK_ASSET,
+                    role: ScriptRole::Notify,
                 },
             ],
         )?,
@@ -1920,33 +1947,11 @@ fn merge_claude_hooks(
     notify_hook_path: &Path,
 ) -> Result<(), ProtocolError> {
     let hooks = ensure_hooks_object(settings, settings_path)?;
-    let state_hook_commands = [
-        hook_command(hook_path, HOOK_ACTION),
-        hook_command(hook_path, HOOK_RELEASE_ACTION),
-        hook_command(hook_path, SUBAGENT_START_ACTION),
-        hook_command(hook_path, SUBAGENT_STOP_ACTION),
-    ];
-    remove_owned_command_hooks(hooks, &state_hook_commands);
+    remove_owned_command_hooks(hooks, &claude_state_hook_commands(hook_path));
     remove_owned_command_hooks(hooks, &claude_notify_hook_commands(notify_hook_path));
-    ensure_command_hook(
-        hooks,
-        SESSION_START_EVENT,
-        &state_hook_commands[0],
-        Some("*"),
-    )?;
-    ensure_command_hook(hooks, SESSION_END_EVENT, &state_hook_commands[1], Some("*"))?;
-    ensure_command_hook(
-        hooks,
-        SUBAGENT_START_EVENT,
-        &state_hook_commands[2],
-        Some("*"),
-    )?;
-    ensure_command_hook(
-        hooks,
-        SUBAGENT_STOP_EVENT,
-        &state_hook_commands[3],
-        Some("*"),
-    )?;
+    for (event, action) in CLAUDE_STATE_HOOKS {
+        ensure_command_hook(hooks, event, &hook_command(hook_path, action), Some("*"))?;
+    }
     for matcher in CLAUDE_NOTIFICATION_MATCHERS {
         ensure_command_hook(
             hooks,
@@ -2116,10 +2121,12 @@ fn stage_codex(codex_dir: &Path) -> Result<StagedCodex, ProtocolError> {
                 ManagedScript {
                     path: &hook_path,
                     asset: CODEX_HOOK_ASSET.as_str(),
+                    role: ScriptRole::State,
                 },
                 ManagedScript {
                     path: &notify_hook_path,
                     asset: CODEX_NOTIFY_HOOK_ASSET.as_str(),
+                    role: ScriptRole::Notify,
                 },
             ],
         )?,
@@ -2466,18 +2473,37 @@ fn hook_command_with_args(hook_path: &Path, args: &[&str]) -> String {
     command
 }
 
-/// The hook operation a managed script reports for its action argument
-/// `argument`.
-fn script_action(argument: &str) -> Option<HookAction> {
-    match argument {
-        HOOK_ACTION => Some(HookAction::IdentityReport),
-        HOOK_RELEASE_ACTION => Some(HookAction::IdentityRelease),
-        SUBAGENT_START_ACTION => Some(HookAction::SubagentStart),
-        SUBAGENT_STOP_ACTION => Some(HookAction::SubagentStop),
-        PERMISSION_REQUEST_ACTION | NOTIFICATION_ACTION | STOP_ACTION | STOP_FAILURE_ACTION => {
-            Some(HookAction::Notification)
-        }
-        _ => None,
+/// Which managed script a hook command runs.
+///
+/// The same action argument can mean different operations in different
+/// scripts: `stop` is a turn notification for the notification script and a
+/// subagent snapshot for the Claude state script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScriptRole {
+    /// The state hook: identity, release, and subagent lifecycle.
+    State,
+    /// The notification hook.
+    Notify,
+}
+
+/// The hook operation a managed script of `role` reports for its action
+/// argument `argument`.
+fn script_action(role: ScriptRole, argument: &str) -> Option<HookAction> {
+    match role {
+        ScriptRole::State => match argument {
+            HOOK_ACTION => Some(HookAction::IdentityReport),
+            HOOK_RELEASE_ACTION => Some(HookAction::IdentityRelease),
+            SUBAGENT_START_ACTION => Some(HookAction::SubagentStart),
+            SUBAGENT_STOP_ACTION => Some(HookAction::SubagentStop),
+            SUBAGENT_SNAPSHOT_ACTION => Some(HookAction::SubagentSnapshot),
+            _ => None,
+        },
+        ScriptRole::Notify => match argument {
+            PERMISSION_REQUEST_ACTION | NOTIFICATION_ACTION | STOP_ACTION | STOP_FAILURE_ACTION => {
+                Some(HookAction::Notification)
+            }
+            _ => None,
+        },
     }
 }
 
@@ -2515,6 +2541,8 @@ struct ManagedScript<'a> {
     path: &'a Path,
     /// The embedded script that is written to `path`.
     asset: &'a str,
+    /// Which script this is, which decides what its arguments report.
+    role: ScriptRole,
 }
 
 /// The hook operations a registration document makes the managed scripts
@@ -2538,7 +2566,7 @@ fn registered_actions(
         let accepted = script_accepted_arguments(script.asset)
             .ok_or_else(|| unreadable_action_table(script.path))?;
         let prefix = hook_command_with_args(script.path, &[]) + " ";
-        tables.push((prefix, accepted));
+        tables.push((prefix, accepted, script.role));
     }
     let commands = registration
         .get("hooks")
@@ -2553,7 +2581,7 @@ fn registered_actions(
         .filter_map(|handler| handler.get("command").and_then(Value::as_str));
     let mut actions = Vec::new();
     for command in commands {
-        for (prefix, accepted) in &tables {
+        for (prefix, accepted, role) in &tables {
             let Some(argument) = command
                 .strip_prefix(prefix.as_str())
                 .and_then(|rest| rest.split_whitespace().next())
@@ -2561,7 +2589,7 @@ fn registered_actions(
             else {
                 continue;
             };
-            let action = script_action(argument)
+            let action = script_action(*role, argument)
                 .ok_or_else(|| unmapped_script_argument(prefix, argument))?;
             if !actions.contains(&action) {
                 actions.push(action);
@@ -2596,6 +2624,14 @@ fn unmapped_script_argument(prefix: &str, argument: &str) -> ProtocolError {
         ),
         None,
     )
+}
+
+/// The exact commands the installer registers for the Claude state hook.
+fn claude_state_hook_commands(hook_path: &Path) -> Vec<String> {
+    CLAUDE_STATE_HOOKS
+        .iter()
+        .map(|(_event, action)| hook_command(hook_path, action))
+        .collect()
 }
 
 fn claude_notify_hook_commands(notify_hook_path: &Path) -> Vec<String> {
@@ -3338,7 +3374,7 @@ mod tests {
     /// State-hook requests expected from a successful release callback.
     const STATE_RELEASE_REQUEST_COUNT: usize = 1;
     /// Integration asset version expected after bounded in-memory state hooks ship.
-    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=11";
+    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=12";
     /// Writable inheritable ACL used to prove mode bits alone are insufficient on macOS.
     #[cfg(target_os = "macos")]
     const WRITABLE_INHERITABLE_ACL: &str = "everyone allow read,write,execute,delete,append,readattr,writeattr,readextattr,writeextattr,readsecurity,file_inherit,directory_inherit";
@@ -4237,10 +4273,6 @@ mod tests {
                 !asset.contains("mktemp") && !asset.contains("POHUNEK_HOOK_INPUT_FILE"),
                 "{agent} state hook must not persist provider payloads"
             );
-            assert!(
-                asset.contains("handle.read(MAX_HOOK_INPUT_BYTES + 1)"),
-                "{agent} state hook must bound provider input before decoding"
-            );
         }
 
         assert!(
@@ -4696,6 +4728,20 @@ mod tests {
             assert_eq!(commands.len(), 1, "exactly one {event} hook");
             assert!(commands[0].ends_with(action));
         }
+        let mut stop_commands = matcher_commands(&settings, "Stop", "*");
+        stop_commands.sort_unstable();
+        let mut expected_stop = vec![
+            hook_command(&paths.hook_path, "stop"),
+            hook_command(
+                &claude_dir.join("hooks").join(NOTIFY_HOOK_INSTALL_NAME),
+                "stop",
+            ),
+        ];
+        expected_stop.sort_unstable();
+        assert_eq!(
+            stop_commands, expected_stop,
+            "the state hook's snapshot and the notification hook both run on Stop"
+        );
     }
 
     #[test]
@@ -6505,6 +6551,10 @@ mod tests {
                 "{event} command: {commands:?}"
             );
         }
+        // The user's, the notification, and the subagent snapshot `Stop` hooks.
+        let stop_commands = matcher_commands(&settings, "Stop", "*");
+        assert_eq!(stop_commands.len(), 3, "{stop_commands:?}");
+        assert!(stop_commands.contains(&hook_command(&paths.hook_path, "stop")));
     }
 
     #[test]

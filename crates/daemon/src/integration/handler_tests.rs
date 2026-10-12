@@ -106,6 +106,32 @@ fn install_current(agent: &RuntimeRef, dir: &Path) -> PathBuf {
     paths.hook_path
 }
 
+/// Removes the state hook's `Stop` registration from Claude's `settings.json`,
+/// leaving the registration shape of the asset set before the main-agent
+/// subagent snapshot existed.
+fn drop_claude_snapshot_registration(dir: &Path, state_hook: &Path) {
+    let settings_path = dir.join("settings.json");
+    let mut settings: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).expect("read settings"))
+            .expect("parse settings");
+    let snapshot = format!("sh '{}' stop", state_hook.display());
+    let stop = settings["hooks"]["Stop"]
+        .as_array_mut()
+        .expect("Claude Stop entries");
+    let registered = stop.len();
+    stop.retain(|group| group["hooks"][0]["command"] != snapshot.as_str());
+    assert_eq!(
+        stop.len(),
+        registered - 1,
+        "the current set registers the snapshot hook once"
+    );
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&settings).expect("serialize settings"),
+    )
+    .expect("write settings");
+}
+
 /// Rewrites the version marker of both managed scripts next to `state_hook`.
 fn set_script_version(state_hook: &Path, version: u32) {
     let notify_hook = state_hook.with_file_name(NOTIFY_HOOK_INSTALL_NAME);
@@ -319,33 +345,43 @@ fn the_staged_registration_reports_exactly_the_declared_operations() {
 #[test]
 fn the_embedded_scripts_accept_only_arguments_the_registration_table_maps() {
     use super::{
-        script_accepted_arguments, script_action, CLAUDE_HOOK_ASSET, CLAUDE_NOTIFY_HOOK_ASSET,
-        CODEX_HOOK_ASSET, CODEX_NOTIFY_HOOK_ASSET,
+        script_accepted_arguments, script_action, ScriptRole, CLAUDE_HOOK_ASSET,
+        CLAUDE_NOTIFY_HOOK_ASSET, CODEX_HOOK_ASSET, CODEX_NOTIFY_HOOK_ASSET,
     };
     let expected = [
         (
             CLAUDE_HOOK_ASSET,
-            vec!["release", "session", "subagent-start", "subagent-stop"],
+            ScriptRole::State,
+            vec![
+                "release",
+                "session",
+                "stop",
+                "subagent-start",
+                "subagent-stop",
+            ],
         ),
         (
             CODEX_HOOK_ASSET.as_str(),
+            ScriptRole::State,
             vec!["session", "subagent-start", "subagent-stop"],
         ),
         (
             CLAUDE_NOTIFY_HOOK_ASSET,
+            ScriptRole::Notify,
             vec!["notification", "stop", "stop_failure"],
         ),
         (
             CODEX_NOTIFY_HOOK_ASSET.as_str(),
+            ScriptRole::Notify,
             vec!["permission_request", "stop"],
         ),
     ];
-    for (asset, arguments) in expected {
+    for (asset, role, arguments) in expected {
         let mut accepted = script_accepted_arguments(asset).expect("a readable action table");
         accepted.sort_unstable();
         assert_eq!(accepted, arguments);
         for argument in accepted {
-            assert!(script_action(argument).is_some(), "{argument}");
+            assert!(script_action(role, argument).is_some(), "{argument}");
         }
     }
 }
@@ -367,7 +403,7 @@ fn an_unreadable_action_table_is_not_an_empty_one() {
 
 #[test]
 fn registered_actions_follow_the_registration_and_the_script_table() {
-    use super::{registered_actions, ManagedScript};
+    use super::{registered_actions, ManagedScript, ScriptRole};
     let path = Path::new("/cfg/state.sh");
     let asset = "case \"$action\" in\n  session|release) ;;\n  *) exit 0 ;;\nesac\n";
     let registration = |commands: &[&str]| {
@@ -379,7 +415,14 @@ fn registered_actions_follow_the_registration_and_the_script_table() {
         })
     };
     let derive = |registration: &serde_json::Value, asset: &str| {
-        registered_actions(registration, &[ManagedScript { path, asset }])
+        registered_actions(
+            registration,
+            &[ManagedScript {
+                path,
+                asset,
+                role: ScriptRole::State,
+            }],
+        )
     };
 
     assert_eq!(
@@ -634,9 +677,19 @@ fn updating_from_the_previous_asset_set_activates_atomically() {
         let dir = scoped_dir("update-previous");
         write_user_config(&agent, &dir);
         let state_hook = install_current(&agent, &dir);
+        let resolved = official(&agent);
+        if agent == RuntimeRef::claude() {
+            drop_claude_snapshot_registration(&dir, &state_hook);
+            let unregistered =
+                with_config_dirs(&dir, &dir, || resolved.handler.inspect(&agent, Ok(&dir)));
+            assert_ne!(
+                unregistered.state,
+                IntegrationInstallState::Current,
+                "a current script without the snapshot Stop registration is incomplete"
+            );
+        }
         set_script_version(&state_hook, EXPECTED_INTEGRATION_VERSION - 1);
         let previous = content_snapshot(&dir);
-        let resolved = official(&agent);
         let outdated = with_config_dirs(&dir, &dir, || resolved.handler.inspect(&agent, Ok(&dir)));
         assert_eq!(outdated.state, IntegrationInstallState::Outdated);
         assert_eq!(

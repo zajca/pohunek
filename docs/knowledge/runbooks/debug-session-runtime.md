@@ -74,11 +74,11 @@ the provider, read the session's worker log
 claim it ignores as `worker.subagent.claim.ignored` and every claim it refuses
 as `worker.subagent.claim.refused`, with `subagent.action`, `subagent.id`, the
 reported and recorded sequences, and a `subagent.reason` code:
-`duplicate_start` (a start for a child that is already running),
+`duplicate_start` (a newer start for a child that is already running),
 `stop_without_start` (a Claude stop with no recorded start, such as Claude's
 prompt-suggestion helper after every main turn), `stale_sequence` (a claim not
 newer than the recorded one, or a start not newer than a remembered Claude
-stop without a start) and `not_running` (a stop for a terminal child) at INFO,
+stop without a start) and `not_running` (a newer stop for a terminal child) at INFO,
 and `capacity` (a start refused because the running-child limit is full) at
 WARN. A child's phase follows the highest-sequence claim the worker admitted
 for it, for every provider: an ignored `duplicate_start` or `not_running`
@@ -86,7 +86,44 @@ claim newer than the record still advances the record's journaled sequence,
 so a later `stale_sequence` line for an older claim of the same child is the
 expected outcome of reordered hooks, not lost state. An inadmissible claim, such as one from the wrong
 process or runtime, is the `worker.identity.rejected` warning with
-`identity.operation` `subagent_start` or `subagent_stop`.
+`identity.operation` `subagent_start`, `subagent_stop` or `subagent_snapshot`
+(the last also for a Claude task list that breaks a bound).
+
+At every Claude main-turn end the state hook sends the worker a snapshot of
+Claude's running background tasks. The worker logs one
+`worker.subagent.snapshot.applied` at INFO per admitted snapshot, with the
+counts `listed` (tasks in the snapshot), `terminalized`, `reopened` and
+`deferred`, and `hosts` (whether the snapshot listed a task that can host an
+unlisted agent, any type except `shell`, `monitor` and `MCP task`). Each row it
+changes is a `worker.subagent.reconciled` INFO event with `subagent.provider`,
+`subagent.id`, the snapshot and recorded sequences, and `subagent.reason`:
+`snapshot_absent` (a running row completed because the snapshot omitted it)
+or `snapshot_listed` (a terminal row reopened because the snapshot listed it).
+A reopen refused by the running-child limit is logged with reason `capacity`.
+A listed running row stays `running` with no `reconciled` event, but its
+journaled sequence advances to the snapshot's, so a delayed stop older than the
+snapshot is then logged as `stale_sequence` and leaves the row running; its
+next newer stop completes it. A non-zero `deferred` count names running rows of the reporting Claude process
+that the snapshot neither listed nor could settle: never listed during their
+current run while `hosts` is true. They are typically teammates, synchronous
+children of a listed background agent, or workflow agents, which Claude does
+not list by agent id; they stay `running` until their own `SubagentStop` or a
+later snapshot with `hosts` false. A deferred count that persists across many
+turns is either such a child that is still alive or one whose stop was missed;
+check the agent in Claude first. A row whose stop was missed stays `running`
+until a snapshot lists no hosting task or the runtime ends, when it becomes
+`lost`. Rows started by another process, such as a second Claude in a shell
+session, are not counted.
+
+When a Claude main turn ends without a `snapshot.applied` event, check in this
+order: a `worker.identity.rejected` warning with `identity.operation`
+`subagent_snapshot` (the worker refused the snapshot, for example a task list
+over a bound); the hook-side cases in which no snapshot is sent (a missing or
+invalid task list, more than 256 tasks, an input over 1 MiB, or a `Stop` with a
+non-empty `agent_id`); a Claude hook asset older than integration version 12,
+which has no `Stop` state hook (`pohunek integration status --agent claude`
+reports it `outdated`; reinstall it); and a session worker started by a release
+without the snapshot claim, which refuses it.
 
 Interpret runtime states as follows:
 

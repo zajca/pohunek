@@ -90,6 +90,36 @@ const TERMINAL_JOURNAL_RETRY_DELAY: Duration = Duration::from_millis(250);
 const MAX_SUBAGENT_ID_BYTES: usize = 256;
 /// Maximum accepted provider-defined subagent type length.
 const MAX_SUBAGENT_TYPE_BYTES: usize = 128;
+/// Maximum tasks accepted in one subagent snapshot.
+///
+/// Claude Code does not cap its main-`Stop` `background_tasks` list. Four
+/// times [`ACTIVE_SUBAGENT_CAPACITY`] leaves room for the shells and monitors
+/// listed beside the agents. The Claude state hook mirrors this value and
+/// sends no snapshot for a longer list; a longer claim is rejected whole,
+/// because a truncated list would read as finished agents.
+const MAX_SNAPSHOT_TASKS: usize = 256;
+/// Maximum accepted byte length of a snapshot task's type label.
+///
+/// Claude Code's task-type labels are short words such as `subagent`, `shell`,
+/// or `MCP task`; 64 bytes leaves room for labels added later. A longer label
+/// rejects the whole snapshot.
+const MAX_SNAPSHOT_TYPE_BYTES: usize = 64;
+/// Maximum accepted byte length of a snapshot task's status.
+///
+/// Claude Code lists tasks with short statuses such as `running` or
+/// `pending`; 32 bytes leaves room for statuses added later. A longer status
+/// rejects the whole snapshot.
+const MAX_SNAPSHOT_STATUS_BYTES: usize = 32;
+/// Snapshot task types that run no agent.
+///
+/// These are the labels of Claude Code's task-type label map for its
+/// agentless tasks: `local_bash` is `shell`, `monitor_mcp` and `monitor_ws`
+/// are `monitor`, and `mcp_task` is `MCP task`. Every other type may host an
+/// agent that Claude does not list by agent id, such as a teammate or the
+/// synchronous child of a background agent, so a snapshot listing one defers
+/// unlisted subagents instead of ending them. A label missing here only
+/// defers more subagents; a label wrongly added here may end a live one.
+const AGENTLESS_TASK_TYPES: &[&str] = &["shell", "monitor", "MCP task"];
 /// Maximum script bytes read and hashed while freezing and rechecking a launch
 /// entrypoint.
 ///
@@ -561,6 +591,9 @@ struct State {
     journal: JournalRecord,
     /// Subagent stops kept out of the journal because no start preceded them.
     orphan_stops: OrphanStops,
+    /// Unjournaled evidence about journaled subagents that subagent snapshots
+    /// reconcile against.
+    subagent_evidence: SubagentEvidence,
 }
 
 impl State {
@@ -579,6 +612,7 @@ impl State {
             stop_requested: false,
             journal,
             orphan_stops: OrphanStops::default(),
+            subagent_evidence: SubagentEvidence::default(),
         }
     }
 }
@@ -2111,6 +2145,8 @@ async fn commit_runtime_completion(
     state.phase = WireRuntimePhase::Exited;
     state.exit = Some(status.clone());
     state.journal = journal;
+    let state = &mut *state;
+    state.subagent_evidence.retain_recorded(&state.journal);
     shared.state_changed.notify_waiters();
     Ok(state.terminal_retention)
 }
@@ -2142,6 +2178,8 @@ async fn mark_runtime_faulted_at_offset(
         }
         state.journal.pending_launch_claims.clear();
         mark_running_subagents_lost(&mut state.journal, unix_ms());
+        let state = &mut *state;
+        state.subagent_evidence.retain_recorded(&state.journal);
         state.journal.updated_at = timestamp();
         persist(shared.journal.clone(), state.journal.clone()).await
     };
@@ -3095,6 +3133,7 @@ enum HookRequest {
         subagent_id: String,
         outcome: Option<JournalSubagentPhase>,
     },
+    SubagentSnapshot(SnapshotRequest),
     NotificationCreate {
         #[serde(rename = "runtime_id")]
         worker_instance_id: String,
@@ -3104,6 +3143,32 @@ enum HookRequest {
         sequence: u64,
         params: serde_json::Value,
     },
+}
+
+/// A provider's list of its live background tasks, reported by the agent
+/// process at the end of a main-agent turn.
+#[derive(Debug, Deserialize)]
+struct SnapshotRequest {
+    #[serde(rename = "runtime_id")]
+    worker_instance_id: String,
+    provider: String,
+    pid: u32,
+    start_identity: u64,
+    /// Monotonic time taken when the hook started, before it read its input.
+    sequence: u64,
+    tasks: Vec<SnapshotTask>,
+}
+
+/// One task of a [`SnapshotRequest`], as the provider labels it.
+#[derive(Debug, Deserialize)]
+struct SnapshotTask {
+    /// Task id; for a background subagent it equals the subagent id.
+    id: String,
+    /// Provider task-type label, matched against [`AGENTLESS_TASK_TYPES`].
+    #[serde(rename = "type")]
+    task_type: String,
+    /// Provider task status; validated but not interpreted.
+    status: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -3432,6 +3497,17 @@ where
                     journal.updated_at = timestamp();
                     persist(shared.journal.clone(), journal.clone()).await?;
                     state.journal = journal;
+                    // An advanced duplicate start begins a new run of the same
+                    // id, so its reporter owns the run as an applied start's
+                    // does.
+                    state.subagent_evidence.record_start(
+                        &provider,
+                        &subagent_id,
+                        Reporter {
+                            pid,
+                            start_identity,
+                        },
+                    );
                 }
                 if outcome == SubagentOutcome::Applied {
                     state.orphan_stops.forget(&provider, &subagent_id);
@@ -3521,6 +3597,7 @@ where
                     journal.updated_at = timestamp();
                     persist(shared.journal.clone(), journal.clone()).await?;
                     state.journal = journal;
+                    state.subagent_evidence.retain_recorded(&state.journal);
                 }
                 if effect != SubagentOutcome::Applied {
                     if effect.reason() == Some(SubagentReason::StopWithoutStart) {
@@ -3530,6 +3607,17 @@ where
                 }
                 (effect.acknowledged(), false, current_runtime, Some(effect))
             }
+        }
+        HookRequest::SubagentSnapshot(snapshot) => {
+            let ok = apply_subagent_snapshot(&shared, snapshot, peer).await?;
+            return writer
+                .write(&HookResponse {
+                    ok,
+                    launch_identity_accepted: false,
+                    launch_identity_status: LaunchClaimStatus::NotApplicable,
+                })
+                .await
+                .map_err(|error| WorkerError::Protocol(error.to_string()));
         }
         HookRequest::NotificationCreate {
             worker_instance_id,
@@ -3634,6 +3722,118 @@ where
         })
         .await
         .map_err(|error| WorkerError::Protocol(error.to_string()))
+}
+
+/// Admits and applies one subagent snapshot, answering whether it was
+/// admitted.
+///
+/// Admission matches a subagent start: schema, runtime generation, running
+/// phase, task bounds, and the peer and ancestry of the reporting process.
+/// An invalid task list is rejected whole. An admitted snapshot is reconciled
+/// by [`reconcile_snapshot`]. The journal is persisted when any record's
+/// sequence advanced, `SubagentsChanged` is emitted only when a subagent was
+/// completed or reopened, and the worker evidence is updated only after that
+/// write succeeded.
+///
+/// # Errors
+///
+/// Returns an error when the runtime has no subagent ordering rule after
+/// admission or the journal write fails.
+async fn apply_subagent_snapshot(
+    shared: &Shared,
+    request: SnapshotRequest,
+    peer: &PeerContext,
+) -> Result<bool, WorkerError> {
+    let occurred_at_ms = unix_ms();
+    let mut guard = shared.state.lock().await;
+    let state = &mut *guard;
+    let current_runtime = state.worker_instance_id.as_ref().map(ToString::to_string);
+    let admitted = admit_hook(
+        state.hook_schema,
+        HookAction::SubagentSnapshot,
+        &request.provider,
+        state.launch_agent_base.as_deref(),
+    );
+    let inadmissible = hook_claim_admissible(
+        admitted.as_ref().err().copied(),
+        current_runtime.as_deref() == Some(request.worker_instance_id.as_str()),
+        state.phase == WireRuntimePhase::Running,
+    )
+    .or_else(|| {
+        let valid = admitted.is_ok_and(HookSchema::admits_subagents)
+            && request.tasks.len() <= MAX_SNAPSHOT_TASKS
+            && request.tasks.iter().all(|task| {
+                valid_subagent_text(&task.id, MAX_SUBAGENT_ID_BYTES)
+                    && valid_subagent_text(&task.task_type, MAX_SNAPSHOT_TYPE_BYTES)
+                    && valid_subagent_text(&task.status, MAX_SNAPSHOT_STATUS_BYTES)
+            });
+        (!valid).then_some(RejectReason::SubagentClaimInvalid)
+    });
+    if let Some(reason) = inadmissible {
+        reject_identity(shared, "subagent_snapshot", reason, peer);
+        return Ok(false);
+    }
+    let process_valid = admitted.is_ok_and(|schema| {
+        state.pty.as_ref().is_some_and(|pty| {
+            hook_claim_valid(
+                shared,
+                "subagent_snapshot",
+                peer,
+                schema.ancestry,
+                request.pid,
+                request.start_identity,
+                pty.identity().pid,
+            )
+        })
+    });
+    if !process_valid {
+        return Ok(false);
+    }
+    admitted_subagent_rule(admitted)?;
+    let claim = SnapshotClaim {
+        provider: &request.provider,
+        reporter: Reporter {
+            pid: request.pid,
+            start_identity: request.start_identity,
+        },
+        sequence: request.sequence,
+        tasks: &request.tasks,
+    };
+    let mut journal = state.journal.clone();
+    let result = reconcile_snapshot(
+        &mut journal,
+        &state.subagent_evidence,
+        claim,
+        occurred_at_ms,
+    );
+    // A listed running record only advances its sequence: that is persisted
+    // but announced only together with a completed or reopened record.
+    let changed = !result.changed.is_empty();
+    if changed || !result.listed.is_empty() {
+        journal.updated_at = timestamp();
+        persist(shared.journal.clone(), journal.clone()).await?;
+        state.journal = journal;
+        state.subagent_evidence.retain_recorded(&state.journal);
+    }
+    let listed = result.listed.iter().map(String::as_str).chain(
+        result
+            .changed
+            .iter()
+            .filter(|item| item.reason == ReconcileReason::SnapshotListed)
+            .map(|item| item.id.as_str()),
+    );
+    for id in listed {
+        state
+            .subagent_evidence
+            .record_listed(claim.provider, id, claim.sequence);
+    }
+    log_snapshot(shared, claim, &result);
+    let worker_instance_id = state.worker_instance_id.clone();
+    drop(guard);
+    if let (true, Some(worker_instance_id)) = (changed, worker_instance_id) {
+        shared.emit(EventKind::SubagentsChanged { worker_instance_id });
+    }
+    Ok(true)
 }
 
 /// Checks one hook operation against the session's hook schema with the rule
@@ -4463,7 +4663,7 @@ fn valid_subagent_text(value: &str, max_bytes: usize) -> bool {
 /// One admissible subagent claim, as the ordering rule and the logs see it.
 #[derive(Debug, Clone, Copy)]
 struct SubagentClaim<'a> {
-    /// `start` or `stop`, as logged in `subagent.action`.
+    /// `start`, `stop`, or `snapshot`, as logged in `subagent.action`.
     action: &'static str,
     provider: &'a str,
     id: &'a str,
@@ -4607,6 +4807,320 @@ impl OrphanStops {
         self.entries
             .retain(|entry| entry.provider != provider || entry.id != id);
     }
+}
+
+/// The agent process that reported a subagent claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Reporter {
+    pid: u32,
+    start_identity: u64,
+}
+
+/// Unjournaled evidence about one journaled subagent.
+#[derive(Debug)]
+struct SubagentWitness {
+    provider: String,
+    id: String,
+    /// Process whose start claim opened, reopened, or advanced the current
+    /// run.
+    reporter: Reporter,
+    /// Sequence of the last snapshot that listed the subagent.
+    listed_at: Option<u64>,
+}
+
+/// Worker-memory evidence that subagent snapshots reconcile against.
+///
+/// An entry exists only for a journaled subagent whose current run was opened,
+/// reopened, or advanced by a start admitted in this worker process, and is dropped
+/// with its record. A subagent without an entry is never reconciled, which
+/// keeps records recovered from an earlier process or recorded by a stop
+/// alone out of reach of a snapshot. The set stays within the journal's
+/// subagent bounds.
+#[derive(Debug, Default)]
+struct SubagentEvidence {
+    entries: Vec<SubagentWitness>,
+}
+
+impl SubagentEvidence {
+    /// Evidence about `provider`'s subagent `id`, if any.
+    fn get(&self, provider: &str, id: &str) -> Option<&SubagentWitness> {
+        self.entries
+            .iter()
+            .find(|entry| entry.provider == provider && entry.id == id)
+    }
+
+    /// Records `reporter` as the process whose start opened, reopened, or
+    /// advanced the subagent's current run.
+    fn record_start(&mut self, provider: &str, id: &str, reporter: Reporter) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.provider == provider && entry.id == id)
+        {
+            entry.reporter = reporter;
+            return;
+        }
+        self.entries.push(SubagentWitness {
+            provider: provider.to_owned(),
+            id: id.to_owned(),
+            reporter,
+            listed_at: None,
+        });
+    }
+
+    /// Records that the snapshot at `sequence` listed the subagent.
+    ///
+    /// A subagent without evidence stays without it.
+    fn record_listed(&mut self, provider: &str, id: &str, sequence: u64) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.provider == provider && entry.id == id)
+        {
+            entry.listed_at = Some(sequence);
+        }
+    }
+
+    /// Drops the evidence of every subagent that has no record in `journal`.
+    fn retain_recorded(&mut self, journal: &JournalRecord) {
+        self.entries.retain(|entry| {
+            journal
+                .subagents
+                .iter()
+                .any(|record| record.provider == entry.provider && record.id == entry.id)
+        });
+    }
+}
+
+/// One admissible subagent snapshot, as reconciliation sees it.
+#[derive(Debug, Clone, Copy)]
+struct SnapshotClaim<'a> {
+    provider: &'a str,
+    reporter: Reporter,
+    sequence: u64,
+    tasks: &'a [SnapshotTask],
+}
+
+/// Why reconciliation changed a subagent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileReason {
+    /// A running subagent the snapshot did not list was completed.
+    SnapshotAbsent,
+    /// A terminal subagent the snapshot listed was reopened.
+    SnapshotListed,
+}
+
+impl ReconcileReason {
+    /// Stable reason code used in logs.
+    const fn code(self) -> &'static str {
+        match self {
+            Self::SnapshotAbsent => "snapshot_absent",
+            Self::SnapshotListed => "snapshot_listed",
+        }
+    }
+}
+
+/// One subagent that reconciliation completed or reopened.
+#[derive(Debug)]
+struct Reconciled {
+    id: String,
+    reason: ReconcileReason,
+    /// Sequence recorded for the subagent before the snapshot.
+    recorded: u64,
+}
+
+/// Effect of one subagent snapshot on the journal.
+#[derive(Debug, Default)]
+struct Reconciliation {
+    /// Subagents completed or reopened, in journal order.
+    changed: Vec<Reconciled>,
+    /// Running subagents kept running because the snapshot listed them; each
+    /// record's sequence is raised to the snapshot's.
+    listed: Vec<String>,
+    /// Running subagents left unchanged because they may run inside a listed
+    /// task.
+    deferred: usize,
+    /// Listed terminal subagents not reopened because
+    /// [`ACTIVE_SUBAGENT_CAPACITY`] subagents are running, with the sequence
+    /// recorded for each.
+    capacity: Vec<(String, u64)>,
+    /// Whether the snapshot listed a task of a type that may host an agent.
+    hosts: bool,
+}
+
+/// Reconciles `journal` with the snapshot `claim` taken at `occurred_at_ms`.
+///
+/// Only the claim provider's subagents whose current run `evidence` ties to
+/// the claim's reporter, and whose recorded sequence is less than the claim's,
+/// are considered; a later claim always wins over an older snapshot.
+///
+/// A considered running subagent the snapshot lists stays running and takes
+/// the claim's sequence without a revision change, so a stop of the same run
+/// ordered before the snapshot and delivered after it is stale. One it
+/// does not list is completed when an earlier snapshot listed it during its
+/// current run, because it was then a background agent; otherwise it is
+/// completed only when no listed task may host an agent, and deferred when
+/// one may, since Claude does not list a teammate, the synchronous child of a
+/// background agent, or a workflow agent by agent id. A considered terminal
+/// subagent the snapshot lists is reopened, because a main-turn listing is
+/// the provider's authoritative liveness, unless
+/// [`ACTIVE_SUBAGENT_CAPACITY`] subagents are running. Completions run before
+/// reopens, so a reopen sees the capacity they free.
+///
+/// Every changed subagent takes the claim's sequence and a fresh revision;
+/// terminal subagents beyond the retention bound are pruned after any change.
+fn reconcile_snapshot(
+    journal: &mut JournalRecord,
+    evidence: &SubagentEvidence,
+    claim: SnapshotClaim<'_>,
+    occurred_at_ms: u64,
+) -> Reconciliation {
+    let listed = claim
+        .tasks
+        .iter()
+        .map(|task| task.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut result = Reconciliation {
+        hosts: claim
+            .tasks
+            .iter()
+            .any(|task| !AGENTLESS_TASK_TYPES.contains(&task.task_type.as_str())),
+        ..Reconciliation::default()
+    };
+    let considered = |record: &SubagentRecord| {
+        (record.provider == claim.provider && record.sequence < claim.sequence)
+            .then(|| evidence.get(&record.provider, &record.id))
+            .flatten()
+            .filter(|entry| entry.reporter == claim.reporter)
+    };
+    for index in 0..journal.subagents.len() {
+        let record = &journal.subagents[index];
+        if record.phase != JournalSubagentPhase::Running {
+            continue;
+        }
+        let Some(entry) = considered(record) else {
+            continue;
+        };
+        if listed.contains(record.id.as_str()) {
+            result.listed.push(record.id.clone());
+            journal.subagents[index].sequence = claim.sequence;
+            continue;
+        }
+        let known_background = entry
+            .listed_at
+            .is_some_and(|listed_at| listed_at >= record.sequence);
+        if !known_background && result.hosts {
+            result.deferred += 1;
+            continue;
+        }
+        result.changed.push(Reconciled {
+            id: record.id.clone(),
+            reason: ReconcileReason::SnapshotAbsent,
+            recorded: record.sequence,
+        });
+        journal.subagent_revision = journal.subagent_revision.saturating_add(1);
+        let record = &mut journal.subagents[index];
+        record.phase = JournalSubagentPhase::Completed;
+        record.sequence = claim.sequence;
+        record.revision = journal.subagent_revision;
+        record.updated_at_ms = occurred_at_ms;
+        record.finished_at_ms = Some(occurred_at_ms);
+    }
+    let mut running = journal
+        .subagents
+        .iter()
+        .filter(|item| item.phase == JournalSubagentPhase::Running)
+        .count();
+    for index in 0..journal.subagents.len() {
+        let record = &journal.subagents[index];
+        if record.phase == JournalSubagentPhase::Running
+            || !listed.contains(record.id.as_str())
+            || considered(record).is_none()
+        {
+            continue;
+        }
+        if running >= ACTIVE_SUBAGENT_CAPACITY {
+            result.capacity.push((record.id.clone(), record.sequence));
+            continue;
+        }
+        running += 1;
+        result.changed.push(Reconciled {
+            id: record.id.clone(),
+            reason: ReconcileReason::SnapshotListed,
+            recorded: record.sequence,
+        });
+        journal.subagent_revision = journal.subagent_revision.saturating_add(1);
+        let record = &mut journal.subagents[index];
+        record.phase = JournalSubagentPhase::Running;
+        record.sequence = claim.sequence;
+        record.revision = journal.subagent_revision;
+        record.updated_at_ms = occurred_at_ms;
+        record.finished_at_ms = None;
+    }
+    if !result.changed.is_empty() {
+        prune_terminal_subagents(journal);
+    }
+    result
+}
+
+/// Records one applied subagent snapshot and every subagent it changed.
+///
+/// Each completed or reopened subagent logs `worker.subagent.reconciled`, a
+/// listed subagent left terminal by the running bound logs a refused
+/// `snapshot` claim, and the snapshot logs one `worker.subagent.snapshot.applied`
+/// with its counts. Task types, statuses, and the ids of unrecorded tasks are
+/// never logged.
+fn log_snapshot(shared: &Shared, claim: SnapshotClaim<'_>, result: &Reconciliation) {
+    for reconciled in &result.changed {
+        event!(
+            name: "worker.subagent.reconciled",
+            Level::INFO,
+            worker.id = %shared.worker_id,
+            session.id = %shared.session_id,
+            subagent.provider = claim.provider,
+            subagent.id = reconciled.id.as_str(),
+            subagent.reason = reconciled.reason.code(),
+            subagent.sequence.reported = claim.sequence,
+            subagent.sequence.recorded = reconciled.recorded,
+            "subagent reconciled from snapshot: {{subagent.reason}}",
+        );
+    }
+    for (id, recorded) in &result.capacity {
+        log_subagent_outcome(
+            shared,
+            SubagentClaim {
+                action: "snapshot",
+                provider: claim.provider,
+                id,
+                sequence: claim.sequence,
+            },
+            SubagentOutcome::Refused {
+                reason: SubagentReason::Capacity,
+                recorded: Some(*recorded),
+            },
+        );
+    }
+    let reopened = result
+        .changed
+        .iter()
+        .filter(|item| item.reason == ReconcileReason::SnapshotListed)
+        .count();
+    event!(
+        name: "worker.subagent.snapshot.applied",
+        Level::INFO,
+        worker.id = %shared.worker_id,
+        session.id = %shared.session_id,
+        subagent.provider = claim.provider,
+        subagent.sequence.reported = claim.sequence,
+        subagent.snapshot.tasks = claim.tasks.len(),
+        subagent.snapshot.hosts = result.hosts,
+        subagent.snapshot.listed = result.listed.len(),
+        subagent.snapshot.terminalized = result.changed.len() - reopened,
+        subagent.snapshot.reopened = reopened,
+        subagent.snapshot.deferred = result.deferred,
+        "subagent snapshot applied: {{subagent.snapshot.terminalized}} completed, \
+         {{subagent.snapshot.reopened}} reopened, {{subagent.snapshot.deferred}} deferred",
+    );
 }
 
 /// Applies a subagent start to `journal` under `rule`.
