@@ -1250,7 +1250,7 @@ mod pin_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::host::fixture::{official_host, official_profile_pin};
+    use crate::agent::host::fixture::{official_host, pin_official_base};
     use crate::agent::{served_native_launch, NativeArg, SessionRef};
 
     fn tmp_agents_dir(tag: &str) -> crate::test_support::ScopedDir {
@@ -1261,17 +1261,6 @@ mod tests {
     /// official fixture host as bases.
     fn registry(dir: Option<PathBuf>) -> ProfileRegistry {
         ProfileRegistry::with_runtimes(dir, official_host())
-    }
-
-    /// `body` with the package binding of its base inserted after its first
-    /// line when that line names the official Codex or Claude package base.
-    fn pinned(body: &str) -> String {
-        for base in ["codex", "claude"] {
-            if let Some(rest) = body.strip_prefix(&format!("base = \"{base}\"\n")) {
-                return format!("base = \"{base}\"\n{}{rest}", official_profile_pin(base));
-            }
-        }
-        body.to_owned()
     }
 
     #[test]
@@ -1316,7 +1305,7 @@ mod tests {
         let dir = tmp_agents_dir("override");
         std::fs::write(
             dir.join("claude-sonnet.toml"),
-            pinned(
+            pin_official_base(
                 "base = \"claude\"\n\
              program = \"claude\"\n\
              args = [\"--model\", \"claude-sonnet-4\"]\n\
@@ -1356,7 +1345,7 @@ mod tests {
         let dir = tmp_agents_dir("debug-redaction");
         std::fs::write(
             dir.join("secret.toml"),
-            pinned("base = \"claude\"\n[env]\nCLAUDE_CONFIG_DIR = \"/home/me/.claude-work\"\nANTHROPIC_API_KEY = \"sk-ant-never-print\"\n"),
+            pin_official_base("base = \"claude\"\n[env]\nCLAUDE_CONFIG_DIR = \"/home/me/.claude-work\"\nANTHROPIC_API_KEY = \"sk-ant-never-print\"\n"),
         )
         .expect("write profile");
         let reg = registry(Some(dir.clone()));
@@ -1449,7 +1438,7 @@ mod tests {
         let dir = tmp_agents_dir("bad-key");
         std::fs::write(
             dir.join("p.toml"),
-            pinned("base = \"claude\"\nflags = [\"--danger\"]\n"),
+            pin_official_base("base = \"claude\"\nflags = [\"--danger\"]\n"),
         )
         .expect("write profile");
         let reg = registry(Some(dir.clone()));
@@ -1464,8 +1453,11 @@ mod tests {
 
         let dir = tmp_agents_dir("bad-file-mode");
         let path = dir.join("unsafe.toml");
-        std::fs::write(&path, pinned("base = \"claude\"\nprogram = \"/bin/sh\"\n"))
-            .expect("write profile");
+        std::fs::write(
+            &path,
+            pin_official_base("base = \"claude\"\nprogram = \"/bin/sh\"\n"),
+        )
+        .expect("write profile");
         let mut perms = std::fs::metadata(&path)
             .expect("profile metadata")
             .permissions();
@@ -1488,7 +1480,8 @@ mod tests {
          contains = \"custom blocker\"\n";
 
     fn write_profile(dir: &Path, name: &str, body: &str) {
-        std::fs::write(dir.join(format!("{name}.toml")), pinned(body)).expect("write profile");
+        std::fs::write(dir.join(format!("{name}.toml")), pin_official_base(body))
+            .expect("write profile");
     }
 
     fn write_manifest(dir: &Path, name: &str, body: &str) {
@@ -1930,8 +1923,11 @@ mod tests {
     fn symlinked_profile_escaping_the_tree_is_rejected() {
         let dir = tmp_agents_dir("symlink-profile");
         let outside = tmp_agents_dir("symlink-outside");
-        std::fs::write(outside.join("evil.toml"), pinned("base = \"claude\"\n"))
-            .expect("write outside");
+        std::fs::write(
+            outside.join("evil.toml"),
+            pin_official_base("base = \"claude\"\n"),
+        )
+        .expect("write outside");
         std::os::unix::fs::symlink(outside.join("evil.toml"), dir.join("evil.toml"))
             .expect("symlink into tree");
         let reg = registry(Some(dir.clone()));

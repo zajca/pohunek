@@ -5883,7 +5883,7 @@ mod tests {
             .collect();
         SessionRegistry::new_with_runtimes_and_environment(
             config,
-            crate::agent::host::fixture::builtin_host(),
+            crate::agent::host::fixture::official_host(),
             crate::runtime::EnvironmentSource::Fixed(variables),
             allowlist,
         )
@@ -6738,7 +6738,8 @@ while os.getppid() == parent:
             shell_command: crate::session::ShellCommand::new("/bin/sh", ["-c", "sleep 1"]),
             ..SessionRegistryConfig::default()
         });
-        let record = ended_assigned_record();
+        let mut record = ended_assigned_record();
+        pin_official_codex(&mut record);
         let id = SessionId(record.session_id.clone());
         assert!(
             registry
@@ -7641,7 +7642,9 @@ while os.getppid() == parent:
             args: vec!["-c".to_owned(), "printf ready; sleep 30".to_owned()],
             input_rules: StoredInputRules::from(InputRules::unrestricted(false, Duration::ZERO)),
             native_launch: Some(test_native_launch(SessionRefKind::Id, true)),
-            launch_binding: crate::agent::host::LaunchPin::Unpinned,
+            launch_binding: crate::agent::host::fixture::official_launch_pin(
+                protocol::RuntimeId::CLAUDE,
+            ),
             native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
             profile_revision: None,
             native_launch_unresolved: false,
@@ -8129,6 +8132,7 @@ while os.getppid() == parent:
         let store_path = root.join("data/metadata.jsonl");
         let state_root = root.join("state/workers");
         let mut record = identity_record();
+        pin_official_codex(&mut record);
         record.session_id = "s-206".to_owned();
         record.info.id = SessionId("s-206".to_owned());
         record.runtime.worker_id = Some("worker-corrupt".to_owned());
@@ -8184,6 +8188,7 @@ while os.getppid() == parent:
         let store_path = root.join("data/metadata.jsonl");
         let state_root = root.join("state/workers");
         let mut logical = identity_record();
+        pin_official_codex(&mut logical);
         logical.session_id = "s-205".to_owned();
         logical.info.id = SessionId("s-205".to_owned());
         logical.runtime.worker_id = Some("worker-terminal".to_owned());
@@ -9031,6 +9036,18 @@ while os.getppid() == parent:
         }
     }
 
+    /// Binds the recovery of `record` (a Codex session) to the official Codex
+    /// package the test registries serve, as a session launched from that
+    /// package records it.
+    fn pin_official_codex(record: &mut SessionRecord) {
+        record
+            .recovery
+            .as_mut()
+            .expect("recovery binding")
+            .launch_binding =
+            crate::agent::host::fixture::official_launch_pin(protocol::RuntimeId::CODEX);
+    }
+
     /// A record whose reference core assigned at launch, naming `reference`.
     fn assigned_record(reference: &str) -> SessionRecord {
         let mut record = identity_record();
@@ -9719,12 +9736,17 @@ while os.getppid() == parent:
         );
         std::fs::write(&store_path, legacy).expect("write legacy record");
 
-        let registry = SessionRegistry::new(SessionRegistryConfig {
-            shell_command: hermetic_shell(),
-            store_path: Some(store_path),
-            worker_runtime_root: Some(root.join("runtime")),
-            ..SessionRegistryConfig::default()
-        });
+        // The unpinned record is served by a built-in Claude only, as the
+        // daemon that wrote it compiled one in.
+        let registry = SessionRegistry::new_with_runtimes(
+            SessionRegistryConfig {
+                shell_command: hermetic_shell(),
+                store_path: Some(store_path),
+                worker_runtime_root: Some(root.join("runtime")),
+                ..SessionRegistryConfig::default()
+            },
+            crate::agent::host::fixture::compiled_in_host(),
+        );
         Box::pin(registry.reconcile_workers())
             .await
             .expect("rehydrate legacy record");
@@ -9780,13 +9802,18 @@ while os.getppid() == parent:
         }
         crate::store::migrate_at_startup(&store_path).expect("migrate the damaged store");
 
-        let registry = SessionRegistry::new(SessionRegistryConfig {
-            shell_command: hermetic_shell(),
-            store_path: Some(store_path),
-            agents_dir: Some(agents),
-            worker_runtime_root: Some(root.join("runtime")),
-            ..SessionRegistryConfig::default()
-        });
+        // The v0.33.1 record is unpinned: it is served by a built-in Claude
+        // only, as the daemon that wrote it compiled one in.
+        let registry = SessionRegistry::new_with_runtimes(
+            SessionRegistryConfig {
+                shell_command: hermetic_shell(),
+                store_path: Some(store_path),
+                agents_dir: Some(agents),
+                worker_runtime_root: Some(root.join("runtime")),
+                ..SessionRegistryConfig::default()
+            },
+            crate::agent::host::fixture::compiled_in_host(),
+        );
         Box::pin(registry.reconcile_workers())
             .await
             .expect("rehydrate damaged store");
@@ -11321,7 +11348,7 @@ handler = "codex-hook-v1"
                 supervision.worker_initialize = worker_initialize;
             }
             let supervisor = Arc::new(supervisor);
-            let registry = SessionRegistry::new_with_launcher_and_inspector(
+            let registry = SessionRegistry::new_with_runtimes_and_launcher(
                 SessionRegistryConfig {
                     shell_command: hermetic_shell(),
                     store_path: Some(root.join("data/metadata.jsonl")),
@@ -11332,6 +11359,9 @@ handler = "codex-hook-v1"
                     log_dir: Some(root.join("logs")),
                     ..SessionRegistryConfig::default()
                 },
+                crate::agent::host::fixture::official_host_over(
+                    &crate::agent::host::BuiltinSource::from_host_environment(),
+                ),
                 Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>,
                 inspector,
             );
@@ -15343,6 +15373,7 @@ handler = "codex-hook-v1"
                 .worker_instance_id
                 .clone()
                 .expect("the record names its worker instance");
+            super::pin_official_codex(&mut record);
             record.info.native_session_id = Some("assigned-ref".to_owned());
             let binding = record.recovery.as_mut().expect("recovery binding");
             binding.native_session_id = Some("assigned-ref".to_owned());
@@ -17628,7 +17659,8 @@ handler = "codex-hook-v1"
 
     fn untouched_record(_: &mut SessionRecord) {}
 
-    /// Rebinds the record to the built-in `claude` runtime.
+    /// Rebinds the record to the `claude` runtime, which the official package
+    /// serves.
     fn claude_record(record: &mut SessionRecord) {
         record.info.agent = "claude".to_owned();
         record.info.agent_base = RuntimeRef::claude();
@@ -17844,7 +17876,7 @@ handler = "codex-hook-v1"
                 reconcile_live: false,
             },
             Differential {
-                name: "a built-in runtime that reported its active identity",
+                name: "an official runtime that reported its active identity",
                 initialized: true,
                 edit_record: claude_record,
                 edit_journal: untouched_journal,
@@ -17857,7 +17889,7 @@ handler = "codex-hook-v1"
             // A worker that journals no schema is validated with the schema its
             // runtime declares.
             Differential {
-                name: "a built-in runtime whose journal carries no hook schema",
+                name: "an official runtime whose journal carries no hook schema",
                 initialized: true,
                 edit_record: claude_record,
                 edit_journal: without_schema,
@@ -18004,6 +18036,18 @@ handler = "codex-hook-v1"
                 std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700))
                     .expect("private journal directories");
             }
+            // The preflight and reconciliation serve the same runtimes: the
+            // built-ins and the official packages of one plugin root.
+            let plugins_dir = root.join("state/plugins");
+            crate::agent::host::fixture::install_official_packages(&plugins_dir);
+            let runtimes = crate::agent::host::RuntimeHost::with_packages(
+                crate::agent::host::BuiltinSource::from_host_environment(),
+                crate::agent::host::PackageSource::new(
+                    crate::agent::host::PackageStore::open(&plugins_dir)
+                        .expect("the plugin root opens"),
+                ),
+            )
+            .expect("the runtime host builds");
 
             let mut record = identity_record();
             record.session_id = session_id.to_owned();
@@ -18026,6 +18070,17 @@ handler = "codex-hook-v1"
             recovery.args = vec!["-c".to_owned(), "sleep 30".to_owned()];
             bind_test_generation(&mut record);
             (case.edit_record)(&mut record);
+            if record.info.agent_base == RuntimeRef::claude() {
+                // A Claude session pins the package it was launched from.
+                let claude = runtimes
+                    .resolve_id(&protocol::RuntimeId::claude())
+                    .expect("the official Claude package is served");
+                record
+                    .recovery
+                    .as_mut()
+                    .expect("recovery binding")
+                    .launch_binding = crate::agent::host::LaunchPin::of(&claude);
+            }
             let store_path = root.join("data/metadata.jsonl");
             Store::new(store_path.clone())
                 .record_session(&record)
@@ -18048,7 +18103,7 @@ handler = "codex-hook-v1"
                 &PreflightInputs {
                     store_path: store_path.clone(),
                     worker_state_root: state_root.clone(),
-                    plugins_dir: root.join("state/plugins"),
+                    plugins_dir,
                 },
                 &crate::procwatch::HostInspector::new(),
             );
@@ -18059,15 +18114,18 @@ handler = "codex-hook-v1"
                 .map(|session| session.verdict);
             // The worker serves one controller at a time.
             drop(controller);
-            let registry = SessionRegistry::new(SessionRegistryConfig {
-                shell_command: hermetic_shell(),
-                store_path: Some(store_path),
-                worker_runtime_root: Some(runtime_root),
-                worker_state_root: Some(state_root),
-                worker_connect_deadline: Duration::from_millis(300),
-                procwatch_poll: Duration::from_secs(60),
-                ..SessionRegistryConfig::default()
-            });
+            let registry = SessionRegistry::new_with_runtimes(
+                SessionRegistryConfig {
+                    shell_command: hermetic_shell(),
+                    store_path: Some(store_path),
+                    worker_runtime_root: Some(runtime_root),
+                    worker_state_root: Some(state_root),
+                    worker_connect_deadline: Duration::from_millis(300),
+                    procwatch_poll: Duration::from_secs(60),
+                    ..SessionRegistryConfig::default()
+                },
+                runtimes,
+            );
             Box::pin(registry.reconcile_workers())
                 .await
                 .expect("reconcile");

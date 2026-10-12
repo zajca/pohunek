@@ -2,7 +2,9 @@
 //!
 //! [`official_host`] serves the official Codex and Claude packages from
 //! `runtime-packages/`, so tests of those runtimes exercise the package
-//! descriptors rather than definitions compiled into the daemon.
+//! descriptors rather than definitions compiled into the daemon;
+//! [`install_official_packages`] installs the same packages into a plugin
+//! root for hosts with a package store.
 //!
 //! The Pi-shaped runtime is a package-provided runtime for tests of the
 //! assigned native reference strategy; it is hook-less unless a test declares
@@ -153,19 +155,6 @@ pub(crate) fn pi_shaped_probed_host(program: &Path, existence: &str, probe: &str
     RuntimeHost::new(registry)
 }
 
-/// A host serving only the built-in runtimes, with `/bin/sh` as the shell, so
-/// it never reads the process environment.
-///
-/// # Panics
-///
-/// Panics when the registry cannot be built, which would be a defect of the
-/// fixture.
-pub(crate) fn builtin_host() -> RuntimeHost {
-    let registry = RuntimeRegistry::from_sources(&[&BuiltinSource::new("/bin/sh")])
-        .expect("the built-in registry builds");
-    RuntimeHost::new(registry)
-}
-
 /// Package digest [`OfficialFixtureSource`] reports for the official Codex
 /// package.
 ///
@@ -213,6 +202,10 @@ const OFFICIAL_PACKAGES: [OfficialPackage; 2] = [
     },
 ];
 
+/// Install time the fixture records for every package it installs; a fixed
+/// value keeps the registry records independent of the test host's clock.
+const INSTALLED_AT_UNIX_SECONDS: u64 = 1_700_000_000;
+
 /// Key of the descriptor line [`OfficialFixtureSource`] drops.
 const VERSION_PROBE_KEY: &str = "version_probe =";
 
@@ -237,13 +230,13 @@ impl RuntimeSource for OfficialFixtureSource {
     }
 }
 
-/// Parses `official` with its version probe dropped.
+/// The `runtime.toml` of `official` with its version probe dropped.
 ///
 /// # Panics
 ///
-/// Panics unless the descriptor declares exactly one `version_probe` line and
-/// then parses, which would be a defect of the fixture or of the package.
-fn official_definition(official: &OfficialPackage) -> RuntimeDefinition {
+/// Panics unless the descriptor declares exactly one `version_probe` line,
+/// which would be a defect of the fixture or of the package.
+fn probeless_descriptor(official: &OfficialPackage) -> String {
     let (probes, kept): (Vec<&str>, Vec<&str>) = official
         .descriptor
         .lines()
@@ -254,11 +247,20 @@ fn official_definition(official: &OfficialPackage) -> RuntimeDefinition {
         "the {} package declares exactly one version_probe line",
         official.runtime
     );
-    let descriptor = kept.join("\n");
-    let entries = [
+    kept.join("\n")
+}
+
+/// The archive entries of `official` with its version probe dropped.
+///
+/// # Panics
+///
+/// Panics unless the descriptor declares exactly one `version_probe` line,
+/// which would be a defect of the fixture or of the package.
+fn official_entries(official: &OfficialPackage) -> [package::ArchiveEntry; 2] {
+    [
         package::ArchiveEntry {
             path: super::RUNTIME_DESCRIPTOR_PATH.to_owned(),
-            contents: descriptor.into_bytes(),
+            contents: probeless_descriptor(official).into_bytes(),
             executable: false,
         },
         package::ArchiveEntry {
@@ -266,14 +268,68 @@ fn official_definition(official: &OfficialPackage) -> RuntimeDefinition {
             contents: official.detect.as_bytes().to_vec(),
             executable: false,
         },
-    ];
+    ]
+}
+
+/// Parses `official` with its version probe dropped.
+///
+/// # Panics
+///
+/// Panics unless the descriptor declares exactly one `version_probe` line and
+/// then parses, which would be a defect of the fixture or of the package.
+fn official_definition(official: &OfficialPackage) -> RuntimeDefinition {
     let digest = PackageDigest::parse(official.digest).expect("valid digest");
-    super::definition_from_archive(&entries, &digest).unwrap_or_else(|error| {
+    super::definition_from_archive(&official_entries(official), &digest).unwrap_or_else(|error| {
         panic!(
             "the official {} package parses: {error:?}",
             official.runtime
         )
     })
+}
+
+/// Installs the official Codex and Claude packages, with the version probe
+/// dropped as [`OfficialFixtureSource`] drops it, into the plugin root
+/// `plugins_dir` as enabled, selected packages recorded with official
+/// provenance, as a catalog-authorized install records them (no catalog is
+/// checked), so a host over the root serves `codex` and `claude` from them.
+///
+/// # Panics
+///
+/// Panics when a package cannot be built or installed, which would be a
+/// defect of the fixture.
+pub(crate) fn install_official_packages(plugins_dir: &Path) {
+    use package::registry::{InstallRequest, PackageSource as InstallSource, Registry};
+    use package::{build_archive, read_archive, Limits};
+
+    let registry = Registry::open_at(plugins_dir, Limits::DEFAULT).expect("the plugin root opens");
+    for official in &OFFICIAL_PACKAGES {
+        let entries = official_entries(official);
+        let bytes = build_archive(&entries, &Limits::DEFAULT).expect("the official archive builds");
+        let digest = read_archive(&bytes, &Limits::DEFAULT)
+            .expect("the official archive reads")
+            .digest()
+            .clone();
+        let protocol::BindingProvenance::Package { package, .. } =
+            super::definition_from_archive(&entries, &digest)
+                .expect("the official package parses")
+                .binding()
+                .provenance
+                .clone()
+        else {
+            panic!("the {} package has package provenance", official.runtime);
+        };
+        registry
+            .install(&InstallRequest {
+                archive: &bytes,
+                expected: &digest,
+                identity: package,
+                source: InstallSource::Official,
+                enabled: true,
+                select: true,
+                installed_at_unix_seconds: INSTALLED_AT_UNIX_SECONDS,
+            })
+            .expect("the official package installs");
+    }
 }
 
 /// A host serving the built-in runtimes, with `/bin/sh` as the shell, and the
@@ -299,6 +355,150 @@ pub(crate) fn official_host_over(builtin: &BuiltinSource) -> RuntimeHost {
     RuntimeHost::new(registry)
 }
 
+/// The launch pin of a session launched from the official package of
+/// `runtime` in [`official_host`].
+///
+/// # Panics
+///
+/// Panics when `runtime` is not `codex` or `claude`.
+pub(crate) fn official_launch_pin(runtime: &str) -> super::LaunchPin {
+    let runtime_id = protocol::RuntimeId::parse(runtime).expect("runtime id");
+    let definition = official_host()
+        .resolve_id(&runtime_id)
+        .unwrap_or_else(|error| panic!("{runtime} is served: {error:?}"));
+    assert!(
+        matches!(
+            definition.binding().provenance,
+            protocol::BindingProvenance::Package { .. }
+        ),
+        "{runtime} is an official fixture package"
+    );
+    super::LaunchPin::of(&definition)
+}
+
+/// The built-in Codex or Claude runtime release v0.34.2 compiled in, frozen as
+/// goldens below `compat/<runtime>/builtin-v0.34/`.
+struct CompiledInGolden {
+    /// Runtime id, which is also the name the descriptor gives its embedded
+    /// detection manifest.
+    runtime: &'static str,
+    /// The golden `runtime.toml`.
+    descriptor: &'static str,
+    /// The golden detection manifest.
+    detect: &'static str,
+}
+
+/// The v0.34.2 built-in Codex and Claude goldens.
+const COMPILED_IN_GOLDENS: [CompiledInGolden; 2] = [
+    CompiledInGolden {
+        runtime: "codex",
+        descriptor: include_str!("../../../../../compat/codex/builtin-v0.34/runtime.toml"),
+        detect: include_str!("../../../../../compat/codex/builtin-v0.34/detect.toml"),
+    },
+    CompiledInGolden {
+        runtime: "claude",
+        descriptor: include_str!("../../../../../compat/claude/builtin-v0.34/runtime.toml"),
+        detect: include_str!("../../../../../compat/claude/builtin-v0.34/detect.toml"),
+    },
+];
+
+/// Start of the first golden header line, followed by the source path.
+const GOLDEN_HEADER_SOURCE: &str = "# Golden copy of ";
+
+/// End of the first golden header line: the release the goldens froze.
+const GOLDEN_HEADER_TAG: &str = " at tag v0.34.2.";
+
+/// Second line of every golden header.
+const GOLDEN_HEADER_NOTICE: &str =
+    "# Do not edit: the parity tests compare the runtime package with these bytes.";
+
+/// `golden` without its three-line header: the source line, the notice and
+/// the blank line after them.
+///
+/// # Panics
+///
+/// Panics when the golden does not start with that header, which would be a
+/// defect of the golden.
+fn golden_body(golden: &str) -> &str {
+    let mut lines = golden.splitn(4, '\n');
+    let source = lines.next().unwrap_or_default();
+    let notice = lines.next().unwrap_or_default();
+    let blank = lines.next().unwrap_or_default();
+    assert!(
+        source.starts_with(GOLDEN_HEADER_SOURCE)
+            && source.ends_with(GOLDEN_HEADER_TAG)
+            && notice == GOLDEN_HEADER_NOTICE
+            && blank.is_empty(),
+        "a golden starts with its three-line header"
+    );
+    lines.next().unwrap_or_default()
+}
+
+/// Built-in runtimes as a daemon that compiles Codex and Claude in serves
+/// them: the runtimes of the wrapped [`BuiltinSource`] other than `codex` and
+/// `claude`, and the Codex and Claude built-ins of release v0.34.2, parsed
+/// from their goldens ([`COMPILED_IN_GOLDENS`]) the way the daemon parses its
+/// embedded descriptors.
+///
+/// A record such a daemon wrote (an unpinned or a built-in-pinned launch
+/// binding) resumes only through a built-in of the same runtime, so scenarios
+/// over those records serve one. The goldens keep it the v0.34.2 built-in
+/// whatever the runtime packages or the daemon's own sources declare.
+#[derive(Debug)]
+struct CompiledInSource(BuiltinSource);
+
+impl RuntimeSource for CompiledInSource {
+    fn trust(&self) -> SourceTrust {
+        SourceTrust::Builtin
+    }
+
+    fn load(&self) -> Result<Vec<RuntimeDefinition>, DefinitionError> {
+        let mut definitions: Vec<RuntimeDefinition> = self
+            .0
+            .load()?
+            .into_iter()
+            .filter(|definition| {
+                COMPILED_IN_GOLDENS
+                    .iter()
+                    .all(|golden| definition.runtime_id().as_str() != golden.runtime)
+            })
+            .collect();
+        for golden in &COMPILED_IN_GOLDENS {
+            definitions.push(RuntimeDefinition::from_toml(
+                golden_body(golden.descriptor),
+                |package| DefinitionOrigin::Builtin {
+                    package: Some(package),
+                },
+                |name| {
+                    if name != golden.runtime {
+                        return Err(DefinitionError::UnknownManifest);
+                    }
+                    let manifest = crate::detect::Manifest::parse_str(golden_body(golden.detect))
+                        .unwrap_or_else(|error| {
+                            panic!("the {} golden manifest parses: {error:?}", golden.runtime)
+                        });
+                    Ok(Arc::new(manifest))
+                },
+            )?);
+        }
+        Ok(definitions)
+    }
+}
+
+/// A host serving Codex and Claude as built-in runtimes through
+/// [`CompiledInSource`], with `/bin/sh` as the shell.
+///
+/// # Panics
+///
+/// Panics when the registry cannot be built, which would be a defect of the
+/// fixture.
+pub(crate) fn compiled_in_host() -> RuntimeHost {
+    let registry =
+        RuntimeRegistry::from_sources(&[&CompiledInSource(BuiltinSource::new("/bin/sh"))])
+            .expect("the compiled-in registry builds");
+    RuntimeHost::new(registry)
+}
+
 /// The profile keys that bind a host profile over `runtime` to its package in
 /// [`official_host`].
 ///
@@ -314,6 +514,36 @@ pub(crate) fn official_profile_pin(runtime: &str) -> String {
         "package = \"{}\"\ndigest = \"{}\"\n",
         official.package, official.digest
     )
+}
+
+/// The detection manifest the official package of `runtime` ships, parsed
+/// from its `detect.toml`.
+///
+/// # Panics
+///
+/// Panics when `runtime` is not `codex` or `claude`, or when the package
+/// manifest does not parse.
+pub(crate) fn official_manifest(runtime: &str) -> crate::detect::Manifest {
+    let official = OFFICIAL_PACKAGES
+        .iter()
+        .find(|official| official.runtime == runtime)
+        .unwrap_or_else(|| panic!("{runtime} is an official fixture package"));
+    crate::detect::Manifest::parse_str(official.detect)
+        .unwrap_or_else(|error| panic!("the {runtime} package manifest parses: {error:?}"))
+}
+
+/// `body` with the [`official_profile_pin`] of its base inserted after its
+/// first line when that line is `base = "codex"` or `base = "claude"`, so the
+/// profile binds the package [`official_host`] serves its base from; any
+/// other profile is returned unchanged.
+pub(crate) fn pin_official_base(body: &str) -> String {
+    for official in &OFFICIAL_PACKAGES {
+        let first = format!("base = \"{}\"\n", official.runtime);
+        if let Some(rest) = body.strip_prefix(&first) {
+            return format!("{first}{}{rest}", official_profile_pin(official.runtime));
+        }
+    }
+    body.to_owned()
 }
 
 /// A host serving the built-in runtimes, the official fixture packages of
@@ -383,7 +613,8 @@ impl RuntimeSource for FixtureSource {
 }
 
 /// [`pi_shaped_host`] with the fixture runtime declaring an integration, so
-/// its sessions admit hook reports.
+/// its sessions admit hook reports, next to the official fixture packages of
+/// [`official_host`], whose runtimes those reports may name.
 ///
 /// # Panics
 ///
@@ -420,8 +651,8 @@ pub(crate) fn pi_shaped_hooked_host_as(
     .expect("the hooked fixture document is valid");
     let builtin = BuiltinSource::new("/bin/sh");
     let fixture = FixtureSource(vec![definition]);
-    let registry =
-        RuntimeRegistry::from_sources(&[&builtin, &fixture]).expect("the fixture registry builds");
+    let registry = RuntimeRegistry::from_sources(&[&builtin, &OfficialFixtureSource, &fixture])
+        .expect("the fixture registry builds");
     RuntimeHost::new(registry)
 }
 
@@ -587,7 +818,7 @@ fn install_document(
             source: InstallSource::ExplicitDigest,
             enabled: true,
             select,
-            installed_at_unix_seconds: 1_700_000_000,
+            installed_at_unix_seconds: INSTALLED_AT_UNIX_SECONDS,
         })
         .expect("the fixture package installs");
     digest

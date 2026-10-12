@@ -227,6 +227,16 @@ const RULES: &[Rule] = &[
         "Claude Code compatibility lock and captured screens read by pohunek-cli's claude_package test; lock and npm project read by xtask's upstream staging scenarios",
     ),
     rule(
+        Pattern::Dir("compat/codex/builtin-v0.34"),
+        Effect::Packages(&["pohunek-daemon"]),
+        "v0.34.2 built-in Codex goldens embedded by the daemon's in-crate compiled-in runtime fixture",
+    ),
+    rule(
+        Pattern::Dir("compat/claude/builtin-v0.34"),
+        Effect::Packages(&["pohunek-daemon"]),
+        "v0.34.2 built-in Claude Code goldens embedded by the daemon's in-crate compiled-in runtime fixture",
+    ),
+    rule(
         Pattern::Dir("compat/pi"),
         Effect::Packages(&["pohunek-cli", "xtask"]),
         "Pi compatibility lock and captured screens read by pohunek-cli's pi_package and pi_frame_properties tests; lock and npm project read by xtask's upstream staging scenarios",
@@ -1028,7 +1038,7 @@ mod tests {
 
     #[test]
     fn embedded_paths_map_to_their_embedding_packages() {
-        let cases: [(&str, &[&str]); 17] = [
+        let cases: [(&str, &[&str]); 19] = [
             (
                 "docs/knowledge/guides/agent-skill.md",
                 &["pohunek-knowledge", "xtask"],
@@ -1051,6 +1061,14 @@ mod tests {
             ),
             ("compat/pi/npm/package-lock.json", &["pohunek-cli", "xtask"]),
             ("compat/claude/screens/idle.txt", &["pohunek-cli", "xtask"]),
+            (
+                "compat/codex/builtin-v0.34/runtime.toml",
+                &["pohunek-daemon", "pohunek-cli", "xtask"],
+            ),
+            (
+                "compat/claude/builtin-v0.34/detect.toml",
+                &["pohunek-cli", "pohunek-daemon", "xtask"],
+            ),
             (
                 "runtime-packages/codex/detect.toml",
                 &["pohunek-cli", "pohunek-daemon"],
