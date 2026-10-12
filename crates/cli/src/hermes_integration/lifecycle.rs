@@ -4,7 +4,7 @@
 //! this module. This module never launches Hermes; `HermesControl` is the
 //! narrow boundary the fixed runner implements later.
 
-// Rust guideline compliant 2026-09-29
+// Rust guideline compliant 2026-10-12
 
 #![expect(
     clippy::map_err_ignore,
@@ -95,31 +95,13 @@ pub(crate) struct InstallRequest<'a> {
     policy_path: &'a Path,
     policy: &'a Policy,
     confirm_modified: bool,
-    bundle: Option<&'a assets::Bundle>,
+    bundle: &'a assets::Bundle,
 }
 
 impl<'a> InstallRequest<'a> {
-    /// Creates a request from already validated command-layer inputs.
+    /// Creates a request from validated inputs and bytes snapshotted before locking.
     #[must_use]
-    #[cfg(test)]
     pub(crate) const fn new(
-        target: &'a ResolvedTarget,
-        policy_path: &'a Path,
-        policy: &'a Policy,
-        confirm_modified: bool,
-    ) -> Self {
-        Self {
-            target,
-            policy_path,
-            policy,
-            confirm_modified,
-            bundle: None,
-        }
-    }
-
-    /// Creates a request using immutable bytes snapshotted before locking.
-    #[must_use]
-    pub(crate) const fn with_bundle(
         target: &'a ResolvedTarget,
         policy_path: &'a Path,
         policy: &'a Policy,
@@ -131,8 +113,25 @@ impl<'a> InstallRequest<'a> {
             policy_path,
             policy,
             confirm_modified,
-            bundle: Some(bundle),
+            bundle,
         }
+    }
+
+    /// Creates a test request that installs the embedded sidecar.
+    ///
+    /// The snapshot is leaked so a temporary request can borrow it, which keeps
+    /// the production request free of an owned fallback source.
+    #[cfg(test)]
+    pub(crate) fn embedded(
+        target: &'a ResolvedTarget,
+        policy_path: &'a Path,
+        policy: &'a Policy,
+        confirm_modified: bool,
+    ) -> Self {
+        let bundle = Box::leak(Box::new(
+            assets::embedded_bundle(policy_path).expect("embedded test bundle"),
+        ));
+        Self::new(target, policy_path, policy, confirm_modified, bundle)
     }
 }
 
@@ -161,7 +160,7 @@ impl<'a> UninstallRequest<'a> {
 }
 
 /// Payload-free lifecycle state for later status and doctor rendering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LifecycleState {
     /// A valid matching ownership marker exists at the fixed plugin root.
     pub(crate) installed: bool,
@@ -169,11 +168,15 @@ pub(crate) struct LifecycleState {
     pub(crate) enabled: bool,
     /// A recorded asset or its private mode differs from the ownership marker.
     pub(crate) modified: bool,
-    /// The assets the marker records are not the ones this binary embeds, so
-    /// the install predates the running release even though no file was touched.
+    /// The selected source supplies other assets or provenance than the marker
+    /// records, although no installed file was touched. It is never set while
+    /// the source is unusable, because no update could apply it.
     pub(crate) outdated: bool,
-    /// The marker names a package source that is not selected and available.
+    /// The marker records a package source, and no usable selected package exists.
     pub(crate) package_source_missing: bool,
+    /// The failure an install or update would report for the current source
+    /// selection, or `None` when the selected source is usable.
+    pub(crate) package_source_error: Option<Error>,
     /// A matching Pohunek stage sibling remains from an interrupted transaction.
     pub(crate) stale_stage: bool,
     /// A matching Pohunek backup sibling remains from an interrupted transaction.
@@ -185,71 +188,40 @@ pub(crate) fn install(
     control: &mut impl HermesControl,
     request: &InstallRequest<'_>,
 ) -> Result<LifecycleState, Error> {
-    let bundle = request
-        .bundle
-        .cloned()
-        .map_or_else(|| assets::embedded_bundle(request.policy_path), Ok)?;
     let _lock = acquire_transaction_lock(request.policy_path)?;
-    install_with_bundle(control, request, &bundle, &mut NativeFileOps)
+    install_with(control, request, &mut NativeFileOps)
 }
 
 /// Updates a policy derived from the current on-disk value under one lock.
 ///
+/// `bundle` is the source snapshot selected before the lock is acquired.
+///
 /// # Errors
 ///
 /// Returns [`Error`] when locking, policy loading, derivation, or installation fails.
-#[cfg(test)]
 pub(crate) fn update(
     control: &mut impl HermesControl,
     target: &ResolvedTarget,
     policy_path: &Path,
     confirm_modified: bool,
+    bundle: &assets::Bundle,
     derive: impl FnOnce(&Policy) -> Result<Policy, Error>,
 ) -> Result<(LifecycleState, Policy), Error> {
-    update_with_bundle(control, target, policy_path, confirm_modified, None, derive)
-}
-
-/// Updates using source bytes resolved before acquiring the lifecycle lock.
-pub(crate) fn update_with_bundle(
-    control: &mut impl HermesControl,
-    target: &ResolvedTarget,
-    policy_path: &Path,
-    confirm_modified: bool,
-    bundle: Option<&assets::Bundle>,
-    derive: impl FnOnce(&Policy) -> Result<Policy, Error>,
-) -> Result<(LifecycleState, Policy), Error> {
-    let bundle = bundle
-        .cloned()
-        .map_or_else(|| assets::embedded_bundle(policy_path), Ok)?;
     let _lock = acquire_transaction_lock(policy_path)?;
     let current = Policy::load_private(policy_path)?;
     let policy = derive(&current)?;
-    let request =
-        InstallRequest::with_bundle(target, policy_path, &policy, confirm_modified, &bundle);
-    let state = install_with_bundle(control, &request, &bundle, &mut NativeFileOps)?;
+    let request = InstallRequest::new(target, policy_path, &policy, confirm_modified, bundle);
+    let state = install_with(control, &request, &mut NativeFileOps)?;
     Ok((state, policy))
 }
 
-#[cfg(test)]
 fn install_with(
     control: &mut impl HermesControl,
     request: &InstallRequest<'_>,
     files: &mut impl FileOps,
 ) -> Result<LifecycleState, Error> {
-    let bundle = request
-        .bundle
-        .cloned()
-        .map_or_else(|| assets::embedded_bundle(request.policy_path), Ok)?;
-    install_with_bundle(control, request, &bundle, files)
-}
-
-fn install_with_bundle(
-    control: &mut impl HermesControl,
-    request: &InstallRequest<'_>,
-    bundle: &assets::Bundle,
-    files: &mut impl FileOps,
-) -> Result<LifecycleState, Error> {
     validate_request_target(request.target, request.policy_path)?;
+    let bundle = request.bundle;
     let assets = &bundle.assets;
     let desired =
         assets::ownership_for_bundle(request.target.hermes_home(), request.policy_path, bundle)?;
@@ -257,9 +229,11 @@ fn install_with_bundle(
     assets::parse_marker(&marker)?;
     let policy_bytes = request.policy.to_json()?;
     let existing = installed(request.target, request.policy_path, Some(bundle))?;
-    if existing.as_ref().is_some_and(|installed| {
-        installed.ownership.source.as_deref() == Some("package") && bundle.package_id.is_none()
-    }) {
+    // A package-backed install never silently moves to the embedded sidecar.
+    if existing
+        .as_ref()
+        .is_some_and(|installed| package_source_missing(&installed.ownership, Some(bundle)))
+    {
         return Err(Error::PackageSourceMissing);
     }
     if existing.as_ref().is_some_and(|value| value.modified) && !request.confirm_modified {
@@ -363,6 +337,7 @@ fn install_with_bundle(
         modified: existing.is_some_and(|value| value.modified),
         outdated: false,
         package_source_missing: false,
+        package_source_error: None,
         stale_stage: false,
         stale_backup: false,
     })
@@ -399,7 +374,7 @@ fn uninstall_with(
 ) -> Result<LifecycleState, Error> {
     validate_request_target(request.target, request.policy_path)?;
     let Some(existing) = installed(request.target, request.policy_path, None)? else {
-        return inspect(control, request.target, request.policy_path);
+        return inspect_tree(control, request.target, request.policy_path, None);
     };
     if existing.modified && !request.confirm_modified {
         return Err(Error::ConfirmationRequired);
@@ -457,32 +432,50 @@ fn uninstall_with(
         modified: false,
         outdated: false,
         package_source_missing: false,
+        package_source_error: None,
         stale_stage: false,
         stale_backup: false,
     })
 }
 
 /// Inspects the fixed managed tree without discovering unrelated Hermes state.
+///
+/// `source` is the operator source selected before any lock. A failed
+/// selection is reported as the state's `package_source_error`; the installed
+/// assets are then not compared against any other source.
+///
+/// # Errors
+///
+/// Returns [`Error`] when the target, marker, or Hermes plugin state is invalid.
 pub(crate) fn inspect(
     control: &mut impl HermesControl,
     target: &ResolvedTarget,
     policy_path: &Path,
+    source: Result<&assets::Bundle, &Error>,
 ) -> Result<LifecycleState, Error> {
-    let bundle = assets::embedded_bundle(policy_path)?;
-    inspect_with_bundle(control, target, policy_path, &bundle)
+    let mut state = inspect_tree(control, target, policy_path, source.ok())?;
+    state.package_source_error = match source {
+        Err(error) => Some(error.clone()),
+        Ok(_) if state.package_source_missing => Some(Error::PackageSourceMissing),
+        Ok(_) => None,
+    };
+    Ok(state)
 }
 
-/// Inspects against the source snapshot selected before acquiring any lock.
-pub(crate) fn inspect_with_bundle(
+/// Inspects the tree against a usable source, or against none when it is unusable.
+fn inspect_tree(
     control: &mut impl HermesControl,
     target: &ResolvedTarget,
     policy_path: &Path,
-    bundle: &assets::Bundle,
+    bundle: Option<&assets::Bundle>,
 ) -> Result<LifecycleState, Error> {
     validate_request_target(target, policy_path)?;
-    let current = installed(target, policy_path, Some(bundle))?;
-    let assets = &bundle.assets;
-    let (stale_stage, stale_backup) = stale_siblings(target, policy_path, assets)?;
+    let current = installed(target, policy_path, bundle)?;
+    let (stale_stage, stale_backup) = stale_siblings(
+        target,
+        policy_path,
+        bundle.map(|bundle| bundle.assets.as_slice()),
+    )?;
     Ok(LifecycleState {
         installed: current.is_some(),
         enabled: control.is_enabled(target)?,
@@ -490,19 +483,25 @@ pub(crate) fn inspect_with_bundle(
         outdated: current.as_ref().is_some_and(|value| value.outdated),
         package_source_missing: current
             .as_ref()
-            .is_some_and(|value| value.package_source_missing),
+            .is_some_and(|value| package_source_missing(&value.ownership, bundle)),
+        package_source_error: None,
         stale_stage,
         stale_backup,
     })
+}
+
+/// Whether the marker records a package source that `source` cannot supply.
+fn package_source_missing(ownership: &Ownership, source: Option<&assets::Bundle>) -> bool {
+    ownership.source.as_deref() == Some(assets::PACKAGE_SOURCE)
+        && source.is_none_or(|bundle| bundle.package_id.is_none())
 }
 
 #[derive(Debug)]
 struct Installed {
     ownership: Ownership,
     modified: bool,
-    /// The marker's recorded payload or sidecar provenance differs from this binary.
+    /// The selected source supplies other payload or sidecar provenance than recorded.
     outdated: bool,
-    package_source_missing: bool,
 }
 
 /// Narrow filesystem seam for transactional writes and moves.
@@ -776,26 +775,25 @@ fn installed(
         expected_bundle.map(|bundle| bundle.assets.as_slice()),
     )?;
     let modified = managed_modified(root, &ownership)? || has_unmanaged_entries(root, &ownership)?;
-    let package_source_missing = ownership.source.as_deref() == Some("package")
-        && expected_bundle.is_some_and(|bundle| bundle.package_id.is_none());
-    let outdated = if let Some(bundle) = expected_bundle {
-        let assets_outdated = bundle
-            .assets
-            .iter()
-            .any(|asset| ownership.assets.get(asset.path()) != Some(&asset.checksum()));
-        let provenance_outdated = ownership.operator_sha256.as_deref()
-            != Some(bundle.manifest_sha256.as_str())
-            || ownership.package_id != bundle.package_id
-            || ownership.package_digest != bundle.package_digest;
-        assets_outdated || provenance_outdated || package_source_missing
-    } else {
-        false
-    };
+    // A lost package source leaves nothing an update could apply, so it is
+    // reported as source loss and never as an outdated install.
+    let outdated = expected_bundle
+        .filter(|_| !package_source_missing(&ownership, expected_bundle))
+        .is_some_and(|bundle| {
+            let assets_outdated = bundle
+                .assets
+                .iter()
+                .any(|asset| ownership.assets.get(asset.path()) != Some(&asset.checksum()));
+            let provenance_outdated = ownership.operator_sha256.as_deref()
+                != Some(bundle.manifest_sha256.as_str())
+                || ownership.package_id != bundle.package_id
+                || ownership.package_digest != bundle.package_digest;
+            assets_outdated || provenance_outdated
+        });
     Ok(Some(Installed {
         ownership,
         modified,
         outdated,
-        package_source_missing,
     }))
 }
 
@@ -1323,7 +1321,7 @@ fn collect_directories(
 fn stale_siblings(
     target: &ResolvedTarget,
     policy_path: &Path,
-    assets: &[Asset],
+    assets: Option<&[Asset]>,
 ) -> Result<(bool, bool), Error> {
     let Some(parent) = target.plugin_root().parent() else {
         return Err(Error::UnsafeTarget);
@@ -1351,8 +1349,7 @@ fn stale_siblings(
         }
         if metadata.is_dir()
             && validate_private_directory(&path).is_ok()
-            && (read_matching_ownership(&path, target, policy_path, Some(assets)).is_ok()
-                || is_stage)
+            && (read_matching_ownership(&path, target, policy_path, assets).is_ok() || is_stage)
         {
             stage |= is_stage;
             backup |= is_backup;
@@ -1537,6 +1534,16 @@ mod tests {
     use crate::hermes_integration::target::{ProfileName, TargetContext, TargetSelection};
 
     static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
+
+    /// Inspects against the embedded sidecar, the source these fixtures install.
+    fn inspect_embedded(
+        control: &mut impl HermesControl,
+        target: &ResolvedTarget,
+        policy_path: &Path,
+    ) -> Result<LifecycleState, Error> {
+        let bundle = assets::embedded_bundle(policy_path)?;
+        inspect(control, target, policy_path, Ok(&bundle))
+    }
 
     struct Fixture(PathBuf);
 
@@ -1843,7 +1850,7 @@ mod tests {
     #[test]
     fn installs_idempotently_and_reports_private_modes() {
         let (_root, target, policy_path, policy) = setup("install");
-        let request = InstallRequest::new(&target, &policy_path, &policy, false);
+        let request = InstallRequest::embedded(&target, &policy_path, &policy, false);
         let mut hermes = ControlledHermes::default();
         let first = install(&mut hermes, &request).expect("install");
         assert!(hermes.saw_staged_policy);
@@ -1855,6 +1862,7 @@ mod tests {
                 modified: false,
                 outdated: false,
                 package_source_missing: false,
+                package_source_error: None,
                 stale_stage: false,
                 stale_backup: false,
             }
@@ -1884,7 +1892,7 @@ mod tests {
         let mut hermes = ControlledHermes::default();
         install(
             &mut hermes,
-            &InstallRequest::new(&target, &policy_path, &policy, false),
+            &InstallRequest::embedded(&target, &policy_path, &policy, false),
         )
         .expect("install");
         let note = target.plugin_root().join("operator-note.txt");
@@ -1894,13 +1902,13 @@ mod tests {
         assert_eq!(
             install(
                 &mut hermes,
-                &InstallRequest::new(&target, &policy_path, &policy, false),
+                &InstallRequest::embedded(&target, &policy_path, &policy, false),
             ),
             Err(Error::ConfirmationRequired)
         );
         let state = install(
             &mut hermes,
-            &InstallRequest::new(&target, &policy_path, &policy, true),
+            &InstallRequest::embedded(&target, &policy_path, &policy, true),
         )
         .expect("confirmed update");
         assert!(state.modified);
@@ -1916,7 +1924,7 @@ mod tests {
         let mut hermes = ControlledHermes::default();
         install(
             &mut hermes,
-            &InstallRequest::new(&target, &policy_path, &policy, false),
+            &InstallRequest::embedded(&target, &policy_path, &policy, false),
         )
         .expect("initial install");
         let full = Policy::new(PolicyInput {
@@ -1935,7 +1943,7 @@ mod tests {
         .expect("full policy");
         install(
             &mut hermes,
-            &InstallRequest::new(&target, &policy_path, &full, false),
+            &InstallRequest::embedded(&target, &policy_path, &full, false),
         )
         .expect("access mode update");
         let value: serde_json::Value =
@@ -1983,7 +1991,7 @@ mod tests {
         .expect("policy");
         install(
             &mut ControlledHermes::default(),
-            &InstallRequest::new(&target, &policy_path, &policy, false),
+            &InstallRequest::embedded(&target, &policy_path, &policy, false),
         )
         .expect("install custom target");
         for path in [
@@ -2020,7 +2028,7 @@ mod tests {
         assert_eq!(
             install(
                 &mut ControlledHermes::default(),
-                &InstallRequest::new(&target, &policy_path, &policy, false),
+                &InstallRequest::embedded(&target, &policy_path, &policy, false),
             ),
             Err(Error::Collision)
         );
@@ -2032,7 +2040,7 @@ mod tests {
         let mut hermes = ControlledHermes::default();
         install(
             &mut hermes,
-            &InstallRequest::new(&target, &policy_path, &policy, false),
+            &InstallRequest::embedded(&target, &policy_path, &policy, false),
         )
         .expect("install");
         let assets = assets::render(&policy_path).expect("assets");
@@ -2048,7 +2056,7 @@ mod tests {
         )
         .expect("replace marker");
         assert_eq!(
-            inspect(&mut hermes, &target, &policy_path),
+            inspect_embedded(&mut hermes, &target, &policy_path),
             Err(Error::InvalidMarker)
         );
     }
@@ -2066,7 +2074,7 @@ mod tests {
         assert_eq!(
             install(
                 &mut ControlledHermes::default(),
-                &InstallRequest::new(&target, &policy_path, &policy, false),
+                &InstallRequest::embedded(&target, &policy_path, &policy, false),
             ),
             Err(Error::Collision)
         );
@@ -2085,7 +2093,7 @@ mod tests {
         assert_eq!(
             install_with(
                 &mut hermes,
-                &InstallRequest::new(&target, &policy_path, &policy, false),
+                &InstallRequest::embedded(&target, &policy_path, &policy, false),
                 &mut files,
             ),
             Err(Error::Collision)
@@ -2108,7 +2116,7 @@ mod tests {
         assert_eq!(
             install_with(
                 &mut hermes,
-                &InstallRequest::new(&target, &policy_path, &policy, false),
+                &InstallRequest::embedded(&target, &policy_path, &policy, false),
                 &mut files,
             ),
             Err(Error::RecoveryRequired)
@@ -2231,7 +2239,7 @@ mod tests {
     #[test]
     fn rolls_back_after_validation_or_enable_failure() {
         let (_root, target, policy_path, policy) = setup("rollback");
-        let request = InstallRequest::new(&target, &policy_path, &policy, false);
+        let request = InstallRequest::embedded(&target, &policy_path, &policy, false);
         let mut invalid = ControlledHermes {
             fail_validation: true,
             ..ControlledHermes::default()
@@ -2309,7 +2317,7 @@ esac"#,
         assert_eq!(
             install(
                 &mut runner,
-                &InstallRequest::new(&target, &policy_path, &policy, false),
+                &InstallRequest::embedded(&target, &policy_path, &policy, false),
             ),
             Err(Error::HermesCommand)
         );
@@ -2342,7 +2350,7 @@ esac"#,
     #[test]
     fn status_failure_leaves_no_prepared_transaction() {
         let (_root, target, policy_path, policy) = setup("status-failure");
-        let request = InstallRequest::new(&target, &policy_path, &policy, false);
+        let request = InstallRequest::embedded(&target, &policy_path, &policy, false);
         let mut hermes = ControlledHermes {
             fail_status: true,
             ..ControlledHermes::default()
@@ -2361,7 +2369,7 @@ esac"#,
             let mut hermes = ControlledHermes::default();
             install(
                 &mut hermes,
-                &InstallRequest::new(&target, &policy_path, &policy, false),
+                &InstallRequest::embedded(&target, &policy_path, &policy, false),
             )
             .expect("initial install");
             let original_tool =
@@ -2371,7 +2379,7 @@ esac"#,
             assert_eq!(
                 install_with(
                     &mut hermes,
-                    &InstallRequest::new(&target, &policy_path, &policy, false),
+                    &InstallRequest::embedded(&target, &policy_path, &policy, false),
                     &mut files,
                 ),
                 Err(Error::Io {
@@ -2414,7 +2422,7 @@ esac"#,
         let mut hermes = ControlledHermes::default();
         install(
             &mut hermes,
-            &InstallRequest::new(&target, &policy_path, &policy, false),
+            &InstallRequest::embedded(&target, &policy_path, &policy, false),
         )
         .expect("initial install");
         let original_tool = fs::read(target.plugin_root().join("tools.py")).expect("original tool");
@@ -2428,7 +2436,7 @@ esac"#,
         }
         install(
             &mut hermes,
-            &InstallRequest::new(&target, &policy_path, &policy, false),
+            &InstallRequest::embedded(&target, &policy_path, &policy, false),
         )
         .expect("random transaction name bypasses predictable reservations");
         assert_eq!(
@@ -2450,7 +2458,7 @@ esac"#,
         let mut hermes = ControlledHermes::default();
         install(
             &mut hermes,
-            &InstallRequest::new(&target, &policy_path, &policy, false),
+            &InstallRequest::embedded(&target, &policy_path, &policy, false),
         )
         .expect("initial install");
         // Stage writes and activation moves precede committed backup cleanup.
@@ -2458,7 +2466,7 @@ esac"#,
         assert_eq!(
             install_with(
                 &mut hermes,
-                &InstallRequest::new(&target, &policy_path, &policy, false),
+                &InstallRequest::embedded(&target, &policy_path, &policy, false),
                 &mut files,
             ),
             Err(Error::RecoveryRequired)
@@ -2484,7 +2492,7 @@ esac"#,
         };
         install(
             &mut hermes,
-            &InstallRequest::new(&target, &policy_path, &policy, false),
+            &InstallRequest::embedded(&target, &policy_path, &policy, false),
         )
         .expect("install");
         fs::remove_file(&policy_path).expect("remove external policy before uninstall");
@@ -2501,6 +2509,7 @@ esac"#,
                 modified: false,
                 outdated: false,
                 package_source_missing: false,
+                package_source_error: None,
                 stale_stage: false,
                 stale_backup: false,
             }
@@ -2518,7 +2527,7 @@ esac"#,
             let mut hermes = ControlledHermes::default();
             install(
                 &mut hermes,
-                &InstallRequest::new(&target, &policy_path, &policy, false),
+                &InstallRequest::embedded(&target, &policy_path, &policy, false),
             )
             .expect("initial install");
             let original_tool =
@@ -2554,7 +2563,7 @@ esac"#,
         let mut hermes = ControlledHermes::default();
         install(
             &mut hermes,
-            &InstallRequest::new(&target, &policy_path, &policy, false),
+            &InstallRequest::embedded(&target, &policy_path, &policy, false),
         )
         .expect("initial install");
         // The second move fails, then the first restore move fails.
@@ -2694,7 +2703,7 @@ esac"#,
         let (root, target, policy_path, policy) = setup("embedded-install");
         install(
             &mut ControlledHermes::default(),
-            &InstallRequest::new(&target, &policy_path, &policy, false),
+            &InstallRequest::embedded(&target, &policy_path, &policy, false),
         )
         .expect("install from embedded assets");
         let rendered = assets::render(&policy_path).expect("embedded assets");
@@ -2738,7 +2747,7 @@ esac"#,
         let mut hermes = ControlledHermes::default();
         install(
             &mut hermes,
-            &InstallRequest::new(&target, &policy_path, &policy, false),
+            &InstallRequest::embedded(&target, &policy_path, &policy, false),
         )
         .expect("install");
         fs::write(target.plugin_root().join("operator-note.txt"), b"keep").expect("unrelated");
@@ -2767,7 +2776,7 @@ esac"#,
         let mut hermes = ControlledHermes::default();
         install(
             &mut hermes,
-            &InstallRequest::new(&target, &policy_path, &policy, false),
+            &InstallRequest::embedded(&target, &policy_path, &policy, false),
         )
         .expect("install");
         fs::write(target.plugin_root().join("tools.py"), b"modified").expect("modify");
@@ -2796,20 +2805,21 @@ esac"#,
         let mut hermes = ControlledHermes::default();
         install(
             &mut hermes,
-            &InstallRequest::new(&target, &policy_path, &policy, false),
+            &InstallRequest::embedded(&target, &policy_path, &policy, false),
         )
         .expect("install");
         let parent = target.plugin_root().parent().expect("parent");
         let stale = parent.join(format!("{STAGE_PREFIX}stale"));
         fs::rename(target.plugin_root(), &stale).expect("move stage");
         let assets = assets::render(&policy_path).expect("assets");
-        let lifecycle = inspect(&mut hermes, &target, &policy_path).expect("inspect");
+        let lifecycle = inspect_embedded(&mut hermes, &target, &policy_path).expect("inspect");
         assert!(lifecycle.stale_stage);
         assert!(!lifecycle.installed);
         fs::rename(&stale, target.plugin_root()).expect("restore plugin");
         let backup = parent.join(format!("{BACKUP_PREFIX}stale"));
         fs::rename(target.plugin_root(), &backup).expect("move backup");
-        let backup_state = inspect(&mut hermes, &target, &policy_path).expect("backup inspect");
+        let backup_state =
+            inspect_embedded(&mut hermes, &target, &policy_path).expect("backup inspect");
         assert!(backup_state.stale_backup);
         fs::rename(&backup, target.plugin_root()).expect("restore backup");
         let policy_stage = policy_path
@@ -2820,7 +2830,7 @@ esac"#,
         fs::set_permissions(&policy_stage, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
             .expect("private policy stage");
         assert!(
-            inspect(&mut hermes, &target, &policy_path)
+            inspect_embedded(&mut hermes, &target, &policy_path)
                 .expect("policy stale inspect")
                 .stale_stage
         );
@@ -2828,7 +2838,7 @@ esac"#,
         let link = root.0.join("link-policy.json");
         symlink(&policy_path, &link).expect("symlink");
         assert_eq!(
-            inspect(&mut hermes, &target, &link),
+            inspect_embedded(&mut hermes, &target, &link),
             Err(Error::UnsafePolicyPath)
         );
         assert_eq!(assets.len(), assets::ASSET_COUNT);
@@ -2851,21 +2861,24 @@ esac"#,
         let (_root, target, policy_path, policy) = setup("concurrent-update");
         install(
             &mut ControlledHermes::default(),
-            &InstallRequest::new(&target, &policy_path, &policy, false),
+            &InstallRequest::embedded(&target, &policy_path, &policy, false),
         )
         .expect("install initial policy");
+        let bundle = assets::embedded_bundle(&policy_path).expect("embedded bundle");
         let (loaded_tx, loaded_rx) = std::sync::mpsc::sync_channel(0);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
 
         std::thread::scope(|scope| {
             let target_ref = &target;
             let policy_path_ref = &policy_path;
+            let bundle_ref = &bundle;
             let first = scope.spawn(move || {
                 update(
                     &mut ControlledHermes::default(),
                     target_ref,
                     policy_path_ref,
                     false,
+                    bundle_ref,
                     |existing| {
                         loaded_tx.send(()).expect("signal locked policy load");
                         release_rx.recv().expect("release first update");
@@ -2882,6 +2895,7 @@ esac"#,
                     &target,
                     &policy_path,
                     false,
+                    &bundle,
                     |existing| policy_with(existing, existing.access_mode(), ["remote"]),
                 ),
                 Err(Error::TransactionBusy)
@@ -2898,6 +2912,7 @@ esac"#,
             &target,
             &policy_path,
             false,
+            &bundle,
             |existing| policy_with(existing, existing.access_mode(), ["remote"]),
         )
         .expect("retry second update from committed snapshot");

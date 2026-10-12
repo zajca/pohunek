@@ -4,7 +4,7 @@
 //! fixed local runner. It neither reads Hermes state databases nor contacts an
 //! allowed remote host.
 
-// Rust guideline compliant 2026-09-29
+// Rust guideline compliant 2026-10-12
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Read as _;
@@ -15,6 +15,7 @@ use nix::unistd::Uid;
 use serde::Serialize;
 
 use super::assets;
+use super::error::Error;
 use super::lifecycle;
 use super::policy::{Policy, WildcardConfirmation};
 use super::runner::{HermesRunner, InstalledProbe};
@@ -22,6 +23,8 @@ use super::target::ResolvedTarget;
 
 /// A policy is small configuration; this cap rejects replacement-file abuse.
 const MAX_POLICY_BYTES: usize = 64 * 1024;
+/// Recovery for managed assets that differ from their marker or fail to import.
+const ASSET_INTEGRITY_HINT: &str = "replace the managed plugin assets from the selected source with `pohunek integration update --agent hermes`, adding `--confirm-modified` when status reports `modified=true`";
 /// The installed probe accepts only the seven contract-defined lifecycle hooks.
 const MANAGED_HOOK_COUNT: u8 = 7;
 /// Hooks must finish inside the one-second bound enforced by the Python probe.
@@ -105,11 +108,18 @@ impl Check {
     }
 }
 
-/// Inspects one already-resolved Hermes plugin installation.
-///
-/// The runner constructor has already validated the executable. This function
-/// returns every check even when an earlier check fails, and never exposes
-/// selected paths, policy bytes, sockets, or child-process output.
+/// A doctor report plus the source findings `integration status` also reports.
+#[derive(Debug)]
+pub(crate) struct Diagnosis {
+    /// The fixed-order report.
+    pub(crate) report: Report,
+    /// The marker records a package source, and no usable selected package exists.
+    pub(crate) package_source_missing: bool,
+    /// The failure an install or update would report for the current source selection.
+    pub(crate) package_source_error: Option<Error>,
+}
+
+/// Inspects one installation against the embedded sidecar, the unit fixture source.
 #[must_use]
 #[cfg(test)]
 pub(crate) fn inspect(
@@ -117,33 +127,30 @@ pub(crate) fn inspect(
     target: &ResolvedTarget,
     policy_path: &Path,
 ) -> Report {
-    let bundle = assets::embedded_bundle(policy_path);
-    if let Ok(bundle) = bundle {
-        inspect_with_bundle(runner, target, policy_path, &bundle, true)
-    } else {
-        let mut checks: Vec<Check> = CHECK_CODES.iter().copied().map(Check::not_run).collect();
-        set_fail(
-            &mut checks,
-            "asset_source",
-            "restore a valid Hermes operator asset source",
-        );
-        Report { ok: false, checks }
-    }
+    let bundle = assets::embedded_bundle(policy_path).expect("embedded test bundle");
+    diagnose(runner, target, policy_path, Ok(&bundle)).report
 }
 
-/// Inspects the fixed plugin against an immutable package source snapshot.
+/// Inspects one already-resolved Hermes plugin installation.
+///
+/// `source` is the operator source selected before any lock. The runner
+/// constructor has already validated the executable. This function returns
+/// every check even when an earlier check fails, and never exposes selected
+/// paths, policy bytes, sockets, or child-process output. `asset_source` fails
+/// exactly when an install or update would fail on the source selection.
 #[must_use]
 #[expect(
     clippy::too_many_lines,
     reason = "the complete fixed-order doctor report stays together for auditability"
 )]
-pub(crate) fn inspect_with_bundle(
+pub(crate) fn diagnose(
     runner: &mut HermesRunner,
     target: &ResolvedTarget,
     policy_path: &Path,
-    bundle: &assets::Bundle,
-    package_source_available: bool,
-) -> Report {
+    source: Result<&assets::Bundle, &Error>,
+) -> Diagnosis {
+    let mut package_source_missing = false;
+    let mut package_source_error = source.err().cloned();
     let mut checks: Vec<Check> = CHECK_CODES.iter().copied().map(Check::not_run).collect();
     set_pass(&mut checks, "hermes_executable");
 
@@ -176,8 +183,7 @@ pub(crate) fn inspect_with_bundle(
         set_pass(&mut checks, "access_mode");
     }
 
-    let lifecycle =
-        target_safe.then(|| lifecycle::inspect_with_bundle(runner, target, policy_path, bundle));
+    let lifecycle = target_safe.then(|| lifecycle::inspect(runner, target, policy_path, source));
     match lifecycle {
         Some(Ok(state)) => {
             set_result(
@@ -190,20 +196,20 @@ pub(crate) fn inspect_with_bundle(
                 &mut checks,
                 "asset_integrity",
                 state.installed && !state.modified,
-                "restore the embedded managed plugin assets",
+                ASSET_INTEGRITY_HINT,
             );
-            set_result(
-                &mut checks,
-                "asset_current",
-                state.installed && !state.outdated,
-                "run `pohunek integration update --agent hermes` with the original `--hermes-profile` or `--hermes-home` to replace assets from their recorded source",
-            );
-            set_result(
-                &mut checks,
-                "asset_source",
-                package_source_available && !state.package_source_missing,
-                "restore and select the official Hermes package recorded by this install before updating",
-            );
+            // Without a usable source no update can apply, so currency is not judged.
+            if state.package_source_error.is_none() {
+                set_result(
+                    &mut checks,
+                    "asset_current",
+                    state.installed && !state.outdated,
+                    "run `pohunek integration update --agent hermes` with the original `--hermes-profile` or `--hermes-home` to replace assets from the selected source",
+                );
+                set_pass(&mut checks, "asset_source");
+            }
+            package_source_missing = state.package_source_missing;
+            package_source_error = state.package_source_error;
             set_result(
                 &mut checks,
                 "plugin_enabled",
@@ -232,6 +238,9 @@ pub(crate) fn inspect_with_bundle(
         }
         None => {}
     }
+    if let Some(error) = &package_source_error {
+        set_fail(&mut checks, "asset_source", error.recovery_hint());
+    }
 
     let ready_for_probe = is_pass(&checks, "hermes_version")
         && is_pass(&checks, "plugin_ownership")
@@ -252,7 +261,11 @@ pub(crate) fn inspect_with_bundle(
     }
 
     let ok = checks.iter().all(|check| check.status == Status::Pass);
-    Report { ok, checks }
+    Diagnosis {
+        report: Report { ok, checks },
+        package_source_missing,
+        package_source_error,
+    }
 }
 
 fn target_is_safe(target: &ResolvedTarget, policy_path: &Path) -> bool {
@@ -336,10 +349,7 @@ fn apply_probe(checks: &mut [Check], probe: InstalledProbe) {
     let complete = probe.probe_complete && probe.failure_phase == 0 && probe.failure_errno == 0;
     if !complete {
         let (code, recovery_hint) = match probe.failure_phase {
-            1 | 3 => (
-                "asset_integrity",
-                "restore the embedded managed plugin assets",
-            ),
+            1 | 3 => ("asset_integrity", ASSET_INTEGRITY_HINT),
             2 | 5 | 21..=214 => (
                 "hook_registration",
                 "repair the managed hook registration and local reporting",

@@ -1,4 +1,4 @@
-// Rust guideline compliant 2026-09-19
+// Rust guideline compliant 2026-10-12
 
 use std::io::ErrorKind;
 
@@ -41,10 +41,16 @@ pub(crate) enum Error {
     /// The derived policy location would be inside the managed plugin tree.
     #[error("Hermes policy location is unsafe")]
     UnsafePolicyPath,
-    /// An embedded plugin asset did not meet the fixed ownership contract.
+    /// The selected operator source failed integrity or the closed sidecar contract.
     #[error("Hermes plugin asset manifest is invalid")]
     InvalidAsset,
-    /// The package source recorded by a package-backed install is unavailable.
+    /// The runtime package registry could not be opened or read safely.
+    #[error("the runtime package registry is unreadable")]
+    PackageRegistryUnreadable,
+    /// A Hermes package is installed, but no enabled official version is selected.
+    #[error("no enabled official Hermes package is selected")]
+    PackageNotSelected,
+    /// The marker records a package source, and no Hermes package is installed.
     #[error("the Hermes operator package source is unavailable")]
     PackageSourceMissing,
     /// A directory exists but was not created by this lifecycle.
@@ -114,10 +120,16 @@ impl Error {
             }
             Self::UnsafePolicyPath => "select a Pohunek configuration root outside the plugin tree",
             Self::InvalidAsset => {
-                "verify the official Hermes package with `pohunek plugin doctor`; restore it from its signed catalog and enable/select it, or update Pohunek if its embedded assets are invalid"
+                "verify the selected Hermes package with `pohunek plugin doctor` and reinstall it from its signed catalog, or update Pohunek if its embedded assets are invalid"
+            }
+            Self::PackageRegistryUnreadable => {
+                "run `pohunek plugin doctor` and repair the owner-private runtime package registry before retrying"
+            }
+            Self::PackageNotSelected => {
+                "enable and select an official `pohunek.runtime.hermes` version with `pohunek plugin enable` and `pohunek plugin select`, or install one from its signed catalog"
             }
             Self::PackageSourceMissing => {
-                "restore or re-enable the recorded Hermes package before updating"
+                "reinstall and select the official Hermes package from its signed catalog before updating, or uninstall the integration"
             }
             Self::Collision => "choose a profile without an unrelated `pohunek` plugin",
             Self::InvalidMarker => "repair or manually preserve the affected plugin directory",
@@ -137,7 +149,9 @@ impl Error {
             Self::ConfirmationRequired => {
                 "repeat the action with explicit modification confirmation"
             }
-            Self::StagedValidation => "use a supported local Python runtime and embedded assets",
+            Self::StagedValidation => {
+                "use a supported local Python runtime and a valid operator asset source"
+            }
             Self::InstalledProbe => {
                 "repair the managed plugin, policy, or Pohunek CLI before retrying"
             }

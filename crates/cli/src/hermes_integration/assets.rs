@@ -1,6 +1,10 @@
-//! Embedded plugin assets and their explicit ownership contract.
+//! Operator asset sources and their explicit ownership contract.
+//!
+//! The managed plugin comes from exactly one immutable source: the selected,
+//! enabled official Hermes runtime package, or the closed sidecar embedded in
+//! the CLI while no Hermes package is installed.
 
-// Rust guideline compliant 2026-09-29
+// Rust guideline compliant 2026-10-12
 
 #![expect(
     clippy::map_err_ignore,
@@ -10,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use package::registry::{PackageSource, Registry};
+use package::registry::{PackageSource, Registry, RegistryError};
 use package::Limits;
 use protocol::PackageId;
 use serde::de::{Error as _, MapAccess, Visitor};
@@ -66,6 +70,14 @@ const CORE_OWNED_ASSETS: [(&str, &[u8]); 1] = [(
     include_bytes!("assets/pohunek/_pohunek_reporter.py"),
 )];
 const POLICY_TOKEN: &str = "__POHUNEK_POLICY_PATH__";
+/// Runtime package that may supply the operator sidecar and payload.
+///
+/// The marker records it for package-backed installs; parsing accepts no other id.
+const PACKAGE_ID: &str = "pohunek.runtime.hermes";
+/// Marker `source` of an install rendered from the sidecar embedded in the CLI.
+pub(crate) const EMBEDDED_SOURCE: &str = "embedded";
+/// Marker `source` of an install rendered from the selected runtime package.
+pub(crate) const PACKAGE_SOURCE: &str = "package";
 /// Immutable core assets excluded from any future runtime-package overlay.
 const CORE_OWNED_ASSET_PATHS: [&str; 1] = ["_pohunek_reporter.py"];
 const EXPECTED_PAYLOAD_PATHS: [&str; 8] = [
@@ -135,30 +147,47 @@ pub(crate) struct Bundle {
 }
 
 /// Selects and snapshots the enabled, selected official Hermes package.
+///
+/// The embedded sidecar is the source only while no Hermes package is
+/// installed; a present but unusable candidate never falls back to it.
+///
+/// # Errors
+///
+/// Returns [`Error::PackageRegistryUnreadable`] when the registry cannot be
+/// opened or read safely, [`Error::PackageNotSelected`] when a Hermes package
+/// is installed but no enabled official version is selected, and
+/// [`Error::InvalidAsset`] when the selected package fails verification or
+/// the closed sidecar contract.
 pub(crate) fn selected_bundle(registry_path: &Path, policy_path: &Path) -> Result<Bundle, Error> {
-    const PACKAGE_ID: &str = "pohunek.runtime.hermes";
     let Some(registry) = Registry::open_existing_at(registry_path, Limits::DEFAULT)
-        .map_err(|_| Error::InvalidAsset)?
+        .map_err(|_| Error::PackageRegistryUnreadable)?
     else {
         return embedded_bundle(policy_path);
     };
-    let state = registry.state().map_err(|_| Error::InvalidAsset)?;
-    let id = PackageId::parse(PACKAGE_ID).map_err(|_| Error::InvalidAsset)?;
-    let candidates: Vec<_> = state
+    let state = registry
+        .state()
+        .map_err(|_| Error::PackageRegistryUnreadable)?;
+    let id = PackageId::parse(PACKAGE_ID).expect("the Hermes package id constant is valid");
+    if !state
         .packages()
         .iter()
-        .filter(|record| record.identity().id == id)
-        .collect();
-    if candidates.is_empty() {
+        .any(|record| record.identity().id == id)
+    {
         return embedded_bundle(policy_path);
     }
-    let selected = state.selected(&id).ok_or(Error::InvalidAsset)?;
-    let record = state.package(selected).ok_or(Error::InvalidAsset)?;
-    if record.identity().id != id || !record.enabled() || record.source() != PackageSource::Official
-    {
-        return Err(Error::InvalidAsset);
+    let selected = state.selected(&id).ok_or(Error::PackageNotSelected)?;
+    // A validated registry state only selects installed records of the same id.
+    let record = state
+        .package(selected)
+        .filter(|record| record.identity().id == id)
+        .ok_or(Error::PackageRegistryUnreadable)?;
+    if !record.enabled() || record.source() != PackageSource::Official {
+        return Err(Error::PackageNotSelected);
     }
-    let verified = registry.verify(selected).map_err(|_| Error::InvalidAsset)?;
+    let verified = registry.verify(selected).map_err(|error| match error {
+        RegistryError::RootInvalid(_) => Error::InvalidAsset,
+        _ => Error::PackageRegistryUnreadable,
+    })?;
     let source = verified
         .read_file("operator.toml")
         .map_err(|_| Error::InvalidAsset)?;
@@ -416,7 +445,7 @@ pub(crate) fn ownership(
         hermes_home: hermes_home.to_owned(),
         policy_path: policy_path.to_owned(),
         operator_sha256: Some(operator_sha256()?),
-        source: Some("embedded".to_owned()),
+        source: Some(EMBEDDED_SOURCE.to_owned()),
         package_id: None,
         package_digest: None,
         assets: checksums,
@@ -433,15 +462,15 @@ pub(crate) fn ownership_for_bundle(
     ownership.operator_sha256 = Some(bundle.manifest_sha256.clone());
     ownership.source = Some(
         if bundle.package_id.is_some() {
-            "package"
+            PACKAGE_SOURCE
         } else {
-            "embedded"
+            EMBEDDED_SOURCE
         }
         .to_owned(),
     );
     ownership.package_id.clone_from(&bundle.package_id);
     ownership.package_digest.clone_from(&bundle.package_digest);
-    if ownership.source.as_deref() == Some("package")
+    if ownership.source.as_deref() == Some(PACKAGE_SOURCE)
         && (ownership.package_id.is_none()
             || ownership
                 .package_digest
@@ -481,11 +510,11 @@ pub(crate) fn parse_marker(bytes: &[u8]) -> Result<Ownership, Error> {
             ownership.operator_sha256.as_deref().is_some_and(is_sha256)
                 && has_current_paths(&ownership.assets)
                 && match ownership.source.as_deref() {
-                    Some("embedded") => {
+                    Some(EMBEDDED_SOURCE) => {
                         ownership.package_id.is_none() && ownership.package_digest.is_none()
                     }
-                    Some("package") => {
-                        ownership.package_id.as_deref() == Some("pohunek.runtime.hermes")
+                    Some(PACKAGE_SOURCE) => {
+                        ownership.package_id.as_deref() == Some(PACKAGE_ID)
                             && ownership.package_digest.as_deref().is_some_and(is_sha256)
                     }
                     _ => false,

@@ -856,6 +856,7 @@ struct PohunekIntegrationResult {
     stale_stage: bool,
     stale_backup: bool,
     package_source_missing: bool,
+    package_source_error: Option<String>,
     access_mode: Option<String>,
     allowed_host_count: Option<usize>,
     doctor: Option<PohunekDoctorReport>,
@@ -2031,6 +2032,7 @@ fn validate_pohunek_envelope(
         || result.stale_stage
         || result.stale_backup
         || result.package_source_missing
+        || result.package_source_error.is_some()
     {
         return Err(fail(format!(
             "Pohunek integration action `{}` returned an invalid envelope",
@@ -5216,6 +5218,7 @@ PY
                     "stale_stage": false,
                     "stale_backup": false,
                     "package_source_missing": false,
+                    "package_source_error": null,
                     "access_mode": access_mode,
                     "allowed_host_count": access_mode.map(|_| 1),
                     "doctor": doctor,
@@ -5347,6 +5350,7 @@ PY
             "stale_stage": false,
             "stale_backup": false,
             "package_source_missing": false,
+            "package_source_error": null,
             "access_mode": "read_only",
             "allowed_host_count": 1,
             "doctor": null,

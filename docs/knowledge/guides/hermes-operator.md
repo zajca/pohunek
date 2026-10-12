@@ -33,16 +33,35 @@ separately by Pohunek.
 
 The operator assets use the selected, enabled official `pohunek.runtime.hermes`
 package when one is installed. Before that package is available, Pohunek uses
-the transitional copy embedded in the CLI. `integration status` and `doctor`
-still report `asset_source` as failed when an installed package is disabled,
-unselected, missing, or corrupt; they use the embedded copy only to finish the
-diagnostic report. `integration install` and `update` require a valid selected
-package whenever an installed Hermes package is present. To recover, verify the
-package with `pohunek plugin doctor`, then enable and select the intended
-official version with `pohunek plugin enable` and `pohunek plugin select`.
-Restore a missing or corrupt package from its signed catalog after clearing any
-session or profile pins. Re-run `integration doctor`, then update the operator
-assets from that selected source.
+the transitional copy embedded in the CLI. A present but unusable package never
+falls back to the embedded copy: `integration install` and `update` refuse with
+a typed source error and change nothing, `integration status` and `doctor`
+report the same code in `package_source_error`, and `doctor` fails its
+`asset_source` check with that code's recovery hint:
+
+- `hermes_package_not_selected`: a Hermes package is installed, but no enabled,
+  catalog-authorized version is selected. Enable and select the intended
+  official version with `pohunek plugin enable` and `pohunek plugin select`, or
+  install one from its signed catalog.
+- `hermes_invalid_asset`: the selected package fails verification or its closed
+  operator sidecar contract, such as an unlisted, missing, or altered operator
+  file, or a policy-path placeholder that is absent or repeated. Verify it with
+  `pohunek plugin doctor` and reinstall it from its signed catalog.
+- `hermes_package_registry_unreadable`: the runtime package registry cannot be
+  read safely. Run `pohunek plugin doctor` and repair the registry.
+- `hermes_package_source_missing`: the install records a package source, and no
+  Hermes package is installed. Reinstall and select the official package from
+  its signed catalog, or uninstall the integration.
+
+`package_source_missing=true` means the install records a package source and no
+usable selected package exists. Such an install is never reported as
+`outdated`, because no update could apply. `integration uninstall` verifies
+ownership from the marker and the installed bytes, so it succeeds without the
+package. Restore a missing or corrupt package from its signed catalog after
+clearing any session or profile pins, then re-run `integration doctor`. When the
+selected package or version differs from the recorded source, status shows
+`outdated=true` and `integration update` replaces the assets from the selected
+source.
 
 The Hermes operator plugin is an owner-private, Pohunek-managed integration. It
 is not a same-user sandbox: the daemon remains authoritative for its public API,
@@ -275,9 +294,10 @@ corresponding payload-free hook dry run and returns typed findings for missing
 files, policy, permissions, version compatibility, registration, host policy,
 or stale ownership state.
 
-After upgrading Pohunek, run `integration doctor` for the selected Hermes home:
-the `asset_current` check fails (and status shows `outdated=true`) when the
-installed plugin was written by an older release, even though no file was edited.
+After upgrading Pohunek or selecting another Hermes package version, run
+`integration doctor` for the selected Hermes home: the `asset_current` check
+fails (and status shows `outdated=true`) when the installed plugin differs from
+the selected source, even though no file was edited.
 `integration update` with the same target flags replaces it and needs
 `--confirm-modified` only when `modified=true`.
 

@@ -542,90 +542,64 @@ pub(crate) fn run_hermes(
     options.validate_for_action(action)?;
     let target = resolve_target(options)?;
     let policy_path = policy_path(&target)?;
-    let mut package_source_failed = false;
-    let bundle = match action {
-        HermesAction::Install | HermesAction::Update => {
-            let plugins_dir = Paths::plugins_dir()?;
-            Some(assets::selected_bundle(&plugins_dir, &policy_path).map_err(hermes_error)?)
-        }
-        HermesAction::Status | HermesAction::Doctor => {
-            let plugins_dir = Paths::plugins_dir()?;
-            Some(
-                if let Ok(bundle) = assets::selected_bundle(&plugins_dir, &policy_path) {
-                    bundle
-                } else {
-                    package_source_failed = true;
-                    assets::embedded_bundle(&policy_path).map_err(hermes_error)?
-                },
-            )
-        }
-        HermesAction::Uninstall => None,
-    };
     let mut runner = HermesRunner::new(&resolve_hermes_executable(options.hermes_bin.as_deref())?)
         .map_err(hermes_error)?;
 
     let result = match action {
         HermesAction::Install => {
+            let bundle = selected_source(&policy_path)?.map_err(hermes_error)?;
             let policy = install_policy(options)?;
             let lifecycle = lifecycle::install(
                 &mut runner,
-                &InstallRequest::with_bundle(
+                &InstallRequest::new(
                     &target,
                     &policy_path,
                     &policy,
                     options.confirm_modified,
-                    bundle.as_ref().expect("install bundle"),
+                    &bundle,
                 ),
             )
             .map_err(hermes_error)?;
-            result(action, &target, lifecycle, Some(&policy), None)
+            result(action, &target, &lifecycle, Some(&policy), None)
         }
         HermesAction::Status => {
-            let mut lifecycle = lifecycle::inspect_with_bundle(
-                &mut runner,
-                &target,
-                &policy_path,
-                bundle.as_ref().expect("status bundle"),
-            )
-            .map_err(hermes_error)?;
-            lifecycle.package_source_missing |= package_source_failed;
+            let source = selected_source(&policy_path)?;
+            let lifecycle = lifecycle::inspect(&mut runner, &target, &policy_path, source.as_ref())
+                .map_err(hermes_error)?;
             let policy = lifecycle
                 .installed
                 .then(|| Policy::load_private(&policy_path))
                 .transpose()
                 .map_err(hermes_error)?;
-            result(action, &target, lifecycle, policy.as_ref(), None)
+            result(action, &target, &lifecycle, policy.as_ref(), None)
         }
         HermesAction::Doctor => {
-            let report = doctor::inspect_with_bundle(
-                &mut runner,
-                &target,
-                &policy_path,
-                bundle.as_ref().expect("doctor bundle"),
-                !package_source_failed,
-            );
-            let lifecycle = lifecycle_from_doctor(&report);
-            result(action, &target, lifecycle, None, Some(report))
+            let source = selected_source(&policy_path)?;
+            let diagnosis = doctor::diagnose(&mut runner, &target, &policy_path, source.as_ref());
+            let lifecycle = lifecycle_from_doctor(&diagnosis);
+            result(action, &target, &lifecycle, None, Some(diagnosis.report))
         }
         HermesAction::Update => {
-            let (lifecycle, policy) = lifecycle::update_with_bundle(
+            let bundle = selected_source(&policy_path)?.map_err(hermes_error)?;
+            let (lifecycle, policy) = lifecycle::update(
                 &mut runner,
                 &target,
                 &policy_path,
                 options.confirm_modified,
-                bundle.as_ref(),
+                &bundle,
                 |existing| update_policy(options, existing),
             )
             .map_err(hermes_error)?;
-            result(action, &target, lifecycle, Some(&policy), None)
+            result(action, &target, &lifecycle, Some(&policy), None)
         }
+        // Uninstall verifies ownership from the marker and installed bytes alone.
         HermesAction::Uninstall => {
             let lifecycle = lifecycle::uninstall(
                 &mut runner,
                 &UninstallRequest::new(&target, &policy_path, options.confirm_modified),
             )
             .map_err(hermes_error)?;
-            result(action, &target, lifecycle, None, None)
+            result(action, &target, &lifecycle, None, None)
         }
     };
 
@@ -635,6 +609,11 @@ pub(crate) fn run_hermes(
         print!("{}", render_hermes_human(&result));
     }
     Ok(result.doctor.as_ref().is_none_or(|report| report.ok))
+}
+
+/// Snapshots the operator source before any lifecycle lock is taken.
+fn selected_source(policy_path: &Path) -> Result<Result<assets::Bundle, HermesError>, CliError> {
+    Ok(assets::selected_bundle(&Paths::plugins_dir()?, policy_path))
 }
 
 /// Returns the typed unsupported-action error before any daemon connection.
@@ -1078,6 +1057,7 @@ struct HermesResult {
     modified: bool,
     outdated: bool,
     package_source_missing: bool,
+    package_source_error: Option<&'static str>,
     stale_stage: bool,
     stale_backup: bool,
     access_mode: Option<AccessMode>,
@@ -1088,7 +1068,7 @@ struct HermesResult {
 fn result(
     action: HermesAction,
     target: &crate::hermes_integration::target::ResolvedTarget,
-    lifecycle: LifecycleState,
+    lifecycle: &LifecycleState,
     policy: Option<&Policy>,
     doctor: Option<doctor::Report>,
 ) -> HermesResult {
@@ -1109,6 +1089,10 @@ fn result(
         modified: lifecycle.modified,
         outdated: lifecycle.outdated,
         package_source_missing: lifecycle.package_source_missing,
+        package_source_error: lifecycle
+            .package_source_error
+            .as_ref()
+            .map(crate::error::hermes_error_code),
         stale_stage: lifecycle.stale_stage,
         stale_backup: lifecycle.stale_backup,
         access_mode: policy.map(Policy::access_mode),
@@ -1117,9 +1101,10 @@ fn result(
     }
 }
 
-fn lifecycle_from_doctor(report: &doctor::Report) -> LifecycleState {
+fn lifecycle_from_doctor(diagnosis: &doctor::Diagnosis) -> LifecycleState {
     let has_status = |code: &str, status: doctor::Status| {
-        report
+        diagnosis
+            .report
             .checks
             .iter()
             .any(|check| check.code == code && check.status == status)
@@ -1131,7 +1116,8 @@ fn lifecycle_from_doctor(report: &doctor::Report) -> LifecycleState {
             && has_status("asset_integrity", doctor::Status::Fail),
         outdated: has_status("plugin_ownership", doctor::Status::Pass)
             && has_status("asset_current", doctor::Status::Fail),
-        package_source_missing: has_status("asset_source", doctor::Status::Fail),
+        package_source_missing: diagnosis.package_source_missing,
+        package_source_error: diagnosis.package_source_error.clone(),
         stale_stage: has_status("stale_stage", doctor::Status::Fail),
         stale_backup: has_status("stale_backup", doctor::Status::Fail),
     }
@@ -1139,7 +1125,7 @@ fn lifecycle_from_doctor(report: &doctor::Report) -> LifecycleState {
 
 fn render_hermes_human(result: &HermesResult) -> String {
     let mut output = format!(
-        "Hermes {}: {} {} (installed={}, enabled={}, modified={}, outdated={}, package_source_missing={})\n",
+        "Hermes {}: {} {} (installed={}, enabled={}, modified={}, outdated={}, package_source_missing={}, package_source_error={})\n",
         result.action,
         result.target_kind,
         result.target_label,
@@ -1148,6 +1134,7 @@ fn render_hermes_human(result: &HermesResult) -> String {
         result.modified,
         result.outdated,
         result.package_source_missing,
+        result.package_source_error.unwrap_or("none"),
     );
     if let (Some(access_mode), Some(allowed_host_count)) =
         (result.access_mode, result.allowed_host_count)
@@ -1499,6 +1486,7 @@ mod tests {
             modified,
             outdated: false,
             package_source_missing: false,
+            package_source_error: None,
             stale_stage,
             stale_backup,
         };
@@ -1543,7 +1531,11 @@ mod tests {
         ];
         for (case, statuses, expected) in cases {
             assert_eq!(
-                lifecycle_from_doctor(&doctor_report(statuses)),
+                lifecycle_from_doctor(&doctor::Diagnosis {
+                    report: doctor_report(statuses),
+                    package_source_missing: false,
+                    package_source_error: None,
+                }),
                 expected,
                 "{case}"
             );
@@ -1804,6 +1796,7 @@ mod tests {
             modified: false,
             outdated: false,
             package_source_missing: false,
+            package_source_error: None,
             stale_stage: false,
             stale_backup: false,
             access_mode: None,
