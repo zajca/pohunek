@@ -5,7 +5,7 @@
 //! follow `--host`). Hermes is an owner-local plugin lifecycle and deliberately
 //! never contacts the daemon.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 use std::env;
 use std::fmt::Write as _;
@@ -28,7 +28,7 @@ use crate::hermes_integration::assets;
 use crate::hermes_integration::doctor;
 use crate::hermes_integration::error::Error as HermesError;
 use crate::hermes_integration::lifecycle::{
-    self, InstallRequest, LifecycleState, UninstallRequest,
+    self, InstallRequest, LifecycleState, Provenance, UninstallRequest,
 };
 use crate::hermes_integration::policy::{
     self, AccessMode, Policy, PolicyInput, WildcardConfirmation, DEFAULT_REQUEST_TIMEOUT_MS,
@@ -1063,6 +1063,34 @@ struct HermesResult {
     access_mode: Option<AccessMode>,
     allowed_host_count: Option<usize>,
     doctor: Option<doctor::Report>,
+    /// The source the installed plugin's ownership marker records, or `null`
+    /// when no managed plugin is installed.
+    provenance: Option<HermesProvenance>,
+}
+
+/// The recorded source of an installed Hermes plugin, as the envelope reports it.
+#[derive(Debug, Serialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+enum HermesProvenance {
+    /// Rendered from the sidecar compiled into the CLI.
+    Embedded,
+    /// Rendered from the selected official runtime package.
+    Package {
+        package_id: String,
+        package_digest: String,
+    },
+}
+
+impl From<&Provenance> for HermesProvenance {
+    fn from(provenance: &Provenance) -> Self {
+        match provenance {
+            Provenance::Embedded => Self::Embedded,
+            Provenance::Package { id, digest } => Self::Package {
+                package_id: id.clone(),
+                package_digest: digest.clone(),
+            },
+        }
+    }
 }
 
 fn result(
@@ -1098,6 +1126,7 @@ fn result(
         access_mode: policy.map(Policy::access_mode),
         allowed_host_count: policy.map(|policy| policy.allowed_hosts().len()),
         doctor,
+        provenance: lifecycle.provenance.as_ref().map(HermesProvenance::from),
     }
 }
 
@@ -1120,6 +1149,7 @@ fn lifecycle_from_doctor(diagnosis: &doctor::Diagnosis) -> LifecycleState {
         package_source_error: diagnosis.package_source_error.clone(),
         stale_stage: has_status("stale_stage", doctor::Status::Fail),
         stale_backup: has_status("stale_backup", doctor::Status::Fail),
+        provenance: diagnosis.provenance.clone(),
     }
 }
 
@@ -1143,6 +1173,18 @@ fn render_hermes_human(result: &HermesResult) -> String {
             output,
             "policy: access_mode={access_mode:?}, allowed_hosts={allowed_host_count}"
         );
+    }
+    match result.provenance.as_ref() {
+        Some(HermesProvenance::Embedded) => {
+            let _ = writeln!(output, "source: embedded");
+        }
+        Some(HermesProvenance::Package {
+            package_id,
+            package_digest,
+        }) => {
+            let _ = writeln!(output, "source: package {package_id} {package_digest}");
+        }
+        None => {}
     }
     if let Some(report) = result.doctor.as_ref() {
         let _ = writeln!(output, "doctor: ok={}", report.ok);
@@ -1489,6 +1531,7 @@ mod tests {
             package_source_error: None,
             stale_stage,
             stale_backup,
+            provenance: None,
         };
         let cases: [Case<'_>; 5] = [
             (
@@ -1535,6 +1578,7 @@ mod tests {
                     report: doctor_report(statuses),
                     package_source_missing: false,
                     package_source_error: None,
+                    provenance: None,
                 }),
                 expected,
                 "{case}"
@@ -1802,6 +1846,7 @@ mod tests {
             access_mode: None,
             allowed_host_count: None,
             doctor: None,
+            provenance: None,
         };
         let human = super::render_hermes_human(&output);
         assert!(human.contains("custom_home custom"));

@@ -971,6 +971,45 @@ fn check<'a>(envelope: &'a Value, code: &str) -> (&'a str, &'a str) {
     )
 }
 
+/// The `provenance` an envelope reports for a package-backed install of `digest`.
+fn package_provenance(digest: &PackageDigest) -> Value {
+    serde_json::json!({
+        "source": "package",
+        "package_id": PACKAGE_ID,
+        "package_digest": digest.as_str(),
+    })
+}
+
+/// The `provenance` an envelope reports for an install from the CLI's sidecar.
+fn embedded_provenance() -> Value {
+    serde_json::json!({ "source": "embedded" })
+}
+
+/// Asserts that status and doctor both report `expected` as the recorded source.
+async fn assert_reported_provenance(
+    harness: &Harness,
+    hermes: &HermesFixture,
+    expected: &Value,
+    context: &str,
+) {
+    let status = hermes.status(harness).await;
+    assert_eq!(&status["provenance"], expected, "{context}: {status:#}");
+    let doctor = hermes.doctor(harness).await;
+    assert_eq!(&doctor["provenance"], expected, "{context}: {doctor:#}");
+}
+
+/// Runs update and asserts that its result, status, and doctor report `expected`.
+async fn assert_update_reports(
+    harness: &Harness,
+    hermes: &HermesFixture,
+    expected: &Value,
+    context: &str,
+) {
+    let updated = hermes.update(harness).await;
+    assert_eq!(&updated["provenance"], expected, "{context}: {updated:#}");
+    assert_reported_provenance(harness, hermes, expected, context).await;
+}
+
 /// Asserts the source findings that status and doctor report for one state.
 async fn assert_source_findings(
     harness: &Harness,
@@ -1616,7 +1655,19 @@ async fn package_backed_install_writes_the_selected_package_bytes() {
     let hermes = HermesFixture::new(&harness);
     hermes.refuses_unowned_collision(&harness).await;
 
-    hermes.install(&harness).await;
+    let installed = hermes.install(&harness).await;
+    assert_eq!(
+        installed["provenance"],
+        package_provenance(&digest),
+        "install reports the package it rendered from: {installed:#}"
+    );
+    assert_reported_provenance(
+        &harness,
+        &hermes,
+        &package_provenance(&digest),
+        "package install",
+    )
+    .await;
     let package = package_entries();
     let packaged_skill = entry(&package, &format!("operator/{SKILL_PATH}"));
     let installed_skill =
@@ -1928,6 +1979,11 @@ async fn losing_the_recorded_package_refuses_update_without_mutation() {
         code, 0,
         "marker-backed uninstall survives missing source: {uninstalled:#}"
     );
+    assert_eq!(
+        uninstalled["ok"]["provenance"],
+        Value::Null,
+        "an uninstalled plugin records no source: {uninstalled:#}"
+    );
     assert!(!hermes.plugin_root.exists());
     harness.stop().await;
 }
@@ -1939,7 +1995,8 @@ async fn update_moves_an_install_to_the_newly_selected_source() {
     let harness = trusted_harness(&key).await;
     let hermes = HermesFixture::new(&harness);
 
-    hermes.install(&harness).await;
+    let installed = hermes.install(&harness).await;
+    assert_eq!(installed["provenance"], embedded_provenance());
     let marker = hermes.marker();
     assert_eq!(marker["source"], "embedded");
     assert!(marker.get("package_digest").is_none());
@@ -1957,6 +2014,13 @@ async fn update_moves_an_install_to_the_newly_selected_source() {
         status["outdated"], true,
         "a selected package outdates embedded assets"
     );
+    assert_reported_provenance(
+        &harness,
+        &hermes,
+        &embedded_provenance(),
+        "a selected package does not change the recorded source before update",
+    )
+    .await;
     assert_source_findings(
         &harness,
         &hermes,
@@ -1973,7 +2037,7 @@ async fn update_moves_an_install_to_the_newly_selected_source() {
             .contains("selected source"),
         "{doctor:#}"
     );
-    hermes.update(&harness).await;
+    assert_update_reports(&harness, &hermes, &package_provenance(&first), "package D1").await;
     let marker = hermes.marker();
     assert_eq!(marker["source"], "package");
     assert_eq!(
@@ -2003,7 +2067,7 @@ async fn update_moves_an_install_to_the_newly_selected_source() {
     let status = hermes.status(&harness).await;
     assert_eq!(status["outdated"], true, "a newer selection outdates D1");
     assert_source_findings(&harness, &hermes, false, None, "package D1, D2 selected").await;
-    hermes.update(&harness).await;
+    assert_update_reports(&harness, &hermes, &package_provenance(&second_digest), "D2").await;
     let marker = hermes.marker();
     assert_eq!(
         marker["package_digest"],

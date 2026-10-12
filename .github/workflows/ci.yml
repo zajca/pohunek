@@ -795,9 +795,11 @@ jobs:
               - 'crates/cli/tests/support/hermes_provider.rs'
               - 'crates/worker-protocol/src/hook_schema.rs'
               - 'crates/xtask/src/hermes*.rs'
+              - 'crates/xtask/src/hermes/**'
               - 'crates/daemon/src/agent/hermes.rs'
               - 'scripts/provision-hermes-compat'
               - 'scripts/tests/provision-hermes-compat.sh'
+              - 'scripts/build-hermes-package'
               - 'scripts/smoke-hermes-plugin-release'
               - 'scripts/tests/smoke-hermes-plugin-release.sh'
               - 'scripts/tests/fixtures/smoke-*'
@@ -830,6 +832,7 @@ jobs:
               - 'scripts/provision-hermes-compat'
               - 'scripts/tests/provision-hermes-compat.sh'
               - 'packaging/**'
+              - 'scripts/build-hermes-package'
               - 'scripts/smoke-hermes-plugin-release'
               - 'scripts/tests/smoke-hermes-plugin-release.sh'
               - 'scripts/tests/fixtures/smoke-*'
@@ -1372,21 +1375,34 @@ jobs:
           # group-writable framework builds the harness refuses.
           printf 'python=%s\n' "${hermes_bin%/*}/python" >> "$GITHUB_OUTPUT"
 
-      - name: Download built CLI
+      - name: Download built binaries
         uses: actions/download-artifact@v4
         with:
           name: pohunek-bins
           path: target/debug
 
+      # The gate installs the operator plugin from the Hermes runtime package
+      # through the downloaded daemon, so the archive is built from
+      # compat/hermes in this job.
+      - name: Build the Hermes runtime package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/hermes-package/hermes.tar.zst"
+          mkdir -p "${archive%/*}"
+          scripts/build-hermes-package "$archive"
+          printf 'archive=%s\n' "$archive" >> "$GITHUB_OUTPUT"
+
       - name: Check pinned Hermes compatibility
         shell: bash
         run: |
           set -euo pipefail
-          chmod +x target/debug/pohunek
-          pohunek_bin="$(realpath target/debug/pohunek)"
+          chmod +x target/debug/pohunek target/debug/pohunekd target/debug/pohunek-sessiond
           cargo xtask hermes compatibility \
             --hermes-bin "${{ steps.hermes.outputs.bin }}" \
-            --pohunek-bin "$pohunek_bin"
+            --bin-dir "$(realpath target/debug)" \
+            --package "${{ steps.package.outputs.archive }}"
 
       # The test daemon spawns the session worker found beside the test
       # profile, so it is built from this checkout before the real session.
@@ -2008,8 +2024,9 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
       # mold is Linux-only: keep the default linker on macOS runners.
       RUSTFLAGS: -D warnings
-    # The release CLI build and the debug build of the CLI integration tests
-    # for the real Hermes session each take a large share of a cold run.
+    # The release daemon-archive build and the debug build of the CLI
+    # integration tests for the real Hermes session each take a large share of
+    # a cold run.
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -2121,19 +2138,19 @@ jobs:
 
       # The packaged archive is built with the release scripts and extracted
       # outside the checkout, so the gate and the smoke can only use what the
-      # published macOS CLI archive contains: the binary with its embedded
-      # plugin and skill assets, and the packaged smoke script.
-      - name: Build, package, and extract the CLI archive outside the source tree
+      # published macOS daemon archive contains: the binaries and the packaged
+      # smoke script.
+      - name: Build, package, and extract the daemon archive outside the source tree
         id: packaged
         shell: /bin/bash {0}
         run: |
           set -euo pipefail
           version="$(awk -F'"' '/^\[workspace\.package\]/ { in_pkg = 1; next } /^\[/ { in_pkg = 0 } in_pkg && /^version[[:space:]]*=/ { print $2; exit }' Cargo.toml)"
-          bindir="$(packaging/macos/build-release cli)"
-          dist="$RUNNER_TEMP/dist-cli"
+          bindir="$(packaging/macos/build-release daemon)"
+          dist="$RUNNER_TEMP/dist-daemon"
           rm -rf "$dist"
           mkdir -p "$dist"
-          archive="$(packaging/macos/package --development cli "$version" "$bindir" target/pohunek-docs "$dist")"
+          archive="$(packaging/macos/package --development daemon "$version" "$bindir" target/pohunek-docs "$dist")"
           extract_dir="$RUNNER_TEMP/packaged-pohunek"
           rm -rf "$extract_dir"
           mkdir -p "$extract_dir"
@@ -2143,9 +2160,28 @@ jobs:
             echo "packaged directory is inside a Git worktree: $packaged_dir" >&2
             exit 1
           fi
-          test -x "$packaged_dir/pohunek"
+          for binary in pohunek pohunekd pohunek-sessiond; do
+            test -x "$packaged_dir/$binary"
+          done
           test -x "$packaged_dir/packaging/smoke-hermes-plugin-release"
           printf 'dir=%s\n' "$packaged_dir" >> "$GITHUB_OUTPUT"
+
+      # The gate and the smoke install the operator plugin from the Hermes
+      # runtime package, built here from compat/hermes. The smoke's catalog is
+      # signed with a throwaway key that only its anchor trusts.
+      - name: Build the Hermes runtime package and its throwaway catalog
+        id: package
+        shell: /bin/bash {0}
+        run: |
+          set -euo pipefail
+          package_dir="$RUNNER_TEMP/hermes-package"
+          rm -rf "$package_dir"
+          mkdir -p "$package_dir"
+          scripts/build-hermes-package "$package_dir/hermes.tar.zst"
+          cargo xtask hermes throwaway-catalog \
+            --package "$package_dir/hermes.tar.zst" \
+            --output-dir "$package_dir/trust"
+          printf 'dir=%s\n' "$package_dir" >> "$GITHUB_OUTPUT"
 
       - name: Check pinned Hermes compatibility
         shell: /bin/bash {0}
@@ -2153,7 +2189,8 @@ jobs:
           set -euo pipefail
           cargo xtask hermes compatibility \
             --hermes-bin "${{ steps.hermes.outputs.bin }}" \
-            --pohunek-bin "${{ steps.packaged.outputs.dir }}/pohunek"
+            --bin-dir "${{ steps.packaged.outputs.dir }}" \
+            --package "${{ steps.package.outputs.dir }}/hermes.tar.zst"
 
       # The previous step wrote into the stage it used; the next one runs on
       # a fresh restore of the untouched copy at the same absolute path.
@@ -2173,7 +2210,10 @@ jobs:
         run: |
           set -euo pipefail
           "${{ steps.packaged.outputs.dir }}/packaging/smoke-hermes-plugin-release" \
-            "${{ steps.packaged.outputs.dir }}/pohunek" \
+            "${{ steps.packaged.outputs.dir }}" \
+            "${{ steps.package.outputs.dir }}/hermes.tar.zst" \
+            "${{ steps.package.outputs.dir }}/trust/runtime-catalog.json" \
+            "${{ steps.package.outputs.dir }}/trust/runtime-catalog-anchor.json" \
             "${{ steps.hermes.outputs.bin }}"
 
       # The test daemon spawns the session worker found beside the test

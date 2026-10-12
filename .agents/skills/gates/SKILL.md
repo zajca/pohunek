@@ -38,7 +38,9 @@ cargo nextest run --profile ci --test-threads 4 --workspace --all-features
 cargo test --doc --workspace --all-features             # nextest excludes doctests
 cargo build --workspace --release
 cargo xtask docs check
-cargo xtask hermes compatibility --pohunek-bin /abs/path/to/pohunek
+scripts/build-hermes-package /abs/path/to/hermes.tar.zst
+cargo xtask hermes compatibility --bin-dir /abs/path/to/target/release \
+  --package /abs/path/to/hermes.tar.zst
 ```
 
 A local pass does not *guarantee* CI green — shard partitioning, macOS jobs,

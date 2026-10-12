@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 ed25519-dalek = { workspace = true }
+getrandom = { workspace = true }
 knowledge = { workspace = true }
 cli = { workspace = true }
 pohunek-package = { workspace = true }

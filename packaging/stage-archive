@@ -80,8 +80,6 @@ copy_binary() {
 case $component in
     cli)
         copy_binary pohunek
-        mkdir -p "$staging/packaging"
-        cp scripts/smoke-hermes-plugin-release "$staging/packaging/"
         ;;
     daemon)
         copy_binary pohunekd
@@ -89,6 +87,9 @@ case $component in
         copy_binary pohunek-sessiond
         mkdir -p "$staging/packaging"
         cp packaging/install-daemon.sh packaging/verify-archive "$staging/packaging/"
+        # The Hermes plugin smoke starts the daemon to install the Hermes
+        # runtime package, so it ships with the daemon binaries.
+        cp scripts/smoke-hermes-plugin-release "$staging/packaging/"
         # The daemon reads the anchor from its executable's directory and
         # refuses group/other-writable files; `archive` keeps the 0644 mode
         # because no execute bit is set.

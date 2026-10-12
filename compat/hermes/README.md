@@ -54,15 +54,36 @@ package record must be enabled and catalog-authorized. The S5 release inventory
 will provide the official package; until then the CLI keeps the embedded S3
 sidecar as its source when no Hermes package is installed.
 
-Run the model-free CI gate with an installed pinned executable on `PATH`:
+Run the model-free CI gate with an installed pinned executable on `PATH`,
+the directory of built Pohunek binaries, and the Hermes runtime package
+archive built from this directory:
 
 ```bash
-cargo xtask hermes compatibility --pohunek-bin ABS
+scripts/build-hermes-package /abs/hermes.tar.zst
+cargo xtask hermes compatibility --bin-dir ABS_BIN_DIR --package /abs/hermes.tar.zst
 ```
 
-`ABS` must be the absolute, canonical path to a built `pohunek` executable with
-no symlink components or group/world-write permissions. For local diagnosis,
-`--hermes-bin <path>` selects another Hermes executable. The gate creates
+`ABS_BIN_DIR` must be an absolute directory holding `pohunek`, `pohunekd`, and
+`pohunek-sessiond`, each a canonical regular executable with no symlink
+components or group/world-write permissions. `scripts/build-hermes-package`
+copies `package/runtime.toml`, `package/detect.toml`, `operator.toml`, and
+`operator/` into one package directory and builds it with `cargo xtask package
+build`. For local diagnosis, `--hermes-bin <path>` selects another Hermes
+executable.
+
+The gate installs the operator plugin from that package, the way an operator
+host does, and never through a source switch. It refuses an archive whose
+descriptor is not `pohunek.runtime.hermes` for runtime `hermes`, copies the
+three binaries into a private prefix, writes beside the copied daemon a trust
+anchor for a signing key that exists only in the gate process, signs a catalog
+with that key that authorizes exactly the archive, starts the copied daemon,
+and runs `pohunek plugin install --catalog`. The daemon must then list the
+archive digest as the one enabled, selected official Hermes package. Every
+`integration` result of the locked install, status, and doctor steps must
+report `provenance` `source=package` with `pohunek.runtime.hermes` and the
+archive digest, and uninstall must report none; a result with `source=embedded`
+fails the gate, because the CLI still renders its embedded copy when no package
+is installed. The daemon must exit cleanly on SIGTERM afterwards. The gate creates
 temporary `HOME`, `HERMES_HOME`, XDG, Python user, bytecode, and
 uv-cache locations. It clears the ambient environment except for the minimum
 process-launch variables, bounds every command by time and output size, checks
@@ -106,11 +127,19 @@ with the stock macOS `/bin/bash` 3.2 and BSD userland (the provisioner uses
 `curl`, `tar`, `sha256sum` or `shasum -a 256`, whichever exists, and no GNU
 `realpath`),
 runs both shell tests, the xtask Hermes unit tests, the compatibility gate, and
-`scripts/smoke-hermes-plugin-release`. The smoke runs a release `pohunek`
-copied outside the checkout with a clean isolated home, so the plugin and skill
-it installs can only come from assets embedded in the binary; it resolves
-symlinked temporary parents (macOS `/tmp` and `/var/tmp`) before validating
-them. The harness resolves symlinks in its isolation root so redaction matches
+`scripts/smoke-hermes-plugin-release` against a packaged development daemon
+archive extracted outside the checkout. The smoke takes the extracted daemon
+archive, the Hermes package archive, a signed catalog that authorizes it, and
+the anchor that trusts the catalog's signer. It copies the three binaries into
+a private prefix with that anchor beside the daemon, starts the daemon with a
+clean isolated home, installs the package with `pohunek plugin install
+--catalog`, and requires every installed-state `integration` result to report
+the package and its digest as the provenance. Until Hermes ships in the release
+catalog, CI and the release workflows build the package with
+`scripts/build-hermes-package` and write the catalog and anchor with `cargo
+xtask hermes throwaway-catalog`, whose signing key is random and never written.
+The smoke resolves symlinked temporary parents (macOS `/tmp` and `/var/tmp`)
+before validating them. The harness resolves symlinks in its isolation root so redaction matches
 the paths child processes print, and uses `en_US.UTF-8` where macOS lacks
 `C.UTF-8`. The production-plugin isolation root and the smoke root are chosen
 short enough that `$XDG_RUNTIME_DIR/pohunek/daemon.sock` fits the platform

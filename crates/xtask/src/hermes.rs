@@ -1,6 +1,6 @@
 //! Validates the pinned Hermes CLI and refreshes bounded PTY evidence.
 
-// Rust guideline compliant 2026-10-01
+// Rust guideline compliant 2026-10-12
 
 use std::ffi::OsString;
 use std::fs;
@@ -19,6 +19,10 @@ use tempfile::TempDir;
 
 use crate::hermes_mock::{Mock, Scenario as MockScenario, MODEL_ID};
 use crate::XtaskError;
+
+mod package_host;
+
+pub(crate) use package_host::{write_throwaway_trust, CATALOG_FILE};
 
 const LOCK_PATH: &str = "compat/hermes/compatibility-lock.json";
 const GOLDEN_ROOT: &str = "compat/hermes/goldens";
@@ -884,6 +888,19 @@ struct PohunekProtocol {
     maximum: u32,
 }
 
+/// The source an integration envelope reports for the installed plugin.
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+enum PohunekProvenance {
+    /// Rendered from the operator sidecar compiled into the CLI.
+    Embedded,
+    /// Rendered from the selected official runtime package.
+    Package {
+        package_id: String,
+        package_digest: String,
+    },
+}
+
 #[expect(
     clippy::struct_excessive_bools,
     reason = "the CLI lifecycle envelope intentionally exposes independent state findings"
@@ -905,6 +922,7 @@ struct PohunekIntegrationResult {
     access_mode: Option<String>,
     allowed_host_count: Option<usize>,
     doctor: Option<PohunekDoctorReport>,
+    provenance: Option<PohunekProvenance>,
 }
 
 /// Checks in the Hermes doctor report of the CLI under test; it matches the
@@ -1194,12 +1212,18 @@ struct Scenario {
 }
 
 /// Runs the model-free compatibility checks.
+///
+/// `bin_dir` holds the release `pohunek`, `pohunekd` and `pohunek-sessiond`;
+/// `package` is the Hermes runtime package archive the plugin lifecycle
+/// installs its operator assets from.
 pub(crate) fn compatibility(
     repo: &Path,
     hermes_bin: &Path,
-    pohunek_bin: &Path,
+    bin_dir: &Path,
+    package: &Path,
 ) -> Result<CompatibilitySummary, XtaskError> {
-    compatibility_with(repo, hermes_bin, pohunek_bin, Limits::production())
+    let inputs = package_host::Inputs::new(bin_dir, package)?;
+    compatibility_with(repo, hermes_bin, &inputs, Limits::production())
 }
 
 /// Refreshes sanitized PTY goldens against the repository-owned local mock.
@@ -1213,17 +1237,16 @@ pub(crate) fn refresh_goldens(
 fn compatibility_with(
     repo: &Path,
     hermes_bin: &Path,
-    pohunek_bin: &Path,
+    inputs: &package_host::Inputs,
     limits: Limits,
 ) -> Result<CompatibilitySummary, XtaskError> {
-    let pohunek_bin = require_safe_pohunek_binary(pohunek_bin)?;
     let hermes_bin = resolve_compatibility_hermes_binary(hermes_bin)?;
     let lock = check_cli(repo, &hermes_bin, limits)?;
     let manifest = load_golden_manifest(repo)?;
     validate_golden_manifest(repo, &lock, &manifest, limits.pty_output_bytes, false)?;
     check_pohunek_integration(
         &hermes_bin,
-        &pohunek_bin,
+        inputs,
         &lock.plugin_contract.integration_lifecycle,
         limits,
     )?;
@@ -1942,12 +1965,16 @@ fn validate_integration_contract(contract: &IntegrationLifecycle) -> Result<(), 
     Ok(())
 }
 
+/// Installs the release binaries and the Hermes package into an isolated
+/// prefix, then runs the locked lifecycle steps against the package-backed
+/// install; every installed-state envelope must name the archive digest.
 fn check_pohunek_integration(
     hermes_bin: &Path,
-    pohunek_bin: &Path,
+    inputs: &package_host::Inputs,
     contract: &IntegrationLifecycle,
     limits: Limits,
 ) -> Result<(), XtaskError> {
+    let package = inputs.read_package()?;
     let isolation = production_integration_isolation()?;
     let hermes_home = isolation.home.join(".hermes");
     let profile_home = hermes_home.join("profiles").join(EXPECTED_NAMED_PROFILE);
@@ -1968,47 +1995,54 @@ fn check_pohunek_integration(
         return Err(fail("Pohunek integration lifecycle step count changed"));
     };
 
-    run_pohunek_integration_action(
-        pohunek_bin,
-        hermes_bin,
-        install,
-        &isolation.work,
+    let host = package_host::Host::start(
+        inputs,
+        &package,
+        &isolation.root,
         &env,
-        limits,
-    )?;
-    run_pohunek_integration_action(
-        pohunek_bin,
-        hermes_bin,
-        status,
         &isolation.work,
-        &env,
-        limits,
+        &package_host::daemon_socket(&runtime_home),
     )?;
+    host.install_package(
+        &package,
+        &env,
+        &isolation.work,
+        limits.integration_action_timeout,
+        limits.command_output_bytes,
+    )?;
+    let pohunek_bin = host.pohunek();
+    let digest = package.digest().as_str();
+    for step in [install, status] {
+        run_pohunek_integration_action(
+            &pohunek_bin,
+            hermes_bin,
+            step,
+            digest,
+            &isolation.work,
+            &env,
+            limits,
+        )?;
+    }
     run_production_plugin_runtime(
-        pohunek_bin,
+        &pohunek_bin,
         hermes_bin,
         &profile_home,
         &isolation.work,
         &env,
         limits,
     )?;
-    run_pohunek_integration_action(
-        pohunek_bin,
-        hermes_bin,
-        doctor,
-        &isolation.work,
-        &env,
-        limits,
-    )?;
-    run_pohunek_integration_action(
-        pohunek_bin,
-        hermes_bin,
-        uninstall,
-        &isolation.work,
-        &env,
-        limits,
-    )?;
-    Ok(())
+    for step in [doctor, uninstall] {
+        run_pohunek_integration_action(
+            &pohunek_bin,
+            hermes_bin,
+            step,
+            digest,
+            &isolation.work,
+            &env,
+            limits,
+        )?;
+    }
+    host.stop()
 }
 
 fn create_private_directory(path: &Path) -> Result<(), XtaskError> {
@@ -2063,10 +2097,13 @@ fn integration_environment(
     env
 }
 
+/// Runs one locked lifecycle step and validates its envelope; an installed
+/// state must report `package_digest` as its package provenance.
 fn run_pohunek_integration_action(
     pohunek_bin: &Path,
     hermes_bin: &Path,
     step: &IntegrationStep,
+    package_digest: &str,
     cwd: &Path,
     env: &[(OsString, OsString)],
     limits: Limits,
@@ -2112,7 +2149,7 @@ fn run_pohunek_integration_action(
             integration_action_name(step.action)
         ))
     })?;
-    validate_pohunek_envelope(step, &envelope)
+    validate_pohunek_envelope(step, &envelope, package_digest)
 }
 
 fn integration_action_name(action: IntegrationAction) -> &'static str {
@@ -2127,6 +2164,7 @@ fn integration_action_name(action: IntegrationAction) -> &'static str {
 fn validate_pohunek_envelope(
     step: &IntegrationStep,
     envelope: &PohunekEnvelope,
+    package_digest: &str,
 ) -> Result<(), XtaskError> {
     let result = &envelope.ok;
     if envelope.cli_version.is_empty()
@@ -2191,7 +2229,40 @@ fn validate_pohunek_envelope(
             integration_action_name(step.action)
         )));
     }
-    Ok(())
+    validate_provenance(step, result.provenance.as_ref(), package_digest)
+}
+
+/// Requires the package provenance of the installed archive while the plugin
+/// is installed, and no provenance once it is uninstalled.
+fn validate_provenance(
+    step: &IntegrationStep,
+    provenance: Option<&PohunekProvenance>,
+    package_digest: &str,
+) -> Result<(), XtaskError> {
+    let action = integration_action_name(step.action);
+    let expected = match step.action {
+        IntegrationAction::Install | IntegrationAction::Status | IntegrationAction::Doctor => {
+            Some(PohunekProvenance::Package {
+                package_id: EXPECTED_PACKAGE_ID.to_owned(),
+                package_digest: package_digest.to_owned(),
+            })
+        }
+        IntegrationAction::Uninstall => None,
+    };
+    if provenance == expected.as_ref() {
+        return Ok(());
+    }
+    Err(fail(match provenance {
+        Some(PohunekProvenance::Embedded) => format!(
+            "Pohunek integration action `{action}` reported source=embedded: the operator assets came from the CLI's embedded copy, not from the Hermes package"
+        ),
+        Some(PohunekProvenance::Package { .. }) => format!(
+            "Pohunek integration action `{action}` reported package provenance other than the installed archive {package_digest}"
+        ),
+        None => format!(
+            "Pohunek integration action `{action}` reported no package provenance"
+        ),
+    }))
 }
 
 fn doctor_is_healthy(report: &PohunekDoctorReport) -> bool {
@@ -4118,37 +4189,32 @@ fn require_explicit_binary(path: &Path) -> Result<(), XtaskError> {
     Ok(())
 }
 
+/// Checks one release executable named by `--bin-dir`; every refusal names
+/// the executable's file name.
 fn require_safe_pohunek_binary(path: &Path) -> Result<PathBuf, XtaskError> {
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let refuse = |reason: &str| fail(format!("Hermes compatibility executable `{name}` {reason}"));
     if !path.is_absolute() {
-        return Err(fail(
-            "Hermes compatibility requires an absolute --pohunek-bin path",
-        ));
+        return Err(refuse("is not below an absolute --bin-dir path"));
     }
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component.as_os_str());
-        let metadata = fs::symlink_metadata(&current)
-            .map_err(|_error| fail("Hermes compatibility Pohunek executable does not exist"))?;
+        let metadata = fs::symlink_metadata(&current).map_err(|_error| refuse("does not exist"))?;
         if metadata.file_type().is_symlink() {
-            return Err(fail(
-                "Hermes compatibility Pohunek executable contains a symlink",
-            ));
+            return Err(refuse("path contains a symlink"));
         }
     }
-    let canonical = fs::canonicalize(path).map_err(|_error| {
-        fail("Hermes compatibility Pohunek executable cannot be canonicalized")
-    })?;
+    let canonical = fs::canonicalize(path).map_err(|_error| refuse("cannot be canonicalized"))?;
     if canonical != path {
-        return Err(fail(
-            "Hermes compatibility Pohunek executable is not canonical",
-        ));
+        return Err(refuse("is not canonical"));
     }
-    let metadata = fs::metadata(&canonical)
-        .map_err(|_error| fail("Hermes compatibility Pohunek executable is unavailable"))?;
+    let metadata = fs::metadata(&canonical).map_err(|_error| refuse("is unavailable"))?;
     if !metadata.is_file() {
-        return Err(fail(
-            "Hermes compatibility Pohunek executable is not a regular file",
-        ));
+        return Err(refuse("is not a regular file"));
     }
     #[cfg(unix)]
     {
@@ -4156,9 +4222,7 @@ fn require_safe_pohunek_binary(path: &Path) -> Result<PathBuf, XtaskError> {
 
         let mode = metadata.permissions().mode();
         if mode & 0o111 == 0 || mode & 0o022 != 0 {
-            return Err(fail(
-                "Hermes compatibility Pohunek executable has unsafe permissions",
-            ));
+            return Err(refuse("has unsafe permissions"));
         }
     }
     Ok(canonical)
@@ -4264,6 +4328,10 @@ mod tests {
         }
         result
     }
+
+    /// Archive digest the controlled lifecycle envelopes report.
+    const CONTROLLED_PACKAGE_DIGEST: &str =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
     /// Limits for the controlled fixtures.
     ///
@@ -5284,9 +5352,18 @@ PY
         (hermes, marker)
     }
 
+    /// Gate inputs whose binaries exit unsuccessfully and whose package file
+    /// is not an archive; checks that fail first never reach either.
     #[cfg(unix)]
-    fn fake_pohunek(root: &Path) -> PathBuf {
-        script(root, "pohunek", "#!/bin/sh\nexit 2\n")
+    fn fake_inputs(root: &Path) -> super::package_host::Inputs {
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&bin_dir).expect("create controlled binary directory");
+        for name in super::package_host::BINARIES {
+            script(&bin_dir, name, "#!/bin/sh\nexit 2\n");
+        }
+        let package = root.join("hermes.tar.zst");
+        write_file(&package, b"not an archive").expect("write controlled package file");
+        super::package_host::Inputs::new(&bin_dir, &package).expect("controlled gate inputs")
     }
 
     #[cfg(unix)]
@@ -5330,6 +5407,11 @@ PY
                     "access_mode": access_mode,
                     "allowed_host_count": access_mode.map(|_| 1),
                     "doctor": doctor,
+                    "provenance": installed.then(|| serde_json::json!({
+                        "source": "package",
+                        "package_id": super::EXPECTED_PACKAGE_ID,
+                        "package_digest": CONTROLLED_PACKAGE_DIGEST,
+                    })),
                 }
             })
             .to_string()
@@ -5462,6 +5544,11 @@ PY
             "access_mode": "read_only",
             "allowed_host_count": 1,
             "doctor": null,
+            "provenance": {
+                "source": "package",
+                "package_id": super::EXPECTED_PACKAGE_ID,
+                "package_digest": CONTROLLED_PACKAGE_DIGEST,
+            },
         });
         if let (Some(target), Some(added)) = (result.as_object_mut(), extra.as_object()) {
             target.extend(added.clone());
@@ -5487,20 +5574,23 @@ PY
     fn the_envelope_validator_accepts_a_current_install_and_rejects_an_outdated_one() {
         let current: super::PohunekEnvelope =
             serde_json::from_value(status_envelope(&serde_json::json!({}))).expect("parse");
-        super::validate_pohunek_envelope(&status_step(), &current).expect("current install");
+        super::validate_pohunek_envelope(&status_step(), &current, CONTROLLED_PACKAGE_DIGEST)
+            .expect("current install");
 
         let mut narrowed = status_envelope(&serde_json::json!({}));
         narrowed["protocol"]["minimum"] = protocol::PROTOCOL_VERSION.get().into();
         let narrowed: super::PohunekEnvelope = serde_json::from_value(narrowed).expect("parse");
-        let error = super::validate_pohunek_envelope(&status_step(), &narrowed)
-            .expect_err("the CLI must advertise its complete supported window");
+        let error =
+            super::validate_pohunek_envelope(&status_step(), &narrowed, CONTROLLED_PACKAGE_DIGEST)
+                .expect_err("the CLI must advertise its complete supported window");
         assert!(error.to_string().contains("invalid envelope"), "{error}");
 
         let outdated: super::PohunekEnvelope =
             serde_json::from_value(status_envelope(&serde_json::json!({"outdated": true})))
                 .expect("parse");
-        let error = super::validate_pohunek_envelope(&status_step(), &outdated)
-            .expect_err("an outdated plugin fails the compatibility run");
+        let error =
+            super::validate_pohunek_envelope(&status_step(), &outdated, CONTROLLED_PACKAGE_DIGEST)
+                .expect_err("an outdated plugin fails the compatibility run");
         assert!(error.to_string().contains("invalid envelope"), "{error}");
     }
 
@@ -6068,6 +6158,7 @@ PY
                 &pohunek,
                 Path::new("/controlled/hermes"),
                 step,
+                CONTROLLED_PACKAGE_DIGEST,
                 isolation.path(),
                 &[],
                 fast_limits(),
@@ -6123,6 +6214,7 @@ PY
                 &executable,
                 Path::new("/controlled/hermes"),
                 &step(action, state),
+                CONTROLLED_PACKAGE_DIGEST,
                 isolation.path(),
                 &[],
                 fast_limits(),
@@ -6135,6 +6227,7 @@ PY
             &missing,
             Path::new("/controlled/hermes"),
             &step(IntegrationAction::Install, IntegrationState::Installed),
+            CONTROLLED_PACKAGE_DIGEST,
             isolation.path(),
             &[],
             fast_limits(),
@@ -6161,6 +6254,7 @@ PY
             &sleeper,
             Path::new("/controlled/hermes"),
             &step,
+            CONTROLLED_PACKAGE_DIGEST,
             isolation.path(),
             &[],
             limits,
@@ -6234,8 +6328,8 @@ PY
         rendered.push('\n');
         write_file(manifest_path, rendered).expect("write rehashed manifest");
 
-        let pohunek = fake_pohunek(repo.path());
-        let error = compatibility_with(repo.path(), &binary, &pohunek, fast_limits())
+        let inputs = fake_inputs(repo.path());
+        let error = compatibility_with(repo.path(), &binary, &inputs, fast_limits())
             .expect_err("every captured state is validated even when another state is pending");
 
         assert!(error
@@ -6351,8 +6445,8 @@ PY
         rendered.push('\n');
         write_file(manifest_path, rendered).expect("write pending manifest");
 
-        let pohunek = fake_pohunek(repo.path());
-        let error = compatibility_with(repo.path(), &binary, &pohunek, fast_limits())
+        let inputs = fake_inputs(repo.path());
+        let error = compatibility_with(repo.path(), &binary, &inputs, fast_limits())
             .expect_err("pending evidence fails closed");
 
         assert!(error.to_string().contains("is pending"));
@@ -6400,8 +6494,8 @@ PY
         bytes.push(b'\n');
         write_file(lock, bytes).expect("modify lock");
 
-        let pohunek = fake_pohunek(repo.path());
-        let error = compatibility_with(repo.path(), &hermes, &pohunek, fast_limits())
+        let inputs = fake_inputs(repo.path());
+        let error = compatibility_with(repo.path(), &hermes, &inputs, fast_limits())
             .expect_err("modified lock fails before process launch");
 
         assert!(error.to_string().contains("lock digest mismatch"));
@@ -6419,8 +6513,8 @@ PY
         let mut timeout_limits = fast_limits();
         timeout_limits.command_timeout = Duration::from_millis(50);
 
-        let pohunek = fake_pohunek(repo.path());
-        let timeout = compatibility_with(repo.path(), &sleeper, &pohunek, timeout_limits)
+        let inputs = fake_inputs(repo.path());
+        let timeout = compatibility_with(repo.path(), &sleeper, &inputs, timeout_limits)
             .expect_err("slow CLI fails closed");
         assert!(timeout.to_string().contains("time limit"));
 
@@ -6432,7 +6526,7 @@ PY
         let mut output_limits = fast_limits();
         output_limits.command_output_bytes = 1024;
 
-        let output = compatibility_with(repo.path(), &noisy, &pohunek, output_limits)
+        let output = compatibility_with(repo.path(), &noisy, &inputs, output_limits)
             .expect_err("noisy CLI fails closed");
         assert!(output.to_string().contains("output limit"));
     }

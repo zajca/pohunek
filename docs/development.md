@@ -494,15 +494,23 @@ workflow; it writes the seed to a 0700 tmpfs directory
 with mode 0600, removes it from the environment before any program starts, and
 shreds it afterwards. Developer ID signing and notarization are not part of the
 pipeline. The offline docs, the README, and the reference
-pages under `docs/` are bundled into every native component archive. CLI archives also contain
+pages under `docs/` are bundled into every native component archive. Daemon archives also contain
 `packaging/smoke-hermes-plugin-release`. Release automation provisions the
-source-locked Hermes runtime without provider credentials, runs the model-free
-compatibility gate, extracts each CLI archive, and executes its packaged smoke
-script against the extracted `pohunek` binary. Operators can repeat the same
+source-locked Hermes runtime without provider credentials, extracts each daemon
+archive, builds the Hermes runtime package with `scripts/build-hermes-package`,
+runs the model-free compatibility gate against the extracted binaries and that
+package, and executes the packaged smoke script. The smoke takes the extracted
+daemon archive, the package archive, a signed catalog that authorizes it, and
+the anchor that trusts the catalog's signer; until Hermes ships in the release
+catalog, `cargo xtask hermes throwaway-catalog` writes that catalog and anchor
+with a random signing key that is never stored. Operators can repeat the same
 script with an explicitly supplied, preinstalled pinned Hermes executable. It
-creates an isolated temporary profile/state, requires that executable rather
-than downloading it, and fails if install, status, doctor, or uninstall cannot
-prove the embedded plugin and generated skill.
+copies the binaries into a private prefix with the anchor beside the daemon,
+starts the daemon in an isolated temporary profile/state, installs the package
+with `pohunek plugin install --catalog`, requires the Hermes executable rather
+than downloading it, and fails if install, status, doctor, or uninstall fails
+or an installed-state result does not report the package and its digest as the
+plugin's provenance.
 
 ### Release rehearsal
 

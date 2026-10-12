@@ -145,7 +145,8 @@ cargo nextest run --profile ci --test-threads 4 --workspace --all-features
 cargo test --doc --workspace --all-features
 cargo build --workspace --release
 RUSTFLAGS="-D warnings" cargo xtask docs check
-cargo xtask hermes compatibility --pohunek-bin "$PWD/target/release/pohunek"
+scripts/build-hermes-package "$PWD/target/hermes.tar.zst"
+cargo xtask hermes compatibility --bin-dir "$PWD/target/release" --package "$PWD/target/hermes.tar.zst"
 ```
 
 SDK workspace gates (from the worktree root, which is the Bun workspace root):

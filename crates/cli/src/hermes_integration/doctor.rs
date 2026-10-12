@@ -119,6 +119,9 @@ pub(crate) struct Diagnosis {
     pub(crate) package_source_missing: bool,
     /// The failure an install or update would report for the current source selection.
     pub(crate) package_source_error: Option<Error>,
+    /// The source the ownership marker records, or `None` when the managed
+    /// plugin is not installed or its marker could not be read.
+    pub(crate) provenance: Option<lifecycle::Provenance>,
 }
 
 /// Inspects one installation against the embedded sidecar, the unit fixture source.
@@ -153,6 +156,7 @@ pub(crate) fn diagnose(
 ) -> Diagnosis {
     let mut package_source_missing = false;
     let mut package_source_error = source.err().cloned();
+    let mut provenance = None;
     let mut checks: Vec<Check> = CHECK_CODES.iter().copied().map(Check::not_run).collect();
     set_pass(&mut checks, "hermes_executable");
 
@@ -216,6 +220,7 @@ pub(crate) fn diagnose(
             }
             package_source_missing = state.package_source_missing;
             package_source_error = state.package_source_error;
+            provenance = state.provenance;
             set_result(
                 &mut checks,
                 "plugin_enabled",
@@ -271,6 +276,7 @@ pub(crate) fn diagnose(
         report: Report { ok, checks },
         package_source_missing,
         package_source_error,
+        provenance,
     }
 }
 

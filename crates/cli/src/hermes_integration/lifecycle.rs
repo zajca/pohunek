@@ -181,6 +181,47 @@ pub(crate) struct LifecycleState {
     pub(crate) stale_stage: bool,
     /// A matching Pohunek backup sibling remains from an interrupted transaction.
     pub(crate) stale_backup: bool,
+    /// The source the ownership marker records, or `None` when no managed
+    /// plugin is installed.
+    pub(crate) provenance: Option<Provenance>,
+}
+
+/// Prefix of the canonical package digest form the package commands report.
+const PACKAGE_DIGEST_PREFIX: &str = "sha256:";
+
+/// The immutable source an installed plugin's ownership marker records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Provenance {
+    /// Rendered from the sidecar compiled into the CLI. Version 1 and 2
+    /// markers record no source and predate package-backed installs, so they
+    /// read as this source.
+    Embedded,
+    /// Rendered from the selected official runtime package.
+    Package {
+        /// Runtime package id.
+        id: String,
+        /// Package archive digest in its canonical `sha256:<hex>` form.
+        digest: String,
+    },
+}
+
+impl Provenance {
+    /// Reads the source a validated ownership marker records.
+    fn of(ownership: &Ownership) -> Option<Self> {
+        match (
+            ownership.source.as_deref(),
+            &ownership.package_id,
+            &ownership.package_digest,
+        ) {
+            (None | Some(assets::EMBEDDED_SOURCE), None, None) => Some(Self::Embedded),
+            (Some(assets::PACKAGE_SOURCE), Some(id), Some(digest)) => Some(Self::Package {
+                id: id.clone(),
+                digest: format!("{PACKAGE_DIGEST_PREFIX}{digest}"),
+            }),
+            // `assets::parse_marker` refuses every other combination.
+            _ => None,
+        }
+    }
 }
 
 /// Installs or atomically updates the managed plugin and external policy.
@@ -227,6 +268,7 @@ fn install_with(
         assets::ownership_for_bundle(request.target.hermes_home(), request.policy_path, bundle)?;
     let marker = assets::marker_bytes(&desired)?;
     assets::parse_marker(&marker)?;
+    let provenance = Provenance::of(&desired);
     let policy_bytes = request.policy.to_json()?;
     let existing = installed(request.target, request.policy_path, Some(bundle))?;
     // A package-backed install never silently moves to the embedded sidecar.
@@ -340,6 +382,7 @@ fn install_with(
         package_source_error: None,
         stale_stage: false,
         stale_backup: false,
+        provenance,
     })
 }
 
@@ -435,6 +478,7 @@ fn uninstall_with(
         package_source_error: None,
         stale_stage: false,
         stale_backup: false,
+        provenance: None,
     })
 }
 
@@ -487,6 +531,9 @@ fn inspect_tree(
         package_source_error: None,
         stale_stage,
         stale_backup,
+        provenance: current
+            .as_ref()
+            .and_then(|value| Provenance::of(&value.ownership)),
     })
 }
 
@@ -1865,6 +1912,7 @@ mod tests {
                 package_source_error: None,
                 stale_stage: false,
                 stale_backup: false,
+                provenance: Some(Provenance::Embedded),
             }
         );
         assert_eq!(
@@ -2512,6 +2560,7 @@ esac"#,
                 package_source_error: None,
                 stale_stage: false,
                 stale_backup: false,
+                provenance: None,
             }
         );
         assert_eq!(hermes.status_calls, 1);
