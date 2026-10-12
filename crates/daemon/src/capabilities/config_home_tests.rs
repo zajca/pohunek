@@ -3,7 +3,7 @@
 //! Every test builds its own host profiles, host-state directory and base
 //! environment, so none reads or changes the process environment.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 use std::ffi::OsString;
 use std::fs;
@@ -14,7 +14,7 @@ use pohunek_worker_protocol::{BaseEnv, DEFAULT_ENVIRONMENT_ALLOWLIST};
 use protocol::{AgentRuntime, HostCapabilities};
 
 use super::host_capabilities;
-use crate::agent::host::fixture::builtin_host;
+use crate::agent::host::fixture::{official_host, official_profile_pin};
 use crate::agent::ProfileRegistry;
 use crate::runtime::environment::{base_environment, EnvironmentSource};
 use crate::test_support::{scoped_dir, ScopedDir};
@@ -64,11 +64,14 @@ impl Rig {
         dir
     }
 
+    /// Writes the profile `name` over the official package `base`, setting
+    /// `variable` to `value`.
     fn profile(&self, name: &str, base: &str, variable: &str, value: &Path) {
         fs::write(
             self.root.join("agents").join(format!("{name}.toml")),
             format!(
-                "base = \"{base}\"\n[env]\n{variable} = \"{}\"\n",
+                "base = \"{base}\"\n{}[env]\n{variable} = \"{}\"\n",
+                official_profile_pin(base),
                 value.display()
             ),
         )
@@ -95,7 +98,7 @@ impl Rig {
 
     /// A registry over the rig's profiles keyed under `state`.
     fn registry(&self, state: Option<PathBuf>) -> ProfileRegistry {
-        ProfileRegistry::with_runtimes(Some(self.root.join("agents")), builtin_host())
+        ProfileRegistry::with_runtimes(Some(self.root.join("agents")), official_host())
             .with_revision_state_dir(state)
     }
 
@@ -197,7 +200,8 @@ fn the_identifier_reveals_neither_the_path_nor_any_environment_value() {
     fs::write(
         rig.root.join("agents").join("extra.toml"),
         format!(
-            "base = \"claude\"\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\nUNRELATED_TOKEN = \"{DISTINCTIVE_OTHER}\"\n",
+            "base = \"claude\"\n{}[env]\nCLAUDE_CONFIG_DIR = \"{}\"\nUNRELATED_TOKEN = \"{DISTINCTIVE_OTHER}\"\n",
+            official_profile_pin("claude"),
             other.display()
         ),
     )
@@ -289,7 +293,10 @@ fn a_relative_home_value_is_not_expanded_into_an_identifier() {
     let rig = Rig::new();
     fs::write(
         rig.root.join("agents").join("tilde.toml"),
-        "base = \"claude\"\n[env]\nCLAUDE_CONFIG_DIR = \"~/accounts/work\"\n",
+        format!(
+            "base = \"claude\"\n{}[env]\nCLAUDE_CONFIG_DIR = \"~/accounts/work\"\n",
+            official_profile_pin("claude")
+        ),
     )
     .expect("write a profile");
 

@@ -312,7 +312,10 @@ pub struct InstallPaths {
 pub fn install(
     agent: Option<RuntimeRef>,
 ) -> Result<protocol::IntegrationInstallResult, ProtocolError> {
-    install_for(&crate::agent::host::fixture::builtin_host(), agent.as_ref())
+    install_for(
+        &crate::agent::host::fixture::official_host(),
+        agent.as_ref(),
+    )
 }
 
 /// Inspect the managed hook files of the selected runtime(s) without writing
@@ -329,7 +332,7 @@ pub fn install(
 pub fn status(
     params: protocol::IntegrationStatusParams,
 ) -> Result<protocol::IntegrationStatusResult, ProtocolError> {
-    status_for(&crate::agent::host::fixture::builtin_host(), params)
+    status_for(&crate::agent::host::fixture::official_host(), params)
 }
 
 /// The session warning for a launch of `agent` whose managed hook assets are
@@ -1689,15 +1692,15 @@ fn report(agent: RuntimeRef, paths: &InstallPaths) -> IntegrationInstallReport {
     }
 }
 
-/// Claude's config dir as the built-in descriptor and this test process's
-/// environment name it.
+/// Claude's config dir as the official package descriptor and this test
+/// process's environment name it.
 #[cfg(test)]
 pub fn claude_config_dir() -> Result<PathBuf, ProtocolError> {
     homes::process_environment::runtime_config_dir(&RuntimeRef::claude())
 }
 
-/// Codex's config dir as the built-in descriptor and this test process's
-/// environment name it.
+/// Codex's config dir as the official package descriptor and this test
+/// process's environment name it.
 #[cfg(test)]
 pub fn codex_config_dir() -> Result<PathBuf, ProtocolError> {
     homes::process_environment::runtime_config_dir(&RuntimeRef::codex())

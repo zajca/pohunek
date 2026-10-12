@@ -202,6 +202,16 @@ fn runtime(value: &str) -> RuntimeId {
     RuntimeId::parse(value).expect("runtime id")
 }
 
+/// The runtime ids the daemon's built-in source serves.
+fn builtin_ids() -> Vec<RuntimeId> {
+    RuntimeRegistry::from_sources(&[&BuiltinSource::new("/bin/sh")])
+        .expect("built-in registry builds")
+        .inventory()
+        .into_iter()
+        .map(|entry| entry.runtime_id)
+        .collect()
+}
+
 /// The launch pin a session of `built` freezes.
 fn pin_of(built: &Built, runtime_id: &str) -> LaunchPin {
     LaunchPin::Pinned(Box::new(LaunchBinding {
@@ -234,8 +244,8 @@ fn an_enabled_selected_package_serves_a_package_origin_runtime_next_to_the_built
         }
     );
     assert_eq!(definition.program().as_str(), "acme-agent");
-    for builtin in ["shell", "codex", "claude", "hermes"] {
-        host.resolve_id(&runtime(builtin)).expect("built-in");
+    for builtin in builtin_ids() {
+        host.resolve_id(&builtin).expect("built-in");
     }
     assert_eq!(*host.package_report(), super::PackageReport::default());
     host.verify_launchable(&definition).expect("launchable");
@@ -313,7 +323,7 @@ fn reload_picks_up_installs_and_uninstalls_and_keeps_the_builtins() {
     host.reload().expect("reload");
     host.resolve_id(&runtime("acme"))
         .expect_err("the runtime is not served");
-    host.resolve_id(&runtime("codex")).expect("built-in stays");
+    host.resolve_id(&runtime("shell")).expect("built-in stays");
 }
 
 #[test]
@@ -518,7 +528,7 @@ fn a_package_modified_after_install_never_launches_pins_or_loads() {
         ));
         host.resolve_id(&runtime("acme"))
             .expect_err("the runtime is not served");
-        host.resolve_id(&runtime("codex")).expect("built-in stays");
+        host.resolve_id(&runtime("shell")).expect("built-in stays");
     }
 }
 
@@ -575,7 +585,7 @@ fn a_broken_package_does_not_take_down_the_others_or_the_builtins() {
     let host = plugins.host();
 
     host.resolve_id(&runtime("acme")).expect("good package");
-    host.resolve_id(&runtime("claude")).expect("built-in");
+    host.resolve_id(&runtime("shell")).expect("built-in");
     let report = host.package_report();
     assert_eq!(report.rejected.len(), 1);
     assert_eq!(report.rejected[0].digest, broken.digest);
@@ -612,7 +622,7 @@ fn packages_claiming_the_same_runtime_are_both_refused() {
         .rejected
         .iter()
         .all(|rejected| rejected.reason == PackageRejection::RuntimeIdConflict));
-    host.resolve_id(&runtime("codex")).expect("built-in");
+    host.resolve_id(&runtime("shell")).expect("built-in");
 }
 
 #[test]
@@ -643,12 +653,24 @@ fn a_package_cannot_claim_a_reserved_runtime_id() {
                 "{reserved}"
             );
         }
-        // The built-in keeps its own provenance.
-        let definition = host.resolve_id(&runtime(reserved)).expect("built-in");
-        assert!(matches!(
-            definition.binding().provenance,
-            BindingProvenance::Builtin { .. }
-        ));
+        // A built-in keeps its own provenance; an id without a built-in
+        // stays unserved.
+        let served = host.resolve_id(&runtime(reserved));
+        if builtin_ids().contains(&runtime(reserved)) {
+            assert!(
+                matches!(
+                    served.expect("built-in").binding().provenance,
+                    BindingProvenance::Builtin { .. }
+                ),
+                "{reserved}"
+            );
+        } else {
+            assert_eq!(
+                code(&served.expect_err("not served")),
+                "runtime_not_installed",
+                "{reserved}"
+            );
+        }
         // And a pin to the package cannot resolve either.
         let error = host
             .resolve_pinned(&RuntimeRef::from_wire(reserved), &pin_of(&built, reserved))
@@ -695,10 +717,10 @@ fn a_catalog_authorized_package_serves_an_official_alias_in_place_of_the_built_i
             .resolve_pinned(&RuntimeRef::from_wire(alias), &pin_of(&built, alias))
             .expect("a pin to the official package resolves");
         assert_eq!(pinned.binding(), definition.binding());
-        for other in ["shell", "codex", "claude", "hermes"] {
-            if other != alias {
+        for other in builtin_ids() {
+            if other.as_str() != alias {
                 assert!(matches!(
-                    host.resolve_id(&runtime(other))
+                    host.resolve_id(&other)
                         .expect("built-in")
                         .binding()
                         .provenance,
@@ -715,18 +737,18 @@ fn a_built_in_pinned_session_is_neither_launched_nor_observed_through_the_packag
     let plugins = Plugins::new();
     let builtin_pin = LaunchPin::of(
         &RuntimeHost::from_host_environment()
-            .resolve_id(&runtime("codex"))
-            .expect("built-in codex"),
+            .resolve_id(&runtime("hermes"))
+            .expect("built-in hermes"),
     );
     let built = build(
-        &descriptor("pohunek.runtime.official", "1.0.0", "codex"),
+        &descriptor("pohunek.runtime.official", "1.0.0", "hermes"),
         "official",
         identity("pohunek.runtime.official", "1.0.0"),
     );
     let host = plugins.host();
-    let codex = RuntimeRef::from_wire("codex");
+    let hermes = RuntimeRef::from_wire("hermes");
     let provenance_of = |host: &RuntimeHost, pin: &LaunchPin| {
-        host.pinned_definition(&codex, pin)
+        host.pinned_definition(&hermes, pin)
             .map(|definition| definition.binding().provenance.clone())
     };
     assert!(matches!(
@@ -744,16 +766,16 @@ fn a_built_in_pinned_session_is_neither_launched_nor_observed_through_the_packag
 
     for pin in [&builtin_pin, &LaunchPin::Unpinned] {
         let refused = host
-            .resolve_pinned(&codex, pin)
+            .resolve_pinned(&hermes, pin)
             .expect_err("a built-in snapshot is not served by the package");
         assert_eq!(code(&refused), "runtime_served_by_package");
         let unobserved = host
-            .definition_for_pin(&codex, pin)
+            .definition_for_pin(&hermes, pin)
             .expect_err("the package never describes a built-in snapshot");
         assert_eq!(code(&unobserved), "runtime_served_by_package");
         assert_eq!(provenance_of(&host, pin), None);
     }
-    host.ensure_session_runtime(&codex, &builtin_pin)
+    host.ensure_session_runtime(&hermes, &builtin_pin)
         .expect("a live session of the built-in stays controllable");
     // An ordinary package-served id never serves an unpinned snapshot either.
     install(&plugins.registry(), &acme("1.0.0"), true, true);
@@ -856,7 +878,7 @@ fn an_unreadable_registry_record_degrades_to_the_builtins_and_blocks_reload() {
     restarted
         .resolve_id(&runtime("acme"))
         .expect_err("the runtime is not served");
-    restarted.resolve_id(&runtime("codex")).expect("built-in");
+    restarted.resolve_id(&runtime("shell")).expect("built-in");
     let pinned = restarted
         .resolve_pinned(&RuntimeRef::from_wire("acme"), &pin_of(&built, "acme"))
         .expect_err("registry unreadable");

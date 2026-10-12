@@ -231,17 +231,18 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
+    use crate::agent::host::fixture::official_host;
     use crate::api::handler::{handle_request, HealthInfo};
     use crate::governance::HostGovernanceService;
-    use crate::session::SessionRegistry;
+    use crate::session::{SessionRegistry, SessionRegistryConfig};
 
     fn classify(wire: &str) -> Result<(), ProtocolError> {
-        check_agent(&RuntimeHost::default(), Some(&RuntimeRef::from_wire(wire)))
+        check_agent(&official_host(), Some(&RuntimeRef::from_wire(wire)))
     }
 
     #[test]
     fn an_absent_agent_and_the_installed_runtimes_pass() {
-        check_agent(&RuntimeHost::default(), None).expect("no agent selected");
+        check_agent(&official_host(), None).expect("no agent selected");
         for wire in ["codex", "claude", "hermes", "shell"] {
             classify(wire).unwrap_or_else(|error| panic!("{wire} is installed: {error:?}"));
         }
@@ -307,7 +308,7 @@ mod tests {
         );
         let state = DaemonState::new(
             HealthInfo::new("test"),
-            SessionRegistry::default(),
+            SessionRegistry::new_with_runtimes(SessionRegistryConfig::default(), official_host()),
             governance,
             crate::test_support::overlay_registry(),
         )

@@ -1,9 +1,14 @@
-//! A package-provided runtime for tests of the assigned native reference
-//! strategy; it is hook-less unless a test declares an integration for it.
+//! Runtime fixtures for in-crate tests.
 //!
-//! The runtime is shaped like Pi: it starts with a caller-chosen id, resumes
-//! with `--session <id>` and forks with `--fork <id>`, and its conversations
-//! live as `<stamp>_<id>.jsonl` files below a config home.
+//! [`official_host`] serves the official Codex and Claude packages from
+//! `runtime-packages/`, so tests of those runtimes exercise the package
+//! descriptors rather than definitions compiled into the daemon.
+//!
+//! The Pi-shaped runtime is a package-provided runtime for tests of the
+//! assigned native reference strategy; it is hook-less unless a test declares
+//! an integration for it. It starts with a caller-chosen id, resumes with
+//! `--session <id>` and forks with `--fork <id>`, and its conversations live as
+//! `<stamp>_<id>.jsonl` files below a config home.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -161,8 +166,159 @@ pub(crate) fn builtin_host() -> RuntimeHost {
     RuntimeHost::new(registry)
 }
 
-/// A host serving the built-in runtimes plus the Pi-shaped fixture declaring
-/// the integration `handler` driving the hook schema `hook_schema`.
+/// Package digest [`OfficialFixtureSource`] reports for the official Codex
+/// package.
+///
+/// It names no real archive: a host built from the fixture has no package
+/// store, so nothing verifies a package root against it. Profiles pin it
+/// through [`official_profile_pin`].
+pub(crate) const OFFICIAL_CODEX_DIGEST: &str =
+    "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+
+/// Package digest [`OfficialFixtureSource`] reports for the official Claude
+/// package; see [`OFFICIAL_CODEX_DIGEST`].
+pub(crate) const OFFICIAL_CLAUDE_DIGEST: &str =
+    "sha256:4444444444444444444444444444444444444444444444444444444444444444";
+
+/// One official runtime package as `runtime-packages/` ships it.
+struct OfficialPackage {
+    /// Runtime id the descriptor declares.
+    runtime: &'static str,
+    /// Package id the descriptor declares.
+    package: &'static str,
+    /// The `runtime.toml` of the package.
+    descriptor: &'static str,
+    /// The `detect.toml` of the package.
+    detect: &'static str,
+    /// Digest the fixture reports for the package.
+    digest: &'static str,
+}
+
+/// The official Codex and Claude packages, read from the workspace's
+/// `runtime-packages/` tree at build time.
+const OFFICIAL_PACKAGES: [OfficialPackage; 2] = [
+    OfficialPackage {
+        runtime: "codex",
+        package: "pohunek.runtime.codex",
+        descriptor: include_str!("../../../../../runtime-packages/codex/runtime.toml"),
+        detect: include_str!("../../../../../runtime-packages/codex/detect.toml"),
+        digest: OFFICIAL_CODEX_DIGEST,
+    },
+    OfficialPackage {
+        runtime: "claude",
+        package: "pohunek.runtime.claude",
+        descriptor: include_str!("../../../../../runtime-packages/claude/runtime.toml"),
+        detect: include_str!("../../../../../runtime-packages/claude/detect.toml"),
+        digest: OFFICIAL_CLAUDE_DIGEST,
+    },
+];
+
+/// Key of the descriptor line [`OfficialFixtureSource`] drops.
+const VERSION_PROBE_KEY: &str = "version_probe =";
+
+/// The official Codex and Claude packages as a catalog-authorized source.
+///
+/// Each definition is parsed by [`super::definition_from_archive`] from the
+/// package's own `runtime.toml` and `detect.toml`, so it carries package
+/// provenance and the package's detection manifest. The `version_probe` line
+/// is dropped: the probe would run the real `codex`/`claude` binary, while
+/// in-crate tests launch stand-in programs; out-of-process tests keep the
+/// probe and use fakes that answer `--version`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct OfficialFixtureSource;
+
+impl RuntimeSource for OfficialFixtureSource {
+    fn trust(&self) -> SourceTrust {
+        SourceTrust::Official
+    }
+
+    fn load(&self) -> Result<Vec<RuntimeDefinition>, DefinitionError> {
+        Ok(OFFICIAL_PACKAGES.iter().map(official_definition).collect())
+    }
+}
+
+/// Parses `official` with its version probe dropped.
+///
+/// # Panics
+///
+/// Panics unless the descriptor declares exactly one `version_probe` line and
+/// then parses, which would be a defect of the fixture or of the package.
+fn official_definition(official: &OfficialPackage) -> RuntimeDefinition {
+    let (probes, kept): (Vec<&str>, Vec<&str>) = official
+        .descriptor
+        .lines()
+        .partition(|line| line.trim_start().starts_with(VERSION_PROBE_KEY));
+    assert_eq!(
+        probes.len(),
+        1,
+        "the {} package declares exactly one version_probe line",
+        official.runtime
+    );
+    let descriptor = kept.join("\n");
+    let entries = [
+        package::ArchiveEntry {
+            path: super::RUNTIME_DESCRIPTOR_PATH.to_owned(),
+            contents: descriptor.into_bytes(),
+            executable: false,
+        },
+        package::ArchiveEntry {
+            path: "detect.toml".to_owned(),
+            contents: official.detect.as_bytes().to_vec(),
+            executable: false,
+        },
+    ];
+    let digest = PackageDigest::parse(official.digest).expect("valid digest");
+    super::definition_from_archive(&entries, &digest).unwrap_or_else(|error| {
+        panic!(
+            "the official {} package parses: {error:?}",
+            official.runtime
+        )
+    })
+}
+
+/// A host serving the built-in runtimes, with `/bin/sh` as the shell, and the
+/// official Codex and Claude packages through [`OfficialFixtureSource`].
+///
+/// # Panics
+///
+/// Panics when the registry cannot be built, which would be a defect of the
+/// fixture.
+pub(crate) fn official_host() -> RuntimeHost {
+    official_host_over(&BuiltinSource::new("/bin/sh"))
+}
+
+/// Like [`official_host`], with the built-in runtimes of `builtin`.
+///
+/// # Panics
+///
+/// Panics when the registry cannot be built, which would be a defect of the
+/// fixture.
+pub(crate) fn official_host_over(builtin: &BuiltinSource) -> RuntimeHost {
+    let registry = RuntimeRegistry::from_sources(&[builtin, &OfficialFixtureSource])
+        .expect("the official fixture registry builds");
+    RuntimeHost::new(registry)
+}
+
+/// The profile keys that bind a host profile over `runtime` to its package in
+/// [`official_host`].
+///
+/// # Panics
+///
+/// Panics when `runtime` is not `codex` or `claude`.
+pub(crate) fn official_profile_pin(runtime: &str) -> String {
+    let official = OFFICIAL_PACKAGES
+        .iter()
+        .find(|official| official.runtime == runtime)
+        .unwrap_or_else(|| panic!("{runtime} is an official fixture package"));
+    format!(
+        "package = \"{}\"\ndigest = \"{}\"\n",
+        official.package, official.digest
+    )
+}
+
+/// A host serving the built-in runtimes, the official fixture packages of
+/// [`official_host`] and the Pi-shaped fixture declaring the integration
+/// `handler` driving the hook schema `hook_schema`.
 ///
 /// # Panics
 ///
@@ -208,8 +364,8 @@ pub(crate) fn pi_shaped_integration_host_as(
     .expect("the integration fixture document is valid");
     let builtin = BuiltinSource::new("/bin/sh");
     let fixture = FixtureSource(vec![definition]);
-    let registry =
-        RuntimeRegistry::from_sources(&[&builtin, &fixture]).expect("the fixture registry builds");
+    let registry = RuntimeRegistry::from_sources(&[&builtin, &OfficialFixtureSource, &fixture])
+        .expect("the fixture registry builds");
     RuntimeHost::new(registry)
 }
 

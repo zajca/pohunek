@@ -335,11 +335,12 @@ impl SessionRef {
     }
 }
 
-/// The native-session launch spec of a built-in runtime kind, `None` for a
-/// kind without native recovery or without an installed definition.
+/// The native-session launch spec of a runtime the official fixture host
+/// serves, `None` for a kind without native recovery or without an installed
+/// definition.
 #[cfg(test)]
-pub(crate) fn builtin_native_launch(kind: &protocol::RuntimeId) -> Option<NativeSessionLaunch> {
-    host::RuntimeHost::default()
+pub(crate) fn served_native_launch(kind: &protocol::RuntimeId) -> Option<NativeSessionLaunch> {
+    host::fixture::official_host()
         .resolve_id(kind)
         .ok()
         .and_then(|definition| definition.native().cloned())
@@ -503,9 +504,9 @@ mod tests {
 
     use super::host::{launch_command, RuntimeHost};
     use super::{
-        build_pty_command, builtin_native_launch, fork_pty_command_from_launch, resolve_binary,
-        resume_pty_command_from_launch, trusted_program, which_executable, LaunchCommand,
-        LaunchOpts, NativeArgs, NativeSessionLaunch, SessionRef, SessionRefKind,
+        build_pty_command, fork_pty_command_from_launch, resolve_binary,
+        resume_pty_command_from_launch, served_native_launch, trusted_program, which_executable,
+        LaunchCommand, LaunchOpts, NativeArgs, NativeSessionLaunch, SessionRef, SessionRefKind,
         ValidatedLaunchProgram,
     };
 
@@ -551,20 +552,23 @@ mod tests {
         run()
     }
 
-    /// Launches the built-in runtime `name` the way a bare agent name does, with
-    /// `$SHELL` as the shell program.
-    fn launch_builtin(
+    /// Launches the runtime `name` the way a bare agent name does, with
+    /// `$SHELL` as the shell program and Codex and Claude served by their
+    /// official packages.
+    fn launch_served(
         name: &str,
         opts: &LaunchOpts,
     ) -> Result<LaunchCommand, protocol::ProtocolError> {
-        let host = RuntimeHost::from_host_environment();
+        let host = super::host::fixture::official_host_over(
+            &super::host::BuiltinSource::from_host_environment(),
+        );
         let runtime_id = protocol::RuntimeId::parse(name).expect("runtime id");
-        let definition = host.resolve_id(&runtime_id).expect("built-in resolves");
+        let definition = host.resolve_id(&runtime_id).expect("the runtime is served");
         launch_command(&host, &definition, opts)
     }
 
     #[test]
-    fn built_in_launches_resolve_their_binary_with_exact_argv_and_preserve_opts() {
+    fn served_launches_resolve_their_binary_with_exact_argv_and_preserve_opts() {
         for (name, expected_args) in [
             ("codex", &[][..]),
             ("claude", &[][..]),
@@ -577,7 +581,7 @@ mod tests {
 
             // The shell runtime launches `$SHELL`, here a bare name on `PATH`.
             let command = with_path_and_shell(&bin_dir, "shell", || {
-                launch_builtin(name, &launch_opts(cwd.clone())).expect("launch command")
+                launch_served(name, &launch_opts(cwd.clone())).expect("launch command")
             });
 
             assert_eq!(command.program, program.display().to_string(), "{name}");
@@ -900,8 +904,7 @@ mod tests {
         write_executable(&bin_dir, "claude-sonnet");
         let cwd = temp_dir("template-fork-cwd");
         let session = SessionRef::id("native-123").expect("id ref");
-        let launch =
-            builtin_native_launch(&protocol::RuntimeId::claude()).expect("claude recovers");
+        let launch = served_native_launch(&protocol::RuntimeId::claude()).expect("claude recovers");
 
         let command = with_path(&bin_dir, || {
             fork_pty_command_from_launch(
@@ -937,7 +940,7 @@ mod tests {
             resume_pty_command_from_launch(
                 "hermes",
                 vec!["chat".to_owned()],
-                &builtin_native_launch(&protocol::RuntimeId::hermes()).expect("Hermes resumes"),
+                &served_native_launch(&protocol::RuntimeId::hermes()).expect("Hermes resumes"),
                 &session,
                 &launch_opts(temp_dir("hermes-resume-cwd")),
             )
@@ -959,8 +962,7 @@ mod tests {
         let bin_dir = temp_dir("template-meta-bin");
         write_executable(&bin_dir, "myagent");
         let cwd = temp_dir("template-meta-cwd");
-        let launch =
-            builtin_native_launch(&protocol::RuntimeId::claude()).expect("claude recovers");
+        let launch = served_native_launch(&protocol::RuntimeId::claude()).expect("claude recovers");
         let hostile_id = "a b;$(touch pwned)|`x` 'q' \"z\" *";
         let hostile_path = "/work/a b/$(touch pwned);|.jsonl";
 
@@ -1021,8 +1023,7 @@ mod tests {
         write_executable(&bin_dir, "myagent");
         let cwd = temp_dir("template-args-cwd");
         let session = SessionRef::id("native-123").expect("id ref");
-        let launch =
-            builtin_native_launch(&protocol::RuntimeId::claude()).expect("claude recovers");
+        let launch = served_native_launch(&protocol::RuntimeId::claude()).expect("claude recovers");
 
         let command = with_path(&bin_dir, || {
             resume_pty_command_from_launch(
@@ -1050,7 +1051,7 @@ mod tests {
         let cwd = temp_dir("missing-cwd");
 
         let err = with_path(&empty_path, || {
-            launch_builtin("codex", &launch_opts(&cwd)).expect_err("missing codex binary")
+            launch_served("codex", &launch_opts(&cwd)).expect_err("missing codex binary")
         });
 
         assert_eq!(err.class, ErrorClass::Runtime);

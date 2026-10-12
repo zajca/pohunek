@@ -554,7 +554,7 @@ pub(crate) mod process_environment {
     /// The config directory of `runtime` as its descriptor and this process's
     /// environment name it.
     pub(crate) fn runtime_config_dir(runtime: &RuntimeRef) -> Result<PathBuf, ProtocolError> {
-        let host = crate::agent::host::fixture::builtin_host();
+        let host = crate::agent::host::fixture::official_host();
         let homes = config_homes_for_tests(&host);
         let mut targets = homes.targets(Some(runtime), &HomeSelection::Runtime)?;
         targets

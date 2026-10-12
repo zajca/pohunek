@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 use tokio::task::JoinHandle;
 
 use super::{handle_request, DaemonState, HealthInfo};
+use crate::agent::host::fixture::{official_host, official_profile_pin};
 use crate::notifications::{
     default_policy, AttentionCoordinator, AttentionCoordinatorTask, NotificationProjector,
     NotificationService, DEFAULT_ATTENTION_DEBOUNCE_SECS,
@@ -30,12 +31,12 @@ use crate::session::{SessionRegistry, SessionRegistryConfig};
 /// Name of the host profile every scenario session launches.
 const AGENT: &str = "turn-agent";
 
-/// A Claude-based profile, so Claude hook reports are admitted for the
-/// session, running a shell that prints `tick` whenever a `go` file appears in
-/// its working directory. The loop ends by itself after 2,400 polls of 50 ms,
-/// the two-minute test hang guard, so a failed stop cannot leave it running.
-const AGENT_PROFILE: &str = r#"base = "claude"
-program = "/bin/sh"
+/// Launch keys of a profile over the official Claude package, so Claude hook
+/// reports are admitted for the session, running a shell that prints `tick`
+/// whenever a `go` file appears in its working directory. The loop ends by
+/// itself after 2,400 polls of 50 ms, the two-minute test hang guard, so a
+/// failed stop cannot leave it running.
+const AGENT_LAUNCH: &str = r#"program = "/bin/sh"
 args = ["-c", "printf ready; i=0; while [ $i -lt 2400 ] && sleep 0.05; do i=$((i+1)); if [ -e go ]; then rm -f go; printf tick; fi; done"]
 "#;
 
@@ -92,17 +93,26 @@ impl Fixture {
         let root = pohunek_test_support::tempdir_with_prefix("ph-turn-").expect("fixture root");
         let agents = root.path().join("agents");
         std::fs::create_dir_all(&agents).expect("create the agents dir");
-        std::fs::write(agents.join(format!("{AGENT}.toml")), AGENT_PROFILE)
-            .expect("write the agent profile");
+        std::fs::write(
+            agents.join(format!("{AGENT}.toml")),
+            format!(
+                "base = \"claude\"\n{}{AGENT_LAUNCH}",
+                official_profile_pin("claude")
+            ),
+        )
+        .expect("write the agent profile");
         let notifications = NotificationService::open(&root.path().join("data"))
             .expect("notification service opens");
         if let Some(policy) = policy {
             notifications.set_policy(policy).expect("set the policy");
         }
-        let sessions = SessionRegistry::new(SessionRegistryConfig {
-            agents_dir: Some(agents),
-            ..config
-        });
+        let sessions = SessionRegistry::new_with_runtimes(
+            SessionRegistryConfig {
+                agents_dir: Some(agents),
+                ..config
+            },
+            official_host(),
+        );
         let (attention, coordinator) =
             AttentionCoordinator::spawn(notifications.clone(), &sessions);
         let projector =

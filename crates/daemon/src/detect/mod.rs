@@ -594,6 +594,7 @@ mod tests {
 
     use protocol::{PackageId, PackageIdentity, PackageVersion, RuntimeId};
 
+    use crate::agent::host::fixture::official_host;
     use crate::agent::host::{
         DefinitionError, DefinitionOrigin, DefinitionParts, LaunchProgram, RuntimeDefinition,
         RuntimeHost, RuntimeRegistry, RuntimeSource, SourceTrust,
@@ -601,9 +602,19 @@ mod tests {
     use crate::agent::InputRules;
     use crate::procwatch::{Pid, ProcessFact};
 
-    /// Detector config of a built-in runtime, selected through the registry.
-    fn builtin_config(kind: &RuntimeRef) -> DetectorConfig {
-        DetectorConfig::for_agent(&RuntimeHost::default(), kind)
+    /// Detector config of an official package runtime, selected through the
+    /// registry of [`official_host`].
+    fn package_config(kind: &RuntimeRef) -> DetectorConfig {
+        let host = official_host();
+        let definition = host.resolve_ref(kind).expect("the runtime is served");
+        assert!(
+            matches!(
+                definition.binding().provenance,
+                protocol::BindingProvenance::Package { .. }
+            ),
+            "{kind:?} is served by its official package"
+        );
+        DetectorConfig::for_agent(&host, kind)
     }
 
     fn instant() -> Instant {
@@ -664,26 +675,20 @@ mod tests {
     }
 
     #[test]
-    fn identify_agent_matches_builtin_process_sections() {
+    fn identify_agent_matches_the_process_sections_of_served_runtimes() {
         assert_eq!(
-            super::identify_agent(
-                &RuntimeHost::default(),
-                &fact(100, "codex", &["/usr/bin/codex"])
-            ),
+            super::identify_agent(&official_host(), &fact(100, "codex", &["/usr/bin/codex"])),
             Some(RuntimeRef::codex())
         );
         assert_eq!(
             super::identify_agent(
-                &RuntimeHost::default(),
+                &official_host(),
                 &fact(101, "node", &["node", "/opt/claude-code/bin/claude.js"],)
             ),
             Some(RuntimeRef::claude())
         );
         assert_eq!(
-            super::identify_agent(
-                &RuntimeHost::default(),
-                &fact(102, "sleep", &["sleep", "30"])
-            ),
+            super::identify_agent(&official_host(), &fact(102, "sleep", &["sleep", "30"])),
             None
         );
 
@@ -706,7 +711,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                super::identify_agent(&RuntimeHost::default(), &fact(pid, comm, &cmdline)),
+                super::identify_agent(&official_host(), &fact(pid, comm, &cmdline)),
                 Some(RuntimeRef::hermes())
             );
         }
@@ -737,7 +742,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                super::identify_agent(&RuntimeHost::default(), &fact(pid, comm, &cmdline)),
+                super::identify_agent(&official_host(), &fact(pid, comm, &cmdline)),
                 None,
                 "unrelated process must not be identified as Hermes"
             );
@@ -1530,7 +1535,7 @@ mod tests {
         );
 
         let mut config = super::DetectorConfig::for_profile(
-            &RuntimeHost::default(),
+            &official_host(),
             &protocol::RuntimeRef::codex(),
             Some(override_manifest),
         );
@@ -1551,12 +1556,12 @@ mod tests {
         // behavior: feeding a Claude blocking pattern yields the same blocked
         // transition the base Claude config produces.
         let mut profile_config = super::DetectorConfig::for_profile(
-            &RuntimeHost::default(),
+            &official_host(),
             &protocol::RuntimeRef::claude(),
             None,
         );
         profile_config.detection = self::config().detection;
-        let mut base_config = builtin_config(&RuntimeRef::claude());
+        let mut base_config = package_config(&RuntimeRef::claude());
         base_config.detection = self::config().detection;
         assert!(
             profile_config.manifest.is_some(),
@@ -1616,7 +1621,7 @@ mod tests {
 
         detector.reconfigure(
             started_at + Duration::from_millis(10),
-            builtin_config(&RuntimeRef::codex()),
+            package_config(&RuntimeRef::codex()),
         );
 
         assert_eq!(
@@ -1628,7 +1633,7 @@ mod tests {
     #[test]
     fn claude_manifest_maps_ink_selection_form_to_blocked() {
         let started_at = instant();
-        let mut detector_config = builtin_config(&RuntimeRef::claude());
+        let mut detector_config = package_config(&RuntimeRef::claude());
         detector_config.detection = config().detection;
         let mut detector = Detector::new(8, 80, started_at, detector_config);
 
@@ -1644,7 +1649,7 @@ mod tests {
     #[test]
     fn claude_manifest_maps_braille_title_spinner_to_working() {
         let started_at = instant();
-        let mut detector_config = builtin_config(&RuntimeRef::claude());
+        let mut detector_config = package_config(&RuntimeRef::claude());
         detector_config.detection = config().detection;
         let mut detector = Detector::new(3, 80, started_at, detector_config);
 
@@ -1657,7 +1662,7 @@ mod tests {
     #[test]
     fn claude_manifest_maps_live_status_spinner_to_working() {
         let started_at = instant();
-        let mut detector_config = builtin_config(&RuntimeRef::claude());
+        let mut detector_config = package_config(&RuntimeRef::claude());
         detector_config.detection = config().detection;
         let mut detector = Detector::new(8, 120, started_at, detector_config);
 
@@ -1676,7 +1681,7 @@ mod tests {
     #[test]
     fn claude_manifest_finished_status_line_resolves_prompt_box_idle() {
         let started_at = instant();
-        let mut detector_config = builtin_config(&RuntimeRef::claude());
+        let mut detector_config = package_config(&RuntimeRef::claude());
         detector_config.detection = config().detection;
         let mut detector = Detector::new(8, 120, started_at, detector_config);
 
@@ -1693,7 +1698,11 @@ mod tests {
 
     #[test]
     fn claude_manifest_maps_prompt_adjacent_completion_status_to_idle() {
-        let matched = super::claude_manifest()
+        let claude = official_host()
+            .resolve_ref(&RuntimeRef::claude())
+            .expect("the Claude package is served");
+        let matched = claude
+            .manifest()
             .match_context(&MatchContext::default().with_region_text(
                 ManifestRegion::LastNonEmptyAbovePromptBox,
                 "✻ Cogitated for 26s",
@@ -1707,7 +1716,7 @@ mod tests {
     #[test]
     fn claude_manifest_permission_dialog_outranks_stale_spinner_line() {
         let started_at = instant();
-        let mut detector_config = builtin_config(&RuntimeRef::claude());
+        let mut detector_config = package_config(&RuntimeRef::claude());
         detector_config.detection = config().detection;
         let mut detector = Detector::new(10, 120, started_at, detector_config);
 
