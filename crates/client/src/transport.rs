@@ -1544,7 +1544,7 @@ fn response_id_mismatch_error(
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::{Arc, RwLock};
 
     use super::*;
@@ -1791,17 +1791,40 @@ mod tests {
         drop(client);
     }
 
+    /// Loopback addresses that can stand in for a member IP distinct from
+    /// `127.0.0.1`, in order of preference.
+    ///
+    /// Linux routes the whole `127.0.0.0/8` block to the loopback interface, so
+    /// `127.0.0.2` is bindable without configuration. macOS configures only
+    /// `127.0.0.1` (plus `::1`) on `lo0` and answers a bind to any other
+    /// `127.x.y.z` with `AddrNotAvailable`, so the IPv6 loopback is the second
+    /// address there.
+    const ALTERNATE_LOOPBACKS: [IpAddr; 2] = [
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ];
+
+    /// Binds `port` on the first of [`ALTERNATE_LOOPBACKS`] this host can
+    /// bind, skipping only an address the host does not configure.
+    async fn bind_alternate_loopback(port: u16) -> (IpAddr, TcpListener) {
+        for address in ALTERNATE_LOOPBACKS {
+            match TcpListener::bind(SocketAddr::new(address, port)).await {
+                Ok(listener) => return (address, listener),
+                Err(error) if error.kind() == io::ErrorKind::AddrNotAvailable => {}
+                Err(error) => panic!("bind alternate loopback {address}:{port}: {error}"),
+            }
+        }
+        panic!("this host configures no loopback address besides 127.0.0.1 for port {port}");
+    }
+
     #[tokio::test]
     async fn fresh_clients_reresolve_stable_peer_and_avoid_reassigned_ip() {
         let first_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let second_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
         let first_listener = TcpListener::bind(SocketAddr::new(first_ip, 0))
             .await
             .expect("first listener");
         let port = first_listener.local_addr().expect("first address").port();
-        let second_listener = TcpListener::bind(SocketAddr::new(second_ip, port))
-            .await
-            .expect("second listener");
+        let (second_ip, second_listener) = bind_alternate_loopback(port).await;
         let current_ip = Arc::new(RwLock::new(first_ip));
         let registry = mutable_policy_registry(Arc::clone(&current_ip), port);
         let identity = overlay::ExternalIdentity::peer_id("stable-peer")

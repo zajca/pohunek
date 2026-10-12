@@ -14,6 +14,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{symlink, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
@@ -281,6 +282,76 @@ impl Fixture {
             .expect("run the POSIX verifier")
             .success()
     }
+
+    /// Asserts that the POSIX verifier refuses the stage, on a host whose
+    /// userland can run it (see [`posix_verifier_available`]). A host that
+    /// cannot run it refuses every stage, so its verdict proves nothing.
+    fn assert_posix_refuses(&self, context: std::fmt::Arguments<'_>) {
+        if posix_verifier_available() {
+            assert!(!self.posix_verify(), "{context}");
+        }
+    }
+
+    /// Asserts that the POSIX verifier accepts the stage, on a host whose
+    /// userland can run it (see [`posix_verifier_available`]).
+    fn assert_posix_accepts(&self, context: std::fmt::Arguments<'_>) {
+        if posix_verifier_available() {
+            assert!(self.posix_verify(), "{context}");
+        }
+    }
+}
+
+/// Shell probe of the tools `POSIX_VERIFY` documents, run with [`TOOL_PATH`].
+const POSIX_TOOLS_PROBE: &str =
+    "for tool in sha256sum find sed sort grep readlink iconv tr wc; do \
+     command -v \"$tool\" >/dev/null || exit 1; done; readlink -e / >/dev/null 2>&1";
+
+/// Whether [`TOOL_PATH`] offers the userland the POSIX verifier documents:
+/// `sha256sum` and a `readlink` with `-e`, which GNU coreutils provide and the
+/// macOS userland does not. The verifier is the artifact of the isolated Linux
+/// namespace, so only a macOS host may lack them; on any other host a missing
+/// tool fails the test instead of switching the POSIX checks off.
+fn posix_verifier_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let available = Command::new("/bin/sh")
+            .args(["-c", POSIX_TOOLS_PROBE])
+            .env_clear()
+            .env("PATH", TOOL_PATH)
+            .status()
+            .expect("probe the POSIX verifier tools")
+            .success();
+        assert!(
+            available || cfg!(target_os = "macos"),
+            "the POSIX verifier needs sha256sum and `readlink -e` in {TOOL_PATH}"
+        );
+        if !available {
+            eprintln!(
+                "POSIX verifier checks are not run: {TOOL_PATH} lacks sha256sum or `readlink -e`"
+            );
+        }
+        available
+    })
+}
+
+/// Whether the filesystem below `dir` can hold a name that is not UTF-8.
+/// APFS on macOS 27 answers `EILSEQ`; every other host must store the name,
+/// and any other error is a fixture failure.
+fn stores_raw_byte_names(dir: &Path) -> bool {
+    let probe = dir.join(OsStr::from_bytes(b"raw\xffname"));
+    match fs::create_dir(&probe) {
+        Ok(()) => {
+            fs::remove_dir(&probe).expect("remove the raw name probe");
+            true
+        }
+        Err(error)
+            if cfg!(target_os = "macos")
+                && error.raw_os_error() == Some(nix::errno::Errno::EILSEQ as i32) =>
+        {
+            false
+        }
+        Err(error) => panic!("probe raw byte names below {}: {error}", dir.display()),
+    }
 }
 
 fn refusal(result: Result<impl std::fmt::Debug, XtaskError>) -> (String, Fault, usize) {
@@ -307,18 +378,17 @@ fn an_untouched_stage_verifies_with_every_independent_checker() {
     let summary = fixture.verify().expect("verify the untouched stage");
     assert_eq!(summary.release, RELEASE);
     assert_eq!(summary.links, 2, "bin/up and lib/node_modules/.bin/up");
-    assert!(
-        fixture.posix_verify(),
-        "the documented POSIX verifier agrees"
-    );
-    let status = Command::new("sha256sum")
-        .args(["-c", "STAGE.sha256"])
-        .current_dir(&stage)
-        .env_clear()
-        .env("PATH", TOOL_PATH)
-        .output()
-        .expect("run sha256sum");
-    assert!(status.status.success(), "sha256sum -c accepts STAGE.sha256");
+    fixture.assert_posix_accepts(format_args!("the documented POSIX verifier agrees"));
+    if posix_verifier_available() {
+        let status = Command::new("sha256sum")
+            .args(["-c", "STAGE.sha256"])
+            .current_dir(&stage)
+            .env_clear()
+            .env("PATH", TOOL_PATH)
+            .output()
+            .expect("run sha256sum");
+        assert!(status.status.success(), "sha256sum -c accepts STAGE.sha256");
+    }
 
     assert_eq!(
         fs::read_link(stage.join("bin").join(BINARY)).expect("bin link"),
@@ -481,7 +551,7 @@ fn drift_after_staging_is_refused_by_both_verifiers() {
     for (name, mutate, subject, fault) in cases {
         let fixture = Fixture::new();
         let stage = fixture.staged();
-        assert!(fixture.posix_verify(), "{name}: baseline");
+        fixture.assert_posix_accepts(format_args!("{name}: baseline"));
         mutate(&stage);
         let (got_subject, got_fault, _more) = refusal(fixture.verify());
         assert_eq!(
@@ -489,10 +559,7 @@ fn drift_after_staging_is_refused_by_both_verifiers() {
             (subject, fault),
             "{name}"
         );
-        assert!(
-            !fixture.posix_verify(),
-            "{name}: the POSIX verifier accepted it"
-        );
+        fixture.assert_posix_refuses(format_args!("{name}: the POSIX verifier accepted it"));
     }
 }
 
@@ -556,10 +623,7 @@ fn malformed_links_manifest_is_refused_by_both_verifiers() {
     for (name, content) in cases {
         write_file(stage.join("STAGE.links"), content).expect("mutate links manifest");
         refused(fixture.verify(), "STAGE.links", Fault::Malformed);
-        assert!(
-            !fixture.posix_verify(),
-            "{name}: POSIX verifier accepted it"
-        );
+        fixture.assert_posix_refuses(format_args!("{name}: POSIX verifier accepted it"));
     }
 
     let target = "../lib/node_modules/@fake/up/bin/up.sh\u{85}";
@@ -572,10 +636,9 @@ fn malformed_links_manifest_is_refused_by_both_verifiers() {
     )
     .expect("record link with C1 control");
     refused(fixture.verify(), "STAGE.links", Fault::Malformed);
-    assert!(
-        !fixture.posix_verify(),
+    fixture.assert_posix_refuses(format_args!(
         "POSIX verifier accepted a C1 control in a link target"
-    );
+    ));
 }
 
 #[test]
@@ -586,22 +649,25 @@ fn raw_invalid_bytes_in_manifests_are_refused_by_both_verifiers() {
     let stage = fixture.staged();
     let sha_path = stage.join("STAGE.sha256");
     let sha_original = fs::read(&sha_path).expect("sha256 manifest");
-    let raw_name = b"lib/node_modules/dep/bad\xffname";
-    let content = b"invalid UTF-8 path\n";
-    write_file(stage.join(OsStr::from_bytes(raw_name)), content).expect("raw named file");
-    let mut sha = sha_original.clone();
-    sha.extend_from_slice(format!("{:x}  ", Sha256::digest(content)).as_bytes());
-    sha.extend_from_slice(raw_name);
-    sha.push(b'\n');
-    write_file(&sha_path, sha).expect("raw sha256 manifest");
-    refused(fixture.verify(), "STAGE.sha256", Fault::Malformed);
-    assert!(
-        !fixture.posix_verify(),
-        "POSIX verifier accepted invalid UTF-8 in a file path"
-    );
+    // A name that is not UTF-8 exists only where the filesystem stores it; a
+    // link target is data, so the link half below runs everywhere.
+    if stores_raw_byte_names(&stage) {
+        let raw_name = b"lib/node_modules/dep/bad\xffname";
+        let content = b"invalid UTF-8 path\n";
+        write_file(stage.join(OsStr::from_bytes(raw_name)), content).expect("raw named file");
+        let mut sha = sha_original.clone();
+        sha.extend_from_slice(format!("{:x}  ", Sha256::digest(content)).as_bytes());
+        sha.extend_from_slice(raw_name);
+        sha.push(b'\n');
+        write_file(&sha_path, sha).expect("raw sha256 manifest");
+        refused(fixture.verify(), "STAGE.sha256", Fault::Malformed);
+        fixture.assert_posix_refuses(format_args!(
+            "POSIX verifier accepted invalid UTF-8 in a file path"
+        ));
 
-    fs::remove_file(stage.join(OsStr::from_bytes(raw_name))).expect("remove raw named file");
-    write_file(&sha_path, sha_original).expect("restore sha256 manifest");
+        fs::remove_file(stage.join(OsStr::from_bytes(raw_name))).expect("remove raw named file");
+        write_file(&sha_path, sha_original).expect("restore sha256 manifest");
+    }
     let link_path = stage.join("bin/up");
     fs::remove_file(&link_path).expect("remove staged link");
     let raw_target = b"../lib/node_modules/@fake/up/bin/up.sh\xff";
@@ -616,10 +682,9 @@ fn raw_invalid_bytes_in_manifests_are_refused_by_both_verifiers() {
     links.push(b'\n');
     write_file(&links_path, links).expect("raw links manifest");
     refused(fixture.verify(), "STAGE.links", Fault::Malformed);
-    assert!(
-        !fixture.posix_verify(),
+    fixture.assert_posix_refuses(format_args!(
         "POSIX verifier accepted invalid UTF-8 in a link target"
-    );
+    ));
 }
 
 #[test]
@@ -635,10 +700,7 @@ fn a_nul_in_links_manifest_is_refused_by_both_verifiers() {
     write_file(&links_path, links).expect("links manifest with NUL");
 
     refused(fixture.verify(), "STAGE.links", Fault::Malformed);
-    assert!(
-        !fixture.posix_verify(),
-        "POSIX verifier accepted a NUL byte"
-    );
+    fixture.assert_posix_refuses(format_args!("POSIX verifier accepted a NUL byte"));
 }
 
 #[test]
@@ -660,10 +722,9 @@ fn a_link_outside_the_stage_is_refused_by_both_verifiers() {
     .expect("record the escaping link target");
 
     refused(fixture.verify(), "bin/up", Fault::EscapingLink);
-    assert!(
-        !fixture.posix_verify(),
+    fixture.assert_posix_refuses(format_args!(
         "POSIX verifier accepted an escaping link target"
-    );
+    ));
 }
 
 #[test]
@@ -679,10 +740,9 @@ fn a_link_escaping_through_another_link_is_refused_by_both_verifiers() {
     write_file(manifest, links).expect("record links");
 
     refused(fixture.verify(), "bin/escape", Fault::EscapingLink);
-    assert!(
-        !fixture.posix_verify(),
+    fixture.assert_posix_refuses(format_args!(
         "POSIX verifier followed a chained link outside the stage"
-    );
+    ));
 }
 
 #[test]
@@ -701,10 +761,9 @@ fn a_link_that_leaves_and_reenters_the_stage_is_refused() {
     write_file(manifest, links).expect("record links");
 
     refused(fixture.verify(), "bin/escape", Fault::EscapingLink);
-    assert!(
-        !fixture.posix_verify(),
+    fixture.assert_posix_refuses(format_args!(
         "POSIX verifier accepted an external intermediate target"
-    );
+    ));
 }
 
 #[test]
@@ -726,10 +785,7 @@ fn a_link_with_a_missing_final_target_is_refused_by_both_verifiers() {
     .expect("record dangling link");
 
     refused(fixture.verify(), "bin/up", Fault::EscapingLink);
-    assert!(
-        !fixture.posix_verify(),
-        "POSIX verifier accepted a dangling link"
-    );
+    fixture.assert_posix_refuses(format_args!("POSIX verifier accepted a dangling link"));
 }
 
 #[test]
@@ -755,10 +811,9 @@ fn a_regular_file_used_as_a_directory_in_a_link_target_is_refused() {
         write_file(manifest, links).expect("record link");
 
         refused(fixture.verify(), "bin/odd", Fault::EscapingLink);
-        assert!(
-            !fixture.posix_verify(),
+        fixture.assert_posix_refuses(format_args!(
             "POSIX verifier accepted a regular file as a directory: {target}"
-        );
+        ));
     }
 }
 
@@ -775,10 +830,7 @@ fn a_symlink_cycle_is_refused_by_both_verifiers() {
 
     let (_subject, fault, _more) = refusal(fixture.verify());
     assert_eq!(fault, Fault::EscapingLink);
-    assert!(
-        !fixture.posix_verify(),
-        "POSIX verifier accepted a link cycle"
-    );
+    fixture.assert_posix_refuses(format_args!("POSIX verifier accepted a link cycle"));
 }
 
 #[test]
@@ -793,10 +845,9 @@ fn a_trailing_newline_in_the_link_target_is_refused_by_the_posix_verifier() {
         fixture.verify().is_err(),
         "Rust verifier accepted a retargeted link"
     );
-    assert!(
-        !fixture.posix_verify(),
+    fixture.assert_posix_refuses(format_args!(
         "POSIX verifier discarded the target's trailing newline"
-    );
+    ));
 }
 
 #[test]
@@ -808,14 +859,17 @@ fn a_stage_below_a_directory_with_a_trailing_newline_still_verifies() {
     let moved = parent.join(RUNTIME);
     fs::rename(stage, &moved).expect("move stage");
 
-    let status = Command::new("/bin/sh")
-        .args(["-c", POSIX_VERIFY, "sh"])
-        .arg(moved)
-        .env_clear()
-        .env("PATH", TOOL_PATH)
-        .status()
-        .expect("run verifier below a newline parent");
-    assert!(status.success(), "the path's trailing newline was lost");
+    verify_stage(&fixture.root(), RUNTIME, &parent).expect("Rust verifier below a newline parent");
+    if posix_verifier_available() {
+        let status = Command::new("/bin/sh")
+            .args(["-c", POSIX_VERIFY, "sh"])
+            .arg(moved)
+            .env_clear()
+            .env("PATH", TOOL_PATH)
+            .status()
+            .expect("run verifier below a newline parent");
+        assert!(status.success(), "the path's trailing newline was lost");
+    }
 }
 
 #[test]
@@ -827,10 +881,9 @@ fn a_symlinked_stage_root_is_refused_by_both_verifiers() {
     symlink("real-stage", &stage).expect("link the stage root");
 
     refused(fixture.verify(), RUNTIME, Fault::TypeChanged);
-    assert!(
-        !fixture.posix_verify(),
+    fixture.assert_posix_refuses(format_args!(
         "POSIX verifier followed a symlinked stage root"
-    );
+    ));
 }
 
 #[test]
@@ -843,14 +896,16 @@ fn unsafe_empty_directory_names_are_refused_by_both_verifiers() {
     ] {
         let fixture = Fixture::new();
         let stage = fixture.staged();
+        if name.to_str().is_none() && !stores_raw_byte_names(&stage) {
+            continue;
+        }
         fs::create_dir(stage.join(name)).expect("create unsafe empty directory");
 
         let (_subject, fault, _more) = refusal(fixture.verify());
         assert_eq!(fault, Fault::UnsafeName);
-        assert!(
-            !fixture.posix_verify(),
+        fixture.assert_posix_refuses(format_args!(
             "POSIX verifier accepted an unsafe empty directory: {name:?}"
-        );
+        ));
     }
 }
 
@@ -874,10 +929,7 @@ fn malformed_sha256_manifest_is_refused_by_both_verifiers() {
         )
         .expect("mutate sha256 manifest");
         refused(fixture.verify(), "STAGE.sha256", Fault::Malformed);
-        assert!(
-            !fixture.posix_verify(),
-            "POSIX verifier accepted an unsafe file name"
-        );
+        fixture.assert_posix_refuses(format_args!("POSIX verifier accepted an unsafe file name"));
         fs::remove_file(stage.join(unsafe_path)).expect("remove unsafe named file");
     }
     let last_line = original.lines().next().expect("at least one file");
@@ -894,10 +946,7 @@ fn malformed_sha256_manifest_is_refused_by_both_verifiers() {
     for (name, content) in cases {
         write_file(stage.join("STAGE.sha256"), content).expect("mutate sha256 manifest");
         refused(fixture.verify(), "STAGE.sha256", Fault::Malformed);
-        assert!(
-            !fixture.posix_verify(),
-            "{name}: POSIX verifier accepted it"
-        );
+        fixture.assert_posix_refuses(format_args!("{name}: POSIX verifier accepted it"));
     }
 }
 
@@ -911,10 +960,9 @@ fn a_group_execute_bit_does_not_mean_owner_executable() {
     fixture
         .verify()
         .expect("Rust verifier checks only the owner execute bit");
-    assert!(
-        fixture.posix_verify(),
+    fixture.assert_posix_accepts(format_args!(
         "POSIX verifier treated group execute as owner execute"
-    );
+    ));
 }
 
 #[cfg(target_os = "linux")]
@@ -965,10 +1013,7 @@ fn a_manifest_symlink_outside_the_stage_is_refused_by_both_verifiers() {
         symlink(&outside, &manifest).expect("link to the external manifest");
 
         refused(fixture.verify(), name, Fault::TypeChanged);
-        assert!(
-            !fixture.posix_verify(),
-            "{name}: POSIX verifier accepted a link"
-        );
+        fixture.assert_posix_refuses(format_args!("{name}: POSIX verifier accepted a link"));
     }
 }
 
@@ -982,10 +1027,7 @@ fn a_directory_in_place_of_a_manifest_is_refused_by_both_verifiers() {
         fs::create_dir(&manifest).expect("replace manifest with directory");
 
         refused(fixture.verify(), name, Fault::TypeChanged);
-        assert!(
-            !fixture.posix_verify(),
-            "{name}: POSIX verifier accepted a directory"
-        );
+        fixture.assert_posix_refuses(format_args!("{name}: POSIX verifier accepted a directory"));
     }
 }
 

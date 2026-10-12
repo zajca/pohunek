@@ -71,7 +71,20 @@ fn non_utf8_names_are_rejected() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt as _;
     let dir = package_dir();
-    fs::write(dir.path().join(OsStr::from_bytes(b"bad\xff")), b"x").expect("write");
+    match fs::write(dir.path().join(OsStr::from_bytes(b"bad\xff")), b"x") {
+        Ok(()) => {}
+        // A macOS volume that enforces UTF-8 names (APFS on macOS 27) answers
+        // EILSEQ, so no directory on it can hold a name the builder could
+        // reject. Every other host must store the name, and any other error is
+        // a fixture failure.
+        Err(error)
+            if cfg!(target_os = "macos")
+                && error.raw_os_error() == Some(nix::errno::Errno::EILSEQ as i32) =>
+        {
+            return;
+        }
+        Err(error) => panic!("write: {error}"),
+    }
     assert_eq!(
         build_directory_archive(dir.path(), &Limits::DEFAULT),
         Err(DirectoryError::InvalidPath)
