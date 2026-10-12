@@ -34,6 +34,7 @@ use pohunek_daemon::runtime::{
 };
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 use pohunek_test_support::env::{check_socket_path, TestEnv};
+use pohunek_test_support::wait::guard;
 use pohunek_test_support::worker_binary;
 use serde_json::Value;
 use tokio::sync::oneshot;
@@ -262,10 +263,11 @@ impl Harness {
 
     /// Runs `pohunek` with the hermetic environment.
     pub(crate) async fn run(&self, arguments: &[&str]) -> Output {
-        self.env
-            .tokio_command(pohunek_test_support::bin_exe("pohunek"))
-            .args(arguments)
-            .output()
+        let mut command = self
+            .env
+            .tokio_command(pohunek_test_support::bin_exe("pohunek"));
+        command.args(arguments);
+        guard("the pohunek binary to finish", command.output())
             .await
             .expect("run the pohunek binary")
     }

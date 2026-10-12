@@ -874,21 +874,39 @@ Hooks have two separate roles:
 
 - **Native recovery binding.** A launch-agent `SessionStart` hook prefers the
   worker socket and posts the agent's session ID or transcript path. The worker
-  validates process ancestry and accepts this binding only for the designated
-  immutable launch agent or the provider's hook-helper process the launch agent started
-  directly (for Codex the `app-server` child it runs its hooks from; a
-  same-provider child in any other role is refused); it journals the accepted value before forwarding it
-  to the daemon. This keeps recovery tied to the original launch identity and
+  validates process ancestry and accepts this binding only from the launch
+  process the session's hook schema declares; the worker alone applies that
+  rule. Under `NamedForProvider`, the rule of the subagent-capable schema (and
+  the core default for a session without a schema, never reached because such
+  a session admits no hook report), that is the designated immutable launch agent (the earliest process at or below the
+  PTY root whose executable is named for the provider) or the provider's
+  hook-helper process the launch agent started directly (for Codex the
+  `app-server` child it runs its hooks from; a same-provider child in any other
+  role is refused). Under `FrozenRootEntrypoint`, the rule of the identity-only
+  schema, it is the PTY root alone, reporting in process: the kernel peer of
+  the report must be the root's PID and start time, and the root qualifies only
+  while its command line and executable match the entrypoint the worker froze
+  before spawning it (a native executable, or a script together with the
+  absolute, argument-free shebang interpreter that runs it) and those files keep
+  their frozen inode, size, modification and status-change times. Every other
+  process is refused, including a descendant that names the root or is named for
+  the provider; every later native reference of the root is verified the same
+  way before it is journaled; and an entrypoint that cannot be frozen accepts no
+  claim. The worker journals the accepted value before
+  forwarding it to the daemon. This keeps recovery tied to the original launch identity and
   retains the claim across daemon outage. A notification hook uses the same
   endpoint: the worker attests the caller, binds the notification to its own
   session, and forwards it to the daemon's public socket; when the worker
   refuses or lacks the request type the hook dials the daemon directly. Every private report is additionally
   bound to its reporter: the worker accepts it only from the process it names or
-  from a descendant of that process, using kernel peer identity the caller
+  from a descendant of that process (under `FrozenRootEntrypoint`, a report
+  naming the PTY root only from the root itself), using kernel peer identity the caller
   cannot supply. That is the shape the shipped hooks already have, and it stops
   an unrelated command in the same terminal from rewriting another process's
   identity. If the private endpoint cannot be reached, the hook uses the local
-  public daemon as a hardened fallback; that path has no kernel peer binding and
+  public daemon as a hardened fallback; that path has no kernel peer binding,
+  is not covered by the worker's launch-process rule (tracked in
+  [#868](https://github.com/zajca/pohunek/issues/868)), and
   relies on its runtime, ordering, expiry, and provider rules alone. That
   report carries the exact runtime id, PID plus kernel start identity, a
   monotonic sequence, and a short RFC 3339 expiry. The daemon rejects stale

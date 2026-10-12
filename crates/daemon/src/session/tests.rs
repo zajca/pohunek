@@ -19075,6 +19075,131 @@ async fn the_identity_schema_admits_hermes_reports_and_refuses_unlisted_sessions
     rig.finish(&created.id).await;
 }
 
+/// Drives the core-owned Hermes reporter's public activity report and public
+/// release fallback from inside a session, then records how many of each the
+/// daemon did not accept and the daemon's reply to each method.
+///
+/// The worker socket is hidden from the reporter, so its release takes the
+/// public fallback. It reports only after one line on the gate, and the
+/// results file is renamed into place once complete.
+#[cfg(unix)]
+const HERMES_PUBLIC_REPORTER: &str = r#"
+import importlib.util
+import json
+import os
+import sys
+
+reporter_path, results_path, gate_path = sys.argv[1:4]
+# The test releases the gate once the daemon registered the session.
+with open(gate_path, encoding="ascii") as gate:
+    gate.readline()
+spec = importlib.util.spec_from_file_location("pohunek_reporter", reporter_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+environ = {name: value for name, value in os.environ.items() if name != "POHUNEK_WORKER_SOCKET_PATH"}
+# The reporter's longest hook deadline keeps a slow host from turning a daemon
+# answer into a recorded failure.
+environ["POHUNEK_HOOK_TIMEOUT_MS"] = "1000"
+reporter = module.Reporter("hermes", environ)
+replies = {}
+send = reporter._send
+
+def recording_send(endpoint, message):
+    reply = send(endpoint, message)
+    replies[message.get("method")] = reply
+    return reply
+
+reporter._send = recording_send
+active = reporter.active
+reporter.activity("working")
+activity_failures = reporter.failures
+reporter.release()
+results = {
+    "active": active,
+    "activity_failures": activity_failures,
+    "release_failures": reporter.failures - activity_failures,
+    "replies": replies,
+}
+with open(results_path + ".partial", "w", encoding="utf-8") as handle:
+    json.dump(results, handle)
+os.replace(results_path + ".partial", results_path)
+"#;
+
+/// The Hermes reporter's public `session.report_agent` and
+/// `session.release_agent` requests parse and the activity report is recorded.
+///
+/// The real core-owned reporter runs inside a shell session whose hook schema
+/// admits Hermes, against the real control server, and the reporter counts
+/// every answer that is not a result as a failure.
+#[tokio::test]
+#[cfg(unix)]
+async fn the_hermes_reporters_public_activity_and_release_reports_are_accepted() {
+    let dir = temp_dir("hook-schema-hermes-public");
+    let reporter = pohunek_test_support::workspace_root()
+        .join("crates/cli/src/hermes_integration/assets/pohunek/_pohunek_reporter.py");
+    let program = dir.join("hermes-public-reporter.py");
+    fs::write(&program, HERMES_PUBLIC_REPORTER).expect("write the reporter program");
+    let results = dir.join("hermes-public.results");
+    let gate_path = dir.join("hermes-public.gate");
+    let gate = hook_gate(&gate_path);
+    let script = dir.join("hermes-public-session");
+    write_executable(
+        &script,
+        &format!(
+            "#!/bin/sh\npython3 '{}' '{}' '{}' '{}'\nexec sleep 30\n",
+            program.display(),
+            reporter.display(),
+            results.display(),
+            gate_path.display(),
+        ),
+    );
+    let command = ShellCommand::new("/bin/sh", [script.to_str().expect("utf-8 path")]);
+    let rig = HookRig::start(&dir, None, command).await;
+    let created = rig
+        .registry
+        .create(SessionNewParams {
+            cwd: Some(dir.clone()),
+            ..params()
+        })
+        .await
+        .expect("create session");
+    release_hook_gate(&gate);
+
+    let recorded: serde_json::Value = wait_until("the Hermes reporter to finish", || async {
+        fs::read_to_string(&results)
+            .ok()
+            .map(|text| serde_json::from_str(&text).expect("results are JSON"))
+    })
+    .await;
+    assert_eq!(
+        (
+            &recorded["active"],
+            &recorded["activity_failures"],
+            &recorded["release_failures"],
+        ),
+        (
+            &serde_json::json!(true),
+            &serde_json::json!(0),
+            &serde_json::json!(0)
+        ),
+        "the daemon answers both public reports with a result: {recorded}"
+    );
+    let replies = &recorded["replies"];
+    assert_eq!(
+        replies[method::SESSION_REPORT_AGENT]["ok"],
+        serde_json::json!({"recorded": true}),
+        "the activity report is recorded: {recorded}"
+    );
+    // Procwatch may already have released the claim, so either answer is a
+    // parsed release.
+    assert!(
+        replies[method::SESSION_RELEASE_AGENT]["ok"]["released"].is_boolean(),
+        "the release fallback is answered: {recorded}"
+    );
+
+    rig.finish(&created.id).await;
+}
+
 /// The variable the Claude descriptor declares for its config home.
 #[cfg(unix)]
 const CLAUDE_CONFIG_DIR_VARIABLE: &str = "CLAUDE_CONFIG_DIR";

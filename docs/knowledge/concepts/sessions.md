@@ -286,9 +286,11 @@ core keeps the schemas as a closed compiled set. The daemon passes the schema
 id to the worker at initialization, the worker journals it, and both the
 worker (when a hook reports) and the daemon (when it imports worker state)
 check the provider, the action, the native-reference kind, the nested-agent
-rule, the ancestry matcher and the subagent fields against it. The worker also
-applies the schema's subagent sequence rule (a stop must be ordered after its
-start; a schema without one admits no subagent record), and the daemon refuses
+rule, the ancestry matcher and the subagent fields against it. The worker alone
+applies the schema's launch-process rule, which decides which process may set
+the launch identity (the daemon holds an imported launch identity to the core
+ancestry matcher only), and the schema's subagent sequence rule (a stop must be
+ordered after its start; a schema without one admits no subagent record), and the daemon refuses
 imported subagents whose fields or outcome the schema does not admit. Peer
 binding and expiry checks are shared by every schema. The schema the worker
 journaled outranks the one the pinned runtime resolves to, and reports of a
@@ -784,8 +786,11 @@ launch process and sequence for the worker's active identity), a stale or
 refused one leaves the stored reference alone, and an assigned value never
 replaces a reported one, also across a daemon restart. Sequences are compared per
 transport (worker claim or public report) and per runtime generation, so one
-clock never makes the other stale, and a recovered generation's first claim
-supersedes the reference it was relaunched with. The worker journals the latest
+clock never makes the other stale. Inside the worker, the claims of every
+reporter in a session share one ordering, so every shipped reporter stamps its
+worker claims from the system-wide monotonic clock in nanoseconds and a nested
+agent's claim never makes the launch agent's later claim stale. A recovered
+generation's first claim supersedes the reference it was relaunched with. The worker journals the latest
 reference of the verified launch process apart from the active claim's lease, so
 a switch made while the daemon was down survives the lease, and every
 replacement carries an ordering key that decides record-versus-projection
@@ -799,10 +804,26 @@ has the field-level contract.
 ### Which process may report the conversation id
 
 A hook reports the conversation id through the worker, and the worker accepts it
-as the launch claim only from the launch process: the process named for the
-provider that started first below the PTY root, never an interpreter such as
-`node`. A process named for the provider that the launch process started
-directly is accepted as well only in the provider's hook-helper role, which is
+as the launch claim only from the launch process the session's hook schema
+declares. Under `NamedForProvider` (`identity-subagent-v1`; it is also the core
+default for a session without a schema, which is never reached because such a
+session admits no hook report) that is the process named for the provider that
+started first below the PTY root, never an interpreter such as `node`. Under
+`FrozenRootEntrypoint` (`identity-v1`, used by Hermes, whose `hermes` entrypoint
+is a Python script) it is the PTY root alone, reporting in process: the worker
+requires the kernel peer of the report to be the root's PID and start time, so
+a report naming the root from any other process, a descendant included, is
+refused, and it accepts the root's report only while the root still runs the
+exact entrypoint and shebang interpreter the worker froze before spawning it.
+Every later conversation id of the root is verified the same way before it is
+journaled. The rule requires the entrypoint's shebang interpreter to run the
+script itself. An interpreter that re-executes another image, such as a macOS
+framework Python stub or an `xcrun` shim like `/usr/bin/python3`, leaves the
+session without a launch identity: every claim is refused as
+`image_mismatch` or `cmdline_mismatch` (a `worker.launch_identity.rejected`
+warning in the worker log). The runtime still runs, but native resume is
+unavailable for that session. Under `NamedForProvider`, a process named for the
+provider that the launch process started directly is accepted as well only in the provider's hook-helper role, which is
 a command line whose second argument is `app-server` for Codex (it runs its
 hooks from a `codex app-server` child of the launched `codex`); a provider
 without a declared helper role gets no exemption. An independent same-provider
@@ -812,7 +833,10 @@ first accepted claim is the initial reference. A later switch replaces it only
 when the launch agent reports a newer verified conversation. Only the
 `SessionStart` identity report carries a conversation
 id; a subagent's `SubagentStart` and `SubagentStop` reports are a separate
-claim type that never touches the reference.
+claim type that never touches the reference. The worker's launch-process rule
+does not cover the daemon's public `session.report_native_id` fallback, which
+keeps its own runtime, process-identity, ordering and expiry checks; that gap is
+tracked separately.
 The official Pi package is the worked example: see the [Pi runtime package](../guides/pi-package.md).
 
 `session.fork` creates a new pohunek session id and PTY from the source session's

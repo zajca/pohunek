@@ -62,16 +62,26 @@ GitHub Actions provisions the executable with
 `scripts/provision-hermes-compat`. The provisioner verifies the reviewed lock
 digest before any upstream command runs, then verifies the locked tag, commit,
 tree, and canonical source archive before installing the hash-locked upstream
-environment. It clears provider and GitHub credential variables, refuses Python
-fallback downloads, copies the selected interpreter into the isolated runtime
-root required by Pohunek's executable-containment checks, and uses the reviewed
-frozen upstream resolution. Its network-free fail-closed test is
-`scripts/tests/provision-hermes-compat.sh`.
+environment. It clears provider and GitHub credential variables and the `uv`
+interpreter redirects, and builds the environment from one pinned
+python-build-standalone CPython: the release, version, flavor and a SHA-256 per
+supported host (Linux x86_64, macOS arm64) are fixed at the top of the script,
+the archive is fetched over HTTPS only and checked against its digest before it
+is extracted into the isolated runtime root required by Pohunek's
+executable-containment checks. A framework build, another version, or an
+unsupported host is refused, because the frozen launch rule needs the
+entrypoint's shebang interpreter to run the script itself. The host `python3`
+only runs the provisioner's helper programs. It uses the reviewed frozen
+upstream resolution, and its network-free fail-closed test is
+`scripts/tests/provision-hermes-compat.sh`. Both pinned Hermes CI jobs also
+drive a real Hermes session through the package
+(`crates/cli/tests/hermes_package.rs` with `POHUNEK_HERMES_E2E=1`).
 
 The same gate runs natively on Apple Silicon in the
 `hermes-compatibility-macos` CI job. That job provisions the locked runtime
 with the stock macOS `/bin/bash` 3.2 and BSD userland (the provisioner uses
-`sha256sum` or `shasum -a 256`, whichever exists, and no GNU `realpath`),
+`curl`, `tar`, `sha256sum` or `shasum -a 256`, whichever exists, and no GNU
+`realpath`),
 runs both shell tests, the xtask Hermes unit tests, the compatibility gate, and
 `scripts/smoke-hermes-plugin-release`. The smoke runs a release `pohunek`
 copied outside the checkout with a clean isolated home, so the plugin and skill
