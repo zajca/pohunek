@@ -31,7 +31,7 @@ use tempfile::TempDir;
 #[cfg(target_os = "linux")]
 use crate::upstream_stage::run_bounded;
 use crate::upstream_stage::{
-    host_key, read_lock, read_project, stage_upstream, verify_stage, Fault, Outcome, StageError,
+    check_inputs, host_key, read_lock, stage_upstream, verify_stage, Fault, Outcome, StageError,
     Tools, POSIX_VERIFY,
 };
 use crate::XtaskError;
@@ -103,7 +103,7 @@ impl Fixture {
 
     fn tools(&self) -> Tools {
         Tools {
-            npm: self.dir.path().join("tools").join("npm"),
+            npm: Some(self.dir.path().join("tools").join("npm")),
             path: TOOL_PATH.into(),
         }
     }
@@ -1463,24 +1463,42 @@ fn an_npm_manifest_that_does_not_pin_exactly_is_refused_before_npm_runs() {
     assert_refused_before_npm(cases);
 }
 
+/// The Hermes lock selects the provisioner kind by its data: the lock and its
+/// in-repository provisioner are accepted, verification looks for a stage,
+/// and a stage path at which uv would write a `#!/bin/sh` trampoline is
+/// refused before the network provisioner runs.
 #[test]
-fn the_hermes_lock_is_not_a_shape_this_command_stages() {
+fn the_hermes_lock_is_staged_by_its_provisioner_at_a_direct_shebang_path() {
     let root = pohunek_test_support::workspace_root();
+    let lock = read_lock(&root, "hermes").expect("the Hermes lock is a stageable shape");
+    check_inputs(&root, "hermes", &lock).expect("the lock names the committed provisioner");
     let out = pohunek_test_support::tempdir().expect("out");
-    let tools = Tools {
-        npm: PathBuf::from("/nonexistent/npm"),
-        path: TOOL_PATH.into(),
-    };
-    refused(
-        stage_upstream(&root, "hermes", out.path(), &tools),
-        "upstream.npm",
-        Fault::Unsupported,
-    );
     refused(
         verify_stage(&root, "hermes", out.path()),
-        "upstream.npm",
-        Fault::Unsupported,
+        "hermes",
+        Fault::Missing,
     );
+
+    let tools = Tools {
+        npm: None,
+        path: TOOL_PATH.into(),
+    };
+    // uv wraps a shebang line longer than 127 bytes, or one with a space.
+    for unusable in [
+        out.path().join("x".repeat(128)),
+        out.path().join("with space"),
+    ] {
+        refused(
+            stage_upstream(&root, "hermes", &unusable, &tools),
+            "out",
+            Fault::IndirectShebang,
+        );
+        assert!(
+            !unusable.join("hermes").exists(),
+            "nothing was provisioned at {}",
+            unusable.display()
+        );
+    }
 }
 
 #[test]
@@ -1504,8 +1522,603 @@ fn every_official_runtime_package_has_a_consistent_upstream_pin() {
         }
         let runtime = entry.file_name().into_string().expect("utf-8 name");
         let lock = read_lock(&root, &runtime).unwrap_or_else(|e| panic!("{runtime}: {e}"));
-        read_project(&root, &runtime, &lock).unwrap_or_else(|e| panic!("{runtime}: {e}"));
+        check_inputs(&root, &runtime, &lock).unwrap_or_else(|e| panic!("{runtime}: {e}"));
         checked += 1;
     }
     assert!(checked >= 3, "the official packages were found");
+}
+
+// ---------------------------------------------------------------------------
+// Provisioned runtimes
+// ---------------------------------------------------------------------------
+
+const PROVISIONED: &str = "fakepy";
+const PROVISIONED_BINARY: &str = "fakepy";
+const PROVISIONER: &str = "provision-fakepy";
+
+/// Entrypoint body run by the fixture interpreter: it requires the bytecode
+/// switch every consumer of a provisioned stage sets, then prints the banner
+/// and a diagnostic line after it, as Hermes does.
+const ENTRY_BODY: &str = "[ \"${PYTHONDONTWRITEBYTECODE-}\" = 1 ] || exit 9\n\
+                          printf '%s\\n' 'fake-py 1.2.3' 'Install directory: elsewhere'\n";
+
+/// A throwaway repository root with one runtime whose lock selects a
+/// provisioner. The provisioner is a shell script in `scripts/` that builds
+/// the layout the real one does: a copy of `/bin/sh` as `venv/bin/python` and
+/// an entrypoint whose direct shebang names it, the same interpreter trick as
+/// the fake agents of the upgrade test.
+struct Provisioned {
+    dir: TempDir,
+}
+
+impl Provisioned {
+    fn new() -> Self {
+        let fixture = Self {
+            dir: pohunek_test_support::tempdir().expect("fixture root"),
+        };
+        fixture.write_lock(&json!({
+            "schema": 1,
+            "package": "pohunek.runtime.fakepy",
+            "runtime": PROVISIONED,
+            "upstream": {
+                "kind": "provisioner",
+                "provisioner": format!("scripts/{PROVISIONER}"),
+                "release": RELEASE,
+                "binary": PROVISIONED_BINARY,
+                "version_output": "fake-py {release}"
+            },
+            "supported": {"min": "1.0.0", "below": "2.0.0"}
+        }));
+        fixture.write_provisioner("", ENTRY_BODY, "");
+        fs::create_dir_all(fixture.dir.path().join("log")).expect("log dir");
+        fixture
+    }
+
+    fn root(&self) -> PathBuf {
+        self.dir.path().join("repo")
+    }
+
+    fn out(&self) -> PathBuf {
+        self.dir.path().join("out")
+    }
+
+    fn stage(&self) -> PathBuf {
+        self.out().join(PROVISIONED)
+    }
+
+    fn log(&self, name: &str) -> PathBuf {
+        self.dir.path().join("log").join(name)
+    }
+
+    fn script(&self) -> PathBuf {
+        self.root().join("scripts").join(PROVISIONER)
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        self.root()
+            .join("compat")
+            .join(PROVISIONED)
+            .join("compatibility-lock.json")
+    }
+
+    fn write_lock(&self, lock: &Value) {
+        let path = self.lock_path();
+        fs::create_dir_all(path.parent().expect("lock dir")).expect("lock dir");
+        write_file(path, serde_json::to_vec_pretty(lock).expect("json")).expect("write lock");
+    }
+
+    fn edit_lock(&self, edit: impl FnOnce(&mut Value)) {
+        let mut lock: Value =
+            serde_json::from_slice(&fs::read(self.lock_path()).expect("read lock"))
+                .expect("lock json");
+        edit(&mut lock);
+        self.write_lock(&lock);
+    }
+
+    /// Writes the provisioner. `shebang` replaces the direct `#!<python>`
+    /// line of the entrypoint when not empty; `extra` runs after the layout
+    /// is built.
+    fn write_provisioner(&self, shebang: &str, entry_body: &str, extra: &str) {
+        let shebang = if shebang.is_empty() {
+            "#!$root/venv/bin/python"
+        } else {
+            shebang
+        };
+        let script = [
+            "#!/bin/sh\nset -eu\n",
+            "env | sed 's/=.*//' | sort > \"$(dirname \"$0\")/../../log/env-names\"\n",
+            "root=$1\n[ ! -e \"$root\" ] || exit 4\nmkdir -m 0700 \"$root\"\n",
+            "mkdir -p \"$root/venv/bin\" \"$root/venv/lib/site\"\n",
+            "cp /bin/sh \"$root/venv/bin/python\"\n",
+            "{ printf '%s\\n' \"",
+            shebang,
+            "\"; cat <<'ENTRY'\n",
+            entry_body,
+            "ENTRY\n} > \"$root/venv/bin/fakepy\"\n",
+            "chmod 0755 \"$root/venv/bin/fakepy\"\n",
+            "printf 'payload\\n' > \"$root/venv/lib/site/module.py\"\n",
+            extra,
+            "\nprintf '%s\\n' \"$root/venv/bin/fakepy\"\n",
+        ]
+        .concat();
+        fs::create_dir_all(self.root().join("scripts")).expect("scripts dir");
+        write_executable(self.script(), script).expect("provisioner");
+    }
+
+    fn run_stage(&self) -> Result<crate::upstream_stage::StageSummary, XtaskError> {
+        stage_upstream(&self.root(), PROVISIONED, &self.out(), &provisioner_tools())
+    }
+
+    fn staged(&self) -> PathBuf {
+        self.run_stage().expect("stage the provisioned runtime");
+        self.stage()
+    }
+
+    fn verify(&self) -> Result<crate::upstream_stage::StageSummary, XtaskError> {
+        verify_stage(&self.root(), PROVISIONED, &self.out())
+    }
+
+    fn assert_nothing_left(&self, context: &str) {
+        let left: Vec<_> = fs::read_dir(self.out())
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.expect("entry").file_name())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(left.is_empty(), "{context}: left {left:?}");
+    }
+}
+
+/// Tools of a provisioned stage: no npm, the fixture's tool search path.
+fn provisioner_tools() -> Tools {
+    Tools {
+        npm: None,
+        path: TOOL_PATH.into(),
+    }
+}
+
+/// Runs the documented POSIX verifier on `stage`; `None` on a host whose
+/// userland cannot run it (see [`posix_verifier_available`]).
+fn posix_verdict(stage: &Path) -> Option<bool> {
+    posix_verifier_available().then(|| {
+        Command::new("/bin/sh")
+            .args(["-c", POSIX_VERIFY, "sh"])
+            .arg(stage)
+            .env_clear()
+            .env("PATH", TOOL_PATH)
+            .status()
+            .expect("run the POSIX verifier")
+            .success()
+    })
+}
+
+/// Rewrites the `STAGE.sha256` line of `path` to its current digest, so a
+/// refusal comes from a check other than the byte manifest.
+fn rerecord(stage: &Path, path: &str) {
+    use sha2::{Digest as _, Sha256};
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(fs::read(stage.join(path)).expect("read"))
+    );
+    let manifest = fs::read_to_string(stage.join("STAGE.sha256")).expect("manifest");
+    let suffix = format!("  {path}");
+    let rewritten: String = manifest
+        .lines()
+        .map(|line| {
+            if line.ends_with(&suffix) {
+                format!("{digest}{suffix}\n")
+            } else {
+                format!("{line}\n")
+            }
+        })
+        .collect();
+    assert_ne!(rewritten, manifest, "{path} is recorded");
+    fs::write(stage.join("STAGE.sha256"), rewritten).expect("rewrite manifest");
+}
+
+#[test]
+fn a_provisioned_runtime_is_staged_in_place_and_verifies() {
+    let fixture = Provisioned::new();
+    let mut env = ProcessEnv::lock();
+    env.set("GITHUB_TOKEN", "must-not-leak")
+        .set("UV_INDEX_URL", "https://evil.example.test/");
+    let summary = fixture.run_stage().expect("stage the provisioned runtime");
+    drop(env);
+
+    let stage = fixture.stage();
+    assert_eq!(summary.release, RELEASE);
+    assert_eq!(summary.stage, fs::canonicalize(&stage).expect("stage"));
+    assert_eq!(summary.links, 1, "bin/fakepy");
+    assert_eq!(
+        fs::read_link(stage.join("bin/fakepy")).expect("bin link"),
+        Path::new("../venv/bin/fakepy")
+    );
+    let entry = fs::read_to_string(stage.join("venv/bin/fakepy")).expect("entrypoint");
+    assert_eq!(
+        entry.lines().next(),
+        Some(format!("#!{}/venv/bin/python", summary.stage.display()).as_str()),
+        "the entrypoint names exactly the venv interpreter at the stage path"
+    );
+    assert_eq!(
+        fs::read(stage.join("inputs/compatibility-lock.json")).expect("lock copy"),
+        fs::read(fixture.lock_path()).expect("lock")
+    );
+    assert_eq!(
+        fs::read(stage.join("inputs").join(PROVISIONER)).expect("script copy"),
+        fs::read(fixture.script()).expect("script")
+    );
+
+    let names = fs::read_to_string(fixture.log("env-names")).expect("env names");
+    for name in names.lines() {
+        assert!(
+            ["PATH", "HOME", "TMPDIR", "PWD", "OLDPWD", "SHLVL", "_"].contains(&name),
+            "{name} reached the provisioner"
+        );
+    }
+
+    let verified = fixture.verify().expect("verify the untouched stage");
+    assert_eq!(
+        (verified.files, verified.links),
+        (summary.files, summary.links)
+    );
+    assert_ne!(
+        posix_verdict(&stage),
+        Some(false),
+        "the POSIX verifier agrees"
+    );
+    let leftovers: Vec<_> = fs::read_dir(fixture.out())
+        .expect("out")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    assert_eq!(leftovers, [PROVISIONED], "no scratch directory remains");
+}
+
+#[test]
+fn consumer_drift_in_a_provisioned_stage_is_refused_by_both_verifiers() {
+    type Mutation = fn(&Path);
+    let cases: [(&str, Mutation, &str, Fault); 3] = [
+        (
+            "bytecode written by a consumer",
+            |s| {
+                fs::create_dir(s.join("venv/lib/site/__pycache__")).unwrap();
+                write_file(
+                    s.join("venv/lib/site/__pycache__/module.cpython-312.pyc"),
+                    "bytecode",
+                )
+                .unwrap();
+            },
+            "venv/lib/site/__pycache__/module.cpython-312.pyc",
+            Fault::Added,
+        ),
+        (
+            "modified module",
+            |s| {
+                write_file(s.join("venv/lib/site/module.py"), "patched\n").unwrap();
+            },
+            "venv/lib/site/module.py",
+            Fault::Modified,
+        ),
+        (
+            "modified interpreter",
+            |s| {
+                write_file(s.join("venv/bin/python"), "#!/bin/sh\n").unwrap();
+            },
+            "venv/bin/python",
+            Fault::Modified,
+        ),
+    ];
+    for (name, mutate, subject, fault) in cases {
+        let fixture = Provisioned::new();
+        let stage = fixture.staged();
+        mutate(&stage);
+        let (got_subject, got_fault, _more) = refusal(fixture.verify());
+        assert_eq!(
+            (got_subject.as_str(), got_fault),
+            (subject, fault),
+            "{name}"
+        );
+        assert_ne!(posix_verdict(&stage), Some(true), "{name}: POSIX verifier");
+    }
+}
+
+#[test]
+fn a_trampoline_entrypoint_is_refused_even_when_its_bytes_are_recorded() {
+    let fixture = Provisioned::new();
+    let stage = fixture.staged();
+    let python = fs::canonicalize(stage.join("venv/bin/python")).expect("python");
+    // The shape uv writes for an interpreter path it cannot put in a shebang.
+    let trampoline = format!(
+        "#!/bin/sh\n'''exec' '{}' \"$0\" \"$@\"\n' '''\n{ENTRY_BODY}",
+        python.display()
+    );
+    write_executable(stage.join("venv/bin/fakepy"), trampoline).expect("trampoline");
+    rerecord(&stage, "venv/bin/fakepy");
+
+    assert_ne!(
+        posix_verdict(&stage),
+        Some(false),
+        "the manifests alone accept the recorded trampoline"
+    );
+    refused(fixture.verify(), "bin/fakepy", Fault::IndirectShebang);
+}
+
+/// uv names the interpreter as `sys.executable` reports it, `venv/bin/python3`
+/// on macOS; that exact path is accepted like `venv/bin/python`.
+#[test]
+fn an_entrypoint_naming_the_venv_python3_stages_and_verifies() {
+    let fixture = Provisioned::new();
+    fixture.write_provisioner(
+        "#!$root/venv/bin/python3",
+        ENTRY_BODY,
+        "cp /bin/sh \"$root/venv/bin/python3\"",
+    );
+    let summary = fixture.run_stage().expect("stage the python3 entrypoint");
+    let entry = fs::read_to_string(fixture.stage().join("venv/bin/fakepy")).expect("entrypoint");
+    assert_eq!(
+        entry.lines().next(),
+        Some(format!("#!{}/venv/bin/python3", summary.stage.display()).as_str())
+    );
+    fixture.verify().expect("verify the python3 entrypoint");
+}
+
+/// The shebang names the canonical stage path; a stage reached through a
+/// symlinked parent (macOS `/tmp` is `/private/tmp`) still verifies there.
+#[test]
+fn a_stage_reached_through_a_symlinked_parent_verifies() {
+    let fixture = Provisioned::new();
+    fs::create_dir(fixture.out()).expect("out");
+    let linked = fixture.dir.path().join("linked-out");
+    symlink(fixture.out(), &linked).expect("symlinked parent");
+    let summary = stage_upstream(&fixture.root(), PROVISIONED, &linked, &provisioner_tools())
+        .expect("stage through the symlinked parent");
+    let real = fs::canonicalize(fixture.stage()).expect("real stage");
+    assert_eq!(summary.stage, real);
+    let entry = fs::read_to_string(real.join("venv/bin/fakepy")).expect("entrypoint");
+    assert_eq!(
+        entry.lines().next(),
+        Some(format!("#!{}/venv/bin/python", real.display()).as_str())
+    );
+    verify_stage(&fixture.root(), PROVISIONED, &linked).expect("verify through the link");
+    fixture.verify().expect("verify at the real path");
+}
+
+#[test]
+fn an_entrypoint_naming_another_recorded_python_is_refused() {
+    let fixture = Provisioned::new();
+    fixture.write_provisioner("", ENTRY_BODY, "cp /bin/sh \"$root/venv/bin/python3.12\"");
+    let stage = fixture.staged();
+    let other = fs::canonicalize(stage.join("venv/bin/python3.12")).expect("python3.12");
+    write_executable(
+        stage.join("venv/bin/fakepy"),
+        format!("#!{}\n{ENTRY_BODY}", other.display()),
+    )
+    .expect("rewrite the entrypoint");
+    rerecord(&stage, "venv/bin/fakepy");
+
+    assert_ne!(
+        posix_verdict(&stage),
+        Some(false),
+        "the manifests alone accept the recorded entrypoint"
+    );
+    refused(fixture.verify(), "bin/fakepy", Fault::IndirectShebang);
+}
+
+#[test]
+fn a_moved_provisioned_stage_is_refused() {
+    let fixture = Provisioned::new();
+    let stage = fixture.staged();
+    let elsewhere = fixture.dir.path().join("moved");
+    fs::create_dir(&elsewhere).expect("moved dir");
+    fs::rename(&stage, elsewhere.join(PROVISIONED)).expect("move the stage");
+
+    refused(
+        verify_stage(&fixture.root(), PROVISIONED, &elsewhere),
+        "bin/fakepy",
+        Fault::IndirectShebang,
+    );
+}
+
+#[test]
+fn a_provisioned_stage_from_other_inputs_is_refused() {
+    let fixture = Provisioned::new();
+    fixture.staged();
+    fixture.edit_lock(|lock| lock["verified_with"] = json!("a later run"));
+    refused(
+        fixture.verify(),
+        "inputs/compatibility-lock.json",
+        Fault::Mismatch,
+    );
+
+    let fixture = Provisioned::new();
+    fixture.staged();
+    fixture.write_provisioner("", ENTRY_BODY, "true");
+    refused(
+        fixture.verify(),
+        &format!("inputs/{PROVISIONER}"),
+        Fault::Mismatch,
+    );
+}
+
+#[test]
+fn a_failed_provisioned_stage_leaves_nothing() {
+    type Setup = fn(&Provisioned);
+    let fixture = Provisioned::new();
+    fixture.write_provisioner("", ENTRY_BODY, "exit 3");
+    match fixture.run_stage() {
+        Err(XtaskError::UpstreamStage(StageError::Command { step, outcome })) => {
+            assert_eq!((step, outcome), ("provisioner", Outcome::Exit(Some(3))));
+        }
+        other => panic!("expected a provisioner failure, got {other:?}"),
+    }
+    fixture.assert_nothing_left("failed provisioner");
+
+    let cases: [(&str, Setup, &str, Fault); 6] = [
+        (
+            "trampoline entrypoint",
+            |f| {
+                f.write_provisioner(
+                    "#!/bin/sh\n'''exec' \\\"$root/venv/bin/python\\\" \\\"\\$0\\\" \\\"\\$@\\\"\n' '''",
+                    ENTRY_BODY,
+                    "",
+                );
+            },
+            "bin/fakepy",
+            Fault::IndirectShebang,
+        ),
+        (
+            "interpreter outside the stage",
+            |f| f.write_provisioner("#!/bin/sh", ENTRY_BODY, ""),
+            "bin/fakepy",
+            Fault::IndirectShebang,
+        ),
+        (
+            "another python beside the venv interpreter",
+            |f| {
+                f.write_provisioner(
+                    "#!$root/venv/bin/python3.12",
+                    ENTRY_BODY,
+                    "cp /bin/sh \"$root/venv/bin/python3.12\"",
+                );
+            },
+            "bin/fakepy",
+            Fault::IndirectShebang,
+        ),
+        (
+            "entrypoint of another name",
+            |f| {
+                f.write_provisioner(
+                    "",
+                    ENTRY_BODY,
+                    "cp \"$root/venv/bin/fakepy\" \"$root/venv/bin/other\"\n\
+                     printf '%s\\n' \"$root/venv/bin/other\"; exit 0",
+                );
+            },
+            "provisioner output",
+            Fault::Mismatch,
+        ),
+        (
+            "entrypoint outside the stage",
+            |f| f.write_provisioner("", ENTRY_BODY, "printf '%s\\n' /bin/sh; exit 0"),
+            "provisioner output",
+            Fault::EscapingLink,
+        ),
+        (
+            "probe writing bytecode into the stage",
+            |f| {
+                f.write_provisioner(
+                    "",
+                    "printf x > \"$(dirname \"$0\")/../venv/lib/site/module.pyc\"\n\
+                     printf '%s\\n' 'fake-py 1.2.3'\n",
+                    "",
+                );
+            },
+            "venv/lib/site/module.pyc",
+            Fault::Added,
+        ),
+    ];
+    for (name, setup, subject, fault) in cases {
+        let fixture = Provisioned::new();
+        setup(&fixture);
+        let (got_subject, got_fault, _more) = refusal(fixture.run_stage());
+        assert_eq!(
+            (got_subject.as_str(), got_fault),
+            (subject, fault),
+            "{name}"
+        );
+        fixture.assert_nothing_left(name);
+    }
+
+    let fixture = Provisioned::new();
+    fixture.write_provisioner("", "printf '%s\\n' 'fake-py 9.9.9'\n", "");
+    assert!(
+        matches!(
+            fixture.run_stage(),
+            Err(XtaskError::UpstreamStage(StageError::Banner { .. }))
+        ),
+        "a first line other than the locked banner fails"
+    );
+    fixture.assert_nothing_left("banner");
+}
+
+#[test]
+fn a_provisioner_lock_is_checked_before_its_script_runs() {
+    type Setup = fn(&Provisioned);
+    let cases: [(&str, Setup, &str, Fault); 8] = [
+        (
+            "script outside scripts/",
+            |f| f.edit_lock(|l| l["upstream"]["provisioner"] = json!("compat/provision")),
+            "upstream.provisioner",
+            Fault::Unsupported,
+        ),
+        (
+            "script in a subdirectory",
+            |f| f.edit_lock(|l| l["upstream"]["provisioner"] = json!("scripts/sub/provision")),
+            "upstream.provisioner",
+            Fault::Unsupported,
+        ),
+        (
+            "script leaving the checkout",
+            |f| f.edit_lock(|l| l["upstream"]["provisioner"] = json!("scripts/../../provision")),
+            "upstream.provisioner",
+            Fault::Unsupported,
+        ),
+        (
+            "unknown kind",
+            |f| f.edit_lock(|l| l["upstream"]["kind"] = json!("pip")),
+            "upstream.kind",
+            Fault::Unsupported,
+        ),
+        (
+            "npm recipe beside the provisioner",
+            |f| f.edit_lock(|l| l["upstream"]["npm"] = json!("@fake/up")),
+            "upstream.kind",
+            Fault::Malformed,
+        ),
+        (
+            "missing script",
+            |f| fs::remove_file(f.script()).unwrap(),
+            "upstream.provisioner",
+            Fault::Missing,
+        ),
+        (
+            "script that is a link",
+            |f| {
+                let real = f.root().join("scripts/real-provisioner");
+                fs::rename(f.script(), &real).unwrap();
+                symlink("real-provisioner", f.script()).unwrap();
+            },
+            "upstream.provisioner",
+            Fault::TypeChanged,
+        ),
+        (
+            "script that is not executable",
+            |f| {
+                fs::set_permissions(f.script(), fs::Permissions::from_mode(0o644)).unwrap();
+            },
+            "upstream.provisioner",
+            Fault::ModeChanged,
+        ),
+    ];
+    for (name, setup, subject, fault) in cases {
+        let fixture = Provisioned::new();
+        setup(&fixture);
+        let (got_subject, got_fault, _more) = refusal(fixture.run_stage());
+        assert_eq!(
+            (got_subject.as_str(), got_fault),
+            (subject, fault),
+            "{name}"
+        );
+        assert!(!fixture.log("env-names").exists(), "{name}: the script ran");
+        assert!(!fixture.stage().exists(), "{name}: a stage was created");
+    }
+
+    let fixture = Provisioned::new();
+    let spaced = fixture.out().join("with space");
+    refused(
+        stage_upstream(&fixture.root(), PROVISIONED, &spaced, &provisioner_tools()),
+        "out",
+        Fault::IndirectShebang,
+    );
+    assert!(!fixture.log("env-names").exists(), "the script ran");
 }

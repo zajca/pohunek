@@ -77,8 +77,12 @@ credentials. Validation does not trust a matching checksum alone: every
 approval, interruption, exit, resume, or alternate-screen evidence contract
 recorded by the refresh.
 
-GitHub Actions provisions the executable with
-`scripts/provision-hermes-compat`. The provisioner verifies the reviewed lock
+GitHub Actions stages the executable with `cargo xtask compat stage-upstream
+--runtime hermes`, which runs `scripts/provision-hermes-compat` in place and
+records the stage in `STAGE.sha256` and `STAGE.links`; on a runtime cache hit
+the restored stage goes back to the same absolute path and `cargo xtask compat
+verify-stage` re-checks it before the gate runs
+(`docs/knowledge/concepts/upstream-staging.md`). The provisioner verifies the reviewed lock
 digest before any upstream command runs, then verifies the locked tag, commit,
 tree, and canonical source archive before installing the hash-locked upstream
 environment. It clears provider and GitHub credential variables and the `uv`
