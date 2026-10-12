@@ -605,13 +605,15 @@ Runtime package archive format:
 - `runtime-packages/codex/detect.toml` — Codex detection manifest, equal to the built-in one.
 - `compat/codex/compatibility-lock.json` — pinned Codex release and supported range.
 - `compat/codex/screens/` — screens and terminal titles captured from a real Codex that the manifest test classifies.
-- `crates/cli/tests/codex_package.rs` — pure package tests (descriptor and manifest parity with the built-in), catalog-installed package launch and version-probe tests, and the opt-in real-Codex tests.
+- `compat/codex/builtin-v0.34/` — golden copies of the built-in Codex descriptor and detection manifest of release 0.34.2.
+- `crates/cli/tests/codex_package.rs` — pure package tests (descriptor and manifest parity with the v0.34.2 built-in goldens), catalog-installed package launch and version-probe tests, and the opt-in real-Codex tests.
 - `crates/cli/tests/support/responses_stub.rs` — loopback Responses-API stub used instead of a model provider.
 - `runtime-packages/claude/runtime.toml` — Claude Code runtime descriptor (hook native reference, resume and fork argv, `semver-line-v1` version probe).
 - `runtime-packages/claude/detect.toml` — Claude Code detection manifest, equal to the built-in one.
 - `compat/claude/compatibility-lock.json` — pinned Claude Code release, native binary SHA-256 and supported range.
 - `compat/claude/screens/` — screens and terminal titles captured from a real Claude Code that the manifest test classifies.
-- `crates/cli/tests/claude_package.rs` — pure package tests (descriptor and manifest parity with the built-in), catalog-installed package launch and version-probe tests, the opt-in real-Claude tests and the screen capture.
+- `compat/claude/builtin-v0.34/` — golden copies of the built-in Claude descriptor and detection manifest of release 0.34.2.
+- `crates/cli/tests/claude_package.rs` — pure package tests (descriptor and manifest parity with the v0.34.2 built-in goldens), catalog-installed package launch and version-probe tests, the opt-in real-Claude tests and the screen capture.
 - `crates/cli/tests/support/messages_stub.rs` — loopback Messages-API stub used instead of a model provider.
 - `crates/cli/tests/support/process_guard.rs` — process cleanup shared by the real-agent package tests.
 - `crates/cli/tests/support/plugin_harness.rs` — real-daemon harness shared by the package tests.

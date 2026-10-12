@@ -27,14 +27,19 @@ archive ships the package as `runtime/packages/codex.tar.zst` with a signed
 [installing official packages](runtime-packages.md#install-official-packages-from-a-release)
 has the procedure. Until the built-in is removed (#145), the built-in
 descriptor, detection manifest and Codex handler serve `codex` on a host that
-has not installed the package, and the package tests keep the package equal to
-the built-in.
+has not installed the package.
 
 ## What the package declares
 
-Every fact below equals the built-in Codex descriptor
-(`crates/daemon/src/agent/builtin/codex.toml`), except the version probe, which
-only the package declares.
+Every fact below equals the built-in Codex descriptor release 0.34.2 shipped,
+except the version probe and the transcript tree (`[transcripts]`), which that
+descriptor does not declare. The package tests compare the package with golden
+copies of that descriptor and its detection manifest in
+`compat/codex/builtin-v0.34/` (`runtime.toml`, `detect.toml`). While the daemon
+embeds the built-in (`crates/daemon/src/agent/builtin/codex.toml` and
+`crates/daemon/src/detect/manifests/codex.toml`), they also check that the
+built-in manifest is the golden byte for byte and the built-in descriptor is
+the golden followed by the package's transcript tree.
 
 - Launch: `codex` with the first prompt as a trailing positional argument;
   bracketed paste followed by a separate Enter 150 ms later for later input.
@@ -146,8 +151,9 @@ absence of egress), and the older folder-dialog wording the rule still names.
 - `crates/cli/tests/codex_package.rs` always runs: it builds the directory
   twice and requires identical bytes, parses it with the daemon's install
   parser, compares every descriptor fact and the whole manifest with the
-  built-in Codex files (as parsed definitions, as TOML data, and by feeding both
-  manifests every captured frame, title and synthetic dialog), requires the
+  v0.34.2 built-in Codex goldens in `compat/codex/builtin-v0.34/` (as parsed
+  definitions, as TOML data, and by feeding both manifests every captured frame,
+  title and synthetic dialog), requires the
   supported range to equal `compat/codex/compatibility-lock.json`, reads the
   version banner, runs the title, screen and process rules, and asserts the
   `--sha256` install refusal above.
