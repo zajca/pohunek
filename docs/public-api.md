@@ -475,6 +475,7 @@ All params and result type names below refer to structs exported by
 | `session.read` | `SessionReadParams` | `SessionReadResult` | Reads bounded text from the current rendered terminal without attaching. `lines` accepts `1..=1,000`, defaults to that ceiling, and keeps the newest rendered rows. The complete serialized result is capped by `MAX_SESSION_READ_RESPONSE_BYTES`; byte truncation keeps the newest UTF-8 text and sets `truncated`. ANSI is a reserved request value that v2 always rejects. |
 | `session.output` | `SessionOutputParams` | `SessionOutputResult` | Reads a newest retained tail or continues from an exact runtime-scoped output cursor. A request with `wait_ms` uses a dedicated connection with bounded-wait headroom. |
 | `session.wait` | `SessionWaitParams` | `SessionWaitResult` | Performs one bounded long poll for state, activity, metadata, terminal, output, or runtime change. It always uses a dedicated connection. |
+| `session.wait_turn` | `SessionWaitTurnParams` | `SessionWaitTurnResult` | Waits for the next turn event (`turn_completed`, `agent_blocked`, `approval_required`, `exited`) of one or more sessions after an opaque cursor, bounded by an agent-chosen timeout under a daemon ceiling; a timeout returns per-session progress. It always uses a dedicated connection. New in protocol 4: a protocol 3 client or daemon does not define it. See [Turn Waits](#turn-waits). |
 | `session.report_agent` | `SessionReportAgentParams` | `SessionReportAgentResult` | Hook callback for nested agents running inside an existing session. It records an active-agent claim, optional process binding, and optional active native metadata without changing launch identity or resume binding; ignored reports return `recorded: false`. Claims are reconciled with process facts and can be auto-released when no live backing process remains. |
 | `session.release_agent` | `SessionReleaseAgentParams` | `SessionReleaseAgentResult` | Hook callback that clears a matching active nested-agent report and restores the session's default detector identity. Claude `SessionEnd` hooks use this as the clean-exit fast path; non-current releases return `released: false`; process-backed auto-release uses the same clear path. |
 | `session.report_native_id` | `SessionReportNativeIdParams` | `SessionReportNativeIdResult` | Hardened public fallback for launch-agent resume metadata. Reports are runtime- and process-bound, ordered, expiring, and provider-matched; ignored reports return `recorded: false`. The owner-private worker claim path is preferred. This is not the nested-agent active identity callback. |
@@ -520,9 +521,12 @@ All params and result type names below refer to structs exported by
 daemon method in this API version. It returns `daemon/method_not_found`.
 
 `HostCapabilities` advertises `terminal_read_supported`,
-`output_read_supported`, and `session_wait_supported` independently. Clients
-must check the relevant flag instead of assuming that a reachable daemon or an
-attach-capable session supports every observation method. Its `runtimes` entries
+`output_read_supported`, `session_wait_supported`, and
+`session_wait_turn_supported` independently. Clients must check the relevant
+flag instead of assuming that a reachable daemon or an attach-capable session
+supports every observation method. A daemon that predates `session.wait_turn`
+omits `session_wait_turn_supported`, which decodes as `false`; it answers the
+method itself with `daemon/method_not_found` when it speaks protocol 4. Its `runtimes` entries
 are live host-local probes: `agent` is the selected profile or base name and
 optional `agent_base` is the `RuntimeRef` of the runtime behind it. Optional
 `version` and `supported` are a provider policy, not generic availability:
@@ -754,9 +758,13 @@ default `false`.
 Observation limits are validated together when the session registry starts.
 Defaults are 783,240 raw output bytes, an 8,000 ms output wait, an 8,000 ms
 session wait, 200 rows, 500 columns, a 1,048,418-byte serialized screen result,
-128 global waiters, and 8 waiters per session. Values must be non-zero, must not
-exceed the shared protocol ceilings, and the per-session waiter cap must not
-exceed the global cap. Invalid combinations fail fast with
+128 global waiters, and 8 waiters per session. Turn waits have their own limits:
+a 5-minute default duration, a 30-minute ceiling, 128 global and 8 per-session
+turn waiters, and a 1,024-event journal. Values must be non-zero, must not
+exceed the shared protocol ceilings (the turn-wait ceiling at most
+`MAX_SESSION_WAIT_TURN_MS`, one day), the per-session waiter caps must not
+exceed their global caps, and the turn-wait default must not exceed its
+ceiling. Invalid combinations fail fast with
 `runtime/observation_limits_invalid`; the daemon does not silently substitute
 defaults.
 
@@ -1574,6 +1582,152 @@ Observation errors are stable and payload-free: `session_terminal_unavailable`,
 fresh screen/tail after runtime change. A worker on the immediately preceding
 private protocol remains usable for existing lifecycle and attach operations,
 but observation returns `worker_feature_unavailable`.
+
+### Turn Waits
+
+`session.wait_turn` blocks until one of the targeted sessions records a turn
+event newer than a cursor, or until the timeout elapses. It is the primitive for
+a manager agent that starts sessions and follows them: chain waits with the
+returned cursor and branch on the reason.
+
+```json
+{
+  "session_ids": ["s-41", "s-42"],
+  "until": ["turn_completed", "agent_blocked", "approval_required", "exited"],
+  "after": "t1.17.1791800000000000000.d-4242-1791799000000000000-0",
+  "timeout_ms": 300000
+}
+```
+
+| Param | Type | Notes |
+|---|---|---|
+| `session_ids` | `SessionId[]` | Required, 1 to `MAX_SESSION_WAIT_TURN_TARGETS` (32), no repeats. Every target must exist when the call starts, or it fails with `session_not_found` before taking a waiter slot. |
+| `until` | `SessionTurnEventKind[]` | Required, non-empty, no repeats: `turn_completed`, `agent_blocked`, `approval_required`, `exited`. |
+| `after` | opaque string, optional | The `cursor` of an earlier result; 1 to `MAX_SESSION_TURN_CURSOR_BYTES` (256) printable ASCII bytes. |
+| `timeout_ms` | `u32`, optional | Non-zero. Omitted means the daemon default (5 minutes). Above the daemon ceiling (30 minutes) the call fails with `session_wait_limit_exceeded`; it is never clamped. |
+
+The wait is edge-triggered: it completes only with an event recorded after
+`after`, or after the call started when `after` is omitted, never with the
+current state. A turn event is recorded when its debounce window ends (see
+"Event sources"), so a turn whose event was recorded before the call is not
+returned, while a stop reported shortly before the call whose window ends
+during the call is. An event recorded between two chained waits is returned by
+the second one.
+With several targets the oldest matching event wins and names its session. The
+call sends no heartbeat frames; the result is the only response line.
+
+```json
+{
+  "reason": "event",
+  "event": {
+    "session_id": "s-42",
+    "kind": "turn_completed",
+    "at": "2026-10-12T10:05:00.123456789Z"
+  },
+  "cursor": "t1.18.1791800700000000000.d-4242-1791799000000000000-0",
+  "progress": [
+    {
+      "session_id": "s-41",
+      "state": "running",
+      "activity": "working",
+      "last_output_at": "2026-10-12T10:04:59.5Z",
+      "output_advanced": true,
+      "turn_started_at": "2026-10-12T10:01:12Z"
+    },
+    {
+      "session_id": "s-42",
+      "state": "running",
+      "activity": "idle",
+      "last_output_at": "2026-10-12T10:04:58Z",
+      "output_advanced": true,
+      "turn_started_at": "2026-10-12T10:03:40Z"
+    }
+  ]
+}
+```
+
+| Result field | Type | Notes |
+|---|---|---|
+| `reason` | `SessionWaitTurnReason` | `event`, `timeout`, `cursor_reset`, or `targets_ended`. |
+| `event` | `SessionTurnEvent`, optional | Present exactly when `reason` is `event`: `session_id`, `kind`, `at` (RFC 3339 time the daemon recorded the event, after any debounce), and `notification_id` when the notification policy kept an inbox record for the same event. |
+| `cursor` | opaque string | Pass it as `after` to the next wait. |
+| `progress` | `SessionTurnProgress[]` | One entry per target, in request order, in every result. |
+
+Each progress entry carries `state`, `activity` (omitted when unknown),
+`last_output_at` (the last terminal output this daemon observed, omitted when
+none), `output_advanced` (output arrived after the cursor was issued, or after
+the call started without a cursor), and `turn_started_at` (the last transition
+into `working` this daemon observed, omitted when none). A timeout with
+`output_advanced: true` and `activity: "working"` reads as "still working, wait
+again"; a long-quiet `last_output_at` reads as "stuck or waiting on an empty
+prompt, investigate".
+
+Reasons:
+
+- `event`: a selected event newer than the cursor was recorded.
+- `timeout`: the duration elapsed without one. The cursor covers every event
+  recorded so far, so the next wait does not see unselected events again.
+- `cursor_reset`: the cursor is not one this daemon instance can place: it was
+  issued by another daemon instance (for example before a restart), is older
+  than the retained journal window, or is not a cursor this daemon issued. The
+  call then returns at once with a fresh cursor at the current end and
+  progress. A wait already in progress also resets when events after its
+  position are evicted from the journal while it waits.
+  Events between the old cursor and the reset are not reported; never treat a
+  reset as "no event happened".
+- `targets_ended`: every target is in a terminal state (`stopped`, `done`,
+  `failed`) and no selected event is newer than the cursor. It returns at once,
+  because no event can follow without an external resume.
+
+The cursor is opaque. Store it, pass it back, and never parse or construct
+one; only the issuing daemon instance can place it. Turn events live in a
+bounded in-memory journal (1,024 events by default) and do not survive a
+daemon restart.
+
+Event sources:
+
+- `turn_completed`, `agent_blocked`, and `approval_required` come from two
+  trusted producers only: provider hook reports through `notification.create`
+  with the `turn:<session_id>` or `attention:<session_id>` dedupe key, from a
+  provider with a hook schema (Claude, Codex, Hermes) whose report the
+  session's runtime admits, for a session this daemon holds (the worker relays
+  its hook socket reports the same way); and the daemon projector's
+  `agent_blocked` for a detected blocked activity. A create from any other
+  producer, or naming a session the daemon does not hold, is handled by the
+  inbox only and records no turn event. Trusted signals are recorded whether or
+  not the notification policy keeps an inbox record. With the default policy,
+  `turn_completed` is disabled for the inbox, so `notification.create` still
+  answers `notification_kind_disabled` and no record is listed, yet the turn
+  event is recorded and completes waits.
+- They follow the attention debounce: an event is recorded when
+  `attention_debounce_secs` (5 seconds by default) has passed since the last
+  signal for the same session and kind, so it arrives no earlier than that
+  window after the agent stops, and later when signals repeat. An
+  `agent_blocked` or `approval_required` is dropped when the session resumes
+  work or ends inside the window. A `turn_completed` is dropped when the
+  session is `working` when its window ends: that is the stale stop of an
+  earlier turn, and the running turn reports its own stop. A turn that starts
+  and stops within the window (a short turn) is recorded once, after its stop.
+- `exited` is recorded when a session the daemon holds moves from a running
+  state into a terminal lifecycle state, at the moment the terminal state
+  becomes visible; a wait that sees every target terminal therefore already
+  finds their exits. A session that ended before the daemon started does not
+  record one; a wait on it returns `targets_ended`.
+
+Errors: `bad_request` (invalid params), `session_not_found` (an unknown target
+at the start, or a target removed during the wait),
+`session_wait_limit_exceeded` (`timeout_ms` above the ceiling),
+`session_waiter_limit_reached` (the turn waiter pool is full), and
+`daemon_shutting_down` (daemon shutdown started during the wait). The turn
+waiter pool is separate from the `session.wait` pool: a call takes one global
+slot and one slot on every target, all or none, and releases them when the
+call returns. Legacy `session.wait` and its 8,000 ms limit are
+unchanged.
+
+A protocol 3 connection does not define the method: the daemon answers
+`method_not_found`, and a current SDK client fails with
+`daemon/daemon_protocol_too_old` before sending it. A protocol 4 daemon of an
+earlier release answers `daemon/method_not_found`.
 
 ### Active-Agent Hook Payloads
 
@@ -2799,6 +2953,11 @@ Request APIs:
   responses that omit epoch- and runtime-scoped activity evidence.
 - `Client::session_wait(SessionWaitParams)`: automatically opens a dedicated
   connection for the bounded long poll.
+- `Client::session_wait_turn(SessionWaitTurnParams)`: opens a dedicated
+  connection whose response deadline is `timeout_ms` plus transport headroom,
+  or `MAX_SESSION_WAIT_TURN_MS` plus headroom when the request leaves the
+  duration to the daemon default, so the client deadline never cuts a valid
+  wait short.
 - `Client::host_governance_inspect()`: calls `host.governance.inspect` with
   exact null parameters and returns the safe `HostGovernanceStatus` projection.
   It has no local cache or mutation behavior.

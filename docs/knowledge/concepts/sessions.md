@@ -34,6 +34,29 @@ evicted; a runtime change means discard old cursors and restart from a fresh
 screen or tail. Waiting calls use dedicated connections, and their timeout is
 the guaranteed waiter-slot release bound after a client disappears.
 
+To follow agents across turns, a client calls the protocol method
+`session.wait_turn` (Rust SDK `Client::session_wait_turn`). It waits for the
+next turn event of one or more sessions, `turn_completed`, `agent_blocked`,
+`approval_required`, or `exited`, newer than an opaque cursor (or newer than
+the call when no cursor is given), bounded by an agent-chosen `timeout_ms`
+(daemon default 5 minutes, ceiling 30 minutes; a longer request fails with
+`session_wait_limit_exceeded`). Every result carries the next `cursor` and, for
+every target, `state`, `activity`, `last_output_at`, `output_advanced` (output
+since the cursor), and `turn_started_at`, so a timeout still tells "still
+working" from "stuck". Chain waits with the returned cursor; an event recorded
+between two waits is returned by the next one. `cursor_reset` means the cursor
+came from another daemon instance or lies outside what the in-memory journal retains
+(also while waiting); take the fresh cursor and inspect the sessions.
+`targets_ended` means every target is terminal and nothing newer is pending.
+Turn events come only from admitted provider hook reports for sessions the
+daemon holds and from the daemon's own projector, and are independent of the
+notification policy: a `turn_completed` the inbox drops (the default) still
+completes the wait. An event is recorded when the attention debounce window
+(5 seconds by default) has passed since the last report, so it arrives no
+earlier than that after the agent stops. A `turn_completed` whose window ends
+while the session is `working` is a stale stop and is dropped; a short turn
+that starts and stops inside one window is still recorded once.
+
 Detection manifests can read `osc_title`, `osc_progress`, `whole_recent`,
 `bottom_lines(N)`, `bottom_non_empty_lines(N)`, `top_non_empty_lines(N)`,
 `last_non_empty_above_prompt_box`, `after_last_prompt_marker`,
@@ -214,7 +237,14 @@ created — the same self-resolve edge described above, applied before the recor
 surfaces rather than after. Only a genuinely outstanding session signal, still unresolved once
 the window elapses, is committed and broadcast. This is distinct from
 `attention_dedupe_window_secs`, which merges duplicate attention reports across
-producers rather than delaying when a session notification surfaces.
+producers rather than delaying when a session notification surfaces. When the
+window elapses the daemon also records the session turn event that
+`session.wait_turn` returns, whether or not the policy keeps an inbox record for
+the kind, when the report came from the projector or from an admitted provider
+hook for a session the daemon holds; a create whose kind the policy disables
+still answers `notification_kind_disabled`. The turn event does not use the
+inbox's stale-stop suppression after resumed work: a `turn_completed` is
+dropped instead when the session is `working` as its window ends.
 
 Unread `turn_completed` rows are bounded per session. A newer
 `turn:<session_id>` record acknowledges any older unread turn for that key with

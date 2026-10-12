@@ -87,6 +87,8 @@ mod resume;
 mod retention;
 mod supervision;
 mod target;
+mod turn_events;
+mod turn_wait;
 
 pub use attach::{RedeemedAttach, RedeemedRuntime};
 pub use package_lifecycle::HostTrustAnchor;
@@ -106,6 +108,7 @@ pub use resume::ProfileChange;
 use resume::ResumeSnapshot;
 pub(crate) use target::ActiveSupervision;
 use target::{build_launch_command, LaunchCommandPlan, PtySessionSpec, TargetResolution};
+pub(crate) use turn_events::TurnEvents;
 
 const DEFAULT_ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
 /// Time to retain a failed raw attach outcome for one control-plane lookup.
@@ -210,6 +213,34 @@ pub const DEFAULT_OBSERVATION_WAIT: Duration =
 pub const DEFAULT_GLOBAL_WAITERS: usize = 128;
 /// Default maximum number of concurrent bounded waits for one session.
 pub const DEFAULT_SESSION_WAITERS: usize = 8;
+/// Default `session.wait_turn` duration when a request omits `timeout_ms`.
+///
+/// Five minutes covers a typical agent turn in one call, so a manager agent
+/// usually wakes on the event itself, while a timeout still returns progress
+/// often enough to notice a stuck session.
+pub const DEFAULT_TURN_WAIT: Duration = Duration::from_mins(5);
+/// Default ceiling on a requested `session.wait_turn` duration.
+///
+/// Thirty minutes bounds how long an abandoned turn-waiter slot can stay held
+/// on a host whose client vanished without closing its connection. It must
+/// not exceed `protocol::MAX_SESSION_WAIT_TURN_MS`.
+pub const DEFAULT_TURN_WAIT_MAX: Duration = Duration::from_mins(30);
+/// Default maximum number of concurrent `session.wait_turn` requests.
+///
+/// Turn waits hold a dedicated connection for minutes; 128 matches the
+/// observation pool and leaves room for many manager agents on one host.
+pub const DEFAULT_TURN_GLOBAL_WAITERS: usize = 128;
+/// Default maximum number of concurrent turn waits targeting one session.
+///
+/// A session usually has one manager; eight leaves room for observers and a
+/// manager restarting its wait while the old connection drains.
+pub const DEFAULT_TURN_SESSION_WAITERS: usize = 8;
+/// Default number of turn events the in-memory journal retains.
+///
+/// Turn events arrive at human interaction rate, so 1,024 entries (about
+/// 100 KB) cover hours of chained waits across many sessions. A cursor older
+/// than the retained window yields `cursor_reset`, never a silent gap.
+pub const DEFAULT_TURN_EVENT_CAPACITY: usize = 1_024;
 /// Default maximum rendered terminal row count accepted by the daemon.
 pub const DEFAULT_SCREEN_ROWS: u16 = 200;
 /// Default maximum rendered terminal column count accepted by the daemon.
@@ -308,6 +339,17 @@ pub struct SessionRegistryConfig {
     pub observation_global_waiters: usize,
     /// Maximum concurrent bounded waiters for one session.
     pub observation_session_waiters: usize,
+    /// `session.wait_turn` duration applied when a request omits `timeout_ms`.
+    pub turn_wait_default: Duration,
+    /// Ceiling on a requested `session.wait_turn` duration; a longer request
+    /// fails with `session_wait_limit_exceeded`.
+    pub turn_wait_max: Duration,
+    /// Maximum concurrent `session.wait_turn` requests.
+    pub turn_global_waiters: usize,
+    /// Maximum concurrent `session.wait_turn` requests targeting one session.
+    pub turn_session_waiters: usize,
+    /// Number of turn events the in-memory journal retains.
+    pub turn_event_capacity: usize,
     /// Submit delay per runtime id, replacing the host setting and the
     /// descriptor's delay for runtimes whose descriptor marks it
     /// configurable. Production leaves this empty: the host setting below
@@ -424,6 +466,11 @@ impl Default for SessionRegistryConfig {
             observation_screen_bytes: protocol::MAX_SESSION_SCREEN_RESPONSE_BYTES,
             observation_global_waiters: DEFAULT_GLOBAL_WAITERS,
             observation_session_waiters: DEFAULT_SESSION_WAITERS,
+            turn_wait_default: DEFAULT_TURN_WAIT,
+            turn_wait_max: DEFAULT_TURN_WAIT_MAX,
+            turn_global_waiters: DEFAULT_TURN_GLOBAL_WAITERS,
+            turn_session_waiters: DEFAULT_TURN_SESSION_WAITERS,
+            turn_event_capacity: DEFAULT_TURN_EVENT_CAPACITY,
             submit_delay_overrides: BTreeMap::new(),
             host_submit_delay: None,
             initial_input_startup_grace: DEFAULT_INITIAL_INPUT_STARTUP_GRACE,
@@ -480,6 +527,8 @@ struct SessionRegistryInner {
     observation_waiters: AtomicUsize,
     /// Per-session active bounded observation waits.
     observation_session_waiters: std::sync::Mutex<HashMap<SessionId, usize>>,
+    /// Turn-event journal, per-session turn progress, and turn waiter pool.
+    turns: TurnEvents,
     /// Set when daemon process shutdown starts. Natural PTY exits observed after
     /// this point are treated as restart fallout, not terminal session state.
     daemon_shutdown_started: AtomicBool,
@@ -580,6 +629,9 @@ struct SessionRegistryInner {
     /// Holds the next committed create before its initial input.
     #[cfg(test)]
     initial_input_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Holds the next committed exit before it is announced.
+    #[cfg(test)]
+    exit_announce_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
     /// Holds the next create between its delivered input and the commit.
     #[cfg(test)]
     initial_input_commit_hold:
@@ -1561,6 +1613,8 @@ impl SessionRegistry {
         let profiles = ProfileRegistry::with_runtimes(config.agents_dir.clone(), runtimes)
             .with_revision_state_dir(config.host_state_dir.clone());
         let retention = retention::RetentionState::new(config.retention_policy_path.clone());
+        let daemon_instance_id = generate_daemon_instance_id();
+        let turns = TurnEvents::new(daemon_instance_id.clone(), config.turn_event_capacity);
         let registry = Self {
             inner: Arc::new(SessionRegistryInner {
                 sessions: Mutex::new(HashMap::new()),
@@ -1574,10 +1628,11 @@ impl SessionRegistry {
                 next_resize_sequence: AtomicU64::new(1),
                 observation_waiters: AtomicUsize::new(0),
                 observation_session_waiters: std::sync::Mutex::new(HashMap::new()),
+                turns,
                 daemon_shutdown_started: AtomicBool::new(false),
                 legacy_migration_pending: AtomicBool::new(false),
                 daemon_shutdown: CancellationToken::new(),
-                daemon_instance_id: generate_daemon_instance_id(),
+                daemon_instance_id,
                 config,
                 launcher,
                 profiles,
@@ -1612,6 +1667,8 @@ impl SessionRegistry {
                 recovery_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 initial_input_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                exit_announce_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 initial_input_commit_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
@@ -1656,6 +1713,15 @@ impl SessionRegistry {
     #[must_use]
     pub fn daemon_instance_id(&self) -> &str {
         &self.inner.daemon_instance_id
+    }
+
+    /// The turn-event journal of this registry.
+    ///
+    /// The notification debounce coordinator records the turn events it
+    /// flushes here, whether or not the inbox policy keeps a record.
+    #[must_use]
+    pub(crate) fn turn_events(&self) -> TurnEvents {
+        self.inner.turns.clone()
     }
 
     fn allocate_session_id() -> SessionId {
@@ -2188,6 +2254,40 @@ impl SessionRegistry {
         let gate = self
             .inner
             .initial_input_commit_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_if(|gate| gate.session_id.as_deref().is_none_or(|held| held == id.0));
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    /// Arms a hold that parks the next committed session exit between the
+    /// state commit and its announcement.
+    #[cfg(test)]
+    pub(crate) fn hold_next_exit_announcement(
+        &self,
+    ) -> crate::runtime::lifecycle::tests::StartGate {
+        let gate = crate::runtime::lifecycle::tests::StartGate {
+            session_id: None,
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        *self
+            .inner
+            .exit_announce_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate.clone());
+        gate
+    }
+
+    /// Parks a committed exit before its announcement when a test armed the hold.
+    #[cfg(test)]
+    async fn hold_exit_announcement(&self, id: &SessionId) {
+        let gate = self
+            .inner
+            .exit_announce_hold
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take_if(|gate| gate.session_id.as_deref().is_none_or(|held| held == id.0));
@@ -2895,6 +2995,9 @@ impl SessionRegistry {
             entry.info.active_agent_session_id = valid_session_id;
             entry.info.active_agent_session_path = valid_session_path;
             let evidence = reported_activity.and_then(|activity| {
+                self.inner
+                    .turns
+                    .note_activity(&params.session_id, entry.info.activity, activity);
                 entry.info.activity = Some(activity);
                 entry.info.state_source = StateSource::Report;
                 record_activity_evidence(entry, activity, StateSource::Report, &activity_epoch)
@@ -3060,6 +3163,21 @@ impl SessionRegistry {
             .inspect(id)
             .await
             .ok_or_else(|| session_not_found(&id.0))
+    }
+
+    /// Whether the registry holds a managed session `id`.
+    pub(crate) async fn holds(&self, id: &SessionId) -> bool {
+        self.inner.sessions.lock().await.contains_key(id)
+    }
+
+    /// The current activity of managed session `id`, when it has one.
+    pub(crate) async fn current_activity(&self, id: &SessionId) -> Option<AgentActivity> {
+        self.inner
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .and_then(|entry| entry.info.activity)
     }
 
     /// Inspect a session by raw id string.
@@ -4461,6 +4579,7 @@ impl SessionRegistry {
         }
         let info = candidate.info.clone();
         self.set_unpersisted(&id.0, None);
+        self.inner.turns.observe_state(id, info.state);
         sessions.insert(id.clone(), candidate);
         RuntimeTransitionOutcome::Applied(Box::new(info))
     }
@@ -4494,6 +4613,7 @@ impl SessionRegistry {
         let replaced = {
             let mut sessions = self.inner.sessions.lock().await;
             self.set_unpersisted(&id.0, None);
+            self.inner.turns.observe_state(id, entry.info.state);
             sessions.insert(id.clone(), entry)
         };
         if let Some(replaced) = replaced {
@@ -4516,6 +4636,7 @@ impl SessionRegistry {
             return false;
         }
         self.set_unpersisted(&id.0, Some(shown));
+        self.inner.turns.observe_state(id, placeholder.info.state);
         sessions.insert(id.clone(), placeholder);
         true
     }
@@ -4524,6 +4645,7 @@ impl SessionRegistry {
     async fn remove_session_entry(&self, id: &SessionId) -> Option<SessionEntry> {
         let mut sessions = self.inner.sessions.lock().await;
         self.set_unpersisted(&id.0, None);
+        self.inner.turns.forget(id);
         sessions.remove(id)
     }
 
@@ -4606,6 +4728,8 @@ impl SessionRegistry {
             }
             RuntimeTransitionOutcome::RetryableConcurrentChange => return Ok(false),
         };
+        #[cfg(test)]
+        self.hold_exit_announcement(id).await;
         updated.detector_cancel.cancel();
         updated.procwatch_cancel.cancel();
         if updated.cancel_attaches {
@@ -5003,6 +5127,9 @@ impl SessionRegistry {
     }
 
     fn emit(&self, name: &str, info: &SessionInfo) {
+        if name == event::SESSION_REMOVED {
+            self.inner.turns.forget(&info.id);
+        }
         let event = crate::events::event(
             name,
             event_payload(SessionEvent {
@@ -6044,6 +6171,7 @@ fn open_runtime_host(plugins_dir: &Path) -> Result<RuntimeHost, ProtocolError> {
 
 fn validate_observation_config(config: &SessionRegistryConfig) -> Result<(), ProtocolError> {
     let hard_wait_ceiling = Duration::from_millis(u64::from(protocol::MAX_SESSION_WAIT_MS));
+    let turn_wait_ceiling = Duration::from_millis(u64::from(protocol::MAX_SESSION_WAIT_TURN_MS));
     let invalid = config.observation_output_bytes == 0
         || config.observation_output_bytes > protocol::MAX_SESSION_OUTPUT_BYTES
         || config.observation_output_wait.is_zero()
@@ -6056,7 +6184,14 @@ fn validate_observation_config(config: &SessionRegistryConfig) -> Result<(), Pro
         || config.observation_screen_bytes > protocol::MAX_SESSION_SCREEN_RESPONSE_BYTES
         || config.observation_global_waiters == 0
         || config.observation_session_waiters == 0
-        || config.observation_session_waiters > config.observation_global_waiters;
+        || config.observation_session_waiters > config.observation_global_waiters
+        || config.turn_wait_default.is_zero()
+        || config.turn_wait_default > config.turn_wait_max
+        || config.turn_wait_max > turn_wait_ceiling
+        || config.turn_global_waiters == 0
+        || config.turn_session_waiters == 0
+        || config.turn_session_waiters > config.turn_global_waiters
+        || config.turn_event_capacity == 0;
     if invalid {
         return Err(ProtocolError::new(
             ErrorClass::Configuration,

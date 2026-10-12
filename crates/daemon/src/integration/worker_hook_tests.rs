@@ -45,14 +45,14 @@ impl DaemonStub {
         };
         policy.providers.clear();
         notifications.set_policy(policy).expect("enable all kinds");
+        let sessions =
+            crate::session::SessionRegistry::new(crate::session::SessionRegistryConfig::default());
         let (attention, _task) =
-            crate::notifications::AttentionCoordinator::spawn(notifications.clone());
+            crate::notifications::AttentionCoordinator::spawn(notifications.clone(), &sessions);
         let state = Arc::new(
             DaemonState::new(
                 HealthInfo::new("test"),
-                crate::session::SessionRegistry::new(
-                    crate::session::SessionRegistryConfig::default(),
-                ),
+                sessions,
                 Arc::new(crate::governance::HostGovernanceService::open_test()),
                 crate::test_support::overlay_registry(),
             )

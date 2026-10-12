@@ -208,7 +208,8 @@ async fn spawn_server(socket: &Path) -> (oneshot::Sender<()>, tokio::task::JoinH
         .set_policy(policy)
         .expect("enable every notification kind");
     // Session-scoped notifications (approval, turn) are debounced by the coordinator.
-    let (attention, _attention_task) = AttentionCoordinator::spawn(notifications.clone());
+    let (attention, _attention_task) =
+        AttentionCoordinator::spawn(notifications.clone(), &registry);
     let state = DaemonState::new(
         HealthInfo::new("0.0.0"),
         registry,

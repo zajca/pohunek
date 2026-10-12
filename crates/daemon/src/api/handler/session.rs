@@ -12,7 +12,7 @@ use protocol::{
     SessionPolicyParams, SessionPolicyResult, SessionReadParams, SessionReleaseAgentParams,
     SessionRenameParams, SessionReportAgentParams, SessionReportNativeIdParams,
     SessionResizeParams, SessionResumeParams, SessionResumeResult, SessionRetentionParams,
-    SessionScreenParams, SessionSetMetadataParams, SessionWaitParams,
+    SessionScreenParams, SessionSetMetadataParams, SessionWaitParams, SessionWaitTurnParams,
 };
 
 use super::util::{error_value, ok_value, ok_value_bounded, parse_optional_params, parse_params};
@@ -397,6 +397,20 @@ pub(super) async fn handle_session_wait(request: &Request, sessions: &SessionReg
         Err(err) => return error_value(request, err),
     };
     match sessions.wait(&params).await {
+        Ok(result) => ok_value(request, &result),
+        Err(err) => error_value(request, err),
+    }
+}
+
+pub(super) async fn handle_session_wait_turn(
+    request: &Request,
+    sessions: &SessionRegistry,
+) -> Response {
+    let params = match parse_params::<SessionWaitTurnParams>(request) {
+        Ok(params) => params,
+        Err(err) => return error_value(request, err),
+    };
+    match sessions.wait_turn(&params).await {
         Ok(result) => ok_value(request, &result),
         Err(err) => error_value(request, err),
     }

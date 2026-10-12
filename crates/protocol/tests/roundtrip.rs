@@ -3342,6 +3342,7 @@ fn host_capabilities_json_shape_roundtrips() {
         terminal_read_supported: true,
         output_read_supported: true,
         session_wait_supported: true,
+        session_wait_turn_supported: true,
     };
 
     let value = serde_json::to_value(&caps).expect("serialize host capabilities");
@@ -3368,7 +3369,8 @@ fn host_capabilities_json_shape_roundtrips() {
             "worktree_supported": true,
             "terminal_read_supported": true,
             "output_read_supported": true,
-            "session_wait_supported": true
+            "session_wait_supported": true,
+            "session_wait_turn_supported": true
         })
     );
 
@@ -3396,6 +3398,10 @@ fn host_capabilities_ignores_unknown_fields_for_additive_evolution() {
     assert_eq!(caps.protocol_version, PROTOCOL_VERSION);
     assert!(!caps.git_available);
     assert!(caps.runtimes.is_empty());
+    assert!(
+        !caps.session_wait_turn_supported,
+        "a host that omits the turn-wait flag does not serve session.wait_turn"
+    );
 }
 
 #[test]

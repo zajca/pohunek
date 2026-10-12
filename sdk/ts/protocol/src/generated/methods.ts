@@ -105,6 +105,8 @@ import type {
   SessionStopResult,
   SessionWaitParams,
   SessionWaitResult,
+  SessionWaitTurnParams,
+  SessionWaitTurnResult,
   WorktreeRemoveParams,
   WorktreeRemoveResult,
 } from "./index";
@@ -171,6 +173,7 @@ export interface Methods {
   "session.set_metadata": { params: SessionSetMetadataParams; output: SessionSetMetadataResult };
   "session.stop": { params: SessionId; output: SessionStopResult };
   "session.wait": { params: SessionWaitParams; output: SessionWaitResult };
+  "session.wait_turn": { params: SessionWaitTurnParams; output: SessionWaitTurnResult };
   "subscribe": { params: null; output: JsonValue };
   "worktree.remove": { params: WorktreeRemoveParams; output: WorktreeRemoveResult };
 }
@@ -238,6 +241,7 @@ export const METHOD_NAMES = [
   "session.set_metadata",
   "session.stop",
   "session.wait",
+  "session.wait_turn",
   "subscribe",
   "worktree.remove",
 ] as const satisfies readonly (keyof Methods)[];

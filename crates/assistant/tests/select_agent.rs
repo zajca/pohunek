@@ -71,6 +71,7 @@ fn capabilities(runtimes: Vec<AgentRuntime>) -> HostCapabilities {
         terminal_read_supported: true,
         output_read_supported: true,
         session_wait_supported: true,
+        session_wait_turn_supported: true,
     }
 }
 

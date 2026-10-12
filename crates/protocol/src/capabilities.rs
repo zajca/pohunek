@@ -95,4 +95,11 @@ pub struct HostCapabilities {
     pub output_read_supported: bool,
     /// Whether managed sessions support bounded `session.wait` long polls.
     pub session_wait_supported: bool,
+    /// Whether the daemon serves `session.wait_turn` turn-event waits.
+    ///
+    /// A daemon that predates the method omits the field, which decodes as
+    /// `false`; `false` is likewise omitted on the wire, so a protocol 3
+    /// snapshot round-trips unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_wait_turn_supported: bool,
 }

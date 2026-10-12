@@ -36,7 +36,7 @@ use crate::{
     SessionResizeResult, SessionResumeParams, SessionResumeResult, SessionRetentionParams,
     SessionRetentionResult, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
     SessionSetMetadataResult, SessionStopResult, SessionWaitParams, SessionWaitResult,
-    WorktreeRemoveParams, WorktreeRemoveResult,
+    SessionWaitTurnParams, SessionWaitTurnResult, WorktreeRemoveParams, WorktreeRemoveResult,
 };
 
 /// A typed control-protocol method contract.
@@ -312,6 +312,16 @@ method_table!(
     SessionWaitResult,
     "SessionWaitParams",
     "SessionWaitResult";
+
+    /// Wait on a dedicated connection for the next turn event of one or more
+    /// sessions, bounded by an agent-chosen timeout under a daemon ceiling.
+    SessionWaitTurn,
+    SESSION_WAIT_TURN,
+    "session.wait_turn",
+    SessionWaitTurnParams,
+    SessionWaitTurnResult,
+    "SessionWaitTurnParams",
+    "SessionWaitTurnResult";
 
     /// Subscribe to daemon events.
     Subscribe,

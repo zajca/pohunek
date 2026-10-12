@@ -23,6 +23,8 @@ mod notification;
 mod package;
 mod project;
 mod session;
+#[cfg(test)]
+mod turn_wait_tests;
 mod util;
 mod worktree;
 
@@ -379,6 +381,9 @@ async fn handle_negotiated(
         method::SESSION_OUTPUT => session::handle_session_output(request, &state.sessions).await,
         method::SESSION_READ => session::handle_session_read(request, &state.sessions).await,
         method::SESSION_WAIT => session::handle_session_wait(request, &state.sessions).await,
+        method::SESSION_WAIT_TURN => {
+            session::handle_session_wait_turn(request, &state.sessions).await
+        }
         method::SESSION_REPORT_NATIVE_ID => {
             session::handle_session_report_native_id(request, &state.sessions).await
         }
@@ -1128,13 +1133,11 @@ mod tests {
         let notifications =
             NotificationService::open(notification_dir.path()).expect("notification service opens");
         enable_all_notification_kinds(&notifications);
-        let (attention, _task) = AttentionCoordinator::spawn(notifications.clone());
-        let state = daemon_state(
-            HealthInfo::new("test"),
-            SessionRegistry::new(SessionRegistryConfig::default()),
-        )
-        .with_notifications(notifications)
-        .with_attention_coordinator(attention);
+        let sessions = SessionRegistry::new(SessionRegistryConfig::default());
+        let (attention, _task) = AttentionCoordinator::spawn(notifications.clone(), &sessions);
+        let state = daemon_state(HealthInfo::new("test"), sessions)
+            .with_notifications(notifications)
+            .with_attention_coordinator(attention);
 
         // Attention create: the handler mints and returns the record, but holds it
         // pending, so it is not yet listable.

@@ -656,6 +656,162 @@ async fn direct_request_timeout_assignment_bounds_session_creation_with_input() 
     inhibitor.release().await;
 }
 
+/// Daemon-side duration of each turn wait the fixture answers, far above the
+/// client's 5 s default request timeout and the 30 min default ceiling.
+const TURN_WAIT_FIXTURE_DELAY: Duration = Duration::from_mins(45);
+
+/// Turn waits the fixture daemon answers: typed helper and generic call, each
+/// with an explicit and an omitted timeout.
+const TURN_WAIT_FIXTURE_CALLS: usize = 4;
+
+/// A turn-wait request the fixture daemon received, answered once the test
+/// sends on `reply`.
+type HeldTurnWait = (Request, oneshot::Sender<()>);
+
+/// Serves the turn-wait scenario: a health reply on the shared connection,
+/// then [`TURN_WAIT_FIXTURE_CALLS`] dedicated turn waits, each held until the
+/// test releases it. Each dedicated request goes to `request_tx`; a request on
+/// the shared connection goes to `stray_tx`.
+fn spawn_turn_wait_daemon(
+    listener: UnixListener,
+    request_tx: tokio::sync::mpsc::UnboundedSender<HeldTurnWait>,
+    stray_tx: tokio::sync::mpsc::UnboundedSender<String>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let (primary, _) = listener.accept().await.expect("accept primary connection");
+        let mut primary = BufReader::new(primary);
+        let mut health_line = String::new();
+        primary
+            .read_line(&mut health_line)
+            .await
+            .expect("read health request");
+        let health: Request =
+            serde_json::from_str(trim_line_end(&health_line)).expect("parse health request");
+        write_health_reply(primary.get_mut(), health.id()).await;
+        // A turn wait sent on the shared connection is reported, so a call
+        // that skips the dedicated connection fails at once.
+        tokio::spawn(async move {
+            let mut stray = String::new();
+            if primary
+                .read_line(&mut stray)
+                .await
+                .is_ok_and(|read| read > 0)
+            {
+                let _ = stray_tx.send(stray);
+            }
+        });
+        for _ in 0..TURN_WAIT_FIXTURE_CALLS {
+            let (dedicated, _) = listener
+                .accept()
+                .await
+                .expect("accept turn wait connection");
+            let mut dedicated = BufReader::new(dedicated);
+            let mut wait_line = String::new();
+            dedicated
+                .read_line(&mut wait_line)
+                .await
+                .expect("read turn wait request");
+            let wait: Request =
+                serde_json::from_str(trim_line_end(&wait_line)).expect("parse turn wait request");
+            let wait_id = wait.id().to_owned();
+            let (reply, release) = oneshot::channel();
+            request_tx
+                .send((wait, reply))
+                .expect("report turn wait request");
+            release.await.expect("the test releases the turn wait");
+            let response = Response::ok(
+                protocol::PROTOCOL_VERSION,
+                wait_id,
+                json!({
+                    "reason": "timeout",
+                    "cursor": "t1.0.1.d-fixture",
+                    "progress": [{
+                        "session_id": "s-1",
+                        "state": "running",
+                        "activity": "working",
+                        "output_advanced": false
+                    }]
+                }),
+            )
+            .expect("create turn wait response");
+            dedicated
+                .get_mut()
+                .write_all(
+                    format!(
+                        "{}\n",
+                        serde_json::to_string(&response).expect("response JSON")
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write turn wait response");
+        }
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn turn_wait_deadline_covers_the_requested_and_the_daemon_default_duration() {
+    let inhibitor = AutoAdvanceInhibitor::new();
+    let socket_file = SocketFile::new();
+    let listener = UnixListener::bind(socket_file.path()).expect("bind fixture daemon");
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (stray_tx, mut stray_rx) = tokio::sync::mpsc::unbounded_channel();
+    let server = spawn_turn_wait_daemon(listener, request_tx, stray_tx);
+
+    let mut client = Client::connect_local_with_options(socket_file.path(), no_origin_options())
+        .await
+        .expect("connect fixture daemon");
+    client.handshake().await.expect("negotiate protocol");
+    let wait_minutes = u32::try_from(TURN_WAIT_FIXTURE_DELAY.as_millis()).expect("fits u32");
+    // The typed helper and the generic typed call, each with an explicit and
+    // an omitted timeout.
+    for (generic, timeout_ms) in [
+        (false, Some(wait_minutes)),
+        (false, None),
+        (true, Some(wait_minutes)),
+        (true, None),
+    ] {
+        let params = protocol::SessionWaitTurnParams::new(
+            vec![protocol::SessionId("s-1".to_owned())],
+            vec![protocol::SessionTurnEventKind::TurnCompleted],
+            None,
+            timeout_ms,
+        )
+        .expect("valid turn wait params");
+        let waiting = tokio::spawn(async move {
+            let result = if generic {
+                client
+                    .call::<protocol::method::SessionWaitTurn>(params)
+                    .await
+            } else {
+                client.session_wait_turn(params).await
+            };
+            (client, result)
+        });
+        let (request, reply) = tokio::select! {
+            request = request_rx.recv() => request.expect("turn wait reached the daemon"),
+            stray = stray_rx.recv() => panic!(
+                "the turn wait (generic: {generic}) used the shared connection: {stray:?}"
+            ),
+        };
+        assert_eq!(request.method(), protocol::method::SESSION_WAIT_TURN);
+        assert_eq!(
+            request.params().get("timeout_ms").and_then(Value::as_u64),
+            timeout_ms.map(u64::from)
+        );
+        // The daemon-side wait lasts this long before it answers.
+        tokio::time::advance(TURN_WAIT_FIXTURE_DELAY + TIMER_TICK).await;
+        reply.send(()).expect("release the turn wait");
+        let (returned, result) = waiting.await.expect("turn wait task joins");
+        client = returned;
+        let result = result.expect("the dedicated deadline outlasts the daemon-side wait");
+        assert_eq!(result.reason, protocol::SessionWaitTurnReason::Timeout);
+    }
+    server.await.expect("fixture daemon completed");
+    drop(socket_file);
+    inhibitor.release().await;
+}
+
 #[test]
 fn request_response_sdk_request_ids_are_method_prefixed_and_unique() {
     let first = next_request_id(protocol::method::DAEMON_HEALTH);

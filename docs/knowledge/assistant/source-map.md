@@ -467,6 +467,11 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/api/handler/session.rs`
 - `crates/daemon/src/session/mod.rs`
 - `crates/daemon/src/session/observation.rs`
+- `crates/daemon/src/session/turn_wait.rs` — `session.wait_turn`: edge-triggered
+  selection, `targets_ended`, `cursor_reset`, per-target progress.
+- `crates/daemon/src/session/turn_events.rs` — the in-memory turn-event journal,
+  cursor placement, `exited` edge detection, output and turn-start times, and
+  the turn waiter pool.
 - `crates/daemon/src/session/diff.rs`
 - `crates/daemon/src/session/hooks.rs`
 - `crates/daemon/src/session/detector.rs`
@@ -698,6 +703,8 @@ Protocol contracts and transport:
 - `crates/protocol/src/envelope.rs`
 - `crates/protocol/src/decimal.rs`
 - `crates/protocol/src/limits.rs`
+- `crates/protocol/src/turn_wait.rs` — `session.wait_turn` params, result,
+  cursor, and progress wire types.
 - `crates/protocol/src/lib.rs`
 - `crates/protocol/src/method.rs`
 - `crates/protocol/src/notification.rs`

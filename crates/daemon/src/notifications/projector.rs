@@ -1,6 +1,6 @@
 //! Derived notifications from session events.
 
-// Rust guideline compliant 2026-09-11
+// Rust guideline compliant 2026-10-12
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -19,8 +19,8 @@ use tracing::warn;
 use crate::session::SessionRegistry;
 
 use super::{
-    is_debounced_create, policy_enables_kind, AttentionCoordinator, NotificationService,
-    ATTENTION_DEDUPE_KEY_PREFIX, TURN_DEDUPE_KEY_PREFIX,
+    is_debounced_create, policy_enables_kind, AttentionCoordinator, DeferredNotification,
+    NotificationService, ATTENTION_DEDUPE_KEY_PREFIX, TURN_DEDUPE_KEY_PREFIX,
 };
 
 /// Provider namespace used for daemon-derived notification records.
@@ -430,7 +430,11 @@ impl ProjectorState {
         notifications: &NotificationService,
         derived: DerivedNotification,
     ) -> Option<PendingNotification> {
-        if !policy_enables_kind(&notifications.policy(), PROJECTOR_PROVIDER, derived.kind) {
+        // A debounced session signal is derived even when the policy drops its
+        // inbox record: the coordinator still records the turn event.
+        if !is_debounced_create(derived.kind, derived.dedupe_key.as_deref())
+            && !policy_enables_kind(&notifications.policy(), PROJECTOR_PROVIDER, derived.kind)
+        {
             return None;
         }
         let transition_epoch = self.next_transition_epoch(&derived.session_id, derived.kind);
@@ -525,7 +529,11 @@ fn defer_pending_notification(
     pending: PendingNotification,
 ) {
     match notifications.prepare_deferred(pending.params) {
-        Ok(record) => attention.defer(record),
+        // The projector derives the signal from the registry's own events.
+        Ok(deferred) => attention.defer(DeferredNotification {
+            signal: true,
+            ..deferred
+        }),
         Err(err) => {
             warn!(
                 error = %err,
@@ -638,6 +646,19 @@ mod tests {
 
     fn service(tag: &str) -> NotificationService {
         NotificationService::open(&temp_data_dir(tag)).expect("open notification service")
+    }
+
+    /// Spawns a coordinator over a registry that holds no session.
+    fn spawn_coordinator(
+        service: &NotificationService,
+    ) -> (
+        AttentionCoordinator,
+        crate::notifications::AttentionCoordinatorTask,
+    ) {
+        AttentionCoordinator::spawn(
+            service.clone(),
+            &crate::session::SessionRegistry::new(crate::session::SessionRegistryConfig::default()),
+        )
     }
 
     fn list(service: &NotificationService) -> Vec<protocol::NotificationRecord> {
@@ -788,7 +809,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn blocked_transition_defers_then_flushes_agent_blocked_notification() {
         let service = service("blocked");
-        let (attention, _task) = AttentionCoordinator::spawn(service.clone());
+        let (attention, _task) = spawn_coordinator(&service);
         let mut projector = ProjectorState::default();
 
         projector
@@ -826,7 +847,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn blocked_then_working_within_window_suppresses_notification() {
         let service = service("resolve-projector");
-        let (attention, _task) = AttentionCoordinator::spawn(service.clone());
+        let (attention, _task) = spawn_coordinator(&service);
         let mut projector = ProjectorState::default();
 
         projector
@@ -862,7 +883,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn working_acknowledges_provider_hook_attention_notification() {
         let service = service("resolve-hook");
-        let (attention, _task) = AttentionCoordinator::spawn(service.clone());
+        let (attention, _task) = spawn_coordinator(&service);
         let mut projector = ProjectorState::default();
 
         // A provider hook creates the attention notification directly (visible),
@@ -892,7 +913,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn idle_keeps_provider_approval_notification_active() {
         let service = service("keep-hook-idle");
-        let (attention, _task) = AttentionCoordinator::spawn(service.clone());
+        let (attention, _task) = spawn_coordinator(&service);
         let mut projector = ProjectorState::default();
 
         service
@@ -916,7 +937,7 @@ mod tests {
     async fn working_acknowledges_provider_hook_turn_notification() {
         let service = service("resolve-turn-hook");
         enable_turn_completed(&service);
-        let (attention, _task) = AttentionCoordinator::spawn(service.clone());
+        let (attention, _task) = spawn_coordinator(&service);
         let mut projector = ProjectorState::default();
 
         service
@@ -944,7 +965,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn repeated_blocked_events_during_one_period_do_not_duplicate() {
         let service = service("blocked-dedupe");
-        let (attention, _task) = AttentionCoordinator::spawn(service.clone());
+        let (attention, _task) = spawn_coordinator(&service);
         let mut projector = ProjectorState::default();
 
         projector
@@ -978,7 +999,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn provider_approval_suppresses_projector_blocked_for_same_attention_key() {
         let service = service("provider-suppresses-projector");
-        let (attention, _task) = AttentionCoordinator::spawn(service.clone());
+        let (attention, _task) = spawn_coordinator(&service);
         let provider = service
             .create(provider_approval_params("s-1"))
             .expect("provider create");
@@ -1117,7 +1138,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn source_ids_are_deterministic_per_kind_transition_epoch() {
         let service = service("source-id");
-        let (attention, _task) = AttentionCoordinator::spawn(service.clone());
+        let (attention, _task) = spawn_coordinator(&service);
         let mut projector = ProjectorState::default();
 
         projector
