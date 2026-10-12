@@ -11,13 +11,14 @@ use pohunek_platform::filesystem::FsError;
 use pohunek_platform::shell_env::SearchPath;
 use pohunek_platform::supervisor::Namespace;
 use pohunek_service_config::{
-    ConfigError, ConfigSpec, Deadlines, ServiceConfig, DEFAULT_INPUT_TIMING, MAX_ALLOWLIST_ENTRIES,
-    MAX_CONFIG_BYTES, MAX_DEADLINE, MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES,
+    ConfigError, ConfigSpec, Deadlines, ServiceConfig, WaitTiming, DEFAULT_INPUT_TIMING,
+    DEFAULT_WAIT_TIMING, MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES, MAX_DEADLINE, MAX_PATTERN_BYTES,
+    MAX_SEARCH_PATH_BYTES,
 };
 use tempfile::TempDir;
 
 /// The schema example from the crate contract.
-const GOLDEN: &str = r#"schema_version = 3
+const GOLDEN: &str = r#"schema_version = 4
 prefix = "/home/u/.local"
 active_version = "0.31.6"
 
@@ -46,12 +47,16 @@ grace_ms = 5000
 initial_startup_grace_ms = 5000
 submit_delay_ms = 150
 
+[waits]
+turn_default_ms = 300000
+turn_max_ms = 1800000
+
 [limits]
 open_files = 8192
 "#;
 
 /// Every required key and the `namespace` table, as a missing-field diagnostic names them.
-const REQUIRED_KEYS: [&str; 20] = [
+const REQUIRED_KEYS: [&str; 23] = [
     "schema_version",
     "prefix",
     "active_version",
@@ -70,6 +75,9 @@ const REQUIRED_KEYS: [&str; 20] = [
     "input",
     "initial_startup_grace_ms",
     "submit_delay_ms",
+    "waits",
+    "turn_default_ms",
+    "turn_max_ms",
     "open_files",
     "namespace",
 ];
@@ -148,6 +156,7 @@ fn spec() -> ConfigSpec {
         search_path: SearchPath::empty(),
         sweep_grace: Duration::from_secs(5),
         input_timing: DEFAULT_INPUT_TIMING,
+        wait_timing: DEFAULT_WAIT_TIMING,
         open_files: 8192,
     }
 }
@@ -207,6 +216,14 @@ fn golden_example_parses_into_typed_values() {
     assert_eq!(config.environment_allowlist()[6], "LC_*");
     assert_eq!(config.sweep_grace(), Duration::from_secs(5));
     assert_eq!(config.input_timing(), DEFAULT_INPUT_TIMING);
+    assert_eq!(
+        config.wait_timing(),
+        WaitTiming {
+            turn_default: Duration::from_mins(5),
+            turn_max: Duration::from_mins(30),
+        }
+    );
+    assert_eq!(config.wait_timing(), DEFAULT_WAIT_TIMING);
     assert_eq!(config.open_files(), 8192);
     assert_eq!(
         config.namespace(),
@@ -222,11 +239,11 @@ fn golden_example_parses_into_typed_values() {
 fn every_missing_key_is_named() {
     let fixture = Fixture::new();
     for key in REQUIRED_KEYS {
-        let text = if key == "namespace" || key == "input" {
-            let (table, next) = if key == "namespace" {
-                ("[namespace]", "[deadlines]")
-            } else {
-                ("[input]", "[limits]")
+        let text = if ["namespace", "input", "waits"].contains(&key) {
+            let (table, next) = match key {
+                "namespace" => ("[namespace]", "[deadlines]"),
+                "input" => ("[input]", "[waits]"),
+                _ => ("[waits]", "[limits]"),
             };
             let start = GOLDEN.find(table).expect("table");
             let end = GOLDEN.find(next).expect("next table");
@@ -259,7 +276,8 @@ fn missing_tables_are_named() {
         ("[deadlines]", "[environment]"),
         ("[environment]", "[sweep]"),
         ("[sweep]", "[input]"),
-        ("[input]", "[limits]"),
+        ("[input]", "[waits]"),
+        ("[waits]", "[limits]"),
     ] {
         let start = GOLDEN.find(table).expect("table");
         let end = GOLDEN.find(next).expect("next table");
@@ -287,6 +305,11 @@ fn unknown_keys_are_rejected_at_every_level() {
             GOLDEN,
             "initial_startup_grace_ms = 5000",
             "initial_startup_grace_ms = 5000\nsurprise = 1",
+        ),
+        replace(
+            GOLDEN,
+            "turn_max_ms = 1800000",
+            "turn_max_ms = 1800000\nsurprise = 1",
         ),
         replace(
             GOLDEN,
@@ -453,21 +476,21 @@ fn other_schema_versions_are_rejected_before_their_keys() {
     let fixture = Fixture::new();
     let newer = replace(
         GOLDEN,
-        "schema_version = 3",
-        "schema_version = 4\nfuture_key = true",
+        "schema_version = 4",
+        "schema_version = 5\nfuture_key = true",
     );
     assert!(matches!(
         fixture.load(&newer),
-        Err(ConfigError::UnsupportedSchema { found: 4 })
+        Err(ConfigError::UnsupportedSchema { found: 5 })
     ));
-    let zero = replace(GOLDEN, "schema_version = 3", "schema_version = 0");
+    let zero = replace(GOLDEN, "schema_version = 4", "schema_version = 0");
     assert!(matches!(
         fixture.load(&zero),
         Err(ConfigError::UnsupportedSchema { found: 0 })
     ));
 }
 
-/// Frozen previous-release shape, independent of the schema-3 writer.
+/// Frozen previous-release shape, independent of the current writer.
 const SCHEMA_TWO_GOLDEN: &str = r#"schema_version = 2
 prefix = "/home/u/.local"
 active_version = "0.33.1"
@@ -513,6 +536,7 @@ fn upgrade_source_explicitly_migrates_schema_two_to_required_input_keys() {
     let source = ServiceConfig::load_upgrade_source(&path).expect("schema 2 upgrade source");
     assert_eq!(source.source_schema_version, 2);
     assert_eq!(source.config.input_timing(), DEFAULT_INPUT_TIMING);
+    assert_eq!(source.config.wait_timing(), DEFAULT_WAIT_TIMING);
     assert_eq!(source.original_bytes(), previous.as_bytes());
     let backup = fixture.root.join("upgrade-backup/service.toml");
     source.write_original(&backup).expect("save private backup");
@@ -525,13 +549,23 @@ fn upgrade_source_explicitly_migrates_schema_two_to_required_input_keys() {
             & 0o777,
         0o600
     );
-    source.config.write(&path).expect("write schema 3");
-    let current = ServiceConfig::load_upgrade_source(&path).expect("schema 3 upgrade source");
-    assert_eq!(current.source_schema_version, 3);
+    source.config.write(&path).expect("write schema 4");
+    let current = ServiceConfig::load_upgrade_source(&path).expect("schema 4 upgrade source");
+    assert_eq!(current.source_schema_version, 4);
     assert_eq!(current.config, source.config);
-    assert!(fs::read_to_string(&path)
-        .expect("read migrated config")
-        .contains("submit_delay_ms = 150"));
+    let migrated = fs::read_to_string(&path).expect("read migrated config");
+    for line in [
+        "schema_version = 4",
+        "submit_delay_ms = 150",
+        "turn_default_ms = 300000",
+        "turn_max_ms = 1800000",
+    ] {
+        assert!(migrated.contains(line), "{line} missing from {migrated}");
+    }
+    assert_eq!(
+        ServiceConfig::load(&path).expect("migrated file loads"),
+        source.config
+    );
     let saved = ServiceConfig::load_upgrade_source(&backup).expect("verified backup");
     assert_eq!(saved.source_schema_version, 2);
     saved
@@ -541,6 +575,102 @@ fn upgrade_source_explicitly_migrates_schema_two_to_required_input_keys() {
     assert!(matches!(
         ServiceConfig::load(&path),
         Err(ConfigError::UnsupportedSchema { found: 2 })
+    ));
+}
+
+/// Frozen schema-3 shape, independent of the current writer. Its `[input]`
+/// values differ from the defaults, so a migration that reset them would show.
+const SCHEMA_THREE_GOLDEN: &str = r#"schema_version = 3
+prefix = "/home/u/.local"
+active_version = "0.40.0"
+
+[namespace]
+uid = 1000
+state_root = "/home/u/.local/state/pohunek"
+runtime_root = "/run/user/1000/pohunek"
+
+[deadlines]
+worker_connect_ms = 10000
+worker_initialize_ms = 45000
+launchctl_command_ms = 10000
+worker_exit_timeout_ms = 30000
+daemon_exit_timeout_ms = 30000
+daemon_restart_throttle_ms = 5000
+
+[environment]
+search_path = ["/usr/bin"]
+allowlist = ["PATH", "HOME", "LANG", "LC_*", "XDG_*"]
+
+[sweep]
+grace_ms = 5000
+
+[input]
+initial_startup_grace_ms = 9000
+submit_delay_ms = 275
+
+[limits]
+open_files = 8192
+"#;
+
+#[test]
+fn upgrade_source_migrates_schema_three_keeping_input_and_adding_default_waits() {
+    let fixture = Fixture::new();
+    let previous = SCHEMA_THREE_GOLDEN.to_owned();
+    let path = fixture.write(&previous, 0o600);
+    assert!(matches!(
+        ServiceConfig::load(&path),
+        Err(ConfigError::UnsupportedSchema { found: 3 })
+    ));
+    let source = ServiceConfig::load_upgrade_source(&path).expect("schema 3 upgrade source");
+    assert_eq!(source.source_schema_version, 3);
+    assert_eq!(source.config.active_version(), "0.40.0");
+    assert_eq!(
+        source.config.input_timing().initial_startup_grace,
+        Duration::from_secs(9)
+    );
+    assert_eq!(
+        source.config.input_timing().submit_delay,
+        Duration::from_millis(275)
+    );
+    assert_eq!(
+        source.config.wait_timing(),
+        WaitTiming {
+            turn_default: Duration::from_mins(5),
+            turn_max: Duration::from_mins(30),
+        }
+    );
+    assert_eq!(source.original_bytes(), previous.as_bytes());
+
+    let backup = fixture.root.join("upgrade-backup/service.toml");
+    source.write_original(&backup).expect("save private backup");
+    assert_eq!(fs::read(&backup).expect("read backup"), previous.as_bytes());
+
+    source.config.write(&path).expect("write schema 4");
+    let migrated = fs::read_to_string(&path).expect("read migrated config");
+    for line in [
+        "schema_version = 4",
+        "initial_startup_grace_ms = 9000",
+        "submit_delay_ms = 275",
+        "[waits]",
+        "turn_default_ms = 300000",
+        "turn_max_ms = 1800000",
+    ] {
+        assert!(migrated.contains(line), "{line} missing from {migrated}");
+    }
+    assert_eq!(
+        ServiceConfig::load(&path).expect("migrated file loads"),
+        source.config
+    );
+
+    let saved = ServiceConfig::load_upgrade_source(&backup).expect("verified backup");
+    assert_eq!(saved.source_schema_version, 3);
+    saved
+        .write_original(&path)
+        .expect("rollback exact schema 3");
+    assert_eq!(fs::read(&path).expect("read rollback"), previous.as_bytes());
+    assert!(matches!(
+        ServiceConfig::load(&path),
+        Err(ConfigError::UnsupportedSchema { found: 3 })
     ));
 }
 
@@ -567,6 +697,33 @@ fn upgrade_source_rejects_invalid_previous_shape_and_unsupported_schema() {
     assert!(matches!(
         ServiceConfig::load_upgrade_source(&path),
         Err(ConfigError::UnsupportedSchema { found: 1 })
+    ));
+    // Schema 3 is parsed in its exact shape: it neither lacks `[input]` nor
+    // carries the `[waits]` table of the current schema.
+    let schema_three = SCHEMA_THREE_GOLDEN;
+    let start = schema_three.find("[input]").expect("input table");
+    let end = schema_three.find("[limits]").expect("limits table");
+    for text in [
+        format!("{}{}", &schema_three[..start], &schema_three[end..]),
+        replace(
+            schema_three,
+            "[limits]",
+            "[waits]\nturn_default_ms = 300000\nturn_max_ms = 1800000\n\n[limits]",
+        ),
+    ] {
+        fixture.write(&text, 0o600);
+        match ServiceConfig::load_upgrade_source(&path) {
+            Err(ConfigError::Parse { .. }) => {}
+            other => panic!("schema 3 of the wrong shape: {other:?}"),
+        }
+    }
+    fixture.write(
+        &replace(GOLDEN, "schema_version = 4", "schema_version = 5"),
+        0o600,
+    );
+    assert!(matches!(
+        ServiceConfig::load_upgrade_source(&path),
+        Err(ConfigError::UnsupportedSchema { found: 5 })
     ));
 }
 
@@ -618,6 +775,108 @@ fn durations_are_bounded() {
         let text = replace(GOLDEN, line, &format!("{name} = {max}"));
         fixture.load(&text).expect("maximum deadline is accepted");
     }
+}
+
+/// The `[waits]` bounds and order rule, from the crate contract: each value
+/// within 5000..=3600000 ms, and the default at most the ceiling.
+#[test]
+fn wait_timings_are_bounded_and_ordered() {
+    let fixture = Fixture::new();
+    let waits = |default_ms: u64, max_ms: u64| {
+        replace(
+            &replace(
+                GOLDEN,
+                "turn_default_ms = 300000",
+                &format!("turn_default_ms = {default_ms}"),
+            ),
+            "turn_max_ms = 1800000",
+            &format!("turn_max_ms = {max_ms}"),
+        )
+    };
+    for (text, key, value) in [
+        (waits(0, 1_800_000), "waits.turn_default_ms", 0),
+        (waits(4_999, 1_800_000), "waits.turn_default_ms", 4_999),
+        (waits(300_000, 3_600_001), "waits.turn_max_ms", 3_600_001),
+        (waits(300_000, 0), "waits.turn_max_ms", 0),
+        (
+            waits(3_600_001, 3_600_001),
+            "waits.turn_default_ms",
+            3_600_001,
+        ),
+    ] {
+        match fixture.load(&text) {
+            Err(ConfigError::OutOfRange {
+                key: rejected,
+                value: rejected_value,
+                min: 5_000,
+                max: 3_600_000,
+            }) => assert_eq!((rejected, rejected_value), (key, value)),
+            other => panic!("{key} = {value}: {other:?}"),
+        }
+    }
+    for (default_ms, max_ms) in [(5_000, 5_000), (5_000, 3_600_000), (3_600_000, 3_600_000)] {
+        let loaded = fixture
+            .load(&waits(default_ms, max_ms))
+            .expect("bounds are inclusive");
+        assert_eq!(
+            loaded.wait_timing(),
+            WaitTiming {
+                turn_default: Duration::from_millis(default_ms),
+                turn_max: Duration::from_millis(max_ms),
+            }
+        );
+    }
+
+    let error = fixture
+        .load(&waits(1_800_001, 1_800_000))
+        .expect_err("a default above the ceiling is refused");
+    assert!(
+        matches!(
+            error,
+            ConfigError::WaitDefaultAboveMax {
+                default_ms: 1_800_001,
+                max_ms: 1_800_000,
+            }
+        ),
+        "{error:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("waits.turn_default_ms") && message.contains("waits.turn_max_ms"),
+        "{message}"
+    );
+}
+
+#[test]
+fn custom_wait_timing_is_loaded_and_preserved_on_write() {
+    let fixture = Fixture::new();
+    let custom = replace(
+        &replace(
+            GOLDEN,
+            "turn_default_ms = 300000",
+            "turn_default_ms = 120000",
+        ),
+        "turn_max_ms = 1800000",
+        "turn_max_ms = 2700000",
+    );
+    let loaded = fixture.load(&custom).expect("load custom wait timing");
+    assert_eq!(
+        loaded.wait_timing(),
+        WaitTiming {
+            turn_default: Duration::from_secs(120),
+            turn_max: Duration::from_mins(45),
+        }
+    );
+    loaded
+        .write(&fixture.path())
+        .expect("write custom wait timing");
+    let written = fs::read_to_string(fixture.path()).expect("read written config");
+    assert!(written.contains("turn_default_ms = 120000"), "{written}");
+    assert!(written.contains("turn_max_ms = 2700000"), "{written}");
+    assert_eq!(
+        ServiceConfig::load(&fixture.path()).expect("reload written config"),
+        loaded
+    );
 }
 
 #[test]
@@ -1224,7 +1483,7 @@ fn invalid_search_paths_are_rejected_without_quoting_the_value() {
 fn a_schema_one_file_is_rejected_with_an_actionable_error() {
     let fixture = Fixture::new();
     let without_search_path = GOLDEN
-        .replacen("schema_version = 3", "schema_version = 1", 1)
+        .replacen("schema_version = 4", "schema_version = 1", 1)
         .lines()
         .filter(|line| !line.starts_with("search_path = "))
         .collect::<Vec<_>>()

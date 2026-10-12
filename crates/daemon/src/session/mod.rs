@@ -215,16 +215,16 @@ pub const DEFAULT_GLOBAL_WAITERS: usize = 128;
 pub const DEFAULT_SESSION_WAITERS: usize = 8;
 /// Default `session.wait_turn` duration when a request omits `timeout_ms`.
 ///
-/// Five minutes covers a typical agent turn in one call, so a manager agent
-/// usually wakes on the event itself, while a timeout still returns progress
-/// often enough to notice a stuck session.
-pub const DEFAULT_TURN_WAIT: Duration = Duration::from_mins(5);
+/// The `service.toml` default (see `pohunek_service_config::DEFAULT_WAIT_TIMING`)
+/// applies to a daemon started without a service file too. Overridable via
+/// [`SessionRegistryConfig::turn_wait_default`].
+pub const DEFAULT_TURN_WAIT: Duration = pohunek_service_config::DEFAULT_WAIT_TIMING.turn_default;
 /// Default ceiling on a requested `session.wait_turn` duration.
 ///
-/// Thirty minutes bounds how long an abandoned turn-waiter slot can stay held
-/// on a host whose client vanished without closing its connection. It must
-/// not exceed `protocol::MAX_SESSION_WAIT_TURN_MS`.
-pub const DEFAULT_TURN_WAIT_MAX: Duration = Duration::from_mins(30);
+/// The `service.toml` default ceiling; it must not exceed
+/// `protocol::MAX_SESSION_WAIT_TURN_MS`. Overridable via
+/// [`SessionRegistryConfig::turn_wait_max`].
+pub const DEFAULT_TURN_WAIT_MAX: Duration = pohunek_service_config::DEFAULT_WAIT_TIMING.turn_max;
 /// Default maximum number of concurrent `session.wait_turn` requests.
 ///
 /// Turn waits hold a dedicated connection for minutes; 128 matches the

@@ -38,10 +38,11 @@
 //!
 //! # Config migration
 //!
-//! A `service.toml` written by the previous release (`schema_version` 2, in
-//! contrast to this crate's [`SCHEMA_VERSION`]) is read only at the upgrade
-//! boundary, through `ServiceConfig::load_upgrade_source`, which adds the
-//! documented default input timings explicitly. Its upgrade is a dedicated
+//! A `service.toml` written by a previous release (`schema_version` 2 or 3,
+//! in contrast to this crate's [`SCHEMA_VERSION`]) is read only at the
+//! upgrade boundary, through `ServiceConfig::load_upgrade_source`, which
+//! assigns the documented defaults to the tables that schema lacks (input
+//! and turn-wait timings) explicitly. Its upgrade is a dedicated
 //! migration flavor of the transaction, journaled in the record's
 //! `config_backup` (`source_schema_version` and the SHA-256 of the exact
 //! pre-upgrade bytes), with two consequences for ordering:
@@ -49,7 +50,7 @@
 //! * Before anything rewrites `service.toml`, the migration saves the exact
 //!   pre-upgrade bytes to an owner-private backup next to the record (the
 //!   `backed_up` step), so a rollback can restore them byte for byte.
-//! * A previous daemon cannot read a schema-3 file: the moment
+//! * A previous daemon cannot read a current-schema file: the moment
 //!   `service.toml` is rewritten, its own strict reader would refuse a restart
 //!   and its restart policy would crash-loop it. The migration therefore
 //!   stops the daemon job (journaling the `stop_daemon` step) after the
@@ -592,7 +593,7 @@ impl<'a> Engine<'a> {
         let gated = self.adoption_gate(&plan, from, version).await?;
         let (resume, rolled_back) = self.resolve_plan(plan).await?;
         // The file is read as an upgrade source, so a previous release's
-        // schema-2 installation upgrades into this one instead of being
+        // schema-2 or schema-3 installation upgrades into this one instead of being
         // refused: the migration below carries its exact bytes and schema.
         let source = load_config_for_upgrade(&config_path)?.ok_or(Error::NotInstalled {
             path: config_path.clone(),
@@ -635,7 +636,7 @@ impl<'a> Engine<'a> {
                 config_schema_migration: None,
             });
         }
-        // A schema-2 source makes this a migration transaction: the record
+        // A previous-schema source makes this a migration transaction: the record
         // journals the exact backup from the start, before any effect.
         let mut record = if let Some(record) = &resume {
             record.clone()
@@ -700,7 +701,7 @@ impl<'a> Engine<'a> {
     /// `plan` swaps the daemon, and applies the operator's choice.
     ///
     /// Runs before any effect of the plan, a rollback included. The installed
-    /// version is read leniently, so a schema-2 source is judged like any
+    /// version is read leniently, so a previous-schema source is judged like any
     /// other.
     async fn adoption_gate(
         &self,
@@ -751,7 +752,7 @@ impl<'a> Engine<'a> {
         let registered = self.resolve_uninstall_pending(options, &mut report).await?;
         let config_path = self.context.config_path();
         // The uninstall reads the installed configuration as an upgrade
-        // source, so it removes a previous release's schema-2 installation
+        // source, so it removes a previous release's schema-2 or schema-3 installation
         // with this version as well, without a migration.
         let config = match (
             load_config_for_upgrade(&config_path)?.map(|source| source.config),
@@ -1288,7 +1289,7 @@ impl<'a> Engine<'a> {
                 {
                     // A journaled migration stop may not have happened yet;
                     // a later swap may have registered the new daemon. Stop
-                    // either job before restoring schema-2 bytes so neither
+                    // either job before restoring previous-schema bytes so neither
                     // can restart against a file it cannot read.
                     match self.backend.daemon().uninstall().await {
                         Ok(()) | Err(supervisor::Error::NotFound(_)) => {}
@@ -1376,7 +1377,7 @@ impl<'a> Engine<'a> {
     /// after verifying them against the record's digest, so the previous
     /// daemon starts against the file it wrote itself. Every other record
     /// rewrites the current file with the previous version, which the
-    /// schema-3 reader of the running daemon understands.
+    /// current-schema reader of the running daemon understands.
     ///
     /// # Errors
     ///
@@ -2379,7 +2380,7 @@ fn load_config(path: &Path) -> Result<Option<ServiceConfig>, Error> {
 /// Loads `service.toml` as an upgrade source, or `None` when it does not
 /// exist.
 ///
-/// The current schema and the previous release's schema 2 are accepted; a
+/// The current schema and the previous schemas 2 and 3 are accepted; a
 /// schema the binary neither writes nor upgrades from is refused with its
 /// regular error, which names `pohunek service uninstall` and `install`.
 fn load_config_for_upgrade(path: &Path) -> Result<Option<UpgradeSource>, Error> {

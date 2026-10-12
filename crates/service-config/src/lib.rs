@@ -10,7 +10,7 @@
 //! # Schema
 //!
 //! ```toml
-//! schema_version = 3
+//! schema_version = 4
 //! prefix = "/home/u/.local"                       # absolute install prefix
 //! active_version = "0.31.6"                       # <prefix>/libexec/pohunek/<version>
 //!
@@ -38,12 +38,28 @@
 //! initial_startup_grace_ms = 5000
 //! submit_delay_ms = 150
 //!
+//! [waits]                                          # milliseconds, 5000..=3600000
+//! turn_default_ms = 300000                         # at most turn_max_ms
+//! turn_max_ms = 1800000
+//!
 //! [limits]
 //! open_files = 8192                                # 256..=1048576
 //! ```
 //!
 //! This crate validates allowlist patterns only syntactically; which names
 //! the installer allowlists by default is decided by its caller.
+//!
+//! `[waits]` bounds `session.wait_turn`: `turn_default_ms` applies when a
+//! caller omits its timeout, and `turn_max_ms` is the ceiling a requested
+//! timeout may not exceed. See [`WaitTiming`] and [`DEFAULT_WAIT_TIMING`].
+//!
+//! # Upgrades
+//!
+//! A normal load accepts only [`SCHEMA_VERSION`]. The installer reads the
+//! previous schemas through [`ServiceConfig::load_upgrade_source`], which
+//! assigns the documented defaults to the tables those schemas lack: schema 2
+//! has neither `[input]` nor `[waits]`, schema 3 has no `[waits]`. Every
+//! value a previous file records is kept.
 //!
 //! `environment.search_path` is the executable search path the installer
 //! resolved (see `pohunek_platform::shell_env`) and hands to the daemon job as
@@ -87,7 +103,7 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-09-30
+// Rust guideline compliant 2026-10-12
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -116,16 +132,49 @@ pub use error::ConfigError;
 ///
 /// A file with any other value is rejected before its keys are interpreted,
 /// so an older binary never half-understands a newer installation and a newer
-/// binary never reads a file that lacks keys it requires. Version 3 added
-/// `[input]`; schema 2 is read only through [`ServiceConfig::load_upgrade_source`].
-pub const SCHEMA_VERSION: u32 = 3;
+/// binary never reads a file that lacks keys it requires. Version 3 holds
+/// `[input]` and version 4 `[waits]`; schemas 2 and 3 are read only through
+/// [`ServiceConfig::load_upgrade_source`].
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Input timings written on fresh installs and assigned explicitly when
-/// upgrading a schema-2 service file, which had no input timing keys.
+/// upgrading a schema-2 service file, which has no input timing keys.
 pub const DEFAULT_INPUT_TIMING: InputTiming = InputTiming {
     initial_startup_grace: Duration::from_secs(5),
     submit_delay: Duration::from_millis(150),
 };
+
+/// Turn-wait timings written on fresh installs, assigned when upgrading a
+/// schema-2 or schema-3 file, and used by a daemon without `service.toml`.
+///
+/// The five-minute default lets an agent that omits a timeout follow a
+/// typical agent turn in one call while still getting a progress report often
+/// enough to notice a stuck session. The thirty-minute ceiling covers long
+/// turns (large builds, test suites) in one wait, and bounds how long one
+/// waiter slot stays taken: a client that disappears without closing its
+/// connection, such as a vanished overlay host, holds its slot until the
+/// timeout. Raising the ceiling lengthens that worst case; lowering the
+/// default makes callers that omit a timeout poll more often.
+pub const DEFAULT_WAIT_TIMING: WaitTiming = WaitTiming {
+    turn_default: Duration::from_mins(5),
+    turn_max: Duration::from_mins(30),
+};
+
+/// Shortest accepted `[waits]` value.
+///
+/// Turn events are counted only after the attention debounce (5 s by
+/// default), so a shorter wait would time out before a turn that ends during
+/// it could count. A smaller value is most likely seconds written as
+/// milliseconds.
+pub const MIN_TURN_WAIT: Duration = Duration::from_secs(5);
+
+/// Longest accepted `[waits]` value.
+///
+/// One hour is twice the default ceiling, room for an operator whose agents
+/// run longer turns, while a waiter slot of a client that vanished without
+/// closing its connection is still released within the hour. It is not
+/// [`MAX_DEADLINE`]: turn waits are not native job timeouts.
+pub const MAX_TURN_WAIT: Duration = Duration::from_hours(1);
 
 /// File name of the configuration inside the application config directory.
 pub const FILE_NAME: &str = "service.toml";
@@ -254,12 +303,26 @@ pub struct InputTiming {
     pub submit_delay: Duration,
 }
 
+/// Turn-wait timings recorded in `[waits]`, in whole milliseconds.
+///
+/// [`ServiceConfig::new`] keeps both within
+/// [`MIN_TURN_WAIT`]`..=`[`MAX_TURN_WAIT`] and `turn_default` at most
+/// `turn_max`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WaitTiming {
+    /// Timeout of a `session.wait_turn` call that names none.
+    pub turn_default: Duration,
+    /// Longest timeout a `session.wait_turn` call may request.
+    pub turn_max: Duration,
+}
+
 /// A validated service file read for an installer upgrade.
 ///
 /// The source schema must be recorded with the upgrade transaction so a
 /// rollback can restore the format understood by the previous daemon.
 pub struct UpgradeSource {
-    /// Current typed values, with explicit input timings added for schema 2.
+    /// Current typed values, with the documented defaults assigned to the
+    /// tables a previous schema lacks.
     pub config: ServiceConfig,
     /// Schema of the file before the upgrade.
     pub source_schema_version: u32,
@@ -322,6 +385,8 @@ pub struct ConfigSpec {
     pub sweep_grace: Duration,
     /// Initial input readiness and Claude submit timings.
     pub input_timing: InputTiming,
+    /// Default and ceiling of a turn wait.
+    pub wait_timing: WaitTiming,
     /// Open-file limit applied to supervised jobs.
     pub open_files: u64,
 }
@@ -343,6 +408,7 @@ pub struct ServiceConfig {
     search_path: SearchPath,
     sweep_grace: Duration,
     input_timing: InputTiming,
+    wait_timing: WaitTiming,
     open_files: u64,
 }
 
@@ -355,8 +421,8 @@ impl ServiceConfig {
     /// non-UTF-8, or oversized path; [`ConfigError::InvalidVersion`],
     /// [`ConfigError::InvalidUid`], [`ConfigError::OutOfRange`],
     /// [`ConfigError::Precision`], [`ConfigError::AllowlistSize`],
-    /// [`ConfigError::InvalidPattern`], or [`ConfigError::DuplicatePattern`]
-    /// for the respective invalid value.
+    /// [`ConfigError::InvalidPattern`], [`ConfigError::DuplicatePattern`], or
+    /// [`ConfigError::WaitDefaultAboveMax`] for the respective invalid value.
     pub fn new(spec: ConfigSpec) -> Result<Self, ConfigError> {
         let layout = validate_prefix(&spec.prefix)?;
         if valid_install_version(&spec.active_version).is_none() {
@@ -399,6 +465,7 @@ impl ServiceConfig {
             spec.input_timing.initial_startup_grace,
         )?;
         validate_duration("input.submit_delay_ms", spec.input_timing.submit_delay)?;
+        validate_wait_timing(spec.wait_timing)?;
         if !(MIN_OPEN_FILES..=MAX_OPEN_FILES).contains(&spec.open_files) {
             return Err(ConfigError::OutOfRange {
                 key: "limits.open_files",
@@ -420,6 +487,7 @@ impl ServiceConfig {
             search_path: spec.search_path,
             sweep_grace: spec.sweep_grace,
             input_timing: spec.input_timing,
+            wait_timing: spec.wait_timing,
             open_files: spec.open_files,
         })
     }
@@ -444,18 +512,21 @@ impl ServiceConfig {
         parse(path, &read_config_text(path)?)
     }
 
-    /// Reads a current or schema-2 service file for an installer upgrade.
+    /// Reads a current, schema-3, or schema-2 service file for an installer upgrade.
     ///
-    /// Schema 2 had no `[input]` table. This method supplies the documented
-    /// [`DEFAULT_INPUT_TIMING`] explicitly; normal daemon and worker loads
-    /// still require every schema-3 key. The caller must preserve the source
+    /// Schema 2 has no `[input]` or `[waits]` table and schema 3 no
+    /// `[waits]`. This method supplies the documented [`DEFAULT_INPUT_TIMING`]
+    /// and [`DEFAULT_WAIT_TIMING`] explicitly for the missing tables and keeps
+    /// every recorded value; normal daemon and worker loads still require
+    /// every key of the current schema. The caller must preserve the source
     /// schema across the transaction and restore it if the old daemon is
     /// restarted on rollback.
     ///
     /// # Errors
     ///
     /// Returns the same trust and validation errors as [`Self::load`], and
-    /// [`ConfigError::UnsupportedSchema`] for schemas other than 2 or 3.
+    /// [`ConfigError::UnsupportedSchema`] for schemas other than 2, 3, or
+    /// [`SCHEMA_VERSION`].
     pub fn load_upgrade_source(path: &Path) -> Result<UpgradeSource, ConfigError> {
         Self::load_upgrade_source_bytes(path, read_config_text(path)?.as_bytes())
     }
@@ -472,7 +543,8 @@ impl ServiceConfig {
     ///
     /// Returns [`ConfigError::Parse`] for bytes that are not UTF-8, invalid
     /// TOML, or a missing, unknown, or mistyped key, and
-    /// [`ConfigError::UnsupportedSchema`] for schemas other than 2 or 3.
+    /// [`ConfigError::UnsupportedSchema`] for schemas other than 2, 3, or
+    /// [`SCHEMA_VERSION`].
     pub fn load_upgrade_source_bytes(
         path: &Path,
         bytes: &[u8],
@@ -543,6 +615,7 @@ impl ServiceConfig {
                 initial_startup_grace_ms: millis(self.input_timing.initial_startup_grace),
                 submit_delay_ms: millis(self.input_timing.submit_delay),
             },
+            waits: RawWaits::from(self.wait_timing),
             limits: RawLimits {
                 open_files: self.open_files,
             },
@@ -569,6 +642,7 @@ impl ServiceConfig {
             search_path: self.search_path.clone(),
             sweep_grace: self.sweep_grace,
             input_timing: self.input_timing,
+            wait_timing: self.wait_timing,
             open_files: self.open_files,
         }
     }
@@ -700,6 +774,12 @@ impl ServiceConfig {
         self.input_timing
     }
 
+    /// Returns the default and ceiling of a turn wait.
+    #[must_use]
+    pub fn wait_timing(&self) -> WaitTiming {
+        self.wait_timing
+    }
+
     /// Returns the open-file limit for supervised jobs.
     #[must_use]
     pub fn open_files(&self) -> u64 {
@@ -743,6 +823,22 @@ fn write_config_text(path: &Path, text: &str) -> Result<(), ConfigError> {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
+    schema_version: u32,
+    prefix: String,
+    active_version: String,
+    namespace: RawNamespace,
+    deadlines: RawDeadlines,
+    environment: RawEnvironment,
+    sweep: RawSweep,
+    input: RawInput,
+    waits: RawWaits,
+    limits: RawLimits,
+}
+
+/// Exact on-disk schema-3 shape accepted only for an explicit upgrade.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfigV3 {
     schema_version: u32,
     prefix: String,
     active_version: String,
@@ -816,6 +912,23 @@ struct RawInput {
     submit_delay_ms: u64,
 }
 
+/// On-disk `[waits]` table in milliseconds.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWaits {
+    turn_default_ms: u64,
+    turn_max_ms: u64,
+}
+
+impl From<WaitTiming> for RawWaits {
+    fn from(timing: WaitTiming) -> Self {
+        Self {
+            turn_default_ms: millis(timing.turn_default),
+            turn_max_ms: millis(timing.turn_max),
+        }
+    }
+}
+
 /// On-disk `[limits]` table.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -846,7 +959,10 @@ fn parse(path: &Path, text: &str) -> Result<ServiceConfig, ConfigError> {
     config_from_raw(raw)
 }
 
-/// Parses only the exact previous schema at the installer upgrade boundary.
+/// Parses the current or an exact previous schema at the installer upgrade boundary.
+///
+/// A previous schema gets the documented defaults for the tables it lacks
+/// and keeps every value it records.
 fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32), ConfigError> {
     let parse_error = |error: toml::de::Error| ConfigError::Parse {
         path: path.to_path_buf(),
@@ -868,10 +984,28 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                     initial_startup_grace_ms: millis(DEFAULT_INPUT_TIMING.initial_startup_grace),
                     submit_delay_ms: millis(DEFAULT_INPUT_TIMING.submit_delay),
                 },
+                waits: RawWaits::from(DEFAULT_WAIT_TIMING),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 2);
             Ok((config_from_raw(raw)?, 2))
+        }
+        Some(toml::Value::Integer(3)) => {
+            let previous: RawConfigV3 = toml::from_str(text).map_err(parse_error)?;
+            let raw = RawConfig {
+                schema_version: SCHEMA_VERSION,
+                prefix: previous.prefix,
+                active_version: previous.active_version,
+                namespace: previous.namespace,
+                deadlines: previous.deadlines,
+                environment: previous.environment,
+                sweep: previous.sweep,
+                input: previous.input,
+                waits: RawWaits::from(DEFAULT_WAIT_TIMING),
+                limits: previous.limits,
+            };
+            debug_assert_eq!(previous.schema_version, 3);
+            Ok((config_from_raw(raw)?, 3))
         }
         _ => Ok((parse(path, text)?, SCHEMA_VERSION)),
     }
@@ -911,6 +1045,10 @@ fn config_from_raw(raw: RawConfig) -> Result<ServiceConfig, ConfigError> {
         input_timing: InputTiming {
             initial_startup_grace: Duration::from_millis(raw.input.initial_startup_grace_ms),
             submit_delay: Duration::from_millis(raw.input.submit_delay_ms),
+        },
+        wait_timing: WaitTiming {
+            turn_default: Duration::from_millis(raw.waits.turn_default_ms),
+            turn_max: Duration::from_millis(raw.waits.turn_max_ms),
         },
         open_files: raw.limits.open_files,
     })
@@ -1116,6 +1254,33 @@ fn validate_duration(key: &'static str, value: Duration) -> Result<(), ConfigErr
     Ok(())
 }
 
+/// Validates each `[waits]` bound and that the default stays within the ceiling.
+fn validate_wait_timing(timing: WaitTiming) -> Result<(), ConfigError> {
+    for (key, value) in [
+        ("waits.turn_default_ms", timing.turn_default),
+        ("waits.turn_max_ms", timing.turn_max),
+    ] {
+        if !value.subsec_nanos().is_multiple_of(NANOS_PER_MILLI) {
+            return Err(ConfigError::Precision { key });
+        }
+        if !(MIN_TURN_WAIT..=MAX_TURN_WAIT).contains(&value) {
+            return Err(ConfigError::OutOfRange {
+                key,
+                value: u64::try_from(value.as_millis()).unwrap_or(u64::MAX),
+                min: millis(MIN_TURN_WAIT),
+                max: millis(MAX_TURN_WAIT),
+            });
+        }
+    }
+    if timing.turn_default > timing.turn_max {
+        return Err(ConfigError::WaitDefaultAboveMax {
+            default_ms: millis(timing.turn_default),
+            max_ms: millis(timing.turn_max),
+        });
+    }
+    Ok(())
+}
+
 /// Validates the environment allowlist syntax, size, and uniqueness.
 fn validate_allowlist(patterns: &[String]) -> Result<(), ConfigError> {
     if patterns.is_empty() || patterns.len() > MAX_ALLOWLIST_ENTRIES {
@@ -1179,8 +1344,13 @@ fn verify_root(key: &'static str, recorded: &Path, actual: &Path) -> Result<(), 
 }
 
 /// Returns a validated duration in whole milliseconds.
+///
+/// # Panics
+///
+/// Panics above `u64::MAX` milliseconds, which no validated duration reaches:
+/// the longest is [`MAX_TURN_WAIT`].
 fn millis(value: Duration) -> u64 {
-    u64::try_from(value.as_millis()).expect("validated durations are at most MAX_DEADLINE")
+    u64::try_from(value.as_millis()).expect("validated durations are at most MAX_TURN_WAIT")
 }
 
 /// Returns a validated path as UTF-8.

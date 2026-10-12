@@ -28,7 +28,7 @@ use pohunek_cli::service::record::{ConfigBackup, Operation, Record, Step, Store}
 use pohunek_cli::service::{Backend, Engine, VERSION};
 use pohunek_platform::process::{HostInspector, ProcessIdentity, ProcessInspector as _};
 use pohunek_platform::supervisor::ServiceObservation;
-use pohunek_service_config::DEFAULT_INPUT_TIMING;
+use pohunek_service_config::{InputTiming, DEFAULT_INPUT_TIMING, DEFAULT_WAIT_TIMING};
 
 /// Version directory the upgrade installs this build under.
 const UPGRADE_SUFFIX: &str = "-upgrade";
@@ -126,7 +126,7 @@ async fn upgrade_with_live_workers_keeps_their_pty_and_version() {
 }
 
 /// Frozen schema-2 shape from the previous service writer. The placeholders
-/// supply this installation's identity; no schema-3 serializer supplies the
+/// supply this installation's identity; no current serializer supplies the
 /// expected bytes of the migration.
 const SCHEMA_TWO_TEMPLATE: &str = r#"# Pohunek service configuration, written by `pohunek service install`.
 # Every key is required; unknown keys are rejected.
@@ -159,10 +159,52 @@ grace_ms = 5000
 open_files = 8192
 "#;
 
+/// Frozen schema-3 shape, the last one without `[waits]`. Its `[input]`
+/// values differ from the defaults, so a migration that reset them would show.
+const SCHEMA_THREE_TEMPLATE: &str = r#"# Pohunek service configuration, written by `pohunek service install`.
+# Every key is required; unknown keys are rejected.
+
+schema_version = 3
+prefix = "{PREFIX}"
+active_version = "{VERSION}"
+
+[namespace]
+uid = {UID}
+state_root = "{STATE_ROOT}"
+runtime_root = "{RUNTIME_ROOT}"
+
+[deadlines]
+worker_connect_ms = 10000
+worker_initialize_ms = 45000
+launchctl_command_ms = 10000
+worker_exit_timeout_ms = 30000
+daemon_exit_timeout_ms = 30000
+daemon_restart_throttle_ms = 5000
+
+[environment]
+search_path = ["/usr/bin"]
+allowlist = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "XDG_*"]
+
+[sweep]
+grace_ms = 5000
+
+[input]
+initial_startup_grace_ms = 9000
+submit_delay_ms = 275
+
+[limits]
+open_files = 8192
+"#;
+
 /// A schema-2 `service.toml` for this isolated installation. Tests capture
 /// these bytes before the transaction and compare them after exact restore.
 fn schema_two_config(installation: &Installation) -> Vec<u8> {
-    SCHEMA_TWO_TEMPLATE
+    previous_config(installation, SCHEMA_TWO_TEMPLATE)
+}
+
+/// `template` with this isolated installation's identity filled in.
+fn previous_config(installation: &Installation, template: &str) -> Vec<u8> {
+    template
         .replace("{PREFIX}", &installation.prefix().display().to_string())
         .replace("{VERSION}", VERSION)
         .replace("{UID}", &nix::unistd::Uid::effective().as_raw().to_string())
@@ -212,7 +254,7 @@ fn backup_path(installation: &Installation) -> PathBuf {
 
 /// The native fixture uses this build for both versions. Once a rollback has
 /// proved the exact schema-2 restore and registered the previous job, repair
-/// only that synthetic reader: the current binary itself requires schema 3.
+/// only that synthetic reader: the current binary itself requires the current schema.
 async fn repair_synthetic_previous_reader(installation: &Installation, backend: &Backend) {
     let config_path = installation.context.config_path();
     let config = pohunek_service_config::ServiceConfig::load_upgrade_source(&config_path)
@@ -220,7 +262,7 @@ async fn repair_synthetic_previous_reader(installation: &Installation, backend: 
         .config;
     config
         .write(&config_path)
-        .expect("write a schema-3 fixture config");
+        .expect("write a current-schema fixture config");
     match backend.daemon().uninstall().await {
         Ok(()) | Err(pohunek_platform::supervisor::Error::NotFound(_)) => {}
         Err(error) => panic!("stop the synthetic previous job: {error}"),
@@ -429,9 +471,10 @@ async fn upgrade_migrates_the_previous_release_config_over_a_stopped_daemon() {
     // The migration rewrote the file into the current schema, with no
     // backup left and no transaction pending.
     let current = pohunek_service_config::ServiceConfig::load(&installation.context.config_path())
-        .expect("schema 3");
+        .expect("current schema");
     assert_eq!(current.active_version(), new);
     assert_eq!(current.input_timing(), DEFAULT_INPUT_TIMING);
+    assert_eq!(current.wait_timing(), DEFAULT_WAIT_TIMING);
     assert!(
         !backup_path(&installation).exists(),
         "the backup goes with the record"
@@ -451,6 +494,78 @@ async fn upgrade_migrates_the_previous_release_config_over_a_stopped_daemon() {
         "the worker stays on its version"
     );
     let _ = schema_two;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn upgrade_migrates_a_schema_three_config_keeping_its_input_timing() {
+    let mut installation = Installation::new();
+    installation.reported_version = Some(VERSION.to_owned());
+    let from = installation.stage();
+    let namespace = installation.context.namespace().expect("namespace");
+    let backend = connect(&installation.context, &namespace).await;
+    let prefix = installation.prefix();
+    let old = VERSION.to_owned();
+    let new = format!("{VERSION}{UPGRADE_SUFFIX}");
+    let versions = prefix.join("libexec/pohunek");
+
+    Engine::new(&installation.context, &backend)
+        .install(&from, &prefix, &old)
+        .await
+        .expect("install version A");
+    let old_daemon = daemon_process(&backend).await;
+    std::fs::write(
+        installation.context.config_path(),
+        previous_config(&installation, SCHEMA_THREE_TEMPLATE),
+    )
+    .expect("write the schema-3 source");
+
+    let report = Engine::new(&installation.context, &backend)
+        .with_reported_version(old.clone())
+        .upgrade(&from, &new)
+        .await
+        .expect("migrating upgrade");
+    assert!(!report.resumed);
+    assert_eq!(
+        report.config_schema_migration,
+        Some(3),
+        "{report:?}: the report names the schema-3 migration"
+    );
+
+    eventually("the daemon restarted from version B", || async {
+        let daemon = backend.daemon().inspect().await.ok()?;
+        daemon.process.filter(|process| {
+            *process != old_daemon
+                && daemon
+                    .definition
+                    .as_ref()
+                    .map(|facts| facts.executable.clone())
+                    == Some(versions.join(&new).join("pohunekd"))
+        })
+    })
+    .await;
+
+    // The recorded input timings survive; the turn-wait timings the schema-3
+    // file lacks are the documented defaults.
+    let current = pohunek_service_config::ServiceConfig::load(&installation.context.config_path())
+        .expect("current schema");
+    assert_eq!(current.active_version(), new);
+    assert_eq!(
+        current.input_timing(),
+        InputTiming {
+            initial_startup_grace: std::time::Duration::from_secs(9),
+            submit_delay: std::time::Duration::from_millis(275),
+        }
+    );
+    assert_eq!(current.wait_timing(), DEFAULT_WAIT_TIMING);
+    assert!(
+        !backup_path(&installation).exists(),
+        "the backup goes with the record"
+    );
+    assert_eq!(pending_record(&installation), None);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -512,7 +627,7 @@ async fn upgrade_resumes_a_migration_from_its_journaled_state() {
     assert_eq!(pending_record(&installation), None);
     assert_eq!(
         pohunek_service_config::ServiceConfig::load(&installation.context.config_path())
-            .expect("schema 3")
+            .expect("current schema")
             .active_version(),
         new
     );
@@ -637,7 +752,7 @@ async fn upgrade_replays_a_journaled_stop_intent_while_the_old_daemon_still_runs
     target_os = "linux",
     ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"
 )]
-async fn upgrade_resumes_after_schema_three_write_before_its_checkpoint() {
+async fn upgrade_resumes_after_current_schema_write_before_its_checkpoint() {
     let mut installation = Installation::new();
     installation.reported_version = Some(VERSION.to_owned());
     let from = installation.stage();
@@ -980,7 +1095,7 @@ async fn migration_rejects_a_third_config_during_the_config_checkpoint_gap() {
     target_os = "linux",
     ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"
 )]
-async fn migration_rejects_edited_schema_three_after_the_config_checkpoint() {
+async fn migration_rejects_edited_current_schema_after_the_config_checkpoint() {
     let mut installation = Installation::new();
     installation.reported_version = Some(VERSION.to_owned());
     let from = installation.stage();
@@ -994,18 +1109,18 @@ async fn migration_rejects_edited_schema_three_after_the_config_checkpoint() {
     )
     .await;
     let expected =
-        std::fs::read_to_string(installation.context.config_path()).expect("journaled schema 3");
+        std::fs::read_to_string(installation.context.config_path()).expect("journaled target");
     let edited = expected.replace("submit_delay_ms = 150", "submit_delay_ms = 151");
     assert_ne!(edited, expected);
     std::fs::write(installation.context.config_path(), &edited)
-        .expect("write valid but unjournaled schema 3");
+        .expect("write valid but unjournaled target");
 
     for version in [format!("{VERSION}{UPGRADE_SUFFIX}"), VERSION.to_owned()] {
         let error = Engine::new(&installation.context, &backend)
             .with_reported_version(VERSION)
             .upgrade(&from, &version)
             .await
-            .expect_err("resume and rollback reject edited schema 3");
+            .expect_err("resume and rollback reject an edited target");
         assert_eq!(error.code(), "service_config_backup_invalid", "{error:?}");
         assert_eq!(
             pending_record(&installation).expect("record kept").step,
