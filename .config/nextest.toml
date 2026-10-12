@@ -15,6 +15,22 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 # .agents/instructions/verification.md, "Flaky tests").
 flaky-result = "fail"
 
+# Tests that share the host process table run one at a time.
+#
+# Each supervised-lifecycle test runs its own daemon and its own native worker
+# jobs, then sweeps the host's process table for the processes of a runtime it
+# lost or removed. Where the kernel withholds the environment of platform
+# binaries (macOS 27), the sweep attributes such a process only by its fork
+# lineage, and it cannot exclude a process that descends from a native job another
+# test started later: that chain ends at the system's first process, which proves
+# nothing. Concurrent installations therefore block each other's cleanups.
+[test-groups]
+supervised-lifecycle = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(=pohunek-daemon) and binary(=supervised_lifecycle)'
+test-group = 'supervised-lifecycle'
+
 [profile.default.archive]
 # Daemon tests spawn the real durable worker from the profile
 # directory of their own test binaries (`target/debug/pohunek-sessiond`), and

@@ -331,6 +331,17 @@ Both checks read the process table from `/proc` (never through `PATH`), kill the
 worker's workload (descendants and the sessions they lead, which outlive a terminated
 worker) before the worker, and signal each process only after re-verifying its start time. Plain `cargo nextest run` relies on
 the guards alone.
+The daemon crate's fixtures end every other process a failing fixture started the same
+way: its `ScopedDir` and thread-scoped roots and the supervised-lifecycle `Installation`
+carry a `ScopeReaper` (`procwatch::scoped_host`) that, on drop and on unwind, kills every
+same-user process whose working directory is at or below the root, read through the
+`pohunek_platform` `HostInspector` (libproc on macOS, `/proc` on Linux); the `Installation`
+reaper spares `pohunek-sessiond` so its `WorkerGuard` still fails the test that leaks a
+worker, and a reaper never panics, because it can drop at thread exit. A fixture process
+whose ownership markers the product must read runs the test binary as the holding image
+(`pohunek_test_support::hold`, declared with `hold_image!`; it returns at once under a
+plain `--ignored` run) instead of a platform binary, because macOS 27 withholds the
+environment of `/bin/sh`, `/bin/cat` and `/bin/sleep`.
 `crates/xtask/tests/hermetic_scan.rs` enforces all of this in test code with no
 baseline. A case where the host state is the subject carries
 `// hermetic-allowed: #<issue> <reason>` on or directly above its line; the

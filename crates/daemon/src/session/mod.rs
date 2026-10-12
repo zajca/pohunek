@@ -6654,7 +6654,15 @@ fn owned_test_worker_roots(
 /// satisfy the job contract.
 #[cfg(test)]
 fn test_supervision(runtime_root: &Path, state_root: &Path) -> SupervisionConfig {
-    crate::runtime::SubprocessWorkerEnvironment {
+    /// Sweep grace of the unit-test fixtures.
+    ///
+    /// The sweep waits this long for a process it cannot attribute before it
+    /// leaves a cleanup unconfirmed, and every refused sweep of a scripted host
+    /// waits it out in real time. A few hundred milliseconds is far above the
+    /// scripted hosts' response time and short enough to keep those scenarios
+    /// quick; the production default is `DEV_SWEEP_GRACE`.
+    const TEST_SWEEP_GRACE: Duration = Duration::from_millis(300);
+    let mut supervision = crate::runtime::SubprocessWorkerEnvironment {
         runtime_home: runtime_root.to_path_buf(),
         state_home: state_root.to_path_buf(),
         data_home: state_root.to_path_buf(),
@@ -6664,7 +6672,9 @@ fn test_supervision(runtime_root: &Path, state_root: &Path) -> SupervisionConfig
         daemon_socket: runtime_root.join("test-daemon.sock"),
     }
     .supervision(PathBuf::from("/nonexistent/pohunek-sessiond"))
-    .with_environment_source(crate::test_support::thread_environment_source())
+    .with_environment_source(crate::test_support::thread_environment_source());
+    supervision.sweep_grace = TEST_SWEEP_GRACE;
+    supervision
 }
 
 #[cfg(test)]

@@ -511,6 +511,70 @@ impl SweepOutcome {
     }
 }
 
+/// Builds the sweep request of one runtime, or logs why it cannot be swept.
+fn sweep_request(
+    session_id: &str,
+    worker_instance_id: &str,
+    bounds: WorkerBounds,
+    expected_session_id: Option<&str>,
+    grace: Duration,
+) -> Option<SweepRequest> {
+    let request = match SweepRequest::new(
+        worker_instance_id,
+        rustix::process::geteuid().as_raw(),
+        grace,
+        SWEEP_POLL_INTERVAL.min(grace),
+    ) {
+        Ok(request) => request
+            .with_runtime_session(session_id)
+            .with_worker_start_identity(bounds.start_identity)
+            .with_worker_spawn_id(bounds.spawn_id),
+        Err(error) => {
+            tracing::warn!(session_id, worker_instance_id, error = %error, "lost runtime cannot be swept");
+            return None;
+        }
+    };
+    Some(match expected_session_id {
+        Some(id) => request.with_session_id(id),
+        None => request,
+    })
+}
+
+/// Whether a sweep pass signalled nothing and skipped only processes whose
+/// ownership markers could not be read.
+fn leaves_only_unreadable(report: &SweepReport) -> bool {
+    !report.skipped.is_empty()
+        && report.terminated.is_empty()
+        && report.killed.is_empty()
+        && report.unconfirmed.is_empty()
+        && report
+            .skipped
+            .iter()
+            .all(|skipped| skipped.reason == SkipReason::MarkersUnreadable)
+}
+
+/// Pauses one poll interval while the settle window of the unreadable-marker
+/// processes is open, and reports whether it paused.
+///
+/// The window opens at the first call and lasts `grace`. Nothing was signalled
+/// when only such processes remain, so repeating the sweep at once would read the
+/// same table: the process is either caught between images, or an orphan of a
+/// creator that has exited and is about to follow it (the fork lineage cannot
+/// attribute it, and on macOS 27 its environment is withheld). The caller leaves
+/// the cleanup unconfirmed once the window has closed.
+async fn settle_unreadable(
+    settle_until: &mut Option<tokio::time::Instant>,
+    grace: Duration,
+) -> bool {
+    let deadline = *settle_until.get_or_insert_with(|| tokio::time::Instant::now() + grace);
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return false;
+    }
+    tokio::time::sleep(SWEEP_POLL_INTERVAL.min(remaining)).await;
+    true
+}
+
 /// Sessions waiting for their supervisor to answer again.
 #[derive(Debug, Default)]
 pub(super) struct SupervisionRetries {
@@ -552,7 +616,10 @@ impl SessionRegistry {
     /// Reaps the processes an ended generation's runtime left behind.
     ///
     /// Runs [`sweep_runtime`] until a pass selects nothing, at most
-    /// [`MAX_SWEEP_PASSES`] times. An unconfirmed exit or a sweep error stops
+    /// [`MAX_SWEEP_PASSES`] times. When only unreadable-marker processes remain,
+    /// the sweep re-reads the process table for up to the sweep grace, so a
+    /// process that is caught between images or about to exit does not leave the
+    /// cleanup unconfirmed. An unconfirmed exit or a sweep error stops
     /// immediately and is reported; a crash classification never repeats the
     /// sweep as a kill loop. Removal sweeps every runtime of the session it
     /// forgets ([`Self::sweep_removed_runtimes`]) and repeats that sweep only
@@ -628,29 +695,23 @@ impl SessionRegistry {
             );
             return SweepOutcome::blocked_by_other();
         };
-        let request = match SweepRequest::new(
+        let Some(request) = sweep_request(
+            session_id,
             worker_instance_id,
-            rustix::process::geteuid().as_raw(),
+            bounds,
+            expected_session_id,
             grace,
-            SWEEP_POLL_INTERVAL.min(grace),
-        ) {
-            Ok(request) => {
-                let request = request
-                    .with_runtime_session(session_id)
-                    .with_worker_start_identity(bounds.start_identity)
-                    .with_worker_spawn_id(bounds.spawn_id);
-                match expected_session_id {
-                    Some(id) => request.with_session_id(id),
-                    None => request,
-                }
-            }
-            Err(error) => {
-                tracing::warn!(session_id, worker_instance_id, error = %error, "lost runtime cannot be swept");
-                return SweepOutcome::blocked_by_other();
-            }
+        ) else {
+            return SweepOutcome::blocked_by_other();
         };
-        let mut last_pass = None;
-        for pass in 1..=MAX_SWEEP_PASSES {
+        // Sweep passes made, not counting the pauses of an unreadable-marker
+        // wait; the pass in flight is `passes + 1`.
+        let mut passes = 0;
+        // End of the wait for unreadable-marker processes, fixed by the first
+        // pass that leaves nothing else to do.
+        let mut settle_until: Option<tokio::time::Instant> = None;
+        let deciding_pass = loop {
+            let pass = passes + 1;
             let report = match sweep_runtime(self.inner.inspector.as_ref(), &request).await {
                 Ok(report) => report,
                 Err(error) => {
@@ -664,11 +725,22 @@ impl SessionRegistry {
                     return SweepOutcome::blocked_by_other();
                 }
             };
-            log_sweep_pass(session_id, worker_instance_id, pass, &report);
             // An unreadable-marker process that could still belong to the
-            // runtime counts as selected, so the sweep is retried: a process
-            // caught between images reads its markers on a later pass, while
-            // one that stays unreadable leaves the cleanup unconfirmed below.
+            // runtime counts as selected; once nothing else remains, the sweep
+            // waits for it (see [`settle_unreadable`]).
+            let only_unreadable = leaves_only_unreadable(&report);
+            let settling = only_unreadable && settle_unreadable(&mut settle_until, grace).await;
+            let role = if settling {
+                PassRole::Settling
+            } else if only_unreadable || passes + 1 >= MAX_SWEEP_PASSES {
+                PassRole::Deciding
+            } else {
+                PassRole::Intermediate
+            };
+            log_sweep_pass(session_id, worker_instance_id, pass, role, &report);
+            if settling {
+                continue;
+            }
             if !report.is_complete()
                 || report
                     .skipped
@@ -691,18 +763,18 @@ impl SessionRegistry {
             if selected == 0 {
                 return SweepOutcome::complete();
             }
-            last_pass = Some(report);
-        }
+            passes += 1;
+            if only_unreadable || passes >= MAX_SWEEP_PASSES {
+                break report;
+            }
+        };
         tracing::warn!(
             session_id,
             worker_instance_id,
-            sweep.passes = MAX_SWEEP_PASSES,
-            "lost runtime still had marked or unreadable processes after every sweep pass"
+            sweep.passes = passes,
+            "lost runtime still had marked or unreadable processes after the sweep settled"
         );
-        match last_pass {
-            Some(report) => self.unreadable_outcome(&report),
-            None => SweepOutcome::blocked_by_other(),
-        }
+        self.unreadable_outcome(&deciding_pass)
     }
 
     /// The outcome of a sweep whose deciding pass still selected processes.
@@ -1413,9 +1485,27 @@ fn stale_orphan(id: &ServiceId) -> RuntimeInventoryEntry {
     }
 }
 
-/// Logs what one pass of a lost-runtime sweep did, and on the deciding last
-/// pass warns about session processes it could not attribute.
-fn log_sweep_pass(session_id: &str, worker_instance_id: &str, pass: usize, report: &SweepReport) {
+/// Role of one sweep pass in the outcome of a lost-runtime sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassRole {
+    /// A re-read while only unreadable-marker processes remain; the pass number
+    /// repeats until the settle window closes.
+    Settling,
+    /// A pass after which the sweep runs again.
+    Intermediate,
+    /// The pass whose report decides the outcome.
+    Deciding,
+}
+
+/// Logs what one pass of a lost-runtime sweep did, and on the deciding pass
+/// warns about session processes it could not attribute.
+fn log_sweep_pass(
+    session_id: &str,
+    worker_instance_id: &str,
+    pass: usize,
+    role: PassRole,
+    report: &SweepReport,
+) {
     let unreadable = report
         .skipped
         .iter()
@@ -1435,10 +1525,11 @@ fn log_sweep_pass(session_id: &str, worker_instance_id: &str, pass: usize, repor
         sweep.unconfirmed = report.unconfirmed.len(),
         sweep.unreadable = unreadable,
         sweep.unmarked = unmarked,
+        sweep.settling = role == PassRole::Settling,
         "swept processes of a lost runtime"
     );
-    // The last pass decides the outcome, so it alone names the cause.
-    if unmarked > 0 && pass == MAX_SWEEP_PASSES {
+    // The deciding pass settles the outcome, so it alone names the cause.
+    if unmarked > 0 && role == PassRole::Deciding {
         let pids = report
             .skipped
             .iter()

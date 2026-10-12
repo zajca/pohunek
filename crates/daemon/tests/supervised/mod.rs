@@ -10,13 +10,23 @@
 //! Workers are the daemon's own per-generation native jobs.
 //!
 //! Dropping the installation retires every job of its namespace, removes the
-//! daemon definition, and kills the probe processes the agent command left.
+//! daemon definition, and kills every process still working in the
+//! installation's root, on success and while a panic unwinds.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-10-12
 
 #[cfg_attr(target_os = "linux", path = "linux.rs")]
 #[cfg_attr(target_os = "macos", path = "macos.rs")]
 pub(crate) mod backend;
+
+/// The daemon's process-table view of a fixture root and the reaper built on it,
+/// included by path as the other integration tests include `readable_host`.
+#[path = "../../src/procwatch/scoped_host.rs"]
+#[expect(
+    dead_code,
+    reason = "the suite uses the reaper only; the scoped table view serves the daemon's own tests"
+)]
+mod scoped_host;
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -168,6 +178,12 @@ pub(crate) struct Installation {
     inspector: HostInspector,
     /// Jobs planted outside the namespace or the daemon, removed on drop.
     extra: backend::Extra,
+    /// Ends the processes working in the root (the agents' hangup-ignoring
+    /// descendants, including those of superseded generations whose probe
+    /// files were overwritten), but spares session workers: the environment's
+    /// `WorkerGuard` fails the test that leaks one. Declared before the root so
+    /// it drops while the root exists.
+    _reaper: scoped_host::ScopeReaper,
     _temporary: TestEnv,
 }
 
@@ -229,6 +245,7 @@ impl Installation {
         let namespace = config.namespace();
         let workers = backend::workers(&paths, &namespace).await;
         let daemon = backend::daemon(&root, &namespace).await;
+        let reaper = scoped_host::ScopeReaper::sparing_workers(&root);
         Self {
             root,
             paths,
@@ -240,6 +257,7 @@ impl Installation {
             daemon,
             inspector: HostInspector::new(),
             extra: backend::Extra::default(),
+            _reaper: reaper,
             _temporary: temporary,
         }
     }
@@ -857,39 +875,6 @@ impl Drop for Installation {
         if teardown.join().is_err() {
             eprintln!("teardown of {} panicked", self.root.display());
         }
-        self.kill_probes();
-    }
-}
-
-impl Installation {
-    /// Kills every hangup-ignoring descendant still running.
-    fn kill_probes(&self) {
-        let Ok(entries) = std::fs::read_dir(&self.probe) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("descendant") {
-                continue;
-            }
-            let Some(pid) = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|text| text.trim().parse::<u32>().ok())
-            else {
-                continue;
-            };
-            // Only a `sleep` still carrying this installation's probe marker
-            // is ours; a reused PID is left alone.
-            let ours = self
-                .inspector
-                .process(pid)
-                .ok()
-                .flatten()
-                .is_some_and(|fact| fact.comm.contains("sleep"));
-            if ours {
-                signal(pid, nix::sys::signal::Signal::SIGKILL);
-            }
-        }
     }
 }
 
@@ -1163,11 +1148,17 @@ fn write_agent_profile(paths: &BasePaths, probe: &Path) {
 /// PTY hangup nor the sweep's `SIGTERM` ends it) and records its PID, prints
 /// and records a counter every [`COUNTER_INTERVAL`], and echoes each input
 /// line. `POHUNEK_SESSION_ID` is part of the worker-provided child identity.
+///
+/// The descendant is the test binary run as the holding image, not a platform
+/// binary: it outlives its parent shell, and the sweep can attribute such an
+/// orphan to the runtime only by the marker in its environment, which macOS 27
+/// withholds from platform binaries.
 pub(crate) fn agent_script(probe: &Path) -> String {
     let probe = path_string(probe);
+    let hold = pohunek_test_support::hold::shell_words();
     format!(
         "p='{probe}'; s=\"$POHUNEK_SESSION_ID\"; \
-         (trap '' HUP TERM; exec sleep 100000) & echo $! > \"$p/$s.descendant\"; \
+         (trap '' HUP TERM; exec {hold}) & echo $! > \"$p/$s.descendant\"; \
          (n=0; while :; do n=$((n+1)); printf 'counter:%04d\\n' \"$n\"; \
          echo \"$n\" > \"$p/$s.counter\"; sleep {COUNTER_INTERVAL}; done) & \
          while IFS= read -r line; do printf 'input:%s\\n' \"$line\"; done"

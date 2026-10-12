@@ -45,6 +45,10 @@
 //! throwaway signing key, trust anchor and signed runtime catalog for tests
 //! that install an official package.
 //!
+//! The [`hold`] module holds the process image fixtures start when they need a
+//! long-lived process whose ownership markers the kernel always exposes, which
+//! a restricted platform binary on macOS 27 is not.
+//!
 //! The [`workers`] module holds [`workers::WorkerGuard`], which terminates the
 //! `pohunek-sessiond` workers a fixture root owns when it drops and fails the
 //! test that left them running; [`env::TestEnv`] carries one for its root.
@@ -60,12 +64,13 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
-// Rust guideline compliant 2026-10-02
+// Rust guideline compliant 2026-10-12
 
 #[cfg(feature = "catalog")]
 pub mod catalog;
 pub mod env;
 pub mod fs;
+pub mod hold;
 pub mod process_env;
 pub mod time;
 pub mod wait;

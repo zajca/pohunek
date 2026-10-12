@@ -728,8 +728,14 @@ mod tests {
 
     #[tokio::test]
     async fn origin_guard_allows_foreign_daemon_to_stop_a_live_session() {
+        // The guard verifies which daemon owns the session from the markers in
+        // the session process's environment. `/bin/sleep` is a platform binary
+        // whose environment macOS 27 withholds, which the guard must read as
+        // unverifiable and deny, so the session runs an image whose environment
+        // every host exposes.
+        let holder = format!("exec {}", pohunek_test_support::hold::shell_words());
         let sessions = SessionRegistry::new(SessionRegistryConfig {
-            shell_command: ShellCommand::new("/bin/sh", ["-c", SLEEP_SESSION_SCRIPT]),
+            shell_command: ShellCommand::new("/bin/sh", ["-c".to_owned(), holder]),
             ..SessionRegistryConfig::default()
         });
         let id = inert_live_session(&sessions).await;
@@ -744,12 +750,13 @@ mod tests {
 
     /// Creates a live shell session whose recorded runtime has no definition.
     async fn inert_live_session(sessions: &SessionRegistry) -> SessionId {
-        let cwd = pohunek_test_support::tempdir().expect("create the session working directory");
+        // Ends with the test thread, together with the processes working in it.
+        let cwd = crate::test_support::thread_scoped_dir("pohunek-cwd-");
         let created = sessions
             .create(SessionNewParams {
                 agent: "shell".to_owned(),
                 name: None,
-                cwd: Some(cwd.path().to_path_buf()),
+                cwd: Some(cwd),
                 cols: 80,
                 rows: 24,
                 project: None,
