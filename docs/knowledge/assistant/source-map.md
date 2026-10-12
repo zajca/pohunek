@@ -429,6 +429,8 @@ Release packaging and contributor verification:
 - `scripts/provision-hermes-compat`
 - `scripts/tests/provision-hermes-compat.sh`
 - `scripts/smoke-hermes-plugin-release`
+- `scripts/build-hermes-package`
+- `crates/xtask/src/hermes/package_host.rs`
 - `docs/runbooks/hermes-operator-plugin.md`
 - `docs/migrations/hermes-operator-plugin.md`
 

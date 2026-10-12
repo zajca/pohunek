@@ -120,6 +120,7 @@ class StageArchiveTest(unittest.TestCase):
             "pohunek-sessiond",
             "packaging/install-daemon.sh",
             "packaging/verify-archive",
+            "packaging/smoke-hermes-plugin-release",
             "completions/pohunek.bash",
             "completions/_pohunek",
             "completions/pohunek.fish",
@@ -160,12 +161,11 @@ class StageArchiveTest(unittest.TestCase):
         # Archives that never carry the anchor do not need it.
         ws.stage("cli")
 
-    def test_cli_archive_carries_the_packaged_smoke_and_no_daemon(self):
+    def test_cli_archive_carries_no_daemon_and_no_daemon_smoke(self):
         ws = Workspace(self)
         staging = ws.out / ws.stage("cli")
-        self.assertTrue((staging / "packaging/smoke-hermes-plugin-release").is_file())
         self.assertFalse((staging / "pohunekd").exists())
-        self.assertFalse((staging / "packaging/install-daemon.sh").exists())
+        self.assertFalse((staging / "packaging").exists())
 
     def test_every_archive_carries_the_release_pages(self):
         for component in ("cli", "daemon", "relay"):

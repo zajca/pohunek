@@ -415,11 +415,25 @@ fn run_hermes(action: HermesAction, root: &Path) -> Result<(), XtaskError> {
     match action {
         HermesAction::Compatibility {
             hermes_bin,
-            pohunek_bin,
+            bin_dir,
+            package,
         } => {
-            let summary = hermes::compatibility(root, &hermes_bin, &pohunek_bin)?;
+            let summary = hermes::compatibility(root, &hermes_bin, &bin_dir, &package)?;
             let message = hermes_compatibility_message(&summary);
             println!("{message}");
+            Ok(())
+        }
+        HermesAction::ThrowawayCatalog {
+            package,
+            output_dir,
+        } => {
+            hermes::write_throwaway_trust(&package, &output_dir)?;
+            println!(
+                "hermes throwaway-catalog ok: {} and {} written to {}",
+                package::ANCHOR_FILE_NAME,
+                hermes::CATALOG_FILE,
+                output_dir.display()
+            );
             Ok(())
         }
         HermesAction::RefreshGoldens { hermes_bin } => {
@@ -673,13 +687,34 @@ enum HermesAction {
         /// Hermes executable to inspect; defaults to PATH resolution.
         #[arg(long, value_name = "PATH", default_value = "hermes")]
         hermes_bin: PathBuf,
-        #[arg(
-            long,
-            value_name = "PATH",
-            required = true,
-            help = "Required absolute canonical path to a safe Pohunek executable: no symlink components and no group- or world-write permissions."
-        )]
-        pohunek_bin: PathBuf,
+        /// Absolute directory holding the release `pohunek`, `pohunekd` and
+        /// `pohunek-sessiond`. Each must be a canonical regular executable
+        /// with no symlink component and no group or world write permission.
+        #[arg(long, value_name = "DIR", required = true)]
+        bin_dir: PathBuf,
+        /// Absolute path of the Hermes runtime package archive (`tar.zst`).
+        /// The gate signs a throwaway catalog for it, installs it through the
+        /// copied daemon, and requires every installed lifecycle envelope to
+        /// report it as the operator asset source.
+        #[arg(long, value_name = "FILE", required = true)]
+        package: PathBuf,
+    },
+    /// Write a signed catalog authorizing one Hermes package archive and the
+    /// trust anchor of its throwaway signing key.
+    ///
+    /// The key comes from operating-system randomness and is never written;
+    /// the catalog lists the package for this machine's platforms with
+    /// placeholder attestations and expires after a day. A daemon trusts it
+    /// only when the anchor file is placed beside its executable, so release
+    /// smokes use it with a private copy of the binaries.
+    ThrowawayCatalog {
+        /// Hermes runtime package archive to authorize.
+        #[arg(long, value_name = "FILE", required = true)]
+        package: PathBuf,
+        /// Directory to create; it receives `runtime-catalog-anchor.json` and
+        /// `runtime-catalog.json`.
+        #[arg(long, value_name = "DIR", required = true)]
+        output_dir: PathBuf,
     },
     /// Refresh sanitized PTY goldens with an explicit Hermes executable.
     RefreshGoldens {

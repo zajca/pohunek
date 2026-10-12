@@ -73,6 +73,15 @@ selected package or version differs from the recorded source, status shows
 `outdated=true` and `integration update` replaces the assets from the selected
 source.
 
+Every `integration` result for Hermes reports in `provenance` the source the
+installed plugin's ownership marker records:
+`{"source":"package","package_id":"pohunek.runtime.hermes","package_digest":"sha256:<hex>"}`
+for a package-backed install, `{"source":"embedded"}` for the copy compiled
+into the CLI, and `null` when no managed plugin is installed (also after
+`uninstall`). It names the recorded source, not the currently selected one:
+compare `package_digest` with the `digest` of `pohunek plugin list --json` to
+see which version is installed.
+
 The Hermes operator plugin is an owner-private, Pohunek-managed integration. It
 is not a same-user sandbox: the daemon remains authoritative for its public API,
 session preconditions, and the origin-session guard.

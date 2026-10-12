@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Controlled release daemon for scripts/tests/smoke-hermes-plugin-release.sh.
+# The test copies it into a release directory and rewrites `mode`.
+set -euo pipefail
+
+mode=ok
+
+for forbidden in POHUNEK_SMOKE_AMBIENT_SENTINEL OPENAI_API_KEY HTTPS_PROXY HERMES_API_KEY; do
+  if [[ -n "${!forbidden+set}" ]]; then
+    exit 91
+  fi
+done
+# The smoke starts the daemon without a service manager and with its anchor
+# beside the executable, where a real daemon reads it.
+if [[ "${POHUNEK_WORKER_LAUNCHER:-}" != subprocess || "${SHELL:-}" != /bin/sh ]]; then
+  exit 95
+fi
+test -f "${0%/*}/runtime-catalog-anchor.json" || exit 96
+if [[ "$mode" == exits ]]; then
+  exit 97
+fi
+
+ready="$XDG_RUNTIME_DIR/pohunek/daemon.ready"
+mkdir -p "${ready%/*}"
+: > "$ready"
+printf 'controlled daemon pid %s\n' "$$"
+sleeper=""
+if [[ "$mode" == ignores-term ]]; then
+  trap '' TERM
+else
+  trap 'rm -f "$ready"; [[ -z "$sleeper" ]] || kill "$sleeper" 2>/dev/null || true; exit 0' TERM
+fi
+while true; do
+  sleep 1 &
+  sleeper=$!
+  wait "$sleeper" || true
+done

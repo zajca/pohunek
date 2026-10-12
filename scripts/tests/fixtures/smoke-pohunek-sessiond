@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Controlled session worker for scripts/tests/smoke-hermes-plugin-release.sh;
+# the smoke starts no session, so it only has to be installed.
+exit 98

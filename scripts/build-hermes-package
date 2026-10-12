@@ -1,0 +1,39 @@
+#!/bin/sh
+# Build the Hermes runtime package archive from its repository sources.
+#
+# usage: build-hermes-package <output-archive>
+#
+# The package's files live in three places of compat/hermes: the descriptor and
+# detection manifest in package/, the closed operator sidecar operator.toml, and
+# its payload in operator/. This script copies exactly those into one fresh
+# package directory and builds it with `cargo xtask package build`, so the
+# compatibility gate and the release plugin smoke install the same bytes an
+# operator host would. Run from the repository root.
+
+set -eu
+
+fail() {
+    printf 'build-hermes-package: %s\n' "$*" >&2
+    exit 1
+}
+
+[ "$#" -eq 1 ] || fail "usage: build-hermes-package <output-archive>"
+output=$1
+source_dir=compat/hermes
+for path in package/runtime.toml package/detect.toml operator.toml operator; do
+    [ -e "$source_dir/$path" ] || fail "missing $source_dir/$path (run from the repository root)"
+done
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/hermes-package.XXXXXX")
+cleanup() {
+    rm -rf -- "$work"
+}
+trap cleanup EXIT
+
+package_dir=$work/hermes
+mkdir "$package_dir"
+cp "$source_dir/package/runtime.toml" "$source_dir/package/detect.toml" \
+    "$source_dir/operator.toml" "$package_dir/"
+cp -R "$source_dir/operator" "$package_dir/operator"
+cargo xtask package build "$package_dir" --output "$output" >&2
+printf '%s\n' "$output"

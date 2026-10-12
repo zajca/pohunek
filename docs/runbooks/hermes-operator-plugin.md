@@ -130,10 +130,26 @@ modified managed file requires the explicit confirmation. Existing non-Hermes
 workers and non-plugin session observation continue normally.
 
 For a release-artifact smoke, run the script bundled under
-`packaging/smoke-hermes-plugin-release` after extracting a CLI archive. Supply
-the archive's `pohunek` binary and an absolute, preinstalled pinned Hermes
-executable. The script creates its own temporary home/profile/state and fails
-hard if either executable is missing or install/status/doctor/uninstall fails;
-it never downloads runtime dependencies or contacts a model/provider. The
-release workflow performs this check for every CLI target before publication;
-repeat it manually when validating a downloaded archive or local canary.
+`packaging/smoke-hermes-plugin-release` after extracting a daemon archive.
+Supply the extracted archive directory, the Hermes runtime package archive, a
+signed catalog that authorizes it, the trust anchor of that catalog's signer,
+and an absolute, preinstalled pinned Hermes executable:
+
+```bash
+packaging/smoke-hermes-plugin-release /abs/pohunek-daemon-X.Y.Z-TARGET \
+  /abs/hermes.tar.zst /abs/runtime-catalog.json \
+  /abs/runtime-catalog-anchor.json /abs/pinned/hermes
+```
+
+Until Hermes ships in the release catalog, build the package from a checkout
+with `scripts/build-hermes-package` and write a catalog and anchor for it with
+`cargo xtask hermes throwaway-catalog --package <archive> --output-dir <dir>`.
+The script copies the binaries into a private prefix with the anchor beside the
+daemon, starts that daemon with its own temporary home/profile/state, installs
+the package with `pohunek plugin install --catalog`, and fails hard if an
+executable is missing, the daemon does not start or stop cleanly,
+install/status/doctor/uninstall fails, or an installed-state result does not
+report the package and its digest as the plugin's provenance. It never
+downloads runtime dependencies or contacts a model/provider. The release
+workflow performs this check for every daemon target before publication; repeat
+it manually when validating a downloaded archive or local canary.

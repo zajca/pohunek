@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
+# Controlled release CLI for scripts/tests/smoke-hermes-plugin-release.sh.
+# The test copies it into a release directory and rewrites `mode`:
+#   ok            installs from the package and reports its provenance
+#   embedded      reports the CLI's embedded copy as the source
+#   wrong-digest  reports another package digest
+#   wrong-layout  installs the plugin below the wrong directory
+#   empty-assets  installs empty plugin files
 set -euo pipefail
+
+mode=ok
 
 for forbidden in POHUNEK_SMOKE_AMBIENT_SENTINEL OPENAI_API_KEY HTTPS_PROXY HERMES_API_KEY; do
   if [[ -n "${!forbidden+set}" ]]; then
@@ -7,9 +16,44 @@ for forbidden in POHUNEK_SMOKE_AMBIENT_SENTINEL OPENAI_API_KEY HTTPS_PROXY HERME
   fi
 done
 
+ready="$XDG_RUNTIME_DIR/pohunek/daemon.ready"
+installed="$XDG_DATA_HOME/installed-package-digest"
+
+sha256_of() {
+  if [[ -x /usr/bin/sha256sum ]]; then
+    /usr/bin/sha256sum -- "$1" | cut -d' ' -f1
+  else
+    /usr/bin/shasum -a 256 -- "$1" | cut -d' ' -f1
+  fi
+}
+
+envelope() {
+  printf '{\n  "cli_version": "controlled",\n  "protocol": {\n    "minimum": 2,\n    "maximum": 2\n  },\n  "ok": %s\n}\n' "$1"
+}
+
+if [[ "${1:-}" == plugin ]]; then
+  test -e "$ready" || exit 1
+  case "${2:-}" in
+    list)
+      envelope '{ "packages": [] }'
+      ;;
+    install)
+      [[ "$#" -eq 7 && -f "$3" && "$4" == --catalog && -f "$5" && "$6" == --yes && "$7" == --json ]] || exit 92
+      digest="sha256:$(sha256_of "$3")"
+      printf '%s\n' "$digest" > "$installed"
+      envelope "{ \"status\": \"installed\", \"package\": { \"origin\": \"official\", \"digest\": \"$digest\" } }"
+      ;;
+    *)
+      exit 93
+      ;;
+  esac
+  exit 0
+fi
+
 if [[ "$#" -lt 2 || "$1" != "integration" ]]; then
   exit 92
 fi
+test -e "$ready" || exit 1
 
 current="$HERMES_HOME"
 while true; do
@@ -25,12 +69,35 @@ while true; do
   fi
 done
 
-plugin_root="$HERMES_HOME/plugins/operators/pohunek"
+hermes_home=""
+previous=""
+for argument in "$@"; do
+  if [[ "$previous" == --hermes-home ]]; then
+    hermes_home="$argument"
+  fi
+  previous="$argument"
+done
+plugin_root="$hermes_home/plugins/operators/pohunek"
+if [[ "$mode" == wrong-layout ]]; then
+  plugin_root="$hermes_home/plugins/pohunek"
+fi
+
+case "$mode" in
+  embedded) provenance='{ "source": "embedded" }' ;;
+  wrong-digest) provenance="{ \"source\": \"package\", \"package_id\": \"pohunek.runtime.hermes\", \"package_digest\": \"sha256:$(printf '0%.0s' $(seq 1 64))\" }" ;;
+  *) provenance="{ \"source\": \"package\", \"package_id\": \"pohunek.runtime.hermes\", \"package_digest\": \"$(cat "$installed")\" }" ;;
+esac
+
 case "$2" in
   install)
     mkdir -p "$plugin_root/skills/pohunek"
-    printf '%s\n' 'name: pohunek' >"$plugin_root/plugin.yaml"
-    printf '%s\n' '# pohunek' >"$plugin_root/skills/pohunek/SKILL.md"
+    if [[ "$mode" == empty-assets ]]; then
+      : > "$plugin_root/plugin.yaml"
+      : > "$plugin_root/skills/pohunek/SKILL.md"
+    else
+      printf '%s\n' 'name: pohunek' >"$plugin_root/plugin.yaml"
+      printf '%s\n' '# pohunek' >"$plugin_root/skills/pohunek/SKILL.md"
+    fi
     ;;
   status|doctor)
     test -f "$plugin_root/plugin.yaml"
@@ -38,9 +105,10 @@ case "$2" in
   uninstall)
     rm -f "$plugin_root/skills/pohunek/SKILL.md" "$plugin_root/plugin.yaml"
     rmdir "$plugin_root/skills/pohunek" "$plugin_root/skills" "$plugin_root"
+    provenance=null
     ;;
   *)
     exit 93
     ;;
 esac
-printf '%s\n' '{"cli_version":"controlled","protocol":{"minimum":2,"maximum":2},"ok":{}}'
+envelope "{ \"action\": \"$2\", \"provenance\": $provenance }"

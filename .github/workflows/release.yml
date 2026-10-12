@@ -521,31 +521,31 @@ jobs:
           done
 
       - name: Install Python for Hermes release verification
-        if: matrix.component == 'cli'
+        if: matrix.component == 'daemon'
         id: python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
       - name: Install uv for Hermes release verification
-        if: matrix.component == 'cli'
+        if: matrix.component == 'daemon'
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           version: "0.9.28"
           enable-cache: true
 
       - name: Install Rust toolchain
-        if: matrix.component == 'cli'
+        if: matrix.component == 'daemon'
         uses: ./.github/actions/setup-rust
 
       - name: Cache cargo build
-        if: matrix.component == 'cli'
+        if: matrix.component == 'daemon'
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: release-macos-verify
 
       - name: Provision locked Hermes runtime
-        if: matrix.component == 'cli'
+        if: matrix.component == 'daemon'
         id: hermes
         shell: /bin/bash {0}
         run: |
@@ -553,20 +553,37 @@ jobs:
           hermes_bin="$(PATH="/bin:$PATH" scripts/provision-hermes-compat "$RUNNER_TEMP/hermes-compat")"
           printf 'bin=%s\n' "$hermes_bin" >> "$GITHUB_OUTPUT"
 
-      - name: Verify packaged CLI against pinned Hermes
-        if: matrix.component == 'cli'
+      # The gate and the packaged smoke install the operator plugin from the
+      # Hermes runtime package through the archive's own daemon. Until Hermes
+      # ships in the release catalog, the package is built from compat/hermes
+      # and authorized by a throwaway catalog whose anchor only the smoke's
+      # private prefix trusts; the archive's production anchor is untouched.
+      - name: Verify packaged daemon against pinned Hermes
+        if: matrix.component == 'daemon'
         shell: /bin/bash {0}
         run: |
           set -euo pipefail
-          release_root="${{ steps.extract.outputs.root }}"
-          release_pohunek="$(cd "$release_root" && pwd -P)/pohunek"
+          release_root="$(cd "${{ steps.extract.outputs.root }}" && pwd -P)"
           packaged_smoke="$release_root/packaging/smoke-hermes-plugin-release"
-          test -x "$release_pohunek"
+          for binary in pohunek pohunekd pohunek-sessiond; do
+            test -x "$release_root/$binary"
+          done
           test -x "$packaged_smoke"
+          package_dir="$RUNNER_TEMP/hermes-package"
+          rm -rf "$package_dir"
+          mkdir -p "$package_dir"
+          scripts/build-hermes-package "$package_dir/hermes.tar.zst"
+          cargo xtask hermes throwaway-catalog \
+            --package "$package_dir/hermes.tar.zst" \
+            --output-dir "$package_dir/trust"
           cargo xtask hermes compatibility \
             --hermes-bin "${{ steps.hermes.outputs.bin }}" \
-            --pohunek-bin "$release_pohunek"
-          PATH="/bin:$PATH" "$packaged_smoke" "$release_pohunek" "${{ steps.hermes.outputs.bin }}"
+            --bin-dir "$release_root" \
+            --package "$package_dir/hermes.tar.zst"
+          PATH="/bin:$PATH" "$packaged_smoke" "$release_root" "$package_dir/hermes.tar.zst" \
+            "$package_dir/trust/runtime-catalog.json" \
+            "$package_dir/trust/runtime-catalog-anchor.json" \
+            "${{ steps.hermes.outputs.bin }}"
 
   # Per-row compatibility attestations, provenance, the signed catalog and
   # bundle, and the archive smoke. The called workflow downloads the artifacts

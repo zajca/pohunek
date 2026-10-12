@@ -1,29 +1,70 @@
 #!/usr/bin/env bash
-# Smoke a packaged Pohunek CLI against an explicitly supplied pinned Hermes.
+# Smoke a packaged Pohunek daemon release against an explicitly supplied pinned
+# Hermes, installing the operator plugin from the Hermes runtime package.
+#
+# usage: smoke-hermes-plugin-release <release-dir> <package-archive> <catalog>
+#                                    <anchor> <hermes-bin>
+#
+# <release-dir> is an extracted daemon archive holding `pohunek`, `pohunekd`
+# and `pohunek-sessiond`. <catalog> is a signed runtime catalog that authorizes
+# <package-archive>, and <anchor> is the trust anchor file that trusts its
+# signer. The three binaries are copied into a private prefix with <anchor>
+# beside the daemon, which is the only place a daemon reads its anchor from;
+# the copied daemon is started, the package is installed with
+# `pohunek plugin install --catalog`, and the Hermes integration lifecycle then
+# runs against it. Every installed-state result must report the package with
+# the archive's digest as its provenance (`source=package`); an install from
+# the CLI's embedded copy fails the smoke.
 #
 # This script deliberately creates every mutable path below one temporary root.
 # It never downloads Hermes, Python/Node dependencies, plugins, or models, and
-# it must be run with an extracted release binary rather than a source-tree
+# it must be run with an extracted release rather than a source-tree
 # `cargo run` command.
 
 set -euo pipefail
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly REQUIRED_ARGUMENTS=2
-readonly CONTROLLED_ARGUMENTS=6
+readonly REQUIRED_ARGUMENTS=5
+readonly CONTROLLED_ARGUMENTS=9
+# The controlled form plus `--daemon-exit-attempts N`, which lets the script's
+# own test bound a daemon that ignores SIGTERM without waiting the full bound.
+readonly CONTROLLED_EXIT_ARGUMENTS=11
 readonly PRIVATE_DIRECTORY_MODE=700
+# The daemon refuses an anchor whose directory chain or file group or others
+# can write; these are the service installer's public modes.
+readonly PUBLIC_EXECUTABLE_MODE=755
+readonly PUBLIC_FILE_MODE=644
 readonly ISOLATED_PATH="/usr/bin:/bin"
 readonly ISOLATED_LOCALE="C"
 readonly NO_COLOR_VALUE="1"
 readonly DEFAULT_TEMP_PARENT="/tmp"
 readonly FALLBACK_TEMP_PARENT="/var/tmp"
+readonly RELEASE_BINARIES=(pohunek pohunekd pohunek-sessiond)
+readonly ANCHOR_FILE_NAME="runtime-catalog-anchor.json"
+readonly PACKAGE_ID="pohunek.runtime.hermes"
+# Shell the daemon hands to terminal sessions; the smoke starts none.
+readonly DAEMON_SHELL="/bin/sh"
+# Direct-child worker supervision, the documented contract for a daemon that
+# runs without a service manager.
+readonly DAEMON_LAUNCHER="subprocess"
+# Readiness is polled through the CLI: 150 attempts 0.2 s apart bound a daemon
+# start at 30 s, ample for opening an empty store on a loaded runner.
+readonly DAEMON_READY_ATTEMPTS=150
+readonly DAEMON_READY_INTERVAL_SECONDS=0.2
+# Exit is polled at the same interval: 300 attempts bound the wait after
+# SIGTERM at 60 s. The daemon stops its workers and flushes its event log
+# (itself bounded at 5 s), so a daemon still running after that is hung; it is
+# then killed with SIGKILL and the smoke fails.
+readonly DAEMON_EXIT_ATTEMPTS=300
+# Trailing daemon-log lines printed when the daemon fails.
+readonly DAEMON_LOG_TAIL_LINES=40
 
 # Absolute utility paths differ by platform (`rm` is /bin/rm on macOS and
 # Linux, `mktemp` and `env` are /usr/bin on macOS). Each utility is resolved
 # from these fixed directories, never from the caller's PATH.
 readonly UTILITY_DIRECTORIES=(/bin /usr/bin)
 
-resolve_utility() {
+find_utility() {
   local name="$1" directory
   for directory in "${UTILITY_DIRECTORIES[@]}"; do
     if [[ -x "$directory/$name" && ! -d "$directory/$name" ]]; then
@@ -31,8 +72,14 @@ resolve_utility() {
       return 0
     fi
   done
-  printf '%s: required utility not found in /bin or /usr/bin: %s\n' "$SCRIPT_NAME" "$name" >&2
-  exit 2
+  return 1
+}
+
+resolve_utility() {
+  if ! find_utility "$1"; then
+    printf '%s: required utility not found in /bin or /usr/bin: %s\n' "$SCRIPT_NAME" "$1" >&2
+    exit 2
+  fi
 }
 
 UNAME_EXECUTABLE="$(resolve_utility uname)"
@@ -40,12 +87,38 @@ ENV_EXECUTABLE="$(resolve_utility env)"
 MKTEMP_EXECUTABLE="$(resolve_utility mktemp)"
 MKDIR_EXECUTABLE="$(resolve_utility mkdir)"
 CHMOD_EXECUTABLE="$(resolve_utility chmod)"
+CP_EXECUTABLE="$(resolve_utility cp)"
 RM_EXECUTABLE="$(resolve_utility rm)"
-readonly UNAME_EXECUTABLE ENV_EXECUTABLE MKTEMP_EXECUTABLE MKDIR_EXECUTABLE CHMOD_EXECUTABLE RM_EXECUTABLE
+TR_EXECUTABLE="$(resolve_utility tr)"
+TAIL_EXECUTABLE="$(resolve_utility tail)"
+SLEEP_EXECUTABLE="$(resolve_utility sleep)"
+PS_EXECUTABLE="$(resolve_utility ps)"
+readonly UNAME_EXECUTABLE ENV_EXECUTABLE MKTEMP_EXECUTABLE MKDIR_EXECUTABLE CHMOD_EXECUTABLE \
+  CP_EXECUTABLE RM_EXECUTABLE TR_EXECUTABLE TAIL_EXECUTABLE SLEEP_EXECUTABLE PS_EXECUTABLE
+
+# Linux ships sha256sum; macOS ships `shasum -a 256`.
+if SHA256SUM_EXECUTABLE="$(find_utility sha256sum)"; then
+  SHASUM_EXECUTABLE=""
+elif SHASUM_EXECUTABLE="$(find_utility shasum)"; then
+  SHA256SUM_EXECUTABLE=""
+else
+  printf '%s: required utility not found in /bin or /usr/bin: sha256sum or shasum\n' "$SCRIPT_NAME" >&2
+  exit 2
+fi
+readonly SHA256SUM_EXECUTABLE SHASUM_EXECUTABLE
+
+# Prints the lowercase SHA-256 of file $1 followed by its name.
+sha256_line() {
+  if [[ -n "$SHA256SUM_EXECUTABLE" ]]; then
+    "$SHA256SUM_EXECUTABLE" -- "$1"
+  else
+    "$SHASUM_EXECUTABLE" -a 256 -- "$1"
+  fi
+}
 
 # Longest Unix socket path in bytes, terminator included (`DARWIN_` and
-# `LINUX_SOCKET_PATH_MAX_BYTES` in crates/paths/src/lib.rs). The CLI places its
-# daemon socket at $XDG_RUNTIME_DIR/pohunek/daemon.sock, and this script sets
+# `LINUX_SOCKET_PATH_MAX_BYTES` in crates/paths/src/lib.rs). The daemon binds
+# its socket at $XDG_RUNTIME_DIR/pohunek/daemon.sock, and this script sets
 # XDG_RUNTIME_DIR to `xdg-runtime` below the smoke root.
 readonly DARWIN_SOCKET_PATH_MAX_BYTES=103
 readonly LINUX_SOCKET_PATH_MAX_BYTES=107
@@ -61,13 +134,27 @@ socket_path_limit() {
 }
 
 usage() {
-  printf 'usage: %s /absolute/path/to/release/pohunek /absolute/path/to/pinned/hermes\n' "$SCRIPT_NAME" >&2
+  printf 'usage: %s /abs/release-dir /abs/package.tar.zst /abs/runtime-catalog.json /abs/runtime-catalog-anchor.json /abs/pinned/hermes\n' "$SCRIPT_NAME" >&2
 }
 
-absolute_executable() {
+fail() {
+  printf '%s: %s\n' "$SCRIPT_NAME" "$1" >&2
+  exit 1
+}
+
+absolute_directory() {
   local candidate="$1"
-  if [[ "$candidate" != /* || ! -f "$candidate" || ! -x "$candidate" ]]; then
-    printf '%s: expected an executable absolute path\n' "$SCRIPT_NAME" >&2
+  if [[ "$candidate" != /* || ! -d "$candidate" ]]; then
+    printf '%s: expected an absolute directory path\n' "$SCRIPT_NAME" >&2
+    exit 2
+  fi
+  (cd -- "$candidate" && pwd -P)
+}
+
+absolute_file() {
+  local candidate="$1"
+  if [[ "$candidate" != /* || ! -f "$candidate" ]]; then
+    printf '%s: expected an absolute regular file path\n' "$SCRIPT_NAME" >&2
     exit 2
   fi
   local candidate_directory="${candidate%/*}"
@@ -77,21 +164,18 @@ absolute_executable() {
   printf '%s/%s\n' "$directory" "$candidate_name"
 }
 
+absolute_executable() {
+  local resolved
+  resolved="$(absolute_file "$1")"
+  if [[ ! -x "$resolved" ]]; then
+    printf '%s: expected an executable absolute path\n' "$SCRIPT_NAME" >&2
+    exit 2
+  fi
+  printf '%s\n' "$resolved"
+}
+
 run_isolated() {
-  "$ENV_EXECUTABLE" -i \
-    HOME="$release_smoke_home" \
-    HERMES_HOME="$release_smoke_hermes_home" \
-    XDG_CONFIG_HOME="$release_smoke_xdg_config" \
-    XDG_DATA_HOME="$release_smoke_xdg_data" \
-    XDG_STATE_HOME="$release_smoke_xdg_state" \
-    XDG_CACHE_HOME="$release_smoke_xdg_cache" \
-    XDG_RUNTIME_DIR="$release_smoke_xdg_runtime" \
-    PATH="$ISOLATED_PATH" \
-    LANG="$ISOLATED_LOCALE" \
-    LC_ALL="$ISOLATED_LOCALE" \
-    NO_COLOR="$NO_COLOR_VALUE" \
-    PYTHONDONTWRITEBYTECODE=1 \
-    "$@"
+  "$ENV_EXECUTABLE" -i "${isolated_environment[@]}" "$@"
 }
 
 # Prints the symlink-free form of the writable directory $1 when neither it nor
@@ -147,24 +231,67 @@ select_temp_parent() {
   return 1
 }
 
-if [[ "$#" -ne "$REQUIRED_ARGUMENTS" && "$#" -ne "$CONTROLLED_ARGUMENTS" ]]; then
+# The pretty-printed `--json` document of a command with every whitespace
+# character removed. JSON values compared below hold no whitespace, so a field
+# can be matched as one exact compact substring.
+compact_json() {
+  "$TR_EXECUTABLE" -d '[:space:]' <<<"$1"
+}
+
+daemon_log_tail() {
+  "$TAIL_EXECUTABLE" -n "$DAEMON_LOG_TAIL_LINES" -- "$release_smoke_daemon_log" >&2 || true
+}
+
+# Requires the integration result of action $1 (compact JSON $2) to report the
+# installed package archive as its provenance.
+require_package_provenance() {
+  local action="$1" compact="$2"
+  local expected="\"provenance\":{\"source\":\"package\",\"package_id\":\"$PACKAGE_ID\",\"package_digest\":\"$package_digest\"}"
+  if [[ "$compact" == *'"provenance":{"source":"embedded"}'* ]]; then
+    fail "integration $action reported source=embedded: the operator assets came from the CLI's embedded copy, not from the Hermes package"
+  fi
+  if [[ "$compact" != *"$expected"* ]]; then
+    fail "integration $action did not report the installed Hermes package $package_digest as its provenance"
+  fi
+}
+
+if [[ "$#" -ne "$REQUIRED_ARGUMENTS" && "$#" -ne "$CONTROLLED_ARGUMENTS" && "$#" -ne "$CONTROLLED_EXIT_ARGUMENTS" ]]; then
   usage
   exit 2
 fi
 
 temp_parent_primary="$DEFAULT_TEMP_PARENT"
 temp_parent_fallback="$FALLBACK_TEMP_PARENT"
-if [[ "$#" -eq "$CONTROLLED_ARGUMENTS" ]]; then
-  if [[ "$3" != "--temp-parent-primary" || "$5" != "--temp-parent-fallback" ]]; then
+daemon_exit_attempts="$DAEMON_EXIT_ATTEMPTS"
+if [[ "$#" -ge "$CONTROLLED_ARGUMENTS" ]]; then
+  if [[ "$6" != "--temp-parent-primary" || "$8" != "--temp-parent-fallback" ]]; then
     usage
     exit 2
   fi
-  temp_parent_primary="$4"
-  temp_parent_fallback="$6"
+  temp_parent_primary="$7"
+  temp_parent_fallback="$9"
 fi
+if [[ "$#" -eq "$CONTROLLED_EXIT_ARGUMENTS" ]]; then
+  if [[ "${10}" != "--daemon-exit-attempts" || ! "${11}" =~ ^[1-9][0-9]*$ ]]; then
+    usage
+    exit 2
+  fi
+  daemon_exit_attempts="${11}"
+fi
+readonly daemon_exit_attempts
 
-release_pohunek="$(absolute_executable "$1")"
-pinned_hermes="$(absolute_executable "$2")"
+release_dir="$(absolute_directory "$1")"
+release_package="$(absolute_file "$2")"
+release_catalog="$(absolute_file "$3")"
+release_anchor="$(absolute_file "$4")"
+pinned_hermes="$(absolute_executable "$5")"
+for binary in "${RELEASE_BINARIES[@]}"; do
+  absolute_executable "$release_dir/$binary" >/dev/null
+done
+package_digest="sha256:$(sha256_line "$release_package")"
+package_digest="${package_digest%% *}"
+[[ "$package_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "cannot compute the package archive digest"
+
 release_smoke_parent="$(select_temp_parent "$temp_parent_primary" "$temp_parent_fallback")"
 release_smoke_root="$(
   "$ENV_EXECUTABLE" -i \
@@ -180,7 +307,7 @@ release_smoke_root="$(
     LC_ALL="$ISOLATED_LOCALE" \
     NO_COLOR="$NO_COLOR_VALUE" \
     PYTHONDONTWRITEBYTECODE=1 \
-    "$MKTEMP_EXECUTABLE" -d "$release_smoke_parent/pohunek-hermes-release.XXXXXX"
+    "$MKTEMP_EXECUTABLE" -d "$release_smoke_parent/$SMOKE_ROOT_NAME"
 )"
 
 release_smoke_home="$release_smoke_root/home"
@@ -191,8 +318,64 @@ release_smoke_xdg_data="$release_smoke_root/xdg-data"
 release_smoke_xdg_state="$release_smoke_root/xdg-state"
 release_smoke_xdg_cache="$release_smoke_root/xdg-cache"
 release_smoke_xdg_runtime="$release_smoke_root/xdg-runtime"
+release_smoke_prefix="$release_smoke_root/prefix"
+release_smoke_catalog_dir="$release_smoke_root/catalog"
+release_smoke_daemon_log="$release_smoke_root/pohunekd.log"
+release_smoke_daemon_pid=""
+isolated_environment=(
+  HOME="$release_smoke_home"
+  HERMES_HOME="$release_smoke_hermes_home"
+  XDG_CONFIG_HOME="$release_smoke_xdg_config"
+  XDG_DATA_HOME="$release_smoke_xdg_data"
+  XDG_STATE_HOME="$release_smoke_xdg_state"
+  XDG_CACHE_HOME="$release_smoke_xdg_cache"
+  XDG_RUNTIME_DIR="$release_smoke_xdg_runtime"
+  PATH="$ISOLATED_PATH"
+  LANG="$ISOLATED_LOCALE"
+  LC_ALL="$ISOLATED_LOCALE"
+  NO_COLOR="$NO_COLOR_VALUE"
+  PYTHONDONTWRITEBYTECODE=1
+)
+readonly isolated_environment
+
+# Whether process $1 still runs. A zombie that bash has not reaped yet has
+# already exited.
+daemon_running() {
+  local state
+  kill -0 "$1" 2>/dev/null || return 1
+  state="$("$PS_EXECUTABLE" -o stat= -p "$1" 2>/dev/null)" || return 1
+  [[ -n "$state" && "$state" != Z* ]]
+}
+
+# Sends SIGTERM to daemon $1 and waits at most `daemon_exit_attempts` polls for
+# it to exit. Returns its exit status, or kills it with SIGKILL, reaps it, and
+# returns 124 when it is still running after the bound.
+terminate_daemon() {
+  local pid="$1" attempt=0 status=0
+  kill -TERM "$pid" 2>/dev/null || true
+  while daemon_running "$pid"; do
+    attempt=$((attempt + 1))
+    if (( attempt >= daemon_exit_attempts )); then
+      kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    "$SLEEP_EXECUTABLE" "$DAEMON_READY_INTERVAL_SECONDS"
+  done
+  wait "$pid" 2>/dev/null || status=$?
+  return "$status"
+}
+
+stop_daemon() {
+  local pid="$release_smoke_daemon_pid"
+  release_smoke_daemon_pid=""
+  if [[ -n "$pid" ]]; then
+    terminate_daemon "$pid" || true
+  fi
+}
 
 cleanup() {
+  stop_daemon
   run_isolated "$RM_EXECUTABLE" -rf -- "$release_smoke_root"
 }
 trap cleanup EXIT
@@ -200,25 +383,74 @@ trap cleanup EXIT
 run_isolated "$MKDIR_EXECUTABLE" -p "$release_smoke_home" "$release_smoke_hermes_home" "$release_smoke_workdir"
 run_isolated "$CHMOD_EXECUTABLE" "$PRIVATE_DIRECTORY_MODE" "$release_smoke_root" "$release_smoke_home" "$release_smoke_hermes_home"
 
-# Keep the release CLI out of the source tree and give both the installer and
-# Hermes a fresh owner-private profile/state. The preinstalled Hermes path is
-# explicit; PATH is never used to discover a model or runtime. Every child gets
-# an empty environment followed by this exact non-secret allowlist, so ambient
-# provider credentials, proxies, and operator Hermes settings cannot propagate.
+# Keep the release out of the source tree and give the daemon, the installer
+# and Hermes a fresh owner-private profile/state. The preinstalled Hermes path
+# is explicit; PATH is never used to discover a model or runtime. Every child
+# gets an empty environment followed by this exact non-secret allowlist, so
+# ambient provider credentials, proxies, and operator Hermes settings cannot
+# propagate.
 run_isolated "$MKDIR_EXECUTABLE" -p "$release_smoke_xdg_config" "$release_smoke_xdg_data" "$release_smoke_xdg_state" "$release_smoke_xdg_cache" "$release_smoke_xdg_runtime"
 run_isolated "$CHMOD_EXECUTABLE" "$PRIVATE_DIRECTORY_MODE" "$release_smoke_xdg_config" "$release_smoke_xdg_data" "$release_smoke_xdg_state" "$release_smoke_xdg_cache" "$release_smoke_xdg_runtime"
+
+# The daemon reads its trust anchor only from beside its own executable, so the
+# binaries run from a private prefix that holds the supplied anchor.
+run_isolated "$MKDIR_EXECUTABLE" -p "$release_smoke_prefix" "$release_smoke_catalog_dir"
+run_isolated "$CHMOD_EXECUTABLE" "$PUBLIC_EXECUTABLE_MODE" "$release_smoke_prefix" "$release_smoke_catalog_dir"
+for binary in "${RELEASE_BINARIES[@]}"; do
+  run_isolated "$CP_EXECUTABLE" -- "$release_dir/$binary" "$release_smoke_prefix/$binary"
+  run_isolated "$CHMOD_EXECUTABLE" "$PUBLIC_EXECUTABLE_MODE" "$release_smoke_prefix/$binary"
+done
+run_isolated "$CP_EXECUTABLE" -- "$release_anchor" "$release_smoke_prefix/$ANCHOR_FILE_NAME"
+run_isolated "$CP_EXECUTABLE" -- "$release_package" "$release_smoke_catalog_dir/hermes.tar.zst"
+run_isolated "$CP_EXECUTABLE" -- "$release_catalog" "$release_smoke_catalog_dir/runtime-catalog.json"
+run_isolated "$CHMOD_EXECUTABLE" "$PUBLIC_FILE_MODE" "$release_smoke_prefix/$ANCHOR_FILE_NAME" \
+  "$release_smoke_catalog_dir/hermes.tar.zst" "$release_smoke_catalog_dir/runtime-catalog.json"
+release_pohunek="$release_smoke_prefix/pohunek"
 cd -- "$release_smoke_workdir"
 
-run_isolated "$release_pohunek" integration install --agent hermes \
+# `env` is started directly, not through a shell function, so it execs the
+# daemon in the background process and `$!` is the daemon's own pid.
+"$ENV_EXECUTABLE" -i "${isolated_environment[@]}" \
+  SHELL="$DAEMON_SHELL" POHUNEK_WORKER_LAUNCHER="$DAEMON_LAUNCHER" \
+  "$release_smoke_prefix/pohunekd" >"$release_smoke_daemon_log" 2>&1 &
+release_smoke_daemon_pid=$!
+
+attempt=0
+until run_isolated "$release_pohunek" plugin list --json >/dev/null 2>&1; do
+  if ! kill -0 "$release_smoke_daemon_pid" 2>/dev/null; then
+    daemon_log_tail
+    fail "the release daemon exited before it accepted connections"
+  fi
+  attempt=$((attempt + 1))
+  if (( attempt >= DAEMON_READY_ATTEMPTS )); then
+    daemon_log_tail
+    fail "the release daemon did not accept connections in time"
+  fi
+  "$SLEEP_EXECUTABLE" "$DAEMON_READY_INTERVAL_SECONDS"
+done
+
+# Each result is captured by a plain assignment, so a failing command ends the
+# smoke through `set -e` before its output is inspected.
+installed_package="$(run_isolated "$release_pohunek" plugin install \
+  "$release_smoke_catalog_dir/hermes.tar.zst" \
+  --catalog "$release_smoke_catalog_dir/runtime-catalog.json" \
+  --yes --json)"
+installed_package="$(compact_json "$installed_package")"
+if [[ "$installed_package" != *'"origin":"official"'* || "$installed_package" != *"\"digest\":\"$package_digest\""* ]]; then
+  fail "plugin install did not install the official Hermes package $package_digest"
+fi
+
+install_result="$(run_isolated "$release_pohunek" integration install --agent hermes \
   --hermes-home "$release_smoke_hermes_home" \
   --hermes-bin "$pinned_hermes" \
   --pohunek-bin "$release_pohunek" \
   --access-mode manage \
   --allow-host local \
-  --json
+  --json)"
+require_package_provenance install "$(compact_json "$install_result")"
 
-# The installed files can only come from assets embedded in the release binary:
-# the working directory and every profile path are fresh empty directories.
+# The installed files come from the selected package: the working directory and
+# every profile path are fresh empty directories.
 test -s "$release_smoke_hermes_home/plugins/operators/pohunek/plugin.yaml"
 test -s "$release_smoke_hermes_home/plugins/operators/pohunek/skills/pohunek/SKILL.md"
 
@@ -226,18 +458,38 @@ test -s "$release_smoke_hermes_home/plugins/operators/pohunek/skills/pohunek/SKI
 # profile semantics. This command does not start a model turn.
 run_isolated "$pinned_hermes" plugins list --json
 
-run_isolated "$release_pohunek" integration status --agent hermes \
+status_result="$(run_isolated "$release_pohunek" integration status --agent hermes \
   --hermes-home "$release_smoke_hermes_home" \
   --hermes-bin "$pinned_hermes" \
-  --json
-run_isolated "$release_pohunek" integration doctor --agent hermes \
+  --json)"
+status_result="$(compact_json "$status_result")"
+require_package_provenance status "$status_result"
+doctor_result="$(run_isolated "$release_pohunek" integration doctor --agent hermes \
   --hermes-home "$release_smoke_hermes_home" \
   --hermes-bin "$pinned_hermes" \
-  --json
-run_isolated "$release_pohunek" integration uninstall --agent hermes \
+  --json)"
+doctor_result="$(compact_json "$doctor_result")"
+require_package_provenance doctor "$doctor_result"
+uninstall_result="$(run_isolated "$release_pohunek" integration uninstall --agent hermes \
   --hermes-home "$release_smoke_hermes_home" \
   --hermes-bin "$pinned_hermes" \
-  --json
+  --json)"
+uninstall_result="$(compact_json "$uninstall_result")"
+[[ "$uninstall_result" == *'"provenance":null'* ]] \
+  || fail "integration uninstall still reports an installed plugin source"
 
 test ! -e "$release_smoke_hermes_home/plugins/operators/pohunek"
+
+daemon_pid="$release_smoke_daemon_pid"
+release_smoke_daemon_pid=""
+daemon_status=0
+terminate_daemon "$daemon_pid" || daemon_status=$?
+if [[ "$daemon_status" -eq 124 ]]; then
+  daemon_log_tail
+  fail "the release daemon did not exit within $daemon_exit_attempts polls of SIGTERM and was killed"
+fi
+if [[ "$daemon_status" -ne 0 ]]; then
+  daemon_log_tail
+  fail "the release daemon did not exit cleanly after SIGTERM (status $daemon_status)"
+fi
 printf '%s\n' 'Hermes release-plugin smoke passed.'

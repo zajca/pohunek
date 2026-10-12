@@ -86,42 +86,37 @@ jobs:
             runner: ubuntu-latest
             component: cli
             archive_prefix: pohunek-cli
-            binary: pohunek
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             component: daemon
             archive_prefix: pohunek-daemon
-            binary: pohunekd
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             component: relay
             archive_prefix: pohunek-relay
-            binary: pohunek-relayd
           # Fully static musl CLI and daemon builds: self-contained binaries
           # that run on x86_64 Linux regardless of the host glibc version.
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             component: cli
             archive_prefix: pohunek-cli
-            binary: pohunek
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             component: daemon
             archive_prefix: pohunek-daemon
-            binary: pohunekd
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
       - name: Install Python for Hermes release verification
-        if: ${{ inputs.mode == 'release' && matrix.component == 'cli' }}
+        if: ${{ inputs.mode == 'release' && matrix.component == 'daemon' }}
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
       - name: Install uv for Hermes release verification
-        if: ${{ inputs.mode == 'release' && matrix.component == 'cli' }}
+        if: ${{ inputs.mode == 'release' && matrix.component == 'daemon' }}
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           version: "0.9.28"
@@ -224,7 +219,7 @@ jobs:
           echo "checksum=dist/$name.tar.gz.sha256" >> "$GITHUB_OUTPUT"
 
       - name: Provision locked Hermes runtime
-        if: ${{ inputs.mode == 'release' && matrix.component == 'cli' }}
+        if: ${{ inputs.mode == 'release' && matrix.component == 'daemon' }}
         id: hermes
         shell: bash
         run: |
@@ -232,14 +227,18 @@ jobs:
           hermes_bin="$(scripts/provision-hermes-compat "$RUNNER_TEMP/hermes-compat")"
           printf 'bin=%s\n' "$hermes_bin" >> "$GITHUB_OUTPUT"
 
-      - name: Verify packaged CLI against pinned Hermes
-        if: ${{ inputs.mode == 'release' && matrix.component == 'cli' }}
+      # The gate and the packaged smoke install the operator plugin from the
+      # Hermes runtime package through the archive's own daemon. Until Hermes
+      # ships in the release catalog, the package is built from compat/hermes
+      # and authorized by a throwaway catalog whose anchor only the smoke's
+      # private prefix trusts; the archive's production anchor is untouched.
+      - name: Verify packaged daemon against pinned Hermes
+        if: ${{ inputs.mode == 'release' && matrix.component == 'daemon' }}
         shell: bash
         env:
           ARCHIVE: ${{ steps.package.outputs.archive }}
           HERMES_BIN: ${{ steps.hermes.outputs.bin }}
           ARCHIVE_PREFIX: ${{ matrix.archive_prefix }}
-          BINARY: ${{ matrix.binary }}
           TARGET: ${{ matrix.target }}
           VERSION: ${{ needs.meta.outputs.version }}
         run: |
@@ -247,15 +246,26 @@ jobs:
           extract_dir="$(mktemp -d)"
           trap 'rm -rf "$extract_dir"' EXIT
           tar -xzf "$ARCHIVE" -C "$extract_dir"
-          release_root="$extract_dir/$ARCHIVE_PREFIX-$VERSION-$TARGET"
-          release_pohunek="$(realpath "$release_root/$BINARY")"
+          release_root="$(realpath "$extract_dir/$ARCHIVE_PREFIX-$VERSION-$TARGET")"
           packaged_smoke="$release_root/packaging/smoke-hermes-plugin-release"
-          test -x "$release_pohunek"
+          for binary in pohunek pohunekd pohunek-sessiond; do
+            test -x "$release_root/$binary"
+          done
           test -x "$packaged_smoke"
+          package_dir="$extract_dir/hermes-package"
+          mkdir "$package_dir"
+          scripts/build-hermes-package "$package_dir/hermes.tar.zst"
+          cargo xtask hermes throwaway-catalog \
+            --package "$package_dir/hermes.tar.zst" \
+            --output-dir "$package_dir/trust"
           cargo xtask hermes compatibility \
             --hermes-bin "$HERMES_BIN" \
-            --pohunek-bin "$release_pohunek"
-          "$packaged_smoke" "$release_pohunek" "$HERMES_BIN"
+            --bin-dir "$release_root" \
+            --package "$package_dir/hermes.tar.zst"
+          "$packaged_smoke" "$release_root" "$package_dir/hermes.tar.zst" \
+            "$package_dir/trust/runtime-catalog.json" \
+            "$package_dir/trust/runtime-catalog-anchor.json" \
+            "$HERMES_BIN"
 
       # Only the archive and its checksum leave this job.
       - name: Upload release archive

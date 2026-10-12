@@ -223,9 +223,11 @@ For the Hermes M2 runtime, inspect the `hermes` entry after upgrade. It is
 launchable only with `version: "0.20.0"` and `supported: true`; a missing
 binary has no version-policy result, while a wrong or unparseable version is
 reported as unsupported. The model-free compatibility check, `cargo xtask
-hermes compatibility --pohunek-bin ABS`, needs the pinned Hermes executable on
-`PATH` and an absolute, canonical built Pohunek executable at `ABS`; it validates
-committed evidence. Refresh goldens with `cargo xtask hermes refresh-goldens
+hermes compatibility --bin-dir ABS --package ARCHIVE`, needs the pinned Hermes
+executable on `PATH`, an absolute directory `ABS` of canonical built `pohunek`,
+`pohunekd`, and `pohunek-sessiond` executables, and the Hermes runtime package
+archive built by `scripts/build-hermes-package`; it installs the plugin from
+that package and validates committed evidence. Refresh goldens with `cargo xtask hermes refresh-goldens
 --hermes-bin ABS`, where `ABS` is the absolute path to the pinned Hermes
 executable. The harness runs that real Hermes process in a real PTY but replaces
 the model API with a repository-owned, deterministic IPv4-loopback mock.
