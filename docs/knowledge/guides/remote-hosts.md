@@ -57,7 +57,9 @@ client-side fan-out. `pohunek notifications list --all-hosts` queries the local
 daemon plus reachable daemon peers discovered directly from local overlay state, then
 renders per-host successes and structured per-host errors. The matching watch
 command with `--all-hosts` opens one subscription per reachable host and streams
-notification create, update, and delete events as they arrive.
+notification create, update, and delete events as they arrive. Its `--session`,
+`--kind`, and `--status` (or `--unread`) filters run client-side on every host's
+stream.
 
 A remote daemon outage does not imply that its sessions stopped. Per-session
 workers continue on that host, but clients cannot attach until the replacement

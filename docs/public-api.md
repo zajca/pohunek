@@ -2566,7 +2566,10 @@ The CLI exposes durable notifications through `pohunek notifications`:
   cache. It does not need a local daemon to expand remote targets.
 - `pohunek notifications watch`: stream `notification_created`,
   `notification_updated`, and `notification_deleted`; `--all-hosts` opens one
-  subscription per reachable host.
+  subscription per reachable host. `--session`, `--kind`, and `--status` (or
+  `--unread`) filter client-side on the record each create or update event
+  carries; while any filter is set, `notification_deleted` events are dropped
+  because they carry only the notification id.
 - `pohunek notifications read|ack|archive|delete <target>`: update one record.
   Targets accept bare `id` or `host/id`; an explicit target host overrides
   `--host`.

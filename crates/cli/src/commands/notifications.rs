@@ -82,6 +82,52 @@ pub(crate) struct ListFilters {
     pub(crate) cursor: Option<String>,
 }
 
+/// Filters accepted by `notifications watch`.
+///
+/// The daemon subscription is global, so these filters run client-side on each
+/// streamed event, with the value semantics of the matching `notifications
+/// list` flags.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WatchFilters {
+    /// Alias for `--status unread`.
+    pub(crate) unread: bool,
+    /// Lifecycle status the record carries in the event.
+    pub(crate) status: Option<NotificationStatus>,
+    /// Notification kind filter.
+    pub(crate) kind: Option<NotificationKind>,
+    /// Linked session id filter; a record without a session never matches.
+    pub(crate) session: Option<String>,
+}
+
+impl WatchFilters {
+    /// Returns whether no filter is set, so every event passes unchanged.
+    fn is_empty(&self) -> bool {
+        self.effective_status().is_none() && self.kind.is_none() && self.session.is_none()
+    }
+
+    /// Returns the status filter with `--unread` resolved.
+    fn effective_status(&self) -> Option<NotificationStatus> {
+        if self.unread {
+            Some(NotificationStatus::Unread)
+        } else {
+            self.status
+        }
+    }
+
+    /// Returns whether `record` satisfies every set filter.
+    fn matches(&self, record: &NotificationRecord) -> bool {
+        self.effective_status()
+            .is_none_or(|status| record.status == status)
+            && self.kind.is_none_or(|kind| record.kind == kind)
+            && self.session.as_deref().is_none_or(|session| {
+                record
+                    .session_id
+                    .as_ref()
+                    .is_some_and(|linked| linked.0 == session)
+            })
+    }
+}
+
 /// Output mode for `notifications watch`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WatchOutputMode {
@@ -196,6 +242,23 @@ pub(crate) fn parse_notification_status(value: &str) -> Result<NotificationStatu
     }
 }
 
+/// Parse a `notifications watch --status` value.
+///
+/// Accepts every status `notifications list` accepts except `deleted`: the
+/// daemon announces a deletion only as a `notification_deleted` event that
+/// carries the id alone, so no streamed record can ever match it.
+pub(crate) fn parse_watch_status(value: &str) -> Result<NotificationStatus, String> {
+    match parse_notification_status(value)? {
+        NotificationStatus::Deleted => Err(
+            "notifications watch cannot filter on status 'deleted': deletions stream as \
+             notification_deleted events, which carry only the id; watch without filters \
+             to see them"
+                .to_owned(),
+        ),
+        status => Ok(status),
+    }
+}
+
 /// Parse a notification kind wire value.
 pub(crate) fn parse_notification_kind(value: &str) -> Result<NotificationKind, String> {
     match value {
@@ -295,6 +358,8 @@ pub(crate) async fn run_list(
 
 /// Run `notifications watch`.
 ///
+/// Every host subscription applies `filters` to its own event stream.
+///
 /// # Errors
 ///
 /// Returns [`CliError`] when host discovery fails or a selected subscription
@@ -302,6 +367,7 @@ pub(crate) async fn run_list(
 pub(crate) async fn run_watch(
     host: &str,
     paths: &Paths,
+    filters: WatchFilters,
     all_hosts: bool,
     json: bool,
 ) -> Result<(), CliError> {
@@ -317,7 +383,7 @@ pub(crate) async fn run_watch(
     };
 
     if targets.len() == 1 {
-        watch_one(paths, targets[0].clone(), mode)
+        watch_one(paths, targets[0].clone(), mode, &filters)
             .await
             .map_err(CliError::Protocol)?;
         return Ok(());
@@ -327,8 +393,9 @@ pub(crate) async fn run_watch(
     for target in targets {
         let paths = paths.clone();
         let sender = sender.clone();
+        let filters = filters.clone();
         tokio::spawn(async move {
-            let result = watch_one(&paths, target.clone(), mode).await;
+            let result = watch_one(&paths, target.clone(), mode, &filters).await;
             if let Err(error) = result {
                 let _ = sender.send(render_watch_host_error(&target, &error, mode));
             }
@@ -631,6 +698,7 @@ async fn watch_one(
     paths: &Paths,
     target: HostTarget,
     mode: WatchOutputMode,
+    filters: &WatchFilters,
 ) -> Result<(), protocol::ProtocolError> {
     let client = connect_target(paths, &target)
         .await
@@ -655,6 +723,9 @@ async fn watch_one(
         .map_err(CliError::from)
         .map_err(error_details)?
     {
+        if !watch_event_selected(&event, filters).map_err(error_details)? {
+            continue;
+        }
         let rendered = render_watch_event(&target.host_id, &event, mode).map_err(error_details)?;
         if !rendered.is_empty() {
             print!("{rendered}");
@@ -855,6 +926,35 @@ fn render_list_human(rows: &[HostedNotification], errors: &[HostErrorRow]) -> St
         );
     }
     output
+}
+
+/// Returns whether `event` passes the `notifications watch` filters.
+///
+/// Without filters every event passes undecoded. With any filter, a create or
+/// update passes when its record matches, and a delete never passes because its
+/// payload carries only the notification id.
+///
+/// # Errors
+///
+/// Returns [`CliError`] when a filtered create or update payload cannot be
+/// decoded.
+fn watch_event_selected(event: &Event, filters: &WatchFilters) -> Result<bool, CliError> {
+    if filters.is_empty() {
+        return Ok(true);
+    }
+    match event.event() {
+        event::NOTIFICATION_CREATED => {
+            let payload: NotificationCreatedEvent =
+                serde_json::from_value(event.payload().clone())?;
+            Ok(filters.matches(&payload.record))
+        }
+        event::NOTIFICATION_UPDATED => {
+            let payload: NotificationUpdatedEvent =
+                serde_json::from_value(event.payload().clone())?;
+            Ok(filters.matches(&payload.record))
+        }
+        _ => Ok(false),
+    }
 }
 
 fn render_watch_event(

@@ -268,6 +268,29 @@ fn notifications_all_hosts_conflicts_with_host_under_json() {
 }
 
 #[test]
+fn notifications_watch_refuses_a_deleted_status_filter_under_json() {
+    // A deletion streams as `notification_deleted` with only the id, so a
+    // watch filtered on `deleted` could never print anything.
+    let out = pohunek()
+        .args(["notifications", "watch", "--status", "deleted", "--json"])
+        .output()
+        .expect("spawn pohunek");
+
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stderr.is_empty());
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    let doc: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be JSON ({e}): {stdout:?}"));
+    assert_eq!(doc["err"]["code"], "cli_usage");
+    assert!(
+        doc["err"]["msg"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("deleted") && msg.contains("notification_deleted")),
+        "usage message should explain why `deleted` is refused: {doc:?}"
+    );
+}
+
+#[test]
 fn usage_error_without_json_stays_human_on_stderr() {
     // No `--json`: behavior must be identical to a plain `Cli::parse()` — human
     // error on stderr, nothing on stdout, exit 2.

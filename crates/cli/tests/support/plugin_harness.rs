@@ -10,7 +10,7 @@
     reason = "each test binary uses a different subset of these helpers"
 )]
 
-// Rust guideline compliant 2026-10-06
+// Rust guideline compliant 2026-10-12
 
 use std::fs;
 use std::net::IpAddr;
@@ -28,6 +28,7 @@ use package::{Limits, PackageDigest};
 use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo};
 use pohunek_daemon::catalog_anchor::CatalogTrust;
 use pohunek_daemon::governance::HostGovernanceService;
+use pohunek_daemon::notifications::NotificationService;
 use pohunek_daemon::runtime::{
     EnvironmentSource, SubprocessWorkerEnvironment, SubprocessWorkerLauncher,
 };
@@ -136,9 +137,27 @@ impl Harness {
         Self::start_with_trust_and_worker(CatalogTrust::Absent, worker_executable).await
     }
 
+    /// Starts the daemon with a durable notification inbox, so `notification.*`
+    /// methods and the notification events of `subscribe` are live.
+    ///
+    /// No attention debounce coordinator is attached: a create with a
+    /// `turn:<id>` or `attention:<id>` dedupe key is refused with
+    /// `notifications_not_configured`, and every other create persists at once.
+    pub(crate) async fn start_with_notifications() -> Self {
+        Self::start_with(CatalogTrust::Absent, worker_binary(), true).await
+    }
+
     async fn start_with_trust_and_worker(
         catalog_trust: CatalogTrust,
         worker_executable: PathBuf,
+    ) -> Self {
+        Self::start_with(catalog_trust, worker_executable, false).await
+    }
+
+    async fn start_with(
+        catalog_trust: CatalogTrust,
+        worker_executable: PathBuf,
+        notifications: bool,
     ) -> Self {
         let env = TestEnv::new().expect("create the hermetic test environment");
         let runtime = env.runtime_dir().join("pohunek");
@@ -191,12 +210,17 @@ impl Harness {
                 .await
                 .expect("open the host-governance service"),
         );
-        let state = DaemonState::new(
+        let mut state = DaemonState::new(
             HealthInfo::new("0.0.0-test"),
             registry,
             governance,
             overlay_registry(),
         );
+        if notifications {
+            let inbox = NotificationService::open(&env.root().join("daemon-data"))
+                .expect("open the notification inbox");
+            state = state.with_notifications(inbox);
+        }
         let server = ControlServer::bind_with_state(&socket, state)
             .await
             .expect("the control server binds");
@@ -259,6 +283,11 @@ impl Harness {
             )
         });
         (output.status.code().expect("exit code"), document)
+    }
+
+    /// The daemon's control socket in the hermetic runtime directory.
+    pub(crate) fn socket(&self) -> PathBuf {
+        self.env.runtime_dir().join("pohunek").join("daemon.sock")
     }
 
     /// The package registry as the plugin root records it on disk.

@@ -488,10 +488,27 @@ enum NotificationsAction {
     },
 
     /// Watch notification create/update/delete events.
+    ///
+    /// Filters apply client-side to each record in a create or update event.
+    /// While any filter is set, delete events are dropped: they carry only the
+    /// notification id, so they cannot be matched.
     Watch {
         /// Include local plus all reachable hosts discovered by the local daemon.
         #[arg(long, conflicts_with = "host")]
         all_hosts: bool,
+        /// Alias for `--status unread`.
+        #[arg(long, conflicts_with = "status")]
+        unread: bool,
+        /// Only records whose status in the event is this lifecycle status
+        /// (`deleted` is refused: deletions carry no record to match).
+        #[arg(long, value_parser = commands::notifications::parse_watch_status)]
+        status: Option<protocol::NotificationStatus>,
+        /// Only records of this notification kind.
+        #[arg(long, value_parser = commands::notifications::parse_notification_kind)]
+        kind: Option<protocol::NotificationKind>,
+        /// Only records linked to this session id.
+        #[arg(long)]
+        session: Option<String>,
         /// Emit machine-readable JSON event lines instead of human text.
         #[arg(long)]
         json: bool,
@@ -2411,8 +2428,27 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     )
                     .await?;
                 }
-                NotificationsAction::Watch { all_hosts, json } => {
-                    commands::notifications::run_watch(&host, &paths, all_hosts, json).await?;
+                NotificationsAction::Watch {
+                    all_hosts,
+                    unread,
+                    status,
+                    kind,
+                    session,
+                    json,
+                } => {
+                    commands::notifications::run_watch(
+                        &host,
+                        &paths,
+                        commands::notifications::WatchFilters {
+                            unread,
+                            status,
+                            kind,
+                            session,
+                        },
+                        all_hosts,
+                        json,
+                    )
+                    .await?;
                 }
                 NotificationsAction::Read { target, json } => {
                     let host = effective_notification_host(&host, &target);

@@ -109,6 +109,10 @@ For durable notification issues:
    event. A create should emit `notification_created`; read, acknowledge,
    archive, provider upgrade, or dedupe upgrade should emit
    `notification_updated`; delete should emit `notification_deleted`.
+   To follow one session, add `--session <id>`, `--kind <kind>`, or
+   `--status <status>` (`--unread`); these filter the record in each create or
+   update event client-side and drop delete events, so leave them off while
+   checking that a delete is emitted.
 8. If a provider approval prompt does not appear, reinstall hooks with
    `pohunek integration install --agent <codex-or-claude>` and confirm the
    provider build supports the modern hook surface. Codex approval notifications
