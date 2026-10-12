@@ -493,8 +493,9 @@ generation's processes and therefore loses the runtime. Use
 For a Hermes runtime, first run `pohunek host inspect local --json`. The runtime
 must identify `agent_base: "hermes"`, `version: "0.20.0"`, and
 `supported: true` before starting a new Hermes session. A missing executable
-has no version-policy fields; an installed but unparseable or wrong version is
-`supported: false`. Do not diagnose by opening, copying, or editing Hermes
+has no version-policy fields, and a launch answers `agent_binary_missing`; an
+installed but unparseable or wrong version is `supported: false`, and a launch
+answers `agent_runtime_unsupported`. Do not diagnose by opening, copying, or editing Hermes
 `state.db` or the operator's real `HERMES_HOME`. The compatibility commands use
 their own temporary homes.
 

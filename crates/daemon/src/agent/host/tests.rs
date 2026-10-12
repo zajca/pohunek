@@ -12,7 +12,7 @@ use super::{
     check_pin, validate_launch_runtime, BuiltinSource, DefinitionError, DefinitionInvariant,
     DefinitionOrigin, DefinitionParts, HandlerId, Integration, LaunchPin, LaunchProgram,
     RegistryError, RuntimeDefinition, RuntimeHost, RuntimeRegistry, RuntimeSource, SourceTrust,
-    RESERVED_RUNTIME_IDS,
+    Spawn, RESERVED_RUNTIME_IDS,
 };
 use crate::agent::{
     InputRules, NativeLaunchError, NativeReferenceError, NativeReferenceStrategy,
@@ -1126,19 +1126,6 @@ mod launch_validation {
     }
 
     #[test]
-    fn a_runtime_without_a_version_probe_launches_without_validation() {
-        let missing = "/nonexistent/pohunek/agent";
-        for definition in [
-            builtin_definition("shell"),
-            Arc::new(package_definition("acme")),
-        ] {
-            let validated = validate_launch_runtime(&definition, missing, None)
-                .expect("no probe, no validation");
-            assert!(validated.is_none(), "{}", definition.runtime_id());
-        }
-    }
-
-    #[test]
     fn the_hermes_probe_runs_for_a_definition_that_names_its_parser() {
         let dir = crate::test_support::scoped_dir("pohunek-launch-validation-");
         let hermes = builtin_definition("hermes");
@@ -1150,7 +1137,7 @@ mod launch_validation {
         );
 
         let supported = executable(&dir, "#!/bin/sh\necho 'Hermes Agent v0.20.0'\n");
-        let validated = validate_launch_runtime(&hermes, &supported, None)
+        let validated = validate_launch_runtime(&hermes, Spawn::Program(&supported), None)
             .expect("the pinned release passes")
             .expect("the probed executable is pinned");
         assert_eq!(
@@ -1161,11 +1148,13 @@ mod launch_validation {
         );
 
         let newer = executable(&dir, "#!/bin/sh\necho 'Hermes Agent v0.21.0'\n");
-        let error = validate_launch_runtime(&hermes, &newer, None).expect_err("another release");
+        let error = validate_launch_runtime(&hermes, Spawn::Program(&newer), None)
+            .expect_err("another release");
         assert_eq!(error.code, "agent_runtime_unsupported");
-        let error = validate_launch_runtime(&hermes, "/nonexistent/pohunek/hermes", None)
-            .expect_err("a missing executable");
-        assert_eq!(error.code, "agent_runtime_unsupported");
+        let error =
+            validate_launch_runtime(&hermes, Spawn::Program("/nonexistent/pohunek/hermes"), None)
+                .expect_err("a missing executable");
+        assert_eq!(error.code, "agent_binary_missing");
     }
 
     #[test]
@@ -1191,7 +1180,10 @@ mod launch_validation {
             integration: None,
         })
         .expect("valid package definition");
-        let error = validate_launch_runtime(&unknown, "acme", None).expect_err("unknown parser");
+        let dir = crate::test_support::scoped_dir("pohunek-launch-validation-");
+        let acme = executable(&dir, "#!/bin/sh\necho 'acme 1.0.0'\n");
+        let error = validate_launch_runtime(&unknown, Spawn::Program(&acme), None)
+            .expect_err("unknown parser");
         assert_eq!(error.code, "agent_runtime_unsupported");
     }
 }

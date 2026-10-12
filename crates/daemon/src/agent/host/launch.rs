@@ -152,40 +152,56 @@ fn same_origin(frozen: &BindingProvenance, current: &BindingProvenance) -> bool 
     }
 }
 
+/// What a launch spawns, which decides what launch validation resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Spawn<'a> {
+    /// A bare host-shell launch: it spawns the configured shell command,
+    /// which the launch itself resolves.
+    HostShell,
+    /// A program the launch spawns by name or absolute path: a runtime's own
+    /// program, a profile's program (a profile over the shell included) or
+    /// the program frozen into a relaunched session.
+    Program(&'a str),
+}
+
 /// Runs the launch-time executable validation the definition declares.
 ///
-/// A definition without a version probe launches whatever `program` resolves
-/// to. A definition naming a version-probe parser resolves the executable once,
-/// probes it in the bounded sandbox and returns that exact path only for the
-/// pinned release; the probes and their pinned versions are core data in
-/// `capabilities`.
+/// Every spawned program must resolve to an executable before anything is
+/// created; only a bare host-shell launch ([`Spawn::HostShell`]) is resolved
+/// by its launch. A definition without a version probe then launches whatever
+/// the program resolves to. A definition naming a
+/// version-probe parser resolves the executable once, probes it in the bounded
+/// sandbox and returns that exact path only for the pinned release; the probes
+/// and their pinned versions are core data in `capabilities`.
 ///
 /// # Errors
 ///
-/// Returns `agent_runtime_unsupported` when the probe rejects the executable
-/// or the definition names a parser this daemon does not provide.
+/// Returns `agent_binary_missing`, naming only the program's file name, when
+/// the spawned program does not resolve to an executable, and
+/// `agent_runtime_unsupported` when the probe rejects an executable that
+/// exists or the definition names a parser this daemon does not provide.
 ///
 /// `launch_path` is the `PATH` the launched agent will see (the daemon's base
 /// environment overridden by the profile); the probe runs under it so an
 /// interpreter script resolves the interpreter the launch will use.
 pub(crate) fn validate_launch_runtime(
     definition: &RuntimeDefinition,
-    program: &str,
+    spawn: Spawn<'_>,
     launch_path: Option<&std::ffi::OsStr>,
 ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
-    crate::capabilities::validate_definition_launch(definition, program, launch_path)
+    crate::capabilities::validate_definition_launch(definition, spawn, launch_path)
 }
 
 /// Validate a launch runtime while preserving a shortened-budget timeout.
 pub(crate) fn validate_launch_runtime_with_timeout_detailed(
     definition: &RuntimeDefinition,
-    program: &str,
+    spawn: Spawn<'_>,
     launch_path: Option<&std::ffi::OsStr>,
     timeout: std::time::Duration,
 ) -> Result<Option<ValidatedLaunchProgram>, crate::capabilities::LaunchValidationFailure> {
     crate::capabilities::validate_definition_launch_with_timeout_detailed(
         definition,
-        program,
+        spawn,
         launch_path,
         timeout,
     )

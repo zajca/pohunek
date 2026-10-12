@@ -49,9 +49,12 @@ version reports `supported: false`. Launch a runtime only when `available` is tr
 `false`; a present runtime with a version policy (Hermes) always reports
 `supported`, so Hermes launches only on `supported: true`. The daemon re-runs that isolated, bounded version
 probe for bare and profile-based Hermes immediately before `session.new` and
-`session.resume`; a missing, unparseable, or non-pinned executable returns
+`session.resume`; an unparseable or non-pinned executable returns
 `agent_runtime_unsupported` before it creates a worker, session, worktree, or
-recovery write. The probe clears ambient user state and uses private temporary
+recovery write. A program that does not resolve to an executable, for Hermes
+or any other runtime but a bare host shell, returns `agent_binary_missing` at the
+same point, before any probe runs; that refusal names only the program's file
+name. The probe clears ambient user state and uses private temporary
 HOME, Hermes, XDG, Python-cache, and working directories. Pohunek canonicalizes
 the executable once and launches that exact absolute path without another PATH
 lookup. A same-owner replacement of the canonical file between probe and exec

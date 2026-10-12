@@ -3025,10 +3025,16 @@ async fn incompatible_hermes_profile_fails_before_session_and_worktree_side_effe
             .await
             .expect_err("incompatible Hermes runtime must fail before launch");
 
-        assert_eq!(error.code, "agent_runtime_unsupported");
         assert!(!error.msg.contains(&executable.display().to_string()));
         if let Some(version_output) = version_output {
+            assert_eq!(error.code, "agent_runtime_unsupported", "{case}");
             assert!(!error.msg.contains(version_output));
+        } else {
+            // A missing executable is reported as missing, naming only its
+            // file name, before any probe runs.
+            assert_eq!(error.code, "agent_binary_missing", "{case}");
+            assert!(error.msg.contains(&format!("hermes-{case}")), "{error:?}");
+            assert!(error.recover.is_some(), "{error:?}");
         }
         assert!(registry.list().await.is_empty());
         assert!(
@@ -3055,6 +3061,175 @@ async fn incompatible_hermes_profile_fails_before_session_and_worktree_side_effe
         assert!(worktree_listing.status.success());
         assert!(!String::from_utf8_lossy(&worktree_listing.stdout).contains("feat/hermes-"));
     }
+}
+
+/// A runtime without a version probe whose program is missing is refused
+/// before the create writes its record or binds its worktree, with the same
+/// typed error a probed runtime answers.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_missing_program_without_a_probe_fails_before_the_target_is_bound() {
+    let dir = temp_dir("unprobed-missing-program");
+    let missing = dir.join("pohunek-unprobed-agent");
+    let repo = init_git_repo("unprobed-missing-program");
+    let store_path = temp_store_path("unprobed-missing-program");
+    let worktree_root = store_path.parent().expect("store parent").join("worktrees");
+    let registry = SessionRegistry::new_with_runtimes(
+        SessionRegistryConfig {
+            shell_command: hermetic_shell(),
+            store_path: Some(store_path.clone()),
+            worktree_root: Some(worktree_root.clone()),
+            ..SessionRegistryConfig::default()
+        },
+        crate::agent::host::fixture::pi_shaped_host(
+            &missing,
+            crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+        ),
+    );
+    let gate = hold_bound_create(&registry);
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        let params = SessionNewParams {
+            agent: crate::agent::host::fixture::PI_SHAPED_ID.to_owned(),
+            cwd: None,
+            repo: Some(repo.clone()),
+            branch: Some("feat/unprobed".to_owned()),
+            ..params()
+        };
+        async move { registry.create(params).await }
+    });
+
+    let error = tokio::select! {
+        () = gate.entered.notified() => {
+            gate.release.notify_one();
+            panic!("the create bound its target before resolving the program");
+        }
+        joined = creating => joined
+            .expect("create task joins")
+            .expect_err("a missing program must not launch"),
+    };
+
+    assert_eq!(error.code, "agent_binary_missing", "{error:?}");
+    assert!(error.msg.contains("pohunek-unprobed-agent"), "{error:?}");
+    assert!(!error.msg.contains(&dir.display().to_string()), "{error:?}");
+    assert!(error.recover.is_some(), "{error:?}");
+    assert!(registry.list().await.is_empty());
+    assert!(
+        crate::store::Store::new(store_path)
+            .load_sessions()
+            .expect("load sessions")
+            .is_empty(),
+        "no logical session record"
+    );
+    let worktrees = std::fs::read_dir(&worktree_root)
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or_default();
+    assert_eq!(worktrees, 0, "no worktree side effect");
+}
+
+/// A profile over the shell launches its own program, which defaults to the
+/// login shell. When that shell is not installed, the create is refused
+/// before it writes its record or binds its worktree, while a bare shell,
+/// which launches the configured shell command, still binds and launches.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_shell_profile_with_a_missing_login_shell_fails_before_the_target_is_bound() {
+    let dir = temp_dir("shell-profile-missing-login-shell");
+    let login_shell = dir.join("pohunek-uninstalled-shell");
+    let repo = init_git_repo("shell-profile-missing-login-shell");
+    let store_path = temp_store_path("shell-profile-missing-login-shell");
+    let worktree_root = store_path.parent().expect("store parent").join("worktrees");
+    let agents_dir = temp_agents_dir_with(
+        "shell-profile-missing-login-shell",
+        "work",
+        "base = \"shell\"\n",
+    );
+    let builtin = crate::agent::host::BuiltinSource::new(
+        login_shell.to_str().expect("UTF-8 login shell path"),
+    );
+    let runtimes = crate::agent::host::RuntimeHost::new(
+        crate::agent::host::RuntimeRegistry::from_sources(&[&builtin])
+            .expect("the built-in registry builds"),
+    );
+    let registry = SessionRegistry::new_with_runtimes(
+        SessionRegistryConfig {
+            shell_command: hermetic_shell(),
+            agents_dir: Some(agents_dir),
+            store_path: Some(store_path.clone()),
+            worktree_root: Some(worktree_root.clone()),
+            ..SessionRegistryConfig::default()
+        },
+        runtimes,
+    );
+    let gate = hold_bound_create(&registry);
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        let params = SessionNewParams {
+            agent: "work".to_owned(),
+            cwd: None,
+            repo: Some(repo.clone()),
+            branch: Some("feat/shell-profile".to_owned()),
+            ..params()
+        };
+        async move { registry.create(params).await }
+    });
+
+    let error = tokio::select! {
+        () = gate.entered.notified() => {
+            gate.release.notify_one();
+            panic!("the create bound its target before resolving the program");
+        }
+        joined = creating => joined
+            .expect("create task joins")
+            .expect_err("a missing login shell must not launch"),
+    };
+
+    assert_eq!(error.code, "agent_binary_missing", "{error:?}");
+    assert!(error.msg.contains("pohunek-uninstalled-shell"), "{error:?}");
+    assert!(!error.msg.contains(&dir.display().to_string()), "{error:?}");
+    assert!(error.recover.is_some(), "{error:?}");
+    assert!(registry.list().await.is_empty());
+    assert!(
+        crate::store::Store::new(store_path)
+            .load_sessions()
+            .expect("load sessions")
+            .is_empty(),
+        "no logical session record"
+    );
+    let worktrees = std::fs::read_dir(&worktree_root)
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or_default();
+    assert_eq!(worktrees, 0, "no worktree side effect");
+
+    // A bare shell launches the configured shell command, which exists, so
+    // the missing login shell does not refuse it: it binds its target and
+    // launches.
+    let bare_gate = hold_bound_create(&registry);
+    let mut creating = tokio::spawn({
+        let registry = registry.clone();
+        let params = SessionNewParams {
+            agent: "shell".to_owned(),
+            cwd: None,
+            repo: Some(repo.clone()),
+            branch: Some("feat/bare-shell".to_owned()),
+            ..params()
+        };
+        async move { registry.create(params).await }
+    });
+    let created = tokio::select! {
+        () = bare_gate.entered.notified() => {
+            bare_gate.release.notify_one();
+            (&mut creating).await
+        }
+        joined = &mut creating => joined,
+    }
+    .expect("create task joins")
+    .expect("a bare shell launches its configured shell command");
+    assert_eq!(created.agent, "shell");
+    registry
+        .stop(&created.id)
+        .await
+        .expect("stop the bare shell");
 }
 
 /// Raw `$SHELL` values the daemon must never launch or persist.
@@ -12459,6 +12634,34 @@ async fn incompatible_hermes_resume_has_no_runtime_or_store_side_effects() {
         assert_eq!(after.pid, terminal.pid);
         assert_eq!(after.runtime, terminal.runtime);
     }
+
+    // An executable that vanished after the launch is reported as missing,
+    // not as an incompatible runtime, with the same absence of side effects.
+    fs::remove_file(&script).expect("remove the Hermes executable");
+    let error = registry
+        .resume(&created.id)
+        .await
+        .expect_err("a vanished Hermes executable must not resume");
+    assert_eq!(error.code, "agent_binary_missing");
+    assert!(error.msg.contains("hermes"), "{error:?}");
+    assert!(
+        !error.msg.contains(&script.display().to_string()),
+        "{error:?}"
+    );
+    assert!(error.recover.is_some(), "{error:?}");
+    assert_eq!(
+        fs::read_to_string(&marker).expect("launch marker"),
+        marker_before
+    );
+    assert_eq!(fs::read(&store_path).expect("session store"), store_before);
+    assert_eq!(registry.list().await.len(), 1);
+    let after = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect terminal");
+    assert_eq!(after.state, terminal.state);
+    assert_eq!(after.pid, terminal.pid);
+    assert_eq!(after.runtime, terminal.runtime);
 }
 
 #[cfg(unix)]
@@ -12516,12 +12719,21 @@ async fn incompatible_hermes_resume_binding_fails_before_recovery_side_effects()
             .resume_binding(candidate)
             .await
             .expect_err("incompatible Hermes binding must not enter recovery");
-        assert_eq!(error.code, "agent_runtime_unsupported");
-        assert_eq!(
-            error.msg,
-            "the selected agent runtime is unavailable or incompatible with this daemon"
-        );
-        assert!(error.recover.is_none());
+        if version_output == "missing" {
+            // A vanished executable is reported as missing, naming only its
+            // file name, before any probe runs.
+            assert_eq!(error.code, "agent_binary_missing");
+            assert!(error.msg.contains("missing-hermes"), "{error:?}");
+            assert!(!error.msg.contains(&dir.display().to_string()), "{error:?}");
+            assert!(error.recover.is_some(), "{error:?}");
+        } else {
+            assert_eq!(error.code, "agent_runtime_unsupported");
+            assert_eq!(
+                error.msg,
+                "the selected agent executable did not pass this daemon's version check"
+            );
+            assert!(error.recover.is_none());
+        }
         assert_eq!(fs::read(&store_path).expect("store sentinel"), sentinel);
         assert!(!marker.exists(), "resume process must not be launched");
         assert!(registry.list().await.is_empty());

@@ -876,11 +876,16 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     }
     const runtime = this.agentRuntime(params.agent);
     if (runtime === undefined) {
-      return errResponse(request.id, agentRuntimeUnsupported());
+      return errResponse(request.id, agentProfileNotFound(params.agent));
     }
     if (!this.isLaunchableRuntime(runtime)) {
       if (runtime.agent_base !== undefined && !isLaunchableAgentBase(runtime.agent_base)) {
         return errResponse(request.id, agentKindUnsupported(runtime.agent_base));
+      }
+      // The daemon answers a missing executable before any version probe, for
+      // every runtime; the fixture names the base runtime's program.
+      if (!runtime.available) {
+        return errResponse(request.id, agentBinaryMissing(runtime.agent_base ?? params.agent));
       }
       return errResponse(request.id, agentRuntimeUnsupported());
     }
@@ -2945,11 +2950,29 @@ function agentKindUnsupported(agent: string): ProtocolError {
   );
 }
 
+function agentProfileNotFound(name: string): ProtocolError {
+  return protocolError(
+    "runtime",
+    "agent_profile_not_found",
+    `no agent profile or base kind named '${name}' on this host`,
+    "use shell|codex|claude|hermes, or add ~/.config/pohunek/agents/<name>.toml on the target host",
+  );
+}
+
+function agentBinaryMissing(binary: string): ProtocolError {
+  return protocolError(
+    "runtime",
+    "agent_binary_missing",
+    `agent binary not found on PATH: ${binary}`,
+    `install the ${binary} CLI and ensure it is on PATH; run \`pohunek doctor\` to verify`,
+  );
+}
+
 function agentRuntimeUnsupported(): ProtocolError {
   return protocolError(
     "runtime",
     "agent_runtime_unsupported",
-    "the selected agent runtime is unavailable or incompatible with this daemon",
+    "the selected agent executable did not pass this daemon's version check",
   );
 }
 
