@@ -10,6 +10,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use package::registry::{PackageSource, Registry};
+use package::Limits;
+use protocol::PackageId;
 use serde::de::{Error as _, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -17,7 +20,7 @@ use sha2::{Digest as _, Sha256};
 use super::error::Error;
 
 /// Version of the marker format written into one managed plugin root.
-pub(crate) const MARKER_VERSION: u32 = 2;
+pub(crate) const MARKER_VERSION: u32 = 3;
 /// The generated marker is deliberately not self-checksummed.
 pub(crate) const MARKER_NAME: &str = ".pohunek-owned.json";
 /// Closed operator sidecar embedded into the CLI for verification at install time.
@@ -122,6 +125,88 @@ pub(crate) struct Asset {
     bytes: Vec<u8>,
 }
 
+/// Immutable bytes and provenance selected before the filesystem transaction.
+#[derive(Debug, Clone)]
+pub(crate) struct Bundle {
+    pub(crate) assets: Vec<Asset>,
+    pub(crate) manifest_sha256: String,
+    pub(crate) package_id: Option<String>,
+    pub(crate) package_digest: Option<String>,
+}
+
+/// Selects and snapshots the enabled, selected official Hermes package.
+pub(crate) fn selected_bundle(registry_path: &Path, policy_path: &Path) -> Result<Bundle, Error> {
+    const PACKAGE_ID: &str = "pohunek.runtime.hermes";
+    let Some(registry) = Registry::open_existing_at(registry_path, Limits::DEFAULT)
+        .map_err(|_| Error::InvalidAsset)?
+    else {
+        return embedded_bundle(policy_path);
+    };
+    let state = registry.state().map_err(|_| Error::InvalidAsset)?;
+    let id = PackageId::parse(PACKAGE_ID).map_err(|_| Error::InvalidAsset)?;
+    let candidates: Vec<_> = state
+        .packages()
+        .iter()
+        .filter(|record| record.identity().id == id)
+        .collect();
+    if candidates.is_empty() {
+        return embedded_bundle(policy_path);
+    }
+    let selected = state.selected(&id).ok_or(Error::InvalidAsset)?;
+    let record = state.package(selected).ok_or(Error::InvalidAsset)?;
+    if record.identity().id != id || !record.enabled() || record.source() != PackageSource::Official
+    {
+        return Err(Error::InvalidAsset);
+    }
+    let verified = registry.verify(selected).map_err(|_| Error::InvalidAsset)?;
+    let source = verified
+        .read_file("operator.toml")
+        .map_err(|_| Error::InvalidAsset)?;
+    let mut payload = BTreeMap::new();
+    let mut operator_paths = BTreeSet::new();
+    for file in verified.files() {
+        if file.path.starts_with("operator/") {
+            operator_paths.insert(file.path.clone());
+            let bytes = verified
+                .read_file(&file.path)
+                .map_err(|_| Error::InvalidAsset)?;
+            payload.insert(file.path.clone(), bytes);
+        }
+    }
+    let assets = render_source(policy_path, &source, |path| {
+        payload.get(path).cloned().ok_or(Error::InvalidAsset)
+    })?;
+    let expected_operator_paths: BTreeSet<_> = EXPECTED_PAYLOAD_PATHS
+        .iter()
+        .map(|path| format!("operator/{path}"))
+        .collect();
+    if operator_paths != expected_operator_paths {
+        return Err(Error::InvalidAsset);
+    }
+    Ok(Bundle {
+        assets,
+        manifest_sha256: checksum(&source),
+        package_id: Some(record.identity().id.to_string()),
+        package_digest: Some(
+            record
+                .digest()
+                .to_string()
+                .trim_start_matches("sha256:")
+                .to_owned(),
+        ),
+    })
+}
+
+/// Returns the embedded S3 sidecar as an immutable byte snapshot.
+pub(crate) fn embedded_bundle(policy_path: &Path) -> Result<Bundle, Error> {
+    Ok(Bundle {
+        assets: render(policy_path)?,
+        manifest_sha256: checksum(OPERATOR_MANIFEST),
+        package_id: None,
+        package_digest: None,
+    })
+}
+
 impl Asset {
     /// Returns the normalized relative asset path.
     #[must_use]
@@ -155,6 +240,15 @@ pub(crate) struct Ownership {
     /// Digest of the exact closed operator sidecar used for this install.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) operator_sha256: Option<String>,
+    /// Explicit immutable source used for this install.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source: Option<String>,
+    /// Runtime package identity for package-backed assets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) package_id: Option<String>,
+    /// Archive digest for package-backed assets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) package_digest: Option<String>,
     /// Rendered checksum for every immutable managed asset.
     #[serde(deserialize_with = "deserialize_checksums")]
     pub(crate) assets: BTreeMap<String, String>,
@@ -162,32 +256,42 @@ pub(crate) struct Ownership {
 
 /// Renders immutable assets for exactly one validated absolute policy path.
 pub(crate) fn render(policy_path: &Path) -> Result<Vec<Asset>, Error> {
+    render_source(policy_path, OPERATOR_MANIFEST, |path| {
+        let path = path.strip_prefix("operator/").ok_or(Error::InvalidAsset)?;
+        OPERATOR_PAYLOAD
+            .iter()
+            .find(|(asset_path, _)| *asset_path == path)
+            .map(|(_, bytes)| bytes.to_vec())
+            .ok_or(Error::InvalidAsset)
+    })
+}
+
+/// Renders a closed sidecar from an already snapshotted manifest and payload.
+pub(crate) fn render_source(
+    policy_path: &Path,
+    source: &[u8],
+    mut read: impl FnMut(&str) -> Result<Vec<u8>, Error>,
+) -> Result<Vec<Asset>, Error> {
     if !policy_path.is_absolute() || policy_path.to_str().is_none() {
         return Err(Error::UnsafePolicyPath);
     }
     let escaped = serde_json::to_string(policy_path.to_str().ok_or(Error::UnsafePolicyPath)?)
         .map_err(|_| Error::UnsafePolicyPath)?;
-    let manifest = verified_operator_manifest()?;
+    let manifest = parse_operator_manifest(source, &mut read)?;
     let mut rendered = Vec::with_capacity(EXPECTED_PATHS.len());
     for record in manifest.payload {
-        let (path, bytes) = OPERATOR_PAYLOAD
-            .iter()
-            .find(|(path, _)| *path == record.path)
-            .ok_or(Error::InvalidAsset)?;
-        if checksum(bytes) != record.sha256 {
+        let bytes = read(&format!("operator/{}", record.path))?;
+        if checksum(&bytes) != record.sha256 {
             return Err(Error::InvalidAsset);
         }
-        let path = *path;
-        validate_relative_path(path)?;
+        let path = record.path;
+        validate_relative_path(&path)?;
         let bytes = if path == "__init__.py" {
-            replace_policy_token(bytes, &escaped)?
+            replace_policy_token(&bytes, &escaped)?
         } else {
-            bytes.to_vec()
+            bytes
         };
-        rendered.push(Asset {
-            path: path.to_owned(),
-            bytes,
-        });
+        rendered.push(Asset { path, bytes });
     }
     for (path, bytes) in CORE_OWNED_ASSETS {
         validate_relative_path(path)?;
@@ -205,6 +309,38 @@ pub(crate) fn render(policy_path: &Path) -> Result<Vec<Asset>, Error> {
         return Err(Error::InvalidAsset);
     }
     Ok(rendered)
+}
+
+fn parse_operator_manifest(
+    source: &[u8],
+    read: &mut impl FnMut(&str) -> Result<Vec<u8>, Error>,
+) -> Result<OperatorManifest, Error> {
+    let text = std::str::from_utf8(source).map_err(|_| Error::InvalidAsset)?;
+    let manifest: OperatorManifest =
+        toml_edit::de::from_str(text).map_err(|_| Error::InvalidAsset)?;
+    if manifest.schema != 1 || manifest.payload.len() != EXPECTED_PAYLOAD_PATHS.len() {
+        return Err(Error::InvalidAsset);
+    }
+    let paths: Vec<_> = manifest
+        .payload
+        .iter()
+        .map(|asset| asset.path.as_str())
+        .collect();
+    if paths != EXPECTED_PAYLOAD_PATHS
+        || manifest
+            .payload
+            .iter()
+            .any(|asset| !is_sha256(&asset.sha256))
+    {
+        return Err(Error::InvalidAsset);
+    }
+    for asset in &manifest.payload {
+        let bytes = read(&format!("operator/{}", asset.path))?;
+        if checksum(&bytes) != asset.sha256 {
+            return Err(Error::InvalidAsset);
+        }
+    }
+    Ok(manifest)
 }
 
 /// Returns a parsed sidecar only when its closed schema and exact payload set match.
@@ -280,8 +416,41 @@ pub(crate) fn ownership(
         hermes_home: hermes_home.to_owned(),
         policy_path: policy_path.to_owned(),
         operator_sha256: Some(operator_sha256()?),
+        source: Some("embedded".to_owned()),
+        package_id: None,
+        package_digest: None,
         assets: checksums,
     })
+}
+
+/// Builds a marker with provenance for a snapshotted package or embedded bundle.
+pub(crate) fn ownership_for_bundle(
+    hermes_home: &Path,
+    policy_path: &Path,
+    bundle: &Bundle,
+) -> Result<Ownership, Error> {
+    let mut ownership = ownership(hermes_home, policy_path, &bundle.assets)?;
+    ownership.operator_sha256 = Some(bundle.manifest_sha256.clone());
+    ownership.source = Some(
+        if bundle.package_id.is_some() {
+            "package"
+        } else {
+            "embedded"
+        }
+        .to_owned(),
+    );
+    ownership.package_id.clone_from(&bundle.package_id);
+    ownership.package_digest.clone_from(&bundle.package_digest);
+    if ownership.source.as_deref() == Some("package")
+        && (ownership.package_id.is_none()
+            || ownership
+                .package_digest
+                .as_deref()
+                .is_none_or(|value| !is_sha256(value)))
+    {
+        return Err(Error::InvalidAsset);
+    }
+    Ok(ownership)
 }
 
 /// Serializes the ownership marker deterministically.
@@ -295,10 +464,32 @@ pub(crate) fn parse_marker(bytes: &[u8]) -> Result<Ownership, Error> {
     let inventory_valid =
         has_current_paths(&ownership.assets) || has_previous_paths(&ownership.assets);
     let provenance_valid = match ownership.version {
-        1 => ownership.operator_sha256.is_none(),
+        1 => {
+            ownership.operator_sha256.is_none()
+                && ownership.source.is_none()
+                && ownership.package_id.is_none()
+                && ownership.package_digest.is_none()
+        }
+        2 => {
+            ownership.operator_sha256.as_deref().is_some_and(is_sha256)
+                && ownership.source.is_none()
+                && ownership.package_id.is_none()
+                && ownership.package_digest.is_none()
+                && has_current_paths(&ownership.assets)
+        }
         MARKER_VERSION => {
             ownership.operator_sha256.as_deref().is_some_and(is_sha256)
                 && has_current_paths(&ownership.assets)
+                && match ownership.source.as_deref() {
+                    Some("embedded") => {
+                        ownership.package_id.is_none() && ownership.package_digest.is_none()
+                    }
+                    Some("package") => {
+                        ownership.package_id.as_deref() == Some("pohunek.runtime.hermes")
+                            && ownership.package_digest.as_deref().is_some_and(is_sha256)
+                    }
+                    _ => false,
+                }
         }
         _ => false,
     };
@@ -598,6 +789,9 @@ mod tests {
         let mut previous = ownership.clone();
         previous.version = 1;
         previous.operator_sha256 = None;
+        previous.source = None;
+        previous.package_id = None;
+        previous.package_digest = None;
         previous.assets.remove("_pohunek_reporter.py");
         assert!(has_previous_inventory(&previous));
         assert_eq!(
@@ -609,6 +803,9 @@ mod tests {
         let mut reporter_release = ownership.clone();
         reporter_release.version = 1;
         reporter_release.operator_sha256 = None;
+        reporter_release.source = None;
+        reporter_release.package_id = None;
+        reporter_release.package_digest = None;
         assert_eq!(
             parse_marker(&marker_bytes(&reporter_release).expect("v1 reporter marker"))
                 .expect("previous S2 marker remains readable"),
@@ -626,6 +823,17 @@ mod tests {
         assert_eq!(
             parse_marker(&marker_bytes(&unexpected_provenance).expect("v1 marker with digest")),
             Err(Error::InvalidMarker)
+        );
+
+        let mut previous_v2 = ownership.clone();
+        previous_v2.version = 2;
+        previous_v2.source = None;
+        previous_v2.package_id = None;
+        previous_v2.package_digest = None;
+        assert_eq!(
+            parse_marker(&marker_bytes(&previous_v2).expect("v2 marker"))
+                .expect("S3a marker remains readable"),
+            previous_v2
         );
 
         previous

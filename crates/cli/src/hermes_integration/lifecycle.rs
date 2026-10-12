@@ -95,11 +95,13 @@ pub(crate) struct InstallRequest<'a> {
     policy_path: &'a Path,
     policy: &'a Policy,
     confirm_modified: bool,
+    bundle: Option<&'a assets::Bundle>,
 }
 
 impl<'a> InstallRequest<'a> {
     /// Creates a request from already validated command-layer inputs.
     #[must_use]
+    #[cfg(test)]
     pub(crate) const fn new(
         target: &'a ResolvedTarget,
         policy_path: &'a Path,
@@ -111,6 +113,25 @@ impl<'a> InstallRequest<'a> {
             policy_path,
             policy,
             confirm_modified,
+            bundle: None,
+        }
+    }
+
+    /// Creates a request using immutable bytes snapshotted before locking.
+    #[must_use]
+    pub(crate) const fn with_bundle(
+        target: &'a ResolvedTarget,
+        policy_path: &'a Path,
+        policy: &'a Policy,
+        confirm_modified: bool,
+        bundle: &'a assets::Bundle,
+    ) -> Self {
+        Self {
+            target,
+            policy_path,
+            policy,
+            confirm_modified,
+            bundle: Some(bundle),
         }
     }
 }
@@ -151,6 +172,8 @@ pub(crate) struct LifecycleState {
     /// The assets the marker records are not the ones this binary embeds, so
     /// the install predates the running release even though no file was touched.
     pub(crate) outdated: bool,
+    /// The marker names a package source that is not selected and available.
+    pub(crate) package_source_missing: bool,
     /// A matching Pohunek stage sibling remains from an interrupted transaction.
     pub(crate) stale_stage: bool,
     /// A matching Pohunek backup sibling remains from an interrupted transaction.
@@ -162,8 +185,12 @@ pub(crate) fn install(
     control: &mut impl HermesControl,
     request: &InstallRequest<'_>,
 ) -> Result<LifecycleState, Error> {
+    let bundle = request
+        .bundle
+        .cloned()
+        .map_or_else(|| assets::embedded_bundle(request.policy_path), Ok)?;
     let _lock = acquire_transaction_lock(request.policy_path)?;
-    install_with(control, request, &mut NativeFileOps)
+    install_with_bundle(control, request, &bundle, &mut NativeFileOps)
 }
 
 /// Updates a policy derived from the current on-disk value under one lock.
@@ -171,6 +198,7 @@ pub(crate) fn install(
 /// # Errors
 ///
 /// Returns [`Error`] when locking, policy loading, derivation, or installation fails.
+#[cfg(test)]
 pub(crate) fn update(
     control: &mut impl HermesControl,
     target: &ResolvedTarget,
@@ -178,26 +206,62 @@ pub(crate) fn update(
     confirm_modified: bool,
     derive: impl FnOnce(&Policy) -> Result<Policy, Error>,
 ) -> Result<(LifecycleState, Policy), Error> {
+    update_with_bundle(control, target, policy_path, confirm_modified, None, derive)
+}
+
+/// Updates using source bytes resolved before acquiring the lifecycle lock.
+pub(crate) fn update_with_bundle(
+    control: &mut impl HermesControl,
+    target: &ResolvedTarget,
+    policy_path: &Path,
+    confirm_modified: bool,
+    bundle: Option<&assets::Bundle>,
+    derive: impl FnOnce(&Policy) -> Result<Policy, Error>,
+) -> Result<(LifecycleState, Policy), Error> {
+    let bundle = bundle
+        .cloned()
+        .map_or_else(|| assets::embedded_bundle(policy_path), Ok)?;
     let _lock = acquire_transaction_lock(policy_path)?;
     let current = Policy::load_private(policy_path)?;
     let policy = derive(&current)?;
-    let request = InstallRequest::new(target, policy_path, &policy, confirm_modified);
-    let state = install_with(control, &request, &mut NativeFileOps)?;
+    let request =
+        InstallRequest::with_bundle(target, policy_path, &policy, confirm_modified, &bundle);
+    let state = install_with_bundle(control, &request, &bundle, &mut NativeFileOps)?;
     Ok((state, policy))
 }
 
+#[cfg(test)]
 fn install_with(
     control: &mut impl HermesControl,
     request: &InstallRequest<'_>,
     files: &mut impl FileOps,
 ) -> Result<LifecycleState, Error> {
+    let bundle = request
+        .bundle
+        .cloned()
+        .map_or_else(|| assets::embedded_bundle(request.policy_path), Ok)?;
+    install_with_bundle(control, request, &bundle, files)
+}
+
+fn install_with_bundle(
+    control: &mut impl HermesControl,
+    request: &InstallRequest<'_>,
+    bundle: &assets::Bundle,
+    files: &mut impl FileOps,
+) -> Result<LifecycleState, Error> {
     validate_request_target(request.target, request.policy_path)?;
-    let assets = assets::render(request.policy_path)?;
-    let desired = assets::ownership(request.target.hermes_home(), request.policy_path, &assets)?;
+    let assets = &bundle.assets;
+    let desired =
+        assets::ownership_for_bundle(request.target.hermes_home(), request.policy_path, bundle)?;
     let marker = assets::marker_bytes(&desired)?;
     assets::parse_marker(&marker)?;
     let policy_bytes = request.policy.to_json()?;
-    let existing = installed(request.target, request.policy_path, Some(&assets))?;
+    let existing = installed(request.target, request.policy_path, Some(bundle))?;
+    if existing.as_ref().is_some_and(|installed| {
+        installed.ownership.source.as_deref() == Some("package") && bundle.package_id.is_none()
+    }) {
+        return Err(Error::PackageSourceMissing);
+    }
     if existing.as_ref().is_some_and(|value| value.modified) && !request.confirm_modified {
         return Err(Error::ConfirmationRequired);
     }
@@ -227,7 +291,7 @@ fn install_with(
             return Err(error);
         }
     };
-    let write_result = write_stage(files, &stage_plugin, &assets, &desired)
+    let write_result = write_stage(files, &stage_plugin, assets, &desired)
         .and_then(|()| files.write_reserved(&stage_policy, &policy_bytes))
         .and_then(|()| {
             existing.as_ref().map_or(Ok(()), |installed| {
@@ -298,6 +362,7 @@ fn install_with(
         enabled: true,
         modified: existing.is_some_and(|value| value.modified),
         outdated: false,
+        package_source_missing: false,
         stale_stage: false,
         stale_backup: false,
     })
@@ -391,6 +456,7 @@ fn uninstall_with(
         enabled: false,
         modified: false,
         outdated: false,
+        package_source_missing: false,
         stale_stage: false,
         stale_backup: false,
     })
@@ -402,15 +468,29 @@ pub(crate) fn inspect(
     target: &ResolvedTarget,
     policy_path: &Path,
 ) -> Result<LifecycleState, Error> {
+    let bundle = assets::embedded_bundle(policy_path)?;
+    inspect_with_bundle(control, target, policy_path, &bundle)
+}
+
+/// Inspects against the source snapshot selected before acquiring any lock.
+pub(crate) fn inspect_with_bundle(
+    control: &mut impl HermesControl,
+    target: &ResolvedTarget,
+    policy_path: &Path,
+    bundle: &assets::Bundle,
+) -> Result<LifecycleState, Error> {
     validate_request_target(target, policy_path)?;
-    let assets = assets::render(policy_path)?;
-    let current = installed(target, policy_path, Some(&assets))?;
-    let (stale_stage, stale_backup) = stale_siblings(target, policy_path, &assets)?;
+    let current = installed(target, policy_path, Some(bundle))?;
+    let assets = &bundle.assets;
+    let (stale_stage, stale_backup) = stale_siblings(target, policy_path, assets)?;
     Ok(LifecycleState {
         installed: current.is_some(),
         enabled: control.is_enabled(target)?,
         modified: current.as_ref().is_some_and(|value| value.modified),
         outdated: current.as_ref().is_some_and(|value| value.outdated),
+        package_source_missing: current
+            .as_ref()
+            .is_some_and(|value| value.package_source_missing),
         stale_stage,
         stale_backup,
     })
@@ -422,6 +502,7 @@ struct Installed {
     modified: bool,
     /// The marker's recorded payload or sidecar provenance differs from this binary.
     outdated: bool,
+    package_source_missing: bool,
 }
 
 /// Narrow filesystem seam for transactional writes and moves.
@@ -677,7 +758,7 @@ fn trusted_remove_dir_all(path: &Path) -> Result<(), Error> {
 fn installed(
     target: &ResolvedTarget,
     policy_path: &Path,
-    expected_assets: Option<&[Asset]>,
+    expected_bundle: Option<&assets::Bundle>,
 ) -> Result<Option<Installed>, Error> {
     let root = target.plugin_root();
     match fs::symlink_metadata(root) {
@@ -688,16 +769,25 @@ fn installed(
         }
         Ok(_) => validate_private_directory(root)?,
     }
-    let ownership = read_matching_ownership(root, target, policy_path, expected_assets)?;
+    let ownership = read_matching_ownership(
+        root,
+        target,
+        policy_path,
+        expected_bundle.map(|bundle| bundle.assets.as_slice()),
+    )?;
     let modified = managed_modified(root, &ownership)? || has_unmanaged_entries(root, &ownership)?;
-    let outdated = if let Some(expected) = expected_assets {
-        let assets_outdated = expected
+    let package_source_missing = ownership.source.as_deref() == Some("package")
+        && expected_bundle.is_some_and(|bundle| bundle.package_id.is_none());
+    let outdated = if let Some(bundle) = expected_bundle {
+        let assets_outdated = bundle
+            .assets
             .iter()
             .any(|asset| ownership.assets.get(asset.path()) != Some(&asset.checksum()));
-        let current_operator_sha256 = assets::operator_sha256()?;
-        let provenance_outdated =
-            ownership.operator_sha256.as_deref() != Some(current_operator_sha256.as_str());
-        assets_outdated || provenance_outdated
+        let provenance_outdated = ownership.operator_sha256.as_deref()
+            != Some(bundle.manifest_sha256.as_str())
+            || ownership.package_id != bundle.package_id
+            || ownership.package_digest != bundle.package_digest;
+        assets_outdated || provenance_outdated || package_source_missing
     } else {
         false
     };
@@ -705,6 +795,7 @@ fn installed(
         ownership,
         modified,
         outdated,
+        package_source_missing,
     }))
 }
 
@@ -1763,6 +1854,7 @@ mod tests {
                 enabled: true,
                 modified: false,
                 outdated: false,
+                package_source_missing: false,
                 stale_stage: false,
                 stale_backup: false,
             }
@@ -2408,6 +2500,7 @@ esac"#,
                 enabled: false,
                 modified: false,
                 outdated: false,
+                package_source_missing: false,
                 stale_stage: false,
                 stale_backup: false,
             }

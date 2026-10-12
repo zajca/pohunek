@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use nix::unistd::Uid;
 use serde::Serialize;
 
+use super::assets;
 use super::lifecycle;
 use super::policy::{Policy, WildcardConfirmation};
 use super::runner::{HermesRunner, InstalledProbe};
@@ -26,13 +27,14 @@ const MANAGED_HOOK_COUNT: u8 = 7;
 /// Hooks must finish inside the one-second bound enforced by the Python probe.
 const HOOK_LATENCY_CEILING_MS: u32 = 1_000;
 /// The complete, stable report inventory in user-facing presentation order.
-const CHECK_CODES: [&str; 16] = [
+const CHECK_CODES: [&str; 17] = [
     "hermes_executable",
     "hermes_version",
     "target_safety",
     "plugin_ownership",
     "asset_integrity",
     "asset_current",
+    "asset_source",
     "plugin_enabled",
     "policy_schema_permissions",
     "pohunek_cli_compatibility",
@@ -109,10 +111,38 @@ impl Check {
 /// returns every check even when an earlier check fails, and never exposes
 /// selected paths, policy bytes, sockets, or child-process output.
 #[must_use]
+#[cfg(test)]
 pub(crate) fn inspect(
     runner: &mut HermesRunner,
     target: &ResolvedTarget,
     policy_path: &Path,
+) -> Report {
+    let bundle = assets::embedded_bundle(policy_path);
+    if let Ok(bundle) = bundle {
+        inspect_with_bundle(runner, target, policy_path, &bundle, true)
+    } else {
+        let mut checks: Vec<Check> = CHECK_CODES.iter().copied().map(Check::not_run).collect();
+        set_fail(
+            &mut checks,
+            "asset_source",
+            "restore a valid Hermes operator asset source",
+        );
+        Report { ok: false, checks }
+    }
+}
+
+/// Inspects the fixed plugin against an immutable package source snapshot.
+#[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the complete fixed-order doctor report stays together for auditability"
+)]
+pub(crate) fn inspect_with_bundle(
+    runner: &mut HermesRunner,
+    target: &ResolvedTarget,
+    policy_path: &Path,
+    bundle: &assets::Bundle,
+    package_source_available: bool,
 ) -> Report {
     let mut checks: Vec<Check> = CHECK_CODES.iter().copied().map(Check::not_run).collect();
     set_pass(&mut checks, "hermes_executable");
@@ -146,7 +176,8 @@ pub(crate) fn inspect(
         set_pass(&mut checks, "access_mode");
     }
 
-    let lifecycle = target_safe.then(|| lifecycle::inspect(runner, target, policy_path));
+    let lifecycle =
+        target_safe.then(|| lifecycle::inspect_with_bundle(runner, target, policy_path, bundle));
     match lifecycle {
         Some(Ok(state)) => {
             set_result(
@@ -165,7 +196,13 @@ pub(crate) fn inspect(
                 &mut checks,
                 "asset_current",
                 state.installed && !state.outdated,
-                "run `pohunek integration update --agent hermes` with the original `--hermes-profile` or `--hermes-home` to replace assets from an older release",
+                "run `pohunek integration update --agent hermes` with the original `--hermes-profile` or `--hermes-home` to replace assets from their recorded source",
+            );
+            set_result(
+                &mut checks,
+                "asset_source",
+                package_source_available && !state.package_source_missing,
+                "restore and select the official Hermes package recorded by this install before updating",
             );
             set_result(
                 &mut checks,
@@ -199,6 +236,7 @@ pub(crate) fn inspect(
     let ready_for_probe = is_pass(&checks, "hermes_version")
         && is_pass(&checks, "plugin_ownership")
         && is_pass(&checks, "asset_integrity")
+        && is_pass(&checks, "asset_source")
         && is_pass(&checks, "policy_schema_permissions");
     if ready_for_probe {
         match runner.probe_installed(target, policy_path) {
@@ -379,7 +417,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::hermes_integration::assets;
     use crate::hermes_integration::target::{ProfileName, TargetContext, TargetSelection};
     use crate::hermes_integration::test_python;
 

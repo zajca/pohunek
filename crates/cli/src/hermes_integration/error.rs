@@ -44,6 +44,9 @@ pub(crate) enum Error {
     /// An embedded plugin asset did not meet the fixed ownership contract.
     #[error("Hermes plugin asset manifest is invalid")]
     InvalidAsset,
+    /// The package source recorded by a package-backed install is unavailable.
+    #[error("the Hermes operator package source is unavailable")]
+    PackageSourceMissing,
     /// A directory exists but was not created by this lifecycle.
     #[error("Hermes plugin directory is not owned by Pohunek")]
     Collision,
@@ -110,7 +113,12 @@ impl Error {
                 "confirm the wildcard host explicitly before creating the policy"
             }
             Self::UnsafePolicyPath => "select a Pohunek configuration root outside the plugin tree",
-            Self::InvalidAsset => "use the plugin assets embedded by this Pohunek release",
+            Self::InvalidAsset => {
+                "verify the official Hermes package with `pohunek plugin doctor`; restore it from its signed catalog and enable/select it, or update Pohunek if its embedded assets are invalid"
+            }
+            Self::PackageSourceMissing => {
+                "restore or re-enable the recorded Hermes package before updating"
+            }
             Self::Collision => "choose a profile without an unrelated `pohunek` plugin",
             Self::InvalidMarker => "repair or manually preserve the affected plugin directory",
             Self::HermesCommand => "inspect the Hermes command result without exposing its output",

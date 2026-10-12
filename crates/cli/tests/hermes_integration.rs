@@ -288,7 +288,8 @@ esac"#,
     )
     .expect("parse ownership marker");
     let operator_manifest = include_bytes!("../../../compat/hermes/operator.toml");
-    assert_eq!(marker["version"], 2);
+    assert_eq!(marker["version"], 3);
+    assert_eq!(marker["source"], "embedded");
     assert_eq!(
         marker["operator_sha256"],
         format!(
@@ -601,6 +602,18 @@ esac"#,
         .as_object_mut()
         .expect("marker object")
         .remove("operator_sha256");
+    previous_marker
+        .as_object_mut()
+        .expect("marker object")
+        .remove("source");
+    previous_marker
+        .as_object_mut()
+        .expect("marker object")
+        .remove("package_id");
+    previous_marker
+        .as_object_mut()
+        .expect("marker object")
+        .remove("package_digest");
     previous_marker["assets"]
         .as_object_mut()
         .expect("asset map")
@@ -667,7 +680,7 @@ esac"#,
     assert_eq!(doctor_ok["doctor"]["ok"], true);
     assert_eq!(
         doctor_ok["doctor"]["checks"].as_array().map(Vec::len),
-        Some(16)
+        Some(17)
     );
 
     let reporter_path = plugin_root.join("_pohunek_reporter.py");
@@ -726,6 +739,18 @@ esac"#,
         .as_object_mut()
         .expect("marker object")
         .remove("operator_sha256");
+    previous_uninstall_marker
+        .as_object_mut()
+        .expect("marker object")
+        .remove("source");
+    previous_uninstall_marker
+        .as_object_mut()
+        .expect("marker object")
+        .remove("package_id");
+    previous_uninstall_marker
+        .as_object_mut()
+        .expect("marker object")
+        .remove("package_digest");
     fs::remove_file(plugin_root.join("_pohunek_reporter.py"))
         .expect("remove asset absent from previous inventory");
     fs::write(

@@ -28,6 +28,13 @@ writes the embedded payload under `operator/` and refreshes its `operator.toml`
 checksum. `cargo xtask hermes check-skill` and `cargo xtask docs check` verify
 that exact embedded payload and checksum.
 
+The S3 package-backed contract places the closed sidecar at `operator.toml` in
+the root of an installed Hermes runtime package and its exact allowlisted files
+at `operator/<path>` alongside `runtime.toml` and `detect.toml`. The selected
+package record must be enabled and catalog-authorized. The S5 release inventory
+will provide the official package; until then the CLI keeps the embedded S3
+sidecar as its source when no Hermes package is installed.
+
 Run the model-free CI gate with an installed pinned executable on `PATH`:
 
 ```bash

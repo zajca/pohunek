@@ -24,6 +24,7 @@ use serde::Serialize;
 
 use crate::client::Client;
 use crate::error::CliError;
+use crate::hermes_integration::assets;
 use crate::hermes_integration::doctor;
 use crate::hermes_integration::error::Error as HermesError;
 use crate::hermes_integration::lifecycle::{
@@ -541,6 +542,25 @@ pub(crate) fn run_hermes(
     options.validate_for_action(action)?;
     let target = resolve_target(options)?;
     let policy_path = policy_path(&target)?;
+    let mut package_source_failed = false;
+    let bundle = match action {
+        HermesAction::Install | HermesAction::Update => {
+            let plugins_dir = Paths::plugins_dir()?;
+            Some(assets::selected_bundle(&plugins_dir, &policy_path).map_err(hermes_error)?)
+        }
+        HermesAction::Status | HermesAction::Doctor => {
+            let plugins_dir = Paths::plugins_dir()?;
+            Some(
+                if let Ok(bundle) = assets::selected_bundle(&plugins_dir, &policy_path) {
+                    bundle
+                } else {
+                    package_source_failed = true;
+                    assets::embedded_bundle(&policy_path).map_err(hermes_error)?
+                },
+            )
+        }
+        HermesAction::Uninstall => None,
+    };
     let mut runner = HermesRunner::new(&resolve_hermes_executable(options.hermes_bin.as_deref())?)
         .map_err(hermes_error)?;
 
@@ -549,14 +569,26 @@ pub(crate) fn run_hermes(
             let policy = install_policy(options)?;
             let lifecycle = lifecycle::install(
                 &mut runner,
-                &InstallRequest::new(&target, &policy_path, &policy, options.confirm_modified),
+                &InstallRequest::with_bundle(
+                    &target,
+                    &policy_path,
+                    &policy,
+                    options.confirm_modified,
+                    bundle.as_ref().expect("install bundle"),
+                ),
             )
             .map_err(hermes_error)?;
             result(action, &target, lifecycle, Some(&policy), None)
         }
         HermesAction::Status => {
-            let lifecycle =
-                lifecycle::inspect(&mut runner, &target, &policy_path).map_err(hermes_error)?;
+            let mut lifecycle = lifecycle::inspect_with_bundle(
+                &mut runner,
+                &target,
+                &policy_path,
+                bundle.as_ref().expect("status bundle"),
+            )
+            .map_err(hermes_error)?;
+            lifecycle.package_source_missing |= package_source_failed;
             let policy = lifecycle
                 .installed
                 .then(|| Policy::load_private(&policy_path))
@@ -565,16 +597,23 @@ pub(crate) fn run_hermes(
             result(action, &target, lifecycle, policy.as_ref(), None)
         }
         HermesAction::Doctor => {
-            let report = doctor::inspect(&mut runner, &target, &policy_path);
+            let report = doctor::inspect_with_bundle(
+                &mut runner,
+                &target,
+                &policy_path,
+                bundle.as_ref().expect("doctor bundle"),
+                !package_source_failed,
+            );
             let lifecycle = lifecycle_from_doctor(&report);
             result(action, &target, lifecycle, None, Some(report))
         }
         HermesAction::Update => {
-            let (lifecycle, policy) = lifecycle::update(
+            let (lifecycle, policy) = lifecycle::update_with_bundle(
                 &mut runner,
                 &target,
                 &policy_path,
                 options.confirm_modified,
+                bundle.as_ref(),
                 |existing| update_policy(options, existing),
             )
             .map_err(hermes_error)?;
@@ -1038,6 +1077,7 @@ struct HermesResult {
     enabled: bool,
     modified: bool,
     outdated: bool,
+    package_source_missing: bool,
     stale_stage: bool,
     stale_backup: bool,
     access_mode: Option<AccessMode>,
@@ -1068,6 +1108,7 @@ fn result(
         enabled: lifecycle.enabled,
         modified: lifecycle.modified,
         outdated: lifecycle.outdated,
+        package_source_missing: lifecycle.package_source_missing,
         stale_stage: lifecycle.stale_stage,
         stale_backup: lifecycle.stale_backup,
         access_mode: policy.map(Policy::access_mode),
@@ -1090,6 +1131,7 @@ fn lifecycle_from_doctor(report: &doctor::Report) -> LifecycleState {
             && has_status("asset_integrity", doctor::Status::Fail),
         outdated: has_status("plugin_ownership", doctor::Status::Pass)
             && has_status("asset_current", doctor::Status::Fail),
+        package_source_missing: has_status("asset_source", doctor::Status::Fail),
         stale_stage: has_status("stale_stage", doctor::Status::Fail),
         stale_backup: has_status("stale_backup", doctor::Status::Fail),
     }
@@ -1097,7 +1139,7 @@ fn lifecycle_from_doctor(report: &doctor::Report) -> LifecycleState {
 
 fn render_hermes_human(result: &HermesResult) -> String {
     let mut output = format!(
-        "Hermes {}: {} {} (installed={}, enabled={}, modified={}, outdated={})\n",
+        "Hermes {}: {} {} (installed={}, enabled={}, modified={}, outdated={}, package_source_missing={})\n",
         result.action,
         result.target_kind,
         result.target_label,
@@ -1105,6 +1147,7 @@ fn render_hermes_human(result: &HermesResult) -> String {
         result.enabled,
         result.modified,
         result.outdated,
+        result.package_source_missing,
     );
     if let (Some(access_mode), Some(allowed_host_count)) =
         (result.access_mode, result.allowed_host_count)
@@ -1455,6 +1498,7 @@ mod tests {
             enabled,
             modified,
             outdated: false,
+            package_source_missing: false,
             stale_stage,
             stale_backup,
         };
@@ -1759,6 +1803,7 @@ mod tests {
             enabled: true,
             modified: false,
             outdated: false,
+            package_source_missing: false,
             stale_stage: false,
             stale_backup: false,
             access_mode: None,

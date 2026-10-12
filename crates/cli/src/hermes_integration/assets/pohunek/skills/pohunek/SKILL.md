@@ -32,10 +32,25 @@ validation, not a published or released package. It preserves the built-in
 launch and detection contract and supports only the locked 0.20.0 release. The
 reserved `hermes` runtime id requires authorization by a signed catalog;
 Hermes is not in the published catalog, and no Hermes release package artifact
-exists yet. `compat/hermes/operator.toml` closes the allowlist for the local
-operator payload fixture in `compat/hermes/operator/`; the CLI verifies its
-paths and digests before installation. The generic hook reporter remains
-exclusively core-owned and is embedded separately by Pohunek.
+exists yet. The fixture contains only the runtime descriptor and detection
+manifest. When an official Hermes package is installed, enabled, and selected,
+Pohunek loads the operator plugin and its generated skill from that package.
+The copies compiled into the CLI are transitional fallbacks for hosts without
+an installed official package. The generic hook reporter remains embedded in
+Pohunek independently of the package.
+
+The operator assets use the selected, enabled official `pohunek.runtime.hermes`
+package when one is installed. Before that package is available, Pohunek uses
+the transitional copy embedded in the CLI. `integration status` and `doctor`
+still report `asset_source` as failed when an installed package is disabled,
+unselected, missing, or corrupt; they use the embedded copy only to finish the
+diagnostic report. `integration install` and `update` require a valid selected
+package whenever an installed Hermes package is present. To recover, verify the
+package with `pohunek plugin doctor`, then enable and select the intended
+official version with `pohunek plugin enable` and `pohunek plugin select`.
+Restore a missing or corrupt package from its signed catalog after clearing any
+session or profile pins. Re-run `integration doctor`, then update the operator
+assets from that selected source.
 
 The Hermes operator plugin is an owner-private, Pohunek-managed integration. It
 is not a same-user sandbox: the daemon remains authoritative for its public API,
