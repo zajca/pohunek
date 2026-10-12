@@ -25,24 +25,26 @@
 mod handler;
 
 use std::ffi::{OsStr, OsString};
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::{SinkExt, StreamExt};
 use pohunek_worker_protocol::{
     read_frame, write_frame, ControlCode, ControlError, DataFrame, FrameHeader, FrameKind, WriteId,
 };
 use protocol::{
-    negotiate, ErrorClass, Event, ProtocolError, ProtocolVersion, ProtocolVersionRange, Request,
-    Response, MAX_CONTROL_LINE_BYTES, SUPPORTED_PROTOCOL_VERSIONS,
+    method, negotiate, ErrorClass, Event, ProtocolError, ProtocolVersion, ProtocolVersionRange,
+    Request, Response, MAX_CONTROL_LINE_BYTES, SUPPORTED_PROTOCOL_VERSIONS,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::broadcast;
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use overlay::OverlayTransport;
 use pohunek_paths::{validate_staged_socket_path, Platform, SocketKind, STAGED_SOCKET_PREFIX};
@@ -489,12 +491,32 @@ impl RemoteServer {
     }
 }
 
+/// Methods whose in-flight request is cancelled when the client hangs up.
+///
+/// Each one is a read-only wait that can hold a waiter slot until its bounded
+/// timeout: an observation slot for `session.wait` and `session.output`, turn
+/// slots for `session.wait_turn`. Every slot is an RAII permit owned by the
+/// request future, so dropping the future on hangup releases it at once and
+/// changes no session state. A method that mutates state, or one whose permit
+/// a spawned task holds, must run to completion and never belongs here;
+/// supporting another read-only wait is one more entry in this list.
+const CANCEL_ON_HANGUP: &[&str] = &[
+    method::SESSION_WAIT,
+    method::SESSION_OUTPUT,
+    method::SESSION_WAIT_TURN,
+];
+
 /// Serve one control connection: read newline-delimited JSON requests, dispatch
 /// each, and write back one response line per request.
 ///
 /// Generic over the underlying stream so the same logic serves a local Unix
 /// connection ([`ControlServer`]) and a `NetBird` TCP connection ([`RemoteServer`])
 /// without divergence.
+///
+/// Requests are answered strictly in order. While a [`CANCEL_ON_HANGUP`] method
+/// runs, the read side is watched (see [`dispatch_until_hangup`]): a hangup
+/// cancels the wait and ends the connection, and a pipelined line is held and
+/// answered after the wait's reply.
 ///
 /// A `subscribe` request is the exception: after its OK ack the connection turns
 /// into a one-way stream of session lifecycle events ([`run_event_subscription`])
@@ -506,17 +528,18 @@ where
     let codec = LinesCodec::new_with_max_length(MAX_CONTROL_LINE_BYTES);
     let mut framed = Framed::new(stream, codec);
     let mut negotiated_version = None;
+    let mut pending = None;
 
-    while let Some(line) = framed.next().await {
-        let line = match line {
-            Ok(line) => line,
-            Err(LinesCodecError::MaxLineLengthExceeded) => {
-                warn!("control line exceeded max length; closing connection");
-                break;
-            }
-            Err(LinesCodecError::Io(err)) => return Err(err),
+    loop {
+        let line = match pending.take() {
+            Some(line) => line,
+            None => match read_control_line(framed.next().await)? {
+                Some(line) => line,
+                None => break,
+            },
         };
 
+        let mut watched_request = None;
         if let Ok(request) = serde_json::from_str::<Request>(&line) {
             if let Some(rejection) = enforce_connection_version(
                 &request,
@@ -528,9 +551,22 @@ where
                 framed.send(response).await.map_err(codec_to_io)?;
                 continue;
             }
+            if CANCEL_ON_HANGUP.contains(&request.method()) {
+                watched_request = Some(request);
+            }
         }
 
-        match handler::dispatch_line(&line, &state, negotiated_version).await {
+        let dispatch = handler::dispatch_line(&line, &state, negotiated_version);
+        let dispatch = match &watched_request {
+            Some(request) => {
+                match dispatch_until_hangup(dispatch, &mut framed, &mut pending, request).await? {
+                    Some(dispatch) => dispatch,
+                    None => return Ok(()),
+                }
+            }
+            None => dispatch.await,
+        };
+        match dispatch {
             Dispatch::Reply(response_line) => {
                 framed.send(response_line).await.map_err(codec_to_io)?;
             }
@@ -563,6 +599,91 @@ where
         }
     }
     Ok(())
+}
+
+/// Maps one read from the control codec to the next request line.
+///
+/// `None` ends the connection: the client closed its side, or sent a line
+/// longer than [`MAX_CONTROL_LINE_BYTES`], which is logged.
+///
+/// # Errors
+///
+/// Returns the transport error of a failed read.
+fn read_control_line(
+    item: Option<Result<String, LinesCodecError>>,
+) -> Result<Option<String>, io::Error> {
+    match item {
+        Some(Ok(line)) => Ok(Some(line)),
+        None => Ok(None),
+        Some(Err(LinesCodecError::MaxLineLengthExceeded)) => {
+            warn!("control line exceeded max length; closing connection");
+            Ok(None)
+        }
+        Some(Err(LinesCodecError::Io(err))) => Err(err),
+    }
+}
+
+/// Awaits `dispatch` for `request` while watching the read side of `framed`.
+///
+/// When the read side ends first (EOF, an over-long line, or a read error),
+/// `dispatch` is dropped, which releases the waiter slot it holds, and `None`
+/// tells the caller to end the connection without a reply. A client that
+/// closes only its write side is treated the same way, because EOF on the
+/// control socket is the only hangup signal the daemon gets.
+///
+/// A complete line that arrives while `dispatch` runs is stored in `pending`
+/// for the caller to answer after this reply, so pipelined requests keep
+/// their order. The read side then stays unpolled until `dispatch`
+/// finishes: holding at most one line bounds the look-ahead to
+/// [`MAX_CONTROL_LINE_BYTES`], and bytes behind that line, such as raw attach
+/// input after an attach prelude, stay unread in the codec buffer. A hangup
+/// after a pipelined line is therefore noticed only when the wait ends.
+///
+/// Dropping `framed.next()` when `dispatch` wins is cancel-safe: the codec
+/// keeps every byte it has read in its own buffer.
+///
+/// # Errors
+///
+/// Returns the transport error of a failed read after cancelling `dispatch`.
+async fn dispatch_until_hangup<S>(
+    dispatch: impl Future<Output = Dispatch>,
+    framed: &mut Framed<S, LinesCodec>,
+    pending: &mut Option<String>,
+    request: &Request,
+) -> Result<Option<Dispatch>, io::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let started = Instant::now();
+    tokio::pin!(dispatch);
+    loop {
+        tokio::select! {
+            biased;
+            dispatched = &mut dispatch => return Ok(Some(dispatched)),
+            incoming = framed.next(), if pending.is_none() => match read_control_line(incoming) {
+                Ok(Some(line)) => *pending = Some(line),
+                Ok(None) => {
+                    debug!(
+                        method = %request.method(),
+                        id = %request.id(),
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "control connection closed; cancelled the in-flight wait"
+                    );
+                    return Ok(None);
+                }
+                Err(err) => {
+                    debug!(
+                        method = %request.method(),
+                        id = %request.id(),
+                        elapsed_ms = started.elapsed().as_millis(),
+                        error = %err,
+                        "control connection read failed; cancelled the in-flight wait"
+                    );
+                    return Err(err);
+                }
+            }
+        }
+    }
 }
 
 fn enforce_connection_version(

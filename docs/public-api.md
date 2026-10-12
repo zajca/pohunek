@@ -1557,8 +1557,15 @@ It returns `reason`, the current redacted `SessionInfo`, and optional current
 `runtime_changed`, or `timeout`. Registration follows snapshot-register-recheck
 and holds no registry write lock while sleeping. Each wait uses a dedicated
 connection and consumes one waiter slot; defaults are 128 concurrent waiters
-globally and 8 per session. Disconnect is not promised as immediate daemon-side
-cancellation: the required timeout is the resource-release bound.
+globally and 8 per session. When the client closes the connection (EOF on the
+read side) while a `session.wait`, a `session.output` with `wait_ms`, or a
+`session.wait_turn` is in flight, the daemon cancels that read-only wait,
+releases its slots, and closes the connection without a reply; closing only the write side counts as closing.
+Other methods, including `session.input` with `wait`, run to completion. The
+timeout stays the guaranteed release bound for a peer that vanishes without
+closing the connection, and for a client that pipelines another request line
+behind the wait: that line is answered in order after the wait's reply, and
+the read side is not watched again until then.
 
 A wake and a timeout use the same result shape; callers branch only on the
 typed reason:
@@ -1772,8 +1779,10 @@ at the start, or a target removed during the wait),
 `daemon_shutting_down` (daemon shutdown started during the wait). The turn
 waiter pool is separate from the `session.wait` pool: a call takes one global
 slot and one slot on every target, all or none, and releases them when the
-call returns. Legacy `session.wait` and its 8,000 ms limit are
-unchanged.
+call returns or when the client closes the connection during the wait (no
+reply is sent then). The timeout stays the guaranteed release bound for a
+client that vanishes without closing the connection. `session.wait` is a
+separate method with its own 8,000 ms limit.
 
 A protocol 3 connection does not define the method: the daemon answers
 `method_not_found`, and a current SDK client fails with

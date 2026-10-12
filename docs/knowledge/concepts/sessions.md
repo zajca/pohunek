@@ -31,8 +31,10 @@ bounded state/activity/terminal/output change. Continue output with the exact
 `worker_instance_id`, decimal-string `runtime_generation`, and `next_offset` returned by
 the previous result. A retained-history `gap` means older requested bytes were
 evicted; a runtime change means discard old cursors and restart from a fresh
-screen or tail. Waiting calls use dedicated connections, and their timeout is
-the guaranteed waiter-slot release bound after a client disappears.
+screen or tail. Waiting calls use dedicated connections. Closing the
+connection releases the waiter slots of an in-flight `session.wait`, waited
+`session.output`, or `session.wait_turn` at once; the timeout stays the
+guaranteed release bound for a client that vanishes without closing it.
 
 To follow agents across turns, a client calls the protocol method
 `session.wait_turn` (Rust SDK `Client::session_wait_turn`). It waits for the
