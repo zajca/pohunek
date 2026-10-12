@@ -3,20 +3,21 @@
 //! A driver prepares a hermetic configuration of one real upstream agent that
 //! talks only to a loopback model stub, and names the few facts the shared
 //! scenario cannot derive: how the agent signals that it is ready, how a
-//! reply is held until the suite releases it, and whether the native
-//! reference comes from a hook. The table is explicit and keyed by runtime id;
+//! reply is held until the suite releases it, and which integration, if any,
+//! reports the native reference. The table is explicit and keyed by runtime id;
 //! a runtime without an entry fails the suite, so a new official package
 //! cannot ship without a driver.
 
-// Rust guideline compliant 2026-10-08
+// Rust guideline compliant 2026-10-12
 
 use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use pohunek_test_support::env::TestEnv;
 
+use crate::hermes_provider::{self, Exchanges, HermesProvider};
 use crate::messages_stub::{self, MessagesStub};
 use crate::model_stub::{self, ModelStub};
 use crate::responses_stub::{self, ResponsesStub};
@@ -44,11 +45,35 @@ const CLAUDE_APPROVED_KEY_SUFFIX_LEN: usize = 20;
 /// width.
 const CLAUDE_COLUMNS: &str = "100";
 
+/// The whole reply of the loopback Hermes provider. Plain ASCII without
+/// characters JSON escapes, so it reads the same on screen and inside a later
+/// request body.
+const HERMES_REPLY: &str = "HERMES_CONSUMER_TURN_OK";
+
+/// Text of the line the pinned Hermes 0.20.0 prints below its banner once its
+/// prompt accepts input, both at launch and after `--resume` (there below the
+/// restored conversation).
+const HERMES_READY_LINE: &str = "Welcome to Hermes Agent!";
+
+/// The operator plugin's hook runs again in the resumed Hermes process and
+/// reports its pid once that process initializes its agent for the next turn.
+const HERMES_REPORTS_AFTER_RESUME: bool = true;
+
+/// Hermes traffic of one run: the launched process and the resumed one, one
+/// turn each. The pinned release probes the discovery paths once per process,
+/// when it initializes its agent for the first turn, and sends no `CONNECT`
+/// probe with the home [`hermes_provider::write_home`] writes.
+const HERMES_EXCHANGES: Exchanges = Exchanges {
+    processes: 2,
+    turns: 2,
+};
+
 /// The loopback model endpoint of one run.
 pub(crate) enum Stub {
     Pi(ModelStub),
     Codex(ResponsesStub),
     Claude(MessagesStub),
+    Hermes(HermesProvider),
 }
 
 impl Stub {
@@ -58,6 +83,7 @@ impl Stub {
             Self::Pi(stub) => stub.open_gate(),
             Self::Codex(stub) => stub.open_gate(),
             Self::Claude(stub) => stub.open_gate(),
+            Self::Hermes(stub) => stub.open_gate(),
         }
     }
 
@@ -67,6 +93,7 @@ impl Stub {
             Self::Pi(stub) => stub.started(),
             Self::Codex(stub) => stub.started(),
             Self::Claude(stub) => stub.started(),
+            Self::Hermes(stub) => stub.started(),
         }
     }
 
@@ -76,6 +103,7 @@ impl Stub {
             Self::Pi(stub) => stub.finished(),
             Self::Codex(stub) => stub.finished(),
             Self::Claude(stub) => stub.finished(),
+            Self::Hermes(stub) => stub.finished(),
         }
     }
 
@@ -85,6 +113,7 @@ impl Stub {
             Self::Pi(stub) => stub.bodies_containing(needle),
             Self::Codex(stub) => stub.bodies_containing(needle),
             Self::Claude(stub) => stub.bodies_containing(needle),
+            Self::Hermes(stub) => stub.bodies_containing(needle),
         }
     }
 
@@ -95,6 +124,23 @@ impl Stub {
             Self::Pi(_) => None,
             Self::Codex(stub) => Some(stub.saw_credential()),
             Self::Claude(stub) => Some(stub.saw_credential()),
+            Self::Hermes(stub) => Some(stub.saw_foreign_credential()),
+        }
+    }
+
+    /// Checks the whole traffic of the run against the turns `prompts`, in
+    /// order, for a stub that pins it; the other stubs accept any traffic.
+    pub(crate) fn assert_exchanges(&self, prompts: &[&str]) {
+        if let Self::Hermes(stub) = self {
+            stub.assert_exchanges(prompts);
+        }
+    }
+
+    /// Panics with the stub's diagnostics once it refused an exchange; a stub
+    /// that answers every request never does.
+    pub(crate) fn assert_healthy(&self) {
+        if let Self::Hermes(stub) = self {
+            stub.assert_healthy();
         }
     }
 }
@@ -104,6 +150,23 @@ pub(crate) struct Prepared {
     pub(crate) stub: Stub,
     /// Entries of the profile's `[env]` table.
     pub(crate) profile_env: Vec<(String, String)>,
+    /// The runtime home the driver wrote, for an integration that is
+    /// installed into a home named by path.
+    pub(crate) runtime_home: Option<PathBuf>,
+}
+
+/// How the runtime reports its conversation id to the daemon.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Integration {
+    /// No hook; the daemon assigns the reference at launch.
+    None,
+    /// `integration install --agent <runtime> --profile <profile>` registers
+    /// a hook in the config home the profile's environment selects.
+    ProfileHook,
+    /// `integration install --agent hermes` installs the operator plugin from
+    /// the installed package into [`Prepared::runtime_home`]; the plugin's
+    /// hook reports the conversation id.
+    HermesPlugin,
 }
 
 /// Facts about one runtime the shared scenario needs.
@@ -115,9 +178,8 @@ pub(crate) struct Driver {
     pub(crate) ready_line: Option<&'static str>,
     /// Prefix of the prompt that makes the stub hold its reply.
     pub(crate) hold_marker: Option<&'static str>,
-    /// Whether the runtime reports its conversation id through a hook that
-    /// `integration install` registers.
-    pub(crate) hooks: bool,
+    /// How the runtime reports its conversation id.
+    pub(crate) integration: Integration,
     /// Whether the resumed process reports itself through the hook again.
     /// Codex 0.160.0 registers no new reporter after a resume.
     pub(crate) reports_after_resume: bool,
@@ -131,13 +193,13 @@ pub(crate) struct Driver {
 }
 
 /// The drivers, one per official runtime package.
-pub(crate) const DRIVERS: [Driver; 3] = [
+pub(crate) const DRIVERS: [Driver; 4] = [
     Driver {
         runtime: "pi",
         columns: None,
         ready_line: None,
         hold_marker: None,
-        hooks: false,
+        integration: Integration::None,
         reports_after_resume: false,
         prepare: prepare_pi,
         reply: || format!("{}{}", model_stub::FIRST_CHUNK, model_stub::SECOND_CHUNK),
@@ -148,7 +210,7 @@ pub(crate) const DRIVERS: [Driver; 3] = [
         columns: None,
         ready_line: None,
         hold_marker: Some(responses_stub::HOLD_MARKER),
-        hooks: true,
+        integration: Integration::ProfileHook,
         reports_after_resume: false,
         prepare: prepare_codex,
         reply: || {
@@ -171,7 +233,7 @@ pub(crate) const DRIVERS: [Driver; 3] = [
         columns: Some(CLAUDE_COLUMNS),
         ready_line: Some("for shortcuts"),
         hold_marker: Some(messages_stub::HOLD_MARKER),
-        hooks: true,
+        integration: Integration::ProfileHook,
         reports_after_resume: true,
         prepare: prepare_claude,
         reply: || messages_stub::SECOND_CHUNK.to_owned(),
@@ -184,6 +246,17 @@ pub(crate) const DRIVERS: [Driver; 3] = [
                 messages_stub::SECOND_CHUNK
             )
         },
+    },
+    Driver {
+        runtime: "hermes",
+        columns: None,
+        ready_line: Some(HERMES_READY_LINE),
+        hold_marker: None,
+        integration: Integration::HermesPlugin,
+        reports_after_resume: HERMES_REPORTS_AFTER_RESUME,
+        prepare: prepare_hermes,
+        reply: || HERMES_REPLY.to_owned(),
+        history_reply: || HERMES_REPLY.to_owned(),
     },
 ];
 
@@ -269,6 +342,7 @@ fn prepare_pi(env: &TestEnv) -> Prepared {
     .expect("write settings.json");
     Prepared {
         stub: Stub::Pi(stub),
+        runtime_home: None,
         profile_env: [
             ("PI_OFFLINE", "1"),
             ("PI_SKIP_VERSION_CHECK", "1"),
@@ -298,6 +372,7 @@ fn prepare_codex(env: &TestEnv) -> Prepared {
     Prepared {
         stub: Stub::Codex(stub),
         profile_env: vec![("CODEX_HOME".to_owned(), path_text(&home))],
+        runtime_home: None,
     }
 }
 
@@ -347,5 +422,37 @@ fn prepare_claude(env: &TestEnv) -> Prepared {
     Prepared {
         stub: Stub::Claude(stub),
         profile_env,
+        runtime_home: None,
+    }
+}
+
+fn prepare_hermes(env: &TestEnv) -> Prepared {
+    // Every completion is held until the suite opens the gate, so the turn's
+    // working state is observable without a prompt marker.
+    let stub = HermesProvider::held(HERMES_REPLY, HERMES_EXCHANGES);
+    let home = env.root().join("hermes-home");
+    hermes_provider::write_home(&home, &stub);
+    // Bytecode writes would change the verified stage the upstream runs from;
+    // lazy installs would reach the network; the unreachable session bus keeps
+    // Hermes off the host's desktop services.
+    let mut profile_env: Vec<(String, String)> = [
+        ("HERMES_HOME", path_text(&home)),
+        ("PYTHONDONTWRITEBYTECODE", "1".to_owned()),
+        ("HERMES_DISABLE_LAZY_INSTALLS", "1".to_owned()),
+        (
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!(
+                "unix:path={}",
+                path_text(&env.root().join("no-session-bus"))
+            ),
+        ),
+    ]
+    .map(|(key, value)| (key.to_owned(), value))
+    .to_vec();
+    profile_env.extend(stub.proxy_env());
+    Prepared {
+        stub: Stub::Hermes(stub),
+        profile_env,
+        runtime_home: Some(home),
     }
 }

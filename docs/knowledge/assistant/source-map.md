@@ -674,7 +674,7 @@ Signed runtime catalog:
 - `scripts/release-workflow/` — the helper scripts the release workflows call.
 - `crates/xtask/src/upstream_stage.rs` — `cargo xtask compat stage-upstream|verify-stage`: npm or provisioner staging of the pinned upstream runtimes, selected by the lock's `upstream.kind`, and the stage verifier.
 - `compat/pi/npm/package-lock.json` — the pinned npm dependency tree of the Pi upstream (with the codex and claude counterparts under `compat/`).
-- `crates/cli/tests/release_consumer.rs` — out-of-process consumer suite on the exact release binaries (inputs, layout, drivers, report).
+- `crates/cli/tests/release_consumer.rs` — out-of-process consumer suite on the exact release binaries (inputs, layout, report); the per-runtime drivers (pi, codex, claude, hermes) are in `crates/cli/tests/support/release_drivers.rs`.
 - `crates/xtask/src/attestation.rs` — `cargo xtask compat attest|verify|matrix-check`, the binary-set digest and the compatibility attestation.
 - `compat/matrix.json` — the required runtime x target rows and the suite version of the release compatibility matrix.
 
@@ -687,6 +687,7 @@ Hermes compatibility evidence:
 - `crates/xtask/src/hermes_mock.rs`
 - `crates/xtask/src/eval.rs`
 - `crates/xtask/src/hermes_skill.rs`
+- `crates/cli/tests/support/hermes_provider.rs` — the loopback Hermes model provider and private Hermes home of the Hermes package tests and the release consumer's Hermes driver.
 
 Bundled agent skill:
 

@@ -119,7 +119,9 @@ only runs the provisioner's helper programs. It uses the reviewed frozen
 upstream resolution, and its network-free fail-closed test is
 `scripts/tests/provision-hermes-compat.sh`. Both pinned Hermes CI jobs also
 drive a real Hermes session through the package
-(`crates/cli/tests/hermes_package.rs` with `POHUNEK_HERMES_E2E=1`).
+(`crates/cli/tests/hermes_package.rs` with `POHUNEK_HERMES_E2E=1`). The Linux
+job then runs the release consumer suite's Hermes driver in row mode on a fresh
+restore of the stage (`docs/development.md`, "Release consumer suite").
 
 The same gate runs natively on Apple Silicon in the
 `hermes-compatibility-macos` CI job. That job provisions the locked runtime

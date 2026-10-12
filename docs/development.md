@@ -268,7 +268,7 @@ non-regular value (a link counts as non-regular) fails naming the variable:
 | Variable | Meaning |
 | --- | --- |
 | `POHUNEK_CONSUMER_BIN_DIR` | directory with `pohunek`, `pohunekd`, `pohunek-sessiond` (and `runtime-catalog-anchor.json` in smoke mode) |
-| `POHUNEK_CONSUMER_RUNTIME` | runtime id to exercise (`pi`, `codex`, `claude`, ...) |
+| `POHUNEK_CONSUMER_RUNTIME` | runtime id to exercise (`pi`, `codex`, `claude`, `hermes`, ...) |
 | `POHUNEK_CONSUMER_PACKAGE` | package archive from `cargo xtask package build` |
 | `POHUNEK_CONSUMER_REPORT` | where the report is written after success |
 | `POHUNEK_CONSUMER_CATALOG` | optional; selects smoke mode |
@@ -313,7 +313,8 @@ hermetic XDG environment with the upstream's directory in front of `PATH`;
 checks through `/proc/<pid>/exe` that the daemon and the worker execute the
 layout copies and that the executed image hashes to the installed bytes; runs
 every command as the layout's `pohunek` subprocess: `plugin install --catalog`,
-`plugin list`/`inspect` (official, enabled, selected), `host inspect local`
+`plugin list`/`inspect` (official, enabled, selected), the driver's
+`integration install` when it has one, `host inspect local`
 (the daemon's version probe must report a supported release equal to a direct
 `<upstream> --version` read with the package's own probe grammar), one session
 against a loopback model stub through ready, input, working, idle, stop and
@@ -347,13 +348,43 @@ selects the suite by name (`the_release_binaries_serve_the_runtime_out_of_proces
 Adding a driver: a new `runtime-packages/<runtime>/` directory without an entry
 in `DRIVERS` (`crates/cli/tests/support/release_drivers.rs`) makes the suite
 fail with a message saying so. An entry names the runtime id, how its screen
-shows readiness, the marker that makes the model stub hold a reply, whether
-the conversation id arrives through a hook, a `prepare` function that writes the
+shows readiness, the marker that makes the model stub hold a reply (none when
+the stub holds every reply until the gate opens), which integration reports
+the conversation id (none, a hook that `integration install --profile`
+registers in the profile's config home, or the Hermes operator plugin), whether
+the resumed process reports itself again, a `prepare` function that writes the
 upstream's hermetic configuration (throwaway home or config directory, the
 loopback stub as its only model endpoint, every update, telemetry and
 marketplace switch off) and returns the profile `[env]`, and the text of the
 reply as it appears on screen. Reuse a stub from `crates/cli/tests/support/`
-or add one beside them.
+or add one beside them. Drivers exist for `pi`, `codex`, `claude` and `hermes`.
+
+The Hermes driver writes a private Hermes home whose only model provider is
+the loopback endpoint of `crates/cli/tests/support/hermes_provider.rs` (the
+one the Hermes package tests use), with every other request going to that
+endpoint as a fail-closed proxy, and sets `PYTHONDONTWRITEBYTECODE=1` and
+`HERMES_DISABLE_LAZY_INSTALLS=1` in the profile. The endpoint accepts at most two
+discovery rounds in total (the pinned release sends one per process) and at
+most two turns, and holds every completion until the gate opens. After the package install the scenario runs
+`integration install --agent hermes --hermes-home <home> --hermes-bin
+<resolved upstream>` (the CLI refuses a path with a link component, so the
+stage's `bin/hermes` link is resolved) and requires the install and `integration
+status` results to report `provenance` `source=package` with the archive's
+package id and digest, so the operator plugin comes from the installed
+package. The plugin hook reports the conversation id, the session resumes by
+it, and the resumed process reports itself again. The upstream is a
+provisioned stage (`cargo xtask compat stage-upstream --runtime hermes`); a
+used stage is not stable, so every run starts from a pristine copy that
+`compat verify-stage` accepted.
+
+CI runs the Hermes driver in row mode in the `hermes-compatibility` job, after
+the real Hermes session test: it restores and verifies the pristine stage,
+builds the consumer with `scripts/release-workflow/build-consumer`, and runs it
+the way `run-row` does (a scrubbed environment, the stage's `bin` first on
+`PATH`, a short root outside any Git checkout) against the `build-bins`
+binaries, copied aside before any cargo step of the job rebuilds
+`target/debug`, and the archive `scripts/build-hermes-package` built from
+`compat/hermes`; the report must name that archive's digest.
 
 ## Archive smoke
 
