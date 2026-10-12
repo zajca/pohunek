@@ -210,6 +210,42 @@ def filter_names() -> list[str]:
     return re.findall(r"(?m)^            ([a-z_]+):\n", filters.group(1))
 
 
+# Runtime package jobs and the package each one drives (issue #149). The
+# selector job decides which of them a pull request runs; nothing else may.
+PACKAGE_JOBS = {"pi-package": "pi", "codex-package": "codex", "claude-package": "claude"}
+PACKAGE_SELECTOR = "package-selection"
+PACKAGE_SELECT_COMMAND = 'cargo xtask package affected --base "$BASE_SHA" --json'
+
+
+def evaluate_package_condition(expression: str, event: str, cancelled: bool, result: str, outputs: dict[str, str]) -> bool:
+    """Evaluate a package job's `if:` in Python for the operators it may use.
+
+    Only `!cancelled()`, `github.event_name`, the selector's `result` and
+    `outputs.<name>`, string literals, `==`, `!=`, `&&`, `||` and parentheses
+    are understood; anything else fails the translation. A missing output reads
+    as the empty string and string comparison ignores case, as in GitHub Actions.
+    """
+    python = expression.replace("!cancelled()", "(not cancelled)")
+    python = python.replace("github.event_name", "event")
+    python = python.replace(f"needs.{PACKAGE_SELECTOR}.result", "result")
+    python = re.sub(
+        rf"needs\.{re.escape(PACKAGE_SELECTOR)}\.outputs\.([a-z_]+)",
+        r"outputs.get('\1', '')",
+        python,
+    )
+    python = python.replace("&&", " and ").replace("||", " or ")
+    python = re.sub(r"'[^']*'", lambda literal: literal.group(0).lower(), python)
+    leftover = re.sub(r"'[^']*'|\b(?:not|and|or|event|result|cancelled|outputs\.get)\b|==|!=|[()\s,]", "", python)
+    if leftover:
+        raise AssertionError(f"untranslated condition syntax {leftover!r} in {expression!r}")
+    return bool(eval(python, {"__builtins__": {}}, {
+        "event": event.lower(),
+        "cancelled": cancelled,
+        "result": result.lower(),
+        "outputs": {name: value.lower() for name, value in outputs.items()},
+    }))
+
+
 class CiTierWorkflowTests(unittest.TestCase):
     def test_every_paths_filter_reacts_to_a_toolchain_change(self):
         for name in filter_names():
@@ -342,6 +378,88 @@ class CiTierWorkflowTests(unittest.TestCase):
                     self.assertTrue(
                         all(path not in pr_paths for path in main_paths),
                         "main-tier-only inputs must stay out of the PR filter inventory",
+                    )
+
+
+class RuntimePackageSelectionTests(unittest.TestCase):
+    """Package jobs follow the fail-closed selector, never hand-kept path lists."""
+
+    def condition(self, job: str) -> str:
+        match = re.search(r"(?m)^    if: \$\{\{ (.+) \}\}$", workflow_jobs()[job])
+        self.assertIsNotNone(match, f"{job} has no condition")
+        assert match is not None
+        return match.group(1)
+
+    def test_every_official_package_has_a_job_and_a_selector_output(self):
+        official = {
+            entry.name for entry in (ROOT / "runtime-packages").iterdir() if entry.is_dir()
+        }
+        self.assertEqual(set(PACKAGE_JOBS.values()), official)
+        outputs = block(workflow_jobs()[PACKAGE_SELECTOR], "outputs", indent=4)
+        for package in official:
+            self.assertIn(f"      {package}: ${{{{ steps.select.outputs.{package} }}}}\n", outputs)
+        select = workflow_jobs()[PACKAGE_SELECTOR].split("      - name: Select the runtime packages\n", 1)[1]
+        self.assertIn(f"for package in {' '.join(PACKAGE_JOBS.values())}; do", select)
+
+    def test_the_selector_runs_the_xtask_command_on_pull_requests(self):
+        selector = workflow_jobs()[PACKAGE_SELECTOR]
+        self.assertEqual(self.condition(PACKAGE_SELECTOR), "github.event_name == 'pull_request'")
+        self.assertIn(PACKAGE_SELECT_COMMAND, selector)
+        self.assertIn("          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n", selector)
+        self.assertIn("set -euo pipefail", selector)
+        self.assertIn("fetch-depth: 0", selector)
+        # The base commit reaches the script only through the environment.
+        script = selector.split("        run: |\n", 1)[1]
+        self.assertNotIn("${{", script)
+
+    def test_package_jobs_depend_on_the_selector_and_carry_no_path_lists(self):
+        jobs = workflow_jobs()
+        changes = jobs["changes"]
+        for job, package in PACKAGE_JOBS.items():
+            with self.subTest(job=job):
+                self.assertRegex(jobs[job], rf"(?m)^    needs: {PACKAGE_SELECTOR}$")
+                self.assertNotIn("needs.changes", jobs[job])
+                self.assertNotIn(f"{package}_package", changes)
+                with self.assertRaises(AssertionError):
+                    filter_paths(f"{package}_package")
+
+    def test_package_jobs_run_unless_a_successful_selection_excludes_them(self):
+        scenarios = (
+            # (event, cancelled, selector result, outputs, runs)
+            ("push", False, "skipped", {}, True),
+            ("schedule", False, "skipped", {}, True),
+            ("workflow_dispatch", False, "skipped", {}, True),
+            ("pull_request", False, "success", {"pi": "true", "codex": "true", "claude": "true"}, True),
+            # A selection that did not succeed runs every package, whatever
+            # outputs it set before failing.
+            ("pull_request", False, "failure", {}, True),
+            ("pull_request", False, "failure", {"pi": "false", "codex": "false", "claude": "false"}, True),
+            ("pull_request", False, "skipped", {}, True),
+            ("pull_request", False, "cancelled", {"pi": "false", "codex": "false", "claude": "false"}, True),
+            # A successful selection with a missing or malformed output runs the package.
+            ("pull_request", False, "success", {}, True),
+            ("pull_request", False, "success", {"pi": "", "codex": "", "claude": ""}, True),
+            ("pull_request", False, "success", {"pi": "no", "codex": "0", "claude": "yes"}, True),
+            # GitHub compares strings case-insensitively, so any casing of false excludes.
+            ("pull_request", False, "success", {"pi": "False", "codex": "FALSE", "claude": "False"}, False),
+            ("pull_request", True, "success", {"pi": "true", "codex": "true", "claude": "true"}, False),
+        )
+        for job, package in PACKAGE_JOBS.items():
+            expression = self.condition(job)
+            for event, cancelled, result, outputs, runs in scenarios:
+                with self.subTest(job=job, event=event, cancelled=cancelled, result=result, outputs=outputs):
+                    self.assertEqual(
+                        evaluate_package_condition(expression, event, cancelled, result, outputs), runs
+                    )
+            with self.subTest(job=job, excluded=True):
+                others = {name: "true" for name in PACKAGE_JOBS.values()}
+                others[package] = "false"
+                self.assertFalse(evaluate_package_condition(expression, "pull_request", False, "success", others))
+                for other in set(PACKAGE_JOBS.values()) - {package}:
+                    only_other = {name: "false" for name in PACKAGE_JOBS.values()}
+                    only_other[other] = "true"
+                    self.assertFalse(
+                        evaluate_package_condition(expression, "pull_request", False, "success", only_other)
                     )
 
 

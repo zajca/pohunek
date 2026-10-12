@@ -11,6 +11,7 @@ mod generators;
 mod hermes;
 mod hermes_mock;
 mod hermes_skill;
+mod package_affected;
 mod release;
 mod release_inventory;
 mod release_policy;
@@ -616,6 +617,14 @@ enum PackageAction {
         /// Package directory holding `runtime.toml` and the package files.
         dir: PathBuf,
     },
+    /// Print the official runtime packages the current change must test.
+    ///
+    /// A file below `runtime-packages/<p>/` or `compat/<p>/` selects package
+    /// `<p>`; a reviewed allowlist of prose paths selects nothing; every other
+    /// file, and any file a Rust source embeds, is a core change and selects
+    /// every package under `runtime-packages/`. Fails without printing a
+    /// selection when Git or the file system fails.
+    Affected(package_affected::Options),
 }
 
 #[derive(Debug, Subcommand)]
@@ -675,6 +684,7 @@ fn run_package(action: PackageAction) -> Result<(), XtaskError> {
             let digest = runtime_package::verify(&dir)?;
             println!("package verify ok: reproducible build, {digest}");
         }
+        PackageAction::Affected(options) => package_affected::run(&options)?,
     }
     Ok(())
 }

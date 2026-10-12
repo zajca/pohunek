@@ -23,7 +23,7 @@
 //!
 //! This is an inner-loop accelerator. It never replaces the full gate set.
 
-// Rust guideline compliant 2026-10-03
+// Rust guideline compliant 2026-10-12
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -75,7 +75,7 @@ struct Package {
 
 /// Path shape matched by a classification rule.
 #[derive(Clone, Copy, Debug)]
-enum Pattern {
+pub(crate) enum Pattern {
     /// Exactly this repository-relative file.
     File(&'static str),
     /// Any file below this repository-relative directory.
@@ -87,7 +87,8 @@ enum Pattern {
 }
 
 impl Pattern {
-    fn matches(self, path: &str) -> bool {
+    /// Whether the repository-relative, `/`-separated `path` has this shape.
+    pub(crate) fn matches(self, path: &str) -> bool {
         match self {
             Self::File(file) => path == file,
             Self::Dir(dir) => is_below(path, dir),
@@ -673,7 +674,7 @@ fn render_summary(base: &str, plan: &Plan, args: Option<&[OsString]>) -> String 
 ///
 /// File names may contain newlines or ESC; printed raw they could forge report
 /// lines or drive terminal escape sequences. Other characters stay readable.
-fn printable(text: &str) -> String {
+pub(crate) fn printable(text: &str) -> String {
     text.chars()
         .map(|c| {
             if c.is_control() {
@@ -720,7 +721,7 @@ fn ensure_git_toplevel(workspace_root: &Path) -> Result<(), XtaskError> {
 }
 
 /// Resolves `--base`, or the first of [`DEFAULT_BASES`] that names a commit.
-fn resolve_base(root: &Path, explicit: Option<&str>) -> Result<String, XtaskError> {
+pub(crate) fn resolve_base(root: &Path, explicit: Option<&str>) -> Result<String, XtaskError> {
     let names_commit = |candidate: &str| -> Result<bool, XtaskError> {
         let revision = format!("{candidate}^{{commit}}");
         let status = command_in(root, GIT)
@@ -764,7 +765,7 @@ fn resolve_base(root: &Path, explicit: Option<&str>) -> Result<String, XtaskErro
 ///
 /// `--no-renames` reports both sides of a move, so the package that lost a file
 /// is selected too.
-fn changed_files(root: &Path, base: &str) -> Result<BTreeSet<String>, XtaskError> {
+pub(crate) fn changed_files(root: &Path, base: &str) -> Result<BTreeSet<String>, XtaskError> {
     let range = format!("{base}...HEAD");
     let listings = [
         command_output(
@@ -793,7 +794,7 @@ fn changed_files(root: &Path, base: &str) -> Result<BTreeSet<String>, XtaskError
 ///
 /// Invalid UTF-8 is replaced lossily: the directory components that decide the
 /// classification stay intact, and an unmatched path still selects everything.
-fn parse_nul_list(bytes: &[u8]) -> impl Iterator<Item = String> + '_ {
+pub(crate) fn parse_nul_list(bytes: &[u8]) -> impl Iterator<Item = String> + '_ {
     bytes
         .split(|byte| *byte == 0)
         .filter(|entry| !entry.is_empty())
@@ -801,7 +802,7 @@ fn parse_nul_list(bytes: &[u8]) -> impl Iterator<Item = String> + '_ {
 }
 
 /// The Git executable the changed-file queries run.
-const GIT: &str = "git";
+pub(crate) const GIT: &str = "git";
 
 /// Variables that move Git to another repository, index or object store than
 /// the one in the working directory.
@@ -847,7 +848,11 @@ fn command_in(dir: &Path, program: &str) -> Command {
 }
 
 /// Runs `program` with `args` in `dir` and returns stdout, failing on a non-zero exit.
-fn command_output(dir: &Path, program: &str, args: &[&str]) -> Result<Vec<u8>, XtaskError> {
+pub(crate) fn command_output(
+    dir: &Path,
+    program: &str,
+    args: &[&str],
+) -> Result<Vec<u8>, XtaskError> {
     let output = command_in(dir, program)
         .args(args)
         .output()

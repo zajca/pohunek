@@ -315,6 +315,7 @@ Rust:
 cargo t                                       # default inner loop: cost-filtered fast tests
 cargo ta                                      # CPU-saving loop: fast tests of changed crates + dependents
 cargo ta --print                              # per-file reasons and the command; runs nothing
+cargo xtask package affected --json          # official runtime packages a change selects (CI package jobs)
 cargo t -p pohunek-daemon                     # fast tests in one crate (alias takes -p)
 cargo nextest run --profile local -p pohunek-cli some_test_name  # one test
 cargo clippy -p pohunek-daemon --all-targets  # lint one crate
