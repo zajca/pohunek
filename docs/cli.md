@@ -211,7 +211,17 @@ pohunek notifications ack buildbox/n-42
 pohunek notifications policy set --provider claude --kind turn_completed --enabled
 pohunek notifications policy set --provider hermes --kind agent_blocked --enabled
 pohunek notifications retention prune --status archived --before 2026-06-01T00:00:00Z --apply
+
+# follow new finished turns of one session
+pohunek notifications watch --session s-01J00000000000000000000000 --kind turn_completed --unread --json
 ```
+
+`notifications watch` filters with `--session`, `--kind`, and `--status`
+(`--unread` is `--status unread`) apply client-side to the record each create
+or update event carries, so an update that marks an earlier finish
+`acknowledged` does not pass `--unread`. While any filter is set, delete events
+are dropped, because they carry only the notification id; for the same reason
+`--status deleted` is refused.
 
 ### Assistant
 
