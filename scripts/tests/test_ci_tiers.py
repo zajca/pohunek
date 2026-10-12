@@ -42,6 +42,8 @@ MACOS_PATH_OWNERSHIP = {
             "Cargo.lock",
             ".cargo/**",
             ".github/workflows/ci.yml",
+            "rust-toolchain.toml",
+            ".github/actions/setup-rust/**",
         },
         "main": set(),
     },
@@ -53,12 +55,13 @@ MACOS_PATH_OWNERSHIP = {
             "scripts/acceptance/launchd_lifetime_evidence.py",
             "crates/platform/src/supervisor/launchd/**",
             ".github/workflows/ci.yml",
+            "rust-toolchain.toml",
+            ".github/actions/setup-rust/**",
             ".github/workflows/release.yml",
         },
         "main": {
             "docs/knowledge/**",
             "crates/xtask/**",
-            "rust-toolchain*",
             "compat/**",
             "README.md",
             "LICENSE",
@@ -105,6 +108,8 @@ MACOS_PATH_OWNERSHIP = {
             "sdk/ts/sdk/test/e2e.test.ts",
             "sdk/ts/sdk/test/hermes-plugin.e2e.test.ts",
             ".github/workflows/ci.yml",
+            "rust-toolchain.toml",
+            ".github/actions/setup-rust/**",
         },
         "main": {
             "Cargo.toml",
@@ -126,6 +131,8 @@ MACOS_PATH_OWNERSHIP = {
             "bun.lock",
             ".bun-version",
             ".github/workflows/ci.yml",
+            "rust-toolchain.toml",
+            ".github/actions/setup-rust/**",
         },
         "main": {
             "tsconfig*.json",
@@ -191,7 +198,24 @@ def filter_paths(name: str) -> set[str]:
     return set(re.findall(r"              - '([^']+)'", match.group(1)))
 
 
+# A toolchain change must run every Rust job, so every filter that selects
+# one lists the pin and the action that installs it.
+TOOLCHAIN_INPUTS = {"rust-toolchain.toml", ".github/actions/setup-rust/**"}
+
+
+def filter_names() -> list[str]:
+    filters = re.search(r"(?ms)^          filters: \|\n(.*?)(?=^\S|^  [a-z])", CI)
+    if filters is None:
+        raise AssertionError("paths filter block not found")
+    return re.findall(r"(?m)^            ([a-z_]+):\n", filters.group(1))
+
+
 class CiTierWorkflowTests(unittest.TestCase):
+    def test_every_paths_filter_reacts_to_a_toolchain_change(self):
+        for name in filter_names():
+            with self.subTest(filter=name):
+                self.assertLessEqual(TOOLCHAIN_INPUTS, filter_paths(name))
+
     def test_nightly_runs_daily_and_manual_dispatch_requires_a_tier(self):
         triggers = CI.split("on:\n", 1)[1]
         schedule = block(triggers, "schedule", indent=2)

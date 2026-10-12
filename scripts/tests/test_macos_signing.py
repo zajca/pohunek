@@ -357,6 +357,13 @@ class ReleaseWorkflowTest(unittest.TestCase):
     def test_every_action_that_shapes_the_signed_bytes_is_pinned(self):
         for name, job in self.macos.items():
             for use in re.findall(r"uses: (\S+)", job):
+                # A local composite action comes from the release commit
+                # itself; the actions it uses must be pinned to a commit.
+                if re.fullmatch(r"\./\.github/actions/[a-z-]+", use):
+                    nested = (ROOT / use / "action.yml").read_text()
+                    for inner in re.findall(r"uses: (\S+)", nested):
+                        self.assertRegex(inner, r"@[0-9a-f]{40}", "%s: %s: %s" % (name, use, inner))
+                    continue
                 self.assertRegex(use, r"@[0-9a-f]{40}", "%s: %s" % (name, use))
 
     def test_no_artifact_derived_value_is_interpolated_into_a_script(self):

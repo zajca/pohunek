@@ -1,0 +1,8 @@
+# The exact Rust toolchain for CI and local development. Every CI job installs
+# this channel through .github/actions/setup-rust, and rustup selects it for any
+# cargo/rustc run inside the repository. `scripts/check-rust-toolchain-pin`
+# rejects a floating channel; bump the pin with `scripts/bump-rust-toolchain`.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

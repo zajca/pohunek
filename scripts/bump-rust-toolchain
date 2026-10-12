@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""Move the pinned Rust toolchains to new releases (stdlib only).
+
+`--stable X.Y.Z` rewrites the `channel` of `rust-toolchain.toml`, the
+toolchain every CI job and the rustup proxies use. `--nightly YYYY-MM-DD`
+rewrites every `toolchain: nightly-YYYY-MM-DD` input in
+`.github/workflows/*.yml`, the only place a dated nightly is named (today the
+`cargo-udeps` job). Either flag or both may be given.
+
+Every input is validated and every new file content is computed before
+anything is written, so a rejected run leaves the tree untouched; each file
+is then replaced atomically. A run whose requested pins are already in place
+changes nothing and says so. The command never touches the network or
+installs anything: it prints the follow-up commands (installing the new
+toolchain, the lint and format gates, the pin scan, the docs check) for the
+developer to run in the same pull request.
+
+Exit status: 0 on success or no change, 2 on invalid arguments or a
+repository input that cannot be read or rewritten as expected.
+"""
+
+import argparse
+import datetime
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    sys.exit(
+        "bump-rust-toolchain: Python >= 3.11 is required (tomllib); install a "
+        "newer python3 with your distribution's package manager"
+    )
+
+ROOT = Path(__file__).resolve().parents[1]
+TOOLCHAIN_FILE = Path("rust-toolchain.toml")
+WORKFLOW_DIR = Path(".github") / "workflows"
+WORKFLOW_GLOB = "*.yml"
+
+# An exact stable release without leading zeros: `1.100.0`, not `1.100`.
+STABLE_RE = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)")
+DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+# The whole `channel = "..."` line, including any trailing text after the
+# quote. The line is always written back as exactly `channel = "X.Y.Z"`:
+# `.github/actions/setup-rust` reads the pin with a line pattern that accepts
+# only whitespace after the closing quote.
+CHANNEL_LINE_RE = re.compile(r'^[ \t]*channel[ \t]*=[ \t]*"([^"\n]*)"[^\n]*$', re.MULTILINE)
+# A workflow `toolchain:` input naming a dated nightly, optionally quoted.
+NIGHTLY_INPUT_RE = re.compile(
+    r"""^(\s*(?:-\s+)?toolchain:\s*["']?nightly-)(\d{4}-\d{2}-\d{2})(?=["']?\s*(?:#.*)?$)""",
+    re.MULTILINE,
+)
+
+
+class BumpError(Exception):
+    """A repository input is missing, ambiguous, or would not round-trip."""
+
+
+def stable_release(text):
+    """argparse type: an exact `X.Y.Z` stable release."""
+    if STABLE_RE.fullmatch(text) is None:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not an exact stable release X.Y.Z (e.g. 1.100.0)"
+        )
+    return text
+
+
+def nightly_date(text):
+    """argparse type: a real calendar date `YYYY-MM-DD`."""
+    try:
+        valid = DATE_RE.fullmatch(text) is not None and bool(
+            datetime.date.fromisoformat(text)
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a nightly date YYYY-MM-DD (e.g. 2026-10-11)"
+        )
+    return text
+
+
+def read_text(path):
+    """A repository file's text, or a BumpError naming it."""
+    try:
+        return path.read_text()
+    except (OSError, UnicodeDecodeError) as error:
+        raise BumpError(f"cannot read {path}: {error}") from error
+
+
+def bump_stable(root, release):
+    """`(path, old text, new text, changes)` for the `rust-toolchain.toml` pin."""
+    path = Path(root) / TOOLCHAIN_FILE
+    text = read_text(path)
+    matches = list(CHANNEL_LINE_RE.finditer(text))
+    if len(matches) != 1:
+        raise BumpError(
+            f"{path}: expected exactly one `channel = \"...\"` line, found {len(matches)}"
+        )
+    match = matches[0]
+    current = match.group(1)
+    line = f'channel = "{release}"'
+    new_text = text[: match.start()] + line + text[match.end():]
+    try:
+        parsed = tomllib.loads(new_text)
+    except tomllib.TOMLDecodeError as error:
+        raise BumpError(f"{path}: rewritten file is not valid TOML: {error}") from error
+    toolchain = parsed.get("toolchain")
+    if not isinstance(toolchain, dict) or toolchain.get("channel") != release:
+        raise BumpError(f"{path}: the `channel` line is not the [toolchain] channel")
+    changes = [] if current == release else [f"{TOOLCHAIN_FILE}: channel {current} -> {release}"]
+    if match.group(0) != f'channel = "{current}"':
+        changes.append(
+            f"{TOOLCHAIN_FILE}: channel line rewritten as exactly `{line}` "
+            f"(was `{match.group(0).strip()}`; the CI action accepts no trailing text)"
+        )
+    return path, text, new_text, changes
+
+
+def bump_nightly(root, date):
+    """`(path, old text, new text, changes)` for every workflow naming a nightly."""
+    workflows = sorted((Path(root) / WORKFLOW_DIR).glob(WORKFLOW_GLOB))
+    found = 0
+    rewrites = []
+    for path in workflows:
+        text = read_text(path)
+        changes = []
+
+        def replace(match, path=path, text=text, changes=changes):
+            line = text.count("\n", 0, match.start()) + 1
+            if match.group(2) != date:
+                relative = path.relative_to(root)
+                changes.append(
+                    f"{relative}:{line}: nightly-{match.group(2)} -> nightly-{date}"
+                )
+            return match.group(1) + date
+
+        new_text, count = NIGHTLY_INPUT_RE.subn(replace, text)
+        found += count
+        rewrites.append((path, text, new_text, changes))
+    if found == 0:
+        raise BumpError(
+            f"no `toolchain: nightly-YYYY-MM-DD` input in "
+            f"{WORKFLOW_DIR / WORKFLOW_GLOB}; nothing pins a dated nightly"
+        )
+    return rewrites
+
+
+def write_atomically(path, text):
+    """Replace `path` with `text` through a sibling temp file, keeping its mode."""
+    mode = path.stat().st_mode & 0o7777
+    handle = tempfile.NamedTemporaryFile(
+        "w", dir=path.parent, prefix=f".{path.name}.", delete=False
+    )
+    try:
+        with handle:
+            handle.write(text)
+        os.chmod(handle.name, mode)
+        os.replace(handle.name, path)
+    except OSError:
+        os.unlink(handle.name)
+        raise
+
+
+def follow_ups(stable, nightly):
+    """The commands the same pull request runs after the bump.
+
+    `stable` and `nightly` are the releases the run changed, or None.
+    """
+    steps = []
+    if stable:
+        steps.append("rustup toolchain install   # in the repository root; installs the rust-toolchain.toml pin")
+    if nightly:
+        steps.append(f"rustup toolchain install nightly-{nightly}")
+    steps += [
+        "cargo fmt --all --check",
+        "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+        "scripts/check-rust-toolchain-pin",
+        "cargo xtask docs check",
+    ]
+    if nightly:
+        steps.append(
+            f"cargo +nightly-{nightly} udeps --workspace --all-targets --all-features"
+        )
+    steps.append("the full gate set (.agents/skills/gates/SKILL.md); fix new lints and fmt in this PR")
+    return steps
+
+
+def parse_args(argv):
+    """Command-line flags."""
+    parser = argparse.ArgumentParser(
+        prog="bump-rust-toolchain",
+        description=(
+            "Rewrite the pinned stable toolchain in rust-toolchain.toml and/or "
+            "the dated nightly in .github/workflows/*.yml, then print the "
+            "follow-up gates. Never installs anything."
+        ),
+    )
+    parser.add_argument("--stable", type=stable_release, metavar="X.Y.Z",
+                        help="the exact stable release to pin, e.g. 1.100.0")
+    parser.add_argument("--nightly", type=nightly_date, metavar="YYYY-MM-DD",
+                        help="the nightly date the workflows install, e.g. 2026-10-11")
+    args = parser.parse_args(argv)
+    if args.stable is None and args.nightly is None:
+        parser.error("give --stable X.Y.Z, --nightly YYYY-MM-DD, or both")
+    return args
+
+
+def main(argv=None, root=ROOT, out=sys.stdout):
+    """Validate, rewrite, and report; the process exit status."""
+    args = parse_args(argv)
+    try:
+        stable = [bump_stable(root, args.stable)] if args.stable else []
+        nightly = bump_nightly(root, args.nightly) if args.nightly else []
+    except BumpError as error:
+        print(f"bump-rust-toolchain: {error}", file=sys.stderr)
+        return 2
+    rewrites = stable + nightly
+    changes = [change for _, _, _, file_changes in rewrites for change in file_changes]
+    if not changes:
+        print("bump-rust-toolchain: no change; the requested pins are already in place", file=out)
+        return 0
+    written = []
+    try:
+        for path, old, new, _ in rewrites:
+            if new != old:
+                write_atomically(path, new)
+                written.append(str(path))
+    except OSError as error:
+        # Each file is replaced atomically, the set is not: name what landed.
+        done = ", ".join(written) or "nothing"
+        print(f"bump-rust-toolchain: cannot write: {error}; already rewritten: {done}",
+              file=sys.stderr)
+        return 2
+    print("bump-rust-toolchain: changed", file=out)
+    for change in changes:
+        print(f"  {change}", file=out)
+    print("next, in the same pull request (from the repository root):", file=out)
+    stable_changed = any(changes for _, _, _, changes in stable)
+    nightly_changed = any(changes for _, _, _, changes in nightly)
+    steps = follow_ups(
+        args.stable if stable_changed else None,
+        args.nightly if nightly_changed else None,
+    )
+    for step in steps:
+        print(f"  {step}", file=out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

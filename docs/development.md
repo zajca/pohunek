@@ -4,7 +4,9 @@ Workspace layout, the CI gate set, fast test loops, and the release pipeline.
 [AGENTS.md](../AGENTS.md) is the canonical instruction entry point; detailed
 policy lives in its linked scoped guides.
 
-The workspace is a Cargo monorepo (edition 2021, MSRV 1.96) plus a Bun
+The workspace is a Cargo monorepo (edition 2021, MSRV 1.96; CI and local
+runs use the exact stable release pinned in `rust-toolchain.toml`, bumped with
+`scripts/bump-rust-toolchain`) plus a Bun
 workspace (rooted at the repository root, spanning `sdk/ts/*`) for the TypeScript packages.
 
 | Crate | Role |

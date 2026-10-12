@@ -19,9 +19,29 @@ Categories:
   and, on Linux only, `mold` (the CI linker, set through CI `RUSTFLAGS` only;
   `.cargo/config.toml` configures no linker; macOS jobs link with the
   default linker). They are reported, and fail the run only under `--strict`.
+* pin -- the active `rustc` (the first on PATH) against the exact `channel`
+  of `rust-toolchain.toml`, the toolchain every CI job installs. Running
+  through the rustup proxies (`$CARGO_HOME/bin` first on PATH) makes rustup
+  select that toolchain. A mismatch is reported with the PATH and
+  `rustup toolchain install` fix, and fails the run only under `--strict`:
+  the workspace builds and tests on any `rustc` at or above the MSRV floor,
+  a mismatch changes only what clippy and rustfmt report (CI enforces those
+  on the pin), and a distribution `rustc` without rustup cannot follow the
+  pin at all. The row is not compared while the `rustc` row itself fails.
+
+A rustup proxy whose active toolchain (the pin, unless an override wins) is
+not installed is reported as `toolchain-not-installed` on the `rustc` and
+cargo-subcommand rows, with `rustup toolchain install` in the repository
+root as the fix. It fails the run: until that toolchain exists, every
+`cargo`/`rustc` call in the repository either fails or downloads it first.
+
+Version commands run from the repository root, so a rustup proxy resolves
+`rust-toolchain.toml`, and with `RUSTUP_AUTO_INSTALL=0`, so a proxy whose
+pinned toolchain is absent reports it instead of downloading it.
 
 Exit status: 0 when every tool that counts passes, 1 otherwise, 2 on a
-configuration error (an unreadable `.config/nextest.toml`).
+configuration error (an unreadable `.config/nextest.toml`, or a missing or
+malformed `rust-toolchain.toml` channel).
 """
 
 import argparse
@@ -45,6 +65,16 @@ except ModuleNotFoundError:
 
 ROOT = Path(__file__).resolve().parents[1]
 NEXTEST_CONFIG = Path(".config") / "nextest.toml"
+TOOLCHAIN_FILE = Path("rust-toolchain.toml")
+# The pin is one exact stable release (`1.99.0`); a floating channel
+# (`stable`, `1.99`) would let CI and local toolchains drift apart.
+PIN_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+# rustup proxies install a missing active toolchain unless this is `0`; the
+# check reports the absence instead, because it never installs anything.
+VERSION_ENV = {"RUSTUP_AUTO_INSTALL": "0"}
+# rustup's refusal under RUSTUP_AUTO_INSTALL=0 names the missing toolchain:
+# `error: toolchain '1.99.0-x86_64-unknown-linux-gnu' is not installed`.
+NOT_INSTALLED_RE = re.compile(r"toolchain '([^'\n]+)' is not installed")
 
 # `scripts/test-partitions` and this script import `tomllib`, added in 3.11.
 PYTHON_MIN_VERSION = (3, 11, 0)
@@ -81,9 +111,23 @@ TOO_OLD = "too-old"
 OFF_PATH = "off-path"
 UNKNOWN_VERSION = "unknown-version"
 NO_CARGO = "no-cargo"
+PIN_MISMATCH = "pin-mismatch"
+NOT_COMPARED = "not-compared"
+TOOLCHAIN_NOT_INSTALLED = "toolchain-not-installed"
+INSTALL_ACTIVE_TOOLCHAIN = (
+    "run `rustup toolchain install` in the repository root (it installs the "
+    "active toolchain: the rust-toolchain.toml pin unless RUSTUP_TOOLCHAIN or "
+    "`rustup override` selects another)"
+)
 MANUAL_RUST = (
-    "update the Rust toolchain to the workspace MSRV or newer "
-    "(`rustup update stable`, or your distribution's rust package)"
+    "with rustup, run `rustup toolchain install` in the repository root (it "
+    "installs the rust-toolchain.toml pin) and put the rustup proxies first "
+    "on PATH; otherwise update your distribution's rust package to the "
+    "workspace MSRV or newer"
+)
+MANUAL_RUSTUP = (
+    "install rustup (https://rustup.rs), which puts its proxies in "
+    "$CARGO_HOME/bin"
 )
 MANUAL_CARGO = (
     "install the Rust toolchain so `cargo` is on PATH (https://rustup.rs); "
@@ -110,6 +154,9 @@ class Tool:
     # `$CARGO_HOME/bin/cargo-<sub>` over `PATH`, so only Cargo itself reports
     # the copy that `cargo t` runs.
     cargo_subcommand: bool = False
+    # The `rust-toolchain.toml` row: `min_version` is the exact pin, compared
+    # with the `rustc` row's result instead of running a command of its own.
+    pin: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -123,14 +170,20 @@ class Result:
     detail: str = None
     # The first copy on PATH, if any; it decides whether a fix must reorder PATH.
     on_path: str = None
+    # The version carried a `-pre` suffix (`1.99.0-beta.3`, `1.99.0-nightly`).
+    prerelease: bool = False
 
     def counts(self, strict):
         """Whether this row decides the exit status."""
         return self.tool.required or strict
 
     def failed(self, strict):
-        """Whether this row fails the run."""
-        return self.status != OK and self.counts(strict)
+        """Whether this row fails the run.
+
+        A pin row that was not compared never fails: the `rustc` row it
+        depends on already reports, and counts for, the underlying problem.
+        """
+        return self.status not in (OK, NOT_COMPARED) and self.counts(strict)
 
 
 def format_version(version):
@@ -184,6 +237,27 @@ def rust_min_version(root):
     return version
 
 
+def rust_toolchain_pin(root):
+    """The exact `[toolchain] channel` release pinned in `rust-toolchain.toml`."""
+    path = Path(root) / TOOLCHAIN_FILE
+    try:
+        with path.open("rb") as handle:
+            config = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise ConfigError(f"cannot read {path}: {error}") from error
+    toolchain = config.get("toolchain")
+    channel = toolchain.get("channel") if isinstance(toolchain, dict) else None
+    if not isinstance(channel, str):
+        raise ConfigError(f"{path} declares no [toolchain] channel")
+    match = PIN_RE.fullmatch(channel)
+    if match is None:
+        raise ConfigError(
+            f"{path}: channel {channel!r} is not an exact X.Y.Z release; pin "
+            "one with scripts/bump-rust-toolchain --stable X.Y.Z"
+        )
+    return tuple(int(part) for part in match.groups())
+
+
 def nextest_min_version(root):
     """The `nextest-version` minimum declared in `.config/nextest.toml`.
 
@@ -216,6 +290,13 @@ def tools(root, system):
             min_version=rust_min_version(root),
             required=True,
             manual=MANUAL_RUST,
+        ),
+        Tool(
+            name="rustc-pin",
+            version_args=(),
+            min_version=rust_toolchain_pin(root),
+            required=False,
+            pin=True,
         ),
         Tool(
             name="cargo-nextest",
@@ -266,14 +347,16 @@ def cargo_bin_dir(environ):
     return Path.home() / ".cargo" / "bin"
 
 
-def run_version(argv):
-    """Output of one `--version` call; raises when the tool cannot run."""
+def run_version(argv, cwd, environ):
+    """Output of one `--version` call in `cwd`; raises when the tool cannot run."""
     completed = subprocess.run(
         argv,
         capture_output=True,
         text=True,
         check=True,
         timeout=VERSION_TIMEOUT_SECONDS,
+        cwd=cwd,
+        env={**environ, **VERSION_ENV},
     )
     return completed.stdout if completed.stdout.strip() else completed.stderr
 
@@ -353,11 +436,25 @@ def failure_detail(error):
     return detail
 
 
+def missing_toolchain(error):
+    """The toolchain a rustup proxy reports as not installed, or None."""
+    for stream in (getattr(error, "stderr", None), getattr(error, "stdout", None)):
+        if isinstance(stream, bytes):
+            stream = stream.decode(errors="replace")
+        match = NOT_INSTALLED_RE.search(stream or "")
+        if match is not None:
+            return match.group(1)
+    return None
+
+
 def version_result(tool, argv, path, runner):
     """Run one version command and compare it with the tool's minimum."""
     try:
         output = runner(argv)
     except (OSError, subprocess.SubprocessError) as error:
+        toolchain = missing_toolchain(error)
+        if toolchain is not None:
+            return Result(tool, TOOLCHAIN_NOT_INSTALLED, path=path, detail=toolchain)
         return Result(tool, UNKNOWN_VERSION, path=path, detail=failure_detail(error))
     version = parse_version(output)
     if version is None:
@@ -366,17 +463,70 @@ def version_result(tool, argv, path, runner):
             tool, UNKNOWN_VERSION, path=path,
             detail=f"unparseable version output {first!r}",
         )
-    if below_minimum(version, is_prerelease(output), tool.min_version):
-        return Result(tool, TOO_OLD, version=version, path=path)
-    return Result(tool, OK, version=version, path=path)
+    prerelease = is_prerelease(output)
+    if below_minimum(version, prerelease, tool.min_version):
+        return Result(tool, TOO_OLD, version=version, path=path, prerelease=prerelease)
+    return Result(tool, OK, version=version, path=path, prerelease=prerelease)
 
 
-def check_all(tool_list, which, runner, cargo_bin):
-    """One result per tool, in tool order."""
-    return [
-        dataclasses.replace(check_tool(tool, which, runner, cargo_bin), on_path=which(tool.name))
-        for tool in tool_list
-    ]
+def check_pin(tool, rustc):
+    """Compare the active `rustc` (the `rustc` row's result) with the pin.
+
+    Only a passing `rustc` row is the copy first on PATH with a known
+    version, so any other row leaves the pin uncompared.
+    """
+    if rustc.status != OK:
+        return Result(tool, NOT_COMPARED)
+    status = OK if rustc.version == tool.min_version and not rustc.prerelease else PIN_MISMATCH
+    return Result(
+        tool, status, version=rustc.version, path=rustc.path,
+        prerelease=rustc.prerelease,
+    )
+
+
+def pin_fix(active, which, cargo_bin, environ):
+    """The fix for an active `rustc` that differs from the pin.
+
+    rustup reads `rust-toolchain.toml` only through its proxies, and an
+    explicit override (`RUSTUP_TOOLCHAIN`, `rustup override`) wins over the
+    file. Distribution packages that ship rustup link the proxies to it.
+    """
+    install = "run `rustup toolchain install` in the repository root to install the pin"
+    is_proxy = Path(active).parent == Path(cargo_bin) or Path(active).resolve().name == "rustup"
+    if is_proxy:
+        if "RUSTUP_TOOLCHAIN" in environ:
+            override = "RUSTUP_TOOLCHAIN is set and wins over rust-toolchain.toml; unset it"
+        else:
+            override = (
+                "a `rustup override` wins over rust-toolchain.toml; run "
+                "`rustup override unset` in the repository root"
+            )
+        return f"{override}, then {install}"
+    reorder = (
+        "put the rustup proxies first so rustup selects the pin from "
+        f"rust-toolchain.toml: {path_fix(cargo_bin)}"
+    )
+    if which("rustc", path=str(cargo_bin)) is None:
+        return f"{MANUAL_RUSTUP}; {reorder}; then {install}"
+    return f"{active} is not the rustup proxy; {reorder}; then {install}"
+
+
+def check_all(tool_list, which, runner, cargo_bin, environ):
+    """One result per tool, in tool order; the pin row follows its `rustc` row."""
+    results = []
+    for tool in tool_list:
+        if tool.pin:
+            rustc = next(result for result in results if result.tool.name == "rustc")
+            pin = dataclasses.replace(check_pin(tool, rustc), on_path=rustc.on_path)
+            if pin.status == PIN_MISMATCH:
+                pin = dataclasses.replace(
+                    pin, detail=pin_fix(pin.path, which, cargo_bin, environ)
+                )
+            results.append(pin)
+            continue
+        result = check_tool(tool, which, runner, cargo_bin)
+        results.append(dataclasses.replace(result, on_path=which(tool.name)))
+    return results
 
 
 def path_fix(cargo_bin):
@@ -388,6 +538,10 @@ def fix_hint(result, cargo_bin):
     """The exact command or manual step that fixes one failing row."""
     if result.status == NO_CARGO:
         return MANUAL_CARGO
+    if result.status == PIN_MISMATCH:
+        return result.detail
+    if result.status == TOOLCHAIN_NOT_INSTALLED:
+        return INSTALL_ACTIVE_TOOLCHAIN
     if result.status == OFF_PATH:
         where = result.detail or "not on PATH"
         return (
@@ -427,6 +581,8 @@ def install_fix(result, cargo_bin):
 def describe(result, strict, cargo_bin):
     """One report line."""
     tool = result.tool
+    if tool.pin:
+        return describe_pin(result, strict)
     kind = "required" if tool.required else "optional"
     minimum = format_version(tool.min_version)
     if result.status == OK:
@@ -444,6 +600,11 @@ def describe(result, strict, cargo_bin):
         )
     elif result.status == NO_CARGO:
         what = f"`cargo` is not on PATH, so {tool.name} cannot run"
+    elif result.status == TOOLCHAIN_NOT_INSTALLED:
+        what = (
+            f"{tool.name} cannot run: rustup toolchain {result.detail} "
+            "is not installed"
+        )
     elif result.status == OFF_PATH:
         what = (
             f"{tool.name} {format_version(result.version)} is {result.detail}"
@@ -454,6 +615,25 @@ def describe(result, strict, cargo_bin):
     return (
         f"  {label:<8} {what} ({kind})\n"
         f"           fix: {fix_hint(result, cargo_bin)}"
+    )
+
+
+def describe_pin(result, strict):
+    """One report line for the `rust-toolchain.toml` pin row."""
+    pin = format_version(result.tool.min_version)
+    if result.status == OK:
+        return f"  ok       rustc {pin} matches the {TOOLCHAIN_FILE} pin (pin)"
+    if result.status == NOT_COMPARED:
+        return (
+            f"  n/a      {TOOLCHAIN_FILE} pin {pin} not compared: the rustc "
+            "row above fails (pin)"
+        )
+    label = "FAIL" if result.failed(strict) else "warn"
+    active = format_version(result.version) + (" (pre-release)" if result.prerelease else "")
+    return (
+        f"  {label:<8} rustc {active} at {result.path} differs from the "
+        f"{TOOLCHAIN_FILE} pin {pin} (pin)\n"
+        f"           fix: {result.detail}"
     )
 
 
@@ -482,7 +662,7 @@ def parse_args(argv):
     parser.add_argument(
         "--strict",
         action="store_true",
-        help="fail on optional tools as well",
+        help="fail on optional tools and a rust-toolchain.toml pin mismatch as well",
     )
     return parser.parse_args(argv)
 
@@ -490,7 +670,7 @@ def parse_args(argv):
 def main(
     argv=None,
     which=shutil.which,
-    runner=run_version,
+    runner=None,
     root=ROOT,
     environ=os.environ,
     out=sys.stdout,
@@ -503,10 +683,13 @@ def main(
     except ConfigError as error:
         print(f"dev-bootstrap: {error}", file=out)
         return 2
+    if runner is None:
+        def runner(argv):
+            return run_version(argv, cwd=root, environ=environ)
     cargo_bin = cargo_bin_dir(environ)
     mode = "strict" if args.strict else "required tools only fail the run"
     print(f"dev-bootstrap: local tool check ({mode})", file=out)
-    results = check_all(tool_list, which, runner, cargo_bin)
+    results = check_all(tool_list, which, runner, cargo_bin, environ)
     passed = report(results, args.strict, cargo_bin, out)
     return 0 if passed else 1
 

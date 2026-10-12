@@ -188,15 +188,35 @@ Release packaging and contributor verification:
 - `bacon.toml` — optional watcher jobs for the documented fast loops
   (`check`, `nextest-fast` on the `fast` profile, `affected`, `clippy-fast`)
   with explicit `e`/`n`/`a`/`c` job-switch keys; no gate depends on it.
+- `rust-toolchain.toml` — the exact stable Rust that CI and local rustup
+  proxies use (`channel`, clippy and rustfmt); the workspace `rust-version`
+  stays the declared MSRV floor. `.github/actions/setup-rust` installs it (or a
+  job's dated nightly) in every workflow job.
+- `scripts/check-rust-toolchain-pin` — CI gate rejecting a floating channel
+  (`stable`, `beta`, undated `nightly`) or a direct `dtolnay/rust-toolchain`
+  use outside `.github/actions/setup-rust` in workflows and actions, and a
+  non-exact pin; `scripts/tests/test_rust_toolchain_pin.py` runs it on fixture
+  trees and the real tree.
+- `scripts/bump-rust-toolchain` — moves the stable pin (`--stable X.Y.Z`)
+  and the dated workflow nightly (`--nightly YYYY-MM-DD`) in one step; the
+  bump PR also fixes new lints. `scripts/tests/test_bump_rust_toolchain.py`
+  covers it.
 - `scripts/dev-bootstrap` — local tool check: required `rustc` (the workspace `rust-version`), `cargo-nextest` (minimum
   read from `.config/nextest.toml`) and `python3` >= 3.11, optional `bacon`,
-  `hyperfine`, and on Linux `mold` (fail only with `--strict`); prints the exact fix for
+  `hyperfine`, and on Linux `mold` (fail only with `--strict`); a `rustc-pin`
+  row warns when the active `rustc` differs from `rust-toolchain.toml` (fails
+  only with `--strict`); a rustup proxy whose pinned toolchain is not
+  installed is reported as `toolchain-not-installed` on the `rustc` and
+  `cargo-nextest` rows with `rustup toolchain install` as the fix (fails the
+  run); version commands run in the repository root with
+  `RUSTUP_AUTO_INSTALL=0`; prints the exact fix for
   each missing or too-old tool (a shadowed or off-PATH copy gets the
   shell-quoted `export PATH` fix) and never installs anything itself.
 - `scripts/tests/test_dev_bootstrap.py` — regression checks for version
   parsing, the config-derived nextest minimum, required vs. optional and
-  `--strict` exit status, MSRV and missing-`cargo` handling, and shadowed
-  copies; `which` and version calls are injected.
+  `--strict` exit status, MSRV and missing-`cargo` handling, the
+  `rust-toolchain.toml` pin row and malformed pins, and shadowed copies;
+  `which` and version calls are injected.
 - `scripts/ci-timings` — reproduction of CI timing evidence from `gh` run
   data: per-job wall clock and workflow medians (`runs`, `compare`), per-shard
   nextest JUnit summaries (`junit`), sccache/rust-cache

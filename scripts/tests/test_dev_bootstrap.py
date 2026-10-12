@@ -1,8 +1,8 @@
 """Integration scenarios for the `scripts/dev-bootstrap` CLI (stdlib only).
 
 Each test runs the actual script as a child process of a disposable
-repository root (the script copy, its `Cargo.toml` and
-`.config/nextest.toml`) with executable fake tools on `PATH`. The fake
+repository root (the script copy, its `Cargo.toml`, `rust-toolchain.toml`
+and `.config/nextest.toml`) with executable fake tools on `PATH`. The fake
 `cargo` mirrors the real one's subcommand resolution: it prefers
 `$CARGO_HOME/bin/cargo-<sub>` unless that directory already sits later on
 `PATH`, exactly the order `dev-bootstrap` relies on. No host tool, network
@@ -25,6 +25,17 @@ CARGO_BIN = f"{CARGO_HOME}/bin"
 
 MSRV_MANIFEST = "[workspace.package]\nrust-version = \"1.96\"\n"
 NEXTEST_CONFIG = 'nextest-version = { required = "0.9.115" }\n'
+# Pins the release the fake `rustc` reports, so the pin row passes by default.
+TOOLCHAIN_PIN = "1.98.1"
+
+
+def toolchain_file(channel):
+    return (
+        "# CI and local toolchain pin.\n"
+        f'[toolchain]\nchannel = "{channel}"\n'
+        'components = ["clippy", "rustfmt"]\nprofile = "minimal"\n'
+    )
+
 
 # Version outputs shaped like the real tools'.
 RUSTC_VERSION = "rustc 1.98.1 (48a229cea 2026-09-01)\n"
@@ -62,6 +73,7 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
         (self.root / "scripts").mkdir()
         (self.root / "scripts" / "dev-bootstrap").write_text(REPO_SCRIPT.read_text())
         (self.root / "Cargo.toml").write_text(MSRV_MANIFEST)
+        (self.root / "rust-toolchain.toml").write_text(toolchain_file(TOOLCHAIN_PIN))
         (self.root / ".config" / "nextest.toml").write_text(NEXTEST_CONFIG)
         self.fakes = self.home / "fakes"
         self.fakes.mkdir()
@@ -102,6 +114,18 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
             'exec "$tool" "$@"\n'
         )
 
+    def write_all_tools(self):
+        # Every optional tool present and current, so `--strict` judges only
+        # the rows a scenario changes.
+        self.write_tool("cargo-nextest", NEXTEST_VERSION)
+        self.write_tool("bacon", BACON_VERSION)
+        self.write_tool("hyperfine", HYPERFINE_VERSION)
+        if IS_LINUX:
+            self.write_tool("mold", MOLD_VERSION)
+
+    def pin(self, channel):
+        (self.root / "rust-toolchain.toml").write_text(toolchain_file(channel))
+
     def write_cargo(self):
         # `cargo` itself must be invocable on PATH, as in a real install.
         (self.fakes / "cargo").write_text(self.cargo_script())
@@ -115,12 +139,13 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
             "HOME": str(self.home),
         }
 
-    def run_script(self, *args, path_entries=None, cargo_home=None):
+    def run_script(self, *args, path_entries=None, cargo_home=None, cwd=None,
+                   extra_env=None):
         path = ":".join(map(str, path_entries)) if path_entries else str(self.fakes)
         completed = subprocess.run(
-            [sys.executable, "scripts/dev-bootstrap", *args],
-            cwd=self.root,
-            env={**self.env(cargo_home), "PATH": path},
+            [sys.executable, str(self.root / "scripts" / "dev-bootstrap"), *args],
+            cwd=cwd or self.root,
+            env={**self.env(cargo_home), "PATH": path, **(extra_env or {})},
             capture_output=True,
             text=True,
             timeout=60,
@@ -354,6 +379,165 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
         self.assertIn("`cargo` is not on PATH", output)
         self.assertIn("https://rustup.rs", output)
         self.assertNotIn("cargo install --locked", output)
+
+    # -- the rust-toolchain.toml pin ------------------------------------
+
+    def test_rustc_matching_the_pin_passes_strict(self):
+        self.write_all_tools()
+        status, output = self.run_script("--strict")
+        self.assertEqual(status, 0, output)
+        self.assertIn(
+            f"ok       rustc {TOOLCHAIN_PIN} matches the rust-toolchain.toml pin (pin)",
+            output,
+        )
+
+    def test_rustc_differing_from_the_pin_warns_and_fails_only_under_strict(self):
+        # A distribution rustc first on PATH, the rustup proxy behind it in
+        # $CARGO_HOME/bin: the fix reorders PATH and installs the pin.
+        self.write_all_tools()
+        self.pin("1.99.0")
+        self.write_tool("rustc", "rustc 1.99.0 (b940084d7 2026-09-28)\n",
+                        directory=self.cargo_bin)
+        status, output = self.run_script()
+        self.assertEqual(status, 0, output)
+        self.assertIn(
+            f"warn     rustc 1.98.1 at {self.fakes / 'rustc'} differs from the "
+            "rust-toolchain.toml pin 1.99.0 (pin)",
+            output,
+        )
+        self.assertIn(
+            f"fix: {self.fakes / 'rustc'} is not the rustup proxy; put the rustup "
+            "proxies first so rustup selects the pin from rust-toolchain.toml: "
+            f'export PATH={self.cargo_bin}:"$PATH"; then run `rustup toolchain '
+            "install` in the repository root to install the pin",
+            output,
+        )
+        # The MSRV floor still holds for the same rustc.
+        self.assertIn("ok       rustc 1.98.1 >= 1.96.0 (required)", output)
+
+        status, output = self.run_script("--strict")
+        self.assertEqual(status, 1, output)
+        self.assertIn("FAIL     rustc 1.98.1 at", output)
+        self.assertIn("dev-bootstrap: failing: rustc-pin\n", output)
+
+    def test_pin_mismatch_without_rustup_points_at_rustup(self):
+        self.write_all_tools()
+        self.pin("1.99.0")
+        status, output = self.run_script()
+        self.assertEqual(status, 0, output)
+        self.assertIn("install rustup (https://rustup.rs)", output)
+        self.assertIn(f'export PATH={self.cargo_bin}:"$PATH"', output)
+
+    def test_pin_mismatch_through_the_proxy_names_the_override(self):
+        # The proxy is first on PATH and still selects another toolchain:
+        # only an override can win over rust-toolchain.toml.
+        self.write_all_tools()
+        self.write_tool("rustc", "rustc 1.97.0 (aaaaaaaaa 2026-07-07)\n",
+                        directory=self.cargo_bin)
+        entries = [self.cargo_bin, self.fakes]
+        status, output = self.run_script(path_entries=entries)
+        self.assertEqual(status, 0, output)
+        self.assertIn("rustc 1.97.0 at", output)
+        self.assertIn("`rustup override unset` in the repository root", output)
+
+        status, output = self.run_script(
+            path_entries=entries, extra_env={"RUSTUP_TOOLCHAIN": "1.97.0"}
+        )
+        self.assertEqual(status, 0, output)
+        self.assertIn("RUSTUP_TOOLCHAIN is set and wins over rust-toolchain.toml", output)
+
+    def test_prerelease_of_the_pin_is_a_mismatch(self):
+        self.write_all_tools()
+        self.write_tool("rustc", f"rustc {TOOLCHAIN_PIN}-beta.3 (ccccccccc 2026-08-20)\n")
+        status, output = self.run_script("--strict")
+        self.assertEqual(status, 1, output)
+        self.assertIn(
+            f"rustc {TOOLCHAIN_PIN} (pre-release) at {self.fakes / 'rustc'} differs",
+            output,
+        )
+
+    def test_pin_is_not_compared_while_the_rustc_row_fails(self):
+        self.write_all_tools()
+        self.write_tool("rustc", "rustc 1.95.0 (ddddddddd 2026-05-01)\n")
+        status, output = self.run_script("--strict")
+        self.assertEqual(status, 1, output)
+        self.assertIn("rustc 1.95.0 is older than 1.96.0 (required)", output)
+        self.assertIn(
+            f"n/a      rust-toolchain.toml pin {TOOLCHAIN_PIN} not compared", output
+        )
+        self.assertIn("dev-bootstrap: failing: rustc\n", output)
+
+    def test_version_commands_run_in_the_root_without_rustup_auto_install(self):
+        # A rustup proxy resolves rust-toolchain.toml from its working
+        # directory and downloads a missing pin unless RUSTUP_AUTO_INSTALL=0;
+        # these fakes fail unless both hold, even when the script is started
+        # from outside the repository.
+        guard = (
+            '[ "$RUSTUP_AUTO_INSTALL" = 0 ] && [ -f rust-toolchain.toml ] || '
+            "{ echo 'would resolve or install a toolchain' >&2; exit 1; }; "
+        )
+        self.write_all_tools()
+        self.write_tool("rustc", None, body=guard + f"printf %s {sh_quote(RUSTC_VERSION)}")
+        self.write_tool("cargo-nextest", None,
+                        body=guard + f"printf %s {sh_quote(NEXTEST_VERSION)}")
+        status, output = self.run_script("--strict", cwd=self.home)
+        self.assertEqual(status, 0, output)
+        self.assertIn(f"ok       rustc {TOOLCHAIN_PIN} matches", output)
+        self.assertIn("ok       cargo-nextest 0.9.145", output)
+
+    def test_pinned_toolchain_not_installed_names_rustup_install(self):
+        # The rustup proxies come first and the pin is not installed yet (the
+        # state right after a bump): with auto-install off, every proxy
+        # refuses, and the fix installs the toolchain instead of the tools.
+        self.write_all_tools()
+        refusal = (
+            "printf %s 'error: toolchain '\\''1.98.1-x86_64-unknown-linux-gnu'\\'' "
+            "is not installed\nhelp: run `rustup toolchain install` to install it\n' >&2; "
+            "exit 1"
+        )
+        self.write_tool("rustc", None, directory=self.cargo_bin, body=refusal)
+        self.write_tool("cargo", None, directory=self.cargo_bin, body=refusal)
+        status, output = self.run_script(path_entries=[self.cargo_bin, self.fakes])
+        self.assertEqual(status, 1, output)
+        for tool in ("rustc", "cargo-nextest"):
+            self.assertIn(
+                f"FAIL     {tool} cannot run: rustup toolchain "
+                "1.98.1-x86_64-unknown-linux-gnu is not installed (required)",
+                output,
+            )
+        self.assertEqual(
+            output.count("fix: run `rustup toolchain install` in the repository root"), 2,
+            output,
+        )
+        self.assertNotIn("cargo install", output)
+        self.assertIn(f"n/a      rust-toolchain.toml pin {TOOLCHAIN_PIN} not compared", output)
+        self.assertIn("dev-bootstrap: failing: rustc, cargo-nextest\n", output)
+
+    def test_missing_or_malformed_pin_is_a_configuration_error(self):
+        cases = {
+            "missing": (None, "cannot read"),
+            "invalid toml": ("[toolchain\n", "cannot read"),
+            "no channel": ('[toolchain]\nprofile = "minimal"\n',
+                           "declares no [toolchain] channel"),
+            "floating stable": (toolchain_file("stable"),
+                                "channel 'stable' is not an exact X.Y.Z release"),
+            "minor only": (toolchain_file("1.99"),
+                           "channel '1.99' is not an exact X.Y.Z release"),
+            "dated nightly": (toolchain_file("nightly-2026-10-11"),
+                              "is not an exact X.Y.Z release"),
+        }
+        pin_file = self.root / "rust-toolchain.toml"
+        for case, (content, message) in cases.items():
+            with self.subTest(case):
+                if content is None:
+                    pin_file.unlink(missing_ok=True)
+                else:
+                    pin_file.write_text(content)
+                status, output = self.run_script()
+                self.assertEqual(status, 2, output)
+                self.assertIn("rust-toolchain.toml", output)
+                self.assertIn(message, output)
+                self.assertNotIn("local tool check", output)
 
     # -- malformed configuration ---------------------------------------
 
