@@ -170,9 +170,11 @@ captured screen through the package manifest.
   (`stop`), which forwards only each task's `id`, `type` and `status` as a
   `subagent_snapshot` claim to the worker, reads at most 1 MiB, and sends
   nothing for a Stop with a non-empty `agent_id` or a missing, invalid or
-  over-long list. The
-  worker completes listed-then-missing background agents of the same Claude
-  process and reopens listed terminal ones (see
+  over-long list. Claude builds the list before the hook reads its clock and
+  often still lists a fast background agent whose own SubagentStop already
+  arrived, so the worker never reopens a listed row: it completes background
+  agents of the same Claude process that an earlier list named and this one
+  omits, and leaves listed rows to their own start and stop (see
   [sessions](../concepts/sessions.md); evidence in
   [#883](https://github.com/zajca/pohunek/issues/883)).
 - A Claude state hook action (`session`, `release`, `subagent-start`,
@@ -312,7 +314,20 @@ established by the network namespace, not by Claude's own switches.
   must not read idle for longer than two title changes), the SessionStart
   reference and its transcript,
   resume and fork argv, the subagent hooks (the same subagent must reach
-  `completed` while the parent runtime is live), and the approval dialog.
+  `completed` while the parent runtime is live), and the approval dialog. The
+  subagent tracking of #883 has three more:
+  `a_resumed_real_claude_background_agent_keeps_one_row_through_both_runs`
+  (a background agent resumed with `SendMessage` keeps one row, `running`
+  during each run and `completed` after it),
+  `a_real_claude_background_agent_without_its_stop_is_settled_by_the_main_stop`
+  (pohunek's SubagentStop hook is removed; an earlier main Stop listed the
+  running agent, and the first main Stop whose list omits the finished agent
+  completes it, logged as `snapshot_absent`) and
+  `real_claude_prompt_suggestion_stops_create_no_subagent_row` (the
+  prompt-suggestion helper's stops create no row). The helper test sets
+  `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=1` in the session profile, because
+  without it Claude reads the helper's enablement from a remote feature flag
+  that a hermetic run never fetches.
   Hooks come from `pohunek integration install --agent claude --profile …`,
   which resolves the profile's `CLAUDE_CONFIG_DIR` so the real home is never
   touched. Run them with `POHUNEK_CLAUDE_E2E=1 cargo test -p pohunek-cli --test

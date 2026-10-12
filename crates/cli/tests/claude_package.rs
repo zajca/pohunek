@@ -19,6 +19,7 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -38,7 +39,7 @@ use pohunek_daemon::detect::{
 use pohunek_daemon::procwatch::{ProcessFact, StartIdentity};
 use pohunek_daemon::session::HostTrustAnchor;
 use pohunek_test_support::fs::write_executable;
-use pohunek_test_support::wait::wait_until;
+use pohunek_test_support::wait::{wait_until, HANG_GUARD};
 use pohunek_test_support::workspace_root;
 use protocol::{
     AgentActivity, BindingProvenance, PackageId, PackageVersion, RuntimeId, StateSource,
@@ -1721,6 +1722,21 @@ const IDLE_TITLE_PREFIX: &str = "\u{2733} ";
 /// The prompt the tests submit.
 const PROMPT: &str = "say hi";
 
+/// Prompts of the main turns a test submits after [`PROMPT`], each a plain
+/// text turn.
+const FOLLOW_UP_PROMPTS: [&str; 2] = ["say more", "say again"];
+
+/// Claude Code's switch for its prompt-suggestion helper.
+///
+/// Without it Claude Code reads the helper's enablement from a remote feature
+/// flag, which a hermetic run never fetches, so the helper stays off.
+const PROMPT_SUGGESTION_VARIABLE: &str = "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION";
+
+/// Directory of the session worker's log, relative to the harness root: the
+/// harness gives the worker `worker/state` as its state home, and the worker
+/// writes `pohunek-session-<id>.jsonl` to `pohunek/logs` below it.
+const WORKER_LOG_DIR: &str = "worker/state/pohunek/logs";
+
 /// How long one `session wait` polls before the caller retries, in
 /// milliseconds.
 const WAIT_SLICE_MS: &str = "8000";
@@ -1904,10 +1920,19 @@ impl Fixture {
     /// Writes the profile `name`, pinned to the installed package and to the
     /// fixture's Claude home. `program` replaces the runtime's `claude`.
     fn write_profile(&self, name: &str, program: Option<&Path>) {
+        self.write_profile_with(name, program, &[]);
+    }
+
+    /// Writes the profile `name` as [`Fixture::write_profile`] does, with
+    /// `extra` added to Claude's environment.
+    fn write_profile_with(&self, name: &str, program: Option<&Path>, extra: &[(&str, &str)]) {
         let program = program.map_or_else(String::new, |program| {
             format!("program = \"{}\"\n", path_str(program))
         });
-        let env = claude_environment(&self.claude_home, &self.stub.base_url())
+        let mut variables: Vec<(&str, String)> =
+            claude_environment(&self.claude_home, &self.stub.base_url());
+        variables.extend(extra.iter().map(|(key, value)| (*key, (*value).to_owned())));
+        let env = variables
             .iter()
             .fold(String::new(), |mut env, (key, value)| {
                 writeln!(env, "{key} = \"{value}\"").expect("write to a string");
@@ -1953,6 +1978,27 @@ impl Fixture {
             settings.contains("SessionStart") && settings.contains("SubagentStart"),
             "pohunek registered its hooks in the fixture home: {settings}"
         );
+    }
+
+    /// Removes every `event` hook from the fixture's Claude settings, so Claude
+    /// reports that event to no hook.
+    fn remove_hooks(&self, event: &str) {
+        let path = self.claude_home.join("settings.json");
+        let mut settings: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings.json"))
+                .expect("settings.json is JSON");
+        let removed = settings["hooks"]
+            .as_object_mut()
+            .and_then(|hooks| hooks.remove(event));
+        assert!(
+            removed.is_some(),
+            "the integration registered {event}: {settings}"
+        );
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&settings).expect("settings JSON"),
+        )
+        .expect("write settings.json");
     }
 
     /// The inventory entry `host inspect local` reports for `profile`.
@@ -2123,6 +2169,128 @@ impl Fixture {
         inspected["ok"].clone()
     }
 
+    /// The subagent rows `session inspect` reports; none when it reports no
+    /// collection.
+    async fn subagents(&self, id: &str) -> Vec<Value> {
+        self.inspect(id).await["subagents"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The session's one subagent row; fails when the session reports another
+    /// number of rows.
+    async fn only_subagent(&self, id: &str) -> Value {
+        let rows = self.subagents(id).await;
+        assert_eq!(rows.len(), 1, "one subagent row: {rows:#?}");
+        rows[0].clone()
+    }
+
+    /// Waits until the session's one subagent row is `running` and returns it;
+    /// `what` names the awaited run.
+    async fn wait_running_subagent(&self, id: &str, what: &str) -> Value {
+        wait_until(&format!("{what}: a running subagent row"), || async {
+            let rows = self.subagents(id).await;
+            assert!(rows.len() <= 1, "at most one subagent row: {rows:#?}");
+            rows.into_iter().find(|row| row["lifecycle"] == "running")
+        })
+        .await
+    }
+
+    /// Waits until the session's one subagent row is `agent` and `completed`
+    /// while the runtime launched as `pid` stays live, and returns that row.
+    async fn wait_completed_subagent(&self, id: &str, agent: &str, pid: &Value) -> Value {
+        wait_until(&format!("subagent {agent} to complete"), || async {
+            let inspected = self.inspect(id).await;
+            assert_eq!(
+                inspected["runtime"]["state"], "live",
+                "the parent runtime stays live: {inspected}"
+            );
+            assert_eq!(&inspected["pid"], pid, "{inspected}");
+            let rows = inspected["subagents"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                rows.len() == 1 && rows[0]["id"] == agent,
+                "the session keeps one row, for {agent}: {rows:#?}"
+            );
+            (rows[0]["lifecycle"] == "completed").then(|| rows[0].clone())
+        })
+        .await
+    }
+
+    /// The structured fields of every event the session worker logged so far,
+    /// one JSON object per log line; a line still being written is skipped.
+    fn worker_events(&self, id: &str) -> Vec<Value> {
+        let path = self
+            .harness
+            .env
+            .root()
+            .join(WORKER_LOG_DIR)
+            .join(format!("pohunek-session-{id}.jsonl"));
+        fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .map(|event| event["fields"].clone())
+            .collect()
+    }
+
+    /// The worker's log events of applied main-`Stop` snapshots, in log order.
+    fn snapshots(&self, id: &str) -> Vec<Value> {
+        self.worker_events(id)
+            .into_iter()
+            .filter(|event| event.get("subagent.snapshot.tasks").is_some())
+            .collect()
+    }
+
+    /// Adds a second `SubagentStop` hook to the fixture's Claude settings that
+    /// blocks each invocation until [`StopHold::release`]; Claude keeps the
+    /// stopping agent running in its task registry until its hooks return.
+    fn hold_subagent_stops(&self) -> StopHold {
+        let root = self.harness.env.root();
+        let hold = StopHold {
+            fifo: root.join("subagent-stop.fifo"),
+            waiting: root.join("subagent-stop.waiting"),
+        };
+        let made = std::process::Command::new("mkfifo")
+            .arg(&hold.fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo {}", hold.fifo.display());
+        let script = root.join("hold-subagent-stop.sh");
+        write_executable(
+            &script,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\necho >>'{}'\ncat '{}' >/dev/null\n",
+                path_str(&hold.waiting),
+                path_str(&hold.fifo)
+            ),
+        )
+        .expect("write the holding hook");
+        let path = self.claude_home.join("settings.json");
+        let mut settings: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read settings.json"))
+                .expect("settings.json is JSON");
+        settings["hooks"]["SubagentStop"]
+            .as_array_mut()
+            .expect("the integration registered SubagentStop")
+            .push(serde_json::json!({
+                "hooks": [{
+                    "type": "command",
+                    "command": path_str(&script),
+                    "timeout": HELD_HOOK_TIMEOUT_SECS,
+                }],
+            }));
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&settings).expect("settings JSON"),
+        )
+        .expect("write settings.json");
+        hold
+    }
+
     /// Waits until the hook reported the conversation id and returns the
     /// session record that carries it.
     async fn wait_reported_conversation(&self, id: &str) -> Value {
@@ -2186,6 +2354,65 @@ impl Fixture {
             !stub.saw_credential(),
             "no request to the stub carried an Authorization header or a foreign key"
         );
+    }
+}
+
+/// Most [`HANG_GUARD`]-bounded waits one invocation of the blocking
+/// `SubagentStop` hook stays blocked across: from the agent's stop, the wait
+/// for its completed row, the wait for the next main-`Stop` snapshot, and the
+/// two waits of [`StopHold::release`].
+const HELD_HOOK_WAITS: u64 = 4;
+
+/// Timeout, in seconds, of the blocking `SubagentStop` hook
+/// [`Fixture::hold_subagent_stops`] adds.
+///
+/// Claude Code ends a command hook once its timeout elapses (600 s when the
+/// entry sets none, in 2.1.289 and 2.1.296), and an ended hook lets the agent
+/// finish before the test releases it. The value covers every wait a held
+/// invocation spans, each bounded by [`HANG_GUARD`], plus one more for the
+/// CLI calls between them, so a slow but healthy run never loses its hold; a
+/// stuck run fails at a guard first, and the fixture's process guard ends
+/// the held hook with the session.
+const HELD_HOOK_TIMEOUT_SECS: u64 = (HELD_HOOK_WAITS + 1) * HANG_GUARD.as_secs();
+
+const _: () = assert!(HELD_HOOK_TIMEOUT_SECS > HELD_HOOK_WAITS * HANG_GUARD.as_secs());
+
+/// The blocking `SubagentStop` hook [`Fixture::hold_subagent_stops`] adds.
+struct StopHold {
+    /// FIFO each invocation reads until a writer opens and closes it.
+    fifo: PathBuf,
+    /// File each invocation appends one line to before it blocks.
+    waiting: PathBuf,
+}
+
+impl StopHold {
+    /// Waits until the hook's `invocation`-th run blocks, then releases every
+    /// blocked run.
+    ///
+    /// The FIFO is opened without blocking: the open fails with `ENXIO` while
+    /// no reader has it open, and the wait retries until the reader is there,
+    /// bounded by [`HANG_GUARD`]. Closing the writer ends the reader's `cat`.
+    async fn release(&self, invocation: usize) {
+        wait_until(&format!("held SubagentStop hook {invocation}"), || async {
+            let lines = fs::read_to_string(&self.waiting).map_or(0, |text| text.lines().count());
+            (lines >= invocation).then_some(())
+        })
+        .await;
+        wait_until(
+            &format!("the reader of held SubagentStop hook {invocation}"),
+            || async {
+                match fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&self.fifo)
+                {
+                    Ok(_writer) => Some(()),
+                    Err(error) if error.raw_os_error() == Some(libc::ENXIO) => None,
+                    Err(error) => panic!("open the hook FIFO {}: {error}", self.fifo.display()),
+                }
+            },
+        )
+        .await;
     }
 }
 
@@ -2850,6 +3077,320 @@ async fn a_real_claude_subagent_is_reported_through_the_hook_schema() {
 
     fixture.stop(&id).await;
     fixture.finish().await;
+}
+
+/// The row revision `row` reports.
+fn revision(row: &Value) -> u64 {
+    row["revision"]
+        .as_str()
+        .and_then(|revision| revision.parse().ok())
+        .unwrap_or_else(|| panic!("a numeric revision: {row}"))
+}
+
+/// A background agent the main agent resumes with `SendMessage` keeps its one
+/// row through both runs, and no main `Stop` reopens the row once a run's own
+/// `SubagentStop` completed it.
+///
+/// Claude Code reports the resumed run with a second `SubagentStart` for the
+/// same agent id (issue #883, R1). Its main-`Stop` `background_tasks` still
+/// lists an agent as running while that agent's `SubagentStop` hooks run, so
+/// the `Stop` of the turn that launched or resumed a fast agent lists an agent
+/// pohunek already completed. That listing leaves the row `completed`.
+///
+/// Each step is deterministic:
+/// - the stub holds each run until the test read the row `running`; while a
+///   run is held, only its `SubagentStart` can make the row `running`;
+/// - the stub holds the main turn that launched or resumed the agent until
+///   the run's `SubagentStop` completed the row;
+/// - a second `SubagentStop` hook of the fixture blocks until the test
+///   releases it, so that turn's main `Stop` is built while Claude still lists
+///   the agent;
+/// - each main `Stop` is awaited through the worker's snapshot log event.
+///
+/// `session inspect` follows the worker's subagent changes asynchronously, so
+/// the row is compared at points that need a later change to be visible: the
+/// resumed run's start, and a second background agent launched at the end.
+#[tokio::test]
+#[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
+async fn a_resumed_real_claude_background_agent_keeps_one_row_through_both_runs() {
+    require_real_claude();
+    let fixture = Fixture::start(Seed::Trusted).await;
+    fixture.install_integration().await;
+    let stops = fixture.hold_subagent_stops();
+    let id = fixture.new_session_id("resume").await;
+    fixture.wait_activity(&id, "idle").await;
+    let pid = fixture.inspect(&id).await["pid"].clone();
+
+    fixture
+        .input(
+            &id,
+            &format!("{} start it", messages_stub::BACKGROUND_MARKER),
+        )
+        .await;
+    wait_until("the background agent's first request", || async {
+        (fixture.stub.background_requests() >= 1).then_some(())
+    })
+    .await;
+    let first_run = fixture.wait_running_subagent(&id, "the first run").await;
+    assert_eq!(first_run["provider"], "claude", "{first_run}");
+    let agent = first_run["id"].as_str().expect("subagent id").to_owned();
+
+    fixture.stub.open_run_gate();
+    let first_done = fixture.wait_completed_subagent(&id, &agent, &pid).await;
+    assert_eq!(
+        first_done["started_at_ms"], first_run["started_at_ms"],
+        "{first_done}"
+    );
+    fixture.stub.open_launch_result_gate();
+    let lagging = no_snapshot_reopens(&fixture, &id, &agent, 1).await;
+    assert_lists_finished_agent(&lagging);
+    stops.release(1).await;
+    no_snapshot_reopens(&fixture, &id, &agent, 2).await;
+
+    fixture
+        .input(&id, &format!("{} {agent}", messages_stub::RESUME_MARKER))
+        .await;
+    wait_until("the resumed run's first request", || async {
+        (fixture.stub.resumed_requests() >= 1).then_some(())
+    })
+    .await;
+    let resumed = fixture
+        .wait_running_subagent(&id, "the resumed run's SubagentStart")
+        .await;
+    assert_eq!(resumed["id"], agent.as_str(), "{resumed}");
+    assert!(resumed["finished_at_ms"].is_null(), "{resumed}");
+    // The worker numbers subagent changes consecutively, so the resumed run's
+    // start is the only change since the first run completed: neither main
+    // Stop between them changed the row.
+    assert_eq!(
+        revision(&resumed),
+        revision(&first_done) + 1,
+        "only the resumed run's SubagentStart changed the row: {first_done} -> {resumed}"
+    );
+    assert_eq!(
+        resumed["started_at_ms"], first_run["started_at_ms"],
+        "the reopened row keeps its first start: {resumed}"
+    );
+
+    fixture.stub.open_resume_gate();
+    let second_done = fixture.wait_completed_subagent(&id, &agent, &pid).await;
+    assert!(revision(&second_done) > revision(&resumed), "{second_done}");
+    assert_eq!(
+        second_done["started_at_ms"], first_run["started_at_ms"],
+        "{second_done}"
+    );
+    fixture.stub.open_resume_result_gate();
+    let lagging = no_snapshot_reopens(&fixture, &id, &agent, 3).await;
+    assert_lists_finished_agent(&lagging);
+    stops.release(2).await;
+    no_snapshot_reopens(&fixture, &id, &agent, 4).await;
+
+    // A second background agent's row is a change after both main Stops, so
+    // once it is visible the first agent's row shows every earlier change.
+    fixture
+        .input(
+            &id,
+            &format!("{} start another", messages_stub::BACKGROUND_MARKER),
+        )
+        .await;
+    let rows = wait_until("the second background agent's row", || async {
+        let rows = fixture.subagents(&id).await;
+        (rows.len() == 2).then_some(rows)
+    })
+    .await;
+    let last = rows
+        .iter()
+        .find(|row| row["id"] == agent.as_str())
+        .unwrap_or_else(|| panic!("the first agent keeps its row: {rows:#?}"));
+    assert_eq!(
+        last, &second_done,
+        "no main Stop changed the completed row: {rows:#?}"
+    );
+    stops.release(3).await;
+
+    fixture.stop(&id).await;
+    fixture.finish().await;
+}
+
+/// Waits until the worker applied its `snapshots`-th main-`Stop` snapshot and
+/// checks that no snapshot so far reconciled `agent`, whose own
+/// `SubagentStop` completed it. Returns that snapshot's log event.
+///
+/// The worker logs a snapshot's reconciliations before the snapshot itself,
+/// so the log read after the snapshot's event holds them.
+async fn no_snapshot_reopens(fixture: &Fixture, id: &str, agent: &str, snapshots: usize) -> Value {
+    let applied = wait_until(&format!("main Stop snapshot {snapshots}"), || async {
+        fixture.snapshots(id).get(snapshots - 1).cloned()
+    })
+    .await;
+    let reconciled: Vec<Value> = fixture
+        .worker_events(id)
+        .into_iter()
+        .filter(|event| event["subagent.id"] == agent && event.get("subagent.reason").is_some())
+        .filter(|event| event.get("subagent.action").is_none())
+        .collect();
+    assert!(
+        reconciled.is_empty(),
+        "main Stop snapshot {snapshots} leaves the completed row alone ({applied}): {reconciled:#?}"
+    );
+    applied
+}
+
+/// Checks that a main-`Stop` snapshot listed the finished agent whose blocked
+/// `SubagentStop` hook keeps it running in Claude's registry, after its own
+/// stop completed its row: the snapshot names a task, yet counts no listed
+/// running row (only running rows are counted as listed) and completes none.
+fn assert_lists_finished_agent(applied: &Value) {
+    assert!(
+        applied["subagent.snapshot.tasks"]
+            .as_u64()
+            .is_some_and(|tasks| tasks >= 1),
+        "the main Stop lists the agent whose SubagentStop already completed its row: {applied}"
+    );
+    assert_eq!(
+        (
+            &applied["subagent.snapshot.listed"],
+            &applied["subagent.snapshot.terminalized"]
+        ),
+        (&Value::from(0), &Value::from(0)),
+        "the listed agent's row was already completed when the snapshot arrived: {applied}"
+    );
+}
+
+/// A background agent whose `SubagentStop` never reaches pohunek is settled by
+/// the main agent's `Stop` (issue #883, R4). The `Stop` of the turn that
+/// launched the agent lists it while it runs, which makes the row a known
+/// background agent; the first main `Stop` after it finished lists it no
+/// more, so the row is completed while the parent runtime stays live.
+///
+/// The lost stop is deterministic: pohunek's `SubagentStop` hook is removed
+/// from the fixture's Claude settings before the session starts. The stub
+/// holds the agent's run until the worker applied the launching turn's
+/// snapshot, awaited through the worker's snapshot log event.
+#[tokio::test]
+#[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
+async fn a_real_claude_background_agent_without_its_stop_is_settled_by_the_main_stop() {
+    require_real_claude();
+    let fixture = Fixture::start(Seed::Trusted).await;
+    fixture.install_integration().await;
+    fixture.remove_hooks("SubagentStop");
+    let id = fixture.new_session_id("snapshot").await;
+    fixture.wait_activity(&id, "idle").await;
+    let pid = fixture.inspect(&id).await["pid"].clone();
+
+    fixture
+        .input(
+            &id,
+            &format!("{} start it", messages_stub::BACKGROUND_MARKER),
+        )
+        .await;
+    wait_until("the background agent's first request", || async {
+        (fixture.stub.background_requests() >= 1).then_some(())
+    })
+    .await;
+    let started = fixture
+        .wait_running_subagent(&id, "the background agent's SubagentStart")
+        .await;
+    let agent = started["id"].as_str().expect("subagent id").to_owned();
+
+    fixture.stub.open_launch_result_gate();
+    let listing = wait_until("the launching turn's main Stop snapshot", || async {
+        fixture.snapshots(&id).first().cloned()
+    })
+    .await;
+    assert_eq!(
+        listing["subagent.snapshot.listed"], 1,
+        "the snapshot lists the running agent: {listing}"
+    );
+    let listed = fixture.only_subagent(&id).await;
+    assert_eq!(
+        listed["lifecycle"], "running",
+        "a Stop that lists the agent keeps it running: {listed}"
+    );
+
+    fixture.stub.open_run_gate();
+    let settled = fixture.wait_completed_subagent(&id, &agent, &pid).await;
+    assert_eq!(settled["provider"], "claude", "{settled}");
+    // The worker's log writer appends on a background thread, so the line can
+    // trail the journal change `inspect` already reports.
+    wait_until("the worker's log of the snapshot completion", || async {
+        fixture
+            .worker_events(&id)
+            .iter()
+            .any(|event| {
+                event["subagent.id"] == agent.as_str()
+                    && event["subagent.reason"] == "snapshot_absent"
+            })
+            .then_some(())
+    })
+    .await;
+
+    fixture.stop(&id).await;
+    fixture.finish().await;
+}
+
+/// The prompt-suggestion helper Claude Code runs after a main turn reports a
+/// `SubagentStop` with a fresh agent id, an empty agent type and no
+/// `SubagentStart` (issue #883, R3). The session lists no row for those
+/// stops, and the worker logs each one as an ignored stop without a start.
+///
+/// The profile enables the helper with [`PROMPT_SUGGESTION_VARIABLE`]. Claude
+/// runs it only once the conversation holds two assistant messages, so the
+/// second and third main turn each produce one helper stop. Each next turn is
+/// submitted after the previous helper stop was handled, because a new turn
+/// cancels a pending suggestion.
+#[tokio::test]
+#[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
+async fn real_claude_prompt_suggestion_stops_create_no_subagent_row() {
+    require_real_claude();
+    let fixture = Fixture::start(Seed::Trusted).await;
+    fixture.write_profile_with(PROFILE, None, &[(PROMPT_SUGGESTION_VARIABLE, "1")]);
+    fixture.install_integration().await;
+    let id = fixture.new_session_id("suggestion").await;
+    fixture.wait_activity(&id, "idle").await;
+
+    fixture.input(&id, PROMPT).await;
+    wait_until("the first main turn's request", || async {
+        (fixture.stub.requests_with_prompt(PROMPT) >= 1).then_some(())
+    })
+    .await;
+    for (index, prompt) in FOLLOW_UP_PROMPTS.iter().enumerate() {
+        let helpers = index + 1;
+        fixture.input(&id, prompt).await;
+        let (ignored, rows) = wait_until(&format!("helper stop {helpers}"), || async {
+            let ignored = helper_stops(&fixture.worker_events(&id));
+            let rows = fixture.subagents(&id).await;
+            (ignored.len() >= helpers || !rows.is_empty()).then_some((ignored, rows))
+        })
+        .await;
+        assert!(rows.is_empty(), "a helper stop creates no row: {rows:#?}");
+        assert_eq!(ignored.len(), helpers, "{ignored:?}");
+    }
+    let ignored = helper_stops(&fixture.worker_events(&id));
+    assert_ne!(ignored[0], ignored[1], "each helper run has its own id");
+    assert!(
+        fixture
+            .stub
+            .last_messages_containing(messages_stub::SUGGESTION_OPENING)
+            >= FOLLOW_UP_PROMPTS.len(),
+        "each helper stop followed a prompt-suggestion request"
+    );
+    assert!(fixture.subagents(&id).await.is_empty());
+
+    fixture.stop(&id).await;
+    fixture.finish().await;
+}
+
+/// Ids of the stops the worker logged as ignored because no start was
+/// recorded for them, in log order.
+fn helper_stops(events: &[Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|event| {
+            event["subagent.action"] == "stop" && event["subagent.reason"] == "stop_without_start"
+        })
+        .filter_map(|event| event["subagent.id"].as_str().map(str::to_owned))
+        .collect()
 }
 
 /// A tool approval prompt of the real Claude is blocked through the screen,
