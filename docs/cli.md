@@ -45,7 +45,7 @@ port is retained.
 | `pohunek session screen <target>` | Read the current rendered terminal; `--json` preserves runtime identity, watermark, geometry, cursor, and visible lines. |
 | `pohunek session detection <target>` | Preview the active detection manifest regions; `--json` also lists every supported region kind. |
 | `pohunek session output <target>` | Read a newest retained tail or continue with `--worker-instance-id` (the session's `worker_instance_id`), `--runtime-generation`, and `--after-offset`; `--wait-ms` performs a bounded wait. |
-| `pohunek session wait <target>` | Long-poll up to 8000 ms for explicit state, activity, metadata, terminal, output, or runtime predicates. |
+| `pohunek session wait <target>...` | Wait for the next turn event (`turn_completed`, `agent_blocked`, `approval_required`, `exited`) of one or more sessions on one host: `--until`, `--after <cursor>`, `--timeout <duration>`; this is the mode with no flags. Any legacy flag (`--state`, `--activity`, the `--after-*` cursors, the runtime identity, `--timeout-ms`) selects a single-target long-poll of up to 8000 ms for explicit predicates. |
 | `pohunek session fork <target>` | Fork an agent conversation into a new session when that session advertises fork capability (Claude Code, and runtime packages that declare a fork such as `pi`). |
 | `pohunek session resume <target>` | Relaunch a stopped or lost session from its captured native reference. A session launched from a host profile relaunches only while the profile still has the revision frozen into the session; an edited or legacy profile fails with `agent_profile_changed` and a deleted one with `agent_profile_missing`. `--accept-profile-change` relaunches under the current profile and freezes its revision (also on `session fork`); the local daemon honors it, a remote host refuses it with `agent_profile_change_local_only`. |
 | `pohunek session diff <target> [--base <ref>]` | Unified diff of the session's worktree vs its base. |
@@ -202,6 +202,82 @@ const client = await connectLocal(socketPath, {
   origin: { sessionId: "s-origin", daemonId: "daemon-origin" },
 });
 ```
+
+### Following agent turns
+
+A manager agent that starts sessions and follows them waits for turn events
+instead of polling. A turn event is a finished turn (`turn_completed`), an agent
+blocked on the owner (`agent_blocked`), a pending approval
+(`approval_required`), or the session entering `stopped`, `done`, or `failed`
+(`exited`). Events are recorded whatever the notification policy keeps in the
+inbox. `turn_completed`, `agent_blocked`, and `approval_required` are recorded
+when the attention debounce window (`attention_debounce_secs`, 5 seconds by
+default) after the agent's report ends, so a stop followed at once by resumed
+work is not a finished turn; `exited` is recorded at once. Every result carries
+the next cursor; pass it as `--after` so the next wait returns only events
+recorded after it and nothing recorded between two waits is lost.
+
+The cursor orders recording, not the agent's timeline: the stop of the previous
+turn can be recorded after a cursor taken shortly after that stop. If the turn
+ended at T, a cursor is taken at T+1s, input is sent at T+4.5s, and the agent is
+seen working only at T+5.2s, the old `turn_completed` is recorded at T+5s and a
+wait `--after` that cursor returns it as the end of the new prompt. Chain the
+next prompt from the cursor of the result that returned the previous turn
+event, or take a fresh cursor only once at least `attention_debounce_secs` have
+passed since the previous turn ended. A short wait returns the current cursor,
+usually with `reason: timeout`, but it can also return an `event` (handle it) or
+`targets_ended`:
+
+```bash
+# a cursor taken at least attention_debounce_secs after the previous turn ended
+pohunek session wait s-01J00000000000000000000000 --timeout 1ms --json
+pohunek session input s-01J00000000000000000000000 --stdin --json < prompt.txt
+pohunek session wait s-01J00000000000000000000000 s-01J00000000000000000000001 \
+  --until turn_completed,agent_blocked,approval_required,exited \
+  --after <cursor> --timeout 5m --json
+# the cursor of that result covers the finished turn: chain the next prompt from it
+```
+
+`session wait <target>...` takes up to 32 targets; every target must be on one
+host, or the command fails as a usage error before any request (run one wait
+per host). Targets may be ids, `host/id`, or display names. `--until` takes a
+comma list or a repeated flag and defaults to all four kinds. `--timeout` needs a
+unit (`ms`, `s`, `m`, or `h`, for example `90s` or `5m`); without it the daemon
+default applies (5 minutes unless `service.toml` `[waits]` sets another), and a
+value above the daemon ceiling (30 minutes by default) fails with
+`session_wait_limit_exceeded`. With no flags at all, `session wait
+<target>` is a turn wait with every kind and the daemon default.
+
+`--json` prints the daemon result as one document: `reason` (`event`,
+`timeout`, `cursor_reset`, or `targets_ended`), the `event` (`session_id`,
+`kind`, `at`, and `notification_id` when the inbox kept a record), the next
+`cursor`, and `progress` for every target. The human form prints the event as
+`<session> <kind> <at>` or the bare reason, then one `progress:` line per target
+(`<session> <state> <activity> output_advanced=<bool> last_output_at=<time>
+turn_started_at=<time>`, `-` for a time the daemon has not observed), then
+`cursor: <cursor>` as the last line, so a shell loop can chain waits:
+
+```bash
+cursor=$(pohunek session wait s-01J00000000000000000000000 --timeout 1ms | sed -n 's/^cursor: //p')
+pohunek session wait s-01J00000000000000000000000 --after "$cursor" --timeout 5m
+```
+
+The command exits 0 for every reason, a timeout included, as the legacy wait
+does; branch on the reason. A `timeout` with `output_advanced=true` and activity
+`working` means the agent is still working, so wait again with the new cursor; a
+long-quiet `last_output_at` means it is stuck or waiting at an empty prompt, so
+inspect it. `cursor_reset` means the cursor came from another daemon instance
+(for example before a restart) or is older than the retained events: events in
+between are not reported, so take the fresh cursor and inspect the sessions.
+`targets_ended` means every target is terminal and nothing newer is pending.
+To stream instead of wait, use `notifications watch --session <id> --kind
+<kind> --unread`, which follows only the inbox records the policy keeps.
+
+The legacy single-target predicate wait stays available unchanged: any of
+`--state`, `--activity`, `--after-updated-at`, `--after-terminal-watermark`,
+`--after-output-offset`, `--worker-instance-id`, `--runtime-generation`, or
+`--timeout-ms` selects it, it requires `--timeout-ms` (1 to 8000), and mixing
+it with `--until`, `--after`, or `--timeout` is a usage error.
 
 ### Notifications triage
 

@@ -1,4 +1,5 @@
-//! End-to-end: dynamic shell completion against an absent daemon is silent.
+//! End-to-end: dynamic shell completion without a daemon. Lookups are silent,
+//! and values the command tree defines still complete.
 //!
 //! These drive the built `pohunek` binary through clap's environment
 //! completion protocol, the way the installed `source <(POHUNEK_COMPLETE=bash
@@ -52,6 +53,8 @@ fn dynamic_completion_without_a_daemon_prints_nothing_and_starts_nothing() {
 
     for words in [
         ["pohunek", "attach", "local/"].as_slice(),
+        // A later `session wait` target uses the same session completer.
+        ["pohunek", "session", "wait", "s-1", "local/"].as_slice(),
         ["pohunek", "plugin", "inspect", "acme"].as_slice(),
     ] {
         let env = TestEnv::new().expect("create the hermetic test environment");
@@ -71,5 +74,39 @@ fn dynamic_completion_without_a_daemon_prints_nothing_and_starts_nothing() {
             "{words:?} printed an error"
         );
         assert_eq!(entries(env.runtime_dir()), before, "{words:?}");
+    }
+}
+
+/// `session wait --until` completes the turn event kinds offline, after a
+/// comma as well, so a comma list is completable one kind at a time.
+#[test]
+fn session_wait_until_completes_turn_kinds_in_a_comma_list() {
+    for (words, expected) in [
+        (
+            ["pohunek", "session", "wait", "s-1", "--until", "a"].as_slice(),
+            "agent_blocked\napproval_required",
+        ),
+        (
+            [
+                "pohunek",
+                "session",
+                "wait",
+                "s-1",
+                "--until",
+                "turn_completed,ex",
+            ]
+            .as_slice(),
+            "turn_completed,exited",
+        ),
+    ] {
+        let env = TestEnv::new().expect("create the hermetic test environment");
+        let output = complete_bash(&env, words);
+        assert!(output.status.success(), "{words:?}: {:?}", output.status);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            expected,
+            "{words:?}"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "", "{words:?}");
     }
 }

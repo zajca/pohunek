@@ -491,6 +491,53 @@ fn settled_wait_examples_cover_every_normal_outcome() {
     );
 }
 
+/// A turn wait that names only some kinds times out when the agent ends its
+/// turn another way, the turn-mode form of the settled-wait trap above. Every
+/// turn-mode example must select all four kinds, explicitly or by omitting
+/// `--until`, and the artifact must show the chained form with `--after`.
+#[test]
+fn turn_wait_examples_cover_every_kind_and_chain_a_cursor() {
+    const ALL_KINDS: [&str; 4] = [
+        "turn_completed",
+        "agent_blocked",
+        "approval_required",
+        "exited",
+    ];
+    let mut saw_chained_wait = false;
+    for example in collect_pohunek_examples(EMBEDDED_SKILL) {
+        let Some(matches) = parse_example(example.line, &example.command) else {
+            continue;
+        };
+        let Some(("wait", args)) = session_args(&matches) else {
+            continue;
+        };
+        // `--timeout-ms` is required by, and so present in, every legacy wait.
+        if supplied_on_command_line(args, "timeout_ms") {
+            continue;
+        }
+        let tokens: Vec<&str> = example.command.split_whitespace().collect();
+        let kinds: Vec<&str> = flag_values(&tokens, "--until")
+            .into_iter()
+            .flat_map(|value| value.split(','))
+            .collect();
+        if !kinds.is_empty() {
+            for kind in ALL_KINDS {
+                assert!(
+                    kinds.contains(&kind),
+                    "turn wait example at line {} omits --until {kind}; it times \
+                     out when the agent ends its turn that way",
+                    example.line
+                );
+            }
+        }
+        saw_chained_wait |= supplied_on_command_line(args, "after");
+    }
+    assert!(
+        saw_chained_wait,
+        "artifact must contain a turn `session wait` example chained with --after"
+    );
+}
+
 /// Returns every value supplied to one flag in a parsed example's token list.
 fn flag_values<'a>(tokens: &[&'a str], flag: &str) -> Vec<&'a str> {
     tokens

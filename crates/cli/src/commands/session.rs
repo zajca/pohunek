@@ -25,8 +25,10 @@ use protocol::{
     SessionReadSource, SessionRemoveResult, SessionRenameParams, SessionResizeParams,
     SessionResumeParams, SessionRetentionParams, SessionRetentionPolicy, SessionRetentionResult,
     SessionRuntimeIdentity, SessionScreenParams, SessionSetMetadataParams, SessionState,
-    SessionStopResult, SessionWaitParams, SessionWarningKind, StateSource, SubagentLifecycle,
-    TerminalWatermark, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES,
+    SessionStopResult, SessionTurnCursor, SessionTurnEventKind, SessionTurnProgress,
+    SessionWaitParams, SessionWaitTurnParams, SessionWaitTurnReason, SessionWaitTurnResult,
+    SessionWarningKind, StateSource, SubagentLifecycle, TerminalWatermark, MAX_SESSION_INPUT_BYTES,
+    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_WAIT_TURN_MS,
 };
 
 use crate::client::Client;
@@ -83,6 +85,93 @@ fn parse_bounded_wait_timeout_ms(value: &str, flag: &str) -> Result<u32, String>
         ));
     }
     Ok(parsed)
+}
+
+/// Turn event kind accepted by `session wait --until`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub(crate) enum TurnKindArg {
+    /// The agent finished a turn.
+    TurnCompleted,
+    /// The agent is blocked on the owner.
+    AgentBlocked,
+    /// The agent waits for an approval decision.
+    ApprovalRequired,
+    /// The session entered a terminal lifecycle state.
+    Exited,
+}
+
+impl From<TurnKindArg> for SessionTurnEventKind {
+    fn from(kind: TurnKindArg) -> Self {
+        match kind {
+            TurnKindArg::TurnCompleted => Self::TurnCompleted,
+            TurnKindArg::AgentBlocked => Self::AgentBlocked,
+            TurnKindArg::ApprovalRequired => Self::ApprovalRequired,
+            TurnKindArg::Exited => Self::Exited,
+        }
+    }
+}
+
+/// Turn event kinds a `session wait` without `--until` selects.
+///
+/// Every normal end of a turn is included: a wait that leaves one out times
+/// out when the agent ends its turn that way.
+const ALL_TURN_KINDS: [SessionTurnEventKind; 4] = [
+    SessionTurnEventKind::TurnCompleted,
+    SessionTurnEventKind::AgentBlocked,
+    SessionTurnEventKind::ApprovalRequired,
+    SessionTurnEventKind::Exited,
+];
+
+/// Milliseconds per unit accepted by [`parse_turn_timeout`].
+const TURN_TIMEOUT_UNITS: [(&str, u64); 4] = [
+    ("ms", 1),
+    ("s", 1_000),
+    ("m", 60 * 1_000),
+    ("h", 60 * 60 * 1_000),
+];
+
+/// Parse a `session wait --timeout` duration such as `500ms`, `90s`, `5m`, or
+/// `1h` into milliseconds.
+///
+/// A unit is required: `session input --timeout` takes bare milliseconds, so
+/// a bare number would mean different things on sibling flags. The upper bound
+/// is the protocol's absolute turn-wait ceiling; the daemon rejects a value
+/// above its own configured ceiling with `session_wait_limit_exceeded`.
+pub(crate) fn parse_turn_timeout(value: &str) -> Result<u32, String> {
+    let invalid = || {
+        format!(
+            "--timeout must be a positive integer followed by ms, s, m, or h \
+             (for example 90s or 5m), got {value:?}"
+        )
+    };
+    let split = value
+        .find(|character: char| !character.is_ascii_digit())
+        .ok_or_else(invalid)?;
+    let (number, unit) = value.split_at(split);
+    let scale = TURN_TIMEOUT_UNITS
+        .iter()
+        .find_map(|(name, scale)| (*name == unit).then_some(*scale))
+        .ok_or_else(invalid)?;
+    let count = number.parse::<u64>().map_err(|_error| invalid())?;
+    let milliseconds = count.saturating_mul(scale);
+    if milliseconds == 0 {
+        return Err("--timeout must be greater than zero".to_owned());
+    }
+    u32::try_from(milliseconds)
+        .ok()
+        .filter(|milliseconds| *milliseconds <= MAX_SESSION_WAIT_TURN_MS)
+        .ok_or_else(|| format!("--timeout must not exceed {MAX_SESSION_WAIT_TURN_MS} ms (24h)"))
+}
+
+/// Parse a `session wait --after` cursor with the protocol's cursor checks.
+pub(crate) fn parse_turn_cursor(value: &str) -> Result<SessionTurnCursor, String> {
+    SessionTurnCursor::new(value).map_err(|_error| {
+        format!(
+            "--after must be the cursor of an earlier session wait: 1 to {} printable ASCII bytes",
+            protocol::MAX_SESSION_TURN_CURSOR_BYTES
+        )
+    })
 }
 
 /// Parse a non-zero daemon response timeout for `session new`.
@@ -1057,6 +1146,121 @@ pub(crate) async fn run_wait(
         );
     }
     Ok(())
+}
+
+/// Event, cursor, and duration arguments for a turn-mode `session wait`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TurnWaitArgs {
+    /// Kinds that end the wait; empty selects every kind.
+    pub until: Vec<TurnKindArg>,
+    /// Cursor of an earlier result.
+    pub after: Option<SessionTurnCursor>,
+    /// Wait duration in milliseconds; `None` leaves it to the daemon default.
+    pub timeout_ms: Option<u32>,
+}
+
+/// Wait for the next turn event of `targets`, which share one host.
+///
+/// Display names resolve to session ids with one `session.list` request; the
+/// wait itself runs on a dedicated connection and ends early on a process
+/// signal. Every completion reason, a timeout included, is a success.
+pub(crate) async fn run_wait_turn(
+    host: &str,
+    paths: &Paths,
+    targets: &[Target],
+    args: TurnWaitArgs,
+    json: bool,
+) -> Result<(), CliError> {
+    let until: Vec<SessionTurnEventKind> = if args.until.is_empty() {
+        ALL_TURN_KINDS.to_vec()
+    } else {
+        args.until.into_iter().map(Into::into).collect()
+    };
+    let params = |session_ids: Vec<SessionId>| {
+        SessionWaitTurnParams::new(
+            session_ids,
+            until.clone(),
+            args.after.clone(),
+            args.timeout_ms,
+        )
+        .map_err(|error| CliError::InvalidObservation {
+            detail: error.to_string(),
+        })
+    };
+    params(
+        targets
+            .iter()
+            .map(|target| SessionId(target.session_id.clone()))
+            .collect(),
+    )?;
+    let mut sdk = Client::connect(host, paths).await?.into_sdk();
+    let sessions = sdk
+        .call::<protocol::method::SessionList>(SessionListParams {
+            filters: Vec::new(),
+        })
+        .await?;
+    let session_ids = targets
+        .iter()
+        .map(|target| {
+            resolve_target_from_sessions(target, &sessions)
+                .map(|target| SessionId(target.session_id))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // Two targets can name one session, for example its id and its display name.
+    let params = params(session_ids)?;
+    let result = cancellable(sdk.session_wait_turn(params)).await?;
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        print!("{}", render_turn_wait(&result));
+    }
+    Ok(())
+}
+
+/// Placeholder for a progress field the daemon has not observed.
+const UNOBSERVED: &str = "-";
+
+/// Render a turn-wait result as human text.
+///
+/// The first line names the event (`<session> <kind> <at>`) or the reason the
+/// wait ended without one; one `progress:` line per target follows, then the
+/// `cursor:` line a shell loop passes to the next `--after`.
+fn render_turn_wait(result: &SessionWaitTurnResult) -> String {
+    let mut output = String::new();
+    match &result.event {
+        Some(event) => {
+            let _ = writeln!(output, "{} {} {}", event.session_id.0, event.kind, event.at);
+        }
+        None => {
+            let _ = writeln!(output, "{}", turn_wait_reason(result.reason));
+        }
+    }
+    for progress in &result.progress {
+        let _ = writeln!(output, "progress: {}", render_turn_progress(progress));
+    }
+    let _ = writeln!(output, "cursor: {}", result.cursor);
+    output
+}
+
+fn turn_wait_reason(reason: SessionWaitTurnReason) -> &'static str {
+    match reason {
+        SessionWaitTurnReason::Event => "event",
+        SessionWaitTurnReason::Timeout => "timeout",
+        SessionWaitTurnReason::CursorReset => "cursor_reset",
+        SessionWaitTurnReason::TargetsEnded => "targets_ended",
+    }
+}
+
+fn render_turn_progress(progress: &SessionTurnProgress) -> String {
+    format!(
+        "{} {} {} output_advanced={} last_output_at={} turn_started_at={}",
+        progress.session_id.0,
+        progress.state.as_str(),
+        progress.activity.map_or("unknown", AgentActivity::as_str),
+        progress.output_advanced,
+        progress.last_output_at.as_deref().unwrap_or(UNOBSERVED),
+        progress.turn_started_at.as_deref().unwrap_or(UNOBSERVED),
+    )
 }
 
 pub(crate) async fn run_resume(

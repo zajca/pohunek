@@ -55,6 +55,7 @@ Current CLI and command surface:
 - `crates/cli/tests/prompt_link.rs`
 - `crates/cli/tests/standalone_discovery.rs`
 - `crates/cli/tests/session_process_api.rs`
+- `crates/cli/tests/session_wait_turn.rs` — `session wait` turn mode against a real daemon.
 
 Assistant launch and prompt rendering:
 

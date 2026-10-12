@@ -542,3 +542,151 @@ fn wait_timeout_is_required_and_bounded_by_shared_contract() {
         assert_eq!(document["err"]["code"], "cli_usage");
     }
 }
+
+/// `session wait` arguments that cannot form one request, each with a
+/// fragment of its usage message: legacy and turn flags mixed, several
+/// targets in legacy mode, targets on different hosts, and malformed turn
+/// values.
+const SESSION_WAIT_USAGE_ERRORS: &[(&[&str], &str)] = &[
+    (
+        &[
+            "session",
+            "wait",
+            "s-1",
+            "--until",
+            "exited",
+            "--state",
+            "done",
+            "--timeout-ms",
+            "100",
+            "--json",
+        ],
+        "cannot be used with",
+    ),
+    (
+        &[
+            "session",
+            "wait",
+            "s-1",
+            "--timeout",
+            "5m",
+            "--timeout-ms",
+            "100",
+            "--json",
+        ],
+        "cannot be used with",
+    ),
+    (
+        &[
+            "session",
+            "wait",
+            "s-1",
+            "--after",
+            "cursor",
+            "--activity",
+            "idle",
+            "--timeout-ms",
+            "100",
+            "--json",
+        ],
+        "cannot be used with",
+    ),
+    (
+        &[
+            "session",
+            "wait",
+            "s-1",
+            "s-2",
+            "--state",
+            "done",
+            "--timeout-ms",
+            "100",
+            "--json",
+        ],
+        "takes exactly one target",
+    ),
+    (
+        &["session", "wait", "local/s-1", "host-b/s-2", "--json"],
+        "must all be on one host",
+    ),
+    (
+        &[
+            "--host",
+            "host-b",
+            "session",
+            "wait",
+            "s-1",
+            "local/s-2",
+            "--json",
+        ],
+        "must all be on one host",
+    ),
+    (
+        &["session", "wait", "s-1", "--timeout", "90", "--json"],
+        "followed by ms, s, m, or h",
+    ),
+    (
+        &["session", "wait", "s-1", "--timeout", "5x", "--json"],
+        "followed by ms, s, m, or h",
+    ),
+    (
+        &["session", "wait", "s-1", "--timeout", "0s", "--json"],
+        "greater than zero",
+    ),
+    (
+        &["session", "wait", "s-1", "--timeout", "25h", "--json"],
+        "must not exceed",
+    ),
+    (
+        &["session", "wait", "s-1", "--until", "finished", "--json"],
+        "--until",
+    ),
+    (
+        &[
+            "session",
+            "wait",
+            "s-1",
+            "--after",
+            "not a cursor",
+            "--json",
+        ],
+        "--after must be",
+    ),
+    (&["session", "wait", "--json"], "required"),
+];
+
+/// Every [`SESSION_WAIT_USAGE_ERRORS`] row fails as a usage error before any
+/// connection, while the accepted spellings get past parsing and fail only on
+/// the absent daemon.
+#[test]
+fn session_wait_mode_and_target_errors_precede_any_request() {
+    for (arguments, fragment) in SESSION_WAIT_USAGE_ERRORS {
+        assert_json_usage_error(arguments, fragment);
+    }
+
+    for arguments in [
+        &[
+            "session",
+            "wait",
+            "s-1",
+            "local/s-2",
+            "--until",
+            "turn_completed,exited",
+            "--until",
+            "agent_blocked",
+            "--timeout",
+            "200ms",
+            "--json",
+        ][..],
+        &["session", "wait", "s-1", "--json"],
+    ] {
+        let output = pohunek().args(arguments).output().expect("spawn pohunek");
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}: {output:?}");
+        let document: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("one JSON error document");
+        assert_eq!(
+            document["err"]["code"], "daemon_unreachable",
+            "{arguments:?}"
+        );
+    }
+}

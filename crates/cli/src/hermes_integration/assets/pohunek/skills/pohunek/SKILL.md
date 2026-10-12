@@ -273,6 +273,14 @@ then wait. Re-read screen or incremental output after each wait. Preserve the
 logical ID, runtime ID, decimal cursor, runtime generation, and next offset
 exactly as returned.
 
+`pohunek_session_wait` is the short predicate wait of one session: at most
+8000 ms per call for a state, activity, or output change. It does not report
+finished turns. Following a peer's turn means repeating bounded waits and
+re-reading the screen or output each time; a run of timeouts is not proof of
+progress. The cursor-driven turn wait of the CLI and SDK (`session wait`
+without the legacy predicate flags, which reports per-session progress on
+timeout) is not one of the plugin's tools.
+
 An output `gap` means retained history was evicted: discard the old cursor and
 start from a fresh screen or newest tail. A runtime change also invalidates prior
 cursors. Report truncation and UTF-8 replacement as data. Distinguish no change,

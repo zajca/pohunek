@@ -26,8 +26,9 @@ bounded current-screen text. Current workers safely report `source_used:
 "visible"` for recent, unwrapped, and detection requests because they do not
 expose scrollback or soft-wrap metadata; `alternate_screen` remains truthful.
 `pohunek session output <target> --json` for a bounded newest retained tail,
-and `pohunek session wait <target> ... --timeout-ms <1..8000> --json` for one
-bounded state/activity/terminal/output change. Continue output with the exact
+and `pohunek session wait <target> --state ... --timeout-ms <1..8000> --json`
+(any legacy predicate flag selects this mode) for one bounded
+state/activity/terminal/output change of one session. Continue output with the exact
 `worker_instance_id`, decimal-string `runtime_generation`, and `next_offset` returned by
 the previous result. A retained-history `gap` means older requested bytes were
 evicted; a runtime change means discard old cursors and restart from a fresh
@@ -36,9 +37,11 @@ connection releases the waiter slots of an in-flight `session.wait`, waited
 `session.output`, or `session.wait_turn` at once; the timeout stays the
 guaranteed release bound for a client that vanishes without closing it.
 
-To follow agents across turns, a client calls the protocol method
-`session.wait_turn` (Rust SDK `Client::session_wait_turn`, TypeScript SDK
-`client.sessionWaitTurn`). It waits for the
+To follow agents across turns, a client runs `pohunek session wait <target>...
+[--until <kinds>] [--after <cursor>] [--timeout <duration>] --json` (turn mode,
+also the mode with no flags) or calls the protocol method `session.wait_turn`
+(Rust SDK `Client::session_wait_turn`, TypeScript SDK `client.sessionWaitTurn`).
+It waits for the
 next turn event of one or more sessions, `turn_completed`, `agent_blocked`,
 `approval_required`, or `exited`, newer than an opaque cursor (or newer than
 the call when no cursor is given), bounded by an agent-chosen `timeout_ms`
@@ -59,6 +62,31 @@ completes the wait. An event is recorded when the attention debounce window
 earlier than that after the agent stops. A `turn_completed` whose window ends
 while the session is `working` is a stale stop and is dropped; a short turn
 that starts and stops inside one window is still recorded once.
+
+The CLI turn mode takes up to 32 targets that must all be on one host (targets
+on different hosts are a usage error before any request; run one wait per
+host). `--until` is a comma list or repeated flag and defaults to all four
+kinds; `--timeout` needs a unit (`90s`, `5m`) and defaults to the daemon
+default. `--json` prints the daemon result as one document; the human form
+prints the event (`<session> <kind> <at>`) or the reason, one `progress:` line
+per target, and `cursor: <cursor>` last. Every reason exits 0, a timeout
+included, as the legacy wait does. Mixing `--until`, `--after`, or `--timeout`
+with a legacy flag is a usage error, and the legacy mode takes one target.
+
+The cursor orders when the daemon records events, not when the agent acted.
+`turn_completed`, `agent_blocked`, and `approval_required` are recorded when the
+debounce window ends, and a pending `turn_completed` is dropped when the
+daemon sees the session enter `working` inside the window or finds it `working`
+when the window ends; `exited` is recorded
+at once. The stop of the previous turn can therefore be recorded after a
+cursor taken shortly after it, and a wait `--after` that cursor would return
+the old stop as the end of a new prompt. Before sending a prompt, use the
+cursor of the result that returned the previous turn event, or take a cursor
+(`session wait <target> --timeout 1ms --json`) only once at least
+`attention_debounce_secs` have passed since the previous turn ended; then send
+the input and wait with `--after <cursor>`. A short wait returns the current
+cursor, usually with `reason: timeout`, but it can also return an `event` or
+`targets_ended`.
 
 Detection manifests can read `osc_title`, `osc_progress`, `whole_recent`,
 `bottom_lines(N)`, `bottom_non_empty_lines(N)`, `top_non_empty_lines(N)`,
