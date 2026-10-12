@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::config_home::ConfigHome;
+use super::transcripts::Transcripts;
 use super::version_probe::{VersionProbePolicy, SEMVER_LINE_PARSER_ID, SEMVER_PARSER_ID};
 use crate::agent::{
     AssignedReference, ExistenceSpec, InputRules, InputTextPolicy, NativeArgs, NativeLaunchError,
@@ -339,6 +340,9 @@ pub struct RuntimeDefinition {
     version_probe_policy: Option<VersionProbePolicy>,
     integration: Option<Integration>,
     config_home: Option<ConfigHome>,
+    /// Where below the config home the agent writes transcripts and which
+    /// compiled parser reads them; `None` for a runtime that declares none.
+    transcripts: Option<Transcripts>,
     /// The existence check recovery runs on a hook runtime's id-kind
     /// reference, as declared by `[native_reference.existence]`; `None` for a
     /// hook runtime that leaves the check undeclared.
@@ -441,6 +445,7 @@ impl RuntimeDefinition {
             version_probe_policy,
             integration,
             config_home: None,
+            transcripts: None,
             hook_existence: None,
         })
     }
@@ -464,6 +469,27 @@ impl RuntimeDefinition {
         self
     }
 
+    /// This definition declaring `transcripts` as the transcript tree below
+    /// its config home and the parser that reads it.
+    ///
+    /// Like the config home, the declaration takes no part in launching the
+    /// agent; it only tells the external observer where to look.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DefinitionError::Field`] when the definition declares no
+    /// config home, because the transcript tree is relative to it.
+    pub fn with_transcripts(mut self, transcripts: Transcripts) -> Result<Self, DefinitionError> {
+        if self.config_home.is_none() {
+            return Err(DefinitionError::Field {
+                field: "transcripts",
+                reason: "requires a [config_home] table",
+            });
+        }
+        self.transcripts = Some(transcripts);
+        Ok(self)
+    }
+
     /// Parses a `runtime.toml` document.
     ///
     /// `origin` receives the package identity declared by the document and
@@ -474,7 +500,9 @@ impl RuntimeDefinition {
     ///
     /// Returns a [`DefinitionError`] for a malformed or oversized document, an
     /// unsupported `schema` or `runtime_api`, an unknown field, an invalid
-    /// resume or fork template, or a manifest the resolver rejects.
+    /// resume or fork template, a manifest the resolver rejects, or a
+    /// `[transcripts]` table with an unknown parser, an unsafe directory or
+    /// no `[config_home]` next to it.
     pub fn from_toml(
         source: &str,
         origin: impl FnOnce(PackageIdentity) -> DefinitionOrigin,
@@ -530,6 +558,11 @@ impl RuntimeDefinition {
             .as_ref()
             .map(|declared| ConfigHome::new(&declared.env, &declared.default))
             .transpose()?;
+        let transcripts = raw
+            .transcripts
+            .as_ref()
+            .map(|declared| Transcripts::new(&declared.parser, &declared.dir))
+            .transpose()?;
         let definition = Self::new(DefinitionParts {
             runtime_id,
             origin: origin(package),
@@ -571,10 +604,7 @@ impl RuntimeDefinition {
             Some(existence) => definition.with_hook_existence(existence),
             None => definition,
         };
-        Ok(match config_home {
-            Some(config_home) => definition.with_config_home(config_home),
-            None => definition,
-        })
+        with_declared_files(definition, config_home, transcripts)
     }
 
     /// The runtime identity.
@@ -679,12 +709,36 @@ impl RuntimeDefinition {
         self.config_home.as_ref()
     }
 
+    /// Where the agent writes transcripts below its config home and which
+    /// compiled parser reads them, when the descriptor declares it.
+    #[must_use]
+    pub fn transcripts(&self) -> Option<&Transcripts> {
+        self.transcripts.as_ref()
+    }
+
     /// The existence check recovery runs on a hook runtime's id-kind
     /// reference, when the descriptor declares one under
     /// `[native_reference.existence]`.
     #[must_use]
     pub fn hook_existence(&self) -> Option<&ReferenceExistence> {
         self.hook_existence.as_ref()
+    }
+}
+
+/// `definition` declaring where its agent keeps its own files: the config home
+/// and the transcript tree below it.
+fn with_declared_files(
+    definition: RuntimeDefinition,
+    config_home: Option<ConfigHome>,
+    transcripts: Option<Transcripts>,
+) -> Result<RuntimeDefinition, DefinitionError> {
+    let definition = match config_home {
+        Some(config_home) => definition.with_config_home(config_home),
+        None => definition,
+    };
+    match transcripts {
+        Some(transcripts) => definition.with_transcripts(transcripts),
+        None => Ok(definition),
     }
 }
 
@@ -929,6 +983,8 @@ struct RawDefinition {
     integration: Option<RawIntegration>,
     #[serde(default)]
     config_home: Option<RawConfigHome>,
+    #[serde(default)]
+    transcripts: Option<RawTranscripts>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1050,6 +1106,13 @@ struct RawIntegration {
 struct RawConfigHome {
     env: String,
     default: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTranscripts {
+    parser: String,
+    dir: String,
 }
 
 impl RawDefinition {

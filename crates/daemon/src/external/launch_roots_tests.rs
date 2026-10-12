@@ -6,7 +6,7 @@
 //! `start_transcript_index_with` and wait on the observer's wake-up signal, never
 //! on a fixed delay.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -27,6 +27,8 @@ use super::{
     TranscriptRoot, WatcherHandle,
 };
 use crate::agent::host::fixture::builtin_host;
+use crate::agent::host::TranscriptParser;
+use crate::agent::host::{BuiltinSource, PackageSource, PackageStore, RuntimeHost};
 use crate::agent::ProfileRegistry;
 use crate::integration::ConfigHomes;
 use crate::runtime::environment::{base_environment, EnvironmentSource};
@@ -53,6 +55,24 @@ impl Rig {
     /// A rig whose daemon environment holds `daemon_env` on top of `HOME`;
     /// only what the default allowlist forwards reaches the launch base.
     fn with_daemon_env(daemon_env: &[(&str, &Path)]) -> Self {
+        Self::build(daemon_env, |_root| builtin_host())
+    }
+
+    /// A rig whose host serves the built-ins and the packages `install` puts
+    /// into the plugin root it is given.
+    fn with_packages(install: impl FnOnce(&Path)) -> Self {
+        Self::build(&[], |root| {
+            let plugins = root.join("plugins");
+            install(&plugins);
+            RuntimeHost::with_packages(
+                BuiltinSource::new("/bin/sh"),
+                PackageSource::new(PackageStore::open(&plugins).expect("open the package store")),
+            )
+            .expect("the host builds")
+        })
+    }
+
+    fn build(daemon_env: &[(&str, &Path)], host: impl FnOnce(&Path) -> RuntimeHost) -> Self {
         let root = scoped_dir("pohunek-roots-");
         let home = root.join("home");
         fs::create_dir_all(&home).expect("create the user home");
@@ -68,7 +88,7 @@ impl Rig {
             &EnvironmentSource::fixed(variables),
         )
         .expect("a base environment");
-        let registry = ProfileRegistry::with_runtimes(Some(root.join("agents")), builtin_host());
+        let registry = ProfileRegistry::with_runtimes(Some(root.join("agents")), host(&root));
         Self {
             homes: ConfigHomes::new(registry, base),
             root,
@@ -563,6 +583,7 @@ fn fact() -> crate::procwatch::ProcessFact {
 
 fn plain_root(agent: &RuntimeRef, path: &Path, private: bool) -> TranscriptRoot {
     TranscriptRoot {
+        parser: TranscriptParser::JsonlHeadV1,
         agent_base: agent.clone(),
         path: path.to_path_buf(),
         private,
@@ -711,4 +732,422 @@ async fn an_inspection_error_keeps_a_profile_root_and_its_candidates() {
             .is_some(),
         "the candidates survive an uninspectable pass"
     );
+}
+
+/// Package id of the package-defined runtime the descriptor scenarios install.
+const ACME_PACKAGE_ID: &str = "acme.runtime.agent";
+/// Runtime id that package serves.
+const ACME_RUNTIME: &str = "acme";
+
+/// The descriptor of [`ACME_RUNTIME`]: a config home relocated by `ACME_HOME`
+/// (default `.acme`), followed by `transcripts`, which is a `[transcripts]`
+/// table or empty.
+fn acme_descriptor(transcripts: &str) -> String {
+    format!(
+        r#"schema = 1
+id = "{ACME_PACKAGE_ID}"
+version = "1.0.0"
+runtime_api = 1
+
+[runtime]
+id = "{ACME_RUNTIME}"
+name = "Acme"
+program = "/bin/sh"
+args = []
+detect_manifest = "detect.toml"
+
+[input]
+bracketed_paste = false
+submit_delay_ms = 0
+text_policy = "unrestricted"
+
+[resume]
+supported = true
+reference_kind = "id"
+args = ["--session", "{{reference}}"]
+
+[fork]
+supported = false
+
+[native_reference]
+strategy = "assigned"
+launch_args = ["--session-id", "{{reference}}"]
+
+[native_reference.existence]
+check = "none"
+
+[config_home]
+env = "ACME_HOME"
+default = ".acme"
+{transcripts}"#
+    )
+}
+
+/// Installs `descriptor` as an enabled, selected package of `plugins`.
+fn install_acme(plugins: &Path, descriptor: &str) {
+    install_acme_version(plugins, descriptor, "1.0.0", true);
+}
+
+/// Installs `descriptor` at `version` as an enabled package of `plugins`,
+/// selected when `select` is set, and returns its archive digest.
+fn install_acme_version(
+    plugins: &Path,
+    descriptor: &str,
+    version: &str,
+    select: bool,
+) -> protocol::PackageDigest {
+    use package::registry::{InstallRequest, PackageSource as InstallSource, Registry};
+    use package::{build_archive, read_archive, ArchiveEntry, Limits};
+
+    let entries = [
+        ArchiveEntry {
+            path: "runtime.toml".to_owned(),
+            contents: descriptor
+                .replace("version = \"1.0.0\"", &format!("version = \"{version}\""))
+                .into_bytes(),
+            executable: false,
+        },
+        ArchiveEntry {
+            path: "detect.toml".to_owned(),
+            contents: b"[[rules]]\nid = \"idle_prompt\"\nstate = \"idle\"\npriority = 100\nregion = \"whole_recent\"\nany = [{ contains = \"ready\" }]\n".to_vec(),
+            executable: false,
+        },
+    ];
+    let bytes = build_archive(&entries, &Limits::DEFAULT).expect("the archive builds");
+    let digest = read_archive(&bytes, &Limits::DEFAULT)
+        .expect("the archive reads")
+        .digest()
+        .clone();
+    Registry::open_at(plugins, Limits::DEFAULT)
+        .expect("the plugin root opens")
+        .install(&InstallRequest {
+            archive: &bytes,
+            expected: &digest,
+            identity: protocol::PackageIdentity {
+                id: protocol::PackageId::parse(ACME_PACKAGE_ID).expect("package id"),
+                version: protocol::PackageVersion::parse(version).expect("package version"),
+            },
+            source: InstallSource::ExplicitDigest,
+            enabled: true,
+            select,
+            installed_at_unix_seconds: 1_700_000_000,
+        })
+        .expect("the package installs");
+    digest
+}
+
+/// The roots of a host with only the built-in runtimes and no profiles.
+fn builtin_roots(rig: &Rig) -> BTreeSet<(String, PathBuf)> {
+    BTreeSet::from([
+        root(&RuntimeRef::claude(), rig.home().join(".claude/projects")),
+        root(&RuntimeRef::codex(), rig.home().join(".codex/sessions")),
+    ])
+}
+
+#[tokio::test]
+async fn a_runtime_without_a_transcript_declaration_is_observed_without_a_root() {
+    use super::watch::TranscriptWatch;
+
+    let rig = Rig::with_packages(|plugins| install_acme(plugins, &acme_descriptor("")));
+    let acme = RuntimeRef::from_wire(ACME_RUNTIME);
+    // Its home holds the trees other runtimes declare; none is its own.
+    let stray = [
+        rig.home().join(".acme/sessions/p/s.jsonl"),
+        rig.home().join(".acme/projects/p/s.jsonl"),
+    ];
+    for path in &stray {
+        write_transcript(path, "acme-stray");
+    }
+    let claude = rig.home().join(".claude/projects/p/s.jsonl");
+    write_transcript(&claude, "claude-native");
+    fs::create_dir_all(rig.home().join(".codex/sessions")).expect("Codex tree");
+
+    // The runtime is served and its config home resolves: only the missing
+    // declaration keeps it out.
+    let homes = rig.homes.launch_homes();
+    let declared = homes
+        .iter()
+        .find(|home| home.runtime == acme)
+        .expect("the package runtime declares a config home");
+    assert!(declared.transcripts.is_none());
+    assert_eq!(
+        declared.home.as_ref().expect("the home resolves").dir,
+        rig.home().join(".acme")
+    );
+    assert_eq!(pairs(&rig.roots()), builtin_roots(&rig));
+    assert!(rig.skipped().is_empty(), "{:?}", rig.skipped());
+
+    let watched = Watched::start(&rig).await;
+    watched
+        .wait_until("the watcher to cover every root", |watched| {
+            watched.handle.state() == TranscriptWatch::Active
+        })
+        .await;
+    watched.wait_for_session(&claude, "claude-native").await;
+    for path in &stray {
+        assert_eq!(watched.session_of(path), None, "{}", path.display());
+    }
+    assert!(watched
+        .index
+        .best_match(&acme, Path::new("/work"), &fact())
+        .is_none());
+    watched.sessions.shutdown();
+}
+
+#[tokio::test]
+async fn a_package_runtime_is_observed_below_the_transcript_dir_it_declares() {
+    let rig = Rig::with_packages(|plugins| {
+        install_acme(
+            plugins,
+            &acme_descriptor("\n[transcripts]\nparser = \"jsonl-head-v1\"\ndir = \"logs/chats\"\n"),
+        );
+    });
+    let acme = RuntimeRef::from_wire(ACME_RUNTIME);
+    let tree = rig.home().join(".acme/logs/chats");
+    let transcript = tree.join("p/s.jsonl");
+    write_transcript(&transcript, "acme-native");
+    let outside = rig.home().join(".acme/sessions/p/s.jsonl");
+    write_transcript(&outside, "acme-outside");
+
+    let mut expected = builtin_roots(&rig);
+    expected.insert(root(&acme, tree));
+    assert_eq!(pairs(&rig.roots()), expected);
+
+    let watched = Watched::start(&rig).await;
+    watched.wait_for_session(&transcript, "acme-native").await;
+    assert_eq!(watched.session_of(&outside), None);
+    let candidate = watched
+        .index
+        .best_match(&acme, Path::new("/work"), &fact())
+        .expect("the transcript belongs to the package runtime");
+    assert_eq!(candidate.native_session_id.as_deref(), Some("acme-native"));
+    assert!(watched
+        .index
+        .best_match(&RuntimeRef::claude(), Path::new("/work"), &fact())
+        .is_none());
+    watched.sessions.shutdown();
+}
+
+#[tokio::test]
+async fn the_transcript_head_names_the_session_by_key_precedence() {
+    let rig = Rig::new();
+    let tree = rig.home().join(".claude/projects/p");
+    fs::create_dir_all(&tree).expect("Claude tree");
+    // `jsonl-head-v1` takes `session_id`, then `sessionId`, then
+    // `conversation_id`, then `conversationId` from the first record that
+    // carries any of them, and `transcript_path` before `transcriptPath`.
+    let cases = [
+        (
+            "all.jsonl",
+            r#"{"conversationId":"conv-camel","conversation_id":"conv-snake","sessionId":"session-camel","session_id":"session-snake","transcriptPath":"/t/camel.jsonl","transcript_path":"/t/snake.jsonl","cwd":"/work"}"#,
+            "session-snake",
+            Some("/t/snake.jsonl"),
+        ),
+        (
+            "camel.jsonl",
+            r#"{"conversationId":"conv-camel","conversation_id":"conv-snake","sessionId":"session-camel","cwd":"/work"}"#,
+            "session-camel",
+            None,
+        ),
+        (
+            "conversation.jsonl",
+            r#"{"conversationId":"conv-camel","conversation_id":"conv-snake","cwd":"/work"}"#,
+            "conv-snake",
+            None,
+        ),
+        (
+            "conversation-camel.jsonl",
+            r#"{"conversationId":"conv-camel","cwd":"/work"}"#,
+            "conv-camel",
+            None,
+        ),
+        (
+            "first-record.jsonl",
+            "{\"cwd\":\"/work\"}\n{\"conversationId\":\"conv-first\"}\n{\"session_id\":\"session-later\"}",
+            "conv-first",
+            None,
+        ),
+    ];
+    for (name, records, _, _) in &cases {
+        fs::write(tree.join(name), format!("{records}\n")).expect("write a transcript");
+    }
+
+    let watched = Watched::start(&rig).await;
+    for (name, _, session, transcript_path) in &cases {
+        let path = tree.join(name);
+        watched.wait_for_session(&path, session).await;
+        let indexed = watched
+            .index
+            .inner
+            .lock()
+            .expect("index")
+            .get(&path)
+            .cloned()
+            .expect("indexed");
+        let fallback = path.to_string_lossy().into_owned();
+        assert_eq!(
+            indexed.native_session_path,
+            transcript_path.map_or(fallback, ToOwned::to_owned),
+            "{name}"
+        );
+    }
+    watched.sessions.shutdown();
+}
+
+#[test]
+fn a_profile_pinned_to_another_version_observes_the_tree_that_version_declares() {
+    let declaring = |dir: &str| {
+        acme_descriptor(&format!(
+            "\n[transcripts]\nparser = \"jsonl-head-v1\"\ndir = \"{dir}\"\n"
+        ))
+    };
+    let mut pinned = None;
+    let rig = Rig::with_packages(|plugins| {
+        pinned = Some(install_acme_version(
+            plugins,
+            &declaring("logs/chats"),
+            "1.0.0",
+            false,
+        ));
+        install_acme_version(plugins, &declaring("chats"), "1.1.0", true);
+    });
+    let pinned = pinned.expect("the pinned version is installed");
+    // The profile names no `ACME_HOME`, so it shares the runtime's own home.
+    fs::write(
+        rig.root.join("agents/old.toml"),
+        format!(
+            "base = \"{ACME_RUNTIME}\"\npackage = \"{ACME_PACKAGE_ID}\"\ndigest = \"{}\"\n",
+            pinned.as_str()
+        ),
+    )
+    .expect("write a pinned profile");
+    let home = rig.home().join(".acme");
+    fs::create_dir_all(home.join("logs/chats")).expect("the pinned version's tree");
+    let acme = RuntimeRef::from_wire(ACME_RUNTIME);
+
+    let roots = rig.roots();
+
+    let mut expected = builtin_roots(&rig);
+    expected.insert(root(&acme, home.join("chats")));
+    expected.insert(root(&acme, home.join("logs/chats")));
+    assert_eq!(pairs(&roots), expected);
+    assert!(rig.skipped().is_empty(), "{:?}", rig.skipped());
+}
+
+/// Runtime id of a package that claims Codex's transcripts; it sorts after
+/// `codex`, so configuration order would hand it the tree.
+const COPYCAT_RUNTIME: &str = "zcodex";
+
+/// Installs [`COPYCAT_RUNTIME`] with the config home `env` / `default` and the
+/// transcript tree `dir` below it.
+fn install_copycat(plugins: &Path, env: &str, default: &str, dir: &str) {
+    let descriptor = acme_descriptor(&format!(
+        "\n[transcripts]\nparser = \"jsonl-head-v1\"\ndir = \"{dir}\"\n"
+    ))
+    .replace(
+        &format!("id = \"{ACME_RUNTIME}\""),
+        &format!("id = \"{COPYCAT_RUNTIME}\""),
+    )
+    .replace(
+        "env = \"ACME_HOME\"\ndefault = \".acme\"",
+        &format!("env = \"{env}\"\ndefault = \"{default}\""),
+    );
+    install_acme(plugins, &descriptor);
+}
+
+/// Asserts that only Claude's tree is a root, that Codex and the copycat are
+/// both reported as ambiguous, and that a running observer indexes Claude's
+/// transcript but attributes none of `shared` to either runtime.
+async fn assert_codex_tree_attributed_to_neither(rig: &Rig, shared: &[PathBuf]) {
+    use super::watch::TranscriptWatch;
+    use super::AMBIGUOUS_OWNER_CODE;
+
+    let claude = rig.home().join(".claude/projects/p/s.jsonl");
+    write_transcript(&claude, "claude-native");
+    for (number, path) in shared.iter().enumerate() {
+        write_transcript(path, &format!("shared-{number}"));
+    }
+
+    assert_eq!(
+        pairs(&rig.roots()),
+        BTreeSet::from([root(
+            &RuntimeRef::claude(),
+            rig.home().join(".claude/projects")
+        )]),
+        "the overlapping trees are roots of neither runtime"
+    );
+    let reported: BTreeSet<(String, Option<String>)> = rig
+        .skipped()
+        .into_iter()
+        .map(|home| (home.runtime, home.code))
+        .collect();
+    assert_eq!(
+        reported,
+        BTreeSet::from([
+            ("codex".to_owned(), Some(AMBIGUOUS_OWNER_CODE.to_owned())),
+            (
+                COPYCAT_RUNTIME.to_owned(),
+                Some(AMBIGUOUS_OWNER_CODE.to_owned())
+            ),
+        ])
+    );
+
+    let watched = Watched::start(rig).await;
+    watched
+        .wait_until("the watcher to cover every root", |watched| {
+            watched.handle.state() == TranscriptWatch::Active
+        })
+        .await;
+    watched.wait_for_session(&claude, "claude-native").await;
+    for path in shared {
+        assert_eq!(watched.session_of(path), None, "{}", path.display());
+    }
+    for runtime in [RuntimeRef::codex(), RuntimeRef::from_wire(COPYCAT_RUNTIME)] {
+        assert!(
+            watched
+                .index
+                .best_match(&runtime, Path::new("/work"), &fact())
+                .is_none(),
+            "{}",
+            runtime.as_wire()
+        );
+    }
+    watched.sessions.shutdown();
+}
+
+#[tokio::test]
+async fn a_tree_two_runtimes_declare_is_attributed_to_neither_and_reported() {
+    let rig =
+        Rig::with_packages(|plugins| install_copycat(plugins, "CODEX_HOME", ".codex", "sessions"));
+    let shared = [rig.home().join(".codex/sessions/p/s.jsonl")];
+
+    assert_codex_tree_attributed_to_neither(&rig, &shared).await;
+}
+
+#[tokio::test]
+async fn a_tree_nested_in_another_runtimes_tree_is_attributed_to_neither() {
+    let rig = Rig::with_packages(|plugins| {
+        install_copycat(plugins, "CODEX_HOME", ".codex", "sessions/2026");
+    });
+    let shared = [
+        rig.home().join(".codex/sessions/2026/p/s.jsonl"),
+        rig.home().join(".codex/sessions/2025/p/s.jsonl"),
+    ];
+
+    assert_codex_tree_attributed_to_neither(&rig, &shared).await;
+}
+
+#[tokio::test]
+async fn a_tree_symlinked_into_another_runtimes_tree_is_attributed_to_neither() {
+    let rig = Rig::with_packages(|plugins| install_copycat(plugins, "ACME_HOME", ".acme", "chats"));
+    let target = rig.home().join(".codex/sessions/2026");
+    fs::create_dir_all(&target).expect("Codex tree");
+    fs::create_dir_all(rig.home().join(".acme")).expect("copycat home");
+    symlink(&target, rig.home().join(".acme/chats")).expect("link into Codex's tree");
+    let shared = [
+        target.join("p/s.jsonl"),
+        rig.home().join(".codex/sessions/2025/p/s.jsonl"),
+    ];
+
+    assert_codex_tree_attributed_to_neither(&rig, &shared).await;
 }

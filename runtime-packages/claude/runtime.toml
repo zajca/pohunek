@@ -61,3 +61,10 @@ hook_schema = "identity-subagent-v1"
 [config_home]
 env = "CLAUDE_CONFIG_DIR"
 default = ".claude"
+
+# Claude writes one JSON Lines transcript per conversation below `projects` in
+# its config home; the external observer reads the head of each with this
+# parser.
+[transcripts]
+parser = "jsonl-head-v1"
+dir = "projects"

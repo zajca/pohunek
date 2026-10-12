@@ -584,13 +584,20 @@ exit.
 
 The observer also indexes provider transcripts so a newly started external agent
 is enriched without waiting for the next process sweep. It watches only the
-Claude (`projects`) and Codex (`sessions`) transcript roots of the config homes
-the host launches those agents with (each runtime's own home and the home of
-every host profile, re-read on every pass), never their parents or `$HOME`. The transcript index is converged by a bounded reconciliation pass
-that runs every 30 seconds, on a lost-event or directory-change hint, and after a
+transcript trees runtime descriptors declare in `[transcripts]` (Claude
+`projects`, Codex `sessions`) below the config homes the host launches those
+agents with (each runtime's own home and the home of every host profile,
+re-read on every pass), never their parents or `$HOME`, and reads each with the
+parser the descriptor names. A runtime without the declaration contributes no
+root. Trees of two different runtimes that are the same directory or nested in
+each other are attributed to neither; the daemon logs the warning
+`external.transcript_roots.ambiguous` with code `transcripts_ambiguous_owner`.
+The transcript index is converged by a bounded reconciliation pass that runs
+every 30 seconds, on a lost-event or directory-change hint, and after a
 watcher restart, whether or not the live watcher (inotify on Linux, FSEvents on
 macOS) is healthy. Each pass re-resolves the configured roots (symlinked or
-aliased roots are scanned once, a nested root owns its own transcripts), registers
+aliased roots are scanned once, a nested root of the same runtime owns its own
+transcripts), registers
 them with the watcher, and scans them, dropping indexed transcripts it no longer
 sees. A pass that could not finish drops nothing. The watcher only reduces
 latency: a file notification is a hint that schedules one debounced, bounded

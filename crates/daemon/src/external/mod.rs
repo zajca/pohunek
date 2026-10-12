@@ -5,7 +5,7 @@
 //! controls external processes; it only publishes read-only `SessionInfo`
 //! snapshots for UI and CLI visibility.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
@@ -26,6 +26,7 @@ use tracing::{debug, warn};
 
 use watch::{RootProvider, RootScan, TranscriptSink, WatchBackend, WatcherHandle};
 
+use crate::agent::host::TranscriptParser;
 use crate::integration::{ConfigHomes, LaunchHome};
 use crate::procwatch::{Pid, ProcessFact, ProcessIdentity};
 use crate::session::SessionRegistry;
@@ -69,10 +70,6 @@ const TRANSCRIPT_SCAN_LINE_LIMIT: usize = 32;
 /// The file reader is capped before line splitting, bounding memory and I/O
 /// even if an initial transcript record has no newline.
 const TRANSCRIPT_SCAN_BYTE_LIMIT: usize = 64 * 1024;
-/// Claude transcript root below its config home.
-const CLAUDE_TRANSCRIPT_SUBDIR: &str = "projects";
-/// Codex transcript root below its config home.
-const CODEX_TRANSCRIPT_SUBDIR: &str = "sessions";
 /// JSONL transcript extension.
 const JSONL_EXTENSION: &str = "jsonl";
 
@@ -144,11 +141,13 @@ pub(crate) enum ExternalSessionChange {
     Updated(SessionInfo),
 }
 
-/// Transcript root watched for one provider.
+/// Transcript root watched for one runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TranscriptRoot {
     agent_base: RuntimeRef,
     path: PathBuf,
+    /// The compiled parser the runtime's descriptor names for its transcripts.
+    parser: TranscriptParser,
     /// Whether the directory derives from a host profile's environment. Such a
     /// path never reaches a log line or a remote response.
     private: bool,
@@ -540,7 +539,7 @@ impl TranscriptIndex {
             #[cfg(test)]
             self.parses
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            match parse_transcript(owner.agent_base.clone(), path) {
+            match parse_transcript(owner.parser, owner.agent_base.clone(), path) {
                 Ok(candidate) => candidate.map(|candidate| TranscriptCandidate {
                     owner: Arc::new(owner.clone()),
                     ..candidate
@@ -805,7 +804,11 @@ fn canonical_roots(roots: &[TranscriptRoot]) -> Vec<PathBuf> {
 /// through the configured root that spells it to its canonical location, and the
 /// root with the longest canonical prefix owns it. A root reached through a
 /// symlink into another root's tree therefore owns its own transcripts, and every
-/// canonical file has exactly one owner. `canonical` holds `canonical_roots`.
+/// canonical file has at most one owner: when several different roots share the
+/// longest canonical prefix, the path is ambiguous and none owns it, so neither
+/// configuration order nor tie-breaking attributes it. Nested roots of
+/// different runtimes never reach this from the host's config homes:
+/// `observed_roots` drops both. `canonical` holds `canonical_roots`.
 fn owning_root<'a>(
     roots: &'a [TranscriptRoot],
     canonical: &[PathBuf],
@@ -817,12 +820,21 @@ fn owning_root<'a>(
         .filter(|(_, root)| path.starts_with(&root.path))
         .max_by_key(|(_, root)| root.path.components().count())?;
     let resolved = canonical[spelled_by].join(path.strip_prefix(&roots[spelled_by].path).ok()?);
-    canonical
-        .iter()
-        .zip(roots)
-        .filter(|(root_canonical, _)| resolved.starts_with(root_canonical))
-        .max_by_key(|(root_canonical, _)| root_canonical.components().count())
-        .map(|(_, root)| root)
+    let containing = || {
+        canonical
+            .iter()
+            .zip(roots)
+            .filter(|(root_canonical, _)| resolved.starts_with(root_canonical))
+    };
+    // Prefixes of one path with equal depth are the same directory.
+    let deepest = containing()
+        .map(|(root_canonical, _)| root_canonical.components().count())
+        .max()?;
+    let mut owners = containing()
+        .filter(|(root_canonical, _)| root_canonical.components().count() == deepest)
+        .map(|(_, root)| root);
+    let owner = owners.next()?;
+    owners.all(|other| other == owner).then_some(owner)
 }
 
 /// Whether a filesystem error proves the path does not exist.
@@ -973,73 +985,128 @@ async fn start_transcript_index_with(
     (index, watcher)
 }
 
-/// The transcript tree below a config home, for a runtime whose agent writes
-/// transcripts the observer reads.
-fn transcript_subdir(runtime: &RuntimeRef) -> Option<&'static str> {
-    if *runtime == RuntimeRef::claude() {
-        Some(CLAUDE_TRANSCRIPT_SUBDIR)
-    } else if *runtime == RuntimeRef::codex() {
-        Some(CODEX_TRANSCRIPT_SUBDIR)
-    } else {
-        None
-    }
-}
+/// Skip code of a transcript tree that overlaps the tree of another runtime.
+///
+/// Two runtimes whose config home and `[transcripts] dir` resolve to one
+/// directory, or to directories nested in each other, cannot both own the
+/// shared transcripts, and nothing in the files says which agent wrote them.
+/// Attributing the inner tree to its declarer would let a package claim part
+/// of another runtime's conversations, so both trees are attributed to neither.
+const AMBIGUOUS_OWNER_CODE: &str = "transcripts_ambiguous_owner";
+
+/// Log label of a profile home whose transcript tree does not exist.
+const TRANSCRIPTS_ABSENT_LABEL: &str = "transcripts_absent";
 
 /// Why a config home contributes no transcript root.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct SkippedHome {
+    /// The runtime whose home it is.
+    runtime: String,
     /// The profile that names the home; `None` for a runtime's own home.
     profile: Option<String>,
-    /// The error code of the home that does not resolve, or `None` when it
-    /// resolves to a directory without a transcript tree.
+    /// The error code of the home that does not resolve,
+    /// [`AMBIGUOUS_OWNER_CODE`] for a transcript tree that equals or nests
+    /// with another runtime's, or `None` when the home has no transcript tree.
     code: Option<String>,
+}
+
+/// A transcript tree a home would contribute before ownership is settled.
+struct Declared {
+    runtime: RuntimeRef,
+    profile: Option<String>,
+    path: PathBuf,
+    /// The canonical tree, or the tree below the canonical home while it does
+    /// not exist, so two spellings of one directory compare equal and a
+    /// symlink into another tree is seen where it leads.
+    tree: PathBuf,
+    parser: TranscriptParser,
 }
 
 /// The transcript roots of `homes`, and the homes that contribute none.
 ///
-/// A runtime's own home is always a root: a transcript tree created later is
-/// reached by the pass that finds it. A profile's home is a root only while its
-/// transcript tree exists, so a profile that was never used does not hold the
-/// watcher in a missing-root state. Homes that share a directory yield one
-/// root, kept for the first of them. The paths of a profile's home derive from
+/// A home is observed only when its runtime's descriptor declares
+/// `[transcripts]`; the root is the declared directory below the home, read by
+/// the declared parser. A home without the declaration is neither a root nor
+/// skipped. A declaring runtime's own home is always a root: a transcript tree
+/// created later is reached by the pass that finds it. A profile's home is a
+/// root only while its transcript tree exists, so a profile that was never
+/// used does not hold the watcher in a missing-root state. Homes of one runtime that share a tree
+/// yield one root, kept for the first of them, and nested trees of one runtime
+/// each stay a root. Trees of different runtimes that are equal or nested in
+/// each other are attributed to none of them and each such home is skipped
+/// with [`AMBIGUOUS_OWNER_CODE`]. The paths of a profile's home derive from
 /// its environment and never reach a log line.
 fn observed_roots(homes: Vec<LaunchHome>) -> (Vec<TranscriptRoot>, BTreeSet<SkippedHome>) {
-    let mut roots = Vec::new();
     let mut skipped = BTreeSet::new();
-    let mut seen = BTreeSet::new();
+    let mut declared = Vec::new();
     for launch in homes {
-        let Some(subdir) = transcript_subdir(&launch.runtime) else {
+        let Some(transcripts) = launch.transcripts else {
             continue;
         };
         let home = match launch.home {
             Ok(home) => home,
             Err(error) => {
                 skipped.insert(SkippedHome {
+                    runtime: launch.runtime.as_wire().to_owned(),
                     profile: launch.profile,
                     code: Some(error.code),
                 });
                 continue;
             }
         };
-        let path = home.dir.join(subdir);
-        let private = launch.profile.is_some();
+        let path = home.dir.join(transcripts.dir());
         // Only a tree that is genuinely absent is skipped. A tree that cannot
         // be inspected (permissions, I/O, a symlink loop) stays a root, so its
         // candidates stay indexed and the scan and the watcher report it as
         // degraded instead of the profile silently dropping out.
-        if private && transcript_tree_is_absent(&path) {
+        if launch.profile.is_some() && transcript_tree_is_absent(&path) {
             skipped.insert(SkippedHome {
+                runtime: launch.runtime.as_wire().to_owned(),
                 profile: launch.profile,
                 code: None,
             });
             continue;
         }
-        // Two runtimes may share one directory; each keeps its own tree.
-        if seen.insert((launch.runtime.as_wire().to_owned(), home.identity())) {
+        let tree =
+            fs::canonicalize(&path).unwrap_or_else(|_| home.identity().join(transcripts.dir()));
+        declared.push(Declared {
+            runtime: launch.runtime,
+            profile: launch.profile,
+            path,
+            tree,
+            parser: transcripts.parser(),
+        });
+    }
+
+    // The homes of one pass are few (each runtime's own and one per profile),
+    // so the pairwise comparison stays small.
+    let ambiguous: Vec<bool> = declared
+        .iter()
+        .map(|entry| {
+            declared.iter().any(|other| {
+                other.runtime != entry.runtime
+                    && (other.tree.starts_with(&entry.tree) || entry.tree.starts_with(&other.tree))
+            })
+        })
+        .collect();
+
+    let mut roots = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (entry, ambiguous) in declared.into_iter().zip(ambiguous) {
+        if ambiguous {
+            skipped.insert(SkippedHome {
+                runtime: entry.runtime.as_wire().to_owned(),
+                profile: entry.profile,
+                code: Some(AMBIGUOUS_OWNER_CODE.to_owned()),
+            });
+            continue;
+        }
+        if seen.insert((entry.runtime.as_wire().to_owned(), entry.tree)) {
             roots.push(TranscriptRoot {
-                agent_base: launch.runtime,
-                path,
-                private,
+                agent_base: entry.runtime,
+                path: entry.path,
+                parser: entry.parser,
+                private: entry.profile.is_some(),
             });
         }
     }
@@ -1109,10 +1176,21 @@ impl RootProvider for LaunchHomeRoots {
             };
             let (roots, skipped) = observed_roots(homes.launch_homes());
             for home in skipped.difference(&state.reported) {
+                if home.code.as_deref() == Some(AMBIGUOUS_OWNER_CODE) {
+                    warn!(
+                        name: "external.transcript_roots.ambiguous",
+                        runtime = %home.runtime,
+                        profile = home.profile.as_deref().unwrap_or("-"),
+                        code = AMBIGUOUS_OWNER_CODE,
+                        "the transcript tree equals or nests with another runtime's; it is attributed to neither"
+                    );
+                    continue;
+                }
                 debug!(
                     name: "external.transcript_roots.skipped",
+                    runtime = %home.runtime,
                     profile = home.profile.as_deref().unwrap_or("-"),
-                    code = home.code.as_deref().unwrap_or("transcripts_absent"),
+                    code = home.code.as_deref().unwrap_or(TRANSCRIPTS_ABSENT_LABEL),
                     "config home contributes no transcript root"
                 );
             }
@@ -1171,7 +1249,22 @@ fn transcript_matches_process(
     cwd_matches || native_matches
 }
 
+/// Parses the transcript at `path` with `parser`, the compiled parser the
+/// owning runtime's descriptor names.
 fn parse_transcript(
+    parser: TranscriptParser,
+    agent_base: RuntimeRef,
+    path: &Path,
+) -> io::Result<Option<TranscriptCandidate>> {
+    match parser {
+        TranscriptParser::JsonlHeadV1 => parse_jsonl_head(agent_base, path),
+    }
+}
+
+/// The `jsonl-head-v1` parser: reads at most `TRANSCRIPT_SCAN_LINE_LIMIT`
+/// records within `TRANSCRIPT_SCAN_BYTE_LIMIT` bytes and takes the first
+/// session id, transcript path and absolute working directory they carry.
+fn parse_jsonl_head(
     agent_base: RuntimeRef,
     path: &Path,
 ) -> io::Result<Option<TranscriptCandidate>> {
@@ -1229,6 +1322,7 @@ fn parse_transcript(
     let owner = Arc::new(TranscriptRoot {
         agent_base: agent_base.clone(),
         path: PathBuf::new(),
+        parser: TranscriptParser::JsonlHeadV1,
         private: true,
     });
     Ok(Some(TranscriptCandidate {
@@ -1277,6 +1371,7 @@ mod tests {
     use protocol::RuntimeRef;
 
     use super::{parse_transcript, TRANSCRIPT_SCAN_BYTE_LIMIT};
+    use crate::agent::host::TranscriptParser;
 
     /// FIFO permissions used by the bounded-read test fixture.
     const TRANSCRIPT_FIFO_MODE: libc::mode_t = 0o600;
@@ -1295,7 +1390,11 @@ mod tests {
         let (result_tx, result_rx) = mpsc::channel();
         let parser_path = fifo.clone();
         let parser = thread::spawn(move || {
-            let result = parse_transcript(RuntimeRef::claude(), &parser_path);
+            let result = parse_transcript(
+                TranscriptParser::JsonlHeadV1,
+                RuntimeRef::claude(),
+                &parser_path,
+            );
             let _ = result_tx.send(result);
         });
 
@@ -1365,6 +1464,7 @@ mod observer_tests {
         start_transcript_index, ExternalObserverConfig, ExternalSessions, ObservedRoots,
         TranscriptRoot,
     };
+    use crate::agent::host::TranscriptParser;
     use crate::procwatch::{
         Error, ExitWatch, HostInspector, OwnershipMarkers, Pid, ProcessFact, ProcessIdentity,
         ProcessInspector,
@@ -1453,6 +1553,7 @@ mod observer_tests {
     async fn the_observer_reports_its_watcher_and_still_scans_and_sweeps() {
         let (root, transcript) = transcript_root();
         let roots = vec![TranscriptRoot {
+            parser: TranscriptParser::JsonlHeadV1,
             agent_base: RuntimeRef::claude(),
             path: root.path().to_path_buf(),
             private: false,
@@ -1495,6 +1596,7 @@ mod scan_tests {
 
     use super::watch::RootScan;
     use super::{ScanLimits, TranscriptIndex, TranscriptRoot, SCAN_LIMITS};
+    use crate::agent::host::TranscriptParser;
 
     const GENEROUS: ScanLimits = SCAN_LIMITS;
 
@@ -1509,6 +1611,7 @@ mod scan_tests {
 
     fn root(path: &Path) -> TranscriptRoot {
         TranscriptRoot {
+            parser: TranscriptParser::JsonlHeadV1,
             agent_base: RuntimeRef::claude(),
             path: path.to_path_buf(),
             private: false,
@@ -1785,6 +1888,7 @@ mod scan_tests {
         let outer = root(dir.path());
         let inner_path = dir.path().join("codex");
         let inner = TranscriptRoot {
+            parser: TranscriptParser::JsonlHeadV1,
             agent_base: RuntimeRef::codex(),
             path: inner_path.clone(),
             private: false,
@@ -1868,6 +1972,7 @@ mod scan_tests {
         std::os::unix::fs::symlink(claude_dir.join("codex"), &link).expect("symlink");
         let claude = root(&claude_dir);
         let codex = TranscriptRoot {
+            parser: TranscriptParser::JsonlHeadV1,
             agent_base: RuntimeRef::codex(),
             path: link.clone(),
             private: false,
@@ -1909,6 +2014,7 @@ mod scan_tests {
         let roots = [
             root(&claude_dir),
             TranscriptRoot {
+                parser: TranscriptParser::JsonlHeadV1,
                 agent_base: RuntimeRef::codex(),
                 path: link.clone(),
                 private: false,

@@ -9,7 +9,7 @@
 //! package serves `codex` with official trust. The real-Codex tests additionally
 //! drive an actual `codex` binary; see their documentation for the opt-in.
 
-// Rust guideline compliant 2026-10-06
+// Rust guideline compliant 2026-10-12
 
 #![cfg(unix)]
 
@@ -26,7 +26,7 @@ use package::directory::build_directory_archive;
 use package::{read_archive, CatalogEntry, Limits, PackageDigest};
 use pohunek_daemon::agent::host::{
     definition_from_archive, BuiltinSource, HandlerId, LaunchProgram, ProbeVersion,
-    RuntimeDefinition, RuntimeSource,
+    RuntimeDefinition, RuntimeSource, TranscriptParser,
 };
 use pohunek_daemon::agent::{NativeReferenceStrategy, SessionRef};
 use pohunek_daemon::catalog_anchor::CatalogTrust;
@@ -233,6 +233,15 @@ fn the_descriptor_declares_the_verified_codex_launch_contract() {
     let home = definition.config_home().expect("a config home is declared");
     assert_eq!(home.env(), "CODEX_HOME");
     assert_eq!(home.default_relative(), ".codex");
+    let transcripts = definition
+        .transcripts()
+        .expect("a transcript tree is declared");
+    assert_eq!(transcripts.parser(), TranscriptParser::JsonlHeadV1);
+    assert_eq!(
+        transcripts.dir(),
+        "sessions",
+        "Codex keeps its rollouts below `sessions`"
+    );
 }
 
 /// The package keeps every fact the built-in Codex descriptor carries; only
@@ -260,6 +269,7 @@ fn the_package_descriptor_preserves_every_builtin_codex_fact() {
     assert_eq!(package.integration_handler(), builtin.integration_handler());
     assert_eq!(package.hook_schema(), builtin.hook_schema());
     assert_eq!(package.config_home(), builtin.config_home());
+    assert_eq!(package.transcripts(), builtin.transcripts());
 
     assert!(
         builtin.version_probe_policy().is_none(),
@@ -292,6 +302,7 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
         "native_reference",
         "integration",
         "config_home",
+        "transcripts",
     ] {
         assert!(package.contains_key(section), "[{section}] is declared");
     }

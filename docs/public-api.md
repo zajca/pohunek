@@ -855,6 +855,32 @@ daemon-run integration handlers install into this home, so a runtime that names
 one needs the table. The built-in `claude` and `codex` declare it; a package may
 too. Pi keeps declaring its conversation root under `[native_reference.existence]`.
 
+### Transcripts
+
+A runtime may declare where below its config home the agent writes JSON Lines
+conversation transcripts and which compiled parser reads them; the external
+observer watches that tree of every config home the host launches the runtime
+with:
+
+```toml
+[transcripts]
+parser = "jsonl-head-v1"
+dir = "sessions"
+```
+
+`parser` is a closed set compiled into core (`jsonl-head-v1`: the first session
+id, transcript path and absolute working directory in the first 32 records or
+64 KiB, with `session_id` before `sessionId`, `conversation_id` and
+`conversationId`). `dir` follows the `[config_home]` `default` rule (relative,
+plain components, no `.` or `..`, no empty segment, bounded). The table requires
+`[config_home]`; an unknown parser, an unsafe `dir`, a missing or unknown key,
+or a missing `[config_home]` is `descriptor_invalid`. The built-in `codex`
+declares `sessions` and `claude` declares `projects`; a runtime without the
+table contributes no transcript root. Trees of two different runtimes that are
+the same directory or nested in each other are attributed to neither; the
+daemon logs the warning `external.transcript_roots.ambiguous` with code
+`transcripts_ambiguous_owner`.
+
 ### Hook schemas
 
 A runtime that reports lifecycle hooks (identity, release, notification,
