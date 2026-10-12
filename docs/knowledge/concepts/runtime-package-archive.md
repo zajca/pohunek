@@ -82,12 +82,14 @@ the reader accepts.
 ```sh
 cargo xtask package build <dir> -o <archive.tar.zst>
 cargo xtask package verify <dir>
+cargo xtask package affected [--base REF] [--json]
 ```
 
 `build` writes the canonical archive of a package directory (regular files
 only; symlinks are rejected; any execute bit marks a file executable) and
 prints its digest. `verify` builds the directory twice and requires identical
-bytes. The release pipeline uses `verify` semantics to require byte-for-byte
+bytes. `affected` prints which official packages a change selects for
+the per-PR package jobs; any core change selects all of them. The release pipeline uses `verify` semantics to require byte-for-byte
 reproducibility from independent clean roots.
 
 Both commands call `package::directory::build_directory_archive(dir, limits)`

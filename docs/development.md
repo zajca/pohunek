@@ -82,6 +82,24 @@ their opt-in status. Each CI shard uploads a uniquely named JUnit artifact;
 sequential local fast shards overwrite `target/nextest/ci/junit.xml`, while heavy
 writes `target/nextest/heavy/junit.xml`.
 
+The official runtime package jobs (`pi-package`, `codex-package`,
+`claude-package`) take their pull-request selection from
+`cargo xtask package affected [--base REF] [--json]`, which the
+`package-selection` CI job runs against the pull request's base commit. It
+collects changed files like `cargo xtask affected` (committed diff against the
+merge base, staged, unstaged, untracked) in the Git repository of the working
+directory. A file below `runtime-packages/<p>/` or `compat/<p>/` selects package
+`<p>`; prose (`docs/` outside `docs/knowledge`, root `*.md`, the GitHub issue
+forms and pull request template) selects nothing; every other file (including
+`compat/<d>/` of a `<d>` without a package directory) and every file a Rust source
+embeds with `include_str!`/`include_bytes!` (for example
+`compat/codex/subagent-hooks.json`) is a core change that selects every package.
+The official packages are the directories under `runtime-packages/`. `--json`
+prints `{"core_changed": bool, "packages": [...]}` on stdout and the per-file
+reasons on stderr; any Git or file-system failure exits non-zero with nothing on
+stdout. A package job skips only when the selector succeeded and reported its
+package as `false`; push, schedule and dispatch runs run every package job.
+
 The target is fast feedback in about two minutes for routine changes, not a
 promise for cold builds or the complete required CI suite. Review JUnit execution
 times separately from compile/setup time; validating the 90%-of-changes target
@@ -401,6 +419,9 @@ entry for the consumer suite. Nothing in `release.yml`, `release-build.yml` or
 smoke derive them from those directories and files. A new target needs a runner
 mapping in `scripts/release-workflow/row-matrix`, a build leg in
 `release-build.yml` and the policy entries in `packaging/release-policy.json`.
+The per-pull-request package job in `ci.yml` needs a `package-selection` output
+for the runtime and an entry in `PACKAGE_JOBS` of `scripts/tests/test_ci_tiers.py`,
+which fails until every `runtime-packages/` directory has both.
 
 The structure of the workflows (one writer, the OIDC jobs, the secret, pinned
 actions, asset names against the policy) is pinned by
