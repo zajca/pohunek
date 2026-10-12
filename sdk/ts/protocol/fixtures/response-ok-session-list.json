@@ -10,6 +10,38 @@
       "activity": "idle",
       "agent": "codex",
       "agent_base": "codex",
+      "background": {
+        "items": [
+          {
+            "agent_type": "Explore",
+            "first_seen_ms": 1788825600000,
+            "id": "agent-fixture-1",
+            "kind": "subagent",
+            "label": "Map the store schema",
+            "last_seen_ms": 1788825600500,
+            "status": "running"
+          },
+          {
+            "first_seen_ms": 1788825600100,
+            "id": "shell-fixture-1",
+            "kind": "shell",
+            "label": "cargo watch -x test",
+            "last_seen_ms": 1788825600500,
+            "program": "cargo",
+            "status": "running"
+          },
+          {
+            "first_seen_ms": 1788825600200,
+            "id": "task-fixture-1",
+            "kind": "other",
+            "last_seen_ms": 1788825600500,
+            "provider_kind": "provider-task",
+            "status": "other"
+          }
+        ],
+        "observed_at_ms": 1788825600500,
+        "revision": "2"
+      },
       "branch": "zajca/12-typescript-sdk",
       "capabilities": {
         "fork": true,

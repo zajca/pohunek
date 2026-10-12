@@ -695,7 +695,7 @@ release-notes line for each one that changed.
 `metadata.jsonl` holds four record kinds: session, resume, worktree and project.
 Each line carries `schema_version`; a line without it is schema 1. The current
 value is `STORE_SCHEMA_VERSION` (`crates/daemon/src/store/schema.rs`, currently
-4), and `SessionRecord.info` embeds the protocol type `SessionInfo`, so a
+8), and `SessionRecord.info` embeds the protocol type `SessionInfo`, so a
 protocol field that reaches `info` is a persisted-shape change too.
 
 Startup order in `crates/daemon/src/main.rs`:
@@ -1385,6 +1385,15 @@ Secrets are never written to the metadata stores, the event log, or session
 metadata. They
 stay in the OS keychain, provider CLIs (`gh`, etc.), the SSH/agent environment,
 or explicit local environment files that are not committed.
+
+Background-task labels and shell program names are not secrets, and they are
+kept on purpose (operator decision of 2026-10-12 in
+[#890](https://github.com/zajca/pohunek/issues/890)). They are written to the
+worker journal, to the session records of `metadata.jsonl`, and to the event log
+(`events/*.jsonl`, in the `session_updated` and `background_state` payloads),
+and clients and the relay receive them. A shell command and its arguments are in
+none of these sinks: the worker keeps only the basename of the command word, and
+the worker and daemon logs record counts only.
 
 The worker journal contains runtime identity, process identity, dimensions,
 phase, terminal outcome, sanitized identity claims, and output offsets. It does

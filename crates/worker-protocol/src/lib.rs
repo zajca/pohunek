@@ -20,6 +20,7 @@ pub const WORKER_DIAGNOSTIC_SCHEMA_VERSION: u32 = 1;
 /// path can create a longer-lived claim.
 pub const MAX_IDENTITY_CLAIM_TTL_SECS: u64 = 60;
 
+mod background_fields;
 mod codec;
 mod control;
 mod data;
@@ -31,6 +32,11 @@ mod text;
 mod token;
 mod version;
 
+#[doc(inline)]
+pub use background_fields::{
+    is_task_text, is_valid_agent_type, is_valid_label, is_valid_program, is_valid_provider_kind,
+    is_valid_task_id,
+};
 #[doc(inline)]
 pub use codec::{ControlCodecError, ControlReader, ControlWriter, MAX_CONTROL_LINE_BYTES};
 #[doc(inline)]
@@ -70,7 +76,6 @@ pub use id::{
 };
 #[doc(inline)]
 pub use secret::{DataToken, LeaseChallenge, SecretBytes, SecretEnv, SecretError};
-#[doc(inline)]
 #[doc(inline)]
 pub use text::is_hidden_or_separator;
 pub use token::{TokenClaims, TokenError, TokenVault};

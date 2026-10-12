@@ -9,12 +9,13 @@ use pohunek_platform::{filesystem::TrustedDir, process::BootIdentity, supervisor
 use pohunek_service_config::preflight::CODE_WORKER_MARKER_LEGACY;
 use pohunek_worker_protocol::{
     AncestryMatcher, ControlCode, InspectSnapshot, PtyRelation, ReleasedIdentityClaim,
-    RuntimePhase, SubagentField,
+    RuntimePhase, SubagentField, BACKGROUND_MAX_ITEMS,
 };
 use protocol::{
-    AgentActivity, RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryStatus,
-    RuntimeRef, SessionRuntimeIdentity, SubagentInfo, SubagentLifecycle, SubagentRevision,
-    SubagentStateEvent, UnconfirmedProcess,
+    AgentActivity, BackgroundItem, BackgroundKind, BackgroundRevision, BackgroundStatus,
+    RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryStatus, RuntimeRef,
+    SessionBackground, SubagentInfo, SubagentLifecycle, SubagentRevision, SubagentStateEvent,
+    UnconfirmedProcess,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -27,7 +28,7 @@ use super::supervision::{
     RUNTIME_LOST_CLEANUP_UNCONFIRMED, UNREADABLE_CANDIDATES_RECOVER, UNSUPERVISED_WORKER,
 };
 use super::{
-    current_time_millis, event, event_payload, identity_claim_expiry_is_valid, mpsc,
+    current_time_millis, event, event_payload, event_runtime, identity_claim_expiry_is_valid, mpsc,
     preserve_durable_worker_metadata, preserve_newer_updated_at, runtime_error, sort_subagents,
     terminalize_running_subagents, timestamp_now, watch, ActiveAgentReport, CancellationToken,
     DesiredState, DetectorConfig, DetectorConfigUpdate, DetectorInputs, DetectorScope, Mutex,
@@ -558,6 +559,18 @@ impl SessionRegistry {
                 return WorkerMetadataApplyOutcome::Discarded;
             }
         };
+        // `None` leaves the held snapshot as it is: a rejected background must not
+        // discard the subagent and identity updates of the same snapshot.
+        let background_update = match import_worker_background(snapshot) {
+            Ok((background, drops)) => {
+                log_background_drops(id, drops);
+                Some(background)
+            }
+            Err(reason) => {
+                tracing::warn!(session_id = %id.0, reason, "rejected worker background snapshot");
+                None
+            }
+        };
         let durable_base = match self.load_durable_session_record(id).await {
             Ok(Some(record)) => record,
             Ok(None) if self.inner.store.is_none() => memory_base.clone(),
@@ -595,6 +608,9 @@ impl SessionRegistry {
             WorkerIdentityProjection::unreported()
         };
         candidate.info.subagents.clone_from(&subagents);
+        if let Some(update) = &background_update {
+            candidate.info.background.clone_from(update);
+        }
         if candidate != durable_base {
             candidate.info.updated_at = timestamp_now();
         }
@@ -667,6 +683,14 @@ impl SessionRegistry {
                 entry.info.subagents = subagents;
                 changed = true;
             }
+            let background_changed = match &background_update {
+                Some(update) if entry.info.background != *update => {
+                    entry.info.background.clone_from(update);
+                    changed = true;
+                    true
+                }
+                _ => false,
+            };
             entry
                 .last_native_report
                 .clone_from(&candidate.native_identity_ordering);
@@ -675,23 +699,17 @@ impl SessionRegistry {
                 preserve_newer_updated_at(&entry.info.updated_at, &mut updated_at);
                 entry.info.updated_at = updated_at;
             }
-            (changed, entry.info.clone(), subagent_events)
+            (
+                changed,
+                entry.info.clone(),
+                subagent_events,
+                background_changed,
+            )
         };
         if updated.0 {
             self.persist_resume_binding(id).await;
             self.emit(event::SESSION_UPDATED, &updated.1);
-            let runtime = updated.1.runtime.as_ref().and_then(|runtime| {
-                runtime
-                    .worker_instance_id
-                    .as_ref()
-                    .and_then(|worker_instance_id| {
-                        SessionRuntimeIdentity::new(
-                            worker_instance_id.clone(),
-                            runtime.runtime_generation,
-                        )
-                        .ok()
-                    })
-            });
+            let runtime = event_runtime(&updated.1);
             for subagent in updated.2 {
                 let event = crate::events::event(
                     event::SUBAGENT_STATE,
@@ -702,6 +720,9 @@ impl SessionRegistry {
                     }),
                 );
                 let _ = self.inner.events.send(event);
+            }
+            if updated.3 {
+                self.emit_background_state(&updated.1);
             }
         } else if identities_accepted
             && (snapshot.launch_identity.is_some() || snapshot.active_identity.is_some())
@@ -2905,6 +2926,8 @@ impl SessionRegistry {
                 runtime.runtime_generation
             });
         record.transaction = None;
+        // An ended runtime has no background tasks left to report.
+        record.info.background = None;
         let schema = self
             .record_hook_schema(&record, evidence.hook_schema.as_deref())
             .and_then(|schema| map_worker_subagents(&evidence.subagents, schema));
@@ -3117,6 +3140,7 @@ impl SessionRegistry {
             }
         }
         terminalize_running_subagents(&mut record.info.subagents, current_time_millis());
+        record.info.background = None;
         import_terminal_native_reference(
             &mut record,
             snapshot,
@@ -3425,6 +3449,17 @@ impl SessionRegistry {
                 return true;
             }
         };
+        // A rejected background keeps the record's own snapshot, so a reconciled
+        // record never shows a snapshot the worker did not validate.
+        match import_worker_background(&snapshot) {
+            Ok((background, drops)) => {
+                log_background_drops(&id, drops);
+                record.info.background = background;
+            }
+            Err(reason) => {
+                tracing::warn!(session_id = %id.0, reason, "rejected worker background snapshot");
+            }
+        }
         let active_agent = identity_projection
             .active
             .or_else(|| active_report_from_info(&record.info));
@@ -3650,6 +3685,13 @@ impl SessionRegistry {
             .expect("unpersisted classifications are never poisoned")
             .get(&id.0)
             .is_some_and(|(shown, shown_reason)| *shown == state && shown_reason == reason);
+        let had_background = self
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(&id)
+            .is_some_and(|current| current.info.background.is_some());
         self.install_session_entry(&id, entry).await;
         if !logged {
             warn_unavailable(&id.0, info_worker_id(&info), state, reason, "");
@@ -3663,6 +3705,9 @@ impl SessionRegistry {
             | RuntimeState::Terminal => event::SESSION_UPDATED,
         };
         self.emit(event_name, &info);
+        if had_background {
+            self.emit_background_state(&info);
+        }
         true
     }
 
@@ -3733,6 +3778,8 @@ impl SessionRegistry {
         if matches!(state, RuntimeState::Lost | RuntimeState::Terminal) {
             terminalize_running_subagents(&mut record.info.subagents, current_time_millis());
         }
+        // A runtime that cannot be reached holds no background snapshot it can vouch for.
+        record.info.background = None;
         record.info.updated_at = now;
         let recovery = record.recovery.clone();
         let input_rules = recovery.as_ref().map_or_else(
@@ -4093,6 +4140,190 @@ fn map_worker_subagents(
         .collect::<Result<Vec<_>, _>>()?;
     sort_subagents(&mut mapped);
     Ok(mapped)
+}
+
+/// Maps the worker's background snapshot to its public form, and returns with
+/// it what the mapping dropped, counted by reason.
+///
+/// The worker takes the snapshot from the same claim as the subagent rows, so
+/// only a schema that declares a subagent sequence rule admits it.
+fn import_worker_background(
+    snapshot: &InspectSnapshot,
+) -> Result<(Option<SessionBackground>, BackgroundDrops), &'static str> {
+    let Some(background) = snapshot.background.as_ref() else {
+        return Ok((None, BackgroundDrops::default()));
+    };
+    let admitted = reported_hook_schema(snapshot.hook_schema.as_deref())?
+        .is_some_and(pohunek_worker_protocol::HookSchema::admits_subagents);
+    if !admitted {
+        return Err("background_sequence_rule_missing");
+    }
+    let (mapped, drops) = map_worker_background(background)?;
+    Ok((Some(mapped), drops))
+}
+
+/// What a background snapshot dropped while it was mapped, counted by reason.
+///
+/// Only counts are kept, so a log line carries no task text.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BackgroundDrops {
+    /// Items whose identifier broke its rule. The whole item is dropped.
+    items_invalid_id: usize,
+    /// Optional fields whose value broke their rule. Only the field is dropped.
+    fields_invalid: usize,
+    /// Optional fields the item's kind does not carry. Only the field is dropped.
+    fields_kind_mismatch: usize,
+}
+
+impl BackgroundDrops {
+    /// Whether nothing was dropped.
+    const fn is_empty(self) -> bool {
+        self.items_invalid_id == 0 && self.fields_invalid == 0 && self.fields_kind_mismatch == 0
+    }
+}
+
+/// Logs what a snapshot dropped, as counts only.
+fn log_background_drops(id: &SessionId, drops: BackgroundDrops) {
+    if !drops.is_empty() {
+        tracing::warn!(
+            session_id = %id.0,
+            dropped_items_invalid_id = drops.items_invalid_id,
+            dropped_fields_invalid = drops.fields_invalid,
+            dropped_fields_kind_mismatch = drops.fields_kind_mismatch,
+            "dropped background task fields that broke their rule"
+        );
+    }
+}
+
+/// Maps the worker's bounded background snapshot. The snapshot is rejected when
+/// it lists more items than the worker may send, since the worker never
+/// produces such a snapshot; otherwise each item is mapped by [`map_background_item`].
+fn map_worker_background(
+    background: &pohunek_worker_protocol::BackgroundSnapshot,
+) -> Result<(SessionBackground, BackgroundDrops), &'static str> {
+    if background.items.len() > BACKGROUND_MAX_ITEMS {
+        return Err("background_items_too_many");
+    }
+    let mut drops = BackgroundDrops::default();
+    let items = background
+        .items
+        .iter()
+        .filter_map(|item| map_background_item(item, &mut drops))
+        .collect();
+    Ok((
+        SessionBackground {
+            revision: BackgroundRevision::new(background.revision),
+            observed_at_ms: background.observed_at_ms,
+            items,
+        },
+        drops,
+    ))
+}
+
+/// Maps one background item by the worker's granularity.
+///
+/// An item whose identifier breaks its rule is dropped. Its optional fields are
+/// checked by their own rules and dropped alone: a program is carried only by a
+/// shell, an agent type only by a subagent, and a provider type only by the
+/// other kind.
+fn map_background_item(
+    item: &pohunek_worker_protocol::BackgroundItem,
+    drops: &mut BackgroundDrops,
+) -> Option<BackgroundItem> {
+    use pohunek_worker_protocol::BackgroundKind as Worker;
+    if !pohunek_worker_protocol::is_valid_task_id(&item.id) {
+        drops.items_invalid_id += 1;
+        return None;
+    }
+    let kind = map_background_kind(item.kind);
+    let label = match item.label.as_deref() {
+        None => None,
+        Some(label) if pohunek_worker_protocol::is_valid_label(label) => Some(label.to_owned()),
+        Some(_) => {
+            drops.fields_invalid += 1;
+            None
+        }
+    };
+    let program = checked_kind_field(
+        item.program.as_deref(),
+        item.kind == Worker::Shell,
+        pohunek_worker_protocol::is_valid_program,
+        drops,
+    );
+    let agent_type = checked_kind_field(
+        item.agent_type.as_deref(),
+        item.kind == Worker::Subagent,
+        pohunek_worker_protocol::is_valid_agent_type,
+        drops,
+    );
+    let provider_kind = checked_kind_field(
+        item.provider_kind.as_deref(),
+        item.kind == Worker::Other,
+        pohunek_worker_protocol::is_valid_provider_kind,
+        drops,
+    );
+    Some(BackgroundItem {
+        id: item.id.clone(),
+        kind,
+        provider_kind,
+        status: map_background_status(item.status),
+        agent_type,
+        label,
+        program,
+        first_seen_ms: item.first_seen_ms,
+        last_seen_ms: item.last_seen_ms,
+    })
+}
+
+/// Checks one optional field of an item of a given kind.
+///
+/// A value on an item whose kind does not carry the field is counted as a kind
+/// mismatch; a value of a carrying kind that breaks `valid` is counted as
+/// invalid. Either way only this field is dropped.
+fn checked_kind_field(
+    value: Option<&str>,
+    carried: bool,
+    valid: fn(&str) -> bool,
+    drops: &mut BackgroundDrops,
+) -> Option<String> {
+    match value {
+        None => None,
+        Some(_) if !carried => {
+            drops.fields_kind_mismatch += 1;
+            None
+        }
+        Some(value) if valid(value) => Some(value.to_owned()),
+        Some(_) => {
+            drops.fields_invalid += 1;
+            None
+        }
+    }
+}
+
+fn map_background_kind(kind: pohunek_worker_protocol::BackgroundKind) -> BackgroundKind {
+    use pohunek_worker_protocol::BackgroundKind as Worker;
+    match kind {
+        Worker::Subagent => BackgroundKind::Subagent,
+        Worker::Workflow => BackgroundKind::Workflow,
+        Worker::Shell => BackgroundKind::Shell,
+        Worker::Monitor => BackgroundKind::Monitor,
+        Worker::McpTask => BackgroundKind::McpTask,
+        Worker::Teammate => BackgroundKind::Teammate,
+        Worker::Dream => BackgroundKind::Dream,
+        Worker::AutoModeScan => BackgroundKind::AutoModeScan,
+        Worker::MemoryImport => BackgroundKind::MemoryImport,
+        Worker::CloudSession => BackgroundKind::CloudSession,
+        Worker::Other => BackgroundKind::Other,
+    }
+}
+
+fn map_background_status(status: pohunek_worker_protocol::BackgroundStatus) -> BackgroundStatus {
+    use pohunek_worker_protocol::BackgroundStatus as Worker;
+    match status {
+        Worker::Running => BackgroundStatus::Running,
+        Worker::Pending => BackgroundStatus::Pending,
+        Worker::Other => BackgroundStatus::Other,
+    }
 }
 
 /// Whether `record` carries a stop intent no outcome committed yet.
@@ -7601,6 +7832,7 @@ while os.getppid() == parent:
             state_source: StateSource::Process,
             activity: None,
             subagents: Vec::new(),
+            background: None,
             active_agent: Some("claude".to_owned()),
             active_agent_base: Some(RuntimeRef::claude()),
             active_agent_pid: Some(released_pid),
@@ -8982,6 +9214,7 @@ while os.getppid() == parent:
                 state_source: StateSource::Process,
                 activity: None,
                 subagents: Vec::new(),
+                background: None,
                 active_agent: None,
                 active_agent_base: None,
                 active_agent_pid: None,
@@ -10492,6 +10725,7 @@ handler = "codex-hook-v1"
             state_source: StateSource::Process,
             activity: None,
             subagents: Vec::new(),
+            background: None,
             active_agent: None,
             active_agent_base: None,
             active_agent_pid: None,

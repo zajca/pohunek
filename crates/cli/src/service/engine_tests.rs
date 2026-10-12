@@ -531,6 +531,7 @@ fn session(id: &str, name: Option<&str>) -> SessionInfo {
         state_source: StateSource::Process,
         activity: None,
         subagents: Vec::new(),
+        background: None,
         native_session_id: None,
         native_session_path: None,
         active_agent: None,

@@ -7348,7 +7348,7 @@ fn a_journaled_native_reference_alone_changes_the_worker_metadata_fingerprint() 
 
 #[test]
 fn metadata_tracker_recovers_unchanged_fingerprint_after_previous_limit() {
-    let fingerprint = (None, None, None, None, Vec::new());
+    let fingerprint = (None, None, None, None, Vec::new(), None);
     let mut tracker = WorkerMetadataTracker::default();
     let now = Instant::now();
 
@@ -7407,7 +7407,7 @@ fn metadata_tracker_recovers_unchanged_fingerprint_after_previous_limit() {
 
 #[test]
 fn terminal_identity_retry_finishes_without_completing_commit_failures() {
-    let fingerprint = (None, None, None, None, Vec::new());
+    let fingerprint = (None, None, None, None, Vec::new(), None);
     let now = Instant::now();
     let mut identity_tracker = WorkerMetadataTracker::default();
 

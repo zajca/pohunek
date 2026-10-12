@@ -23,6 +23,7 @@ use pohunek_platform::process::{
     ProcessInspector, StartIdentity,
 };
 use pohunek_worker_protocol as protocol;
+use pohunek_worker_protocol::is_task_text;
 use protocol::{
     ActiveIdentityClaim, AncestryMatcher, AttachStart, BackgroundSnapshot, Capability, CloseReason,
     ControlCode, ControlError, ControlEvent, ControlMessage, ControlReader, ControlRequest,
@@ -3625,13 +3626,13 @@ where
                             || schema.admits_subagent_field(SubagentField::AgentType))
                 });
                 let text_valid = fields_admitted
-                    && valid_subagent_text(&subagent_id, MAX_SUBAGENT_ID_BYTES)
+                    && is_task_text(&subagent_id, MAX_SUBAGENT_ID_BYTES)
                     && parent_id
                         .as_deref()
-                        .is_none_or(|value| valid_subagent_text(value, MAX_SUBAGENT_ID_BYTES))
+                        .is_none_or(|value| is_task_text(value, MAX_SUBAGENT_ID_BYTES))
                     && agent_type
                         .as_deref()
-                        .is_none_or(|value| valid_subagent_text(value, MAX_SUBAGENT_TYPE_BYTES));
+                        .is_none_or(|value| is_task_text(value, MAX_SUBAGENT_TYPE_BYTES));
                 (!text_valid).then_some(RejectReason::SubagentClaimInvalid)
             });
             if let Some(reason) = inadmissible {
@@ -3731,7 +3732,7 @@ where
                             || schema.admits_subagent_field(SubagentField::Outcome))
                 });
                 let text_valid = outcome_admitted
-                    && valid_subagent_text(&subagent_id, MAX_SUBAGENT_ID_BYTES)
+                    && is_task_text(&subagent_id, MAX_SUBAGENT_ID_BYTES)
                     && outcome.is_none_or(|phase| phase != JournalSubagentPhase::Running);
                 (!text_valid).then_some(RejectReason::SubagentClaimInvalid)
             });
@@ -3942,9 +3943,9 @@ async fn apply_subagent_snapshot(
         let valid = admitted.is_ok_and(HookSchema::admits_subagents)
             && request.tasks.len() <= MAX_SNAPSHOT_TASKS
             && request.tasks.iter().all(|task| {
-                valid_subagent_text(&task.id, MAX_SUBAGENT_ID_BYTES)
-                    && valid_subagent_text(&task.task_type, MAX_SNAPSHOT_TYPE_BYTES)
-                    && valid_subagent_text(&task.status, MAX_SNAPSHOT_STATUS_BYTES)
+                is_task_text(&task.id, MAX_SUBAGENT_ID_BYTES)
+                    && is_task_text(&task.task_type, MAX_SNAPSHOT_TYPE_BYTES)
+                    && is_task_text(&task.status, MAX_SNAPSHOT_STATUS_BYTES)
             });
         (!valid).then_some(RejectReason::SubagentClaimInvalid)
     });
@@ -4949,10 +4950,6 @@ fn event_visible_to_connection(event: &protocol::ControlEvent, connection: &Conn
         || connection
             .capabilities
             .contains(&Capability::SubagentObservation)
-}
-
-fn valid_subagent_text(value: &str, max_bytes: usize) -> bool {
-    !value.is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
 }
 
 /// One admissible subagent claim, as the ordering rule and the logs see it.

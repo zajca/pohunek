@@ -13,12 +13,12 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use pohunek_service_config::preflight::CODE_WORKER_MARKER_LEGACY;
 use protocol::{
-    event, ActivityRevision, AgentActivity, AgentStateEvent, AttachEvent, CwdSource, ErrorClass,
-    Event, ProjectRemoveResult, ProtocolError, RuntimeId, RuntimeInventoryEntry,
-    RuntimeInventoryResult, RuntimeRef, RuntimeState, SessionAttachParams, SessionEvent,
-    SessionForkParams, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
-    SessionInputWait, SessionListFilter, SessionNativeRecoveredEvent, SessionNewParams,
-    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
+    event, ActivityRevision, AgentActivity, AgentStateEvent, AttachEvent, BackgroundStateEvent,
+    CwdSource, ErrorClass, Event, ProjectRemoveResult, ProtocolError, RuntimeId,
+    RuntimeInventoryEntry, RuntimeInventoryResult, RuntimeRef, RuntimeState, SessionAttachParams,
+    SessionEvent, SessionForkParams, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionInputWait, SessionListFilter, SessionNativeRecoveredEvent,
+    SessionNewParams, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
     SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
     SessionReportNativeIdResult, SessionRuntime, SessionRuntimeIdentity, SessionSetMetadataResult,
     SessionState, SessionStopResult, SessionWarning, StateSource, SubagentInfo, SubagentLifecycle,
@@ -1020,6 +1020,7 @@ fn exit_transition(
     candidate.info.state_source = StateSource::Process;
     candidate.info.activity = None;
     terminalize_running_subagents(&mut candidate.info.subagents, current_time_millis());
+    candidate.info.background = None;
     candidate.active_agent = None;
     candidate.last_agent_report = None;
     candidate.info.active_agent = None;
@@ -4330,6 +4331,10 @@ impl SessionRegistry {
                             return;
                         };
                         worker = reconnected;
+                        // The fingerprint applied before the outage may equal the
+                        // reconnected worker's, while the unreachable runtime cleared
+                        // what it held, so its metadata is applied again.
+                        metadata = WorkerMetadataTracker::default();
                     }
                 }
                 tokio::select! {
@@ -4496,6 +4501,7 @@ impl SessionRegistry {
             let base = Self::session_record(id, entry, entry.desired_state, None);
             let mut candidate = entry.clone();
             candidate.runtime = RuntimeHandle::Unavailable(state);
+            candidate.info.background = None;
             if let Some(runtime) = candidate.info.runtime.as_mut() {
                 runtime.state = state;
                 runtime.loss_reason = Some(reason.to_owned());
@@ -4534,6 +4540,9 @@ impl SessionRegistry {
                 | RuntimeState::Terminal => event::SESSION_UPDATED,
             };
             self.emit(event_name, info.as_ref());
+            if base.info.background.is_some() {
+                self.emit_background_state(info.as_ref());
+            }
         }
         outcome
     }
@@ -4841,6 +4850,7 @@ impl SessionRegistry {
             };
             &loaded_durable_base
         };
+        let had_background = updated.base.info.background.is_some();
         let updated = *updated;
         let committed_info = match Box::pin(self.commit_runtime_transition(
             id,
@@ -4888,6 +4898,9 @@ impl SessionRegistry {
             activity: None,
         });
         self.emit(updated.event, committed_info.as_ref());
+        if had_background {
+            self.emit_background_state(committed_info.as_ref());
+        }
         Ok(true)
     }
 
@@ -5265,6 +5278,21 @@ impl SessionRegistry {
             .await;
     }
 
+    /// Publishes `background_state` carrying the snapshot `info` holds, or a
+    /// null snapshot when it holds none. Callers publish the session event that
+    /// names the same runtime first, so clients accept the snapshot against it.
+    fn emit_background_state(&self, info: &SessionInfo) {
+        let event = crate::events::event(
+            event::BACKGROUND_STATE,
+            event_payload(BackgroundStateEvent {
+                session_id: info.id.clone(),
+                background: info.background.clone(),
+                runtime: event_runtime(info),
+            }),
+        );
+        let _ = self.inner.events.send(event);
+    }
+
     fn emit(&self, name: &str, info: &SessionInfo) {
         if name == event::SESSION_REMOVED {
             self.inner.turns.forget(&info.id);
@@ -5305,6 +5333,7 @@ type WorkerMetadataFingerprint = (
     Option<pohunek_worker_protocol::ReleasedIdentityClaim>,
     Option<pohunek_worker_protocol::ReportedNativeReference>,
     Vec<pohunek_worker_protocol::SubagentSnapshot>,
+    Option<pohunek_worker_protocol::BackgroundSnapshot>,
 );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5423,6 +5452,7 @@ fn worker_metadata_fingerprint(
         snapshot.active_identity_release.clone(),
         snapshot.native_reference.clone(),
         snapshot.subagents.clone(),
+        snapshot.background.clone(),
     )
 }
 
@@ -5432,6 +5462,7 @@ fn worker_metadata_is_empty(identity: &WorkerMetadataFingerprint) -> bool {
         && identity.2.is_none()
         && identity.3.is_none()
         && identity.4.is_empty()
+        && identity.5.is_none()
 }
 
 fn identity_claim_expiry_is_valid(value: &str) -> bool {
@@ -5515,6 +5546,7 @@ fn external_session_info(
         state_source: StateSource::Process,
         activity: None,
         subagents: Vec::new(),
+        background: None,
         active_agent: None,
         active_agent_base: None,
         active_agent_pid: None,
@@ -5683,6 +5715,7 @@ fn create_intent_record(
         state_source: StateSource::Process,
         activity: None,
         subagents: Vec::new(),
+        background: None,
         active_agent: None,
         active_agent_base: None,
         active_agent_pid: None,
@@ -6419,6 +6452,10 @@ fn preserve_durable_worker_metadata(existing: &SessionRecord, replacement: &mut 
         .clone_from(&existing.info.subagents);
     replacement
         .info
+        .background
+        .clone_from(&existing.info.background);
+    replacement
+        .info
         .active_agent
         .clone_from(&existing.info.active_agent);
     replacement
@@ -6485,6 +6522,7 @@ fn preserve_durable_transition_metadata(
     );
     if policy == RuntimeMetadataPolicy::Terminal {
         terminalize_running_subagents(&mut replacement.info.subagents, current_time_millis());
+        replacement.info.background = None;
     } else {
         sort_subagents(&mut replacement.info.subagents);
     }
@@ -6514,6 +6552,17 @@ fn current_time_millis() -> u64 {
         .unwrap_or_default()
         .as_millis();
     u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+/// The runtime identity a session event carries: the worker instance and the
+/// generation of the runtime the session holds.
+fn event_runtime(info: &SessionInfo) -> Option<SessionRuntimeIdentity> {
+    let runtime = info.runtime.as_ref()?;
+    SessionRuntimeIdentity::new(
+        runtime.worker_instance_id.clone()?,
+        runtime.runtime_generation,
+    )
+    .ok()
 }
 
 fn terminalize_running_subagents(subagents: &mut [SubagentInfo], occurred_at_ms: u64) {

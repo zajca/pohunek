@@ -474,9 +474,16 @@ most 64 KiB, or 1 MiB for the main `Stop`, whose input also carries the final
 assistant message and each task's description and command); it does not create a payload
 file. Subagent lifecycle rows keep lifecycle fields only: a snapshot's task
 `type` and `status` decide the reconciliation and are not stored in the rows.
-The background snapshot below is the one place where task text is kept. No
-prompt, result, final message, transcript path or raw hook payload is kept
-anywhere, and no command or argument of any task is kept.
+Task text is kept only in the sinks that hold the background snapshot. Each of
+them holds a task's sanitized `label` and a shell's `program`, and nothing else
+of the task: the worker journal (the snapshot below), `metadata.jsonl` (the
+`info.background` of the session record), the daemon event log under `events/`
+(the `session_updated` and `background_state` payloads), and the protocol
+surfaces clients read, which reach remote clients through the relay. No command
+or argument of any task is kept in any of them, and no prompt, result, final
+message, transcript path or raw hook payload is kept anywhere. The worker and
+daemon logs record the number of items and their kinds, never a label or a
+program.
 
 The current privacy rule for background tasks is the operator decision of
 2026-10-12 in [#890](https://github.com/zajca/pohunek/issues/890). It exposes a
@@ -602,6 +609,37 @@ Bounds the daemon re-checks for stored items are public constants in
 and `BACKGROUND_AGENT_TYPE_MAX_BYTES` (128). The worker refuses a snapshot whose
 task id, type or status exceeds its bound, and drops an agent type that exceeds
 its bound from that item alone.
+
+Clients read the snapshot as `SessionInfo.background`: the decimal-string
+`revision`, `observed_at_ms` and the items, with `id`, `kind`, `status`,
+`agent_type`, `label`, `program`, `first_seen_ms` and `last_seen_ms`. The daemon
+imports it from the worker's inspect poll, not from a worker event, and only
+under a hook schema that declares a subagent sequence rule, the gate the
+subagent rows use. A snapshot whose items exceed the worker's bounds is
+rejected. When the imported snapshot differs from the held one by value (the
+revision included), the daemon stores it with the session record, publishes
+`session_updated`, and then one `background_state` event. The event carries the
+complete new snapshot, or `background: null` when it was cleared, and the
+`runtime` (worker instance id and generation) that holds it. Clients accept an
+event only when that runtime matches the current session snapshot, the rule
+`subagent_state` follows; a `session.list` or `session.inspect` snapshot seeds
+the state after a reconnect. A subagent item shares its `id` with its
+`subagents` row, and the snapshot never changes that row.
+
+The daemon clears the snapshot wherever it ends or loses a runtime: an exit or a
+stop, a worker that is lost, reconnecting, in conflict, or incompatible. Each of
+those paths publishes `background_state` with `null` after its session event,
+naming the runtime that held the snapshot, when it held one. Startup reconciliation runs before
+the API is exposed, so it clears without an event; a live worker found there
+re-seeds the snapshot from its own inspect, and a dead or unreachable one leaves
+none. A new runtime, including a recovered or restarted session, starts with no
+snapshot until its own worker reports one. A worker that becomes reachable again
+after an unreachable spell has its snapshot applied again, so the snapshot it
+still holds is shown again.
+
+Protocol 3 connections never receive `background_state`, and their session
+objects carry no `background` key. The field and the event are current-version
+additions; see the protocol window in `docs/public-api.md`.
 
 Human-readable `pohunek session list` shows the running/recent child count, and
 `pohunek session inspect` includes the corresponding lifecycle rows. Streaming

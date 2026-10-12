@@ -40,6 +40,7 @@ const SHAPE_SNAPSHOTS: &[(u32, &str)] = &[
     (5, include_str!("fixtures/shape/schema-5.txt")),
     (6, include_str!("fixtures/shape/schema-6.txt")),
     (7, include_str!("fixtures/shape/schema-7.txt")),
+    (8, include_str!("fixtures/shape/schema-8.txt")),
 ];
 
 /// A profile revision: 64 lowercase hex digits.
@@ -145,8 +146,22 @@ fn project_json() -> Value {
     })
 }
 
-fn session_json() -> Value {
+/// Background snapshot with one item of each kind shape: subagent, shell and an
+/// `other` kind carrying its provider string.
+fn background_json() -> Value {
     json!({
+        "revision": "1",
+        "observed_at_ms": 1000,
+        "items": [
+            {"id": "sub-1", "kind": "subagent", "status": "running", "agent_type": "explore", "label": "scan", "first_seen_ms": 1, "last_seen_ms": 2},
+            {"id": "bash-1", "kind": "shell", "status": "pending", "label": "watch", "program": "cargo", "first_seen_ms": 1, "last_seen_ms": 2},
+            {"id": "x-1", "kind": "other", "provider_kind": "future", "status": "other", "first_seen_ms": 1, "last_seen_ms": 2}
+        ]
+    })
+}
+
+fn session_json() -> Value {
+    let mut record = json!({
         "schema_version": STORE_SCHEMA_VERSION,
         "session_id": "s-1",
         "desired_state": "running",
@@ -231,7 +246,9 @@ fn session_json() -> Value {
             "executable": "/opt/pohunek/pohunek-sessiond",
             "reason": "none"
         }
-    })
+    });
+    record["info"]["background"] = background_json();
+    record
 }
 
 /// Fails to compile when a persisted struct gains, loses or renames a field.
@@ -352,6 +369,7 @@ fn assert_every_field_is_reviewed(
         state_source: _,
         activity: _,
         subagents,
+        background,
         active_agent: _,
         active_agent_base: _,
         active_agent_pid: _,
@@ -396,6 +414,25 @@ fn assert_every_field_is_reviewed(
         finished_at_ms: _,
     } in subagents
     {}
+    if let Some(protocol::SessionBackground {
+        revision: _,
+        observed_at_ms: _,
+        items,
+    }) = background
+    {
+        for protocol::BackgroundItem {
+            id: _,
+            kind: _,
+            provider_kind: _,
+            status: _,
+            agent_type: _,
+            label: _,
+            program: _,
+            first_seen_ms: _,
+            last_seen_ms: _,
+        } in items
+        {}
+    }
     for protocol::SessionWarning {
         kind: _,
         message: _,
