@@ -2385,8 +2385,8 @@ Active-Agent Hook Payloads): `POHUNEK_HOOK_TRACE_PATH`, the absolute path of
 `~/.local/state/pohunek/logs/`), one file shared by every session of the host,
 and `POHUNEK_HOOK_TRACE_MAX_BYTES`, the size at which the hooks rotate it
 (1 MiB). A hook traces only when the path is absolute and the size is a
-positive decimal integer without a leading zero; otherwise it writes no trace
-and still exits 0.
+positive decimal integer of at most 15 digits without a leading zero;
+otherwise it writes no trace and still exits 0.
 
 Each line is one JSON object of at most 512 bytes; a line that would be longer
 is dropped, never truncated. Fields:
