@@ -1032,6 +1032,56 @@ process and screen detection remain the daemon's fallback. `on_session_end` is
 not a process-exit signal. A higher-sequence continuation identity reported by
 `pre_llm_call` supersedes the launch identity for a later native resume.
 
+## Runtime Packages and Trust
+
+A runtime package is a content-addressed `tar.zst` archive with a runtime
+descriptor (`runtime.toml`), a detection manifest and other checked data. It
+carries no code that Pohunek loads. The archive format, the owner-private
+registry and the signed catalog are in `crates/package`; the daemon turns a
+verified package into a validated runtime definition
+(`crates/daemon/src/agent/host/package.rs`) and runs install, enable, select
+and uninstall in `crates/daemon/src/session/package_lifecycle/`.
+
+| Class | Authorized by | Status |
+|---|---|---|
+| Official package | A signed release catalog entry that binds package id, runtime id, version and archive digest, verified against `runtime-catalog-anchor.json` beside `pohunekd` (`crates/package/src/catalog.rs`, `crates/daemon/src/catalog_anchor.rs`, `package_lifecycle/trust.rs`). | Shipped. Each Linux daemon archive carries the Pi, Codex and Claude Code packages and the catalog under `runtime/`. Only an official package may serve the reserved ids `codex`, `claude` and `hermes` (`crates/daemon/src/agent/host/claim.rs`); `shell` is never claimable. |
+| Third-party package | The archive digest the owner supplies (`--sha256`). `plugin link` copies a developer directory and installs it disabled. | Shipped. Never serves a reserved id. |
+| Workflow plugin | Not a runtime package. | Planned ([#148](https://github.com/zajca/pohunek/issues/148)): an external command that runs as the owner and calls the public CLI or SDK. The v1 boundary ([#480](https://github.com/zajca/pohunek/issues/480)) gives core no channel or record for plugin data and no launch-time policy hook; a launch still names one concrete, locally approved profile. |
+| Daemon, overlay, session worker or GUI extension | None. | Unsupported. Protocol methods, overlay providers, worker behavior and GUI code stay compiled and audited in core or in the client that owns them. |
+
+Trust boundary:
+
+- **Same-UID owner trust, not a sandbox.** A descriptor may name any program,
+  and that program runs as the owner. The digest or the catalog signature
+  proves which bytes were installed and who published them; it does not
+  restrict what they launch. A package gains nothing a same-user process does
+  not already have.
+- **No package code inside the daemon or the session worker.** The daemon
+  reads package data into a definition. Integration handlers, hook schemas and
+  the reporter scripts the handlers install are compiled core code selected by
+  id (`crates/daemon/src/integration/`). The declared program runs only as a
+  separate owner process: the agent the worker execs in its PTY from the launch
+  plan (`crates/daemon/src/agent/host/launch.rs`), and the bounded version
+  probe the daemon spawns (`crates/daemon/src/capabilities.rs`).
+- **Local lifecycle only.** `package.*` methods are served on the local control
+  socket only (`crates/daemon/src/api/handler/package.rs`, error
+  `local_only_method`), and the CLI refuses a remote `--host`
+  (`plugin_local_only`). A remote owner connection over the overlay can launch
+  only what is already installed and enabled on that host.
+- **Remote and relay launches select approved profiles.** A relay-origin launch
+  names only a locally approved profile at its approved revision
+  (`LaunchSource::RelayProfile` in `crates/daemon/src/agent/host/source.rs`),
+  never a runtime id, package, program or argv. A profile pins its package by
+  digest, so `plugin update` or `plugin select` does not change what an
+  approved profile launches. The relay connection is covered at the resolution
+  seam only until [#82](https://github.com/zajca/pohunek/issues/82).
+- **Fail closed.** A fresh launch rechecks that the package is enabled and its
+  root verifies (`verify_launchable` in
+  `crates/daemon/src/agent/host/handle.rs`). A pinned session or profile
+  resolves exactly its digest and never falls back to another package or to
+  `shell`. Recovery steps are in
+  `docs/knowledge/runbooks/runtime-package-recovery.md`.
+
 ## Overlay Registry and Discovery
 
 The daemon, SDK, CLI, and external browser gateways consume one configured overlay

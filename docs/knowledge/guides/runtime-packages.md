@@ -14,13 +14,17 @@ session) to the host. `pohunek plugin` manages the packages installed on the
 machine the daemon runs on. See the
 [runtime package archive](../concepts/runtime-package-archive.md) for the file
 format and the [runtime catalog](../concepts/runtime-catalog.md) for official
-trust. The repository's own package, [Pi](pi-package.md), is installed this way.
-The [Codex package](codex-package.md) is the second official package source; it
-serves the reserved `codex` id only through a signed catalog, and no release
-catalog or signing key exists yet.
-The [Claude Code package](claude-package.md) is the third; it serves the
-reserved `claude` id the same way, and the built-in Claude runtime stays in the
-daemon until a production catalog key exists.
+trust. The official packages are [Pi](pi-package.md), [Codex](codex-package.md)
+and [Claude Code](claude-package.md). Every Linux daemon archive of a release
+carries them under `runtime/packages/`, with the signed
+`runtime/runtime-catalog.json` that authorizes them (see
+[Install official packages from a release](#install-official-packages-from-a-release)).
+The Codex and Claude Code packages serve the reserved `codex` and `claude` ids
+only through that catalog. The built-in Codex, Claude and Hermes runtimes stay
+in the daemon and serve their ids whenever no official package is installed,
+enabled and selected for them. Recovery steps for verification, trust and
+profile pin failures are in the
+[runtime package recovery runbook](../runbooks/runtime-package-recovery.md).
 
 ```bash
 pohunek plugin list
@@ -37,6 +41,26 @@ pohunek plugin doctor
 Every subcommand accepts `--json`: one envelope on stdout, digests in full.
 Tables abbreviate a digest to its first 12 hex characters; that prefix is a
 valid `--digest` selector.
+
+## Install official packages from a release
+
+Install from the extracted daemon archive of the release the daemon runs. The
+catalog pins every entry to exactly that core version (`core = "=<version>"`),
+so a catalog of another release is refused with `package_incompatible` (or
+`package_untrusted` when it is older than a catalog the host already accepted):
+
+```bash
+cd pohunek-daemon-<version>-<target>
+pohunek plugin install runtime/packages/pi.tar.zst --catalog runtime/runtime-catalog.json
+pohunek plugin install runtime/packages/pi.tar.zst --catalog runtime/runtime-catalog.json --yes
+```
+
+Current releases list only the Linux x86_64 glibc and musl targets; the Apple Silicon
+archive carries the catalog and no package. `pohunek doctor` must report the
+`catalog_trust_anchor` check as `ok` first. Installing `codex.tar.zst` or
+`claude.tar.zst` takes the alias over from the built-in at once (see
+[Official aliases](#official-aliases)); `--no-enable` stages the package until
+`plugin enable`. `docs/install.md` has the complete procedure.
 
 ## Config home
 
@@ -139,6 +163,13 @@ launch on that machine, so it is never a remote operation.
   trusted by `--sha256` are unaffected.
 - `link <dir>` copies a developer directory. The copy is installed disabled and
   unselected, and is recorded with the `link` origin.
+
+Packages are trusted local software, not a sandbox: the digest and the catalog
+signature establish integrity and provenance, and an installed package can name
+any program your account could run. Workflow plugins (planned, #148) are a
+separate class that does not use this install path, and daemon, overlay,
+session worker and GUI extensions are not packages at all; see "Runtime packages
+and trust" in `docs/architecture.md`.
 
 ## Consent
 

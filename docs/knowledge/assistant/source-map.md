@@ -314,7 +314,7 @@ Release packaging and contributor verification:
 - `sdk/ts/scripts/test/pack-contract.test.ts` — real tarballs, a local HTTP
   server and a real `bun install` of a URL-pinned consumer.
 - `README.md`
-- `docs/install.md` — manual install: release archives, login service, upgrades, quick start.
+- `docs/install.md` — manual install: release archives, login service, upgrades, quick start, and installing the official runtime packages from a release daemon archive with its signed catalog.
 - `docs/development.md` — workspace layout, gates, fast loops, release pipeline.
 - `packaging/install-daemon.sh` — release-archive wrapper that re-executes
   itself under `pohunek service lock` and retires a legacy template-unit
@@ -543,6 +543,8 @@ Runtime package archive format:
 - `crates/package/src/directory.rs` — directory-to-archive builder behind `plugin link` and `cargo xtask package build`.
 - `crates/package/src/catalog_state.rs` — persisted catalog high-water mark and revoked key ids.
 - `crates/daemon/src/session/package_lifecycle/` — the `package.*` operations: validate from the verified archive, claim rules, catalog trust, record, reload, and the compatibility-gated selection (`selection.rs`).
+- `crates/daemon/src/session/package_lifecycle/trust.rs` — catalog verification against the host anchor and persisted high-water mark, and the official entry, core version and platform checks (`package_untrusted`, `package_incompatible`).
+- `crates/daemon/src/session/package_lifecycle/fault.rs` — the mapping of root and descriptor failures to the `plugin doctor` fault kinds.
 - `crates/daemon/src/agent/host/claim.rs` — which package may serve which runtime id.
 - `crates/daemon/src/agent/host/config_home.rs` — the `[config_home]` descriptor declaration and the one resolver of a runtime's config directory.
 - `crates/daemon/src/api/handler/package.rs` — `package.*` handlers and the local-only gate.
@@ -551,6 +553,8 @@ Runtime package archive format:
 - `crates/cli/src/commands/plugin.rs` — `pohunek plugin list|inspect|install|link|update|select|enable|disable|uninstall|doctor`.
 - `crates/cli/src/commands/plugin_profile.rs` — `pohunek plugin profile list|migrate`.
 - `docs/knowledge/guides/runtime-packages.md`
+- `docs/knowledge/runbooks/runtime-package-recovery.md` — recovery from failed package verification, refused official installs, and disabled, removed or damaged pinned packages.
+- `docs/architecture.md` — "Runtime Packages and Trust": the package classes and the same-UID owner trust boundary.
 - `docs/knowledge/guides/pi-package.md`
 - `docs/knowledge/guides/codex-package.md`
 - `docs/knowledge/guides/claude-package.md`
