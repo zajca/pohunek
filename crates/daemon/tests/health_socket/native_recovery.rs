@@ -31,15 +31,15 @@ fn activity_for<'a>(id: &SessionId, sessions: &'a [SessionInfo]) -> Option<&'a s
 /// Installs a private copy of the host Bash image at `program`, named for the
 /// provider the fixture agent stands in for.
 ///
-/// macOS only runs a platform binary from the system volume, so a copy of one
-/// is killed on launch on recent releases; the copy is re-signed ad hoc, the
-/// signature every non-platform executable on macOS carries, so it runs on
-/// every release.
+/// macOS 27 kills a copy of a platform binary (`/bin/bash`) on launch. The
+/// copy is probed by running it, and only a copy the kernel killed is re-signed
+/// ad hoc, the signature every non-platform executable on macOS carries; a copy
+/// that runs as copied is never modified.
 fn install_fixture_agent_image(program: &Path) {
     // hermetic-allowed: #421 copy the host Bash image into a private fake Claude fixture.
     std::fs::copy("/bin/bash", program).expect("copy fixture agent executable");
     #[cfg(target_os = "macos")]
-    {
+    if image_killed_on_launch(program) {
         let signed = pohunek_test_support::process_env::command("codesign")
             .args(["--force", "--sign", "-"])
             .arg(program)
@@ -50,7 +50,37 @@ fn install_fixture_agent_image(program: &Path) {
             "ad-hoc signing the fixture agent executable failed: {}",
             String::from_utf8_lossy(&signed.stderr)
         );
+        assert!(
+            !image_killed_on_launch(program),
+            "the fixture agent executable is killed on launch even after ad-hoc signing"
+        );
     }
+}
+
+/// Whether the kernel kills `program` when it starts: runs `program -c true`
+/// and reports a termination by signal.
+///
+/// # Panics
+///
+/// Panics when the image cannot be spawned or exits non-zero without a signal,
+/// which means it is not a usable shell.
+#[cfg(target_os = "macos")]
+fn image_killed_on_launch(program: &Path) -> bool {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let probe = pohunek_test_support::process_env::command(&program.to_string_lossy())
+        .args(["-c", "true"])
+        .output()
+        .expect("spawn the fixture agent executable");
+    if probe.status.signal().is_some() {
+        return true;
+    }
+    assert!(
+        probe.status.success(),
+        "the fixture agent executable fails `-c true`: {}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    false
 }
 
 struct ClaudeRig {
