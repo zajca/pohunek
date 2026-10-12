@@ -427,6 +427,76 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
     let _ = registry.stop(&created.id).await;
 }
 
+/// A foreground `codex` in a shell session is attributed only through the
+/// detection manifest of an installed runtime: the daemon ships no Codex, so
+/// on a host without the official package the process stays unattributed.
+#[tokio::test]
+async fn procwatch_leaves_a_foreground_codex_unattributed_without_the_official_package() {
+    let env = TestEnv::new().expect("create the test environment");
+    let dir = env.cwd();
+    let fake_codex = dir.join("codex");
+    let pid_file = dir.join("agent.pid");
+    symlink_sleep_as(&fake_codex);
+    let script = format!(
+        "{} {SHELL_LINGER_SECS} & echo $! > {}; wait $!",
+        fake_codex.display(),
+        pid_file.display()
+    );
+    let inspector = PollBlindInspector::new();
+    let registry = worker_backed_registry_with_launcher(
+        &env,
+        SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", script.as_str()]),
+            procwatch_poll: TEST_PROCWATCH_POLL,
+            ..SessionRegistryConfig::default()
+        },
+        Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
+        Arc::new(SubprocessWorkerLauncher::new()),
+        &official_runtimes::OfficialCatalog::new(),
+    );
+    let created = {
+        let _process_env = without_pohunek_markers();
+        registry
+            .create(SessionNewParams {
+                name: Some("procwatch-unserved-codex".to_owned()),
+                agent: "shell".to_owned(),
+                cwd: Some(dir.to_path_buf()),
+                cols: TEST_COLS,
+                rows: TEST_ROWS,
+                project: None,
+                repo: None,
+                branch: None,
+                base_branch: None,
+                input: None,
+                extended_input_ready_wait: None,
+                metadata: BTreeMap::new(),
+            })
+            .await
+            .expect("create shell session")
+    };
+    let child_pid = wait_for_pid_file(&pid_file).await;
+    let foreground_group = HostInspector::new()
+        .foreground_process_group(created.pid)
+        .expect("inspect root foreground group");
+    assert_eq!(foreground_group, Some(created.pid));
+
+    // The agent was live before these listings were taken, so a complete scan
+    // saw it.
+    wait_for_scans_after_thaw(&inspector).await;
+    let scanned = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert!(
+        fs::metadata(format!("/proc/{child_pid}")).is_ok(),
+        "the fake codex stayed live across the scan"
+    );
+    assert_eq!(scanned.active_agent_pid, None, "{scanned:?}");
+    assert_eq!(scanned.active_agent, None, "{scanned:?}");
+    assert_eq!(scanned.active_agent_base, None, "{scanned:?}");
+    let _ = registry.stop(&created.id).await;
+}
+
 #[tokio::test]
 async fn procwatch_keeps_worker_agent_after_daemon_restart() {
     let env = TestEnv::new().expect("create the test environment");

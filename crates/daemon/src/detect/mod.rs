@@ -37,17 +37,16 @@ const BEL: u8 = 0x07;
 /// drive the screen/manifest layer. It is a trusted, unit-tested constant (not
 /// user input), so parsing it with `.expect` at startup is acceptable.
 const GENERIC_SHELL_MANIFEST: &str = include_str!("manifests/shell.toml");
-const CODEX_MANIFEST: &str = include_str!("manifests/codex.toml");
 const CLAUDE_MANIFEST: &str = include_str!("manifests/claude.toml");
 const HERMES_MANIFEST: &str = include_str!("manifests/hermes.toml");
 
-/// Compiled manifest sources checked by daemon readiness diagnostics.
-pub(crate) fn embedded_manifest_sources() -> [&'static str; 4] {
+/// Compiled manifest sources checked by daemon readiness diagnostics, each
+/// with the runtime id of the built-in runtime it belongs to.
+pub(crate) fn embedded_manifest_sources() -> [(&'static str, &'static str); 3] {
     [
-        GENERIC_SHELL_MANIFEST,
-        CODEX_MANIFEST,
-        CLAUDE_MANIFEST,
-        HERMES_MANIFEST,
+        (protocol::RuntimeId::SHELL, GENERIC_SHELL_MANIFEST),
+        (protocol::RuntimeId::CLAUDE, CLAUDE_MANIFEST),
+        (protocol::RuntimeId::HERMES, HERMES_MANIFEST),
     ]
 }
 
@@ -139,11 +138,6 @@ pub fn generic_shell_manifest() -> &'static Manifest {
     MANIFEST.get_or_init(|| {
         Manifest::parse_str(GENERIC_SHELL_MANIFEST).expect("generic shell manifest must parse")
     })
-}
-
-pub fn codex_manifest() -> &'static Manifest {
-    static MANIFEST: OnceLock<Manifest> = OnceLock::new();
-    MANIFEST.get_or_init(|| Manifest::parse_str(CODEX_MANIFEST).expect("codex manifest must parse"))
 }
 
 pub fn claude_manifest() -> &'static Manifest {

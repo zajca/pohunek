@@ -670,7 +670,9 @@ runtime registry to complete its launch spec is reported as
 `native_recovery_unverified`. A session whose launch pin names a runtime source
 the new binary does not serve, resolved as resume resolves it against that
 binary's built-in runtimes and the installed packages, is `would_lose_recovery`
-with `runtime_source_not_served`. A live worker journal without a store record is
+with `runtime_source_not_served`, and so is any live session, resumable or not,
+whose runtime resolves nowhere on the new binary, because every interaction
+with it would be refused. A live worker journal without a store record is
 listed as an unmanaged worker and does not refuse the upgrade, unless a store
 line that names no session cannot be read (`worker_without_session_record`).
 Sessions at risk refuse the upgrade with
@@ -772,6 +774,19 @@ pinned to version 0.20.0 and deliberately excludes its remote, browser,
 desktop, gateway, ACP, and other non-local backends: Pohunek must own the PTY,
 process, worktree, and diff on the same host.
 
+The daemon compiles the shell, Claude Code and Hermes runtimes in. Codex is not
+compiled in: only the official `pohunek.runtime.codex` package, installed from
+the release catalog, serves `codex`. On a host without it, a bare `codex` is
+`agent_profile_not_found`, a host profile over `codex` that pins no package is
+`runtime_not_installed`, and both hints name the catalog install (and, for the
+profile, `pohunek plugin profile migrate`). A session launched from the
+built-in Codex of an earlier release is refused with `runtime_builtin_removed`
+while nothing serves `codex` and with `runtime_served_by_package` once the
+package does: it is never rebound, and its recovery is a new session. A
+foreground or unmanaged `codex` process is attributed only through the
+installed package's detection manifest and `[transcripts]` table, so without
+the package it is not observed as Codex.
+
 Runtime responsibilities:
 
 - Start one agent subprocess inside each worker-owned PTY.
@@ -825,13 +840,20 @@ directory instead of resolving one themselves, so install, status, doctor,
 removal and a launched agent agree; `profile` and `all_profiles` on the
 integration methods select one profile's home or every distinct home (one
 transaction per canonical directory) and are served on the local control socket
-only.
+only. The one home a handler keeps itself is that of a built-in runtime this
+build does not compile in (the Codex handler keeps `CODEX_HOME`, else
+`~/.codex`, of the 0.34 built-in): status, doctor and uninstall that name such an
+official alias while nothing serves it address that home, so the hooks it
+installed can be reported and removed without a package; install never does.
+Host profiles over that alias do not resolve then, so their homes are found
+from each profile file's `base` and `[env]` alone, read under the same
+containment and owner checks as a profile load.
 
 The built-in descriptors and the remaining per-agent names are data or work
 owned by other issues. A source-scan test
 (`crates/xtask/tests/no_special_dispatch.rs`) pins every production line under
 `crates/daemon/src` that still names `codex`, `claude` or `hermes`, per file,
-with the issue that removes it (#144 integration handlers, #145-#147 built-in
+with the issue that removes it (#144 integration handlers, #146-#147 built-in
 packages) or `data`. The external observer takes each transcript root and its
 parser from the runtime's `[transcripts]` table
 (`crates/daemon/src/agent/host/transcripts.rs`), so it names no agent. The pin

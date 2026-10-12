@@ -4,9 +4,9 @@
 //! launched from a built-in runtime may do afterwards.
 //!
 //! The fixture daemon serves Hermes as a built-in runtime, so the scenarios
-//! that take a built-in over inside one daemon use `hermes`. Whether it also
-//! serves Codex and Claude as built-ins depends on the binary, so the `codex`
-//! and `claude` cases assert only what holds either way; a Codex or Claude
+//! that take a built-in over inside one daemon use `hermes`. It compiles no
+//! Codex in, and whether it serves Claude as a built-in depends on the binary,
+//! so the `claude` cases assert only what holds either way; a Codex or Claude
 //! session launched from a built-in runtime is written by a daemon that
 //! compiles them in ([`compiled_in_host`]), as a previous release did.
 //!
@@ -514,17 +514,7 @@ async fn launch_on_a_compiled_in_daemon(
     store_path: &Path,
     cwd: PathBuf,
 ) -> protocol::SessionInfo {
-    let previous = SessionRegistry::new_with_runtimes(
-        SessionRegistryConfig {
-            shell_command: hermetic_shell(),
-            stop_grace: std::time::Duration::from_millis(50),
-            store_path: Some(store_path.to_path_buf()),
-            agents_dir: Some(fixture.agents.clone()),
-            host_state_dir: Some(fixture.dir.join("state")),
-            ..SessionRegistryConfig::default()
-        },
-        compiled_in_host(),
-    );
+    let previous = compiled_in_daemon(fixture, store_path);
     let created = previous
         .create(protocol::SessionNewParams {
             agent: PROFILE.to_owned(),
@@ -535,6 +525,23 @@ async fn launch_on_a_compiled_in_daemon(
         .expect("a session of the built-in runtime");
     previous.stop(&created.id).await.expect("stop the session");
     created
+}
+
+/// A daemon that compiles Codex and Claude in ([`compiled_in_host`]), over the
+/// agents directory, host state and session store `store_path` of `fixture`,
+/// as a previous release ran.
+fn compiled_in_daemon(fixture: &Fixture, store_path: &Path) -> SessionRegistry {
+    SessionRegistry::new_with_runtimes(
+        SessionRegistryConfig {
+            shell_command: hermetic_shell(),
+            stop_grace: std::time::Duration::from_millis(50),
+            store_path: Some(store_path.to_path_buf()),
+            agents_dir: Some(fixture.agents.clone()),
+            host_state_dir: Some(fixture.dir.join("state")),
+            ..SessionRegistryConfig::default()
+        },
+        compiled_in_host(),
+    )
 }
 
 #[tokio::test]
@@ -593,6 +600,164 @@ async fn a_built_in_claude_session_is_neither_resumed_nor_forked_after_the_takeo
         .remove(&created.id)
         .await
         .expect("a refused session is still removable");
+}
+
+/// A Codex session a previous release launched from its built-in runtime, on
+/// a daemon that serves no `codex`: resume is refused as a removed built-in
+/// whose recovery is the official package and a new session, and once the
+/// package is installed, as a session the package does not serve. Neither
+/// refusal touches the stored session.
+#[tokio::test]
+async fn a_built_in_codex_session_is_refused_as_removed_until_the_package_serves_codex() {
+    let key = signing_key("root");
+    let dir = temp_dir("alias-codex-removed");
+    let store_path = temp_store_path("alias-codex-removed");
+    let fixture = Fixture::with_anchor_and_store(
+        "alias-codex-removed-plugins",
+        anchor(&[&key], Vec::new()),
+        store_path.clone(),
+    );
+    fixture.write_profile(
+        PROFILE,
+        "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n",
+    );
+    let created = launch_on_a_compiled_in_daemon(&fixture, &store_path, dir).await;
+    assert!(matches!(
+        durable_recovery(&store_path, &created.id)
+            .launch_binding
+            .binding()
+            .map(|binding| &binding.provenance),
+        Some(protocol::BindingProvenance::Builtin { .. })
+    ));
+    let restarted = fixture.reopen();
+    Box::pin(restarted.registry.reconcile_workers())
+        .await
+        .expect("startup reconciliation");
+    assert_eq!(
+        served_by(&restarted, RuntimeId::CODEX),
+        None,
+        "the daemon ships no Codex"
+    );
+    let before = fs::read(&store_path).expect("read the store");
+
+    let removed = restarted
+        .registry
+        .resume(&created.id)
+        .await
+        .expect_err("nothing serves the built-in the session was launched from");
+    assert_eq!(removed.code, "runtime_builtin_removed", "{removed:?}");
+    let hint = removed.recover.as_deref().expect("a recovery hint");
+    assert!(
+        hint.contains(
+            "`pohunek plugin install runtime/packages/codex.tar.zst --catalog runtime/runtime-catalog.json`"
+        ),
+        "{hint}"
+    );
+    assert!(
+        hint.contains("`pohunek session new --agent codex`"),
+        "{hint}"
+    );
+    assert!(hint.contains("cannot be rebound"), "{hint}");
+    assert_eq!(
+        fs::read(&store_path).expect("read the store"),
+        before,
+        "the refusal leaves the stored session untouched"
+    );
+
+    drop(restarted);
+
+    install_official(&fixture, &official(RuntimeId::CODEX), RuntimeId::CODEX, 5).await;
+    let served = fixture.reopen();
+    Box::pin(served.registry.reconcile_workers())
+        .await
+        .expect("startup reconciliation");
+    let refused = served
+        .registry
+        .resume(&created.id)
+        .await
+        .expect_err("the package serves the runtime now");
+    assert_migration_refusal(&refused, RuntimeId::CODEX);
+
+    served
+        .registry
+        .remove(&created.id)
+        .await
+        .expect("a refused session is still removable");
+}
+
+/// A live Codex session a previous release launched from its built-in runtime,
+/// adopted by a daemon that serves no `codex`: input is refused as a removed
+/// built-in, and once the official package serves `codex` the live session
+/// takes input again.
+#[tokio::test]
+async fn an_adopted_built_in_codex_session_takes_input_only_once_the_package_serves_codex() {
+    let key = signing_key("root");
+    let dir = temp_dir("alias-codex-live");
+    let store_path = temp_store_path("alias-codex-live");
+    let fixture = Fixture::with_anchor_and_store(
+        "alias-codex-live-plugins",
+        anchor(&[&key], Vec::new()),
+        store_path.clone(),
+    );
+    fixture.write_profile(
+        PROFILE,
+        "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 600\"]\n",
+    );
+    let previous = compiled_in_daemon(&fixture, &store_path);
+    let created = previous
+        .create(protocol::SessionNewParams {
+            agent: PROFILE.to_owned(),
+            cwd: Some(dir),
+            ..params()
+        })
+        .await
+        .expect("a session of the built-in runtime");
+    let adopted = fixture.reopen_with_workers_of(&previous).await;
+    adopted
+        .registry
+        .reconcile_workers()
+        .await
+        .expect("startup reconciliation");
+    let live = adopted
+        .registry
+        .inspect(&created.id)
+        .await
+        .expect("the live session survives the restart");
+    assert_eq!(
+        live.runtime.as_ref().map(|runtime| runtime.state),
+        Some(protocol::RuntimeState::Live)
+    );
+    let input = || protocol::SessionInputParams {
+        session_id: created.id.clone(),
+        text: "continue".to_owned(),
+        wait: None,
+    };
+
+    let refused = adopted
+        .registry
+        .input(input())
+        .await
+        .expect_err("nothing serves the runtime the session was launched from");
+    assert_eq!(refused.code, "runtime_builtin_removed", "{refused:?}");
+
+    install_official(&fixture, &official(RuntimeId::CODEX), RuntimeId::CODEX, 5).await;
+    adopted.host.reload().expect("load the installed package");
+    adopted
+        .registry
+        .input(input())
+        .await
+        .expect("the package serves codex, so the live session takes input");
+
+    adopted
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the adopted session");
+    adopted
+        .registry
+        .remove(&created.id)
+        .await
+        .expect("remove the adopted session");
 }
 
 /// A live session of the built-in Hermes runtime, launched through the

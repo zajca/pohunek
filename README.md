@@ -31,6 +31,9 @@ attention.
 pohunek host discover
 
 # Start Codex on the build box, in a fresh worktree, with its first prompt.
+# Codex is served only by its official package: install it on buildbox first,
+# then its hooks with `pohunek integration install --agent codex` (docs/install.md,
+# "Install official runtime packages from the release archive").
 # The project name resolves on buildbox; no filesystem path crosses the wire.
 pohunek session new --host buildbox --project myapp --agent codex \
   --branch feat/parser --input "Fix the parser fuzz failures." --yes

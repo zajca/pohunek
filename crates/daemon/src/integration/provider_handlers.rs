@@ -4,7 +4,7 @@
 //! rollback-capable commit machinery; the Hermes handler is registered so a
 //! descriptor can name it, and its lifecycle runs in the CLI.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 use std::path::Path;
 
@@ -12,7 +12,7 @@ use pohunek_worker_protocol::HookAction;
 use protocol::{IntegrationAgentStatus, IntegrationUninstallReport, ProtocolError, RuntimeRef};
 
 use super::commit::StepGate;
-use super::handler::{CliRunHandler, DaemonHandler, Handler, StagedUpdate};
+use super::handler::{CliRunHandler, DaemonHandler, Handler, RetiredBuiltin, StagedUpdate};
 use super::{
     reported_agent_status, stage_claude, stage_codex, AssetManifest, InstallPaths, StagedClaude,
     StagedCodex, StatusAgent, CLAUDE_REPORTED_ACTIONS, CODEX_REPORTED_ACTIONS,
@@ -35,6 +35,17 @@ pub(super) static REGISTRY: [Handler; 3] = [
 /// Handler of the Codex hook asset set.
 #[derive(Debug)]
 struct CodexHook;
+
+/// The built-in Codex runtime release 0.34.2 compiled in, as its descriptor
+/// declared it (`compat/codex/builtin-v0.34/runtime.toml`), so the hooks it
+/// installed into `~/.codex` stay removable on a host without the package.
+static CODEX_RETIRED: RetiredBuiltin = RetiredBuiltin {
+    runtime_id: "codex",
+    display_name: "Codex",
+    config_env: "CODEX_HOME",
+    config_default: ".codex",
+    hook_schema: "identity-subagent-v1",
+};
 
 /// Handler of the Claude hook asset set.
 #[derive(Debug)]
@@ -95,6 +106,10 @@ impl DaemonHandler for CodexHook {
         let mut report = super::uninstall::uninstall_codex(dir)?;
         report.agent = runtime.clone();
         Ok(report)
+    }
+
+    fn retired_builtin(&self) -> Option<&'static RetiredBuiltin> {
+        Some(&CODEX_RETIRED)
     }
 }
 

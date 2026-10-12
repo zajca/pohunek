@@ -539,6 +539,9 @@ fn judge(
     if let Some(judgement) = judge_identity(journal, &mut candidate, inspector, runtimes) {
         return judgement;
     }
+    if let Some(judgement) = judge_runtime_source(&candidate, runtimes) {
+        return judgement;
+    }
     judge_recovery(facts, &candidate, runtimes)
 }
 
@@ -787,14 +790,67 @@ fn judge_recovery(
     )
 }
 
+/// Every interaction with an adopted session needs its runtime source served.
+///
+/// Input, attach, resize, rename and metadata changes all pass the mutation
+/// guard (`RuntimeHost::ensure_session_runtime`), which refuses a session whose
+/// runtime resolves nowhere: a built-in of an official alias this binary does
+/// not compile in while no package serves the alias, or a runtime that is not
+/// installed. Such a session is judged with the guard itself, whatever its
+/// resume and fork capabilities. Its worker is adopted, so the verdict is
+/// `would_lose_recovery` with the code of an unserved runtime source, like a
+/// session whose pin only resume and fork refuse, and the detail names what
+/// is refused beyond them.
+fn judge_runtime_source(candidate: &SessionRecord, runtimes: &RuntimeHost) -> Option<Judgement> {
+    let pin = candidate
+        .recovery
+        .as_ref()
+        .map(|binding| binding.launch_binding.clone())
+        .unwrap_or_default();
+    let agent_base = &candidate.info.agent_base;
+    let error = runtimes.ensure_session_runtime(agent_base, &pin).err()?;
+    let runtime = agent_base.as_wire();
+    let outcome = match agent_base.launchable() {
+        // The package that serves the alias then is no stand-in for the
+        // built-in the session was launched from (`check_pin`).
+        Ok(runtime_id) if error.code == "runtime_builtin_removed" => format!(
+            "every interaction with the session (input, attach, resize, rename, metadata) is \
+             refused until you {}, and resume and fork stay refused even after that install \
+             (`runtime_served_by_package`), because a session cannot be rebound to another \
+             runtime source; install the package with the running release before the upgrade \
+             to keep the session usable, finish the work in it, and continue in a new session \
+             started with `pohunek session new --agent {runtime}`",
+            protocol::official_package_install_step(runtime_id)
+        ),
+        _ => format!(
+            "every interaction with the session (input, attach, resize, rename, metadata) and \
+             resume and fork are refused until the runtime it was launched from is installed \
+             and enabled again; a session cannot be rebound to another runtime source, so \
+             otherwise continue in a new session started with `pohunek session new --agent \
+             {runtime}` once this daemon serves that runtime"
+        ),
+    };
+    Some((
+        Verdict::WouldLoseRecovery,
+        CODE_RUNTIME_SOURCE_NOT_SERVED,
+        format!(
+            "the session was launched from a runtime source this daemon does not serve ({}: \
+             {}), so the worker is adopted but {outcome}, or upgrade with \
+             --accept-runtime-loss",
+            error.code, error.msg
+        ),
+    ))
+}
+
 /// The session's launch pin must name a runtime source the new daemon serves:
 /// resume and fork resolve exactly that source, and nothing else stands in.
 ///
 /// The pin is resolved as resume resolves it, against the built-in runtimes
-/// of this binary and the packages installed now, so a built-in this binary
-/// does not ship, a built-in an official package serves in place of, and a
-/// package digest that is not installed each lose the session's recovery. A
-/// session without native resume or fork has no recovery to lose.
+/// of this binary and the packages installed now, so a built-in an official
+/// package serves in place of and a package digest that is not installed each
+/// lose the session's recovery. A session without native resume or fork has
+/// no recovery to lose. A runtime source no interaction is served from is
+/// judged first, by [`judge_runtime_source`].
 fn judge_pin(candidate: &SessionRecord, runtimes: &RuntimeHost) -> Option<Judgement> {
     let binding = candidate.recovery.as_ref()?;
     let capabilities = &candidate.info.capabilities;

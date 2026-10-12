@@ -9,8 +9,11 @@ intents: [setup, project, debug, help]
 
 # Agent Profiles
 
-An agent name can refer to a base runtime such as `shell`, `codex`, `claude`,
-or `hermes`, or to a host profile resolved by the daemon. Profiles define the program,
+An agent name can refer to a base runtime such as `shell`, `claude`, `hermes`,
+or `codex` once its official package is installed, or to a host profile
+resolved by the daemon. A name that is neither is `agent_profile_not_found`;
+for `codex` without its package the hint names the catalog install of the
+official package. Profiles define the program,
 arguments, optional environment entries, input behavior, resume behavior, and
 manifest metadata for that host.
 
@@ -242,7 +245,11 @@ launch binding (runtime id plus where its definition came from). A profile whose
 `runtime_not_installed`; a `base` that is not a runtime id fails with
 `invalid_profile`. A recovery binding whose runtime is not installed stays in the
 store, refuses resume and fork with `runtime_not_installed`, and works again once
-the runtime is installed. `session stop` and `session rm` still work on such
+the runtime is installed. The exception is a session launched from the built-in
+runtime of an official alias this daemon does not compile in (the built-in Codex
+of an earlier release): it is refused with `runtime_builtin_removed`, and
+installing the official package restores interaction with a live session only,
+never resume or fork (`runtime_served_by_package`). `session stop` and `session rm` still work on such
 a session (or one whose recorded kind is a historical label): they release the
 worker and the session's worktrees and never launch, resume, fork or write
 input, so they need no runtime definition. Removal keeps its fail-closed
@@ -266,8 +273,12 @@ package = "acme.runtime"                        # the package id
 digest = "sha256:<64 lowercase hex digits>"     # the archive digest to launch from
 ```
 
-- A profile over a built-in base (`shell`, `codex`, `claude`, `hermes`) has
+- A profile over a built-in base (`shell`, `claude`, `hermes`) has
   neither key; supplying them is `invalid_profile`, as is supplying only one.
+- A profile over `codex` needs the keys of its official package, because the
+  daemon compiles no Codex in. While nothing serves `codex`, a profile without
+  them is `runtime_not_installed`, and the hint names the catalog install and
+  then `pohunek plugin profile migrate <name>`.
 - A profile over a package-served base without the keys is `invalid_profile`.
   Its message names the migration command
   `pohunek plugin profile migrate <name>`, which the daemon applies under the

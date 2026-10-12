@@ -24,6 +24,7 @@ use protocol::{ErrorClass, IntegrationHome, IntegrationSelector, ProtocolError, 
 use super::handler::{self, Resolved};
 use super::{config_dir_invalid, config_path_kind, ConfigPath};
 use crate::agent::host::{ConfigHome, HomeError, RuntimeHost, Transcripts};
+use crate::agent::ProfileEnv;
 use crate::agent::{ProfileRegistry, ResolvedAgent};
 use crate::runtime::environment::effective_variable;
 
@@ -137,10 +138,22 @@ impl ConfigHomes {
     }
 
     /// The runtimes `agent` selects: that runtime, else every runtime that
-    /// names a daemon-run handler and declares a config home.
-    fn runtimes(&self, agent: Option<&RuntimeRef>) -> Result<Vec<Resolved>, ProtocolError> {
+    /// names a daemon-run handler and declares a config home. With
+    /// [`Reach::Existing`] a named official alias nothing serves resolves to
+    /// its retired built-in ([`handler::retired`]).
+    fn runtimes(
+        &self,
+        agent: Option<&RuntimeRef>,
+        reach: Reach,
+    ) -> Result<Vec<Resolved>, ProtocolError> {
         match agent {
-            Some(agent) => Ok(vec![handler::resolve(self.host(), agent)?]),
+            Some(agent) => Ok(vec![match handler::resolve(self.host(), agent) {
+                Ok(resolved) => resolved,
+                Err(error) => match reach {
+                    Reach::Existing => handler::retired(self.host(), agent).ok_or(error)?,
+                    Reach::Served => return Err(error),
+                },
+            }]),
             None => Ok(handler::managed(self.host())
                 .into_iter()
                 .filter(|resolved| resolved.config_home.is_some())
@@ -180,35 +193,63 @@ impl ConfigHomes {
     /// `agent_profile_not_found` when no profile file has that name,
     /// `integration_profile_runtime_mismatch` when it extends another runtime
     /// than `agent`, and `agent_not_installable` when its runtime has no
-    /// daemon-run handler.
+    /// daemon-run handler. With [`Reach::Existing`] a profile over an official
+    /// alias nothing serves resolves to the alias's retired built-in under the
+    /// profile's own environment ([`Self::retired_profile`]); otherwise the
+    /// profile's resolution error.
     fn profile(
         &self,
         agent: Option<&RuntimeRef>,
         name: &str,
+        reach: Reach,
     ) -> Result<(Resolved, Vec<(String, String)>), ProtocolError> {
-        let resolved_agent = self.profiles.resolve_agent(name)?;
+        let resolved_agent = match (self.profiles.resolve_agent(name), reach) {
+            (Ok(resolved_agent), _) => resolved_agent,
+            (Err(error), Reach::Existing) => {
+                return self.retired_profile(agent, name)?.ok_or(error);
+            }
+            (Err(error), Reach::Served) => return Err(error),
+        };
         let Some(profile) = resolved_agent.profile.as_ref() else {
             return Err(crate::agent::agent_profile_not_found(name));
         };
         let base = resolved_agent.definition.runtime_id().as_str();
         if let Some(agent) = agent.filter(|agent| agent.as_wire() != base) {
-            return Err(ProtocolError::new(
-                ErrorClass::Configuration,
-                "integration_profile_runtime_mismatch",
-                format!(
-                    "profile `{name}` extends runtime `{base}`, not `{}`",
-                    agent.as_wire()
-                ),
-                Some(format!(
-                    "pass --agent {base}, or a profile of {}",
-                    agent.as_wire()
-                )),
-            ));
+            return Err(profile_runtime_mismatch(name, base, agent));
         }
         self.host().verify_launchable(&resolved_agent.definition)?;
         let resolved = handler::resolved(&resolved_agent.definition, RuntimeRef::from_wire(base))
             .ok_or_else(|| handler::not_installable(base))?;
         Ok((resolved, profile.env.as_slice().to_vec()))
+    }
+
+    /// The profile `name` whose base is an official alias nothing serves, as
+    /// the alias's retired built-in under the profile's own environment.
+    ///
+    /// Such a profile never resolves, but the hooks a release that compiled
+    /// the built-in in installed into its home stay there. `None` when no
+    /// profile file has that name or its base resolves to no retired
+    /// built-in.
+    ///
+    /// # Errors
+    ///
+    /// The load error of an unsafe or malformed profile file, and
+    /// `integration_profile_runtime_mismatch` when its base is not `agent`.
+    fn retired_profile(
+        &self,
+        agent: Option<&RuntimeRef>,
+        name: &str,
+    ) -> Result<Option<(Resolved, ProfileEnv)>, ProtocolError> {
+        let Some((base, env)) = self.profiles.unresolved_base_env(name)? else {
+            return Ok(None);
+        };
+        let Some(resolved) = handler::retired(self.host(), &RuntimeRef::from(base.clone())) else {
+            return Ok(None);
+        };
+        if let Some(agent) = agent.filter(|agent| agent.as_wire() != base.as_str()) {
+            return Err(profile_runtime_mismatch(name, base.as_str(), agent));
+        }
+        Ok(Some((resolved, env)))
     }
 
     /// The host profiles that extend `runtime_id`, sorted by name.
@@ -235,21 +276,58 @@ impl ConfigHomes {
         agent: Option<&RuntimeRef>,
         selection: &HomeSelection,
     ) -> Result<Vec<Target>, ProtocolError> {
+        self.targets_reaching(agent, selection, Reach::Served)
+    }
+
+    /// [`Self::targets`] for inspecting or removing hooks that already exist:
+    /// a named official alias nothing serves addresses the config home of its
+    /// retired built-in, so the hooks that built-in installed can be reported
+    /// and removed without a package.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::targets`].
+    pub(super) fn existing_targets(
+        &self,
+        agent: Option<&RuntimeRef>,
+        selection: &HomeSelection,
+    ) -> Result<Vec<Target>, ProtocolError> {
+        self.targets_reaching(agent, selection, Reach::Existing)
+    }
+
+    fn targets_reaching(
+        &self,
+        agent: Option<&RuntimeRef>,
+        selection: &HomeSelection,
+        reach: Reach,
+    ) -> Result<Vec<Target>, ProtocolError> {
         let targets = match selection {
             HomeSelection::Runtime => self
-                .runtimes(agent)?
+                .runtimes(agent, reach)?
                 .into_iter()
                 .map(|resolved| self.target(resolved, None, false))
                 .collect(),
             HomeSelection::Profile(name) => {
-                let (resolved, env) = self.profile(agent, name)?;
+                let (resolved, env) = self.profile(agent, name, reach)?;
                 vec![self.target(resolved, Some((name, &env)), true)]
             }
             HomeSelection::All => {
                 let mut targets = Vec::new();
-                for resolved in self.runtimes(agent)? {
-                    let profiles = self.profiles_of(resolved.runtime_id.as_str());
+                for resolved in self.runtimes(agent, reach)? {
                     targets.push(self.target(resolved.clone(), None, true));
+                    if reach == Reach::Existing
+                        && self.host().served_by(&resolved.runtime_id).is_none()
+                    {
+                        // A retired built-in: none of its profiles resolves,
+                        // so each is addressed by its own environment.
+                        for (name, env) in
+                            self.profiles.unresolved_profiles_on(&resolved.runtime_id)
+                        {
+                            targets.push(self.target(resolved.clone(), Some((&name, &env)), true));
+                        }
+                        continue;
+                    }
+                    let profiles = self.profiles_of(resolved.runtime_id.as_str());
                     for profile in profiles {
                         let Some(env) = profile.profile.as_ref().map(|launch| launch.env.clone())
                         else {
@@ -285,6 +363,33 @@ impl ConfigHomes {
         }
         Ok(merged)
     }
+}
+
+/// `integration_profile_runtime_mismatch`: the profile `name` extends `base`,
+/// not the runtime `agent` the request names.
+fn profile_runtime_mismatch(name: &str, base: &str, agent: &RuntimeRef) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Configuration,
+        "integration_profile_runtime_mismatch",
+        format!(
+            "profile `{name}` extends runtime `{base}`, not `{}`",
+            agent.as_wire()
+        ),
+        Some(format!(
+            "pass --agent {base}, or a profile of {}",
+            agent.as_wire()
+        )),
+    )
+}
+
+/// Which runtimes a request may address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// Only runtimes the host serves: an install acts for a launchable runtime.
+    Served,
+    /// Also a named official alias nothing serves, through its retired
+    /// built-in: inspection and removal of hooks that already exist.
+    Existing,
 }
 
 /// One config home a launch gives an agent, and whom it belongs to.

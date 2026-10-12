@@ -73,7 +73,10 @@ pub const CODE_RECOVERY_UNVERIFIED: &str = "native_recovery_unverified";
 /// serve: a built-in runtime it does not ship or an official package serves
 /// in its place, or a package digest that is not installed. The worker is
 /// adopted, but resume and fork are refused, because no other source stands
-/// in for the pinned one.
+/// in for the pinned one. While the session's runtime resolves nowhere (a
+/// built-in it does not ship and no package serves, or a runtime that is not
+/// installed), every interaction with the session is refused too, whether or
+/// not it can resume.
 pub const CODE_RUNTIME_SOURCE_NOT_SERVED: &str = "runtime_source_not_served";
 /// The metadata store is unusable, so the new daemon cannot start.
 pub const CODE_STORE_UNUSABLE: &str = "store_unusable";

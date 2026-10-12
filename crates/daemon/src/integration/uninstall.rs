@@ -60,7 +60,7 @@ pub fn uninstall_in(
     let per_home = matches!(selection, HomeSelection::All);
     let mut uninstalled = Vec::new();
     let mut failed = Vec::new();
-    for target in homes.targets(Some(agent), selection)? {
+    for target in homes.existing_targets(Some(agent), selection)? {
         match uninstall_target(&target) {
             Ok(report) => uninstalled.push(report),
             Err(error) if per_home => failed.push(IntegrationHomeFailure {

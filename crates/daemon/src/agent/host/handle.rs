@@ -18,7 +18,7 @@ use protocol::{BindingProvenance, LaunchBinding, PackageId, ProtocolError, Runti
 use tracing::warn;
 
 use super::builtin::BuiltinSource;
-use super::claim::ServedBy;
+use super::claim::{is_reserved, ServedBy};
 use super::definition::{DefinitionError, LaunchProgram, RuntimeDefinition};
 use super::launch::{check_pin, LaunchPin};
 use super::package::{PackageSource, PackageStore, RejectedPackage};
@@ -339,16 +339,20 @@ impl RuntimeHost {
     ///
     /// Returns `agent_kind_unsupported` for a value that is not a runtime id,
     /// `runtime_served_by_package` for a built-in or unpinned snapshot of an
-    /// official alias a package serves, `runtime_not_installed` for any other
-    /// runtime or package that is not installed or does not match the pin, and
-    /// `runtime_incompatible` for a pinned package whose root fails
-    /// verification.
+    /// official alias a package serves, `runtime_builtin_removed` for a
+    /// built-in or unpinned snapshot of an official alias nothing serves,
+    /// `runtime_not_installed` for any other runtime or package that is not
+    /// installed or does not match the pin, and `runtime_incompatible` for a
+    /// pinned package whose root fails verification.
     pub fn resolve_pinned(
         &self,
         reference: &RuntimeRef,
         pin: &LaunchPin,
     ) -> Result<Arc<RuntimeDefinition>, ProtocolError> {
         let runtime_id = reference.launchable()?;
+        if let Some(refusal) = self.removed_builtin(runtime_id, pin) {
+            return Err(refusal);
+        }
         let (
             Some(store),
             Some(LaunchBinding {
@@ -423,14 +427,19 @@ impl RuntimeHost {
     ///
     /// # Errors
     ///
-    /// Returns `agent_kind_unsupported` for a value that is not a runtime id
-    /// and `runtime_not_installed` when neither condition holds.
+    /// Returns `agent_kind_unsupported` for a value that is not a runtime id,
+    /// `runtime_builtin_removed` for a built-in or unpinned snapshot of an
+    /// official alias nothing serves, and otherwise `runtime_not_installed`
+    /// when neither condition holds.
     pub fn ensure_session_runtime(
         &self,
         reference: &RuntimeRef,
         pin: &LaunchPin,
     ) -> Result<(), ProtocolError> {
         let runtime_id = reference.launchable()?;
+        if let Some(refusal) = self.removed_builtin(runtime_id, pin) {
+            return Err(refusal);
+        }
         let resolved = self.resolve_id(runtime_id).map(|_definition| ());
         let (Err(_), Some(store), Some(binding)) = (&resolved, self.package_store(), pin.binding())
         else {
@@ -515,6 +524,29 @@ impl RuntimeHost {
             .read_legacy_integration_handler(package_digest, package)
             .ok()??;
         pohunek_worker_protocol::hook_schema_for_handler(handler.as_str())
+    }
+
+    /// The refusal of a session launched from the built-in runtime of the
+    /// official alias `runtime_id` while nothing serves that alias: this
+    /// daemon does not compile the built-in in and no official package is
+    /// installed, enabled and selected for it.
+    ///
+    /// A session was launched from the built-in when its pin names it, or when
+    /// it carries no pin, which only a built-in serves (see [`check_pin`]). A
+    /// package serving the alias is not a stand-in for the built-in, so the
+    /// refusal names the install and a new session.
+    fn removed_builtin(&self, runtime_id: &RuntimeId, pin: &LaunchPin) -> Option<ProtocolError> {
+        let built_in = match pin {
+            LaunchPin::Unpinned => true,
+            LaunchPin::Pinned(binding) => {
+                binding.runtime_id == *runtime_id
+                    && matches!(binding.provenance, BindingProvenance::Builtin { .. })
+            }
+        };
+        // The shell is reserved too, but every daemon compiles it in.
+        let removed =
+            built_in && is_reserved(runtime_id) && self.registry().resolve(runtime_id).is_err();
+        removed.then(|| ProtocolError::runtime_builtin_removed(runtime_id))
     }
 
     fn snapshot(&self) -> Arc<HostState> {

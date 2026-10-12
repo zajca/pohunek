@@ -6,6 +6,9 @@
 //! test whose verdict needs the session's runtime served by this binary
 //! rebinds the fixture's Claude session to a runtime it ships built in.
 
+#[path = "support/official_runtimes.rs"]
+mod official_runtimes;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -1005,5 +1008,135 @@ fn a_session_pinned_to_a_runtime_source_this_binary_does_not_serve_loses_recover
             "{case}: an unpinned session of a served built-in is unchanged"
         );
         assert_eq!(host.snapshot(), before, "{case}: nothing is written");
+    }
+}
+
+/// A Codex session the v0.33.0 daemon launched from its built-in runtime loses
+/// its recovery on this binary, which ships no Codex: without the official
+/// package the pin names a built-in that is gone, and with the package the
+/// package serves `codex` in place of the built-in the session was launched
+/// from. Either way the migration is a new session.
+#[tokio::test]
+async fn a_session_of_the_built_in_codex_loses_recovery_with_or_without_the_official_package() {
+    for (preinstalled, refusal) in [
+        (false, "runtime_builtin_removed"),
+        (true, "runtime_served_by_package"),
+    ] {
+        let host = Host::new();
+        if preinstalled {
+            official_runtimes::OfficialCatalog::new()
+                .preinstall(&host.inputs().plugins_dir, host.env.root())
+                .await;
+        }
+        let mut line = session_line("s-1", "w-fixture");
+        rebind_agent(&mut line, "codex");
+        host.write_store(&[line]);
+        host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
+
+        let report = host.report();
+
+        assert_eq!(
+            verdict_of(&report, "s-1"),
+            (&Verdict::WouldLoseRecovery, CODE_RUNTIME_SOURCE_NOT_SERVED),
+            "package installed: {preinstalled}: {:?}",
+            report.sessions
+        );
+        let detail = &report
+            .sessions
+            .iter()
+            .find(|verdict| verdict.session_id == "s-1")
+            .expect("the verdict of s-1")
+            .detail;
+        assert!(detail.contains(refusal), "{detail}");
+        assert!(
+            detail.contains("`pohunek session new --agent codex`"),
+            "{detail}"
+        );
+        // Without the package the adopted session refuses input too, which
+        // installing the package before the upgrade avoids.
+        assert_eq!(
+            detail.contains(
+                "`pohunek plugin install runtime/packages/codex.tar.zst --catalog runtime/runtime-catalog.json`"
+            ),
+            !preinstalled,
+            "{detail}"
+        );
+    }
+}
+
+/// A live Codex session the v0.33.0 daemon launched from its built-in runtime
+/// that cannot resume or fork (a host profile with `[resume] resumable =
+/// false`) still depends on the runtime source: this binary ships no Codex, so
+/// without the official package every interaction with the adopted session is
+/// refused, and installing the package restores interaction only, never
+/// resume or fork. The preflight reports that loss instead of `adoptable`;
+/// with the package installed the session has nothing left to lose.
+#[tokio::test]
+async fn a_built_in_codex_session_without_native_recovery_is_at_risk_only_without_the_package() {
+    for preinstalled in [false, true] {
+        for keep_recovery in [true, false] {
+            let case =
+                format!("package installed: {preinstalled}, recovery record kept: {keep_recovery}");
+            let host = Host::new();
+            if preinstalled {
+                official_runtimes::OfficialCatalog::new()
+                    .preinstall(&host.inputs().plugins_dir, host.env.root())
+                    .await;
+            }
+            let mut line = session_line("s-1", "w-fixture");
+            rebind_agent(&mut line, "codex");
+            line["info"]["capabilities"] = json!({ "resume": false, "fork": false });
+            if keep_recovery {
+                // The v0.33.0 binding of a profile that resumes and forks nothing.
+                line["recovery"]["resumable"] = json!(false);
+                line["recovery"]["forkable"] = json!(false);
+            } else {
+                line["recovery"] = Value::Null;
+            }
+            host.write_store(&[line]);
+            host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
+
+            let report = host.report();
+
+            if preinstalled {
+                assert_eq!(
+                    verdict_of(&report, "s-1"),
+                    (&Verdict::Adoptable, CODE_ADOPTABLE),
+                    "{case}: {:?}",
+                    report.sessions
+                );
+                continue;
+            }
+            assert_eq!(
+                verdict_of(&report, "s-1"),
+                (&Verdict::WouldLoseRecovery, CODE_RUNTIME_SOURCE_NOT_SERVED),
+                "{case}: {:?}",
+                report.sessions
+            );
+            let detail = &report
+                .sessions
+                .iter()
+                .find(|verdict| verdict.session_id == "s-1")
+                .expect("the verdict of s-1")
+                .detail;
+            assert!(detail.contains("runtime_builtin_removed"), "{detail}");
+            assert!(detail.contains("every interaction"), "{detail}");
+            assert!(
+                detail.contains(
+                    "`pohunek plugin install runtime/packages/codex.tar.zst --catalog runtime/runtime-catalog.json`"
+                ),
+                "{detail}"
+            );
+            // The install restores interaction only: resume and fork are
+            // never tied to it.
+            assert!(
+                detail.contains("resume and fork stay refused even after that install"),
+                "{detail}"
+            );
+            assert!(
+                !detail.contains("resume and fork are refused until"),
+                "{detail}"
+            );
+        }
     }
 }

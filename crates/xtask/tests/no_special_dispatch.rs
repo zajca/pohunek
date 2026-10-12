@@ -10,7 +10,11 @@
 //!
 //! The names that remain are data, work owned by another issue, or the
 //! implementation of a compiled integration handler (which runtime uses a
-//! handler is decided by its descriptor, never by a name here). Each
+//! handler is decided by its descriptor, never by a name here). The one
+//! exception is the frozen descriptor data of a retired built-in that a handler
+//! keeps (`RetiredBuiltin`, the 0.34 built-in Codex): it binds the official
+//! alias to the handler by name, but only to inspect and remove hooks that
+//! built-in installed while nothing serves the alias, never to install. Each
 //! allow-list entry pins the exact trimmed text of every source line that still
 //! names an agent in one file (a SHA-256 over those lines for the large
 //! integration files owned wholesale by one issue) and states which issue
@@ -19,7 +23,7 @@
 //! fail the scan until the entry is updated. `regenerate_allow_list` (ignored)
 //! prints the entries of the current tree.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -38,13 +42,16 @@ const AGENT_NAMES: [&str; 3] = ["codex", "claude", "hermes"];
 /// Who removes an allow-listed occurrence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Owner {
-    /// Compiled descriptor data that becomes package data when the built-in
-    /// Codex, Claude and Hermes packages exist.
+    /// Compiled descriptor data of the built-in Claude and Hermes runtimes,
+    /// which their official packages replace.
     Packages,
     /// Compiled integration handler implementations. A handler is selected by
     /// the id a runtime descriptor names; the Claude and Codex handlers still
     /// own their provider ids, config paths and asset code, which is data of
-    /// the handler and not dispatch.
+    /// the handler and not dispatch. The exception is a retired built-in's
+    /// frozen descriptor data (`RetiredBuiltin`), which selects the handler by
+    /// the alias name for inspecting and removing existing hooks only, never
+    /// for an install.
     Handlers,
     /// The profile doctor reports runtime integrations it cannot inspect (#68).
     Doctor,
@@ -55,7 +62,7 @@ enum Owner {
 impl Owner {
     fn issue(self) -> &'static str {
         match self {
-            Self::Packages => "#145 #146 #147",
+            Self::Packages => "#146 #147",
             Self::Handlers => "handlers",
             Self::Doctor => "#68",
             Self::Data => "data",
@@ -88,10 +95,8 @@ const ALLOW_LIST: &[Entry] = &[
         "crates/daemon/src/agent/host/builtin.rs",
         Approved::Lines(&[
     "\"claude\" => detect::claude_manifest(),",
-    "\"codex\" => detect::codex_manifest(),",
     "\"hermes\" => detect::hermes_manifest(),",
     "include_str!(\"../builtin/claude.toml\"),",
-    "include_str!(\"../builtin/codex.toml\"),",
     "include_str!(\"../builtin/hermes.toml\"),",
 ]),
         Owner::Packages,
@@ -129,14 +134,6 @@ const ALLOW_LIST: &[Entry] = &[
         "the Hermes safe-text input policy a descriptor selects by name",
     ),
     (
-        "crates/daemon/src/agent/profile.rs",
-        Approved::Lines(&[
-    "\"use shell|codex|claude|hermes, or add ~/.config/pohunek/agents/<name>.toml on the target host\"",
-]),
-        Owner::Data,
-        "recovery hint listing the built-in runtime ids",
-    ),
-    (
         "crates/daemon/src/capabilities.rs",
         Approved::Lines(&[
     "\"hermes-v1\" => Some(Self::HermesV1),",
@@ -170,17 +167,13 @@ const ALLOW_LIST: &[Entry] = &[
     (
         "crates/daemon/src/detect/mod.rs",
         Approved::Lines(&[
+    "(protocol::RuntimeId::CLAUDE, CLAUDE_MANIFEST),",
+    "(protocol::RuntimeId::HERMES, HERMES_MANIFEST),",
     ".get_or_init(|| Manifest::parse_str(CLAUDE_MANIFEST).expect(\"claude manifest must parse\"))",
     ".get_or_init(|| Manifest::parse_str(HERMES_MANIFEST).expect(\"Hermes manifest must parse\"))",
-    "MANIFEST.get_or_init(|| Manifest::parse_str(CODEX_MANIFEST).expect(\"codex manifest must parse\"))",
     "const CLAUDE_MANIFEST: &str = include_str!(\"manifests/claude.toml\");",
-    "const CODEX_MANIFEST: &str = include_str!(\"manifests/codex.toml\");",
     "const HERMES_MANIFEST: &str = include_str!(\"manifests/hermes.toml\");",
-    "CODEX_MANIFEST,",
-    "CLAUDE_MANIFEST,",
-    "HERMES_MANIFEST,",
     "pub fn claude_manifest() -> &'static Manifest {",
-    "pub fn codex_manifest() -> &'static Manifest {",
     "pub fn hermes_manifest() -> &'static Manifest {",
 ]),
         Owner::Packages,
@@ -228,9 +221,13 @@ const ALLOW_LIST: &[Entry] = &[
     "Handler::Daemon(&CodexHook),",
     "Ok(Box::new(stage_claude(dir)?))",
     "Ok(Box::new(stage_codex(dir)?))",
+    "Some(&CODEX_RETIRED)",
     "StagedCodex, StatusAgent, CLAUDE_REPORTED_ACTIONS, CODEX_REPORTED_ACTIONS,",
     "actions: HERMES_REPORTED_ACTIONS,",
+    "config_default: \".codex\",",
+    "config_env: \"CODEX_HOME\",",
     "const HERMES_REPORTED_ACTIONS: &[HookAction] = &[",
+    "display_name: \"Codex\",",
     "id: \"hermes-hook-v1\",",
     "impl DaemonHandler for ClaudeHook {",
     "impl DaemonHandler for CodexHook {",
@@ -241,12 +238,14 @@ const ALLOW_LIST: &[Entry] = &[
     "reported_agent_status(StatusAgent::Claude, home)",
     "reported_agent_status(StatusAgent::Codex, home)",
     "reported_agent_status, stage_claude, stage_codex, AssetManifest, InstallPaths, StagedClaude,",
+    "runtime_id: \"codex\",",
+    "static CODEX_RETIRED: RetiredBuiltin = RetiredBuiltin {",
     "static HERMES_HOOK: CliRunHandler = CliRunHandler {",
     "struct ClaudeHook;",
     "struct CodexHook;",
 ]),
         Owner::Handlers,
-        "compiled Claude and Codex handler implementations: they own their provider ids, paths and asset code",
+        "compiled Claude and Codex handler implementations: they own their provider ids, paths and asset code; CODEX_RETIRED is the frozen descriptor data of the retired 0.34 built-in Codex, which binds the alias to the handler by name for inspecting and removing existing hooks only, never for an install",
     ),
     (
         "crates/daemon/src/integration/uninstall.rs",

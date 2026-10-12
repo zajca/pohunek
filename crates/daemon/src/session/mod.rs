@@ -403,7 +403,7 @@ pub struct SessionRegistryConfig {
     /// in-repo layer). Read through [`SessionRegistry::config_dir`].
     pub config_dir: Option<PathBuf>,
     /// Directory holding host agent profiles (`<config_dir>/agents`). `None`
-    /// disables host profiles (a bare `shell`/`codex`/`claude` still resolves).
+    /// disables host profiles (a bare installed runtime id still resolves).
     /// Part C: a profile extends a base kind with program/args/env/input-rules.
     pub agents_dir: Option<PathBuf>,
     /// Application state directory whose host-state subdirectory holds the
@@ -5017,8 +5017,11 @@ impl SessionRegistry {
     ///
     /// # Errors
     ///
-    /// Returns `agent_kind_unsupported` for a kind that is not a runtime id and
-    /// `runtime_not_installed` for a runtime id no definition backs.
+    /// Returns `agent_kind_unsupported` for a kind that is not a runtime id,
+    /// `runtime_builtin_removed` for a session launched from the built-in
+    /// runtime of an official alias this daemon does not compile in while
+    /// nothing serves the alias, and `runtime_not_installed` for any other
+    /// runtime id no definition backs.
     fn ensure_mutable_kinds(
         &self,
         info: &SessionInfo,
@@ -5029,11 +5032,11 @@ impl SessionRegistry {
         if let Some(active) = &info.active_agent_base {
             // An active agent that is the session's own runtime is covered by
             // the session's pin; any other runtime must resolve on its own.
-            let own = active == &info.agent_base;
-            runtimes.ensure_session_runtime(
-                active,
-                if own { pin } else { &host::LaunchPin::Unpinned },
-            )?;
+            if active == &info.agent_base {
+                runtimes.ensure_session_runtime(active, pin)?;
+            } else {
+                runtimes.resolve_ref(active)?;
+            }
         }
         Ok(())
     }

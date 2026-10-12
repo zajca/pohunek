@@ -20,9 +20,13 @@
 //! A handler never decides where its asset set lives. The config home comes
 //! from the runtime descriptor and the environment a launch would give the agent
 //! ([`ConfigHomes`]), so each home a runtime can launch with is its own
-//! transaction.
+//! transaction. The one exception is cleanup after a built-in runtime this
+//! build does not compile in: the handler keeps that built-in's config home
+//! ([`RetiredBuiltin`]) so the hooks it installed can be inspected and removed
+//! while no package serves the runtime ([`retired`]); nothing is installed
+//! through it.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 use std::collections::BTreeSet;
 use std::fmt::Debug;
@@ -39,7 +43,7 @@ use protocol::{
 use super::commit::StepGate;
 use super::homes::{ConfigHomes, HomeSelection, Target};
 use super::{config_dir_is_symlink, config_path_kind, report, ConfigPath, InstallPaths};
-use crate::agent::host::{ConfigHome, RuntimeHost};
+use crate::agent::host::{is_reserved, ConfigHome, RuntimeHost};
 
 /// Error code for an update whose asset set is not compatible with the active
 /// set or with the runtime's hook schema.
@@ -151,6 +155,31 @@ pub trait DaemonHandler: Send + Sync + Debug {
         runtime: &RuntimeRef,
         dir: &Path,
     ) -> Result<IntegrationUninstallReport, ProtocolError>;
+
+    /// The built-in runtime of an earlier release that used this handler and
+    /// that this build does not compile in, if any.
+    fn retired_builtin(&self) -> Option<&'static RetiredBuiltin> {
+        None
+    }
+}
+
+/// What a built-in runtime of an earlier release declared about its hooks,
+/// kept by the handler that installed them after the built-in is gone.
+///
+/// The values are the built-in's descriptor data at the last release that
+/// compiled it in; they only locate and describe hooks that already exist.
+#[derive(Debug)]
+pub struct RetiredBuiltin {
+    /// Runtime id the built-in served, an official alias.
+    pub runtime_id: &'static str,
+    /// Display name of the built-in.
+    pub display_name: &'static str,
+    /// `[config_home] env` of the built-in descriptor.
+    pub config_env: &'static str,
+    /// `[config_home] default` of the built-in descriptor.
+    pub config_default: &'static str,
+    /// `[integration] hook_schema` of the built-in descriptor.
+    pub hook_schema: &'static str,
 }
 
 /// Why `schema` cannot carry the asset set `manifest` of handler `handler`:
@@ -379,6 +408,44 @@ pub(super) fn resolved(
     })
 }
 
+/// Resolves `agent`, an official alias nothing serves, to the handler that the
+/// alias's retired built-in used, with that built-in's config home.
+///
+/// It exists so the hooks such a built-in installed can be inspected and
+/// removed without a package serving the alias; an install never resolves
+/// through it. `None` for any other runtime, an alias something serves, and an
+/// alias no handler retired.
+pub(super) fn retired(host: &RuntimeHost, agent: &RuntimeRef) -> Option<Resolved> {
+    let runtime_id = agent.launchable().ok()?;
+    if !is_reserved(runtime_id) || host.served_by(runtime_id).is_some() {
+        return None;
+    }
+    handlers().iter().find_map(|entry| {
+        let Handler::Daemon(handler) = entry else {
+            return None;
+        };
+        let retired = handler
+            .retired_builtin()
+            .filter(|retired| retired.runtime_id == runtime_id.as_str())?;
+        Some(Resolved {
+            runtime: agent.clone(),
+            runtime_id: runtime_id.clone(),
+            display_name: retired.display_name.to_owned(),
+            config_home: Some(ConfigHome::new(retired.config_env, retired.config_default).ok()?),
+            handler: *handler,
+            schema: pohunek_worker_protocol::hook_schema(retired.hook_schema)?,
+        })
+    })
+}
+
+/// Whether `agent` resolves only through [`retired`]: an official alias
+/// nothing serves whose retired built-in's hooks can still be inspected and
+/// removed.
+#[must_use]
+pub fn serves_retired(host: &RuntimeHost, agent: &RuntimeRef) -> bool {
+    retired(host, agent).is_some()
+}
+
 /// Every runtime of the host that names a daemon-run handler.
 ///
 /// Built-in runtimes are visited before package runtimes, each group in runtime
@@ -593,7 +660,7 @@ pub fn status_in(
         all_profiles,
     } = params;
     let selection = HomeSelection::from_params(profile, all_profiles)?;
-    let targets = homes.targets(agent.as_ref(), &selection)?;
+    let targets = homes.existing_targets(agent.as_ref(), &selection)?;
     Ok(IntegrationStatusResult {
         agents: targets.iter().map(inspect_target).collect(),
         home_selectors: true,

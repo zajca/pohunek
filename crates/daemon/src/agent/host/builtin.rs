@@ -1,8 +1,9 @@
 //! The runtimes compiled into the daemon.
 //!
-//! Codex, Claude and Hermes are parsed from embedded `runtime.toml`
-//! descriptors. The shell has no package identity and no native resume, so it
-//! is assembled from explicit parts around the host's login shell.
+//! Claude and Hermes are parsed from embedded `runtime.toml` descriptors. Codex
+//! is not compiled in; only its official runtime package serves it. The shell
+//! has no package identity and no native resume, so it is assembled from
+//! explicit parts around the host's login shell.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,8 +19,7 @@ use crate::agent::InputRules;
 use crate::detect::{self, Manifest};
 
 /// Embedded descriptors of the built-in agent runtimes.
-const EMBEDDED_DESCRIPTORS: [&str; 3] = [
-    include_str!("../builtin/codex.toml"),
+const EMBEDDED_DESCRIPTORS: [&str; 2] = [
     include_str!("../builtin/claude.toml"),
     include_str!("../builtin/hermes.toml"),
 ];
@@ -34,7 +34,7 @@ const SHELL_DISPLAY_NAME: &str = "Shell";
 /// integration handler of its own.
 const SHELL_HOOK_SCHEMA: &str = "identity-subagent-v1";
 
-/// Supplies the shell, Codex, Claude and Hermes definitions.
+/// Supplies the shell, Claude and Hermes definitions.
 #[derive(Debug, Clone)]
 pub struct BuiltinSource {
     shell_program: String,
@@ -111,7 +111,6 @@ impl RuntimeSource for BuiltinSource {
 fn embedded_manifest(name: &str) -> Result<Arc<Manifest>, DefinitionError> {
     let manifest = match name {
         "shell" => detect::generic_shell_manifest(),
-        "codex" => detect::codex_manifest(),
         "claude" => detect::claude_manifest(),
         "hermes" => detect::hermes_manifest(),
         _ => return Err(DefinitionError::UnknownManifest),

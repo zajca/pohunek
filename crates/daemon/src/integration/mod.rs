@@ -51,7 +51,8 @@ pub use doctor::doctor;
 #[cfg(unix)]
 pub use doctor::doctor_in;
 pub use handler::{
-    install_in, status_in, AssetManifest, DaemonHandler, Handler, RetainedSchemas, StagedUpdate,
+    install_in, serves_retired, status_in, AssetManifest, DaemonHandler, Handler, RetainedSchemas,
+    RetiredBuiltin, StagedUpdate,
 };
 #[cfg(all(test, unix))]
 pub use homes::process_environment::uninstall_for;

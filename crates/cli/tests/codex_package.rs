@@ -7,8 +7,9 @@
 //! and the screens captured from a real Codex (`compat/codex/screens`).
 //! The daemon-backed tests install the built archive through `pohunek plugin
 //! install --catalog` against a throwaway signing key and trust anchor, so the
-//! package serves `codex` with official trust. The real-Codex tests additionally
-//! drive an actual `codex` binary; see their documentation for the opt-in.
+//! package serves `codex` with official trust; the daemon compiles no Codex in,
+//! so nothing else serves it. The real-Codex tests additionally drive an actual
+//! `codex` binary; see their documentation for the opt-in.
 
 // Rust guideline compliant 2026-10-12
 
@@ -38,6 +39,7 @@ use pohunek_daemon::detect::{
 use pohunek_daemon::procwatch::{ProcessFact, StartIdentity};
 use pohunek_daemon::session::HostTrustAnchor;
 use pohunek_test_support::fs::write_executable;
+use pohunek_test_support::process_env::ProcessEnv;
 use pohunek_test_support::wait::{poll_until, wait_until};
 use pohunek_test_support::workspace_root;
 use protocol::{
@@ -70,10 +72,12 @@ const LOCK_PATH: &str = "compat/codex/compatibility-lock.json";
 /// Captured screens, relative to the workspace root.
 const SCREENS_DIR: &str = "compat/codex/screens";
 
-/// Built-in Codex descriptor, relative to the workspace root.
+/// Where release [`GOLDEN_TAG`] kept the built-in Codex descriptor, relative
+/// to the workspace root; the golden's header names it.
 const BUILTIN_DESCRIPTOR: &str = "crates/daemon/src/agent/builtin/codex.toml";
 
-/// Built-in Codex detection manifest, relative to the workspace root.
+/// Where release [`GOLDEN_TAG`] kept the built-in Codex detection manifest,
+/// relative to the workspace root; the golden's header names it.
 const BUILTIN_MANIFEST: &str = "crates/daemon/src/detect/manifests/codex.toml";
 
 /// Release whose built-in Codex descriptor and manifest the goldens copy.
@@ -345,7 +349,7 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
     ] {
         assert!(package.contains_key(section), "[{section}] is declared");
     }
-    let transcripts = package.remove("transcripts").expect("[transcripts]");
+    package.remove("transcripts");
     let golden_text = golden_body(GOLDEN_DESCRIPTOR, BUILTIN_DESCRIPTOR);
     let golden: toml::Table = golden_text.parse().expect("the golden is TOML");
     assert!(
@@ -353,20 +357,6 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
         "v0.34.2 declares no transcript tree"
     );
     assert_eq!(package, strip(golden));
-
-    // Holds while the daemon embeds the built-in descriptor: its bytes are the
-    // golden bytes followed by the transcript tree the package declares.
-    let builtin_text = fs::read_to_string(workspace_root().join(BUILTIN_DESCRIPTOR))
-        .expect("read the built-in descriptor");
-    let tail: toml::Table = builtin_text
-        .strip_prefix(&golden_text)
-        .expect("the built-in descriptor starts with the golden bytes")
-        .parse()
-        .expect("the rest of the built-in descriptor is TOML");
-    assert_eq!(
-        tail,
-        toml::Table::from_iter([("transcripts".to_owned(), transcripts)])
-    );
 }
 
 /// The manifest file is the golden built-in manifest of release v0.34.2: same
@@ -377,13 +367,6 @@ fn the_package_manifest_file_equals_the_builtin_manifest_file() {
     let golden_text = golden_body(GOLDEN_MANIFEST, BUILTIN_MANIFEST);
     let golden: toml::Table = golden_text.parse().expect("the golden is TOML");
     assert_eq!(package, golden);
-    // Holds while the daemon embeds the built-in manifest: its bytes are the
-    // golden bytes.
-    assert_eq!(
-        fs::read_to_string(workspace_root().join(BUILTIN_MANIFEST))
-            .expect("read the built-in manifest"),
-        golden_text
-    );
     let ids: Vec<&str> = package["rules"]
         .as_array()
         .expect("rules")
@@ -1939,7 +1922,7 @@ async fn a_real_codex_approval_prompt_is_blocked_by_title_and_screen() {
 /// `codex` is a reserved runtime id: an install trusted only by its digest is
 /// refused, so the package serves it through a signed catalog alone.
 #[tokio::test]
-async fn installing_the_package_is_refused_while_codex_is_a_reserved_builtin() {
+async fn installing_the_package_by_digest_is_refused_because_codex_is_reserved() {
     let harness = Harness::start().await;
     let (bytes, digest) = built_archive();
     let archive = harness.env.root().join("codex.tar.zst");
@@ -2019,6 +2002,435 @@ async fn the_package_version_probe_refuses_an_unsupported_codex_and_starts_the_s
     assert_eq!(launched["ok"]["agent_base"], "codex");
     fixture.stop(&id).await;
     fixture.finish().await;
+}
+
+/// The command that installs the official Codex package from an extracted
+/// release archive, as a recovery hint names it.
+const RELEASE_INSTALL_COMMAND: &str =
+    "`pohunek plugin install runtime/packages/codex.tar.zst --catalog runtime/runtime-catalog.json`";
+
+/// A daemon that ships no Codex and trusts a throwaway catalog key, on a host
+/// whose `PATH` finds a fake `codex` of the locked release first.
+///
+/// The daemon runs in this process and resolves launch programs on its
+/// `PATH`, and the sessions inherit the hermetic environment's `PATH`, so the
+/// environment lock is held for the host's lifetime.
+struct CleanHost {
+    harness: Harness,
+    key: ed25519_dalek::SigningKey,
+    _fakes: tempfile::TempDir,
+    _path: ProcessEnv,
+}
+
+impl CleanHost {
+    async fn start() -> Self {
+        let mut path = ProcessEnv::lock();
+        let fakes = pohunek_test_support::tempdir().expect("create the fake codex directory");
+        let fake = write_fake_codex(
+            fakes.path(),
+            "bin",
+            &format!("codex-cli {}", locked_release()),
+        );
+        let directory = fake.parent().expect("the fake codex directory");
+        let mut search = std::ffi::OsString::from(directory);
+        if let Some(inherited) = std::env::var_os("PATH") {
+            search.push(":");
+            search.push(inherited);
+        }
+        path.set("PATH", search);
+        let key = test_key();
+        let anchor =
+            HostTrustAnchor::new(vec![root_of(&key, WINDOW_START, WINDOW_END)], Vec::new())
+                .expect("the test trust anchor");
+        let harness = Harness::start_with_trust(CatalogTrust::Loaded(anchor)).await;
+        Self {
+            harness,
+            key,
+            _fakes: fakes,
+            _path: path,
+        }
+    }
+
+    /// `session new --agent <agent>` in the environment's working directory.
+    async fn launch(&self, agent: &str) -> (i32, Value) {
+        let cwd = self.harness.env.cwd().to_path_buf();
+        self.harness
+            .json(&["session", "new", "--agent", agent, "--cwd", path_str(&cwd)])
+            .await
+    }
+
+    async fn stop(self) {
+        self.harness.stop().await;
+    }
+}
+
+/// The recovery hint of the refusal `refused`.
+fn recovery_hint(refused: &Value) -> &str {
+    refused["err"]["recover"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a recovery hint: {refused}"))
+}
+
+/// The daemon serves `codex` from nothing but the official package: a host
+/// without it refuses the bare runtime and its hook integration with the
+/// release install as the hint, and after the catalog install the same
+/// requests launch a session pinned to the package and report the package's
+/// integration.
+#[tokio::test]
+async fn codex_launches_only_from_the_installed_official_package() {
+    let host = CleanHost::start().await;
+
+    let (code, refused) = host.launch("codex").await;
+    assert_eq!(code, 1, "no runtime serves codex: {refused}");
+    assert_eq!(
+        refused["err"]["code"], "agent_profile_not_found",
+        "{refused}"
+    );
+    let hint = recovery_hint(&refused);
+    assert!(hint.contains(RELEASE_INSTALL_COMMAND), "{hint}");
+    assert!(!hint.contains("shell|codex"), "{hint}");
+    // Installing the hook integration of `codex` needs the package too.
+    let (code, refused) = host
+        .harness
+        .json(&["integration", "install", "--agent", "codex"])
+        .await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(refused["err"]["code"], "runtime_not_installed", "{refused}");
+    assert!(
+        recovery_hint(&refused).contains(RELEASE_INSTALL_COMMAND),
+        "{refused}"
+    );
+
+    let digest = install_package(&host.harness, &host.key).await;
+    let (code, launched) = host.launch("codex").await;
+    assert_eq!(code, 0, "{launched}");
+    assert_eq!(launched["ok"]["agent_base"], "codex", "{launched}");
+    // The session pins the package digest, so the package cannot go away
+    // under it.
+    let (code, refused) = host
+        .harness
+        .json(&["plugin", "uninstall", PACKAGE_ID, "--yes"])
+        .await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(refused["err"]["code"], "package_referenced", "{refused}");
+    let (code, listed) = host.harness.json(&["plugin", "list"]).await;
+    assert_eq!(code, 0, "{listed}");
+    assert_eq!(
+        listed["ok"]["packages"][0]["digest"],
+        digest.as_str(),
+        "{listed}"
+    );
+    assert_eq!(
+        listed["ok"]["packages"][0]["origin"], "official",
+        "{listed}"
+    );
+    let (code, status) = host
+        .harness
+        .json(&["integration", "status", "--agent", "codex"])
+        .await;
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(status["ok"]["agents"][0]["agent"], "codex", "{status}");
+
+    host.stop().await;
+}
+
+/// A host profile over `codex` that pins no package names both steps while
+/// nothing serves `codex`: the release install, then the profile migration.
+/// Once the package is installed the profile must be migrated, and the
+/// migrated profile launches from the package.
+#[tokio::test]
+async fn an_unpinned_codex_profile_names_the_install_and_the_migration() {
+    let host = CleanHost::start().await;
+    host.harness.profile("my-codex", "base = \"codex\"\n");
+
+    let (code, refused) = host.launch("my-codex").await;
+    assert_eq!(code, 1, "no runtime serves the base: {refused}");
+    assert_eq!(refused["err"]["code"], "runtime_not_installed", "{refused}");
+    let hint = recovery_hint(&refused);
+    assert!(hint.contains(RELEASE_INSTALL_COMMAND), "{hint}");
+    assert!(
+        hint.contains("`pohunek plugin profile migrate my-codex`"),
+        "{hint}"
+    );
+
+    install_package(&host.harness, &host.key).await;
+    let (code, unpinned) = host.launch("my-codex").await;
+    assert_eq!(code, 1, "{unpinned}");
+    assert_eq!(unpinned["err"]["code"], "invalid_profile", "{unpinned}");
+    assert!(
+        unpinned["err"]["msg"]
+            .as_str()
+            .is_some_and(|message| message.contains("pohunek plugin profile migrate my-codex")),
+        "{unpinned}"
+    );
+    let (code, migrated) = host
+        .harness
+        .json(&["plugin", "profile", "migrate", "my-codex", "--yes"])
+        .await;
+    assert_eq!(code, 0, "{migrated}");
+    let (code, launched) = host.launch("my-codex").await;
+    assert_eq!(code, 0, "{launched}");
+    assert_eq!(launched["ok"]["agent_base"], "codex", "{launched}");
+
+    host.stop().await;
+}
+
+/// Hooks pohunek installed into `~/.codex` while a runtime served `codex` stay
+/// visible and removable after nothing serves it any more (the built-in of an
+/// earlier release is gone and no package is installed): status reports them
+/// and uninstall removes them through the core-owned Codex handler, while a new
+/// install still needs the package.
+#[tokio::test]
+async fn codex_hooks_stay_removable_without_the_official_package() {
+    let host = CleanHost::start().await;
+    let codex_home = host.harness.env.home().join(".codex");
+    fs::create_dir_all(&codex_home).expect("create the Codex home");
+    install_package(&host.harness, &host.key).await;
+    let (code, installed) = host
+        .harness
+        .json(&["integration", "install", "--agent", "codex"])
+        .await;
+    assert_eq!(code, 0, "{installed}");
+    assert!(codex_home.join("hooks.json").is_file(), "{installed}");
+    let (code, removed) = host
+        .harness
+        .json(&["plugin", "uninstall", PACKAGE_ID, "--yes"])
+        .await;
+    assert_eq!(code, 0, "{removed}");
+
+    let (code, status) = host
+        .harness
+        .json(&["integration", "status", "--agent", "codex"])
+        .await;
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(status["ok"]["agents"][0]["agent"], "codex", "{status}");
+    assert_eq!(status["ok"]["agents"][0]["state"], "current", "{status}");
+    let (code, doctor) = host
+        .harness
+        .json(&["integration", "doctor", "--agent", "codex"])
+        .await;
+    assert_eq!(code, 0, "{doctor}");
+    assert_eq!(doctor["ok"]["agents"][0]["agent"], "codex", "{doctor}");
+
+    let (code, uninstalled) = host
+        .harness
+        .json(&["integration", "uninstall", "--agent", "codex"])
+        .await;
+    assert_eq!(code, 0, "{uninstalled}");
+    assert_eq!(
+        uninstalled["ok"]["uninstalled"][0]["state"], "removed",
+        "{uninstalled}"
+    );
+    let hooks = fs::read_to_string(codex_home.join("hooks.json")).unwrap_or_default();
+    assert!(!hooks.contains("pohunek-agent-state.sh"), "{hooks}");
+    assert!(!codex_home.join("pohunek-agent-state.sh").exists());
+    let (code, status) = host
+        .harness
+        .json(&["integration", "status", "--agent", "codex"])
+        .await;
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(
+        status["ok"]["agents"][0]["state"], "not_installed",
+        "{status}"
+    );
+
+    let (code, refused) = host
+        .harness
+        .json(&["integration", "install", "--agent", "codex"])
+        .await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(refused["err"]["code"], "runtime_not_installed", "{refused}");
+
+    host.stop().await;
+}
+
+/// A host profile over `codex` whose agent keeps its config in `home`, pinned
+/// to the installed package `digest` when there is one.
+fn codex_profile(home: &Path, digest: Option<&PackageDigest>) -> String {
+    let pin = digest.map_or_else(String::new, |digest| {
+        format!(
+            "package = \"{PACKAGE_ID}\"\ndigest = \"{}\"\n",
+            digest.as_str()
+        )
+    });
+    format!(
+        "base = \"codex\"\n{pin}\n[env]\nCODEX_HOME = \"{}\"\n",
+        path_str(home)
+    )
+}
+
+/// Asserts whether each of `homes` holds pohunek's Codex state hook.
+fn assert_hooks(homes: &[&Path], present: bool, context: &Value) {
+    for home in homes {
+        assert_eq!(
+            home.join("pohunek-agent-state.sh").is_file(),
+            present,
+            "{}: {context}",
+            home.display()
+        );
+    }
+}
+
+/// The hooks pohunek installed into the `CODEX_HOME` of host profiles over
+/// `codex` stay removable once nothing serves `codex`, although such a profile
+/// does not resolve: `--profile` and `--all-profiles` address each profile's
+/// home through its own environment, so no profile home is left behind.
+#[tokio::test]
+async fn codex_profile_hooks_stay_removable_without_the_official_package() {
+    let host = CleanHost::start().await;
+    let root = host.harness.env.root().to_path_buf();
+    let own_home = host.harness.env.home().join(".codex");
+    let homes: Vec<(&str, PathBuf)> = vec![
+        ("work", root.join("work-codex")),
+        ("alt", root.join("alt-codex")),
+    ];
+    fs::create_dir_all(&own_home).expect("create the Codex home");
+    for (_name, home) in &homes {
+        fs::create_dir_all(home).expect("create a profile's Codex home");
+    }
+    let digest = install_package(&host.harness, &host.key).await;
+    for (name, home) in &homes {
+        host.harness
+            .profile(name, &codex_profile(home, Some(&digest)));
+    }
+    let (code, installed) = host
+        .harness
+        .json(&[
+            "integration",
+            "install",
+            "--agent",
+            "codex",
+            "--all-profiles",
+        ])
+        .await;
+    assert_eq!(code, 0, "{installed}");
+    let all_homes: Vec<&Path> = std::iter::once(own_home.as_path())
+        .chain(homes.iter().map(|(_name, home)| home.as_path()))
+        .collect();
+    assert_hooks(&all_homes, true, &installed);
+    // The profiles as a release with the built-in Codex wrote them: no pin.
+    for (name, home) in &homes {
+        host.harness.profile(name, &codex_profile(home, None));
+    }
+    let (code, removed) = host
+        .harness
+        .json(&["plugin", "uninstall", PACKAGE_ID, "--yes"])
+        .await;
+    assert_eq!(code, 0, "{removed}");
+
+    let (code, status) = host
+        .harness
+        .json(&[
+            "integration",
+            "status",
+            "--agent",
+            "codex",
+            "--profile",
+            "alt",
+        ])
+        .await;
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(status["ok"]["agents"][0]["state"], "current", "{status}");
+    let (code, uninstalled) = host
+        .harness
+        .json(&[
+            "integration",
+            "uninstall",
+            "--agent",
+            "codex",
+            "--profile",
+            "alt",
+        ])
+        .await;
+    assert_eq!(code, 0, "{uninstalled}");
+    assert_eq!(
+        uninstalled["ok"]["uninstalled"][0]["state"], "removed",
+        "{uninstalled}"
+    );
+    assert!(!homes[1].1.join("pohunek-agent-state.sh").exists());
+    assert!(homes[0].1.join("pohunek-agent-state.sh").is_file());
+
+    let (code, uninstalled) = host
+        .harness
+        .json(&[
+            "integration",
+            "uninstall",
+            "--agent",
+            "codex",
+            "--all-profiles",
+        ])
+        .await;
+    assert_eq!(code, 0, "{uninstalled}");
+    let reports = uninstalled["ok"]["uninstalled"]
+        .as_array()
+        .expect("uninstall reports");
+    assert_eq!(
+        reports.len(),
+        3,
+        "the runtime's home and both profile homes: {uninstalled}"
+    );
+    assert!(
+        uninstalled["ok"]["failed"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "{uninstalled}"
+    );
+    assert_hooks(&all_homes, false, &uninstalled);
+
+    host.stop().await;
+}
+
+/// A host profile over `codex` that a launch would refuse as malformed (here a
+/// misspelled `[env]` table) is refused by the cleanup path as well, instead
+/// of being read with an empty environment that would point it at the
+/// runtime's own home.
+#[tokio::test]
+async fn a_malformed_codex_profile_is_refused_without_the_official_package() {
+    let host = CleanHost::start().await;
+    let own_home = host.harness.env.home().join(".codex");
+    let profile_home = host.harness.env.root().join("work-codex");
+    fs::create_dir_all(&own_home).expect("create the Codex home");
+    fs::create_dir_all(&profile_home).expect("create the profile's Codex home");
+    install_package(&host.harness, &host.key).await;
+    let (code, installed) = host
+        .harness
+        .json(&["integration", "install", "--agent", "codex"])
+        .await;
+    assert_eq!(code, 0, "{installed}");
+    let (code, removed) = host
+        .harness
+        .json(&["plugin", "uninstall", PACKAGE_ID, "--yes"])
+        .await;
+    assert_eq!(code, 0, "{removed}");
+    host.harness.profile(
+        "work",
+        &format!(
+            "base = \"codex\"\n\n[evn]\nCODEX_HOME = \"{}\"\n",
+            path_str(&profile_home)
+        ),
+    );
+
+    for action in ["status", "uninstall"] {
+        let (code, refused) = host
+            .harness
+            .json(&[
+                "integration",
+                action,
+                "--agent",
+                "codex",
+                "--profile",
+                "work",
+            ])
+            .await;
+        assert_eq!(code, 1, "{action}: {refused}");
+        assert_eq!(
+            refused["err"]["code"], "invalid_profile",
+            "{action}: {refused}"
+        );
+    }
+    assert_hooks(&[own_home.as_path()], true, &Value::Null);
+
+    host.stop().await;
 }
 
 /// Whether `pid` is a live process; a terminated one that its parent has not

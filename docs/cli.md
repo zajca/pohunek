@@ -369,6 +369,18 @@ must run; `--host` never turns `integration install` into a remote mutation.
 
 ### Codex and Claude config homes
 
+`--agent` offers the built-in names `claude` and `hermes`; any other value is a
+runtime id, and `codex` is one: the daemon compiles no Codex in, so
+`integration install --agent codex` needs the official Codex package installed
+and answers `runtime_not_installed` (with the package install as the hint)
+until it is. `status`, `doctor` and `uninstall` with `--agent codex` work
+without the package: they address the config home of the earlier built-in
+Codex (`CODEX_HOME`, else `~/.codex`), so hooks pohunek installed there can be
+reported and removed; `--profile` and `--all-profiles` reach the homes of host
+profiles over `codex` through each profile's own `[env]`, although such a
+profile does not resolve without the package. Without `--agent`, `status` and
+`doctor` cover only the runtimes the daemon serves.
+
 A Codex or Claude agent reads its settings and hook registration from a config
 home: the runtime's declared variable (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) as the
 launched agent sees it, else `~/.claude` / `~/.codex`. A host profile can point

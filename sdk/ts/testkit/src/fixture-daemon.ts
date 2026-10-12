@@ -2955,7 +2955,7 @@ function agentProfileNotFound(name: string): ProtocolError {
     "runtime",
     "agent_profile_not_found",
     `no agent profile or base kind named '${name}' on this host`,
-    "use shell|codex|claude|hermes, or add ~/.config/pohunek/agents/<name>.toml on the target host",
+    "use `shell` or an installed runtime (`pohunek plugin list`), or add ~/.config/pohunek/agents/<name>.toml on the target host",
   );
 }
 

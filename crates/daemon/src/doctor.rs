@@ -422,10 +422,8 @@ fn integration_agent_check(diagnosis: &protocol::IntegrationAgentDoctor) -> Doct
 
 /// Validate the canonical embedded manifest sources without invoking their panic-on-error loaders.
 fn embedded_manifest_checks() -> Vec<DoctorCheck> {
-    crate::agent::host::RESERVED_RUNTIME_IDS
-        .iter()
-        .copied()
-        .zip(crate::detect::embedded_manifest_sources())
+    crate::detect::embedded_manifest_sources()
+        .into_iter()
         .map(|(runtime, source)| {
             let (status, detail) = match crate::detect::Manifest::parse_str(source) {
                 Ok(_) => (DoctorStatus::Ok, "Embedded detection manifest is valid."),
