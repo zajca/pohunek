@@ -1453,6 +1453,29 @@ pub(super) fn write_executable(path: &std::path::Path, body: &str) {
     fs::set_permissions(path, perms).expect("chmod executable");
 }
 
+/// Shell lines that append the output of the `record` commands to `marker` as
+/// one launch record.
+///
+/// A shell `printf` may emit each argument with its own `write(2)`, so a test
+/// reading the marker mid-launch would see half a record. The output is staged
+/// in a per-process file (`$$`) beside the marker and `cat` appends a record
+/// this small with one write, which also keeps concurrent launches from
+/// interleaving their lines.
+/// Readers still wait for the complete, newline-terminated record they assert.
+#[cfg(unix)]
+pub(super) fn append_launch_record(marker: &std::path::Path, record: &str) -> String {
+    let marker = marker.display();
+    format!(
+        "{{ {record}; }} > '{marker}'.$$\ncat '{marker}'.$$ >> '{marker}'\nrm -f '{marker}'.$$\n"
+    )
+}
+
+/// The newline-terminated lines of `text`, without a trailing line another
+/// process may still be writing.
+pub(super) fn complete_lines(text: &str) -> std::str::Lines<'_> {
+    text[..text.rfind('\n').map_or(0, |end| end + 1)].lines()
+}
+
 #[cfg(unix)]
 fn write_supported_hermes_executable(path: &std::path::Path, launch_body: &str) {
     write_executable(
@@ -1468,8 +1491,8 @@ fn write_resume_agent_script(path: &std::path::Path, marker: &std::path::Path) {
     write_executable(
         path,
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nsleep 30\n",
-            marker.display()
+            "#!/bin/sh\n{}sleep 30\n",
+            append_launch_record(marker, "printf '%s\\n' \"$@\"")
         ),
     );
 }
@@ -1496,11 +1519,14 @@ pub(super) async fn wait_for_file_contains(path: &std::path::Path, needle: &str)
 
 async fn wait_for_line_count(path: &std::path::Path, expected: usize) -> String {
     wait_until(
-        &format!("{} to contain at least {expected} lines", path.display()),
+        &format!(
+            "{} to contain at least {expected} complete lines",
+            path.display()
+        ),
         || async {
             fs::read_to_string(path)
                 .ok()
-                .filter(|contents| contents.lines().count() >= expected)
+                .filter(|contents| complete_lines(contents).count() >= expected)
         },
     )
     .await
@@ -11347,8 +11373,8 @@ fn temp_agent_that_exits_then_resumes(
     write_executable(
         &script,
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\ncase \" $* \" in *\" --resume \"*) sleep 30 ;; *) read _ < '{}'; exit 0 ;; esac\n",
-            marker.display(),
+            "#!/bin/sh\n{}case \" $* \" in *\" --resume \"*) sleep 30 ;; *) read _ < '{}'; exit 0 ;; esac\n",
+            append_launch_record(marker, "printf '%s\\n' \"$@\""),
             gate_path.display(),
         ),
     );
@@ -11415,8 +11441,8 @@ fn write_hermes_resume_executable(
     write_executable(
         script,
         &format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf '%s\\n' '{version_output}'\n  exit 0\nfi\nprintf '<%s>\\n' \"$@\" >> {}\ncase \" $* \" in *\" --resume \"*) sleep 30 ;; *) read _ < '{}'; exit 0 ;; esac\n",
-            marker.display(),
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf '%s\\n' '{version_output}'\n  exit 0\nfi\n{}case \" $* \" in *\" --resume \"*) sleep 30 ;; *) read _ < '{}'; exit 0 ;; esac\n",
+            append_launch_record(marker, "printf '<%s>\\n' \"$@\""),
             gate.display(),
         ),
     );
@@ -11444,8 +11470,8 @@ async fn fork_live_claude_session_mints_new_id_and_builds_fork_argv() {
     write_executable(
         &script,
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nsleep 30\n",
-            marker.display()
+            "#!/bin/sh\n{}sleep 30\n",
+            append_launch_record(&marker, "printf '%s\\n' \"$@\"")
         ),
     );
     let agents_dir = temp_agents_dir_with(
@@ -12206,7 +12232,7 @@ async fn hermes_resume_reuses_logical_session_with_exact_argv_and_new_generation
             .runtime_generation,
         RuntimeGeneration::new(initial_generation.get() + 1)
     );
-    let argv = wait_for_file_contains(&marker, native_reference).await;
+    let argv = wait_for_file_contains(&marker, &format!("<{native_reference}>\n")).await;
     let lines = argv.lines().collect::<Vec<_>>();
     assert!(
         lines
@@ -12462,8 +12488,8 @@ async fn pi_shaped_profile_resumes_and_forks_through_the_frozen_spec() {
     write_executable(
         &script,
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\ncase \"$1\" in --session|--fork) sleep 30 ;; *) read _ < '{}'; exit 0 ;; esac\n",
-            marker.display(),
+            "#!/bin/sh\n{}case \"$1\" in --session|--fork) sleep 30 ;; *) read _ < '{}'; exit 0 ;; esac\n",
+            append_launch_record(&marker, "printf '%s\\n' \"$@\""),
             gate_path.display(),
         ),
     );
@@ -12510,7 +12536,7 @@ async fn pi_shaped_profile_resumes_and_forks_through_the_frozen_spec() {
         .expect("session exits");
 
     registry.resume(&created.id).await.expect("native recovery");
-    let argv = wait_for_file_contains(&marker, "--session").await;
+    let argv = wait_for_file_contains(&marker, &format!("--session\n{reference}\n")).await;
     // The first launch passes no arguments and prints one empty line.
     assert_eq!(
         argv.lines().skip(1).collect::<Vec<_>>(),
@@ -12528,7 +12554,7 @@ async fn pi_shaped_profile_resumes_and_forks_through_the_frozen_spec() {
         })
         .await
         .expect("native fork");
-    let argv = wait_for_file_contains(&marker, "--fork").await;
+    let argv = wait_for_file_contains(&marker, &format!("--fork\n{reference}\n")).await;
     assert_eq!(
         argv.lines().skip(1).collect::<Vec<_>>(),
         ["--session", reference, "--fork", reference]
@@ -16840,22 +16866,22 @@ pub(super) fn assigned_agent_script(
     write_executable(
         &script,
         &format!(
-            "#!/bin/sh\nprintf 'launch\\n' >> '{marker}'\nprintf '%s\\n' \"$@\" >> '{marker}'\ncase \" $* \" in *\" --session-id \"*) read _ < '{gate}'; exit 0 ;; *) sleep 30 ;; esac\n",
-            marker = marker.display(),
+            "#!/bin/sh\n{record}case \" $* \" in *\" --session-id \"*) read _ < '{gate}'; exit 0 ;; *) sleep 30 ;; esac\n",
+            record = append_launch_record(marker, "printf 'launch\\n'; printf '%s\\n' \"$@\""),
             gate = gate_path.display(),
         ),
     );
     (script, gate)
 }
 
-/// Lines of the launch `index` (zero-based) recorded in `marker`.
+/// The complete lines of launch `index` (zero-based) recorded in `marker`.
 #[cfg(unix)]
 pub(super) fn recorded_launch(marker: &std::path::Path, index: usize) -> Vec<String> {
     fs::read_to_string(marker)
         .expect("read argv marker")
         .split("launch\n")
         .nth(index + 1)
-        .map(|launch| launch.lines().map(str::to_owned).collect())
+        .map(|launch| complete_lines(launch).map(str::to_owned).collect())
         .unwrap_or_default()
 }
 
@@ -16947,7 +16973,7 @@ async fn a_hook_less_runtime_launches_with_an_assigned_reference_and_recovers_fr
         .expect("create a hook-less package session");
 
     // Launch: fixed args, the assigned template, then the prompt.
-    let first = wait_for_file_contains(&marker, "hello").await;
+    let first = wait_for_file_contains(&marker, "hello\n").await;
     assert!(first.starts_with("launch\n"));
     let launch = recorded_launch(&marker, 0);
     let reference = created
@@ -16982,7 +17008,7 @@ async fn a_hook_less_runtime_launches_with_an_assigned_reference_and_recovers_fr
         .await
         .expect("session exits");
     registry.resume(&created.id).await.expect("native recovery");
-    wait_for_file_contains(&marker, "--session\n").await;
+    wait_for_file_contains(&marker, &format!("--session\n{reference}\n")).await;
     assert_eq!(
         recorded_launch(&marker, 1),
         ["--model", "fast", "--session", reference.as_str()]
@@ -17001,7 +17027,7 @@ async fn a_hook_less_runtime_launches_with_an_assigned_reference_and_recovers_fr
         })
         .await
         .expect("native fork");
-    wait_for_file_contains(&marker, "--fork\n").await;
+    wait_for_file_contains(&marker, &format!("--fork\n{reference}\n")).await;
     assert_eq!(
         recorded_launch(&marker, 2),
         ["--model", "fast", "--fork", reference.as_str()]
@@ -17033,9 +17059,9 @@ fn probed_agent_script(
     write_executable(
         &script,
         &format!(
-            "#!/bin/sh\nif [ \"$1\" = --version ]; then cat '{version}'; exit 0; fi\nprintf 'launch\\n' >> '{marker}'\nprintf '%s\\n' \"$@\" >> '{marker}'\ncase \" $* \" in *\" --session-id \"*) read _ < '{gate}'; exit 0 ;; *) sleep 30 ;; esac\n",
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then cat '{version}'; exit 0; fi\n{record}case \" $* \" in *\" --session-id \"*) read _ < '{gate}'; exit 0 ;; *) sleep 30 ;; esac\n",
             version = version_file.display(),
-            marker = marker.display(),
+            record = append_launch_record(marker, "printf 'launch\\n'; printf '%s\\n' \"$@\""),
             gate = gate_path.display(),
         ),
     );
@@ -17180,7 +17206,7 @@ async fn recovery_refuses_an_assigned_reference_whose_conversation_is_missing() 
         .native_session_id
         .clone()
         .expect("assigned reference");
-    wait_for_file_contains(&marker, "--session-id").await;
+    wait_for_file_contains(&marker, &format!("--session-id\n{reference}\n")).await;
     assert_eq!(
         recorded_launch(&marker, 0),
         ["--session-id", reference.as_str()],
@@ -17245,7 +17271,7 @@ async fn recovery_refuses_an_assigned_reference_whose_conversation_is_missing() 
     )
     .expect("conversation file");
     registry.resume(&created.id).await.expect("native recovery");
-    wait_for_file_contains(&marker, "--session\n").await;
+    wait_for_file_contains(&marker, &format!("--session\n{reference}\n")).await;
     assert_eq!(
         recorded_launch(&marker, 1),
         ["--session", reference.as_str()]
@@ -18354,8 +18380,8 @@ fn write_argv_recording_agent(path: &std::path::Path, marker: &std::path::Path) 
     write_supported_hermes_executable(
         path,
         &format!(
-            "printf '%s\\n' \"$@\" >> '{}'\nsleep 30\n",
-            marker.display()
+            "{}sleep 30\n",
+            append_launch_record(marker, "printf '%s\\n' \"$@\"")
         ),
     );
 }

@@ -2,7 +2,7 @@
 //! workers and a Pi-shaped runtime whose agent reports its conversation the way
 //! a hooked agent does when the user switches conversations (`/clear`).
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 use super::*;
 use crate::agent::NativeReferenceProvenance;
@@ -212,8 +212,7 @@ impl Rig {
             &inner,
             &format!(
                 "#!{interpreter}\n\
-                 printf 'launch\\n' >> '{marker}'\n\
-                 printf '%s\\n' \"$@\" >> '{marker}'\n\
+                 {record}\
                  case \" $* \" in *\" {ASSIGNED_FLAG} \"*|*\" --session \"*) ;; *) exec sleep 30 ;; esac\n\
                  command -v python3 > '{python}' || true\n\
                  while read -r command argument < '{commands}'; do\n\
@@ -229,7 +228,7 @@ impl Rig {
                  esac\n\
                  done\n",
                 interpreter = interpreter.display(),
-                marker = marker.display(),
+                record = append_launch_record(&marker, "printf 'launch\\n'; printf '%s\\n' \"$@\""),
                 python = python.display(),
                 commands = commands_path.display(),
                 adapter = adapter.display(),
@@ -287,8 +286,8 @@ impl Rig {
             .native_session_id
             .clone()
             .expect("the session holds its assigned reference at once");
-        // The launch records its argv line by line; later launches are counted
-        // against a settled first one.
+        // The first launch's record ends with the assigned reference; later
+        // launches are counted against that settled record.
         wait_for_file_contains(&marker, &format!("{assigned}\n")).await;
         // A fixture whose launch process image is not named for the provider can
         // never be verified; failing here names that once instead of as a
@@ -729,7 +728,7 @@ async fn a_conversation_switch_after_the_launch_claim_survives_a_restart_a_resum
     // not run for it.
     rig.exit(&restarted).await;
     restarted.resume(rig.id()).await.expect("native recovery");
-    wait_for_file_contains(&rig.marker, "--session\n").await;
+    wait_for_file_contains(&rig.marker, "--session\nconversation-cleared\n").await;
     assert_eq!(
         rig.launch_argv(1),
         ["--model", "fast", "--session", "conversation-cleared"]
@@ -744,7 +743,7 @@ async fn a_conversation_switch_after_the_launch_claim_survives_a_restart_a_resum
         .fork(fork_params(rig.id()))
         .await
         .expect("native fork");
-    wait_for_file_contains(&rig.marker, "--fork\n").await;
+    wait_for_file_contains(&rig.marker, "--fork\nconversation-cleared\n").await;
     assert_eq!(
         rig.launch_argv(2),
         ["--model", "fast", "--fork", "conversation-cleared"]
@@ -882,7 +881,7 @@ async fn a_public_report_replaces_the_assigned_reference_in_sequence_order_and_r
         .resume(rig.id())
         .await
         .expect("native recovery");
-    wait_for_file_contains(&rig.marker, "--session\n").await;
+    wait_for_file_contains(&rig.marker, "--session\nconversation-two\n").await;
     assert_eq!(
         rig.launch_argv(1),
         ["--model", "fast", "--session", "conversation-two"]
@@ -898,7 +897,7 @@ async fn a_public_report_replaces_the_assigned_reference_in_sequence_order_and_r
         .fork(fork_params(rig.id()))
         .await
         .expect("native fork");
-    wait_for_file_contains(&rig.marker, "--fork\n").await;
+    wait_for_file_contains(&rig.marker, "--fork\nconversation-two\n").await;
     assert_eq!(
         rig.launch_argv(2),
         ["--model", "fast", "--fork", "conversation-two"]
@@ -1041,7 +1040,7 @@ async fn recovery_checks_an_assigned_reference_but_trusts_a_reported_one() {
         .resume(second.id())
         .await
         .expect("a reported reference is recovered unchecked");
-    wait_for_file_contains(&second.marker, "--session\n").await;
+    wait_for_file_contains(&second.marker, "--session\nconversation-without-file\n").await;
     assert_eq!(
         second.launch_argv(1),
         ["--session", "conversation-without-file"],
@@ -1210,7 +1209,7 @@ async fn a_switch_below_a_wrapper_is_followed_through_the_verified_launch_proces
         .resume(rig.id())
         .await
         .expect("native recovery");
-    wait_for_file_contains(&rig.marker, "--session\n").await;
+    wait_for_file_contains(&rig.marker, "--session\nconversation-below-wrapper\n").await;
     assert_eq!(
         rig.launch_argv(1),
         ["--model", "fast", "--session", "conversation-below-wrapper"]
