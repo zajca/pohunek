@@ -205,7 +205,10 @@ Release packaging and contributor verification:
   bump PR also fixes new lints. `scripts/tests/test_bump_rust_toolchain.py`
   covers it.
 - `scripts/dev-bootstrap` — local tool check: required `rustc` (the workspace `rust-version`), `cargo-nextest` (minimum
-  read from `.config/nextest.toml`) and `python3` >= 3.11, optional `bacon`,
+  read from `.config/nextest.toml`), `python3` >= 3.11 and the Hermes test
+  interpreter (`POHUNEK_PYTHON_BIN` or the `test_python.rs` candidates: Python
+  >= 3.10 with `yaml` passing the runtime file policy; the printed uv fix
+  mirrors the CI step), optional `bacon`,
   `hyperfine`, and on Linux `mold` (fail only with `--strict`); a `rustc-pin`
   row warns when the active `rustc` differs from `rust-toolchain.toml` (fails
   only with `--strict`); a rustup proxy whose pinned toolchain is not
@@ -237,7 +240,8 @@ Release packaging and contributor verification:
   fake tools on `PATH`: version parsing, the config-derived nextest minimum,
   required vs. optional and `--strict` exit status, MSRV and missing-`cargo`
   handling, the `rust-toolchain.toml` pin row and malformed pins, shadowed
-  copies, the byte-exact default report, every contribution path, each
+  copies, the Hermes test interpreter check (explicit, policy, version,
+  `yaml`, CI-derived fix), the byte-exact default report, every contribution path, each
   path's focused checks and final-gate pointer (listed only with an explicit
   `--path`), the `--json` contract and its error codes, and that the relay
   database URL never reaches any output. The `platform contracts (arm64)` CI

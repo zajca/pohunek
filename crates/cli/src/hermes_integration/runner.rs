@@ -2401,6 +2401,16 @@ mod tests {
         assert_process_gone(child_pid);
     }
 
+    /// Deadline for the timeout scenario: long enough that the fixture script
+    /// has started its descendant and recorded the PID before the runner kills
+    /// the group, short enough to keep the scenario quick.
+    ///
+    /// The first execution of a freshly written executable can take about 200
+    /// ms on hosts that scan new binaries before running them, on top of the
+    /// shell and descendant start-up. A deadline below that cost kills the
+    /// script before the PID file exists. The scenario still waits for the full
+    /// deadline because the script blocks until killed.
+    const TIMEOUT_SCENARIO_DEADLINE: Duration = Duration::from_secs(2);
     /// Upper cap for the descriptor number the high-descriptor fixtures aim at.
     const HIGH_DESCRIPTOR_TARGET: libc::rlim_t = 200;
 
@@ -2830,7 +2840,7 @@ mod tests {
         );
         let runner = HermesRunner {
             executable: validate_executable(&script(&root.0, &body)).expect("executable"),
-            timeout: Duration::from_millis(80),
+            timeout: TIMEOUT_SCENARIO_DEADLINE,
             stream_limit: MAX_STREAM_BYTES,
         };
         assert_eq!(runner.pohunek_state(&selected), Err(Error::HermesTimeout));

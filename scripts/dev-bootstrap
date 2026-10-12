@@ -12,8 +12,9 @@ Contribution paths (`--path NAME`, repeatable; `rust` when none is given):
 
 * rust -- the Rust fast loops: `rustc` at the workspace MSRV
   (`[workspace.package] rust-version`), `rustc-pin`, `cargo-nextest` (every
-  `cargo t`/`cargo ta` alias and the test gates run through it) and `python3`
-  (`scripts/test-partitions` and this script import `tomllib`) are required;
+  `cargo t`/`cargo ta` alias and the test gates run through it), `python3`
+  (`scripts/test-partitions` and this script import `tomllib`) and the Hermes
+  test interpreter (below) are required;
   `bacon` (the watcher over `bacon.toml`), `hyperfine`
   (`scripts/measure-dev-loop`) and, on Linux only, `mold` (the CI linker, set
   through CI `RUSTFLAGS` only; `.cargo/config.toml` configures no linker) are
@@ -79,7 +80,8 @@ Status codes (stable; the `status` of every row in `--json`):
 
 * ok -- present and at or above the minimum, or set, or available.
 * missing -- not found on PATH or in `$CARGO_HOME/bin`; for the rustup
-  target row, the target (or rustup itself) is absent.
+  target row, the target (or rustup itself) is absent; for the Hermes test
+  interpreter row, no candidate qualifies (the detail names each reason).
 * too-old -- found, but below the minimum (a pre-release of the minimum is
   older than the minimum).
 * off-path -- a passing copy exists only in `$CARGO_HOME/bin`, or is
@@ -106,6 +108,20 @@ downloads it first.
 Version commands run from the repository root, so a rustup proxy resolves
 `rust-toolchain.toml`, and with `RUSTUP_AUTO_INSTALL=0`, so a proxy whose
 pinned toolchain is absent reports it instead of downloading it.
+
+The Hermes test interpreter is not a `PATH` tool but the Python that stands in
+for the pinned Hermes runtime in the `pohunek-cli` Hermes tests. It is
+required: those tests fail when it is absent (a missing prerequisite is a
+failure, never a skip), so the workspace test gate, and any fast loop that
+includes `pohunek-cli`, cannot pass without it. It is searched the way
+`crates/cli/src/hermes_integration/test_python.rs` searches it:
+`POHUNEK_PYTHON_BIN` alone when set, otherwise `python3` in every absolute
+`PATH` directory, then `/usr/bin/python3`. The first candidate that is
+canonical, passes the runtime file policy (owned by root or the current user,
+no group/other write bit on the file or any ancestor, executable), is Python
+>= 3.10 and imports `yaml` wins. The printed fix mirrors the `Require the
+Hermes test interpreter` step of `.github/workflows/ci.yml` and takes the
+Python and PyYAML versions from it.
 
 `--json` prints exactly one JSON document on stdout and nothing else there:
 `schema` (`pohunek.dev-bootstrap`), `version` (1), `paths`, `strict`, `os`
@@ -135,8 +151,10 @@ its value.
 Exit status: 0 when every row that counts passes, 1 otherwise, 2 on an
 unsupported `--path`, an internal error under `--json`, or a configuration
 error (Python without `tomllib`, a malformed `Cargo.toml` MSRV, an unreadable
-`.config/nextest.toml`, a missing or malformed `rust-toolchain.toml` channel,
-or for the sdk path a missing, malformed or disagreeing `.bun-version` /
+`.config/nextest.toml`, an unreadable `.github/workflows/ci.yml` or one that
+no longer pins `uv python install` and `pyyaml==` for the Hermes test
+interpreter, a missing or malformed `rust-toolchain.toml` channel, or for the
+sdk path a missing, malformed or disagreeing `.bun-version` /
 `package.json` pin). A path's repository inputs are read only when it is
 selected.
 """
@@ -150,6 +168,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 from typing import Optional
@@ -163,6 +182,7 @@ except ModuleNotFoundError:
 
 ROOT = Path(__file__).resolve().parents[1]
 NEXTEST_CONFIG = Path(".config") / "nextest.toml"
+CI_WORKFLOW = Path(".github") / "workflows" / "ci.yml"
 TOOLCHAIN_FILE = Path("rust-toolchain.toml")
 BUN_VERSION_FILE = Path(".bun-version")
 PACKAGE_JSON = Path("package.json")
@@ -195,6 +215,31 @@ HYPERFINE_MIN_VERSION = (1, 9, 0)
 # has been linked with in CI; CI itself pins a newer release (`MOLD_VERSION`
 # in .github/workflows/ci.yml). A local mold is optional and only links.
 MOLD_MIN_VERSION = (2, 30, 0)
+# The embedded Hermes plugin uses syntax and typing features from Python 3.10
+# (`MINIMUM_VERSION` in crates/cli/src/hermes_integration/test_python.rs).
+HERMES_PYTHON_MIN_VERSION = (3, 10, 0)
+# Environment variable naming the interpreter explicitly (`INTERPRETER_ENV`).
+HERMES_INTERPRETER_ENV = "POHUNEK_PYTHON_BIN"
+# Last-resort candidate searched after every PATH entry (`SYSTEM_INTERPRETER`).
+HERMES_SYSTEM_INTERPRETER = "/usr/bin/python3"
+# Executable name searched in each absolute PATH directory (`INTERPRETER_NAME`).
+HERMES_INTERPRETER_NAME = "python3"
+# The module the staged validator imports (`PROBE_MODULE`).
+HERMES_PROBE_MODULE = "yaml"
+# Mode bits of the runtime policy (`UNSAFE_WRITE_BITS`, `STICKY_BIT` in
+# crates/cli/src/hermes_integration/runner.rs): group/other write is unsafe,
+# except on a root-owned sticky directory such as `/tmp`.
+UNSAFE_WRITE_BITS = 0o022
+STICKY_BIT = 0o1000
+# Name of the check row.
+HERMES_TOOL_NAME = "hermes-test-python"
+# Default private directory of the printed fix. It must be owned by the
+# developer and not group/other writable, because the runtime policy rejects
+# shared interpreter trees (Homebrew, framework installs).
+HERMES_PRIVATE_ROOT = '"${XDG_DATA_HOME:-$HOME/.local/share}/pohunek/hermes-test-python"'
+# Line prefix of a fix in the report; continuation lines of a multi-line fix
+# align under its first line.
+FIX_PREFIX = "           fix: "
 # Marks a cargo-subcommand row's location: Cargo, not a PATH lookup, chose
 # the binary that ran.
 CARGO_RESOLUTION = " (Cargo's resolution)"
@@ -647,6 +692,17 @@ def rust_tools(root, system):
             cargo_subcommand=True,
         ),
         python_tool(),
+        # Required although it is not on the path of every crate: the
+        # `pohunek-cli` Hermes tests fail without it, so the documented
+        # workspace gate (`cargo nextest run --workspace`) cannot pass.
+        Tool(
+            name=HERMES_TOOL_NAME,
+            version_args=(),
+            min_version=HERMES_PYTHON_MIN_VERSION,
+            required=True,
+            manual=hermes_python_fix(root),
+            probe=check_hermes_interpreter,
+        ),
         Tool(
             name="bacon",
             version_args=("--version",),
@@ -1154,6 +1210,131 @@ def version_result(tool, argv, path, runner):
     return Result(tool, OK, version=version, path=path, prerelease=prerelease)
 
 
+def read_ci_workflow(root):
+    """The text of the CI workflow that provisions the Hermes test interpreter."""
+    path = Path(root) / CI_WORKFLOW
+    try:
+        return path.read_text()
+    except OSError as error:
+        raise ConfigError(f"cannot read {path}: {error}") from error
+
+
+def hermes_python_fix(root):
+    """The uv commands of the CI `Require the Hermes test interpreter` step.
+
+    The Python minor release and the PyYAML pin are read from the workflow, so
+    the printed fix cannot drift from what CI installs.
+    """
+    workflow = read_ci_workflow(root)
+    python = re.search(r"uv python install (\d+(?:\.\d+)*)", workflow)
+    pyyaml = re.search(r"pyyaml==(\d[0-9A-Za-z.]*)", workflow)
+    if python is None or pyyaml is None:
+        raise ConfigError(
+            f"{Path(root) / CI_WORKFLOW} no longer pins `uv python install` and "
+            "`pyyaml==` for the Hermes test interpreter"
+        )
+    version, pin = python.group(1), pyyaml.group(1)
+    return "\n".join([
+        "install uv (https://docs.astral.sh/uv/), then run:",
+        f"private_root={HERMES_PRIVATE_ROOT}",
+        'install -d -m 700 "$private_root" "$private_root/install" "$private_root/bin-links"',
+        'export UV_PYTHON_INSTALL_DIR="$private_root/install" '
+        'UV_PYTHON_BIN_DIR="$private_root/bin-links"',
+        f"uv python install {version} --no-config",
+        f'found="$(uv python find {version} --no-config --no-project --managed-python)"',
+        "python_bin=\"$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' \"$found\")\"",
+        'uv pip install --no-config --link-mode copy --python "$python_bin" '
+        f"--break-system-packages pyyaml=={pin}",
+        'find "$private_root" -not -type l -exec chmod go-w {} +',
+        'export POHUNEK_PYTHON_BIN="$python_bin"   # add to your shell profile',
+    ])
+
+
+def hermes_candidates(environ):
+    """Interpreter candidates in the order `test_python.rs` tries them."""
+    explicit = environ.get(HERMES_INTERPRETER_ENV)
+    if explicit is not None:
+        return [explicit]
+    candidates = [
+        os.path.join(directory, HERMES_INTERPRETER_NAME)
+        for directory in environ.get("PATH", "").split(os.pathsep)
+        if os.path.isabs(directory)
+    ]
+    # `/usr/bin` is usually on PATH too; examining a path twice adds nothing.
+    return list(dict.fromkeys([*candidates, HERMES_SYSTEM_INTERPRETER]))
+
+
+def runtime_policy_violation(path, uid, root_uid):
+    """The first finding that the production runtime policy rejects, or None.
+
+    Mirrors `validate_runtime` and `safe_ancestor` in
+    crates/cli/src/hermes_integration/runner.rs for a canonical `path`.
+    """
+    try:
+        metadata = os.stat(path)
+    except OSError as error:
+        return f"cannot stat ({error.strerror})"
+    if not stat.S_ISREG(metadata.st_mode):
+        return "not a regular file"
+    if metadata.st_uid not in (uid, root_uid):
+        return f"owner uid {metadata.st_uid} is neither {uid} nor root"
+    if metadata.st_mode & UNSAFE_WRITE_BITS:
+        return f"file mode {stat.S_IMODE(metadata.st_mode):o} has group/other write bits"
+    if not os.access(path, os.X_OK):
+        return "not executable by this user"
+    for ancestor in [Path(path), *Path(path).parents]:
+        try:
+            found = os.stat(ancestor)
+        except OSError as error:
+            return f"cannot stat {ancestor} ({error.strerror})"
+        owner_ok = found.st_uid in (uid, root_uid)
+        sticky_shared = (
+            stat.S_ISDIR(found.st_mode)
+            and found.st_uid == root_uid
+            and found.st_mode & STICKY_BIT
+            and found.st_mode & UNSAFE_WRITE_BITS
+        )
+        if not owner_ok or (found.st_mode & UNSAFE_WRITE_BITS and not sticky_shared):
+            return (
+                f"ancestor {ancestor} is unsafe (uid {found.st_uid}, "
+                f"mode {stat.S_IMODE(found.st_mode):o})"
+            )
+    return None
+
+
+def examine_hermes_interpreter(candidate, runner, uid, root_uid):
+    """`(canonical path, version, None)` or `(None, None, reason)` for one candidate."""
+    try:
+        canonical = os.path.realpath(candidate, strict=True)
+    except OSError as error:
+        return None, None, f"cannot canonicalize ({error.strerror})"
+    violation = runtime_policy_violation(canonical, uid, root_uid)
+    if violation is not None:
+        return None, None, f"violates the runtime policy: {violation}"
+    try:
+        output = runner([
+            canonical, "-I", "-c",
+            "import sys; print('.'.join(map(str, sys.version_info[:3])))",
+        ])
+    except (OSError, subprocess.SubprocessError) as error:
+        return None, None, f"cannot run: {failure_detail(error)}"
+    version = parse_version(output)
+    if version is None:
+        return None, None, "unparseable version output"
+    if version < HERMES_PYTHON_MIN_VERSION:
+        return None, None, (
+            f"is Python {format_version(version)}, older than "
+            f"{format_version(HERMES_PYTHON_MIN_VERSION)}"
+        )
+    try:
+        runner([canonical, "-I", "-c", f"import {HERMES_PROBE_MODULE}"])
+    except (OSError, subprocess.SubprocessError):
+        return None, None, f"cannot import {HERMES_PROBE_MODULE}"
+    return canonical, version, None
+
+
+
+
 def check_rustup_target(tool, host):
     """Whether rustup lists the target as installed for the active toolchain."""
     rustup = host.which("rustup")
@@ -1189,6 +1370,27 @@ def check_variable_set(tool, host):
     if host.environ.get(tool.name):
         return Result(tool, OK, detail="set")
     return Result(tool, UNSET)
+
+
+def check_hermes_interpreter(tool, host):
+    """The row for the Hermes test interpreter: the first acceptable candidate."""
+    uid = os.geteuid()
+    root_uid = os.stat("/").st_uid
+    rejections = []
+    for candidate in hermes_candidates(host.environ):
+        path, version, reason = examine_hermes_interpreter(candidate, host.runner, uid, root_uid)
+        if path is not None:
+            return Result(tool, OK, version=version, path=path)
+        # A PATH or system candidate that does not exist is the normal case
+        # and carries no information; an explicit one is always reported.
+        if os.path.lexists(candidate) or HERMES_INTERPRETER_ENV in host.environ:
+            rejections.append(f"{candidate}: {reason}")
+    detail = "; ".join(rejections) or (
+        f"no {HERMES_INTERPRETER_NAME} on PATH or at {HERMES_SYSTEM_INTERPRETER}"
+    )
+    return Result(tool, MISSING, detail=detail)
+
+
 
 
 def check_systemd_user_manager(tool, host):
@@ -1424,7 +1626,9 @@ def describe(result, strict, cargo_bin):
         return f"  n/a      {tool.name}: not needed on this OS: {result.detail} ({kind})"
     label = "FAIL" if result.failed(strict) else "warn"
     if result.status == MISSING:
-        if minimum is not None:
+        if minimum is not None and result.detail is not None:
+            what = f"{tool.name} is missing (needs >= {minimum}): {result.detail}"
+        elif minimum is not None:
             what = f"{tool.name} is missing (needs >= {minimum})"
         elif result.detail is not None:
             what = f"{tool.name} is missing: {result.detail}"
@@ -1453,10 +1657,8 @@ def describe(result, strict, cargo_bin):
         what = f"{tool.name} is unavailable: {result.detail}"
     else:
         what = f"{tool.name} version unknown: {result.detail}"
-    return (
-        f"  {label:<8} {what} ({kind})\n"
-        f"           fix: {fix_hint(result, cargo_bin)}"
-    )
+    fix = fix_hint(result, cargo_bin).replace("\n", "\n" + " " * len(FIX_PREFIX))
+    return f"  {label:<8} {what} ({kind})\n{FIX_PREFIX}{fix}"
 
 
 def describe_pin(result, strict, cargo_bin):

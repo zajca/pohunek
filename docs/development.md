@@ -131,6 +131,18 @@ PTY/worker lifecycle, PostgreSQL, Hermes subprocess suites,
 and nested Cargo integration checks. Fast includes short filesystem, mock-socket,
 and CLI integration tests; `--lib` alone is **not** a cost boundary.
 
+The `pohunek-cli` Hermes tests also need a test interpreter that stands in for
+the pinned Hermes runtime: a canonical Python >= 3.10 that imports `yaml`, owned
+by you or root with no group/other write bit on the file or any parent
+directory. A distribution interpreter qualifies once PyYAML is
+installed; the stock macOS `/usr/bin/python3` (3.9) and shared-tree Homebrew or
+framework Pythons do not. Without it those tests fail with "no usable test interpreter",
+never skip. Run `scripts/dev-bootstrap`: it checks `POHUNEK_PYTHON_BIN` (or, when
+unset, `python3` on `PATH` and `/usr/bin/python3`) and prints the uv commands,
+mirroring the CI step in `.github/workflows/ci.yml`, that install a private
+CPython 3.12 with PyYAML and the `export POHUNEK_PYTHON_BIN=...` line to keep in
+your shell profile.
+
 CI runs four fast matrix shards and separate heavy jobs without waiting for
 Clippy or release builds. Heavy uses four test processes and the real worker
 binary. Relay heavy tests (the only PostgreSQL fixture consumers) run in a

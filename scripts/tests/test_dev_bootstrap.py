@@ -1,9 +1,9 @@
 """Integration scenarios for the `scripts/dev-bootstrap` CLI (stdlib only).
 
 Each test runs the actual script as a child process of a disposable
-repository root (the script copy, its `Cargo.toml`, `rust-toolchain.toml`
-and `.config/nextest.toml`; `.bun-version` and `package.json` for the sdk
-scenarios) with executable fake tools on `PATH`. The fake
+repository root (the script copy, its `Cargo.toml`, `rust-toolchain.toml`,
+`.config/nextest.toml` and `.github/workflows/ci.yml`; `.bun-version` and
+`package.json` for the sdk scenarios) with executable fake tools on `PATH`. The fake
 `cargo` mirrors the real one's subcommand resolution: it prefers
 `$CARGO_HOME/bin/cargo-<sub>` unless that directory already sits later on
 `PATH`, exactly the order `dev-bootstrap` relies on. No host tool, network
@@ -39,6 +39,35 @@ def toolchain_file(channel):
         'components = ["clippy", "rustfmt"]\nprofile = "minimal"\n'
     )
 
+
+# The two lines of the CI step that provisions the Hermes test interpreter,
+# from which the printed fix takes its pins.
+CI_WORKFLOW = (
+    "          uv python install 3.12 --no-config\n"
+    "          uv pip install --no-config --python \"$python_bin\" pyyaml==6.0.2\n"
+)
+HERMES_FAILURE = "hermes-test-python is missing (needs >= 3.10.0)"
+# A Python that runs but lacks PyYAML, shaped like a bare interpreter.
+NO_YAML_BODY = (
+    'case "$*" in *yaml*) echo "ModuleNotFoundError: No module named yaml" >&2; '
+    "exit 1;; esac; printf %s 'Python 3.12.1\\n'"
+)
+
+# Version outputs shaped like the real tools'.
+RUSTC_VERSION = "rustc 1.98.1 (48a229cea 2026-09-01)\n"
+NEXTEST_VERSION = (
+    "cargo-nextest 0.9.145 (00af4550e 2026-09-16)\n"
+    "release: 0.9.145\nhost: x86_64-unknown-linux-gnu\n"
+)
+PYTHON_VERSION = "Python 3.13.1\n"
+BACON_VERSION = "bacon 3.25.0\n"
+HYPERFINE_VERSION = "hyperfine 1.20.0\n"
+MOLD_VERSION = (
+    "mold 2.42.1 (9b376bc6a9899d4a16b41777de1f013989459fbc; "
+    "compatible with GNU ld)\n"
+)
+
+IS_LINUX = platform.system() == "Linux"
 
 # Version outputs shaped like the real tools'.
 RUSTC_VERSION = "rustc 1.98.1 (48a229cea 2026-09-01)\n"
@@ -98,8 +127,10 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
         (self.root / "Cargo.toml").write_text(MSRV_MANIFEST)
         (self.root / "rust-toolchain.toml").write_text(toolchain_file(TOOLCHAIN_PIN))
         (self.root / ".config" / "nextest.toml").write_text(NEXTEST_CONFIG)
+        (self.root / ".github" / "workflows").mkdir(parents=True)
+        (self.root / ".github" / "workflows" / "ci.yml").write_text(CI_WORKFLOW)
         self.fakes = self.home / "fakes"
-        self.fakes.mkdir()
+        self.make_private_dir(self.fakes)
         self.cargo_bin = self.home / CARGO_BIN
         (self.cargo_bin).mkdir(parents=True)
         self.write_cargo()
@@ -107,6 +138,17 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
         self.write_tool("python3", PYTHON_VERSION)
 
     # -- fake-world helpers -------------------------------------------
+
+    @staticmethod
+    def make_private_dir(path):
+        """Create `path` with mode 0o755 whatever the umask is.
+
+        Interpreters live in these directories, and the Hermes runtime file
+        policy rejects a group/other-writable ancestor, which a umask of 002
+        would otherwise produce.
+        """
+        path.mkdir(exist_ok=True)
+        path.chmod(0o755)
 
     def write_tool(self, name, output, directory=None, bad=False, body=None):
         """Write an executable fake tool that prints `output` (or garbage).
@@ -236,6 +278,9 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
             "--locked cargo-nextest",
             output,
         )
+        self.assertIn(
+            "\n           fix: cargo install --root", output
+        )  # `fix:` sits at a fixed column under its row
         self.assertIn("failing: cargo-nextest", output)
 
     def test_too_old_required_tool_fails(self):
@@ -267,6 +312,130 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
         self.assertIn(
             "cargo-nextest 0.9.145 is older than 0.9.200 (required)", output
         )
+
+    # -- the Hermes test interpreter -------------------------------------
+
+    def explicit_interpreter(self, body=None, name="hermes-python", mode=0o755):
+        """An interpreter outside PATH, selected through POHUNEK_PYTHON_BIN."""
+        directory = self.home / "explicit"
+        self.make_private_dir(directory)
+        path = self.write_tool(
+            name, "Python 3.12.1\n", directory=directory, body=body
+        )
+        path.chmod(mode)
+        return {"POHUNEK_PYTHON_BIN": str(path)}
+
+    def test_hermes_interpreter_found_on_path_is_ready(self):
+        self.write_tool("cargo-nextest", NEXTEST_VERSION)
+        status, output = self.run_script()
+        self.assertEqual(status, 0, output)
+        self.assertIn("ok       hermes-test-python 3.13.1 >= 3.10.0 (required)", output)
+
+    def test_explicit_interpreter_is_the_only_candidate(self):
+        # The good python3 on PATH is ignored once the variable is set, as in
+        # test_python.rs, so a broken explicit choice is a failure.
+        self.write_tool("cargo-nextest", NEXTEST_VERSION)
+        status, output = self.run_script(
+            extra_env=self.explicit_interpreter(body=NO_YAML_BODY)
+        )
+        self.assertEqual(status, 1, output)
+        self.assertIn(HERMES_FAILURE, output)
+        self.assertIn("hermes-python: cannot import yaml", output)
+        self.assertIn("failing: hermes-test-python", output)
+
+    def test_explicit_interpreter_is_judged_independently_of_path_python(self):
+        self.write_tool("cargo-nextest", NEXTEST_VERSION)
+        self.write_tool("python3", "Python 3.9.1\n")
+        status, output = self.run_script(extra_env=self.explicit_interpreter())
+        # python3 3.9.1 fails its own row (the script needs >= 3.11); only the
+        # Hermes row is judged by the explicit interpreter.
+        self.assertEqual(status, 1, output)
+        self.assertIn("failing: python3\n", output)
+        self.assertIn("ok       hermes-test-python 3.12.1 >= 3.10.0 (required)", output)
+        self.assertNotIn(HERMES_FAILURE, output)
+
+    def test_too_old_interpreter_fails_the_run_without_strict(self):
+        # Required, not optional: the pohunek-cli Hermes tests fail without it.
+        self.write_tool("cargo-nextest", NEXTEST_VERSION)
+        env = self.explicit_interpreter(body="printf %s 'Python 3.9.18'")
+        status, output = self.run_script(extra_env=env)
+        self.assertEqual(status, 1, output)
+        self.assertIn("is Python 3.9.18, older than 3.10.0", output)
+        self.assertIn("FAIL     " + HERMES_FAILURE, output)
+        self.assertIn("(required)", output)
+
+    def test_missing_explicit_interpreter_fails(self):
+        self.write_tool("cargo-nextest", NEXTEST_VERSION)
+        status, output = self.run_script(
+            extra_env={"POHUNEK_PYTHON_BIN": str(self.home / "absent" / "python3")}
+        )
+        self.assertEqual(status, 1, output)
+        self.assertIn("cannot canonicalize", output)
+
+    def test_interpreter_violating_the_runtime_policy_is_rejected(self):
+        self.write_tool("cargo-nextest", NEXTEST_VERSION)
+        env = self.explicit_interpreter(mode=0o775)
+        status, output = self.run_script(extra_env=env)
+        self.assertEqual(status, 1, output)
+        self.assertIn("violates the runtime policy", output)
+        self.assertIn("has group/other write bits", output)
+
+    def test_failing_interpreter_prints_the_uv_fix_from_the_ci_workflow(self):
+        self.write_tool("cargo-nextest", NEXTEST_VERSION)
+        status, output = self.run_script(
+            extra_env=self.explicit_interpreter(body=NO_YAML_BODY)
+        )
+        self.assertEqual(status, 1, output)
+        for line in (
+            "uv python install 3.12 --no-config",
+            "uv python find 3.12 --no-config --no-project --managed-python",
+            "--break-system-packages pyyaml==6.0.2",
+            'export POHUNEK_PYTHON_BIN="$python_bin"',
+        ):
+            self.assertIn(line, output)
+        # The multi-line fix aligns every command under the first line.
+        self.assertIn("\n           fix: install uv (https://docs.astral.sh/uv/)", output)
+        self.assertIn("\n                uv python install 3.12 --no-config\n", output)
+        # Nothing is installed by the check itself.
+        self.assertFalse((self.home / ".local").exists())
+
+    def test_json_row_carries_the_status_and_the_uv_fix(self):
+        self.write_tool("cargo-nextest", NEXTEST_VERSION)
+        status, doc, _ = self.run_json(
+            extra_env=self.explicit_interpreter(body=NO_YAML_BODY)
+        )
+        self.assertEqual(status, 1)
+        row = next(r for r in doc["rows"] if r["name"] == "hermes-test-python")
+        self.assertEqual(row["status"], "missing")
+        self.assertEqual(row["category"], "required")
+        self.assertEqual(row["minimum"], "3.10.0")
+        self.assertIn("cannot import yaml", row["detail"])
+        self.assertIn("uv python install 3.12 --no-config", row["fix"])
+        self.assertIn("hermes-test-python", doc["failing"])
+
+    def test_fix_follows_the_pins_in_the_ci_workflow(self):
+        self.write_tool("cargo-nextest", NEXTEST_VERSION)
+        (self.root / ".github" / "workflows" / "ci.yml").write_text(
+            "uv python install 3.13 --no-config\nuv pip install pyyaml==6.1.0\n"
+        )
+        _, output = self.run_script(
+            extra_env=self.explicit_interpreter(body=NO_YAML_BODY)
+        )
+        self.assertIn("uv python install 3.13 --no-config", output)
+        self.assertIn("pyyaml==6.1.0", output)
+
+    def test_ci_workflow_without_the_pins_is_a_configuration_error(self):
+        (self.root / ".github" / "workflows" / "ci.yml").write_text("name: ci\n")
+        status, output = self.run_script()
+        self.assertEqual(status, 2, output)
+        self.assertIn("no longer pins", output)
+
+    def test_missing_ci_workflow_is_a_configuration_error(self):
+        (self.root / ".github" / "workflows" / "ci.yml").unlink()
+        status, output = self.run_script()
+        self.assertEqual(status, 2, output)
+        self.assertIn("cannot read", output)
+        self.assertIn("ci.yml", output)
 
     # -- optional tools ------------------------------------------------
 
@@ -637,6 +806,7 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
             f"  ok       rustc {TOOLCHAIN_PIN} matches the rust-toolchain.toml pin (pin)\n"
             "  ok       cargo-nextest 0.9.145 >= 0.9.115 (required)\n"
             "  ok       python3 3.13.1 >= 3.11.0 (required)\n"
+            "  ok       hermes-test-python 3.13.1 >= 3.10.0 (required)\n"
             "  ok       bacon 3.25.0 >= 3.13.0 (optional)\n"
             "  ok       hyperfine 1.20.0 >= 1.9.0 (optional)\n"
             f"{mold}"
@@ -680,7 +850,10 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
             {"schema", "version", "paths", "strict", "os", "rows", "checks",
              "failing", "result", "error", "message"},
         )
-        names = ["rustc", "rustc-pin", "cargo-nextest", "python3", "bacon", "hyperfine"]
+        names = [
+            "rustc", "rustc-pin", "cargo-nextest", "python3", "hermes-test-python",
+            "bacon", "hyperfine",
+        ]
         if IS_LINUX:
             names.append("mold")
         self.assertEqual([row["name"] for row in doc["rows"]], names)

@@ -427,8 +427,11 @@ manual nightly-tier run of the bump branch
 
 Local toolchain: `scripts/dev-bootstrap` checks the tools these loops need
 against their minimum versions and prints the exact install command for each
-missing or too-old one. `rustc` (the workspace `rust-version`), `cargo-nextest` (minimum from `.config/nextest.toml`)
-and `python3` >= 3.11 are required; `bacon`, `hyperfine`
+missing or too-old one. `rustc` (the workspace `rust-version`), `cargo-nextest` (minimum from `.config/nextest.toml`),
+`python3` >= 3.11, and the Hermes test interpreter (`POHUNEK_PYTHON_BIN` or the
+`test_python.rs` candidates: Python >= 3.10 with `yaml` that passes the runtime
+file policy; the `pohunek-cli` Hermes tests fail without it, and the printed
+fix mirrors the CI uv step) are required; `bacon`, `hyperfine`
 (`scripts/measure-dev-loop`), and `mold` (CI linker only; checked on Linux only) fail only with
 `--strict`. The `rustc-pin` row compares the active `rustc` (first on PATH)
 with the `rust-toolchain.toml` pin and prints the PATH and `rustup toolchain
