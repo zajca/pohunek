@@ -611,7 +611,9 @@ mod subagent_sequences {
             action: &'static str,
             payload: Value,
         },
-        /// Runs a shell command, such as the crafted-claim client.
+        /// Runs a shell command, such as the crafted-claim client, which
+        /// only Linux runs.
+        #[cfg(target_os = "linux")]
         Command(String),
         /// Reports an identity barrier and waits on the gate; the test checks
         /// these rows before it releases the gate.
@@ -756,6 +758,7 @@ mod subagent_sequences {
                         quoted(&input)
                     ));
                 }
+                #[cfg(target_os = "linux")]
                 Step::Command(command) => lines.push(command),
                 Step::Checkpoint(rows) => {
                     lines.extend([barrier.clone(), pause.clone()]);
@@ -981,7 +984,9 @@ mod subagent_sequences {
     }
 
     /// More helper stops than the terminal history holds, after a real
-    /// subagent completed, leave that real row in place (#883 D2).
+    /// subagent completed, leave that real row in place (#883 D2: helper stops
+    /// do not evict terminal history). The recorded R3 sequence has three
+    /// helper stops, too few for any eviction to show.
     #[tokio::test(flavor = "multi_thread")]
     async fn helper_stops_do_not_evict_terminal_history() {
         let root = crate::test_support::scoped_dir("ph-subagent-evict-");
@@ -1036,7 +1041,7 @@ mod subagent_sequences {
     }
 
     /// A Codex `SubagentStop` without a recorded start is a resumed Codex
-    /// child, so it still records a completed row (#883 D2 Codex rule, #916).
+    /// child, so it records a completed row (#883 D2 Codex rule, #916).
     #[tokio::test(flavor = "multi_thread")]
     async fn a_codex_stop_without_a_recorded_start_records_a_completed_row() {
         let root = crate::test_support::scoped_dir("ph-subagent-codex-");
@@ -1091,19 +1096,59 @@ mod subagent_sequences {
         run.close();
     }
 
-    /// Crafted subagent claim sent by the process that runs it, with an
-    /// explicit sequence: `<action> <sequence> <subagent id> <results file>`.
+    /// Ordering scenarios driven by crafted subagent claims with explicit
+    /// sequences, so that a claim can reach the worker before a claim it
+    /// follows, as hooks of separate processes can.
     ///
-    /// Each claim appends `{"action", "sequence", "response"}` to the results
-    /// file; any failure goes to `<results file>.failure`, which the test reads.
+    /// Expected rows follow the ordering invariant decided on #883: a record's
+    /// phase is the phase implied by the highest-sequence claim the worker has
+    /// admitted for that id.
+    ///
+    /// Linux only: the crafted client reads its start identity from `/proc`.
     #[cfg(target_os = "linux")]
-    const CRAFTED_CLAIM: &str = r#"
+    mod crafted {
+        use std::path::{Path, PathBuf};
+        use std::sync::{Arc, Mutex, OnceLock};
+
+        use pohunek_worker_protocol::SubagentPhase;
+        use serde_json::Value;
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+
+        use super::{claude_rows, quoted, replay, row, Row, Rows, Step, CLAUDE, CODEX};
+
+        /// Claim type of a subagent start.
+        const START: &str = "subagent_start";
+
+        /// Claim type of a subagent stop.
+        const STOP: &str = "subagent_stop";
+
+        /// Synthetic subagent id of the recorded Claude shape.
+        const REORDERED: &str = "a1b3d5f7c9e0a2b4d";
+
+        /// Subagents the worker runs at once: `ACTIVE_SUBAGENT_CAPACITY` in
+        /// `crates/session-worker/src/server.rs`, which is private to the worker.
+        const ACTIVE_CAPACITY: usize = 64;
+
+        /// Name of the worker event for a claim that changed no phase.
+        const IGNORED_EVENT: &str = "worker.subagent.claim.ignored";
+
+        /// Name of the worker event for a claim that hit a bound.
+        const REFUSED_EVENT: &str = "worker.subagent.claim.refused";
+
+        /// Crafted-claim client: `<results file> <provider>` and then claims
+        /// as `<claim type>:<sequence>:<subagent id>`, sent one after the other
+        /// by the process that runs the client, which reports itself.
+        ///
+        /// Each answered claim appends `{"action", "sequence", "id",
+        /// "response"}` to the results file; any failure goes to
+        /// `<results file>.failure`, which the test reads.
+        const CLIENT: &str = r#"
 import json
 import os
 import socket
 import sys
 
-action, sequence, subagent_id, results_path = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+results_path, provider = sys.argv[1], sys.argv[2]
 
 def record_failure(kind, value, trace):
     # The test reads this file, so a claim never fails without a reason.
@@ -1118,93 +1163,411 @@ def start_identity(pid):
         return int(handle.read().rsplit(")", 1)[1].split()[19])
 
 pid = os.getpid()
-request = {
-    "type": action,
-    "runtime_id": os.environ["POHUNEK_WORKER_INSTANCE_ID"],
-    "provider": "claude",
-    "pid": pid,
-    "start_identity": start_identity(pid),
-    "sequence": sequence,
-    "subagent_id": subagent_id,
-}
-if action == "subagent_start":
-    request.update({"agent_type": "general-purpose", "parent_id": None})
-else:
-    request["outcome"] = "completed"
-client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-client.connect(os.environ["POHUNEK_WORKER_SOCKET_PATH"])
-client.sendall((json.dumps(request) + "\n").encode())
-received = b""
-while b"\n" not in received:
-    chunk = client.recv(4096)
-    if not chunk:
-        raise RuntimeError(f"worker closed the socket before a full response line: {received!r}")
-    received += chunk
-client.close()
-response = json.loads(received.split(b"\n", 1)[0])
-with open(results_path, "a", encoding="utf-8") as handle:
-    handle.write(json.dumps({"action": action, "sequence": sequence, "response": response}) + "\n")
+for claim in sys.argv[3:]:
+    action, sequence, subagent_id = claim.split(":")
+    request = {
+        "type": action,
+        "runtime_id": os.environ["POHUNEK_WORKER_INSTANCE_ID"],
+        "provider": provider,
+        "pid": pid,
+        "start_identity": start_identity(pid),
+        "sequence": int(sequence),
+        "subagent_id": subagent_id,
+    }
+    if action == "subagent_start":
+        request.update({"agent_type": "general-purpose", "parent_id": None})
+    else:
+        request["outcome"] = "completed"
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(os.environ["POHUNEK_WORKER_SOCKET_PATH"])
+    client.sendall((json.dumps(request) + "\n").encode())
+    received = b""
+    while b"\n" not in received:
+        chunk = client.recv(4096)
+        if not chunk:
+            raise RuntimeError(f"worker closed the socket before a full response line: {received!r}")
+        received += chunk
+    client.close()
+    response = json.loads(received.split(b"\n", 1)[0])
+    with open(results_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({
+            "action": action,
+            "sequence": int(sequence),
+            "id": subagent_id,
+            "response": response,
+        }) + "\n")
 "#;
 
-    /// Claude delivers hooks from separate processes, so a stop can reach the
-    /// worker before the start it follows. A Claude stop for an unknown id at
-    /// sequence 20, then the start for that id at sequence 10, leaves no row;
-    /// a later start at sequence 30 creates a running row.
-    ///
-    /// Linux only: the crafted client reads its start identity from `/proc`.
-    #[cfg(target_os = "linux")]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_claude_start_older_than_an_ignored_stop_creates_no_row() {
-        /// Synthetic subagent id of the recorded shape.
-        const REORDERED: &str = "a1b3d5f7c9e0a2b4d";
-        let root = crate::test_support::scoped_dir("ph-subagent-reorder-");
-        let client = root.join("crafted-claim.py");
-        std::fs::write(&client, CRAFTED_CLAIM).expect("write the crafted-claim client");
-        let results = root.join("crafted-claim.results");
-        let claim = |action: &str, sequence: u64| {
-            Step::Command(format!(
-                "python3 -I {} {action} {sequence} {REORDERED} {}",
-                quoted(&client),
-                quoted(&results)
-            ))
-        };
-        let steps = vec![
-            claim("subagent_stop", 20),
-            claim("subagent_start", 10),
-            Step::Checkpoint(Rows::new()),
-            claim("subagent_start", 30),
-        ];
-        let running = claude_rows(&[Row {
-            agent_id: REORDERED.to_owned(),
-            lifecycle: SubagentPhase::Running,
-        }]);
-        let run = replay(&root, steps, &running).await;
-
-        if let Ok(failure) = std::fs::read_to_string(format!("{}.failure", results.display())) {
-            panic!("a crafted claim failed: {failure}");
+        /// One crafted claim and whether the worker acknowledged it.
+        #[derive(Debug, PartialEq, Eq)]
+        struct Answer {
+            action: String,
+            sequence: u64,
+            id: String,
+            ok: bool,
         }
-        let delivered: Vec<(String, u64)> = std::fs::read_to_string(&results)
-            .expect("the crafted claims recorded their responses")
-            .lines()
-            .map(|line| {
-                let entry: Value = serde_json::from_str(line).expect("result line is JSON");
-                assert!(entry["response"]["ok"].is_boolean(), "{entry}");
-                (
-                    entry["action"].as_str().expect("action").to_owned(),
-                    entry["sequence"].as_u64().expect("sequence"),
-                )
-            })
-            .collect();
-        assert_eq!(
-            delivered,
-            [
-                ("subagent_stop".to_owned(), 20),
-                ("subagent_start".to_owned(), 10),
-                ("subagent_start".to_owned(), 30),
-            ],
-            "every claim reached the worker and was answered"
-        );
-        run.finish().await;
+
+        impl Answer {
+            fn new(action: &str, sequence: u64, id: &str, ok: bool) -> Self {
+                Self {
+                    action: action.to_owned(),
+                    sequence,
+                    id: id.to_owned(),
+                    ok,
+                }
+            }
+        }
+
+        /// The crafted-claim client written into a scenario's directory.
+        struct Client {
+            script: PathBuf,
+            results: PathBuf,
+        }
+
+        impl Client {
+            fn new(root: &Path) -> Self {
+                let script = root.join("crafted-claim.py");
+                std::fs::write(&script, CLIENT).expect("write the crafted-claim client");
+                Self {
+                    script,
+                    results: root.join("crafted-claim.results"),
+                }
+            }
+
+            /// A step sending `claims` (claim type, sequence, subagent id) as
+            /// `provider` from one process, in order.
+            fn step(&self, provider: &str, claims: &[(&str, u64, &str)]) -> Step {
+                let claims = claims
+                    .iter()
+                    .map(|(action, sequence, id)| format!("{action}:{sequence}:{id}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                Step::Command(format!(
+                    "python3 -I {} {} {provider} {claims}",
+                    quoted(&self.script),
+                    quoted(&self.results)
+                ))
+            }
+
+            /// Every answered claim, in the order the worker answered them.
+            fn answers(&self) -> Vec<Answer> {
+                if let Ok(failure) =
+                    std::fs::read_to_string(format!("{}.failure", self.results.display()))
+                {
+                    panic!("a crafted claim failed: {failure}");
+                }
+                std::fs::read_to_string(&self.results)
+                    .expect("the crafted claims recorded their answers")
+                    .lines()
+                    .map(|line| {
+                        let entry: Value = serde_json::from_str(line).expect("result line is JSON");
+                        Answer {
+                            action: entry["action"].as_str().expect("claim type").to_owned(),
+                            sequence: entry["sequence"].as_u64().expect("sequence"),
+                            id: entry["id"].as_str().expect("subagent id").to_owned(),
+                            ok: entry["response"]["ok"]
+                                .as_bool()
+                                .unwrap_or_else(|| panic!("the answer carries ok: {entry}")),
+                        }
+                    })
+                    .collect()
+            }
+        }
+
+        /// One subagent claim event the worker logged.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct Logged {
+            name: String,
+            action: String,
+            id: String,
+            reason: String,
+        }
+
+        impl Logged {
+            fn new(name: &str, action: &str, id: &str, reason: &str) -> Self {
+                Self {
+                    name: name.to_owned(),
+                    action: action.to_owned(),
+                    id: id.to_owned(),
+                    reason: reason.to_owned(),
+                }
+            }
+        }
+
+        /// The worker's subagent claim events, captured on the test thread.
+        ///
+        /// These scenarios serve the worker in process on a current-thread
+        /// runtime, so the worker logs on the thread whose default subscriber
+        /// this installs.
+        #[derive(Clone, Default)]
+        struct ClaimLog(Arc<Mutex<Vec<Logged>>>);
+
+        impl ClaimLog {
+            /// Installs this capture as the thread's default subscriber.
+            ///
+            /// A process-wide anchor dispatcher is registered first, for the
+            /// reason `crate::runtime::lifecycle::tests::LogCapture` gives: with
+            /// two registered dispatchers a callsite's interest is combined
+            /// over both and each event consults the emitting thread's default.
+            fn install(&self) -> tracing::subscriber::DefaultGuard {
+                static ANCHOR: OnceLock<tracing::Dispatch> = OnceLock::new();
+                ANCHOR.get_or_init(|| {
+                    tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new())
+                });
+                tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+            }
+
+            fn events(&self) -> Vec<Logged> {
+                self.0.lock().expect("claim log").clone()
+            }
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ClaimLog {
+            fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
+                let name = event.metadata().name();
+                if name != IGNORED_EVENT && name != REFUSED_EVENT {
+                    return;
+                }
+                let mut fields = ClaimFields::default();
+                event.record(&mut fields);
+                self.0.lock().expect("claim log").push(Logged {
+                    name: name.to_owned(),
+                    action: fields.action,
+                    id: fields.id,
+                    reason: fields.reason,
+                });
+            }
+        }
+
+        /// The string fields of a subagent claim event.
+        #[derive(Default)]
+        struct ClaimFields {
+            action: String,
+            id: String,
+            reason: String,
+        }
+
+        impl tracing::field::Visit for ClaimFields {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                let slot = match field.name() {
+                    "subagent.action" => &mut self.action,
+                    "subagent.id" => &mut self.id,
+                    "subagent.reason" => &mut self.reason,
+                    _ => return,
+                };
+                value.clone_into(slot);
+            }
+
+            fn record_debug(
+                &mut self,
+                _field: &tracing::field::Field,
+                _value: &dyn std::fmt::Debug,
+            ) {
+            }
+        }
+
+        /// Rows of one Claude subagent `id` in `lifecycle`.
+        fn one(id: &str, lifecycle: SubagentPhase) -> Rows {
+            claude_rows(&[Row {
+                agent_id: id.to_owned(),
+                lifecycle,
+            }])
+        }
+
+        /// Claude delivers hooks from separate processes, so a stop can reach
+        /// the worker before the start it follows. A Claude stop for an unknown
+        /// id at sequence 20, then the start for that id at sequence 10,
+        /// leaves no row; a later start at sequence 30 creates a running row.
+        /// Every claim is acknowledged.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_claude_start_older_than_an_ignored_stop_creates_no_row() {
+            let root = crate::test_support::scoped_dir("ph-subagent-reorder-");
+            let client = Client::new(&root);
+            let steps = vec![
+                client.step(CLAUDE, &[(STOP, 20, REORDERED), (START, 10, REORDERED)]),
+                Step::Checkpoint(Rows::new()),
+                client.step(CLAUDE, &[(START, 30, REORDERED)]),
+            ];
+            let run = replay(&root, steps, &one(REORDERED, SubagentPhase::Running)).await;
+            assert_eq!(
+                client.answers(),
+                [
+                    Answer::new(STOP, 20, REORDERED, true),
+                    Answer::new(START, 10, REORDERED, true),
+                    Answer::new(START, 30, REORDERED, true),
+                ]
+            );
+            run.finish().await;
+        }
+
+        /// Run 1 is 10..20. The stop of run 2 (40) reaches the worker before
+        /// its start (30): the row stays completed, because the highest
+        /// admitted claim is the stop at 40.
+        #[tokio::test]
+        async fn a_stop_ahead_of_its_start_keeps_the_next_run_completed() {
+            let log = ClaimLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-subagent-stop-ahead-");
+            let client = Client::new(&root);
+            let completed = one(REORDERED, SubagentPhase::Completed);
+            let steps = vec![
+                client.step(CLAUDE, &[(START, 10, REORDERED), (STOP, 20, REORDERED)]),
+                Step::Checkpoint(completed.clone()),
+                client.step(CLAUDE, &[(STOP, 40, REORDERED)]),
+                Step::Checkpoint(completed.clone()),
+                client.step(CLAUDE, &[(START, 30, REORDERED)]),
+            ];
+            let run = replay(&root, steps, &completed).await;
+            assert_eq!(
+                client.answers(),
+                [
+                    Answer::new(START, 10, REORDERED, true),
+                    Answer::new(STOP, 20, REORDERED, true),
+                    Answer::new(STOP, 40, REORDERED, true),
+                    Answer::new(START, 30, REORDERED, true),
+                ]
+            );
+            assert_eq!(
+                log.events(),
+                [
+                    Logged::new(IGNORED_EVENT, "stop", REORDERED, "not_running"),
+                    Logged::new(IGNORED_EVENT, "start", REORDERED, "stale_sequence"),
+                ],
+                "the newer stop on the terminal row and the older start are ignored"
+            );
+            run.finish().await;
+        }
+
+        /// Run 1 starts at 10. The start of run 2 (30) reaches the worker
+        /// before the stop of run 1 (20): the row stays running, because the
+        /// highest admitted claim is the start at 30; the stop of run 2 (40)
+        /// completes it.
+        #[tokio::test]
+        async fn a_start_ahead_of_the_previous_stop_keeps_the_row_running() {
+            let log = ClaimLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-subagent-start-ahead-");
+            let client = Client::new(&root);
+            let steps = vec![
+                client.step(
+                    CLAUDE,
+                    &[
+                        (START, 10, REORDERED),
+                        (START, 30, REORDERED),
+                        (STOP, 20, REORDERED),
+                    ],
+                ),
+                Step::Checkpoint(one(REORDERED, SubagentPhase::Running)),
+                client.step(CLAUDE, &[(STOP, 40, REORDERED)]),
+            ];
+            let run = replay(&root, steps, &one(REORDERED, SubagentPhase::Completed)).await;
+            assert_eq!(
+                client.answers(),
+                [
+                    Answer::new(START, 10, REORDERED, true),
+                    Answer::new(START, 30, REORDERED, true),
+                    Answer::new(STOP, 20, REORDERED, true),
+                    Answer::new(STOP, 40, REORDERED, true),
+                ]
+            );
+            assert_eq!(
+                log.events(),
+                [
+                    Logged::new(IGNORED_EVENT, "start", REORDERED, "duplicate_start"),
+                    Logged::new(IGNORED_EVENT, "stop", REORDERED, "stale_sequence"),
+                ],
+                "the newer start on the running row and the older stop are ignored"
+            );
+            run.finish().await;
+        }
+
+        /// A Codex stop-only row at sequence 20 is journaled as completed; a
+        /// Codex start at sequence 10 for it is older, so it is ignored and the
+        /// row neither reopens nor changes revision.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_older_start_does_not_reopen_a_journaled_terminal_row() {
+            /// Synthetic Codex child thread id.
+            const CHILD: &str = "agent-child-reordered";
+            let root = crate::test_support::scoped_dir("ph-subagent-stale-start-");
+            let client = Client::new(&root);
+            let completed = Rows::from([(
+                (CODEX.to_owned(), CHILD.to_owned()),
+                SubagentPhase::Completed,
+            )]);
+            let steps = vec![
+                client.step(CODEX, &[(STOP, 20, CHILD)]),
+                Step::Checkpoint(completed.clone()),
+                client.step(CODEX, &[(START, 10, CHILD)]),
+            ];
+            let run = replay(&root, steps, &completed).await;
+            assert_eq!(
+                client.answers(),
+                [
+                    Answer::new(STOP, 20, CHILD, true),
+                    Answer::new(START, 10, CHILD, true),
+                ]
+            );
+            let [journaled, after] = run.snapshots.as_slice() else {
+                panic!("one checkpoint and the final rows: {:?}", run.snapshots);
+            };
+            assert_eq!(row(after, CHILD).revision, row(journaled, CHILD).revision);
+            run.finish().await;
+        }
+
+        /// With the active capacity of running subagents reached, one more
+        /// start is refused: the hook is answered `ok: false`, no row is
+        /// created, and the worker logs the refusal with reason `capacity`.
+        #[tokio::test]
+        async fn a_start_beyond_the_active_capacity_is_refused() {
+            let log = ClaimLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-subagent-capacity-");
+            let client = Client::new(&root);
+            // Fresh ids of the recorded Claude shape: `a` and 16 hex digits.
+            let ids: Vec<String> = (0..=ACTIVE_CAPACITY)
+                .map(|index| format!("ac{index:015x}"))
+                .collect();
+            let (running_ids, overflow) = ids.split_at(ACTIVE_CAPACITY);
+            let overflow = overflow[0].as_str();
+            let sequence = |index: usize| u64::try_from(index).expect("index fits u64") + 1;
+            let starts: Vec<(&str, u64, &str)> = running_ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| (START, sequence(index), id.as_str()))
+                .collect();
+            let running: Rows = claude_rows(
+                &running_ids
+                    .iter()
+                    .map(|id| Row {
+                        agent_id: id.clone(),
+                        lifecycle: SubagentPhase::Running,
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let steps = vec![
+                client.step(CLAUDE, &starts),
+                Step::Checkpoint(running.clone()),
+                client.step(CLAUDE, &[(START, sequence(ACTIVE_CAPACITY), overflow)]),
+            ];
+            let run = replay(&root, steps, &running).await;
+            let answers = client.answers();
+            let (accepted, refused) = answers.split_at(ACTIVE_CAPACITY);
+            assert!(accepted.iter().all(|answer| answer.ok), "{accepted:?}");
+            assert_eq!(
+                refused,
+                [Answer::new(
+                    START,
+                    sequence(ACTIVE_CAPACITY),
+                    overflow,
+                    false
+                )]
+            );
+            assert_eq!(
+                log.events(),
+                [Logged::new(REFUSED_EVENT, "start", overflow, "capacity")]
+            );
+            run.finish().await;
+        }
     }
 }
 

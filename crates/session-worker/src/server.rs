@@ -3428,10 +3428,12 @@ where
                     state.orphan_stops.sequence(&provider, &subagent_id),
                     occurred_at_ms,
                 );
-                if outcome == SubagentOutcome::Applied {
+                if outcome.persists() {
                     journal.updated_at = timestamp();
                     persist(shared.journal.clone(), journal.clone()).await?;
                     state.journal = journal;
+                }
+                if outcome == SubagentOutcome::Applied {
                     state.orphan_stops.forget(&provider, &subagent_id);
                 } else {
                     log_subagent_outcome(&shared, claim, outcome);
@@ -3515,11 +3517,12 @@ where
                     outcome.unwrap_or(JournalSubagentPhase::Completed),
                     occurred_at_ms,
                 );
-                if effect == SubagentOutcome::Applied {
+                if effect.persists() {
                     journal.updated_at = timestamp();
                     persist(shared.journal.clone(), journal.clone()).await?;
                     state.journal = journal;
-                } else {
+                }
+                if effect != SubagentOutcome::Applied {
                     if effect.reason() == Some(SubagentReason::StopWithoutStart) {
                         state.orphan_stops.record(&provider, &subagent_id, sequence);
                     }
@@ -3609,8 +3612,8 @@ where
                 .map_err(|error| WorkerError::Protocol(error.to_string()));
         }
     };
-    // A subagent claim emits only when it changed the journal; an ignored claim
-    // still answers `ok` without an event.
+    // A subagent claim emits only when it was applied; an ignored claim still
+    // answers `ok` without an event, even when it persisted a newer sequence.
     let changed = subagent_outcome.map_or(accepted, |outcome| outcome == SubagentOutcome::Applied);
     if changed {
         if let Some(worker_instance_id) =
@@ -4467,16 +4470,19 @@ struct SubagentClaim<'a> {
     sequence: u64,
 }
 
-/// Why an admissible subagent claim left the journal unchanged.
+/// Why an admissible subagent claim left the subagent's public state
+/// unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubagentReason {
-    /// A start for a subagent that is already running.
+    /// A start ordered after the recorded claim of a subagent that is already
+    /// running.
     DuplicateStart,
     /// A stop with no recorded start from a provider whose stop requires one.
     StopWithoutStart,
     /// A claim not ordered after the claim recorded for the same subagent.
     StaleSequence,
-    /// A stop for a subagent that is already terminal.
+    /// A stop ordered after the recorded claim of a subagent that is already
+    /// terminal.
     NotRunning,
     /// A start that would exceed [`ACTIVE_SUBAGENT_CAPACITY`].
     Capacity,
@@ -4496,16 +4502,29 @@ impl SubagentReason {
 }
 
 /// Effect of one admissible subagent claim on the journal.
+///
+/// A record's phase is the phase implied by the highest-sequence claim the
+/// worker admitted for its subagent, so a record's sequence is the highest
+/// sequence of any admitted claim for it, including claims that leave its
+/// phase unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubagentOutcome {
-    /// The claim changed the journal, which is persisted and announced.
+    /// The claim changed the subagent's public state; the journal is persisted
+    /// and the change announced.
     Applied,
-    /// The claim changes nothing by its order or because it repeats the
-    /// recorded state; the hook still succeeds. `recorded` is the sequence the
-    /// claim was ordered against, when there is one.
+    /// The claim leaves the subagent's public state unchanged by its order or
+    /// because it repeats the recorded phase; the hook still succeeds.
+    /// `recorded` is the sequence the claim was ordered against, when there is
+    /// one. `advanced` is set when the claim is ordered after that sequence and
+    /// the record's sequence was raised to the claim's: the journal is then
+    /// persisted, with no revision change and no announcement, so a claim of
+    /// the same run delivered later is ordered against it. This applies to
+    /// every provider, so each repeated Codex stop of a finished child is one
+    /// journal write.
     Ignored {
         reason: SubagentReason,
         recorded: Option<u64>,
+        advanced: bool,
     },
     /// The claim would exceed a bound; the hook fails. `recorded` is as for
     /// [`Self::Ignored`].
@@ -4521,7 +4540,12 @@ impl SubagentOutcome {
         !matches!(self, Self::Refused { .. })
     }
 
-    /// Why the journal is unchanged, or `None` for an applied claim.
+    /// Whether the journal changed and must be persisted before the answer.
+    const fn persists(self) -> bool {
+        matches!(self, Self::Applied | Self::Ignored { advanced: true, .. })
+    }
+
+    /// Why the public state is unchanged, or `None` for an applied claim.
     const fn reason(self) -> Option<SubagentReason> {
         match self {
             Self::Applied => None,
@@ -4587,11 +4611,13 @@ impl OrphanStops {
 
 /// Applies a subagent start to `journal` under `rule`.
 ///
-/// A start for a running subagent changes nothing. A start ordered after a
-/// terminal subagent's recorded claim reopens it as running, keeping its start
-/// time and any field the claim omits. A start for an unknown subagent opens a
-/// new run unless `orphan_stop`, the sequence of a remembered stop without a
-/// start, is not ordered before it. Opening or reopening a run is refused once
+/// A start ordered after a running subagent's recorded claim only raises the
+/// record's sequence to its own, so a stop of the earlier run delivered later
+/// is stale. A start ordered after a terminal subagent's recorded claim
+/// reopens it as running, keeping its start time and any field the claim
+/// omits. A start not ordered after the recorded claim changes nothing. A
+/// start for an unknown subagent opens a new run unless `orphan_stop`, the
+/// sequence of a remembered stop without a start, is not ordered before it. Opening or reopening a run is refused once
 /// [`ACTIVE_SUBAGENT_CAPACITY`] subagents are running.
 fn start_subagent(
     journal: &mut JournalRecord,
@@ -4607,23 +4633,26 @@ fn start_subagent(
         .iter()
         .position(|item| item.provider == claim.provider && item.id == claim.id);
     let recorded = match index {
-        Some(index) => {
-            let record = &journal.subagents[index];
-            if record.phase == JournalSubagentPhase::Running {
-                return SubagentOutcome::Ignored {
-                    reason: SubagentReason::DuplicateStart,
-                    recorded: Some(record.sequence),
-                };
-            }
-            Some(record.sequence)
-        }
+        Some(index) => Some(journal.subagents[index].sequence),
         None => orphan_stop,
     };
     if !rule.admits_start(recorded, claim.sequence) {
         return SubagentOutcome::Ignored {
             reason: SubagentReason::StaleSequence,
             recorded,
+            advanced: false,
         };
+    }
+    if let Some(index) = index {
+        let record = &mut journal.subagents[index];
+        if record.phase == JournalSubagentPhase::Running {
+            record.sequence = claim.sequence;
+            return SubagentOutcome::Ignored {
+                reason: SubagentReason::DuplicateStart,
+                recorded,
+                advanced: true,
+            };
+        }
     }
     if journal
         .subagents
@@ -4671,10 +4700,12 @@ fn start_subagent(
 /// Applies a subagent stop to `journal` under `rule`.
 ///
 /// A stop ordered after a running subagent's recorded claim moves it to
-/// `phase`. A stop for a terminal subagent, or one not ordered after the
-/// recorded claim, changes nothing. A stop for an unknown subagent creates no
-/// record when `requires_start` holds for its provider, and otherwise records
-/// a subagent that is already terminal.
+/// `phase`. A stop ordered after a terminal subagent's recorded claim only
+/// raises the record's sequence to its own, so a start of the earlier run
+/// delivered later is stale. A stop not ordered after the recorded claim
+/// changes nothing. A stop for an unknown subagent creates no record when
+/// `requires_start` holds for its provider, and otherwise records a subagent
+/// that is already terminal.
 fn stop_subagent(
     journal: &mut JournalRecord,
     rule: SubagentSequence,
@@ -4688,15 +4719,30 @@ fn stop_subagent(
         .iter()
         .position(|item| item.provider == claim.provider && item.id == claim.id);
     let recorded = index.map(|index| journal.subagents[index].sequence);
-    let unchanged = match index {
-        Some(index) if journal.subagents[index].phase != JournalSubagentPhase::Running => {
-            Some(SubagentReason::NotRunning)
+    if index.is_none() && requires_start {
+        return SubagentOutcome::Ignored {
+            reason: SubagentReason::StopWithoutStart,
+            recorded,
+            advanced: false,
+        };
+    }
+    if !rule.admits_stop(recorded, claim.sequence) {
+        return SubagentOutcome::Ignored {
+            reason: SubagentReason::StaleSequence,
+            recorded,
+            advanced: false,
+        };
+    }
+    if let Some(index) = index {
+        let record = &mut journal.subagents[index];
+        if record.phase != JournalSubagentPhase::Running {
+            record.sequence = claim.sequence;
+            return SubagentOutcome::Ignored {
+                reason: SubagentReason::NotRunning,
+                recorded,
+                advanced: true,
+            };
         }
-        None if requires_start => Some(SubagentReason::StopWithoutStart),
-        _ => (!rule.admits_stop(recorded, claim.sequence)).then_some(SubagentReason::StaleSequence),
-    };
-    if let Some(reason) = unchanged {
-        return SubagentOutcome::Ignored { reason, recorded };
     }
     journal.subagent_revision = journal.subagent_revision.saturating_add(1);
     if let Some(index) = index {
@@ -4724,7 +4770,7 @@ fn stop_subagent(
     SubagentOutcome::Applied
 }
 
-/// Records one admissible subagent claim that left the journal unchanged.
+/// Records one admissible subagent claim that left the public state unchanged.
 ///
 /// The claim already passed schema admission and the process-ancestry check,
 /// so its provider, subagent id, and sequences are logged with the reason
@@ -4733,7 +4779,9 @@ fn stop_subagent(
 fn log_subagent_outcome(shared: &Shared, claim: SubagentClaim<'_>, outcome: SubagentOutcome) {
     match outcome {
         SubagentOutcome::Applied => {}
-        SubagentOutcome::Ignored { reason, recorded } => event!(
+        SubagentOutcome::Ignored {
+            reason, recorded, ..
+        } => event!(
             name: "worker.subagent.claim.ignored",
             Level::INFO,
             worker.id = %shared.worker_id,

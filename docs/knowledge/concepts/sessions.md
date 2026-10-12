@@ -324,7 +324,8 @@ rule, the ancestry matcher and the subagent fields against it. The worker alone
 applies the schema's launch-process rule, which decides which process may set
 the launch identity (the daemon holds an imported launch identity to the core
 ancestry matcher only), and the schema's subagent sequence rule (a stop must be
-ordered after its start, a newer start reopens a terminal record, and the
+ordered after its start, a newer start reopens a terminal record, a record's
+phase follows the highest-sequence claim admitted for it, and the
 providers the schema lists, `claude` in `identity-subagent-v1`, have a stop
 admitted only after a recorded start; a schema without the rule admits no
 subagent record), and the daemon refuses
@@ -347,29 +348,39 @@ monotonic decimal-string revisions, and retains bounded completed history across
 daemon and client reconnects. A running child is marked `lost` when its owning
 runtime terminates.
 
-A `SubagentStart` for a known child whose record is terminal and whose sequence
-is newer than the recorded one reopens that record: it is `running` again with
-a new revision, its terminal time is cleared, `started_at_ms` keeps the time of
-the first run, and the next `SubagentStop` completes it. Claude sends such a
+For every provider, a child's phase is the phase implied by the
+highest-sequence claim the worker has admitted for that id, and the journal
+keeps that sequence with the record. A `SubagentStart` newer than the recorded
+claim of a terminal child reopens the record: it is `running` again with a new
+revision, its terminal time is cleared, `started_at_ms` keeps the time of the
+first run, and the next newer `SubagentStop` completes it. Claude sends such a
 start when a finished background agent is resumed with `SendMessage` or wakes
-itself. A start for a child that is already running changes nothing. A Claude
-`SubagentStop` without a recorded start creates no row, leaves the running and
-recent counts and the retained history unchanged, and is remembered in a
-bounded in-memory set for the worker's lifetime, so a delayed start with an
-older sequence is still refused; Claude sends such a stop for its
-prompt-suggestion helper after every main turn, which is not a subagent. A
-Codex `SubagentStop` without a recorded start records a completed child,
-because Codex reports resumed children with stops and no start
+itself. A newer start for a child that is already running, or a newer stop for
+a terminal child, is ignored: the phase and revision stay, but the worker
+persists the claim's sequence in the journal, so a delayed older claim cannot
+reopen or complete the record. A claim not newer than the recorded sequence is
+ignored and changes nothing.
+
+A Claude `SubagentStop` without a recorded start creates no row and leaves the
+running and recent counts and the retained history unchanged; Claude sends
+such a stop for its prompt-suggestion helper after every main turn, which is
+not a subagent. The worker remembers the sequence of such a stop in memory
+only, in a set bounded to 64 entries that drops its oldest entry beyond that,
+and drops an entry once a start for that id applies. A delayed start whose
+sequence is not newer than the remembered stop is ignored, so it creates no
+row. A Codex `SubagentStop` without a recorded start records a completed
+child, because Codex reports resumed children with stops and no start
 ([#916](https://github.com/zajca/pohunek/issues/916)).
 
 Every admitted subagent claim the worker ignores or refuses is logged in the
 session's worker log with a reason code: `duplicate_start`,
 `stop_without_start`, `stale_sequence` and `not_running` at INFO, and
 `capacity` (the running-child limit) at WARN; an inadmissible claim is logged
-as the `worker.identity.rejected` warning. The worker answers the hook with success when it admitted the
-claim and either applied it or ignored it for one of the INFO reasons, and with
-failure when the claim was refused or inadmissible; in both cases the hook
-exits quietly, because subagent claims have no daemon fallback.
+as the `worker.identity.rejected` warning. The worker answers the hook with
+success when it admitted the claim and either applied it or ignored it for one
+of the INFO reasons, and with failure when the claim was refused, was
+inadmissible, or its journal write failed; in every case the hook exits
+quietly, because subagent claims have no daemon fallback.
 
 This collection does not change the parent session's
 `activity`, launch identity, or recovery binding. The hook validates its action

@@ -943,9 +943,12 @@ A schema declares the provider ids that may report, the admitted actions, the
 native-reference kinds (`id`, `path`), the process-ancestry matcher, the
 launch-process rule, whether a nested provider may become the active identity, the optional subagent claim
 fields (`parent_id`, `agent_type`, and the `outcome` of a stop), and the
-subagent sequence rule (a start for a running subagent is idempotent, a start
-newer than a terminal record reopens it, and a stop is admitted only when it is
-ordered after the recorded claim), and the subagent providers whose stop is
+subagent sequence rule (a record's phase is the phase implied by the
+highest-sequence claim admitted for its id: a start newer than a terminal
+record reopens it, a stop newer than a running record ends it, a newer start
+for a running record or a newer stop for a terminal one changes no phase but
+advances the record's journaled sequence, and a claim not newer than that
+sequence is ignored), and the subagent providers whose stop is
 admitted only after a recorded start (`claude` in `identity-subagent-v1`, keyed
 by the reporting provider, so it also covers a Claude in a shell session's
 foreground). A schema that admits subagent
@@ -1241,7 +1244,9 @@ Important fields:
   runtime ends. A terminal child returns to `running` with a new `revision` when
   its provider starts it again (a resumed or self-woken Claude background
   agent): `finished_at_ms` is cleared, `started_at_ms` keeps the first run's
-  time, and `updated_at_ms` marks the reopen. A Claude `SubagentStop` without a
+  time, and `updated_at_ms` marks the reopen. A delayed claim older than the
+  latest one the worker admitted for a child never changes that child. A
+  Claude `SubagentStop` without a
   recorded start (the prompt-suggestion helper Claude runs after every main
   turn) produces no item; a Codex one records a completed child. No prompt,
   result, transcript path, or raw hook payload is exposed.

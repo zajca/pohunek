@@ -98,6 +98,30 @@
       ],
       "checkpoints": [
         {
+          "after_events": 1,
+          "rows": [{"agent_id": "ab6095d32d09fd8cd", "lifecycle": "running"}]
+        },
+        {
+          "after_events": 2,
+          "rows": [{"agent_id": "ab6095d32d09fd8cd", "lifecycle": "completed"}]
+        },
+        {
+          "after_events": 3,
+          "rows": [{"agent_id": "ab6095d32d09fd8cd", "lifecycle": "running"}]
+        },
+        {
+          "after_events": 4,
+          "rows": [{"agent_id": "ab6095d32d09fd8cd", "lifecycle": "completed"}]
+        },
+        {
+          "after_events": 5,
+          "rows": [{"agent_id": "ab6095d32d09fd8cd", "lifecycle": "running"}]
+        },
+        {
+          "after_events": 6,
+          "rows": [{"agent_id": "ab6095d32d09fd8cd", "lifecycle": "completed"}]
+        },
+        {
           "after_events": 7,
           "rows": [{"agent_id": "ab6095d32d09fd8cd", "lifecycle": "running"}]
         },

@@ -73,12 +73,18 @@ the provider, read the session's worker log
 (`pohunek-session-<session-id>.jsonl`). The worker logs every admitted subagent
 claim it ignores as `worker.subagent.claim.ignored` and every claim it refuses
 as `worker.subagent.claim.refused`, with `subagent.action`, `subagent.id`, the
-reported and recorded sequences, and a `subagent.reason` code: `duplicate_start` (a start for a child that is already running),
+reported and recorded sequences, and a `subagent.reason` code:
+`duplicate_start` (a start for a child that is already running),
 `stop_without_start` (a Claude stop with no recorded start, such as Claude's
-prompt-suggestion helper after every main turn), `stale_sequence` (a claim
-ordered before the recorded one) and `not_running` (a stop for a terminal
-child) at INFO, and `capacity` (a start refused because the running-child
-limit is full) at WARN. An inadmissible claim, such as one from the wrong
+prompt-suggestion helper after every main turn), `stale_sequence` (a claim not
+newer than the recorded one, or a start not newer than a remembered Claude
+stop without a start) and `not_running` (a stop for a terminal child) at INFO,
+and `capacity` (a start refused because the running-child limit is full) at
+WARN. A child's phase follows the highest-sequence claim the worker admitted
+for it, for every provider: an ignored `duplicate_start` or `not_running`
+claim newer than the record still advances the record's journaled sequence,
+so a later `stale_sequence` line for an older claim of the same child is the
+expected outcome of reordered hooks, not lost state. An inadmissible claim, such as one from the wrong
 process or runtime, is the `worker.identity.rejected` warning with
 `identity.operation` `subagent_start` or `subagent_stop`.
 
