@@ -21,7 +21,12 @@ over this procedural summary.
 ## Core gate set
 
 Run from the workspace root. `clippy` and `docs check` run with warnings as
-errors, mirroring CI.
+errors, mirroring CI. Run them on the CI toolchain: with the rustup proxies
+(`$CARGO_HOME/bin`, default `~/.cargo/bin`) first on PATH, rustup selects the
+`rust-toolchain.toml` pin for `rustc`, `clippy` and `rustfmt` alike. A
+distribution toolchain earlier on PATH ignores the pin, so its clippy and fmt
+results are not gate evidence; the `rustc-pin` row of `scripts/dev-bootstrap`
+flags a differing `rustc`.
 
 ```bash
 cargo fmt --all --check
@@ -90,8 +95,11 @@ any gate above.
 cargo audit
 cargo hack --feature-powerset --workspace clippy --all-targets
 cargo shear --locked --deny-warnings                           # stable; PR gate
-cargo +nightly udeps --workspace --all-targets --all-features  # optional; CI: main/weekly
+cargo +nightly-YYYY-MM-DD udeps --workspace --all-targets --all-features  # optional; CI: main/nightly
 ```
+
+The udeps date is the pinned nightly: the `toolchain: nightly-YYYY-MM-DD`
+input of the `cargo-udeps` job in `.github/workflows/ci.yml`.
 
 Note: `knowledge` gates its protocol bridge behind a `protocol` feature, so
 `--all-features` only covers the everything-on case — the feature-powerset job

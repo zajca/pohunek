@@ -88,6 +88,9 @@ JOB_HEADER = re.compile(r"^  ([a-z][a-z0-9-]*):\n", re.M)
 USES = re.compile(r"^\s+(?:- )?uses:\s*(\S+)", re.M)
 RUN = re.compile(r"^(\s+)(?:- )?run:\s*(.*)$", re.M)
 PINNED = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$")
+# A local composite action runs from the same commit as the workflow; every
+# action it uses is pinned to a commit in turn.
+LOCAL_ACTION = re.compile(r"^\./\.github/actions/[a-z-]+$")
 
 PERMISSIONS_LINE = re.compile(r"^\s*['\"]?permissions['\"]?\s*:", re.M)
 OIDC_SCOPE = re.compile(r"^\s*['\"]?(id-token|attestations)['\"]?\s*:", re.M)
@@ -792,7 +795,11 @@ class PinningTests(ReleaseWorkflowFiles):
         for file, text in self.texts.items():
             for action in all_uses(text):
                 with self.subTest(file=file, action=action):
-                    if action.startswith("./"):
+                    if LOCAL_ACTION.match(action):
+                        nested = (ROOT / action / "action.yml").read_text()
+                        for inner in all_uses(nested):
+                            self.assertRegex(inner, PINNED)
+                    elif action.startswith("./"):
                         self.assertRegex(action, r"^\./\.github/workflows/[a-z-]+\.yml$")
                     else:
                         self.assertRegex(action, PINNED)

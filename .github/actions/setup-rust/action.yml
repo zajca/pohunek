@@ -1,0 +1,146 @@
+name: Setup Rust
+description: >-
+  Install the Rust toolchain pinned by rust-toolchain.toml, or an explicitly
+  dated nightly, through the SHA-pinned dtolnay/rust-toolchain action. The pin
+  is read from the repository tree this action belongs to (three directories
+  above it), so a job that checks the repository out into a subdirectory uses
+  `./<subdir>/.github/actions/setup-rust` and gets that tree's pin.
+
+inputs:
+  toolchain:
+    description: >-
+      Empty for the `channel` of rust-toolchain.toml (its `components` are
+      installed too). Otherwise a dated nightly `nightly-YYYY-MM-DD`; any other
+      value fails the step.
+    required: false
+    default: ""
+  components:
+    description: Comma-separated extra components (e.g. `clippy, rustfmt`).
+    required: false
+    default: ""
+  targets:
+    description: Comma-separated extra target triples (e.g. `aarch64-apple-darwin`).
+    required: false
+    default: ""
+
+outputs:
+  toolchain:
+    description: The installed toolchain name (`1.99.0` or `nightly-YYYY-MM-DD`).
+    value: ${{ steps.resolve.outputs.toolchain }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve the Rust toolchain
+      id: resolve
+      shell: bash
+      env:
+        INPUT_TOOLCHAIN: ${{ inputs.toolchain }}
+        INPUT_COMPONENTS: ${{ inputs.components }}
+        INPUT_TARGETS: ${{ inputs.targets }}
+      # POSIX sh constructs and BSD-compatible sed/grep only: the macOS runners
+      # run this with bash 3.2 and BSD userland.
+      run: |
+        set -eu
+        fail() {
+          echo "::error::setup-rust: $*" >&2
+          exit 1
+        }
+        newline='
+        '
+        repo_root=$(cd "$GITHUB_ACTION_PATH/../../.." && pwd -P)
+        pin_file="$repo_root/rust-toolchain.toml"
+        [ -f "$pin_file" ] || fail "missing $pin_file"
+
+        # `channel = "X.Y.Z"` on one line; anything else is not an exact pin.
+        channel=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' "$pin_file")
+        case "$channel" in
+          *"$newline"*) fail "rust-toolchain.toml declares more than one channel" ;;
+        esac
+        printf '%s\n' "$channel" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' \
+          || fail "rust-toolchain.toml channel '$channel' is not an exact X.Y.Z release"
+
+        # `components = [...]` must be a one-line array so it can be read here.
+        pin_components=""
+        if grep -Eq '^[[:space:]]*components[[:space:]]*=' "$pin_file"; then
+          marked=$(sed -n 's/^[[:space:]]*components[[:space:]]*=[[:space:]]*\[\(.*\)\][[:space:]]*$/x\1/p' "$pin_file")
+          case "$marked" in
+            x*) ;;
+            *) fail "rust-toolchain.toml components must be a one-line array" ;;
+          esac
+          case "$marked" in
+            *"$newline"*) fail "rust-toolchain.toml declares components more than once" ;;
+          esac
+          pin_components=$(printf '%s' "${marked#x}" | tr -d '"[:space:]')
+        fi
+
+        # Names reach the rustup command line unquoted, so only the
+        # characters of real component and target names pass.
+        normalize_list() {
+          list=$(printf '%s' "$2" | tr -d '[:space:]')
+          [ -z "$list" ] && return 0
+          printf '%s\n' "$list" | grep -Eqx '[A-Za-z0-9_.-]+(,[A-Za-z0-9_.-]+)*' \
+            || fail "$1 '$2' is not a comma-separated list of names"
+          printf '%s' "$list"
+        }
+        pin_components=$(normalize_list "rust-toolchain.toml components" "$pin_components")
+        input_components=$(normalize_list "input components" "$INPUT_COMPONENTS")
+        targets=$(normalize_list "input targets" "$INPUT_TARGETS")
+
+        if [ -z "$INPUT_TOOLCHAIN" ]; then
+          toolchain=$channel
+          requested="$pin_components,$input_components"
+        else
+          case "$INPUT_TOOLCHAIN" in
+            nightly-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+            *) fail "toolchain '$INPUT_TOOLCHAIN' is not empty (the rust-toolchain.toml pin) or a dated nightly-YYYY-MM-DD" ;;
+          esac
+          toolchain=$INPUT_TOOLCHAIN
+          requested=$input_components
+          # The rust-toolchain.toml directory override outranks the rustup
+          # default, so later steps select the nightly through the
+          # environment, which outranks the override.
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+        fi
+
+        components=""
+        for component in $(printf '%s' "$requested" | tr ',' ' '); do
+          case ",$components," in
+            *",$component,"*) ;;
+            *) components="${components:+$components,}$component" ;;
+          esac
+        done
+
+        {
+          echo "toolchain=$toolchain"
+          echo "components=$components"
+          echo "targets=$targets"
+          echo "repo-root=$repo_root"
+        } >> "$GITHUB_OUTPUT"
+        echo "setup-rust: toolchain=$toolchain components=${components:-none} targets=${targets:-none}"
+
+    - name: Install Rust ${{ steps.resolve.outputs.toolchain }}
+      uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      with:
+        toolchain: ${{ steps.resolve.outputs.toolchain }}
+        components: ${{ steps.resolve.outputs.components }}
+        targets: ${{ steps.resolve.outputs.targets }}
+
+    # Fails when cargo in the repository would run another toolchain than the
+    # one just installed.
+    - name: Verify the active Rust toolchain
+      shell: bash
+      env:
+        TOOLCHAIN: ${{ steps.resolve.outputs.toolchain }}
+        REPO_ROOT: ${{ steps.resolve.outputs.repo-root }}
+      run: |
+        set -eu
+        active=$(cd "$REPO_ROOT" && rustup show active-toolchain)
+        case "$active" in
+          "$TOOLCHAIN"-*) ;;
+          *)
+            echo "::error::setup-rust: the repository resolves '$active', expected $TOOLCHAIN" >&2
+            exit 1
+            ;;
+        esac
+        (cd "$REPO_ROOT" && rustc --version)

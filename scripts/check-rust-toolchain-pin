@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""Reject floating Rust toolchains in CI: every job installs an exact pin.
+
+    scripts/check-rust-toolchain-pin [ROOT]
+
+ROOT defaults to the repository this script belongs to. The check reads
+ROOT/rust-toolchain.toml, every ROOT/.github/workflows/*.yml and every
+ROOT/.github/actions/**/action.yml, and reports one `path:line: message` per
+violation:
+
+* rust-toolchain.toml is missing or unparsable, its [toolchain] `channel` is
+  not an exact `X.Y.Z` release, or its `channel`/`components` lines are not in
+  the one-line forms .github/actions/setup-rust reads with sed
+  (`channel = "X.Y.Z"`, `components = ["a", "b"]`, no trailing comment). A
+  legacy `rust-toolchain` file shadows it.
+* A `toolchain:` value (block or flow mapping) is anything but a dated
+  `nightly-YYYY-MM-DD`. The stable pin lives only in rust-toolchain.toml.
+* A command selects a toolchain that is neither the pinned channel nor a dated
+  nightly: `cargo +X`, `--toolchain X`, `RUSTUP_TOOLCHAIN=X`, and the
+  toolchain operands of `rustup update`, `rustup install`, `rustup toolchain
+  install|add|update`, `rustup default`, `rustup set default-toolchain`,
+  `rustup override set` and `rustup run`.
+* An action whose name contains `rust-toolchain` or `setup-rust` (or
+  `actions-rs/toolchain`) is used anywhere but as the local composite
+  `.github/actions/setup-rust`; inside that composite, dtolnay/rust-toolchain
+  must be referenced by commit SHA, since its branch names are channels.
+
+Expressions (`${{ ... }}`) and shell variables as a toolchain are allowed only
+inside .github/actions/setup-rust/action.yml, which validates and passes on
+its resolved value.
+
+Exit status: 0 clean, 1 violations, 2 configuration error (unreadable input,
+no workflow directory, Python without tomllib).
+"""
+
+import argparse
+import datetime
+from pathlib import Path
+import re
+import sys
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    tomllib = None
+
+EXIT_CLEAN = 0
+EXIT_VIOLATIONS = 1
+EXIT_CONFIG = 2
+
+PIN_FILE = "rust-toolchain.toml"
+LEGACY_PIN_FILE = "rust-toolchain"
+WORKFLOW_DIR = Path(".github") / "workflows"
+ACTIONS_DIR = Path(".github") / "actions"
+SETUP_RUST_ACTION = ".github/actions/setup-rust/action.yml"
+# A long report is a broken tree, not a list anyone reads to the end; the
+# count of the rest is still printed.
+MAX_REPORTED_VIOLATIONS = 50
+
+EXACT_RELEASE = re.compile(r"\d+\.\d+\.\d+")
+DATED_NIGHTLY = re.compile(r"nightly-(\d{4}-\d{2}-\d{2})")
+COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
+
+# The line forms the setup-rust resolve step accepts (its sed expressions).
+CHANNEL_KEY_LINE = re.compile(r"^\s*channel\s*=")
+CHANNEL_LINE = re.compile(r'^\s*channel\s*=\s*"(?P<channel>[^"]*)"\s*$')
+COMPONENTS_KEY_LINE = re.compile(r"^\s*components\s*=")
+COMPONENT_NAME = r'"[A-Za-z0-9_.-]+"'
+COMPONENTS_LINE = re.compile(
+    rf"^\s*components\s*=\s*\[\s*(?:{COMPONENT_NAME}(?:\s*,\s*{COMPONENT_NAME})*)?\s*\]\s*$"
+)
+
+# A `toolchain:` or `uses:` key at the start of a block mapping entry or
+# inside a flow mapping (`with: { toolchain: stable }`).
+KEY_PREFIX = r"(?:^\s*(?:-\s+)?|[{,]\s*)"
+TOOLCHAIN_KEY = re.compile(KEY_PREFIX + r"toolchain:(?=\s|$)")
+USES_KEY = re.compile(KEY_PREFIX + r"uses:\s*(?P<value>[^\s,}#]+)")
+RUSTUP_TOOLCHAIN_ASSIGNMENT = re.compile(
+    r"\bRUSTUP_TOOLCHAIN\s*(?:=|:\s)\s*(?P<value>[^\s;&|,}]+)"
+)
+LOCAL_SETUP_RUST = re.compile(r"\./(?:[\w.-]+/)*\.github/actions/setup-rust")
+INSTALLER_NAME = re.compile(r"rust-toolchain|setup-rust|actions-rs/toolchain", re.I)
+DTOLNAY = "dtolnay/rust-toolchain"
+
+# Shell words that end one command and start the next.
+COMMAND_SEPARATOR = re.compile(r"&&|\|\||[;|&()`]|\$\(")
+TOOLCHAIN_COMMANDS = {"cargo", "rustc", "rustdoc", "rustup", "clippy-driver", "rustfmt"}
+# rustup options whose value is the next word, so it is not an operand.
+RUSTUP_VALUE_OPTIONS = {"--profile", "-c", "--component", "-t", "--target", "--path"}
+# rustup subcommand paths whose operands are toolchain names; for `run` only
+# the first operand is.
+RUSTUP_SELECTING = {
+    ("update",): False,
+    ("install",): False,
+    ("default",): False,
+    ("toolchain", "install"): False,
+    ("toolchain", "add"): False,
+    ("toolchain", "update"): False,
+    ("set", "default-toolchain"): False,
+    ("override", "set"): False,
+    ("override", "add"): False,
+    ("run",): True,
+}
+
+
+class ConfigError(Exception):
+    """An input the check cannot read; the tree is neither clean nor dirty."""
+
+
+def read_text(path):
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ConfigError(f"cannot read {path}: {error}") from error
+
+
+def unquote(word):
+    word = word.strip()
+    if len(word) >= 2 and word[0] == word[-1] and word[0] in "\"'":
+        word = word[1:-1].strip()
+    return word
+
+
+def is_dated_nightly(value):
+    match = DATED_NIGHTLY.fullmatch(value)
+    if match is None:
+        return False
+    try:
+        datetime.date.fromisoformat(match.group(1))
+    except ValueError:
+        return False
+    return True
+
+
+def is_indirect(value):
+    """A value computed at run time: a workflow expression or shell variable."""
+    return value.startswith("${{") or value.startswith("$")
+
+
+def check_pin_file(root):
+    """Violations of the pin file, and its channel when it is a valid pin."""
+    violations = []
+    legacy = root / LEGACY_PIN_FILE
+    if legacy.exists():
+        violations.append((LEGACY_PIN_FILE, 1, f"legacy file shadows {PIN_FILE}; delete it"))
+    pin = root / PIN_FILE
+    if not pin.exists():
+        violations.append(
+            (PIN_FILE, 1, 'missing; pin the exact stable release: [toolchain] channel = "X.Y.Z"')
+        )
+        return violations, None
+    text = read_text(pin)
+    try:
+        document = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        line = re.search(r"line (\d+)", str(error))
+        violations.append((PIN_FILE, int(line.group(1)) if line else 1, f"unparsable TOML: {error}"))
+        return violations, None
+
+    lines = text.splitlines()
+    channel_lines = [n for n, content in enumerate(lines, start=1) if CHANNEL_KEY_LINE.match(content)]
+    for number in channel_lines:
+        if CHANNEL_LINE.match(lines[number - 1]) is None:
+            violations.append(
+                (PIN_FILE, number, 'channel must be exactly `channel = "X.Y.Z"` (double quotes, '
+                 "no trailing comment): .github/actions/setup-rust reads that line form")
+            )
+    if len(channel_lines) > 1:
+        violations.append((PIN_FILE, channel_lines[1], "more than one channel line"))
+    components_lines = [n for n, content in enumerate(lines, start=1) if COMPONENTS_KEY_LINE.match(content)]
+    for number in components_lines:
+        if COMPONENTS_LINE.match(lines[number - 1]) is None:
+            violations.append(
+                (PIN_FILE, number, 'components must be a one-line array of double-quoted names '
+                 '(`components = ["clippy", "rustfmt"]`, no trailing comma or comment)')
+            )
+    if len(components_lines) > 1:
+        violations.append((PIN_FILE, components_lines[1], "more than one components line"))
+
+    toolchain = document.get("toolchain")
+    channel = toolchain.get("channel") if isinstance(toolchain, dict) else None
+    first_line = channel_lines[0] if channel_lines else 1
+    if channel is None:
+        violations.append((PIN_FILE, first_line, "no [toolchain] channel; pin the exact stable release X.Y.Z"))
+        return violations, None
+    if not isinstance(channel, str) or EXACT_RELEASE.fullmatch(channel) is None:
+        violations.append(
+            (PIN_FILE, first_line, f"channel {channel!r} floats; pin an exact stable release X.Y.Z")
+        )
+        return violations, None
+    line_form = CHANNEL_LINE.match(lines[first_line - 1]) if channel_lines else None
+    if line_form is not None and line_form.group("channel") != channel:
+        violations.append((PIN_FILE, first_line, "the channel line is not the [toolchain] channel"))
+    return violations, channel
+
+
+def toolchain_values(line):
+    """The values of every `toolchain:` key on a YAML line (empty for none)."""
+    values = []
+    for key in TOOLCHAIN_KEY.finditer(line):
+        rest = line[key.end():].lstrip()
+        if rest.startswith("${{"):
+            end = rest.find("}}")
+            values.append(rest[: end + 2] if end >= 0 else rest)
+        elif rest[:1] in ("'", '"'):
+            end = rest.find(rest[0], 1)
+            values.append(rest[: end + 1] if end >= 0 else rest)
+        else:
+            values.append(re.split(r"\s+#|[,}]", rest, maxsplit=1)[0].strip())
+    return [unquote(value) for value in values]
+
+
+def command_selectors(line):
+    """Toolchain names selected by the shell commands on one line."""
+    selectors = []
+    for segment in COMMAND_SEPARATOR.split(line):
+        words = [unquote(word) for word in segment.split()]
+        for index, word in enumerate(words):
+            if word == "--toolchain" and index + 1 < len(words):
+                selectors.append(words[index + 1])
+            elif word.startswith("--toolchain="):
+                selectors.append(word.split("=", 1)[1])
+        for index, word in enumerate(words):
+            command = word.rsplit("/", 1)[-1]
+            if command not in TOOLCHAIN_COMMANDS:
+                continue
+            arguments = words[index + 1:]
+            if arguments and arguments[0].startswith("+"):
+                selectors.append(arguments[0][1:])
+            if command == "rustup":
+                selectors.extend(rustup_operands(arguments))
+            break
+    return selectors
+
+
+def rustup_operands(arguments):
+    """Toolchain operands of a rustup invocation whose subcommand selects one."""
+    words = []
+    skip = False
+    for word in arguments:
+        if skip:
+            skip = False
+        elif word in RUSTUP_VALUE_OPTIONS or word == "--toolchain":
+            skip = True
+        elif word.startswith("-") or word.startswith("+"):
+            continue
+        else:
+            words.append(word)
+    for path, first_only in RUSTUP_SELECTING.items():
+        if tuple(words[: len(path)]) == path:
+            operands = words[len(path):]
+            return operands[:1] if first_only else operands
+    return []
+
+
+def check_selector(relative, number, value, pinned, is_setup_rust, source):
+    if not value or is_dated_nightly(value) or (pinned is not None and value == pinned):
+        return None
+    if is_indirect(value):
+        if is_setup_rust:
+            return None
+        return (relative, number, f"{source} {value!r} hides the channel; use a literal pin")
+    return (
+        relative,
+        number,
+        f"{source} {value!r} is neither the {PIN_FILE} channel nor a dated nightly-YYYY-MM-DD",
+    )
+
+
+def check_uses(relative, number, reference, is_setup_rust):
+    name, _, ref = reference.partition("@")
+    if LOCAL_SETUP_RUST.fullmatch(name) and not ref:
+        return None
+    if INSTALLER_NAME.search(name) is None:
+        return None
+    if is_setup_rust and name == DTOLNAY:
+        if COMMIT_SHA.fullmatch(ref):
+            return None
+        return (relative, number, f"{reference} is not pinned to a commit SHA")
+    return (relative, number, f"{name} installs Rust outside ./.github/actions/setup-rust; use that action")
+
+
+def check_yaml(relative, text, pinned):
+    violations = []
+    is_setup_rust = relative == SETUP_RUST_ACTION
+    for number, line in enumerate(text.splitlines(), start=1):
+        if line.lstrip().startswith("#"):
+            continue
+        found = []
+        for value in toolchain_values(line):
+            if not value:
+                continue
+            if is_indirect(value):
+                if not is_setup_rust:
+                    found.append((relative, number, f"toolchain {value!r} hides the channel; use a literal nightly-YYYY-MM-DD"))
+            elif not is_dated_nightly(value):
+                found.append(
+                    (relative, number, f"toolchain {value!r} is not a dated nightly-YYYY-MM-DD; "
+                     f"the stable pin belongs in {PIN_FILE} (omit `toolchain`)")
+                )
+        for uses in USES_KEY.finditer(line):
+            found.append(check_uses(relative, number, unquote(uses.group("value")), is_setup_rust))
+        for assignment in RUSTUP_TOOLCHAIN_ASSIGNMENT.finditer(line):
+            found.append(check_selector(
+                relative, number, unquote(assignment.group("value")), pinned, is_setup_rust, "RUSTUP_TOOLCHAIN"
+            ))
+        for selector in command_selectors(line):
+            found.append(check_selector(relative, number, selector, pinned, is_setup_rust, "toolchain selector"))
+        violations.extend(violation for violation in found if violation is not None)
+    return violations
+
+
+def scanned_files(root):
+    workflows = root / WORKFLOW_DIR
+    if not workflows.is_dir():
+        raise ConfigError(f"no workflow directory at {workflows}")
+    files = sorted(workflows.glob("*.yml")) + sorted(workflows.glob("*.yaml"))
+    actions = root / ACTIONS_DIR
+    if actions.is_dir():
+        files += sorted(actions.rglob("action.yml")) + sorted(actions.rglob("action.yaml"))
+    return files
+
+
+def main(argv=None):
+    default_root = Path(__file__).resolve().parent.parent
+    parser = argparse.ArgumentParser(
+        description="Reject floating Rust toolchains in rust-toolchain.toml and CI workflows."
+    )
+    parser.add_argument("root", nargs="?", type=Path, default=default_root,
+                        help="repository root (default: this script's repository)")
+    args = parser.parse_args(argv)
+    root = args.root.resolve()
+
+    try:
+        if tomllib is None:
+            raise ConfigError("needs Python >= 3.11 (tomllib)")
+        violations, pinned = check_pin_file(root)
+        files = scanned_files(root)
+        for path in files:
+            relative = path.relative_to(root).as_posix()
+            violations.extend(check_yaml(relative, read_text(path), pinned))
+    except ConfigError as error:
+        print(f"check-rust-toolchain-pin: {error}", file=sys.stderr)
+        return EXIT_CONFIG
+
+    if not violations:
+        print(f"check-rust-toolchain-pin: ok ({len(files)} workflow and action files)")
+        return EXIT_CLEAN
+    for path, line, message in violations[:MAX_REPORTED_VIOLATIONS]:
+        print(f"{path}:{line}: {message}")
+    hidden = len(violations) - MAX_REPORTED_VIOLATIONS
+    if hidden > 0:
+        print(f"... and {hidden} more")
+    print(f"check-rust-toolchain-pin: {len(violations)} violation(s)", file=sys.stderr)
+    return EXIT_VIOLATIONS
+
+
+if __name__ == "__main__":
+    sys.exit(main())

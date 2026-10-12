@@ -381,16 +381,67 @@ bun test sdk/ts/sdk/test/config.test.ts -t "one case" # file plus name pattern
 cd sdk/ts/sdk && bun run typecheck                   # one package's tsc -b graph
 ```
 
+Rust toolchain pin: `rust-toolchain.toml` pins the exact stable release
+(`channel`, with `clippy` and `rustfmt`) that every CI job installs through
+`.github/actions/setup-rust` and that local runs use. The MSRV
+(`rust-version = "1.96"` in `Cargo.toml`) stays the declared floor; nothing
+builds at it in CI. Local runs follow the pin only through the rustup proxies:
+put `$CARGO_HOME/bin` (default `~/.cargo/bin`) first on PATH and run `rustup
+toolchain install` once in the repository root (with no argument it installs
+the toolchain `rust-toolchain.toml` names). A distribution `cargo`/`rustc`
+earlier on PATH (`/usr/bin`) ignores the file. `RUSTUP_TOOLCHAIN` and `rustup
+override` win over it. Inside the repository a missing pinned toolchain is
+auto-installed by the proxies and by most `rustup` subcommands; set
+`RUSTUP_AUTO_INSTALL=0` to prevent that. The one other toolchain is the dated
+nightly of the `cargo-udeps` job: its `toolchain: nightly-YYYY-MM-DD` input in
+`.github/workflows/ci.yml` is the only place a dated nightly is named.
+`scripts/check-rust-toolchain-pin` rejects a floating channel (`stable`, an
+undated `nightly`, a non-exact `channel`) and any direct
+`dtolnay/rust-toolchain` use outside the composite action.
+
+Bumping the pin is one pull request per bump:
+
+```bash
+scripts/bump-rust-toolchain --stable X.Y.Z           # rewrites rust-toolchain.toml
+scripts/bump-rust-toolchain --nightly YYYY-MM-DD     # rewrites every dated nightly input in the workflows
+```
+
+Either flag or both; it validates the formats, rewrites only the pins,
+reports a second identical run as no change, prints the follow-up commands,
+and never installs anything. In the same PR, install the new toolchain, fix
+every new clippy lint and `cargo fmt` change it brings, run the gate set, and
+make sure `scripts/check-rust-toolchain-pin` passes. Pull-request CI does not
+run the `cargo-udeps` job, so a nightly bump is verified before merge by a
+manual nightly-tier run of the bump branch
+(`gh workflow run ci.yml --ref <branch> -f tier=nightly`).
+
 Local toolchain: `scripts/dev-bootstrap` checks the tools these loops need
 against their minimum versions and prints the exact install command for each
 missing or too-old one. `rustc` (the workspace `rust-version`), `cargo-nextest` (minimum from `.config/nextest.toml`)
 and `python3` >= 3.11 are required; `bacon`, `hyperfine`
 (`scripts/measure-dev-loop`), and `mold` (CI linker only; checked on Linux only) fail only with
-`--strict`. It never installs anything; run the printed fixes yourself:
+`--strict`. The `rustc-pin` row compares the active `rustc` (first on PATH)
+with the `rust-toolchain.toml` pin and prints the PATH and `rustup toolchain
+install` fix on a mismatch. A mismatch fails only with `--strict`: the
+workspace builds and tests on any `rustc` at or above the MSRV, a mismatch
+changes only what clippy and rustfmt report (CI enforces both on the pin), and
+a distribution `rustc` without rustup cannot follow the pin. The row checks
+`rustc` only; a local clippy or fmt result is gate evidence when the rustup
+proxies are first on PATH, because only then do `clippy` and `rustfmt` come
+from the pinned toolchain too. A missing or
+malformed `rust-toolchain.toml` is a configuration error (exit 2). Version
+commands run in the repository root with `RUSTUP_AUTO_INSTALL=0`, so when the
+rustup proxies are first and the pinned toolchain is not installed yet (right
+after a bump), the `rustc` and `cargo-nextest` rows report
+`toolchain-not-installed` with `rustup toolchain install` (in the repository
+root) as the fix, and the pin row is not compared. That fails the run without
+`--strict`: until the toolchain exists, every `cargo`/`rustc` call in the
+repository fails or downloads it first. It never
+installs anything; run the printed fixes yourself:
 
 ```bash
 scripts/dev-bootstrap            # report; non-zero if a required tool fails
-scripts/dev-bootstrap --strict   # optional tools fail the run too
+scripts/dev-bootstrap --strict   # optional tools and a pin mismatch fail the run too
 ```
 
 Watcher (`bacon.toml` at the repo root; optional tool, no gate depends on it —
@@ -530,7 +581,10 @@ Extra CI jobs (run if your change touches deps/features): `cargo audit`,
 `cargo hack --feature-powerset --workspace clippy --all-targets`,
 `cargo shear --locked --deny-warnings` (stable, seconds; the unused-dependency
 gate on every PR), and
-optionally `cargo +nightly udeps --workspace --all-targets --all-features`
+optionally `cargo +nightly-YYYY-MM-DD udeps --workspace --all-targets
+--all-features` on the pinned dated nightly (the date is the `toolchain:` input
+of the `cargo-udeps` job in `.github/workflows/ci.yml`; install it with `rustup
+toolchain install nightly-YYYY-MM-DD`)
 (CI runs it only on `main`, the nightly sweep and manual dispatch, as the
 backstop for a dependency referenced only in code compiled out for the host).
 Suppress a verified `cargo shear` false positive with

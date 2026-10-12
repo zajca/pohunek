@@ -201,9 +201,8 @@ jobs:
           printf 'POHUNEK_PYTHON_BIN=%s\n' "$python_bin" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: stable
           components: clippy
 
       - name: Cache cargo build
@@ -356,9 +355,7 @@ jobs:
         run: test "$(uname -m)" = "arm64"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
-        with:
-          toolchain: stable
+        uses: ./.github/actions/setup-rust
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -466,9 +463,8 @@ jobs:
           sha256: ${{ env.MOLD_SHA256 }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: stable
           components: rustfmt, clippy
 
       - name: Cache cargo build
@@ -514,9 +510,8 @@ jobs:
           sha256: ${{ env.ZIG_SHA256 }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: stable
           components: clippy
           targets: aarch64-apple-darwin
 
@@ -546,9 +541,7 @@ jobs:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
 
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
-        with:
-          toolchain: stable
+      - uses: ./.github/actions/setup-rust
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -611,6 +604,11 @@ jobs:
         if: matrix.shard == 'core'
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
+      # Every workflow installs Rust from rust-toolchain.toml or a dated nightly.
+      - name: Check the Rust toolchain pin
+        if: matrix.shard == 'core'
+        run: scripts/check-rust-toolchain-pin
+
       # No dependency on Clippy, PostgreSQL, PTYs, or the release build.
       - name: Run fast shard
         run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" run "${{ matrix.shard }}"
@@ -633,7 +631,9 @@ jobs:
   # always-critical jobs (fmt, clippy, fast tests, heavy tests, doctests,
   # docs check, relay DB) still run on every push and PR. The release build
   # is gated by the `release` filter. The workflow file
-  # itself forces a relay run so filter edits are always validated.
+  # itself forces a relay run so filter edits are always validated. Every
+  # filter lists rust-toolchain.toml and .github/actions/setup-rust/**, so a
+  # toolchain pin change runs every Rust job.
   changes:
     name: required jobs (paths filter)
     runs-on: ubuntu-latest
@@ -671,6 +671,8 @@ jobs:
               - 'crates/relay/migrations/**'
               - 'Cargo.lock'
               - '.github/workflows/ci.yml'
+              - 'rust-toolchain.toml'
+              - '.github/actions/setup-rust/**'
             # cargo-hack feature-powerset is expensive (issue #125): run only
             # on schedule or when the dependency graph, feature set, or any
             # workspace Rust source changes — the powerset compiles feature
@@ -681,6 +683,8 @@ jobs:
               - 'Cargo.lock'
               - '.github/workflows/ci.yml'
               - 'crates/**/*.rs'
+              - 'rust-toolchain.toml'
+              - '.github/actions/setup-rust/**'
             # macOS platform, path, private-protocol, session-worker, daemon,
             # CLI, launchd, and Hermes filesystem contracts run on the native
             # arm64 runner (issues #96-#100 and #125): gate on every crate
@@ -715,6 +719,8 @@ jobs:
               - 'Cargo.lock'
               - '.cargo/**'
               - '.github/workflows/ci.yml'
+              - 'rust-toolchain.toml'
+              - '.github/actions/setup-rust/**'
             # Native macOS release packaging (issue #104): PRs gate the archive
             # scripts, install acceptance and launchd service code. Main and
             # nightly runs cover the complete packaged daemon dependency tree.
@@ -728,6 +734,8 @@ jobs:
               - 'crates/platform/src/supervisor/launchd/**'
               - '.github/workflows/ci.yml'
               - '.github/workflows/release.yml'
+              - 'rust-toolchain.toml'
+              - '.github/actions/setup-rust/**'
             # The SDK workspace runs natively on Apple Silicon against the
             # real macOS daemon (issue #103): PRs run it for SDK workspace
             # inputs; main and nightly also exercise the Rust binaries.
@@ -737,6 +745,8 @@ jobs:
               - 'bun.lock'
               - '.bun-version'
               - '.github/workflows/ci.yml'
+              - 'rust-toolchain.toml'
+              - '.github/actions/setup-rust/**'
             # Pinned Hermes compatibility provisioning + runtime check
             # (issue #125): gate on the locked runtime metadata, the full CLI
             # surface (the gate drives the CLI parser/dispatch, not just the
@@ -764,6 +774,8 @@ jobs:
               - 'sdk/ts/sdk/test/e2e.test.ts'
               - 'sdk/ts/sdk/test/hermes-plugin.e2e.test.ts'
               - '.github/workflows/ci.yml'
+              - 'rust-toolchain.toml'
+              - '.github/actions/setup-rust/**'
             # Linux Hermes compatibility keeps the broader source filter: Linux
             # runner capacity is not the constrained macOS budget.
             hermes:
@@ -783,6 +795,8 @@ jobs:
               - 'scripts/tests/smoke-hermes-plugin-release.sh'
               - 'scripts/tests/fixtures/smoke-*'
               - '.github/workflows/ci.yml'
+              - 'rust-toolchain.toml'
+              - '.github/actions/setup-rust/**'
             # Official Pi runtime package: the package source and its
             # compatibility lock, the daemon and CLI code the real-Pi test
             # drives, and the crates those link. Any of them can change what a
@@ -802,6 +816,8 @@ jobs:
               - 'crates/platform/**'
               - 'crates/paths/**'
               - '.github/workflows/ci.yml'
+              - 'rust-toolchain.toml'
+              - '.github/actions/setup-rust/**'
             # Official Codex runtime package: same inputs as the Pi package
             # with its own lock and captured screens. The real-Codex tests also
             # drive the daemon's integration install and the hook reporters.
@@ -822,6 +838,8 @@ jobs:
               - 'crates/test-support/**'
               - 'crates/xtask/src/runtime_package.rs'
               - '.github/workflows/ci.yml'
+              - 'rust-toolchain.toml'
+              - '.github/actions/setup-rust/**'
             # Official Claude Code runtime package: the Codex package's inputs
             # with its own lock and captured screens.
             claude_package:
@@ -841,6 +859,8 @@ jobs:
               - 'crates/test-support/**'
               - 'crates/xtask/src/runtime_package.rs'
               - '.github/workflows/ci.yml'
+              - 'rust-toolchain.toml'
+              - '.github/actions/setup-rust/**'
             # Generated TS binding drift lives under a schedule or when the
             # protocol surface or generation driver changes (issue #125).
             # Covers both generators' inputs and outputs: the main protocol
@@ -857,6 +877,8 @@ jobs:
               - 'sdk/ts/protocol/fixtures/**'
               - 'Cargo.lock'
               - '.github/workflows/ci.yml'
+              - 'rust-toolchain.toml'
+              - '.github/actions/setup-rust/**'
             # The release build catches a broken release profile before
             # tagging. That is caused by profile/manifest, lockfile, Cargo
             # configuration, toolchain, or packaging changes; ordinary source
@@ -873,6 +895,7 @@ jobs:
               - '.github/workflows/release.yml'
               - 'scripts/release'
               - 'packaging/**'
+              - '.github/actions/setup-rust/**'
             # Release rehearsal (issue #150): the release workflows, the
             # packaging and assembly tools, the compatibility matrix and locks,
             # the official packages, the consumer suite, and the crates the
@@ -898,6 +921,8 @@ jobs:
               - 'sdk/ts/scripts/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.github/actions/setup-rust/**'
             # Upgrade from the previous release's published binaries to this
             # build with a live session (issue #525): the crates that decide
             # whether a live session survives (public protocol, worker
@@ -922,6 +947,8 @@ jobs:
               - 'packaging/install-daemon.sh'
               - '.github/workflows/upgrade.yml'
               - '.github/workflows/ci.yml'
+              - 'rust-toolchain.toml'
+              - '.github/actions/setup-rust/**'
 
   integration:
     name: tests (heavy, PTY + Hermes)
@@ -945,9 +972,8 @@ jobs:
       # toolchain with Clippy and the locked crates in the cargo registry. It
       # compiles nothing else: the test binaries come from the archive.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        uses: ./relocated/.github/actions/setup-rust
         with:
-          toolchain: stable
           components: clippy
 
       - name: Fetch locked dependency sources
@@ -1003,9 +1029,7 @@ jobs:
           sha256: ${{ env.MOLD_SHA256 }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
-        with:
-          toolchain: stable
+        uses: ./.github/actions/setup-rust
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -1142,9 +1166,7 @@ jobs:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
 
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
-        with:
-          toolchain: stable
+      - uses: ./.github/actions/setup-rust
 
       # Doctests link the debug library builds that the `test-debug` saver
       # (`build-tests`) persists; this job only restores them.
@@ -1176,9 +1198,7 @@ jobs:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
 
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
-        with:
-          toolchain: stable
+      - uses: ./.github/actions/setup-rust
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -1247,9 +1267,7 @@ jobs:
           sha256: ${{ env.MOLD_SHA256 }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
-        with:
-          toolchain: stable
+        uses: ./.github/actions/setup-rust
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -1316,9 +1334,7 @@ jobs:
           sha256: ${{ env.MOLD_SHA256 }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
-        with:
-          toolchain: stable
+        uses: ./.github/actions/setup-rust
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -1451,9 +1467,7 @@ jobs:
           sha256: ${{ env.MOLD_SHA256 }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
-        with:
-          toolchain: stable
+        uses: ./.github/actions/setup-rust
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -1530,9 +1544,7 @@ jobs:
           sha256: ${{ env.MOLD_SHA256 }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
-        with:
-          toolchain: stable
+        uses: ./.github/actions/setup-rust
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -1620,9 +1632,7 @@ jobs:
           sha256: ${{ env.MOLD_SHA256 }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
-        with:
-          toolchain: stable
+        uses: ./.github/actions/setup-rust
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -1706,9 +1716,7 @@ jobs:
             ${{ hashFiles('.github/workflows/ci.yml') }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
-        with:
-          toolchain: stable
+        uses: ./.github/actions/setup-rust
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -1833,9 +1841,7 @@ jobs:
           sha256: ${{ env.MOLD_SHA256 }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
-        with:
-          toolchain: stable
+        uses: ./.github/actions/setup-rust
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -1982,9 +1988,7 @@ jobs:
             bun-${{ runner.os }}-${{ runner.arch }}-1.3.11-
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
-        with:
-          toolchain: stable
+        uses: ./.github/actions/setup-rust
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -2027,6 +2031,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `cargo audit` goes through the rustup proxy, which resolves the
+      # rust-toolchain.toml pin in the repository root.
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+
       # Prebuilt, checksum-verified binary; `fallback: none` fails the step
       # rather than compiling cargo-audit from source.
       - name: Install cargo-audit
@@ -2048,9 +2057,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
-        with:
-          toolchain: stable
+        uses: ./.github/actions/setup-rust
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -2085,9 +2092,8 @@ jobs:
           sha256: ${{ env.MOLD_SHA256 }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: stable
           components: clippy
 
       - name: Cache cargo build
@@ -2127,10 +2133,13 @@ jobs:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
 
+      # A dated nightly, never a floating one (scripts/check-rust-toolchain-pin);
+      # scripts/bump-rust-toolchain --nightly moves it. setup-rust exports
+      # RUSTUP_TOOLCHAIN so cargo uses it despite rust-toolchain.toml.
       - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-10-11
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -2162,9 +2171,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
-        with:
-          toolchain: stable
+        uses: ./.github/actions/setup-rust
 
       - name: Install cargo-shear
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
