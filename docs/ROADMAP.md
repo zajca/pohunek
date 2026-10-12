@@ -89,7 +89,7 @@ core consumes no plugin data in v1 (#480). Open:
   progress, 2/3 (open: #592).
 - Claude Code package [#146](https://github.com/zajca/pohunek/issues/146) — in
   progress; slices 1–2 merged, clean-host catalog install and built-in cutover
-  open (#612, #613 related).
+  open (#613 related).
 - Hermes package [#147](https://github.com/zajca/pohunek/issues/147) — in
   progress (PR #839 merged 2026-10-11; issue open).
 - Package CI and compatibility matrix
