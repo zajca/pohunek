@@ -131,7 +131,11 @@ transcript = hook_input.get("transcript_path")
 transcript_path = transcript if isinstance(transcript, str) and transcript else None
 
 timestamp_ms = int(time.time() * TIMESTAMP_MS_FACTOR)
-sequence = time.monotonic_ns()
+# Every hook event is its own short-lived interpreter, and the worker orders the
+# reports of one agent by this value. `time.monotonic_ns()` is only defined
+# within one process (Apple's Python 3.9 on macOS 27 counts from its own
+# start), so the system-wide monotonic clock is read instead.
+sequence = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
 
 
 # Darwin `proc_pidinfo(PROC_PIDTBSDINFO)` layout of `struct proc_bsdinfo`: the

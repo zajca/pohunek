@@ -28,6 +28,31 @@ fn activity_for<'a>(id: &SessionId, sessions: &'a [SessionInfo]) -> Option<&'a s
         .as_deref()
 }
 
+/// Installs a private copy of the host Bash image at `program`, named for the
+/// provider the fixture agent stands in for.
+///
+/// macOS only runs a platform binary from the system volume, so a copy of one
+/// is killed on launch on recent releases; the copy is re-signed ad hoc, the
+/// signature every non-platform executable on macOS carries, so it runs on
+/// every release.
+fn install_fixture_agent_image(program: &Path) {
+    // hermetic-allowed: #421 copy the host Bash image into a private fake Claude fixture.
+    std::fs::copy("/bin/bash", program).expect("copy fixture agent executable");
+    #[cfg(target_os = "macos")]
+    {
+        let signed = pohunek_test_support::process_env::command("codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(program)
+            .output()
+            .expect("run codesign on the fixture agent executable");
+        assert!(
+            signed.status.success(),
+            "ad-hoc signing the fixture agent executable failed: {}",
+            String::from_utf8_lossy(&signed.stderr)
+        );
+    }
+}
+
 struct ClaudeRig {
     socket: TestSocket,
     control: Framed<UnixStream, LinesCodec>,
@@ -117,8 +142,7 @@ impl ClaudeRig {
             ),
         );
         let program = bin.join("claude");
-        // hermetic-allowed: #421 copy the host Bash image into a private fake Claude fixture.
-        std::fs::copy("/bin/bash", &program).expect("copy fixture agent executable");
+        install_fixture_agent_image(&program);
         std::fs::write(
             agents.join("claude-fixture.toml"),
             format!(

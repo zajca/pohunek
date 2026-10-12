@@ -84,6 +84,33 @@ default = ".codex"
     RuntimeHost::new(RuntimeRegistry::from_sources(&[&builtin, &official]).expect("runtime host"))
 }
 
+/// Installs a private copy of the `source` Bash image at `program`, named for
+/// the provider the fixture agent stands in for.
+///
+/// macOS only runs a platform binary from the system volume, so a copy of one
+/// (`/bin/bash`) is killed on launch on recent releases; the copy is re-signed
+/// ad hoc, the signature every non-platform executable on macOS carries, so it
+/// runs on every release. The `health_socket` integration test keeps its own
+/// copy of this helper because an integration-test crate cannot reach the
+/// library's `#[cfg(test)]` modules and the shared test-support crates are
+/// owned elsewhere.
+fn install_fixture_agent_image(source: &std::path::Path, program: &std::path::Path) {
+    fs::copy(source, program).expect("copy fixture agent image");
+    #[cfg(target_os = "macos")]
+    {
+        let signed = pohunek_test_support::process_env::command("codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(program)
+            .output()
+            .expect("run codesign on the fixture agent image");
+        assert!(
+            signed.status.success(),
+            "ad-hoc signing the fixture agent image failed: {}",
+            String::from_utf8_lossy(&signed.stderr)
+        );
+    }
+}
+
 /// A launch backed by a real worker, official-shaped Codex hook and store.
 struct Rig {
     registry: SessionRegistry,
@@ -125,7 +152,7 @@ impl Rig {
         );
         let program = if verified_launch {
             let copied = dir.join("codex");
-            fs::copy(native_supersede::bash_path(), &copied).expect("copy fixture agent image");
+            install_fixture_agent_image(&native_supersede::bash_path(), &copied);
             copied
         } else {
             native_supersede::bash_path()
@@ -158,6 +185,10 @@ impl Rig {
             session.native_session_id, None,
             "hook runtime starts unbound"
         );
+        // The agent logs its argv line as its first act. A scenario that stops
+        // the session before then would race the exec of the fixture image and
+        // find no launch marker to compare against.
+        wait_for_file_contains(&launch_log_path, "\n").await;
         Self {
             registry,
             host,
