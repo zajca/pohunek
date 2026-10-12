@@ -7,7 +7,31 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use pohunek_platform::filesystem::{AtomicReplaceError, TrustedDir};
+use pohunek_worker_protocol::BackgroundSnapshot;
 use serde::{Deserialize, Serialize};
+
+/// Process that reported a background snapshot.
+///
+/// The pid and start identity name the reporting process, so a release or a
+/// session start can be matched to the owner. A snapshot from any process of
+/// the managed PTY tree belongs to that process alone. `Debug` redacts both
+/// fields, so the owner reaches no log or debug output.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundOwner {
+    /// Reporting process identifier.
+    pub pid: u32,
+    /// Reporting process start identity, as the decimal string the journal stores.
+    pub start_identity: String,
+}
+
+impl Debug for BackgroundOwner {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackgroundOwner")
+            .field("pid", &"[REDACTED]")
+            .field("start_identity", &"[REDACTED]")
+            .finish()
+    }
+}
 
 /// Worker journal schema this crate writes and the daemon reads as current.
 pub const JOURNAL_SCHEMA_VERSION: u32 = 4;
@@ -408,6 +432,22 @@ pub struct JournalRecord {
     /// Active subagents plus bounded recent terminal history.
     #[serde(default)]
     pub subagents: Vec<SubagentRecord>,
+    /// Latest background-work snapshot of the session, absent when none was
+    /// applied or the last one was cleared.
+    #[serde(default)]
+    pub background: Option<BackgroundSnapshot>,
+    /// Process that reported the stored background snapshot. Set and cleared
+    /// with `background`, and never part of the inspect snapshot or the logs.
+    #[serde(default)]
+    pub background_owner: Option<BackgroundOwner>,
+    /// Highest sequence the background has taken effect at: applied snapshots
+    /// and clears (a release, a session start, a changed owner, or an exited
+    /// owner). A claim ordered at or before it is stale.
+    #[serde(default)]
+    pub background_sequence: u64,
+    /// Worker-owned counter from which each background revision is taken.
+    #[serde(default)]
+    pub background_revision: u64,
     /// Id of the hook schema the worker validates reports with, delivered at
     /// initialization. Absent when the runtime has no integration.
     #[serde(default)]
@@ -447,6 +487,13 @@ impl Debug for JournalRecord {
             .field("native_reference_claim", &self.native_reference_claim)
             .field("subagent_revision", &self.subagent_revision)
             .field("subagents", &self.subagents)
+            .field("background", &self.background)
+            .field(
+                "background_owner",
+                &self.background_owner.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("background_sequence", &self.background_sequence)
+            .field("background_revision", &self.background_revision)
             .field("hook_schema", &self.hook_schema)
             .field("next_output_offset", &self.next_output_offset)
             .field("terminal_acknowledged", &self.terminal_acknowledged)
@@ -497,6 +544,10 @@ impl JournalRecord {
             native_reference_claim: None,
             subagent_revision: 0,
             subagents: Vec::new(),
+            background: None,
+            background_owner: None,
+            background_sequence: 0,
+            background_revision: 0,
             hook_schema: None,
             next_output_offset: 0,
             terminal_acknowledged: false,

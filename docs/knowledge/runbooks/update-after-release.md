@@ -33,7 +33,7 @@ v3 spelled it `runtime_id`. The daemon translates that spelling for protocol 3
 clients only; a v4 client or hook never sends it. Do not downgrade one peer
 independently: a v3 client is served by a v4 daemon, a v4 CLI or
 SDK client works against a v3 daemon. Managed Codex and Claude hook assets carry
-`POHUNEK_INTEGRATION_VERSION=13`, and the upgrade never rewrites them: follow
+`POHUNEK_INTEGRATION_VERSION=14`, and the upgrade never rewrites them: follow
 "Managed hook assets after an upgrade" below. An older hook still sends the old
 key, which the daemon accepts only inside a session whose launch baked protocol
 3; in any other session its native-identity reports are rejected. Hooks of a
@@ -49,7 +49,8 @@ and stale Claude subagent rows are not reconciled until they are reinstalled; a
 session worker started by a release without the snapshot claim refuses it, so
 those sessions keep their rows until their own stops arrive. Codex and Claude
 state hooks older than version 13 write no hook failure trace
-(`pohunek-hooks.jsonl`), and a session worker started by a release without the
+(`pohunek-hooks.jsonl`), state hooks older than version 14 send their Stop
+snapshot without the `label`, `program` and `agent_type` fields, and a session worker started by a release without the
 trace sets neither `POHUNEK_HOOK_TRACE_PATH` nor `POHUNEK_HOOK_TRACE_MAX_BYTES`,
 so its hooks write no trace either until the session gets a new worker.
 Earlier protocol transitions (integer-v1 to range negotiation,

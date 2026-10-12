@@ -863,7 +863,9 @@ def process_start_identity(pid):
     return int(fields[19])
 
 start_identity = process_start_identity(pid)
-sequence = int(time.time() * 1000)
+# Worker claim sequences are the host CLOCK_MONOTONIC in nanoseconds; the worker
+# refuses a claim ahead of its own reading of that clock.
+sequence = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
 
 def send(request):
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -7326,6 +7328,7 @@ fn a_journaled_native_reference_alone_changes_the_worker_metadata_fingerprint() 
         native_reference: value.map(reference),
         subagents: Vec::new(),
         hook_schema: None,
+        background: None,
     };
     let (first, second) = (
         super::worker_metadata_fingerprint(&snapshot(Some("a"))),

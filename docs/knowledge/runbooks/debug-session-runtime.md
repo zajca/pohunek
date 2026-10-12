@@ -136,6 +136,53 @@ settles it, and a row whose reporter never ends another main turn stays
 `running` until the runtime ends, when it becomes `lost`. Rows started by
 another process, such as a second Claude in a shell session, are not counted.
 
+The same snapshot also updates the session's background work, which the
+session inspect detail shows beside the subagent rows. The worker logs the
+background snapshot at INFO with four events, none of which carries a label,
+program, command or background item id:
+
+- `worker.background.applied`: the snapshot replaced the background, with
+  `background.revision`, `background.sequence.reported`, `background.items`
+  and `background.kinds`, the item count per kind as `kind=count` pairs
+  (`shell=2 subagent=1`).
+- `worker.background.ignored`: the snapshot did not replace it, with
+  `background.reason` and the reported sequence and item count. `stale_sequence`:
+  a newer background snapshot was already applied, from any process, so the
+  latest sequence wins. `too_many_items`: the list is over
+  `BACKGROUND_MAX_ITEMS` (64) tasks, so the previous background stays.
+- `worker.background.fields_dropped`: optional fields were dropped, with
+  `background.dropped.invalid` (a label or program failed its check, or had
+  the wrong JSON type) and `background.dropped.kind_mismatch` (a field the
+  task's kind does not carry). The rest of the snapshot applied.
+- `worker.background.cleared`: the background was cleared, with
+  `background.reason` `runtime_end`, `release` (the process that reported the
+  snapshot released its session, with a release reason other than `clear`),
+  `agent_changed` (an admitted identity report from another process than the
+  snapshot's reporter), `session_start` (an admitted `startup` or `resume`
+  report from that reporter), or `owner_exited` (the reporting process is no
+  longer running: exited, reaped, a zombie, or its pid now names another process; the inspect path
+  checks it, so the clear follows the exit within one daemon poll, about
+  100 ms).
+
+A release or session-start clear also raises the sequence mark, so a claim the
+reporter began before that clear is `stale_sequence` if it arrives late. An
+`owner_exited` clear does not raise it. A `worker.identity.rejected` warning
+with `identity.reason` `future_sequence` means a hook claim's sequence was
+ahead of the worker's `CLOCK_MONOTONIC` reading at receipt: that is a clock
+mismatch or a forged claim, not a slow hook, because a genuine hook is never
+ahead of the reading. The claim is refused whole, whatever its kind (subagent,
+identity, notification or background snapshot).
+
+The snapshot belongs to the process that reported it. A nested Claude inside
+the session reports its own snapshot, which replaces the outer one, and its
+release clears it. The outer agent's next turn end restores its own snapshot,
+so an empty background while the outer agent runs no turn is expected after a
+nested owner has exited. A `clear` release or a `compact` session of the owner
+keeps the background, and so does a `clear` session that follows a `clear`
+release. When a turn that listed tasks is missing from the background, look
+for one of these events in the log, or for a Claude main turn that never
+ended, because the snapshot is sent at the end of each turn.
+
 When a Claude main turn ends without a `snapshot.applied` event, check in this
 order: a `worker.identity.rejected` warning with `identity.operation`
 `subagent_snapshot` (the worker refused the snapshot, for example a task list

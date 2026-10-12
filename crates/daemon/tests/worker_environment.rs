@@ -304,6 +304,10 @@ async fn current_worker_child_gets_only_base_term_profile_and_identity() {
     // `$XDG_STATE_HOME/pohunek/logs`.
     let hook_trace = fixture.root.join("state/pohunek/logs/pohunek-hooks.jsonl");
     let hook_trace_max_bytes = pohunek_logging::config::HOOK_TRACE_MAX_FILE_BYTES.to_string();
+    let background_label_max_bytes =
+        pohunek_worker_protocol::BACKGROUND_LABEL_MAX_BYTES.to_string();
+    let background_program_max_bytes =
+        pohunek_worker_protocol::BACKGROUND_PROGRAM_MAX_BYTES.to_string();
     let expected = BTreeMap::from([
         ("HOME", "/home/base"),
         ("LANG", "C"),
@@ -320,6 +324,14 @@ async fn current_worker_child_gets_only_base_term_profile_and_identity() {
         (
             "POHUNEK_HOOK_TRACE_MAX_BYTES",
             hook_trace_max_bytes.as_str(),
+        ),
+        (
+            "POHUNEK_BACKGROUND_LABEL_MAX_BYTES",
+            background_label_max_bytes.as_str(),
+        ),
+        (
+            "POHUNEK_BACKGROUND_PROGRAM_MAX_BYTES",
+            background_program_max_bytes.as_str(),
         ),
         ("POHUNEK_NATIVE_REFERENCE_KIND", "id"),
         ("POHUNEK_PROTOCOL_VERSION", "7"),

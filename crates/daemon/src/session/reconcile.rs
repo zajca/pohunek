@@ -402,6 +402,7 @@ impl JournalEvidence {
             native_reference,
             subagents: self.subagents.clone(),
             hook_schema: self.hook_schema.clone(),
+            background: None,
         })
     }
 }
@@ -9955,6 +9956,7 @@ while os.getppid() == parent:
             native_reference: None,
             subagents: Vec::new(),
             hook_schema: Some("identity-subagent-v1".to_owned()),
+            background: None,
         }
     }
 
