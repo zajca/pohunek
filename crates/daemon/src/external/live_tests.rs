@@ -16,6 +16,8 @@ use std::time::Duration;
 
 use protocol::RuntimeRef;
 
+use crate::agent::host::TranscriptParser;
+
 use super::watch::{TranscriptWatch, WatcherDegraded};
 use super::{
     start_transcript_index, ExternalSessions, TranscriptIndex, TranscriptRoot, WatcherHandle,
@@ -62,6 +64,7 @@ impl Live {
         prepare(base.path(), &root);
         let sessions = ExternalSessions::new();
         let roots = vec![TranscriptRoot {
+            parser: TranscriptParser::JsonlHeadV1,
             agent_base: RuntimeRef::claude(),
             path: root.clone(),
             private: false,
@@ -435,11 +438,13 @@ async fn a_nested_root_keeps_its_own_agent_kind_in_scans_and_live_events() {
     let sessions = ExternalSessions::new();
     let roots = vec![
         TranscriptRoot {
+            parser: TranscriptParser::JsonlHeadV1,
             agent_base: RuntimeRef::claude(),
             path: outer.clone(),
             private: false,
         },
         TranscriptRoot {
+            parser: TranscriptParser::JsonlHeadV1,
             agent_base: RuntimeRef::codex(),
             path: inner.clone(),
             private: false,

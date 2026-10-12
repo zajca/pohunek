@@ -125,8 +125,8 @@ expanded). The pieces fit together like this:
   and never tries to decode it. The entry is absent when the home cannot be
   resolved or the host cannot key the digest.
 - **External observer.** With external observation enabled the daemon watches
-  the transcript tree (`projects` for Claude, `sessions` for Codex) of every
-  distinct config home of the host: each runtime's own home and the home of each
+  the transcript tree a runtime declares in `[transcripts]` (`projects` for
+  Claude, `sessions` for Codex) of every distinct config home of the host: each runtime's own home and the home of each
   profile. The set is re-read on every pass, so a profile that is added, edited
   or removed is followed without a restart, and a profile whose home does not
   exist yet is skipped until it does. An external session is still matched by

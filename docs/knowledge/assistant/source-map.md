@@ -565,6 +565,7 @@ Runtime package archive format:
 - `crates/daemon/src/session/package_lifecycle/fault.rs` — the mapping of root and descriptor failures to the `plugin doctor` fault kinds.
 - `crates/daemon/src/agent/host/claim.rs` — which package may serve which runtime id.
 - `crates/daemon/src/agent/host/config_home.rs` — the `[config_home]` descriptor declaration and the one resolver of a runtime's config directory.
+- `crates/daemon/src/agent/host/transcripts.rs` — the `[transcripts]` descriptor declaration: transcript tree below the config home and the compiled parser id.
 - `crates/daemon/src/api/handler/package.rs` — `package.*` handlers and the local-only gate.
 - `crates/daemon/src/agent/profile.rs` — profile `package`/`digest` pins and `pinned_digests`.
 - `crates/protocol/src/package.rs` — `package.*` payloads and stable error codes.

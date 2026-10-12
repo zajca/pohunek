@@ -6,7 +6,7 @@
 //! The Unix socket serves the whole lifecycle; every package method is refused
 //! on the remote connection before it reads a parameter or touches the disk.
 
-// Rust guideline compliant 2026-10-04
+// Rust guideline compliant 2026-10-12
 
 mod support;
 
@@ -276,10 +276,14 @@ any = [{ contains = "ready" }]
 "#;
 
 fn entries(program: &str) -> Vec<ArchiveEntry> {
+    entries_of(&descriptor(program))
+}
+
+fn entries_of(descriptor: &str) -> Vec<ArchiveEntry> {
     vec![
         ArchiveEntry {
             path: "runtime.toml".to_owned(),
-            contents: descriptor(program).into_bytes(),
+            contents: descriptor.as_bytes().to_vec(),
             executable: false,
         },
         ArchiveEntry {
@@ -291,7 +295,11 @@ fn entries(program: &str) -> Vec<ArchiveEntry> {
 }
 
 fn archive(program: &str) -> (Vec<u8>, PackageDigest) {
-    let bytes = build_archive(&entries(program), &Limits::DEFAULT).expect("archive builds");
+    archive_of(&entries(program))
+}
+
+fn archive_of(entries: &[ArchiveEntry]) -> (Vec<u8>, PackageDigest) {
+    let bytes = build_archive(entries, &Limits::DEFAULT).expect("archive builds");
     let digest = read_archive(&bytes, &Limits::DEFAULT)
         .expect("archive reads")
         .digest()
@@ -444,6 +452,115 @@ async fn the_lifecycle_runs_end_to_end_on_the_local_socket() {
         .contains(&RUNTIME.to_owned()));
 
     drop(remote);
+    drop(local);
+    servers.stop().await;
+}
+
+/// `[config_home]` table the transcript scenarios declare next to
+/// `[transcripts]`.
+const CONFIG_HOME_TABLE: &str = "\n[config_home]\nenv = \"ACME_HOME\"\ndefault = \".acme\"\n";
+
+/// A `[transcripts]` table naming `parser` and `dir`.
+fn transcripts_table(parser: &str, dir: &str) -> String {
+    format!("\n[transcripts]\nparser = \"{parser}\"\ndir = \"{dir}\"\n")
+}
+
+/// Installs the fixture descriptor followed by `tables` through
+/// `package.install` and returns the wire result.
+async fn install_with_tables<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    plugins: &Path,
+    name: &str,
+    tables: &str,
+) -> Result<Value, protocol::ProtocolError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (bytes, digest) = archive_of(&entries_of(&format!("{}{tables}", descriptor("/bin/sh"))));
+    let archive_path = plugins.with_file_name(format!("{name}.tar.zst"));
+    std::fs::write(&archive_path, &bytes).expect("write the archive");
+    exchange(
+        framed,
+        method::PACKAGE_INSTALL,
+        json!({
+            "archive_path": archive_path,
+            "trust": { "kind": "explicit_digest", "digest": digest },
+            "enable": true,
+            "select": true,
+            "dry_run": false
+        }),
+    )
+    .await
+    .into_result()
+}
+
+#[tokio::test]
+async fn a_descriptor_with_an_invalid_transcript_declaration_is_refused() {
+    use pohunek_daemon::agent::host::{MAX_TRANSCRIPT_DIR_BYTES, MAX_TRANSCRIPT_DIR_COMPONENTS};
+
+    let servers = spawn_servers("pkg-transcripts").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let declared =
+        |parser: &str, dir: &str| format!("{CONFIG_HOME_TABLE}{}", transcripts_table(parser, dir));
+    let refused = [
+        ("unknown-parser", declared("jsonl-head-v9", "sessions")),
+        ("escaping-dir", declared("jsonl-head-v1", "../sessions")),
+        (
+            "nested-escape",
+            declared("jsonl-head-v1", "logs/../../sessions"),
+        ),
+        ("absolute-dir", declared("jsonl-head-v1", "/var/log/acme")),
+        ("empty-segment", declared("jsonl-head-v1", "logs//chats")),
+        ("dot-segment", declared("jsonl-head-v1", "./sessions")),
+        ("empty-dir", declared("jsonl-head-v1", "")),
+        (
+            "over-long-dir",
+            declared("jsonl-head-v1", &"a".repeat(MAX_TRANSCRIPT_DIR_BYTES + 1)),
+        ),
+        (
+            "over-deep-dir",
+            declared(
+                "jsonl-head-v1",
+                &["a"; MAX_TRANSCRIPT_DIR_COMPONENTS + 1].join("/"),
+            ),
+        ),
+        (
+            "without-config-home",
+            transcripts_table("jsonl-head-v1", "sessions"),
+        ),
+        (
+            "unknown-key",
+            format!("{}extra = 1\n", declared("jsonl-head-v1", "sessions")),
+        ),
+        (
+            "missing-dir",
+            format!("{CONFIG_HOME_TABLE}\n[transcripts]\nparser = \"jsonl-head-v1\"\n"),
+        ),
+    ];
+    for (name, tables) in &refused {
+        let error = install_with_tables(&mut local, &servers.plugins, name, tables)
+            .await
+            .expect_err(name);
+        assert_eq!(error.code, "package_descriptor_invalid", "{name}");
+    }
+    let listed: PackageListResult = call(&mut local, method::PACKAGE_LIST, Value::Null).await;
+    assert!(
+        listed.packages.is_empty(),
+        "a refused descriptor records nothing"
+    );
+
+    install_with_tables(
+        &mut local,
+        &servers.plugins,
+        "valid",
+        &declared("jsonl-head-v1", "logs/chats"),
+    )
+    .await
+    .expect("a valid declaration installs");
+    assert!(supported_agents(&mut local)
+        .await
+        .contains(&RUNTIME.to_owned()));
+
     drop(local);
     servers.stop().await;
 }

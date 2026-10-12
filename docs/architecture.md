@@ -832,9 +832,12 @@ owned by other issues. A source-scan test
 (`crates/xtask/tests/no_special_dispatch.rs`) pins every production line under
 `crates/daemon/src` that still names `codex`, `claude` or `hermes`, per file,
 with the issue that removes it (#144 integration handlers, #145-#147 built-in
-packages, #487 transcript parsing) or `data`. The pin is the exact trimmed text
-of each naming line (a SHA-256 over them for the large integration files), so a
-new, replaced or edited line and a stale entry all fail the test.
+packages) or `data`. The external observer takes each transcript root and its
+parser from the runtime's `[transcripts]` table
+(`crates/daemon/src/agent/host/transcripts.rs`), so it names no agent. The pin
+is the exact trimmed text of each naming line (a SHA-256 over them for the
+large integration files), so a new, replaced or edited line and a stale entry
+all fail the test.
 
 ### Agent state detection
 

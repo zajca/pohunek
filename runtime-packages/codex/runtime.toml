@@ -49,3 +49,9 @@ hook_schema = "identity-subagent-v1"
 [config_home]
 env = "CODEX_HOME"
 default = ".codex"
+
+# Codex writes one JSON Lines rollout per conversation below `sessions` in its
+# config home; the external observer reads the head of each with this parser.
+[transcripts]
+parser = "jsonl-head-v1"
+dir = "sessions"

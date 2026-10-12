@@ -86,6 +86,38 @@ needs the table, or `integration install` answers `agent_config_home_undeclared`
 for it. A runtime without an integration (Pi) may omit it; Pi keeps declaring
 its conversation root under `[native_reference.existence]`.
 
+## Transcripts
+
+A runtime whose agent writes JSON Lines conversation transcripts below its
+config home may declare them in an optional `[transcripts]` table, so external
+observation (`POHUNEK_OBSERVE_EXTERNAL_AGENTS=1`) can enrich agents started
+outside pohunek:
+
+```toml
+[transcripts]
+parser = "jsonl-head-v1"   # compiled parser core provides
+dir = "sessions"           # transcript tree below [config_home]
+```
+
+`parser` names a parser compiled into core; `jsonl-head-v1` is the only one. It
+reads at most the first 32 records (64 KiB) of each `*.jsonl` file and takes the
+first `session_id`, `sessionId`, `conversation_id` or `conversationId` (in that
+order within the first record that has one), `transcript_path` or
+`transcriptPath`, and an absolute `cwd`, `working_directory` or
+`workingDirectory`. `dir` is a relative path of plain components (no `..`, no
+`.`, no empty segment, no absolute path, no glob or shell character, at most
+128 bytes and 8 components). The table requires `[config_home]`; an unknown
+parser id, an unsafe `dir`, a missing key, an unknown key or a table without
+`[config_home]` is refused (`descriptor_invalid`) before anything is recorded.
+A runtime without the table (Pi) is served as usual; its config home
+contributes no transcript root. When the transcript trees of two different
+runtimes are the same directory or one lies inside the other (a shared config
+home with the same or a nested `dir`, or a symlink into another runtime's
+tree), the observer attributes both trees to neither and logs a warning
+`external.transcript_roots.ambiguous` with code `transcripts_ambiguous_owner`
+for each home; the other roots stay watched. The official `codex` package
+declares `sessions` and `claude` declares `projects`.
+
 ## Hook schemas and integration handlers
 
 A package whose agent reports lifecycle hooks names its compiled integration

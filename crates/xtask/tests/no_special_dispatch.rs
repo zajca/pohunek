@@ -46,8 +46,6 @@ enum Owner {
     /// own their provider ids, config paths and asset code, which is data of
     /// the handler and not dispatch.
     Handlers,
-    /// Transcript parsing of external sessions (#487).
-    Transcripts,
     /// The profile doctor reports runtime integrations it cannot inspect (#68).
     Doctor,
     /// Data tables that stay data: reserved ids and wire spellings.
@@ -59,7 +57,6 @@ impl Owner {
         match self {
             Self::Packages => "#145 #146 #147",
             Self::Handlers => "handlers",
-            Self::Transcripts => "#487",
             Self::Doctor => "#68",
             Self::Data => "data",
         }
@@ -202,19 +199,6 @@ const ALLOW_LIST: &[Entry] = &[
 ]),
         Owner::Doctor,
         "issue #68 reports Hermes profiles as unverified because the daemon cannot inspect its CLI-managed integration",
-    ),
-    (
-        "crates/daemon/src/external/mod.rs",
-        Approved::Lines(&[
-    "Some(CLAUDE_TRANSCRIPT_SUBDIR)",
-    "Some(CODEX_TRANSCRIPT_SUBDIR)",
-    "const CLAUDE_TRANSCRIPT_SUBDIR: &str = \"projects\";",
-    "const CODEX_TRANSCRIPT_SUBDIR: &str = \"sessions\";",
-    "if *runtime == RuntimeRef::claude() {",
-    "} else if *runtime == RuntimeRef::codex() {",
-]),
-        Owner::Transcripts,
-        "external transcript roots and parsing per provider",
     ),
     (
         "crates/daemon/src/integration/doctor.rs",
@@ -508,7 +492,6 @@ fn regenerate_allow_list() {
         let owner = known.map_or("Data", |entry| match entry.2 {
             Owner::Packages => "Packages",
             Owner::Handlers => "Handlers",
-            Owner::Transcripts => "Transcripts",
             Owner::Doctor => "Doctor",
             Owner::Data => "Data",
         });

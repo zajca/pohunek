@@ -12,7 +12,7 @@
 //! that resolve to the same canonical directory share one [`Target`], so a home
 //! is never installed into twice by one request.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-12
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -23,7 +23,7 @@ use protocol::{ErrorClass, IntegrationHome, IntegrationSelector, ProtocolError, 
 
 use super::handler::{self, Resolved};
 use super::{config_dir_invalid, config_path_kind, ConfigPath};
-use crate::agent::host::{ConfigHome, HomeError, RuntimeHost};
+use crate::agent::host::{ConfigHome, HomeError, RuntimeHost, Transcripts};
 use crate::agent::{ProfileRegistry, ResolvedAgent};
 use crate::runtime::environment::effective_variable;
 
@@ -116,6 +116,7 @@ impl ConfigHomes {
             homes.push(LaunchHome {
                 runtime: RuntimeRef::from(definition.runtime_id().clone()),
                 profile: None,
+                transcripts: definition.transcripts().cloned(),
                 home: Home::resolve(declared, &self.base, &[]),
             });
         }
@@ -128,6 +129,7 @@ impl ConfigHomes {
             homes.push(LaunchHome {
                 runtime: RuntimeRef::from(agent.base.clone()),
                 profile: Some(agent.name.clone()),
+                transcripts: agent.definition.transcripts().cloned(),
                 home: Home::resolve(declared, &self.base, &profile.env),
             });
         }
@@ -293,6 +295,9 @@ pub(crate) struct LaunchHome {
     /// The host profile that launches the agent; `None` for the runtime's own
     /// home.
     pub(crate) profile: Option<String>,
+    /// The transcript tree below the home and its parser, as the runtime's
+    /// descriptor declares them; `None` when it declares none.
+    pub(crate) transcripts: Option<Transcripts>,
     /// The resolved home, or why the launch environment names none.
     pub(crate) home: Result<Home, ProtocolError>,
 }
