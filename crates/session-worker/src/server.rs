@@ -3869,22 +3869,28 @@ where
                         native_reference: native_reference.clone(),
                     });
                     journal.active_identity_release = None;
-                    // Accepted as the active identity, a report of another process
-                    // clears the owner's snapshot whatever its own clock reads.
-                    let background_cleared = background_clear
-                        .or_else(|| {
-                            report_background_clear(
-                                &journal,
-                                pid,
-                                start_identity,
-                                sequence,
-                                session_source.as_deref(),
-                                true,
-                            )
-                        })
-                        .and_then(|reason| {
+                    let background_cleared = match background_clear {
+                        Some(reason) => {
                             background::clear_at(&mut journal, sequence).then_some(reason)
-                        });
+                        }
+                        // Accepted as the active identity, a report of another
+                        // process clears the owner's snapshot whatever its own clock
+                        // reads. That clock is not ordered against the owner's, so
+                        // the worker's own clock is the barrier: an owner snapshot
+                        // taken before this report arrived is stale.
+                        None => report_background_clear(
+                            &journal,
+                            pid,
+                            start_identity,
+                            sequence,
+                            session_source.as_deref(),
+                            true,
+                        )
+                        .and_then(|reason| {
+                            background::clear_at(&mut journal, background::monotonic_nanos())
+                                .then_some(reason)
+                        }),
+                    };
                     if let (Some(reference_kind), Some(native_reference), Some(launch_base)) = (
                         reference_kind,
                         native_reference,

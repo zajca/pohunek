@@ -6080,8 +6080,9 @@ with open(gate_path, encoding="ascii") as gate:
     }
 
     /// Claude launch root that reports itself and a background snapshot from
-    /// `CLOCK_MONOTONIC`, waits for one gate line, then has a forked descendant
-    /// report its own process from a clock of its own that reads far lower,
+    /// `CLOCK_MONOTONIC`, waits for one gate line, takes a second snapshot's
+    /// sequence, has a forked descendant report its own process from a clock
+    /// of its own that reads far lower, then delivers that second snapshot,
     /// and waits for a second gate line before it exits.
     const BACKGROUND_SWITCH: &str = r#"
 import datetime
@@ -6152,6 +6153,8 @@ send("root_snapshot", {
 })
 with open(gate_path, encoding="ascii") as gate:
     gate.readline()
+# A snapshot the root takes before the switch and delivers after it.
+pending = now()
 child = os.fork()
 if child == 0:
     try:
@@ -6163,13 +6166,19 @@ if child == 0:
 _, status = os.waitpid(child, 0)
 if os.waitstatus_to_exitcode(status) != 0:
     raise RuntimeError("the descendant report failed")
+send("root_late_snapshot", {
+    "type": "subagent_snapshot",
+    "sequence": pending,
+    "tasks": [{"id": "shell-1", "type": "shell", "status": "running", "label": "Test watch", "program": "cargo"}],
+})
 with open(gate_path, encoding="ascii") as gate:
     gate.readline()
 "#;
 
     /// A process whose own clock reads below the background owner's still
     /// clears the owner's snapshot once its report is accepted as the active
-    /// identity: sequences of different processes are never compared.
+    /// identity: sequences of different processes are never compared. An owner
+    /// snapshot taken before that report but delivered after it stays stale.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_accepted_report_of_another_process_clears_the_background_whatever_its_clock() {
         let root = crate::test_support::scoped_dir("ph-background-switch-");
@@ -6195,11 +6204,17 @@ with open(gate_path, encoding="ascii") as gate:
         );
 
         std::io::Write::write_all(&mut gate, b"report\n").expect("release the reporter");
-        let responses = frozen_root_responses(&results, 3).await;
+        let responses = frozen_root_responses(&results, 4).await;
         assert_eq!(
             responses["descendant_low"]["ok"],
             json!(true),
             "the descendant's own first report is accepted: {responses:?}"
+        );
+        // The late snapshot is admitted for its subagents; only its background
+        // is stale, which the inspect below shows.
+        assert!(
+            responses.contains_key("root_late_snapshot"),
+            "{responses:?}"
         );
         let snapshot = worker.inspect().await.expect("inspect");
         let root_identity = snapshot.child_process.expect("the PTY root");
@@ -6207,7 +6222,7 @@ with open(gate_path, encoding="ascii") as gate:
         assert_ne!(active.process, root_identity, "the descendant is active");
         assert!(
             snapshot.background.is_none(),
-            "the previous owner's snapshot is cleared: {:?}",
+            "the previous owner's snapshot is cleared and its late snapshot is stale: {:?}",
             snapshot.background
         );
 

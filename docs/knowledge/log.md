@@ -150,7 +150,9 @@
   orders its process's later claims.
 - A report of another process accepted as the active identity clears the
   background owner's snapshot (`agent_changed`) whatever its sequence, since
-  sequences of different processes are never compared.
+  sequences of different processes are never compared; the clear raises the
+  background mark to the worker's own clock, so an owner snapshot taken before
+  the report and delivered after it stays stale.
 - `docs/public-api.md`, the runtime packages guide and the sessions concept
   state the per-process order; the sequence contract is a value strictly
   increasing across every hook event that reports the same process.
