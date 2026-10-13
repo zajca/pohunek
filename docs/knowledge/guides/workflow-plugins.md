@@ -128,9 +128,10 @@ fails, the command fails with `workflow_installed_disabled`, whose `cause`
 is the failure's own code. Normally everything is undone: the plugin stays
 installed disabled with no units, and after fixing the cause
 `pohunek workflow enable <id>` finishes the job; installing the archive again
-does not enable it. When undoing a failed unit install fails too, the message
-says the plugin may remain enabled or keep units: run
-`pohunek workflow disable <id>` until it succeeds, then enable it. Installing
+does not enable it. When undoing the failed step fails too (a unit install, or
+clearing a flag that may have been written), the message says the plugin may
+remain enabled or keep units: run `pohunek workflow disable <id>` until it
+succeeds, then enable it. Installing
 a recorded archive again never touches its units: running jobs and services
 are neither stopped nor restarted.
 

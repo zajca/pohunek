@@ -436,32 +436,64 @@ pub(crate) async fn run(action: Action, host: &str) -> Result<ExitCode, CliError
             remove_modified,
             json,
         } => {
-            let mut warnings = Vec::new();
-            // The unit lock spans the unit removal and the record removal;
-            // without a store there is nothing of either.
-            let lock = store.lock_units()?;
-            if lock.is_some() && store.installed(&plugin)?.is_some() {
-                let mut host = Host::resolve_lazily();
-                units::retire(&store, &mut host, &plugin, remove_modified, &mut warnings).await?;
-            }
-            let removal = store.uninstall(&plugin, purge, remove_modified)?;
-            drop(lock);
-            warnings.extend(removal.warnings);
-            let result = Uninstalled {
-                plugin: removal.record.as_ref().map(PluginInfo::from),
-                purged: removal.purged.is_some(),
-                purge: removal.purged.map(|(state, config)| PurgeInfo {
-                    state_dir: state,
-                    config_dir: config,
-                }),
-                warnings,
-                state_dir: store.state_dir(&plugin),
-                config_dir: store.config_dir(&plugin),
-            };
-            print_output(json, &result, || render_uninstall(&plugin, &result))?;
+            uninstall(&store, &plugin, purge, remove_modified, json).await?;
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Removes plugin `plugin` from the store: stops and removes its units under
+/// the unit lock, then removes the record and, with `--purge`, its directories.
+async fn uninstall(
+    store: &Store,
+    plugin: &PackageId,
+    purge: bool,
+    remove_modified: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    let mut warnings = Vec::new();
+    // The unit lock spans the record check, the unit removal and the
+    // record removal, because an enabling install of a plugin with
+    // units takes it before it records the plugin. A missing store
+    // root holds no record, but an enabling install can create the
+    // root right after a check, so without `--purge` the id is refused
+    // as unknown here, as an existing store without the record does.
+    // `--purge` also removes state and config directories outside the
+    // store root, so it cannot stop at a missing root; it takes the
+    // lock in creating mode instead.
+    let lock = if purge {
+        store.lock_units_creating()?
+    } else {
+        match store.lock_units()? {
+            Some(lock) => lock,
+            None => {
+                return Err(Error::PluginUnknown {
+                    id: plugin.to_string(),
+                }
+                .into());
+            }
+        }
+    };
+    if store.installed(plugin)?.is_some() {
+        let mut host = Host::resolve_lazily();
+        units::retire(store, &mut host, plugin, remove_modified, &mut warnings).await?;
+    }
+    let removal = store.uninstall(plugin, purge, remove_modified)?;
+    drop(lock);
+    warnings.extend(removal.warnings);
+    let result = Uninstalled {
+        plugin: removal.record.as_ref().map(PluginInfo::from),
+        purged: removal.purged.is_some(),
+        purge: removal.purged.map(|(state, config)| PurgeInfo {
+            state_dir: state,
+            config_dir: config,
+        }),
+        warnings,
+        state_dir: store.state_dir(plugin),
+        config_dir: store.config_dir(plugin),
+    };
+    print_output(json, &result, || render_uninstall(plugin, &result))?;
+    Ok(())
 }
 
 /// The exit status of `workflow run`, printing a `--json` result; a run that
@@ -560,8 +592,9 @@ async fn install(store: &Store, args: &InstallArgs) -> Result<ExitCode, CliError
     // An enabling install of a new plugin with units checks everything its
     // units need, then holds the unit lifecycle lock from before the record
     // is written until the units run, so every refusal comes before any
-    // effect. Only reaching the service manager and installing the units
-    // happen after the record is written.
+    // effect. Reaching the service manager, marking the plugin enabled and
+    // installing each unit happen after the record is written; a failure in
+    // any of them leaves the plugin installed disabled.
     let mut planned = None;
     // Held through the record write when the archive was recorded, so an
     // uninstall cannot remove it in between and turn this install into a
@@ -571,7 +604,8 @@ async fn install(store: &Store, args: &InstallArgs) -> Result<ExitCode, CliError
         let recorded = if recorded == Recorded::No {
             recorded
         } else {
-            // The store exists, so taking its lock creates nothing.
+            // The store root exists, so the lock creates no root; it can still
+            // create `units.lock` itself.
             held = store.lock_units()?;
             store.recorded(&candidate)?
         };

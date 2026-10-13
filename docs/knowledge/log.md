@@ -45,6 +45,14 @@
   `min_interval_s`, `check_period_s`) and `[services]`
   (`restart_initial_ms`, `restart_max_ms`, `stable_after_ms`).
 - The architecture concept says which login units exist besides the daemon.
+- `uninstall` of an id with no record and no store root is refused as
+  `workflow_plugin_unknown` before any lock is taken, the same answer as an
+  existing store without the record. With `--purge` the unit lock is taken in
+  creating mode, so an enabling install cannot record the plugin between the
+  check and the removal; a recorded plugin is still disabled and its units
+  removed first.
+- A failure while marking a fresh plugin enabled that may have written the flag
+  disables it again before `workflow_installed_disabled` is reported.
 
 ## Unreleased (2026-10-13, workflow run --json and verbatim arguments, #325)
 

@@ -424,10 +424,11 @@ pub(crate) struct StartFailed {
 /// # Errors
 ///
 /// Returns [`Error::Units`] when the service manager cannot be reached
-/// (nothing changed) or a unit cannot be installed (rolled back), and the
-/// errors of [`Store::set_enabled`] when the plugin cannot be marked
-/// enabled (nothing changed): [`Error::Busy`], [`Error::Store`],
-/// [`Error::RootInvalid`] or [`Error::PluginUnknown`].
+/// (nothing changed) or a unit cannot be installed (rolled back). When the
+/// plugin cannot be marked enabled, [`Error::Busy`], [`Error::RootInvalid`]
+/// and [`Error::PluginUnknown`] change nothing; any other
+/// [`Store::set_enabled`] error may follow a committed flag, so the plugin is
+/// disabled again and `undone` reports whether that succeeded.
 pub(crate) async fn start(
     store: &Store,
     context: &Context,
@@ -441,7 +442,20 @@ pub(crate) async fn start(
     let backend = connect(context, &plan.installation, id)
         .await
         .map_err(unchanged)?;
-    let enabled = store.set_enabled(id, true).map_err(unchanged)?;
+    // Busy, an unknown plugin and an unverifiable root refuse before the flag
+    // is written. Any other error may follow a committed write, so the flag is
+    // cleared again; `set_enabled(false)` is Ok for a plugin already disabled,
+    // which covers the case where nothing was committed.
+    let enabled = match store.set_enabled(id, true) {
+        Ok(record) => record,
+        Err(error @ (Error::Busy | Error::PluginUnknown { .. } | Error::RootInvalid { .. })) => {
+            return Err(unchanged(error));
+        }
+        Err(error) => {
+            let undone = store.set_enabled(id, false).is_ok();
+            return Err(StartFailed { error, undone });
+        }
+    };
     for (key, definition) in &plan.units {
         if let Err(error) = backend.install(key, definition).await {
             let mut detail = format!("installing the {key} unit failed: {error}");

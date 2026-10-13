@@ -307,7 +307,7 @@ pub(crate) enum Error {
     /// A fresh install recorded the plugin, but enabling it failed after
     /// that; the plugin stays installed disabled with no units, unless
     /// undoing the failed enable failed too.
-    #[error("workflow plugin {id} was installed, but enabling it failed, so {}: {source}", if *.undone { "it stays installed disabled with no units" } else { "and undoing that failed too, it may remain enabled or keep units" })]
+    #[error("workflow plugin {id} was installed, but enabling it failed{}: {source}", if *.undone { ", so it stays installed disabled with no units" } else { ", and undoing that failed too, so it may remain enabled or keep units" })]
     InstalledDisabled {
         /// The plugin id.
         id: String,
@@ -536,9 +536,10 @@ impl Error {
         }
     }
 
-    /// The recovery shown beneath the error: [`Error::hint`], preceded for
-    /// an installed-disabled plugin by the hint of the failure that left it
-    /// disabled.
+    /// The recovery shown beneath the error: [`Error::hint`]. For an
+    /// installed-disabled plugin it is prefixed by the fix clause of the
+    /// failure that left it disabled ([`enable_fix`] of its `source`), then a
+    /// comma.
     pub(crate) fn recovery(&self) -> String {
         match self {
             Self::InstalledDisabled { source, .. } => {
