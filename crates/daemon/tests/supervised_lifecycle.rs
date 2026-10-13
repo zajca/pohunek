@@ -862,11 +862,13 @@ impl Bystanders {
             .push(start_running(fixture, &*self.jobs, logs, &key).await);
     }
 
-    fn assert_alive(&self, fixture: &Installation) {
+    /// Asserts that every stand-in job started so far still runs; `after`
+    /// names the step that just finished.
+    fn assert_alive(&self, fixture: &Installation, after: &str) {
         for process in &self.processes {
             assert!(
                 fixture.is_running(*process),
-                "a removal or recovery signalled an unrelated launchd job"
+                "{after} signalled an unrelated job of another installation"
             );
         }
     }
@@ -893,7 +895,9 @@ fn orphaning_agent_script(probe: &std::path::Path) -> String {
 
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
-async fn an_orphaned_platform_process_of_the_runtime_keeps_the_cleanup_unconfirmed() {
+async fn an_orphaned_platform_process_of_the_runtime_is_attributed_by_what_the_host_exposes() {
+    use pohunek_platform::process::{Error, HostInspector, ProcessInspector as _};
+
     let fixture = Installation::new(Settings::default()).await;
     let profile = format!(
         "base = \"shell\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", {}]\n",
@@ -919,23 +923,38 @@ async fn an_orphaned_platform_process_of_the_runtime_keeps_the_cleanup_unconfirm
     })
     .await;
     let orphan = fixture.identity(orphan_pid).expect("the orphan runs");
+    // Whether the host withholds the environment of the platform binary,
+    // read from the live orphan itself.
+    let withheld = matches!(
+        HostInspector::new().ownership_markers(orphan_pid),
+        Err(Error::Unobservable { .. } | Error::PermissionDenied { .. })
+    );
 
     signal(before.worker.pid, Signal::SIGKILL);
     fixture.wait_gone(before.worker, "crashed worker").await;
-    // The orphan shares the worker's coalitions, so no coalition evidence
-    // dismisses it, and nothing else attributes it: the cleanup stays
-    // unconfirmed and the process is neither signalled nor dismissed.
-    fixture
-        .wait_reason(
-            &session,
-            RuntimeState::Lost,
-            RUNTIME_LOST_CLEANUP_UNCONFIRMED,
-        )
-        .await;
-    assert!(
-        fixture.is_running(orphan),
-        "a process the sweep could not attribute was signalled"
-    );
+    if withheld {
+        // The orphan shares the worker's coalitions, so no coalition evidence
+        // dismisses it, and nothing else attributes it: the cleanup stays
+        // unconfirmed and the process is neither signalled nor dismissed.
+        fixture
+            .wait_reason(
+                &session,
+                RuntimeState::Lost,
+                RUNTIME_LOST_CLEANUP_UNCONFIRMED,
+            )
+            .await;
+        assert!(
+            fixture.is_running(orphan),
+            "a process the sweep could not attribute was signalled"
+        );
+    } else {
+        // A host that exposes the environment attributes the orphan by its
+        // marker, so the sweep ends it and the cleanup is confirmed.
+        fixture
+            .wait_reason(&session, RuntimeState::Lost, RUNTIME_LOST)
+            .await;
+        fixture.wait_gone(orphan, "the orphan of the runtime").await;
+    }
 }
 
 /// An unrelated process that takes over a crashed worker's journaled PID.
@@ -1129,6 +1148,7 @@ async fn repeated_start_stop_recover_cycles_leave_no_orphans() {
             .call::<method::SessionRemove>(SessionId(removed.clone()))
             .await
             .unwrap_or_else(|error| panic!("remove {removed}: {error}"));
+        bystanders.assert_alive(&fixture, &format!("the stop and remove of round {round}"));
         if round % 2 == 0 {
             fixture.restart_daemon().await;
         } else {
@@ -1141,8 +1161,11 @@ async fn repeated_start_stop_recover_cycles_leave_no_orphans() {
             .wait_gone(snapshots[1].worker, "removed session's worker")
             .await;
         assert_only_current_jobs(&fixture, &namespace, kept.values(), round).await;
+        bystanders.assert_alive(
+            &fixture,
+            &format!("the daemon restart or kill of round {round}"),
+        );
     }
-    bystanders.assert_alive(&fixture);
     stays("no orphan job reappears", SETTLED, || async {
         fixture.job_ids().await == sorted_ids(&kept.values().cloned().collect::<Vec<_>>())
     })
