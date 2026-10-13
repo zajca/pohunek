@@ -37,6 +37,7 @@ EVIDENCE = WORKFLOWS / "release-evidence.yml"
 CI = WORKFLOWS / "ci.yml"
 POLICY = ROOT / "packaging" / "release-policy.json"
 SCRIPTS = ROOT / "scripts" / "release-workflow"
+SCCACHE_ACTION = ROOT / ".github" / "actions" / "setup-sccache" / "action.yml"
 
 DOWNLOAD = "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
 ATTEST_ACTION = "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6"
@@ -1189,6 +1190,70 @@ class OfflineDependencySourcesTests(unittest.TestCase):
                 with self.subTest(job=name):
                     self.assertIsNotNone(fetch, f"{name} runs cargo test without `cargo fetch --locked`")
                     self.assertLess(fetch.start(), test_run.start(), f"{name} fetches after running cargo test")
+
+
+class SccacheSetupTests(unittest.TestCase):
+    """The Rust jobs reach sccache only through .github/actions/setup-sccache."""
+
+    SETUP_STEP = (
+        r"(?m)^      - name: Enable sccache\n"
+        r"        uses: \./\.github/actions/setup-sccache\n"
+        r"        with:\n"
+        r"          version: \$\{\{ env\.SCCACHE_VERSION \}\}\n"
+        r"          sha256: \$\{\{ env\.SCCACHE_SHA256 \}\}\n"
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.action = SCCACHE_ACTION.read_text()
+        cls.texts = {
+            name: (WORKFLOWS / name).read_text()
+            for name in ("release.yml", "release-build.yml", "release-evidence.yml", "ci.yml")
+        }
+
+    def test_no_job_sets_the_wrapper_or_the_sccache_flag(self):
+        for name, text in self.texts.items():
+            header = text.partition("\njobs:\n")[0]
+            with self.subTest(file=name):
+                self.assertNotRegex(header, r"(?m)^  (RUSTC_WRAPPER|SCCACHE_GHA_ENABLED):")
+                for job, block in jobs(text).items():
+                    self.assertNotRegex(block, r"(?m)^\s+(RUSTC_WRAPPER|SCCACHE_GHA_ENABLED):", job)
+
+    def test_sccache_is_set_up_only_through_the_composite(self):
+        for name, text in self.texts.items():
+            with self.subTest(file=name):
+                self.assertNotIn("mozilla-actions/sccache-action", text)
+        self.assertEqual(len(re.findall(self.SETUP_STEP, self.texts["release.yml"])), 3)
+        self.assertEqual(len(re.findall(self.SETUP_STEP, self.texts["release-build.yml"])), 1)
+        self.assertEqual(self.texts["release.yml"].count("- name: Enable sccache"), 3)
+        self.assertEqual(self.texts["release-build.yml"].count("- name: Enable sccache"), 1)
+
+    def test_the_composite_pins_the_action_and_passes_the_version_explicitly(self):
+        steps = re.split(r"(?m)^    - ", self.action)
+        action_steps = [step for step in steps if "uses: mozilla-actions/sccache-action@" in step]
+        self.assertEqual(len(action_steps), 1)
+        step = action_steps[0]
+        self.assertRegex(step, r"uses: mozilla-actions/sccache-action@[0-9a-f]{40} # v0\.0\.11\n")
+        self.assertIn("        version: v${{ inputs.version }}\n", step)
+        self.assertIn("      if: ${{ steps.seed.outputs.ok == 'true' }}\n", step)
+
+    def test_the_wrapper_is_exported_only_after_the_verified_binary_is_resolved(self):
+        steps = re.split(r"(?m)^    - ", self.action)
+        export = [step for step in steps if "RUSTC_WRAPPER=sccache" in step]
+        self.assertEqual(len(export), 1)
+        self.assertIn("      if: ${{ steps.seed.outputs.ok == 'true' }}\n", export[0])
+        self.assertNotIn("continue-on-error", self.action)
+
+    def test_the_pinned_release_agrees_between_the_two_workflows(self):
+        pins = {}
+        for name in ("release.yml", "release-build.yml"):
+            header = self.texts[name].partition("\njobs:\n")[0]
+            version = re.search(r'(?m)^  SCCACHE_VERSION: "([0-9.]+)"$', header)
+            digest = re.search(r"(?m)^  SCCACHE_SHA256: ([0-9a-f]{64})$", header)
+            self.assertIsNotNone(version, name)
+            self.assertIsNotNone(digest, name)
+            pins[name] = (version.group(1), digest.group(1))
+        self.assertEqual(pins["release.yml"], pins["release-build.yml"])
 
 
 if __name__ == "__main__":

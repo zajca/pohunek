@@ -40,6 +40,13 @@ env:
   # Disable incremental compilation: rust-cache strips incremental artifacts
   # before persisting anyway (issue #124).
   CARGO_INCREMENTAL: "0"
+  # Pinned sccache release for .github/actions/setup-sccache. SCCACHE_SHA256
+  # is the sha256 of sccache-v0.18.0-x86_64-unknown-linux-musl.tar.gz as
+  # published in the release's .sha256 asset
+  # (https://github.com/mozilla/sccache/releases/tag/v0.18.0), cross-checked
+  # against a local download. Bump both together with release.yml.
+  SCCACHE_VERSION: "0.18.0"
+  SCCACHE_SHA256: 45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89
 
 jobs:
   meta:
@@ -72,8 +79,6 @@ jobs:
     needs: [meta]
     runs-on: ${{ matrix.runner }}
     env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     permissions:
       contents: read
@@ -138,7 +143,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y mold
 
       - name: Enable sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        uses: ./.github/actions/setup-sccache
+        with:
+          version: ${{ env.SCCACHE_VERSION }}
+          sha256: ${{ env.SCCACHE_SHA256 }}
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
