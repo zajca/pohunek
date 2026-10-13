@@ -7,15 +7,19 @@
 //! installs nothing until the owner repeats the command with `--yes`.
 //!
 //! `run` exits with the action's own status (128 plus the signal number when
-//! a signal ended it). A run the CLI stopped exits with
+//! a signal ended it), in both output modes. A run the CLI stopped exits with
 //! [`TIMEOUT_EXIT_CODE`], [`OUTPUT_LIMIT_EXIT_CODE`], or 128 plus the
-//! signal number for a terminating signal the CLI received; a refusal exits
-//! with status 1 like every other failed command.
+//! signal number for a terminating signal the CLI received; a refusal, and a
+//! `--json` run whose stdout is not one complete JSON document, exits with
+//! status 1 like every other failed command. With `--json`, stdout carries
+//! exactly one envelope: the action's document byte for byte as `ok`, or the
+//! error, which never holds output bytes.
 
 // Rust guideline compliant 2026-10-13
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -25,11 +29,12 @@ use protocol::{PackageDigest, PackageId, PackageVersion};
 use serde::Serialize;
 
 use crate::commands::plugin::{self, print_output, sanitize, summary};
+use crate::commands::{render_json, render_json_error_with};
 use crate::error::CliError;
 use crate::paths::Paths;
 use crate::target::is_local_host;
 use crate::workflow::manifest::{Action as Declared, ArgsMode, Manifest};
-use crate::workflow::runner::{run_action, Invocation};
+use crate::workflow::runner::{run_action, Completed, Invocation, Output};
 use crate::workflow::store::{read_candidate, Candidate, Purged, Recorded, Store};
 use crate::workflow::{config, Error};
 
@@ -101,17 +106,34 @@ pub(crate) enum Action {
     /// shell, in the plugin's files directory, with a minimal environment
     /// and the owner limits of `workflow.toml`; its stdout and stderr stream
     /// here. Exits with the action's status.
+    ///
+    /// Every argument after ACTION goes to the action verbatim, including
+    /// `--json`, `--`, `-h` and empty strings, so pohunek options such as
+    /// `--json` and `--host` must come before PLUGIN.
+    #[command(override_usage = "pohunek workflow run [OPTIONS] <PLUGIN> <ACTION> [ARGS]...")]
     Run {
+        /// Print one JSON envelope whose `ok` is the action's stdout, which
+        /// must be exactly one JSON document; stderr still streams here.
+        #[arg(long)]
+        json: bool,
         /// Plugin id.
         #[arg(value_name = "PLUGIN")]
         plugin: PackageId,
-        /// Action name, as shown by `pohunek workflow inspect`.
-        #[arg(value_name = "ACTION")]
-        action: String,
-        /// Extra arguments after `--`, passed verbatim to an action that
-        /// declares `args = "passthrough"`.
-        #[arg(last = true, value_name = "ARGS")]
-        args: Vec<OsString>,
+        /// The action name, as shown by `pohunek workflow inspect`, then
+        /// extra arguments passed verbatim to an action that declares
+        /// `args = "passthrough"`.
+        // One trailing vector holds the action and its arguments: clap
+        // stops option parsing only once a trailing vector has its first
+        // value, so a separate ACTION positional would let `--json`, `-h`
+        // or `--` right after it reach pohunek instead of the action.
+        #[arg(
+            value_names = ["ACTION", "ARGS"],
+            required = true,
+            num_args = 1..,
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
+        call: Vec<OsString>,
     },
 
     /// Remove an installed plugin.
@@ -144,9 +166,9 @@ impl Action {
             | Self::Inspect { json, .. }
             | Self::Enable { json, .. }
             | Self::Disable { json, .. }
-            | Self::Uninstall { json, .. } => *json,
+            | Self::Uninstall { json, .. }
+            | Self::Run { json, .. } => *json,
             Self::Install(args) => args.json,
-            Self::Run { .. } => false,
         }
     }
 }
@@ -286,18 +308,19 @@ pub(crate) fn run(action: Action, host: &str) -> Result<ExitCode, CliError> {
             print_output(json, &result, || render_inspect(&result))?;
         }
         Action::Install(args) => install(&store, &args)?,
-        Action::Run {
-            plugin,
-            action,
-            args,
-        } => {
+        Action::Run { json, plugin, call } => {
             let knobs = config::load(&knobs_path)?;
+            let (action, args) = call.split_first().expect("clap requires the action name");
+            // A name that is not UTF-8 matches no declared action; it is
+            // refused as unknown with its bytes escaped.
+            let action = action.to_string_lossy();
             let invocation = Invocation {
                 plugin: &plugin,
                 action: &action,
-                args: &args,
+                args,
+                output: if json { Output::Json } else { Output::Text },
             };
-            return run_exit(run_action(&store, &knobs, &invocation));
+            return run_exit(run_action(&store, &knobs, &invocation), json);
         }
         Action::Enable { plugin, json } => set_enabled(&store, &plugin, true, json)?,
         Action::Disable { plugin, json } => set_enabled(&store, &plugin, false, json)?,
@@ -325,11 +348,18 @@ pub(crate) fn run(action: Action, host: &str) -> Result<ExitCode, CliError> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// The exit status of `workflow run`; a run the CLI stopped is reported here,
-/// with its own status, and every other failure goes to the shared error sink.
-fn run_exit(result: Result<std::process::ExitStatus, Error>) -> Result<ExitCode, CliError> {
+/// The exit status of `workflow run`, printing a `--json` result; a run that
+/// ended with a status of its own is reported here with that status, and
+/// every other failure goes to the shared error sink.
+fn run_exit(result: Result<Completed, Error>, json: bool) -> Result<ExitCode, CliError> {
     let error = match result {
-        Ok(status) => return Ok(ExitCode::from(crate::service::exit_code(status))),
+        Ok(Completed::Exited(status)) => {
+            return Ok(ExitCode::from(crate::service::exit_code(status)));
+        }
+        Ok(Completed::Document(document)) => {
+            print!("{}", render_json(&*document)?);
+            return Ok(ExitCode::SUCCESS);
+        }
         Err(error) => error,
     };
     let code = match &error {
@@ -338,10 +368,38 @@ fn run_exit(result: Result<std::process::ExitStatus, Error>) -> Result<ExitCode,
         Error::Interrupted { signal, .. } => {
             u8::try_from(SIGNAL_EXIT_BASE + signal).unwrap_or(u8::MAX)
         }
+        &Error::ActionFailed { status, .. } => {
+            let code = crate::service::exit_code(status);
+            if json {
+                let failed = Failed {
+                    error: CliError::from(error).to_protocol_error(),
+                    exit_code: code,
+                    signal: status.signal(),
+                };
+                print!("{}", render_json_error_with(&failed)?);
+            } else {
+                crate::error::render(&error.into(), false);
+            }
+            return Ok(ExitCode::from(code));
+        }
         _ => return Err(error.into()),
     };
-    crate::error::render(&error.into(), false);
+    crate::error::render(&error.into(), json);
     Ok(ExitCode::from(code))
+}
+
+/// The `--json` error of an action that failed by itself: the standard error
+/// object plus the status the CLI exits with.
+#[derive(Debug, Serialize)]
+struct Failed {
+    #[serde(flatten)]
+    error: protocol::ProtocolError,
+    /// The action's exit code, or 128 plus the signal number when a signal
+    /// ended it; the CLI exits with the same status.
+    exit_code: u8,
+    /// The signal that ended the action, when one did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signal: Option<i32>,
 }
 
 fn set_enabled(store: &Store, id: &PackageId, enabled: bool, json: bool) -> Result<(), CliError> {

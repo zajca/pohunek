@@ -49,6 +49,12 @@ pub(crate) enum Outcome {
     Failed,
     /// The run was refused before anything was started.
     Refused,
+    /// A JSON-mode child exited zero, but its stdout did not end: a process
+    /// outside the group held it open.
+    OutputIncomplete,
+    /// A JSON-mode child exited zero, but its stdout is not exactly one JSON
+    /// document.
+    OutputInvalid,
 }
 
 /// One run record.

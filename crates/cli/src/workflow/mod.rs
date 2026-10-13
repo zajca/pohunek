@@ -17,6 +17,7 @@ pub(crate) mod runner;
 pub(crate) mod store;
 
 use std::io::ErrorKind;
+use std::process::ExitStatus;
 
 use package::verify::VerifyError;
 use protocol::ErrorClass;
@@ -234,6 +235,40 @@ pub(crate) enum Error {
         limit: u64,
     },
 
+    /// A JSON-mode action ended by itself with a non-zero status or by a
+    /// signal the CLI did not send.
+    #[error("action {action} of workflow plugin {id} {}", failure(*status))]
+    ActionFailed {
+        /// The plugin id.
+        id: String,
+        /// The declared action name.
+        action: String,
+        /// How the child ended.
+        status: ExitStatus,
+    },
+
+    /// A JSON-mode action exited zero, but a process outside its group held
+    /// its stdout open, so the document could not be read to its end.
+    #[error("the stdout of action {action} of workflow plugin {id} did not end: a process that left the action's process group still holds it open; nothing was printed")]
+    OutputIncomplete {
+        /// The plugin id.
+        id: String,
+        /// The declared action name.
+        action: String,
+    },
+
+    /// A JSON-mode action exited zero, but its stdout is not exactly one
+    /// JSON document.
+    #[error("the stdout of action {action} of workflow plugin {id} is not exactly one JSON document: {reason}")]
+    OutputInvalid {
+        /// The plugin id.
+        id: String,
+        /// The declared action name.
+        action: String,
+        /// Content-free reason.
+        reason: &'static str,
+    },
+
     /// The CLI received a terminating signal while the action ran.
     #[error("action {action} of workflow plugin {id} was stopped because pohunek received signal {signal}")]
     Interrupted {
@@ -276,10 +311,17 @@ impl Error {
             Self::ActionTimeout { .. } => "workflow_action_timeout",
             Self::OutputLimit { .. } => "workflow_output_limit",
             Self::Interrupted { .. } => "workflow_action_interrupted",
+            Self::ActionFailed { .. } => "workflow_action_failed",
+            Self::OutputIncomplete { .. } => "workflow_output_incomplete",
+            Self::OutputInvalid { .. } => "workflow_output_invalid",
         }
     }
 
     /// Recovery hint shown beneath the error.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one flat arm per error variant keeps every recovery hint in one place"
+    )]
     pub(crate) fn hint(&self) -> &'static str {
         match self {
             Self::LocalOnly { .. } => "run the command on the machine itself, without --host",
@@ -349,7 +391,7 @@ impl Error {
                 "list the plugin's actions with `pohunek workflow inspect <id>`"
             }
             Self::ArgsRefused { .. } => {
-                "run the action without arguments after `--`; it declares `args = \"none\"`"
+                "run the action without extra arguments; it declares `args = \"none\"`"
             }
             Self::OriginIncomplete => {
                 "set both POHUNEK_SESSION_ID and POHUNEK_DAEMON_ID or neither; inside a managed \
@@ -379,6 +421,18 @@ impl Error {
                  one that applied"
             }
             Self::Interrupted { .. } => "run the action again when it may finish",
+            Self::ActionFailed { .. } => {
+                "the action reported a failure; its stderr above says why, and its stdout was \
+                 not printed"
+            }
+            Self::OutputIncomplete { .. } => {
+                "the action left a process running that keeps its stdout open; ask the plugin \
+                 author to close stdout in processes it leaves behind"
+            }
+            Self::OutputInvalid { .. } => {
+                "with --json the action must print exactly one JSON document on stdout; run it \
+                 without --json to see what it prints"
+            }
         }
     }
 
@@ -397,8 +451,22 @@ impl Error {
             | Self::RunFailed { .. }
             | Self::ActionTimeout { .. }
             | Self::OutputLimit { .. }
-            | Self::Interrupted { .. } => ErrorClass::Runtime,
+            | Self::Interrupted { .. }
+            | Self::ActionFailed { .. }
+            | Self::OutputIncomplete { .. }
+            | Self::OutputInvalid { .. } => ErrorClass::Runtime,
             _ => ErrorClass::Configuration,
         }
+    }
+}
+
+/// How a failed action ended, for [`Error::ActionFailed`]'s message.
+fn failure(status: ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    match (status.code(), status.signal()) {
+        (Some(code), _) => format!("exited with status {code}"),
+        (None, Some(signal)) => format!("was ended by signal {signal}"),
+        (None, None) => "ended without an exit status".to_owned(),
     }
 }

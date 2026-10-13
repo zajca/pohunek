@@ -277,14 +277,11 @@ impl Fixture {
         command
     }
 
-    /// `pohunek workflow run acme.work <action> [-- <args>]` with `extra`
+    /// `pohunek workflow run acme.work <action> [<args>]` with `extra`
     /// variables on top of the hermetic environment.
     fn run_with(&self, action: &str, args: &[&str], extra: &[(&str, &OsStr)]) -> Output {
         let mut arguments = vec!["workflow", "run", PLUGIN_ID, action];
-        if !args.is_empty() {
-            arguments.push("--");
-            arguments.extend_from_slice(args);
-        }
+        arguments.extend_from_slice(args);
         let mut command = self.command(&arguments);
         command.envs(extra.iter().copied());
         command.output().expect("run the pohunek binary")
@@ -950,7 +947,7 @@ fn an_action_inside_a_managed_session_cannot_stop_that_session() {
     let cli = bin_exe("pohunek");
     // The agent runs the action once, then keeps the session alive.
     let script = format!(
-        "'{}' workflow run {PLUGIN_ID} stop_self -- \"$POHUNEK_SESSION_ID\"; exec /bin/cat",
+        "'{}' workflow run {PLUGIN_ID} stop_self \"$POHUNEK_SESSION_ID\"; exec /bin/cat",
         cli.display()
     );
     let agents = env.config_home().join("pohunek/agents");

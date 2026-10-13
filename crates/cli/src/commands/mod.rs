@@ -38,7 +38,7 @@ pub(crate) mod workflow;
 /// serializes its result type identically and a script receives exactly one JSON
 /// document on stdout.
 pub(crate) fn render_json<T: Serialize + ?Sized>(value: &T) -> Result<String, CliError> {
-    render_json_document(&JsonEnvelope {
+    render_json_document(&JsonEnvelope::<T> {
         cli_version: env!("CARGO_PKG_VERSION"),
         protocol: CLIENT_PROTOCOL_VERSIONS,
         ok: Some(value),
@@ -119,7 +119,17 @@ fn merge_v3_runtime_id(current: &mut serde_json::Value, legacy: &serde_json::Val
 
 /// Render a typed error in the same versioned process envelope as successes.
 pub(crate) fn render_json_error(error: &ProtocolError) -> Result<String, CliError> {
-    render_json_document(&JsonEnvelope::<()> {
+    render_json_error_with(error)
+}
+
+/// Render an error object in the versioned process envelope.
+///
+/// `error` serializes as the standard `{class, code, msg, recover?}` object,
+/// optionally followed by command-specific fields (for example a
+/// [`ProtocolError`] flattened beside an `exit_code`). The fields stay a CLI
+/// envelope detail; the protocol's error type is unchanged.
+pub(crate) fn render_json_error_with<E: Serialize + ?Sized>(error: &E) -> Result<String, CliError> {
+    render_json_document(&JsonEnvelope::<(), E> {
         cli_version: env!("CARGO_PKG_VERSION"),
         protocol: CLIENT_PROTOCOL_VERSIONS,
         ok: None,
@@ -128,13 +138,13 @@ pub(crate) fn render_json_error(error: &ProtocolError) -> Result<String, CliErro
 }
 
 #[derive(Serialize)]
-struct JsonEnvelope<'a, T: ?Sized> {
+struct JsonEnvelope<'a, T: ?Sized, E: ?Sized = ProtocolError> {
     cli_version: &'static str,
     protocol: protocol::ProtocolVersionRange,
     #[serde(skip_serializing_if = "Option::is_none")]
     ok: Option<&'a T>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    err: Option<&'a ProtocolError>,
+    err: Option<&'a E>,
 }
 
 fn render_json_document<T: Serialize + ?Sized>(value: &T) -> Result<String, CliError> {
