@@ -49,7 +49,7 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
-// Rust guideline compliant 2026-06-26
+// Rust guideline compliant 2026-10-13
 
 use std::ffi::OsString;
 use std::io;
@@ -778,15 +778,22 @@ mod tests {
     /// Starts a stand-in worker that is a direct child of this process, with
     /// its control socket below `root`.
     fn spawn_child_worker(root: &Path) -> Child {
-        Command::new("/bin/sh")
-            .arg0("/fake/target/debug/pohunek-sessiond")
-            .args(["-c", FAKE_WORKER_SCRIPT, "--daemon-socket-path"])
-            .arg(root.join("r/pohunek/daemon.sock"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn stand-in worker")
+        // Hold the environment lock while spawning: the child copies the process
+        // environment at spawn time, so this guard prevents a concurrent test's
+        // override (e.g., of PATH, which the stand-in script needs to find `sleep`)
+        // from affecting the child's environment.
+        {
+            let _guard = ProcessEnv::lock();
+            Command::new("/bin/sh")
+                .arg0("/fake/target/debug/pohunek-sessiond")
+                .args(["-c", FAKE_WORKER_SCRIPT, "--daemon-socket-path"])
+                .arg(root.join("r/pohunek/daemon.sock"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn stand-in worker")
+        }
     }
 
     /// Starts a stand-in worker named `executable` whose parent has exited, as
@@ -801,13 +808,24 @@ mod tests {
         std::fs::create_dir_all(executable.parent().expect("executable directory"))
             .expect("create executable directory");
         symlink("/bin/sh", executable).expect("name the stand-in worker executable");
-        Command::new("/bin/sh")
-            .args(["-c", DETACH_SCRIPT])
-            .arg(executable)
-            .arg(script)
-            .arg(socket)
-            .status()
-            .expect("detach stand-in worker");
+        // Hold the environment lock while spawning: the child copies the process
+        // environment at spawn time, so this guard prevents a concurrent test's
+        // override (e.g., of PATH, which the stand-in script needs to find `sleep`)
+        // from affecting the child's environment.
+        let status = {
+            let _guard = ProcessEnv::lock();
+            Command::new("/bin/sh")
+                .args(["-c", DETACH_SCRIPT])
+                .arg(executable)
+                .arg(script)
+                .arg(socket)
+                .status()
+                .expect("execute detach shell for stand-in worker")
+        };
+        assert!(
+            status.success(),
+            "detach shell for the stand-in worker failed: {status}"
+        );
         poll_until("the detached stand-in worker appears", || {
             workers_under(root).into_iter().next()
         })

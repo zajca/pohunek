@@ -71,7 +71,7 @@
 //! assert!(std::env::var_os("TEST_SUPPORT_PROCESS_ENV_DOC_EXAMPLE").is_none());
 //! ```
 
-// Rust guideline compliant 2026-10-02
+// Rust guideline compliant 2026-10-13
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::PermissionsExt as _;
@@ -337,7 +337,11 @@ mod tests {
 
     #[test]
     fn command_keeps_the_captured_path_when_another_test_changes_it_before_the_spawn() {
-        let captured = std::env::var_os("PATH").expect("the test process has a PATH");
+        let captured = {
+            let _env = ProcessEnv::lock();
+            // Readers hold the lock so a concurrent writer's override is never captured.
+            std::env::var_os("PATH").expect("the test process has a PATH")
+        };
         let mut command = super::command("sh");
         command.args(["-c", "printf %s \"$PATH\""]);
         let output = {
