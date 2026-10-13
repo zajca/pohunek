@@ -98,6 +98,27 @@ impl DetectorConfig {
         }
     }
 
+    /// The configuration of a session whose profile override and resolved
+    /// definition are already known: the override wins, else the definition's
+    /// manifest, else the generic shell manifest. An override manifest keeps
+    /// the readiness of the resolved definition.
+    #[must_use]
+    pub fn for_resolution(
+        override_manifest: Option<Manifest>,
+        definition: Option<&RuntimeDefinition>,
+    ) -> Self {
+        match (override_manifest, definition) {
+            (Some(manifest), definition) => Self {
+                detection: DetectionConfig::default(),
+                manifest: Some(manifest),
+                input_readiness: definition
+                    .map_or_else(InputReadiness::default, RuntimeDefinition::input_readiness),
+            },
+            (None, Some(definition)) => Self::for_definition(definition),
+            (None, None) => Self::generic_shell(),
+        }
+    }
+
     /// Production detector config driven by `definition`'s manifest and
     /// input readiness.
     #[must_use]

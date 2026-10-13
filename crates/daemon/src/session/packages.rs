@@ -15,11 +15,15 @@ use std::sync::Arc;
 
 use package::registry::{RegistryError, RetainedDigests};
 use package::PackageDigest;
-use protocol::BindingProvenance;
+use protocol::{BindingProvenance, RuntimeRef};
 use thiserror::Error;
 
-use super::{host, ProtocolError, SessionRegistry};
-use crate::agent::host::{PackageReport, ReloadError};
+use super::{host, ProtocolError, SessionId, SessionRegistry};
+use crate::agent::host::{LaunchPin, PackageReport, ReloadError, RuntimeDefinition, RuntimeHost};
+use crate::agent::ProfileRegistry;
+
+use crate::detect::DetectorConfig;
+use tracing::warn;
 
 /// Why a package could not be uninstalled.
 #[derive(Debug, Error)]
@@ -56,33 +60,86 @@ impl SessionRegistry {
         self.inner.profiles.runtimes().reload()
     }
 
-    /// Re-derives the pinned definition of each live session launched from a
-    /// built-in runtime an official package may adopt, after the runtime
-    /// registry was rebuilt, so callbacks and observation follow the package
-    /// that serves the runtime now.
+    /// Re-derives the pinned definition and the default detector configuration
+    /// of each live session launched from a built-in runtime an official
+    /// package may adopt, after the runtime registry was rebuilt, so callbacks,
+    /// observation and detection follow the package that serves the runtime
+    /// now.
+    ///
+    /// The default configuration follows the same rule as at launch: the
+    /// profile's manifest override when it has one, else the pinned
+    /// definition's manifest. A running nested agent keeps its own detector
+    /// configuration; the default is sent again when that agent ends.
     ///
     /// Other pins keep their definition: a package pin resolves from its own
     /// digest and does not change with the registry.
     pub(super) async fn refresh_adopted_pins(&self) {
-        let runtimes = self.inner.profiles.runtimes();
-        let mut sessions = self.inner.sessions.lock().await;
-        for entry in sessions.values_mut() {
-            let adoptable = entry
-                .snapshot
-                .launch_binding
-                .binding()
-                .is_some_and(|binding| {
-                    matches!(
-                        binding.provenance,
-                        protocol::BindingProvenance::Builtin {
-                            package: Some(_),
-                            ..
-                        }
+        // Only the collection holds the sessions lock: the package root is
+        // verified by the resolution below, which is filesystem work.
+        let candidates: Vec<(SessionId, String, RuntimeRef, LaunchPin)> = {
+            let sessions = self.inner.sessions.lock().await;
+            sessions
+                .iter()
+                .filter(|(_, entry)| {
+                    entry
+                        .snapshot
+                        .launch_binding
+                        .binding()
+                        .is_some_and(|binding| {
+                            matches!(
+                                binding.provenance,
+                                protocol::BindingProvenance::Builtin {
+                                    package: Some(_),
+                                    ..
+                                }
+                            )
+                        })
+                })
+                .map(|(id, entry)| {
+                    (
+                        id.clone(),
+                        entry.info.agent.clone(),
+                        entry.info.agent_base.clone(),
+                        entry.snapshot.launch_binding.clone(),
                     )
-                });
-            if adoptable {
-                entry.pinned = runtimes
-                    .pinned_definition(&entry.info.agent_base, &entry.snapshot.launch_binding);
+                })
+                .collect()
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        let runtimes = self.inner.profiles.runtimes().clone();
+        let profiles = self.inner.profiles.clone();
+        let resolved = match tokio::task::spawn_blocking(move || {
+            candidates
+                .into_iter()
+                .map(|(id, agent, base, pin)| {
+                    let resolution = resolve_adopted(&runtimes, &profiles, &agent, &base, &pin);
+                    (id, pin, resolution)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                warn!(%error, "the adopted sessions' runtime sources were not resolved");
+                return;
+            }
+        };
+        let mut sessions = self.inner.sessions.lock().await;
+        for (id, pin, (pinned, config)) in resolved {
+            // A session whose pin changed while resolving keeps its own state.
+            let Some(entry) = sessions.get_mut(&id) else {
+                continue;
+            };
+            if entry.snapshot.launch_binding != pin {
+                continue;
+            }
+            entry.pinned = pinned;
+            entry.default_detector_config = config.clone();
+            if entry.active_agent.is_none() {
+                super::send_detector_config(entry, config);
             }
         }
     }
@@ -292,4 +349,29 @@ fn pinned_digest(pin: &host::LaunchPin) -> Option<PackageDigest> {
         Some(BindingProvenance::Package { package_digest, .. }) => Some(package_digest.clone()),
         _ => None,
     }
+}
+
+/// The pinned definition and the default detector configuration of an adopted
+/// session, resolved once. Loading the definition verifies the package root,
+/// so this runs off the async runtime.
+fn resolve_adopted(
+    runtimes: &RuntimeHost,
+    profiles: &ProfileRegistry,
+    agent: &str,
+    base: &RuntimeRef,
+    pin: &LaunchPin,
+) -> (Option<Arc<RuntimeDefinition>>, DetectorConfig) {
+    let definition = runtimes.definition_for_pin(base, pin);
+    let resolved = match &definition {
+        Ok(pinned) => profiles.resolve_agent_pinned(agent, pinned),
+        Err(_unresolved) => profiles.resolve_agent(agent),
+    };
+    let manifest_override = resolved
+        .ok()
+        .and_then(|resolved| resolved.profile.and_then(|profile| profile.manifest));
+    let config = DetectorConfig::for_resolution(
+        manifest_override,
+        definition.as_ref().ok().map(Arc::as_ref),
+    );
+    (definition.ok(), config)
 }

@@ -20,7 +20,7 @@ use tracing::warn;
 use super::builtin::BuiltinSource;
 use super::claim::{is_reserved, ServedBy};
 use super::definition::{DefinitionError, LaunchProgram, RuntimeDefinition};
-use super::launch::{check_pin, LaunchPin};
+use super::launch::{adopts, check_pin, LaunchPin};
 use super::package::{PackageRejection, PackageSource, PackageStore, RejectedPackage};
 use super::registry::{RegistryError, RuntimeRegistry, RuntimeSource, SourceTrust};
 
@@ -386,11 +386,41 @@ impl RuntimeHost {
         else {
             let definition = self.resolve_ref(reference)?;
             check_pin(pin, &definition)?;
-            return Ok(definition);
+            return self.verified_adopter(pin, definition);
         };
         if pinned_id != runtime_id {
             return Err(ProtocolError::runtime_not_installed(runtime_id));
         }
+        store
+            .load_pinned(runtime_id, package_digest, package)
+            .map(Arc::new)
+            .map_err(|reason| refuse(runtime_id, &reason))
+    }
+
+    /// Verifies the package root of a definition that adopts a built-in `pin`.
+    ///
+    /// The registry is built once, so an adopting package whose root changed or
+    /// disappeared afterwards is served from its exact digest again, as a
+    /// package pin is. Other definitions are returned as given.
+    fn verified_adopter(
+        &self,
+        pin: &LaunchPin,
+        definition: Arc<RuntimeDefinition>,
+    ) -> Result<Arc<RuntimeDefinition>, ProtocolError> {
+        let (
+            Some(store),
+            BindingProvenance::Package {
+                package,
+                package_digest,
+            },
+        ) = (self.package_store(), &definition.binding().provenance)
+        else {
+            return Ok(definition);
+        };
+        if !adopts(pin, &definition) {
+            return Ok(definition);
+        }
+        let runtime_id = definition.runtime_id();
         store
             .load_pinned(runtime_id, package_digest, package)
             .map(Arc::new)

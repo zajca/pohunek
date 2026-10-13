@@ -318,6 +318,25 @@ impl NativeSessionLaunch {
         self.fork_args.is_some()
     }
 
+    /// The same spec without fork support.
+    ///
+    /// Only a spec whose reference is not assigned may drop its fork: an
+    /// assigned fork reference needs fork arguments.
+    #[must_use]
+    pub fn without_fork(&self) -> Self {
+        debug_assert!(
+            !self
+                .assigned
+                .as_ref()
+                .is_some_and(|assigned| assigned.assigns_fork()),
+            "an assigned fork reference keeps its fork arguments"
+        );
+        Self {
+            fork_args: None,
+            ..self.clone()
+        }
+    }
+
     /// Build the resume argv fragment for `reference`.
     ///
     /// # Errors

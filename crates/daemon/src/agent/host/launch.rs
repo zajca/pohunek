@@ -203,6 +203,26 @@ pub(crate) fn honors_frozen_launch(
     }
 }
 
+/// The launch spec a relaunch of a session frozen with `frozen` runs under.
+///
+/// An adopting package that does not support fork has its fork arguments
+/// removed, so the relaunched session cannot fork through a spec the package
+/// does not honor.
+pub(crate) fn relaunch_launch(
+    frozen: &LaunchPin,
+    definition: &RuntimeDefinition,
+    launch: NativeSessionLaunch,
+) -> NativeSessionLaunch {
+    let package_forks = definition
+        .native()
+        .is_some_and(NativeSessionLaunch::supports_fork);
+    if adopts(frozen, definition) && !package_forks {
+        launch.without_fork()
+    } else {
+        launch
+    }
+}
+
 /// The pin a relaunch of a session frozen with `frozen` records: an adopted
 /// session records the package it now launches from, so later resumes resolve
 /// that exact digest; every other session keeps its pin.

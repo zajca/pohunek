@@ -445,6 +445,11 @@ impl SessionRegistry {
         change: ProfileChange,
     ) -> Result<SessionInfo, ProtocolError> {
         self.ensure_not_external(id).await?;
+        // Held from resolving the pin until the detached registration has
+        // persisted the resumed record, so an adopting package cannot be
+        // uninstalled in between: the built-in pin does not count as a
+        // reference to it. Taken before the lifecycle guard, as `fork` does.
+        let package_authority = Arc::clone(&self.inner.package_lifecycle).read_owned().await;
         let guard = self.lock_lifecycle(id).await;
         let (binding, definition, registration, record) = {
             let sessions = self.inner.sessions.lock().await;
@@ -521,7 +526,13 @@ impl SessionRegistry {
         let relaunch = self.plan_relaunch(&binding, definition, launch, change)?;
 
         let info = match self
-            .resume_binding_with_registration(binding, registration, relaunch, guard)
+            .resume_binding_with_registration(
+                binding,
+                registration,
+                relaunch,
+                guard,
+                Some(package_authority),
+            )
             .await
         {
             Ok(info) => info,
@@ -1026,6 +1037,7 @@ impl SessionRegistry {
         launch: NativeSessionLaunch,
         change: ProfileChange,
     ) -> Result<RelaunchPlan, ProtocolError> {
+        let launch = host::relaunch_launch(&binding.launch_binding, &definition, launch);
         // Build the native reference from the field the frozen reference kind
         // names, so a `path`-kind spec applies the absolute-path guard and an
         // `id`-kind spec the leading-dash guard (the documented asymmetry).
@@ -1161,7 +1173,7 @@ impl SessionRegistry {
             },
             None => super::target::PtyRegistration::Create,
         };
-        self.resume_binding_with_registration(binding, registration, relaunch, guard)
+        self.resume_binding_with_registration(binding, registration, relaunch, guard, None)
             .await
     }
 
@@ -1172,6 +1184,7 @@ impl SessionRegistry {
         registration: super::target::PtyRegistration,
         relaunch: RelaunchPlan,
         guard: super::LifecycleGuard,
+        package_authority: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     ) -> Result<SessionInfo, ProtocolError> {
         // The resume mechanics come from the frozen structural snapshot (C.4). A
         // binding without a snapshot program falls back to the base kind's
@@ -1270,7 +1283,7 @@ impl SessionRegistry {
                 metadata: binding.metadata,
                 warnings: outdated_hooks,
                 initial_input_pending: false,
-                package_authority: None,
+                package_authority,
             },
             guard,
         )
