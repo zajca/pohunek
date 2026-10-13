@@ -15,7 +15,7 @@
 //! re-run as [`hold`], which is not a platform binary on any macOS release.
 #![cfg(target_os = "macos")]
 
-// Rust guideline compliant 2026-10-10
+// Rust guideline compliant 2026-10-13
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -61,23 +61,29 @@ publish worker.pids "$!"
 wait
 "#;
 
-/// The creator `a`: starts a `sleep` and the creator `b`.
+/// The creator `a`: starts a `sleep` and the creator `b`, then replaces itself
+/// with `sleep`.
+///
+/// The `exec` keeps its pid, start identity and spawn id, and the `sleep` does
+/// not react to its children's deaths, so it is still running when the sweep
+/// signals it after its children (the sweep signals newest first).
 const CREATOR_A: &str = r#"/bin/sleep 600 &
 sleeper=$!
 /bin/sh "$DIR/b.sh" "$IMAGE" "$DIR" &
 creator=$!
 publish a.pids "$sleeper $creator"
-wait
+exec /bin/sleep 600
 "#;
 
 /// The creator `b`: starts a `sleep` and the holding image, which carries a
-/// readable marker on every host.
+/// readable marker on every host, then replaces itself with `sleep` for the
+/// reason given on [`CREATOR_A`].
 const CREATOR_B: &str = r#"/bin/sleep 600 &
 sleeper=$!
 "$IMAGE" --exact hold --ignored &
 holder=$!
 publish b.pids "$sleeper $holder"
-wait
+exec /bin/sleep 600
 "#;
 
 /// The stand-in worker of the dead-creator shape: starts the creator `m`.
@@ -409,7 +415,8 @@ struct Tree {
 
 impl Scenario {
     /// Starts a worker whose tree is the creator chain `a -> b` with a `sleep`
-    /// at each level and the holding image at the bottom.
+    /// at each level and the holding image at the bottom; each creator ends as
+    /// a `sleep` itself.
     fn launch_chain(&mut self) -> Tree {
         self.write_script("w.sh", WORKER_WITH_CHAIN);
         self.write_script("a.sh", CREATOR_A);
@@ -424,10 +431,12 @@ impl Scenario {
             panic!("creator b publishes a sleeper and the holder");
         };
         let image = image();
+        // Each creator is resolved once it runs its final `sleep` image, so
+        // every member is settled before the scenario kills the worker.
         let members = vec![
-            self.member("creator a", creator_a, "/bin/sh"),
+            self.member("creator a", creator_a, "/bin/sleep"),
             self.member("sleeper under a", sleeper_a, "/bin/sleep"),
-            self.member("creator b", creator_b, "/bin/sh"),
+            self.member("creator b", creator_b, "/bin/sleep"),
             self.member("sleeper under b", sleeper_b, "/bin/sleep"),
             self.member("holder under b", holder, &image),
         ];
@@ -632,7 +641,8 @@ async fn a_lost_workers_hidden_descendants_are_reaped_through_its_spawn_id() {
         reaped(&report),
         expected,
         "every process the worker created is signalled and observed to exit, \
-         whether its marker is readable (exposures: {exposures:?}) or its lineage proves it"
+         whether its marker is readable (exposures: {exposures:?}) or its lineage proves it: \
+         {report:?}"
     );
     assert!(report.unconfirmed.is_empty());
     for member in &tree.members {
@@ -697,8 +707,19 @@ async fn hidden_processes_outside_the_workers_tree_are_dismissed_untouched() {
         tree.members
             .iter()
             .map(|member| key(member.identity))
-            .collect::<BTreeSet<_>>()
+            .collect::<BTreeSet<_>>(),
+        "every process the worker created is signalled and observed to exit: {report:?}"
     );
+    assert!(report.unconfirmed.is_empty());
+    for member in &tree.members {
+        assert!(!scenario.is_running(member), "{} must be dead", member.name);
+        assert_eq!(
+            skip_reasons(&report, member.identity),
+            Vec::new(),
+            "{} is attributed, never skipped",
+            member.name
+        );
+    }
 }
 
 #[tokio::test]
@@ -763,6 +784,12 @@ async fn without_a_spawn_id_hidden_descendants_stay_skipped_as_unreadable() {
             Exposure::Exposed => {
                 expected_reaped.insert(key(member.identity));
                 assert!(!scenario.is_running(member), "{} is marked", member.name);
+                assert_eq!(
+                    skip_reasons(&report, member.identity),
+                    Vec::new(),
+                    "{} is attributed by its marker, never skipped",
+                    member.name
+                );
             }
             Exposure::Withheld => {
                 assert!(
@@ -779,7 +806,12 @@ async fn without_a_spawn_id_hidden_descendants_stay_skipped_as_unreadable() {
             }
         }
     }
-    assert_eq!(reaped(&report), expected_reaped);
+    assert_eq!(
+        reaped(&report),
+        expected_reaped,
+        "exactly the marked members are signalled and observed to exit \
+         (exposures: {exposures:?}): {report:?}"
+    );
     assert!(report.unconfirmed.is_empty());
 }
 
