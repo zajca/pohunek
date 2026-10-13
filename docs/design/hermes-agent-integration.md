@@ -2,6 +2,11 @@
 
 Status: implemented (M1-M3 released in v0.30.1)
 
+Current runtime delivery: only `shell` is built in; Hermes, Codex and Claude Code
+ship only as official runtime packages (see
+[`runtime-packages.md`](../knowledge/guides/runtime-packages.md)), which
+supersedes this document's built-in runtime delivery.
+
 Research baseline: 2026-07-27
 
 Companion implementation plan:

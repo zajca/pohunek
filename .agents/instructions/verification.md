@@ -194,8 +194,9 @@ and the lock together; the pure test fails when they differ.
 The Codex runtime package source (`runtime-packages/codex`, lock and captured
 screens in `compat/codex/`) has the same shape in
 `crates/cli/tests/codex_package.rs`: always-running descriptor and manifest
-parity with the built-in Codex files, the supported range against the lock, and
-the manifest on real screens, plus `#[ignore]`d tests that drive a real `codex`
+parity with the frozen v0.34.2 goldens in `compat/codex/builtin-v0.34/`, the
+supported range against the lock, and the manifest on real screens, plus
+`#[ignore]`d tests that drive a real `codex`
 with a loopback Responses stub and a fresh `CODEX_HOME`. The daemon-backed
 tests install the built archive through a signed catalog with a throwaway key
 and trust anchor, so the real-Codex tests launch through the installed package

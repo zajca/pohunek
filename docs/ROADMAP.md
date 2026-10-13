@@ -78,38 +78,35 @@ instead of competing with them.
 ### Runtime plugin packages — [#139](https://github.com/zajca/pohunek/issues/139) (milestone C, project 5)
 
 Runtimes become signed, content-addressed packages installed per host; only
-`shell` stays built in. **17/28.** Landed: the accepted RFC (#152), the
+`shell` stays built in. **28/40.** Landed: the accepted RFC (#152), the
 `RuntimeId` protocol and generic runtime host (#140), the authenticated package
 registry (#141), the CLI lifecycle and profile migration (#143), generic hook
 schemas and integration activation (#144), digest-bound package releases with
 catalog signing (#150), the official Pi package (#538), the official Codex
-(#145) and Claude Code (#146) packages with their compiled-in runtimes removed,
-and the decision that core consumes no plugin data in v1 (#480). Open:
+(#145), Claude Code (#146) and Hermes (#147) packages with their compiled-in
+runtimes removed, the package CI and compatibility matrix (#149), and the
+decision that core consumes no plugin data in v1 (#480). Open:
 
-- Hermes package [#147](https://github.com/zajca/pohunek/issues/147) — in
-  progress: the package with its operator payload (PRs #829–#935, moved to
-  `runtime-packages/hermes` in #944), the operator plugin installed only from
-  the package (#947), and the removal of the compiled-in Hermes (#964) merged
-  by 2026-10-13; the issue stays open for its documentation closure.
-- Package CI and compatibility matrix
-  [#149](https://github.com/zajca/pohunek/issues/149) and package
-  documentation [#151](https://github.com/zajca/pohunek/issues/151) — blocked
-  by the extractions (and #151 by #148).
-- Follow-ups #487, #493, #547, and the flaky test #597; #546 (resumable Pi
-  forks) is delivered.
+- Package documentation [#151](https://github.com/zajca/pohunek/issues/151) —
+  waits on workflow plugins
+  [#148](https://github.com/zajca/pohunek/issues/148): the plugin store, the
+  action runner, `--json` runs and shell completion have landed; jobs and
+  services, and event reactions are in progress.
+- Follow-ups #868, #870, #879, #884, #894, #899, #911, #969, #991 and #1003.
 
 Guide: [`knowledge/guides/runtime-packages.md`](knowledge/guides/runtime-packages.md).
 
 ### Workflow plugins — [#148](https://github.com/zajca/pohunek/issues/148) (child of #139; milestone C, project 5)
 
-Bounded out-of-process plugins with declared actions and jobs. **2/4.** Landed:
+Bounded out-of-process plugins with declared actions and jobs. **3/4.** Landed:
 `session.list` metadata filter (#327) and the display decision (#328: core adds
 no UI data contract; `zajca/pohunek-work` renders plugin data from public
 contracts). Also landed under #148: the CLI-owned workflow plugin store,
 the strict `workflow.toml` manifest and the consent install (`pohunek
-workflow`). Open: CLI action
-invocation [#325](https://github.com/zajca/pohunek/issues/325) and periodic
-jobs/services in manifests [#326](https://github.com/zajca/pohunek/issues/326).
+workflow`), and CLI action invocation with `--json` results and shell
+completion ([#325](https://github.com/zajca/pohunek/issues/325)). Open:
+periodic jobs/services in manifests
+[#326](https://github.com/zajca/pohunek/issues/326) and event reactions.
 Core consumes no plugin data for launch-profile policy in v1
 ([#480](https://github.com/zajca/pohunek/issues/480), closed).
 

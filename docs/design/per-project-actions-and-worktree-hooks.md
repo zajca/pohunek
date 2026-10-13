@@ -5,6 +5,12 @@ all three parts below — is implemented and merged into `main`; see the compani
 [`*-plan.md`](per-project-actions-and-worktree-hooks-plan.md) for the
 slice-by-slice landing record.
 
+Current runtime delivery: only `shell` is built in; Hermes, Codex and Claude Code
+ship only as official runtime packages (see
+[`runtime-packages.md`](../knowledge/guides/runtime-packages.md)), which
+supersedes the compiled-in `codex` and `claude` base kinds this document
+describes.
+
 This RFC proposes three related features that share one config model:
 
 - **Part A — Per-project templates, actions & prompts** (daemon-resolved): make the
