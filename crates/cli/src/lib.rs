@@ -18,6 +18,7 @@ mod paths;
 mod process;
 pub mod service;
 mod target;
+mod workflow;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -113,6 +114,15 @@ enum Commands {
     Plugin {
         #[command(subcommand)]
         action: commands::plugin::Action,
+    },
+
+    /// Install, inspect, and remove workflow plugins on this machine.
+    ///
+    /// Purely local: workflow plugins live in this user's own store and never
+    /// reach the daemon, so a remote `--host` is rejected before anything runs.
+    Workflow {
+        #[command(subcommand)]
+        action: commands::workflow::Action,
     },
 
     /// Query daemon health over the control socket.
@@ -1555,6 +1565,7 @@ impl Commands {
             },
             Commands::Service { action } => action.wants_json(),
             Commands::Plugin { action } => action.wants_json(),
+            Commands::Workflow { action } => action.wants_json(),
             Commands::Setup { action, json } => {
                 action.as_ref().map_or(*json, SetupAction::wants_json)
             }
@@ -1583,6 +1594,7 @@ impl Commands {
             | Commands::Daemon { .. }
             | Commands::Service { .. }
             | Commands::Plugin { .. }
+            | Commands::Workflow { .. }
             | Commands::Health { .. }
             | Commands::Status { .. }
             | Commands::Session { .. }
@@ -1877,6 +1889,11 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             // Package lifecycle is local-only; the global `--host` is checked,
             // not ignored.
             commands::plugin::run(action, &global_host).await
+        }
+        Commands::Workflow { action } => {
+            // The workflow store is local-only; the global `--host` is checked
+            // before any filesystem access.
+            commands::workflow::run(action, &global_host)
         }
         Commands::Health { json } | Commands::Status { json } => {
             let paths = Paths::resolve()?;

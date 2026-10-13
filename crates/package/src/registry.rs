@@ -20,11 +20,11 @@
 //! digests live sessions reference: the caller supplies the install time, the
 //! package identity and the set of retained digests.
 
-// Rust guideline compliant 2026-10-04
+// Rust guideline compliant 2026-10-13
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use pohunek_platform::filesystem::{
     AdvisoryLock, AtomicReplaceError, EntryKind, FsError, StageOutcome, TrustedDir,
@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::install::{collect_staging, install_archive, remove_directory, InstallError};
-use crate::layout::{digest_hex, COLLECT_PREFIX, DIRECTORY_MODE, FILE_MODE};
+use crate::layout::{digest_hex, COLLECT_PREFIX, DIRECTORY_MODE, FILES_DIR, FILE_MODE};
 use crate::manifest::ManifestDigest;
 use crate::verify::{verify_root, VerifiedRoot, VerifyError};
 use crate::{read_archive_with_digest, ArchiveError, Limits};
@@ -68,6 +68,19 @@ const MAX_REGISTRY_BYTES: usize = 1024 * 1024;
 /// The ceiling keeps the record under the 1 MiB record limit and bounds the
 /// work of a retention check.
 pub const MAX_PACKAGES: usize = 1024;
+
+/// Location of the extracted tree of `digest` below the plugin root `root`.
+///
+/// Pure path arithmetic over the registry layout: nothing is opened or
+/// created, so a caller can show where a package's files will live before it
+/// asks for consent. It equals [`VerifiedRoot::files_path`] of the installed
+/// package.
+#[must_use]
+pub fn files_path(root: &Path, digest: &PackageDigest) -> PathBuf {
+    root.join(PACKAGES_DIR)
+        .join(digest_hex(digest))
+        .join(FILES_DIR)
+}
 
 /// Where an installed package came from, which decides how it is trusted.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

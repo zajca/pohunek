@@ -238,10 +238,11 @@ launch on that machine, so it is never a remote operation.
 
 Packages are trusted local software, not a sandbox: the digest and the catalog
 signature establish integrity and provenance, and an installed package can name
-any program your account could run. Workflow plugins (planned, #148) are a
-separate class that does not use this install path, and daemon, overlay,
-session worker and GUI extensions are not packages at all; see "Runtime packages
-and trust" in `docs/architecture.md`.
+any program your account could run. [Workflow plugins](workflow-plugins.md)
+are a separate class with their own CLI-owned store and `pohunek workflow`
+install path; `pohunek plugin install` refuses a workflow archive because it
+has no `runtime.toml`. Daemon, overlay, session worker and GUI extensions are
+not packages at all; see "Runtime packages and trust" in `docs/architecture.md`.
 
 ## Consent
 

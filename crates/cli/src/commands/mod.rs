@@ -29,6 +29,7 @@ pub(crate) mod relay;
 pub(crate) mod service;
 pub(crate) mod session;
 pub(crate) mod setup;
+pub(crate) mod workflow;
 
 /// Render a command result as the pretty-printed JSON document (with a trailing
 /// newline) emitted under `--json`.

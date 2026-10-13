@@ -105,7 +105,9 @@ Guide: [`knowledge/guides/runtime-packages.md`](knowledge/guides/runtime-package
 Bounded out-of-process plugins with declared actions and jobs. **2/4.** Landed:
 `session.list` metadata filter (#327) and the display decision (#328: core adds
 no UI data contract; `zajca/pohunek-work` renders plugin data from public
-contracts). Open: CLI action
+contracts). Also landed under #148: the CLI-owned workflow plugin store,
+the strict `workflow.toml` manifest and the consent install (`pohunek
+workflow`). Open: CLI action
 invocation [#325](https://github.com/zajca/pohunek/issues/325) and periodic
 jobs/services in manifests [#326](https://github.com/zajca/pohunek/issues/326).
 Core consumes no plugin data for launch-profile policy in v1

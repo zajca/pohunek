@@ -137,6 +137,13 @@ The assistant must:
   same-user sandbox; the daemon's exact nine-method origin-session denial is
   authoritative. Ask a human to attach when typed model control is insufficient.
 
+- Treat a workflow plugin as owner code with the owner's full authority. Its
+  archive digest proves which bytes the owner approved, not what they do; the
+  plugin can read the owner's files and use every public owner API, as any
+  same-UID process can. Show the owner the review `pohunek workflow install`
+  prints, pass `--yes` only after the owner approved it, and never describe a
+  plugin as sandboxed.
+
 The assistant may write host or repo configuration when that is the requested
 task, but it must stay inside the user's requested scope and respect the
 boundaries in [secrets](secrets.md) and [repo `.pohunek/`](repo-pohunek.md).

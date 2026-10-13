@@ -45,7 +45,11 @@ Start here:
   [Hermes runtime package](guides/hermes-package.md) documents the official
   Hermes package (the only source of `hermes`) with its operator plugin
   payload, where releases ship it, and how its tests, CI and the release keep
-  it honest.
+  it honest. The
+  [workflow plugins guide](guides/workflow-plugins.md) covers owner tooling
+  installed with `pohunek workflow`: the `workflow.toml` manifest, install
+  pinned by the owner's digest with consent, the CLI-owned store, and the
+  same-UID trust boundary.
   [Environment and executable resolution](guides/environment-resolution.md)
   documents the macOS `PATH` policy. The
   [Hermes operator](guides/hermes-operator.md) documents the managed plugin,

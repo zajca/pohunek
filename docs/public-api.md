@@ -3104,6 +3104,71 @@ The global `--host` flag is accepted and deliberately ignored. The skill is
 embedded locally, so no host is resolved, probed, or connected to, and local
 and remote invocations print the same document.
 
+## Workflow Plugin CLI
+
+`pohunek workflow` is a local CLI lifecycle, not a daemon public method. There
+is no protocol method, event, record or SDK type for workflow plugins: the CLI
+keeps them in its own package registry under `<state>/pohunek/workflow-plugins/`,
+with per-plugin directories `<state>/pohunek/workflow-plugin-state/<id>/` and
+`<config>/pohunek/workflow-plugin-config/<id>/`, and never contacts a daemon.
+Every command that changes the store holds the store lock
+`<state>/pohunek/workflow-plugins/store.lock` for its whole run.
+
+```bash
+pohunek workflow install work.tar.zst --sha256 <digest> --yes --json
+pohunek workflow list --json
+pohunek workflow inspect acme.work --json
+pohunek workflow enable acme.work --json
+pohunek workflow disable acme.work --json
+pohunek workflow uninstall acme.work --purge --json
+pohunek workflow uninstall acme.work --remove-modified --json
+```
+
+Every `--json` result is one standard CLI process envelope. The `ok` payloads:
+
+- `install`: `{status, plugin, warnings?}`, where `status` is `installed`,
+  `already_installed` or `root_restored`. `warnings` is present when the
+  plugin was recorded but the store could not confirm the change is durable.
+- `list`: `{plugins: [plugin...]}`.
+- `enable` and `disable`: the updated `plugin`.
+- `inspect`: `{plugin, description, files_dir, state_dir, config_dir,
+  actions: [{name, argv, args, timeout_ms?, max_output_bytes?}]}`. `argv[0]`
+  is resolved to an absolute path; `args` is `none` or `passthrough`.
+- `uninstall`: `{plugin, purged, purge?, warnings?, state_dir, config_dir}`.
+  `plugin` is `null` when `--purge` removed only the directories of an id that
+  has no record. `purge` is `{state_dir, config_dir}`, each `removed` or
+  `absent`. `warnings` is present when the record was removed but the store
+  could not delete every installed file (the warning names where the residue
+  is) or confirm durability, or when a leftover of an earlier purge still
+  cannot be removed (the warning names its location). No warning changes the
+  result.
+
+A `plugin` is `{id, version, digest, enabled, installed_at_unix_seconds}`.
+
+Typed errors use the standard `{class, code, msg, recover?}` shape and never
+contain an argv value, an environment value or manifest text:
+
+| Code | Class | Meaning |
+|---|---|---|
+| `workflow_local_only` | `configuration` | A remote `--host` was given; nothing was read or written. |
+| `workflow_archive_invalid` | `configuration` | The archive file is unreadable, too large, or not a canonical package archive. |
+| `workflow_digest_mismatch` | `configuration` | The archive does not have the `--sha256` digest; nothing was installed. |
+| `workflow_descriptor_invalid` | `configuration` | `workflow.toml` is missing, too large, or breaks a manifest rule, or the archive also carries `runtime.toml`. |
+| `consent_required` | `configuration` | `install` ran without `--yes`; nothing was created. |
+| `workflow_plugin_unknown` | `configuration` | No installed plugin has the id. |
+| `workflow_plugin_installed` | `configuration` | Another archive of the id is installed. |
+| `workflow_root_invalid` | `runtime` | The installed files are missing, changed or unreadable; they are left as found. The hint names the recovery for the cause: reinstall or plain `uninstall` for missing files, `uninstall --remove-modified` for changed ones. |
+| `workflow_root_intact` | `runtime` | `uninstall --remove-modified` was given for installed files that verify or are missing; nothing was removed. |
+| `workflow_install_uncertain` | `runtime` | An install's record replacement committed without confirmed durability and could not be read back; the plugin's directories were kept. Check `pohunek workflow list`; installing the same archive again is safe. |
+| `workflow_store_busy` | `runtime` | Another workflow command holds the store lock; nothing was changed. |
+| `workflow_purge_incomplete` | `runtime` | A purge did not finish; the message says whether the plugin was uninstalled, the outcome for each directory, and where remaining data is. |
+| `workflow_dirs_overlap` | `configuration` | The store, state and config locations contain each other; nothing was read or written. |
+| `workflow_store_failed` | `runtime` | The store or a plugin directory cannot be read or changed safely. |
+
+Running actions, event reactions, periodic jobs and services are not yet
+available. The manifest and trust rules are in
+`docs/knowledge/guides/workflow-plugins.md`.
+
 ## Hermes Operator Plugin CLI
 
 The Hermes operator plugin is a local CLI lifecycle, not a daemon public method.
