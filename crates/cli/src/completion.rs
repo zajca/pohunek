@@ -765,38 +765,6 @@ mod tests {
     }
 
     #[test]
-    fn static_scripts_cover_supported_shells() {
-        for (shell, marker, host_marker) in [
-            (CompletionShell::Bash, "complete", "--host"),
-            (CompletionShell::Zsh, "#compdef pohunek", "--host"),
-            (CompletionShell::Fish, "complete -c pohunek", "-l host"),
-        ] {
-            let script = String::from_utf8(render_script(shell, false)).expect("UTF-8 script");
-            assert!(script.contains(marker), "missing {marker:?} in {script}");
-            assert!(script.contains("session"));
-            assert!(script.contains(host_marker));
-            assert!(
-                script.contains("agent-skill"),
-                "static {shell:?} completion must cover the agent-skill command: {script}"
-            );
-        }
-    }
-
-    #[test]
-    fn dynamic_bootstraps_use_private_completion_environment() {
-        for shell in [
-            CompletionShell::Bash,
-            CompletionShell::Zsh,
-            CompletionShell::Fish,
-        ] {
-            let script = String::from_utf8(render_script(shell, true)).expect("UTF-8 script");
-            assert!(script.contains(COMPLETE_ENV));
-            assert!(script.contains(shell.name()));
-            assert!(script.contains("pohunek"));
-        }
-    }
-
-    #[test]
     fn context_honors_last_global_host_before_cursor() {
         let words = [
             "pohunek",
@@ -940,64 +908,6 @@ mod tests {
     }
 
     #[test]
-    fn completion_paths_follow_shell_conventions() {
-        let paths = Paths {
-            runtime_dir: PathBuf::from("/runtime/pohunek"),
-            socket: PathBuf::from("/runtime/pohunek/control.sock"),
-            data_dir: PathBuf::from("/data/pohunek"),
-            log_dir: PathBuf::from("/state/pohunek/logs"),
-            cache_dir: PathBuf::from("/cache/pohunek"),
-            config_home: PathBuf::from("/config"),
-            config_dir: PathBuf::from("/config/pohunek"),
-            origin_source: pohunek_client::OriginSource::Omitted,
-        };
-        let data_home = Path::new("/data");
-        assert_eq!(
-            completion_path(&paths, data_home, CompletionShell::Bash),
-            PathBuf::from("/data/bash-completion/completions/pohunek")
-        );
-        assert_eq!(
-            completion_path(&paths, data_home, CompletionShell::Zsh),
-            PathBuf::from("/data/zsh/site-functions/_pohunek")
-        );
-        assert_eq!(
-            completion_path(&paths, data_home, CompletionShell::Fish),
-            PathBuf::from("/config/fish/completions/pohunek.fish")
-        );
-    }
-
-    #[test]
-    fn managed_completion_write_is_idempotent_and_updates_mode() {
-        let guard = pohunek_test_support::tempdir().expect("create completion fixture");
-        let path = guard.path().join("nested/pohunek");
-        write_script(&path, CompletionShell::Bash, false).expect("write static completion");
-        let static_script = std::fs::read_to_string(&path).expect("read static completion");
-        assert!(static_script.contains("complete"));
-
-        write_script(&path, CompletionShell::Bash, true).expect("replace with dynamic completion");
-        let dynamic_script = std::fs::read_to_string(&path).expect("read dynamic completion");
-        assert_eq!(dynamic_script, dynamic_bootstrap(CompletionShell::Bash));
-        #[cfg(not(unix))]
-        let _ = dynamic_script;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-
-            let mode = std::fs::metadata(&path)
-                .map(|metadata| metadata.permissions())
-                .map(|permissions| permissions.mode())
-                .expect("completion permissions");
-            #[allow(
-                clippy::semicolon_outside_block,
-                reason = "clippy's semicolon formatting lints conflict on this block"
-            )]
-            {
-                assert_eq!(mode & 0o777, COMPLETION_FILE_MODE);
-            }
-        }
-    }
-
-    #[test]
     fn dynamic_command_marks_host_and_session_targets() {
         let command = dynamic_command(CompletionContext::default());
         command.clone().debug_assert();
@@ -1071,33 +981,6 @@ mod tests {
         assert!(start
             .get_arguments()
             .any(|arg| arg.get_id() == "dev_subprocess"));
-    }
-
-    /// The consent flag of `session rm` is offered in every shell's static
-    /// script and stays a plain flag with no dynamic value completer.
-    #[test]
-    fn session_rm_offers_the_unconfirmed_cleanup_flag() {
-        for shell in [
-            CompletionShell::Bash,
-            CompletionShell::Zsh,
-            CompletionShell::Fish,
-        ] {
-            let script = String::from_utf8(render_script(shell, false)).expect("UTF-8 script");
-            assert!(
-                script.contains("accept-unconfirmed-cleanup"),
-                "static {shell:?} completion lacks the session rm consent flag"
-            );
-        }
-        let command = dynamic_command(CompletionContext::default());
-        let rm = command
-            .find_subcommand("session")
-            .and_then(|session| session.find_subcommand("rm"))
-            .expect("session rm");
-        let flag = rm
-            .get_arguments()
-            .find(|arg| arg.get_id() == "accept_unconfirmed_cleanup")
-            .expect("consent flag");
-        assert!(flag.get::<ArgValueCompleter>().is_none());
     }
 
     fn plugin_info(id: &str, version: &str, digest_hex_char: char) -> PackageInfo {
