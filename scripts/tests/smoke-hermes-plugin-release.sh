@@ -78,8 +78,8 @@ if [[ -n "$(find "$safe_temp_parent" -mindepth 1 -maxdepth 1 -print)" ]]; then
   exit 1
 fi
 
-# An install from the CLI's embedded copy, or from another package, is not the
-# package-backed install the release must prove.
+# An install that records an older CLI's compiled copy (`source=embedded`), or
+# another package, is not the package-backed install the release must prove.
 expect_failure 'reported source=embedded' "$(release embedded ok)" "$safe_temp_parent" "$safe_temp_parent"
 expect_failure 'did not report the installed Hermes package' "$(release wrong-digest ok)" "$safe_temp_parent" "$safe_temp_parent"
 

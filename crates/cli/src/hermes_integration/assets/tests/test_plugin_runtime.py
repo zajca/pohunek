@@ -1,4 +1,9 @@
-"""Stdlib-only checks for the embedded Hermes plugin runtime."""
+"""Stdlib-only checks for the Hermes operator plugin runtime.
+
+The suite imports the plugin from ``pohunek/`` beside its own directory: the
+official package's operator payload plus the core hook reporter, as
+``crates/cli/tests/hermes_plugin_suites.rs`` assembles them.
+"""
 
 from __future__ import annotations
 

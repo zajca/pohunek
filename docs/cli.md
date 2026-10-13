@@ -59,7 +59,7 @@ port is retained.
 | `pohunek notifications list / watch` | Inspect or stream the durable inbox; `--all-hosts` fans out. |
 | `pohunek notifications read / ack / archive / delete` | Drive one record's lifecycle (`host/id` targets a specific host). |
 | `pohunek notifications policy / retention` | Per-kind policy for the default flags or any runtime id (`--provider default\|<runtime-id>`; `default` is always the base flags, even if a runtime is named `default`), retention pruning (`--dry-run` / `--apply`). |
-| `pohunek integration install` | Install Codex/Claude hooks into the runtime's own config home, one host profile's home (`--profile NAME`) or every distinct home (`--all-profiles`), or install a selected Hermes profile's managed plugin with explicit access mode and host allowlist. |
+| `pohunek integration install` | Install Codex/Claude hooks into the runtime's own config home, one host profile's home (`--profile NAME`) or every distinct home (`--all-profiles`), or install a selected Hermes profile's managed plugin from the installed Hermes package with explicit access mode and host allowlist. |
 | `pohunek integration status` | Inspect daemon-managed Codex/Claude hooks on the effective `--host` (`--profile` and `--all-profiles` select profile config homes and are local-only), or one explicitly selected local Hermes target. |
 | `pohunek integration doctor / uninstall` | Diagnose or remove daemon-managed Codex/Claude hooks (`doctor` follows `--host`; `uninstall` targets the local daemon; both accept `--profile NAME` and `--all-profiles`, local-only), or, with `--agent hermes`, one explicitly selected local Hermes plugin target. |
 | `pohunek integration update --agent hermes` | Atomically refresh one explicitly selected local Hermes plugin target. |
@@ -337,6 +337,13 @@ profile is valid only when stated as `--hermes-profile default`; named profiles
 and a custom absolute home are isolated alternatives. The installer creates a
 Pohunek-owned owner-private policy outside the plugin checksum set, and binds
 its exact absolute path into the managed plugin asset.
+
+The operator plugin comes from the installed, enabled and selected official
+Hermes package (`pohunek plugin install runtime/packages/hermes.tar.zst
+--catalog runtime/runtime-catalog.json` from a Linux daemon archive). Without
+it, `integration install` and `update` fail with
+`hermes_package_not_installed` and change nothing, while `status`, `doctor`
+and `uninstall` keep working on an existing install.
 
 ```bash
 # Observation plus constrained peer-session management in one named profile.

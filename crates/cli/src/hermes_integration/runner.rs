@@ -1550,9 +1550,9 @@ mod tests {
     use pohunek_test_support::process_env::ProcessEnv;
 
     use super::*;
-    use crate::hermes_integration::assets;
     use crate::hermes_integration::target::{ProfileName, TargetContext, TargetSelection};
     use crate::hermes_integration::test_python;
+    use crate::hermes_integration::{assets, test_package};
 
     static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
@@ -1720,15 +1720,15 @@ mod tests {
         fs::set_permissions(&policy, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
             .expect("private staged policy");
 
-        let rendered = assets::render(&final_policy).expect("render plugin assets");
-        for asset in &rendered {
+        let bundle = test_package::bundle(&final_policy).expect("package fixture bundle");
+        for asset in &bundle.assets {
             let destination = plugin.join(asset.path());
             create_private_parent(&plugin, destination.parent().expect("asset parent"));
             fs::write(&destination, asset.bytes()).expect("write staged asset");
             fs::set_permissions(&destination, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
                 .expect("private staged asset");
         }
-        let ownership = assets::ownership(selected.hermes_home(), &final_policy, &rendered)
+        let ownership = assets::ownership(selected.hermes_home(), &final_policy, &bundle)
             .expect("stage ownership");
         let marker = plugin.join(assets::MARKER_NAME);
         fs::write(

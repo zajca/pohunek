@@ -5,6 +5,11 @@ the then-current public protocol v2; it added a local, profile-owned Hermes
 plugin lifecycle to the CLI. Current releases use protocol v4 and follow the
 [current update runbook](../knowledge/runbooks/update-after-release.md).
 
+Current releases install the plugin only from the official Hermes runtime
+package; the [rollout runbook](../runbooks/hermes-operator-plugin.md) covers
+installing that package first and handling an install an older CLI rendered
+from its compiled copy (`provenance` `source=embedded`).
+
 ## Upgrade order
 
 1. If any local or NetBird peer still uses the pre-M1 exact-version protocol,

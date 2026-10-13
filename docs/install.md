@@ -311,6 +311,24 @@ longer be resumed or forked (`runtime_served_by_package`) until the package is
 disabled or uninstalled again, and a host agent profile over `hermes` must be
 pinned to the package with `pohunek plugin profile migrate <name> --yes`.
 
+The Hermes operator plugin comes only from the Hermes package as well: the CLI
+carries no copy of its payload, so install the package before the plugin:
+
+```bash
+pohunek plugin install runtime/packages/hermes.tar.zst --catalog runtime/runtime-catalog.json --yes
+pohunek integration install --agent hermes --hermes-profile default \
+  --access-mode manage --allow-host local
+```
+
+Without the package, `pohunek integration install|update --agent hermes` fails
+with `hermes_package_not_installed` and changes nothing; its recovery hint names
+the package install. A plugin an earlier CLI installed from its compiled copy
+(`provenance` `source=embedded`) is not migrated automatically: status and
+doctor report the missing package, `integration uninstall` still removes it,
+and `integration update` moves it to the package once the package is
+installed. The Apple Silicon archive carries no package, so a macOS host cannot
+install the plugin until darwin packages are attested (#929).
+
 To prepare first, install with `--no-enable` and run
 `pohunek plugin enable <package-id>` when you are ready to switch. `pohunek
 plugin disable` or `pohunek plugin uninstall` leaves `claude` or `codex`

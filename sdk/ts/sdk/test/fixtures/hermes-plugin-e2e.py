@@ -1,4 +1,4 @@
-"""Run the embedded Pohunek plugin tools against an isolated real daemon.
+"""Run the Pohunek Hermes operator plugin tools against an isolated real daemon.
 
 This fixture deliberately imports the production package with ``importlib`` instead
 of adding its asset directory to ``sys.path``.  The one rendered policy-path

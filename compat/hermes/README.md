@@ -42,10 +42,10 @@ runtime package.
 The package's `operator.toml` is the closed sidecar of the allowlisted Hermes
 operator payload in its `operator/` directory. The CLI verifies the sidecar and
 its payload before installing; the core-owned `_pohunek_reporter.py` remains
-outside the sidecar and is embedded separately. When an official Hermes package
-is installed, enabled, selected and catalog-authorized, the CLI installs the
-plugin from that package. The CLI also embeds this sidecar and payload and uses
-that copy only as the transitional source when no Hermes package is installed.
+outside the sidecar and is compiled into the CLI. The CLI installs the plugin
+only from an official Hermes package that is installed, enabled, selected and
+catalog-authorized; without one, install and update fail with
+`hermes_package_not_installed`.
 
 The skill payload is generated from `docs/knowledge/guides/hermes-operator.md`.
 Run `cargo xtask hermes generate-skill` after changing that guide; the command
@@ -79,9 +79,9 @@ and runs `pohunek plugin install --catalog`. The daemon must then list the
 archive digest as the one enabled, selected official Hermes package. Every
 `integration` result of the locked install, status, and doctor steps must
 report `provenance` `source=package` with `pohunek.runtime.hermes` and the
-archive digest, and uninstall must report none; a result with `source=embedded`
-fails the gate, because the CLI still renders its embedded copy when no package
-is installed. The daemon must exit cleanly on SIGTERM afterwards. The gate creates
+archive digest, and uninstall must report none; a result with `source=embedded`,
+the source an install from an older CLI's compiled copy records, fails the
+gate. The daemon must exit cleanly on SIGTERM afterwards. The gate creates
 temporary `HOME`, `HERMES_HOME`, XDG, Python user, bytecode, and
 uv-cache locations. It clears the ambient environment except for the minimum
 process-launch variables, bounds every command by time and output size, checks

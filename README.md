@@ -292,8 +292,9 @@ Repository implementation rules start at [AGENTS.md](AGENTS.md).
 
 ## License
 
-[MIT](LICENSE). The embedded Pohunek Hermes plugin and generated skill are
-repository-owned MIT assets. Their Python modules use only the Python standard
-library plus the pinned Hermes host API; Pohunek does not bundle Hermes code,
-marks, model/provider SDKs, or third-party Python dependencies in the CLI
-archive.
+[MIT](LICENSE). The Pohunek Hermes operator plugin and generated skill, shipped
+in the official Hermes runtime package (`runtime-packages/hermes`), and the core
+hook reporter compiled into the CLI are repository-owned MIT assets. Their
+Python modules use only the Python standard library plus the pinned Hermes host
+API; Pohunek does not bundle Hermes code, marks, model/provider SDKs, or
+third-party Python dependencies in that package or the CLI archive.

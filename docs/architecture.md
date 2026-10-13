@@ -1070,8 +1070,11 @@ ignored the additive `wait` request from confirming delivery.
 The pinned local Hermes Agent `0.20.0` runtime may load a Pohunek-owned plugin
 from one explicitly selected Hermes profile. This is a CLI/client-side
 integration; the daemon stays provider-neutral and M3 does not increase the
-public protocol version. The release `pohunek` binary embeds the plugin assets
-and the deterministically generated `pohunek:pohunek` skill. Installation uses
+public protocol version. The plugin assets and the deterministically generated
+`pohunek:pohunek` skill come only from the installed, selected official Hermes
+runtime package (`runtime-packages/hermes`); the `pohunek` binary carries just
+the core hook reporter and refuses to install or update the plugin without the
+package (`hermes_package_not_installed`). Installation uses
 only Hermes's supported plugin commands and places a separate owner-private
 Pohunek policy outside the immutable plugin checksum set. The rendered plugin
 asset stores the exact absolute policy path selected by the installer.

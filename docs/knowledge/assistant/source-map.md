@@ -631,7 +631,7 @@ Runtime package archive format:
 - `runtime-packages/hermes/runtime.toml` — Hermes runtime descriptor (the built-in Hermes descriptor with a `semver-line-v1` version probe and the package's own detection manifest).
 - `runtime-packages/hermes/detect.toml` — Hermes detection manifest, equal to the built-in one.
 - `runtime-packages/hermes/operator.toml` — closed sidecar of the Hermes operator plugin payload in `runtime-packages/hermes/operator/`.
-- `crates/cli/tests/hermes_package.rs` — catalog-installed Hermes package tests (descriptor and manifest parity with the built-in Hermes files, the version probe, operator installs from the selected package and the source errors) and the opt-in real-Hermes session test.
+- `crates/cli/tests/hermes_package.rs` — catalog-installed Hermes package tests (descriptor and manifest parity with the built-in Hermes files, the version probe, operator installs from the selected package, the package-backed operator lifecycle, the source errors including a missing package, and installs with an `embedded` marker) and the opt-in real-Hermes session test.
 - `crates/cli/tests/support/process_guard.rs` — process cleanup shared by the real-agent package tests.
 - `crates/cli/tests/support/plugin_harness.rs` — real-daemon harness shared by the package tests.
 - `crates/test-support/src/catalog.rs` — throwaway signing key, trust anchor and signed catalog helpers (feature `catalog`) shared by the catalog install tests of the CLI and the daemon.
@@ -710,12 +710,13 @@ Hermes operator plugin and managed lifecycle:
 - `crates/cli/src/hermes_integration/doctor.rs`
 - `crates/cli/src/hermes_integration/skill.rs`
 - `runtime-packages/hermes/operator/plugin.yaml`
-- `crates/cli/src/hermes_integration/assets/pohunek/__init__.py`
-- `crates/cli/src/hermes_integration/assets/pohunek/cli.py`
-- `crates/cli/src/hermes_integration/assets/pohunek/hooks.py`
-- `crates/cli/src/hermes_integration/assets/pohunek/policy.py`
-- `crates/cli/src/hermes_integration/assets/pohunek/redact.py`
-- `crates/cli/src/hermes_integration/assets/pohunek/tools.py`
+- `runtime-packages/hermes/operator/__init__.py`
+- `runtime-packages/hermes/operator/cli.py`
+- `runtime-packages/hermes/operator/hooks.py`
+- `runtime-packages/hermes/operator/policy.py`
+- `runtime-packages/hermes/operator/redact.py`
+- `runtime-packages/hermes/operator/tools.py`
+- `crates/cli/src/hermes_integration/assets/pohunek/_pohunek_reporter.py`
 - `crates/cli/src/hermes_integration/assets/tests/test_plugin_runtime.py`
 - `docs/knowledge/guides/hermes-operator.md`
 - `docs/design/hermes-agent-integration.md`

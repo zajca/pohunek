@@ -1,4 +1,4 @@
-//! Generates and checks the embedded Hermes Pohunek skill payload.
+//! Generates and checks the Hermes package's Pohunek operator skill payload.
 //!
 //! The generated artifact has one hand-authored body source and an explicit,
 //! fixed plugin tool contract. Keeping both checks here makes source changes
@@ -113,7 +113,7 @@ fn check_sidecar_checksum(root: &Path, skill: &[u8]) -> Result<bool, XtaskError>
         .and_then(|record| record.get("sha256"))
         .and_then(toml_edit::Item::as_str);
     if recorded == Some(expected.as_str()) {
-        println!("[PASS] hermes-skill: embedded operator payload and sidecar checksum are current");
+        println!("[PASS] hermes-skill: packaged operator payload and sidecar checksum are current");
         Ok(true)
     } else {
         println!(
@@ -351,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn public_commands_generate_and_check_the_embedded_operator_payload() {
+    fn public_commands_generate_and_check_the_packaged_operator_payload() {
         const FIXTURE_ROOT_VAR: &str = "POHUNEK_HERMES_SKILL_FIXTURE_ROOT";
 
         let _process_env = ProcessEnv::lock();
@@ -386,7 +386,7 @@ mod tests {
             .command(executable)
             .args([
                 "--exact",
-                "hermes_skill::tests::public_commands_generate_and_check_the_embedded_operator_payload",
+                "hermes_skill::tests::public_commands_generate_and_check_the_packaged_operator_payload",
             ])
             .env(FIXTURE_ROOT_VAR, root)
             .env("CARGO_MANIFEST_DIR", &manifest_dir)
@@ -407,7 +407,7 @@ mod tests {
         crate::run(["hermes", "generate-skill"]).expect("run public generator command");
 
         let generated_path = root.join("runtime-packages/hermes/operator/skills/pohunek/SKILL.md");
-        let generated = fs::read(&generated_path).expect("read embedded payload target");
+        let generated = fs::read(&generated_path).expect("read packaged payload target");
         let generated_text = String::from_utf8(generated.clone()).expect("generated UTF-8");
         assert!(generated_text.ends_with("# Hermes operator\n\nSafely use `pohunek_sessions`.\n"));
         let sidecar_path = root.join("runtime-packages/hermes/operator.toml");
@@ -421,7 +421,7 @@ mod tests {
         assert!(crate::run(["hermes", "check-skill"]).is_err());
         crate::run(["hermes", "generate-skill"]).expect("repair checksum through CLI");
 
-        fs::write(&generated_path, b"corrupt body\n").expect("corrupt embedded payload");
+        fs::write(&generated_path, b"corrupt body\n").expect("corrupt packaged payload");
         assert!(crate::run(["hermes", "check-skill"]).is_err());
         crate::run(["hermes", "generate-skill"]).expect("repair payload through CLI");
         crate::run(["hermes", "check-skill"]).expect("check regenerated payload");

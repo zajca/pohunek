@@ -1,10 +1,11 @@
-//! Operator asset sources and their explicit ownership contract.
+//! Operator asset source and its explicit ownership contract.
 //!
 //! The managed plugin comes from exactly one immutable source: the selected,
-//! enabled official Hermes runtime package, or the closed sidecar embedded in
-//! the CLI while no Hermes package is installed.
+//! enabled official Hermes runtime package. The CLI carries only the core hook
+//! reporter; without an installed Hermes package no operator plugin can be
+//! installed or updated.
 
-// Rust guideline compliant 2026-10-12
+// Rust guideline compliant 2026-10-13
 
 #![expect(
     clippy::map_err_ignore,
@@ -27,55 +28,18 @@ use super::error::Error;
 pub(crate) const MARKER_VERSION: u32 = 3;
 /// The generated marker is deliberately not self-checksummed.
 pub(crate) const MARKER_NAME: &str = ".pohunek-owned.json";
-/// Closed operator sidecar embedded into the CLI for verification at install time.
-const OPERATOR_MANIFEST: &[u8] =
-    include_bytes!("../../../../runtime-packages/hermes/operator.toml");
-/// Payload files available to the closed operator manifest.
-const OPERATOR_PAYLOAD: [(&str, &[u8]); 8] = [
-    (
-        "plugin.yaml",
-        include_bytes!("../../../../runtime-packages/hermes/operator/plugin.yaml"),
-    ),
-    (
-        "__init__.py",
-        include_bytes!("../../../../runtime-packages/hermes/operator/__init__.py"),
-    ),
-    (
-        "cli.py",
-        include_bytes!("../../../../runtime-packages/hermes/operator/cli.py"),
-    ),
-    (
-        "hooks.py",
-        include_bytes!("../../../../runtime-packages/hermes/operator/hooks.py"),
-    ),
-    (
-        "policy.py",
-        include_bytes!("../../../../runtime-packages/hermes/operator/policy.py"),
-    ),
-    (
-        "redact.py",
-        include_bytes!("../../../../runtime-packages/hermes/operator/redact.py"),
-    ),
-    (
-        "tools.py",
-        include_bytes!("../../../../runtime-packages/hermes/operator/tools.py"),
-    ),
-    (
-        "skills/pohunek/SKILL.md",
-        include_bytes!("../../../../runtime-packages/hermes/operator/skills/pohunek/SKILL.md"),
-    ),
-];
-/// The reporter stays embedded and owned exclusively by the core CLI.
+/// The hook reporter is compiled into the CLI and owned exclusively by it.
 const CORE_OWNED_ASSETS: [(&str, &[u8]); 1] = [(
     "_pohunek_reporter.py",
     include_bytes!("assets/pohunek/_pohunek_reporter.py"),
 )];
 const POLICY_TOKEN: &str = "__POHUNEK_POLICY_PATH__";
-/// Runtime package that may supply the operator sidecar and payload.
+/// Runtime package that supplies the operator sidecar and payload.
 ///
 /// The marker records it for package-backed installs; parsing accepts no other id.
-const PACKAGE_ID: &str = "pohunek.runtime.hermes";
-/// Marker `source` of an install rendered from the sidecar embedded in the CLI.
+pub(crate) const PACKAGE_ID: &str = "pohunek.runtime.hermes";
+/// Marker `source` of an install rendered from an operator payload that a CLI
+/// binary carried. This CLI reads such markers and never writes them.
 pub(crate) const EMBEDDED_SOURCE: &str = "embedded";
 /// Marker `source` of an install rendered from the selected runtime package.
 pub(crate) const PACKAGE_SOURCE: &str = "package";
@@ -138,32 +102,33 @@ pub(crate) struct Asset {
     bytes: Vec<u8>,
 }
 
-/// Immutable bytes and provenance selected before the filesystem transaction.
+/// Immutable bytes and package provenance selected before the filesystem transaction.
 #[derive(Debug, Clone)]
 pub(crate) struct Bundle {
     pub(crate) assets: Vec<Asset>,
+    /// Digest of the package's closed operator sidecar.
     pub(crate) manifest_sha256: String,
-    pub(crate) package_id: Option<String>,
-    pub(crate) package_digest: Option<String>,
+    /// Runtime package id that supplied the operator payload.
+    pub(crate) package_id: String,
+    /// Package archive digest as lowercase hex, without the `sha256:` prefix.
+    pub(crate) package_digest: String,
 }
 
 /// Selects and snapshots the enabled, selected official Hermes package.
 ///
-/// The embedded sidecar is the source only while no Hermes package is
-/// installed; a present but unusable candidate never falls back to it.
-///
 /// # Errors
 ///
-/// Returns [`Error::PackageRegistryUnreadable`] when the registry cannot be
-/// opened or read safely, [`Error::PackageNotSelected`] when a Hermes package
-/// is installed but no enabled official version is selected, and
+/// Returns [`Error::PackageNotInstalled`] when no Hermes package is installed,
+/// [`Error::PackageRegistryUnreadable`] when the registry cannot be opened or
+/// read safely, [`Error::PackageNotSelected`] when a Hermes package is
+/// installed but no enabled official version is selected, and
 /// [`Error::InvalidAsset`] when the selected package fails verification or
 /// the closed sidecar contract.
 pub(crate) fn selected_bundle(registry_path: &Path, policy_path: &Path) -> Result<Bundle, Error> {
     let Some(registry) = Registry::open_existing_at(registry_path, Limits::DEFAULT)
         .map_err(|_| Error::PackageRegistryUnreadable)?
     else {
-        return embedded_bundle(policy_path);
+        return Err(Error::PackageNotInstalled);
     };
     let state = registry
         .state()
@@ -174,7 +139,7 @@ pub(crate) fn selected_bundle(registry_path: &Path, policy_path: &Path) -> Resul
         .iter()
         .any(|record| record.identity().id == id)
     {
-        return embedded_bundle(policy_path);
+        return Err(Error::PackageNotInstalled);
     }
     let selected = state.selected(&id).ok_or(Error::PackageNotSelected)?;
     // A validated registry state only selects installed records of the same id.
@@ -216,24 +181,12 @@ pub(crate) fn selected_bundle(registry_path: &Path, policy_path: &Path) -> Resul
     Ok(Bundle {
         assets,
         manifest_sha256: checksum(&source),
-        package_id: Some(record.identity().id.to_string()),
-        package_digest: Some(
-            record
-                .digest()
-                .to_string()
-                .trim_start_matches("sha256:")
-                .to_owned(),
-        ),
-    })
-}
-
-/// Returns the embedded S3 sidecar as an immutable byte snapshot.
-pub(crate) fn embedded_bundle(policy_path: &Path) -> Result<Bundle, Error> {
-    Ok(Bundle {
-        assets: render(policy_path)?,
-        manifest_sha256: checksum(OPERATOR_MANIFEST),
-        package_id: None,
-        package_digest: None,
+        package_id: record.identity().id.to_string(),
+        package_digest: record
+            .digest()
+            .to_string()
+            .trim_start_matches("sha256:")
+            .to_owned(),
     })
 }
 
@@ -284,19 +237,10 @@ pub(crate) struct Ownership {
     pub(crate) assets: BTreeMap<String, String>,
 }
 
-/// Renders immutable assets for exactly one validated absolute policy path.
-pub(crate) fn render(policy_path: &Path) -> Result<Vec<Asset>, Error> {
-    render_source(policy_path, OPERATOR_MANIFEST, |path| {
-        let path = path.strip_prefix("operator/").ok_or(Error::InvalidAsset)?;
-        OPERATOR_PAYLOAD
-            .iter()
-            .find(|(asset_path, _)| *asset_path == path)
-            .map(|(_, bytes)| bytes.to_vec())
-            .ok_or(Error::InvalidAsset)
-    })
-}
-
 /// Renders a closed sidecar from an already snapshotted manifest and payload.
+///
+/// `read` returns the bytes of one `operator/<path>` payload file. The core
+/// reporter is appended from the CLI binary.
 pub(crate) fn render_source(
     policy_path: &Path,
     source: &[u8],
@@ -373,55 +317,11 @@ fn parse_operator_manifest(
     Ok(manifest)
 }
 
-/// Returns a parsed sidecar only when its closed schema and exact payload set match.
-fn verified_operator_manifest() -> Result<OperatorManifest, Error> {
-    verified_operator_manifest_bytes(OPERATOR_MANIFEST)
-}
-
-fn verified_operator_manifest_bytes(source: &[u8]) -> Result<OperatorManifest, Error> {
-    let source = std::str::from_utf8(source).map_err(|_| Error::InvalidAsset)?;
-    let manifest: OperatorManifest =
-        toml_edit::de::from_str(source).map_err(|_| Error::InvalidAsset)?;
-    if manifest.schema != 1 || manifest.payload.len() != EXPECTED_PAYLOAD_PATHS.len() {
-        return Err(Error::InvalidAsset);
-    }
-    let paths: Vec<_> = manifest
-        .payload
-        .iter()
-        .map(|asset| asset.path.as_str())
-        .collect();
-    if paths != EXPECTED_PAYLOAD_PATHS {
-        return Err(Error::InvalidAsset);
-    }
-    if manifest
-        .payload
-        .iter()
-        .any(|asset| !is_sha256(&asset.sha256))
-    {
-        return Err(Error::InvalidAsset);
-    }
-    for record in &manifest.payload {
-        let (_, bytes) = OPERATOR_PAYLOAD
-            .iter()
-            .find(|(path, _)| *path == record.path)
-            .ok_or(Error::InvalidAsset)?;
-        if checksum(bytes) != record.sha256 {
-            return Err(Error::InvalidAsset);
-        }
-    }
-    Ok(manifest)
-}
-
-pub(crate) fn operator_sha256() -> Result<String, Error> {
-    verified_operator_manifest()?;
-    Ok(checksum(OPERATOR_MANIFEST))
-}
-
-/// Builds a marker from rendered assets and selected target metadata.
+/// Builds a package-provenance marker for a snapshotted bundle and target.
 pub(crate) fn ownership(
     hermes_home: &Path,
     policy_path: &Path,
-    assets: &[Asset],
+    bundle: &Bundle,
 ) -> Result<Ownership, Error> {
     let hermes_home = hermes_home.to_str().ok_or(Error::UnsafeTarget)?;
     let policy_path = policy_path.to_str().ok_or(Error::UnsafePolicyPath)?;
@@ -429,7 +329,7 @@ pub(crate) fn ownership(
         return Err(Error::UnsafeTarget);
     }
     let mut checksums = BTreeMap::new();
-    for asset in assets {
+    for asset in &bundle.assets {
         validate_relative_path(asset.path())?;
         if checksums
             .insert(asset.path.clone(), asset.checksum())
@@ -438,49 +338,23 @@ pub(crate) fn ownership(
             return Err(Error::InvalidAsset);
         }
     }
-    if !has_current_paths(&checksums) {
+    if !has_current_paths(&checksums)
+        || !is_sha256(&bundle.manifest_sha256)
+        || bundle.package_id != PACKAGE_ID
+        || !is_sha256(&bundle.package_digest)
+    {
         return Err(Error::InvalidAsset);
     }
     Ok(Ownership {
         version: MARKER_VERSION,
         hermes_home: hermes_home.to_owned(),
         policy_path: policy_path.to_owned(),
-        operator_sha256: Some(operator_sha256()?),
-        source: Some(EMBEDDED_SOURCE.to_owned()),
-        package_id: None,
-        package_digest: None,
+        operator_sha256: Some(bundle.manifest_sha256.clone()),
+        source: Some(PACKAGE_SOURCE.to_owned()),
+        package_id: Some(bundle.package_id.clone()),
+        package_digest: Some(bundle.package_digest.clone()),
         assets: checksums,
     })
-}
-
-/// Builds a marker with provenance for a snapshotted package or embedded bundle.
-pub(crate) fn ownership_for_bundle(
-    hermes_home: &Path,
-    policy_path: &Path,
-    bundle: &Bundle,
-) -> Result<Ownership, Error> {
-    let mut ownership = ownership(hermes_home, policy_path, &bundle.assets)?;
-    ownership.operator_sha256 = Some(bundle.manifest_sha256.clone());
-    ownership.source = Some(
-        if bundle.package_id.is_some() {
-            PACKAGE_SOURCE
-        } else {
-            EMBEDDED_SOURCE
-        }
-        .to_owned(),
-    );
-    ownership.package_id.clone_from(&bundle.package_id);
-    ownership.package_digest.clone_from(&bundle.package_digest);
-    if ownership.source.as_deref() == Some(PACKAGE_SOURCE)
-        && (ownership.package_id.is_none()
-            || ownership
-                .package_digest
-                .as_deref()
-                .is_none_or(|value| !is_sha256(value)))
-    {
-        return Err(Error::InvalidAsset);
-    }
-    Ok(ownership)
 }
 
 /// Serializes the ownership marker deterministically.
@@ -640,13 +514,14 @@ mod tests {
     use pohunek_test_support::env::TestEnv;
 
     use super::*;
-    use crate::hermes_integration::test_python;
+    use crate::hermes_integration::{test_package, test_python};
 
     #[test]
     fn renderer_replaces_exactly_one_policy_token_and_owns_every_asset() {
         let policy_path = Path::new("/work/policy\\\"quoted-á.json");
-        let assets = render(policy_path).expect("rendered assets");
-        let init = assets
+        let bundle = test_package::bundle(policy_path).expect("rendered package bundle");
+        let init = bundle
+            .assets
             .iter()
             .find(|asset| asset.path() == "__init__.py")
             .expect("init asset");
@@ -658,14 +533,15 @@ mod tests {
         let ownership = ownership(
             Path::new("/work/hermes"),
             Path::new("/work/policy.json"),
-            &assets,
+            &bundle,
         )
         .expect("ownership");
         assert_eq!(ownership.assets.len(), 9);
         assert_eq!(
             ownership.operator_sha256.as_deref(),
-            Some(checksum(OPERATOR_MANIFEST).as_str())
+            Some(bundle.manifest_sha256.as_str())
         );
+        assert_eq!(ownership.source.as_deref(), Some(PACKAGE_SOURCE));
         assert!(!ownership.assets.contains_key(MARKER_NAME));
         assert_eq!(
             parse_marker(&marker_bytes(&ownership).expect("marker")).expect("parsed"),
@@ -676,8 +552,10 @@ mod tests {
     #[test]
     fn rendered_init_is_valid_python_for_escaped_absolute_paths() {
         let env = TestEnv::new().expect("hermetic test environment");
-        let assets = render(Path::new("/work/policy\\\"quoted-á.json")).expect("rendered assets");
-        let init = assets
+        let bundle = test_package::bundle(Path::new("/work/policy\\\"quoted-á.json"))
+            .expect("rendered package bundle");
+        let init = bundle
+            .assets
             .iter()
             .find(|asset| asset.path() == "__init__.py")
             .expect("init asset");
@@ -696,22 +574,24 @@ mod tests {
         assert!(status.success(), "rendered init must parse and compile");
     }
 
-    /// Copies the embedded hook and the start-identity suite into an isolated
-    /// tree and runs them on the host interpreter, so the suite never reads the
-    /// source tree.
+    /// Copies the packaged hook, the core reporter, and the start-identity
+    /// suite into an isolated tree and runs them on the host interpreter, so
+    /// the suite never imports from the source tree.
     #[test]
     fn start_identity_suite_passes_on_the_host_interpreter() {
         let env = TestEnv::new().expect("hermetic test environment");
-        let hooks = OPERATOR_PAYLOAD
-            .iter()
-            .find(|(path, _)| *path == "hooks.py")
-            .expect("embedded hooks asset")
-            .1;
-        let reporter = CORE_OWNED_ASSETS
-            .iter()
-            .find(|(path, _)| *path == "_pohunek_reporter.py")
-            .expect("embedded core reporter asset")
-            .1;
+        let bundle =
+            test_package::bundle(Path::new("/work/policy.json")).expect("rendered package bundle");
+        let asset = |path: &str| {
+            bundle
+                .assets
+                .iter()
+                .find(|asset| asset.path() == path)
+                .unwrap_or_else(|| panic!("rendered asset {path}"))
+                .bytes()
+        };
+        let hooks = asset("hooks.py");
+        let reporter = asset("_pohunek_reporter.py");
         for (relative, bytes) in [
             ("pohunek/hooks.py", hooks),
             ("pohunek/_pohunek_reporter.py", reporter),
@@ -737,8 +617,8 @@ mod tests {
         );
     }
 
-    /// Production code embeds assets with `include_bytes!` and never resolves a
-    /// source-tree location at run time.
+    /// Production code compiles the core reporter in with `include_bytes!` and
+    /// never resolves a source-tree location at run time.
     #[test]
     fn production_code_has_no_runtime_source_tree_lookup() {
         let sources = [
@@ -767,11 +647,12 @@ mod tests {
 
     #[test]
     fn marker_rejects_unknown_missing_duplicate_and_malformed_checksums() {
-        let assets = render(Path::new("/work/policy.json")).expect("rendered assets");
+        let bundle =
+            test_package::bundle(Path::new("/work/policy.json")).expect("rendered package bundle");
         let ownership = ownership(
             Path::new("/work/hermes"),
             Path::new("/work/policy.json"),
-            &assets,
+            &bundle,
         )
         .expect("ownership");
         let document = String::from_utf8(marker_bytes(&ownership).expect("marker")).expect("utf8");
@@ -799,8 +680,9 @@ mod tests {
                 "/work/pohunek-hermes-lifecycle-x/config/policy.json",
             ),
         ] {
-            let assets = render(Path::new(policy_path)).expect("rendered assets");
-            let ownership = ownership(Path::new(hermes_home), Path::new(policy_path), &assets)
+            let bundle =
+                test_package::bundle(Path::new(policy_path)).expect("rendered package bundle");
+            let ownership = ownership(Path::new(hermes_home), Path::new(policy_path), &bundle)
                 .expect("ownership");
             let marker = marker_bytes(&ownership).expect("marker");
             assert_eq!(parse_marker(&marker).expect("parsed marker"), ownership);
@@ -809,11 +691,12 @@ mod tests {
 
     #[test]
     fn marker_accepts_only_the_previous_exact_asset_inventory() {
-        let assets = render(Path::new("/work/policy.json")).expect("rendered assets");
+        let bundle =
+            test_package::bundle(Path::new("/work/policy.json")).expect("rendered package bundle");
         let ownership = ownership(
             Path::new("/work/hermes"),
             Path::new("/work/policy.json"),
-            &assets,
+            &bundle,
         )
         .expect("ownership");
         let mut previous = ownership.clone();

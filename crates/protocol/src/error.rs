@@ -1265,7 +1265,19 @@ const RELEASE_CATALOG: &str = "runtime/runtime-catalog.json";
 #[must_use]
 pub fn official_package_install_step(runtime: &RuntimeId) -> String {
     format!(
-        "install the official `{runtime}` package with `pohunek plugin install {RELEASE_PACKAGES_DIR}/{runtime}.tar.zst --catalog {RELEASE_CATALOG}` from an extracted release archive whose catalog lists this platform (or enable it with `pohunek plugin enable <package>` when it is installed but disabled)"
+        "{} (or enable it with `pohunek plugin enable <package>` when it is installed but disabled)",
+        official_package_install_only_step(runtime)
+    )
+}
+
+/// [`official_package_install_step`] without the enable alternative.
+///
+/// For a caller that has already established that no package of `runtime` is
+/// installed at all, so enabling an installed one cannot apply.
+#[must_use]
+pub fn official_package_install_only_step(runtime: &RuntimeId) -> String {
+    format!(
+        "install the official `{runtime}` package with `pohunek plugin install {RELEASE_PACKAGES_DIR}/{runtime}.tar.zst --catalog {RELEASE_CATALOG}` from an extracted release archive whose catalog lists this platform"
     )
 }
 

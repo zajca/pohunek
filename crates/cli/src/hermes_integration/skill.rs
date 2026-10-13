@@ -1,6 +1,6 @@
 //! Hermetic parity checks for the generated Pohunek skill asset.
 
-// Rust guideline compliant 2026-08-06
+// Rust guideline compliant 2026-10-13
 
 #[cfg(test)]
 mod tests {
@@ -35,12 +35,13 @@ mod tests {
     ];
 
     #[test]
-    fn embedded_skill_frontmatter_and_tool_assets_have_exact_parity() {
-        let assets = crate::hermes_integration::assets::render(Path::new("/work/policy.json"))
-            .expect("render embedded plugin assets");
-        let skill = asset_text(&assets, "skills/pohunek/SKILL.md");
-        let manifest = asset_text(&assets, "plugin.yaml");
-        let tools = asset_text(&assets, "tools.py");
+    fn packaged_skill_frontmatter_and_tool_assets_have_exact_parity() {
+        let bundle =
+            crate::hermes_integration::test_package::bundle(Path::new("/work/policy.json"))
+                .expect("render the packaged plugin assets");
+        let skill = asset_text(&bundle.assets, "skills/pohunek/SKILL.md");
+        let manifest = asset_text(&bundle.assets, "plugin.yaml");
+        let tools = asset_text(&bundle.assets, "tools.py");
 
         assert!(skill.starts_with("---\nname: pohunek\n"));
         assert_eq!(
@@ -62,9 +63,9 @@ mod tests {
         let bytes = assets
             .iter()
             .find(|asset| asset.path() == path)
-            .unwrap_or_else(|| panic!("missing embedded asset {path}"))
+            .unwrap_or_else(|| panic!("missing packaged asset {path}"))
             .bytes();
-        std::str::from_utf8(bytes).unwrap_or_else(|_| panic!("embedded asset {path} is not UTF-8"))
+        std::str::from_utf8(bytes).unwrap_or_else(|_| panic!("packaged asset {path} is not UTF-8"))
     }
 
     fn yaml_sequence<'a>(document: &'a str, header: &str, item_prefix: &str) -> Vec<&'a str> {
