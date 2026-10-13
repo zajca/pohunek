@@ -774,7 +774,12 @@ differ is skipped, never selected. Those processes are not reported at once: whi
 unreadable processes remain, the sweep re-reads the process table for up to the
 sweep grace (`sweep.grace_ms`), so one that is caught between images or about to
 exit does not leave the cleanup unconfirmed; a candidate that outlives the grace
-is listed. The daemon uses the journaled number only when the journal was
+is listed. That wait is shared by every runtime one operation sweeps: the startup
+reconciliation (which runs before the daemon reports readiness), one background
+re-check of a session, and one removal or stop cleanup each wait at most one
+sweep grace in total, however many runtimes a persistent candidate blocks; once
+it has passed, a further runtime left with only such candidates is decided
+without waiting and stays unconfirmed. The daemon uses the journaled number only when the journal was
 written in the boot the host reports now, because creation numbers restart at
 reboot, and several journals of one runtime bound it only when they agree. Every
 journal-backed sweep passes it; the sweep of a runtime absent from its journal
