@@ -11,7 +11,7 @@
 //! `PRIV_GLOBAL_PROC_INFO` privilege that only root holds, and such a refusal is
 //! reported as a denial rather than as absence.
 
-// Rust guideline compliant 2026-10-12
+// Rust guideline compliant 2026-10-13
 
 use std::io;
 use std::os::fd::AsFd;
@@ -22,7 +22,7 @@ use async_io::Async;
 use super::darwin_layout::{
     bounded_descendants, children_by_parent, controlling_terminal_group, decode_argument_region,
     decode_command_name, decode_kernel_path, encode_boot_identity, encode_start_identity,
-    ArgumentRegion, LayoutError,
+    match_environment_entry, ArgumentRegion, EnvironmentMatch, LayoutError,
 };
 use super::{
     BootIdentity, CoalitionId, Error, ExitWatch, OwnershipMarkers, Pid, ProcessCoalitions,
@@ -237,6 +237,58 @@ impl ProcessInspector for DarwinInspector {
             fact.terminal_device,
             fact.terminal_group,
         ))
+    }
+}
+
+/// Returns whether the first `key` entry of the environment a same-user
+/// process was executed with equals `expected`.
+///
+/// The value is compared inside the kernel buffer and never retained or
+/// logged; an absent key is `false`.
+///
+/// # Errors
+///
+/// Returns [`Error::Race`] when the process is gone or exiting, and
+/// [`Error::Unobservable`] when its environment cannot be read now or the
+/// kernel withholds it (restricted platform binaries on macOS 27), so an
+/// unreadable environment is never mistaken for a different value.
+pub(crate) fn environment_entry_is(pid: Pid, key: &str, expected: &str) -> Result<bool, Error> {
+    const OPERATION: &str = "read_environment_entry";
+
+    let Some(fact) = read_bsd_fact(pid, native::effective_uid(), OPERATION)? else {
+        return Err(Error::Race {
+            operation: OPERATION,
+        });
+    };
+    if fact.is_zombie || fact.is_exiting {
+        return Err(Error::Race {
+            operation: OPERATION,
+        });
+    }
+    let buffer = match native::process_arguments(native_pid(pid, OPERATION)?) {
+        Ok(buffer) => buffer,
+        Err(error) if is_process_race(&error) => {
+            return Err(Error::Race {
+                operation: OPERATION,
+            });
+        }
+        Err(error)
+            if is_missing_argument_region(&error) || is_uncopyable_argument_region(&error) =>
+        {
+            return Err(Error::Unobservable {
+                operation: OPERATION,
+            });
+        }
+        Err(source) => return Err(Error::from_io(OPERATION, source)),
+    };
+    match match_environment_entry(&buffer, key.as_bytes(), expected.as_bytes()) {
+        Ok(EnvironmentMatch::Matches) => Ok(true),
+        Ok(EnvironmentMatch::Differs) => Ok(false),
+        // A buffer contradicting the layout describes a process whose
+        // image is being replaced, as for the argument region.
+        Ok(EnvironmentMatch::Withheld) | Err(_) => Err(Error::Unobservable {
+            operation: OPERATION,
+        }),
     }
 }
 

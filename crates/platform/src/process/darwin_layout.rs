@@ -4,7 +4,7 @@
 //! buffer. Keeping the decoding here makes region separation, bounds, and
 //! integer conversions testable on every host, not only on macOS.
 
-// Rust guideline compliant 2026-10-12
+// Rust guideline compliant 2026-10-13
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
@@ -130,6 +130,99 @@ pub(super) fn decode_argument_region(buffer: &[u8]) -> ArgumentRegion {
 /// count is negative or oversized, a marker value exceeds its bound, or the
 /// environment holds more entries than the scan bound.
 pub(super) fn parse_process_arguments(buffer: &[u8]) -> Result<NativeArguments, LayoutError> {
+    let regions = split_regions(buffer)?;
+    Ok(NativeArguments {
+        executable: PathBuf::from(OsString::from_vec(regions.executable.to_vec())),
+        argv: regions
+            .argv
+            .iter()
+            .map(|argument| String::from_utf8_lossy(argument).into_owned())
+            .collect(),
+        markers: collect_ownership_markers(regions.environment)?,
+        environment_withheld: regions.environment.is_empty(),
+    })
+}
+
+/// How one environment entry of a process compares with an expected value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    expect(
+        dead_code,
+        reason = "only the Darwin backend compares environment entries"
+    )
+)]
+pub(super) enum EnvironmentMatch {
+    /// The first entry for the key holds exactly the expected value.
+    Matches,
+    /// The key is absent or its first entry holds another value.
+    Differs,
+    /// The kernel withheld the environment region, so nothing is known.
+    Withheld,
+}
+
+/// Compares the first `key` entry of the environment in one
+/// `KERN_PROCARGS2` buffer with `expected`.
+///
+/// The value is compared in place and never copied, so no other environment
+/// value outlives the buffer. The first entry wins, matching `getenv`.
+///
+/// # Errors
+///
+/// Returns [`LayoutError::Malformed`] when a region is truncated or the
+/// environment holds more than [`MAX_ENVIRONMENT_ENTRIES`] entries before the
+/// key.
+#[cfg_attr(
+    not(target_os = "macos"),
+    expect(
+        dead_code,
+        reason = "only the Darwin backend compares environment entries"
+    )
+)]
+pub(super) fn match_environment_entry(
+    buffer: &[u8],
+    key: &[u8],
+    expected: &[u8],
+) -> Result<EnvironmentMatch, LayoutError> {
+    let mut region = split_regions(buffer)?.environment;
+    if region.is_empty() {
+        return Ok(EnvironmentMatch::Withheld);
+    }
+    let mut scanned = 0_usize;
+    while let Some((entry, rest)) = split_c_string(region) {
+        region = rest;
+        if entry.is_empty() {
+            break;
+        }
+        if scanned == MAX_ENVIRONMENT_ENTRIES {
+            return Err(LayoutError::Malformed);
+        }
+        scanned += 1;
+        if let Some(value) = entry
+            .strip_prefix(key)
+            .and_then(|rest| rest.strip_prefix(b"="))
+        {
+            return Ok(if value == expected {
+                EnvironmentMatch::Matches
+            } else {
+                EnvironmentMatch::Differs
+            });
+        }
+    }
+    Ok(EnvironmentMatch::Differs)
+}
+
+/// The distinct regions of one `KERN_PROCARGS2` buffer, borrowed from it.
+struct Regions<'a> {
+    executable: &'a [u8],
+    argv: Vec<&'a [u8]>,
+    /// The environment followed by the kernel's auxiliary strings; empty when
+    /// the kernel withheld it.
+    environment: &'a [u8],
+}
+
+/// Splits one `KERN_PROCARGS2` buffer into its regions without copying them.
+fn split_regions(buffer: &[u8]) -> Result<Regions<'_>, LayoutError> {
     let Some((count_region, rest)) = buffer.split_at_checked(ARGUMENT_COUNT_BYTES) else {
         return Err(LayoutError::Malformed);
     };
@@ -152,16 +245,14 @@ pub(super) fn parse_process_arguments(buffer: &[u8]) -> Result<NativeArguments, 
     let mut argv = Vec::with_capacity(argument_count);
     for _ in 0..argument_count {
         let (argument, rest) = split_c_string(cursor).ok_or(LayoutError::Malformed)?;
-        argv.push(String::from_utf8_lossy(argument).into_owned());
+        argv.push(argument);
         cursor = rest;
     }
 
-    let environment = skip_nul_padding(cursor);
-    Ok(NativeArguments {
-        executable: PathBuf::from(OsString::from_vec(executable.to_vec())),
+    Ok(Regions {
+        executable,
         argv,
-        markers: collect_ownership_markers(environment)?,
-        environment_withheld: environment.is_empty(),
+        environment: skip_nul_padding(cursor),
     })
 }
 

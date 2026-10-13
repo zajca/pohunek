@@ -21,8 +21,10 @@
 //! lowercase hex characters of SHA-256 over the plugin ID, so an arbitrary
 //! plugin ID becomes a fixed-size, name-safe segment, and `<kind>` is `j` for
 //! a job or `s` for a service, so a job and a service of one name never share
-//! a unit. These names never match the worker glob, so worker discovery never
-//! sees them, and they are never parsed back.
+//! a unit. On launchd the same unit is the label
+//! `io.github.zajca.pohunek.<ns>.wf.<plugin-hash>.<kind>.<name>`. These names
+//! never match the worker glob or the worker label grammar, so worker
+//! discovery never sees them, and they are never parsed back.
 
 use std::path::Path;
 
@@ -30,7 +32,7 @@ use sha2::{Digest, Sha256};
 
 use super::{Error, ServiceId};
 
-// Rust guideline compliant 2026-10-12
+// Rust guideline compliant 2026-10-13
 
 /// Hex characters kept from the namespace digest.
 ///
@@ -50,6 +52,8 @@ const WORKER_LABEL_SEGMENT: &str = ".worker.";
 const DAEMON_UNIT_SUFFIX: &str = "-daemon.service";
 /// systemd unit segment introducing a worker generation.
 const WORKER_UNIT_SEGMENT: &str = "-worker-";
+/// launchd label segment introducing a workflow plugin unit.
+const PLUGIN_LABEL_SEGMENT: &str = ".wf.";
 /// systemd unit segment introducing a workflow plugin unit.
 const PLUGIN_UNIT_SEGMENT: &str = "-wf-";
 /// systemd service unit suffix.
@@ -108,6 +112,25 @@ const _: () = assert!(
         + SERVICE_SUFFIX.len()
         <= super::MAX_SERVICE_ID_BYTES,
     "the longest plugin unit name must fit a service ID"
+);
+
+/// Longest launchd label of a workflow plugin unit:
+/// `io.github.zajca.pohunek.<ns>.wf.<plugin-hash>.<kind>.<name>` at the longest
+/// name, 119 bytes.
+pub(super) const MAX_PLUGIN_LABEL_BYTES: usize = LABEL_PREFIX.len()
+    + NAMESPACE_LEN
+    + PLUGIN_LABEL_SEGMENT.len()
+    + PLUGIN_HASH_LEN
+    + 1
+    + JOB_KIND.len()
+    + 1
+    + MAX_PLUGIN_UNIT_NAME_BYTES;
+
+// The longest plugin label must form a valid service ID, so that the launchd
+// backend can report it without a fallible conversion.
+const _: () = assert!(
+    MAX_PLUGIN_LABEL_BYTES <= super::MAX_SERVICE_ID_BYTES,
+    "the longest plugin label must fit a service ID"
 );
 
 /// Installation namespace embedded in every native job name.
@@ -251,6 +274,18 @@ impl Namespace {
     #[must_use]
     pub fn plugin_timer_unit(&self, key: &PluginUnitKey) -> String {
         format!("{}{TIMER_SUFFIX}", self.plugin_unit_stem(key))
+    }
+
+    /// Returns the launchd label of one workflow plugin unit.
+    #[must_use]
+    pub fn plugin_label(&self, key: &PluginUnitKey) -> String {
+        format!(
+            "{LABEL_PREFIX}{}{PLUGIN_LABEL_SEGMENT}{}.{}.{}",
+            self.0,
+            key.plugin_hash,
+            key.kind.segment(),
+            key.name
+        )
     }
 
     fn plugin_unit_stem(&self, key: &PluginUnitKey) -> String {

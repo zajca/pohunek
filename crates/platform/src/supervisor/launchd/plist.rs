@@ -1,8 +1,8 @@
 //! Renders and reads back launchd job definitions as XML property lists.
 //!
 //! Serialization and escaping belong to the `plist` crate; this module only
-//! chooses keys. One renderer covers both job kinds, keyed on the definition's
-//! [`RestartPolicy`]:
+//! chooses keys. [`render`] covers session workers and the daemon agent, keyed
+//! on the definition's [`RestartPolicy`]:
 //!
 //! - [`RestartPolicy::Never`] (session workers): `RunAtLoad` and no
 //!   `KeepAlive`, so a worker runs once per bootstrap and is never restarted
@@ -10,21 +10,48 @@
 //! - [`RestartPolicy::OnFailure`] (the daemon agent): `KeepAlive` with
 //!   `SuccessfulExit=false` and `ThrottleInterval`, the launchd equivalent of
 //!   systemd `Restart=on-failure` with `RestartSec`.
-//! - [`RestartPolicy::Always`] is refused: no launchd job this module
-//!   renders restarts after a clean exit.
+//! - [`RestartPolicy::Always`] is refused: neither restarts after a clean
+//!   exit.
+//!
+//! [`render_plugin`] covers workflow plugin units, keyed on the
+//! [`Activation`]:
+//!
+//! - [`Activation::Interval`] (a periodic job): `StartInterval` set to the
+//!   interval, `RunAtLoad=false`, no `KeepAlive`, and `ThrottleInterval` set to
+//!   [`JOB_THROTTLE`]. The first run starts one interval after the job is
+//!   loaded (bootstrap or login), as systemd's `OnActiveSec=` does; later
+//!   runs follow the load-relative cadence, not the end of the previous run.
+//!   launchd skips an interval firing while the job is still running and
+//!   never runs two processes of one label, so runs never overlap
+//!   (`launchd.plist(5)`, `StartInterval`). The interval's accuracy has no
+//!   launchd key.
+//! - [`Activation::Service`]: `RunAtLoad`, `KeepAlive=true`, and
+//!   `ThrottleInterval` set to the [`RestartPolicy::Always`] delay, the
+//!   minimum spacing between two spawns.
+//!
+//! Every job keeps `AbandonProcessGroup=false`, so launchd signals the job's
+//! process group when the job ends, and `ExitTimeOut` is the definition's
+//! exit timeout: the grace between `SIGTERM` and `SIGKILL` when launchd stops
+//! the job. launchd has no key bounding how long a running job may run
+//! (`TimeOut` is unimplemented), so the definition's start timeout is not
+//! rendered; readiness is proven through the worker's private socket and a
+//! plugin unit's executable bounds its own run. `ProgramArguments` is the argv
+//! verbatim: launchd expands no variables, and `EnableGlobbing` is never set.
 //!
 //! `ProcessType` is omitted, which selects launchd's Standard class: the
 //! Background class throttles interactive agents and Interactive is reserved
-//! for UI-critical jobs. The definition's start timeout has no launchd key;
-//! readiness is proven through the worker's private socket instead.
+//! for UI-critical jobs.
 
 use std::time::Duration;
 
 use ::plist::{Dictionary, Integer, Value};
 
-use super::super::{DefinitionFacts, Error, JobDefinition, RestartPolicy};
+use super::super::{
+    Activation, DefinitionFacts, Error, JobDefinition, PluginUnitDefinition, RestartPolicy,
+    MIN_JOB_INTERVAL,
+};
 
-// Rust guideline compliant 2026-10-12
+// Rust guideline compliant 2026-10-13
 
 /// Largest definition file read back from disk.
 ///
@@ -32,6 +59,27 @@ use super::super::{DefinitionFacts, Error, JobDefinition, RestartPolicy};
 /// paths; even if every byte needed the longest XML escape (`&quot;`, six
 /// bytes) it stays below 2 MiB. Larger files are corrupt or foreign.
 pub(crate) const MAX_DEFINITION_BYTES: usize = 2 * 1024 * 1024;
+
+/// Minimum spacing between two spawns of a periodic plugin job.
+///
+/// launchd spawns a job at most once per `ThrottleInterval`, 10 s by default
+/// (`launchd.plist(5)`), which would stretch every shorter interval to 10 s.
+/// The shortest accepted interval keeps every interval's cadence while still
+/// pacing spawns.
+pub(crate) const JOB_THROTTLE: Duration = MIN_JOB_INTERVAL;
+
+/// How launchd starts and restarts one rendered job.
+#[derive(Debug, Clone, Copy)]
+enum Launch {
+    /// Once per bootstrap: a session worker.
+    Once,
+    /// At bootstrap, and again after a failed exit: the daemon agent.
+    RestartOnFailure { throttle: Duration },
+    /// Every `every`, starting one interval after bootstrap: a periodic job.
+    Interval { every: Duration },
+    /// At bootstrap, and again after every exit: a plugin service.
+    KeepAlive { delay: Duration },
+}
 
 /// Fields read back from a stored definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,15 +106,61 @@ pub(crate) enum ParseError {
     Value(&'static str),
 }
 
-/// Renders the XML property list for `label`.
+/// Renders the XML property list of the session worker or daemon agent
+/// `label`.
 ///
 /// # Errors
 ///
 /// Returns [`Error::InvalidDefinition`] when a string holds a character that
 /// XML 1.0 cannot carry unchanged: C0 controls other than tab and line feed,
 /// carriage return (parsers normalize it to line feed), and the noncharacters
-/// U+FFFE and U+FFFF, and for a [`RestartPolicy::Always`] definition.
+/// U+FFFE and U+FFFF, and for a [`RestartPolicy::Always`] definition, which
+/// only [`render_plugin`] accepts.
 pub(crate) fn render(label: &str, definition: &JobDefinition) -> Result<Vec<u8>, Error> {
+    let launch = match definition.restart() {
+        RestartPolicy::Never => Launch::Once,
+        RestartPolicy::OnFailure { throttle } => Launch::RestartOnFailure { throttle },
+        RestartPolicy::Always { .. } => {
+            return Err(Error::InvalidDefinition {
+                detail: "a launchd worker or daemon never restarts after a clean exit".to_owned(),
+            });
+        }
+    };
+    render_launch(label, definition, launch)
+}
+
+/// Renders the XML property list of the workflow plugin unit `label`.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidDefinition`] when a string holds a character that
+/// XML 1.0 cannot carry unchanged, as [`render`] does.
+#[cfg_attr(
+    not(target_os = "macos"),
+    expect(dead_code, reason = "only the macOS backend renders plugin units")
+)]
+pub(crate) fn render_plugin(
+    label: &str,
+    definition: &PluginUnitDefinition,
+) -> Result<Vec<u8>, Error> {
+    let launch = match (definition.activation(), definition.job().restart()) {
+        (Activation::Interval { every, .. }, _) => Launch::Interval { every },
+        (Activation::Service, RestartPolicy::Always { delay }) => Launch::KeepAlive { delay },
+        // `PluginUnitDefinition::new` pairs every service with `Always`.
+        (Activation::Service, RestartPolicy::Never | RestartPolicy::OnFailure { .. }) => {
+            return Err(Error::InvalidDefinition {
+                detail: "a plugin service must restart after every exit".to_owned(),
+            });
+        }
+    };
+    render_launch(label, definition.job(), launch)
+}
+
+fn render_launch(
+    label: &str,
+    definition: &JobDefinition,
+    launch: Launch,
+) -> Result<Vec<u8>, Error> {
     let mut job = Dictionary::new();
     job.insert("Label".to_owned(), string("Label", label)?);
     let mut program = Vec::with_capacity(definition.arguments().len() + 1);
@@ -75,19 +169,26 @@ pub(crate) fn render(label: &str, definition: &JobDefinition) -> Result<Vec<u8>,
         program.push(string("ProgramArguments", argument)?);
     }
     job.insert("ProgramArguments".to_owned(), Value::Array(program));
-    job.insert("RunAtLoad".to_owned(), Value::Boolean(true));
-    match definition.restart() {
-        RestartPolicy::Never => {}
-        RestartPolicy::OnFailure { throttle } => {
+    match launch {
+        Launch::Once => {
+            job.insert("RunAtLoad".to_owned(), Value::Boolean(true));
+        }
+        Launch::RestartOnFailure { throttle } => {
+            job.insert("RunAtLoad".to_owned(), Value::Boolean(true));
             let mut keep_alive = Dictionary::new();
             keep_alive.insert("SuccessfulExit".to_owned(), Value::Boolean(false));
             job.insert("KeepAlive".to_owned(), Value::Dictionary(keep_alive));
             job.insert("ThrottleInterval".to_owned(), seconds(throttle));
         }
-        RestartPolicy::Always { .. } => {
-            return Err(Error::InvalidDefinition {
-                detail: "a launchd job never restarts after a clean exit".to_owned(),
-            });
+        Launch::Interval { every } => {
+            job.insert("RunAtLoad".to_owned(), Value::Boolean(false));
+            job.insert("StartInterval".to_owned(), seconds(every));
+            job.insert("ThrottleInterval".to_owned(), seconds(JOB_THROTTLE));
+        }
+        Launch::KeepAlive { delay } => {
+            job.insert("RunAtLoad".to_owned(), Value::Boolean(true));
+            job.insert("KeepAlive".to_owned(), Value::Boolean(true));
+            job.insert("ThrottleInterval".to_owned(), seconds(delay));
         }
     }
     let mut environment = Dictionary::new();

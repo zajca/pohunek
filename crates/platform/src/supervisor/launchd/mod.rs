@@ -1,4 +1,5 @@
-//! Supervises session workers and the daemon agent through launchd.
+//! Supervises session workers, the daemon agent, and workflow plugin units
+//! through launchd.
 //!
 //! Jobs are registered and retired with the fixed `/bin/launchctl`
 //! (`bootstrap`, `bootout`) in the `gui/<uid>` domain. Presence comes only from
@@ -18,7 +19,8 @@
 //!
 //! Worker definitions live only in the private `<state>/pohunek/launchd/`
 //! directory, never in `~/Library/LaunchAgents`, so launchd never resurrects a
-//! worker at login. Only the daemon agent is written to `~/Library/LaunchAgents`.
+//! worker at login. Only the daemon agent and the workflow plugin units, which
+//! must run again after login, are written to `~/Library/LaunchAgents`.
 //!
 //! The `launchctl` runner, the plist rendering, definition registration, and
 //! the classification of discovered definition files are target-neutral and are unit-tested on every host; the backends
@@ -26,7 +28,7 @@
 
 use super::Error;
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-10-13
 
 mod discovery;
 mod launchctl;
@@ -38,11 +40,22 @@ mod backend;
 
 #[cfg(target_os = "macos")]
 #[doc(inline)]
-pub use backend::{Discovery, LaunchdDaemon, LaunchdSupervisor, MAX_DISCOVERED_DEFINITIONS};
+pub use backend::{
+    Discovery, LaunchdDaemon, LaunchdPluginUnits, LaunchdSupervisor, MAX_DISCOVERED_DEFINITIONS,
+};
 #[doc(inline)]
 pub use registration::{ExternalVolume, StrandedDefinition};
 
 use launchctl::{Completion, RunError, Status};
+
+// The longest plugin unit definition file name (125 bytes) stays within the
+// 128-byte service ID bound, far below the 255-byte file name limit, which
+// also leaves room for its set-aside name.
+const _: () = assert!(
+    super::namespace::MAX_PLUGIN_LABEL_BYTES + registration::DEFINITION_SUFFIX.len()
+        <= super::MAX_SERVICE_ID_BYTES,
+    "the longest plugin unit definition file name must fit a service ID"
+);
 
 /// Whether `launchctl print` found a label in its domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
