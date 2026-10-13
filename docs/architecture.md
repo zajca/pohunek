@@ -1079,7 +1079,7 @@ resume command: `bracketed_paste`, `submit_delay_ms`, `text_policy`
 (`unrestricted` or `hermes_safe_text`) and the optional
 `submit_delay_configurable`, which lets a submit delay configured on the daemon
 for that runtime replace the declared one (for example
-`runtime-packages/codex/runtime.toml`). The daemon parses the table into the
+`runtime-packages/claude/runtime.toml`). The daemon parses the table into the
 runtime definition (`crates/daemon/src/agent/host/definition.rs`), and the
 worker input plan below applies it.
 
