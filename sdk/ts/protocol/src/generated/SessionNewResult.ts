@@ -3,6 +3,7 @@
 import type { AgentActivity } from "./AgentActivity";
 import type { CwdSource } from "./CwdSource";
 import type { RuntimeRef } from "./RuntimeRef";
+import type { SessionBackground } from "./SessionBackground";
 import type { SessionCapabilities } from "./SessionCapabilities";
 import type { SessionId } from "./SessionId";
 import type { SessionRuntime } from "./SessionRuntime";
@@ -106,6 +107,11 @@ export type SessionNewResult = {
    * Durable provider-managed subagents, including bounded recent history.
    */
   subagents?: Array<SubagentInfo>;
+  /**
+   * Latest background-task snapshot, or `None` when no snapshot is held
+   * (no agent has reported one, or the runtime ended).
+   */
+  background?: SessionBackground;
   /**
    * Active nested agent profile name reported by a session-level hook.
    *

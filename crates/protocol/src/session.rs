@@ -12,10 +12,10 @@ use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
-    envelope::StateSource, ActivityRevision, OutputOffset, ProcessStartIdentity, ProtocolError,
-    ReportSequence, RuntimeGeneration, RuntimeRef, SubagentRevision, TerminalWatermark,
-    MAX_SESSION_ID_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_WAIT_MS,
-    MAX_WORKER_INSTANCE_ID_BYTES,
+    envelope::StateSource, ActivityRevision, BackgroundRevision, OutputOffset,
+    ProcessStartIdentity, ProtocolError, ReportSequence, RuntimeGeneration, RuntimeRef,
+    SubagentRevision, TerminalWatermark, MAX_SESSION_ID_BYTES, MAX_SESSION_OUTPUT_BYTES,
+    MAX_SESSION_READ_LINES, MAX_SESSION_WAIT_MS, MAX_WORKER_INSTANCE_ID_BYTES,
 };
 
 /// Current detected agent activity within a running session.
@@ -86,6 +86,118 @@ pub struct SubagentInfo {
     #[cfg_attr(feature = "ts", ts(optional))]
     #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub finished_at_ms: Option<u64>,
+}
+
+/// Closed kind of one background task reported by the provider.
+///
+/// Values mirror the provider's own task `type` strings. Any other provider
+/// string maps to [`Self::Other`] with the string kept in
+/// [`BackgroundItem::provider_kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "BackgroundKind.ts"))]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundKind {
+    /// A provider subagent. Its lifecycle is also tracked in [`SubagentInfo`].
+    Subagent,
+    /// A provider workflow run.
+    Workflow,
+    /// A backgrounded local shell command.
+    Shell,
+    /// A watch that runs as a local shell (for example a `Monitor` tool wait).
+    Monitor,
+    /// A task of an MCP server.
+    McpTask,
+    /// A teammate agent.
+    Teammate,
+    /// A provider memory consolidation task.
+    Dream,
+    /// A provider auto-mode scan.
+    AutoModeScan,
+    /// A provider memory import.
+    MemoryImport,
+    /// A cloud session.
+    CloudSession,
+    /// A provider task type this protocol does not name; see
+    /// [`BackgroundItem::provider_kind`].
+    Other,
+}
+
+/// Lifecycle of one background task as reported by the provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "BackgroundStatus.ts"))]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundStatus {
+    /// The provider reports the task as running.
+    Running,
+    /// The provider reports the task as queued or waiting to start.
+    Pending,
+    /// The provider reports a status this protocol does not name.
+    Other,
+}
+
+/// Sanitized state of one background task in a [`SessionBackground`] snapshot.
+///
+/// No command argument, prompt or other free text beyond the bounded `label`
+/// and `program` is ever carried here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "BackgroundItem.ts"))]
+pub struct BackgroundItem {
+    /// Provider-native task identifier. For subagent items it matches
+    /// [`SubagentInfo::id`], so clients can join the two.
+    pub id: String,
+    /// Closed task kind.
+    pub kind: BackgroundKind,
+    /// Provider task type string, present only when [`Self::kind`] is
+    /// [`BackgroundKind::Other`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub provider_kind: Option<String>,
+    /// Current provider-reported status.
+    pub status: BackgroundStatus,
+    /// Provider-defined subagent type, present for subagent items when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub agent_type: Option<String>,
+    /// Sanitized, bounded human-readable description of the task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub label: Option<String>,
+    /// Program name of a shell task (for example `cargo`), never its
+    /// arguments or the full command line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub program: Option<String>,
+    /// Millisecond Unix timestamp of pohunek's first observation of this task.
+    ///
+    /// This is not the task's start time: the provider does not report one, so
+    /// the task started at or before this instant.
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub first_seen_ms: u64,
+    /// Millisecond Unix timestamp of the latest snapshot that listed this task.
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub last_seen_ms: u64,
+}
+
+/// Latest background-task snapshot reported for one session runtime.
+///
+/// The snapshot is replaced wholesale on every change. It is cleared when the
+/// runtime ends or the agent session restarts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionBackground.ts"))]
+pub struct SessionBackground {
+    /// Monotonic revision of this snapshot; a new revision accompanies every
+    /// change, including an age refresh with identical items.
+    pub revision: BackgroundRevision,
+    /// Millisecond Unix timestamp at which the worker observed this snapshot.
+    /// Clients render the snapshot age from it.
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub observed_at_ms: u64,
+    /// Background tasks listed by the snapshot, in provider order.
+    pub items: Vec<BackgroundItem>,
 }
 
 impl AgentActivity {
@@ -2377,6 +2489,11 @@ pub struct SessionInfo {
     /// Durable provider-managed subagents, including bounded recent history.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subagents: Vec<SubagentInfo>,
+    /// Latest background-task snapshot, or `None` when no snapshot is held
+    /// (no agent has reported one, or the runtime ended).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub background: Option<SessionBackground>,
     /// Active nested agent profile name reported by a session-level hook.
     ///
     /// This is runtime metadata only: it does not change the launch identity in
@@ -2623,6 +2740,21 @@ pub struct SubagentStateEvent {
     /// Complete current state for the changed subagent.
     pub subagent: SubagentInfo,
     /// Runtime that accepted the provider hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub runtime: Option<SessionRuntimeIdentity>,
+}
+
+/// Payload for a `background_state` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "BackgroundStateEvent.ts"))]
+pub struct BackgroundStateEvent {
+    /// Session that owns the background tasks.
+    pub session_id: SessionId,
+    /// Complete new snapshot, or `None` when the snapshot was cleared.
+    pub background: Option<SessionBackground>,
+    /// Runtime that accepted the snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub runtime: Option<SessionRuntimeIdentity>,
@@ -3096,6 +3228,7 @@ mod tests {
             state_source: StateSource::Process,
             activity: Some(AgentActivity::Working),
             subagents: Vec::new(),
+            background: None,
             active_agent: None,
             active_agent_base: None,
             active_agent_pid: None,

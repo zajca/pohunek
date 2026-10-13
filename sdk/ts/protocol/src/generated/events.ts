@@ -3,6 +3,7 @@
 import type {
   AgentStateEvent,
   AttachEvent,
+  BackgroundStateEvent,
   NotificationCreatedEvent,
   NotificationDeletedEvent,
   NotificationUpdatedEvent,
@@ -17,6 +18,7 @@ export type ProtocolEvent =
   | ({ v: ProtocolVersion; event: "agent_state"; id?: string } & AgentStateEvent)
   | ({ v: ProtocolVersion; event: "attach_closed"; id?: string } & AttachEvent)
   | ({ v: ProtocolVersion; event: "attach_opened"; id?: string } & AttachEvent)
+  | ({ v: ProtocolVersion; event: "background_state"; id?: string } & BackgroundStateEvent)
   | ({ v: ProtocolVersion; event: "notification_created"; id?: string } & NotificationCreatedEvent)
   | ({ v: ProtocolVersion; event: "notification_deleted"; id?: string } & NotificationDeletedEvent)
   | ({ v: ProtocolVersion; event: "notification_updated"; id?: string } & NotificationUpdatedEvent)

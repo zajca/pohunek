@@ -17,10 +17,10 @@ use protocol::compat::{
 };
 use protocol::method::{self, Method};
 use protocol::{
-    event, AgentStateEvent, AttachEvent, NotificationCreatedEvent, NotificationDeletedEvent,
-    NotificationUpdatedEvent, ProtocolVersion, RuntimeInventoryEvent, SessionEvent,
-    SessionNativeRecoveredEvent, SessionWarning, SessionWarningKind, SubagentStateEvent,
-    MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    event, AgentStateEvent, AttachEvent, BackgroundStateEvent, NotificationCreatedEvent,
+    NotificationDeletedEvent, NotificationUpdatedEvent, ProtocolVersion, RuntimeInventoryEvent,
+    SessionEvent, SessionNativeRecoveredEvent, SessionWarning, SessionWarningKind,
+    SubagentStateEvent, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -179,6 +179,7 @@ fn event_table() -> Vec<(&'static str, Roundtrip)> {
     vec![
         (event::AGENT_STATE, roundtrip::<AgentStateEvent>),
         (event::SUBAGENT_STATE, roundtrip::<SubagentStateEvent>),
+        (event::BACKGROUND_STATE, roundtrip::<BackgroundStateEvent>),
         (event::ATTACH_OPENED, roundtrip::<AttachEvent>),
         (event::ATTACH_CLOSED, roundtrip::<AttachEvent>),
         (
@@ -246,6 +247,13 @@ fn fixtures_cover_every_current_method_and_event() {
         }
     }
     for spec in event::EVENT_SPECS {
+        // Events withheld from protocol 3 have no protocol 3 shape to record.
+        if event_payload(v3(), spec.name, json!({}))
+            .expect("adapter")
+            .is_none()
+        {
+            continue;
+        }
         assert!(
             events
                 .entries

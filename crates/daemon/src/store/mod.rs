@@ -2255,7 +2255,7 @@ mod tests {
     fn resume_line_with_an_invalid_launch_spec_is_dropped() {
         let store = Store::new(temp_store_path("resume-native-launch-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":7,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":8,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"id","resume_args":[{"literal":"--resume"}]}}"#,
             "\n"
@@ -2271,7 +2271,7 @@ mod tests {
     fn resume_line_pairing_an_assignment_with_a_path_kind_is_dropped() {
         let store = Store::new(temp_store_path("resume-assigned-path-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":7,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":8,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"path","resume_args":[{"literal":"--session"},"reference"],"#,
             r#""assigned":{"launch_args":[{"literal":"--session-id"},"reference"],"existence":{"check":"none"}}}}"#,
@@ -2315,6 +2315,7 @@ mod tests {
             "\n"
         );
         write_private(store.path(), legacy);
+        store.migrate_to_current().expect("migrate schema-7 store");
         let loaded = store.load_resume().expect("load");
         assert_eq!(
             loaded[0].native_reference_provenance,
@@ -2350,6 +2351,7 @@ mod tests {
             "\n"
         );
         write_private(store.path(), legacy);
+        store.migrate_to_current().expect("migrate schema-7 store");
         let loaded = store.load_resume().expect("load");
         assert_eq!(loaded[0].profile_revision, None);
         assert!(!serde_json::to_string(&loaded[0])
@@ -2381,7 +2383,7 @@ mod tests {
         for malformed in ["\"nothex\"", "\"ABCDEF\"", "7"] {
             let line = format!(
                 concat!(
-                    r#"{{"kind":"resume","schema_version":7,"session_id":"s-bad","agent":"claude","#,
+                    r#"{{"kind":"resume","schema_version":8,"session_id":"s-bad","agent":"claude","#,
                     r#""agent_base":"claude","cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
                     r#""profile_revision":{}}}"#,
                     "\n"
@@ -2441,6 +2443,7 @@ mod tests {
             "\n"
         );
         write_private(store.path(), legacy);
+        store.migrate_to_current().expect("migrate schema-7 store");
         let loaded = store.load_resume().expect("load legacy");
         assert_eq!(loaded.len(), 1);
         let b = &loaded[0];
@@ -2468,6 +2471,8 @@ mod tests {
             "\n"
         );
         write_private(store.path(), legacy);
+
+        store.migrate_to_current().expect("migrate schema-7 store");
 
         let loaded = store.load_resume().expect("load legacy lines");
 
@@ -2500,7 +2505,7 @@ mod tests {
         write_private(
             &path,
             concat!(
-                r#"{"kind":"resume","schema_version":7,"session_id":"s-future","agent":"future-agent","#,
+                r#"{"kind":"resume","schema_version":8,"session_id":"s-future","agent":"future-agent","#,
                 r#""agent_base":"Future Agent","cwd":"/w","cols":80,"rows":24}"#,
                 "\n"
             ),
@@ -2546,6 +2551,7 @@ mod tests {
                 "\n"
             ),
         );
+        store.migrate_to_current().expect("migrate schema-7 store");
         let loaded = store.load_resume().expect("load");
         assert_eq!(loaded[0].launch_binding, LaunchPin::Unpinned);
 
@@ -2942,6 +2948,7 @@ mod tests {
             "\n"
         );
         write_private(store.path(), legacy);
+        store.migrate_to_current().expect("migrate schema-7 store");
         let loaded = store.load_worktrees().expect("load legacy");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].session_id, "s-2");

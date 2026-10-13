@@ -32,7 +32,7 @@ use pohunek_daemon::notifications::{
     AttentionCoordinator, AttentionCoordinatorTask, NotificationService,
 };
 use pohunek_daemon::runtime::{
-    EnvironmentSource, SubprocessWorkerEnvironment, SubprocessWorkerLauncher,
+    EnvironmentSource, SubprocessWorkerEnvironment, SubprocessWorkerLauncher, WorkerLauncher,
 };
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 use pohunek_test_support::env::{check_socket_path, TestEnv};
@@ -116,14 +116,37 @@ pub(crate) struct Built {
 
 /// A real daemon serving the hermetic environment's runtime socket, plus the
 /// directories the `pohunek` binary and the daemon share.
+///
+/// The daemon runs on a thread of its own, on a runtime that is dropped when
+/// the daemon stops, as a daemon process's tasks end with it. A daemon started
+/// after another on the same root therefore never meets the other's worker
+/// connections.
 pub(crate) struct Harness {
     pub(crate) env: TestEnv,
     pub(crate) plugins: PathBuf,
     pub(crate) agents: PathBuf,
-    pub(crate) shutdown: oneshot::Sender<()>,
-    pub(crate) task: tokio::task::JoinHandle<()>,
-    /// The attention debounce coordinator, when the daemon has one.
-    attention: Option<AttentionCoordinatorTask>,
+    shutdown: oneshot::Sender<()>,
+    task: std::thread::JoinHandle<()>,
+    /// The session registry the server serves.
+    pub(crate) sessions: SessionRegistry,
+    /// The launcher of this daemon's workers.
+    launcher: Arc<dyn WorkerLauncher>,
+}
+
+/// What a daemon thread hands back once it serves.
+struct Started {
+    env: TestEnv,
+    plugins: PathBuf,
+    agents: PathBuf,
+    sessions: SessionRegistry,
+    launcher: Arc<dyn WorkerLauncher>,
+}
+
+/// What survives a daemon shutdown: the environment, and the launcher whose job
+/// records a daemon started later on the same root must observe.
+pub(crate) struct Surviving {
+    env: TestEnv,
+    launcher: Arc<dyn WorkerLauncher>,
 }
 
 /// Which notification components the daemon is built with.
@@ -185,99 +208,185 @@ impl Harness {
         inbox: Inbox,
     ) -> Self {
         let env = TestEnv::new().expect("create the hermetic test environment");
-        let runtime = env.runtime_dir().join("pohunek");
-        fs::create_dir_all(&runtime).expect("create the runtime directory");
-        fs::set_permissions(&runtime, fs::Permissions::from_mode(PRIVATE_MODE))
-            .expect("private runtime directory");
-        let socket = runtime.join("daemon.sock");
-        check_socket_path(&socket).expect("the socket path fits sun_path");
-        let plugins = env.state_home().join("pohunek/plugins");
-        let agents = env.config_home().join("pohunek/agents");
-        fs::create_dir_all(&agents).expect("create the agents directory");
-        fs::set_permissions(&agents, fs::Permissions::from_mode(PRIVATE_MODE))
-            .expect("private agents directory");
-        let worker_home = env.root().join("worker");
-        let environment = SubprocessWorkerEnvironment {
-            runtime_home: worker_home.join("runtime"),
-            state_home: worker_home.join("state"),
-            data_home: worker_home.join("data"),
-            config_home: worker_home.join("config"),
-            cache_home: worker_home.join("cache"),
-            home: worker_home.clone(),
-            daemon_socket: socket.clone(),
-        };
-        let config = SessionRegistryConfig {
-            socket_path: Some(socket.clone()),
-            plugins_dir: Some(plugins.clone()),
-            agents_dir: Some(agents.clone()),
-            // A profile-backed launch freezes a keyed revision, which needs the
-            // host's revision key directory.
-            host_state_dir: Some(env.root().join("host-state")),
-            catalog_trust,
-            worker_runtime_root: Some(environment.runtime_home.join("pohunek/workers")),
-            worker_state_root: Some(environment.state_home.join("pohunek/workers")),
-            supervision: Some(
-                environment
-                    .supervision(worker_executable)
-                    .with_environment_source(EnvironmentSource::fixed(env.environment().clone())),
-            ),
-            shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
-            ..SessionRegistryConfig::default()
-        };
-        let registry = SessionRegistry::new_production_with_inspector(
-            config,
+        Self::serve(
+            env,
             Arc::new(SubprocessWorkerLauncher::new()),
-            Arc::new(readable_host::ReadableHost::new()),
+            DaemonSpec {
+                catalog_trust,
+                worker_executable,
+                inbox,
+                durable: false,
+                reconcile: false,
+            },
         )
-        .expect("the production registry opens the plugin root");
-        let governance = Arc::new(
-            HostGovernanceService::open(env.root().join("governance"))
-                .await
-                .expect("open the host-governance service"),
-        );
-        let notifications = (inbox != Inbox::Absent).then(|| {
-            NotificationService::open(&env.root().join("daemon-data"))
-                .expect("open the notification inbox")
-        });
-        let (coordinator, attention) = match (&notifications, inbox) {
-            (Some(notifications), Inbox::Debounced) => {
-                let (coordinator, task) =
-                    AttentionCoordinator::spawn(notifications.clone(), &registry);
-                (Some(coordinator), Some(task))
-            }
-            _ => (None, None),
-        };
-        let mut state = DaemonState::new(
-            HealthInfo::new("0.0.0-test"),
-            registry,
-            governance,
-            overlay_registry(),
-        );
-        if let Some(notifications) = notifications {
-            state = state.with_notifications(notifications);
-        }
-        if let Some(coordinator) = coordinator {
-            state = state.with_attention_coordinator(coordinator);
-        }
-        let server = ControlServer::bind_with_state(&socket, state)
+        .await
+    }
+
+    /// Starts a daemon whose session records are durable under the root, so a
+    /// daemon started later on the same root can adopt the workers still running.
+    pub(crate) async fn start_durable() -> Self {
+        let env = TestEnv::new().expect("create the hermetic test environment");
+        Self::serve(
+            env,
+            Arc::new(SubprocessWorkerLauncher::new()),
+            DaemonSpec {
+                catalog_trust: CatalogTrust::Absent,
+                worker_executable: worker_binary(),
+                inbox: Inbox::Absent,
+                durable: true,
+                reconcile: false,
+            },
+        )
+        .await
+    }
+
+    /// Stops this daemon's server and returns what survives it. The daemon's
+    /// workers keep running, as they do when the daemon process exits.
+    pub(crate) async fn shut_down(self) -> Surviving {
+        self.sessions.begin_daemon_shutdown();
+        let env_launcher = self.join().await;
+        env_launcher
+    }
+
+    /// Restarts the daemon on the same root: the new daemon reconciles the
+    /// workers the previous one left running.
+    pub(crate) async fn restart(self) -> Self {
+        let surviving = self.shut_down().await;
+        Self::start_over(surviving).await
+    }
+
+    /// Starts a durable daemon over the surviving environment that adopts the
+    /// workers already running on its root.
+    pub(crate) async fn start_over(surviving: Surviving) -> Self {
+        Self::serve(
+            surviving.env,
+            surviving.launcher,
+            DaemonSpec {
+                catalog_trust: CatalogTrust::Absent,
+                worker_executable: worker_binary(),
+                inbox: Inbox::Absent,
+                durable: true,
+                reconcile: true,
+            },
+        )
+        .await
+    }
+
+    /// Signals the server thread to stop and joins it, returning what survives.
+    async fn join(self) -> Surviving {
+        let Self {
+            env,
+            shutdown,
+            task,
+            launcher,
+            ..
+        } = self;
+        let _ = shutdown.send(());
+        tokio::task::spawn_blocking(move || task.join())
             .await
-            .expect("the control server binds");
+            .expect("join the daemon thread")
+            .expect("the server thread stops without a panic");
+        Surviving { env, launcher }
+    }
+
+    /// Serves the daemon of `env` on a thread of its own. A durable daemon keeps
+    /// its session records in the root's metadata store; a reconciling one adopts
+    /// the surviving workers before its socket accepts a connection.
+    async fn serve(env: TestEnv, launcher: Arc<dyn WorkerLauncher>, spec: DaemonSpec) -> Self {
+        let (ready, started) = oneshot::channel::<Started>();
         let (shutdown, stop) = oneshot::channel::<()>();
-        let task = tokio::spawn(async move {
-            server
-                .serve(async move {
-                    let _ = stop.await;
-                })
-                .await;
-        });
+        let task = std::thread::Builder::new()
+            .name("harness-daemon".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("the daemon runtime");
+                runtime.block_on(Self::run_daemon(env, launcher, spec, ready, stop));
+            })
+            .expect("spawn the daemon thread");
+        let Started {
+            env,
+            plugins,
+            agents,
+            sessions,
+            launcher,
+        } = started.await.expect("the daemon starts");
         Self {
             env,
             plugins,
             agents,
             shutdown,
             task,
-            attention,
+            sessions,
+            launcher,
         }
+    }
+
+    /// Builds and serves one daemon on the calling thread's runtime, reporting
+    /// its started state through `ready` and serving until `stop` fires.
+    async fn run_daemon(
+        env: TestEnv,
+        launcher: Arc<dyn WorkerLauncher>,
+        spec: DaemonSpec,
+        ready: oneshot::Sender<Started>,
+        stop: oneshot::Receiver<()>,
+    ) {
+        let DaemonSpec {
+            catalog_trust,
+            worker_executable,
+            inbox,
+            durable,
+            reconcile,
+        } = spec;
+        let dirs = prepare_directories(&env);
+        let environment = worker_environment(&env, &dirs.socket);
+        let config = registry_config(
+            &env,
+            &dirs,
+            &environment,
+            catalog_trust,
+            worker_executable,
+            durable,
+        );
+        let registry = SessionRegistry::new_production_with_inspector(
+            config,
+            Arc::clone(&launcher),
+            Arc::new(readable_host::ReadableHost::new()),
+        )
+        .expect("the production registry opens the plugin root");
+        // The event log starts before any session is created or adopted, so
+        // every lifecycle event of a durable daemon is recorded.
+        if durable {
+            registry
+                .spawn_event_log()
+                .expect("open the daemon event log");
+        }
+        let log_owner = registry.clone();
+        if reconcile {
+            Box::pin(registry.reconcile_workers())
+                .await
+                .expect("adopt the workers the previous daemon left running");
+        }
+        let sessions = registry.clone();
+        let (server, attention) = bind_server(&env, &dirs.socket, registry, inbox).await;
+        let started = Started {
+            env,
+            plugins: dirs.plugins,
+            agents: dirs.agents,
+            sessions,
+            launcher,
+        };
+        let _ = ready.send(started);
+        server
+            .serve(async move {
+                let _ = stop.await;
+            })
+            .await;
+        if let Some(attention) = attention {
+            attention.shutdown().await;
+        }
+        log_owner.shutdown_event_log().await;
     }
 
     /// Removes every session the test started, so no durable worker outlives
@@ -296,10 +405,10 @@ impl Harness {
             assert_eq!(code, 0, "{removed}");
         }
         let _ = self.shutdown.send(());
-        self.task.await.expect("the server stops");
-        if let Some(attention) = self.attention {
-            attention.shutdown().await;
-        }
+        tokio::task::spawn_blocking(move || self.task.join())
+            .await
+            .expect("join the daemon thread")
+            .expect("the server thread stops without a panic");
     }
 
     /// Runs `pohunek` with the hermetic environment.
@@ -354,6 +463,139 @@ impl Harness {
         let hex = digest.as_str().trim_start_matches("sha256:");
         self.plugins.join("packages").join(hex)
     }
+}
+
+/// Which daemon a harness serves: the production configuration it is built
+/// with, and whether its session records persist and adopt surviving workers.
+struct DaemonSpec {
+    catalog_trust: CatalogTrust,
+    worker_executable: PathBuf,
+    inbox: Inbox,
+    durable: bool,
+    reconcile: bool,
+}
+
+/// The directories a daemon of the harness uses, all under its environment.
+struct DaemonDirs {
+    socket: PathBuf,
+    plugins: PathBuf,
+    agents: PathBuf,
+}
+
+/// Creates the runtime and agents directories with private modes and returns
+/// the paths the daemon serves from.
+fn prepare_directories(env: &TestEnv) -> DaemonDirs {
+    let runtime = env.runtime_dir().join("pohunek");
+    fs::create_dir_all(&runtime).expect("create the runtime directory");
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(PRIVATE_MODE))
+        .expect("private runtime directory");
+    let socket = runtime.join("daemon.sock");
+    check_socket_path(&socket).expect("the socket path fits sun_path");
+    let agents = env.config_home().join("pohunek/agents");
+    fs::create_dir_all(&agents).expect("create the agents directory");
+    fs::set_permissions(&agents, fs::Permissions::from_mode(PRIVATE_MODE))
+        .expect("private agents directory");
+    DaemonDirs {
+        socket,
+        plugins: env.state_home().join("pohunek/plugins"),
+        agents,
+    }
+}
+
+/// The directories the workers of the daemon at `socket` run and keep state in.
+fn worker_environment(env: &TestEnv, socket: &Path) -> SubprocessWorkerEnvironment {
+    let worker_home = env.root().join("worker");
+    SubprocessWorkerEnvironment {
+        runtime_home: worker_home.join("runtime"),
+        state_home: worker_home.join("state"),
+        data_home: worker_home.join("data"),
+        config_home: worker_home.join("config"),
+        cache_home: worker_home.join("cache"),
+        home: worker_home,
+        daemon_socket: socket.to_path_buf(),
+    }
+}
+
+/// The registry configuration of a daemon of the harness.
+fn registry_config(
+    env: &TestEnv,
+    dirs: &DaemonDirs,
+    environment: &SubprocessWorkerEnvironment,
+    catalog_trust: CatalogTrust,
+    worker_executable: PathBuf,
+    durable: bool,
+) -> SessionRegistryConfig {
+    SessionRegistryConfig {
+        socket_path: Some(dirs.socket.clone()),
+        plugins_dir: Some(dirs.plugins.clone()),
+        agents_dir: Some(dirs.agents.clone()),
+        // A profile-backed launch freezes a keyed revision, which needs the
+        // host's revision key directory.
+        host_state_dir: Some(env.root().join("host-state")),
+        catalog_trust,
+        worker_runtime_root: Some(environment.runtime_home.join("pohunek/workers")),
+        worker_state_root: Some(environment.state_home.join("pohunek/workers")),
+        supervision: Some(
+            environment
+                .supervision(worker_executable)
+                .with_environment_source(EnvironmentSource::fixed(env.environment().clone())),
+        ),
+        shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
+        store_path: durable.then(|| metadata_store(env)),
+        event_log_dir: durable.then(|| env.root().join("events")),
+        ..SessionRegistryConfig::default()
+    }
+}
+
+/// The metadata store of a durable daemon, in a directory only its owner reads.
+fn metadata_store(env: &TestEnv) -> PathBuf {
+    let directory = env.root().join("metadata");
+    fs::create_dir_all(&directory).expect("create the metadata directory");
+    fs::set_permissions(&directory, fs::Permissions::from_mode(PRIVATE_MODE))
+        .expect("private metadata directory");
+    directory.join("metadata.jsonl")
+}
+
+/// Wraps `registry` in the daemon's state and binds the control socket at
+/// `socket`. Returns the server and the attention coordinator the inbox runs.
+async fn bind_server(
+    env: &TestEnv,
+    socket: &Path,
+    registry: SessionRegistry,
+    inbox: Inbox,
+) -> (ControlServer, Option<AttentionCoordinatorTask>) {
+    let governance = Arc::new(
+        HostGovernanceService::open(env.root().join("governance"))
+            .await
+            .expect("open the host-governance service"),
+    );
+    let notifications = (inbox != Inbox::Absent).then(|| {
+        NotificationService::open(&env.root().join("daemon-data"))
+            .expect("open the notification inbox")
+    });
+    let (coordinator, attention) = match (&notifications, inbox) {
+        (Some(notifications), Inbox::Debounced) => {
+            let (coordinator, task) = AttentionCoordinator::spawn(notifications.clone(), &registry);
+            (Some(coordinator), Some(task))
+        }
+        _ => (None, None),
+    };
+    let mut state = DaemonState::new(
+        HealthInfo::new("0.0.0-test"),
+        registry,
+        governance,
+        overlay_registry(),
+    );
+    if let Some(notifications) = notifications {
+        state = state.with_notifications(notifications);
+    }
+    if let Some(coordinator) = coordinator {
+        state = state.with_attention_coordinator(coordinator);
+    }
+    let server = ControlServer::bind_with_state(socket, state)
+        .await
+        .expect("the control server binds");
+    (server, attention)
 }
 
 pub(crate) fn path_str(path: &Path) -> &str {

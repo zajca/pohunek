@@ -49,8 +49,8 @@ pub use assistant::{
 pub use capabilities::{AgentRuntime, HostCapabilities};
 #[doc(inline)]
 pub use decimal::{
-    ActivityRevision, DecimalWireError, OutputOffset, ProcessStartIdentity, ReportSequence,
-    RuntimeGeneration, SubagentRevision, TerminalWatermark,
+    ActivityRevision, BackgroundRevision, DecimalWireError, OutputOffset, ProcessStartIdentity,
+    ReportSequence, RuntimeGeneration, SubagentRevision, TerminalWatermark,
 };
 #[doc(inline)]
 pub use discovery::{HostClass, HostDiscoverParams, HostRecord};
@@ -130,10 +130,11 @@ pub use runtime_id::{
 };
 #[doc(inline)]
 pub use session::{
-    AgentActivity, AgentStateEvent, AttachEvent, AttachHeader, CwdSource, DetectionRegionKind,
-    DetectionRegionPreview, ForkCwdMode, ObservationParamsError, RuntimeInventoryEntry,
-    RuntimeInventoryEvent, RuntimeInventoryResult, RuntimeInventoryStatus, RuntimeState,
-    SessionAttachParams, SessionAttachResult, SessionCapabilities, SessionDetachParams,
+    AgentActivity, AgentStateEvent, AttachEvent, AttachHeader, BackgroundItem, BackgroundKind,
+    BackgroundStateEvent, BackgroundStatus, CwdSource, DetectionRegionKind, DetectionRegionPreview,
+    ForkCwdMode, ObservationParamsError, RuntimeInventoryEntry, RuntimeInventoryEvent,
+    RuntimeInventoryResult, RuntimeInventoryStatus, RuntimeState, SessionAttachParams,
+    SessionAttachResult, SessionBackground, SessionCapabilities, SessionDetachParams,
     SessionDetachResult, SessionDetectionParams, SessionDetectionResult, SessionDiffParams,
     SessionDiffResult, SessionEvent, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
     SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams,
@@ -213,6 +214,7 @@ pub mod event {
     event_table!(
         AGENT_STATE, "agent_state", crate::AgentStateEvent, "AgentStateEvent";
         SUBAGENT_STATE, "subagent_state", crate::SubagentStateEvent, "SubagentStateEvent";
+        BACKGROUND_STATE, "background_state", crate::BackgroundStateEvent, "BackgroundStateEvent";
         ATTACH_OPENED, "attach_opened", crate::AttachEvent, "AttachEvent";
         ATTACH_CLOSED, "attach_closed", crate::AttachEvent, "AttachEvent";
         NOTIFICATION_CREATED, "notification_created", crate::NotificationCreatedEvent, "NotificationCreatedEvent";

@@ -317,6 +317,7 @@ fn session_info(
     }
     if matches!(direction, Direction::ToLegacy) {
         object.remove("native_last_activity_at");
+        object.remove("background");
         if let Some(Value::Array(warnings)) = object.get_mut("warnings") {
             warnings.retain(|warning| {
                 warning
@@ -594,7 +595,7 @@ mod tests {
             .map(|spec| spec.name)
             .filter(|name| !KNOWN_EVENTS.contains(name))
             .collect();
-        assert_eq!(withheld, Vec::<&str>::new());
+        assert_eq!(withheld, vec![event::BACKGROUND_STATE]);
     }
 
     #[test]

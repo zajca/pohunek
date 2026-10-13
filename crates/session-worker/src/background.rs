@@ -11,14 +11,12 @@
 use std::collections::BTreeMap;
 
 use pohunek_worker_protocol::{
-    is_hidden_or_separator, BackgroundItem, BackgroundKind, BackgroundSnapshot, BackgroundStatus,
-    BACKGROUND_LABEL_MAX_BYTES, BACKGROUND_PROGRAM_MAX_BYTES, BACKGROUND_TASK_TYPE_MAX_BYTES,
+    is_valid_agent_type, is_valid_label, is_valid_program, is_valid_provider_kind, BackgroundItem,
+    BackgroundKind, BackgroundSnapshot, BackgroundStatus,
 };
 use serde_json::Value;
 
 use crate::journal::JournalRecord;
-
-use crate::server::MAX_SUBAGENT_TYPE_BYTES;
 
 /// Provider type labels with a closed kind, in Claude Code's task-type map.
 const KNOWN_KINDS: &[(&str, BackgroundKind)] = &[
@@ -33,51 +31,6 @@ const KNOWN_KINDS: &[(&str, BackgroundKind)] = &[
     ("memory import", BackgroundKind::MemoryImport),
     ("cloud session", BackgroundKind::CloudSession),
 ];
-
-/// Whether `value` is a program name within the program byte bound.
-///
-/// It starts with an alphanumeric byte, so it cannot read as an option or a
-/// path fragment, and holds only the separators tool names use.
-fn valid_program(value: &str) -> bool {
-    let mut bytes = value.bytes();
-    value.len() <= BACKGROUND_PROGRAM_MAX_BYTES
-        && bytes
-            .next()
-            .is_some_and(|byte| byte.is_ascii_alphanumeric())
-        && bytes
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
-}
-
-/// Whether `value` is a label the worker keeps.
-///
-/// It is non-empty, within the label byte bound, and free of controls,
-/// separators and format characters.
-fn valid_label(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= BACKGROUND_LABEL_MAX_BYTES
-        && !value.chars().any(is_hidden_or_separator)
-}
-
-/// Whether `value` is a provider type label the worker may show to clients.
-///
-/// It follows the label character rule, so the type cannot hide text. The
-/// claim check already bounds the type label; the bound is repeated here so the
-/// stored `provider_kind` never depends on that check alone.
-fn valid_provider_kind(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= BACKGROUND_TASK_TYPE_MAX_BYTES
-        && !value.chars().any(is_hidden_or_separator)
-}
-
-/// Whether `value` is an agent type within the subagent type bound.
-///
-/// It is non-empty and free of controls, separators and format characters, so
-/// a client cannot be shown hidden or reordered text.
-fn valid_agent_type(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= MAX_SUBAGENT_TYPE_BYTES
-        && !value.chars().any(is_hidden_or_separator)
-}
 
 /// Maps a provider type label to its closed kind.
 ///
@@ -168,22 +121,22 @@ impl Candidate {
     ) -> Self {
         let (kind, provider_kind) = kind_of(task_type);
         let provider_kind = provider_kind.and_then(|label| {
-            if valid_provider_kind(&label) {
+            if is_valid_provider_kind(&label) {
                 Some(label)
             } else {
                 dropped.invalid += 1;
                 None
             }
         });
-        let label = checked_text(label, valid_label, dropped);
+        let label = checked_text(label, is_valid_label, dropped);
         let program = if kind == BackgroundKind::Shell {
-            checked_text(program, valid_program, dropped)
+            checked_text(program, is_valid_program, dropped)
         } else {
             dropped.kind_mismatch += usize::from(program.is_some_and(|value| !value.is_null()));
             None
         };
         let agent_type = if kind == BackgroundKind::Subagent {
-            checked_text(agent_type, valid_agent_type, dropped)
+            checked_text(agent_type, is_valid_agent_type, dropped)
         } else {
             dropped.kind_mismatch += usize::from(agent_type.is_some_and(|value| !value.is_null()));
             None

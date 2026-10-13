@@ -258,7 +258,10 @@ the protocol 3 adapter: the daemon accepts the `runtime_id` spelling in its
 requests (a request that already carries the v4 spelling is `bad_request`) and
 answers, and streams events, in the `runtime_id` spelling, withholding warning
 kinds and events v3 never defined (a v3 connection never receives a
-`native_recovery` session warning; v4 connections do). A client whose range does not overlap the window
+`native_recovery` session warning; v4 connections do). The `background_state`
+event is withheld from v3 connections, and `SessionInfo.background` is removed
+from the session objects a v3 connection receives, so a v3 client sees no
+background snapshot. A client whose range does not overlap the window
 receives `daemon/version_mismatch` before any method runs; a client of this build
 negotiates v3 and translates as described above. The window covers
 the public daemon protocol and the Hermes CLI tool path: the CLI's `--json`
@@ -1334,8 +1337,27 @@ Important fields:
   and a row with a newer claim than the list is never touched. A reconciled row
   has the same shape as any other; the reason is only in the worker log. A row
   whose Claude process never ends another main turn stays `running` until its
-  own stop or the end of the runtime (`lost`). No prompt, result, task description, transcript path,
-  or raw hook payload is exposed.
+  own stop or the end of the runtime (`lost`). No prompt, result, transcript path,
+  or raw hook payload is exposed. Subagent rows carry lifecycle fields only; the
+  sanitized task label and shell program name appear in `background` instead.
+- `background`: optional latest snapshot of the agent's background tasks, or
+  absent or `null` when no snapshot is held: no agent has reported one, or the
+  snapshot was cleared because the runtime ended, the reporting Claude process
+  exited or released its session (except for `/clear`), it started or resumed a
+  session, or another agent process started one. It holds a decimal-string
+  `revision`, `observed_at_ms` (the worker's observation time, from which clients
+  render the snapshot age), and `items`. Each item has `id`, `kind`, `status`,
+  optional `agent_type` (subagent items), optional `label` (control and format
+  characters removed, whitespace collapsed, bounded), optional `program` (shell
+  items: the program name only, never its arguments or the full command line),
+  `first_seen_ms`, and `last_seen_ms`. `kind` is one of `subagent`, `workflow`,
+  `shell`, `monitor`, `mcp_task`, `teammate`, `dream`, `auto_mode_scan`,
+  `memory_import`, `cloud_session`, or `other`; `other` carries the provider's
+  task type in `provider_kind`. `status` is `running`, `pending`, or `other`.
+  `first_seen_ms` is pohunek's first observation, not a start time: the task
+  started at or before that instant. A subagent item shares its `id` with the
+  matching `subagents` row, which stays the authority for subagent lifecycle.
+  The snapshot is replaced wholesale on every change.
 - `cwd`: current host-local working directory. It starts as the launch
   directory and can change while the session runs when procwatch observes the
   focus process in a new directory or the PTY emits an OSC 7 cwd hint.
@@ -1521,8 +1543,8 @@ All are TypeScript strings except `PackageIdentity`, `LaunchBinding` and
 
 Observation is available only for Pohunek-managed terminals. It does not attach,
 take input ownership, or change terminal dimensions. `runtime_generation`, all
-output offsets, terminal watermarks, process-start identities, and report
-sequences are canonical unsigned decimal strings. They remain exact beyond
+output offsets, terminal watermarks, background revisions, process-start
+identities, and report sequences are canonical unsigned decimal strings. They remain exact beyond
 JavaScript's safe-integer range and reject signs, whitespace, overflow, and
 redundant leading zeroes.
 
@@ -2946,6 +2968,7 @@ The daemon then writes these events:
 | `session_native_recovered` | `{session: SessionInfo, previous_worker_instance_id?: string, worker_instance_id?: string}` | Explicit provider-native recovery created a new worker and runtime generation for the same logical session. `previous_worker_instance_id` can be absent for a one-time migrated legacy session; production worker recovery includes the new `worker_instance_id`. |
 | `agent_state` | `{session_id: SessionId, activity: AgentActivity, source: StateSource, runtime?: SessionRuntimeIdentity, activity_epoch?: string, revision?: ActivityRevision}` | Agent activity changed. `source` may be `report` when a hook report supplied explicit active-agent state. Current daemons emit `runtime`, `activity_epoch`, and decimal-string `revision`, making `(activity_epoch, runtime, revision)` exact reconnect-safe evidence rather than a hint to re-read only the latest snapshot; the fields remain additive for general v2 subscribers, while input-wait success requires them through `SessionInputResult`. |
 | `subagent_state` | `{session_id: SessionId, subagent: SubagentInfo, runtime?: SessionRuntimeIdentity}` | One provider-managed subagent changed. Current daemons emit `runtime`; clients ignore an event without a runtime identity or whose runtime id/generation does not match the session snapshot, then apply only a newer decimal-string `subagent.revision` for the same provider/id. A newer revision may move a terminal subagent back to `running`, so a terminal lifecycle is not final. `session.list` and `session.inspect` remain the reconnect seed through `SessionInfo.subagents`. |
+| `background_state` | `{session_id: SessionId, background: SessionBackground \| null, runtime?: SessionRuntimeIdentity}` | The session's background-task snapshot changed. `background: null` clears it: the runtime ended, or the reporting Claude process exited, released its session (except for `/clear`) or started or resumed one, or another agent process started a session. Current daemons emit `runtime`; clients accept the event only when its runtime id and generation match the current session snapshot, the same rule as `subagent_state`. `session.list` and `session.inspect` seed the snapshot through `SessionInfo.background` after reconnect. This event is withheld from protocol 3 subscribers. |
 | `attach_opened` | `{session_id: SessionId, stream_id: string}` | A pending attach token was redeemed and a raw stream opened. |
 | `attach_closed` | `{session_id: SessionId, stream_id: string}` | A raw attach stream ended or was detached. |
 | `notification_created` | `{record: NotificationRecord}` | A durable notification record was created. |

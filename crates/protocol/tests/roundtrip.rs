@@ -116,6 +116,7 @@ fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
         state_source: StateSource::Process,
         activity: None,
         subagents: Vec::new(),
+        background: None,
         active_agent: None,
         active_agent_base: None,
         active_agent_pid: None,

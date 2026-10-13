@@ -123,6 +123,11 @@ decimal_wire_type!(
     "SubagentRevision.ts"
 );
 decimal_wire_type!(
+    /// Monotonic background-task snapshot revision scoped to one PTY runtime.
+    BackgroundRevision,
+    "BackgroundRevision.ts"
+);
+decimal_wire_type!(
     /// Monotonic lifecycle-report sequence.
     ReportSequence,
     "ReportSequence.ts"

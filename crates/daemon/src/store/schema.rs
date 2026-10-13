@@ -36,7 +36,7 @@ use super::{
 ///
 /// Bump it, and add a [`MIGRATIONS`] step, whenever the serialized shape of a
 /// persisted record kind changes.
-pub const STORE_SCHEMA_VERSION: u32 = 7;
+pub const STORE_SCHEMA_VERSION: u32 = 8;
 
 /// Schema assumed for a line that has no `schema_version` field.
 pub(super) const UNVERSIONED_LINE_SCHEMA: u32 = 1;
@@ -78,6 +78,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
     Migration {
         from: 6,
         apply: migrate_v6_to_v7,
+    },
+    Migration {
+        from: 7,
+        apply: migrate_v7_to_v8,
     },
 ];
 
@@ -128,6 +132,13 @@ fn migrate_v5_to_v6(_record: &mut Map<String, Value>) {}
 /// refuses nothing at launch, which is how every schema 6 session was
 /// launched, so no record needs rewriting.
 fn migrate_v6_to_v7(_record: &mut Map<String, Value>) {}
+
+/// Schema 7 to 8: a session snapshot may carry the latest provider background
+/// task snapshot (`info.background`).
+///
+/// A record written without the field held no snapshot, which is the state
+/// every schema 7 session was in, so no record needs rewriting.
+fn migrate_v7_to_v8(_record: &mut Map<String, Value>) {}
 
 /// A metadata store whose schema this daemon cannot use as is.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

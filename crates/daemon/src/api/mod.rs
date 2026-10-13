@@ -264,7 +264,7 @@ impl ControlServer {
                         Ok((stream, _addr)) => {
                             let state = state.clone();
                             tokio::spawn(async move {
-                                if let Err(err) = serve_connection(stream, state).await {
+                                if let Err(err) = Box::pin(serve_connection(stream, state)).await {
                                     warn!(error = %err, "control connection ended with error");
                                 }
                             });
@@ -474,7 +474,7 @@ impl RemoteServer {
                             info!(peer = %peer, "remote control connection accepted");
                             let state = state.clone();
                             tokio::spawn(async move {
-                                if let Err(err) = serve_connection(stream, state).await {
+                                if let Err(err) = Box::pin(serve_connection(stream, state)).await {
                                     warn!(error = %err, "remote control connection ended with error");
                                 }
                             });

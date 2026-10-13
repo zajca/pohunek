@@ -42,6 +42,7 @@ export const MAX_SESSION_TURN_CURSOR_BYTES = 256 as const;
 export const EVENT_AGENT_STATE = "agent_state" as const;
 export const EVENT_ATTACH_CLOSED = "attach_closed" as const;
 export const EVENT_ATTACH_OPENED = "attach_opened" as const;
+export const EVENT_BACKGROUND_STATE = "background_state" as const;
 export const EVENT_NOTIFICATION_CREATED = "notification_created" as const;
 export const EVENT_NOTIFICATION_DELETED = "notification_deleted" as const;
 export const EVENT_NOTIFICATION_UPDATED = "notification_updated" as const;
@@ -60,6 +61,7 @@ export const EVENT_NAMES = [
   EVENT_AGENT_STATE,
   EVENT_ATTACH_CLOSED,
   EVENT_ATTACH_OPENED,
+  EVENT_BACKGROUND_STATE,
   EVENT_NOTIFICATION_CREATED,
   EVENT_NOTIFICATION_DELETED,
   EVENT_NOTIFICATION_UPDATED,
