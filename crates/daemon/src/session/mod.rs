@@ -561,7 +561,7 @@ struct SessionRegistryInner {
     /// (or two resizes) racing on the same session cannot leave a stale binding:
     /// each persister re-reads current state under this lock, so the last writer
     /// wins with the freshest size. Held across the (blocking) store I/O instead
-    /// of the sessions lock, keeping that hot lock free of file writes.
+    /// of the sessions lock, keeping that hot lock free of binding writes.
     persist_lock: Mutex<()>,
     /// Test hook that drops every resume-binding write, standing for a daemon
     /// that died between the session record and its projection.
@@ -632,6 +632,14 @@ struct SessionRegistryInner {
     /// Holds the next committed exit before it is announced.
     #[cfg(test)]
     exit_announce_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Holds the next exit transition between its in-memory derivation and
+    /// its commit.
+    #[cfg(test)]
+    exit_commit_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Holds the next stop between its in-memory intent and its durable
+    /// intent commit.
+    #[cfg(test)]
+    stop_intent_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
     /// Holds the next create between its delivered input and the commit.
     #[cfg(test)]
     initial_input_commit_hold:
@@ -1005,6 +1013,19 @@ impl RuntimeWatchIdentity {
                 && runtime.runtime_generation == self.generation
         })
     }
+}
+
+/// Outcome of [`SessionRegistry::commit_intent`].
+#[derive(Debug)]
+enum IntentCommit {
+    /// The intent was written over `previous`, the durable record it replaced.
+    Committed {
+        intent: Box<SessionRecord>,
+        previous: Box<SessionRecord>,
+    },
+    /// A runtime transition ended the session in `state` first, so nothing
+    /// was written.
+    Ended(SessionState),
 }
 
 #[derive(Debug)]
@@ -1623,6 +1644,10 @@ impl SessionRegistry {
         Self::build(config, Some(launcher), inspector, None)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one struct literal initializes every registry field, including the test holds"
+    )]
     fn build(
         config: SessionRegistryConfig,
         launcher: Option<Arc<dyn WorkerLauncher>>,
@@ -1725,6 +1750,10 @@ impl SessionRegistry {
                 initial_input_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 exit_announce_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                exit_commit_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                stop_intent_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 initial_input_commit_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
@@ -2344,6 +2373,78 @@ impl SessionRegistry {
         let gate = self
             .inner
             .exit_announce_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_if(|gate| gate.session_id.as_deref().is_none_or(|held| held == id.0));
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    /// Arms a hold that parks the next exit transition of session `id`
+    /// between its in-memory derivation and its commit.
+    #[cfg(test)]
+    pub(crate) fn hold_next_exit_commit(
+        &self,
+        id: &SessionId,
+    ) -> crate::runtime::lifecycle::tests::StartGate {
+        let gate = crate::runtime::lifecycle::tests::StartGate {
+            session_id: Some(id.0.clone()),
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        *self
+            .inner
+            .exit_commit_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate.clone());
+        gate
+    }
+
+    /// Parks a derived exit transition before its commit when a test armed
+    /// the hold.
+    #[cfg(test)]
+    async fn hold_exit_commit(&self, id: &SessionId) {
+        let gate = self
+            .inner
+            .exit_commit_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_if(|gate| gate.session_id.as_deref().is_none_or(|held| held == id.0));
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    /// Arms a hold that parks the next stop of session `id` between its
+    /// in-memory intent and its durable intent commit.
+    #[cfg(test)]
+    pub(crate) fn hold_next_stop_intent(
+        &self,
+        id: &SessionId,
+    ) -> crate::runtime::lifecycle::tests::StartGate {
+        let gate = crate::runtime::lifecycle::tests::StartGate {
+            session_id: Some(id.0.clone()),
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        *self
+            .inner
+            .stop_intent_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate.clone());
+        gate
+    }
+
+    /// Parks a stop before its durable intent commit when a test armed the
+    /// hold.
+    #[cfg(test)]
+    async fn hold_stop_intent(&self, id: &SessionId) {
+        let gate = self
+            .inner
+            .stop_intent_hold
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take_if(|gate| gate.session_id.as_deref().is_none_or(|held| held == id.0));
@@ -3764,8 +3865,27 @@ impl SessionRegistry {
                 ),
             )
         };
-        let (terminal_base, _) = match Box::pin(self.commit_stop_intent(id, durable_intent)).await {
-            Ok(committed) => committed,
+        #[cfg(test)]
+        self.hold_stop_intent(id).await;
+        let committed = Box::pin(self.commit_intent(
+            id,
+            durable_intent,
+            "its stop intent",
+            "session_stop_intent_busy",
+        ))
+        .await;
+        let terminal_base = match committed {
+            Ok(IntentCommit::Committed { intent, .. }) => *intent,
+            // The exit that ended the session saw this stop's in-memory intent
+            // and applied its outcome; the binding is still cleared before
+            // the stop returns.
+            Ok(IntentCommit::Ended(state)) => {
+                runtime_watch_cancel.cancel();
+                Box::pin(self.persist_resume_binding(id)).await;
+                return Ok(SessionStopResult {
+                    stopped: state == SessionState::Stopped,
+                });
+            }
             Err(error) => {
                 self.rollback_stop_intent(
                     id,
@@ -3825,37 +3945,61 @@ impl SessionRegistry {
         Ok(SessionStopResult { stopped: true })
     }
 
-    /// Persists `intent` and returns it with the durable record it replaced.
-    /// Commits an intent record over the durable record conditionally,
-    /// retrying while another writer keeps changing the record under it.
+    /// Commits the desired state and transaction of `intent` over the
+    /// durable record conditionally, retrying while another writer keeps
+    /// changing the record under it.
     ///
-    /// `busy_code` is the error code of the exhaustion after the retry bound:
-    /// the stop keeps its historical `session_stop_intent_busy`.
+    /// The committed record is rebuilt from the registry entry under the
+    /// sessions lock, which is held through the write: a runtime transition
+    /// that committed after the entry took the intent is carried into the
+    /// record instead of being overwritten by it, and a session that such a
+    /// transition ended is reported as [`IntentCommit::Ended`] with nothing
+    /// written.
+    ///
+    /// `busy_code` is the error code of the exhaustion after the retry bound
+    /// and of an entry that no longer carries the intent: the stop keeps its
+    /// historical `session_stop_intent_busy`.
     async fn commit_intent(
         &self,
         id: &SessionId,
         intent: SessionRecord,
         what: &str,
         busy_code: &str,
-    ) -> Result<(SessionRecord, SessionRecord), ProtocolError> {
+    ) -> Result<IntentCommit, ProtocolError> {
         for _ in 0..MAX_RUNTIME_TRANSITION_COMMIT_ATTEMPTS {
-            let durable_base = self
-                .load_durable_session_record(id)
-                .await?
-                .unwrap_or_else(|| intent.clone());
-            let mut candidate = intent.clone();
+            let durable_base = self.load_durable_session_record(id).await?;
+            let sessions = self.inner.sessions.lock().await;
+            let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
+            if is_terminal(entry.info.state) {
+                return Ok(IntentCommit::Ended(entry.info.state));
+            }
+            if entry.desired_state != intent.desired_state {
+                return Err(runtime_error(
+                    busy_code,
+                    format!("session {} changed while committing {what}", id.0),
+                ));
+            }
+            let mut candidate =
+                Self::session_record(id, entry, intent.desired_state, intent.transaction.clone());
+            let durable_base = durable_base.unwrap_or_else(|| candidate.clone());
             preserve_durable_worker_metadata(&durable_base, &mut candidate);
             match self
                 .write_session_record_if_current(durable_base.clone(), candidate.clone())
                 .await
             {
-                Ok(()) => return Ok((candidate, durable_base)),
+                Ok(()) => {
+                    return Ok(IntentCommit::Committed {
+                        intent: Box::new(candidate),
+                        previous: Box::new(durable_base),
+                    })
+                }
                 Err(error)
                     if matches!(
                         error.code.as_str(),
                         "session_record_commit_stale" | "session_runtime_commit_stale"
                     ) =>
                 {
+                    drop(sessions);
                     tokio::task::yield_now().await;
                 }
                 Err(error) => return Err(error),
@@ -3867,27 +4011,49 @@ impl SessionRegistry {
         ))
     }
 
+    /// Commits a stop intent of a session whose runtime cannot end on its
+    /// own, so a session that ended first is refused as busy.
     async fn commit_stop_intent(
         &self,
         id: &SessionId,
         intent: SessionRecord,
     ) -> Result<(SessionRecord, SessionRecord), ProtocolError> {
-        self.commit_intent(id, intent, "its stop intent", "session_stop_intent_busy")
+        self.commit_settled_intent(id, intent, "its stop intent", "session_stop_intent_busy")
             .await
     }
 
+    /// Commits a removal intent of a session whose runtime cannot end on its
+    /// own, so a session that ended first is refused as busy.
     async fn commit_removal_intent(
         &self,
         id: &SessionId,
         intent: SessionRecord,
     ) -> Result<(SessionRecord, SessionRecord), ProtocolError> {
-        self.commit_intent(
+        self.commit_settled_intent(
             id,
             intent,
             "its removal intent",
             "session_removal_intent_busy",
         )
         .await
+    }
+
+    /// Commits `intent` and returns it with the durable record it replaced,
+    /// refusing a session that ended first with `busy_code`.
+    async fn commit_settled_intent(
+        &self,
+        id: &SessionId,
+        intent: SessionRecord,
+        what: &str,
+        busy_code: &str,
+    ) -> Result<(SessionRecord, SessionRecord), ProtocolError> {
+        match self.commit_intent(id, intent, what, busy_code).await? {
+            IntentCommit::Committed { intent, previous } => Ok((*intent, *previous)),
+            IntentCommit::Ended(_) => Err(runtime_error(
+                busy_code,
+                format!("session {} ended while committing {what}", id.0),
+            )),
+        }
     }
 
     async fn commit_user_stop_exit(
@@ -4704,6 +4870,15 @@ impl SessionRegistry {
         candidate.last_native_report = record.native_identity_ordering;
     }
 
+    /// Commits `candidate`, derived from the in-memory `memory_base` and the
+    /// durable `durable_base`, to the store and then to memory.
+    ///
+    /// The sessions lock is held from the memory check through the durable
+    /// write to the install, so a transition derived from a superseded entry
+    /// fails before it writes anything, and no other runtime transition can
+    /// land between this one's durable write and its install. A durable writer
+    /// outside the lock that changes the record after `durable_base` was
+    /// loaded fails the write's condition on it.
     async fn commit_runtime_transition(
         &self,
         id: &SessionId,
@@ -4734,6 +4909,20 @@ impl SessionRegistry {
         candidate
             .last_native_report
             .clone_from(&record.native_identity_ordering);
+        // The memory checks run before the durable write: a refusal after it
+        // would leave the store holding a state the registry never shows, and
+        // nothing would write over it.
+        let mut sessions = self.inner.sessions.lock().await;
+        let Some(current) = sessions.get(id) else {
+            return RuntimeTransitionOutcome::IdentityMismatch;
+        };
+        if !expected.matches(current) {
+            return RuntimeTransitionOutcome::IdentityMismatch;
+        }
+        let current_record = Self::session_record(id, current, current.desired_state, None);
+        if &current_record != memory_base {
+            return RuntimeTransitionOutcome::RetryableConcurrentChange;
+        }
         if let Err(error) = self
             .write_session_record_if_current(durable_base.clone(), record)
             .await
@@ -4745,17 +4934,6 @@ impl SessionRegistry {
                 }
                 _ => RuntimeTransitionOutcome::RetryablePersistenceFailure(error),
             };
-        }
-        let mut sessions = self.inner.sessions.lock().await;
-        let Some(current) = sessions.get(id) else {
-            return RuntimeTransitionOutcome::IdentityMismatch;
-        };
-        if !expected.matches(current) {
-            return RuntimeTransitionOutcome::IdentityMismatch;
-        }
-        let current_record = Self::session_record(id, current, current.desired_state, None);
-        if &current_record != memory_base {
-            return RuntimeTransitionOutcome::RetryableConcurrentChange;
         }
         // An unavailable runtime has no worker left to watch; only a later
         // adoption, with fresh tokens, may watch this session again.
@@ -4880,6 +5058,8 @@ impl SessionRegistry {
 
             exit_transition(id, entry, expected, exit, stopped_by_user)
         });
+        #[cfg(test)]
+        self.hold_exit_commit(id).await;
         let loaded_durable_base;
         let durable_base = if let Some(expected_record) = expected_record {
             expected_record

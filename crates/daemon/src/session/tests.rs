@@ -1557,12 +1557,11 @@ pub(super) async fn wait_for_file_contains(path: &std::path::Path, needle: &str)
 ///
 /// After a natural exit the exit watcher is the only committer, so this
 /// registry writes nothing more for the exit. After a `stop`, the watcher
-/// that lost the commit to the stop can still be inside its own
-/// `record_exit`, whose conditional write lands after the event and emits
-/// nothing, and it loads its write base separately, so neither the event nor
-/// the store lock orders it before a later write. After a stop a test uses
-/// [`drop_settled`] to open another registry or `Store` over the same file,
-/// or [`stop_settled`] to keep writing through this registry.
+/// that lost the commit to the stop writes nothing, but it can still be
+/// inside its own `record_exit`, holding the registry and reading the store.
+/// After a stop a test uses [`drop_settled`] to open another registry or
+/// `Store` over the same file, or [`stop_settled`] to keep writing through
+/// this registry.
 ///
 /// `events` must be subscribed before the exit commits, or its terminal event
 /// is never received.
@@ -1599,7 +1598,7 @@ pub(super) async fn exit_settled(
 
 /// Waits after a `stop` of session `id` until no task of `registry` but the
 /// caller's handle remains, so an exit watcher that lost the commit to the
-/// stop has made its last write.
+/// stop has ended.
 ///
 /// `registry` must run no other session, and the caller must hold no other
 /// handle to it, or the wait never ends.
@@ -10592,8 +10591,8 @@ async fn concurrent_equal_generation_commits_publish_only_the_durable_winner() {
         .expect("preparing runtime")
         .worker_instance_id = None;
     preparing.runtime.worker_instance_id = None;
-    // The registry's own store: its write lock serializes this write against
-    // the late conditional write of an exit watcher that lost to the stop.
+    // The registry's own store, so this write shares its write lock with the
+    // registry's own writers.
     let store = registry.inner.store.clone().expect("registry store");
     assert_eq!(
         store.record_session(&preparing).expect("persist preparing"),
@@ -10820,13 +10819,31 @@ async fn reconnect_persistence_failure_retries_without_orphaning_live_handle() {
         .expect("registry store")
         .fail_next_write_before_rename();
 
-    let failed = registry
+    // A live worker task may change the entry before the adoption commits;
+    // that refusal writes nothing, so the armed store fault stays for the
+    // retry that reaches the write.
+    let mut failed = registry
         .adopt_reconnected_worker(&created.id, &expected, worker.clone())
         .await;
-    assert!(matches!(
-        failed,
-        super::RuntimeTransitionOutcome::RetryablePersistenceFailure(_)
-    ));
+    for _ in 0..CONCURRENT_TRANSITION_RETRY_LIMIT {
+        if !matches!(
+            failed,
+            super::RuntimeTransitionOutcome::RetryableConcurrentChange
+        ) {
+            break;
+        }
+        tokio::task::yield_now().await;
+        failed = registry
+            .adopt_reconnected_worker(&created.id, &expected, worker.clone())
+            .await;
+    }
+    assert!(
+        matches!(
+            failed,
+            super::RuntimeTransitionOutcome::RetryablePersistenceFailure(_)
+        ),
+        "the armed store fault fails the adoption: {failed:?}"
+    );
     assert_eq!(
         registry
             .inspect(&created.id)
@@ -11218,8 +11235,9 @@ async fn assert_reconnect_transition_applied(
     expected: &RuntimeWatchIdentity,
     worker: &Worker,
 ) {
-    // A live worker task may commit a same-runtime snapshot between the durable
-    // write and memory compare. Production retries this explicit outcome.
+    // A live worker task may commit a same-runtime snapshot between this
+    // transition's derivation and its commit. Production retries this
+    // explicit outcome.
     for _ in 0..CONCURRENT_TRANSITION_RETRY_LIMIT {
         match registry
             .adopt_reconnected_worker(id, expected, worker.clone())
@@ -16730,6 +16748,123 @@ async fn initial_input_commit_keeps_a_concurrent_natural_exit() {
     assert_eq!(record.info.state, SessionState::Failed, "the exit survives");
     assert_eq!(record.info.exit_code, Some(3));
     assert_eq!(record.runtime.state, RuntimeState::Terminal);
+}
+
+/// A user stop that commits while the exit watcher of the same runtime
+/// still holds a transition derived before the stop: the watcher's commit
+/// finds the session changed and writes nothing, so the stop's terminal record
+/// stays the durable record and a restarted daemon reconciles it as stopped.
+#[tokio::test]
+async fn exit_watcher_never_overwrites_a_stop_that_committed_first() {
+    let daemon = RestartableDaemon::new("stop-exit-race");
+    let (registry, _supervisor) = scripted_registry(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "read line; exit 3"]),
+        ..daemon.config.clone()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let mut events = registry.subscribe();
+    let watcher = registry.hold_next_exit_commit(&created.id);
+    registry
+        .write_input_to_session(&created.id, "go")
+        .await
+        .expect("the input ends the shell");
+    // The watcher has derived a `failed` transition from the running entry.
+    watcher.entered.notified().await;
+
+    let stopped = registry.stop(&created.id).await.expect("stop session");
+    assert!(stopped.stopped, "the stop commits the terminal state");
+    let stop_record = stored_record(&daemon.store_path, &created.id);
+    assert_eq!(stop_record.info.state, SessionState::Stopped);
+    assert_eq!(
+        stop_record.desired_state,
+        crate::store::DesiredState::Stopped
+    );
+    assert_eq!(stop_record.runtime.state, RuntimeState::Terminal);
+
+    watcher.release.notify_one();
+    stop_settled(&registry, &mut events, &created.id).await;
+
+    assert_eq!(
+        stored_record(&daemon.store_path, &created.id),
+        stop_record,
+        "the watcher's transition never replaces the stop's terminal record"
+    );
+    let memory = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert_eq!(memory.state, SessionState::Stopped);
+    drop(registry);
+
+    let restarted = daemon.restart().await;
+    let reconciled = restarted
+        .inspect(&created.id)
+        .await
+        .expect("inspect the reconciled session");
+    assert_eq!(reconciled.state, SessionState::Stopped);
+    assert_eq!(
+        stored_record(&daemon.store_path, &created.id).desired_state,
+        crate::store::DesiredState::Stopped,
+        "reconciliation keeps the stop"
+    );
+}
+
+/// An exit that commits the terminal state a stop's in-memory intent decided,
+/// before that stop persists its intent: the intent never replaces the
+/// terminal record, so the durable record matches the registry.
+#[tokio::test]
+async fn stop_intent_never_overwrites_an_exit_that_committed_first() {
+    let daemon = RestartableDaemon::new("stop-intent-exit-race");
+    let (registry, _supervisor) = scripted_registry(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "read line; exit 3"]),
+        ..daemon.config.clone()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let mut events = registry.subscribe();
+    let mut settle_events = registry.subscribe();
+    let intent = registry.hold_next_stop_intent(&created.id);
+    let stopping = tokio::spawn({
+        let registry = registry.clone();
+        let id = created.id.clone();
+        async move { registry.stop(&id).await }
+    });
+    // The stop has marked the entry as stopping and not yet persisted it.
+    intent.entered.notified().await;
+    registry
+        .write_input_to_session(&created.id, "go")
+        .await
+        .expect("the input ends the shell");
+    exit_settled(&mut events, &created.id).await;
+    let exited = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert_eq!(
+        exited.state,
+        SessionState::Stopped,
+        "the stop intent decides"
+    );
+
+    intent.release.notify_one();
+    let stopped = stopping
+        .await
+        .expect("stop task joins")
+        .expect("the stop of an ended session succeeds");
+    assert!(stopped.stopped, "the exit applied the stop's outcome");
+    stop_settled(&registry, &mut settle_events, &created.id).await;
+
+    let record = stored_record(&daemon.store_path, &created.id);
+    assert_eq!(record.info.state, SessionState::Stopped);
+    assert_eq!(record.transaction, None, "no stop intent outlives the exit");
+    assert_eq!(record.runtime.state, RuntimeState::Terminal);
+    let memory = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert_eq!(
+        record.info, memory,
+        "the store holds what the registry shows"
+    );
 }
 
 /// A create whose initial input was never delivered because its daemon
