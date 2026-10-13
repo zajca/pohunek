@@ -3841,6 +3841,7 @@ where
                             start_identity,
                             sequence,
                             session_source.as_deref(),
+                            false,
                         )
                     })
                     .flatten();
@@ -3868,9 +3869,22 @@ where
                         native_reference: native_reference.clone(),
                     });
                     journal.active_identity_release = None;
-                    let background_cleared = background_clear.and_then(|reason| {
-                        background::clear_at(&mut journal, sequence).then_some(reason)
-                    });
+                    // Accepted as the active identity, a report of another process
+                    // clears the owner's snapshot whatever its own clock reads.
+                    let background_cleared = background_clear
+                        .or_else(|| {
+                            report_background_clear(
+                                &journal,
+                                pid,
+                                start_identity,
+                                sequence,
+                                session_source.as_deref(),
+                                true,
+                            )
+                        })
+                        .and_then(|reason| {
+                            background::clear_at(&mut journal, sequence).then_some(reason)
+                        });
                     if let (Some(reference_kind), Some(native_reference), Some(launch_base)) = (
                         reference_kind,
                         native_reference,
@@ -4536,23 +4550,30 @@ fn background_candidates(shared: &Shared, request: &SnapshotRequest) -> Vec<Cand
 /// Why an admitted, process-valid identity report clears the background
 /// snapshot, if it does.
 ///
-/// Only a snapshot ordered before the report can be cleared. A report from the
-/// snapshot's owner clears it when the owner starts or resumes its session. A
-/// report from any other process clears it, whatever its source, because that
-/// process did not report the snapshot. The owner's `clear` session keeps it,
-/// since the same process starts the session again.
+/// A report from any process other than the snapshot's owner clears it,
+/// whatever its source, because that process did not report the snapshot.
+/// One `accepted` as the active identity clears it whatever its sequence,
+/// because sequences of different processes are never compared; any other
+/// clears only a snapshot ordered before it. A report from the owner clears a
+/// snapshot ordered before it when the owner starts or resumes its session;
+/// the owner's `clear` session keeps it, since the same process starts the
+/// session again.
 fn report_background_clear(
     journal: &JournalRecord,
     pid: u32,
     start_identity: u64,
     sequence: u64,
     session_source: Option<&str>,
+    accepted: bool,
 ) -> Option<&'static str> {
     let owner = journal.background_owner.as_ref()?;
+    let is_owner = owner.pid == pid && owner.start_identity == start_identity.to_string();
+    if !is_owner && accepted {
+        return Some("agent_changed");
+    }
     if journal.background_sequence >= sequence {
         return None;
     }
-    let is_owner = owner.pid == pid && owner.start_identity == start_identity.to_string();
     if !is_owner {
         Some("agent_changed")
     } else if matches!(session_source, Some("startup" | "resume")) {

@@ -576,9 +576,10 @@ cleared in these cases:
   a `clear` release whose session start never arrived. A release from another
   process changes nothing;
 - an admitted, process-valid identity report comes from a process other than
-  the owner, and the stored sequence is older than the report's
-  (`agent_changed`), whatever its session source. This holds even when the
-  identity rules refuse the report;
+  the owner (`agent_changed`), whatever its session source: when the report is
+  accepted as the active identity, whatever its sequence, because sequences of
+  different processes are never compared; when the identity rules refuse it,
+  only if the stored sequence is older than the report's;
 - an admitted, process-valid identity report from the owner with source
   `startup` or `resume`, ordered after the stored sequence (`session_start`);
 - the owner process is not running (`owner_exited`): it has exited and been

@@ -6079,6 +6079,147 @@ with open(gate_path, encoding="ascii") as gate:
         assert_own_sequence_never_starves_the_root(reporter).await;
     }
 
+    /// Claude launch root that reports itself and a background snapshot from
+    /// `CLOCK_MONOTONIC`, waits for one gate line, then has a forked descendant
+    /// report its own process from a clock of its own that reads far lower,
+    /// and waits for a second gate line before it exits.
+    const BACKGROUND_SWITCH: &str = r#"
+import datetime
+import json
+import os
+import socket
+import sys
+import time
+
+gate_path, results_path = sys.argv[1:3]
+failure_path = results_path + ".failure"
+# The descendant's own clock: far below any CLOCK_MONOTONIC reading of the root.
+DESCENDANT_SEQUENCE = 10
+
+def record_failure(kind, value, trace):
+    # The test reads this file, so the reporter never dies without a reason.
+    import traceback
+    with open(failure_path, "w", encoding="utf-8") as handle:
+        handle.write("".join(traceback.format_exception(kind, value, trace)))
+
+sys.excepthook = record_failure
+
+def start_identity(pid):
+    with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
+        return int(handle.read().rsplit(")", 1)[1].split()[19])
+
+def send(step, request):
+    pid = os.getpid()
+    request = {
+        "runtime_id": os.environ["POHUNEK_WORKER_INSTANCE_ID"],
+        "provider": "claude",
+        "pid": pid,
+        "start_identity": start_identity(pid),
+        **request,
+    }
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(os.environ["POHUNEK_WORKER_SOCKET_PATH"])
+    client.sendall((json.dumps(request) + "\n").encode())
+    received = b""
+    while b"\n" not in received:
+        chunk = client.recv(4096)
+        if not chunk:
+            raise RuntimeError(f"worker closed the socket before a full response line: {received!r}")
+        received += chunk
+    client.close()
+    response = json.loads(received.split(b"\n", 1)[0])
+    with open(results_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"step": step, "response": response}) + "\n")
+
+def report(step, sequence):
+    expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=30)
+    send(step, {
+        "type": "identity_report",
+        "sequence": sequence,
+        "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
+        "reference_kind": "id",
+        "native_reference": step.replace("_", "-"),
+    })
+
+def now():
+    return time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+
+report("root_first", now())
+send("root_snapshot", {
+    "type": "subagent_snapshot",
+    "sequence": now(),
+    "tasks": [{"id": "shell-1", "type": "shell", "status": "running", "label": "Test watch", "program": "cargo"}],
+})
+with open(gate_path, encoding="ascii") as gate:
+    gate.readline()
+child = os.fork()
+if child == 0:
+    try:
+        report("descendant_low", DESCENDANT_SEQUENCE)
+    except BaseException:
+        record_failure(*sys.exc_info())
+        os._exit(1)
+    os._exit(0)
+_, status = os.waitpid(child, 0)
+if os.waitstatus_to_exitcode(status) != 0:
+    raise RuntimeError("the descendant report failed")
+with open(gate_path, encoding="ascii") as gate:
+    gate.readline()
+"#;
+
+    /// A process whose own clock reads below the background owner's still
+    /// clears the owner's snapshot once its report is accepted as the active
+    /// identity: sequences of different processes are never compared.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_accepted_report_of_another_process_clears_the_background_whatever_its_clock() {
+        let root = crate::test_support::scoped_dir("ph-background-switch-");
+        let FrozenRoot {
+            worker,
+            task,
+            mut gate,
+            results,
+            ..
+        } = start_named_root(&root, BACKGROUND_SWITCH, &[]).await;
+
+        let responses = frozen_root_responses(&results, 2).await;
+        assert_eq!(responses["root_first"]["ok"], json!(true), "{responses:?}");
+        assert_eq!(
+            responses["root_snapshot"]["ok"],
+            json!(true),
+            "{responses:?}"
+        );
+        let snapshot = worker.inspect().await.expect("inspect");
+        assert!(
+            snapshot.background.is_some(),
+            "the root's snapshot is applied"
+        );
+
+        std::io::Write::write_all(&mut gate, b"report\n").expect("release the reporter");
+        let responses = frozen_root_responses(&results, 3).await;
+        assert_eq!(
+            responses["descendant_low"]["ok"],
+            json!(true),
+            "the descendant's own first report is accepted: {responses:?}"
+        );
+        let snapshot = worker.inspect().await.expect("inspect");
+        let root_identity = snapshot.child_process.expect("the PTY root");
+        let active = snapshot.active_identity.expect("the descendant's claim");
+        assert_ne!(active.process, root_identity, "the descendant is active");
+        assert!(
+            snapshot.background.is_none(),
+            "the previous owner's snapshot is cleared: {:?}",
+            snapshot.background
+        );
+
+        std::io::Write::write_all(&mut gate, b"done\n").expect("release the reporter");
+        worker
+            .stop(TransactionId::new("transaction-background-switch-stop").expect("transaction id"))
+            .await
+            .expect("stop the PTY");
+        drop(worker);
+        task.abort();
+    }
+
     /// Launch root that drives live descendant reporters, each a forked
     /// process that stays alive and reports its own process as a nested Claude
     /// agent on command.

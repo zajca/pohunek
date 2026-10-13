@@ -148,6 +148,9 @@
   establishes the launch identity, so a full table cannot keep a descendant
   launch process from being pinned. A release answered `ok: false` still
   orders its process's later claims.
+- A report of another process accepted as the active identity clears the
+  background owner's snapshot (`agent_changed`) whatever its sequence, since
+  sequences of different processes are never compared.
 - `docs/public-api.md`, the runtime packages guide and the sessions concept
   state the per-process order; the sequence contract is a value strictly
   increasing across every hook event that reports the same process.
