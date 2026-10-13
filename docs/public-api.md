@@ -3122,6 +3122,7 @@ pohunek workflow enable acme.work --json
 pohunek workflow disable acme.work --json
 pohunek workflow uninstall acme.work --purge --json
 pohunek workflow uninstall acme.work --remove-modified --json
+pohunek workflow run acme.work overview -- --since 1d
 ```
 
 Every `--json` result is one standard CLI process envelope. The `ok` payloads:
@@ -3164,10 +3165,40 @@ contain an argv value, an environment value or manifest text:
 | `workflow_purge_incomplete` | `runtime` | A purge did not finish; the message says whether the plugin was uninstalled, the outcome for each directory, and where remaining data is. |
 | `workflow_dirs_overlap` | `configuration` | The store, state and config locations contain each other; nothing was read or written. |
 | `workflow_store_failed` | `runtime` | The store or a plugin directory cannot be read or changed safely. |
+| `workflow_config_invalid` | `configuration` | `<config>/pohunek/workflow.toml` is unsafe (not an owner-only `0600` regular file in a directory others cannot write), unreadable, not of the knobs schema, or holds an out-of-range value; nothing was run. |
+| `workflow_plugin_disabled` | `configuration` | The plugin is disabled; nothing was run. |
+| `workflow_action_unknown` | `configuration` | The manifest declares no action of the name; nothing was run. |
+| `workflow_action_args_refused` | `configuration` | Arguments after `--` were given to an action declaring `args = "none"`; the message counts them and names no value; nothing was run. |
+| `workflow_origin_incomplete` | `configuration` | Exactly one of `POHUNEK_SESSION_ID` and `POHUNEK_DAEMON_ID` is set; nothing was run. |
+| `workflow_timeout_refused` | `configuration` | The action declares a `timeout_ms` above `limits.action_timeout_max_ms`; nothing was run. |
+| `workflow_context_too_large` | `configuration` | The context JSON is larger than `limits.max_context_bytes`; nothing was run. |
+| `workflow_run_log_failed` | `runtime` | The plugin's run log cannot be opened; nothing was run. |
+| `workflow_spawn_failed` | `runtime` | The action's program is missing or not executable, or its process could not be started. |
+| `workflow_run_failed` | `runtime` | The CLI could not observe the action or read its output; its process group was killed. |
+| `workflow_action_timeout` | `runtime` | The action did not finish before its deadline and its group was stopped. |
+| `workflow_output_limit` | `runtime` | Stdout or stderr passed its cap and the group was stopped; bytes past the cap were not shown. |
+| `workflow_action_interrupted` | `runtime` | The CLI received `SIGINT`, `SIGTERM` or `SIGHUP` and stopped the action's group. |
 
-Running actions, event reactions, periodic jobs and services are not yet
-available. The manifest and trust rules are in
-`docs/knowledge/guides/workflow-plugins.md`.
+`workflow run` has no `--json` result yet; before `--`, `--json` is a usage
+error (`cli_usage`). It streams the action's stdout and stderr, each up to its
+cap, and exits with:
+
+| Exit status | When |
+|---|---|
+| the action's status | The action exited by itself; 128 plus the signal number when a signal it was not sent by the CLI ended it. |
+| 124 | `workflow_action_timeout`. |
+| 125 | `workflow_output_limit`. |
+| 128 plus the signal number | `workflow_action_interrupted`. |
+| 1 | Any other workflow error, including every refusal. |
+
+When several apply, an output stream over its cap wins over a received
+signal, which wins over the deadline. The action's environment, its
+`POHUNEK_PLUGIN_CONTEXT` JSON (schema 1), the content-free run log
+`<state>/pohunek/workflow-plugin-state/<id>/logs/runs.jsonl` and the owner
+knobs `<config>/pohunek/workflow.toml` are specified in
+`docs/knowledge/guides/workflow-plugins.md`, which also holds the manifest and
+trust rules. Event reactions, periodic jobs and services are not yet
+available.
 
 ## Hermes Operator Plugin CLI
 

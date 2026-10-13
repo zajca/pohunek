@@ -48,8 +48,9 @@ Start here:
   it honest. The
   [workflow plugins guide](guides/workflow-plugins.md) covers owner tooling
   installed with `pohunek workflow`: the `workflow.toml` manifest, install
-  pinned by the owner's digest with consent, the CLI-owned store, and the
-  same-UID trust boundary.
+  pinned by the owner's digest with consent, the CLI-owned store, running an
+  action with `pohunek workflow run` (environment, context, limits, run log,
+  owner knobs), and the same-UID trust boundary.
   [Environment and executable resolution](guides/environment-resolution.md)
   documents the macOS `PATH` policy. The
   [Hermes operator](guides/hermes-operator.md) documents the managed plugin,

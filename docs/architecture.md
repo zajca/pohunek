@@ -1170,7 +1170,7 @@ and uninstall in `crates/daemon/src/session/package_lifecycle/`.
 |---|---|---|
 | Official package | A signed release catalog entry that binds package id, runtime id, version and archive digest, verified against `runtime-catalog-anchor.json` beside `pohunekd` (`crates/package/src/catalog.rs`, `crates/daemon/src/catalog_anchor.rs`, `package_lifecycle/trust.rs`). | Shipped. Each Linux daemon archive carries the Pi, Codex, Claude Code and Hermes packages and the catalog under `runtime/`. Only an official package may serve the reserved ids `codex`, `claude` and `hermes` (`crates/daemon/src/agent/host/claim.rs`); `shell` is never claimable. |
 | Third-party package | The archive digest the owner supplies (`--sha256`). `plugin link` copies a developer directory and installs it disabled. | Shipped. Never serves a reserved id. |
-| Workflow plugin | The archive digest the owner supplies (`pohunek workflow install --sha256`). Not a runtime package: the archive carries `workflow.toml` and never `runtime.toml`. | In progress ([#148](https://github.com/zajca/pohunek/issues/148)). Shipped: the CLI-owned store `<state>/pohunek/workflow-plugins/` (a package registry of its own, never read by the daemon), the strict manifest and the consent install (`crates/cli/src/workflow/`, `crates/cli/src/commands/workflow.rs`). Running actions, event reactions, jobs and services are not yet available. A plugin is an external command that runs as the owner and calls the public CLI or SDK. The v1 boundary ([#480](https://github.com/zajca/pohunek/issues/480)) gives core no channel or record for plugin data and no launch-time policy hook; a launch still names one concrete, locally approved profile. |
+| Workflow plugin | The archive digest the owner supplies (`pohunek workflow install --sha256`). Not a runtime package: the archive carries `workflow.toml` and never `runtime.toml`. | In progress ([#148](https://github.com/zajca/pohunek/issues/148)). Shipped: the CLI-owned store `<state>/pohunek/workflow-plugins/` (a package registry of its own, never read by the daemon), the strict manifest, the consent install, and `pohunek workflow run`, which runs one action without a shell under the owner limits of `<config>/pohunek/workflow.toml` with a minimal environment that keeps the complete session origin pair, and logs a content-free record per run (`crates/cli/src/workflow/`, `crates/cli/src/commands/workflow.rs`). Event reactions, jobs, services and `--json` runs are not yet available. A plugin is an external command that runs as the owner and calls the public CLI or SDK. The v1 boundary ([#480](https://github.com/zajca/pohunek/issues/480)) gives core no channel or record for plugin data and no launch-time policy hook; a launch still names one concrete, locally approved profile. |
 | Daemon, overlay, session worker or GUI extension | None. | Unsupported. Protocol methods, overlay providers, worker behavior and GUI code stay compiled and audited in core or in the client that owns them. |
 
 Trust boundary:
@@ -1200,6 +1200,9 @@ Trust boundary:
   The digest proves which bytes the owner approved; plugin code runs with the
   owner's full authority and may use every public owner API, as any same-UID
   process can. No daemon, worker, protocol or event surface knows about them.
+  `pohunek workflow run` gives an action a minimal environment that keeps the
+  complete session origin pair, so `plugin_self_target_denied` still covers an
+  action run inside a managed session; a single marker refuses the run.
 - **Remote and relay launches select approved profiles.** A relay-origin launch
   names only a locally approved profile at its approved revision
   (`LaunchSource::RelayProfile` in `crates/daemon/src/agent/host/source.rs`),

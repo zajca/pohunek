@@ -5,9 +5,16 @@
 //! Install follows the `pohunek plugin` consent pattern: the CLI verifies the
 //! archive against the owner's digest, prints what the plugin declares, and
 //! installs nothing until the owner repeats the command with `--yes`.
+//!
+//! `run` exits with the action's own status (128 plus the signal number when
+//! a signal ended it). A run the CLI stopped exits with
+//! [`TIMEOUT_EXIT_CODE`], [`OUTPUT_LIMIT_EXIT_CODE`], or 128 plus the
+//! signal number for a terminating signal the CLI received; a refusal exits
+//! with status 1 like every other failed command.
 
 // Rust guideline compliant 2026-10-13
 
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -22,8 +29,21 @@ use crate::error::CliError;
 use crate::paths::Paths;
 use crate::target::is_local_host;
 use crate::workflow::manifest::{Action as Declared, ArgsMode, Manifest};
+use crate::workflow::runner::{run_action, Invocation};
 use crate::workflow::store::{read_candidate, Candidate, Purged, Recorded, Store};
-use crate::workflow::Error;
+use crate::workflow::{config, Error};
+
+/// Exit status of a run stopped at its deadline: the status GNU `timeout`
+/// uses, so scripts already treat it as a time-out.
+pub(crate) const TIMEOUT_EXIT_CODE: u8 = 124;
+
+/// Exit status of a run stopped because an output stream passed its cap:
+/// the status after [`TIMEOUT_EXIT_CODE`], which no shell convention claims
+/// for a command's own failure.
+pub(crate) const OUTPUT_LIMIT_EXIT_CODE: u8 = 125;
+
+/// Offset POSIX shells add to a signal number in an exit status.
+const SIGNAL_EXIT_BASE: i32 = 128;
 
 /// `pohunek workflow` subcommands.
 #[derive(Debug, Subcommand)]
@@ -75,6 +95,25 @@ pub(crate) enum Action {
         json: bool,
     },
 
+    /// Run one action of an installed, enabled workflow plugin.
+    ///
+    /// The plugin's files are verified first. The action runs without a
+    /// shell, in the plugin's files directory, with a minimal environment
+    /// and the owner limits of `workflow.toml`; its stdout and stderr stream
+    /// here. Exits with the action's status.
+    Run {
+        /// Plugin id.
+        #[arg(value_name = "PLUGIN")]
+        plugin: PackageId,
+        /// Action name, as shown by `pohunek workflow inspect`.
+        #[arg(value_name = "ACTION")]
+        action: String,
+        /// Extra arguments after `--`, passed verbatim to an action that
+        /// declares `args = "passthrough"`.
+        #[arg(last = true, value_name = "ARGS")]
+        args: Vec<OsString>,
+    },
+
     /// Remove an installed plugin.
     ///
     /// The plugin's state and config directories are kept unless `--purge`
@@ -107,6 +146,7 @@ impl Action {
             | Self::Disable { json, .. }
             | Self::Uninstall { json, .. } => *json,
             Self::Install(args) => args.json,
+            Self::Run { .. } => false,
         }
     }
 }
@@ -227,7 +267,9 @@ pub(crate) fn run(action: Action, host: &str) -> Result<ExitCode, CliError> {
         }
         .into());
     }
-    let store = Store::new(Paths::workflow_dirs()?);
+    let dirs = Paths::workflow_dirs()?;
+    let knobs_path = dirs.knobs.clone();
+    let store = Store::new(dirs);
     match action {
         Action::List { json } => {
             let result = Listed {
@@ -244,6 +286,19 @@ pub(crate) fn run(action: Action, host: &str) -> Result<ExitCode, CliError> {
             print_output(json, &result, || render_inspect(&result))?;
         }
         Action::Install(args) => install(&store, &args)?,
+        Action::Run {
+            plugin,
+            action,
+            args,
+        } => {
+            let knobs = config::load(&knobs_path)?;
+            let invocation = Invocation {
+                plugin: &plugin,
+                action: &action,
+                args: &args,
+            };
+            return run_exit(run_action(&store, &knobs, &invocation));
+        }
         Action::Enable { plugin, json } => set_enabled(&store, &plugin, true, json)?,
         Action::Disable { plugin, json } => set_enabled(&store, &plugin, false, json)?,
         Action::Uninstall {
@@ -268,6 +323,25 @@ pub(crate) fn run(action: Action, host: &str) -> Result<ExitCode, CliError> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The exit status of `workflow run`; a run the CLI stopped is reported here,
+/// with its own status, and every other failure goes to the shared error sink.
+fn run_exit(result: Result<std::process::ExitStatus, Error>) -> Result<ExitCode, CliError> {
+    let error = match result {
+        Ok(status) => return Ok(ExitCode::from(crate::service::exit_code(status))),
+        Err(error) => error,
+    };
+    let code = match &error {
+        Error::ActionTimeout { .. } => TIMEOUT_EXIT_CODE,
+        Error::OutputLimit { .. } => OUTPUT_LIMIT_EXIT_CODE,
+        Error::Interrupted { signal, .. } => {
+            u8::try_from(SIGNAL_EXIT_BASE + signal).unwrap_or(u8::MAX)
+        }
+        _ => return Err(error.into()),
+    };
+    crate::error::render(&error.into(), false);
+    Ok(ExitCode::from(code))
 }
 
 fn set_enabled(store: &Store, id: &PackageId, enabled: bool, json: bool) -> Result<(), CliError> {

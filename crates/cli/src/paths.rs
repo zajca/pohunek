@@ -83,6 +83,7 @@ impl Paths {
             root: state.join(pohunek_paths::WORKFLOW_PLUGINS_SUBDIR),
             state: state.join(pohunek_paths::WORKFLOW_PLUGIN_STATE_SUBDIR),
             config: config.join(pohunek_paths::WORKFLOW_PLUGIN_CONFIG_SUBDIR),
+            knobs: config.join(crate::workflow::config::FILE_NAME),
         };
         let named = [
             ("store", &dirs.root),
@@ -172,6 +173,8 @@ pub(crate) struct WorkflowDirs {
     pub(crate) state: PathBuf,
     /// `<config>/pohunek/workflow-plugin-config`.
     pub(crate) config: PathBuf,
+    /// `<config>/pohunek/workflow.toml`, the owner's run limits.
+    pub(crate) knobs: PathBuf,
 }
 
 fn path_error(err: pohunek_paths::PathError) -> CliError {

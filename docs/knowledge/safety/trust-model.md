@@ -142,7 +142,14 @@ The assistant must:
   plugin can read the owner's files and use every public owner API, as any
   same-UID process can. Show the owner the review `pohunek workflow install`
   prints, pass `--yes` only after the owner approved it, and never describe a
-  plugin as sandboxed.
+  plugin as sandboxed. `pohunek workflow run` forwards the complete
+  `POHUNEK_SESSION_ID`/`POHUNEK_DAEMON_ID` pair to the action, so an action run
+  from inside a managed session is still refused `plugin_self_target_denied`
+  against that session. Never unset or change either marker to get around
+  it; a single marker refuses the run with `workflow_origin_incomplete`, and
+  the fix is to restore the missing marker, not to drop the other. Its environment
+  holds no `PATH`, token or worker variable, and its run log holds no argv,
+  environment, context or output bytes.
 
 The assistant may write host or repo configuration when that is the requested
 task, but it must stay inside the user's requested scope and respect the
