@@ -17,7 +17,7 @@ mod workflow_scenarios;
 mod workflow_units;
 
 use pohunek_test_support::wait::wait_until;
-use workflow_units::{native, Managed, Plugin, RuntimeRoot, KNOBS};
+use workflow_units::{native, variable_names, Managed, Plugin, RuntimeRoot, KNOBS};
 
 macro_rules! launchd_scenario {
     ($name:ident) => {
@@ -64,7 +64,8 @@ impl Drop for ManagerVariable {
 /// not refuse the runs of an installation that uses the macOS default
 /// runtime root: the units do not pin that variable, and the trampoline
 /// resolves the recorded default root instead, so the first job run is
-/// recorded as completed.
+/// recorded as completed, and the job's own environment does not carry the
+/// variable either, so its `POHUNEK_CLI` reaches the same installation.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_inherited_runtime_dir_does_not_refuse_runs_of_the_default_root() {
     let mut managed = Managed::with_runtime(KNOBS, RuntimeRoot::PlatformDefault);
@@ -76,14 +77,19 @@ async fn an_inherited_runtime_dir_does_not_refuse_runs_of_the_default_root() {
         .expect("a UTF-8 runtime directory")
         .to_owned();
     let _variable = ManagerVariable::set("XDG_RUNTIME_DIR", &conflicting);
-    let plugin = Plugin::new("acme.runtime").job("tick", "tick", 1);
+    let plugin = Plugin::new("acme.runtime").job("env", "env", 3600);
     let id = plugin.id.clone();
     managed.enable(&plugin).await;
 
     wait_until("the first job run", || async {
-        (!managed.units.unit_records(&id, "job", "tick").is_empty()).then_some(())
+        (!managed.units.unit_records(&id, "job", "env").is_empty()).then_some(())
     })
     .await;
-    let records = managed.units.unit_records(&id, "job", "tick");
+    let records = managed.units.unit_records(&id, "job", "env");
     assert_eq!(records[0]["outcome"], "ok", "{records:?}");
+    let environment = managed.units.environment(&id);
+    assert!(
+        !variable_names(&environment).contains(&"XDG_RUNTIME_DIR".to_owned()),
+        "the inherited runtime directory reached the job: {environment:?}"
+    );
 }

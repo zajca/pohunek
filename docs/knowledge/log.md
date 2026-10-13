@@ -72,8 +72,9 @@
   record of a manifest at its size limit with short service names is read.
 - On macOS, `__exec` ignores an inherited `XDG_RUNTIME_DIR` when the
   installation records the default runtime root
-  (`/private/tmp/pohunek-<uid>`); before, every run of such an installation was
-  refused after `launchctl setenv XDG_RUNTIME_DIR`.
+  (`/private/tmp/pohunek-<uid>`), and leaves it out of the run's environment;
+  before, every run of such an installation was refused after
+  `launchctl setenv XDG_RUNTIME_DIR`.
 - Known limit on macOS: when `__exec` itself is killed with `SIGKILL`, the
   run's process group can survive the unit; a later start can run alongside it
   and `disable` and `uninstall` do not find it. The guide documents it; a

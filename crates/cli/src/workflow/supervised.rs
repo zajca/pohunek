@@ -273,8 +273,8 @@ fn run(request: &Request, store: &Store, knobs: &Knobs, interrupts: &mut Interru
         );
         Status::Refused
     };
-    let cli = match installed_cli() {
-        Ok(cli) => cli,
+    let (cli, runtime_dir_ignored) = match installed_cli() {
+        Ok(found) => found,
         Err(error) => return refuse(&mut run, &error),
     };
     let unit = Supervised {
@@ -282,6 +282,7 @@ fn run(request: &Request, store: &Store, knobs: &Knobs, interrupts: &mut Interru
         name: &request.name,
         digest: &request.digest,
         cli: &cli,
+        runtime_dir_ignored,
     };
     // Refused from this snapshot, on a path that never starts anything; the
     // unit's lock, schedule and backoff belong to the installed archive and
@@ -362,12 +363,14 @@ fn save_backoff(
     }
 }
 
-/// The installed `<prefix>/bin/pohunek` of a verified service installation.
-fn installed_cli() -> Result<PathBuf, Error> {
+/// The installed `<prefix>/bin/pohunek` of a verified service installation,
+/// and whether an inherited `XDG_RUNTIME_DIR` was ignored to find it (see
+/// [`trampoline_paths`]).
+fn installed_cli() -> Result<(PathBuf, bool), Error> {
     let uid = nix::unistd::Uid::effective().as_raw();
-    let paths = trampoline_paths(uid)?;
+    let (paths, ignored) = trampoline_paths(uid)?;
     installation_at(&paths, uid)?
-        .map(|installation| installation.cli)
+        .map(|installation| (installation.cli, ignored))
         .ok_or_else(|| Error::ServiceNotInstalled {
             reason: "no service.toml exists".to_owned(),
         })
@@ -379,10 +382,11 @@ fn installed_cli() -> Result<PathBuf, Error> {
 /// root except `XDG_RUNTIME_DIR` when the installation uses the macOS default
 /// runtime root. On macOS, a set `XDG_RUNTIME_DIR` is therefore ignored when
 /// the recorded installation names that default root for this uid, so the
-/// trampoline finds the installation it was installed into. Any other case
-/// resolves as the environment says, and a mismatch is refused by
-/// `installation_at`.
-fn trampoline_paths(uid: u32) -> Result<BasePaths, Error> {
+/// trampoline finds the installation it was installed into, and the returned
+/// flag is set so the variable is not forwarded to the run's child either.
+/// Any other case resolves as the environment says, and a mismatch is refused
+/// by `installation_at`.
+fn trampoline_paths(uid: u32) -> Result<(BasePaths, bool), Error> {
     let not_installed = |reason: String| Error::ServiceNotInstalled { reason };
     let platform = Platform::current().map_err(|error| not_installed(error.to_string()))?;
     let env = PathEnv::capture();
@@ -390,7 +394,7 @@ fn trampoline_paths(uid: u32) -> Result<BasePaths, Error> {
         BasePaths::resolve_for(platform, uid, env).map_err(|error| not_installed(error.to_string()))
     };
     if platform != Platform::MacOs || env.xdg_runtime_dir.is_none() {
-        return resolve(&env);
+        return Ok((resolve(&env)?, false));
     }
     // The config root does not depend on the runtime root, so the recorded
     // file is found through the default paths. An inherited variable that
@@ -406,9 +410,9 @@ fn trampoline_paths(uid: u32) -> Result<BasePaths, Error> {
         source.config.uid() == uid && source.config.runtime_root() == default.runtime_dir
     });
     if recorded_default {
-        Ok(default)
+        Ok((default, true))
     } else {
-        resolve(&env)
+        Ok((resolve(&env)?, false))
     }
 }
 

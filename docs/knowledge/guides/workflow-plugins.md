@@ -540,7 +540,8 @@ set-environment`, `launchctl setenv`) and any inherited `POHUNEK_SOCKET_PATH`,
 On macOS, an `XDG_RUNTIME_DIR` that `launchctl setenv` puts into the agent's
 environment is ignored by `__exec` when the installation uses the default
 runtime root (`/private/tmp/pohunek-<uid>`), because the units do not pin
-that variable. Any other installation resolves the variable as set, and a
+that variable, and the job or service does not get it either, so its
+`POHUNEK_CLI` reaches the same installation. Any other installation resolves the variable as set, and a
 runtime root that does not match the recorded one refuses every run.
 
 A stop request (`SIGTERM`, `SIGINT` or `SIGHUP`) to `__exec` stops the run's

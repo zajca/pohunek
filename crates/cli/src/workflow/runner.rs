@@ -173,6 +173,10 @@ pub(crate) struct Supervised<'a> {
     /// The installed `<prefix>/bin/pohunek`, given to the child as
     /// `POHUNEK_CLI`.
     pub(crate) cli: &'a Path,
+    /// Whether the trampoline ignored an inherited `XDG_RUNTIME_DIR` to find
+    /// the installation; the child then does not get it either, so its
+    /// `POHUNEK_CLI` reaches the same installation.
+    pub(crate) runtime_dir_ignored: bool,
 }
 
 /// One `workflow run` request.
@@ -201,6 +205,8 @@ struct Prepared {
     origin: Option<(OsString, OsString)>,
     /// `POHUNEK_CLI`; `None` names the running executable.
     cli: Option<PathBuf>,
+    /// Whether `XDG_RUNTIME_DIR` is left out of the child's environment.
+    omit_runtime_dir: bool,
 }
 
 /// The run log and the facts every record of this run shares.
@@ -476,6 +482,7 @@ fn prepare(
         context,
         origin,
         cli: None,
+        omit_runtime_dir: false,
     })
 }
 
@@ -639,6 +646,7 @@ fn prepare_unit(
         // markers are never forwarded.
         origin: None,
         cli: Some(unit.cli.to_path_buf()),
+        omit_runtime_dir: unit.runtime_dir_ignored,
     })
 }
 
@@ -665,6 +673,9 @@ fn build_environment(
 ) {
     command.env_clear();
     for key in BOOTSTRAP_ENV_ALLOWLIST {
+        if prepared.omit_runtime_dir && key == pohunek_paths::XDG_RUNTIME_DIR {
+            continue;
+        }
         if let Some(value) = std::env::var_os(key) {
             command.env(key, value);
         }
