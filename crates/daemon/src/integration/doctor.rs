@@ -255,6 +255,24 @@ fn socket_findings_for_process() -> Vec<IntegrationFinding> {
     }
 }
 
+/// The remediation of a config home that several runtimes reach through one
+/// handler: nothing in the home is wrong, so the fix is to address one runtime
+/// by name or to give the runtimes different homes.
+fn ambiguous_owner_remediation(agent_label: &str) -> String {
+    format!(
+        "the config home is reached by several runtimes through the same integration handler, so a request without --agent acts for none of them: run `pohunek integration install --agent {agent_label}` (or status, doctor or uninstall with `--agent {agent_label}`) to act for {agent_label}, or give the runtimes different config homes (the variable each descriptor declares, set in a host profile's [env])"
+    )
+}
+
+/// Whether `finding` is a config home that several runtimes reach through one
+/// handler: it is classified `config_root_invalid` like an unresolvable home,
+/// but nothing in the home is malformed or unsafe.
+#[must_use]
+pub(crate) fn is_ambiguous_owner(finding: &IntegrationFinding) -> bool {
+    finding.code == IntegrationFindingCode::ConfigRootInvalid
+        && super::is_ambiguous_owner_warning(&finding.summary)
+}
+
 /// Maps one status warning to its cause and remediation.
 pub(super) fn classify_warning(
     warning: &str,
@@ -271,7 +289,12 @@ pub(super) fn classify_warning(
     } else {
         install.clone()
     };
-    let (code, remediation) = if warning.contains("config path is not a directory")
+    let (code, remediation) = if super::is_ambiguous_owner_warning(warning) {
+        (
+            IntegrationFindingCode::ConfigRootInvalid,
+            ambiguous_owner_remediation(agent_label),
+        )
+    } else if warning.contains("config path is not a directory")
         || warning.contains("config path is a symlink")
         || warning.contains("config directory failed trusted filesystem validation")
         || warning.contains("config directory could not be")

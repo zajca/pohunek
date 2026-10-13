@@ -372,21 +372,31 @@ fn integration_agent_check(diagnosis: &protocol::IntegrationAgentDoctor) -> Doct
     let repair_required = diagnosis.status.as_ref().is_some_and(|status| {
         status.recovery == protocol::IntegrationRecovery::RepairConfiguration
     });
+    let ambiguous_owner = diagnosis
+        .findings
+        .iter()
+        .any(crate::integration::is_ambiguous_owner);
     let has_security_or_malformed_finding = diagnosis.findings.iter().any(|finding| {
-        matches!(
-            finding.code,
-            IntegrationFindingCode::ConfigRootInvalid
-                | IntegrationFindingCode::ProviderConfigInvalid
-                | IntegrationFindingCode::HookSocketPathInvalid
-                | IntegrationFindingCode::UnsafeInstallerLock
-                | IntegrationFindingCode::DisplacedOriginalLeftBehind
-                | IntegrationFindingCode::QuarantineScanIncomplete
-        ) || (finding.code == IntegrationFindingCode::AssetUnsafe && repair_required)
+        !crate::integration::is_ambiguous_owner(finding)
+            && matches!(
+                finding.code,
+                IntegrationFindingCode::ConfigRootInvalid
+                    | IntegrationFindingCode::ProviderConfigInvalid
+                    | IntegrationFindingCode::HookSocketPathInvalid
+                    | IntegrationFindingCode::UnsafeInstallerLock
+                    | IntegrationFindingCode::DisplacedOriginalLeftBehind
+                    | IntegrationFindingCode::QuarantineScanIncomplete
+            )
+            || (finding.code == IntegrationFindingCode::AssetUnsafe && repair_required)
     });
     let (status, detail) = match &diagnosis.status {
         None => (
             DoctorStatus::Warn,
             "Integration inspection is busy; retry doctor after the current install or uninstall finishes.".to_owned(),
+        ),
+        Some(_) if ambiguous_owner && !has_security_or_malformed_finding => (
+            DoctorStatus::Warn,
+            format!("The config home is reached by several runtimes through the same integration handler, so it is attributed to none of them; name the runtime with `--agent {runtime}` (for example `{recovery}`) or give the runtimes different config homes."),
         ),
         Some(_) if has_security_or_malformed_finding => (
             DoctorStatus::Fail,

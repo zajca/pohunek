@@ -254,7 +254,7 @@ const RULES: &[Rule] = &[
     rule(
         Pattern::Dir("runtime-packages"),
         Effect::Packages(&["pohunek-cli"]),
-        "official runtime package sources built and parsed by pohunek-cli's pi_package, pi_frame_properties, codex_package, claude_package, hermes_package and hermes_integration tests; the Claude test also reads the built-in Claude files the daemon embeds",
+        "official runtime package sources built and parsed by pohunek-cli's pi_package, pi_frame_properties, codex_package, claude_package, hermes_package and hermes_integration tests",
     ),
     rule(
         Pattern::Dir("runtime-packages/hermes"),

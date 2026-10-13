@@ -703,7 +703,7 @@ enum IntegrationAction {
     Doctor {
         /// Restrict the diagnosis; Hermes requires an explicit local target.
         /// Without `--agent`, diagnoses every installed runtime whose hooks the
-        /// daemon manages (Codex once its package is installed, and Claude).
+        /// daemon manages (Codex and Claude once their packages are installed).
         #[arg(long, value_parser = commands::integration::hook_agent_parser(), requires_if("hermes", HERMES_TARGET_GROUP))]
         agent: Option<commands::integration::HookAgentArg>,
         #[command(flatten)]
@@ -1080,7 +1080,7 @@ enum DaemonAction {
 enum SessionAction {
     /// Start a new session.
     New {
-        /// Agent name to start: an installed runtime (`shell`, `claude`, `hermes`, or a package runtime such as `codex`) or a host
+        /// Agent name to start: an installed runtime (`shell`, `hermes`, or a package runtime such as `codex` or `claude`) or a host
         /// profile, resolved daemon-side on the target host.
         #[arg(long, default_value = "shell")]
         agent: String,

@@ -1,6 +1,7 @@
 //! Background-work snapshot through the public daemon protocol (#890 S2).
 //!
-//! A real worker runs a fake Claude agent whose state hook is the installed
+//! A real worker runs a fake Claude agent, launched from the official Claude
+//! package the daemon serves `claude` from, whose state hook is the installed
 //! integration. The agent reports its `SessionStart` and each turn end through
 //! that hook, so the daemon sees the snapshot only through the worker's inspect
 //! poll. The scenarios read it back through `session.inspect`, `session.list`
@@ -25,6 +26,8 @@ use serde_json::{json, Value};
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LinesCodec};
 
+#[path = "../../daemon/tests/support/official_runtimes.rs"]
+mod official_runtimes;
 #[path = "support/plugin_harness.rs"]
 mod plugin_harness;
 
@@ -79,7 +82,8 @@ const PREVIOUS_VERSION: u32 = 3;
 
 /// The fake agent. It runs the installed state hook as its direct child for
 /// each `hook:<action>:<fixture>` line, feeding it the named fixture file, and
-/// exits on `quit`. The hook's `$PPID` is therefore this agent.
+/// exits on `quit`. The hook's `$PPID` is therefore this agent. The answer to
+/// the package's version probe precedes it.
 const FAKE_AGENT: &str = r#"set -u
 : "${FAKE_AGENT_DIR:?}" "${FAKE_AGENT_HOOKS:?}"
 umask 077
@@ -122,6 +126,22 @@ const STOP_TWO: &str = r#"{"hook_event_name":"Stop","session_id":"native-backgro
 /// Events a collector has read from one stream, in arrival order.
 type Collected = Arc<Mutex<Vec<Value>>>;
 
+/// Starts a daemon (with durable session records when `durable`) that serves
+/// `claude` from the official package, its only source, installed through a
+/// catalog signed by a throwaway key the daemon trusts.
+async fn start_serving_claude(durable: bool) -> Harness {
+    let catalog = official_runtimes::OfficialCatalog::new();
+    let harness = if durable {
+        Harness::start_durable_with_trust(catalog.trust()).await
+    } else {
+        Harness::start_with_trust(catalog.trust()).await
+    };
+    let scratch = harness.env.root().join("official-packages");
+    fs::create_dir_all(&scratch).expect("create the package scratch directory");
+    catalog.install(&harness.sessions, &scratch).await;
+    harness
+}
+
 /// Writes the fake agent, its interpreter copy and its fixtures under the
 /// hermetic root, installs the Claude state hook into the profile's config
 /// home, and starts a session of the profile that has reported its identity.
@@ -143,7 +163,11 @@ async fn start_agent_session(harness: &Harness) -> (String, PathBuf) {
     let script = agent_dir.join("fake-claude.sh");
     fs::write(
         &script,
-        format!("#!{}\n{FAKE_AGENT}", interpreter.display()),
+        format!(
+            "#!{}\n{}{FAKE_AGENT}",
+            interpreter.display(),
+            official_runtimes::sh_version_answer("claude")
+        ),
     )
     .expect("write the fake agent");
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("agent mode");
@@ -157,8 +181,9 @@ async fn start_agent_session(harness: &Harness) -> (String, PathBuf) {
     harness.profile(
         PROFILE,
         &format!(
-            "base = \"claude\"\nprogram = \"{}\"\n\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n\
+            "base = \"claude\"\n{}program = \"{}\"\n\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n\
              FAKE_AGENT_DIR = \"{}\"\nFAKE_AGENT_HOOKS = \"{}\"\n\n[input_rules]\nbracketed_paste = false\n",
+            official_runtimes::profile_pin("claude"),
             script.display(),
             config_dir.display(),
             agent_dir.display(),
@@ -356,7 +381,7 @@ fn assert_sinks_hold_no_secret(root: &Path) {
 
 #[tokio::test]
 async fn a_turn_end_snapshot_is_listed_and_streamed_for_the_live_runtime() {
-    let harness = Harness::start_durable().await;
+    let harness = start_serving_claude(true).await;
     let collected = subscribe(&harness).await;
     let (id, _) = start_agent_session(&harness).await;
 
@@ -456,7 +481,7 @@ fn revision(background: &Value) -> u64 {
 
 #[tokio::test]
 async fn a_changed_task_set_gives_a_new_revision_and_keeps_first_seen() {
-    let harness = Harness::start().await;
+    let harness = start_serving_claude(false).await;
     let collected = subscribe(&harness).await;
     let (id, _) = start_agent_session(&harness).await;
 
@@ -512,7 +537,7 @@ async fn a_changed_task_set_gives_a_new_revision_and_keeps_first_seen() {
 
 #[tokio::test]
 async fn ending_the_agent_clears_the_background_and_publishes_null() {
-    let harness = Harness::start().await;
+    let harness = start_serving_claude(false).await;
     let collected = subscribe(&harness).await;
     let (id, _) = start_agent_session(&harness).await;
 
@@ -591,7 +616,7 @@ async fn exchange(client: &mut Framed<UnixStream, LinesCodec>, line: &str) -> Va
 
 #[tokio::test]
 async fn a_protocol_3_subscriber_never_receives_background_state_or_the_key() {
-    let harness = Harness::start().await;
+    let harness = start_serving_claude(false).await;
     let current = subscribe(&harness).await;
 
     let mut previous_stream = connect_previous(&harness.socket()).await;
@@ -722,7 +747,7 @@ async fn worker_pid(harness: &Harness, id: &str) -> u32 {
 /// the background it held, and publish that clear for the runtime it held.
 #[tokio::test]
 async fn a_killed_worker_clears_the_background_it_held() {
-    let harness = Harness::start().await;
+    let harness = start_serving_claude(false).await;
     let collected = subscribe(&harness).await;
     let (id, _) = start_agent_session(&harness).await;
 
@@ -775,7 +800,7 @@ async fn a_killed_worker_clears_the_background_it_held() {
 /// still holds.
 #[tokio::test]
 async fn a_restarted_daemon_shows_the_background_its_live_worker_holds() {
-    let harness = Harness::start_durable().await;
+    let harness = start_serving_claude(true).await;
     let (id, _) = start_agent_session(&harness).await;
 
     send_hook(&harness, &id, "stop:stop-one").await;
@@ -802,7 +827,7 @@ async fn a_restarted_daemon_shows_the_background_its_live_worker_holds() {
 /// next daemon reconciles it.
 #[tokio::test]
 async fn a_worker_lost_while_the_daemon_is_down_leaves_no_background() {
-    let harness = Harness::start_durable().await;
+    let harness = start_serving_claude(true).await;
     let (id, _) = start_agent_session(&harness).await;
 
     send_hook(&harness, &id, "stop:stop-one").await;

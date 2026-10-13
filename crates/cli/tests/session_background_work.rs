@@ -11,6 +11,8 @@
 
 #[path = "support/background_host.rs"]
 mod background_host;
+#[path = "../../daemon/tests/support/official_runtimes.rs"]
+mod official_runtimes;
 
 use std::fs;
 use std::path::Path;

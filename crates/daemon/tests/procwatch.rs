@@ -427,19 +427,19 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
     let _ = registry.stop(&created.id).await;
 }
 
-/// A foreground `codex` in a shell session is attributed only through the
-/// detection manifest of an installed runtime: the daemon ships no Codex, so
-/// on a host without the official package the process stays unattributed.
-#[tokio::test]
-async fn procwatch_leaves_a_foreground_codex_unattributed_without_the_official_package() {
+/// A foreground `agent` in a shell session is attributed only through the
+/// detection manifest of an installed runtime: the daemon ships no built-in
+/// `agent`, so on a host without the official package the process stays
+/// unattributed.
+async fn assert_foreground_agent_unattributed_without_the_official_package(agent: &str) {
     let env = TestEnv::new().expect("create the test environment");
     let dir = env.cwd();
-    let fake_codex = dir.join("codex");
+    let fake_agent = dir.join(agent);
     let pid_file = dir.join("agent.pid");
-    symlink_sleep_as(&fake_codex);
+    symlink_sleep_as(&fake_agent);
     let script = format!(
         "{} {SHELL_LINGER_SECS} & echo $! > {}; wait $!",
-        fake_codex.display(),
+        fake_agent.display(),
         pid_file.display()
     );
     let inspector = PollBlindInspector::new();
@@ -458,7 +458,7 @@ async fn procwatch_leaves_a_foreground_codex_unattributed_without_the_official_p
         let _process_env = without_pohunek_markers();
         registry
             .create(SessionNewParams {
-                name: Some("procwatch-unserved-codex".to_owned()),
+                name: Some(format!("procwatch-unserved-{agent}")),
                 agent: "shell".to_owned(),
                 cwd: Some(dir.to_path_buf()),
                 cols: TEST_COLS,
@@ -489,12 +489,22 @@ async fn procwatch_leaves_a_foreground_codex_unattributed_without_the_official_p
         .expect("inspect session");
     assert!(
         fs::metadata(format!("/proc/{child_pid}")).is_ok(),
-        "the fake codex stayed live across the scan"
+        "the fake {agent} stayed live across the scan"
     );
     assert_eq!(scanned.active_agent_pid, None, "{scanned:?}");
     assert_eq!(scanned.active_agent, None, "{scanned:?}");
     assert_eq!(scanned.active_agent_base, None, "{scanned:?}");
     let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn procwatch_leaves_a_foreground_codex_unattributed_without_the_official_package() {
+    assert_foreground_agent_unattributed_without_the_official_package("codex").await;
+}
+
+#[tokio::test]
+async fn procwatch_leaves_a_foreground_claude_unattributed_without_the_official_package() {
+    assert_foreground_agent_unattributed_without_the_official_package("claude").await;
 }
 
 #[tokio::test]

@@ -69,7 +69,9 @@ assets with the ones the new daemon embeds:
    when any asset is outdated. An asset is outdated when its version marker
    differs from the expected one and also when its bytes differ from the
    embedded script at the same version, reported as `asset_modified` with the
-   install command as remediation.
+   install command as remediation. Without `--agent` it covers only the
+   runtimes the daemon serves, so run it with `--agent claude` or `--agent
+   codex` on a host where that package is not installed.
 2. Reinstall each agent it names: `pohunek integration install --agent claude`
    and `--agent codex` (with the same `--profile` or `--all-profiles` selector).
    The install replaces the managed files atomically and keeps unrelated user
@@ -591,8 +593,9 @@ the upgrade is not what ends it.
   else stands in and no command rebinds the session. Finish the work in the
   live session, then continue in a new one with `pohunek session new --agent
   <runtime>` (the `detail` names the runtime), or accept the loss. When the
-  session's runtime resolves nowhere on the new binary (the built-in Codex
-  without the official package, or a package that is not installed), the
+  session's runtime resolves nowhere on the new binary (the built-in Codex or
+  Claude Code without the official package, or a package that is not
+  installed), the
   session is reported this way even if it cannot resume, because every
   interaction with it (input, attach, resize, rename, metadata) would be
   refused too: install the runtime first (the `detail` names the official
@@ -657,16 +660,21 @@ upgrading:
    Sessions launched from the built-in keep running; finish their work before
    the upgrade, or accept losing their native recovery.
 
-   A release that compiles no Codex in (every release after 0.34.x) serves
-   `codex` only from its package. A live Codex session launched from the
-   built-in is adopted, but resume and fork are refused, and without an
-   installed Codex package every interaction with it (input, attach, resize,
-   rename, metadata) is refused too, whether or not it could resume
-   (`runtime_builtin_removed`; the preflight reports it at risk and its detail
-   says so). Installing the package in step 1 keeps such a session usable after
-   the upgrade. On a host that keeps no Codex (macOS has no package yet), the
-   hooks pohunek installed into `~/.codex` stay removable after the upgrade
-   with `pohunek integration uninstall --agent codex`, which needs no package.
+   A release that compiles neither Codex nor Claude Code in (every release
+   after 0.34.x) serves `codex` and `claude` only from their packages. A live
+   Codex or Claude session launched from the built-in is adopted, but resume
+   and fork are refused, and without the installed package every interaction
+   with it (input, attach, resize, rename, metadata) is refused too, whether or
+   not it could resume (`runtime_builtin_removed`; the preflight reports it at
+   risk and its detail says so). Installing the package in step 1 keeps such a
+   session usable after the upgrade. On a host that keeps no Codex or Claude
+   Code (macOS has no package yet, #929), the hooks pohunek installed into
+   `~/.codex` or `~/.claude` stay removable after the upgrade with
+   `pohunek integration uninstall --agent codex` or
+   `pohunek integration uninstall --agent claude`, which need no package.
+   After the upgrade, install the hooks again only after the package:
+   `pohunek integration install --agent claude` (or `codex`) is refused while
+   no package serves the runtime.
 4. Run `pohunek service check` with the new release's binaries: the sessions
    launched from the package are `adoptable`.
 

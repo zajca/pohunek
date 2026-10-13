@@ -429,6 +429,7 @@ async fn stale_refused_socket_without_job_recovers_but_silent_job_stays_conflict
     // A live journal and the record's exact generation must survive the
     // outage. Give that real session a native binding so this test can prove
     // that reconciliation leaves `session.resume` usable.
+    fixture.install_claude_package().await;
     let runtime = fixture.record(&lost).expect("durable session").runtime;
     fixture.seed_record(&lost, runtime);
     assert!(fixture
@@ -680,6 +681,7 @@ async fn foreign_malformed_stale_and_incompatible_inputs_fail_closed() {
     .await;
     let mut runtime = fixture.runtime_record(&incompatible, RuntimeState::Live);
     runtime.worker_id = Some("w-incompatible".to_owned());
+    fixture.install_claude_package().await;
     fixture.seed_record(incompatible.session_id(), runtime);
     let peer = IncompatiblePeer::bind(&fixture, incompatible.session_id());
 
@@ -941,6 +943,7 @@ async fn unavailable_manager_kills_nothing_until_it_answers_again() {
 async fn repeated_start_stop_recover_cycles_leave_no_orphans() {
     let fixture = Installation::new(Settings::default()).await;
     let recovered = "s-5000";
+    fixture.install_claude_package().await;
     fixture.seed_record(
         recovered,
         pohunek_daemon::store::RuntimeRecord {

@@ -17,6 +17,8 @@
 #[cfg_attr(target_os = "linux", path = "linux.rs")]
 #[cfg_attr(target_os = "macos", path = "macos.rs")]
 pub(crate) mod backend;
+#[path = "../support/official_runtimes.rs"]
+mod official_runtimes;
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -686,9 +688,51 @@ impl Installation {
         std::fs::rename(&staged, &path).expect("replace worker journal");
     }
 
+    /// Installs the official Claude package into the plugin root, the only
+    /// source of the `claude` runtime a seeded record is launched from, and
+    /// writes the fake `claude` such a record runs.
+    ///
+    /// The fake answers the package's version probe and otherwise runs its
+    /// arguments with `/bin/sh`. Call it while the daemon is stopped, before
+    /// [`Self::seed_record`].
+    pub(crate) async fn install_claude_package(&self) {
+        let program = self.claude_program();
+        private_dir(program.parent().expect("the fake claude directory"));
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\n{}exec /bin/sh \"$@\"\n",
+                official_runtimes::sh_version_answer("claude")
+            ),
+        )
+        .expect("write the fake claude");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+            .expect("make the fake claude executable");
+        let scratch = self.root.join("official-packages");
+        private_dir(&scratch);
+        official_runtimes::OfficialCatalog::new()
+            .preinstall(
+                &self.paths.state_dir.join(pohunek_paths::PLUGINS_SUBDIR),
+                &scratch,
+            )
+            .await;
+    }
+
+    /// The fake `claude` [`Self::install_claude_package`] writes.
+    fn claude_program(&self) -> PathBuf {
+        self.root.join("bin").join("claude")
+    }
+
     /// Persists a logical record the daemon never created, for inputs a
     /// running daemon cannot produce (a resumable binding, a foreign peer).
+    ///
+    /// The record is a Claude session launched from the official package, so
+    /// [`Self::install_claude_package`] must have run.
     pub(crate) fn seed_record(&self, session_id: &str, runtime: RuntimeRecord) {
+        assert!(
+            self.claude_program().is_file(),
+            "seed_record needs install_claude_package first"
+        );
         seed_transcript(&self.home(), &format!("native-{session_id}"));
         let now = "2026-09-24T00:00:00Z".to_owned();
         let live = runtime.state == RuntimeState::Live;
@@ -752,43 +796,48 @@ impl Installation {
                 desired_state: DesiredState::Running,
                 transaction: None,
                 info,
-                recovery: Some(ResumeBinding {
-                    session_id: session_id.to_owned(),
-                    name: Some(format!("seeded {session_id}")),
-                    agent: "claude".to_owned(),
-                    agent_base: RuntimeRef::claude(),
-                    cwd: self.home(),
-                    cols: 80,
-                    rows: 24,
-                    native_session_id: Some(format!("native-{session_id}")),
-                    native_session_path: None,
-                    project_id: None,
-                    is_linked_worktree: None,
-                    metadata: BTreeMap::new(),
-                    program: "/bin/sh".to_owned(),
-                    args: vec!["-c".to_owned(), agent_script(&self.probe)],
-                    input_rules: StoredInputRules::from(InputRules::unrestricted(
-                        false,
-                        Duration::ZERO,
-                    )),
-                    native_launch: Some(
-                        NativeSessionLaunch::from_templates(
-                            SessionRefKind::Id,
-                            &["--resume", "{reference}"],
-                            None,
-                        )
-                        .expect("valid resume template"),
-                    ),
-                    launch_binding: pohunek_daemon::agent::host::LaunchPin::Unpinned,
-                    native_reference_provenance:
-                        pohunek_daemon::agent::NativeReferenceProvenance::default(),
-                    profile_revision: None,
-                    native_launch_unresolved: false,
-                }),
+                recovery: Some(self.seeded_binding(session_id)),
                 native_identity_ordering: None,
                 runtime,
             })
             .expect("persist seeded record");
+    }
+
+    /// The resume binding of a record [`Self::seed_record`] persists: a
+    /// Claude session launched from the official package.
+    fn seeded_binding(&self, session_id: &str) -> ResumeBinding {
+        ResumeBinding {
+            session_id: session_id.to_owned(),
+            name: Some(format!("seeded {session_id}")),
+            agent: "claude".to_owned(),
+            agent_base: RuntimeRef::claude(),
+            cwd: self.home(),
+            cols: 80,
+            rows: 24,
+            native_session_id: Some(format!("native-{session_id}")),
+            native_session_path: None,
+            project_id: None,
+            is_linked_worktree: None,
+            metadata: BTreeMap::new(),
+            program: path_string(&self.claude_program()),
+            args: vec!["-c".to_owned(), agent_script(&self.probe)],
+            input_rules: StoredInputRules::from(InputRules::unrestricted(false, Duration::ZERO)),
+            native_launch: Some(
+                NativeSessionLaunch::from_templates(
+                    SessionRefKind::Id,
+                    &["--resume", "{reference}"],
+                    None,
+                )
+                .expect("valid resume template"),
+            ),
+            launch_binding: pohunek_daemon::agent::host::LaunchPin::Pinned(Box::new(
+                official_runtimes::package_binding("claude"),
+            )),
+            native_reference_provenance: pohunek_daemon::agent::NativeReferenceProvenance::default(
+            ),
+            profile_revision: None,
+            native_launch_unresolved: false,
+        }
     }
 
     /// Runtime record naming `key` as the current generation.

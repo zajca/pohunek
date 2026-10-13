@@ -9,11 +9,11 @@ intents: [setup, project, debug, help]
 
 # Agent Profiles
 
-An agent name can refer to a base runtime such as `shell`, `claude`, `hermes`,
-or `codex` once its official package is installed, or to a host profile
-resolved by the daemon. A name that is neither is `agent_profile_not_found`;
-for `codex` without its package the hint names the catalog install of the
-official package. Profiles define the program,
+An agent name can refer to a base runtime such as `shell`, `hermes`, or
+`codex` and `claude` once their official packages are installed, or to a host
+profile resolved by the daemon. A name that is neither is
+`agent_profile_not_found`; for `codex` or `claude` without its package the hint
+names the catalog install of the official package. Profiles define the program,
 arguments, optional environment entries, input behavior, resume behavior, and
 manifest metadata for that host.
 
@@ -195,7 +195,8 @@ argument. A `path` reference must still be an absolute path and an `id`
 reference must not begin with `-`; both checks run where the reference is
 recorded and again when it is used.
 
-Built-in specs (all `id` references):
+Specs of the official runtimes (all `id` references; `claude` and `codex` come
+from their official packages, `hermes` and `shell` are built in):
 
 | Base | Resume | Fork |
 |------|--------|------|
@@ -224,10 +225,10 @@ with `invalid_profile`; `resumable = false` switches recovery off and no
 reference is generated. See the sessions concept page for the strategy and its
 limits.
 
-`fork_args` is accepted only on a base with compiled fork support (`claude`);
-a `codex`, `hermes`, or `shell` profile that sets it is rejected, so those
-bases keep returning `agent_fork_unsupported`. Runtime packages will declare
-their own fork support later.
+`fork_args` is accepted only on a base whose runtime declares a native fork
+(`claude`, or a runtime package with a `[fork]` table); a `codex`, `hermes`,
+or `shell` profile that sets it is rejected, so those bases keep returning
+`agent_fork_unsupported`.
 
 `{reference}` must be a whole argv token, appear exactly once per list, and is
 never part of a larger string. The daemon rejects, with `invalid_profile` naming
@@ -247,7 +248,7 @@ launch binding (runtime id plus where its definition came from). A profile whose
 store, refuses resume and fork with `runtime_not_installed`, and works again once
 the runtime is installed. The exception is a session launched from the built-in
 runtime of an official alias this daemon does not compile in (the built-in Codex
-of an earlier release): it is refused with `runtime_builtin_removed`, and
+or Claude Code of an earlier release): it is refused with `runtime_builtin_removed`, and
 installing the official package restores interaction with a live session only,
 never resume or fork (`runtime_served_by_package`). `session stop` and `session rm` still work on such
 a session (or one whose recorded kind is a historical label): they release the
@@ -273,12 +274,12 @@ package = "acme.runtime"                        # the package id
 digest = "sha256:<64 lowercase hex digits>"     # the archive digest to launch from
 ```
 
-- A profile over a built-in base (`shell`, `claude`, `hermes`) has
+- A profile over a built-in base (`shell`, `hermes`) has
   neither key; supplying them is `invalid_profile`, as is supplying only one.
-- A profile over `codex` needs the keys of its official package, because the
-  daemon compiles no Codex in. While nothing serves `codex`, a profile without
-  them is `runtime_not_installed`, and the hint names the catalog install and
-  then `pohunek plugin profile migrate <name>`.
+- A profile over `codex` or `claude` needs the keys of its official package,
+  because the daemon compiles neither in. While nothing serves the base, a
+  profile without them is `runtime_not_installed`, and the hint names the
+  catalog install and then `pohunek plugin profile migrate <name>`.
 - A profile over a package-served base without the keys is `invalid_profile`.
   Its message names the migration command
   `pohunek plugin profile migrate <name>`, which the daemon applies under the

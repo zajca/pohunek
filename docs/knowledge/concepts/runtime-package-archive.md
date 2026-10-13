@@ -402,7 +402,8 @@ and is reported by the host (package-pinned sessions are then incompatible).
   authorizes as official for that exact package id, runtime id and digest; it
   takes the alias over from the built-in runtime (`SourceTrust::Official` in the
   runtime registry, whatever the source order), and disabling or uninstalling it
-  returns the alias to the built-in. A runtime id served by a loaded package of
+  returns the alias to the built-in where one exists (`hermes`); `codex` and
+  `claude` have no built-in, so their alias is then served by nothing. A runtime id served by a loaded package of
   a different package id is a conflict. Trust `explicit_digest` requires the
   archive digest to equal the supplied digest and is never official, and a
   linked directory is never official, so both are refused for an alias; trust

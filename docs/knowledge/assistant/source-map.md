@@ -565,7 +565,6 @@ Agent runtime and profile resolution:
 - `crates/daemon/src/detect/mod.rs`
 - `crates/daemon/src/detect/osc.rs`
 - `crates/daemon/src/detect/manifest/mod.rs`
-- `crates/daemon/src/detect/manifests/claude.toml`
 - `crates/daemon/src/detect/manifests/hermes.toml`
 - `crates/daemon/src/detect/manifests/shell.toml`
 - `crates/terminal/src/screen.rs`
@@ -623,11 +622,11 @@ Runtime package archive format:
 - `crates/cli/tests/codex_package.rs` — pure package tests (descriptor and manifest parity with the v0.34.2 built-in goldens), catalog-installed package launch and version-probe tests, the clean-host scenarios (bare `codex`, its integration and an unpinned `base = "codex"` profile refused with the install hint until the package is installed), and the opt-in real-Codex tests.
 - `crates/cli/tests/support/responses_stub.rs` — loopback Responses-API stub used instead of a model provider.
 - `runtime-packages/claude/runtime.toml` — Claude Code runtime descriptor (hook native reference, resume and fork argv, `semver-line-v1` version probe).
-- `runtime-packages/claude/detect.toml` — Claude Code detection manifest: the built-in one plus the #613 rules (running-turn title and footer, wrapped selection forms, first-run and trust dialogs, the `done <time>` completed-turn line, the npm `claude.exe` process).
+- `runtime-packages/claude/detect.toml` — Claude Code detection manifest: the v0.34.2 built-in one plus the #613 rules (running-turn title and footer, wrapped selection forms, first-run and trust dialogs, the `done <time>` completed-turn line, the npm `claude.exe` process); the daemon compiles no Claude in, so this package is the only source of `claude`.
 - `compat/claude/compatibility-lock.json` — pinned Claude Code release, native binary SHA-256 and supported range.
 - `compat/claude/screens/` — screens and terminal titles captured from a real Claude Code that the manifest test classifies.
 - `compat/claude/builtin-v0.34/` — golden copies of the built-in Claude descriptor and detection manifest of release 0.34.2.
-- `crates/cli/tests/claude_package.rs` — pure package tests (descriptor and manifest parity with the v0.34.2 built-in goldens up to the enumerated #613 rule changes), catalog-installed package launch and version-probe tests, the opt-in real-Claude tests and the screen capture.
+- `crates/cli/tests/claude_package.rs` — pure package tests (descriptor and manifest parity with the v0.34.2 built-in goldens up to the enumerated #613 rule changes), catalog-installed package launch and version-probe tests, the clean-host scenarios (bare `claude`, its integration and an unpinned `base = "claude"` profile refused with the install hint until the package is installed; Claude hooks removable without the package), the reporter-script golden check, the opt-in real-Claude tests and the screen capture.
 - `crates/cli/tests/support/messages_stub.rs` — loopback Messages-API stub used instead of a model provider.
 - `runtime-packages/hermes/runtime.toml` — Hermes runtime descriptor (the built-in Hermes descriptor with a `semver-line-v1` version probe and the package's own detection manifest).
 - `runtime-packages/hermes/detect.toml` — Hermes detection manifest, equal to the built-in one.

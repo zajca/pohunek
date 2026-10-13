@@ -5022,11 +5022,17 @@ impl SessionRegistry {
         Ok(())
     }
 
-    /// Rejects a mutation of a session whose base or active agent is not a
-    /// launchable runtime on this host.
+    /// Rejects a mutation of a session whose runtime is not launchable on
+    /// this host, or whose active agent is not a runtime id.
     ///
     /// A session pinned to a package that is still installed stays mutable
     /// while that package is disabled or another version is selected.
+    ///
+    /// An active agent of another runtime (an agent a shell session hosts in
+    /// its foreground) need not be served: input, attach, resize and the other
+    /// mutations act on the session's own runtime and never read the nested
+    /// runtime's definition, and its package can be missing or uninstalled
+    /// while the hooks of an earlier install still report it.
     ///
     /// # Errors
     ///
@@ -5034,7 +5040,7 @@ impl SessionRegistry {
     /// `runtime_builtin_removed` for a session launched from the built-in
     /// runtime of an official alias this daemon does not compile in while
     /// nothing serves the alias, and `runtime_not_installed` for any other
-    /// runtime id no definition backs.
+    /// session runtime id no definition backs.
     fn ensure_mutable_kinds(
         &self,
         info: &SessionInfo,
@@ -5044,11 +5050,11 @@ impl SessionRegistry {
         runtimes.ensure_session_runtime(&info.agent_base, pin)?;
         if let Some(active) = &info.active_agent_base {
             // An active agent that is the session's own runtime is covered by
-            // the session's pin; any other runtime must resolve on its own.
+            // the session's pin.
             if active == &info.agent_base {
                 runtimes.ensure_session_runtime(active, pin)?;
             } else {
-                runtimes.resolve_ref(active)?;
+                active.launchable()?;
             }
         }
         Ok(())

@@ -449,8 +449,9 @@ pub fn serves_retired(host: &RuntimeHost, agent: &RuntimeRef) -> bool {
 /// Every runtime of the host that names a daemon-run handler.
 ///
 /// Built-in runtimes are visited before package runtimes, each group in runtime
-/// id order, so a config home shared by several runtimes is attributed to the
-/// built-in runtime that names it.
+/// id order. The order only orders the reports: a config home that several
+/// runtimes reach through one handler is attributed to none of them (see
+/// [`ConfigHomes`]), so neither provenance nor id order decides its owner.
 pub(super) fn managed(host: &RuntimeHost) -> Vec<Resolved> {
     let registry = host.registry();
     let (builtin, packaged): (Vec<_>, Vec<_>) = registry.definitions().partition(|definition| {
@@ -561,7 +562,10 @@ fn home_failure(target: &Target, error: ProtocolError) -> IntegrationHomeFailure
 /// `Some(agent)`, or a profile selection, installs the handler its runtime
 /// definition names and fails fast if its config dir is absent. `None` installs
 /// every daemon-run handler whose config dir exists, and errors only if none
-/// are present. [`HomeSelection::All`] installs into every distinct home whose
+/// are present. Outside [`HomeSelection::All`] every selected home is resolved
+/// before the first write, so a home that does not resolve (one several
+/// runtimes reach through one handler, say) refuses the request with nothing
+/// written. [`HomeSelection::All`] installs into every distinct home whose
 /// directory exists, as one transaction per home, and reports a failing home in
 /// the result while the others still run, so there is no atomicity across
 /// homes; it errors only if no home exists.
@@ -569,12 +573,16 @@ fn home_failure(target: &Target, error: ProtocolError) -> IntegrationHomeFailure
 /// # Errors
 ///
 /// `agent_not_installable` for a runtime without a daemon-run handler,
-/// `agent_config_dir_missing` when a requested (or, for `None` and
-/// [`HomeSelection::All`], every) config dir is absent,
-/// `integration_update_incompatible` when the new asset set is not compatible
-/// with the active one, with the runtime's hook schema, or with the schema of a
-/// retained package version, the typed errors of an unusable profile
-/// selection, or any underlying I/O / settings error. With
+/// `integration_no_managed_runtime` when no `agent` is named and no served
+/// runtime names a daemon-run handler with a config home (its hint names the
+/// install of each official package nothing serves, then `--agent`), the
+/// resolution error of a selected home outside [`HomeSelection::All`] (such as
+/// `integration_home_ambiguous_owner`), `agent_config_dir_missing` when a
+/// requested (or, for `None` and [`HomeSelection::All`], every) config dir is
+/// absent, `integration_update_incompatible` when the new asset set is not
+/// compatible with the active one, with the runtime's hook schema, or with the
+/// schema of a retained package version, the typed errors of an unusable
+/// profile selection, or any underlying I/O / settings error. With
 /// [`HomeSelection::All`] only the selection errors are returned; a home's own
 /// failure is part of the result.
 pub fn install_in(
@@ -604,6 +612,17 @@ pub(super) fn install_in_gated(
     let per_home = matches!(selection, HomeSelection::All);
     let skip_absent =
         per_home || (agent.is_none() && !matches!(selection, HomeSelection::Profile(_)));
+    if targets.is_empty() && agent.is_none() && !matches!(selection, HomeSelection::Profile(_)) {
+        return Err(no_managed_runtime(homes.host()));
+    }
+    if !per_home {
+        // A home that does not resolve refuses the request before anything
+        // is written; a later failure of one home can still follow the
+        // commit of an earlier one.
+        if let Some(error) = targets.iter().find_map(|target| target.home.as_ref().err()) {
+            return Err(error.clone());
+        }
+    }
     let mut installed = Vec::new();
     let mut failed = Vec::new();
     let mut looked = Vec::new();
@@ -636,6 +655,41 @@ pub(super) fn install_in_gated(
         ));
     }
     Ok(IntegrationInstallResult { installed, failed })
+}
+
+/// Error code of an install without `agent` on a host where no served runtime
+/// names a daemon-run handler with a config home.
+const NO_MANAGED_RUNTIME_CODE: &str = "integration_no_managed_runtime";
+
+/// `integration_no_managed_runtime`: an install without `agent` has no runtime
+/// to act for on `host`.
+///
+/// The hint names, for each official alias nothing serves, the install of its
+/// official package and then the install of its hooks by name, because the
+/// official packages are the runtimes whose hooks a fresh host can get.
+fn no_managed_runtime(host: &RuntimeHost) -> ProtocolError {
+    let steps: Vec<String> = crate::agent::host::RESERVED_RUNTIME_IDS
+        .iter()
+        .filter_map(|id| RuntimeId::parse(id).ok())
+        .filter(|id| host.served_by(id).is_none())
+        .map(|id| {
+            format!(
+                "{}, then run `pohunek integration install --agent {id}`",
+                protocol::official_package_install_step(&id)
+            )
+        })
+        .collect();
+    let recover = if steps.is_empty() {
+        "install a runtime whose descriptor names a daemon-run integration handler and a config home, then run `pohunek integration install --agent <runtime>`".to_owned()
+    } else {
+        steps.join("; or ")
+    };
+    ProtocolError::new(
+        ErrorClass::Runtime,
+        NO_MANAGED_RUNTIME_CODE,
+        "no installed runtime has hooks the daemon installs, so there is nothing to install without --agent",
+        Some(recover),
+    )
 }
 
 /// Inspects the managed hook files of the selected runtime(s) in the selected

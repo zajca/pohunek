@@ -369,17 +369,30 @@ must run; `--host` never turns `integration install` into a remote mutation.
 
 ### Codex and Claude config homes
 
-`--agent` offers the built-in names `claude` and `hermes`; any other value is a
-runtime id, and `codex` is one: the daemon compiles no Codex in, so
-`integration install --agent codex` needs the official Codex package installed
-and answers `runtime_not_installed` (with the package install as the hint)
-until it is. `status`, `doctor` and `uninstall` with `--agent codex` work
-without the package: they address the config home of the earlier built-in
-Codex (`CODEX_HOME`, else `~/.codex`), so hooks pohunek installed there can be
+`--agent` offers the built-in name `hermes`; any other value is a runtime id,
+and `codex` and `claude` are runtime ids: the daemon compiles neither in, so
+`integration install --agent codex` or `--agent claude` needs the official
+package of that runtime installed and answers `runtime_not_installed` (with the
+package install as the hint) until it is. `status`, `doctor` and `uninstall`
+with `--agent codex` or `--agent claude` work without the package: they address
+the config home of the earlier built-in (`CODEX_HOME`, else `~/.codex`;
+`CLAUDE_CONFIG_DIR`, else `~/.claude`), so hooks pohunek installed there can be
 reported and removed; `--profile` and `--all-profiles` reach the homes of host
-profiles over `codex` through each profile's own `[env]`, although such a
+profiles over that runtime through each profile's own `[env]`, although such a
 profile does not resolve without the package. Without `--agent`, `status` and
-`doctor` cover only the runtimes the daemon serves.
+`doctor` cover only the runtimes the daemon serves, and a home that several
+served runtimes reach through one handler (a third-party package declaring the
+Claude handler and `~/.claude`, say) is attributed to none of them: each
+reports `integration_home_ambiguous_owner` with its hint (the doctor as a
+`config_root_invalid` finding whose remediation names `--agent`), and a bare
+`install` fails with it before writing any home. Name the runtime with
+`--agent` to act on such a home. On a host where no served runtime has
+daemon-managed hooks, a bare `install` fails with
+`integration_no_managed_runtime`, whose hint names the official package install
+and then `pohunek integration install --agent <runtime>`. `--all-profiles` also
+covers host profiles over the runtime that do not resolve (an unpinned profile
+over a package-served `claude`, say): status, doctor and uninstall reach the
+home their own `[env]` names, and install lists them as failing.
 
 A Codex or Claude agent reads its settings and hook registration from a config
 home: the runtime's declared variable (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) as the

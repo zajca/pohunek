@@ -8,7 +8,8 @@
 //! and the screens captured from a real Claude Code (`compat/claude/screens`).
 //! The daemon-backed tests install the built archive through `pohunek plugin
 //! install --catalog` against a throwaway signing key and trust anchor, so the
-//! package serves `claude` with official trust. The real-Claude tests
+//! package serves `claude` with official trust; the daemon compiles no Claude
+//! in, so nothing else serves it. The real-Claude tests
 //! additionally drive an actual `claude` binary against a loopback Messages
 //! stub with a throwaway home; see their documentation for the opt-in.
 
@@ -39,6 +40,7 @@ use pohunek_daemon::detect::{
 use pohunek_daemon::procwatch::{ProcessFact, StartIdentity};
 use pohunek_daemon::session::HostTrustAnchor;
 use pohunek_test_support::fs::write_executable;
+use pohunek_test_support::process_env::ProcessEnv;
 use pohunek_test_support::wait::{wait_until, HANG_GUARD};
 use pohunek_test_support::workspace_root;
 use protocol::{
@@ -70,10 +72,12 @@ const LOCK_PATH: &str = "compat/claude/compatibility-lock.json";
 /// Captured screens, relative to the workspace root.
 const SCREENS_DIR: &str = "compat/claude/screens";
 
-/// Built-in Claude descriptor, relative to the workspace root.
+/// Where release [`GOLDEN_TAG`] kept the built-in Claude descriptor, relative
+/// to the workspace root; the golden's header names it.
 const BUILTIN_DESCRIPTOR: &str = "crates/daemon/src/agent/builtin/claude.toml";
 
-/// Built-in Claude detection manifest, relative to the workspace root.
+/// Where release [`GOLDEN_TAG`] kept the built-in Claude detection manifest,
+/// relative to the workspace root; the golden's header names it.
 const BUILTIN_MANIFEST: &str = "crates/daemon/src/detect/manifests/claude.toml";
 
 /// Release whose built-in Claude descriptor and manifest the goldens copy.
@@ -570,7 +574,7 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
     ] {
         assert!(package.contains_key(section), "[{section}] is declared");
     }
-    let transcripts = package.remove("transcripts").expect("[transcripts]");
+    package.remove("transcripts");
     let golden_text = golden_body(GOLDEN_DESCRIPTOR, BUILTIN_DESCRIPTOR);
     let golden: toml::Table = golden_text.parse().expect("the golden is TOML");
     assert!(
@@ -578,20 +582,6 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
         "v0.34.2 declares no transcript tree"
     );
     assert_eq!(package, strip(golden, GOLDEN_PACKAGE_VERSION));
-
-    // Holds while the daemon embeds the built-in descriptor: its bytes are the
-    // golden bytes followed by the transcript tree the package declares.
-    let builtin_text = fs::read_to_string(workspace_root().join(BUILTIN_DESCRIPTOR))
-        .expect("read the built-in descriptor");
-    let tail: toml::Table = builtin_text
-        .strip_prefix(&golden_text)
-        .expect("the built-in descriptor starts with the golden bytes")
-        .parse()
-        .expect("the rest of the built-in descriptor is TOML");
-    assert_eq!(
-        tail,
-        toml::Table::from_iter([("transcripts".to_owned(), transcripts)])
-    );
 }
 
 /// Rules of the golden manifest the package changes for #613, each with the
@@ -640,13 +630,6 @@ fn the_package_manifest_file_is_the_golden_manifest_with_the_613_rules() {
     let package = read_toml(&format!("{PACKAGE_DIR}/detect.toml"));
     let golden_text = golden_body(GOLDEN_MANIFEST, BUILTIN_MANIFEST);
     let golden: toml::Table = golden_text.parse().expect("the golden is TOML");
-    // Holds while the daemon embeds the built-in manifest: its bytes are the
-    // golden bytes.
-    assert_eq!(
-        fs::read_to_string(workspace_root().join(BUILTIN_MANIFEST))
-            .expect("read the built-in manifest"),
-        golden_text
-    );
 
     assert_eq!(
         package.keys().collect::<Vec<_>>(),
@@ -1848,30 +1831,21 @@ struct Fixture {
     harness: Harness,
     stub: MessagesStub,
     claude_home: PathBuf,
-    /// Digest of the installed package archive; `None` for a daemon that
-    /// serves the built-in Claude.
-    digest: Option<PackageDigest>,
+    /// Digest of the installed package archive.
+    digest: PackageDigest,
 }
 
 impl Fixture {
-    async fn start(seed: Seed) -> Self {
-        Self::start_serving(seed, true).await
-    }
-
     /// Starts a fixture whose daemon serves `claude` from the installed
-    /// package when `package`, from the built-in descriptor otherwise.
-    async fn start_serving(seed: Seed, package: bool) -> Self {
+    /// official package, the only source of `claude`.
+    async fn start(seed: Seed) -> Self {
         let key = test_key();
         let anchor =
             HostTrustAnchor::new(vec![root_of(&key, WINDOW_START, WINDOW_END)], Vec::new())
                 .expect("the test trust anchor");
         let harness = Harness::start_with_trust(CatalogTrust::Loaded(anchor)).await;
         let processes = ProcessGuard::new(harness.env.root());
-        let digest = if package {
-            Some(install_package(&harness, &key).await)
-        } else {
-            None
-        };
+        let digest = install_package(&harness, &key).await;
         let stub = MessagesStub::start();
         let claude_home = harness.env.root().join("claude-home");
         fs::create_dir_all(&claude_home).expect("create the Claude home");
@@ -1938,12 +1912,10 @@ impl Fixture {
                 writeln!(env, "{key} = \"{value}\"").expect("write to a string");
                 env
             });
-        let pin = self.digest.as_ref().map_or_else(String::new, |digest| {
-            format!(
-                "package = \"{PACKAGE_ID}\"\ndigest = \"{}\"\n",
-                digest.as_str()
-            )
-        });
+        let pin = format!(
+            "package = \"{PACKAGE_ID}\"\ndigest = \"{}\"\n",
+            self.digest.as_str()
+        );
         self.harness.profile(
             name,
             &format!("base = \"claude\"\n{pin}{program}\n[env]\n{env}"),
@@ -2027,11 +1999,7 @@ impl Fixture {
         assert_eq!(package["origin"], "official", "{listed}");
         assert_eq!(package["enabled"], true, "{listed}");
         assert_eq!(package["selected"], true, "{listed}");
-        assert_eq!(
-            package["digest"],
-            self.digest.as_ref().expect("a package fixture").as_str(),
-            "{listed}"
-        );
+        assert_eq!(package["digest"], self.digest.as_str(), "{listed}");
 
         let claude = self.inventory_entry(PROFILE).await;
         assert_eq!(claude["available"], true, "{claude}");
@@ -3435,7 +3403,7 @@ async fn a_real_claude_approval_prompt_is_blocked_by_the_screen() {
 /// `claude` is a reserved runtime id: an install trusted only by its digest is
 /// refused, so the package serves it through a signed catalog alone.
 #[tokio::test]
-async fn installing_the_package_is_refused_while_claude_is_a_reserved_builtin() {
+async fn installing_the_package_by_digest_is_refused_because_claude_is_reserved() {
     let harness = Harness::start().await;
     let (bytes, digest) = built_archive();
     let archive = harness.env.root().join("claude.tar.zst");
@@ -3474,11 +3442,7 @@ async fn the_signed_catalog_install_serves_claude_with_official_provenance() {
     );
     assert_eq!(packages[0]["origin"], "official", "{listed}");
     assert_eq!(packages[0]["selected"], true, "{listed}");
-    assert_eq!(
-        packages[0]["digest"],
-        fixture.digest.as_ref().expect("a package fixture").as_str(),
-        "{listed}"
-    );
+    assert_eq!(packages[0]["digest"], fixture.digest.as_str(), "{listed}");
     fixture.finish().await;
 }
 
@@ -3650,6 +3614,845 @@ async fn a_session_removal_ignores_an_unreadable_process_of_the_test_host() {
     let (code, removed) = fixture.harness.json(&["session", "rm", &id]).await;
     assert_eq!(code, 0, "{removed}");
     fixture.finish().await;
+}
+
+/// The command that installs the official Claude package from an extracted
+/// release archive, as a recovery hint names it.
+const RELEASE_INSTALL_COMMAND: &str =
+    "`pohunek plugin install runtime/packages/claude.tar.zst --catalog runtime/runtime-catalog.json`";
+
+/// System directories the clean host's `PATH` searches after its fakes: they
+/// hold the shell and `sleep` the fakes run, and no agent runtime of a test
+/// host.
+const SYSTEM_PATH: &str = "/usr/bin:/bin";
+
+/// A daemon that ships no Claude and trusts a throwaway catalog key, on a host
+/// whose `PATH` finds a fake `claude` of the locked release first and then
+/// only the system directories, so no other agent runtime of the machine
+/// running the test is available.
+///
+/// The daemon runs in this process and resolves launch programs on its
+/// `PATH`, and the sessions inherit the hermetic environment's `PATH`, so the
+/// environment lock is held for the host's lifetime.
+struct CleanHost {
+    harness: Harness,
+    key: ed25519_dalek::SigningKey,
+    _fakes: tempfile::TempDir,
+    _path: ProcessEnv,
+}
+
+impl CleanHost {
+    async fn start() -> Self {
+        let mut path = ProcessEnv::lock();
+        let fakes = pohunek_test_support::tempdir().expect("create the fake claude directory");
+        let fake = write_fake_claude(fakes.path(), "bin", &banner_of(&locked_release()));
+        let directory = fake.parent().expect("the fake claude directory");
+        let mut search = std::ffi::OsString::from(directory);
+        search.push(":");
+        search.push(SYSTEM_PATH);
+        path.set("PATH", search);
+        let key = test_key();
+        let anchor =
+            HostTrustAnchor::new(vec![root_of(&key, WINDOW_START, WINDOW_END)], Vec::new())
+                .expect("the test trust anchor");
+        let harness = Harness::start_with_trust(CatalogTrust::Loaded(anchor)).await;
+        Self {
+            harness,
+            key,
+            _fakes: fakes,
+            _path: path,
+        }
+    }
+
+    /// `session new --agent <agent>` in the environment's working directory.
+    async fn launch(&self, agent: &str) -> (i32, Value) {
+        let cwd = self.harness.env.cwd().to_path_buf();
+        self.harness
+            .json(&["session", "new", "--agent", agent, "--cwd", path_str(&cwd)])
+            .await
+    }
+
+    /// The default config home of `claude` on this host.
+    fn claude_home(&self) -> PathBuf {
+        self.harness.env.home().join(".claude")
+    }
+
+    async fn stop(self) {
+        self.harness.stop().await;
+    }
+}
+
+/// The recovery hint of the refusal `refused`.
+fn recovery_hint(refused: &Value) -> &str {
+    refused["err"]["recover"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a recovery hint: {refused}"))
+}
+
+/// The daemon serves `claude` from nothing but the official package: a host
+/// without it refuses the bare runtime and its hook integration with the
+/// release install as the hint, and after the catalog install the same
+/// requests launch a session pinned to the package and report the package's
+/// integration.
+#[tokio::test]
+async fn claude_launches_only_from_the_installed_official_package() {
+    let host = CleanHost::start().await;
+
+    let (code, refused) = host.launch("claude").await;
+    assert_eq!(code, 1, "no runtime serves claude: {refused}");
+    assert_eq!(
+        refused["err"]["code"], "agent_profile_not_found",
+        "{refused}"
+    );
+    let hint = recovery_hint(&refused);
+    assert!(hint.contains(RELEASE_INSTALL_COMMAND), "{hint}");
+    assert!(!hint.contains("shell|codex|claude"), "{hint}");
+    // Installing the hook integration of `claude` needs the package too.
+    let (code, refused) = host
+        .harness
+        .json(&["integration", "install", "--agent", "claude"])
+        .await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(refused["err"]["code"], "runtime_not_installed", "{refused}");
+    assert!(
+        recovery_hint(&refused).contains(RELEASE_INSTALL_COMMAND),
+        "{refused}"
+    );
+    // So does a bare install: no served runtime has hooks the daemon
+    // installs, and the hint names the package install and the named install.
+    let (code, refused) = host.harness.json(&["integration", "install"]).await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(
+        refused["err"]["code"], "integration_no_managed_runtime",
+        "{refused}"
+    );
+    let hint = recovery_hint(&refused);
+    assert!(hint.contains(RELEASE_INSTALL_COMMAND), "{hint}");
+    assert!(
+        hint.contains("`pohunek integration install --agent claude`"),
+        "{hint}"
+    );
+
+    let digest = install_package(&host.harness, &host.key).await;
+    let (code, launched) = host.launch("claude").await;
+    assert_eq!(code, 0, "{launched}");
+    assert_eq!(launched["ok"]["agent_base"], "claude", "{launched}");
+    let id = launched["ok"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    // The session pins the package digest, so the package cannot go away
+    // under it.
+    let (code, refused) = host
+        .harness
+        .json(&["plugin", "uninstall", PACKAGE_ID, "--yes"])
+        .await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(refused["err"]["code"], "package_referenced", "{refused}");
+    let (code, listed) = host.harness.json(&["plugin", "list"]).await;
+    assert_eq!(code, 0, "{listed}");
+    assert_eq!(
+        listed["ok"]["packages"][0]["digest"],
+        digest.as_str(),
+        "{listed}"
+    );
+    assert_eq!(
+        listed["ok"]["packages"][0]["origin"], "official",
+        "{listed}"
+    );
+    let (code, status) = host
+        .harness
+        .json(&["integration", "status", "--agent", "claude"])
+        .await;
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(status["ok"]["agents"][0]["agent"], "claude", "{status}");
+
+    let (code, stopped) = host.harness.json(&["session", "stop", &id]).await;
+    assert_eq!(code, 0, "{stopped}");
+    host.stop().await;
+}
+
+/// A host profile over `claude` that pins no package names both steps while
+/// nothing serves `claude`: the release install, then the profile migration.
+/// Once the package is installed the profile must be migrated, and the
+/// migrated profile launches from the package.
+#[tokio::test]
+async fn an_unpinned_claude_profile_names_the_install_and_the_migration() {
+    let host = CleanHost::start().await;
+    host.harness.profile("my-claude", "base = \"claude\"\n");
+
+    let (code, refused) = host.launch("my-claude").await;
+    assert_eq!(code, 1, "no runtime serves the base: {refused}");
+    assert_eq!(refused["err"]["code"], "runtime_not_installed", "{refused}");
+    let hint = recovery_hint(&refused);
+    assert!(hint.contains(RELEASE_INSTALL_COMMAND), "{hint}");
+    assert!(
+        hint.contains("`pohunek plugin profile migrate my-claude`"),
+        "{hint}"
+    );
+
+    install_package(&host.harness, &host.key).await;
+    let (code, unpinned) = host.launch("my-claude").await;
+    assert_eq!(code, 1, "{unpinned}");
+    assert_eq!(unpinned["err"]["code"], "invalid_profile", "{unpinned}");
+    assert!(
+        unpinned["err"]["msg"]
+            .as_str()
+            .is_some_and(|message| message.contains("pohunek plugin profile migrate my-claude")),
+        "{unpinned}"
+    );
+    let (code, migrated) = host
+        .harness
+        .json(&["plugin", "profile", "migrate", "my-claude", "--yes"])
+        .await;
+    assert_eq!(code, 0, "{migrated}");
+    let (code, launched) = host.launch("my-claude").await;
+    assert_eq!(code, 0, "{launched}");
+    assert_eq!(launched["ok"]["agent_base"], "claude", "{launched}");
+    let id = launched["ok"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+
+    let (code, stopped) = host.harness.json(&["session", "stop", &id]).await;
+    assert_eq!(code, 0, "{stopped}");
+    host.stop().await;
+}
+
+/// The assistant picks an available Codex, Claude or Hermes runtime; on a host
+/// without the official packages and without Hermes it finds none, although
+/// a `claude` executable is on `PATH`, and its hint names the package install.
+#[tokio::test]
+async fn the_assistant_finds_no_capable_agent_without_the_official_packages() {
+    let host = CleanHost::start().await;
+    let (code, inspected) = host.harness.json(&["host", "inspect", "local"]).await;
+    assert_eq!(code, 0, "{inspected}");
+    let runtimes = inspected["ok"]["runtimes"].as_array().expect("runtimes");
+    assert!(
+        runtimes
+            .iter()
+            .all(|runtime| runtime["agent"] != "hermes" || runtime["available"] == false),
+        "this scenario needs a host without `hermes` on {SYSTEM_PATH}: {inspected}"
+    );
+
+    let (code, refused) = host
+        .harness
+        .json(&[
+            "assistant",
+            "--print-prompt",
+            "--no-snapshot",
+            "--degraded",
+            "--no-start-daemon",
+        ])
+        .await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(refused["err"]["code"], "no_capable_agent", "{refused}");
+    let hint = recovery_hint(&refused);
+    assert!(
+        hint.contains("pohunek plugin install runtime/packages/<runtime>.tar.zst --catalog runtime/runtime-catalog.json"),
+        "{hint}"
+    );
+    assert!(!hint.contains("codex/claude runtime"), "{hint}");
+
+    host.stop().await;
+}
+
+/// Hooks pohunek installed into `~/.claude` while a runtime served `claude`
+/// stay visible and removable after nothing serves it any more (the built-in
+/// of an earlier release is gone and no package is installed): status and
+/// doctor report them and uninstall removes them through the core-owned Claude
+/// handler, while a new install still needs the package.
+#[tokio::test]
+async fn claude_hooks_stay_removable_without_the_official_package() {
+    let host = CleanHost::start().await;
+    let claude_home = host.claude_home();
+    fs::create_dir_all(&claude_home).expect("create the Claude home");
+    install_package(&host.harness, &host.key).await;
+    let (code, installed) = host
+        .harness
+        .json(&["integration", "install", "--agent", "claude"])
+        .await;
+    assert_eq!(code, 0, "{installed}");
+    assert!(
+        claude_home
+            .join("hooks")
+            .join("pohunek-agent-state.sh")
+            .is_file(),
+        "{installed}"
+    );
+    let (code, removed) = host
+        .harness
+        .json(&["plugin", "uninstall", PACKAGE_ID, "--yes"])
+        .await;
+    assert_eq!(code, 0, "{removed}");
+
+    let (code, status) = host
+        .harness
+        .json(&["integration", "status", "--agent", "claude"])
+        .await;
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(status["ok"]["agents"][0]["agent"], "claude", "{status}");
+    assert_eq!(status["ok"]["agents"][0]["state"], "current", "{status}");
+    let (code, doctor) = host
+        .harness
+        .json(&["integration", "doctor", "--agent", "claude"])
+        .await;
+    assert_eq!(code, 0, "{doctor}");
+    assert_eq!(doctor["ok"]["agents"][0]["agent"], "claude", "{doctor}");
+
+    let (code, uninstalled) = host
+        .harness
+        .json(&["integration", "uninstall", "--agent", "claude"])
+        .await;
+    assert_eq!(code, 0, "{uninstalled}");
+    assert_eq!(
+        uninstalled["ok"]["uninstalled"][0]["state"], "removed",
+        "{uninstalled}"
+    );
+    let settings = fs::read_to_string(claude_home.join("settings.json")).unwrap_or_default();
+    assert!(!settings.contains("pohunek-agent-state.sh"), "{settings}");
+    assert!(!claude_home
+        .join("hooks")
+        .join("pohunek-agent-state.sh")
+        .exists());
+    let (code, status) = host
+        .harness
+        .json(&["integration", "status", "--agent", "claude"])
+        .await;
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(
+        status["ok"]["agents"][0]["state"], "not_installed",
+        "{status}"
+    );
+
+    let (code, refused) = host
+        .harness
+        .json(&["integration", "install", "--agent", "claude"])
+        .await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(refused["err"]["code"], "runtime_not_installed", "{refused}");
+
+    host.stop().await;
+}
+
+/// A host profile over `claude` whose agent keeps its config in `home`, pinned
+/// to the installed package `digest` when there is one.
+fn claude_profile(home: &Path, digest: Option<&PackageDigest>) -> String {
+    let pin = digest.map_or_else(String::new, |digest| {
+        format!(
+            "package = \"{PACKAGE_ID}\"\ndigest = \"{}\"\n",
+            digest.as_str()
+        )
+    });
+    format!(
+        "base = \"claude\"\n{pin}\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+        path_str(home)
+    )
+}
+
+/// Asserts whether each of `homes` holds pohunek's Claude state hook.
+fn assert_hooks(homes: &[&Path], present: bool, context: &Value) {
+    for home in homes {
+        assert_eq!(
+            home.join("hooks").join("pohunek-agent-state.sh").is_file(),
+            present,
+            "{}: {context}",
+            home.display()
+        );
+    }
+}
+
+/// The hooks pohunek installed into the `CLAUDE_CONFIG_DIR` of host profiles
+/// over `claude` stay removable once nothing serves `claude`, although such a
+/// profile does not resolve: `--profile` and `--all-profiles` address each
+/// profile's home through its own environment, so no profile home is left
+/// behind.
+#[tokio::test]
+async fn claude_profile_hooks_stay_removable_without_the_official_package() {
+    let host = CleanHost::start().await;
+    let root = host.harness.env.root().to_path_buf();
+    let own_home = host.claude_home();
+    let homes: Vec<(&str, PathBuf)> = vec![
+        ("work", root.join("work-claude")),
+        ("alt", root.join("alt-claude")),
+    ];
+    fs::create_dir_all(&own_home).expect("create the Claude home");
+    for (_name, home) in &homes {
+        fs::create_dir_all(home).expect("create a profile's Claude home");
+    }
+    let digest = install_package(&host.harness, &host.key).await;
+    for (name, home) in &homes {
+        host.harness
+            .profile(name, &claude_profile(home, Some(&digest)));
+    }
+    let (code, installed) = host
+        .harness
+        .json(&[
+            "integration",
+            "install",
+            "--agent",
+            "claude",
+            "--all-profiles",
+        ])
+        .await;
+    assert_eq!(code, 0, "{installed}");
+    let all_homes: Vec<&Path> = std::iter::once(own_home.as_path())
+        .chain(homes.iter().map(|(_name, home)| home.as_path()))
+        .collect();
+    assert_hooks(&all_homes, true, &installed);
+    // The profiles as a release with the built-in Claude wrote them: no pin.
+    for (name, home) in &homes {
+        host.harness.profile(name, &claude_profile(home, None));
+    }
+    let (code, removed) = host
+        .harness
+        .json(&["plugin", "uninstall", PACKAGE_ID, "--yes"])
+        .await;
+    assert_eq!(code, 0, "{removed}");
+
+    let (code, status) = host
+        .harness
+        .json(&[
+            "integration",
+            "status",
+            "--agent",
+            "claude",
+            "--profile",
+            "alt",
+        ])
+        .await;
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(status["ok"]["agents"][0]["state"], "current", "{status}");
+    let (code, uninstalled) = host
+        .harness
+        .json(&[
+            "integration",
+            "uninstall",
+            "--agent",
+            "claude",
+            "--profile",
+            "alt",
+        ])
+        .await;
+    assert_eq!(code, 0, "{uninstalled}");
+    assert_eq!(
+        uninstalled["ok"]["uninstalled"][0]["state"], "removed",
+        "{uninstalled}"
+    );
+    assert_hooks(&[homes[1].1.as_path()], false, &uninstalled);
+    assert_hooks(&[homes[0].1.as_path()], true, &uninstalled);
+
+    let (code, uninstalled) = host
+        .harness
+        .json(&[
+            "integration",
+            "uninstall",
+            "--agent",
+            "claude",
+            "--all-profiles",
+        ])
+        .await;
+    assert_eq!(code, 0, "{uninstalled}");
+    let reports = uninstalled["ok"]["uninstalled"]
+        .as_array()
+        .expect("uninstall reports");
+    assert_eq!(
+        reports.len(),
+        3,
+        "the runtime's home and both profile homes: {uninstalled}"
+    );
+    assert!(
+        uninstalled["ok"]["failed"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "{uninstalled}"
+    );
+    assert_hooks(&all_homes, false, &uninstalled);
+
+    host.stop().await;
+}
+
+/// A host profile over `claude` that does not resolve while the package
+/// serves `claude` (here unpinned, as a release with the built-in Claude wrote
+/// it) keeps the hooks in its own `CLAUDE_CONFIG_DIR` reachable:
+/// `--all-profiles` status and uninstall address that home through the
+/// profile's own environment, and install lists it as failing with the
+/// profile's error instead of leaving it out.
+#[tokio::test]
+async fn an_unresolvable_claude_profile_is_reached_by_all_profiles_while_the_package_serves() {
+    let host = CleanHost::start().await;
+    let own_home = host.claude_home();
+    let profile_home = host.harness.env.root().join("work-claude");
+    fs::create_dir_all(&own_home).expect("create the Claude home");
+    fs::create_dir_all(&profile_home).expect("create the profile's Claude home");
+    let digest = install_package(&host.harness, &host.key).await;
+    host.harness
+        .profile("work", &claude_profile(&profile_home, Some(&digest)));
+    let all_profiles =
+        |action: &'static str| ["integration", action, "--agent", "claude", "--all-profiles"];
+    let (code, installed) = host.harness.json(&all_profiles("install")).await;
+    assert_eq!(code, 0, "{installed}");
+    let homes = [own_home.as_path(), profile_home.as_path()];
+    assert_hooks(&homes, true, &installed);
+    host.harness
+        .profile("work", &claude_profile(&profile_home, None));
+
+    let (code, status) = host.harness.json(&all_profiles("status")).await;
+    assert_eq!(code, 0, "{status}");
+    let work = status["ok"]["agents"]
+        .as_array()
+        .expect("status reports")
+        .iter()
+        .find(|report| report["home"]["profiles"] == serde_json::json!(["work"]))
+        .unwrap_or_else(|| panic!("the profile's home is reported: {status}"));
+    assert_eq!(work["state"], "current", "{status}");
+
+    let (code, refused) = host.harness.json(&all_profiles("install")).await;
+    assert_eq!(code, 1, "{refused}");
+    let failed = refused["ok"]["failed"].as_array().expect("failed homes");
+    assert_eq!(failed.len(), 1, "{refused}");
+    assert_eq!(failed[0]["home"]["profiles"], serde_json::json!(["work"]));
+    assert_eq!(failed[0]["error"]["code"], "invalid_profile", "{refused}");
+
+    let (code, uninstalled) = host.harness.json(&all_profiles("uninstall")).await;
+    assert_eq!(code, 0, "{uninstalled}");
+    assert_eq!(
+        uninstalled["ok"]["uninstalled"]
+            .as_array()
+            .expect("uninstall reports")
+            .len(),
+        2,
+        "the runtime's home and the profile's home: {uninstalled}"
+    );
+    assert_hooks(&homes, false, &uninstalled);
+
+    host.stop().await;
+}
+
+/// A config home that a resolvable and an unresolvable profile over `claude`
+/// both name is attributed to the resolvable one under `--all-profiles`: the
+/// report's selector and its recovery commands name the profile an install
+/// accepts, never the one it refuses.
+#[tokio::test]
+async fn a_home_shared_with_an_unresolvable_profile_is_addressed_through_the_resolvable_one() {
+    let host = CleanHost::start().await;
+    let shared_home = host.harness.env.root().join("shared-claude");
+    fs::create_dir_all(host.claude_home()).expect("create the Claude home");
+    fs::create_dir_all(&shared_home).expect("create the shared Claude home");
+    let digest = install_package(&host.harness, &host.key).await;
+    host.harness
+        .profile("work", &claude_profile(&shared_home, Some(&digest)));
+    // Unpinned, as a release with the built-in Claude wrote it: it does not
+    // resolve while the package serves `claude`.
+    host.harness
+        .profile("work-old", &claude_profile(&shared_home, None));
+
+    for action in ["status", "doctor"] {
+        let (code, report) = host
+            .harness
+            .json(&["integration", action, "--agent", "claude", "--all-profiles"])
+            .await;
+        assert_eq!(code, 0, "{action}: {report}");
+        let shared = report["ok"]["agents"]
+            .as_array()
+            .expect("reports")
+            .iter()
+            .find(|entry| entry["home"]["profiles"] == serde_json::json!(["work", "work-old"]))
+            .unwrap_or_else(|| panic!("{action} reports the shared home once: {report}"));
+        assert_eq!(
+            shared["home"]["selector"],
+            serde_json::json!({ "kind": "profile", "name": "work" }),
+            "{action}: {report}"
+        );
+        let text = shared.to_string();
+        assert!(!text.contains("--profile work-old"), "{action}: {text}");
+        if action == "doctor" {
+            assert!(text.contains("--profile work`"), "{action}: {text}");
+        }
+    }
+
+    host.stop().await;
+}
+
+/// A host profile over `claude` that a launch would refuse as malformed (here
+/// a misspelled `[env]` table) is refused by the cleanup path as well, instead
+/// of being read with an empty environment that would point it at the
+/// runtime's own home.
+#[tokio::test]
+async fn a_malformed_claude_profile_is_refused_without_the_official_package() {
+    let host = CleanHost::start().await;
+    let own_home = host.claude_home();
+    let profile_home = host.harness.env.root().join("work-claude");
+    fs::create_dir_all(&own_home).expect("create the Claude home");
+    fs::create_dir_all(&profile_home).expect("create the profile's Claude home");
+    install_package(&host.harness, &host.key).await;
+    let (code, installed) = host
+        .harness
+        .json(&["integration", "install", "--agent", "claude"])
+        .await;
+    assert_eq!(code, 0, "{installed}");
+    let (code, removed) = host
+        .harness
+        .json(&["plugin", "uninstall", PACKAGE_ID, "--yes"])
+        .await;
+    assert_eq!(code, 0, "{removed}");
+    host.harness.profile(
+        "work",
+        &format!(
+            "base = \"claude\"\n\n[evn]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+            path_str(&profile_home)
+        ),
+    );
+
+    for action in ["status", "uninstall"] {
+        let (code, refused) = host
+            .harness
+            .json(&[
+                "integration",
+                action,
+                "--agent",
+                "claude",
+                "--profile",
+                "work",
+            ])
+            .await;
+        assert_eq!(code, 1, "{action}: {refused}");
+        assert_eq!(
+            refused["err"]["code"], "invalid_profile",
+            "{action}: {refused}"
+        );
+    }
+    assert_hooks(&[own_home.as_path()], true, &Value::Null);
+
+    host.stop().await;
+}
+
+/// A third-party runtime that names a compiled integration handler and a
+/// config home.
+struct HandlerRuntime {
+    /// Package id of its package.
+    package: &'static str,
+    /// Its runtime id.
+    runtime: &'static str,
+    /// The integration handler it names.
+    handler: &'static str,
+    /// `[config_home] env`.
+    env: &'static str,
+    /// `[config_home] default`.
+    default: &'static str,
+}
+
+/// A runtime that names the Claude handler and the config home `claude`
+/// declares; its id orders before `claude`.
+const SHARED_CLAUDE_HOME: HandlerRuntime = HandlerRuntime {
+    package: "acme.runtime.aclaude",
+    runtime: "aclaude",
+    handler: "claude-hook-v1",
+    env: "CLAUDE_CONFIG_DIR",
+    default: ".claude",
+};
+
+/// A runtime that names the Codex handler and Codex's config home while no
+/// Codex is served, so it alone reaches that home; its id orders before every
+/// other runtime of the scenario.
+const OWN_CODEX_HOME: HandlerRuntime = HandlerRuntime {
+    package: "acme.runtime.aaa",
+    runtime: "aaa",
+    handler: "codex-hook-v1",
+    env: "CODEX_HOME",
+    default: ".codex",
+};
+
+/// Installs the package of `spec`, trusted by its digest.
+async fn install_handler_runtime(harness: &Harness, spec: &HandlerRuntime) {
+    let document = format!(
+        r#"schema = 1
+id = "{package}"
+version = "1.0.0"
+runtime_api = 1
+
+[runtime]
+id = "{runtime}"
+name = "Third-party runtime"
+program = "/bin/sh"
+args = []
+detect_manifest = "detect.toml"
+
+[input]
+bracketed_paste = false
+submit_delay_ms = 0
+text_policy = "unrestricted"
+
+[resume]
+supported = false
+
+[fork]
+supported = false
+
+[native_reference]
+strategy = "none"
+
+[integration]
+handler = "{handler}"
+hook_schema = "identity-subagent-v1"
+
+[config_home]
+env = "{env}"
+default = "{default}"
+"#,
+        package = spec.package,
+        runtime = spec.runtime,
+        handler = spec.handler,
+        env = spec.env,
+        default = spec.default,
+    );
+    let entries = [
+        package::ArchiveEntry {
+            path: "runtime.toml".to_owned(),
+            contents: document.into_bytes(),
+            executable: false,
+        },
+        package::ArchiveEntry {
+            path: "detect.toml".to_owned(),
+            contents: b"[[rules]]\nid = \"idle_prompt\"\nstate = \"idle\"\npriority = 100\nregion = \"whole_recent\"\nany = [{ contains = \"ready\" }]\n".to_vec(),
+            executable: false,
+        },
+    ];
+    let bytes = package::build_archive(&entries, &Limits::DEFAULT).expect("the archive builds");
+    let digest = read_archive(&bytes, &Limits::DEFAULT)
+        .expect("the archive reads")
+        .digest()
+        .clone();
+    let archive = harness.env.root().join(format!("{}.tar.zst", spec.runtime));
+    fs::write(&archive, bytes).expect("write the archive");
+    let (code, installed) = harness
+        .json(&[
+            "plugin",
+            "install",
+            path_str(&archive),
+            "--sha256",
+            digest.as_str(),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "{installed}");
+}
+
+/// The report of `runtime` in the `agents` list of `document`.
+fn agent_report<'a>(document: &'a Value, runtime: &str) -> &'a Value {
+    document["ok"]["agents"]
+        .as_array()
+        .expect("agent reports")
+        .iter()
+        .find(|agent| agent["agent"] == runtime)
+        .unwrap_or_else(|| panic!("{runtime} is reported: {document}"))
+}
+
+/// A config home that the official `claude` and a third-party runtime reach
+/// through the Claude handler belongs to neither: without `--agent`, status
+/// and doctor report it as a home two runtimes share, with the fix of naming
+/// one runtime, and install refuses before it writes any home, also the home
+/// a runtime ordered earlier reaches alone. Naming one runtime still acts on
+/// the shared home.
+#[tokio::test]
+async fn a_config_home_two_runtimes_reach_through_the_claude_handler_has_no_owner() {
+    let host = CleanHost::start().await;
+    let claude_home = host.claude_home();
+    fs::create_dir_all(&claude_home).expect("create the Claude home");
+    let codex_home = host.harness.env.home().join(".codex");
+    fs::create_dir_all(&codex_home).expect("create the Codex home");
+    install_package(&host.harness, &host.key).await;
+    install_handler_runtime(&host.harness, &SHARED_CLAUDE_HOME).await;
+    install_handler_runtime(&host.harness, &OWN_CODEX_HOME).await;
+
+    let (_code, status) = host.harness.json(&["integration", "status"]).await;
+    for runtime in ["claude", SHARED_CLAUDE_HOME.runtime] {
+        let report = agent_report(&status, runtime);
+        assert_eq!(report["state"], "outdated", "{runtime}: {status}");
+        let warnings = report["warnings"].as_array().expect("warnings");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.as_str().is_some_and(|text| {
+                    text.contains("integration_home_ambiguous_owner")
+                        && text.contains("`--agent <runtime>`")
+                })),
+            "the warning carries the code and its hint: {runtime}: {status}"
+        );
+    }
+    assert_eq!(
+        agent_report(&status, OWN_CODEX_HOME.runtime)["state"],
+        "not_installed",
+        "{status}"
+    );
+    let (_code, doctor) = host.harness.json(&["integration", "doctor"]).await;
+    for runtime in ["claude", SHARED_CLAUDE_HOME.runtime] {
+        let report = agent_report(&doctor, runtime);
+        assert_eq!(report["ok"], false, "{runtime}: {doctor}");
+        let finding = report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .find(|finding| {
+                finding["summary"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("integration_home_ambiguous_owner"))
+            })
+            .unwrap_or_else(|| panic!("a finding names the shared home: {doctor}"));
+        assert_eq!(finding["code"], "config_root_invalid", "{finding}");
+        let remediation = finding["remediation"].as_str().expect("a remediation");
+        assert!(
+            remediation.contains(&format!("`pohunek integration install --agent {runtime}`"))
+                && remediation.contains("different config homes"),
+            "{remediation}"
+        );
+        assert!(
+            !remediation.contains("existing absolute directory"),
+            "{remediation}"
+        );
+    }
+    let (_code, daemon_doctor) = host.harness.json(&["doctor"]).await;
+    let checks = daemon_doctor.to_string();
+    assert!(
+        checks.contains("several runtimes through the same integration handler"),
+        "{daemon_doctor}"
+    );
+    assert!(
+        !checks.contains("malformed, unsafe, or incomplete"),
+        "{daemon_doctor}"
+    );
+
+    let (code, refused) = host.harness.json(&["integration", "install"]).await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(
+        refused["err"]["code"], "integration_home_ambiguous_owner",
+        "{refused}"
+    );
+    assert!(
+        recovery_hint(&refused).contains("--agent <runtime>"),
+        "{refused}"
+    );
+    assert!(!claude_home.join("hooks").exists(), "nothing is installed");
+    assert!(
+        !codex_home.join("hooks.json").exists(),
+        "the home the earlier runtime reaches alone is not written either"
+    );
+
+    let (code, installed) = host
+        .harness
+        .json(&["integration", "install", "--agent", "claude"])
+        .await;
+    assert_eq!(code, 0, "{installed}");
+    assert_eq!(
+        installed["ok"]["installed"][0]["agent"], "claude",
+        "{installed}"
+    );
+    assert!(claude_home
+        .join("hooks")
+        .join("pohunek-agent-state.sh")
+        .is_file());
+
+    host.stop().await;
 }
 
 /// Whether `pid` is a live process; a terminated one that its parent has not

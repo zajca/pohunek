@@ -954,9 +954,9 @@ agents with (each runtime's own home and the home of every host profile,
 re-read on every pass), never their parents or `$HOME`, and reads each with the
 parser the descriptor names. A runtime without the declaration contributes no
 root, and a runtime that is not installed contributes nothing: a host without
-the official Codex package observes no Codex transcript tree and does not
-recognize a `codex` process outside pohunek or in the foreground of a shell
-session. Trees of two different runtimes that are the
+the official Codex or Claude Code package observes no transcript tree of that
+agent and does not recognize a `codex` or `claude` process outside pohunek or
+in the foreground of a shell session. Trees of two different runtimes that are the
 same directory or nested in each other are attributed to neither; the daemon
 logs the warning `external.transcript_roots.ambiguous` with code
 `transcripts_ambiguous_owner`.
@@ -1085,8 +1085,8 @@ boundaries.
 
 Where the native reference comes from is a per-runtime strategy declared in the
 runtime definition's `[native_reference]` table: `hook` (a validated integration
-report, the behavior of the official Codex package and the built-in `claude`
-and `hermes`), `assigned` (core
+report, the behavior of the official Codex and Claude Code packages and the
+built-in `hermes`), `assigned` (core
 generates the reference and passes it at launch) or `none` (no native recovery,
 the `shell` runtime). A runtime package without an integration handler is
 resumable only with `assigned`, which needs an agent CLI that accepts a
@@ -1116,7 +1116,7 @@ binding, so `/clear` and in-session resume are followed and `session.resume` and
 `session.fork` launch with the reported conversation. The declared existence
 check runs for a still-assigned reference. A hook runtime may declare the same
 kind of check under `[native_reference.existence]` for its id-kind reference;
-the built-in `claude` declares one, so its recovery additionally requires a
+the official `claude` package declares one, so its recovery additionally requires a
 regular transcript file under its effective declared config home; either
 recovery action refuses with `agent_native_reference_missing` before
 launch when the file is absent or cannot be verified. A check may also declare

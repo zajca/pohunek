@@ -456,7 +456,7 @@ All params and result type names below refer to structs exported by
 | Method | Params | `ok` result | Notes |
 |---|---|---|---|
 | `daemon.health` | `null` | `{status, daemon_version, protocol_version}` | Liveness and version probe. |
-| `daemon.doctor` | `null` | `DaemonDoctorResult` | Runs daemon-local checks. Non-null params are `daemon/bad_request`. Each check is `{name, status, detail}`: `name` is the stable code and `detail` carries the remediation. Both platforms report `worker_executable` for the active supervision's worker, including a bounded capability probe of its readable journal schema and overlapping private protocol range; an older worker without capability reporting is `warn` (unverified), while a missing, unsafe, malformed or incompatible required worker is `fail`. Linux also reports `bin:git`, `bin:codex`, `bin:claude`, the socket, state and log directory writability checks, `netbird_cli` and `schema_version`; macOS adds `runtime_dir_private`, `socket_path_length`, `filesystem_access`, `login_shell`, `launchd_domain`, `desktop_notifications` and `keychain`. It also reports configured profile checks as `agent_profile_<name>`, optional provider checks as `agent_runtime_codex`, `agent_runtime_claude` and `agent_runtime_hermes`, embedded manifest checks as `agent_manifest_embedded_<runtime>` for the runtimes compiled in (`shell`, `claude`, `hermes`; Codex ships only as a package, so no embedded Codex manifest is checked), and host override checks as `agent_manifest_override_<name>`. Configured profiles fail when they cannot resolve securely, their package runtime is unavailable, their executable is missing, or the provider's existing pinned version rule rejects it. An absent unconfigured optional provider warns. Embedded manifests are parsed from the daemon's canonical sources; host overrides use the same bounded, contained loader and precedence as launch. An invalid referenced override fails, an invalid unreferenced override warns, and an empty override is valid and disables detection. Details are fixed and redacted. The daemon also reports Codex and Claude hook readiness as `agent_integration_<provider>` for runtime homes and `agent_integration_<provider>_profile_<name>` for configured profile homes. Current hooks are `ok`; missing or outdated hooks and an active install lock are `warn`; malformed or unsafe provider state is `fail`. A local request checks each distinct launch home using the same integration inspector as `integration.doctor`; a remote request checks runtime homes only, preserving the local-only boundary for profile-derived homes. Configured Hermes profiles receive `agent_integration_hermes_profile_<name>` with `warn` and an explicit unverified detail because their hook lifecycle is CLI-managed and the daemon has no config-home inspection policy. No home path, profile environment value, provider config text or parser output is returned. `catalog_trust_anchor` is `ok` when the release's catalog trust anchor is loaded, `warn` when the installation ships none, and `fail` when it cannot be trusted. Hook interpreter readiness (`python3`) is reported by `integration.doctor`, not here. `overall` is `fail` only for required failures. |
+| `daemon.doctor` | `null` | `DaemonDoctorResult` | Runs daemon-local checks. Non-null params are `daemon/bad_request`. Each check is `{name, status, detail}`: `name` is the stable code and `detail` carries the remediation. Both platforms report `worker_executable` for the active supervision's worker, including a bounded capability probe of its readable journal schema and overlapping private protocol range; an older worker without capability reporting is `warn` (unverified), while a missing, unsafe, malformed or incompatible required worker is `fail`. Linux also reports `bin:git`, `bin:codex`, `bin:claude`, the socket, state and log directory writability checks, `netbird_cli` and `schema_version`; macOS adds `runtime_dir_private`, `socket_path_length`, `filesystem_access`, `login_shell`, `launchd_domain`, `desktop_notifications` and `keychain`. It also reports configured profile checks as `agent_profile_<name>`, optional provider checks as `agent_runtime_codex`, `agent_runtime_claude` and `agent_runtime_hermes`, embedded manifest checks as `agent_manifest_embedded_<runtime>` for the runtimes compiled in (`shell`, `hermes`; Codex and Claude Code ship only as packages, so no embedded Codex or Claude manifest is checked), and host override checks as `agent_manifest_override_<name>`. Configured profiles fail when they cannot resolve securely, their package runtime is unavailable, their executable is missing, or the provider's existing pinned version rule rejects it. An absent unconfigured optional provider warns. Embedded manifests are parsed from the daemon's canonical sources; host overrides use the same bounded, contained loader and precedence as launch. An invalid referenced override fails, an invalid unreferenced override warns, and an empty override is valid and disables detection. Details are fixed and redacted. The daemon also reports Codex and Claude hook readiness as `agent_integration_<provider>` for runtime homes and `agent_integration_<provider>_profile_<name>` for configured profile homes. Current hooks are `ok`; missing or outdated hooks and an active install lock are `warn`; malformed or unsafe provider state is `fail`. A local request checks each distinct launch home using the same integration inspector as `integration.doctor`; a remote request checks runtime homes only, preserving the local-only boundary for profile-derived homes. Configured Hermes profiles receive `agent_integration_hermes_profile_<name>` with `warn` and an explicit unverified detail because their hook lifecycle is CLI-managed and the daemon has no config-home inspection policy. No home path, profile environment value, provider config text or parser output is returned. `catalog_trust_anchor` is `ok` when the release's catalog trust anchor is loaded, `warn` when the installation ships none, and `fail` when it cannot be trusted. Hook interpreter readiness (`python3`) is reported by `integration.doctor`, not here. `overall` is `fail` only for required failures. |
 | `host.inspect` | `null` | `HostCapabilities` | Live capability snapshot for the daemon's host. |
 | `host.discover` | `HostDiscoverParams` or `null` | `Vec<HostRecord>` | Enumerates peers from configured overlay transports and classifies daemon reachability. |
 | `host.governance.inspect` | `null` | `HostGovernanceStatus` | Owner-safe, read-only snapshot of the daemon's stable host identity and local governance state. Explicit `null` and omitted params both succeed; every non-null JSON value returns `daemon/bad_request`. The method never changes enrollment, ownership, or sessions. On unavailable governance it returns the fixed redacted `daemon/host_governance_unavailable` error; reload or restart the daemon, then retry. |
@@ -489,7 +489,7 @@ All params and result type names below refer to structs exported by
 | `session.policy.set` | `SessionPolicyParams` | `SessionPolicyResult` | Validates, replaces, and persists the session retention policy at `<data_dir>/session-policy.json`. The running sweep task reloads it on its next cycle, so no daemon restart is needed. |
 | `session.retention.sweep` | `SessionRetentionParams` or `null` | `SessionRetentionResult` | Runs one retention sweep under the current policy TTLs, or reports the selection when `dry_run` is true. It works whether or not automatic sweeps are enabled, never exceeds the policy's own per-sweep removal cap, and never selects an `external` session or one in `conflict`/`incompatible` runtime state. A matched session whose pohunek-owned worktree has an uncommitted change, an untracked file, commits contained in no other branch/remote/tag, or a state git cannot report is **held**, never removed: it is counted in `held`, excluded from `eligible`, and carries the `hold` reason (`worktree_uncommitted`, `worktree_untracked`, `worktree_unpushed`, `worktree_unknown`) on its candidate. One sweep inspects at most 64 checkouts; a matched session beyond that bound is held as `worktree_unknown` and inspected by the next sweep. `worktrees_cleaned` counts only checkouts confirmed gone from disk; a checkout that survived its removal is reported in `worktrees_failed`. The `pohunek session retention sweep` CLI exits non-zero when `failed` or `worktrees_failed` is above zero. |
 | `subscribe` | `null` | `{subscribed: true}` then event stream | Consumes the connection into a one-way event stream. |
-| `integration.install` | `IntegrationInstallParams` or `null` | `IntegrationInstallResult` | Installs agent hooks for active-agent state, native session id capture, provider-managed subagent lifecycle, and notifications into the config home of the selected runtime(s). Each report carries `cleanup_incomplete`, the quarantine paths of replaced originals whose deletion did not finish after the install committed (empty when cleanup completed). `profile` selects the config home a host profile launches with and `all_profiles` every distinct home of the runtime (see "Config homes and host profiles"); both are local-only, exclusive, and unknown fields return `bad_request`. With `all_profiles` a home that fails is listed in `failed` (`{agent, home, error}`) while the others still install, and the result is not atomic across homes. |
+| `integration.install` | `IntegrationInstallParams` or `null` | `IntegrationInstallResult` | Installs agent hooks for active-agent state, native session id capture, provider-managed subagent lifecycle, and notifications into the config home of the selected runtime(s). Each report carries `cleanup_incomplete`, the quarantine paths of replaced originals whose deletion did not finish after the install committed (empty when cleanup completed). `profile` selects the config home a host profile launches with and `all_profiles` every distinct home of the runtime (see "Config homes and host profiles"); both are local-only, exclusive, and unknown fields return `bad_request`. With `all_profiles` a home that fails is listed in `failed` (`{agent, home, error}`) while the others still install, and the result is not atomic across homes. Without `all_profiles` every selected home is resolved before the first write, so a home that does not resolve refuses the request with nothing written. Without `agent` on a host where no served runtime has daemon-managed hooks (a clean host: Hermes is CLI-run and the shell has no handler) the request fails with `runtime/integration_no_managed_runtime`, whose hint names the install of each official package nothing serves and then `pohunek integration install --agent <runtime>`. |
 | `integration.status` | `IntegrationStatusParams` or `null` | `IntegrationStatusResult` | Returns a read-only per-agent report for managed Codex and Claude hooks: availability, expected and present asset paths, inspected registration paths, installed and expected versions, aggregate health (`not_installed`, `current`, or `outdated`), typed recovery (`none`, `reinstall`, or `repair_configuration`), and non-secret warnings. `null` selects both agents; unknown parameter fields return `bad_request`. `profile` and `all_profiles` select profile config homes (local-only; see "Config homes and host profiles") and label each report with `home`. `current` requires exact managed executable permissions and exactly one registration under each installer-owned event. Inspection is size-bounded and runs outside the Tokio request task. It never mutates provider configuration. |
 | `integration.uninstall` | `IntegrationUninstallParams` (`agent` required) | `IntegrationUninstallResult` | Removes exactly the assets and registrations the installer owns for Codex and Claude, as one rollback-protected transaction under the installer lock: registration first, then Codex trust records, then marker-carrying scripts. User hooks, the Codex hooks feature flag, the hooks directory, and the lock file are left alone; a symlink, directory, FIFO, or unmarked file at a managed script path is preserved and reported in `preserved_paths`. Each report carries `state` (`removed` or `not_installed`), `removed_paths`, `updated_paths`, `preserved_paths`, and `cleanup_incomplete` (quarantined originals whose deletion did not finish after the removal committed). `agent` names the one agent to remove and is required: a missing agent, unknown fields, and `null` params return `bad_request`, so removal never widens to every agent and a failure cannot leave one agent removed without a report. `profile` selects one profile's config home and `all_profiles` every distinct home of that agent, one transaction per home with failures listed in `failed` and no atomicity across homes (local-only; see "Config homes and host profiles"); an absent `agent` is still `bad_request` with either. Ownership is judged on the inode that is deleted, and a provider file whose content, mode, or inode changed since it was read is a collision. The same re-verification runs before any rollback, so a file another writer changed is kept there too rather than replaced by the original. Every rollback or cleanup outcome that leaves data in quarantine is reported with its true path, as `integration_recovery_required` during a rollback and as `cleanup_incomplete` after commit. A registration file the removal wrote that another writer changed before the scripts are removed, or before the removal completes, is also a collision: it is re-verified (inode, mode, complete content), the other version is kept, and the removed scripts are moved back. Collisions, interrupted rollbacks, and concurrent installers return `integration_destination_collision`, `integration_recovery_required`, and `integration_install_in_progress`. |
 | `integration.doctor` | `IntegrationDoctorParams` or `null` | `IntegrationDoctorResult` | Read-only diagnosis of the managed Codex and Claude hooks: per agent `ok`, the status report (absent while an operation is running), and findings with a stable snake_case `code`, `severity` (`info` or `error`), `summary`, and `remediation`. Only the absence expected of a not-installed integration is informational: an unsafe, symlinked, or group-writable config path is an error even when nothing is installed. Codes cover absent agents and hooks, config-root, asset, registration, provider-config, and Codex feature/trust drift, `displaced_original_left_behind` (a quarantined original from an earlier install or removal remains in the agent config directory) and `quarantine_scan_incomplete` (the bounded scan could not cover every entry, so it is an error and the diagnosis is never clean), and `operation_in_progress` (info: another install, uninstall, or doctor holds the installer lock, so nothing is read or scanned for that agent, `status` is absent, and the doctor stays `ok`; the doctor takes the lock non-blocking without creating the file and holds it for its whole inspection, so an installer arriving meanwhile gets `integration_install_in_progress`), `unsafe_installer_lock` (error: the lock file is not a regular owner-private file, so every install and uninstall fails), `install_drift`, and three informational `python3` notes that never fail the doctor or change its exit code, because the daemon cannot know the agent's `PATH`: `hook_runtime_python_found` (the first executable `python3` behind an absolute entry of the daemon's own `PATH`), `hook_runtime_missing` (none found; relative and empty entries are skipped), and `hook_runtime_macos_shim` (the first one is the `/usr/bin/python3` stub, recognized through any alias, with no Command Line Tools or Xcode behind it); the probe never runs an interpreter and the remediation is to verify `python3` on the agent's `PATH`, and `hook_socket_path_invalid` (daemon or worker socket path over the platform limit). The runtime notes apply only to an agent whose hooks are installed. `null` selects both agents; unknown fields return `bad_request`. `profile` and `all_profiles` diagnose profile config homes (local-only; see "Config homes and host profiles"); each diagnosis carries `home`, and the recovery commands in its findings name `--profile` for a profile's home. |
@@ -665,21 +665,23 @@ official aliases (the reserved runtime ids other than `shell`) are served only
 by a package the signed catalog authorizes as official for that exact package
 id, runtime id and archive digest; such a package takes the alias over from the
 built-in runtime while it is installed, enabled and selected, and disabling or
-uninstalling it returns the alias to the built-in. The daemon compiles no Codex
-in, so `codex` is served by its official package or not at all: a host without
-it answers a bare `codex` with `agent_profile_not_found`, an unpinned host
-profile over `codex` with `runtime_not_installed`, and `integration.install`
-for `codex` with `runtime_not_installed`, each with a recovery hint naming
-`pohunek plugin install runtime/packages/codex.tar.zst --catalog
+uninstalling it returns the alias to the built-in. The daemon compiles neither
+Codex nor Claude Code in, so `codex` and `claude` are each served by the
+official package or not at all: a host without it answers a bare `codex` or
+`claude` with `agent_profile_not_found`, an unpinned host profile over it with
+`runtime_not_installed`, and `integration.install` for it with
+`runtime_not_installed`, each with a recovery hint naming
+`pohunek plugin install runtime/packages/<runtime>.tar.zst --catalog
 runtime/runtime-catalog.json` from the extracted release archive (and, for the
 profile, `pohunek plugin profile migrate <name>` after it). `integration.status`,
-`integration.doctor` and `integration.uninstall` that name `codex` work without
-the package: the core-owned Codex handler keeps the config home of the earlier
-built-in (`CODEX_HOME`, else `~/.codex`), so hooks pohunek installed there are
-reported and removed (only the entries it owns); `profile` and `all_profiles`
-reach the homes of host profiles over `codex` through each profile's own
-`[env]`, although such a profile does not resolve; without `agent`, status and
-doctor cover only served runtimes. A runtime id served by a
+`integration.doctor` and `integration.uninstall` that name `codex` or `claude`
+work without the package: the core-owned handler keeps the config home of the
+earlier built-in (`CODEX_HOME`, else `~/.codex`; `CLAUDE_CONFIG_DIR`, else
+`~/.claude`), so hooks pohunek installed there are reported and removed (only
+the entries it owns); `profile` and `all_profiles` reach the homes of host
+profiles over that runtime through each profile's own `[env]`, although such a
+profile does not resolve; without `agent`, status and doctor cover only served
+runtimes. A runtime id served by a
 loaded package of a different package id is a conflict. A claim of an alias by
 an explicit-digest or linked package is answered with
 `package_runtime_not_claimable`, and so is a descriptor that names `shell`; a
@@ -687,7 +689,7 @@ catalog that does not authorize the alias for the archive is
 `package_untrusted`. The package that serves an alias is the selected, enabled
 official package whose `runtime_id` is that alias in `package.list` and
 `package.inspect`; no such package means the built-in serves it, or nothing
-does for `codex`.
+does for `codex` and `claude`.
 
 A session launched from the built-in runtime of an alias that a package serves
 now cannot be resumed or forked: the request is refused with
@@ -696,8 +698,8 @@ migration (start a new session with `pohunek session new --agent <runtime>`,
 which the official package serves; a session is never rebound to another
 runtime source), and the stored binding is kept unchanged. A session launched
 from the built-in runtime of an official alias this daemon does not compile in
-(the built-in Codex of an earlier release, pinned or from a record without a
-launch binding) while nothing serves the alias is refused with
+(the built-in Codex or Claude Code of an earlier release, pinned or from a
+record without a launch binding) while nothing serves the alias is refused with
 `runtime/runtime_builtin_removed` on resume, fork and every mutation (input,
 attach, resize, rename, metadata); only stop and remove still work. Its
 recovery hint names the official package install and a new session. Once the
@@ -892,8 +894,8 @@ session reference that resume and fork consume. The table is required.
 | `hook` | a validated integration report (process-bound, ancestry, sequence and expiry checked) | on once a report arrived; requires a supported resume; may declare `[native_reference.existence]` for an id-kind reference |
 | `assigned` | generated by core and passed to the agent at launch (and at fork with `assign_fork = true`) | on from the first moment; requires a supported resume |
 
-The built-in runtimes declare `shell` = `none` and `claude`, `hermes` = `hook`;
-the official Codex package declares `codex` = `hook`.
+The built-in runtimes declare `shell` = `none` and `hermes` = `hook`; the
+official Codex and Claude Code packages declare `codex` and `claude` = `hook`.
 
 ### Config home
 
@@ -913,8 +915,8 @@ user's home used while the variable is unset or empty (a relative path of plain
 components: no `..`, no absolute path, no glob or shell characters, bounded).
 Both keys are required and unknown keys are refused (`descriptor_invalid`). The
 daemon-run integration handlers install into this home, so a runtime that names
-one needs the table. The built-in `claude` and the official Codex package
-declare it; any package may too. Pi keeps declaring its conversation root under `[native_reference.existence]`.
+one needs the table. The official Codex and Claude Code packages declare it;
+any package may too. Pi keeps declaring its conversation root under `[native_reference.existence]`.
 
 ### Transcripts
 
@@ -936,7 +938,8 @@ id, transcript path and absolute working directory in the first 32 records or
 plain components, no `.` or `..`, no empty segment, bounded). The table requires
 `[config_home]`; an unknown parser, an unsafe `dir`, a missing or unknown key,
 or a missing `[config_home]` is `descriptor_invalid`. The official Codex
-package declares `sessions` and the built-in `claude` declares `projects`; a runtime without the
+package declares `sessions` and the official Claude Code package declares
+`projects`; a runtime without the
 table contributes no transcript root. Trees of two different runtimes that are
 the same directory or nested in each other are attributed to neither; the
 daemon logs the warning `external.transcript_roots.ambiguous` with code
@@ -961,9 +964,9 @@ Both keys are required. The schemas are a closed set compiled into core:
 parsing a descriptor refuses an unknown schema id, an unknown handler id, and a
 handler/schema pair the handler does not drive (`descriptor_invalid`). A
 runtime without `[integration]`, such as Pi, has no schema, so its sessions
-admit no hook report. The official Codex package and the built-in `claude`
-runtime use `identity-subagent-v1`, `hermes` uses `identity-v1`, and the shell,
-which hosts Codex and Claude in the foreground, uses `identity-subagent-v1`.
+admit no hook report. The official Codex and Claude Code packages use
+`identity-subagent-v1`, `hermes` uses `identity-v1`, and the shell, which can
+host Codex and Claude Code in the foreground, uses `identity-subagent-v1`.
 
 A schema declares the provider ids that may report, the admitted actions, the
 native-reference kinds (`id`, `path`), the process-ancestry matcher, the
@@ -1161,7 +1164,7 @@ relocating_settings = [                          # optional; refused at launch
   reference under `[native_reference.existence]` (same shape as the `assigned`
   declaration; a path-kind hook reference cannot carry one). Before
   `session.resume` or `session.fork` launches, the declared check runs with the
-  same rules as below. The built-in `claude` declares it: its hook reference is
+  same rules as below. The official Claude Code package declares it: its hook reference is
   checked against a regular transcript file in the `projects` tree below the
   runtime's effective declared config home. An absent or unverifiable file
   returns `runtime/agent_native_reference_missing` without a new worker
@@ -1286,7 +1289,7 @@ Important fields:
   instead of inferring provider behavior from `agent` or `agent_base`. Records
   that predate the field load both flags as `false`. Host profiles declare the
   spec in `[resume]` (`reference_kind`, `args`, optional `fork_args`, accepted only on
-  bases with compiled fork support, currently `claude`); see the
+  bases whose runtime declares a native fork, such as `claude`); see the
   agent-profiles concept page.
 - `name`: optional owner-set display name; absent means the session is shown by
   its id. Set at `session.new` and changed via `session.rename`.
@@ -1388,7 +1391,8 @@ Important fields:
   session.
 - `native_last_activity_at`: optional RFC3339 timestamp of the selected
   conversation's verified regular transcript file modification (the check the
-  session's runtime descriptor declares, currently the built-in Claude).
+  session's runtime descriptor declares, currently the official Claude Code
+  package).
   `session.inspect`
   and `session.list` derive it on read without following symlinks. It is absent
   when no native file is verified and never falls back to `updated_at`.
@@ -1430,15 +1434,20 @@ string round-trips through Rust and TypeScript clients as a neutral value.
 Agent-targeted mutation, resume and fork resolve the value through the daemon's
 runtime registry: a value outside the runtime-id grammar is rejected with
 `runtime/agent_kind_unsupported`, and a grammar-valid id that no enabled runtime
-resolves is rejected with `runtime/runtime_not_installed`. Unknown values never
+resolves is rejected with `runtime/runtime_not_installed`. A session's
+`active_agent_base` of another runtime than the session's own (an agent a shell
+session hosts in its foreground) is only checked against the grammar: mutations
+act on the session's own runtime, so a shell session stays interactive while
+the hosted agent's package is missing or uninstalled. Unknown values never
 silently become a supported launch, resume, or fork runtime. A session or
 recovery record whose runtime is not installed is kept inert: it stays listed
 with its stored recovery binding, refuses resume, fork, input and every other
 mutation with `runtime_not_installed` (or `agent_kind_unsupported` for a
 historical label), and resumes again once the runtime is installed. The
 exception is a session launched from the built-in runtime of an official alias
-this daemon does not compile in (the built-in Codex of an earlier release): it
-is refused with `runtime/runtime_builtin_removed`, and installing the official
+this daemon does not compile in (the built-in Codex or Claude Code of an
+earlier release): it is refused with `runtime/runtime_builtin_removed`, and
+installing the official
 package restores interaction with a live session only, never resume or fork
 (`runtime/runtime_served_by_package`).
 `session.stop` and `session.remove` (also
@@ -2571,8 +2580,9 @@ the host profile's own `[env]`), else the declared default below that
 environment's `HOME`. A value that is not an absolute path (a literal `~`
 included) is `agent_config_dir_invalid`; it is never expanded with the daemon's
 `HOME`. A runtime that names a daemon-run handler but declares no
-`[config_home]` is `agent_config_home_undeclared`. The built-in `claude` and
-`codex` declare `CLAUDE_CONFIG_DIR` / `.claude` and `CODEX_HOME` / `.codex`.
+`[config_home]` is `agent_config_home_undeclared`. The official Claude Code and
+Codex packages declare `CLAUDE_CONFIG_DIR` / `.claude` and `CODEX_HOME` /
+`.codex`.
 The daemon's own process environment steers nothing unless the allowlist
 forwards the variable, so an install, a status report and a launched agent
 always agree on the directory. A daemon that relied on such a variable in its
@@ -2590,14 +2600,31 @@ the selected runtime (`integration_profile_runtime_mismatch` otherwise; a name
 that is no profile file, a bare runtime name included, is
 `agent_profile_not_found`), and without `agent` the profile's runtime is the
 selection. `all_profiles` covers the runtime's own home and the home of each of
-its resolvable host profiles (a profile that does not resolve is skipped and
-logged, as `host.inspect` does). Selectors that resolve to the same canonical
+its host profiles. A profile over the runtime that does not resolve (unpinned
+over a package-served alias, pinned to a version that is not installed, or over
+an alias nothing serves) is still covered: `status`, `doctor` and `uninstall`
+address the home its own `[env]` names, read with the same containment and
+strict parse as a load, and `install` lists it in `failed` with the profile's
+resolution error. A file that cannot be parsed names no runtime and is skipped
+and logged, as `host.inspect` does. Selectors that resolve to the same canonical
 directory share one home and one transaction; the report's `home`
 (`{profiles, bare, selector}`) names every selector it stands for and carries
 `selector` (`{kind: "default"}` or `{kind: "profile", name}`), the one the
 daemon verified reaches the directory the installer uses: an alias can resolve
 through a symlink the installer refuses, so recovery commands are built from
-`selector`, never from the order of `profiles` or from `bare`.
+`selector`, never from the order of `profiles` or from `bare`. A request without
+`agent` that reaches one directory through one handler for several runtimes (a
+package that declares `claude-hook-v1` and Claude's `[config_home]`, say)
+attributes the directory to none of them: each of those runtimes keeps one home
+whose resolution fails with `configuration/integration_home_ambiguous_owner`, so
+a bare `install` fails with it before writing any home (under `all_profiles` it
+is listed in `failed`). `status` reports the home as unresolved with a warning
+that carries the code and its hint; `integration.doctor` reports it as a
+`config_root_invalid` finding whose remediation names `--agent <runtime>` or
+separate config homes, and `daemon.doctor` reports that home's
+`agent_integration_<runtime>` check as `warn`, not as malformed state. The hint
+names `--agent <runtime>`; a request that names `agent` addresses only that
+runtime and is not refused.
 `IntegrationStatusResult` and `IntegrationDoctorResult` carry
 `home_selectors: true`; a daemon that predates the selectors omits it (and an
 older `integration.install` silently ignores the selector fields), so a client
@@ -2631,8 +2658,9 @@ active set of any version is replaceable, so a rolled-back release reinstalls
 its older set.
 
 `integration.status` is the corresponding read-only drift report. Bare status
-reports both daemon-managed agents; `--agent codex` and `--agent claude` select
-one. `--agent` takes any runtime id: the CLI sends it unchanged and the daemon
+reports every served runtime whose daemon-run handler has a config home (the
+Codex and Claude Code packages once installed); `--agent codex` or `--agent
+claude` selects one. `--agent` takes any runtime id: the CLI sends it unchanged and the daemon
 resolves it to the handler the runtime definition names (an id no installed
 runtime backs is `runtime_not_installed`, a runtime without a daemon-run handler
 is `agent_not_installable`), so a package runtime is addressed by its own id and
@@ -2800,11 +2828,11 @@ Canonical public codes currently emitted include:
 
 | Class | Codes |
 |---|---|
-| `configuration` | `paths_unavailable`, `netbird_configuration_invalid`, `overlay_registry_invalid`, `invalid_discovery_options`, `agent_config_dir_invalid`, `integration_path_untrusted`, `integration_trust_conflict` |
+| `configuration` | `paths_unavailable`, `netbird_configuration_invalid`, `overlay_registry_invalid`, `invalid_discovery_options`, `agent_config_dir_invalid`, `integration_path_untrusted`, `integration_trust_conflict`, `integration_home_ambiguous_owner` |
 | `daemon` | `version_mismatch`, `native_store_check_task_panicked`, `version_adapter_failed`, `daemon_protocol_too_old`, `version_translation_failed`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `host_governance_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback`, `daemon_shutting_down` |
 | `transport` | `framing`, `host_unreachable`, `request_timeout` |
 | `discovery` | `<overlay>_cli_missing`, `<overlay>_state_unavailable`, `<overlay>_listener_address_missing`, `overlay_discovery_failed`, `overlay_peer_collision`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `overlay_error`, `host_unknown`, `remote_discovery_failed` |
-| `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `agent_native_reference_missing`, `agent_native_store_relocated`, `native_identity_missing`, `native_identity_unverified`, `native_identity_uncertain`, `native_identity_evidence_unavailable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`,`assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `session_runtime_conflict`, `session_runtime_reconnecting`, `runtime_supervision_unavailable`, `runtime_supervision_ambiguous`, `runtime_identity_mismatch`, `migration_manifest_missing`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `invalid_notification_policy`, `integration_install_in_progress`, `integration_destination_collision`, `integration_recovery_required`, `integration_update_incompatible` |
+| `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `agent_native_reference_missing`, `agent_native_store_relocated`, `native_identity_missing`, `native_identity_unverified`, `native_identity_uncertain`, `native_identity_evidence_unavailable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `integration_no_managed_runtime`, `bundle_unavailable`,`assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `session_runtime_conflict`, `session_runtime_reconnecting`, `runtime_supervision_unavailable`, `runtime_supervision_ambiguous`, `runtime_identity_mismatch`, `migration_manifest_missing`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `invalid_notification_policy`, `integration_install_in_progress`, `integration_destination_collision`, `integration_recovery_required`, `integration_update_incompatible` |
 
 Protocol v4 emits these runtime codes for provider-neutral agent and
 observation behavior: `agent_kind_unsupported`,
@@ -2823,7 +2851,7 @@ uninstalled runtime, and resume, fork or mutation of a session whose runtime is
 not installed or no longer matches its recorded launch binding. A bare
 `session.new` agent name that is neither a profile nor an installed runtime
 stays `agent_profile_not_found`. For an official alias nothing serves (`codex`
-without its package), that `agent_profile_not_found` and the
+or `claude` without its package), that `agent_profile_not_found` and the
 `runtime_not_installed` of an unpinned host profile over the alias carry a
 recovery hint naming the catalog install of the official package.
 `runtime_builtin_removed` is emitted by resume, fork and mutation of a session
