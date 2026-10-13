@@ -47,7 +47,7 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 libc = { workspace = true }
 nix = { workspace = true }
-rustix = { workspace = true, features = ["fs"] }
+rustix = { workspace = true, features = ["fs", "process"] }
 time = { workspace = true }
 ulid = { workspace = true }
 uuid = { workspace = true }

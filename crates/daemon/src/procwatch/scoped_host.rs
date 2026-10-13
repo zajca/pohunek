@@ -1,12 +1,14 @@
 //! Host process table view that confines a cleanup scenario to its own processes,
 //! and the reaper that ends them when the scenario's directory goes away.
 
-// Rust guideline compliant 2026-10-12
+// Rust guideline compliant 2026-10-13
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+#[cfg(not(target_os = "linux"))]
 use nix::sys::signal::{kill, Signal};
+#[cfg(not(target_os = "linux"))]
 use nix::unistd::Pid as NativePid;
 use pohunek_platform::process::{
     Error, ExitWatch, HostInspector, OwnershipMarkers, Pid, ProcessCoalitions, ProcessFact,
@@ -230,16 +232,48 @@ impl ScopeReaper {
     fn kill_running(&self) -> Result<Vec<ProcessIdentity>, Error> {
         let running = self.running()?;
         for identity in &running {
-            let Ok(raw) = i32::try_from(identity.pid) else {
-                continue;
-            };
-            if matches!(self.host.identity(identity.pid), Ok(Some(current)) if current == *identity)
-            {
-                let _signalled = kill(NativePid::from_raw(raw), Signal::SIGKILL);
-            }
+            kill_if_current(&self.host, *identity);
         }
         Ok(running)
     }
+}
+
+/// Sends `SIGKILL` to `identity` only while its PID still names that process.
+///
+/// A process that exited, or whose PID now names another process, is left
+/// alone. On Linux the signal goes through a pidfd opened before the identity
+/// check, so it cannot reach a process that reused the PID after the check.
+/// Elsewhere a PID reused between the check and `kill` is a microsecond-wide
+/// window, and the start-identity check keeps it from covering any process
+/// that existed before the check.
+pub(crate) fn kill_if_current(host: &dyn ProcessInspector, identity: ProcessIdentity) {
+    let Some(pid) = i32::try_from(identity.pid).ok().filter(|raw| *raw > 0) else {
+        return;
+    };
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::process::{pidfd_open, pidfd_send_signal, PidfdFlags, Signal};
+
+        // The pidfd pins the process it opened; the identity check after
+        // opening it proves the pidfd names `identity`.
+        let Some(Ok(pidfd)) =
+            rustix::process::Pid::from_raw(pid).map(|pid| pidfd_open(pid, PidfdFlags::empty()))
+        else {
+            return;
+        };
+        if is_current(host, identity) {
+            let _signalled = pidfd_send_signal(&pidfd, Signal::KILL);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    if is_current(host, identity) {
+        let _signalled = kill(NativePid::from_raw(pid), Signal::SIGKILL);
+    }
+}
+
+/// Whether the PID of `identity` still names that process.
+fn is_current(host: &dyn ProcessInspector, identity: ProcessIdentity) -> bool {
+    matches!(host.identity(identity.pid), Ok(Some(current)) if current == identity)
 }
 
 impl Drop for ScopeReaper {

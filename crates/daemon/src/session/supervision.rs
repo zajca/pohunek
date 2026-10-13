@@ -582,20 +582,66 @@ fn leaves_only_unreadable(report: &SweepReport) -> bool {
             .all(|skipped| skipped.reason == SkipReason::MarkersUnreadable)
 }
 
-/// Pauses one poll interval while the settle window of the unreadable-marker
-/// processes is open, and reports whether it paused.
+tokio::task_local! {
+    /// Settle window of the operation the current task runs; see
+    /// [`with_settle_window`].
+    static SETTLE_WINDOW: SettleWindow;
+}
+
+/// The wait for unreadable-marker processes that every sweep of one operation
+/// shares.
 ///
-/// The window opens at the first call and lasts `grace`. Nothing was signalled
-/// when only such processes remain, so repeating the sweep at once would read the
-/// same table: the process is either caught between images, or an orphan of a
-/// creator that has exited and is about to follow it (the fork lineage cannot
-/// attribute it, and on macOS 27 its environment is withheld). The caller leaves
-/// the cleanup unconfirmed once the window has closed.
-async fn settle_unreadable(
-    settle_until: &mut Option<tokio::time::Instant>,
-    grace: Duration,
-) -> bool {
-    let deadline = *settle_until.get_or_insert_with(|| tokio::time::Instant::now() + grace);
+/// Its end is fixed by the first sweep pass of the operation that leaves only
+/// such processes, one sweep grace after that pass, and later sweeps of the
+/// operation wait only for what is left of it. An operation that sweeps many
+/// runtimes, the startup reconciliation that runs before the daemon reports
+/// readiness above all, therefore waits at most one grace in total, however
+/// many runtimes one persistent candidate blocks.
+#[derive(Debug, Default)]
+struct SettleWindow {
+    until: std::sync::OnceLock<tokio::time::Instant>,
+}
+
+impl SettleWindow {
+    /// End of the window, fixed at `grace` from now by the first call.
+    fn deadline(&self, grace: Duration) -> tokio::time::Instant {
+        *self
+            .until
+            .get_or_init(|| tokio::time::Instant::now() + grace)
+    }
+}
+
+/// Runs `operation` with one settle window shared by every sweep it makes.
+///
+/// Inside an operation that already holds a window, `operation` shares that
+/// window, so a removal swept during startup reconciliation spends the startup
+/// window. The window belongs to the current task: a sweep in a task that
+/// `operation` spawns does not see it and opens its own.
+pub(super) async fn with_settle_window<F: std::future::Future>(operation: F) -> F::Output {
+    if SETTLE_WINDOW.try_with(|_window| ()).is_ok() {
+        operation.await
+    } else {
+        SETTLE_WINDOW
+            .scope(SettleWindow::default(), operation)
+            .await
+    }
+}
+
+/// Pauses one poll interval while the settle window of the current operation
+/// is open, and reports whether it paused.
+///
+/// Nothing was signalled when only unreadable-marker processes remain, so
+/// repeating the sweep at once would read the same table: the process is
+/// either caught between images, or an orphan of a creator that has exited and
+/// is about to follow it (the fork lineage cannot attribute it, and on macOS 27
+/// its environment is withheld). The caller leaves the cleanup unconfirmed
+/// once the window has closed.
+///
+/// # Panics
+///
+/// Panics outside [`with_settle_window`], which every sweep runs within.
+async fn settle_unreadable(grace: Duration) -> bool {
+    let deadline = SETTLE_WINDOW.with(|window| window.deadline(grace));
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
         return false;
@@ -646,9 +692,11 @@ impl SessionRegistry {
     ///
     /// Runs [`sweep_runtime`] until a pass selects nothing, at most
     /// [`MAX_SWEEP_PASSES`] times. When only unreadable-marker processes remain,
-    /// the sweep re-reads the process table for up to the sweep grace, so a
-    /// process that is caught between images or about to exit does not leave the
-    /// cleanup unconfirmed. An unconfirmed exit or a sweep error stops
+    /// the sweep re-reads the process table until the settle window of the
+    /// calling operation closes ([`with_settle_window`]; one sweep grace at
+    /// most, shared by every runtime the operation sweeps), so a process that
+    /// is caught between images or about to exit does not leave the cleanup
+    /// unconfirmed. An unconfirmed exit or a sweep error stops
     /// immediately and is reported; a crash classification never repeats the
     /// sweep as a kill loop. Removal sweeps every runtime of the session it
     /// forgets ([`Self::sweep_removed_runtimes`]) and repeats that sweep only
@@ -733,15 +781,24 @@ impl SessionRegistry {
         ) else {
             return SweepOutcome::blocked_by_other();
         };
+        with_settle_window(self.sweep_passes(session_id, worker_instance_id, grace, &request)).await
+    }
+
+    /// The sweep passes of [`Self::sweep_runtime_detailed`], within the settle
+    /// window of the calling operation.
+    async fn sweep_passes(
+        &self,
+        session_id: &str,
+        worker_instance_id: &str,
+        grace: Duration,
+        request: &SweepRequest,
+    ) -> SweepOutcome {
         // Sweep passes made, not counting the pauses of an unreadable-marker
         // wait; the pass in flight is `passes + 1`.
         let mut passes = 0;
-        // End of the wait for unreadable-marker processes, fixed by the first
-        // pass that leaves nothing else to do.
-        let mut settle_until: Option<tokio::time::Instant> = None;
         let deciding_pass = loop {
             let pass = passes + 1;
-            let report = match sweep_runtime(self.inner.inspector.as_ref(), &request).await {
+            let report = match sweep_runtime(self.inner.inspector.as_ref(), request).await {
                 Ok(report) => report,
                 Err(error) => {
                     tracing::warn!(
@@ -758,7 +815,7 @@ impl SessionRegistry {
             // runtime counts as selected; once nothing else remains, the sweep
             // waits for it (see [`settle_unreadable`]).
             let only_unreadable = leaves_only_unreadable(&report);
-            let settling = only_unreadable && settle_unreadable(&mut settle_until, grace).await;
+            let settling = only_unreadable && settle_unreadable(grace).await;
             let role = if settling {
                 PassRole::Settling
             } else if only_unreadable || passes + 1 >= MAX_SWEEP_PASSES {

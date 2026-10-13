@@ -23,8 +23,8 @@ use sha2::{Digest, Sha256};
 use super::conflict_stop::is_conflict_proven_removal;
 use super::supervision::{
     classify_unreachable, describe_unreadable_candidates, job_identity_mismatch, observe,
-    record_accepted_process, Cleanup, JobEvidence, JournalWorker, Unreachable, WorkerBounds,
-    CREATE_COMPENSATION_PENDING, MAX_ACCEPTED_UNCONFIRMED_PROCESSES, RUNTIME_LOST,
+    record_accepted_process, with_settle_window, Cleanup, JobEvidence, JournalWorker, Unreachable,
+    WorkerBounds, CREATE_COMPENSATION_PENDING, MAX_ACCEPTED_UNCONFIRMED_PROCESSES, RUNTIME_LOST,
     RUNTIME_LOST_CLEANUP_UNCONFIRMED, UNREADABLE_CANDIDATES_RECOVER, UNSUPERVISED_WORKER,
 };
 use super::{
@@ -812,42 +812,49 @@ impl SessionRegistry {
         }
         *self.inner.runtime_inventory.lock().await = inventory;
 
-        for mut record in records {
-            let id = SessionId(record.session_id.clone());
-            let _guard = self.lock_lifecycle(&id).await;
-            let binding = resume_bindings.remove(&record.session_id);
-            if let Err(reason) = self.merge_resume_binding(&mut record, binding) {
-                if !self
-                    .insert_unavailable_record(record, RuntimeState::Conflict, reason)
-                    .await
+        // Every record is reconciled inline in this task before the daemon
+        // reports readiness, so the sweeps of all of them share one settle
+        // window and startup waits at most one sweep grace for
+        // unreadable-marker processes, however many runtimes they block.
+        with_settle_window(Box::pin(async {
+            for mut record in records {
+                let id = SessionId(record.session_id.clone());
+                let _guard = self.lock_lifecycle(&id).await;
+                let binding = resume_bindings.remove(&record.session_id);
+                if let Err(reason) = self.merge_resume_binding(&mut record, binding) {
+                    if !self
+                        .insert_unavailable_record(record, RuntimeState::Conflict, reason)
+                        .await
+                    {
+                        self.schedule_supervision_retry(&id);
+                    }
+                    continue;
+                }
+                let socket = self
+                    .startup_socket_evidence(
+                        &record.session_id,
+                        socket_failure.as_deref(),
+                        &mut discovered,
+                    )
+                    .await;
+                let scan = match &mut journals {
+                    Ok(journals) => Ok(journals.remove(&record.session_id).unwrap_or_default()),
+                    Err(detail) => Err(detail.clone()),
+                };
+                if Box::pin(self.reconcile_logical(
+                    record,
+                    socket,
+                    scan.as_ref().map_err(String::as_str),
+                    lifecycle.as_ref(),
+                    false,
+                ))
+                .await
                 {
                     self.schedule_supervision_retry(&id);
                 }
-                continue;
             }
-            let socket = self
-                .startup_socket_evidence(
-                    &record.session_id,
-                    socket_failure.as_deref(),
-                    &mut discovered,
-                )
-                .await;
-            let scan = match &mut journals {
-                Ok(journals) => Ok(journals.remove(&record.session_id).unwrap_or_default()),
-                Err(detail) => Err(detail.clone()),
-            };
-            if Box::pin(self.reconcile_logical(
-                record,
-                socket,
-                scan.as_ref().map_err(String::as_str),
-                lifecycle.as_ref(),
-                false,
-            ))
-            .await
-            {
-                self.schedule_supervision_retry(&id);
-            }
-        }
+        }))
+        .await;
         Ok(())
     }
 
@@ -959,13 +966,15 @@ impl SessionRegistry {
             .discover_worker_journals()
             .await
             .map(|mut journals| journals.remove(&record.session_id).unwrap_or_default());
-        Box::pin(self.reconcile_logical(
+        // One re-check waits at most one sweep grace for unreadable-marker
+        // processes, whichever of its sweeps meet them.
+        with_settle_window(Box::pin(self.reconcile_logical(
             record,
             socket,
             scan.as_ref().map_err(String::as_str),
             lifecycle.as_ref(),
             true,
-        ))
+        )))
         .await
     }
 
@@ -2515,50 +2524,55 @@ impl SessionRegistry {
                 runtimes.push((worker_instance_id.to_owned(), WorkerBounds::NONE, true));
             }
         }
-        // Each accepted process with the runtime that first listed it. The
-        // caller logs them once the removal has completed.
-        let mut accepted: Vec<(UnconfirmedProcess, String)> = Vec::new();
-        for (worker_instance_id, bounds, requires_session_marker) in runtimes {
-            let outcome = if requires_session_marker {
-                self.sweep_unjournaled_removed_runtime_detailed(&id.0, &worker_instance_id)
-                    .await
-            } else {
-                self.sweep_lost_runtime_detailed(&id.0, &worker_instance_id, bounds)
-                    .await
-            };
-            if outcome.cleanup != Cleanup::Unconfirmed {
-                continue;
-            }
-            if cleanup == UnconfirmedCleanup::Accept && outcome.only_unreadable_candidates_blocked()
-            {
-                for candidate in &outcome.unreadable {
-                    record_accepted_process(&mut accepted, candidate, &worker_instance_id);
-                    // Stops at the first excess process so the work stays
-                    // bounded however many candidates a host has.
-                    if accepted.len() > MAX_ACCEPTED_UNCONFIRMED_PROCESSES {
-                        let mut error = ambiguous(format!(
-                            "more than the {MAX_ACCEPTED_UNCONFIRMED_PROCESSES} unreadable processes one removal can accept may belong to its runtimes"
-                        ));
-                        error.recover = Some(UNREADABLE_CANDIDATES_RECOVER.to_owned());
-                        return Err(error);
-                    }
+        // The runtimes of one removal share one settle window, so the removal
+        // waits at most one sweep grace for unreadable-marker processes.
+        with_settle_window(async {
+            // Each accepted process with the runtime that first listed it. The
+            // caller logs them once the removal has completed.
+            let mut accepted: Vec<(UnconfirmedProcess, String)> = Vec::new();
+            for (worker_instance_id, bounds, requires_session_marker) in runtimes {
+                let outcome = if requires_session_marker {
+                    self.sweep_unjournaled_removed_runtime_detailed(&id.0, &worker_instance_id)
+                        .await
+                } else {
+                    self.sweep_lost_runtime_detailed(&id.0, &worker_instance_id, bounds)
+                        .await
+                };
+                if outcome.cleanup != Cleanup::Unconfirmed {
+                    continue;
                 }
-                continue;
+                if cleanup == UnconfirmedCleanup::Accept && outcome.only_unreadable_candidates_blocked()
+                {
+                    for candidate in &outcome.unreadable {
+                        record_accepted_process(&mut accepted, candidate, &worker_instance_id);
+                        // Stops at the first excess process so the work stays
+                        // bounded however many candidates a host has.
+                        if accepted.len() > MAX_ACCEPTED_UNCONFIRMED_PROCESSES {
+                            let mut error = ambiguous(format!(
+                                "more than the {MAX_ACCEPTED_UNCONFIRMED_PROCESSES} unreadable processes one removal can accept may belong to its runtimes"
+                            ));
+                            error.recover = Some(UNREADABLE_CANDIDATES_RECOVER.to_owned());
+                            return Err(error);
+                        }
+                    }
+                    continue;
+                }
+                let mut error = ambiguous(format!(
+                    "processes of runtime {worker_instance_id} are not proven gone"
+                ));
+                if outcome.only_unreadable_candidates_blocked() {
+                    error.msg = format!(
+                        "{}; processes whose environment cannot be read may belong to it: {}",
+                        error.msg,
+                        describe_unreadable_candidates(&outcome.unreadable)
+                    );
+                    error.recover = Some(UNREADABLE_CANDIDATES_RECOVER.to_owned());
+                }
+                return Err(error);
             }
-            let mut error = ambiguous(format!(
-                "processes of runtime {worker_instance_id} are not proven gone"
-            ));
-            if outcome.only_unreadable_candidates_blocked() {
-                error.msg = format!(
-                    "{}; processes whose environment cannot be read may belong to it: {}",
-                    error.msg,
-                    describe_unreadable_candidates(&outcome.unreadable)
-                );
-                error.recover = Some(UNREADABLE_CANDIDATES_RECOVER.to_owned());
-            }
-            return Err(error);
-        }
-        Ok(accepted)
+            Ok(accepted)
+        })
+        .await
     }
 
     /// Finishes the durable removal intent of `record` once its runtime is
@@ -12177,6 +12191,53 @@ handler = "codex-hook-v1"
             );
         }
 
+        /// Startup reconciles every record before the daemon binds its socket
+        /// and reports readiness, so the wait for unreadable-marker processes is
+        /// shared by all the runtimes it sweeps: one persistent candidate that
+        /// blocks every crashed runtime delays readiness by one sweep grace,
+        /// not by one grace per runtime, and every runtime still ends with its
+        /// cleanup unconfirmed. The clock is paused, so the elapsed time is the
+        /// virtual time the sweeps waited: one full grace for the candidate to
+        /// exit, and nothing more.
+        #[tokio::test(start_paused = true)]
+        async fn startup_waits_one_sweep_grace_for_unreadable_processes_across_crashed_runtimes() {
+            const SESSIONS: [&str; 4] = ["s-395", "s-396", "s-397", "s-398"];
+            let inspector = Arc::new(RetryInspector::default());
+            inspector.fail_markers(true);
+            let fixture =
+                fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
+            let marked = Marked::spawn("runtime-s-395");
+            for session_id in SESSIONS {
+                let runtime = format!("runtime-{session_id}");
+                persist_record(&fixture.root, session_id, Some(&runtime));
+                write_live_journal(&fixture.root, session_id, dead_worker(), Some(&runtime));
+            }
+
+            let started = tokio::time::Instant::now();
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            let elapsed = started.elapsed();
+
+            assert!(
+                (SWEEP_GRACE..SWEEP_GRACE * 2).contains(&elapsed),
+                "startup waited {elapsed:?} for unreadable processes; one sweep grace is {SWEEP_GRACE:?}"
+            );
+            for session_id in SESSIONS {
+                let runtime = runtime_of(&fixture.registry, session_id).await;
+                assert_eq!(runtime.state, RuntimeState::Lost, "{session_id}");
+                assert_eq!(
+                    runtime.loss_reason.as_deref(),
+                    Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED),
+                    "{session_id}"
+                );
+            }
+            assert!(
+                marked.alive(),
+                "an unreadable marker is never a signal permit"
+            );
+        }
+
         #[tokio::test]
         async fn mismatched_job_definition_fails_closed() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
@@ -18248,6 +18309,16 @@ handler = "codex-hook-v1"
                 .await;
                 (None, 0, None, task)
             };
+            // The PTY root while it is known to run, so teardown signals it
+            // only while its PID still names it.
+            let pty_root = (child_pid != 0)
+                .then(|| {
+                    crate::procwatch::HostInspector::new()
+                        .identity(child_pid)
+                        .ok()
+                        .flatten()
+                })
+                .flatten();
             let state_root = root.join("state/workers");
             for private in [
                 root.join("state"),
@@ -18368,7 +18439,7 @@ handler = "codex-hook-v1"
                 entry.procwatch_cancel.cancel();
             }
             if child_pid != 0 {
-                end_worker_runtime(child_pid, &journal_path).await;
+                end_worker_runtime(pty_root, &journal_path).await;
             }
             task.abort();
 
@@ -18479,13 +18550,21 @@ handler = "codex-hook-v1"
     /// terminal journal later; one that runs after the fixture directory was
     /// removed recreates the directory. Ending the root first and waiting for the
     /// terminal record leaves no writer behind.
-    async fn end_worker_runtime(child_pid: u32, journal_path: &Path) {
-        let child = i32::try_from(child_pid).expect("a PTY root PID fits");
-        // The root may already have exited; either way the journal ends terminal.
-        let _ended = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(child),
-            nix::sys::signal::Signal::SIGKILL,
-        );
+    ///
+    /// `root` is the identity the root had while it ran, or `None` when it had
+    /// already exited then. A root the worker has reaped since leaves its PID
+    /// free for another process, so the root is signalled only while its PID
+    /// still names it; either way the journal ends terminal.
+    async fn end_worker_runtime(
+        root: Option<crate::procwatch::ProcessIdentity>,
+        journal_path: &Path,
+    ) {
+        if let Some(root) = root {
+            crate::procwatch::scoped_host::kill_if_current(
+                &crate::procwatch::HostInspector::new(),
+                root,
+            );
+        }
         wait_until("the worker journals the end of its PTY root", || async {
             let journal: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(journal_path).ok()?).ok()?;
