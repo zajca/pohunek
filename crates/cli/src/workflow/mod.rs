@@ -5,10 +5,15 @@
 //! package registry of its own ([`store`]), apart from the runtime packages
 //! the daemon serves, so no daemon, worker or protocol code ever reads it.
 //! Trust is the archive digest the owner supplies at install time.
+//! [`runner`] runs one declared action under the owner limits of [`config`]
+//! and appends a record to the plugin's run log ([`runlog`]).
 
 // Rust guideline compliant 2026-10-13
 
+pub(crate) mod config;
 pub(crate) mod manifest;
+pub(crate) mod runlog;
+pub(crate) mod runner;
 pub(crate) mod store;
 
 use std::io::ErrorKind;
@@ -113,6 +118,132 @@ pub(crate) enum Error {
     /// The store could not be read or changed safely.
     #[error("the workflow plugin store failed: {0}")]
     Store(String),
+
+    /// The owner knobs file is unsafe or invalid.
+    #[error("{path}: the workflow knobs are invalid: {reason}")]
+    ConfigInvalid {
+        /// The knobs file path.
+        path: String,
+        /// Content-free reason: a line, a key and its range, or a cause.
+        reason: String,
+    },
+
+    /// The plugin is installed disabled.
+    #[error("workflow plugin {id} is disabled; nothing was run")]
+    PluginDisabled {
+        /// The plugin id.
+        id: String,
+    },
+
+    /// The plugin's manifest declares no action of the name.
+    #[error("workflow plugin {id} declares no action {action:?}; nothing was run")]
+    ActionUnknown {
+        /// The plugin id.
+        id: String,
+        /// The requested name, quoted with control characters escaped.
+        action: String,
+    },
+
+    /// Extra arguments were given to an action declared with `args = "none"`.
+    #[error("action {action} of workflow plugin {id} accepts no extra arguments; {count} were given and nothing was run")]
+    ArgsRefused {
+        /// The plugin id.
+        id: String,
+        /// The declared action name.
+        action: String,
+        /// How many extra arguments were given; their values are not shown.
+        count: usize,
+    },
+
+    /// Exactly one of the two session origin markers is set.
+    #[error("exactly one of POHUNEK_SESSION_ID and POHUNEK_DAEMON_ID is set; a workflow action runs with both or neither, so nothing was run")]
+    OriginIncomplete,
+
+    /// The action declares a deadline above the owner's ceiling.
+    #[error("action {action} of workflow plugin {id} declares timeout_ms {requested}, above limits.action_timeout_max_ms {max}; nothing was run")]
+    TimeoutRefused {
+        /// The plugin id.
+        id: String,
+        /// The declared action name.
+        action: String,
+        /// The manifest's `timeout_ms`.
+        requested: u64,
+        /// The owner's ceiling.
+        max: u64,
+    },
+
+    /// The run context exceeds the owner's cap.
+    #[error("the run context of workflow plugin {id} has {bytes} bytes, above limits.max_context_bytes {max}; nothing was run")]
+    ContextTooLarge {
+        /// The plugin id.
+        id: String,
+        /// Size of the context JSON.
+        bytes: usize,
+        /// The owner's cap.
+        max: u64,
+    },
+
+    /// The plugin's run log cannot be opened or written.
+    #[error("the workflow plugin run log failed: {detail}")]
+    RunLog {
+        /// Path and cause; never record content.
+        detail: String,
+    },
+
+    /// The action's process could not be started.
+    #[error("action {action} of workflow plugin {id} could not be started: {cause}")]
+    SpawnFailed {
+        /// The plugin id.
+        id: String,
+        /// The declared action name.
+        action: String,
+        /// The operating system's error kind.
+        cause: ErrorKind,
+    },
+
+    /// The runner could not observe the action or read its output.
+    #[error("action {action} of workflow plugin {id} could not be observed; its process group was killed")]
+    RunFailed {
+        /// The plugin id.
+        id: String,
+        /// The declared action name.
+        action: String,
+    },
+
+    /// The action did not finish before its deadline.
+    #[error("action {action} of workflow plugin {id} did not finish within {timeout_ms} ms and was stopped")]
+    ActionTimeout {
+        /// The plugin id.
+        id: String,
+        /// The declared action name.
+        action: String,
+        /// The deadline that applied.
+        timeout_ms: u64,
+    },
+
+    /// An output stream of the action passed its cap.
+    #[error("action {action} of workflow plugin {id} wrote more than {limit} bytes to {stream} and was stopped")]
+    OutputLimit {
+        /// The plugin id.
+        id: String,
+        /// The declared action name.
+        action: String,
+        /// `stdout` or `stderr`.
+        stream: &'static str,
+        /// The cap that applied.
+        limit: u64,
+    },
+
+    /// The CLI received a terminating signal while the action ran.
+    #[error("action {action} of workflow plugin {id} was stopped because pohunek received signal {signal}")]
+    Interrupted {
+        /// The plugin id.
+        id: String,
+        /// The declared action name.
+        action: String,
+        /// The received signal number.
+        signal: i32,
+    },
 }
 
 impl Error {
@@ -132,6 +263,19 @@ impl Error {
             Self::PurgeIncomplete { .. } => "workflow_purge_incomplete",
             Self::DirsOverlap(_) => "workflow_dirs_overlap",
             Self::Store(_) => "workflow_store_failed",
+            Self::ConfigInvalid { .. } => "workflow_config_invalid",
+            Self::PluginDisabled { .. } => "workflow_plugin_disabled",
+            Self::ActionUnknown { .. } => "workflow_action_unknown",
+            Self::ArgsRefused { .. } => "workflow_action_args_refused",
+            Self::OriginIncomplete => "workflow_origin_incomplete",
+            Self::TimeoutRefused { .. } => "workflow_timeout_refused",
+            Self::ContextTooLarge { .. } => "workflow_context_too_large",
+            Self::RunLog { .. } => "workflow_run_log_failed",
+            Self::SpawnFailed { .. } => "workflow_spawn_failed",
+            Self::RunFailed { .. } => "workflow_run_failed",
+            Self::ActionTimeout { .. } => "workflow_action_timeout",
+            Self::OutputLimit { .. } => "workflow_output_limit",
+            Self::Interrupted { .. } => "workflow_action_interrupted",
         }
     }
 
@@ -196,6 +340,45 @@ impl Error {
             Self::Store(_) => {
                 "check that the pohunek state and config directories are owned by you and private"
             }
+            Self::ConfigInvalid { .. } => {
+                "fix workflow.toml as described in the workflow plugin guide, or remove it to use \
+                 the defaults"
+            }
+            Self::PluginDisabled { .. } => "enable it with `pohunek workflow enable <id>`",
+            Self::ActionUnknown { .. } => {
+                "list the plugin's actions with `pohunek workflow inspect <id>`"
+            }
+            Self::ArgsRefused { .. } => {
+                "run the action without arguments after `--`; it declares `args = \"none\"`"
+            }
+            Self::OriginIncomplete => {
+                "set both POHUNEK_SESSION_ID and POHUNEK_DAEMON_ID or neither; inside a managed \
+                 session restore the missing marker, never unset the other"
+            }
+            Self::TimeoutRefused { .. } => {
+                "raise limits.action_timeout_max_ms in workflow.toml, or ask the plugin author \
+                 for a shorter timeout_ms"
+            }
+            Self::ContextTooLarge { .. } => "raise limits.max_context_bytes in workflow.toml",
+            Self::RunLog { .. } => {
+                "check that the plugin state directory and its logs directory are owned by you \
+                 and private"
+            }
+            Self::SpawnFailed { .. } => {
+                "check `pohunek workflow inspect <id>`; reinstall the plugin if its files are \
+                 missing"
+            }
+            Self::RunFailed { .. } => "retry the action; the run log records the outcome",
+            Self::ActionTimeout { .. } => {
+                "the deadline is the action's timeout_ms (up to limits.action_timeout_max_ms) or \
+                 limits.action_timeout_default_ms in workflow.toml; raise the one that applied"
+            }
+            Self::OutputLimit { .. } => {
+                "the cap is the lower of the action's max_output_bytes and \
+                 limits.max_stdout_bytes / limits.max_stderr_bytes in workflow.toml; raise the \
+                 one that applied"
+            }
+            Self::Interrupted { .. } => "run the action again when it may finish",
         }
     }
 
@@ -208,7 +391,13 @@ impl Error {
             | Self::InstallUncertain { .. }
             | Self::Busy
             | Self::PurgeIncomplete { .. }
-            | Self::Store(_) => ErrorClass::Runtime,
+            | Self::Store(_)
+            | Self::RunLog { .. }
+            | Self::SpawnFailed { .. }
+            | Self::RunFailed { .. }
+            | Self::ActionTimeout { .. }
+            | Self::OutputLimit { .. }
+            | Self::Interrupted { .. } => ErrorClass::Runtime,
             _ => ErrorClass::Configuration,
         }
     }

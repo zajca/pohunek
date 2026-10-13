@@ -603,12 +603,16 @@ Runtime package archive format:
 - `crates/cli/src/commands/plugin.rs` — `pohunek plugin list|inspect|install|link|update|select|enable|disable|uninstall|doctor`.
 - `crates/cli/src/commands/plugin_profile.rs` — `pohunek plugin profile list|migrate`.
 - `docs/knowledge/guides/runtime-packages.md`
-- `crates/cli/src/commands/workflow.rs` — `pohunek workflow list|inspect|install|enable|disable|uninstall`, the consent review and the `--json` payloads.
+- `crates/cli/src/commands/workflow.rs` — `pohunek workflow list|inspect|install|enable|disable|uninstall|run`, the consent review, the `--json` payloads and the `run` exit statuses.
 - `crates/cli/src/workflow/mod.rs` — workflow error codes, classes and recovery hints.
 - `crates/cli/src/workflow/manifest.rs` — the strict `workflow.toml` schema, size cap and argv rules.
 - `crates/cli/src/workflow/store.rs` — the workflow registry root, per-plugin state and config directories, install, uninstall and purge.
+- `crates/cli/src/workflow/runner.rs` — `workflow run`: refusals, the child's argv, cwd and exact environment, the context JSON, deadline, output caps, signal handling and outcome precedence.
+- `crates/cli/src/workflow/config.rs` — the owner knobs `<config>/pohunek/workflow.toml`: tables, defaults, ranges and the file safety rule.
+- `crates/cli/src/workflow/runlog.rs` — the per-plugin `logs/runs.jsonl` record and its outcomes.
 - `crates/paths/src/lib.rs` — `WORKFLOW_PLUGINS_SUBDIR`, `WORKFLOW_PLUGIN_STATE_SUBDIR` and `WORKFLOW_PLUGIN_CONFIG_SUBDIR`.
 - `crates/cli/tests/workflow_store.rs` — consent, digest, hostile-manifest, tampered-root, local-only and lifecycle scenarios through the real binary.
+- `crates/cli/tests/workflow_run.rs` — `workflow run` scenarios through the real binary: exact environment and origin pair (with a real `pohunekd` session), refusals, deadline, output cap, interruption, slow output consumer, redaction, context and owner knobs.
 - `docs/knowledge/guides/workflow-plugins.md`
 - `docs/knowledge/runbooks/runtime-package-recovery.md` — recovery from failed package verification, refused official installs, and disabled, removed or damaged pinned packages.
 - `docs/architecture.md` — "Runtime Packages and Trust": the package classes and the same-UID owner trust boundary.
@@ -716,7 +720,7 @@ Hermes operator plugin and managed lifecycle:
 - `crates/cli/src/hermes_integration/policy.rs`
 - `crates/cli/src/hermes_integration/lifecycle.rs`
 - `crates/cli/src/hermes_integration/runner.rs`
-- `crates/cli/src/process/bounded.rs` — the bounded child lifecycle the Hermes runner spawns through: own process group, inherited descriptors closed, deadline kill, and capped output.
+- `crates/cli/src/process/bounded.rs` — the bounded child lifecycle the Hermes runner and `workflow run` spawn through: own process group, inherited descriptors closed, deadline kill (with a `SIGTERM` grace for workflow runs), and capped output, buffered or streamed to a sink.
 - `crates/cli/src/hermes_integration/assets.rs`
 - `crates/cli/src/hermes_integration/doctor.rs`
 - `crates/cli/src/hermes_integration/skill.rs`

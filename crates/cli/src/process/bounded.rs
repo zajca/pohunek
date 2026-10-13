@@ -15,17 +15,26 @@
 //! - **Deadline kill.** [`wait_for_child`] polls until the deadline, then kills
 //!   the group with `SIGKILL` and reaps the direct child. After a normal exit
 //!   it also kills the group, so descendants left in it do not outlive the
-//!   run.
+//!   run. [`supervise_child`] is the same wait with a grace period: at the
+//!   deadline, or when the caller's stop check fires, the group gets
+//!   `SIGTERM`, then `SIGKILL` once the direct child exited or the grace
+//!   elapsed, whichever comes first.
 //! - **Bounded output.** Each pipe is drained on its own thread to prevent a
 //!   pipe deadlock, but at most the caller's limit is retained; the rest is
 //!   discarded and reported as [`BoundedOutput::overflow`]. Collection shares
-//!   the child's deadline.
+//!   the child's deadline. [`spawn_capped_reader`] instead forwards a stream
+//!   to any [`Write`] sink (a terminal, a capture buffer, or a discarding
+//!   counter) and stops reading at the limit, so the caller's stop check can
+//!   end the run early; [`drain_capped`] collects it without counting time
+//!   the sink's consumer takes.
 
 // Rust guideline compliant 2026-10-13
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -75,6 +84,50 @@ pub(crate) enum Error {
     /// A reader thread ended without delivering its result.
     #[error("child process output reader ended without a result")]
     ReaderLost,
+}
+
+/// Why [`supervise_child`] stopped the child's group before the child exited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Cut {
+    /// The deadline expired first.
+    Deadline,
+    /// The caller's stop check fired first.
+    Stopped,
+}
+
+/// How a supervised child ended.
+#[derive(Debug)]
+pub(crate) struct Ended {
+    /// The reaped direct child's status.
+    pub(crate) status: ExitStatus,
+    /// Why the group was stopped, or `None` when the child exited by itself.
+    pub(crate) cut: Option<Cut>,
+}
+
+/// What one capped stream delivered, readable while its reader still runs.
+#[derive(Debug, Default)]
+pub(crate) struct Tally {
+    delivered: AtomicU64,
+    overflowed: AtomicBool,
+    /// Whether the reader is inside a sink write, waiting on the consumer.
+    writing: AtomicBool,
+}
+
+impl Tally {
+    /// Bytes handed to the sink so far; never more than the limit.
+    pub(crate) fn delivered(&self) -> u64 {
+        self.delivered.load(Ordering::Acquire)
+    }
+
+    /// Whether the stream produced more bytes than the limit.
+    pub(crate) fn overflowed(&self) -> bool {
+        self.overflowed.load(Ordering::Acquire)
+    }
+
+    /// Whether the reader is writing to its sink right now.
+    fn writing(&self) -> bool {
+        self.writing.load(Ordering::Acquire)
+    }
 }
 
 /// One drained output stream, truncated to the caller's byte limit.
@@ -277,7 +330,8 @@ fn close_descriptor_range(first: libc::c_int, end: libc::c_int) {
 ///
 /// After the child exits, the rest of its process group is killed and the
 /// child is reaped. At the deadline, or when the child cannot be observed,
-/// the whole group is killed and the child is reaped before returning.
+/// the whole group is killed with `SIGKILL` and the child is reaped before
+/// returning.
 ///
 /// # Errors
 ///
@@ -285,21 +339,60 @@ fn close_descriptor_range(first: libc::c_int, end: libc::c_int) {
 /// [`Error::Wait`] when observing or reaping the child fails, including a
 /// failed reap during the deadline cleanup.
 pub(crate) fn wait_for_child(child: &mut Child, deadline: Instant) -> Result<ExitStatus, Error> {
+    let ended = supervise_child(child, deadline, Duration::ZERO, &mut || false)?;
+    match ended.cut {
+        None => Ok(ended.status),
+        Some(_cut) => Err(Error::Timeout),
+    }
+}
+
+/// Waits for the direct child until `deadline` or until `stop` returns
+/// `true`, then stops its group with a grace period.
+///
+/// `stop` is checked before the deadline on every poll, so a stop request
+/// that is pending when the deadline expires wins. Stopping sends `SIGTERM`
+/// to the group, waits until the direct child exits or `grace` elapses, then
+/// sends `SIGKILL` to the group, so descendants that ignore `SIGTERM` or
+/// outlive the direct child still end. A zero `grace` sends only `SIGKILL`.
+/// After a normal exit the rest of the group is killed with `SIGKILL`. The
+/// direct child is always reaped before returning.
+///
+/// # Errors
+///
+/// Returns [`Error::Wait`] when observing or reaping the child fails; the
+/// group is killed with `SIGKILL` first.
+pub(crate) fn supervise_child(
+    child: &mut Child,
+    deadline: Instant,
+    grace: Duration,
+    stop: &mut dyn FnMut() -> bool,
+) -> Result<Ended, Error> {
     loop {
         match child_exited(child) {
             Ok(true) => {
-                kill_process_group(child.id());
-                return child.wait().map_err(Error::Wait);
+                kill_process_group(child.id(), libc::SIGKILL);
+                let status = child.wait().map_err(Error::Wait)?;
+                return Ok(Ended { status, cut: None });
             }
-            Ok(false) if Instant::now() >= deadline => {
-                terminate_process_group(child)?;
-                return Err(Error::Timeout);
+            Ok(false) => {
+                let cut = if stop() {
+                    Some(Cut::Stopped)
+                } else {
+                    (Instant::now() >= deadline).then_some(Cut::Deadline)
+                };
+                if let Some(cut) = cut {
+                    let status = terminate_process_group(child, grace)?;
+                    return Ok(Ended {
+                        status,
+                        cut: Some(cut),
+                    });
+                }
+                thread::sleep(
+                    PROCESS_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+                );
             }
-            Ok(false) => thread::sleep(
-                PROCESS_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
-            ),
             Err(error) => {
-                terminate_process_group(child)?;
+                terminate_process_group(child, Duration::ZERO)?;
                 return Err(error);
             }
         }
@@ -332,21 +425,36 @@ fn child_exited(child: &Child) -> Result<bool, Error> {
     Ok(pid != 0)
 }
 
-/// Kills the still-live child group and always reaps the direct child.
-fn terminate_process_group(child: &mut Child) -> Result<(), Error> {
-    kill_process_group(child.id());
+/// Stops the still-live child group and always reaps the direct child.
+///
+/// With a non-zero `grace` the group first gets `SIGTERM`, and the direct
+/// child is polled without reaping, so the group ID stays reserved, until it
+/// exits or the grace elapses. The group then gets `SIGKILL` either way.
+fn terminate_process_group(child: &mut Child, grace: Duration) -> Result<ExitStatus, Error> {
+    if !grace.is_zero() {
+        kill_process_group(child.id(), libc::SIGTERM);
+        let until = Instant::now() + grace;
+        // An observation failure ends the grace early; SIGKILL follows.
+        while matches!(child_exited(child), Ok(false)) && Instant::now() < until {
+            thread::sleep(
+                PROCESS_POLL_INTERVAL.min(until.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+    kill_process_group(child.id(), libc::SIGKILL);
     // The group kill includes the direct child. `Child::kill` is a safe
     // fallback if a platform or policy rejected negative-PID signalling.
     let _ = child.kill();
-    child.wait().map(|_| ()).map_err(Error::Wait)
+    child.wait().map_err(Error::Wait)
 }
 
-/// Kills the group while its direct child still reserves the group identifier.
+/// Sends `signal` to the group while its direct child still reserves the
+/// group identifier.
 #[expect(
     unsafe_code,
     reason = "libc kill(2) is the existing dependency API for a negative process-group PID"
 )]
-fn kill_process_group(child_id: u32) {
+fn kill_process_group(child_id: u32, signal: libc::c_int) {
     #[expect(
         clippy::cast_possible_wrap,
         reason = "Linux PIDs are bounded below i32::MAX, so conversion to pid_t cannot wrap"
@@ -356,7 +464,7 @@ fn kill_process_group(child_id: u32) {
     // identifier. WNOWAIT or a still-running direct child reserves the PID, so
     // it cannot be recycled; negative PID targets precisely that process group.
     unsafe {
-        let _ = libc::kill(-process_group, libc::SIGKILL);
+        let _ = libc::kill(-process_group, signal);
     }
 }
 
@@ -430,6 +538,108 @@ fn receive_reader(
         Ok(output) => Ok(output),
         Err(RecvTimeoutError::Timeout) => Err(Error::Timeout),
         Err(RecvTimeoutError::Disconnected) => Err(Error::ReaderLost),
+    }
+}
+
+/// Forwards `reader` to `sink` on its own thread, at most `limit` bytes.
+///
+/// Every chunk is written and flushed as it arrives, so a terminal sink
+/// streams. When the stream passes `limit`, only the bytes up to the limit
+/// reach the sink, the [`Tally`] reports the overflow, and the reader stops
+/// and closes the pipe: a child that keeps writing gets `EPIPE` or
+/// `SIGPIPE`. A failing sink is handled the same way, like a closed pipe
+/// downstream of a shell pipeline. The receiver yields the sink at end of
+/// stream, or [`Error::Read`] when reading the pipe fails.
+pub(crate) fn spawn_capped_reader<W>(
+    mut reader: impl Read + Send + 'static,
+    mut sink: W,
+    limit: u64,
+) -> (Arc<Tally>, Receiver<Result<W, Error>>)
+where
+    W: Write + Send + 'static,
+{
+    let tally = Arc::new(Tally::default());
+    let shared = Arc::clone(&tally);
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut buffer = [0_u8; READ_CHUNK_BYTES];
+        let result = loop {
+            let count = match reader.read(&mut buffer) {
+                Ok(0) => break Ok(sink),
+                Ok(count) => count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => break Err(Error::Read(error)),
+            };
+            let room = limit.saturating_sub(shared.delivered());
+            let taken = usize::try_from(room).map_or(count, |room| room.min(count));
+            shared.writing.store(true, Ordering::Release);
+            let written = sink.write_all(&buffer[..taken]).and_then(|()| sink.flush());
+            shared.writing.store(false, Ordering::Release);
+            shared
+                .delivered
+                .fetch_add(u64::try_from(taken).unwrap_or(u64::MAX), Ordering::AcqRel);
+            if taken < count {
+                shared.overflowed.store(true, Ordering::Release);
+            }
+            if taken < count || written.is_err() {
+                break Ok(sink);
+            }
+        };
+        let _ = sender.send(result);
+    });
+    (tally, receiver)
+}
+
+/// How [`drain_capped`] ended.
+#[derive(Debug)]
+pub(crate) enum Drain<W> {
+    /// The stream ended; the reader handed back its sink.
+    Ended(W),
+    /// The stream stayed open for the idle budget; it is cut.
+    Idle,
+    /// The caller's stop check fired first.
+    Stopped,
+}
+
+/// Receives a capped reader's result once its stream ends.
+///
+/// Call it after the child's group is gone. Every poll interval in which the
+/// reader is not inside a sink write counts against `idle`, whether or not
+/// bytes arrived in it, so a process outside the group that keeps the pipe
+/// open, writing or not, is cut once the counted time reaches `idle`.
+/// Intervals the reader spends blocked writing to its sink are never counted:
+/// a consumer that applies backpressure (a pager, a slow pipe, a paused
+/// terminal) is waited for, and it never has more than the cap to take.
+/// `stop` is checked every interval and ends the wait at once.
+///
+/// # Errors
+///
+/// Returns [`Error::ReaderLost`] when the reader thread ended without a
+/// result, and the reader's own [`Error::Read`].
+pub(crate) fn drain_capped<W>(
+    receiver: &Receiver<Result<W, Error>>,
+    tally: &Tally,
+    idle: Duration,
+    stop: &mut dyn FnMut() -> bool,
+) -> Result<Drain<W>, Error> {
+    let mut counted = Duration::ZERO;
+    loop {
+        let polled = Instant::now();
+        match receiver.recv_timeout(PROCESS_POLL_INTERVAL) {
+            Ok(result) => return result.map(Drain::Ended),
+            Err(RecvTimeoutError::Disconnected) => return Err(Error::ReaderLost),
+            Err(RecvTimeoutError::Timeout) => {
+                if stop() {
+                    return Ok(Drain::Stopped);
+                }
+                if !tally.writing() {
+                    counted += polled.elapsed();
+                    if counted >= idle {
+                        return Ok(Drain::Idle);
+                    }
+                }
+            }
+        }
     }
 }
 

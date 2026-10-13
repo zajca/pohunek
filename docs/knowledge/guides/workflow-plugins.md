@@ -2,7 +2,7 @@
 type: Guide
 id: guide/workflow-plugins
 title: Workflow plugins
-description: What a workflow plugin is, the workflow.toml manifest, installing a plugin pinned by its digest with pohunek workflow, and the same-UID owner trust boundary.
+description: What a workflow plugin is, the workflow.toml manifest, installing a plugin pinned by its digest with pohunek workflow, running its actions with pohunek workflow run (environment, context, limits, run log, owner knobs), and the same-UID owner trust boundary.
 source_kind: manual
 intents: [setup, update, debug, help]
 ---
@@ -27,11 +27,13 @@ pohunek workflow inspect acme.work [--json]
 pohunek workflow disable acme.work
 pohunek workflow enable acme.work
 pohunek workflow uninstall acme.work [--purge] [--remove-modified]
+pohunek workflow run acme.work overview [-- <args>...]
 ```
 
-Running an action, event reactions, periodic jobs, long-running services, and
-shell completion of plugin ids are not yet available; the manifest refuses
-their tables until they ship (#148, #325, #326).
+Event reactions, periodic jobs, long-running services, `--json` for
+`workflow run`, and shell completion of plugin ids are not yet available; the
+manifest refuses the reaction, job and service tables until they ship (#148,
+#325, #326).
 
 ## The archive and its manifest
 
@@ -71,9 +73,9 @@ Rules, each checked at install time:
   even when the archive has a file of that name, because no `PATH` is
   searched. A path with `.`, `..` or empty segments is refused, and so is a
   package path that is missing from the archive or lacks the executable bit.
-- `timeout_ms` and `max_output_bytes`, when present, must be positive. They are
-  recorded with the plugin; the owner limits they must fit arrive with action
-  runs, which are not yet available.
+- `timeout_ms` and `max_output_bytes`, when present, must be positive. They
+  are checked against the owner limits when the action runs (see
+  [Owner knobs](#owner-knobs)), not at install time.
 
 A refused manifest fails with `workflow_descriptor_invalid`. The message names
 the broken rule and, where it applies, a line number, the action name (which
@@ -152,6 +154,179 @@ installed files could not be deleted, the command succeeds with a warning that
 names the `.collect-*` residue below `<state>/pohunek/workflow-plugins/packages/`;
 later store changes retry removing it, best effort.
 
+## Running an action
+
+`pohunek workflow run <plugin> <action> [-- <args>...]` runs one declared
+action in text mode and exits with the action's own status (128 plus the
+signal number when a signal ended it). Arguments after `--` are appended to
+argv verbatim when the action declares `args = "passthrough"`; with
+`args = "none"` any extra argument is refused with
+`workflow_action_args_refused`. `--json` is not yet available for
+`workflow run`: before `--` it is a usage error (`cli_usage`), and after `--`
+it is an ordinary argument for the action.
+
+Before anything starts, the plugin's installed files are verified again, and
+the run is refused when the plugin is unknown (`workflow_plugin_unknown`),
+disabled (`workflow_plugin_disabled`), tampered with
+(`workflow_root_invalid`), the action is not declared
+(`workflow_action_unknown`), exactly one origin marker is set
+(`workflow_origin_incomplete`, see below), the action declares a `timeout_ms`
+above the owner ceiling (`workflow_timeout_refused`), or the context is
+larger than its cap (`workflow_context_too_large`). A refused run starts
+nothing.
+
+The action runs without a shell. argv is the installed `files/<argv0>` (or
+the absolute host path) followed by the manifest arguments and any passed
+arguments. The child runs in the plugin's installed `files/` directory, with
+stdin from `/dev/null`, in a process group of its own, with every inherited
+descriptor above stderr closed.
+
+### Environment
+
+The child environment is built from an empty one. It holds exactly:
+
+- `POHUNEK_PLUGIN_ID`, `POHUNEK_PLUGIN_VERSION`, `POHUNEK_PLUGIN_DIGEST`.
+- `POHUNEK_PLUGIN_CONFIG_DIR` and `POHUNEK_PLUGIN_STATE_DIR`, the plugin's
+  own directories.
+- `POHUNEK_PLUGIN_CONTEXT`, the context JSON below.
+- `POHUNEK_CLI`, the canonical path of the `pohunek` that runs the action.
+  Call it for every pohunek operation; no `PATH` is set.
+- `HOME`, `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, `XDG_CONFIG_HOME`,
+  `XDG_DATA_HOME` and `XDG_CACHE_HOME`, each only when it is set for the CLI.
+  These non-secret roots let `$POHUNEK_CLI` find the same daemon socket and
+  the same stores as the CLI that started the action.
+- `POHUNEK_SESSION_ID` and `POHUNEK_DAEMON_ID`, only when both are set for the
+  CLI. When `workflow run` runs inside a managed session, the action inherits
+  the session's origin, so the daemon still refuses the action's attempts to
+  stop, input to, resize or otherwise act on that same session
+  (`plugin_self_target_denied`). When exactly one of the two is set, the run is
+  refused with `workflow_origin_incomplete` before anything starts.
+
+Nothing else is passed: no `PATH`, locale, `TERM`, tokens,
+`POHUNEK_SOCKET_PATH` or `POHUNEK_WORKER_*` variables.
+
+### Context
+
+`POHUNEK_PLUGIN_CONTEXT` is one compact JSON object:
+
+```json
+{"schema":1,
+ "plugin":{"id":"acme.work","version":"1.2.0","digest":"sha256:…"},
+ "invocation":{"kind":"action","name":"overview","run_id":"01K…"},
+ "output":"text",
+ "cli":{"version":"0.34.2","protocol":{"minimum":3,"maximum":4}}}
+```
+
+`run_id` is a ULID, also written to the run log. `cli.protocol` is the public
+protocol range the running CLI speaks. A context larger than
+`limits.max_context_bytes` refuses the run (`workflow_context_too_large`); it
+is never truncated.
+
+### Deadlines, output caps and stopping
+
+The deadline is the action's `timeout_ms`, or `limits.action_timeout_default_ms`
+when it declares none. Stdout and stderr stream to the terminal, each up to its
+cap: `limits.max_stdout_bytes` and `limits.max_stderr_bytes`, or the action's
+`max_output_bytes` when that is lower.
+
+The CLI stops the action's process group when the deadline passes, when an
+output stream passes its cap (the bytes past the cap are never shown, and the
+CLI stops reading the stream), or when the CLI itself receives `SIGINT`,
+`SIGTERM` or `SIGHUP` (the action's group does not receive the terminal's
+`Ctrl-C` directly). Stopping sends `SIGTERM` to the group, waits until the
+action's process exits or `limits.kill_grace_ms` elapses, then sends `SIGKILL`
+to the group, so a process that ignores `SIGTERM` and descendants left in the
+group still end. The grace ends early when the action's own process exits,
+and the rest of the group is then killed at once, as it is after the action
+exits by itself. A wrapper script should therefore `exec` the real program,
+so the program itself receives `SIGTERM` and the whole grace. A descendant
+that leaves the group (`setsid`) escapes this, as any same-user process can.
+
+The action's output is delivered up to its cap however slowly your terminal,
+pager or pipe reads it: the CLI waits for its own stdout and stderr before it
+ends the run, unless it receives `SIGINT`, `SIGTERM` or `SIGHUP` meanwhile,
+which ends the run as `interrupted`. Once the group is gone, an output pipe
+that is still open is held by such an escaped descendant: after one second
+not spent waiting for your consumer, whether the descendant writes or not,
+the CLI stops waiting for the stream, keeps the run's outcome, and prints
+`warning: the stdout of action … was cut` (or `stderr`) without any of the
+stream's bytes.
+
+When several apply, the outcome is decided in this order: an output stream
+over its cap, then a signal the CLI received, then the deadline, then a
+failure to observe the action, then the action's own exit status.
+
+| Result | Error code | Exit status |
+|---|---|---|
+| The action exited | none | the action's status |
+| Output over its cap | `workflow_output_limit` | 125 |
+| The CLI received a signal | `workflow_action_interrupted` | 128 plus the signal number |
+| The deadline passed | `workflow_action_timeout` | 124 |
+| The action could not be started | `workflow_spawn_failed` | 1 |
+| The CLI could not observe the action | `workflow_run_failed` | 1 |
+| Refused before anything started | the refusal code | 1 |
+
+A missing or non-executable program is reported as `workflow_spawn_failed`
+before anything starts.
+
+### Run log
+
+Every run of an installed plugin, refused or not, appends one JSON line to
+its run log, except a run that fails before the log is opened: for example
+`workflow_local_only`, `workflow_dirs_overlap`, a missing `HOME`/XDG root,
+`workflow_config_invalid` (the knobs set the log's retention),
+`workflow_plugin_unknown`, a `workflow_store_failed` reading the store, or
+`workflow_run_log_failed` itself. The log is
+`<state>/pohunek/workflow-plugin-state/<id>/logs/runs.jsonl`, a bounded,
+rotated, owner-private family (`runs.jsonl`, `runs.jsonl.1`, …):
+
+```json
+{"ts":"2026-10-13T12:00:00Z","run_id":"01K…","kind":"action","name":"overview",
+ "version":"1.2.0","digest":"sha256:…","outcome":"ok","exit_code":0,
+ "duration_ms":412,"stdout_bytes":1830,"stderr_bytes":0,"arg_count":1}
+```
+
+`outcome` is `ok`, `exit_nonzero`, `timeout`, `output_limit`, `interrupted`,
+`spawn_failed`, `failed` or `refused`. `error_code` is present when the run
+ended with an error and holds that error's code. `exit_code` or `signal`
+describes how the action's process ended. `name` is present only when it is an
+action the verified manifest declares. Byte counts are the bytes shown, at
+most the cap. A record never holds an argv value, an environment value, the
+context or any output byte, and neither do the CLI's error messages. A run
+whose log cannot be opened is refused with `workflow_run_log_failed`; a
+record that cannot be written after a run is reported as a warning on stderr.
+
+### Owner knobs
+
+`<config>/pohunek/workflow.toml` holds the owner limits of workflow runs. It is
+optional: without it every knob has its default. Its directory
+`<config>/pohunek/` must not be writable by other accounts even when the file
+is absent, because another account could otherwise plant one; a group- or
+world-writable directory fails every run with `workflow_config_invalid`. When
+the file exists it must be a regular file owned by you with mode `0600`, and
+it is strict: an unknown table or key, a wrong type or an
+out-of-range value fails every run with `workflow_config_invalid`, naming the
+line or the key and its range, before the store is read.
+
+```toml
+[limits]
+action_timeout_default_ms = 60000     # 1..=action_timeout_max_ms
+action_timeout_max_ms = 600000        # 1..=86400000; a larger timeout_ms is refused
+kill_grace_ms = 5000                  # 0..=60000; 0 sends SIGKILL at once
+max_stdout_bytes = 16777216           # 1..=1073741824
+max_stderr_bytes = 1048576            # 1..=1073741824
+max_context_bytes = 65536             # 1..=98304 (96 KiB hard maximum)
+
+[logs]
+run_log_file_bytes = 1048576          # 4096..=67108864
+run_log_files = 4                     # 1..=64, the active file included
+```
+
+The values shown are the defaults. The context cap's hard maximum of 96 KiB
+keeps `POHUNEK_PLUGIN_CONTEXT` below the length Linux allows for one
+environment string. Tables for reactions, jobs and services arrive with those
+features and are refused until then.
+
 ## Local only
 
 Every `pohunek workflow` command works on this user's files and never contacts
@@ -164,7 +339,9 @@ A workflow plugin runs with your account's full authority. The digest proves
 which bytes you approved; it does not restrict what they do. Plugin code can
 read your files and use every public owner API, including the CLI and the SDK,
 as any same-user process can. That is the same owner trust boundary as a
-third-party runtime package, not a sandbox. Install only plugins whose source
+third-party runtime package, not a sandbox. The minimal environment,
+deadlines and caps of `workflow run` bound what the CLI forwards and how long
+it waits; they do not confine the plugin. Install only plugins whose source
 you trust, and review the argv the consent step prints.
 
 Error codes: `workflow_local_only`, `workflow_archive_invalid`,
@@ -172,4 +349,10 @@ Error codes: `workflow_local_only`, `workflow_archive_invalid`,
 `workflow_plugin_unknown`, `workflow_plugin_installed`,
 `workflow_root_invalid`, `workflow_root_intact`, `workflow_install_uncertain`,
 `workflow_store_busy`,
-`workflow_purge_incomplete`, `workflow_dirs_overlap`, `workflow_store_failed`.
+`workflow_purge_incomplete`, `workflow_dirs_overlap`, `workflow_store_failed`,
+`workflow_config_invalid`, `workflow_plugin_disabled`,
+`workflow_action_unknown`, `workflow_action_args_refused`,
+`workflow_origin_incomplete`, `workflow_timeout_refused`,
+`workflow_context_too_large`, `workflow_run_log_failed`,
+`workflow_spawn_failed`, `workflow_run_failed`, `workflow_action_timeout`,
+`workflow_output_limit`, `workflow_action_interrupted`.
