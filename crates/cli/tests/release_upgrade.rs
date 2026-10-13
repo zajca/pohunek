@@ -39,8 +39,19 @@
 //!   `runtime-catalog.json` (v0.34.2 is the first release that ships both);
 //! - `POHUNEK_HEAD_BIN_DIR`: the same three binaries of this build, with a
 //!   version that differs from the previous release;
+//! - `POHUNEK_HEAD_CLAUDE_ARCHIVE`: the official Claude package archive built
+//!   from this build's checkout, which the head CLI installs next to the
+//!   previous release's package after the upgrade;
 //! - `POHUNEK_UPGRADE_ARTIFACTS_DIR`: writable directory receiving the
 //!   previous release's store, journals, `service.toml`, and `--json` outputs.
+//!
+//! The previous release's archive may be of an older package format than this
+//! build reads (the 0.35 move to `ruzstd` 0.9.1), so the test takes its digest
+//! from the raw bytes and its descriptor from a plain zstd and tar decode, and
+//! never hands it to the strict canonical reader. Installed packages keep
+//! working across such an upgrade, because the registry keeps verified roots,
+//! never archive bytes; the head then installs its own archive under its own
+//! digest while the session stays pinned to the previous one.
 //!
 //! Results of both CLIs are read as untyped JSON and only the fields named
 //! below are consulted, so a schema difference between the releases cannot
@@ -56,7 +67,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use package::{read_archive, Limits};
+use package::archive_digest;
 use pohunek_test_support::wait::poll_until;
 use serde_json::Value;
 
@@ -284,6 +295,7 @@ struct Run {
     previous_dir: PathBuf,
     previous_runtime_dir: PathBuf,
     head_dir: PathBuf,
+    head_claude_archive: PathBuf,
     artifacts: PathBuf,
 }
 
@@ -311,6 +323,7 @@ impl Run {
             previous_dir: path("POHUNEK_PREVIOUS_BIN_DIR"),
             previous_runtime_dir: path("POHUNEK_PREVIOUS_RUNTIME_DIR"),
             head_dir: path("POHUNEK_HEAD_BIN_DIR"),
+            head_claude_archive: path("POHUNEK_HEAD_CLAUDE_ARCHIVE"),
             artifacts: path("POHUNEK_UPGRADE_ARTIFACTS_DIR"),
         }
     }
@@ -535,14 +548,10 @@ impl ClaudePackage {
         );
         let bytes = fs::read(&archive)
             .unwrap_or_else(|error| panic!("read {}: {error}", archive.display()));
-        let verified = read_archive(&bytes, &Limits::DEFAULT)
-            .unwrap_or_else(|error| panic!("{} is not a package: {error}", archive.display()));
-        let descriptor = verified
-            .entries()
-            .iter()
-            .find(|entry| entry.path == PACKAGE_DESCRIPTOR)
+        let digest = archive_digest(&bytes).expect("the archive digest");
+        let contents = tar_member(&zstd_decode(&bytes), PACKAGE_DESCRIPTOR)
             .unwrap_or_else(|| panic!("{} has no {PACKAGE_DESCRIPTOR}", archive.display()));
-        let text = std::str::from_utf8(&descriptor.contents).expect("the descriptor is UTF-8");
+        let text = std::str::from_utf8(&contents).expect("the descriptor is UTF-8");
         let descriptor: toml::Table = toml::from_str(text).expect("the descriptor is TOML");
         assert_eq!(
             descriptor.get("id").and_then(toml::Value::as_str),
@@ -575,10 +584,59 @@ impl ClaudePackage {
         Self {
             archive,
             catalog,
-            digest: verified.digest().as_str().to_owned(),
+            digest: digest.as_str().to_owned(),
             version_line: line.replace(VERSION_PLACEHOLDER, field("min")),
         }
     }
+}
+
+/// Decodes one zstd frame, of whichever encoder wrote it.
+fn zstd_decode(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut source = bytes;
+    let mut decoder = ruzstd::decoding::StreamingDecoder::new(&mut source).expect("a zstd frame");
+    let mut tar = Vec::new();
+    decoder
+        .read_to_end(&mut tar)
+        .expect("decode the zstd frame");
+    tar
+}
+
+/// USTAR header block size.
+const TAR_BLOCK: usize = 512;
+
+/// Byte range of a USTAR header's name field.
+const TAR_NAME: std::ops::Range<usize> = 0..100;
+
+/// Byte range of a USTAR header's octal size field.
+const TAR_SIZE: std::ops::Range<usize> = 124..136;
+
+/// The contents of the regular file `name` in the USTAR stream `tar`, if it
+/// has one. The archive's digest is authorized by its signed catalog, which
+/// the previous release checks when it installs it; this only reads one file.
+fn tar_member(tar: &[u8], name: &str) -> Option<Vec<u8>> {
+    let mut offset = 0;
+    while offset + TAR_BLOCK <= tar.len() {
+        let header = &tar[offset..offset + TAR_BLOCK];
+        if header.iter().all(|byte| *byte == 0) {
+            return None;
+        }
+        let field = &header[TAR_NAME];
+        let path = &field[..field
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(field.len())];
+        let size = std::str::from_utf8(&header[TAR_SIZE])
+            .ok()
+            .and_then(|text| usize::from_str_radix(text.trim_matches(['\0', ' ']), 8).ok())?;
+        let start = offset + TAR_BLOCK;
+        let end = start.checked_add(size).filter(|end| *end <= tar.len())?;
+        if path == name.as_bytes() {
+            return Some(tar[start..end].to_vec());
+        }
+        offset = start + size.div_ceil(TAR_BLOCK) * TAR_BLOCK;
+    }
+    None
 }
 
 /// Writes `source` as an owner-only executable script interpreted by
@@ -990,6 +1048,39 @@ fn start_on_previous(run: Run, previous: Cli, head: Cli) -> (Upgrade, Runtime, u
 }
 
 impl Upgrade {
+    /// The head CLI installs the Claude package built from this build's
+    /// checkout, an archive of this build's package format, trusted by its
+    /// digest. Across a format change it is another archive than the previous
+    /// release's and installs next to it, while the session stays pinned to
+    /// the previous digest: both digests are installed afterwards.
+    fn assert_head_installs_its_own_package(&self) {
+        let archive = &self.run.head_claude_archive;
+        let bytes =
+            fs::read(archive).unwrap_or_else(|error| panic!("read {}: {error}", archive.display()));
+        let digest = archive_digest(&bytes).expect("the archive digest");
+        let path = archive.display().to_string();
+        let installed = self.head.json(&[
+            "plugin",
+            "install",
+            &path,
+            "--sha256",
+            digest.as_str(),
+            "--yes",
+            "--json",
+        ]);
+        let info = &installed["package"];
+        assert_eq!(info["digest"], digest.as_str(), "{installed}");
+        assert_eq!(info["package"]["id"], CLAUDE_PACKAGE_ID, "{installed}");
+        let listed = self.head.json(&["plugin", "list", "--json"]);
+        let text = listed.to_string();
+        for expected in [digest.as_str(), self.digest.as_str()] {
+            assert!(
+                text.contains(expected),
+                "{expected} is not installed: {listed}"
+            );
+        }
+    }
+
     /// Stores the previous release's store and protocol goldens, taken before
     /// this build migrates anything in place.
     fn capture_previous_goldens(&self) {
@@ -1230,6 +1321,7 @@ fn previous_release_session_survives_the_upgrade_to_head() {
     upgrade.upgrade();
     let after = upgrade.assert_adopted(&before, daemon_before);
     upgrade.assert_session_works();
+    upgrade.assert_head_installs_its_own_package();
     upgrade.assert_previous_client(&after);
     upgrade.assert_stop_and_resume(&after);
     upgrade.assert_previous_client_creates_with_input();

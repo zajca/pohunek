@@ -59,8 +59,10 @@ judge the session `adoptable`, the session stays live on the same worker,
 `screen`, `input`, hooks and notifications work, the metadata store keeps the
 session pinned to the same package digest after the adoption and after the
 resume, `stop` then `resume` relaunch from that digest with the native
-reference, and the previous release's CLI still talks to the new daemon
-(`crates/cli/tests/release_upgrade.rs`). The previous release must ship
+reference, the head CLI installs the Claude package built from this checkout
+(of this build's package format, which can differ from the previous
+release's) next to the pinned one, and the previous release's CLI still talks
+to the new daemon (`crates/cli/tests/release_upgrade.rs`). The previous release must ship
 `runtime/packages/claude.tar.zst` and a signed catalog that has not expired, so
 v0.34.2 is the oldest usable previous release; `scripts/upgrade-test` refuses an
 older one, or an expired catalog, before building anything. The fake agents are

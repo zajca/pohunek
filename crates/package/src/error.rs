@@ -102,7 +102,12 @@ pub enum ArchiveError {
     #[error("zstd content checksum is missing or wrong")]
     ZstdChecksum,
     /// The zstd frame is valid but not the canonical encoding of its content.
-    #[error("zstd frame is not the canonical encoding of the archive content")]
+    /// An archive built before the format moved to `ruzstd` 0.9.1 is refused
+    /// this way too, so the message names the rebuild.
+    #[error(
+        "zstd frame is not the canonical encoding of the archive content; an archive built \
+         before the package format moved to ruzstd 0.9.1 (pohunek 0.35) must be rebuilt"
+    )]
     NonCanonicalCompression,
     /// Bytes follow the single zstd frame.
     #[error("data follows the zstd frame")]
