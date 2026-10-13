@@ -34,8 +34,10 @@
   trampoline; the final `SIGKILL` still reaches every remaining process.
   Uninstall applies its own refusals first, then disables the plugin and
   removes its units; it fails while a unit cannot be removed. Installing a
-  recorded archive again never touches its units, and a fresh install whose
-  enable failed stays installed disabled. A job outside the `[jobs]` bounds is
+  recorded archive again never touches its units. An enabling install
+  checks everything and takes `units.lock` before it records the plugin; a
+  failure after that leaves it installed disabled
+  (`workflow_installed_disabled`, with the failure's code as `cause`). A job outside the `[jobs]` bounds is
   refused at run time too. Run records gain the kinds `job` and
   `service` and the field `backoff_ms`.
 - New owner knobs `[jobs]` (`timeout_default_ms`, `timeout_max_ms`,

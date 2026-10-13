@@ -370,7 +370,7 @@ impl CliError {
                 error.class(),
                 error.code(),
                 error.to_string(),
-                Some(error.hint().to_owned()),
+                Some(error.recovery()),
             ),
             CliError::Spawn(msg) => ProtocolError::new(
                 ErrorClass::Daemon,

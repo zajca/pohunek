@@ -405,7 +405,7 @@ pub(crate) async fn run(action: Action, host: &str) -> Result<ExitCode, CliError
             };
             print_output(json, &result, || render_inspect(&result))?;
         }
-        Action::Install(args) => install(&store, &args).await?,
+        Action::Install(args) => return install(&store, &args).await,
         Action::Run { json, plugin, call } => {
             let knobs = config::load(&knobs_path)?;
             let (action, args) = call.split_first().expect("clap requires the action name");
@@ -537,7 +537,7 @@ fn print_toggled(
     })
 }
 
-async fn install(store: &Store, args: &InstallArgs) -> Result<(), CliError> {
+async fn install(store: &Store, args: &InstallArgs) -> Result<ExitCode, CliError> {
     let candidate = read_candidate(&args.archive, &args.sha256)?;
     let identity = &candidate.manifest.identity;
     // Unlocked and read-only: it only shapes the review; install checks again
@@ -557,16 +557,20 @@ async fn install(store: &Store, args: &InstallArgs) -> Result<(), CliError> {
         .into());
     }
     let has_units = candidate.manifest.has_units();
-    let mut host = Host::resolve_lazily();
+    // An enabling install of a new plugin with units checks everything its
+    // units need, then holds the unit lifecycle lock from before the record
+    // is written until the units run, so every refusal comes before any
+    // effect. Only reaching the service manager and installing the units
+    // happen after the record is written.
+    let mut planned = None;
     if has_units && !args.no_enable && recorded == Recorded::No {
-        // Units need the service installation and jobs within the owner's
-        // bounds; refuse before any effect.
-        units::check_bounds(&candidate.manifest, &config::load(store.knobs_path())?)?;
+        let knobs = config::load(store.knobs_path())?;
         let context = Context::resolve().map_err(|error| Error::ServiceNotInstalled {
             reason: error.to_string(),
         })?;
-        units::require_installation(&context)?;
-        host = Host::given(context);
+        let plan = units::plan(&context, &candidate.digest, &candidate.manifest, &knobs)?;
+        let lock = store.lock_units_creating()?;
+        planned = Some((context, plan, lock));
     }
     // A plugin with units is recorded disabled and enabled afterwards, so its
     // units start only once it is enabled. Installing a recorded archive
@@ -576,16 +580,20 @@ async fn install(store: &Store, args: &InstallArgs) -> Result<(), CliError> {
         report.status,
         InstallStatus::AlreadyInstalled | InstallStatus::RootRestored
     );
-    let report = if has_units && fresh && !args.no_enable {
-        let record = units::enable(store, &mut host, &identity.id)
-            .await
-            .map_err(|source| Error::InstalledDisabled {
-                id: identity.id.to_string(),
-                source: Box::new(source),
-            })?;
-        package::registry::InstallReport { record, ..report }
-    } else {
-        report
+    let report = match planned {
+        Some((context, plan, _lock)) if fresh => {
+            match units::start(store, &context, &identity.id, &plan).await {
+                Ok(record) => package::registry::InstallReport { record, ..report },
+                Err(source) => {
+                    let error = Error::InstalledDisabled {
+                        id: identity.id.to_string(),
+                        source: Box::new(source),
+                    };
+                    return installed_disabled(error, args.json);
+                }
+            }
+        }
+        _ => report,
     };
     let result = Installed {
         status: match report.status {
@@ -607,7 +615,36 @@ async fn install(store: &Store, args: &InstallArgs) -> Result<(), CliError> {
             let _ = writeln!(text, "warning: {warning}");
         }
         text
-    })
+    })?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Reports a fresh install whose enable failed after the plugin was
+/// recorded; with `--json` the error carries the failure's own code as
+/// `cause`.
+fn installed_disabled(error: Error, json: bool) -> Result<ExitCode, CliError> {
+    let cause = error.cause_code();
+    if json {
+        let document = InstalledDisabled {
+            error: CliError::from(error).to_protocol_error(),
+            cause,
+        };
+        print!("{}", render_json_error_with(&document)?);
+    } else {
+        crate::error::render(&error.into(), false);
+    }
+    Ok(ExitCode::FAILURE)
+}
+
+/// The `--json` error of a fresh install left disabled: the standard error
+/// object plus the code of the failure that left it disabled.
+#[derive(Debug, Serialize)]
+struct InstalledDisabled {
+    #[serde(flatten)]
+    error: protocol::ProtocolError,
+    /// The code of the enable failure, such as `workflow_units_failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cause: Option<&'static str>,
 }
 
 fn details(store: &Store, manifest: &Manifest, files: &Path) -> Details {

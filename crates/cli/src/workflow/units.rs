@@ -29,6 +29,10 @@
 //! service from being uninstalled while plugin units exist. When that
 //! service manager cannot be reached they warn instead: a unit left behind
 //! refuses every run, since the trampoline needs a verified installation.
+//! Units that cannot be listed, because the installed files fail
+//! verification, are reported as a warning too. An enabling install of a new
+//! plugin checks its [`plan`] first and holds the lock from before the
+//! plugin is recorded until its units run ([`start`]).
 
 // Rust guideline compliant 2026-10-13
 
@@ -40,11 +44,11 @@ use std::time::Duration;
 use package::registry::PackageRecord;
 use pohunek_paths::BasePaths;
 use pohunek_platform::supervisor::{
-    Activation, JobDefinition, JobSpec, Namespace, PluginUnitDefinition, PluginUnitKey,
+    self, Activation, JobDefinition, JobSpec, Namespace, PluginUnitDefinition, PluginUnitKey,
     PluginUnitKind, PluginUnits, RestartPolicy, MAX_JOB_TIMEOUT, MIN_JOB_INTERVAL,
 };
 use pohunek_service_config::ServiceConfig;
-use protocol::PackageId;
+use protocol::{PackageDigest, PackageId};
 
 use super::config::{self, Knobs, MAX_KILL_GRACE_MS, SUPERVISED_MARGIN_MS};
 use super::manifest::{Job, Manifest};
@@ -231,14 +235,14 @@ pub(crate) fn check_job(id: &PackageId, name: &str, job: &Job, knobs: &Knobs) ->
 /// Builds every unit definition of `record`'s `manifest`, refusing a job
 /// outside the owner's `[jobs]` bounds before anything changes.
 fn definitions(
-    record: &PackageRecord,
+    digest: &PackageDigest,
     manifest: &Manifest,
     knobs: &Knobs,
     installation: &Installation,
     environment: &BTreeMap<String, String>,
     home: &Path,
 ) -> Result<Vec<(PluginUnitKey, PluginUnitDefinition)>, Error> {
-    let id = &record.identity().id;
+    let id = &manifest.identity.id;
     check_bounds(manifest, knobs)?;
     let mut units = Vec::new();
     for (name, job) in &manifest.jobs {
@@ -262,7 +266,7 @@ fn definitions(
                     "workflow",
                     TRAMPOLINE,
                     id.as_str(),
-                    record.digest().as_str(),
+                    digest.as_str(),
                     kind_name(kind),
                     name.as_str(),
                 ]
@@ -362,6 +366,83 @@ fn units_failed(id: &PackageId, detail: String) -> Error {
     }
 }
 
+/// The units of one plugin archive, checked and ready to install.
+#[derive(Debug)]
+pub(crate) struct Plan {
+    installation: Installation,
+    units: Vec<(PluginUnitKey, PluginUnitDefinition)>,
+}
+
+/// Checks everything installing the units of `manifest` (archive `digest`)
+/// needs, without changing anything or contacting the service manager: the
+/// service installation and its environment, and the owner's `[jobs]`
+/// bounds.
+///
+/// # Errors
+///
+/// Returns [`Error::ServiceNotInstalled`], [`Error::UnitRefused`] or
+/// [`Error::Units`] for a definition the platform refuses.
+pub(crate) fn plan(
+    context: &Context,
+    digest: &PackageDigest,
+    manifest: &Manifest,
+    knobs: &Knobs,
+) -> Result<Plan, Error> {
+    let installation = require_installation(context)?;
+    let environment =
+        context
+            .service_environment()
+            .map_err(|error| Error::ServiceNotInstalled {
+                reason: format!("the service environment is unusable: {error}"),
+            })?;
+    let home = environment
+        .get(pohunek_paths::HOME)
+        .map(PathBuf::from)
+        .expect("the service environment requires HOME");
+    let units = definitions(digest, manifest, knobs, &installation, &environment, &home)?;
+    Ok(Plan {
+        installation,
+        units,
+    })
+}
+
+/// Marks plugin `id` enabled and installs and starts the units of `plan`,
+/// under the unit lifecycle lock the caller holds. A unit that cannot be
+/// installed removes every unit again and disables the plugin again.
+///
+/// # Errors
+///
+/// Returns [`Error::Units`] when the service manager cannot be reached
+/// (nothing changed) or a unit cannot be installed (rolled back), and the
+/// errors of [`Store::set_enabled`].
+pub(crate) async fn start(
+    store: &Store,
+    context: &Context,
+    id: &PackageId,
+    plan: &Plan,
+) -> Result<PackageRecord, Error> {
+    let backend = connect(context, &plan.installation, id).await?;
+    let enabled = store.set_enabled(id, true)?;
+    for (key, definition) in &plan.units {
+        if let Err(error) = backend.install(key, definition).await {
+            let mut detail = format!("installing the {key} unit failed: {error}");
+            for key in plan.units.iter().map(|(key, _definition)| key) {
+                if let Err(error) = backend.remove(key).await {
+                    let _ = write!(detail, "; removing the {key} unit failed too: {error}");
+                }
+            }
+            match store.set_enabled(id, false) {
+                Ok(_record) => detail.push_str("; the plugin was disabled again"),
+                Err(error) => {
+                    let _ = write!(detail, "; disabling the plugin again failed: {error}");
+                }
+            }
+            return Err(units_failed(id, detail));
+        }
+    }
+    Ok(enabled)
+}
+
 /// Enables plugin `id` and installs and starts its units.
 ///
 /// # Errors
@@ -384,45 +465,8 @@ pub(crate) async fn enable(
     }
     let knobs = config::load(store.knobs_path())?;
     let context = host.context()?;
-    let installation = require_installation(context)?;
-    let environment =
-        context
-            .service_environment()
-            .map_err(|error| Error::ServiceNotInstalled {
-                reason: format!("the service environment is unusable: {error}"),
-            })?;
-    let home = environment
-        .get(pohunek_paths::HOME)
-        .map(PathBuf::from)
-        .expect("the service environment requires HOME");
-    let units = definitions(
-        &record,
-        &manifest,
-        &knobs,
-        &installation,
-        &environment,
-        &home,
-    )?;
-    let backend = connect(context, &installation, id).await?;
-    let enabled = store.set_enabled(id, true)?;
-    for (key, definition) in &units {
-        if let Err(error) = backend.install(key, definition).await {
-            let mut detail = format!("installing the {key} unit failed: {error}");
-            for key in units.iter().map(|(key, _definition)| key) {
-                if let Err(error) = backend.remove(key).await {
-                    let _ = write!(detail, "; removing the {key} unit failed too: {error}");
-                }
-            }
-            match store.set_enabled(id, false) {
-                Ok(_record) => detail.push_str("; the plugin was disabled again"),
-                Err(error) => {
-                    let _ = write!(detail, "; disabling the plugin again failed: {error}");
-                }
-            }
-            return Err(units_failed(id, detail));
-        }
-    }
-    Ok(enabled)
+    let plan = plan(context, record.digest(), &manifest, &knobs)?;
+    start(store, context, id, &plan).await
 }
 
 /// Disables plugin `id`, then stops and removes its units.
@@ -499,9 +543,6 @@ async fn remove_units(
         .context()
         .and_then(|context| installation_at(context.paths(), context.uid()));
     let manifest = match (unlisted, installation) {
-        // Units cannot be listed; without a recorded installation none can
-        // run plugin code, so there is nothing to warn about.
-        (Err(_cause), Ok(None)) => return Ok(()),
         (Err(cause), _) => {
             warnings.push(unlisted_warning(&cause));
             return Ok(());
@@ -520,16 +561,42 @@ async fn remove_units(
         .map_err(|error| Error::ServiceNotInstalled {
             reason: error.to_string(),
         })?;
-    match connect_namespace(context, namespace, settings::LAUNCHCTL_COMMAND, id).await {
-        Ok(backend) => remove_keys(backend.as_ref(), id, &manifest).await,
+    let unreachable = |cause: &dyn std::fmt::Display| {
+        format!(
+            "no pohunek service installation is recorded and the service manager could not \
+             be reached ({cause}), so leftover units of the plugin were not looked up; a unit \
+             left behind refuses every run"
+        )
+    };
+    let backend = match connect_namespace(context, namespace, settings::LAUNCHCTL_COMMAND, id).await
+    {
+        Ok(backend) => backend,
         Err(error) => {
-            warnings.push(format!(
-                "no pohunek service installation is recorded and the service manager could \
-                 not be reached ({error}), so leftover units of the plugin were not looked \
-                 up; a unit left behind refuses every run"
-            ));
-            Ok(())
+            warnings.push(unreachable(&error));
+            return Ok(());
         }
+    };
+    let mut failures = Vec::new();
+    for key in keys(id, &manifest) {
+        match backend.remove(&key).await {
+            Ok(()) => {}
+            // A manager without this user's domain or bus, such as launchd
+            // over SSH, holds no unit of it.
+            Err(
+                error @ (supervisor::Error::DomainUnavailable { .. }
+                | supervisor::Error::Unavailable { .. }
+                | supervisor::Error::Timeout { .. }),
+            ) => {
+                warnings.push(unreachable(&error));
+                return Ok(());
+            }
+            Err(error) => failures.push(format!("removing the {key} unit failed: {error}")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(units_failed(id, failures.join("; ")))
     }
 }
 
@@ -556,7 +623,7 @@ async fn remove_keys(
 fn unlisted_warning(cause: &str) -> String {
     format!(
         "the plugin's jobs and services could not be listed because its installed files \
-         fail verification ({cause}); a unit left behind refuses to run"
+         fail verification ({cause}); a unit left behind refuses every run"
     )
 }
 

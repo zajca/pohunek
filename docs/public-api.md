@@ -3137,9 +3137,11 @@ Every `--json` result is one standard CLI process envelope. The `ok` payloads:
   `already_installed` or `root_restored`. `warnings` is present when the
   plugin was recorded but the store could not confirm the change is durable.
 - `list`: `{plugins: [plugin...]}`.
-- `enable` and `disable`: the updated `plugin`, plus `warnings` when
-  `disable` could not list the units of a plugin whose files fail
-  verification.
+- `enable` and `disable`: the updated `plugin`, plus `warnings` from
+  `disable` when it could not list the units of a plugin whose files fail
+  verification, or when no `pohunek service` installation is recorded and
+  the service manager could not be reached to look for leftover units. Each
+  warning says so; a unit left behind refuses every run.
 - `inspect`: `{plugin, description, files_dir, state_dir, config_dir,
   actions: [{name, argv, args, timeout_ms?, max_output_bytes?}],
   jobs?: [{name, argv, every_s, timeout_ms?}], services?: [{name, argv}]}`.
@@ -3154,9 +3156,9 @@ Every `--json` result is one standard CLI process envelope. The `ok` payloads:
   has no record. `purge` is `{state_dir, config_dir}`, each `removed` or
   `absent`. `warnings` is present when the record was removed but the store
   could not delete every installed file (the warning names where the residue
-  is) or confirm durability, or when a leftover of an earlier purge still
-  cannot be removed (the warning names its location). No warning changes the
-  result.
+  is) or confirm durability, when a leftover of an earlier purge still
+  cannot be removed (the warning names its location), or for the same unit
+  warnings as `disable`. No warning changes the result.
 
 A `plugin` is `{id, version, digest, enabled, installed_at_unix_seconds}`.
 
@@ -3164,8 +3166,10 @@ Typed errors use the standard `{class, code, msg, recover?}` shape and never
 contain an argv value, an environment value, manifest text or a byte of an
 action's output. `workflow_action_failed` adds `exit_code` (the action's exit
 code, or 128 plus the signal number) and, when a signal ended the action,
-`signal`; these fields belong to the CLI envelope, not to the protocol's
-error type:
+`signal`. `workflow_installed_disabled` adds `cause`, the code of the failure
+that left the plugin disabled, and its `recover` is that failure's recovery
+followed by the `pohunek workflow enable` step. These fields belong to the
+CLI envelope, not to the protocol's error type:
 
 | Code | Class | Meaning |
 |---|---|---|
@@ -3199,9 +3203,10 @@ error type:
 | `workflow_action_failed` | `runtime` | `run --json` only: the action exited non-zero or was ended by a signal the CLI did not send; carries `exit_code` and `signal?`; its stdout was not printed. |
 | `workflow_output_incomplete` | `runtime` | `run --json` only: the action exited 0, but a process that left its group still held stdout open, so the capture was never judged. |
 | `workflow_output_invalid` | `runtime` | `run --json` only: the action exited 0, but its stdout is empty, not JSON (including arrays and objects nested deeper than 126 levels, so the envelope stays within the 127 levels serde_json's default parser accepts), ends inside its document, or has data after it. |
-| `workflow_service_not_installed` | `configuration` | The plugin declares jobs or services, and no verified `pohunek service` installation (its `service.toml` and `<prefix>/bin/pohunek`) describes this process. `enable` and an enabling `install` change nothing; a `disable` has already marked the plugin disabled when its recorded installation turns out to be unusable. |
+| `workflow_service_not_installed` | `configuration` | The plugin declares jobs or services, and no verified `pohunek service` installation (its `service.toml` and `<prefix>/bin/pohunek`) describes this process. `enable` and an enabling `install` change nothing; a `disable` or `uninstall` has already marked the plugin disabled when its recorded installation turns out to be unusable, and the plugin stays installed disabled. |
 | `workflow_unit_refused` | `configuration` | A job's `every_s` is below `jobs.min_interval_s` or its `timeout_ms` above `jobs.timeout_max_ms`; nothing was changed or run. |
-| `workflow_units_failed` | `runtime` | The service manager did not install or remove a unit. After a failed enable every unit was removed and the plugin disabled again; after a failed disable the plugin stays disabled; a failed uninstall keeps the plugin installed. |
+| `workflow_units_failed` | `runtime` | The service manager did not install or remove a unit. After a failed enable every unit was removed and the plugin disabled again; after a failed disable the plugin stays disabled; a failed uninstall keeps the plugin installed, disabled. |
+| `workflow_installed_disabled` | `runtime` | `install --yes` only: the new plugin was recorded, but reaching the service manager or installing its units failed afterwards, so it stays installed disabled with no units. `cause` is that failure's code (for example `workflow_units_failed` or `workflow_store_busy`); run `pohunek workflow enable <id>` once it is fixed. Every check that can refuse an enabling install runs before the record is written. |
 | `workflow_unit_stale` | `runtime` | A unit names another archive than the installed one; it was refused and recorded. |
 | `workflow_unit_unknown` | `configuration` | The installed manifest declares no job or service of the unit's name; nothing was run. |
 

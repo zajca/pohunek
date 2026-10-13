@@ -580,8 +580,14 @@ fn jobs_and_services_need_the_service_installation() {
     );
 
     // Without a service installation, leftover units are looked up in the
-    // derived namespace; a service manager that cannot be reached, as here
-    // on Linux without a session bus, is a warning, never a silent skip.
+    // derived namespace; a service manager that cannot be reached is a
+    // warning, never a silent skip. On Linux the hermetic environment has no
+    // session bus, so the warning is certain. On macOS a logged-in runner's
+    // `gui/<uid>` domain answers, and the lookup boots out labels of the
+    // namespace of this test's private roots, which no job ever had, so
+    // nothing of the host changes; a host without that domain (SSH,
+    // headless) gets the warning instead. Both outcomes are accepted, and
+    // any warning must be the unreachable one.
     for verb in ["disable", "uninstall"] {
         let (code, document) = fixture.json(&["workflow", verb, PLUGIN_ID]);
         assert_eq!(code, 0, "{verb}: {document}");
@@ -596,6 +602,50 @@ fn jobs_and_services_need_the_service_installation() {
         }
     }
     assert!(fixture.listed().is_empty());
+}
+
+/// An enabling install refuses with `workflow_store_busy` before it records
+/// anything while another unit lifecycle command holds `units.lock`.
+#[test]
+fn an_enabling_install_waits_for_no_unit_lifecycle_lock() {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let units = workflow_units::UnitEnv::new(|env| env.root().join("units"));
+    // Any installed plugin creates the store and its lock files' directory.
+    units.install(&workflow_units::Plugin::new("acme.other"));
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(
+            units
+                .env
+                .state_home()
+                .join("pohunek/workflow-plugins/units.lock"),
+        )
+        .expect("open the unit lifecycle lock");
+    lock.lock().expect("hold the unit lifecycle lock");
+
+    let plugin = workflow_units::Plugin::new(PLUGIN_ID).service("serve", "hang");
+    let digest = units.archive(&plugin);
+    let output = units.install_with(&plugin, &digest, &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        workflow_units::describe(&output)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("a JSON envelope");
+    assert_eq!(document["err"]["code"], "workflow_store_busy", "{document}");
+    let listed: Vec<Value> = units.listed();
+    assert_eq!(
+        listed.len(),
+        1,
+        "only the other plugin is recorded: {listed:?}"
+    );
+    assert_eq!(listed[0]["id"], "acme.other", "{listed:?}");
 }
 
 /// An enabling install whose units cannot be installed keeps the plugin
@@ -618,14 +668,23 @@ fn an_install_whose_enable_fails_stays_installed_disabled() {
     );
     let document: Value = serde_json::from_slice(&output.stdout).expect("a JSON envelope");
     assert_eq!(
-        document["err"]["code"], "workflow_units_failed",
+        document["err"]["code"], "workflow_installed_disabled",
+        "{document}"
+    );
+    assert_eq!(
+        document["err"]["cause"], "workflow_units_failed",
         "{document}"
     );
     let message = document["err"]["msg"].as_str().expect("a message");
-    assert!(message.contains("was installed disabled"), "{message}");
+    assert!(message.contains("stays installed disabled"), "{message}");
     let recover = document["err"]["recover"]
         .as_str()
         .expect("a recovery hint");
+    // The cause's own recovery, then the step that finishes the install.
+    assert!(
+        recover.contains("check the user service manager"),
+        "{recover}"
+    );
     assert!(recover.contains("pohunek workflow enable"), "{recover}");
     assert_eq!(units.listed()[0]["enabled"], false);
 
@@ -1470,10 +1529,24 @@ fn files_that_cannot_be_deleted_leave_a_warning_and_no_record() {
     let (code, document) = fixture.json(&["workflow", "uninstall", PLUGIN_ID, "--remove-modified"]);
     assert_eq!(code, 0, "{document}");
     assert_eq!(document["ok"]["plugin"]["id"], PLUGIN_ID, "{document}");
-    let warning = document["ok"]["warnings"][0].as_str().expect("one warning");
+    let warnings: Vec<&str> = document["ok"]["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .map(|warning| warning.as_str().expect("a warning"))
+        .collect();
     let packages = fixture.store_root().join("packages");
     assert!(
-        warning.contains(".collect-") && warning.contains(path_str(&packages)),
+        warnings
+            .iter()
+            .any(|warning| warning.contains(".collect-") && warning.contains(path_str(&packages))),
+        "{document}"
+    );
+    // Files that fail verification hide which units the plugin had.
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("could not be listed")),
         "{document}"
     );
     assert!(fixture.listed().is_empty(), "the record must be gone");

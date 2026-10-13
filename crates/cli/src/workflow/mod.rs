@@ -304,13 +304,14 @@ pub(crate) enum Error {
         detail: String,
     },
 
-    /// A fresh install recorded the plugin, but enabling it failed; the
-    /// plugin stays installed disabled.
-    #[error("workflow plugin {id} was installed disabled because enabling it failed: {source}")]
+    /// A fresh install recorded the plugin, but enabling it failed after
+    /// that; the plugin stays installed disabled.
+    #[error("workflow plugin {id} was installed, but enabling it failed, so it stays installed disabled: {source}")]
     InstalledDisabled {
         /// The plugin id.
         id: String,
-        /// Why enabling failed; its code is this error's code.
+        /// Why enabling failed; its code is the `cause` of the `--json`
+        /// error.
         source: Box<Error>,
     },
 
@@ -378,7 +379,7 @@ impl Error {
             Self::Units { .. } => "workflow_units_failed",
             Self::UnitStale { .. } => "workflow_unit_stale",
             Self::UnitUnknown { .. } => "workflow_unit_unknown",
-            Self::InstalledDisabled { source, .. } => source.code(),
+            Self::InstalledDisabled { .. } => "workflow_installed_disabled",
             Self::ActionFailed { .. } => "workflow_action_failed",
             Self::OutputIncomplete { .. } => "workflow_output_incomplete",
             Self::OutputInvalid { .. } => "workflow_output_invalid",
@@ -510,8 +511,7 @@ impl Error {
                  `pohunek workflow disable <id>`"
             }
             Self::InstalledDisabled { .. } => {
-                "the plugin is installed disabled; fix the cause above, then run \
-                 `pohunek workflow enable <id>` (installing it again changes nothing)"
+                "run `pohunek workflow enable <id>`; installing the plugin again changes nothing"
             }
             Self::ActionFailed { .. } => {
                 "the action reported a failure; its stderr above says why, and its stdout was \
@@ -528,11 +528,30 @@ impl Error {
         }
     }
 
+    /// The recovery shown beneath the error: [`Error::hint`], preceded for
+    /// an installed-disabled plugin by the hint of the failure that left it
+    /// disabled.
+    pub(crate) fn recovery(&self) -> String {
+        match self {
+            Self::InstalledDisabled { source, .. } => {
+                format!("{}; then {}", source.recovery(), self.hint())
+            }
+            _ => self.hint().to_owned(),
+        }
+    }
+
+    /// The code of the failure that left an installed plugin disabled.
+    pub(crate) fn cause_code(&self) -> Option<&'static str> {
+        match self {
+            Self::InstalledDisabled { source, .. } => Some(source.code()),
+            _ => None,
+        }
+    }
+
     /// Error class: owner input mistakes are configuration, broken local state
     /// is runtime.
     pub(crate) fn class(&self) -> ErrorClass {
         match self {
-            Self::InstalledDisabled { source, .. } => source.class(),
             Self::RootInvalid { .. }
             | Self::RootIntact { .. }
             | Self::InstallUncertain { .. }
@@ -549,7 +568,8 @@ impl Error {
             | Self::OutputIncomplete { .. }
             | Self::OutputInvalid { .. }
             | Self::Units { .. }
-            | Self::UnitStale { .. } => ErrorClass::Runtime,
+            | Self::UnitStale { .. }
+            | Self::InstalledDisabled { .. } => ErrorClass::Runtime,
             _ => ErrorClass::Configuration,
         }
     }

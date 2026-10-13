@@ -567,6 +567,24 @@ impl Store {
         }
     }
 
+    /// Takes the unit lifecycle lock, creating the store root when it is
+    /// missing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Busy`] while another enable, disable, uninstall or
+    /// enabling install holds it, and [`Error::Store`] when the store is
+    /// unsafe.
+    pub(crate) fn lock_units_creating(&self) -> Result<FileLock, Error> {
+        TrustedDir::open_or_create_absolute(&self.dirs.root, PRIVATE_DIR_MODE)
+            .map_err(|error| fs(&error))?
+            .lock_file(UNITS_LOCK_NAME, LOCK_FILE_MODE, LockKind::Exclusive)
+            .map_err(|error| match error {
+                FsError::LockContended { .. } => Error::Busy,
+                other => fs(&other),
+            })
+    }
+
     /// The knobs file path.
     pub(crate) fn knobs_path(&self) -> &Path {
         &self.dirs.knobs
