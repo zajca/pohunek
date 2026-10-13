@@ -126,11 +126,19 @@ pub(crate) async fn an_active_job_run_is_never_overlapped() {
 
     assert_alternating(&units.marks(&id, "gated"));
     // A run's record follows its `end` mark once its output has drained.
-    let records = poll_until("every released run to be recorded", || {
+    poll_until("every released run to be recorded", || {
         let records = units.unit_records(&id, "job", "gated");
-        (outcome_count(&records, "ok") >= REPEATED_RUNS).then_some(records)
+        (outcome_count(&records, "ok") >= REPEATED_RUNS).then_some(())
     });
-    assert_eq!(outcome_count(&records, "overlap_skipped"), 1, "{records:?}");
+    // The skipped run never verified the manifest, so it names no job.
+    let skipped: Vec<Value> = units
+        .records(&id)
+        .into_iter()
+        .filter(|record| record["outcome"] == "overlap_skipped")
+        .collect();
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert_eq!(skipped[0]["kind"], "job", "{skipped:?}");
+    assert!(skipped[0].get("name").is_none(), "{skipped:?}");
 }
 
 /// A job run past its deadline is stopped with its whole process group and
@@ -259,6 +267,91 @@ pub(crate) async fn stale_and_residue_units_are_refused() {
         2,
         "one run started and ended"
     );
+
+    // A unit of a disabled plugin is refused without running.
+    managed.disable(&id).await;
+    let units = &managed.units;
+    units.reset_schedule(&id, "tick");
+    let output = units
+        .exec(&id, digest.as_str(), "job", "tick")
+        .output()
+        .expect("run the trampoline");
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    let record = units.records(&id).pop().expect("a refusal record");
+    assert_eq!(record["outcome"], "refused", "{record}");
+    assert_eq!(record["error_code"], "workflow_plugin_disabled", "{record}");
+    assert_eq!(units.marks(&id, "tick").len(), 2, "a refused unit ran");
+}
+
+/// A job that the owner's changed `[jobs]` bounds no longer admit is
+/// refused at run time, as it would be when enabled.
+pub(crate) async fn a_job_outside_changed_bounds_is_refused_when_it_runs() {
+    let mut managed = Managed::new(DIRECT_KNOBS);
+    let plugin = Plugin::new("acme.bounds").job("tick", "tick", 3600);
+    let id = plugin.id.clone();
+    let digest = managed.enable(&plugin).await;
+    let units = &managed.units;
+    units.knobs(&DIRECT_KNOBS.replace("min_interval_s = 1", "min_interval_s = 7200"));
+
+    let output = units
+        .exec(&id, digest.as_str(), "job", "tick")
+        .output()
+        .expect("run the trampoline");
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    let record = units.records(&id).pop().expect("a refusal record");
+    assert_eq!(record["outcome"], "refused", "{record}");
+    assert_eq!(record["error_code"], "workflow_unit_refused", "{record}");
+    assert_eq!(record["name"], "tick", "{record}");
+    assert!(units.marks(&id, "tick").is_empty(), "a refused job ran");
+}
+
+/// `uninstall --remove-modified` of a plugin whose files verify is refused
+/// before anything changes: the plugin stays enabled and its units keep
+/// running.
+pub(crate) async fn a_refused_uninstall_leaves_the_units_running() {
+    let mut managed = Managed::new(KNOBS);
+    let plugin = Plugin::new("acme.keep").service("serve", "hang");
+    let id = plugin.id.clone();
+    managed.enable(&plugin).await;
+    let child = managed.units.pid(&id, "serve", "child");
+
+    let output = managed
+        .units
+        .command(&["workflow", "uninstall", &id, "--remove-modified", "--json"])
+        .output()
+        .expect("run pohunek workflow uninstall");
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    let document: Value = serde_json::from_slice(&output.stdout).expect("a JSON envelope");
+    assert_eq!(
+        document["err"]["code"], "workflow_root_intact",
+        "{document}"
+    );
+    assert_eq!(managed.unit_files(), managed.names(&id));
+    assert!(kill(child, None).is_ok(), "the service run was stopped");
+    assert_eq!(managed.units.listed()[0]["enabled"], true);
+}
+
+/// Installing the recorded archive of an enabled plugin again changes
+/// nothing: its running service is neither stopped nor restarted.
+pub(crate) async fn installing_again_leaves_running_units_alone() {
+    let mut managed = Managed::new(KNOBS);
+    let plugin = Plugin::new("acme.again").service("serve", "hang");
+    let id = plugin.id.clone();
+    let digest = managed.enable(&plugin).await;
+    let child = managed.units.pid(&id, "serve", "child");
+
+    let output = managed.units.install_with(&plugin, &digest, &[]);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let document: Value = serde_json::from_slice(&output.stdout).expect("a JSON envelope");
+    assert_eq!(document["ok"]["status"], "already_installed", "{document}");
+    assert_eq!(document["ok"]["plugin"]["enabled"], true, "{document}");
+    assert!(kill(child, None).is_ok(), "the service run was stopped");
+    assert_eq!(
+        managed.units.pid(&id, "serve", "child"),
+        child,
+        "the service restarted"
+    );
+    assert_eq!(managed.unit_files(), managed.names(&id));
 }
 
 /// A job started by the service manager gets exactly the supervised

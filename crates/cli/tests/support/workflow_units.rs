@@ -236,28 +236,48 @@ impl UnitEnv {
 
     /// Installs `plugin` disabled and returns its digest.
     pub(crate) fn install(&self, plugin: &Plugin) -> PackageDigest {
+        let digest = self.archive(plugin);
+        let output = self.install_with(plugin, &digest, &["--no-enable"]);
+        assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+        digest
+    }
+
+    /// Writes `plugin`'s archive as `<root>/<id>.tar.zst` and returns its
+    /// digest.
+    pub(crate) fn archive(&self, plugin: &Plugin) -> PackageDigest {
         let bytes = build_archive(&plugin.files(), &Limits::DEFAULT).expect("the archive builds");
         let digest = read_archive(&bytes, &Limits::DEFAULT)
             .expect("the archive reads")
             .digest()
             .clone();
-        let archive = self.env.root().join(format!("{}.tar.zst", plugin.id));
-        fs::write(&archive, bytes).expect("write the archive");
-        let output = self
-            .command(&[
-                "workflow",
-                "install",
-                archive.to_str().expect("UTF-8 path"),
-                "--sha256",
-                digest.as_str(),
-                "--yes",
-                "--no-enable",
-                "--json",
-            ])
-            .output()
-            .expect("run the install");
-        assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+        fs::write(self.archive_path(plugin), bytes).expect("write the archive");
         digest
+    }
+
+    fn archive_path(&self, plugin: &Plugin) -> PathBuf {
+        self.env.root().join(format!("{}.tar.zst", plugin.id))
+    }
+
+    /// `pohunek workflow install <archive> --sha256 <digest> --yes --json
+    /// <extra>` of `plugin`'s archive written by [`UnitEnv::archive`].
+    pub(crate) fn install_with(
+        &self,
+        plugin: &Plugin,
+        digest: &PackageDigest,
+        extra: &[&str],
+    ) -> Output {
+        let archive = self.archive_path(plugin);
+        let mut arguments = vec![
+            "workflow",
+            "install",
+            archive.to_str().expect("UTF-8 path"),
+            "--sha256",
+            digest.as_str(),
+            "--yes",
+            "--json",
+        ];
+        arguments.extend_from_slice(extra);
+        self.command(&arguments).output().expect("run the install")
     }
 
     /// `pohunek workflow __exec <id> <digest> <kind> <name>`.
@@ -346,6 +366,13 @@ impl UnitEnv {
             let text = fs::read_to_string(&path).ok()?;
             text.trim_end().parse().ok().map(Pid::from_raw)
         })
+    }
+
+    /// Makes job `name` due again by removing the trampoline's documented
+    /// `schedule/job-<name>.json`.
+    pub(crate) fn reset_schedule(&self, id: &str, name: &str) {
+        fs::remove_file(self.state_dir(id).join(format!("schedule/job-{name}.json")))
+            .expect("remove the schedule file");
     }
 
     /// Makes job `name` due again and removes the PID files of its earlier

@@ -579,13 +579,66 @@ fn jobs_and_services_need_the_service_installation() {
         "enable changed nothing"
     );
 
-    // Without a service installation there are no units to remove.
-    let (code, document) = fixture.json(&["workflow", "disable", PLUGIN_ID]);
-    assert_eq!(code, 0, "{document}");
-    assert!(document["ok"].get("warnings").is_none(), "{document}");
-    let (code, document) = fixture.json(&["workflow", "uninstall", PLUGIN_ID]);
-    assert_eq!(code, 0, "{document}");
-    assert!(fixture.listed().is_empty(), "{document}");
+    // Without a service installation, leftover units are looked up in the
+    // derived namespace; a service manager that cannot be reached, as here
+    // on Linux without a session bus, is a warning, never a silent skip.
+    for verb in ["disable", "uninstall"] {
+        let (code, document) = fixture.json(&["workflow", verb, PLUGIN_ID]);
+        assert_eq!(code, 0, "{verb}: {document}");
+        if let Some(warnings) = document["ok"]["warnings"].as_array() {
+            for warning in warnings {
+                let warning = warning.as_str().expect("a warning");
+                assert!(
+                    warning.contains("could not be reached"),
+                    "{verb}: {warning}"
+                );
+            }
+        }
+    }
+    assert!(fixture.listed().is_empty());
+}
+
+/// An enabling install whose units cannot be installed keeps the plugin
+/// installed disabled and says how to enable it; installing again changes
+/// nothing. The hermetic environment has no session bus, so the systemd user
+/// manager cannot be reached.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_install_whose_enable_fails_stays_installed_disabled() {
+    let units = workflow_units::UnitEnv::new(|env| env.root().join("units"));
+    let plugin = workflow_units::Plugin::new(PLUGIN_ID).service("serve", "hang");
+    let digest = units.archive(&plugin);
+
+    let output = units.install_with(&plugin, &digest, &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        workflow_units::describe(&output)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("a JSON envelope");
+    assert_eq!(
+        document["err"]["code"], "workflow_units_failed",
+        "{document}"
+    );
+    let message = document["err"]["msg"].as_str().expect("a message");
+    assert!(message.contains("was installed disabled"), "{message}");
+    let recover = document["err"]["recover"]
+        .as_str()
+        .expect("a recovery hint");
+    assert!(recover.contains("pohunek workflow enable"), "{recover}");
+    assert_eq!(units.listed()[0]["enabled"], false);
+
+    let output = units.install_with(&plugin, &digest, &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        workflow_units::describe(&output)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("a JSON envelope");
+    assert_eq!(document["ok"]["status"], "already_installed", "{document}");
+    assert_eq!(document["ok"]["plugin"]["enabled"], false, "{document}");
 }
 
 #[test]

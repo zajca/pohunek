@@ -400,6 +400,40 @@ impl Store {
         Ok((record, root, manifest))
     }
 
+    /// Applies the refusals of [`Store::uninstall`] that depend on the
+    /// installed files, without changing anything: with `remove_modified`
+    /// the files must fail verification for a reason other than being
+    /// missing or unreadable, and without it they must verify or be missing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PluginUnknown`], [`Error::RootIntact`],
+    /// [`Error::RootInvalid`] or [`Error::Store`], as [`Store::uninstall`]
+    /// would.
+    pub(crate) fn check_removable(
+        &self,
+        id: &PackageId,
+        remove_modified: bool,
+    ) -> Result<(), Error> {
+        let (registry, record) = self.require(id)?;
+        match (registry.verify(record.digest()), remove_modified) {
+            (Ok(_) | Err(RegistryError::RootInvalid(VerifyError::RootMissing)), true) => {
+                Err(Error::RootIntact { id: id.to_string() })
+            }
+            (Err(RegistryError::RootInvalid(VerifyError::Unreadable { kind })), true)
+                if kind != ErrorKind::PermissionDenied =>
+            {
+                Err(Error::RootInvalid {
+                    id: id.to_string(),
+                    cause: VerifyError::Unreadable { kind },
+                })
+            }
+            (Err(RegistryError::RootInvalid(_)), true)
+            | (Ok(_) | Err(RegistryError::RootInvalid(VerifyError::RootMissing)), false) => Ok(()),
+            (Err(error), _) => Err(by_id(error, id)),
+        }
+    }
+
     /// Uninstalls plugin `id` and, with `purge`, removes its state and
     /// config directories.
     ///

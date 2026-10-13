@@ -115,7 +115,11 @@ is created until you repeat the command with `--yes`; until then it fails with
 jobs or services is enabled as `pohunek workflow enable` enables it (see
 [Jobs and services](#jobs-and-services)); without a `pohunek service`
 installation an enabling install is refused before anything is created
-(`workflow_service_not_installed`), and `--no-enable` still installs it.
+(`workflow_service_not_installed`), and `--no-enable` still installs it. When
+a fresh install recorded the plugin but enabling it failed, the plugin stays
+installed disabled, the error says so, and `pohunek workflow enable <id>`
+finishes the job. Installing a recorded archive again never touches its
+units: running jobs and services are neither stopped nor restarted.
 
 The store keeps one version per plugin id. Installing the recorded archive
 again changes nothing (`already_installed`), unless its installed files are
@@ -438,12 +442,20 @@ actions never touch the service manager.
   installed for, and the trampoline verifies it first). Recording the
   installed units, so that such units can be removed too, is planned with
   the status command (#326).
-- `uninstall` removes every unit before it removes the plugin. While a unit
-  cannot be removed, for example because the service manager is unreachable,
-  uninstall is refused with `workflow_units_failed` and the plugin stays
-  installed; repeat it once the service manager answers.
-- Without a `pohunek service` installation, `disable` and `uninstall` find no
-  units to remove.
+- `uninstall` first applies its own refusals (`--remove-modified` on files
+  that verify fails with `workflow_root_intact`, and so on), which change
+  nothing; it then marks the plugin disabled and removes every unit before it
+  removes the plugin. While a unit cannot be removed, for example because the
+  service manager is unreachable, uninstall fails with `workflow_units_failed`
+  and the plugin stays installed, disabled; repeat it once the service
+  manager answers.
+- Nothing yet stops `pohunek service uninstall` while plugin units exist.
+  Without a `pohunek service` installation, `disable` and `uninstall` still
+  look for the plugin's units, in the namespace and unit directory a
+  `pohunek service install` would record for this user and these roots, and
+  remove them. When that service manager cannot be reached they say so in a
+  warning instead of failing: a unit left behind refuses every run, because
+  the trampoline needs a verified `pohunek service` installation.
 
 All three hold `<state>/pohunek/workflow-plugins/units.lock` for their whole
 run and are safe to repeat; a command that finds it held fails with

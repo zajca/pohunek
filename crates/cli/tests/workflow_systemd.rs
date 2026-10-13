@@ -35,3 +35,6 @@ systemd_scenario!(stale_and_residue_units_are_refused);
 systemd_scenario!(the_manager_environment_never_reaches_a_job);
 systemd_scenario!(the_trampoline_environment_never_reaches_a_job);
 systemd_scenario!(a_stopped_unit_ends_its_run_cleanly);
+systemd_scenario!(a_job_outside_changed_bounds_is_refused_when_it_runs);
+systemd_scenario!(a_refused_uninstall_leaves_the_units_running);
+systemd_scenario!(installing_again_leaves_running_units_alone);

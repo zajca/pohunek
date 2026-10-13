@@ -62,6 +62,7 @@ use super::config::Knobs;
 use super::manifest::ArgsMode;
 use super::runlog::{Outcome, Record, RunLog};
 use super::store::Store;
+use super::units::check_job;
 use super::Error;
 use crate::process::bounded::{
     configure_child, descriptor_scan_bound, drain_capped, spawn_capped_reader, supervise_child,
@@ -562,24 +563,11 @@ fn prepare_unit(
     let (name, argv, timeout_ms) = match unit.kind {
         PluginUnitKind::Job => {
             let (name, job) = manifest.jobs.get_key_value(unit.name).ok_or_else(unknown)?;
-            let jobs = &knobs.jobs;
-            let timeout_ms = match job.timeout_ms.map(u64::from) {
-                Some(requested) if requested > jobs.timeout_max_ms => {
-                    return Err((
-                        Error::UnitRefused {
-                            id,
-                            unit: format!("{kind} {name}"),
-                            reason: format!(
-                                "declares timeout_ms {requested}, above jobs.timeout_max_ms {}",
-                                jobs.timeout_max_ms
-                            ),
-                        },
-                        Some(name.clone()),
-                    ));
-                }
-                Some(requested) => requested,
-                None => jobs.timeout_default_ms,
-            };
+            // The owner's bounds may have changed since the unit was installed.
+            check_job(plugin, name, job, knobs).map_err(|error| (error, Some(name.clone())))?;
+            let timeout_ms = job
+                .timeout_ms
+                .map_or(knobs.jobs.timeout_default_ms, u64::from);
             (name, &job.argv, Some(timeout_ms))
         }
         PluginUnitKind::Service => {

@@ -441,8 +441,8 @@ pub(crate) async fn run(action: Action, host: &str) -> Result<ExitCode, CliError
             // without a store there is nothing of either.
             let lock = store.lock_units()?;
             if lock.is_some() && store.installed(&plugin)?.is_some() {
-                units::remove_units(&store, &mut Host::resolve_lazily(), &plugin, &mut warnings)
-                    .await?;
+                let mut host = Host::resolve_lazily();
+                units::retire(&store, &mut host, &plugin, remove_modified, &mut warnings).await?;
             }
             let removal = store.uninstall(&plugin, purge, remove_modified)?;
             drop(lock);
@@ -569,14 +569,20 @@ async fn install(store: &Store, args: &InstallArgs) -> Result<(), CliError> {
         host = Host::given(context);
     }
     // A plugin with units is recorded disabled and enabled afterwards, so its
-    // units start only once it is enabled.
+    // units start only once it is enabled. Installing a recorded archive
+    // again never touches its units.
     let (report, warning) = store.install(&candidate, !args.no_enable && !has_units)?;
-    let refresh = match report.status {
-        InstallStatus::AlreadyInstalled | InstallStatus::RootRestored => report.record.enabled(),
-        _ => !args.no_enable,
-    };
-    let report = if has_units && refresh {
-        let record = units::enable(store, &mut host, &identity.id).await?;
+    let fresh = !matches!(
+        report.status,
+        InstallStatus::AlreadyInstalled | InstallStatus::RootRestored
+    );
+    let report = if has_units && fresh && !args.no_enable {
+        let record = units::enable(store, &mut host, &identity.id)
+            .await
+            .map_err(|source| Error::InstalledDisabled {
+                id: identity.id.to_string(),
+                source: Box::new(source),
+            })?;
         package::registry::InstallReport { record, ..report }
     } else {
         report

@@ -16,13 +16,19 @@
 //!   trampoline refuses to run a disabled plugin.
 //! - **Disable** marks the plugin disabled first, so the trampoline refuses
 //!   from then on, then stops and removes every unit.
-//! - **Uninstall** removes every unit before the plugin's record.
+//! - **Uninstall** first applies the store's own refusals, then marks the
+//!   plugin disabled and removes every unit before the plugin's record, so a
+//!   later failure leaves a disabled plugin without units.
 //!
 //! All three hold the store's unit lifecycle lock and are safe to repeat. A
 //! plugin that declares neither jobs nor services never reaches the service
-//! manager, and needs no `pohunek service` installation. Without one,
-//! disable and uninstall find no units to remove: enable requires it, and
-//! the service cannot be uninstalled while plugin units exist.
+//! manager, and needs no `pohunek service` installation. Enable requires
+//! one. Disable and uninstall without one still look for the plugin's units
+//! in the namespace and unit directory this process derives, the ones a
+//! `pohunek service install` would record, because nothing yet stops the
+//! service from being uninstalled while plugin units exist. When that
+//! service manager cannot be reached they warn instead: a unit left behind
+//! refuses every run, since the trampoline needs a verified installation.
 
 // Rust guideline compliant 2026-10-13
 
@@ -34,20 +40,20 @@ use std::time::Duration;
 use package::registry::PackageRecord;
 use pohunek_paths::BasePaths;
 use pohunek_platform::supervisor::{
-    Activation, JobDefinition, JobSpec, PluginUnitDefinition, PluginUnitKey, PluginUnitKind,
-    PluginUnits, RestartPolicy, MAX_JOB_TIMEOUT, MIN_JOB_INTERVAL,
+    Activation, JobDefinition, JobSpec, Namespace, PluginUnitDefinition, PluginUnitKey,
+    PluginUnitKind, PluginUnits, RestartPolicy, MAX_JOB_TIMEOUT, MIN_JOB_INTERVAL,
 };
 use pohunek_service_config::ServiceConfig;
 use protocol::PackageId;
 
 use super::config::{self, Knobs, MAX_KILL_GRACE_MS, SUPERVISED_MARGIN_MS};
-use super::manifest::Manifest;
+use super::manifest::{Job, Manifest};
 use super::runner::kind_name;
 use super::store::Store;
 use super::Error;
 use crate::paths::WorkflowDirs;
 use crate::service::layout::CLI_NAME;
-use crate::service::Context;
+use crate::service::{settings, Context};
 
 /// Hidden `pohunek workflow` subcommand every unit runs.
 pub(crate) const TRAMPOLINE: &str = "__exec";
@@ -186,36 +192,40 @@ fn keys(id: &PackageId, manifest: &Manifest) -> Vec<PluginUnitKey> {
 ///
 /// Returns [`Error::UnitRefused`] naming the job and the knob it breaks.
 pub(crate) fn check_bounds(manifest: &Manifest, knobs: &Knobs) -> Result<(), Error> {
+    manifest
+        .jobs
+        .iter()
+        .try_for_each(|(name, job)| check_job(&manifest.identity.id, name, job, knobs))
+}
+
+/// Refuses job `name` of plugin `id` when its `every_s` is below
+/// `jobs.min_interval_s` or its `timeout_ms` above `jobs.timeout_max_ms`;
+/// checked when units are installed and again before each run.
+///
+/// # Errors
+///
+/// Returns [`Error::UnitRefused`] naming the job and the knob it breaks.
+pub(crate) fn check_job(id: &PackageId, name: &str, job: &Job, knobs: &Knobs) -> Result<(), Error> {
     let jobs = &knobs.jobs;
-    let refused = |name: &str, reason: String| Error::UnitRefused {
-        id: manifest.identity.id.to_string(),
+    let refused = |reason: String| Error::UnitRefused {
+        id: id.to_string(),
         unit: format!("job {name}"),
         reason,
     };
-    for (name, job) in &manifest.jobs {
-        let every = job.every_s.get();
-        if every < jobs.min_interval_s {
-            return Err(refused(
-                name,
-                format!(
-                    "declares every_s {every}, below jobs.min_interval_s {}",
-                    jobs.min_interval_s
-                ),
-            ));
-        }
-        if let Some(timeout) = job.timeout_ms.map(u64::from) {
-            if timeout > jobs.timeout_max_ms {
-                return Err(refused(
-                    name,
-                    format!(
-                        "declares timeout_ms {timeout}, above jobs.timeout_max_ms {}",
-                        jobs.timeout_max_ms
-                    ),
-                ));
-            }
-        }
+    let every = job.every_s.get();
+    if every < jobs.min_interval_s {
+        return Err(refused(format!(
+            "declares every_s {every}, below jobs.min_interval_s {}",
+            jobs.min_interval_s
+        )));
     }
-    Ok(())
+    match job.timeout_ms.map(u64::from) {
+        Some(timeout) if timeout > jobs.timeout_max_ms => Err(refused(format!(
+            "declares timeout_ms {timeout}, above jobs.timeout_max_ms {}",
+            jobs.timeout_max_ms
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Builds every unit definition of `record`'s `manifest`, refusing a job
@@ -285,18 +295,33 @@ fn definitions(
 }
 
 /// Connects the service manager backend of `installation`.
-#[cfg(target_os = "linux")]
-async fn connect(
-    context: &Context,
+fn connect<'a>(
+    context: &'a Context,
     installation: &Installation,
+    id: &'a PackageId,
+) -> impl std::future::Future<Output = Result<Box<dyn PluginUnits>, Error>> + 'a {
+    connect_namespace(
+        context,
+        installation.config.namespace(),
+        installation.config.deadlines().launchctl_command,
+        id,
+    )
+}
+
+/// Connects the service manager backend of `namespace` in `context`'s unit
+/// directory; every `launchctl` command ends after `launchctl_deadline`
+/// (macOS only).
+#[cfg(target_os = "linux")]
+async fn connect_namespace(
+    context: &Context,
+    namespace: Namespace,
+    _launchctl_deadline: Duration,
     id: &PackageId,
 ) -> Result<Box<dyn PluginUnits>, Error> {
     use pohunek_platform::supervisor::systemd::SystemdPluginUnits;
 
-    use crate::service::settings;
-
     SystemdPluginUnits::connect(
-        installation.config.namespace(),
+        namespace,
         context.supervisor_dir().to_path_buf(),
         settings::SUPERVISOR_CALL_TIMEOUT,
     )
@@ -305,11 +330,13 @@ async fn connect(
     .map_err(|error| units_failed(id, format!("the service manager is unreachable: {error}")))
 }
 
-/// Connects the service manager backend of `installation`.
+/// Connects the service manager backend of `namespace` in `context`'s unit
+/// directory; every `launchctl` command ends after `launchctl_deadline`.
 #[cfg(target_os = "macos")]
-fn connect(
+fn connect_namespace(
     context: &Context,
-    installation: &Installation,
+    namespace: Namespace,
+    launchctl_deadline: Duration,
     id: &PackageId,
 ) -> std::future::Ready<Result<Box<dyn PluginUnits>, Error>> {
     use pohunek_platform::supervisor::launchd::LaunchdPluginUnits;
@@ -318,10 +345,10 @@ fn connect(
     // future keeps one call shape with the systemd arm.
     std::future::ready(
         LaunchdPluginUnits::new(
-            installation.config.namespace(),
+            namespace,
             context.uid(),
             context.supervisor_dir().to_path_buf(),
-            installation.config.deadlines().launchctl_command,
+            launchctl_deadline,
         )
         .map(|units| Box::new(units) as Box<dyn PluginUnits>)
         .map_err(|error| units_failed(id, format!("the service manager is unusable: {error}"))),
@@ -423,13 +450,39 @@ pub(crate) async fn disable(
     Ok((record, warnings))
 }
 
-/// Removes the units of plugin `id` before the caller removes its record,
-/// under the unit lifecycle lock the caller holds.
+/// Prepares the uninstall of plugin `id` under the unit lifecycle lock the
+/// caller holds until the record is removed: applies the store's refusals
+/// that depend on the installed files, marks the plugin disabled, and
+/// removes its units, so a refusal changes nothing and a later failure
+/// leaves a disabled plugin without units.
+///
+/// # Errors
+///
+/// Returns the refusals of [`Store::check_removable`], [`Error::Busy`],
+/// [`Error::Store`], and the unit errors of [`disable`].
+pub(crate) async fn retire(
+    store: &Store,
+    host: &mut Host,
+    id: &PackageId,
+    remove_modified: bool,
+    warnings: &mut Vec<String>,
+) -> Result<(), Error> {
+    store.check_removable(id, remove_modified)?;
+    store.set_enabled(id, false)?;
+    remove_units(store, host, id, warnings).await
+}
+
+/// Removes the units of plugin `id`, under the unit lifecycle lock the
+/// caller holds.
+///
+/// The units are looked up in the recorded installation's namespace, or,
+/// without a `service.toml`, in the namespace this process derives (see the
+/// module documentation).
 ///
 /// # Errors
 ///
 /// See [`disable`].
-pub(crate) async fn remove_units(
+async fn remove_units(
     store: &Store,
     host: &mut Host,
     id: &PackageId,
@@ -442,23 +495,52 @@ pub(crate) async fn remove_units(
         Err(Error::DescriptorInvalid(invalid)) => Err(invalid.to_string()),
         Err(error) => return Err(error),
     };
-    // Without a service installation no unit can exist: enable requires one.
     let installation = host
         .context()
         .and_then(|context| installation_at(context.paths(), context.uid()));
-    let (manifest, installation) = match (unlisted, installation) {
-        (_, Ok(None)) => return Ok(()),
+    let manifest = match (unlisted, installation) {
+        // Units cannot be listed; without a recorded installation none can
+        // run plugin code, so there is nothing to warn about.
+        (Err(_cause), Ok(None)) => return Ok(()),
         (Err(cause), _) => {
             warnings.push(unlisted_warning(&cause));
             return Ok(());
         }
         (Ok(_manifest), Err(error)) => return Err(error),
-        (Ok(manifest), Ok(Some(installation))) => (manifest, installation),
+        (Ok(manifest), Ok(Some(installation))) => {
+            let context = host.context()?;
+            let backend = connect(context, &installation, id).await?;
+            return remove_keys(backend.as_ref(), id, &manifest).await;
+        }
+        (Ok(manifest), Ok(None)) => manifest,
     };
     let context = host.context()?;
-    let backend = connect(context, &installation, id).await?;
+    let namespace = context
+        .namespace()
+        .map_err(|error| Error::ServiceNotInstalled {
+            reason: error.to_string(),
+        })?;
+    match connect_namespace(context, namespace, settings::LAUNCHCTL_COMMAND, id).await {
+        Ok(backend) => remove_keys(backend.as_ref(), id, &manifest).await,
+        Err(error) => {
+            warnings.push(format!(
+                "no pohunek service installation is recorded and the service manager could \
+                 not be reached ({error}), so leftover units of the plugin were not looked \
+                 up; a unit left behind refuses every run"
+            ));
+            Ok(())
+        }
+    }
+}
+
+/// Removes every unit `manifest` declares through `backend`.
+async fn remove_keys(
+    backend: &dyn PluginUnits,
+    id: &PackageId,
+    manifest: &Manifest,
+) -> Result<(), Error> {
     let mut failures = Vec::new();
-    for key in keys(id, &manifest) {
+    for key in keys(id, manifest) {
         if let Err(error) = backend.remove(&key).await {
             failures.push(format!("removing the {key} unit failed: {error}"));
         }

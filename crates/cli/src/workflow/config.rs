@@ -10,9 +10,11 @@
 //! later workflow slices are unknown keys here.
 //!
 //! `[jobs]` and `[services]` apply to the supervised runs of the plugin units
-//! (see [`super::supervised`]). Every knob is read again at each run, except
-//! `jobs.check_period_s`, which is written into the job's timer unit when the
-//! plugin is enabled and so needs a new `pohunek workflow enable` to change.
+//! (see [`super::supervised`]). Every knob is read again at each run, and a
+//! job outside `jobs.min_interval_s` or `jobs.timeout_max_ms` is refused then
+//! as when it was enabled, except `jobs.check_period_s`, which is written
+//! into the job's timer unit when the plugin is enabled and so needs a new
+//! `pohunek workflow enable` to change.
 
 // Rust guideline compliant 2026-10-13
 
@@ -71,8 +73,9 @@ pub(crate) const SUPERVISED_MARGIN_MS: u64 = 30 * 1000;
 pub(crate) const MAX_JOB_TIMEOUT_MS: u64 =
     MAX_JOB_TIMEOUT.as_secs() * 1000 - MAX_KILL_GRACE_MS - SUPERVISED_MARGIN_MS;
 
-/// Ceiling of `jobs.min_interval_s` and `jobs.check_period_s`: the longest
-/// interval the service managers accept for a periodic unit.
+/// Ceiling of `jobs.min_interval_s`: the longest interval the service
+/// managers accept for a periodic unit, which is also the longest `every_s`
+/// a manifest may declare.
 const MAX_INTERVAL_S: u64 = MAX_JOB_INTERVAL.as_secs();
 
 /// Ceiling of `jobs.check_period_s`: one hour. The check period is the

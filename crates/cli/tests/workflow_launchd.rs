@@ -34,3 +34,6 @@ launchd_scenario!(stale_and_residue_units_are_refused);
 launchd_scenario!(the_manager_environment_never_reaches_a_job);
 launchd_scenario!(the_trampoline_environment_never_reaches_a_job);
 launchd_scenario!(a_stopped_unit_ends_its_run_cleanly);
+launchd_scenario!(a_job_outside_changed_bounds_is_refused_when_it_runs);
+launchd_scenario!(a_refused_uninstall_leaves_the_units_running);
+launchd_scenario!(installing_again_leaves_running_units_alone);

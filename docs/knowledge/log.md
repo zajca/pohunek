@@ -32,7 +32,11 @@
   manager stopped reads as stopped (the run is recorded `interrupted`).
   systemd plugin units use `KillMode=mixed`, so a stop signals only the
   trampoline; the final `SIGKILL` still reaches every remaining process.
-  Uninstall is refused while a unit cannot be removed. Run records gain the kinds `job` and
+  Uninstall applies its own refusals first, then disables the plugin and
+  removes its units; it fails while a unit cannot be removed. Installing a
+  recorded archive again never touches its units, and a fresh install whose
+  enable failed stays installed disabled. A job outside the `[jobs]` bounds is
+  refused at run time too. Run records gain the kinds `job` and
   `service` and the field `backoff_ms`.
 - New owner knobs `[jobs]` (`timeout_default_ms`, `timeout_max_ms`,
   `min_interval_s`, `check_period_s`) and `[services]`

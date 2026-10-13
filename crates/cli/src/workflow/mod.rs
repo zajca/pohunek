@@ -304,6 +304,16 @@ pub(crate) enum Error {
         detail: String,
     },
 
+    /// A fresh install recorded the plugin, but enabling it failed; the
+    /// plugin stays installed disabled.
+    #[error("workflow plugin {id} was installed disabled because enabling it failed: {source}")]
+    InstalledDisabled {
+        /// The plugin id.
+        id: String,
+        /// Why enabling failed; its code is this error's code.
+        source: Box<Error>,
+    },
+
     /// A unit runs another archive than the installed one: residue of an
     /// earlier installation.
     #[error("a unit of workflow plugin {id} names another archive than the installed one; nothing was run")]
@@ -368,6 +378,7 @@ impl Error {
             Self::Units { .. } => "workflow_units_failed",
             Self::UnitStale { .. } => "workflow_unit_stale",
             Self::UnitUnknown { .. } => "workflow_unit_unknown",
+            Self::InstalledDisabled { source, .. } => source.code(),
             Self::ActionFailed { .. } => "workflow_action_failed",
             Self::OutputIncomplete { .. } => "workflow_output_incomplete",
             Self::OutputInvalid { .. } => "workflow_output_invalid",
@@ -498,6 +509,10 @@ impl Error {
                 "the unit is left over from another install; remove it with \
                  `pohunek workflow disable <id>`"
             }
+            Self::InstalledDisabled { .. } => {
+                "the plugin is installed disabled; fix the cause above, then run \
+                 `pohunek workflow enable <id>` (installing it again changes nothing)"
+            }
             Self::ActionFailed { .. } => {
                 "the action reported a failure; its stderr above says why, and its stdout was \
                  not printed"
@@ -517,6 +532,7 @@ impl Error {
     /// is runtime.
     pub(crate) fn class(&self) -> ErrorClass {
         match self {
+            Self::InstalledDisabled { source, .. } => source.class(),
             Self::RootInvalid { .. }
             | Self::RootIntact { .. }
             | Self::InstallUncertain { .. }

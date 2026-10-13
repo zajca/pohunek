@@ -10,7 +10,7 @@
 //!    plugin is gone is crash residue: it is refused with a message on stderr,
 //!    since there is no run log to write to.
 //! 2. A unit of another archive than the selected one, or of a disabled
-//!    plugin, is refused and recorded at once. Otherwise it takes a
+//!    plugin, is refused and recorded at once, without starting anything. Otherwise it takes a
 //!    non-blocking lock on `locks/<kind>-<name>.lock` in the
 //!    plugin's state directory. A held lock means an earlier run of the same
 //!    unit is still active; the run is recorded as `overlap_skipped` and the
@@ -278,18 +278,16 @@ fn run(request: &Request, store: &Store, knobs: &Knobs, interrupts: &mut Interru
         digest: &request.digest,
         cli: &cli,
     };
-    if installed.digest() != &request.digest || !installed.enabled() {
-        // Refused by the runner before anything starts; the unit's lock,
-        // schedule and backoff belong to the installed archive and stay as
-        // they are.
-        let result = run_supervised(&mut run, store, knobs, id, &unit, interrupts);
-        if let Err(error) = &result {
-            eprintln!(
-                "workflow {kind} {} of plugin {id} was refused: {error}",
-                request.name
-            );
-        }
-        return Status::Refused;
+    // Refused from this snapshot, on a path that never starts anything; the
+    // unit's lock, schedule and backoff belong to the installed archive and
+    // stay as they are. The runner checks both again before it starts.
+    if installed.digest() != &request.digest {
+        let error = Error::UnitStale { id: id.to_string() };
+        return refuse(&mut run, &error);
+    }
+    if !installed.enabled() {
+        let error = Error::PluginDisabled { id: id.to_string() };
+        return refuse(&mut run, &error);
     }
     let state = match TrustedDir::open_absolute(store.state_dir(id), PRIVATE_DIR_MODE) {
         Ok(state) => state,
@@ -297,10 +295,11 @@ fn run(request: &Request, store: &Store, knobs: &Knobs, interrupts: &mut Interru
     };
     let _lock = match lock(&state, request) {
         Ok(lock) => lock,
+        // The name is recorded only once the verified manifest declared it.
         Err(FsError::LockContended { .. }) => {
             run.append(
                 &installed,
-                Some(&request.name),
+                None,
                 Outcome::OverlapSkipped,
                 None,
                 None,
