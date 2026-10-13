@@ -656,6 +656,7 @@ impl SessionRegistry {
             start_identity: Some(observed.start_identity),
             reported_at: now,
             activity_reported: false,
+            observed: true,
         };
         Some(apply_observed_transition(entry, observed, report, agent))
     }
@@ -674,6 +675,7 @@ impl SessionRegistry {
             start_identity: None,
             reported_at: now,
             activity_reported: false,
+            observed: active.observed,
         }
     }
 
@@ -731,6 +733,7 @@ impl SessionRegistry {
                 start_identity: Some(observed.start_identity),
                 reported_at: now,
                 activity_reported: false,
+                observed: true,
             };
             let _ = apply_observed_transition(entry, &observed, report, agent);
             return ForegroundDecision::Updated;

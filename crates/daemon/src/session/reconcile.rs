@@ -4742,6 +4742,7 @@ fn active_report_from_info(info: &protocol::SessionInfo) -> Option<ActiveAgentRe
         start_identity: None,
         reported_at: crate::time::now(),
         activity_reported: false,
+        observed: false,
     })
 }
 
@@ -4765,6 +4766,7 @@ fn release_tombstone(
         start_identity: Some(release.process.start_identity),
         reported_at: crate::time::now(),
         activity_reported: false,
+        observed: false,
     }
 }
 
@@ -4856,6 +4858,7 @@ fn apply_worker_identities_with(
             start_identity: Some(identity.process.start_identity),
             reported_at: crate::time::now(),
             activity_reported: false,
+            observed: false,
         }),
         release: None,
         privately_reported: true,

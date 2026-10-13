@@ -9254,6 +9254,7 @@ async fn procwatch_retires_root_authority_before_reused_pid_can_drive_state() {
             start_identity: Some(1),
             reported_at: Instant::now(),
             activity_reported: false,
+            observed: false,
         });
         entry.info.active_agent = Some("shell".to_owned());
         entry.info.active_agent_base = Some(RuntimeRef::shell());
@@ -9308,6 +9309,7 @@ async fn procwatch_retires_a_zombie_root_with_its_exact_generation() {
             start_identity: Some(root.start_identity.get()),
             reported_at: Instant::now(),
             activity_reported: false,
+            observed: false,
         });
         entry.info.active_agent = Some("shell".to_owned());
         entry.info.active_agent_base = Some(RuntimeRef::shell());
@@ -9378,6 +9380,7 @@ async fn procwatch_discards_cwd_when_focus_generation_changes_inside_bracket() {
             start_identity: Some(agent.start_identity.get()),
             reported_at: Instant::now(),
             activity_reported: false,
+            observed: false,
         });
         entry.info.active_agent = Some("codex".to_owned());
         entry.info.active_agent_base = Some(RuntimeRef::codex());
@@ -9425,6 +9428,7 @@ async fn stale_procwatch_retirement_cannot_clear_replacement_runtime() {
             start_identity: Some(2),
             reported_at: Instant::now(),
             activity_reported: false,
+            observed: false,
         });
         entry.info.active_agent = Some("codex".to_owned());
         entry.info.active_agent_base = Some(RuntimeRef::codex());

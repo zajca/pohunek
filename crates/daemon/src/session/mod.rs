@@ -640,6 +640,10 @@ struct SessionRegistryInner {
     /// before it launches.
     #[cfg(test)]
     recovery_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Parks an adopted detector refresh between resolving the runtime sources
+    /// and applying them.
+    #[cfg(test)]
+    refresh_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
     /// Holds the next committed create before its initial input.
     #[cfg(test)]
     initial_input_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
@@ -875,6 +879,10 @@ struct ActiveAgentReport {
     start_identity: Option<u64>,
     reported_at: Instant,
     activity_reported: bool,
+    /// Whether procwatch observed this agent from its process rather than a
+    /// client reported it: an observed agent runs the pinned definition as
+    /// observed, never a host profile of the same name.
+    observed: bool,
 }
 
 type NativeIdentityReport = crate::store::NativeIdentityOrdering;
@@ -1782,6 +1790,8 @@ impl SessionRegistry {
                 bound_create_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 recovery_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                refresh_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 initial_input_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
@@ -2737,6 +2747,22 @@ impl SessionRegistry {
         }
     }
 
+    /// Parks an adopted detector refresh between resolving the runtime sources
+    /// and applying them, when a test armed the hold.
+    #[cfg(test)]
+    async fn hold_refresh(&self) {
+        let gate = self
+            .inner
+            .refresh_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
     /// Parks a resume or fork after its profile resolved when a test armed the
     /// hold.
     #[cfg(test)]
@@ -3446,6 +3472,7 @@ impl SessionRegistry {
                 start_identity,
                 reported_at: crate::time::now(),
                 activity_reported: reported_activity.is_some(),
+                observed: false,
             };
             entry.active_agent = Some(report.clone());
             entry.last_agent_report = Some(report);
@@ -3554,6 +3581,7 @@ impl SessionRegistry {
                 start_identity: None,
                 reported_at: crate::time::now(),
                 activity_reported: false,
+                observed: false,
             };
             clear_active_agent(entry, tombstone)
         };

@@ -60,100 +60,124 @@ impl SessionRegistry {
         self.inner.profiles.runtimes().reload()
     }
 
-    /// Re-derives the pinned definition and the default detector configuration
+    /// Re-derives the pinned definition and the running detector configuration
     /// of each live session launched from a built-in runtime an official
-    /// package may adopt, after the runtime registry was rebuilt, so callbacks,
-    /// observation and detection follow the package that serves the runtime
-    /// now.
+    /// package may adopt, after the runtime registry was rebuilt.
     ///
-    /// The default configuration follows the same rule as at launch: the
-    /// profile's manifest override when it has one, else the pinned
-    /// definition's manifest. A running nested agent keeps its own detector
-    /// configuration; the default is sent again when that agent ends.
-    ///
-    /// Other pins keep their definition: a package pin resolves from its own
-    /// digest and does not change with the registry.
+    /// The runtime sources are resolved off the sessions lock, once per pass.
+    /// The running configuration is then decided under the lock, from the
+    /// session's active agent at that time: the same rule the launch, report
+    /// and observation paths use. An active agent that changed while the
+    /// sources resolved is collected again, a bounded number of times.
     pub(super) async fn refresh_adopted_pins(&self) {
-        // Only the collection holds the sessions lock: the package root is
-        // verified by the resolution below, which is filesystem work.
-        let candidates: Vec<AdoptedCandidate> = {
-            let sessions = self.inner.sessions.lock().await;
-            sessions
-                .iter()
-                .filter(|(_, entry)| {
-                    entry
-                        .snapshot
-                        .launch_binding
-                        .binding()
-                        .is_some_and(|binding| {
-                            matches!(
-                                binding.provenance,
-                                protocol::BindingProvenance::Builtin {
-                                    package: Some(_),
-                                    ..
-                                }
-                            )
-                        })
-                })
-                .map(|(id, entry)| AdoptedCandidate {
-                    id: id.clone(),
-                    agent: entry.info.agent.clone(),
-                    base: entry.info.agent_base.clone(),
-                    pin: entry.snapshot.launch_binding.clone(),
-                    active: active_snapshot(entry),
-                })
-                .collect()
-        };
-        if candidates.is_empty() {
-            return;
-        }
-        let runtimes = self.inner.profiles.runtimes().clone();
-        let profiles = self.inner.profiles.clone();
-        let resolved = match tokio::task::spawn_blocking(move || {
-            candidates
-                .into_iter()
-                .map(|candidate| {
-                    let resolution = resolve_adopted(&runtimes, &profiles, &candidate);
-                    (candidate, resolution)
-                })
-                .collect::<Vec<_>>()
-        })
-        .await
-        {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                warn!(%error, "the adopted sessions' runtime sources were not resolved");
+        let mut only: Option<Vec<SessionId>> = None;
+        for _attempt in 0..REFRESH_ATTEMPTS {
+            let candidates = self.collect_adopted(only.as_deref()).await;
+            if candidates.is_empty() {
                 return;
             }
-        };
+            let runtimes = self.inner.profiles.runtimes().clone();
+            let profiles = self.inner.profiles.clone();
+            let resolved = match tokio::task::spawn_blocking(move || {
+                candidates
+                    .into_iter()
+                    .map(|candidate| {
+                        let resolution = resolve_adopted(&runtimes, &profiles, &candidate);
+                        (candidate, resolution)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    warn!(%error, "the adopted sessions' runtime sources were not resolved");
+                    return;
+                }
+            };
+            #[cfg(test)]
+            self.hold_refresh().await;
+            let stale = self.apply_adopted(resolved).await;
+            if stale.is_empty() {
+                return;
+            }
+            only = Some(stale);
+        }
+        warn!(
+            "the running detector of sessions whose active agent kept changing was not refreshed"
+        );
+    }
+
+    /// The adopted sessions to refresh, optionally only those `only` names.
+    async fn collect_adopted(&self, only: Option<&[SessionId]>) -> Vec<AdoptedCandidate> {
+        let sessions = self.inner.sessions.lock().await;
+        sessions
+            .iter()
+            .filter(|(id, _)| only.is_none_or(|ids| ids.contains(id)))
+            .filter(|(_, entry)| {
+                entry
+                    .snapshot
+                    .launch_binding
+                    .binding()
+                    .is_some_and(|binding| {
+                        matches!(
+                            binding.provenance,
+                            protocol::BindingProvenance::Builtin {
+                                package: Some(_),
+                                ..
+                            }
+                        )
+                    })
+            })
+            .map(|(id, entry)| AdoptedCandidate {
+                id: id.clone(),
+                agent: entry.info.agent.clone(),
+                base: entry.info.agent_base.clone(),
+                pin: entry.snapshot.launch_binding.clone(),
+                active: active_snapshot(entry),
+            })
+            .collect()
+    }
+
+    /// Applies resolved sources under the lock and returns the sessions whose
+    /// active agent changed in a way this resolution does not cover.
+    async fn apply_adopted(
+        &self,
+        resolved: Vec<(AdoptedCandidate, AdoptedResolution)>,
+    ) -> Vec<SessionId> {
         let mut sessions = self.inner.sessions.lock().await;
+        let mut stale = Vec::new();
         for (candidate, resolution) in resolved {
-            // A session whose pin changed while resolving keeps its own state.
             let Some(entry) = sessions.get_mut(&candidate.id) else {
                 continue;
             };
+            // A changed pin is refreshed by the transaction that changed it.
             if entry.snapshot.launch_binding != candidate.pin {
                 continue;
             }
             entry.pinned = resolution.pinned;
             entry.default_detector_config = resolution.default.clone();
-            // The running configuration is replaced only while the same active
-            // agent runs: a newer report owns its own configuration.
-            if active_snapshot(entry) != candidate.active {
-                continue;
-            }
-            match candidate.active {
-                None => super::send_detector_config(entry, resolution.default),
-                Some(ActiveSnapshot {
-                    own_runtime: true, ..
-                }) => {
-                    let config = resolution.active.unwrap_or(resolution.default);
-                    super::send_detector_config(entry, config);
+            let current = active_snapshot(entry);
+            if current == candidate.active {
+                match candidate.active {
+                    None => super::send_detector_config(entry, resolution.default),
+                    Some(ActiveSnapshot {
+                        own_runtime: true, ..
+                    }) => {
+                        let config = resolution.active.unwrap_or(resolution.default);
+                        super::send_detector_config(entry, config);
+                    }
+                    // A nested agent of another runtime owns its configuration.
+                    Some(_) => {}
                 }
-                // A nested agent of another runtime owns its configuration.
-                Some(_) => {}
+            } else if current.is_none() {
+                // The agent ended: the default is the running configuration.
+                super::send_detector_config(entry, resolution.default);
+            } else {
+                stale.push(candidate.id);
             }
         }
+        stale
     }
 
     /// Package digests that a live, lost or resumable session was launched
@@ -363,18 +387,24 @@ fn pinned_digest(pin: &host::LaunchPin) -> Option<PackageDigest> {
     }
 }
 
-/// The active agent of an adopted session at collection time: its name, and
-/// whether it runs the session's own runtime (a report or a process naming it).
+/// How many times a refresh collects again the sessions whose active agent
+/// changed while the runtime sources resolved.
+const REFRESH_ATTEMPTS: usize = 3;
+
+/// The active agent of an adopted session at collection time: its name, whether
+/// it runs the session's own runtime, and whether procwatch observed it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveSnapshot {
     agent: String,
     own_runtime: bool,
+    observed: bool,
 }
 
 fn active_snapshot(entry: &SessionEntry) -> Option<ActiveSnapshot> {
     entry.active_agent.as_ref().map(|active| ActiveSnapshot {
         agent: active.agent.clone(),
         own_runtime: entry.info.active_agent_base.as_ref() == Some(&entry.info.agent_base),
+        observed: active.observed,
     })
 }
 
@@ -392,8 +422,10 @@ struct AdoptedResolution {
     pinned: Option<Arc<RuntimeDefinition>>,
     /// The session's own default: the profile override, else the pinned manifest.
     default: DetectorConfig,
-    /// The own-runtime active agent's configuration, resolved as its report
-    /// resolves it; `None` when it does not resolve or is not own-runtime.
+    /// The own-runtime active agent's configuration: an observed agent runs the
+    /// pinned definition as procwatch applies it, a reported one resolves its
+    /// name as its report resolves it. `None` when it does not resolve or is not
+    /// of the own runtime.
     active: Option<DetectorConfig>,
 }
 
@@ -413,8 +445,17 @@ fn resolve_adopted(
     );
     let active = match &candidate.active {
         Some(ActiveSnapshot {
+            own_runtime: true,
+            observed: true,
+            ..
+        }) => definition
+            .as_ref()
+            .ok()
+            .map(|pinned| DetectorConfig::for_definition(pinned)),
+        Some(ActiveSnapshot {
             agent,
             own_runtime: true,
+            observed: false,
         }) => resolve_named(profiles, agent, &definition)
             .map(|resolved| super::detector_config_for_resolved_agent(&resolved)),
         _ => None,
