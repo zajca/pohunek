@@ -323,7 +323,7 @@ impl FromStr for DigestSelector {
 }
 
 /// Parse an archive digest: `sha256:<64 hex>` or the bare 64 hex characters.
-fn parse_archive_digest(value: &str) -> Result<PackageDigest, String> {
+pub(super) fn parse_archive_digest(value: &str) -> Result<PackageDigest, String> {
     let hex = value.strip_prefix(DIGEST_PREFIX).unwrap_or(value);
     PackageDigest::parse(&format!("{DIGEST_PREFIX}{hex}")).map_err(|_malformed| {
         format!("expected `{DIGEST_PREFIX}<{DIGEST_HEX_CHARS} lowercase hex>`")
@@ -922,17 +922,19 @@ pub(super) fn summary(id: &PackageId, version: &PackageVersion, digest: &Package
     format!("{id} {version} ({})", short_digest(digest))
 }
 
-/// Escape control characters of text that came from a package.
+/// Escape non-printable characters of text that came from a package.
 ///
 /// Package descriptors are untrusted until the owner consents, so their text
-/// never reaches the terminal raw.
+/// never reaches the terminal raw: control, format (such as bidirectional
+/// overrides and zero-width characters) and other non-printable characters are
+/// escaped as `{:?}` escapes them. Quotes and backslashes stay as written.
 pub(super) fn sanitize(text: &str) -> String {
     text.chars()
         .flat_map(|character| {
-            if character.is_control() {
-                character.escape_default().collect::<Vec<_>>()
-            } else {
+            if matches!(character, '"' | '\'' | '\\') {
                 vec![character]
+            } else {
+                character.escape_debug().collect::<Vec<_>>()
             }
         })
         .collect()

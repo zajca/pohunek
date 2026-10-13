@@ -61,6 +61,49 @@ impl Paths {
             .map_err(path_error)
     }
 
+    /// Resolve the workflow plugin store directories without runtime paths.
+    ///
+    /// Workflow commands never reach the daemon, so they need neither
+    /// `XDG_RUNTIME_DIR` nor the control socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError::MissingEnv`] when neither the relevant XDG
+    /// variable nor `HOME` is available, and a workflow `DirsOverlap` error
+    /// when one of the three locations lies inside another: a purge of one
+    /// plugin's directory must never reach the store or another directory.
+    pub(crate) fn workflow_dirs() -> Result<WorkflowDirs, CliError> {
+        let state = pohunek_paths::state_home()
+            .map_err(path_error)?
+            .join(pohunek_paths::APP_DIR);
+        let config = pohunek_paths::config_home()
+            .map_err(path_error)?
+            .join(pohunek_paths::APP_DIR);
+        let dirs = WorkflowDirs {
+            root: state.join(pohunek_paths::WORKFLOW_PLUGINS_SUBDIR),
+            state: state.join(pohunek_paths::WORKFLOW_PLUGIN_STATE_SUBDIR),
+            config: config.join(pohunek_paths::WORKFLOW_PLUGIN_CONFIG_SUBDIR),
+        };
+        let named = [
+            ("store", &dirs.root),
+            ("state", &dirs.state),
+            ("config", &dirs.config),
+        ];
+        for (index, (name, path)) in named.iter().enumerate() {
+            for (other, other_path) in &named[index + 1..] {
+                if path.starts_with(other_path) || other_path.starts_with(path) {
+                    return Err(crate::workflow::Error::DirsOverlap(format!(
+                        "the {name} directory {} and the {other} directory {}",
+                        path.display(),
+                        other_path.display()
+                    ))
+                    .into());
+                }
+            }
+        }
+        Ok(dirs)
+    }
+
     /// Resolve only the pohunek cache directory.
     ///
     /// Standalone host discovery deliberately does not need a runtime directory
@@ -117,6 +160,18 @@ impl Paths {
             .join("migrations")
             .join("durable-session-workers.json")
     }
+}
+
+/// The workflow plugin store: its registry root and the parents of the
+/// per-plugin state and config directories, each named by plugin id.
+#[derive(Debug, Clone)]
+pub(crate) struct WorkflowDirs {
+    /// `<state>/pohunek/workflow-plugins`, the package registry root.
+    pub(crate) root: PathBuf,
+    /// `<state>/pohunek/workflow-plugin-state`.
+    pub(crate) state: PathBuf,
+    /// `<config>/pohunek/workflow-plugin-config`.
+    pub(crate) config: PathBuf,
 }
 
 fn path_error(err: pohunek_paths::PathError) -> CliError {

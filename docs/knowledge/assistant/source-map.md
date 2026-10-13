@@ -603,6 +603,13 @@ Runtime package archive format:
 - `crates/cli/src/commands/plugin.rs` — `pohunek plugin list|inspect|install|link|update|select|enable|disable|uninstall|doctor`.
 - `crates/cli/src/commands/plugin_profile.rs` — `pohunek plugin profile list|migrate`.
 - `docs/knowledge/guides/runtime-packages.md`
+- `crates/cli/src/commands/workflow.rs` — `pohunek workflow list|inspect|install|enable|disable|uninstall`, the consent review and the `--json` payloads.
+- `crates/cli/src/workflow/mod.rs` — workflow error codes, classes and recovery hints.
+- `crates/cli/src/workflow/manifest.rs` — the strict `workflow.toml` schema, size cap and argv rules.
+- `crates/cli/src/workflow/store.rs` — the workflow registry root, per-plugin state and config directories, install, uninstall and purge.
+- `crates/paths/src/lib.rs` — `WORKFLOW_PLUGINS_SUBDIR`, `WORKFLOW_PLUGIN_STATE_SUBDIR` and `WORKFLOW_PLUGIN_CONFIG_SUBDIR`.
+- `crates/cli/tests/workflow_store.rs` — consent, digest, hostile-manifest, tampered-root, local-only and lifecycle scenarios through the real binary.
+- `docs/knowledge/guides/workflow-plugins.md`
 - `docs/knowledge/runbooks/runtime-package-recovery.md` — recovery from failed package verification, refused official installs, and disabled, removed or damaged pinned packages.
 - `docs/architecture.md` — "Runtime Packages and Trust": the package classes and the same-UID owner trust boundary.
 - `docs/knowledge/guides/pi-package.md`

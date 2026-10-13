@@ -1,0 +1,451 @@
+//! `pohunek workflow` plugin store commands.
+//!
+//! Every subcommand works on this user's local workflow plugin store and never
+//! contacts a daemon, so any other effective host is refused before any I/O.
+//! Install follows the `pohunek plugin` consent pattern: the CLI verifies the
+//! archive against the owner's digest, prints what the plugin declares, and
+//! installs nothing until the owner repeats the command with `--yes`.
+
+// Rust guideline compliant 2026-10-13
+
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use clap::{Args, Subcommand, ValueHint};
+use package::registry::{InstallStatus, PackageRecord};
+use protocol::{PackageDigest, PackageId, PackageVersion};
+use serde::Serialize;
+
+use crate::commands::plugin::{self, print_output, sanitize, summary};
+use crate::error::CliError;
+use crate::paths::Paths;
+use crate::target::is_local_host;
+use crate::workflow::manifest::{Action as Declared, ArgsMode, Manifest};
+use crate::workflow::store::{read_candidate, Candidate, Purged, Recorded, Store};
+use crate::workflow::Error;
+
+/// `pohunek workflow` subcommands.
+#[derive(Debug, Subcommand)]
+pub(crate) enum Action {
+    /// List installed workflow plugins.
+    List {
+        /// Emit machine-readable JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show one installed workflow plugin and the actions it declares.
+    ///
+    /// The installed files are verified first; a plugin whose files changed
+    /// after install is reported, not shown.
+    Inspect {
+        /// Plugin id, as shown by `pohunek workflow list`.
+        #[arg(value_name = "PLUGIN")]
+        plugin: PackageId,
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Install a workflow plugin archive pinned by its digest.
+    ///
+    /// The archive is verified against `--sha256` and its `workflow.toml` is
+    /// validated; this command then prints every action's argv. Nothing is
+    /// installed until you repeat the command with `--yes`.
+    Install(InstallArgs),
+
+    /// Allow the plugin's actions to run.
+    Enable {
+        /// Plugin id.
+        #[arg(value_name = "PLUGIN")]
+        plugin: PackageId,
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Block the plugin's actions from running.
+    Disable {
+        /// Plugin id.
+        #[arg(value_name = "PLUGIN")]
+        plugin: PackageId,
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Remove an installed plugin.
+    ///
+    /// The plugin's state and config directories are kept unless `--purge`
+    /// is given; `--purge` also removes the directories an earlier uninstall
+    /// kept.
+    Uninstall {
+        /// Plugin id.
+        #[arg(value_name = "PLUGIN")]
+        plugin: PackageId,
+        /// Also delete the plugin's state and config directories.
+        #[arg(long)]
+        purge: bool,
+        /// Remove a plugin whose installed files fail verification. Files
+        /// that verify are refused: uninstall them without this flag.
+        #[arg(long)]
+        remove_modified: bool,
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+impl Action {
+    /// Whether the subcommand requested `--json` output.
+    pub(crate) fn wants_json(&self) -> bool {
+        match self {
+            Self::List { json }
+            | Self::Inspect { json, .. }
+            | Self::Enable { json, .. }
+            | Self::Disable { json, .. }
+            | Self::Uninstall { json, .. } => *json,
+            Self::Install(args) => args.json,
+        }
+    }
+}
+
+/// Arguments of `pohunek workflow install`.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct InstallArgs {
+    /// Workflow plugin archive to install.
+    #[arg(value_name = "ARCHIVE", value_hint = ValueHint::FilePath)]
+    archive: PathBuf,
+    /// The archive's SHA-256 digest (`sha256:<64 hex>`, or the bare hex
+    /// `sha256sum` prints). The plugin is trusted only by this digest.
+    #[arg(long, value_name = "DIGEST", value_parser = plugin::parse_archive_digest)]
+    sha256: PackageDigest,
+    /// Install the plugin disabled.
+    #[arg(long)]
+    no_enable: bool,
+    /// Consent to the install after reviewing what the plugin declares.
+    #[arg(long)]
+    yes: bool,
+    /// Emit machine-readable JSON instead of text.
+    #[arg(long)]
+    json: bool,
+}
+
+/// One installed plugin in `--json` output.
+#[derive(Debug, Serialize)]
+struct PluginInfo {
+    id: PackageId,
+    version: PackageVersion,
+    digest: PackageDigest,
+    enabled: bool,
+    installed_at_unix_seconds: u64,
+}
+
+impl From<&PackageRecord> for PluginInfo {
+    fn from(record: &PackageRecord) -> Self {
+        Self {
+            id: record.identity().id.clone(),
+            version: record.identity().version.clone(),
+            digest: record.digest().clone(),
+            enabled: record.enabled(),
+            installed_at_unix_seconds: record.installed_at_unix_seconds(),
+        }
+    }
+}
+
+/// One declared action with `argv[0]` resolved to an absolute path.
+#[derive(Debug, Serialize)]
+struct ActionInfo {
+    name: String,
+    argv: Vec<String>,
+    args: ArgsMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_bytes: Option<u64>,
+}
+
+/// What a plugin declares and where its files and directories are.
+#[derive(Debug, Serialize)]
+struct Details {
+    description: String,
+    files_dir: PathBuf,
+    state_dir: PathBuf,
+    config_dir: PathBuf,
+    actions: Vec<ActionInfo>,
+}
+
+#[derive(Debug, Serialize)]
+struct Listed {
+    plugins: Vec<PluginInfo>,
+}
+
+#[derive(Debug, Serialize)]
+struct Inspected {
+    plugin: PluginInfo,
+    #[serde(flatten)]
+    details: Details,
+}
+
+#[derive(Debug, Serialize)]
+struct Installed {
+    status: &'static str,
+    plugin: PluginInfo,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct Uninstalled {
+    plugin: Option<PluginInfo>,
+    purged: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    purge: Option<PurgeInfo>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
+    state_dir: PathBuf,
+    config_dir: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct PurgeInfo {
+    state_dir: Purged,
+    config_dir: Purged,
+}
+
+/// Run one `pohunek workflow` subcommand.
+///
+/// # Errors
+///
+/// Returns [`CliError`] when the host is not local, the archive or manifest
+/// is refused, consent is missing, the plugin is unknown, or the store fails.
+pub(crate) fn run(action: Action, host: &str) -> Result<ExitCode, CliError> {
+    if !is_local_host(host) {
+        return Err(Error::LocalOnly {
+            host: host.to_owned(),
+        }
+        .into());
+    }
+    let store = Store::new(Paths::workflow_dirs()?);
+    match action {
+        Action::List { json } => {
+            let result = Listed {
+                plugins: store.list()?.iter().map(PluginInfo::from).collect(),
+            };
+            print_output(json, &result, || render_list(&result.plugins))?;
+        }
+        Action::Inspect { plugin, json } => {
+            let (record, root, manifest) = store.inspect(&plugin)?;
+            let result = Inspected {
+                plugin: PluginInfo::from(&record),
+                details: details(&store, &manifest, root.files_path()),
+            };
+            print_output(json, &result, || render_inspect(&result))?;
+        }
+        Action::Install(args) => install(&store, &args)?,
+        Action::Enable { plugin, json } => set_enabled(&store, &plugin, true, json)?,
+        Action::Disable { plugin, json } => set_enabled(&store, &plugin, false, json)?,
+        Action::Uninstall {
+            plugin,
+            purge,
+            remove_modified,
+            json,
+        } => {
+            let removal = store.uninstall(&plugin, purge, remove_modified)?;
+            let result = Uninstalled {
+                plugin: removal.record.as_ref().map(PluginInfo::from),
+                purged: removal.purged.is_some(),
+                purge: removal.purged.map(|(state, config)| PurgeInfo {
+                    state_dir: state,
+                    config_dir: config,
+                }),
+                warnings: removal.warnings,
+                state_dir: store.state_dir(&plugin),
+                config_dir: store.config_dir(&plugin),
+            };
+            print_output(json, &result, || render_uninstall(&plugin, &result))?;
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn set_enabled(store: &Store, id: &PackageId, enabled: bool, json: bool) -> Result<(), CliError> {
+    let record = PluginInfo::from(&store.set_enabled(id, enabled)?);
+    let verb = if enabled { "Enabled" } else { "Disabled" };
+    print_output(json, &record, || format!("{verb} {}\n", line(&record)))
+}
+
+fn install(store: &Store, args: &InstallArgs) -> Result<(), CliError> {
+    let candidate = read_candidate(&args.archive, &args.sha256)?;
+    let identity = &candidate.manifest.identity;
+    // Unlocked and read-only: it only shapes the review; install checks again
+    // under the store lock.
+    let recorded = store.recorded(&candidate)?;
+    if !args.yes {
+        if !args.json {
+            print!(
+                "{}",
+                render_review(store, &candidate, !args.no_enable, recorded)
+            );
+        }
+        return Err(plugin::Error::ConsentRequired {
+            verb: "installing workflow plugin",
+            summary: summary(&identity.id, &identity.version, &candidate.digest),
+        }
+        .into());
+    }
+    let (report, warning) = store.install(&candidate, !args.no_enable)?;
+    let result = Installed {
+        status: match report.status {
+            InstallStatus::AlreadyInstalled => "already_installed",
+            InstallStatus::RootRestored => "root_restored",
+            _ => "installed",
+        },
+        plugin: PluginInfo::from(&report.record),
+        warnings: warning.into_iter().collect(),
+    };
+    print_output(args.json, &result, || {
+        let verb = match report.status {
+            InstallStatus::AlreadyInstalled => "Already installed",
+            InstallStatus::RootRestored => "Restored the files of",
+            _ => "Installed",
+        };
+        let mut text = format!("{verb} {}\n", line(&result.plugin));
+        for warning in &result.warnings {
+            let _ = writeln!(text, "warning: {warning}");
+        }
+        text
+    })
+}
+
+fn details(store: &Store, manifest: &Manifest, files: &Path) -> Details {
+    let id = &manifest.identity.id;
+    Details {
+        description: manifest.description.clone(),
+        files_dir: files.to_path_buf(),
+        state_dir: store.state_dir(id),
+        config_dir: store.config_dir(id),
+        actions: manifest
+            .actions
+            .iter()
+            .map(|(name, action): (&String, &Declared)| ActionInfo {
+                name: name.clone(),
+                argv: action.resolved_argv(files),
+                args: action.args,
+                timeout_ms: action.timeout_ms.map(u64::from),
+                max_output_bytes: action.max_output_bytes.map(u64::from),
+            })
+            .collect(),
+    }
+}
+
+fn line(info: &PluginInfo) -> String {
+    let state = if info.enabled { "enabled" } else { "disabled" };
+    format!(
+        "{} {} {state} ({})",
+        info.id,
+        info.version,
+        plugin::short_digest(&info.digest)
+    )
+}
+
+fn render_list(plugins: &[PluginInfo]) -> String {
+    if plugins.is_empty() {
+        return "No workflow plugins are installed.\n".to_owned();
+    }
+    plugins.iter().fold(String::new(), |mut text, info| {
+        let _ = writeln!(text, "{}", line(info));
+        text
+    })
+}
+
+/// Text shared by the consent review and `inspect`; package text is escaped.
+fn render_details(text: &mut String, details: &Details) {
+    let _ = writeln!(text, "  description: {}", sanitize(&details.description));
+    let _ = writeln!(text, "  files:       {}", details.files_dir.display());
+    let _ = writeln!(text, "  state dir:   {}", details.state_dir.display());
+    let _ = writeln!(text, "  config dir:  {}", details.config_dir.display());
+    let _ = writeln!(text, "Actions (each runs as you, without a shell):");
+    for action in &details.actions {
+        let extra = match action.args {
+            ArgsMode::None => "refused",
+            ArgsMode::Passthrough => "passed through",
+        };
+        let _ = writeln!(text, "  {}  (extra arguments {extra})", action.name);
+        // Debug quoting shows argument boundaries and escapes control characters.
+        let _ = writeln!(text, "    argv: {:?}", action.argv);
+        if let Some(timeout) = action.timeout_ms {
+            let _ = writeln!(text, "    requested timeout: {timeout} ms");
+        }
+        if let Some(bytes) = action.max_output_bytes {
+            let _ = writeln!(text, "    requested output cap: {bytes} bytes");
+        }
+    }
+}
+
+fn render_inspect(result: &Inspected) -> String {
+    let mut text = format!("Workflow plugin {}\n", line(&result.plugin));
+    let _ = writeln!(text, "  digest:      {}", result.plugin.digest);
+    render_details(&mut text, &result.details);
+    text
+}
+
+fn render_review(store: &Store, candidate: &Candidate, enable: bool, recorded: Recorded) -> String {
+    let identity = &candidate.manifest.identity;
+    let mut text = format!("Workflow plugin {} {}\n", identity.id, identity.version);
+    let _ = writeln!(text, "  digest:      {}", candidate.digest);
+    let _ = writeln!(text, "  trust:       explicit digest (pinned by you)");
+    let state = match recorded {
+        Recorded::Intact => "already installed; nothing changes",
+        Recorded::FilesMissing => {
+            "already installed, but its files are missing; --yes extracts them again"
+        }
+        Recorded::FilesModified => {
+            "already installed, but its files fail verification; the install will be refused"
+        }
+        Recorded::No if enable => "installed enabled",
+        Recorded::No => "installed disabled",
+    };
+    let _ = writeln!(text, "  result:      {state}");
+    let files = store.files_dir(&candidate.digest);
+    render_details(&mut text, &details(store, &candidate.manifest, &files));
+    text.push_str(
+        "Plugin programs run with your account's full authority; the digest only proves \
+         which bytes you approved.\nRepeat the command with --yes to install.\n",
+    );
+    text
+}
+
+fn render_uninstall(id: &PackageId, result: &Uninstalled) -> String {
+    let mut text = match &result.plugin {
+        Some(plugin) => format!("Uninstalled {}\n", line(plugin)),
+        None => format!("Workflow plugin {id} is not installed\n"),
+    };
+    for warning in &result.warnings {
+        let _ = writeln!(text, "warning: {warning}");
+    }
+    match &result.purge {
+        Some(purge) => {
+            for (name, path, outcome) in [
+                ("state", &result.state_dir, purge.state_dir),
+                ("config", &result.config_dir, purge.config_dir),
+            ] {
+                let done = match outcome {
+                    Purged::Removed => "removed",
+                    Purged::Absent => "was already absent",
+                };
+                let _ = writeln!(text, "The {name} directory {} {done}.", path.display());
+            }
+        }
+        None => {
+            let _ = writeln!(
+                text,
+                "Kept {} and {} (remove them with --purge).",
+                result.state_dir.display(),
+                result.config_dir.display()
+            );
+        }
+    }
+    text
+}

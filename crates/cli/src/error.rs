@@ -183,6 +183,10 @@ pub(crate) enum CliError {
     #[error(transparent)]
     Plugin(#[from] crate::commands::plugin::Error),
 
+    /// A `pohunek workflow` command was refused or its store failed.
+    #[error(transparent)]
+    Workflow(#[from] crate::workflow::Error),
+
     /// Generic I/O error.
     #[error("io error: {0}")]
     Io(#[from] io::Error),
@@ -357,6 +361,12 @@ impl CliError {
                 error.hint().map(str::to_owned),
             ),
             CliError::Plugin(error) => ProtocolError::new(
+                error.class(),
+                error.code(),
+                error.to_string(),
+                Some(error.hint().to_owned()),
+            ),
+            CliError::Workflow(error) => ProtocolError::new(
                 error.class(),
                 error.code(),
                 error.to_string(),
