@@ -12,7 +12,7 @@
 //! `[env]`, prints file content, or echoes a parse error's source line: a
 //! diagnostic names a key or a line number only.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-13
 
 use std::fmt::Write as _;
 use std::os::unix::fs::MetadataExt as _;
@@ -21,8 +21,8 @@ use std::path::Path;
 use clap::{Args, Subcommand};
 use pohunek_platform::filesystem::{EntryKind, FsError, TrustedDir};
 use protocol::{
-    method, PackageBindProfileParams, PackageBindProfileResult, PackageBindStatus, PackageDigest,
-    PackageId, PackageInfo, RuntimeId,
+    method, official_package_install_only_step, PackageBindProfileParams, PackageBindProfileResult,
+    PackageBindStatus, PackageDigest, PackageId, PackageInfo, PackageOrigin, RuntimeId,
 };
 use serde::Serialize;
 use toml_edit::{DocumentMut, TomlError};
@@ -73,10 +73,13 @@ pub(crate) enum ProfileAction {
     /// List host agent profiles and whether each needs a package pin.
     ///
     /// Reads `agents/*.toml` under the pohunek config directory. States:
-    /// `builtin` (nothing to do), `pinned`, `needs_migration` (an installed
-    /// package serves the base runtime but the profile pins none),
-    /// `pin_not_installed` (the pinned digest is not installed) and
-    /// `unreadable`.
+    /// `builtin` (the base is the built-in `shell`; nothing to do), `pinned`,
+    /// `needs_migration` (an installed package serves the base runtime but the
+    /// profile pins none), `package_not_installed` (no installed package
+    /// serves the base, so the profile cannot launch), `package_unavailable`
+    /// (an installed package that may serve the base cannot be loaded; run
+    /// `pohunek plugin doctor`), `pin_not_installed` (the pinned digest is not
+    /// installed) and `unreadable`.
     List {
         /// Emit machine-readable JSON instead of a table.
         #[arg(long)]
@@ -233,13 +236,19 @@ fn string_key<'a>(document: &'a DocumentMut, key: &str) -> Result<Option<&'a str
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ProfileState {
-    /// No installed package serves the base runtime; nothing to do.
+    /// The base runtime is built into the daemon; nothing to do.
     Builtin,
     /// The profile pins an installed package that serves its base runtime.
     Pinned,
     /// An installed package serves the base runtime and the pin is missing,
     /// incomplete or points at another package.
     NeedsMigration,
+    /// The base runtime is not built in and no installed package serves it,
+    /// so a launch fails with `runtime_not_installed`.
+    PackageNotInstalled,
+    /// The base runtime is not built in, no installed package serves it, and
+    /// an installed package that may serve it cannot be loaded.
+    PackageUnavailable,
     /// The pinned digest is not installed.
     PinNotInstalled,
     /// The file cannot be read or parsed.
@@ -252,14 +261,78 @@ impl ProfileState {
             Self::Builtin => "builtin",
             Self::Pinned => "pinned",
             Self::NeedsMigration => "needs_migration",
+            Self::PackageNotInstalled => "package_not_installed",
+            Self::PackageUnavailable => "package_unavailable",
             Self::PinNotInstalled => "pin_not_installed",
             Self::Unreadable => "unreadable",
         }
     }
 }
 
-/// Classify a readable profile against the installed packages.
-fn classify(head: &ProfileHead, packages: &[PackageInfo]) -> (ProfileState, Option<&'static str>) {
+/// Whether `base` is an official alias, a runtime whose official package the
+/// release archive ships.
+fn is_official_alias(base: &RuntimeId) -> bool {
+    matches!(
+        base.as_str(),
+        RuntimeId::CODEX | RuntimeId::CLAUDE | RuntimeId::HERMES
+    )
+}
+
+/// Whether `info` is installed but cannot be loaded, and may therefore serve
+/// `base`.
+///
+/// The daemon reports no runtime for a package whose root or descriptor fails
+/// to load, so the runtime it would serve is unknown. An official alias is
+/// claimable only by a catalog-authorized package, so only such a package may
+/// serve one.
+fn may_serve_unloaded(info: &PackageInfo, base: &RuntimeId) -> bool {
+    info.runtime_id.is_none()
+        && (!is_official_alias(base) || info.origin == PackageOrigin::Official)
+}
+
+/// The step that pins the profile `name` once its base is served.
+fn migrate_step(name: &str) -> String {
+    format!("pin the profile to it with `pohunek plugin profile migrate {name}`")
+}
+
+/// The recovery for the profile `name`, whose unpinned `base` neither the
+/// daemon builds in nor any installed package serves or may serve.
+///
+/// An official alias names the install of its official package from the
+/// release archive, mirroring the daemon's launch refusal of such a profile.
+/// The enable alternative is left out: a disabled package that serves the base
+/// classifies as [`ProfileState::NeedsMigration`], so none is installed here.
+/// `name` passed [`is_valid_profile_name`] and `base` is a validated
+/// [`RuntimeId`], so echoing both is safe.
+fn install_hint(name: &str, base: &RuntimeId) -> String {
+    let install = if is_official_alias(base) {
+        official_package_install_only_step(base)
+    } else {
+        format!("install a package that serves `{base}`")
+    };
+    format!("{install}, then {}", migrate_step(name))
+}
+
+/// The recovery for the profile `name`, whose unpinned `base` an installed but
+/// unloadable package may serve.
+///
+/// The install that would serve the base is refused while that package stays
+/// recorded (`package_root_invalid` for the same archive,
+/// `package_identity_installed` for another archive of its version), so the
+/// hint names the doctor, which reports the fault and its repair.
+fn unavailable_hint(name: &str, base: &RuntimeId) -> String {
+    format!(
+        "an installed package that may serve `{base}` cannot be loaded; run `pohunek plugin doctor` and repair it, then {}",
+        migrate_step(name)
+    )
+}
+
+/// Classify the readable profile `name` against the installed packages.
+fn classify(
+    name: &str,
+    head: &ProfileHead,
+    packages: &[PackageInfo],
+) -> (ProfileState, Option<String>) {
     let serves_base = |info: &PackageInfo| info.runtime_id.as_ref() == Some(&head.base);
     match (&head.package, &head.digest) {
         (Some(package), Some(digest)) => {
@@ -270,20 +343,34 @@ fn classify(head: &ProfileHead, packages: &[PackageInfo]) -> (ProfileState, Opti
                 }
                 Some(_) => (
                     ProfileState::NeedsMigration,
-                    Some("the pinned package does not serve the base runtime"),
+                    Some("the pinned package does not serve the base runtime".to_owned()),
                 ),
             }
         }
         (None, None) => {
             if packages.iter().any(serves_base) {
                 (ProfileState::NeedsMigration, None)
-            } else {
+            } else if head.base.as_str() == RuntimeId::SHELL {
+                // The shell is the one runtime the daemon builds in.
                 (ProfileState::Builtin, None)
+            } else if packages
+                .iter()
+                .any(|info| may_serve_unloaded(info, &head.base))
+            {
+                (
+                    ProfileState::PackageUnavailable,
+                    Some(unavailable_hint(name, &head.base)),
+                )
+            } else {
+                (
+                    ProfileState::PackageNotInstalled,
+                    Some(install_hint(name, &head.base)),
+                )
             }
         }
         _ => (
             ProfileState::NeedsMigration,
-            Some("`package` and `digest` must be set together"),
+            Some("`package` and `digest` must be set together".to_owned()),
         ),
     }
 }
@@ -481,14 +568,14 @@ fn profile_entry(dir: &TrustedDir, name: &str, packages: &[PackageInfo]) -> Prof
     match parse_head(&loaded.text) {
         Err(detail) => unreadable_entry(name, detail),
         Ok(head) => {
-            let (state, detail) = classify(&head, packages);
+            let (state, detail) = classify(name, &head, packages);
             ProfileEntry {
                 name: name.to_owned(),
                 base: Some(head.base),
                 package: head.package,
                 digest: head.digest,
                 state,
-                detail: detail.map(str::to_owned),
+                detail,
             }
         }
     }

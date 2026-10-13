@@ -13,6 +13,23 @@
   runtime is `agent_profile_not_found` and a host profile over it
   `runtime_not_installed`.
 
+## Unreleased (2026-10-13, profile list reports unserved bases, #958)
+
+- `pohunek plugin profile list` reports `builtin` only for a profile over
+  `shell`, the one runtime built into the daemon. An unpinned profile whose
+  base no installed package serves, such as `codex`, `claude`, `hermes` or a
+  third-party runtime, is `package_not_installed`: its launches fail with
+  `runtime_not_installed`. The detail names the official package install for
+  an official alias, a package that serves the base otherwise, then
+  `pohunek plugin profile migrate <name>`.
+- When an installed package that may serve such a base cannot be loaded (its
+  root or descriptor fails verification; for an official alias only an
+  official package counts), the profile is `package_unavailable` and the
+  detail names `pohunek plugin doctor`: reinstalling that package is refused
+  while it stays recorded.
+- The `runtime-packages` guide, the `runtime-package-recovery` runbook and
+  `docs/cli.md` list the state.
+
 ## Unreleased (2026-10-13, package archives decoded only after digest authorization, #967)
 
 - `plugin install --catalog` looks the raw archive digest up in the verified

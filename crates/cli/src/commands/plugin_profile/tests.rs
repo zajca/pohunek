@@ -2,7 +2,7 @@ use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt as _};
 use std::path::PathBuf;
 
-use protocol::{PackageIdentity, PackageOrigin, PackageVersion};
+use protocol::{PackageIdentity, PackageVersion};
 
 use super::*;
 
@@ -146,13 +146,13 @@ fn state_classification_covers_every_case() {
         ),
     ];
     for (head, expected) in cases {
-        assert_eq!(classify(&head, &packages).0, expected, "{head:?}");
+        assert_eq!(classify("work", &head, &packages).0, expected, "{head:?}");
     }
     let half = ProfileHead {
         package: Some(PackageId::parse("acme.pi").expect("id")),
         ..head("acme-pi", None)
     };
-    let (state, detail) = classify(&half, &packages);
+    let (state, detail) = classify("work", &half, &packages);
     assert_eq!(state, ProfileState::NeedsMigration);
     assert!(detail.is_some());
 }

@@ -417,10 +417,24 @@ select`.
 base, pinned package, and digest (abbreviated in the table, whole in JSON) and
 one state:
 
-- `builtin`: no installed package serves the base; nothing to do.
+- `builtin`: the base is `shell`, the one runtime built into the daemon;
+  nothing to do.
 - `pinned`: the pinned digest is installed and serves the base.
 - `needs_migration`: an installed package serves the base but the pin is
   missing, incomplete, or names a package that does not serve the base.
+- `package_not_installed`: the profile pins nothing, its base is not built in,
+  and no installed package serves it, so its launches fail with
+  `runtime_not_installed`. The detail names the recovery: for `codex`,
+  `claude` or `hermes` the install of the official package from the release
+  archive, for any other base a package that serves it, then
+  `pohunek plugin profile migrate <name>`.
+- `package_unavailable`: the profile pins nothing, no installed package serves
+  its base, and an installed package that may serve it cannot be loaded (its
+  root or descriptor fails verification, so the daemon reports no runtime for
+  it). For `codex`, `claude` or `hermes` only an official package counts,
+  because only one can serve an official alias. Installing that package again
+  is refused while it stays recorded, so the detail names
+  `pohunek plugin doctor`; repair the package, then migrate the profile.
 - `pin_not_installed`: the pinned digest is not installed.
 - `unreadable`: the file is a symlink or special file, is not owned by you, is
   group- or world-writable, is not valid TOML, or has an invalid `base`,

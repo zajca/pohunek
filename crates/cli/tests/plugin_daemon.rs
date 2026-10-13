@@ -15,7 +15,14 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 
-use package::{build_archive, read_archive, ArchiveEntry, Limits};
+use package::{build_archive, read_archive, ArchiveEntry, CatalogEntry, Limits};
+use pohunek_daemon::catalog_anchor::CatalogTrust;
+use pohunek_daemon::session::HostTrustAnchor;
+use pohunek_test_support::catalog::{
+    attestations_for, catalog_of, host_platform, root_of, signed, test_key, ANY_CORE, RUNTIME_API,
+    WINDOW_END, WINDOW_START,
+};
+use protocol::{PackageId, PackageVersion, RuntimeId};
 use serde_json::Value;
 
 #[path = "support/plugin_harness.rs"]
@@ -28,6 +35,10 @@ const PACKAGE_ID: &str = "acme.runtime.pi";
 
 /// Runtime id the fixture package serves.
 const RUNTIME: &str = "pi";
+
+/// Package id of the fixture archive that serves the official `codex` alias
+/// through a signed catalog.
+const OFFICIAL_CODEX_ID: &str = "pohunek.runtime.codex";
 
 /// Programs the fixture runtime launches; it only has to exist.
 const PROGRAM: &str = "/bin/sh";
@@ -43,7 +54,12 @@ any = [{ contains = "ready" }]
 impl Harness {
     /// Writes a package archive of `version` that serves [`RUNTIME`].
     fn archive(&self, version: &str) -> Built {
-        let document = runtime_document(version);
+        self.archive_of(PACKAGE_ID, RUNTIME, version)
+    }
+
+    /// Writes a package archive `package` of `version` that serves `runtime`.
+    fn archive_of(&self, package: &str, runtime: &str, version: &str) -> Built {
+        let document = runtime_document_of(package, runtime, version);
         let entries = [
             ArchiveEntry {
                 path: "runtime.toml".to_owned(),
@@ -61,7 +77,7 @@ impl Harness {
             .expect("the archive reads")
             .digest()
             .clone();
-        let path = self.env.root().join(format!("pi-{version}.tar.zst"));
+        let path = self.env.root().join(format!("{runtime}-{version}.tar.zst"));
         fs::write(&path, bytes).expect("write the archive");
         Built { path, digest }
     }
@@ -77,14 +93,18 @@ impl Harness {
 }
 
 fn runtime_document(version: &str) -> String {
+    runtime_document_of(PACKAGE_ID, RUNTIME, version)
+}
+
+fn runtime_document_of(package: &str, runtime: &str, version: &str) -> String {
     format!(
         r#"schema = 1
-id = "{PACKAGE_ID}"
+id = "{package}"
 version = "{version}"
 runtime_api = 1
 
 [runtime]
-id = "{RUNTIME}"
+id = "{runtime}"
 name = "Pi"
 program = "{PROGRAM}"
 args = ["--model", "fast"]
@@ -508,6 +528,226 @@ async fn an_unpinned_profile_migrates_to_the_installed_package() {
     let (code, listed) = harness.json(&["plugin", "profile", "list"]).await;
     assert_eq!(code, 0, "{listed}");
     assert_eq!(listed["ok"]["profiles"][0]["state"], "pinned");
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn an_unpinned_profile_whose_base_nothing_serves_reports_the_missing_package() {
+    let harness = Harness::start().await;
+    // No package is installed: only the shell is built into the daemon.
+    assert!(serves_agent(&harness, "shell").await);
+    assert!(!serves_agent(&harness, "codex").await);
+    assert!(!serves_agent(&harness, RUNTIME).await);
+    harness.profile("codex-work", "base = \"codex\"\n");
+    harness.profile("pi-work", &format!("base = \"{RUNTIME}\"\n"));
+    harness.profile("shell-work", "base = \"shell\"\n");
+
+    let (code, listed) = harness.json(&["plugin", "profile", "list"]).await;
+    assert_eq!(code, 0, "{listed}");
+    let entry = |name: &str| {
+        listed["ok"]["profiles"]
+            .as_array()
+            .expect("profiles")
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is listed: {listed}"))
+            .clone()
+    };
+    let detail = |entry: &Value| entry["detail"].as_str().unwrap_or_default().to_owned();
+
+    // An official alias names the install from the release archive layout
+    // documented in `docs/install.md`, then the pin.
+    let codex = entry("codex-work");
+    assert_eq!(codex["state"], "package_not_installed", "{codex}");
+    for needle in [
+        "pohunek plugin install runtime/packages/codex.tar.zst",
+        "--catalog runtime/runtime-catalog.json",
+        "pohunek plugin profile migrate codex-work",
+    ] {
+        assert!(
+            detail(&codex).contains(needle),
+            "missing {needle:?}: {codex}"
+        );
+    }
+
+    // Any other base has no official package to name.
+    let pi = entry("pi-work");
+    assert_eq!(pi["state"], "package_not_installed", "{pi}");
+    assert!(
+        detail(&pi).contains("pohunek plugin profile migrate pi-work"),
+        "{pi}"
+    );
+    assert!(!detail(&pi).contains("runtime/packages"), "{pi}");
+
+    let shell = entry("shell-work");
+    assert_eq!(shell["state"], "builtin", "{shell}");
+    assert!(shell.get("detail").is_none(), "{shell}");
+
+    // The daemon agrees that neither unserved profile can launch.
+    for name in ["codex-work", "pi-work"] {
+        let (code, refused) = launch(&harness, name).await;
+        assert_eq!(code, 1, "{refused}");
+        assert_eq!(refused["err"]["code"], "runtime_not_installed", "{refused}");
+    }
+
+    let output = harness.run(&["plugin", "profile", "list"]).await;
+    assert!(output.status.success(), "{}", stderr_text(&output));
+    let table = stdout_text(&output);
+    assert!(
+        table.contains("package_not_installed (install the official `codex` package"),
+        "{table}"
+    );
+
+    harness.stop().await;
+}
+
+/// `plugin install <archive> --catalog <catalog> --yes` of `built`, which a
+/// catalog signed by `key` lists as the official package `package` serving
+/// `runtime`.
+async fn install_official(
+    harness: &Harness,
+    key: &ed25519_dalek::SigningKey,
+    built: &Built,
+    package: &str,
+    runtime: &str,
+) -> (i32, Value) {
+    let entry = CatalogEntry {
+        package_id: PackageId::parse(package).expect("package id"),
+        runtime_id: RuntimeId::parse(runtime).expect("runtime id"),
+        version: PackageVersion::parse("1.0.0").expect("package version"),
+        digest: built.digest.clone(),
+        runtime_api: RUNTIME_API,
+        platforms: vec![host_platform()],
+        attestations: attestations_for(&[host_platform()]),
+        core: ANY_CORE.to_owned(),
+    };
+    let catalog = harness.env.root().join("runtime-catalog.json");
+    fs::write(
+        &catalog,
+        signed(key, catalog_of(1, WINDOW_END, vec![entry])),
+    )
+    .expect("write the catalog");
+    harness
+        .json(&[
+            "plugin",
+            "install",
+            path_str(&built.path),
+            "--catalog",
+            path_str(&catalog),
+            "--yes",
+        ])
+        .await
+}
+
+/// Modifies the installed descriptor of `digest`, so the daemon cannot
+/// load the package or tell which runtime it serves.
+fn tamper(harness: &Harness, digest: &package::PackageDigest) {
+    // The installed tree is read-only; a user with write access can still
+    // change it.
+    let descriptor = harness.root_of(digest).join("files/runtime.toml");
+    fs::set_permissions(&descriptor, fs::Permissions::from_mode(PROFILE_MODE))
+        .expect("make the descriptor writable");
+    fs::write(&descriptor, "tampered").expect("tamper with the installed tree");
+}
+
+#[tokio::test]
+async fn an_unpinned_profile_whose_package_cannot_load_points_at_doctor() {
+    let key = test_key();
+    let anchor = HostTrustAnchor::new(vec![root_of(&key, WINDOW_START, WINDOW_END)], Vec::new())
+        .expect("the test trust anchor");
+    let harness = Harness::start_with_trust(CatalogTrust::Loaded(anchor)).await;
+    harness.profile("codex-work", "base = \"codex\"\n");
+    harness.profile("pi-work", &format!("base = \"{RUNTIME}\"\n"));
+    harness.profile("shell-work", "base = \"shell\"\n");
+    let list = || async {
+        let (code, listed) = harness.json(&["plugin", "profile", "list"]).await;
+        assert_eq!(code, 0, "{listed}");
+        listed["ok"]["profiles"]
+            .as_array()
+            .expect("profiles")
+            .clone()
+    };
+    let entry = |profiles: &[Value], name: &str| {
+        profiles
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is listed: {profiles:?}"))
+            .clone()
+    };
+    let detail = |entry: &Value| entry["detail"].as_str().unwrap_or_default().to_owned();
+    let assert_points_at_doctor = |entry: &Value, name: &str| {
+        assert_eq!(entry["state"], "package_unavailable", "{entry}");
+        for needle in [
+            "pohunek plugin doctor",
+            &format!("pohunek plugin profile migrate {name}"),
+        ] {
+            assert!(
+                detail(entry).contains(needle),
+                "missing {needle:?}: {entry}"
+            );
+        }
+        assert!(!detail(entry).contains("plugin install"), "{entry}");
+    };
+
+    // A local package whose descriptor cannot load may serve `pi`, but never
+    // the official alias `codex`, which only a catalog-authorized package can
+    // claim.
+    let local = harness.archive("1.0.0");
+    install_enabled(&harness, &local).await;
+    tamper(&harness, &local.digest);
+    let profiles = list().await;
+    assert_points_at_doctor(&entry(&profiles, "pi-work"), "pi-work");
+    let codex = entry(&profiles, "codex-work");
+    assert_eq!(codex["state"], "package_not_installed", "{codex}");
+    assert!(
+        detail(&codex).contains("pohunek plugin install runtime/packages/codex.tar.zst"),
+        "{codex}"
+    );
+    assert_eq!(entry(&profiles, "shell-work")["state"], "builtin");
+
+    // The official package serves `codex` until its installed tree changes.
+    let official = harness.archive_of(OFFICIAL_CODEX_ID, "codex", "1.0.0");
+    let (code, installed) =
+        install_official(&harness, &key, &official, OFFICIAL_CODEX_ID, "codex").await;
+    assert_eq!(code, 0, "{installed}");
+    assert_eq!(
+        installed["ok"]["package"]["origin"], "official",
+        "{installed}"
+    );
+    assert_eq!(
+        entry(&list().await, "codex-work")["state"],
+        "needs_migration"
+    );
+    tamper(&harness, &official.digest);
+    let profiles = list().await;
+    assert_points_at_doctor(&entry(&profiles, "codex-work"), "codex-work");
+    assert_eq!(entry(&profiles, "shell-work")["state"], "builtin");
+
+    // Installing the same archive again is refused while its root fails
+    // verification, so the install hint would be no recovery.
+    let (code, refused) =
+        install_official(&harness, &key, &official, OFFICIAL_CODEX_ID, "codex").await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(refused["err"]["code"], "package_root_invalid", "{refused}");
+
+    // The daemon agrees that neither profile can launch, and the migration
+    // cannot pin a faulted package, so the repair comes first. The launch
+    // refusal depends on whether the runtime registry was rebuilt since the
+    // tree changed, so only the refusal itself is asserted.
+    for name in ["codex-work", "pi-work"] {
+        let (code, refused) = launch(&harness, name).await;
+        assert_eq!(code, 1, "{refused}");
+        assert!(refused["err"]["code"].is_string(), "{refused}");
+        let (code, refused) = harness
+            .json(&["plugin", "profile", "migrate", name, "--yes"])
+            .await;
+        assert_eq!(code, 1, "{refused}");
+        assert_eq!(
+            refused["err"]["code"], "package_profile_target_invalid",
+            "{refused}"
+        );
+    }
 
     harness.stop().await;
 }
