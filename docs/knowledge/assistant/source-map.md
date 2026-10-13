@@ -441,13 +441,14 @@ Daemon, sessions, integrations, and project state:
 - `crates/platform/src/process/`
 - `crates/platform/src/peer/`
 - `crates/platform/src/supervisor/mod.rs` — `Supervisor`, `DaemonSupervisor`,
-  `JobDefinition`, and the typed supervision errors.
+  `PluginUnits`, `JobDefinition`, `PluginUnitDefinition`, and the typed
+  supervision errors.
 - `crates/platform/src/supervisor/namespace.rs` — installation namespace,
-  launchd labels, and systemd unit names.
+  launchd labels, systemd unit names, and workflow plugin unit names.
 - `crates/platform/src/supervisor/launchd/` — launchd backend (`/bin/launchctl`
   status table, plist rendering, worker and daemon agents).
-- `crates/platform/src/supervisor/systemd.rs` — systemd transient-unit backend
-  and the daemon unit/slice installer.
+- `crates/platform/src/supervisor/systemd.rs` — systemd transient-unit backend,
+  the daemon unit/slice installer, and the workflow plugin unit installer.
 - `crates/platform/src/shell_env/` — executable search-path policy: bounded
   login-shell discovery, path validation, and executable resolution (see
   `docs/knowledge/guides/environment-resolution.md`).
