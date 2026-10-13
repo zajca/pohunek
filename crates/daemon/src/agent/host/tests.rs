@@ -18,7 +18,7 @@ use crate::agent::{
     InputRules, NativeLaunchError, NativeReferenceError, NativeReferenceStrategy,
     NativeSessionLaunch, SessionRef,
 };
-use crate::detect::{generic_shell_manifest, hermes_manifest, Manifest};
+use crate::detect::{generic_shell_manifest, Manifest};
 
 const DIGEST: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
@@ -30,7 +30,7 @@ fn builtin_registry(shell: &str) -> RuntimeRegistry {
     RuntimeRegistry::from_sources(&[&BuiltinSource::new(shell)]).expect("built-in registry builds")
 }
 
-/// Registry of the built-in runtimes and the official Codex and Claude
+/// Registry of the built-in shell and the official Codex, Claude and Hermes
 /// packages of the in-crate fixture.
 fn served_registry() -> RuntimeRegistry {
     RuntimeRegistry::from_sources(&[
@@ -160,27 +160,15 @@ struct Expected {
 
 #[test]
 fn builtin_definitions_match_the_compiled_behavior() {
-    let delay = Duration::from_millis(150);
-    let expected = [
-        Expected {
-            kind: RuntimeRef::shell(),
-            program: "/bin/sh",
-            args: &[],
-            input: InputRules::unrestricted(false, Duration::ZERO),
-            resume: &[],
-            fork: None,
-            manifest: generic_shell_manifest,
-        },
-        Expected {
-            kind: RuntimeRef::hermes(),
-            program: "hermes",
-            args: &["chat"],
-            input: InputRules::hermes(true, delay),
-            resume: &["--resume", "{reference}"],
-            fork: None,
-            manifest: hermes_manifest,
-        },
-    ];
+    let expected = [Expected {
+        kind: RuntimeRef::shell(),
+        program: "/bin/sh",
+        args: &[],
+        input: InputRules::unrestricted(false, Duration::ZERO),
+        resume: &[],
+        fork: None,
+        manifest: generic_shell_manifest,
+    }];
     let registry = builtin_registry("/bin/sh");
     for case in expected {
         let kind = &case.kind;
@@ -229,14 +217,9 @@ fn builtin_session_behavior_flags_match_the_compiled_dispatch() {
                 .map(|parser| parser.as_str().to_owned()),
         )
     };
-    // Neither shell nor Hermes takes the initial prompt as a launch argument,
-    // uses the configured submit delay or forks natively; Hermes has a version
-    // probe.
+    // The shell takes no initial prompt as a launch argument, uses no
+    // configured submit delay, does not fork natively and has no version probe.
     assert_eq!(flags("shell"), (false, false, false, None));
-    assert_eq!(
-        flags("hermes"),
-        (false, false, false, Some("hermes-v1".to_owned()))
-    );
 }
 
 #[test]
@@ -269,8 +252,9 @@ fn descriptor_digest_tracks_structural_launch_fields_only() {
             .provenance
             .clone()
     };
-    let first = builtin_registry("/bin/sh");
-    let second = builtin_registry("/usr/bin/fish");
+    // The v0.34.2 built-ins, so an embedded descriptor sits next to the shell.
+    let first = super::fixture::compiled_in_registry("/bin/sh");
+    let second = super::fixture::compiled_in_registry("/usr/bin/fish");
     for name in ["shell", "hermes"] {
         // The host login shell is not part of the descriptor.
         assert_eq!(digest(&first, name), digest(&second, name), "{name}");
@@ -494,7 +478,7 @@ fn documents_are_strict() {
 
 #[test]
 fn registry_resolves_installed_runtimes_and_reports_missing_ones() {
-    let registry = builtin_registry("/bin/sh");
+    let registry = served_registry();
     assert_eq!(
         registry
             .resolve(&id("hermes"))
@@ -547,9 +531,7 @@ fn reserved_ids_cannot_be_claimed_by_other_sources() {
     let registry = RuntimeRegistry::from_sources(&[&BuiltinSource::new("/bin/sh"), &source])
         .expect("a non-reserved id registers");
     registry.resolve(&id("acme")).expect("acme is registered");
-    registry
-        .resolve(&id("hermes"))
-        .expect("hermes is registered");
+    registry.resolve(&id("shell")).expect("shell is registered");
 }
 
 #[test]
@@ -558,8 +540,9 @@ fn an_official_source_takes_an_official_alias_over_from_the_built_in_in_any_orde
         trust: SourceTrust::Official,
         definitions: vec![package_definition("hermes")],
     };
-    let builtin = BuiltinSource::new("/bin/sh");
-    let builtins = builtin_registry("/bin/sh").inventory();
+    // The v0.34.2 built-ins, the last release that compiled Hermes in.
+    let builtin = super::fixture::CompiledInSource(BuiltinSource::new("/bin/sh"));
+    let builtins = super::fixture::compiled_in_registry("/bin/sh").inventory();
     for sources in [
         [&builtin as &dyn RuntimeSource, &official()],
         [&official() as &dyn RuntimeSource, &builtin],
@@ -964,9 +947,12 @@ fn package_origin() -> DefinitionOrigin {
     }
 }
 
+/// The built-in `name` of release v0.34.2, the last release that compiled
+/// Codex, Claude and Hermes in, so a pin can name a built-in another runtime
+/// source replaces.
 fn builtin_definition(name: &str) -> Arc<RuntimeDefinition> {
     Arc::clone(
-        builtin_registry("/bin/sh")
+        super::fixture::compiled_in_registry("/bin/sh")
             .resolve(&id(name))
             .expect("built-in resolves"),
     )
@@ -1123,38 +1109,6 @@ mod launch_validation {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
             .expect("set executable mode");
         path.display().to_string()
-    }
-
-    #[test]
-    fn the_hermes_probe_runs_for_a_definition_that_names_its_parser() {
-        let dir = crate::test_support::scoped_dir("pohunek-launch-validation-");
-        let hermes = builtin_definition("hermes");
-        assert_eq!(
-            hermes
-                .version_probe_parser()
-                .map(super::super::HandlerId::as_str),
-            Some("hermes-v1")
-        );
-
-        let supported = executable(&dir, "#!/bin/sh\necho 'Hermes Agent v0.20.0'\n");
-        let validated = validate_launch_runtime(&hermes, Spawn::Program(&supported), None)
-            .expect("the pinned release passes")
-            .expect("the probed executable is pinned");
-        assert_eq!(
-            validated.as_path(),
-            std::path::Path::new(&supported)
-                .canonicalize()
-                .expect("canonical path")
-        );
-
-        let newer = executable(&dir, "#!/bin/sh\necho 'Hermes Agent v0.21.0'\n");
-        let error = validate_launch_runtime(&hermes, Spawn::Program(&newer), None)
-            .expect_err("another release");
-        assert_eq!(error.code, "agent_runtime_unsupported");
-        let error =
-            validate_launch_runtime(&hermes, Spawn::Program("/nonexistent/pohunek/hermes"), None)
-                .expect_err("a missing executable");
-        assert_eq!(error.code, "agent_binary_missing");
     }
 
     #[test]

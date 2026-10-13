@@ -287,8 +287,9 @@ impl ProcessInspector for PollBlindInspector {
 /// leaves room for the worker's nested control socket.
 ///
 /// The registry is the production one over the plugin root of `env`, which
-/// holds the official Codex and Claude packages, so a foreground `codex` or
-/// `claude` is attributed through their detection manifests.
+/// holds the official Codex, Claude and Hermes packages, so a foreground
+/// `codex`, `claude` or `hermes` is attributed through their detection
+/// manifests.
 async fn worker_backed_registry(
     env: &TestEnv,
     config: SessionRegistryConfig,

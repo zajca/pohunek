@@ -336,7 +336,7 @@ async fn cancellable<T>(
 /// optional worktree flags accumulate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NewArgs {
-    /// Agent NAME to start: an installed runtime (`shell`, `hermes`, or a package runtime such as `codex` or `claude`) or a host
+    /// Agent NAME to start: an installed runtime (the built-in `shell`, or a package runtime such as `codex`, `claude` or `hermes`) or a host
     /// profile, resolved daemon-side on the target host (Part C, free string).
     pub agent: String,
     /// Owner-set display name for the session, or `None` to show it by id.

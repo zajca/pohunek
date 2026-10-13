@@ -32,11 +32,10 @@ session workers (see `docs/design/macos-support-rfc.md`, "Worker lifetime"):
 - The Xcode Command Line Tools (`xcode-select --install`), which provide
   `/usr/bin/python3` for the evidence helper.
 - At least one agent profile with native resume whose session-capture hook is
-  installed. `claude` and `codex` are served only by their official packages,
-  which the Apple Silicon release archive does not carry yet (#929); on such a
-  host use `hermes` with its operator plugin installed (see
-  `docs/knowledge/guides/hermes-operator.md`) or a package runtime with native
-  resume. Its captured native session reference is what makes explicit
+  installed. `claude`, `codex` and `hermes` are served only by their official
+  packages, which the Apple Silicon release archive does not carry yet (#929);
+  on such a host use a package runtime with native resume that you install
+  yourself. Its captured native session reference is what makes explicit
   recovery possible; shell sessions have no native resume.
 - "Reopen windows when logging back in" unticked for the logout and reboot
   phases, so no terminal restores an old attach by itself.
@@ -44,7 +43,7 @@ session workers (see `docs/design/macos-support-rfc.md`, "Worker lifetime"):
 ### Running
 
 ```sh
-scripts/acceptance/macos-launchd-lifetime start --agent hermes
+scripts/acceptance/macos-launchd-lifetime start --agent <runtime>
 ```
 
 `start` records the host, prepares session set `a` (two shell sessions plus

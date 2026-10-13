@@ -30,7 +30,8 @@ SHA-256 before it installs the plugin.
 - Every package ships with an always-running test that parses its directory
   through the daemon's install path, pins its supported range to its lock, and
   runs its manifest on the captured screens (the Hermes manifest is instead
-  required to equal the built-in one byte for byte), and with an opt-in test
+  required to equal the v0.34.2 built-in golden in
+  `compat/hermes/builtin-v0.34/` byte for byte), and with an opt-in test
   that drives the real agent through the installed package (see
   `crates/cli/tests/pi_package.rs` and the `pi-package` CI job).
 - A package never carries the hook reporter scripts of an agent integration: the

@@ -277,8 +277,8 @@ async fn spawn_worker_backed_server(
 }
 
 /// [`spawn_worker_backed_server`] whose registry is the production one over a
-/// plugin root next to `socket`, holding the official Codex and Claude
-/// packages that `catalog` authorizes.
+/// plugin root next to `socket`, holding the official Codex, Claude and
+/// Hermes packages that `catalog` authorizes.
 async fn spawn_worker_backed_server_with(
     socket: &Path,
     version: &str,

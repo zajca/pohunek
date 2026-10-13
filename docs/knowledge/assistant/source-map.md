@@ -564,11 +564,9 @@ Agent runtime and profile resolution:
 - `crates/daemon/src/agent/profile.rs`
 - `crates/daemon/src/agent/host/`
 - `crates/xtask/tests/no_special_dispatch.rs`
-- `crates/daemon/src/agent/builtin/`
 - `crates/daemon/src/detect/mod.rs`
 - `crates/daemon/src/detect/osc.rs`
 - `crates/daemon/src/detect/manifest/mod.rs`
-- `crates/daemon/src/detect/manifests/hermes.toml`
 - `crates/daemon/src/detect/manifests/shell.toml`
 - `crates/terminal/src/screen.rs`
 
@@ -631,10 +629,11 @@ Runtime package archive format:
 - `compat/claude/builtin-v0.34/` — golden copies of the built-in Claude descriptor and detection manifest of release 0.34.2.
 - `crates/cli/tests/claude_package.rs` — pure package tests (descriptor and manifest parity with the v0.34.2 built-in goldens up to the enumerated #613 rule changes), catalog-installed package launch and version-probe tests, the clean-host scenarios (bare `claude`, its integration and an unpinned `base = "claude"` profile refused with the install hint until the package is installed; Claude hooks removable without the package), the reporter-script golden check, the opt-in real-Claude tests and the screen capture.
 - `crates/cli/tests/support/messages_stub.rs` — loopback Messages-API stub used instead of a model provider.
-- `runtime-packages/hermes/runtime.toml` — Hermes runtime descriptor (the built-in Hermes descriptor with a `semver-line-v1` version probe and the package's own detection manifest).
-- `runtime-packages/hermes/detect.toml` — Hermes detection manifest, equal to the built-in one.
+- `runtime-packages/hermes/runtime.toml` — Hermes runtime descriptor (the v0.34.2 built-in Hermes descriptor with a `semver-line-v1` version probe and the package's own detection manifest).
+- `runtime-packages/hermes/detect.toml` — Hermes detection manifest, equal to the v0.34.2 built-in one; the daemon compiles no Hermes in, so this package is the only source of `hermes`.
+- `compat/hermes/builtin-v0.34/` — golden copies of the built-in Hermes descriptor and detection manifest of release 0.34.2.
 - `runtime-packages/hermes/operator.toml` — closed sidecar of the Hermes operator plugin payload in `runtime-packages/hermes/operator/`.
-- `crates/cli/tests/hermes_package.rs` — catalog-installed Hermes package tests (descriptor and manifest parity with the built-in Hermes files, the version probe, operator installs from the selected package, the package-backed operator lifecycle, the source errors including a missing package, and installs with an `embedded` marker) and the opt-in real-Hermes session test.
+- `crates/cli/tests/hermes_package.rs` — catalog-installed Hermes package tests (descriptor and manifest parity with the v0.34.2 built-in goldens, the version probe, the clean-host scenario (bare `hermes` refused with the install hint and the assistant without a capable agent until the package is installed), operator installs from the selected package, the package-backed operator lifecycle, the source errors including a missing package, and installs with an `embedded` marker) and the opt-in real-Hermes session test.
 - `crates/cli/tests/support/process_guard.rs` — process cleanup shared by the real-agent package tests.
 - `crates/cli/tests/support/plugin_harness.rs` — real-daemon harness shared by the package tests.
 - `crates/test-support/src/catalog.rs` — throwaway signing key, trust anchor and signed catalog helpers (feature `catalog`) shared by the catalog install tests of the CLI and the daemon.

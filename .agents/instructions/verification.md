@@ -155,15 +155,25 @@ The real-daemon suites are opt-in locally and mandatory in CI after building
 subprocess worker mode, which spawns `pohunek-sessiond` from beside `pohunekd`).
 The Hermes plugin e2e lives in the SDK workspace
 (`sdk/ts/sdk/test/hermes-plugin.e2e.test.ts`), depends on no client package, and
-drives the real CLI:
+drives the real CLI. The daemon serves `hermes` only from the official Hermes
+package, so the e2e installs the archive built from `runtime-packages/hermes`
+through a throwaway signed catalog whose trust anchor it places beside a private
+copy of the daemon:
 
 ```bash
 cargo build -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli
+scripts/build-hermes-package target/hermes-e2e/hermes.tar.zst
+cargo xtask hermes throwaway-catalog --package target/hermes-e2e/hermes.tar.zst \
+  --output-dir target/hermes-e2e/catalog
 POHUNEK_E2E=1 POHUNEK_DAEMON_BIN=/absolute/path/to/target/debug/pohunekd \
   POHUNEK_CLI_BIN=/absolute/path/to/target/debug/pohunek \
   POHUNEK_PYTHON_BIN=/usr/bin/python3 \
+  POHUNEK_HERMES_PACKAGE=/absolute/path/to/target/hermes-e2e/hermes.tar.zst \
+  POHUNEK_HERMES_CATALOG_DIR=/absolute/path/to/target/hermes-e2e/catalog \
   bun test sdk/ts/sdk/test/e2e.test.ts sdk/ts/sdk/test/hermes-plugin.e2e.test.ts
 ```
+
+The throwaway catalog expires a day after `throwaway-catalog` writes it.
 
 The official Pi runtime package (`runtime-packages/pi`, lock in `compat/pi/`) has
 always-running tests in `crates/cli/tests/pi_package.rs` (descriptor, supported

@@ -176,14 +176,14 @@ pohunek session list
 pohunek attach <session-id>        # Ctrl-] detaches, the agent keeps running
 ```
 
-Claude Code and Codex are served only by their official packages, so step 3
-installs the Claude Code package before its hooks: a bare `integration install`
+Claude Code, Codex and Hermes are served only by their official packages, so
+step 3 installs the Claude Code package before its hooks: a bare `integration install`
 covers only the runtimes the daemon serves. The packages capture the native
 session id through those hooks, so without them a session cannot be resumed.
 `--agent claude` needs Claude Code's config home (`CLAUDE_CONFIG_DIR`, else
 `~/.claude`) to exist, which Claude Code creates on its first run. The Apple
 Silicon archive carries no runtime package yet (#929), so on macOS steps 3 and 4
-need another agent (`--agent hermes` or a package runtime you install).
+need a package runtime you install yourself.
 
 For an isolated feature branch, let the daemon create a dedicated worktree. To
 run Codex there, install its package and then its hooks the same way;
@@ -263,14 +263,15 @@ must be on the daemon's `PATH` in the range the package declares (see the
 runtime reports itself unsupported.
 
 `codex`, `claude` and `hermes` are reserved runtime ids that only a
-catalog-authorized package may serve. The daemon compiles neither Codex nor
-Claude Code in, so each is available only once its package is installed:
+catalog-authorized package may serve. The daemon compiles none of Codex, Claude
+Code and Hermes in, so each is available only once its package is installed:
 
 ```bash
 pohunek plugin install runtime/packages/claude.tar.zst --catalog runtime/runtime-catalog.json --yes
 pohunek integration install --agent claude
 pohunek plugin install runtime/packages/codex.tar.zst --catalog runtime/runtime-catalog.json --yes
 pohunek integration install --agent codex
+pohunek plugin install runtime/packages/hermes.tar.zst --catalog runtime/runtime-catalog.json --yes
 ```
 
 Each `integration install` installs that runtime's hooks into its config home
@@ -284,32 +285,39 @@ and no package pin fails with `runtime_not_installed`, and `pohunek integration
 install --agent claude` (or `codex`) fails with `runtime_not_installed`; each
 recovery hint names the matching install command. Hooks pohunek installed
 earlier stay visible and removable without the package (`pohunek integration
-status|uninstall --agent claude`, or `--agent codex`). The catalog lists both
-packages for the Linux x86_64 targets only and the Apple Silicon archive carries
-no package, so a macOS daemon has no source of Codex or Claude Code until
-darwin packages are attested (#929). A `claude` or `codex` started in a shell
-session or outside pohunek is not recognized as that agent without its package.
+status|uninstall --agent claude`, or `--agent codex`). Without its package
+`pohunek session new --agent hermes` fails with `agent_profile_not_found` and a
+host profile with `base = "hermes"` and no package pin with
+`runtime_not_installed`, with the same install hints. The Hermes operator plugin
+lifecycle (`pohunek integration ... --agent hermes`) runs in the CLI against a
+named Hermes profile; see the
+[Hermes operator](knowledge/guides/hermes-operator.md) guide. The catalog lists
+the three packages for the Linux x86_64 targets only and the Apple Silicon
+archive carries no package, so a macOS daemon has no source of Codex, Claude
+Code or Hermes until darwin packages are attested (#929). A `claude`, `codex` or
+`hermes` started in a shell session or outside pohunek is not recognized as that
+agent without its package.
 
-A session launched from the built-in Claude Code or Codex of an earlier release
-is not resumed or forked by this daemon. Without the package every interaction
-with it (input, attach, resize, rename, metadata) is refused too
+A session launched from the built-in Claude Code, Codex or Hermes of an earlier
+release is not resumed or forked by this daemon. Without the package every
+interaction with it (input, attach, resize, rename, metadata) is refused too
 (`runtime_builtin_removed`; only stop and remove work), so its work cannot be
 finished until the package is installed. With the package it can be used again
-but still not resumed or forked (`runtime_served_by_package`), so finish its
-work and continue in a new session. Install the packages on the earlier release
-before upgrading so that live sessions stay usable. On the earlier release the
-first installed version of a package is enabled, selected and takes the id
-over from that release's built-in runtime at once, and a host agent profile on
-that base must be pinned to the package with `pohunek plugin profile migrate
-<name> --yes` (without `--yes` it only previews the change); until then its
-launches fail with `invalid_profile`. The same migration pins a profile over
-`claude` or `codex` on this release once its package is installed.
-
-Installing `hermes.tar.zst` takes the `hermes` id over from the built-in Hermes
-runtime at once: an existing session launched from the built-in Hermes can no
-longer be resumed or forked (`runtime_served_by_package`) until the package is
-disabled or uninstalled again, and a host agent profile over `hermes` must be
-pinned to the package with `pohunek plugin profile migrate <name> --yes`.
+but still not resumed or forked (`runtime_served_by_package`; a fork of a Hermes
+session answers `agent_fork_unsupported`, because Hermes has no native fork),
+so finish its work and continue in a new session. Install the Claude Code and
+Codex packages on the earlier release before upgrading so that live sessions
+stay usable. No earlier release archive carries the Hermes package, so finish or
+stop built-in Hermes sessions before upgrading; the upgrade preflight reports a
+live one at risk, and after an upgrade with `--accept-runtime-loss` installing
+the Hermes package from this release's archive lets you finish its work. On
+the earlier release the first installed version of a package is enabled,
+selected and takes the id over from that release's built-in runtime at once,
+and a host agent profile on that base must be pinned to the package with
+`pohunek plugin profile migrate <name> --yes` (without `--yes` it only previews
+the change); until then its launches fail with `invalid_profile`. The same
+migration pins a profile over `claude`, `codex` or `hermes` on this release once
+its package is installed.
 
 The Hermes operator plugin comes only from the Hermes package as well: the CLI
 carries no copy of its payload, so install the package before the plugin:
@@ -331,8 +339,8 @@ install the plugin until darwin packages are attested (#929).
 
 To prepare first, install with `--no-enable` and run
 `pohunek plugin enable <package-id>` when you are ready to switch. `pohunek
-plugin disable` or `pohunek plugin uninstall` leaves `claude` or `codex`
-unserved and returns `hermes` to the built-in. A daemon upgrade does not change installed packages; they keep
+plugin disable` or `pohunek plugin uninstall` leaves `claude`, `codex` or
+`hermes` unserved. A daemon upgrade does not change installed packages; they keep
 serving until you run `pohunek plugin update <package> runtime/packages/<runtime>.tar.zst
 --catalog runtime/runtime-catalog.json` from the new release's archive. A plain
 `install` of another version leaves it installed but unselected.

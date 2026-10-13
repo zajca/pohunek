@@ -1,13 +1,11 @@
-//! Official runtime aliases: a catalog-authorized package takes `codex`,
-//! `claude` or `hermes` over from whatever serves it without the package (the
-//! built-in runtime, or nothing), nobody else does, and what a session
-//! launched from a built-in runtime may do afterwards.
+//! Official runtime aliases: a catalog-authorized package serves `codex`,
+//! `claude` or `hermes`, which nothing serves without the package, nobody
+//! else does, and what a session launched from a built-in runtime may do
+//! afterwards.
 //!
-//! The fixture daemon serves Hermes as a built-in runtime, so the scenarios
-//! that take a built-in over inside one daemon use `hermes`. It compiles no
-//! Codex or Claude in; a Codex or Claude session launched from a built-in
-//! runtime is written by a daemon that compiles them in
-//! ([`compiled_in_host`]), as a previous release did.
+//! The fixture daemon compiles no Codex, Claude or Hermes in; a session
+//! launched from a built-in runtime is written by a daemon that compiles them
+//! in ([`compiled_in_host`]), as a previous release did.
 //!
 //! The catalog is signed with a test key derived from a fixed label.
 
@@ -17,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use package::PackageDigest;
-use pohunek_service_config::preflight::{Verdict, CODE_ADOPTABLE, CODE_RUNTIME_SOURCE_NOT_SERVED};
+use pohunek_service_config::preflight::{Verdict, CODE_RUNTIME_SOURCE_NOT_SERVED};
 use protocol::{
     PackageBindProfileParams, PackageBindStatus, PackageErrorKind, PackageInstallStatus,
     PackageOrigin, PackageSetEnabledParams, PackageUninstallParams, RuntimeId,
@@ -67,12 +65,23 @@ async fn install_official(
     alias: &str,
     sequence: u64,
 ) -> protocol::PackageInstallResult {
+    install_official_version(fixture, package, alias, "1.0.0", sequence).await
+}
+
+/// Like [`install_official`], for `package` at `version`.
+async fn install_official_version(
+    fixture: &Fixture,
+    package: &Package,
+    alias: &str,
+    version: &str,
+    sequence: u64,
+) -> protocol::PackageInstallResult {
     let key = signing_key("root");
     let document = signed_by(
         &key,
         catalog(
             sequence,
-            vec![entry(package, OFFICIAL_PACKAGE, alias, "1.0.0")],
+            vec![entry(package, OFFICIAL_PACKAGE, alias, version)],
         ),
     );
     fixture
@@ -98,9 +107,8 @@ fn served_aliases(fixture: &Fixture) -> Vec<(&'static str, Option<ServedBy>)> {
         .collect()
 }
 
-/// Writes the [`PROFILE`] host profile over the built-in Hermes runtime,
-/// launching a program that answers the Hermes version probe and then
-/// sleeps.
+/// Writes the [`PROFILE`] host profile over the Hermes runtime, launching a
+/// program that answers the Hermes version probe and then sleeps.
 fn write_hermes_profile(fixture: &Fixture) {
     let program = fixture.dir.join("hermes");
     write_supported_hermes_executable(&program, "sleep 30\n");
@@ -142,17 +150,21 @@ fn fork_params(id: &protocol::SessionId) -> protocol::SessionForkParams {
     }
 }
 
-/// The preflight inputs of `fixture`'s installed state.
-fn preflight_inputs(fixture: &Fixture, store_path: &std::path::Path) -> PreflightInputs {
+/// The preflight inputs of `fixture`'s installed state, over the workers
+/// `workers_of` started.
+fn preflight_inputs(
+    fixture: &Fixture,
+    workers_of: &SessionRegistry,
+    store_path: &std::path::Path,
+) -> PreflightInputs {
     PreflightInputs {
         store_path: store_path.to_path_buf(),
-        worker_state_root: fixture
-            .registry
+        worker_state_root: workers_of
             .inner
             .config
             .worker_state_root
             .clone()
-            .expect("the fixture's worker state root"),
+            .expect("the worker state root"),
         plugins_dir: fixture.plugins.clone(),
     }
 }
@@ -183,9 +195,10 @@ async fn an_official_package_claims_a_reserved_alias_and_is_served() {
             Fixture::with_anchor(&format!("alias-claim-{alias}"), anchor(&[&key], Vec::new()));
         let package = official(alias);
         let before = served_aliases(&fixture);
-        assert!(
-            is_builtin(&fixture, RuntimeId::HERMES),
-            "Hermes starts built-in"
+        assert_eq!(
+            served_by(&fixture, alias),
+            None,
+            "nothing serves {alias} without its package"
         );
         assert_eq!(fixture.serving(alias), None, "no package serves {alias}");
 
@@ -317,7 +330,7 @@ async fn the_shell_is_never_claimable_even_through_a_catalog() {
 }
 
 #[tokio::test]
-async fn disabling_or_uninstalling_the_official_package_returns_the_alias_to_the_built_in() {
+async fn disabling_or_uninstalling_the_official_package_leaves_the_alias_unserved() {
     let key = signing_key("root");
     for alias in ALIASES {
         let fixture = Fixture::with_anchor(
@@ -325,11 +338,9 @@ async fn disabling_or_uninstalling_the_official_package_returns_the_alias_to_the
             anchor(&[&key], Vec::new()),
         );
         let package = official(alias);
-        // The built-in runtime when the daemon serves one, otherwise nothing.
+        // The daemon compiles no official alias in.
         let without_package = served_by(&fixture, alias);
-        if alias == RuntimeId::HERMES {
-            assert_eq!(without_package, Some(ServedBy::Builtin));
-        }
+        assert_eq!(without_package, None, "{alias}");
         install_official(&fixture, &package, alias, 5).await;
         assert_eq!(fixture.serving(alias), Some(package.digest.clone()));
 
@@ -406,9 +417,10 @@ async fn a_profile_on_an_alias_base_is_pinnable_only_once_a_package_serves_it() 
             .registry
             .package_bind_profile(bind(false))
             .await
-            .expect_err("the built-in serves the base"),
-        PackageErrorKind::ProfileBaseBuiltin
+            .expect_err("no package serves the base"),
+        PackageErrorKind::ProfileTargetInvalid
     );
+    assert_eq!(fs::read_to_string(&path).expect("read"), text);
     install_official(&fixture, &package, RuntimeId::HERMES, 5).await;
 
     let preview = fixture
@@ -439,9 +451,12 @@ async fn a_profile_on_an_alias_base_is_pinnable_only_once_a_package_serves_it() 
     );
 }
 
+/// A Hermes session a previous release launched from its built-in runtime is
+/// refused once the official package serves `hermes`, and stays refused, as a
+/// removed built-in, after the package is uninstalled: nothing hands the pin
+/// back to a built-in. No refusal touches the stored session or its pin.
 #[tokio::test]
-async fn a_built_in_launched_session_fails_closed_after_the_takeover_and_resumes_after_the_return()
-{
+async fn a_built_in_launched_session_fails_closed_after_the_takeover_and_after_the_uninstall() {
     let key = signing_key("root");
     let dir = temp_dir("alias-session");
     let store_path = temp_store_path("alias-session");
@@ -451,27 +466,22 @@ async fn a_built_in_launched_session_fails_closed_after_the_takeover_and_resumes
         store_path.clone(),
     );
     write_hermes_profile(&fixture);
-    let created = fixture
-        .registry
-        .create(protocol::SessionNewParams {
-            agent: PROFILE.to_owned(),
-            cwd: Some(dir.clone()),
-            ..params()
-        })
-        .await
-        .expect("a session of the built-in runtime");
+    let created = launch_on_a_compiled_in_daemon(&fixture, &store_path, dir).await;
     let pinned = durable_recovery(&store_path, &created.id).launch_binding;
     assert!(matches!(
         pinned.binding().map(|binding| &binding.provenance),
         Some(protocol::BindingProvenance::Builtin { .. })
     ));
-    let _ = fixture.registry.stop(&created.id).await;
 
     let package = official(RuntimeId::HERMES);
     install_official(&fixture, &package, RuntimeId::HERMES, 5).await;
+    let restarted = fixture.reopen();
+    Box::pin(restarted.registry.reconcile_workers())
+        .await
+        .expect("startup reconciliation");
     let before = fs::read(&store_path).expect("read the store");
 
-    let refused = fixture
+    let refused = restarted
         .registry
         .resume(&created.id)
         .await
@@ -482,7 +492,7 @@ async fn a_built_in_launched_session_fails_closed_after_the_takeover_and_resumes
         before,
         "a refused resume leaves the stored binding untouched"
     );
-    fixture
+    restarted
         .registry
         .inspect(&created.id)
         .await
@@ -493,22 +503,31 @@ async fn a_built_in_launched_session_fails_closed_after_the_takeover_and_resumes
         "the pin keeps its built-in provenance"
     );
 
-    fixture
+    restarted
         .registry
         .package_uninstall(uninstall(&package.digest))
         .await
         .expect("uninstall");
-    let after_return = fixture.registry.resume(&created.id).await;
-    assert_ne!(
-        after_return.as_ref().err().map(|error| error.code.as_str()),
-        Some("runtime_served_by_package"),
-        "the built-in serves the pin again"
+    let removed = restarted
+        .registry
+        .resume(&created.id)
+        .await
+        .expect_err("nothing serves the built-in the session was launched from");
+    assert_eq!(removed.code, "runtime_builtin_removed", "{removed:?}");
+    assert_eq!(
+        fs::read(&store_path).expect("read the store"),
+        before,
+        "a refused resume leaves the stored binding untouched"
     );
-    let _ = fixture.registry.stop(&created.id).await;
+    restarted
+        .registry
+        .remove(&created.id)
+        .await
+        .expect("a refused session is still removable");
 }
 
 /// Launches a session of the [`PROFILE`] host profile on a daemon that
-/// compiles Codex and Claude in ([`compiled_in_host`]), over the agents
+/// compiles Codex, Claude and Hermes in ([`compiled_in_host`]), over the agents
 /// directory, host state and session store `store_path` of `fixture`, and
 /// stops it: a session a previous release launched from its built-in runtime.
 async fn launch_on_a_compiled_in_daemon(
@@ -529,9 +548,9 @@ async fn launch_on_a_compiled_in_daemon(
     created
 }
 
-/// A daemon that compiles Codex and Claude in ([`compiled_in_host`]), over the
-/// agents directory, host state and session store `store_path` of `fixture`,
-/// as a previous release ran.
+/// A daemon that compiles Codex, Claude and Hermes in ([`compiled_in_host`]),
+/// over the agents directory, host state and session store `store_path` of
+/// `fixture`, as a previous release ran.
 fn compiled_in_daemon(fixture: &Fixture, store_path: &Path) -> SessionRegistry {
     SessionRegistry::new_with_runtimes(
         SessionRegistryConfig {
@@ -604,12 +623,41 @@ async fn a_built_in_claude_session_is_neither_resumed_nor_forked_after_the_takeo
         .expect("a refused session is still removable");
 }
 
+/// Asserts the refusal of `operation` on a session of the removed built-in
+/// `alias` nothing serves: the typed code, and a recovery hint that names the
+/// official package install, a new session and no rebinding.
+fn assert_removed_built_in_refusal(
+    removed: &protocol::ProtocolError,
+    alias: &str,
+    operation: &str,
+) {
+    assert_eq!(
+        removed.code, "runtime_builtin_removed",
+        "{alias} {operation}: {removed:?}"
+    );
+    let hint = removed.recover.as_deref().expect("a recovery hint");
+    assert!(
+        hint.contains(&format!(
+            "`pohunek plugin install runtime/packages/{alias}.tar.zst --catalog runtime/runtime-catalog.json`"
+        )),
+        "{alias} {operation}: {hint}"
+    );
+    assert!(
+        hint.contains(&format!("`pohunek session new --agent {alias}`")),
+        "{alias} {operation}: {hint}"
+    );
+    assert!(
+        hint.contains("cannot be rebound"),
+        "{alias} {operation}: {hint}"
+    );
+}
+
 /// A session of the official alias `alias` a previous release launched from
-/// its built-in runtime, on a daemon that serves no `alias`: resume, and fork
-/// when the built-in forks, are refused as a removed built-in whose recovery
-/// is the official package and a new session, and once the package is
-/// installed, as a session the package does not serve. No refusal touches the
-/// stored session.
+/// its built-in runtime, on a daemon that serves no `alias`: resume and fork
+/// are refused as a removed built-in whose recovery is the official package
+/// and a new session, and once the package is installed, as a session the
+/// package does not serve, or as a fork the built-in never supported. No
+/// refusal touches the stored session.
 async fn assert_built_in_session_is_refused_as_removed_until_the_package_serves(
     alias: &'static str,
 ) {
@@ -651,35 +699,14 @@ async fn assert_built_in_session_is_refused_as_removed_until_the_package_serves(
         .resume(&created.id)
         .await
         .expect_err("nothing serves the built-in the session was launched from");
-    let mut refusals = vec![("resume", resumed)];
-    if forks {
-        let forked = restarted
-            .registry
-            .fork(fork_params(&created.id))
-            .await
-            .expect_err("nothing serves the built-in the session was launched from");
-        refusals.push(("fork", forked));
-    }
-    for (operation, removed) in &refusals {
-        assert_eq!(
-            removed.code, "runtime_builtin_removed",
-            "{alias} {operation}: {removed:?}"
-        );
-        let hint = removed.recover.as_deref().expect("a recovery hint");
-        assert!(
-            hint.contains(&format!(
-                "`pohunek plugin install runtime/packages/{alias}.tar.zst --catalog runtime/runtime-catalog.json`"
-            )),
-            "{alias} {operation}: {hint}"
-        );
-        assert!(
-            hint.contains(&format!("`pohunek session new --agent {alias}`")),
-            "{alias} {operation}: {hint}"
-        );
-        assert!(
-            hint.contains("cannot be rebound"),
-            "{alias} {operation}: {hint}"
-        );
+    // The runtime source is checked before the fork capability.
+    let forked = restarted
+        .registry
+        .fork(fork_params(&created.id))
+        .await
+        .expect_err("nothing serves the built-in the session was launched from");
+    for (operation, removed) in [("resume", resumed), ("fork", forked)] {
+        assert_removed_built_in_refusal(&removed, alias, operation);
     }
     assert_eq!(
         fs::read(&store_path).expect("read the store"),
@@ -700,13 +727,18 @@ async fn assert_built_in_session_is_refused_as_removed_until_the_package_serves(
         .await
         .expect_err("the package serves the runtime now");
     assert_migration_refusal(&refused, alias);
+    let refused = served
+        .registry
+        .fork(fork_params(&created.id))
+        .await
+        .expect_err("a fork never launches the package for a built-in session");
     if forks {
-        let refused = served
-            .registry
-            .fork(fork_params(&created.id))
-            .await
-            .expect_err("a fork never launches the package for a built-in session");
         assert_migration_refusal(&refused, alias);
+    } else {
+        assert_eq!(
+            refused.code, "agent_fork_unsupported",
+            "{alias}: {refused:?}"
+        );
     }
 
     served
@@ -725,6 +757,14 @@ async fn a_built_in_codex_session_is_refused_as_removed_until_the_package_serves
 #[tokio::test]
 async fn a_built_in_claude_session_is_refused_as_removed_until_the_package_serves_claude() {
     assert_built_in_session_is_refused_as_removed_until_the_package_serves(RuntimeId::CLAUDE).await;
+}
+
+/// The built-in Hermes runtime does not fork: without the package its fork is
+/// refused as a removed built-in like its resume, and once the package serves
+/// `hermes` as a fork Hermes does not support.
+#[tokio::test]
+async fn a_built_in_hermes_session_is_refused_as_removed_until_the_package_serves_hermes() {
+    assert_built_in_session_is_refused_as_removed_until_the_package_serves(RuntimeId::HERMES).await;
 }
 
 /// A live session of the official alias `alias` a previous release launched
@@ -821,11 +861,20 @@ async fn an_adopted_built_in_claude_session_takes_input_only_once_the_package_se
         .await;
 }
 
+#[tokio::test]
+async fn an_adopted_built_in_hermes_session_takes_input_only_once_the_package_serves_hermes() {
+    assert_adopted_built_in_session_takes_input_only_once_the_package_serves(RuntimeId::HERMES)
+        .await;
+}
+
 /// A live session of the built-in Hermes runtime, launched through the
-/// [`PROFILE`] host profile, before any package serves `hermes`.
+/// [`PROFILE`] host profile by a daemon that compiles Hermes in
+/// ([`compiled_in_daemon`]), as a previous release did.
 struct LaunchedHermes {
     fixture: Fixture,
     store_path: std::path::PathBuf,
+    /// The daemon that launched the session and runs its worker.
+    previous: SessionRegistry,
     created: protocol::SessionInfo,
     /// The input rules the session was launched with.
     input_rules: crate::agent::InputRules,
@@ -841,8 +890,8 @@ async fn launch_built_in_hermes(tag: &str) -> LaunchedHermes {
         store_path.clone(),
     );
     write_hermes_profile(&fixture);
-    let created = fixture
-        .registry
+    let previous = compiled_in_daemon(&fixture, &store_path);
+    let created = previous
         .create(protocol::SessionNewParams {
             agent: PROFILE.to_owned(),
             cwd: Some(dir),
@@ -850,8 +899,7 @@ async fn launch_built_in_hermes(tag: &str) -> LaunchedHermes {
         })
         .await
         .expect("a session of the built-in runtime");
-    let input_rules = fixture
-        .registry
+    let input_rules = previous
         .inner
         .sessions
         .lock()
@@ -862,13 +910,14 @@ async fn launch_built_in_hermes(tag: &str) -> LaunchedHermes {
     LaunchedHermes {
         fixture,
         store_path,
+        previous,
         created,
         input_rules,
     }
 }
 
 /// Installs the official Hermes package, whose detection differs from the
-/// built-in's, so it serves `hermes` in place of the built-in.
+/// built-in's, so it serves `hermes`.
 async fn take_hermes_over(fixture: &Fixture) -> Package {
     let package = Package::build_with_detect(
         OFFICIAL_PACKAGE,
@@ -881,10 +930,13 @@ async fn take_hermes_over(fixture: &Fixture) -> Package {
     package
 }
 
-/// Starts a second daemon over `launched`'s state and checks that it adopts
-/// the live worker.
+/// Starts a daemon of this release over `launched`'s state and checks that it
+/// adopts the live worker the previous daemon started.
 async fn adopt(launched: &LaunchedHermes) -> Fixture {
-    let restarted = launched.fixture.reopen_with_workers().await;
+    let restarted = launched
+        .fixture
+        .reopen_with_workers_of(&launched.previous)
+        .await;
     restarted
         .registry
         .reconcile_workers()
@@ -907,12 +959,25 @@ async fn a_built_in_session_adopted_after_a_takeover_is_observed_only_through_it
     let launched = launch_built_in_hermes("alias-adopted").await;
     let created = &launched.created;
     assert!(created.capabilities.resume, "the built-in Hermes resumes");
-    let inputs = preflight_inputs(&launched.fixture, &launched.store_path);
-    let (verdict, code, _detail) = preflight_verdict(&inputs, &created.id);
+    let inputs = preflight_inputs(&launched.fixture, &launched.previous, &launched.store_path);
+    // Before the takeover nothing serves the pin, so the adopted session
+    // would refuse every interaction until the package is installed.
+    let (verdict, code, detail) = preflight_verdict(&inputs, &created.id);
     assert_eq!(
         (verdict, code.as_str()),
-        (Verdict::Adoptable, CODE_ADOPTABLE),
-        "the built-in serves the pin before the takeover"
+        (Verdict::WouldLoseRecovery, CODE_RUNTIME_SOURCE_NOT_SERVED),
+        "{detail}"
+    );
+    assert!(detail.contains("runtime_builtin_removed"), "{detail}");
+    assert!(
+        detail.contains(
+            "`pohunek plugin install runtime/packages/hermes.tar.zst --catalog runtime/runtime-catalog.json`"
+        ),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("`pohunek session new --agent hermes`"),
+        "{detail}"
     );
 
     take_hermes_over(&launched.fixture).await;
@@ -1055,20 +1120,35 @@ async fn assert_hooks_not_attributed_through_the_package(
 }
 
 #[tokio::test]
-async fn an_adopted_built_in_session_stays_unattributed_after_the_built_in_returns() {
+async fn an_adopted_built_in_session_stays_unattributed_after_another_package_serves_its_runtime() {
     let launched = launch_built_in_hermes("alias-returned").await;
     let id = launched.created.id.clone();
     let package = take_hermes_over(&launched.fixture).await;
     let restarted = adopt(&launched).await;
 
-    // The built-in serves `hermes` again, but the session was adopted without
-    // a definition of its pin; that holds until a restart adopts it again.
+    // Another official package serves `hermes` once the first is gone, one
+    // whose detection recognizes the process the built-in launched, but the
+    // session was adopted without a definition of its pin.
     restarted
         .registry
         .package_uninstall(uninstall(&package.digest))
         .await
         .expect("uninstall the official package");
-    assert!(is_builtin(&restarted, RuntimeId::HERMES));
+    let second = Package::build_with_detect(
+        OFFICIAL_PACKAGE,
+        "1.0.0",
+        RuntimeId::HERMES,
+        INERT_PROGRAM,
+        BUILT_IN_PROCESS_MANIFEST,
+    );
+    install_official(&launched.fixture, &second, RuntimeId::HERMES, 6).await;
+    restarted.host.reload().expect("load the second package");
+    assert_eq!(restarted.serving(RuntimeId::HERMES), Some(second.digest));
+    assert_eq!(
+        crate::detect::identify_agent(&restarted.host, &fact(4001, "hermes")),
+        Some(protocol::RuntimeRef::hermes()),
+        "the second package recognizes the built-in's process"
+    );
 
     let own = {
         let sessions = restarted.registry.inner.sessions.lock().await;
@@ -1197,6 +1277,20 @@ async fn an_ordinary_package_keeps_serving_next_to_an_official_alias() {
     assert_eq!(fixture.serving(RuntimeId::HERMES), Some(package.digest));
 }
 
+/// Detection manifest of a package that recognizes the process the built-in
+/// `hermes` launched.
+const BUILT_IN_PROCESS_MANIFEST: &str = r#"[process]
+comm = ["^hermes$"]
+cmdline = ['(^|/)hermes($| )']
+
+[[rules]]
+id = "built_in_process_blocked"
+state = "blocked"
+priority = 1
+region = "whole_recent"
+contains = "the process needs you"
+"#;
+
 /// Detection manifest of the official package: other process matchers and
 /// other rules than the built-in `hermes`.
 const OFFICIAL_MANIFEST: &str = r#"[process]
@@ -1235,8 +1329,12 @@ fn observe(
         .observed_agents_from_facts(id, vec![process], now, own)
 }
 
+/// A live session keeps observing through the package version it was
+/// launched from while a later version of the official package serves its
+/// runtime: what serves the runtime id now never stands in for the session's
+/// own runtime source.
 #[tokio::test]
-async fn a_live_built_in_session_keeps_its_own_observation_through_a_takeover() {
+async fn a_live_session_keeps_its_own_observation_through_a_later_package_version() {
     let key = signing_key("root");
     let dir = temp_dir("alias-live");
     let store_path = temp_store_path("alias-live");
@@ -1245,22 +1343,42 @@ async fn a_live_built_in_session_keeps_its_own_observation_through_a_takeover() 
         anchor(&[&key], Vec::new()),
         store_path,
     );
-    write_hermes_profile(&fixture);
+    let program = fixture.dir.join("hermes");
+    write_supported_hermes_executable(&program, "sleep 30\n");
+    let first = Package::build_with_detect(
+        OFFICIAL_PACKAGE,
+        "1.0.0",
+        RuntimeId::HERMES,
+        program.to_str().expect("utf-8 program path"),
+        BUILT_IN_PROCESS_MANIFEST,
+    );
+    install_official(&fixture, &first, RuntimeId::HERMES, 5).await;
     let created = fixture
         .registry
         .create(protocol::SessionNewParams {
-            agent: PROFILE.to_owned(),
+            agent: RuntimeId::HERMES.to_owned(),
             cwd: Some(dir),
             ..params()
         })
         .await
-        .expect("a session of the built-in runtime");
-    let builtin_manifest = format!("{:?}", crate::detect::hermes_manifest());
+        .expect("a session of the first package version");
+    let first_manifest = format!(
+        "{:?}",
+        crate::detect::Manifest::parse_str(BUILT_IN_PROCESS_MANIFEST).expect("the manifest parses")
+    );
+    let first_provenance = official_provenance("1.0.0", &first);
 
-    let package = take_hermes_over(&fixture).await;
-    assert_eq!(fixture.serving(RuntimeId::HERMES), Some(package.digest));
+    let second = Package::build_with_detect(
+        OFFICIAL_PACKAGE,
+        "2.0.0",
+        RuntimeId::HERMES,
+        INERT_PROGRAM,
+        OFFICIAL_MANIFEST,
+    );
+    install_official_version(&fixture, &second, RuntimeId::HERMES, "2.0.0", 6).await;
+    assert_eq!(fixture.serving(RuntimeId::HERMES), Some(second.digest));
 
-    // The entry retains the built-in definition it was launched from.
+    // The entry retains the definition it was launched from.
     let pinned = fixture
         .registry
         .inner
@@ -1269,39 +1387,34 @@ async fn a_live_built_in_session_keeps_its_own_observation_through_a_takeover() 
         .await
         .get(&created.id)
         .and_then(|entry| entry.pinned.clone())
-        .expect("a built-in session retains its definition");
-    assert!(matches!(
-        pinned.binding().provenance,
-        protocol::BindingProvenance::Builtin { .. }
-    ));
-    assert_eq!(format!("{:?}", pinned.manifest()), builtin_manifest);
+        .expect("a package session retains its definition");
+    assert_eq!(pinned.binding().provenance, first_provenance);
+    assert_eq!(format!("{:?}", pinned.manifest()), first_manifest);
 
-    // Identity callbacks resolve against the built-in, not the package.
+    // Identity callbacks resolve against the first version, not the selected
+    // one.
     let resolved = fixture
         .registry
         .resolve_session_agent(&created.id, RuntimeId::HERMES)
         .await
         .expect("resolve the callback agent");
-    assert!(matches!(
-        resolved.definition.binding().provenance,
-        protocol::BindingProvenance::Builtin { .. }
-    ));
+    assert_eq!(resolved.definition.binding().provenance, first_provenance);
     assert_eq!(
         format!("{:?}", resolved.definition.manifest()),
-        builtin_manifest
+        first_manifest
     );
 
-    // Process recognition uses the built-in matchers of the session, and the
-    // package's matchers only recognize processes the package describes.
+    // Process recognition uses the matchers of the session's own version, and
+    // the selected version's matchers only recognize processes it describes.
     let now = std::time::Instant::now();
     let own = OwnRuntime::Pinned(std::sync::Arc::clone(&pinned));
-    let builtin_process = observe(&fixture, &created.id, fact(4001, "hermes"), now, Some(&own));
+    let own_process = observe(&fixture, &created.id, fact(4001, "hermes"), now, Some(&own));
     assert_eq!(
-        builtin_process.len(),
+        own_process.len(),
         1,
-        "the built-in process is recognized"
+        "the process of the session's own version is recognized"
     );
-    let official_process = observe(
+    let selected_process = observe(
         &fixture,
         &created.id,
         fact(4002, "official-hermes"),
@@ -1309,25 +1422,37 @@ async fn a_live_built_in_session_keeps_its_own_observation_through_a_takeover() 
         Some(&own),
     );
     assert_eq!(
-        official_process.len(),
+        selected_process.len(),
         1,
-        "the package process is recognized by the registry"
+        "the selected version's process is recognized by the registry"
     );
     let unretained = observe(&fixture, &created.id, fact(4001, "hermes"), now, None);
     assert!(
         unretained.is_empty(),
-        "without the retained definition the built-in process is lost"
+        "without the retained definition the session's own process is lost"
     );
 
     assert_transition_rules(
         &fixture,
         &created.id,
-        &builtin_process,
-        &official_process,
+        &own_process,
+        &selected_process,
+        &first_manifest,
         now,
     )
     .await;
     let _ = fixture.registry.stop(&created.id).await;
+}
+
+/// The provenance of `package`, the official package at `version`.
+fn official_provenance(version: &str, package: &Package) -> protocol::BindingProvenance {
+    protocol::BindingProvenance::Package {
+        package: protocol::PackageIdentity {
+            id: protocol::PackageId::parse(OFFICIAL_PACKAGE).expect("package id"),
+            version: protocol::PackageVersion::parse(version).expect("version"),
+        },
+        package_digest: package.digest.clone(),
+    }
 }
 
 /// Applies the foreground transition to each observed process and checks
@@ -1335,20 +1460,22 @@ async fn a_live_built_in_session_keeps_its_own_observation_through_a_takeover() 
 async fn assert_transition_rules(
     fixture: &Fixture,
     id: &protocol::SessionId,
-    builtin_process: &std::collections::HashMap<crate::procwatch::Pid, super::super::ObservedAgent>,
-    official_process: &std::collections::HashMap<
+    own_process: &std::collections::HashMap<crate::procwatch::Pid, super::super::ObservedAgent>,
+    selected_process: &std::collections::HashMap<
         crate::procwatch::Pid,
         super::super::ObservedAgent,
     >,
+    own_manifest: &str,
     now: std::time::Instant,
 ) {
     // The foreground transition applies the rules of the definition each
-    // process matched: the session's own launch root gets the built-in rules,
-    // a child the package recognizes gets the package rules.
+    // process matched: the session's own launch root gets the rules of its
+    // own version, a child the selected version recognizes gets that
+    // version's rules.
     let blocker = |manifest: &str| manifest.contains("official_blocked");
     let mut sessions = fixture.registry.inner.sessions.lock().await;
     let entry = sessions.get_mut(id).expect("the live session");
-    for (process, expect_package_rule) in [(builtin_process, false), (official_process, true)] {
+    for (process, expect_selected_rule) in [(own_process, false), (selected_process, true)] {
         let observed = process.values().next().expect("one observed process");
         let report = super::super::ActiveAgentReport {
             source: "test".to_owned(),
@@ -1366,12 +1493,9 @@ async fn assert_transition_rules(
             RuntimeId::HERMES.to_owned(),
         );
         let applied = format!("{:?}", entry.detector_config.borrow().config.manifest);
-        assert_eq!(blocker(&applied), expect_package_rule, "{}", observed.pid);
-        if !expect_package_rule {
-            assert_eq!(
-                applied,
-                format!("{:?}", Some(crate::detect::hermes_manifest().clone()))
-            );
+        assert_eq!(blocker(&applied), expect_selected_rule, "{}", observed.pid);
+        if !expect_selected_rule {
+            assert_eq!(applied, format!("Some({own_manifest})"));
         }
     }
     drop(sessions);

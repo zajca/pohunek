@@ -1,13 +1,14 @@
-//! The official Codex and Claude runtime packages for daemon integration tests.
+//! The official Codex, Claude and Hermes runtime packages for daemon
+//! integration tests.
 //!
-//! A host with the official runtime packages installed serves `codex` and
-//! `claude` from them. A test that drives one of them builds the archives from
+//! A host with the official runtime packages installed serves `codex`,
+//! `claude` and `hermes` from them. A test that drives one of them builds the archives from
 //! `runtime-packages/<runtime>`, the bytes `pohunek plugin install` receives,
 //! and installs them through the production `package.install` path with a
 //! catalog signed by a throwaway key that only the test's daemon trusts.
 //!
 //! The installed descriptors keep their version probe, so every fake agent a
-//! test launches as `codex` or `claude` answers `--version` with
+//! test launches as `codex`, `claude` or `hermes` answers `--version` with
 //! [`supported_banner`] before it does anything else; a fake written in Python
 //! runs behind [`python_agent_launcher`].
 
@@ -42,7 +43,7 @@ use protocol::{
 /// The runtimes the official packages serve, each built from
 /// `runtime-packages/<runtime>` and locked by
 /// `compat/<runtime>/compatibility-lock.json`.
-const OFFICIAL_RUNTIMES: [&str; 2] = ["codex", "claude"];
+const OFFICIAL_RUNTIMES: [&str; 3] = ["codex", "claude", "hermes"];
 
 /// Sequence number of the one catalog a test signs.
 const CATALOG_SEQUENCE: u64 = 1;
@@ -80,7 +81,7 @@ impl OfficialCatalog {
         config
     }
 
-    /// Installs the official Codex and Claude packages into `registry`
+    /// Installs the official Codex, Claude and Hermes packages into `registry`
     /// through `package.install`, authorized by one catalog this key signs,
     /// enabled and selected, and returns each runtime's archive digest.
     ///
@@ -130,7 +131,7 @@ impl OfficialCatalog {
         installed
     }
 
-    /// Installs the official Codex and Claude packages into the plugin root
+    /// Installs the official Codex, Claude and Hermes packages into the plugin root
     /// `plugins_dir` before the registry or daemon binary under test opens it.
     ///
     /// A short-lived production registry, rooted below `scratch` and trusting

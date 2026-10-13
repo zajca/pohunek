@@ -735,8 +735,10 @@ fn a_catalog_authorized_package_serves_an_official_alias_in_place_of_the_built_i
 fn a_built_in_pinned_session_is_neither_launched_nor_observed_through_the_package_after_a_takeover()
 {
     let plugins = Plugins::new();
+    // The built-in Hermes of release v0.34.2, the last release that compiled
+    // it in; this daemon serves `hermes` only from a package.
     let builtin_pin = LaunchPin::of(
-        &RuntimeHost::from_host_environment()
+        &super::fixture::compiled_in_host()
             .resolve_id(&runtime("hermes"))
             .expect("built-in hermes"),
     );
@@ -751,10 +753,21 @@ fn a_built_in_pinned_session_is_neither_launched_nor_observed_through_the_packag
         host.pinned_definition(&hermes, pin)
             .map(|definition| definition.binding().provenance.clone())
     };
-    assert!(matches!(
-        provenance_of(&host, &builtin_pin),
-        Some(BindingProvenance::Builtin { .. })
-    ));
+    for pin in [&builtin_pin, &LaunchPin::Unpinned] {
+        let removed = host
+            .resolve_pinned(&hermes, pin)
+            .expect_err("nothing serves the removed built-in");
+        assert_eq!(code(&removed), "runtime_builtin_removed");
+        assert_eq!(provenance_of(&host, pin), None);
+        assert_eq!(
+            code(
+                &host
+                    .ensure_session_runtime(&hermes, pin)
+                    .expect_err("a live session of the removed built-in is refused")
+            ),
+            "runtime_builtin_removed"
+        );
+    }
     install_from(
         &plugins.registry(),
         &built,

@@ -1,7 +1,7 @@
 //! Runtime fixtures for in-crate tests.
 //!
-//! [`official_host`] serves the official Codex and Claude packages from
-//! `runtime-packages/`, so tests of those runtimes exercise the package
+//! [`official_host`] serves the official Codex, Claude and Hermes packages
+//! from `runtime-packages/`, so tests of those runtimes exercise the package
 //! descriptors rather than definitions compiled into the daemon;
 //! [`install_official_packages`] installs the same packages into a plugin
 //! root for hosts with a package store.
@@ -169,6 +169,11 @@ pub(crate) const OFFICIAL_CODEX_DIGEST: &str =
 pub(crate) const OFFICIAL_CLAUDE_DIGEST: &str =
     "sha256:4444444444444444444444444444444444444444444444444444444444444444";
 
+/// Package digest [`OfficialFixtureSource`] reports for the official Hermes
+/// package; see [`OFFICIAL_CODEX_DIGEST`].
+pub(crate) const OFFICIAL_HERMES_DIGEST: &str =
+    "sha256:6666666666666666666666666666666666666666666666666666666666666666";
+
 /// One official runtime package as `runtime-packages/` ships it.
 struct OfficialPackage {
     /// Runtime id the descriptor declares.
@@ -181,17 +186,23 @@ struct OfficialPackage {
     detect: &'static str,
     /// Digest the fixture reports for the package.
     digest: &'static str,
+    /// Whether the fixture keeps the package's `version_probe`. In-crate
+    /// Hermes stand-ins answer `--version` with a banner the probe reads, so
+    /// launch-policy scenarios exercise the package's probe; Codex and Claude
+    /// stand-ins do not answer it.
+    keeps_probe: bool,
 }
 
-/// The official Codex and Claude packages, read from the workspace's
+/// The official Codex, Claude and Hermes packages, read from the workspace's
 /// `runtime-packages/` tree at build time.
-const OFFICIAL_PACKAGES: [OfficialPackage; 2] = [
+const OFFICIAL_PACKAGES: [OfficialPackage; 3] = [
     OfficialPackage {
         runtime: "codex",
         package: "pohunek.runtime.codex",
         descriptor: include_str!("../../../../../runtime-packages/codex/runtime.toml"),
         detect: include_str!("../../../../../runtime-packages/codex/detect.toml"),
         digest: OFFICIAL_CODEX_DIGEST,
+        keeps_probe: false,
     },
     OfficialPackage {
         runtime: "claude",
@@ -199,6 +210,15 @@ const OFFICIAL_PACKAGES: [OfficialPackage; 2] = [
         descriptor: include_str!("../../../../../runtime-packages/claude/runtime.toml"),
         detect: include_str!("../../../../../runtime-packages/claude/detect.toml"),
         digest: OFFICIAL_CLAUDE_DIGEST,
+        keeps_probe: false,
+    },
+    OfficialPackage {
+        runtime: "hermes",
+        package: "pohunek.runtime.hermes",
+        descriptor: include_str!("../../../../../runtime-packages/hermes/runtime.toml"),
+        detect: include_str!("../../../../../runtime-packages/hermes/detect.toml"),
+        digest: OFFICIAL_HERMES_DIGEST,
+        keeps_probe: true,
     },
 ];
 
@@ -209,14 +229,17 @@ const INSTALLED_AT_UNIX_SECONDS: u64 = 1_700_000_000;
 /// Key of the descriptor line [`OfficialFixtureSource`] drops.
 const VERSION_PROBE_KEY: &str = "version_probe =";
 
-/// The official Codex and Claude packages as a catalog-authorized source.
+/// The official Codex, Claude and Hermes packages as a catalog-authorized
+/// source.
 ///
 /// Each definition is parsed by [`super::definition_from_archive`] from the
 /// package's own `runtime.toml` and `detect.toml`, so it carries package
-/// provenance and the package's detection manifest. The `version_probe` line
-/// is dropped: the probe would run the real `codex`/`claude` binary, while
-/// in-crate tests launch stand-in programs; out-of-process tests keep the
-/// probe and use fakes that answer `--version`.
+/// provenance and the package's detection manifest. The Codex and Claude
+/// `version_probe` lines are dropped: the probe would run the real
+/// `codex`/`claude` binary, while in-crate tests launch stand-in programs that
+/// do not answer `--version`. The Hermes package keeps its probe (see
+/// [`OfficialPackage::keeps_probe`]); out-of-process tests keep every probe
+/// and use fakes that answer `--version`.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct OfficialFixtureSource;
 
@@ -250,17 +273,24 @@ fn probeless_descriptor(official: &OfficialPackage) -> String {
     kept.join("\n")
 }
 
-/// The archive entries of `official` with its version probe dropped.
+/// The archive entries of `official`, with its version probe dropped unless
+/// the fixture keeps it ([`OfficialPackage::keeps_probe`]).
 ///
 /// # Panics
 ///
-/// Panics unless the descriptor declares exactly one `version_probe` line,
-/// which would be a defect of the fixture or of the package.
+/// Panics unless a descriptor whose probe is dropped declares exactly one
+/// `version_probe` line, which would be a defect of the fixture or of the
+/// package.
 fn official_entries(official: &OfficialPackage) -> [package::ArchiveEntry; 2] {
+    let descriptor = if official.keeps_probe {
+        official.descriptor.to_owned()
+    } else {
+        probeless_descriptor(official)
+    };
     [
         package::ArchiveEntry {
             path: super::RUNTIME_DESCRIPTOR_PATH.to_owned(),
-            contents: probeless_descriptor(official).into_bytes(),
+            contents: descriptor.into_bytes(),
             executable: false,
         },
         package::ArchiveEntry {
@@ -271,12 +301,14 @@ fn official_entries(official: &OfficialPackage) -> [package::ArchiveEntry; 2] {
     ]
 }
 
-/// Parses `official` with its version probe dropped.
+/// Parses `official` with its version probe dropped unless the fixture keeps
+/// it.
 ///
 /// # Panics
 ///
-/// Panics unless the descriptor declares exactly one `version_probe` line and
-/// then parses, which would be a defect of the fixture or of the package.
+/// Panics unless a descriptor whose probe is dropped declares exactly one
+/// `version_probe` line, or when the package does not parse, which would be a
+/// defect of the fixture or of the package.
 fn official_definition(official: &OfficialPackage) -> RuntimeDefinition {
     let digest = PackageDigest::parse(official.digest).expect("valid digest");
     super::definition_from_archive(&official_entries(official), &digest).unwrap_or_else(|error| {
@@ -287,11 +319,13 @@ fn official_definition(official: &OfficialPackage) -> RuntimeDefinition {
     })
 }
 
-/// Installs the official Codex and Claude packages, with the version probe
-/// dropped as [`OfficialFixtureSource`] drops it, into the plugin root
+/// Installs the official Codex, Claude and Hermes packages, with the Codex and
+/// Claude version probes dropped and the Hermes probe kept as
+/// [`OfficialFixtureSource`] does, into the plugin root
 /// `plugins_dir` as enabled, selected packages recorded with official
 /// provenance, as a catalog-authorized install records them (no catalog is
-/// checked), so a host over the root serves `codex` and `claude` from them.
+/// checked), so a host over the root serves `codex`, `claude` and `hermes`
+/// from them.
 ///
 /// # Panics
 ///
@@ -332,8 +366,9 @@ pub(crate) fn install_official_packages(plugins_dir: &Path) {
     }
 }
 
-/// A host serving the built-in runtimes, with `/bin/sh` as the shell, and the
-/// official Codex and Claude packages through [`OfficialFixtureSource`].
+/// A host serving the built-in shell, with `/bin/sh` as the shell, and the
+/// official Codex, Claude and Hermes packages through
+/// [`OfficialFixtureSource`].
 ///
 /// # Panics
 ///
@@ -360,7 +395,7 @@ pub(crate) fn official_host_over(builtin: &BuiltinSource) -> RuntimeHost {
 ///
 /// # Panics
 ///
-/// Panics when `runtime` is not `codex` or `claude`.
+/// Panics when `runtime` is not `codex`, `claude` or `hermes`.
 pub(crate) fn official_launch_pin(runtime: &str) -> super::LaunchPin {
     let runtime_id = protocol::RuntimeId::parse(runtime).expect("runtime id");
     let definition = official_host()
@@ -376,8 +411,8 @@ pub(crate) fn official_launch_pin(runtime: &str) -> super::LaunchPin {
     super::LaunchPin::of(&definition)
 }
 
-/// The built-in Codex or Claude runtime release v0.34.2 compiled in, frozen as
-/// goldens below `compat/<runtime>/builtin-v0.34/`.
+/// A built-in Codex, Claude or Hermes runtime release v0.34.2 compiled in,
+/// frozen as goldens below `compat/<runtime>/builtin-v0.34/`.
 struct CompiledInGolden {
     /// Runtime id, which is also the name the descriptor gives its embedded
     /// detection manifest.
@@ -388,8 +423,8 @@ struct CompiledInGolden {
     detect: &'static str,
 }
 
-/// The v0.34.2 built-in Codex and Claude goldens.
-const COMPILED_IN_GOLDENS: [CompiledInGolden; 2] = [
+/// The v0.34.2 built-in Codex, Claude and Hermes goldens.
+const COMPILED_IN_GOLDENS: [CompiledInGolden; 3] = [
     CompiledInGolden {
         runtime: "codex",
         descriptor: include_str!("../../../../../compat/codex/builtin-v0.34/runtime.toml"),
@@ -399,6 +434,11 @@ const COMPILED_IN_GOLDENS: [CompiledInGolden; 2] = [
         runtime: "claude",
         descriptor: include_str!("../../../../../compat/claude/builtin-v0.34/runtime.toml"),
         detect: include_str!("../../../../../compat/claude/builtin-v0.34/detect.toml"),
+    },
+    CompiledInGolden {
+        runtime: "hermes",
+        descriptor: include_str!("../../../../../compat/hermes/builtin-v0.34/runtime.toml"),
+        detect: include_str!("../../../../../compat/hermes/builtin-v0.34/detect.toml"),
     },
 ];
 
@@ -434,18 +474,24 @@ fn golden_body(golden: &str) -> &str {
     lines.next().unwrap_or_default()
 }
 
-/// Built-in runtimes as a daemon that compiles Codex and Claude in serves
-/// them: the runtimes of the wrapped [`BuiltinSource`] other than `codex` and
-/// `claude`, and the Codex and Claude built-ins of release v0.34.2, parsed
-/// from their goldens ([`COMPILED_IN_GOLDENS`]) the way the daemon parses its
-/// embedded descriptors.
+/// Built-in runtimes as a daemon that compiles Codex, Claude and Hermes in
+/// serves them: the shell of the wrapped [`BuiltinSource`], and the Codex,
+/// Claude and Hermes built-ins of release v0.34.2, parsed from their goldens
+/// ([`COMPILED_IN_GOLDENS`]) the way that daemon parsed its embedded
+/// descriptors.
 ///
 /// A record such a daemon wrote (an unpinned or a built-in-pinned launch
 /// binding) resumes only through a built-in of the same runtime, so scenarios
 /// over those records serve one. The goldens keep it the v0.34.2 built-in
 /// whatever the runtime packages or the daemon's own sources declare.
+///
+/// The Hermes golden names the `hermes-v1` version-probe parser, which this
+/// daemon does not compile in, so its `version_probe` line is dropped (see
+/// [`compiled_in_descriptor`]) and the previous release's launch can be
+/// replayed. The probe is not part of the launch binding, so a session
+/// launched here records the binding release v0.34.2 recorded.
 #[derive(Debug)]
-struct CompiledInSource(BuiltinSource);
+pub(crate) struct CompiledInSource(pub(crate) BuiltinSource);
 
 impl RuntimeSource for CompiledInSource {
     fn trust(&self) -> SourceTrust {
@@ -453,19 +499,10 @@ impl RuntimeSource for CompiledInSource {
     }
 
     fn load(&self) -> Result<Vec<RuntimeDefinition>, DefinitionError> {
-        let mut definitions: Vec<RuntimeDefinition> = self
-            .0
-            .load()?
-            .into_iter()
-            .filter(|definition| {
-                COMPILED_IN_GOLDENS
-                    .iter()
-                    .all(|golden| definition.runtime_id().as_str() != golden.runtime)
-            })
-            .collect();
+        let mut definitions = self.0.load()?;
         for golden in &COMPILED_IN_GOLDENS {
             definitions.push(RuntimeDefinition::from_toml(
-                golden_body(golden.descriptor),
+                &compiled_in_descriptor(golden),
                 |package| DefinitionOrigin::Builtin {
                     package: Some(package),
                 },
@@ -485,7 +522,17 @@ impl RuntimeSource for CompiledInSource {
     }
 }
 
-/// A host serving Codex and Claude as built-in runtimes through
+/// The golden descriptor of `golden` without its header and without a
+/// `version_probe` line.
+fn compiled_in_descriptor(golden: &CompiledInGolden) -> String {
+    golden_body(golden.descriptor)
+        .lines()
+        .filter(|line| !line.trim_start().starts_with(VERSION_PROBE_KEY))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A host serving Codex, Claude and Hermes as built-in runtimes through
 /// [`CompiledInSource`], with `/bin/sh` as the shell.
 ///
 /// # Panics
@@ -493,10 +540,18 @@ impl RuntimeSource for CompiledInSource {
 /// Panics when the registry cannot be built, which would be a defect of the
 /// fixture.
 pub(crate) fn compiled_in_host() -> RuntimeHost {
-    let registry =
-        RuntimeRegistry::from_sources(&[&CompiledInSource(BuiltinSource::new("/bin/sh"))])
-            .expect("the compiled-in registry builds");
-    RuntimeHost::new(registry)
+    RuntimeHost::new(compiled_in_registry("/bin/sh"))
+}
+
+/// The registry of [`compiled_in_host`], with `shell` as the shell.
+///
+/// # Panics
+///
+/// Panics when the registry cannot be built, which would be a defect of the
+/// fixture.
+pub(crate) fn compiled_in_registry(shell: &str) -> RuntimeRegistry {
+    RuntimeRegistry::from_sources(&[&CompiledInSource(BuiltinSource::new(shell))])
+        .expect("the compiled-in registry builds")
 }
 
 /// The profile keys that bind a host profile over `runtime` to its package in
@@ -504,7 +559,7 @@ pub(crate) fn compiled_in_host() -> RuntimeHost {
 ///
 /// # Panics
 ///
-/// Panics when `runtime` is not `codex` or `claude`.
+/// Panics when `runtime` is not `codex`, `claude` or `hermes`.
 pub(crate) fn official_profile_pin(runtime: &str) -> String {
     let official = OFFICIAL_PACKAGES
         .iter()
@@ -521,8 +576,8 @@ pub(crate) fn official_profile_pin(runtime: &str) -> String {
 ///
 /// # Panics
 ///
-/// Panics when `runtime` is not `codex` or `claude`, or when the package
-/// manifest does not parse.
+/// Panics when `runtime` is not `codex`, `claude` or `hermes`, or when the
+/// package manifest does not parse.
 pub(crate) fn official_manifest(runtime: &str) -> crate::detect::Manifest {
     let official = OFFICIAL_PACKAGES
         .iter()
@@ -533,7 +588,8 @@ pub(crate) fn official_manifest(runtime: &str) -> crate::detect::Manifest {
 }
 
 /// `body` with the [`official_profile_pin`] of its base inserted after its
-/// first line when that line is `base = "codex"` or `base = "claude"`, so the
+/// first line when that line is `base = "codex"`, `base = "claude"` or
+/// `base = "hermes"`, so the
 /// profile binds the package [`official_host`] serves its base from; any
 /// other profile is returned unchanged.
 pub(crate) fn pin_official_base(body: &str) -> String {

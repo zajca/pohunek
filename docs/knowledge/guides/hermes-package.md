@@ -2,16 +2,18 @@
 type: Guide
 id: guide/hermes-package
 title: Hermes runtime package
-description: The official Hermes Agent runtime package source (Hermes Agent 0.20.0) with its operator plugin payload, what it declares and keeps equal to the built-in Hermes runtime, where releases ship it, and how its tests, CI and the release keep it honest.
+description: The official Hermes Agent runtime package source (Hermes Agent 0.20.0) with its operator plugin payload, the only source of the hermes runtime, what it declares and keeps equal to the built-in Hermes runtime of release 0.34.2, where releases ship it, and how its tests, CI and the release keep it honest.
 source_kind: manual
 intents: [setup, update, debug, help]
 ---
 
 # Hermes runtime package
 
-The Hermes package (`runtime-packages/hermes`) is the package form of the
-Hermes Agent runtime that is compiled into the daemon today, plus the operator
-plugin payload that `pohunek integration` installs into a Hermes profile. The
+The Hermes package (`runtime-packages/hermes`) is the only source of the
+Hermes Agent runtime: the daemon compiles no Hermes in. It is the package form
+of the built-in Hermes runtime that releases up to 0.34.x compiled in, plus the
+operator plugin payload that `pohunek integration` installs into a Hermes
+profile. The
 directory holds exactly what the archive holds:
 
 ```text
@@ -29,7 +31,7 @@ packages](runtime-packages.md) for the generic commands and the [Hermes
 operator](hermes-operator.md) guide for the plugin, its policy and the
 integration lifecycle.
 
-## Status: official package on Linux; built-in still present
+## Status: official package on Linux; no built-in
 
 `hermes` is a reserved runtime id. A package serves it only with official
 trust: a `--catalog` install whose signed catalog entry binds the package id,
@@ -52,11 +54,11 @@ pohunek plugin install runtime/packages/hermes.tar.zst --catalog runtime/runtime
 pohunek plugin install runtime/packages/hermes.tar.zst --catalog runtime/runtime-catalog.json --yes
 ```
 
-The first installed version is enabled and selected and takes the `hermes`
-alias over from the built-in runtime (see [official
-aliases](runtime-packages.md#official-aliases)). `pohunek integration install
---agent hermes --hermes-profile <name>` (target and access options in the
-[Hermes operator](hermes-operator.md) guide) then installs the operator plugin
+The first installed version is enabled and selected and serves the `hermes`
+alias (see [official aliases](runtime-packages.md#official-aliases)).
+`pohunek integration install --agent hermes --hermes-profile <name>` (target
+and access options in the [Hermes operator](hermes-operator.md) guide) then
+installs the operator plugin
 from the selected package and reports `provenance` `source=package` with the
 package digest.
 
@@ -67,25 +69,56 @@ recovery hint names the install command above.
 
 macOS has no Hermes package row: the Apple Silicon daemon archive carries the
 signed catalog and no runtime package
-([#929](https://github.com/zajca/pohunek/issues/929)), so a macOS host cannot
-install the operator plugin until darwin packages are attested.
+([#929](https://github.com/zajca/pohunek/issues/929)), so a macOS host has
+no source of Hermes: its daemon serves no `hermes` session and the operator
+plugin cannot be installed until darwin packages are attested.
 
-Until the built-in is removed
-([#147](https://github.com/zajca/pohunek/issues/147)), the built-in Hermes
-descriptor, detection manifest and `hermes-v1` version parser serve `hermes`
-sessions on a host that has no installed, enabled and selected official
-package. An operator plugin that an older CLI installed from its compiled copy
+On a host without the package nothing serves `hermes`:
+
+- `pohunek session new --agent hermes` fails with `agent_profile_not_found`,
+  whose hint names `pohunek plugin install runtime/packages/hermes.tar.zst
+  --catalog runtime/runtime-catalog.json` (run from the extracted release
+  archive). After the catalog install the same request launches a session
+  pinned to the package.
+- A host profile with `base = "hermes"` and no `package`/`digest` keys fails
+  with `runtime_not_installed`; its hint names the install and then `pohunek
+  plugin profile migrate <name>`. While the package serves `hermes`, such a
+  profile needs that migration before it launches.
+- The assistant answers `no_capable_agent` when no package serves `codex`,
+  `claude` or `hermes` and no capable host profile exists; a `hermes` on the
+  daemon's `PATH` alone does not make it capable.
+- A `hermes` started outside pohunek or in the foreground of a shell session
+  is not attributed to Hermes: process recognition reads the package's
+  `detect.toml`.
+- A session the built-in Hermes of an earlier release launched (pinned, or a
+  v0.33.0 record without a launch binding) is refused on resume, fork and
+  every interaction (input, attach, resize, rename, metadata) with
+  `runtime_builtin_removed`, whose hint names the install and a new session
+  with `pohunek session new --agent hermes`; only stop and remove still work.
+  With the package installed, the live session can be used again, resume
+  answers `runtime_served_by_package` and fork `agent_fork_unsupported`: a
+  session is never rebound to another runtime source. Without the package,
+  `pohunekd upgrade-preflight` reports every live built-in Hermes session as
+  `would_lose_recovery` (`runtime_source_not_served`) whether or not it could
+  resume. No earlier release archive carries this package, so such a session
+  cannot be moved onto it before the upgrade: finish or stop it first.
+- Uninstalling or disabling the package leaves `hermes` unserved.
+
+An operator plugin that an older CLI installed from its compiled copy
 reports `provenance` `source=embedded`; `integration update` moves it to the
 package.
 
 ## What the package declares
 
-The descriptor equals the built-in `crates/daemon/src/agent/builtin/hermes.toml`
+The descriptor equals the built-in Hermes descriptor release 0.34.2 shipped
 except for two fields: `detect_manifest` names the package's `detect.toml`
-instead of the embedded `hermes` manifest, and the version probe is the
-data-driven `semver-line-v1` parser instead of the compiled `hermes-v1` one.
-`detect.toml` is byte for byte the built-in
-`crates/daemon/src/detect/manifests/hermes.toml`.
+instead of that release's embedded `hermes` manifest, and the version probe is
+the data-driven `semver-line-v1` parser instead of that release's compiled
+`hermes-v1` parser, which this daemon does not compile in. `detect.toml` is
+byte for byte the built-in detection manifest of release 0.34.2. Golden copies
+of both built-in files are in `compat/hermes/builtin-v0.34/` (`runtime.toml`,
+`detect.toml`), each below a two-line header that names its source path and
+tag; the package tests compare the package with them.
 
 - Launch: `hermes chat`; resume is `hermes chat --resume <reference>` with an
   `id` reference; fork is unsupported. Later input is a bracketed paste
@@ -145,7 +178,7 @@ digest.
   `catalog`); the packaged skill gets one extra line, so the installed bytes
   show which source supplied them. Its scenarios:
   - `the_signed_hermes_package_is_selected_and_failed_installs_preserve_it`:
-    descriptor and manifest parity with the built-in files above, the supported
+    descriptor and manifest parity with the v0.34.2 goldens above, the supported
     range equal to `compat/hermes/compatibility-lock.json`, the probe accepting
     the locked banner and refusing `Hermes Agent v0.20.1 (future)`, and a
     `--sha256` install (`package_runtime_not_claimable`) and a corrupt archive
@@ -171,6 +204,14 @@ digest.
     a confirmed uninstall.
   - `sidecar_violations_in_a_signed_package_fail_install`: a signed package
     whose sidecar contract is violated never reaches the plugin tree.
+  - `hermes_launches_only_from_the_installed_official_package`: on a host
+    whose `PATH` finds a fake `hermes` of the locked release and no package is
+    installed, `session new --agent hermes` is refused with
+    `agent_profile_not_found` and the release install as the hint, and the
+    assistant answers `no_capable_agent`; after the catalog install the same
+    request launches a session pinned to the package (which then refuses
+    `plugin uninstall` with `package_referenced`), and the assistant picks
+    `hermes`.
 - `a_real_hermes_turn_uses_the_selected_package_and_public_session_screen` is
   `#[ignore]`d. It installs the package, installs the operator plugin from it
   into an isolated `HERMES_HOME`, launches a real pinned Hermes with `pohunek

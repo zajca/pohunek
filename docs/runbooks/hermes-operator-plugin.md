@@ -10,7 +10,8 @@ remain under the operator's control.
 - Use a matching Pohunek CLI, daemon, and `pohunek-sessiond` release on the
   host. Install the daemon archive as a set so the worker remains beside the
   daemon.
-- Install the official Hermes runtime package before the plugin. The plugin's
+- Install the official Hermes runtime package before the plugin. The daemon
+  serves `hermes` sessions only from this package, and the plugin's
   operator payload comes only from the installed, enabled and selected
   `pohunek.runtime.hermes` package; without it `integration install` and
   `update` fail with `hermes_package_not_installed` and change nothing. From an
@@ -59,7 +60,9 @@ For each host after that one-time transition:
    pohunek integration doctor --agent hermes --hermes-profile canary --json
    ```
 
-5. Launch one managed Hermes canary. Verify its reported native identity,
+5. Confirm the official Hermes package is installed (`pohunek plugin list`
+   shows `pohunek.runtime.hermes` enabled and selected; see Preconditions),
+   then launch one managed Hermes canary. Verify its reported native identity,
    continuation identity replacement after `pre_llm_call`, rendered screen,
    incremental output, bounded wait, and native resume. Hermes fork must return
    typed unsupported data rather than creating a child.

@@ -1080,7 +1080,7 @@ enum DaemonAction {
 enum SessionAction {
     /// Start a new session.
     New {
-        /// Agent name to start: an installed runtime (`shell`, `hermes`, or a package runtime such as `codex` or `claude`) or a host
+        /// Agent name to start: an installed runtime (the built-in `shell`, or a package runtime such as `codex`, `claude` or `hermes`) or a host
         /// profile, resolved daemon-side on the target host.
         #[arg(long, default_value = "shell")]
         agent: String,

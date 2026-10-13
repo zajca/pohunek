@@ -345,11 +345,11 @@ unknown-schema file is a typed error and is never replaced.
 The daemon opens `<state>/plugins` (`pohunek_paths::PLUGINS_SUBDIR`, exact
 `0700`, owner-owned) at startup through `package::registry::Registry::open_at`;
 an unsafe directory fails startup with `plugin_store_unavailable`. A registry
-record that cannot be read keeps the daemon running on the built-in runtimes
+record that cannot be read keeps the daemon running on the built-in `shell`
 and is reported by the host (package-pinned sessions are then incompatible).
 
-- A package root holds `runtime.toml` at its top level (the runtime descriptor
-  shape of the built-ins) and the detection manifest the descriptor names in
+- A package root holds `runtime.toml` at its top level (the runtime descriptor)
+  and the detection manifest the descriptor names in
   `detect_manifest`, as a package-relative file. Both are read through the
   verified root, so only authenticated bytes are parsed.
 - `PackageSource` loads, for fresh launches, the selected digest of each
@@ -407,11 +407,10 @@ and is reported by the host (package-pinned sessions are then incompatible).
   directory itself is never loaded.
 - Claim rules: `shell` is never claimable. An official alias (a reserved runtime
   id other than `shell`) is served only by a package the signed catalog
-  authorizes as official for that exact package id, runtime id and digest; it
-  takes the alias over from the built-in runtime (`SourceTrust::Official` in the
-  runtime registry, whatever the source order), and disabling or uninstalling it
-  returns the alias to the built-in where one exists (`hermes`); `codex` and
-  `claude` have no built-in, so their alias is then served by nothing. A runtime id served by a loaded package of
+  authorizes as official for that exact package id, runtime id and digest
+  (`SourceTrust::Official` in the runtime registry, whatever the source order).
+  No official alias has a built-in, so disabling or uninstalling the package
+  leaves its alias served by nothing. A runtime id served by a loaded package of
   a different package id is a conflict. Trust `explicit_digest` requires the
   archive digest to equal the supplied digest and is never official, and a
   linked directory is never official, so both are refused for an alias; trust

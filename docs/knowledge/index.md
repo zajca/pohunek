@@ -43,8 +43,9 @@ Start here:
   package](guides/claude-package.md) does the same for Claude Code (the only
   source of `claude`); the
   [Hermes runtime package](guides/hermes-package.md) documents the official
-  Hermes package with its operator plugin payload, where releases ship it, and
-  how its tests, CI and the release keep it honest.
+  Hermes package (the only source of `hermes`) with its operator plugin
+  payload, where releases ship it, and how its tests, CI and the release keep
+  it honest.
   [Environment and executable resolution](guides/environment-resolution.md)
   documents the macOS `PATH` policy. The
   [Hermes operator](guides/hermes-operator.md) documents the managed plugin,

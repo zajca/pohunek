@@ -63,7 +63,8 @@ pub(crate) enum HookAgentArg {
     Runtime(RuntimeId),
 }
 
-/// Wire names of the built-in agents, offered to help and completion.
+/// Agent names the selector handles in the CLI itself (the local Hermes
+/// operator lifecycle), offered to help and completion.
 const BUILTIN_AGENT_NAMES: [&str; 1] = ["hermes"];
 
 impl std::str::FromStr for HookAgentArg {
@@ -79,8 +80,8 @@ impl std::str::FromStr for HookAgentArg {
     }
 }
 
-/// Clap parser of [`HookAgentArg`] that offers the built-in names as possible
-/// values without restricting the argument to them.
+/// Clap parser of [`HookAgentArg`] that offers [`BUILTIN_AGENT_NAMES`] as
+/// possible values without restricting the argument to them.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HookAgentParser;
 

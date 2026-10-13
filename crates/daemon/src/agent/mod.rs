@@ -508,7 +508,7 @@ mod tests {
     use pohunek_test_support::process_env::ProcessEnv;
     use protocol::ErrorClass;
 
-    use super::host::{launch_command, RuntimeHost};
+    use super::host::launch_command;
     use super::{
         build_pty_command, fork_pty_command_from_launch, resolve_binary,
         resume_pty_command_from_launch, served_native_launch, trusted_program, which_executable,
@@ -822,8 +822,8 @@ mod tests {
     }
 
     #[test]
-    fn built_in_runtimes_return_expected_input_rules() {
-        let host = RuntimeHost::default();
+    fn served_runtimes_return_expected_input_rules() {
+        let host = crate::agent::host::fixture::official_host();
         let rules = |kind: protocol::RuntimeRef| super::input_rules_for_kind(&host, &kind);
 
         let hermes = rules(protocol::RuntimeRef::hermes());

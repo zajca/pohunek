@@ -227,8 +227,11 @@ refused the same way; migrate it with an intermediate release.
 8. For important projects, verify `pohunek project show <id-or-label> --json`
    and resolved actions with `pohunek project actions <id-or-label> --json`.
 
-For the Hermes M2 runtime, inspect the `hermes` entry after upgrade. It is
-launchable only with `version: "0.20.0"` and `supported: true`; a missing
+For the Hermes M2 runtime, inspect the `hermes` entry after upgrade. Only the
+official Hermes package serves it, so install that package from the new
+release's daemon archive first (`pohunek plugin install
+runtime/packages/hermes.tar.zst --catalog runtime/runtime-catalog.json
+--yes`). It is launchable only with `version: "0.20.0"` and `supported: true`; a missing
 binary has no version-policy result, while a wrong or unparseable version is
 reported as unsupported. The model-free compatibility check, `cargo xtask
 hermes compatibility --bin-dir ABS --package ARCHIVE`, needs the pinned Hermes
@@ -593,9 +596,9 @@ the upgrade is not what ends it.
   else stands in and no command rebinds the session. Finish the work in the
   live session, then continue in a new one with `pohunek session new --agent
   <runtime>` (the `detail` names the runtime), or accept the loss. When the
-  session's runtime resolves nowhere on the new binary (the built-in Codex or
-  Claude Code without the official package, or a package that is not
-  installed), the
+  session's runtime resolves nowhere on the new binary (the built-in Codex,
+  Claude Code or Hermes without the official package, or a package that is
+  not installed), the
   session is reported this way even if it cannot resume, because every
   interaction with it (input, attach, resize, rename, metadata) would be
   refused too: install the runtime first (the `detail` names the official
@@ -660,14 +663,19 @@ upgrading:
    Sessions launched from the built-in keep running; finish their work before
    the upgrade, or accept losing their native recovery.
 
-   A release that compiles neither Codex nor Claude Code in (every release
-   after 0.34.x) serves `codex` and `claude` only from their packages. A live
-   Codex or Claude session launched from the built-in is adopted, but resume
-   and fork are refused, and without the installed package every interaction
-   with it (input, attach, resize, rename, metadata) is refused too, whether or
-   not it could resume (`runtime_builtin_removed`; the preflight reports it at
-   risk and its detail says so). Installing the package in step 1 keeps such a
-   session usable after the upgrade. On a host that keeps no Codex or Claude
+   A release that compiles none of Codex, Claude Code and Hermes in (every
+   release after 0.34.x) serves `codex`, `claude` and `hermes` only from their
+   packages. A live Codex, Claude or Hermes session launched from the built-in
+   is adopted, but resume and fork are refused, and without the installed
+   package every interaction with it (input, attach, resize, rename, metadata)
+   is refused too, whether or not it could resume (`runtime_builtin_removed`;
+   the preflight reports it at risk and its detail says so). Installing the
+   package in step 1 keeps such a session usable after the upgrade. No release
+   up to 0.34.x ships the Hermes package, so step 1 has no Hermes package to
+   install: finish or stop built-in Hermes sessions before the upgrade, or
+   accept the loss (`--accept-runtime-loss`) and install the Hermes package
+   from the new release's archive afterwards to finish their work in the live
+   session. On a host that keeps no Codex or Claude
    Code (macOS has no package yet, #929), the hooks pohunek installed into
    `~/.codex` or `~/.claude` stay removable after the upgrade with
    `pohunek integration uninstall --agent codex` or

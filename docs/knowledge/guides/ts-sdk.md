@@ -100,4 +100,8 @@ From the repository root, the SDK workspace gates are `bun install
 test sdk/ts/scripts` (the release pack contract). The real-daemon suites
 (`sdk/ts/sdk/test/e2e.test.ts` and `hermes-plugin.e2e.test.ts`) run with
 `POHUNEK_E2E=1` against the built `pohunekd`, `pohunek-sessiond`, and
-`pohunek` binaries.
+`pohunek` binaries. The Hermes plugin e2e also needs the official Hermes
+package archive (`POHUNEK_HERMES_PACKAGE`, from `scripts/build-hermes-package`)
+and a throwaway catalog with its trust anchor (`POHUNEK_HERMES_CATALOG_DIR`,
+from `cargo xtask hermes throwaway-catalog`), because the daemon serves
+`hermes` only from that package.

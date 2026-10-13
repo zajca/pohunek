@@ -1,9 +1,9 @@
-//! The runtimes compiled into the daemon.
+//! The runtime compiled into the daemon.
 //!
-//! Hermes is parsed from an embedded `runtime.toml` descriptor. Codex and
-//! Claude are not compiled in; only their official runtime packages serve
-//! them. The shell has no package identity and no native resume, so it is
-//! assembled from explicit parts around the host's login shell.
+//! The shell is the only built-in runtime. Codex, Claude and Hermes are not
+//! compiled in; only their official runtime packages serve them. The shell has
+//! no package identity and no native resume, so it is assembled from explicit
+//! parts around the host's login shell.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,10 +16,7 @@ use super::definition::{
 };
 use super::registry::{RuntimeSource, SourceTrust};
 use crate::agent::InputRules;
-use crate::detect::{self, Manifest};
-
-/// Embedded descriptors of the built-in agent runtimes.
-const EMBEDDED_DESCRIPTORS: [&str; 1] = [include_str!("../builtin/hermes.toml")];
+use crate::detect;
 
 /// Display name of the shell runtime.
 const SHELL_DISPLAY_NAME: &str = "Shell";
@@ -32,7 +29,7 @@ const SHELL_DISPLAY_NAME: &str = "Shell";
 /// integration handler of its own.
 const SHELL_HOOK_SCHEMA: &str = "identity-subagent-v1";
 
-/// Supplies the shell and Hermes definitions.
+/// Supplies the shell definition.
 #[derive(Debug, Clone)]
 pub struct BuiltinSource {
     shell_program: String,
@@ -75,7 +72,7 @@ impl BuiltinSource {
             default_args: Vec::new(),
             input_rules: InputRules::unrestricted(false, Duration::ZERO),
             submit_delay_configurable: false,
-            manifest: embedded_manifest("shell")?,
+            manifest: Arc::new(detect::generic_shell_manifest().clone()),
             native: None,
             prompt_arg: false,
             version_probe_parser: None,
@@ -91,26 +88,6 @@ impl RuntimeSource for BuiltinSource {
     }
 
     fn load(&self) -> Result<Vec<RuntimeDefinition>, DefinitionError> {
-        let mut definitions = vec![self.shell_definition()?];
-        for source in EMBEDDED_DESCRIPTORS {
-            definitions.push(RuntimeDefinition::from_toml(
-                source,
-                |package| DefinitionOrigin::Builtin {
-                    package: Some(package),
-                },
-                embedded_manifest,
-            )?);
-        }
-        Ok(definitions)
+        Ok(vec![self.shell_definition()?])
     }
-}
-
-/// Resolves the name of a detection manifest embedded in the daemon.
-fn embedded_manifest(name: &str) -> Result<Arc<Manifest>, DefinitionError> {
-    let manifest = match name {
-        "shell" => detect::generic_shell_manifest(),
-        "hermes" => detect::hermes_manifest(),
-        _ => return Err(DefinitionError::UnknownManifest),
-    };
-    Ok(Arc::new(manifest.clone()))
 }

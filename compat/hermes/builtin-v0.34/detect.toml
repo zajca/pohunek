@@ -1,3 +1,6 @@
+# Golden copy of crates/daemon/src/detect/manifests/hermes.toml at tag v0.34.2.
+# Do not edit: the parity tests compare the runtime package with these bytes.
+
 # Hermes Agent 0.20.0 activity manifest for both local terminal interfaces.
 
 [process]

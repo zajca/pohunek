@@ -72,8 +72,10 @@ Options:
 
 start options:
   --agent NAME          Resumable agent profile to start in every session set
-                        (repeatable, at least one; e.g. hermes, or claude or
-                        codex where their official packages are installed).
+                        (repeatable, at least one): a package runtime with
+                        native resume that you install yourself; the macOS
+                        archive carries no claude, codex or hermes package
+                        (#929).
                         Its native session reference proves explicit recovery.
   --shell-sessions N    Shell sessions per set (default: $default_shell_sessions)
 EOF
@@ -435,7 +437,7 @@ preflight() {
 
 start_run() {
   [ ! -e "$state_dir/run.json" ] || die "a run already exists in $state_dir; use 'continue', or move the directory away to start over"
-  [ -s "$agents_file" ] || die "start needs at least one --agent with native resume (e.g. hermes, or claude or codex with their official packages installed)"
+  [ -s "$agents_file" ] || die "start needs at least one --agent with native resume: a package runtime you install yourself (the macOS archive carries no claude, codex or hermes package, #929)"
   preflight
   mkdir -p "$state_dir"
   chmod 700 "$state_dir"

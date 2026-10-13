@@ -11,6 +11,8 @@
 
 #[path = "support/native.rs"]
 mod native;
+#[path = "../../daemon/tests/support/official_runtimes.rs"]
+mod official_runtimes;
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -33,8 +35,9 @@ const GENERATION: &str = "abcd2345";
 const SESSION: &str = "s-01KYAPVPFVHD56Z69B9CX3XWN2";
 /// Worker of the session.
 const WORKER: &str = "w-1";
-/// Built-in runtime with a hook-reported native identity, whose definition
-/// the daemon under test serves to verify the journaled identity.
+/// Runtime with a hook-reported native identity, whose definition the daemon
+/// under test serves from its official package
+/// ([`Host::install_official_packages`]) to verify the journaled identity.
 const IDENTITY_RUNTIME: &str = "hermes";
 
 struct Host {
@@ -82,6 +85,16 @@ impl Host {
         }
     }
 
+    /// Installs the official runtime packages into the plugin root the daemon
+    /// under test reads.
+    async fn install_official_packages(&self) {
+        let scratch = self.root.join("official-packages");
+        std::fs::create_dir_all(&scratch).expect("create the package scratch directory");
+        official_runtimes::OfficialCatalog::new()
+            .preinstall(&self.context.paths().plugins_dir(), &scratch)
+            .await;
+    }
+
     /// The directory a release archive unpacks to: the real daemon only.
     fn archive(&self) -> PathBuf {
         let archive = self.root.join("archive");
@@ -98,8 +111,9 @@ impl Host {
     }
 
     /// Like [`Self::seed_live_session`]; with `reported_identity` the session
-    /// is an agent of the built-in hook runtime [`IDENTITY_RUNTIME`] whose
-    /// worker journaled the active identity it reported.
+    /// is an agent of the hook runtime [`IDENTITY_RUNTIME`], recorded with a
+    /// recovery pinned to its official package, whose worker journaled the
+    /// active identity it reported and no hook schema.
     fn seed_session(&self, broken_record: bool, reported_identity: bool) {
         let executable = self.root.join("libexec/pohunek-sessiond");
         let mut info = session_info();
@@ -129,6 +143,23 @@ impl Host {
         Store::new(store.clone())
             .record_session(&record)
             .expect("record session");
+        if reported_identity {
+            let body = std::fs::read_to_string(&store).expect("read store");
+            let mut line: serde_json::Value =
+                serde_json::from_str(body.trim()).expect("store line");
+            // The recovery a daemon of this release records for the session,
+            // pinned to the package it launched the session from.
+            line["recovery"] = serde_json::json!({
+                "session_id": SESSION,
+                "agent": IDENTITY_RUNTIME,
+                "agent_base": IDENTITY_RUNTIME,
+                "cwd": "/work",
+                "cols": 80,
+                "rows": 24,
+                "launch_binding": official_runtimes::package_binding(IDENTITY_RUNTIME),
+            });
+            std::fs::write(&store, format!("{line}\n")).expect("write store");
+        }
         if broken_record {
             let body = std::fs::read_to_string(&store).expect("read store");
             let mut line: serde_json::Value =
@@ -344,6 +375,7 @@ async fn a_missing_daemon_is_a_staged_binary_error() {
 #[tokio::test]
 async fn a_live_agent_session_that_reported_its_identity_is_adoptable_under_the_real_daemon() {
     let host = Host::new();
+    host.install_official_packages().await;
     host.seed_session(false, true);
     let archive = host.archive();
 

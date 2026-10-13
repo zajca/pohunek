@@ -2,10 +2,10 @@
 //!
 //! A [`RuntimeRegistry`] resolves a protocol [`protocol::RuntimeId`] to an
 //! immutable [`RuntimeDefinition`]. Definitions come from [`RuntimeSource`]s;
-//! the [`BuiltinSource`] supplies the shell, Claude and Hermes descriptors;
-//! local and third-party sources cannot claim the reserved ids (these and
-//! `codex`), while a catalog-authorized package serves an official alias in
-//! place of its built-in, or, for `codex`, as its only source.
+//! the [`BuiltinSource`] supplies the shell; local and third-party sources
+//! cannot claim the reserved ids (the shell and the official aliases `codex`,
+//! `claude` and `hermes`), while a catalog-authorized package is the only
+//! source of an official alias.
 
 mod builtin;
 mod claim;
