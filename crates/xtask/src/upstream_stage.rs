@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, BufRead as _, BufReader, Read as _, Seek as _, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{symlink, OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::process::CommandExt as _;
@@ -73,9 +73,64 @@ const NPM_DIR: &str = "npm";
 /// lockfile is about 70 KiB; the cap only bounds a hostile file.
 const MAX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Wall-clock limit of `npm ci`. Pi installs about 150 packages; a run that
-/// takes a quarter of an hour is hung on the network, not slow.
-const INSTALL_TIMEOUT: Duration = Duration::from_mins(15);
+/// Wall-clock limit shared by all `npm ci` attempts of one runtime. Pi installs
+/// about 150 packages; a run that takes a quarter of an hour is hung on the
+/// network, not slow. Stalls end earlier, through the per-request limits below.
+pub(crate) const INSTALL_TIMEOUT: Duration = Duration::from_mins(15);
+
+/// Idle limit on each registry socket, passed as npm's `fetch-timeout`. npm's
+/// default of 5 minutes lets one stalled request hold an attempt for 15 minutes.
+const NPM_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Retries npm makes of a request that failed before its response headers,
+/// passed as `fetch-retries`. npm's default. A request that stalls before its
+/// headers costs `NPM_FETCH_RETRIES + 1` timeouts plus the backoffs below.
+const NPM_FETCH_RETRIES: u32 = 2;
+
+/// First backoff before a request retry, passed as `fetch-retry-mintimeout`.
+const NPM_FETCH_RETRY_MIN: Duration = Duration::from_secs(1);
+
+/// Largest backoff before a request retry, passed as `fetch-retry-maxtimeout`.
+/// npm's default is 60 seconds, which would hold a retry longer than a stall
+/// is worth; the next `npm ci` attempt covers a registry that stays slow.
+const NPM_FETCH_RETRY_MAX: Duration = Duration::from_secs(10);
+
+/// Multiplier of the backoff per request retry, passed as
+/// `fetch-retry-factor`. Pinned to npm's default so the backoff sequence is the
+/// same across npm releases.
+const NPM_FETCH_RETRY_FACTOR: u32 = 10;
+
+/// `npm ci` attempts per runtime. A stall after the response headers ends
+/// `npm ci` without a request retry, so the attempt is the retry. Budget per
+/// attempt when every request stalls before its headers: 3 timeouts of 30 s
+/// plus backoffs of 1 s and 10 s = 101 s. Three attempts take at most about
+/// 5 minutes, inside `INSTALL_TIMEOUT`, which bounds all attempts together.
+pub(crate) const NPM_CI_ATTEMPTS: u32 = 3;
+
+/// npm error codes that name a network failure, the only failures an attempt
+/// is repeated for. Matched against the last `error code` line of npm's debug
+/// log. Integrity, lockfile and HTTP status failures are not listed, so they
+/// fail on the first attempt.
+const TRANSIENT_NPM_ERRORS: &[&str] = &[
+    // Request failed after npm's own request retries.
+    "FETCH_ERROR",
+    // Socket idle past `fetch-timeout`, during the response headers or body.
+    "EIDLETIMEOUT",
+    "ETIMEDOUT",
+    "ESOCKETTIMEDOUT",
+    "ECONNRESET",
+    "ECONNREFUSED",
+    "ECONNABORTED",
+    "EPIPE",
+    // DNS lookup did not complete.
+    "EAI_AGAIN",
+];
+
+/// Bytes of npm's debug log printed after a failed attempt. The file ends with
+/// the error block and one `silly unfinished npm timer reifyNode:...` line per
+/// package still in flight; npm keeps 15 sockets open per origin by default,
+/// so the in-flight packages fit in a few kilobytes.
+const NPM_LOG_TAIL_BYTES: u64 = 16 * 1024;
 
 /// Wall-clock limit of the `--version` probe, which only prints a banner.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -397,6 +452,8 @@ pub enum StageError {
     },
     /// A delegated command failed.
     Command {
+        /// Runtime the command was staging.
+        runtime: String,
         /// What the command was for.
         step: &'static str,
         /// How it ended.
@@ -425,10 +482,16 @@ impl fmt::Display for StageError {
                 }
                 Ok(())
             }
-            Self::Command { step, outcome } => match outcome {
-                Outcome::Exit(Some(code)) => write!(f, "{step} exited with code {code}"),
-                Outcome::Exit(None) => write!(f, "{step} was killed by a signal"),
-                Outcome::TimedOut => write!(f, "{step} exceeded its time limit"),
+            Self::Command {
+                runtime,
+                step,
+                outcome,
+            } => match outcome {
+                Outcome::Exit(Some(code)) => {
+                    write!(f, "{step} of `{runtime}` exited with code {code}")
+                }
+                Outcome::Exit(None) => write!(f, "{step} of `{runtime}` was killed by a signal"),
+                Outcome::TimedOut => write!(f, "{step} of `{runtime}` exceeded its time limit"),
             },
             Self::Banner { expected, actual } => write!(
                 f,
@@ -512,7 +575,12 @@ pub(crate) fn run(action: UpstreamAction, default_root: &Path) -> Result<(), Xta
         } => {
             let root = root.unwrap_or_else(|| default_root.to_path_buf());
             let path = std::env::var_os("PATH").ok_or_else(|| refuse("PATH", Fault::Missing))?;
-            let summary = stage_upstream(&root, &runtime, &out, &Tools { npm, path })?;
+            let tools = Tools {
+                npm,
+                path,
+                install_limit: INSTALL_TIMEOUT,
+            };
+            let summary = stage_upstream(&root, &runtime, &out, &tools, &mut io::stderr().lock())?;
             println!(
                 "compat stage-upstream ok: {runtime} {} ({} files, {} links) -> {}",
                 summary.release,
@@ -541,6 +609,9 @@ pub(crate) struct Tools {
     /// `PATH` handed to npm, the provisioner and the probe: it must reach
     /// `node` for an npm runtime and the provisioner's own tools otherwise.
     pub(crate) path: OsString,
+    /// Wall-clock limit of all `npm ci` attempts of one runtime. Production
+    /// passes `INSTALL_TIMEOUT`; tests pass a shorter limit.
+    pub(crate) install_limit: Duration,
 }
 
 /// What a stage or a verification covered.
@@ -1558,6 +1629,7 @@ pub(crate) fn run_bounded(
     limit: Duration,
     capture: bool,
     output_limit: u64,
+    runtime: &str,
     step: &'static str,
 ) -> Result<Vec<u8>, XtaskError> {
     command
@@ -1649,6 +1721,7 @@ pub(crate) fn run_bounded(
     };
     if outcome != Outcome::Exit(Some(0)) {
         return Err(XtaskError::UpstreamStage(StageError::Command {
+            runtime: runtime.to_owned(),
             step,
             outcome,
         }));
@@ -1680,17 +1753,119 @@ fn check_destination(destination: &Path, runtime: &str) -> Result<(), XtaskError
     }
 }
 
+/// One runtime's `npm ci` inputs, and where the diagnostics of failed
+/// attempts go.
+struct NpmCi<'a> {
+    runtime: &'a str,
+    npm: &'a Path,
+    pins: &'a NpmPins,
+    project: &'a Project,
+    tools: &'a Tools,
+    diagnostics: &'a mut dyn Write,
+}
+
+/// Installs the committed npm project into `stage`, repeating the attempt for
+/// a network failure only, while the install limit lasts.
 fn install(
     stage: &Path,
     scratch: &Path,
     lock: &Lock,
-    pins: &NpmPins,
-    project: &Project,
-    npm: &Path,
-    tools: &Tools,
+    ci: &mut NpmCi<'_>,
 ) -> Result<(), XtaskError> {
     let lib = stage.join(PROJECT_DIR);
-    fs::create_dir_all(&lib).map_err(io_error(&lib))?;
+    let (home, cache, tmp, logs) = (
+        scratch.join("home"),
+        scratch.join("cache"),
+        scratch.join("tmp"),
+        scratch.join("logs"),
+    );
+    // npm refuses one file loaded as both the user and the global config.
+    let (user_rc, global_rc) = (scratch.join("user.npmrc"), scratch.join("global.npmrc"));
+    for dir in [&home, &cache, &tmp, &logs] {
+        private_dir(dir)?;
+    }
+    for rc in [&user_rc, &global_rc] {
+        File::create(rc).map_err(io_error(rc))?;
+    }
+
+    let scripts_flag = if ci.pins.scripts {
+        "--ignore-scripts=false"
+    } else {
+        "--ignore-scripts"
+    };
+    let deadline = Instant::now() + ci.tools.install_limit;
+    let mut attempt = 1;
+    loop {
+        // Every attempt starts from the committed bytes: `scan_tree` hashes the
+        // whole stage, so a file a failed attempt left behind must not survive.
+        reset_project(&lib, ci.project)?;
+        let attempt_logs = logs.join(attempt.to_string());
+        private_dir(&attempt_logs)?;
+        // Only PATH (npm and its scripts need `node`) comes from the caller; no
+        // token, npmrc or registry setting of the host reaches npm.
+        let mut command = Command::new(ci.npm);
+        command
+            .args(["ci", scripts_flag, "--no-audit", "--no-fund"])
+            .current_dir(&lib)
+            .env_clear()
+            .env("PATH", &ci.tools.path)
+            .env("HOME", &home)
+            .env("TMPDIR", &tmp)
+            .env("npm_config_cache", &cache)
+            .env("npm_config_userconfig", &user_rc)
+            .env("npm_config_globalconfig", &global_rc)
+            .env("npm_config_registry", &ci.project.registry)
+            .env("npm_config_update_notifier", "false")
+            .env("npm_config_logs_dir", &attempt_logs)
+            .env(
+                "npm_config_fetch_timeout",
+                NPM_FETCH_TIMEOUT.as_millis().to_string(),
+            )
+            .env("npm_config_fetch_retries", NPM_FETCH_RETRIES.to_string())
+            .env(
+                "npm_config_fetch_retry_mintimeout",
+                NPM_FETCH_RETRY_MIN.as_millis().to_string(),
+            )
+            .env(
+                "npm_config_fetch_retry_maxtimeout",
+                NPM_FETCH_RETRY_MAX.as_millis().to_string(),
+            )
+            .env(
+                "npm_config_fetch_retry_factor",
+                NPM_FETCH_RETRY_FACTOR.to_string(),
+            );
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let error = match run_bounded(&mut command, remaining, false, 0, ci.runtime, "npm ci") {
+            Ok(_) => break,
+            Err(XtaskError::UpstreamStage(error)) => error,
+            Err(other) => return Err(other),
+        };
+        let retry = attempt < NPM_CI_ATTEMPTS && is_transient(&error, &attempt_logs);
+        report_attempt(ci.diagnostics, ci.runtime, attempt, &error, &attempt_logs);
+        if !retry {
+            return Err(XtaskError::UpstreamStage(error));
+        }
+        attempt += 1;
+    }
+
+    let bin_dir = stage.join(BIN_DIR);
+    fs::create_dir_all(&bin_dir).map_err(io_error(&bin_dir))?;
+    let link = bin_dir.join(&lock.binary);
+    let target = format!(
+        "../{PROJECT_DIR}/node_modules/{}/{}",
+        ci.pins.package, ci.project.bin_path
+    );
+    symlink(&target, &link).map_err(io_error(&link))
+}
+
+/// Empties `lib` and writes the committed manifest and lockfile into it.
+fn reset_project(lib: &Path, project: &Project) -> Result<(), XtaskError> {
+    match fs::remove_dir_all(lib) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => return Err(io_error(lib)(source)),
+    }
+    fs::create_dir(lib).map_err(io_error(lib))?;
     for (name, bytes) in [
         ("package.json", &project.manifest),
         ("package-lock.json", &project.lockfile),
@@ -1698,51 +1873,123 @@ fn install(
         let path = lib.join(name);
         fs::write(&path, bytes).map_err(io_error(&path))?;
     }
+    Ok(())
+}
 
-    let (home, cache, tmp) = (
-        scratch.join("home"),
-        scratch.join("cache"),
-        scratch.join("tmp"),
-    );
-    // npm refuses one file loaded as both the user and the global config.
-    let (user_rc, global_rc) = (scratch.join("user.npmrc"), scratch.join("global.npmrc"));
-    for dir in [&home, &cache, &tmp] {
-        private_dir(dir)?;
-    }
-    for rc in [&user_rc, &global_rc] {
-        File::create(rc).map_err(io_error(rc))?;
-    }
-
-    let scripts_flag = if pins.scripts {
-        "--ignore-scripts=false"
-    } else {
-        "--ignore-scripts"
+/// Whether a failed attempt may be repeated. A timeout has no budget left, and
+/// a signal or an error without a network code is not transient; an unreadable
+/// log fails closed.
+fn is_transient(error: &StageError, logs: &Path) -> bool {
+    let StageError::Command {
+        outcome: Outcome::Exit(Some(_)),
+        ..
+    } = error
+    else {
+        return false;
     };
-    // Only PATH (npm and its scripts need `node`) comes from the caller; no
-    // token, npmrc or registry setting of the host reaches npm.
-    let mut command = Command::new(npm);
-    command
-        .args(["ci", scripts_flag, "--no-audit", "--no-fund"])
-        .current_dir(&lib)
-        .env_clear()
-        .env("PATH", &tools.path)
-        .env("HOME", &home)
-        .env("TMPDIR", &tmp)
-        .env("npm_config_cache", &cache)
-        .env("npm_config_userconfig", &user_rc)
-        .env("npm_config_globalconfig", &global_rc)
-        .env("npm_config_registry", &project.registry)
-        .env("npm_config_update_notifier", "false");
-    run_bounded(&mut command, INSTALL_TIMEOUT, false, 0, "npm ci")?;
+    matches!(
+        last_npm_error_code(logs),
+        Ok(Some(code)) if TRANSIENT_NPM_ERRORS.contains(&code.as_str())
+    )
+}
 
-    let bin_dir = stage.join(BIN_DIR);
-    fs::create_dir_all(&bin_dir).map_err(io_error(&bin_dir))?;
-    let link = bin_dir.join(&lock.binary);
-    let target = format!(
-        "../{PROJECT_DIR}/node_modules/{}/{}",
-        pins.package, project.bin_path
+/// The newest debug log in `logs`. npm names its logs by their start time, so
+/// the greatest file name is the newest.
+fn newest_npm_log(logs: &Path) -> io::Result<Option<PathBuf>> {
+    let mut newest: Option<PathBuf> = None;
+    for entry in fs::read_dir(logs)? {
+        let path = entry?.path();
+        if newest
+            .as_ref()
+            .is_none_or(|current| path.file_name() > current.file_name())
+        {
+            newest = Some(path);
+        }
+    }
+    Ok(newest)
+}
+
+/// The code of the last `N error code CODE` line of the newest npm log.
+fn last_npm_error_code(logs: &Path) -> io::Result<Option<String>> {
+    let Some(path) = newest_npm_log(logs)? else {
+        return Ok(None);
+    };
+    let mut code = None;
+    for line in BufReader::new(File::open(path)?).lines() {
+        if let Some(found) = npm_error_code(&line?) {
+            code = Some(found.to_owned());
+        }
+    }
+    Ok(code)
+}
+
+/// The code of an npm log line of the form `<index> error code <CODE>`.
+fn npm_error_code(line: &str) -> Option<&str> {
+    let (index, rest) = line.split_once(' ')?;
+    if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    rest.strip_prefix("error code ").map(str::trim)
+}
+
+/// Prints a failed attempt and the tail of its npm debug log, one line each,
+/// prefixed with the runtime so the job log names what stalled.
+fn report_attempt(
+    out: &mut dyn Write,
+    runtime: &str,
+    attempt: u32,
+    error: &StageError,
+    logs: &Path,
+) {
+    // Diagnostics are best effort: a closed stderr must not replace the error.
+    let _ = writeln!(
+        out,
+        "[{runtime}] npm ci attempt {attempt} of {NPM_CI_ATTEMPTS} failed: {error}"
     );
-    symlink(&target, &link).map_err(io_error(&link))
+    match npm_log_tail(logs) {
+        Ok(Some((path, tail))) => {
+            let _ = writeln!(
+                out,
+                "[{runtime}] npm debug log {} (last {NPM_LOG_TAIL_BYTES} bytes):",
+                path.display()
+            );
+            for line in tail.lines() {
+                let _ = writeln!(out, "[{runtime}] {}", line.escape_debug());
+            }
+        }
+        Ok(None) => {
+            let _ = writeln!(out, "[{runtime}] npm wrote no debug log");
+        }
+        Err(source) => {
+            let _ = writeln!(
+                out,
+                "[{runtime}] could not read the npm debug log: {source}"
+            );
+        }
+    }
+}
+
+/// The path and the last `NPM_LOG_TAIL_BYTES` of the newest npm log, without
+/// the partial line the read starts in.
+fn npm_log_tail(logs: &Path) -> io::Result<Option<(PathBuf, String)>> {
+    let Some(path) = newest_npm_log(logs)? else {
+        return Ok(None);
+    };
+    let mut file = File::open(&path)?;
+    let start = file.metadata()?.len().saturating_sub(NPM_LOG_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(NPM_LOG_TAIL_BYTES)
+        .read_to_end(&mut bytes)?;
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if start > 0 {
+        match text.find('\n') {
+            Some(newline) => text.drain(..=newline).for_each(drop),
+            None => text.clear(),
+        }
+    }
+    Ok(Some((path, text)))
 }
 
 /// Runs `<stage>/bin/<binary> --version` in a private `HOME` and compares the
@@ -1755,6 +2002,7 @@ fn probe_banner(
     stage: &Path,
     scratch: &Path,
     lock: &Lock,
+    runtime: &str,
     tools: &Tools,
     matching: BannerMatch,
 ) -> Result<(), XtaskError> {
@@ -1776,6 +2024,7 @@ fn probe_banner(
         PROBE_TIMEOUT,
         true,
         PROBE_OUTPUT_LIMIT,
+        runtime,
         "--version probe",
     )?;
     let printed = String::from_utf8_lossy(&stdout);
@@ -1800,6 +2049,7 @@ pub(crate) fn stage_upstream(
     runtime: &str,
     out: &Path,
     tools: &Tools,
+    diagnostics: &mut dyn Write,
 ) -> Result<StageSummary, XtaskError> {
     let lock = read_lock(root, runtime)?;
     let inputs = read_inputs(root, runtime, &lock)?;
@@ -1809,7 +2059,19 @@ pub(crate) fn stage_upstream(
     check_destination(&destination, runtime)?;
     match &inputs {
         Inputs::Npm(pins, project) => {
-            stage_npm(&out, &destination, runtime, &lock, pins, project, tools)
+            let npm = match &tools.npm {
+                Some(npm) => npm.clone(),
+                None => find_in_path("npm", &tools.path)?,
+            };
+            let mut ci = NpmCi {
+                runtime,
+                npm: &npm,
+                pins,
+                project,
+                tools,
+                diagnostics,
+            };
+            stage_npm(&out, &destination, &lock, &mut ci)
         }
         Inputs::Provisioner(provisioner) => {
             stage_provisioned(&out, &destination, runtime, &lock, provisioner, tools)
@@ -1826,29 +2088,29 @@ pub(crate) fn stage_upstream(
 fn stage_npm(
     out: &Path,
     destination: &Path,
-    runtime: &str,
     lock: &Lock,
-    pins: &NpmPins,
-    project: &Project,
-    tools: &Tools,
+    ci: &mut NpmCi<'_>,
 ) -> Result<StageSummary, XtaskError> {
-    let npm = match &tools.npm {
-        Some(npm) => npm.clone(),
-        None => find_in_path("npm", &tools.path)?,
-    };
-    let scratch_dir = out.join(format!(".stage-{runtime}-{}", std::process::id()));
+    let scratch_dir = out.join(format!(".stage-{}-{}", ci.runtime, std::process::id()));
     private_dir(&scratch_dir)?;
     let scratch = Scratch(scratch_dir);
     let stage = scratch.0.join("stage");
     fs::create_dir(&stage).map_err(io_error(&stage))?;
 
-    install(&stage, &scratch.0, lock, pins, project, &npm, tools)?;
-    check_pins(&stage, lock, pins, project)?;
+    install(&stage, &scratch.0, lock, ci)?;
+    check_pins(&stage, lock, ci.pins, ci.project)?;
     let tree = scan_tree(&stage)?;
     let (sha256, links) = render_manifests(&tree);
     write_manifest(&stage.join(SHA256_MANIFEST), &sha256)?;
     write_manifest(&stage.join(LINKS_MANIFEST), &links)?;
-    probe_banner(&stage, &scratch.0, lock, tools, BannerMatch::Whole)?;
+    probe_banner(
+        &stage,
+        &scratch.0,
+        lock,
+        ci.runtime,
+        ci.tools,
+        BannerMatch::Whole,
+    )?;
     check_manifests(&stage)?;
 
     if destination.is_dir() {
@@ -1904,6 +2166,7 @@ fn check_stage_path(destination: &Path) -> Result<(), XtaskError> {
 fn provision(
     destination: &Path,
     scratch: &Path,
+    runtime: &str,
     lock: &Lock,
     provisioner: &Provisioner,
     tools: &Tools,
@@ -1925,6 +2188,7 @@ fn provision(
         PROVISION_TIMEOUT,
         true,
         PROBE_OUTPUT_LIMIT,
+        runtime,
         "provisioner",
     )?;
     let subject = "provisioner output";
@@ -1977,7 +2241,7 @@ fn stage_provisioned(
         complete: false,
     };
 
-    let entrypoint = provision(destination, &scratch.0, lock, provisioner, tools)?;
+    let entrypoint = provision(destination, &scratch.0, runtime, lock, provisioner, tools)?;
     for dir in [BIN_DIR, INPUTS_DIR] {
         let path = destination.join(dir);
         match fs::symlink_metadata(&path) {
@@ -1999,7 +2263,14 @@ fn stage_provisioned(
     let (sha256, links) = render_manifests(&tree);
     write_manifest(&destination.join(SHA256_MANIFEST), &sha256)?;
     write_manifest(&destination.join(LINKS_MANIFEST), &links)?;
-    probe_banner(destination, &scratch.0, lock, tools, BannerMatch::FirstLine)?;
+    probe_banner(
+        destination,
+        &scratch.0,
+        lock,
+        runtime,
+        tools,
+        BannerMatch::FirstLine,
+    )?;
     check_manifests(destination)?;
     partial.complete = true;
     Ok(summarize(lock, &tree, destination))

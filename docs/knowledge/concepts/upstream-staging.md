@@ -62,18 +62,23 @@ attestations made afterwards.
 
 ### npm releases
 
-For an npm lock the stage is an npm prefix: `lib/` is the npm project (`package.json`,
-`package-lock.json`, `node_modules/`) and `bin/<binary>` is a relative link into
-it. It runs `npm ci` with a cleared environment (only `PATH`, which must reach
-`node`, plus private `HOME`, cache and empty user and global npmrc files, so no
-token or registry setting of the host reaches npm), `--ignore-scripts` unless the
-lock says otherwise, and the registry of the lockfile. Then it checks the
-installed release and root integrity, the optional native digest, writes the
-manifests, runs `<binary> --version` in a private `HOME` and requires the lock's
-banner, and re-checks the manifests so a runtime that writes into its own
+For an npm lock the stage is an npm prefix: `lib/` is the npm project
+(`package.json`, `package-lock.json`, `node_modules/`) and `bin/<binary>` is a
+relative link into it. It runs `npm ci` with a cleared environment (only `PATH`,
+which must reach `node`, plus private `HOME`, cache and empty user and global npmrc
+files, so no token or registry setting of the host reaches npm), `--ignore-scripts`
+unless the lock says otherwise, and the registry of the lockfile. A registry socket
+that stays idle for 30 seconds is cut, and a failed attempt is repeated (up to 3
+attempts in all) only when npm's debug log names a network error; every attempt
+shares one 15-minute limit. A failed attempt prints the runtime's name and the tail
+of npm's debug log, which names the packages in flight. The limits and their budget
+are documented next to `INSTALL_TIMEOUT` in `crates/xtask/src/upstream_stage.rs`.
+Then it checks the installed release and root integrity, the optional native digest,
+writes the manifests, runs `<binary> --version` in a private `HOME` and requires the
+lock's banner, and re-checks the manifests so a runtime that writes into its own
 install is refused. The install runs in a scratch directory that is moved to
-`<dir>/<rt>/` only when every check passed, so a failed run leaves nothing
-behind. Node is not staged: the runner provides it.
+`<dir>/<rt>/` only when every check passed, so a failed run leaves nothing behind.
+Node is not staged: the runner provides it.
 
 ### Provisioned runtimes
 
