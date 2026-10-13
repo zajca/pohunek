@@ -12,10 +12,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 /// Current worker protocol version.
-pub const CURRENT_VERSION: Version = Version(6);
+pub const CURRENT_VERSION: Version = Version(7);
 
 /// Immediately preceding worker protocol version.
-pub const PREVIOUS_VERSION: Version = Version(5);
+pub const PREVIOUS_VERSION: Version = Version(6);
 
 /// First version with atomic attach snapshots.
 ///
@@ -36,6 +36,15 @@ pub const SUBAGENT_OBSERVATION_VERSION: Version = Version(5);
 /// base plus the daemon-selected `BaseEnv`, never from its own service-manager
 /// environment. A version-five peer neither sends nor accepts the field.
 pub const BASE_ENVIRONMENT_VERSION: Version = Version(6);
+
+/// First version with bounded PTY input.
+///
+/// From version seven `Initialize` carries the input stall bound, and a worker
+/// fails an input write that makes no progress within it with
+/// [`ControlCode::InputStalled`](crate::ControlCode::InputStalled). A
+/// version-six peer neither sends the bound nor receives that code, and its
+/// input writes stay unbounded.
+pub const INPUT_STALL_VERSION: Version = Version(7);
 
 /// Versions supported by this crate release.
 pub const SUPPORTED_RANGE: VersionRange = VersionRange {

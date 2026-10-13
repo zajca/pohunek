@@ -2,12 +2,12 @@
 //!
 //! A real `pohunek-sessiond` runs with the variables systemd and launchd give a
 //! supervised job plus an unrelated variable, and a real PTY child prints its
-//! environment. Protocol version six must hand the child exactly the base
+//! environment. Protocol version seven must hand the child exactly the base
 //! environment, the worker's `TERM`, the profile, and the worker's reserved
 //! `POHUNEK_*` values. A profile value overrides the base one, while a profile
 //! can neither shadow a reserved value nor pass a service-manager variable. A
-//! version-five session keeps inheriting the worker environment, but without
-//! service-manager variables.
+//! version-six session receives the same base environment; the input policy the
+//! daemon sends with `Initialize` is withheld from it.
 //!
 //! Build the worker first: `cargo build -p pohunek-session-worker --bin
 //! pohunek-sessiond`.
@@ -20,14 +20,15 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use pohunek_daemon::runtime::{Worker, WorkerError};
+use pohunek_daemon::runtime::{DataStream, Worker, WorkerError};
 use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::wait::wait_until;
 use pohunek_test_support::worker_binary;
 use pohunek_worker_protocol::{
-    is_denylisted, BaseEnv, ControlCode, DaemonId, Dimensions, Initialize, InitializeLimits,
-    LaunchIdentity, RuntimePhase, SecretEnv, SessionId, StopPolicy, TransactionId, Version,
-    CURRENT_VERSION, PREVIOUS_VERSION,
+    is_denylisted, read_frame, write_frame, AttachStart, BaseEnv, ControlCode, DaemonId, DataFrame,
+    Dimensions, FrameHeader, FrameKind, Initialize, InitializeLimits, InputFragment, InputPolicy,
+    LaunchIdentity, RuntimePhase, SecretBytes, SecretEnv, SessionId, StopPolicy, StreamId,
+    TransactionId, Version, WriteId, CURRENT_VERSION, PREVIOUS_VERSION,
 };
 
 /// Bounds waiting for the worker socket and the child's exit.
@@ -143,7 +144,13 @@ impl Fixture {
 
     async fn connect(&mut self, maximum_version: Version) -> Worker {
         self.wait_ready();
+        self.connect_controller(maximum_version).await
+    }
 
+    /// Acquires the controller lease once the worker is listening. The worker
+    /// announces readiness only once, so a reconnect after a release skips
+    /// [`Self::wait_ready`].
+    async fn connect_controller(&mut self, maximum_version: Version) -> Worker {
         let socket = self
             .root
             .join("runtime/pohunek/workers")
@@ -224,6 +231,7 @@ impl Fixture {
             ),
             limits: InitializeLimits::new(1_048_576, 1_048_576, 128, 60_000).expect("limits"),
             stop_policy: StopPolicy::new(500).expect("stop policy"),
+            input_policy: Some(InputPolicy::new(3000).expect("input policy")),
             hook_protocol_version: Version::new(1).expect("hook version"),
             public_protocol_version: 7,
             hook_schema: None,
@@ -352,7 +360,7 @@ async fn current_worker_child_gets_only_base_term_profile_and_identity() {
 }
 
 #[tokio::test]
-async fn version_five_child_inherits_the_worker_without_service_manager_variables() {
+async fn previous_version_child_gets_the_base_environment_without_service_manager_variables() {
     let mut fixture = Fixture::start();
     let worker = fixture.connect(PREVIOUS_VERSION).await;
     assert_eq!(worker.selected_version().await, PREVIOUS_VERSION);
@@ -360,10 +368,17 @@ async fn version_five_child_inherits_the_worker_without_service_manager_variable
 
     let environment = child_environment(&worker, initialize).await;
 
+    assert!(
+        !environment.contains_key("UNRELATED_WORKER_VAR"),
+        "a version-six child receives the base environment, not the worker environment"
+    );
     assert_eq!(
-        environment.get("UNRELATED_WORKER_VAR").map(String::as_str),
-        Some(UNRELATED_VALUE),
-        "a version-five child keeps inheriting the worker environment"
+        environment.get("HOME").map(String::as_str),
+        Some("/home/base")
+    );
+    assert_eq!(
+        environment.get("TERM").map(String::as_str),
+        Some("xterm-256color")
     );
     assert_eq!(
         environment.get("PROFILE_TOKEN").map(String::as_str),
@@ -373,20 +388,264 @@ async fn version_five_child_inherits_the_worker_without_service_manager_variable
         environment.get("POHUNEK_SESSION_ID"),
         Some(&fixture.session_id)
     );
-    assert!(
-        !environment.contains_key("TERM"),
-        "only version six sets TERM"
-    );
-    assert!(
-        environment
-            .get("HOME")
-            .is_some_and(|home| home != "/home/base"),
-        "a version-five worker never receives the base environment"
-    );
     for name in environment.keys() {
         assert!(!is_denylisted(name), "{name} leaked to the child");
     }
     assert!(!environment.contains_key("NOTIFY_SOCKET"));
+}
+
+/// Input stall bound the silent-child scenarios initialize with. It is short
+/// so the stall arrives quickly, and the write waits for it on a child that
+/// never reads.
+const SILENT_CHILD_STALL_MS: u64 = 300;
+
+/// Lines in the oversized write. Their total size exceeds the canonical input
+/// queue of the PTY on both Linux (4096 bytes) and macOS.
+const OVERSIZED_LINES: usize = 200;
+
+/// Bytes per oversized write line.
+const OVERSIZED_LINE_BYTES: usize = 78;
+
+/// Initializes the fixture's worker with a child that never reads its
+/// terminal and the short input stall bound.
+async fn initialize_silent_child(fixture: &Fixture, worker: &Worker) {
+    let mut initialize = fixture.initialize(worker.worker_id().await);
+    initialize.executable = PathBuf::from("/bin/sh");
+    initialize.arguments = vec!["-c".to_owned(), "exec sleep 3600".to_owned()];
+    initialize.input_policy =
+        Some(InputPolicy::new(SILENT_CHILD_STALL_MS).expect("silent child input policy"));
+    worker
+        .initialize(initialize)
+        .await
+        .expect("initialize the silent child");
+}
+
+/// One fragment carrying more bytes than the child's PTY can queue unread.
+fn oversized_text() -> Vec<u8> {
+    vec!["x".repeat(OVERSIZED_LINE_BYTES); OVERSIZED_LINES]
+        .join("\n")
+        .into_bytes()
+}
+
+fn oversized_plan() -> Vec<InputFragment> {
+    vec![InputFragment {
+        bytes: SecretBytes::new(oversized_text()),
+        delay_after_ms: 0,
+    }]
+}
+
+#[tokio::test]
+async fn version_seven_controller_sees_a_stalled_write_as_input_stalled() {
+    let mut fixture = Fixture::start();
+    let worker = fixture.connect(CURRENT_VERSION).await;
+    assert_eq!(worker.selected_version().await, CURRENT_VERSION);
+    initialize_silent_child(&fixture, &worker).await;
+
+    let error = worker
+        .write(oversized_plan())
+        .await
+        .expect_err("a write the silent child never reads must stall");
+    assert!(
+        matches!(
+            error,
+            WorkerError::Rejected {
+                code: ControlCode::InputStalled,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    worker
+        .stop(TransactionId::new("stall-cleanup").expect("transaction id"))
+        .await
+        .expect("stop the silent child after the stall");
+}
+
+#[tokio::test]
+async fn version_six_controller_of_a_version_seven_worker_sees_a_stall_as_runtime_fault() {
+    let mut fixture = Fixture::start();
+    let initializer = fixture.connect(CURRENT_VERSION).await;
+    assert_eq!(initializer.selected_version().await, CURRENT_VERSION);
+    initialize_silent_child(&fixture, &initializer).await;
+    // Releasing the lease lets a version-six connection take over the same
+    // worker, which was initialized with the input stall bound.
+    initializer
+        .release_controller()
+        .await
+        .expect("release the version-seven controller");
+    drop(initializer);
+
+    let controller = fixture.connect_controller(PREVIOUS_VERSION).await;
+    assert_eq!(controller.selected_version().await, PREVIOUS_VERSION);
+    let error = controller
+        .write(oversized_plan())
+        .await
+        .expect_err("a write the silent child never reads must stall");
+    assert!(
+        matches!(
+            error,
+            WorkerError::Rejected {
+                code: ControlCode::RuntimeFault,
+                ..
+            }
+        ),
+        "a version-six peer cannot decode InputStalled, so it must see RuntimeFault: {error:?}"
+    );
+    controller
+        .stop(TransactionId::new("stall-cleanup").expect("transaction id"))
+        .await
+        .expect("stop the silent child after the stall");
+}
+
+/// Child script that leaves its terminal unread until the gate file named by
+/// `$1` exists, then drains stdin for good.
+const GATED_DRAIN_SCRIPT: &str = "while [ ! -e \"$1\" ]; do sleep 0.05; done; exec cat >/dev/null";
+
+/// Attach stream that carries the stalled input.
+const ATTACH_STREAM_ID: &str = "attach-stall";
+
+/// Attach stream that observes the PTY echo while the input is pending.
+const OBSERVER_STREAM_ID: &str = "attach-observer";
+
+/// Reads an observer stream until its output contains `marker`. The PTY echoes
+/// each accepted input byte, so an echoed line proves the attach write was
+/// accepted and now holds the execution lock.
+async fn await_pty_echo(observer: &mut DataStream, marker: &[u8]) {
+    let mut echoed = Vec::new();
+    tokio::time::timeout(DEADLINE, async {
+        while !echoed.windows(marker.len()).any(|window| window == marker) {
+            let frame = read_frame(&mut observer.stream)
+                .await
+                .expect("read observer frame")
+                .expect("observer stream stays open");
+            match frame.header().kind {
+                FrameKind::Output { .. } | FrameKind::TerminalSnapshot { .. } => {
+                    echoed.extend_from_slice(frame.payload());
+                }
+                FrameKind::Error { .. } | FrameKind::Close { .. } | FrameKind::Exit { .. } => {
+                    panic!(
+                        "observer stream ended before the echo: {:?}",
+                        frame.header().kind
+                    )
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the attach write is accepted by the PTY");
+}
+
+#[tokio::test]
+async fn a_stalled_attach_write_keeps_its_stream_while_control_input_fails_with_input_stalled() {
+    let mut fixture = Fixture::start();
+    let worker = fixture.connect(CURRENT_VERSION).await;
+    assert_eq!(worker.selected_version().await, CURRENT_VERSION);
+    let gate = fixture.root.join("gate");
+    let mut initialize = fixture.initialize(worker.worker_id().await);
+    initialize.executable = PathBuf::from("/bin/sh");
+    initialize.arguments = vec![
+        "-c".to_owned(),
+        GATED_DRAIN_SCRIPT.to_owned(),
+        "sh".to_owned(),
+        gate.to_str().expect("UTF-8 fixture path").to_owned(),
+    ];
+    initialize.input_policy =
+        Some(InputPolicy::new(SILENT_CHILD_STALL_MS).expect("gated child input policy"));
+    worker
+        .initialize(initialize)
+        .await
+        .expect("initialize the gated child");
+
+    let stream_id = StreamId::new(ATTACH_STREAM_ID).expect("stream id");
+    let mut attach = worker
+        .open_attach(stream_id.clone(), AttachStart { dimensions: None })
+        .await
+        .expect("open attach stream");
+
+    let attach_write_id = WriteId::new(format!("attach-{ATTACH_STREAM_ID}-1")).expect("write id");
+    let text = oversized_text();
+    let attach_input = DataFrame::new(
+        FrameHeader {
+            version: attach.version,
+            stream_id: stream_id.clone(),
+            worker_instance_id: attach.worker_instance_id.clone(),
+            kind: FrameKind::Input {
+                write_id: attach_write_id.clone(),
+            },
+        },
+        text.clone(),
+    )
+    .expect("attach input frame");
+    write_frame(&mut attach.stream, &attach_input)
+        .await
+        .expect("send attach input");
+
+    // The worker does not forward output on a stream while that stream's own
+    // input write is pending, so the echo is observed on a second attach
+    // stream. The attach stream holds the dimension ordering guard until it is
+    // dropped, and a second attach waits for that guard, so release it first.
+    attach.dimension_update = None;
+    let mut observer = worker
+        .open_attach(
+            StreamId::new(OBSERVER_STREAM_ID).expect("observer stream id"),
+            AttachStart { dimensions: None },
+        )
+        .await
+        .expect("open observer attach stream");
+
+    await_pty_echo(&mut observer, &[b'x'; OVERSIZED_LINE_BYTES]).await;
+
+    let error = worker
+        .write(oversized_plan())
+        .await
+        .expect_err("a control write must not run behind the stalled attach write");
+    assert!(
+        matches!(
+            error,
+            WorkerError::Rejected {
+                code: ControlCode::InputStalled,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+
+    // Opening the gate lets the child drain its input, so the pending attach
+    // write completes and its acknowledgement arrives on the same stream.
+    std::fs::File::create(&gate).expect("create gate file");
+    let (acked, bytes_written) = tokio::time::timeout(DEADLINE, async {
+        loop {
+            let frame = read_frame(&mut attach.stream)
+                .await
+                .expect("read attach frame")
+                .expect("attach stream stays open until its write is acknowledged");
+            match frame.header().kind.clone() {
+                FrameKind::InputAck {
+                    write_id,
+                    bytes_written,
+                } => return (write_id, bytes_written),
+                FrameKind::Error { error } => {
+                    panic!("the attach stream failed instead of acknowledging: {error:?}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the attach write is acknowledged after the child drains");
+    assert_eq!(acked, attach_write_id);
+    assert_eq!(
+        bytes_written,
+        u64::try_from(text.len()).expect("text length")
+    );
+
+    drop(attach);
+    drop(observer);
+    worker
+        .stop(TransactionId::new("stall-cleanup").expect("transaction id"))
+        .await
+        .expect("stop the gated child");
 }
 
 #[tokio::test]

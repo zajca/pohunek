@@ -123,10 +123,15 @@ fn times_out_when_protocol_info_closes_output_but_the_process_hangs() {
 fn rejects_schema_or_protocol_mismatches() {
     let root = tempdir().expect("create fixture root");
     let path = executable(root.path(), "worker", valid_info());
+    // A worker whose whole range lies above the supported one.
+    let newer = SUPPORTED_RANGE.maximum().get() + 1;
     let only_new_protocol = executable(
         root.path(),
         "new-protocol",
-        "printf '%s' '{\"schema_version\":1,\"binary\":\"pohunek-sessiond\",\"version\":\"1\",\"journal_schema_version\":4,\"worker_protocol\":{\"minimum\":7,\"maximum\":8}}'",
+        &format!(
+            "printf '%s' '{{\"schema_version\":1,\"binary\":\"pohunek-sessiond\",\"version\":\"1\",\"journal_schema_version\":4,\"worker_protocol\":{{\"minimum\":{newer},\"maximum\":{}}}}}'",
+            newer + 1
+        ),
     );
 
     assert!(matches!(

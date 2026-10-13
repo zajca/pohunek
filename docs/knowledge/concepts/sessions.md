@@ -149,6 +149,18 @@ the same helper, so they cannot bypass this validation. SIGINT or SIGTERM during
 a waited CLI input returns JSON code `session_input_interrupted` without a retry
 hint because delivery outcome is unknown.
 
+Every `session.input` write, waited or not, and the initial input of
+`session.new` are bounded by the worker's input stall bound
+(`input.write_stall_timeout_ms` in service.toml). When an agent stops reading
+its terminal and the PTY accepts no byte for that long, the write fails with
+`session_input_stalled` and the rest of that input is not written; the part
+already accepted may have reached the agent, so inspect the session before
+resending. For `session.new` the failed delivery rolls the new session back. A
+worker started by a daemon older than worker protocol 7 keeps unbounded writes. Input typed or
+pasted through an attached terminal is not bounded and waits like a real
+terminal; while it waits, a `session.input` to the same session fails with
+`session_input_stalled` after the stall bound instead of queueing behind it.
+
 `pohunek session diff <target> [--base <ref>] [--json]` prints a unified diff
 of a session's worktree against a base ref: raw diff text on stdout by
 default, or the structured `SessionDiffResult` (`diff`, `base`, `truncated`)

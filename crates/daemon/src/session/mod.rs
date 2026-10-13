@@ -185,6 +185,12 @@ const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_mins(5);
 const DEFAULT_INITIAL_INPUT_STARTUP_GRACE: Duration =
     pohunek_service_config::DEFAULT_INPUT_TIMING.initial_startup_grace;
 
+/// Default longest time one control input write may wait without the child
+/// reading a byte. Overridable via
+/// [`SessionRegistryConfig::input_write_stall_timeout`].
+const DEFAULT_INPUT_WRITE_STALL_TIMEOUT: Duration =
+    pohunek_service_config::DEFAULT_INPUT_TIMING.write_stall_timeout;
+
 /// Default minimum interval between detector "PTY output lag" WARN logs per
 /// session. The first lag in a window logs immediately; further lags are counted
 /// and folded into one summary WARN once the window elapses. A runaway session
@@ -368,6 +374,13 @@ pub struct SessionRegistryConfig {
     /// on that readiness evidence; a silent agent receives input after this
     /// bound. `Duration::ZERO` injects immediately.
     pub initial_input_startup_grace: Duration,
+    /// Longest time one control input write (`session.input` or initial
+    /// input) may wait without the child reading a byte. A write that exceeds
+    /// it fails with `session_input_stalled` and the rest of its plan is not
+    /// written. Attached terminal input is not bounded. Sent to each worker in
+    /// `Initialize`, so a worker below the input-stall protocol version
+    /// keeps unbounded writes.
+    pub input_write_stall_timeout: Duration,
     /// Control socket path injected into session PTYs so direct or nested agent
     /// hooks can call home. `None` disables hook-handshake env injection (e.g.
     /// in unit tests that do not exercise the hook).
@@ -474,6 +487,7 @@ impl Default for SessionRegistryConfig {
             submit_delay_overrides: BTreeMap::new(),
             host_submit_delay: None,
             initial_input_startup_grace: DEFAULT_INITIAL_INPUT_STARTUP_GRACE,
+            input_write_stall_timeout: DEFAULT_INPUT_WRITE_STALL_TIMEOUT,
             socket_path: None,
             store_path: None,
             worktree_root: None,
@@ -6546,6 +6560,19 @@ fn worker_error_to_protocol(err: WorkerError) -> ProtocolError {
             unsupported.to_string(),
             Some(
                 "restart the session on the upgraded worker, or fork it into a new session"
+                    .to_owned(),
+            ),
+        ),
+        WorkerError::Rejected {
+            code: pohunek_worker_protocol::ControlCode::InputStalled,
+            message,
+            ..
+        } => ProtocolError::new(
+            ErrorClass::Runtime,
+            "session_input_stalled",
+            message,
+            Some(
+                "part of the input may already have reached the agent; inspect the session before resending"
                     .to_owned(),
             ),
         ),

@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 
 use pohunek_session_worker::{Server, ServerArgs, WorkerConfig};
 use pohunek_worker_protocol::{
-    Dimensions, Initialize, InitializeLimits, LaunchIdentity, SecretEnv, SessionId, StopPolicy,
-    TransactionId, WorkerId, CURRENT_VERSION, DEFAULT_ENVIRONMENT_ALLOWLIST,
+    Dimensions, Initialize, InitializeLimits, InputPolicy, LaunchIdentity, SecretEnv, SessionId,
+    StopPolicy, TransactionId, WorkerId, CURRENT_VERSION, DEFAULT_ENVIRONMENT_ALLOWLIST,
 };
 use protocol::method;
 use serde_json::{json, Value};
@@ -140,6 +140,7 @@ fn initialize(
         ),
         limits: InitializeLimits::new(1_048_576, 1_048_576, 1_024, 10_000).expect("limits"),
         stop_policy: StopPolicy::new(500).expect("stop policy"),
+        input_policy: Some(InputPolicy::new(3000).expect("input policy")),
         hook_protocol_version: CURRENT_VERSION,
         public_protocol_version,
         hook_schema: Some(hook_schema.to_owned()),

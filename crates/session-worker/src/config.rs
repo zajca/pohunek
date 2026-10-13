@@ -1,6 +1,6 @@
 //! Defines validated worker runtime policy.
 
-// Rust guideline compliant 2026-09-14
+// Rust guideline compliant 2026-10-13
 
 use std::time::Duration;
 
@@ -56,6 +56,10 @@ const MAX_NOTIFICATION_PARAMS_BYTES: usize = 64 * 1024;
 const MAX_NOTIFICATION_FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
 /// Hard cap for deferred launch-identity work and retained references.
 const MAX_PENDING_LAUNCH_CLAIMS: usize = 64;
+/// Hard cap for the input stall bound, which keeps `Instant` arithmetic in range.
+///
+/// Stops a peer from requesting a deadline that overflows the monotonic clock.
+const MAX_INPUT_STALL: Duration = Duration::from_hours(24);
 
 /// Hard cap preventing one worker from consuming excessive output memory.
 const MAX_HISTORY_BYTES: usize = 256 * 1024 * 1024;
@@ -126,6 +130,11 @@ pub struct WorkerConfig {
     pub data_token_ttl: Duration,
     /// Completed write-plan deduplication capacity.
     pub input_dedup_entries: usize,
+    /// Longest time PTY input may go without the child accepting a byte.
+    ///
+    /// `None` keeps input writes unbounded, which is the behaviour for peers
+    /// that do not send an input policy.
+    pub input_stall: Option<Duration>,
     /// Grace period between soft and hard stop.
     pub stop_grace: Duration,
     /// Maximum natural PTY drain after the root process exits.
@@ -164,6 +173,7 @@ impl WorkerConfig {
             control_line_bytes: DEFAULT_CONTROL_LINE_BYTES,
             data_token_ttl: DEFAULT_DATA_TOKEN_TTL,
             input_dedup_entries: DEFAULT_INPUT_DEDUP_ENTRIES,
+            input_stall: None,
             stop_grace: DEFAULT_STOP_GRACE,
             post_exit_drain_timeout: DEFAULT_POST_EXIT_DRAIN_TIMEOUT,
             terminal_commit_wait_timeout: DEFAULT_TERMINAL_COMMIT_WAIT_TIMEOUT,
@@ -217,6 +227,16 @@ impl WorkerConfig {
             self.input_dedup_entries,
             MAX_INPUT_DEDUP_ENTRIES,
         )?;
+        if let Some(input_stall) = self.input_stall {
+            validate_duration("input_stall", input_stall)?;
+            if input_stall > MAX_INPUT_STALL {
+                return Err(ConfigError::DurationMaximum {
+                    field: "input_stall",
+                    actual: input_stall,
+                    maximum: MAX_INPUT_STALL,
+                });
+            }
+        }
         validate_duration("stop_grace", self.stop_grace)?;
         validate_duration("post_exit_drain_timeout", self.post_exit_drain_timeout)?;
         validate_duration(

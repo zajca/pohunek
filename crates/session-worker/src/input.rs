@@ -1,10 +1,9 @@
 //! Executes ordered PTY input with bounded exact control deduplication.
 
-// Rust guideline compliant 2026-07-28
+// Rust guideline compliant 2026-10-13
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{Debug, Formatter};
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -84,17 +83,59 @@ pub enum InputError {
     /// The PTY writer failed.
     #[error("PTY input write failed: {0}")]
     Io(std::io::Error),
+    /// The child accepted no input byte within the stall bound.
+    ///
+    /// `written` counts bytes accepted across the whole plan before the stall;
+    /// the remaining fragments of the plan were not written.
+    #[error(
+        "PTY input made no progress for {} ms; {written} of {total} bytes reached the terminal",
+        stall.as_millis()
+    )]
+    Stalled {
+        /// Plan bytes accepted by the PTY before the stall.
+        written: usize,
+        /// Total bytes in the plan.
+        total: usize,
+        /// Stall bound that expired.
+        stall: Duration,
+    },
     /// A blocking writer task failed.
     #[error("PTY input writer task terminated unexpectedly")]
     WriterTask,
 }
 
+/// Byte sink for PTY input whose writes may be bounded by a stall.
+pub trait InputWriter: Send {
+    /// Writes a prefix of `buf` and returns how many bytes were accepted.
+    ///
+    /// `stall` bounds the time without an accepted byte. `None` waits for as
+    /// long as the sink blocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`std::io::ErrorKind::TimedOut`] when `stall` expires without
+    /// progress, and the sink's own error otherwise.
+    fn write_within(&mut self, buf: &[u8], stall: Option<Duration>) -> std::io::Result<usize>;
+
+    /// Flushes buffered bytes to the sink.
+    ///
+    /// # Errors
+    ///
+    /// Returns the sink's I/O error.
+    fn flush(&mut self) -> std::io::Result<()>;
+}
+
 /// Cloneable ordered input coordinator.
 #[derive(Clone)]
 pub struct WriteCoordinator {
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    writer: Arc<Mutex<Box<dyn InputWriter>>>,
     execution: Arc<AsyncMutex<()>>,
     state: Arc<Mutex<DedupState>>,
+    /// Stall bound for control plans, reported in [`InputError::Stalled`].
+    ///
+    /// It bounds the wait for the execution lock and every PTY write of a
+    /// control plan. Attach streams never use it.
+    stall: Option<Duration>,
 }
 
 impl Debug for WriteCoordinator {
@@ -112,16 +153,24 @@ impl Debug for WriteCoordinator {
 impl WriteCoordinator {
     /// Creates a coordinator around a real writer.
     ///
+    /// `stall` is the control-plan bound. Attach streams are unbounded whatever
+    /// its value.
+    ///
     /// # Errors
     ///
     /// Returns [`InputError::InvalidCapacity`] when `capacity` is zero.
-    pub fn new(writer: impl Write + Send + 'static, capacity: usize) -> Result<Self, InputError> {
+    pub fn new(
+        writer: impl InputWriter + 'static,
+        capacity: usize,
+        stall: Option<Duration>,
+    ) -> Result<Self, InputError> {
         if capacity == 0 {
             return Err(InputError::InvalidCapacity);
         }
         Ok(Self {
             writer: Arc::new(Mutex::new(Box::new(writer))),
             execution: Arc::new(AsyncMutex::new(())),
+            stall,
             state: Arc::new(Mutex::new(DedupState {
                 entries: HashMap::new(),
                 completed: VecDeque::new(),
@@ -141,6 +190,12 @@ impl WriteCoordinator {
     /// lease sequence must increase in request order. A changed lease starts a
     /// fresh namespace because the previous lease is rejected before input
     /// handling.
+    ///
+    /// The plan is bounded by the coordinator's stall: waiting for the
+    /// execution lock held by an attach write and every PTY write count as no
+    /// progress. A control caller must never wedge its connection behind a
+    /// human's input, so a plan that cannot start within the stall fails with
+    /// [`InputError::Stalled`] and writes nothing.
     ///
     /// # Errors
     ///
@@ -185,7 +240,7 @@ impl WriteCoordinator {
         match action {
             Action::Join(receiver) => wait_result(receiver).await,
             Action::Execute(sender) => {
-                let result = self.execute_once(&plan.fragments).await;
+                let result = self.execute_once(&plan.fragments, self.stall).await;
                 let stored = result.as_ref().copied().map_err(StoredError::from_input);
                 self.complete(&plan.write_id);
                 let _ = sender.send(Some(stored));
@@ -242,7 +297,7 @@ impl WriteCoordinator {
         match action {
             Action::Join(receiver) => wait_result(receiver).await,
             Action::Execute(sender) => {
-                let result = self.execute_once(&plan.fragments).await;
+                let result = self.execute_once(&plan.fragments, self.stall).await;
                 let stored = result.as_ref().copied().map_err(StoredError::from_input);
                 self.complete(&plan.write_id);
                 let _ = sender.send(Some(stored));
@@ -253,6 +308,12 @@ impl WriteCoordinator {
 
     /// Executes input ordered by one attach stream.
     ///
+    /// The attach stream is a human's terminal. Its writes and its wait for
+    /// the execution lock are unbounded, so a paste into a busy foreground
+    /// program is delivered when the program reads it, as in a real terminal,
+    /// and does not end the stream. Control plans are bounded instead, so a
+    /// stalled attach write only delays them up to the stall bound.
+    ///
     /// The stream server validates strictly increasing stream-scoped sequence
     /// identifiers before calling this method. Framed stream delivery is
     /// ordered and never replayed by the daemon, so lifetime deduplication would
@@ -262,22 +323,58 @@ impl WriteCoordinator {
     ///
     /// Returns [`InputError`] when the PTY writer fails.
     pub async fn execute_stream(&self, fragments: Vec<InputFragment>) -> Result<(), InputError> {
-        self.execute_once(&fragments).await
+        self.execute_once(&fragments, None).await
     }
 
-    async fn execute_once(&self, fragments: &[InputFragment]) -> Result<(), InputError> {
-        let _execution = self.execution.lock().await;
+    /// Writes the fragments in order while holding the execution lock.
+    ///
+    /// `stall` bounds the lock wait and every write. `None` leaves both
+    /// unbounded.
+    async fn execute_once(
+        &self,
+        fragments: &[InputFragment],
+        stall: Option<Duration>,
+    ) -> Result<(), InputError> {
+        let total = fragments.iter().map(|fragment| fragment.bytes.len()).sum();
+        let _execution = match stall {
+            Some(stall) => match tokio::time::timeout(stall, self.execution.lock()).await {
+                Ok(guard) => guard,
+                Err(_elapsed) => {
+                    return Err(InputError::Stalled {
+                        written: 0,
+                        total,
+                        stall,
+                    });
+                }
+            },
+            None => self.execution.lock().await,
+        };
+        let mut written = 0;
         for fragment in fragments {
             let bytes = fragment.bytes.clone();
             let writer = Arc::clone(&self.writer);
-            tokio::task::spawn_blocking(move || {
+            let (accepted, result) = tokio::task::spawn_blocking(move || {
                 let mut writer = lock(&writer);
-                writer.write_all(&bytes)?;
-                writer.flush()
+                let (accepted, result) = write_counted(&mut **writer, &bytes, stall);
+                (accepted, result.and_then(|()| writer.flush()))
             })
             .await
-            .map_err(|_join_error| InputError::WriterTask)?
-            .map_err(InputError::Io)?;
+            .map_err(|_join_error| InputError::WriterTask)?;
+            written += accepted;
+            match result {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                    let Some(stall) = stall else {
+                        return Err(InputError::Io(error));
+                    };
+                    return Err(InputError::Stalled {
+                        written,
+                        total,
+                        stall,
+                    });
+                }
+                Err(error) => return Err(InputError::Io(error)),
+            }
             if !fragment.delay_after.is_zero() {
                 tokio::time::sleep(fragment.delay_after).await;
             }
@@ -298,6 +395,31 @@ impl WriteCoordinator {
             }
         }
     }
+}
+
+/// Writes all of `bytes` and reports how many were accepted before any failure.
+///
+/// The count stays exact on failure, which lets a stalled plan report progress.
+fn write_counted(
+    writer: &mut dyn InputWriter,
+    bytes: &[u8],
+    stall: Option<Duration>,
+) -> (usize, std::io::Result<()>) {
+    let mut accepted = 0;
+    while accepted < bytes.len() {
+        match writer.write_within(&bytes[accepted..], stall) {
+            Ok(0) => {
+                return (
+                    accepted,
+                    Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+                );
+            }
+            Ok(count) => accepted += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return (accepted, Err(error)),
+        }
+    }
+    (accepted, Ok(()))
 }
 
 #[derive(Debug)]
@@ -347,6 +469,11 @@ struct DedupEntry {
 enum StoredError {
     Io(String),
     WriterTask,
+    Stalled {
+        written: usize,
+        total: usize,
+        stall: Duration,
+    },
 }
 
 impl StoredError {
@@ -354,6 +481,15 @@ impl StoredError {
         match error {
             InputError::Io(source) => Self::Io(source.to_string()),
             InputError::WriterTask => Self::WriterTask,
+            InputError::Stalled {
+                written,
+                total,
+                stall,
+            } => Self::Stalled {
+                written: *written,
+                total: *total,
+                stall: *stall,
+            },
             InputError::InvalidCapacity
             | InputError::Conflict { .. }
             | InputError::OutcomeUnknown { .. } => Self::Io(error.to_string()),
@@ -364,6 +500,15 @@ impl StoredError {
         match self {
             Self::Io(message) => InputError::Io(std::io::Error::other(message)),
             Self::WriterTask => InputError::WriterTask,
+            Self::Stalled {
+                written,
+                total,
+                stall,
+            } => InputError::Stalled {
+                written,
+                total,
+                stall,
+            },
         }
     }
 }
@@ -453,10 +598,24 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputError, InputFragment, InputPlan, WriteCoordinator};
+    use super::{InputError, InputFragment, InputPlan, InputWriter, WriteCoordinator};
     use std::fs::{self, OpenOptions};
+    use std::io::Write;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    /// Adapts a plain writer whose writes never stall, such as a file.
+    struct Unbounded<W>(W);
+
+    impl<W: Write + Send> InputWriter for Unbounded<W> {
+        fn write_within(&mut self, buf: &[u8], _stall: Option<Duration>) -> std::io::Result<usize> {
+            self.0.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.flush()
+        }
+    }
 
     const PRODUCER: &str = "daemon-a";
 
@@ -488,7 +647,7 @@ mod tests {
     #[tokio::test]
     async fn ordered_fragments_are_written_once() {
         let (_guard, path, writer) = output_file("ordered");
-        let coordinator = WriteCoordinator::new(writer, 8).expect("coordinator");
+        let coordinator = WriteCoordinator::new(Unbounded(writer), 8, None).expect("coordinator");
         let operation = InputPlan {
             write_id: "write-1".to_owned(),
             fragments: vec![
@@ -518,7 +677,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_duplicate_joins_same_result() {
         let (_guard, path, writer) = output_file("concurrent");
-        let coordinator = WriteCoordinator::new(writer, 8).expect("coordinator");
+        let coordinator = WriteCoordinator::new(Unbounded(writer), 8, None).expect("coordinator");
         let operation = InputPlan {
             write_id: "write-1".to_owned(),
             fragments: vec![InputFragment {
@@ -540,7 +699,7 @@ mod tests {
     #[tokio::test]
     async fn conflicting_duplicate_is_rejected_without_writing() {
         let (_guard, path, writer) = output_file("conflict");
-        let coordinator = WriteCoordinator::new(writer, 8).expect("coordinator");
+        let coordinator = WriteCoordinator::new(Unbounded(writer), 8, None).expect("coordinator");
         coordinator
             .execute_control(PRODUCER, 1, plan("write-1", b"a"))
             .await
@@ -558,7 +717,7 @@ mod tests {
     #[tokio::test]
     async fn evicted_write_returns_unknown_instead_of_replaying() {
         let (_guard, path, writer) = output_file("evicted");
-        let coordinator = WriteCoordinator::new(writer, 1).expect("coordinator");
+        let coordinator = WriteCoordinator::new(Unbounded(writer), 1, None).expect("coordinator");
         coordinator
             .execute_control(PRODUCER, 1, plan("write-1", b"a"))
             .await
@@ -580,7 +739,7 @@ mod tests {
     #[tokio::test]
     async fn same_daemon_new_lease_restarts_sequence_in_fresh_namespace() {
         let (_guard, path, writer) = output_file("lease-rotation");
-        let coordinator = WriteCoordinator::new(writer, 1).expect("coordinator");
+        let coordinator = WriteCoordinator::new(Unbounded(writer), 1, None).expect("coordinator");
         coordinator
             .execute_control("lease-a", 1, plan("input-lease-a-1", b"a"))
             .await
@@ -596,7 +755,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_fresh_ids_may_arrive_out_of_order() {
         let (_guard, path, writer) = output_file("legacy-out-of-order");
-        let coordinator = WriteCoordinator::new(writer, 8).expect("coordinator");
+        let coordinator = WriteCoordinator::new(Unbounded(writer), 8, None).expect("coordinator");
         coordinator
             .execute_legacy(PRODUCER, plan("input-2", b"two"))
             .await
@@ -614,7 +773,7 @@ mod tests {
         const ATTACH_INPUTS: usize = 8_192;
 
         let (_guard, path, writer) = output_file("attach-volume");
-        let coordinator = WriteCoordinator::new(writer, 1).expect("coordinator");
+        let coordinator = WriteCoordinator::new(Unbounded(writer), 1, None).expect("coordinator");
         for row in 0..ATTACH_INPUTS {
             let report = format!("\x1b[<35;1;{}M", row % 80 + 1);
             coordinator

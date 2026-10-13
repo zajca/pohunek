@@ -525,6 +525,7 @@ fn select_supervision(
 fn apply_input_timing(config: &mut SessionRegistryConfig, timing: InputTiming) {
     config.initial_input_startup_grace = timing.initial_startup_grace;
     config.host_submit_delay = Some(timing.submit_delay);
+    config.input_write_stall_timeout = timing.write_stall_timeout;
 }
 
 /// Applies the validated `session.wait_turn` default and ceiling.

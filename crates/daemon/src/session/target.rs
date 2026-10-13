@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use pohunek_worker_protocol::{
-    read_frame, DaemonId, Dimensions, FrameKind, Initialize, InitializeLimits,
+    read_frame, DaemonId, Dimensions, FrameKind, Initialize, InitializeLimits, InputPolicy,
     LaunchIdentity as WorkerLaunchIdentity, SecretEnv, SessionId as WorkerSessionId, StopPolicy,
     StreamId, StreamMode, TransactionId, Version,
 };
@@ -1110,6 +1110,10 @@ impl SessionRegistry {
             .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
         let stop_policy = StopPolicy::new(stop_grace_ms)
             .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
+        let input_stall_ms = u64::try_from(self.inner.config.input_write_stall_timeout.as_millis())
+            .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
+        let input_policy = InputPolicy::new(input_stall_ms)
+            .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
         let environment = SecretEnv::new(command.env.iter().cloned().collect())
             .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
         let base_environment = crate::runtime::environment::base_environment(
@@ -1145,6 +1149,7 @@ impl SessionRegistry {
                 base_environment: Some(base_environment),
                 limits,
                 stop_policy,
+                input_policy: Some(input_policy),
                 hook_protocol_version: Version::new(1)
                     .expect("worker hook protocol version is nonzero"),
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),

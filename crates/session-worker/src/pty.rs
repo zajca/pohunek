@@ -1,6 +1,6 @@
 //! Owns one PTY master and its managed process identity.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-10-13
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -24,6 +24,7 @@ use rustix::termios::{tcflow, Action};
 use tokio::sync::{watch, Mutex as AsyncMutex};
 use tracing::{event, Level};
 
+use crate::input::InputWriter;
 use crate::output::OutputCompletion;
 use crate::{OutputEvent, OutputHub, OutputSubscriber, RingError, WriteCoordinator};
 
@@ -394,6 +395,7 @@ impl PtyOwner {
         history_bytes: usize,
         subscriber_bytes: usize,
         input_dedup_entries: usize,
+        input_stall: Option<Duration>,
     ) -> Result<Self, PtyError> {
         if command.cols == 0 || command.rows == 0 {
             return Err(PtyError::InvalidDimensions {
@@ -465,7 +467,7 @@ impl PtyOwner {
                 .try_clone_to_owned()
                 .map_err(PtyError::Io)?,
         };
-        let input = WriteCoordinator::new(writer, input_dedup_entries)
+        let input = WriteCoordinator::new(writer, input_dedup_entries, input_stall)
             .map_err(|source| PtyError::Io(io::Error::other(source)))?;
         let output = OutputHub::new(history_bytes, subscriber_bytes, command.rows, command.cols)?;
         let output_order = Arc::new(Mutex::new(()));
@@ -1240,23 +1242,30 @@ struct OutputReadiness {
     cancel_writer: OwnedFd,
 }
 
-/// Blocking input writer over the non-blocking PTY master description.
+/// Input writer over the non-blocking PTY master description.
 ///
-/// Output reads need the shared description non-blocking. Input keeps
-/// blocking semantics by waiting for writability whenever the child's input
-/// queue is full.
+/// Output reads need the shared description non-blocking, so a write that
+/// meets a full input queue waits for writability. The wait is bounded by the
+/// stall passed to each write: control writes are bounded so they can never
+/// wedge the control connection, while attach writes pass `None` and wait like
+/// a real terminal.
 struct MasterWriter {
     inner: Box<dyn io::Write + Send>,
     /// Duplicate of the master used only to wait for writability.
     master: OwnedFd,
 }
 
-impl io::Write for MasterWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+impl InputWriter for MasterWriter {
+    fn write_within(&mut self, buf: &[u8], stall: Option<Duration>) -> io::Result<usize> {
+        // The stall window starts at the first refused write. Any accepted byte
+        // returns from this call, so each call measures time without progress.
+        let mut deadline = None;
         loop {
             match self.inner.write(buf) {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    wait_writable(&self.master)?;
+                    let deadline =
+                        *deadline.get_or_insert_with(|| stall.map(|stall| Instant::now() + stall));
+                    wait_writable(&self.master, deadline)?;
                 }
                 result => return result,
             }
@@ -1270,14 +1279,32 @@ impl io::Write for MasterWriter {
 
 /// Waits until the PTY master accepts input or reports why it cannot.
 ///
+/// `deadline` bounds the whole wait, so interrupted or spurious wake-ups
+/// continue with the remaining time instead of restarting the bound. `None`
+/// waits indefinitely, which only attach writes request.
+///
 /// # Errors
 ///
 /// Returns an I/O error when `poll` fails or the master reports a hangup or
-/// error without writability, so a closed PTY cannot spin its writer.
-fn wait_writable(master: &OwnedFd) -> io::Result<()> {
+/// error without writability, so a closed PTY cannot spin its writer. Returns
+/// [`io::ErrorKind::TimedOut`] once `deadline` has passed without writability.
+fn wait_writable(master: &OwnedFd, deadline: Option<Instant>) -> io::Result<()> {
     loop {
+        let timeout = match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "PTY master accepted no input before the stall bound",
+                    ));
+                }
+                Some(duration_timespec(remaining))
+            }
+            None => None,
+        };
         let mut fds = [PollFd::new(master, PollFlags::OUT)];
-        match poll(&mut fds, None) {
+        match poll(&mut fds, timeout.as_ref()) {
             Ok(_woken) => {
                 let revents = fds[MASTER_SLOT].revents();
                 if revents.contains(PollFlags::OUT) {
@@ -1293,6 +1320,17 @@ fn wait_writable(master: &OwnedFd) -> io::Result<()> {
             Err(rustix::io::Errno::INTR) => {}
             Err(error) => return Err(io::Error::from(error)),
         }
+    }
+}
+
+/// Converts a bounded wait into the timespec `poll` expects.
+///
+/// Callers bound the duration by `WorkerConfig` validation, so the seconds
+/// value fits `i64` in practice; the saturating conversion only guards the type.
+fn duration_timespec(duration: Duration) -> rustix::event::Timespec {
+    rustix::event::Timespec {
+        tv_sec: i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+        tv_nsec: i64::from(duration.subsec_nanos()),
     }
 }
 
@@ -1968,6 +2006,7 @@ mod tests {
             config.history_bytes,
             config.subscriber_bytes,
             config.input_dedup_entries,
+            config.input_stall,
         )
         .expect("spawn PTY")
     }

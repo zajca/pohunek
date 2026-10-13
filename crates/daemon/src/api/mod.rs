@@ -998,6 +998,7 @@ impl AttachBridgeError {
             ControlCode::RuntimeFault => "worker_runtime_fault",
             ControlCode::WorkerFeatureUnavailable => "worker_feature_unavailable",
             ControlCode::ObservationLimitExceeded => "worker_observation_limit_exceeded",
+            ControlCode::InputStalled => "session_input_stalled",
         };
         Self {
             source: io::Error::other(error.message.clone()),

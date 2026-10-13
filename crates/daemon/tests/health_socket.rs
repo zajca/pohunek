@@ -2478,6 +2478,114 @@ async fn session_new_with_input_writes_text_to_shell_pty() {
     let _ = handle.await;
 }
 
+/// Startup grace for the silent-agent scenarios. Short, so the stall path is
+/// reached at once; the agent never publishes readiness, so the grace always
+/// runs to its end.
+const SILENT_AGENT_STARTUP_GRACE: Duration = Duration::from_millis(50);
+
+/// Stall bound for the silent-agent scenarios. It stays below the client's
+/// five-second request timeout, so a fire-and-forget caller receives the typed
+/// error; the agent never reads, so any nonzero bound stalls.
+const SILENT_AGENT_STALL_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// Upper bound on the daemon shutdown after a stall. The shutdown must not
+/// wait for the stalled write, so this guard fails the test rather than hang.
+const STALL_SCENARIO_SHUTDOWN_GUARD: Duration = Duration::from_secs(30);
+
+/// Lines in the oversized input. Their total size exceeds the canonical input
+/// queue of the PTY on both Linux (4096 bytes) and macOS.
+const OVERSIZED_INPUT_LINES: usize = 200;
+
+/// Bytes per oversized input line.
+const OVERSIZED_INPUT_LINE_BYTES: usize = 78;
+
+/// A child that runs `sleep` and never reads its terminal.
+fn silent_agent_config() -> SessionRegistryConfig {
+    SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "exec sleep 3600"]),
+        initial_input_startup_grace: SILENT_AGENT_STARTUP_GRACE,
+        input_write_stall_timeout: SILENT_AGENT_STALL_TIMEOUT,
+        ..SessionRegistryConfig::default()
+    }
+}
+
+fn oversized_input() -> String {
+    vec!["x".repeat(OVERSIZED_INPUT_LINE_BYTES); OVERSIZED_INPUT_LINES].join("\n")
+}
+
+#[tokio::test]
+async fn session_new_rolls_back_when_the_agent_never_reads_its_initial_input() {
+    let socket = temp_socket("session-new-input-stalled");
+    let (shutdown, handle, _) =
+        spawn_server_with_config(&socket, "0.0.0", silent_agent_config()).await;
+
+    let mut client = connect(&socket).await;
+    let mut params = session_params(&socket);
+    params.input = Some(oversized_input());
+    let error = err_payload(create_session_with_params(&mut client, params).await);
+    assert_eq!(error.code, "session_input_stalled");
+    assert_eq!(error.class, ErrorClass::Runtime);
+
+    let list_request = Request::make(
+        "session-new-stalled-list",
+        method::SESSION_LIST,
+        serde_json::to_value(SessionListParams::default()).expect("serialize session list request"),
+    );
+    let sessions: Vec<SessionInfo> =
+        serde_json::from_value(ok_payload(exchange(&mut client, &list_request).await))
+            .expect("session list");
+    assert!(
+        sessions.is_empty(),
+        "a create whose initial input stalled must be rolled back: {sessions:?}"
+    );
+
+    let _ = shutdown.send(());
+    tokio::time::timeout(STALL_SCENARIO_SHUTDOWN_GUARD, handle)
+        .await
+        .expect("daemon shutdown completes after the rolled-back create")
+        .expect("server task joins");
+}
+
+#[tokio::test]
+async fn session_input_to_an_agent_that_never_reads_fails_with_a_typed_stall() {
+    let socket = temp_socket("session-input-stalled");
+    let (shutdown, handle, _) =
+        spawn_server_with_config(&socket, "0.0.0", silent_agent_config()).await;
+
+    let mut client = connect(&socket).await;
+    let created = create_session(&mut client, &socket).await;
+    let input_request = Request::make(
+        "session-input-stalled",
+        method::SESSION_INPUT,
+        serde_json::to_value(SessionInputParams {
+            session_id: created.id.clone(),
+            text: oversized_input(),
+            wait: None,
+        })
+        .expect("serialize input params"),
+    );
+    let error = err_payload(exchange(&mut client, &input_request).await);
+    assert_eq!(error.code, "session_input_stalled");
+    assert_eq!(error.class, ErrorClass::Runtime);
+
+    // The stalled write must leave the control connection usable, so the
+    // stop of the same session still succeeds over it.
+    let stop_req = Request::make(
+        "session-input-stalled-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut client, &stop_req).await))
+            .expect("stop result after a stalled input");
+
+    let _ = shutdown.send(());
+    tokio::time::timeout(STALL_SCENARIO_SHUTDOWN_GUARD, handle)
+        .await
+        .expect("daemon shutdown completes after a stalled input")
+        .expect("server task joins");
+}
+
 /// Covers delayed reader startup while remaining below the configured
 /// five-second fallback.
 const INITIAL_READER_OBSERVATION_WINDOW: Duration = Duration::from_secs(3);

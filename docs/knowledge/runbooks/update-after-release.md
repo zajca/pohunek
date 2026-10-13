@@ -694,19 +694,22 @@ through `plugin profile migrate`. The release upgrade test
 (`scripts/upgrade-test`, `crates/cli/tests/release_upgrade.rs`) runs this path
 for Claude from the previous release to the build under test.
 
-## Configuration migration from schemas 2 and 3
+## Configuration migration from schemas 2, 3 and 4
 
 When the installed `service.toml` was written by release 0.33.x (schema 2, no
-`[input]` or `[waits]` table) or by a release with schema 3 (no `[waits]`
-table) and the target version differs, `pohunek service upgrade` turns into a
+`[input]` or `[waits]` table), by a release with schema 3 (no `[waits]`
+table), or by a release with schema 4 (no `input.write_stall_timeout_ms`) and
+the target version differs, `pohunek service upgrade` turns into a
 configuration migration and the `--json` reports carry the source schema,
-`config_schema_migration: 2` or `3`. `service check` verifies a pending migration's
+`config_schema_migration: 2`, `3` or `4`. `service check` verifies a pending migration's
 backup and reports the migration it would perform without writing anything,
 so an archive updater sees it before any effect. A same-version refresh runs
 no migration and reports `null`. The migration assigns the documented
-defaults of the missing tables explicitly: `[input]` 5000 ms and 150 ms for
-schema 2, `[waits]` 300000 ms and 1800000 ms for both. Every value the file
-records, including tuned `[input]` timings of a schema-3 file, is kept.
+defaults of the missing keys and tables explicitly: `[input]` 5000 ms and
+150 ms for schema 2, `input.write_stall_timeout_ms` 3000 ms for schemas 2 to 4,
+`[waits]` 300000 ms and 1800000 ms for schemas 2 and 3. Every value the file
+records, including tuned `[input]` and `[waits]` timings of a schema-3 or
+schema-4 file, is kept.
 
 The ordering follows the schema boundary. The transaction first saves the
 exact pre-upgrade bytes owner-private next to its record and journals their

@@ -1,6 +1,6 @@
 //! Serves the private daemon-worker Unix protocol.
 
-// Rust guideline compliant 2026-10-12
+// Rust guideline compliant 2026-10-13
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::OsString;
@@ -1310,6 +1310,9 @@ async fn initialize_request(
         history_bytes,
         subscriber_bytes,
         input_dedup_entries: dedup_entries,
+        input_stall: initialize
+            .input_policy
+            .map(|policy| Duration::from_millis(policy.stall_ms())),
         stop_grace,
         terminal_retention: retention,
         ..shared.config.clone()
@@ -1424,6 +1427,7 @@ fn spawn_pty(command: Command, config: &WorkerConfig) -> Result<PtyOwner, Contro
         config.history_bytes,
         config.subscriber_bytes,
         config.input_dedup_entries,
+        config.input_stall,
     )
     .map_err(|error| control_error(ControlCode::RuntimeFault, error, false))
 }
@@ -1665,6 +1669,7 @@ async fn write_request(
     plan: protocol::InputPlan,
 ) -> Result<ResponseKind, ControlError> {
     let pty = scoped_pty(shared, connection, scope).await?;
+    let version = connection.selected_version.ok_or_else(identity_mismatch)?;
     let byte_len = u64::try_from(plan.byte_len()).unwrap_or(u64::MAX);
     let (write_id, fragments) = plan.into_parts();
     let producer_id = connection
@@ -1692,7 +1697,7 @@ async fn write_request(
         }
         ControlInputId::Legacy => pty.input().execute_legacy(&producer_id, local).await,
     }
-    .map_err(input_control_error)?;
+    .map_err(|error| input_control_error(error, version))?;
     Ok(ResponseKind::WriteCompleted {
         acknowledgement: WriteAck {
             write_id,
@@ -2987,7 +2992,7 @@ where
                         version,
                         stream_id,
                         worker_instance_id,
-                        input_control_error(error),
+                        input_control_error(error, version),
                     ).await;
                 }
                 write_data_frame(
@@ -6552,7 +6557,7 @@ fn lease_control_error(error: LeaseError) -> ControlError {
     }
 }
 
-fn input_control_error(error: crate::InputError) -> ControlError {
+fn input_control_error(error: crate::InputError, version: Version) -> ControlError {
     match error {
         crate::InputError::Conflict { .. } => control_error_message(
             ControlCode::InvalidRequest,
@@ -6564,6 +6569,16 @@ fn input_control_error(error: crate::InputError) -> ControlError {
             "write outcome is no longer retained",
             false,
         ),
+        stalled @ crate::InputError::Stalled { .. } => {
+            // A v6 peer cannot decode `InputStalled`, so it receives the same
+            // stall as a runtime fault with the identical sanitized message.
+            let code = if version >= protocol::INPUT_STALL_VERSION {
+                ControlCode::InputStalled
+            } else {
+                ControlCode::RuntimeFault
+            };
+            control_error(code, stalled, false)
+        }
         other => control_error(ControlCode::RuntimeFault, other, true),
     }
 }
@@ -8124,6 +8139,7 @@ mod tests {
             config.history_bytes,
             config.subscriber_bytes,
             config.input_dedup_entries,
+            config.input_stall,
         )
         .expect("spawn PTY");
         let mut subscriber = pty.subscribe_output(Some(0)).expect("subscribe output");
@@ -9683,6 +9699,7 @@ mod tests {
             hook_protocol_version: Version::new(1).expect("hook version"),
             public_protocol_version: 7,
             hook_schema: None,
+            input_policy: Some(protocol::InputPolicy::new(500).expect("input policy")),
         }
     }
 
