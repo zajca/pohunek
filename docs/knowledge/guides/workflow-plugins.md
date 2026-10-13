@@ -193,7 +193,9 @@ envelope on stdout:
   action's stdout.
 - The action exited 0 but its stdout is empty, is not JSON, ends inside its
   document, or has data after it: `workflow_output_invalid`, exit status 1.
-  Nesting deeper than 128 levels is reported as not JSON.
+  Arrays and objects nested deeper than 126 levels are reported as not JSON:
+  the envelope adds one level, and common JSON parsers, serde_json's default
+  among them, refuse more than 127.
 - The action exited 0 but a process that left its group still held stdout
   open (see below): `workflow_output_incomplete`, exit status 1. The capture
   is never judged, because that process could still add to it.

@@ -676,14 +676,28 @@ fn classify(prepared: &Prepared, observed: Observed) -> (Outcome, Result<Complet
     }
 }
 
+/// Deepest array and object nesting a `--json` document may have.
+///
+/// `serde_json`'s default parser, which pohunek and most consumers of the
+/// envelope use, refuses more than 127 nested levels, and the envelope puts
+/// the document one level down, so a deeper document would make the whole
+/// envelope unreadable to them. The `RawValue` parse that keeps the document's
+/// bytes has no depth limit of its own, so [`parse_document`] enforces this
+/// one. Raising it breaks those consumers; lowering it refuses documents they
+/// can read.
+const MAX_DOCUMENT_DEPTH: usize = 126;
+
 /// Parses captured stdout as exactly one JSON document, with JSON whitespace
-/// allowed around it; `Err` is a content-free reason.
+/// allowed around it, nested at most [`MAX_DOCUMENT_DEPTH`] levels; `Err` is
+/// a content-free reason.
 ///
 /// The document is kept as its own bytes, so key order, number spelling and
-/// inner whitespace reach the caller unchanged. The parser rejects nesting
-/// deeper than its recursion limit of 128 levels.
+/// inner whitespace reach the caller unchanged.
 fn parse_document(bytes: &[u8]) -> Result<Box<RawValue>, &'static str> {
     let error = match serde_json::from_slice::<Box<RawValue>>(bytes) {
+        Ok(document) if nesting_depth(document.get()) > MAX_DOCUMENT_DEPTH => {
+            return Err("it is not JSON");
+        }
         Ok(document) => return Ok(document),
         Err(error) => error,
     };
@@ -702,6 +716,34 @@ fn parse_document(bytes: &[u8]) -> Result<Box<RawValue>, &'static str> {
     } else {
         Err("it is not JSON")
     }
+}
+
+/// The deepest array and object nesting of `document`, which must be valid
+/// JSON; brackets inside strings do not count.
+fn nesting_depth(document: &str) -> usize {
+    let (mut depth, mut deepest) = (0_usize, 0_usize);
+    let (mut in_string, mut escaped) = (false, false);
+    for byte in document.bytes() {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
 }
 
 /// Checks that `program` is a regular file with an executable bit.

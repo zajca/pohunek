@@ -40,6 +40,11 @@ const PLUGIN_VERSION: &str = "1.0.0";
 /// `i64`.
 const DOCUMENT: &str = r#"{"z":1,"a":1.0,"n":12345678901234567890}"#;
 
+/// Deepest array and object nesting a `--json` document may have, as
+/// documented: `serde_json`'s default parser accepts 127 levels, and the
+/// envelope holds the document one level down.
+const MAX_DOCUMENT_DEPTH: usize = 126;
+
 /// Printed on stdout by actions whose output must never be shown.
 const OUTPUT_SENTINEL: &str = "output-sentinel-7a31";
 
@@ -361,6 +366,57 @@ fn the_context_tells_the_action_its_output_is_json() {
     assert_eq!(text.status.code(), Some(0), "{}", describe(&text));
     let context: Value = serde_json::from_slice(&text.stdout).expect("the context is JSON");
     assert_eq!(context["output"], "text", "{context}");
+}
+
+/// `depth` nested arrays.
+fn nested(depth: usize) -> String {
+    format!("{}{}", "[".repeat(depth), "]".repeat(depth))
+}
+
+#[test]
+fn a_document_nested_deeper_than_the_envelope_can_carry_is_refused() {
+    let fixture = Fixture::new();
+
+    // At the limit the envelope stays parseable by a default serde_json
+    // consumer, and the document arrives unchanged.
+    let deepest = nested(MAX_DOCUMENT_DEPTH);
+    let output = fixture.json("emit", &[&deepest]);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let ok = envelope(&output).ok.expect("a success envelope");
+    assert_eq!(ok.get(), deepest);
+    serde_json::from_slice::<Value>(&output.stdout)
+        .unwrap_or_else(|error| panic!("a default consumer cannot parse the envelope: {error}"));
+
+    // Brackets inside strings, after escaped quotes and backslashes, are not
+    // nesting.
+    let brackets = "[".repeat(2 * MAX_DOCUMENT_DEPTH);
+    let quoted = format!(r#"["\"{brackets}","\\",{{"k{brackets}":"{brackets}"}}]"#);
+    let output = fixture.json("emit", &[&quoted]);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    assert_eq!(
+        envelope(&output).ok.expect("a success envelope").get(),
+        quoted
+    );
+
+    for depth in [MAX_DOCUMENT_DEPTH + 1, 1000] {
+        let output = fixture.json("emit", &[&nested(depth)]);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "depth {depth}: {}",
+            describe(&output)
+        );
+        let err = error_envelope(&output, "workflow_output_invalid");
+        let msg = err["msg"].as_str().expect("msg is a string");
+        assert!(msg.ends_with("it is not JSON"), "{msg}");
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("[["),
+            "output bytes were printed: {}",
+            describe(&output)
+        );
+        let record = fixture.last_record();
+        assert_eq!(record["outcome"], "output_invalid", "{record}");
+    }
 }
 
 #[test]

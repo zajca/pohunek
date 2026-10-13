@@ -13,7 +13,8 @@
   `workflow_action_failed` (non-zero exit or a signal the CLI did not send;
   carries `exit_code` and `signal?`, and the CLI exits with the action's
   status), `workflow_output_invalid` (exit 0 but stdout is not exactly one
-  JSON document; exit 1) and `workflow_output_incomplete` (exit 0 but an
+  JSON document, including arrays and objects nested deeper than 126 levels;
+  exit 1) and `workflow_output_incomplete` (exit 0 but an
   escaped process held stdout open; exit 1). The run log gains the outcomes
   `output_invalid` and `output_incomplete`.
 - The workflow plugins guide, `docs/public-api.md` and `docs/cli.md` describe

@@ -3193,7 +3193,7 @@ error type:
 | `workflow_action_interrupted` | `runtime` | The CLI received `SIGINT`, `SIGTERM` or `SIGHUP` and stopped the action's group. |
 | `workflow_action_failed` | `runtime` | `run --json` only: the action exited non-zero or was ended by a signal the CLI did not send; carries `exit_code` and `signal?`; its stdout was not printed. |
 | `workflow_output_incomplete` | `runtime` | `run --json` only: the action exited 0, but a process that left its group still held stdout open, so the capture was never judged. |
-| `workflow_output_invalid` | `runtime` | `run --json` only: the action exited 0, but its stdout is empty, not JSON (including nesting deeper than 128 levels), ends inside its document, or has data after it. |
+| `workflow_output_invalid` | `runtime` | `run --json` only: the action exited 0, but its stdout is empty, not JSON (including arrays and objects nested deeper than 126 levels, so the envelope stays within the 127 levels serde_json's default parser accepts), ends inside its document, or has data after it. |
 
 `workflow run` streams the action's stdout and stderr, each up to its cap.
 With `--json` it captures stdout up to the same cap instead, still streams
