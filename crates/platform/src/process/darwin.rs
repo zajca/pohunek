@@ -1467,6 +1467,21 @@ mod tests {
         Fixture(command.spawn().expect("spawn holder fixture"), env)
     }
 
+    /// Kills a holder that is not a child of the test, such as one a fixture
+    /// shell started in the background, even when an assertion fails.
+    struct OrphanReaper(Pid);
+
+    impl Drop for OrphanReaper {
+        fn drop(&mut self) {
+            let pid = i32::try_from(self.0)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw);
+            if let Some(pid) = pid {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+        }
+    }
+
     /// Spawns `program` directly, without a shell, so its image is the one
     /// the kernel reports for the process.
     fn spawn_image(program: &Path, args: &[&str]) -> Fixture {
@@ -1975,6 +1990,7 @@ mod tests {
                 })
         });
 
+        let _nested_reaper = OrphanReaper(nested.pid);
         let nested_markers = observable_markers(inspector, nested.pid);
         assert_eq!(nested_markers.session_id.as_deref(), Some("inner-session"));
         assert_eq!(
