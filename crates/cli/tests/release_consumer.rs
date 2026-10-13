@@ -1145,8 +1145,11 @@ check = "none"
         let outside = scope.join("elsewhere");
         fs::create_dir_all(&outside).expect("outside dir");
         let impostor = outside.join("pohunekd");
-        write_executable(&impostor, fs::read("/bin/sh").expect("read /bin/sh"))
-            .expect("copy the shell");
+        pohunek_test_support::fs::copy_shell_image(
+            fs::canonicalize("/bin/sh").expect("resolve the shell"),
+            &impostor,
+        )
+        .expect("copy the shell as the impostor");
         let child = host
             .env
             .command(&impostor)
