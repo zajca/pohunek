@@ -229,9 +229,10 @@ Run `pohunek plugin profile list` (implemented in
   `claude` or `hermes` the official package from the release archive), then
   pin the profile with `pohunek plugin profile migrate <name> --yes`.
 - `package_unavailable`: no installed package serves the base, but an
-  installed one that may serve it cannot be loaded. Reinstalling it is refused
-  (`package_root_invalid` for the same archive), and the migration refuses a
-  faulted package (`package_profile_target_invalid`). Run
+  installed one that may serve it cannot be loaded. The migration refuses a
+  faulted package (`package_profile_target_invalid`), and the repair depends
+  on the fault: a missing root is restored by reinstalling the same archive,
+  a modified one refuses that reinstall (`package_root_invalid`). Run
   `pohunek plugin doctor` and repair the package it names as section 1
   describes, then migrate the profile.
 - `pin_not_installed`: the pinned digest is not installed. Reinstall that

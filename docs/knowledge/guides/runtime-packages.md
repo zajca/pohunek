@@ -432,8 +432,9 @@ one state:
   its base, and an installed package that may serve it cannot be loaded (its
   root or descriptor fails verification, so the daemon reports no runtime for
   it). For `codex`, `claude` or `hermes` only an official package counts,
-  because only one can serve an official alias. Installing that package again
-  is refused while it stays recorded, so the detail names
+  because only one can serve an official alias. The repair depends on the
+  fault (a missing root is restored by reinstalling the same archive, a
+  modified one refuses that reinstall), so the detail names
   `pohunek plugin doctor`; repair the package, then migrate the profile.
 - `pin_not_installed`: the pinned digest is not installed.
 - `unreadable`: the file is a symlink or special file, is not owned by you, is

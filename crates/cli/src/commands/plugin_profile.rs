@@ -316,10 +316,11 @@ fn install_hint(name: &str, base: &RuntimeId) -> String {
 /// The recovery for the profile `name`, whose unpinned `base` an installed but
 /// unloadable package may serve.
 ///
-/// The install that would serve the base is refused while that package stays
-/// recorded (`package_root_invalid` for the same archive,
-/// `package_identity_installed` for another archive of its version), so the
-/// hint names the doctor, which reports the fault and its repair.
+/// The repair depends on the fault: a missing root is restored by reinstalling
+/// the same archive, while a modified or unsafe root refuses that reinstall
+/// (`package_root_invalid`, or `package_identity_installed` for another archive
+/// of its version). The hint therefore names the doctor, which reports the
+/// fault and its repair.
 fn unavailable_hint(name: &str, base: &RuntimeId) -> String {
     format!(
         "an installed package that may serve `{base}` cannot be loaded; run `pohunek plugin doctor` and repair it, then {}",

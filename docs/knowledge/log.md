@@ -25,8 +25,8 @@
 - When an installed package that may serve such a base cannot be loaded (its
   root or descriptor fails verification; for an official alias only an
   official package counts), the profile is `package_unavailable` and the
-  detail names `pohunek plugin doctor`: reinstalling that package is refused
-  while it stays recorded.
+  detail names `pohunek plugin doctor`, which reports the fault and its
+  repair.
 - The `runtime-packages` guide, the `runtime-package-recovery` runbook and
   `docs/cli.md` list the state.
 
