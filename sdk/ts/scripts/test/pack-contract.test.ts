@@ -23,7 +23,20 @@ const execFileAsync = promisify(execFile);
 const TEST_VERSION = "0.0.0-test";
 const SOURCE_DATE_EPOCH = 1_700_000_000;
 const INSTALL_TIMEOUT_MS = 120_000;
+// One `packRelease` compiles and tars all three SDK packages. Green CI runs
+// measured 1.4-4.4 s on macOS arm64 and 1.4-2.8 s on Linux, which crosses
+// Bun's 5 s default hook timeout on a loaded macOS runner (issue #491). The
+// budget keeps about 7x headroom over the slowest observed pack.
 const PACK_TIMEOUT_MS = 30_000;
+// Bun's own hook/test timeout is set this much past a step's budget so the
+// step's named deadline error is reported instead of Bun's generic timeout.
+const STEP_REPORT_MARGIN_MS = 1_000;
+// One refused `pack-release.ts` run (Bun start-up plus argument validation)
+// takes about 0.2 s idle and about 1 s with every core saturated on macOS
+// arm64; six sequential runs crossed Bun's 5 s default test timeout under
+// load (issue #491). Each run gets this budget and the runs execute
+// concurrently, so the test is bounded by one budget.
+const RELEASE_SCRIPT_TIMEOUT_MS = 10_000;
 const BUN_EXECUTABLE = process.execPath;
 const REPOSITORY_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..");
 const TSC_ENTRY = join(REPOSITORY_ROOT, "node_modules", "typescript", "bin", "tsc");
@@ -293,6 +306,20 @@ async function expectRejection(operation: Promise<unknown>, fragment?: string): 
   }
 }
 
+// Bounds one named setup step so a slow run fails with the step's name and
+// budget instead of Bun's generic hook timeout.
+async function withinBudget<T>(step: string, budgetMs: number, work: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${step} exceeded its ${budgetMs} ms budget`)), budgetMs);
+  });
+  try {
+    return await Promise.race([work, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function tarList(tarball: string): Promise<string[]> {
   const { stdout } = await execFileAsync("tar", ["-tzf", tarball]);
   return stdout.split("\n").filter((line) => line !== "");
@@ -370,8 +397,7 @@ async function reachableSpecifiers(packageRoot: string, entry: string): Promise<
   return specifiers;
 }
 
-// Packaging builds three real release assets, so it shares the bounded
-// subprocess budget instead of Bun's short default hook timeout.
+// Packing is bounded by its own named budget; see PACK_TIMEOUT_MS.
 beforeAll(async () => {
   workDir = await mkdtemp(join(tmpdir(), "pohunek-pack-contract-"));
   outDir = join(workDir, "assets");
@@ -390,13 +416,13 @@ beforeAll(async () => {
     },
   });
   baseUrl = `http://127.0.0.1:${server.port}/releases/download/v${TEST_VERSION}`;
-  packed = await packRelease({
+  packed = await withinBudget("packing the release assets in beforeAll", PACK_TIMEOUT_MS, packRelease({
     version: TEST_VERSION,
     baseUrl,
     outDir,
     sourceDateEpoch: SOURCE_DATE_EPOCH,
-  });
-}, INSTALL_TIMEOUT_MS);
+  }));
+}, PACK_TIMEOUT_MS + STEP_REPORT_MARGIN_MS);
 
 afterAll(async () => {
   await server?.stop(true);
@@ -473,51 +499,50 @@ describe("SDK release pack contract", () => {
   });
 
   test("packing twice yields byte-identical tarballs", async () => {
-    const second = await packRelease({
+    const second = await withinBudget("packing the release assets a second time", PACK_TIMEOUT_MS, packRelease({
       version: TEST_VERSION,
       baseUrl,
       outDir: join(workDir, "assets-again"),
       sourceDateEpoch: SOURCE_DATE_EPOCH,
-    });
+    }));
     for (const [index, item] of second.entries()) {
       expect(item.sha256).toBe(packed[index]!.sha256);
     }
-  }, PACK_TIMEOUT_MS);
+  }, PACK_TIMEOUT_MS + STEP_REPORT_MARGIN_MS);
 
   test("the release script refuses invalid inputs on its real command line", async () => {
     // The script runs exactly as the Release workflow runs it, with
     // SOURCE_DATE_EPOCH and its flags on the CLI; each hostile input must fail
     // the process with the refusing message, never a default.
     const script = join(REPOSITORY_ROOT, "sdk", "ts", "scripts", "pack-release.ts");
-    const cases: readonly [string, readonly string[]][] = [
-      ["version", ["--version", "v1.2.3", "--base-url", baseUrl, "--out", join(workDir, "rejected")]],
-      ["base URL", ["--version", TEST_VERSION, "--base-url", "not a url", "--out", join(workDir, "rejected")]],
-      ["http or https", ["--version", TEST_VERSION, "--base-url", "ftp://example.com/x", "--out", join(workDir, "rejected")]],
-      ["query", ["--version", TEST_VERSION, "--base-url", `${baseUrl}?token=1`, "--out", join(workDir, "rejected")]],
-      ["output directory", ["--version", TEST_VERSION, "--base-url", baseUrl, "--out", ""]],
+    const cases: readonly { fragment: string; flags: readonly string[]; epoch: string }[] = [
+      { fragment: "version", flags: ["--version", "v1.2.3", "--base-url", baseUrl, "--out", join(workDir, "rejected")], epoch: String(SOURCE_DATE_EPOCH) },
+      { fragment: "base URL", flags: ["--version", TEST_VERSION, "--base-url", "not a url", "--out", join(workDir, "rejected")], epoch: String(SOURCE_DATE_EPOCH) },
+      { fragment: "http or https", flags: ["--version", TEST_VERSION, "--base-url", "ftp://example.com/x", "--out", join(workDir, "rejected")], epoch: String(SOURCE_DATE_EPOCH) },
+      { fragment: "query", flags: ["--version", TEST_VERSION, "--base-url", `${baseUrl}?token=1`, "--out", join(workDir, "rejected")], epoch: String(SOURCE_DATE_EPOCH) },
+      { fragment: "output directory", flags: ["--version", TEST_VERSION, "--base-url", baseUrl, "--out", ""], epoch: String(SOURCE_DATE_EPOCH) },
+      { fragment: "SOURCE_DATE_EPOCH", flags: ["--version", TEST_VERSION, "--base-url", baseUrl, "--out", join(workDir, "rejected")], epoch: "-1" },
     ];
-    for (const [fragment, flags] of cases) {
-      const rejected = await execFileAsync(BUN_EXECUTABLE, [script, ...flags], {
-        cwd: REPOSITORY_ROOT,
-        env: { ...process.env, SOURCE_DATE_EPOCH: String(SOURCE_DATE_EPOCH) },
-      }).then(() => undefined, (error: { stderr?: string }) => error as unknown);
-      expect(rejected).toBeDefined();
-      const stderr = (rejected as { stderr?: string }).stderr ?? "";
+    const results = await Promise.all(
+      cases.map(async (caseItem) => {
+        const rejected = await execFileAsync(BUN_EXECUTABLE, [script, ...caseItem.flags], {
+          cwd: REPOSITORY_ROOT,
+          env: { ...process.env, SOURCE_DATE_EPOCH: caseItem.epoch },
+          timeout: RELEASE_SCRIPT_TIMEOUT_MS,
+        }).then(() => undefined, (error: { stderr?: string; killed?: boolean }) => error as unknown);
+        if (rejected && (rejected as { killed?: boolean }).killed === true) {
+          throw new Error(`the release script refusing ${caseItem.fragment} exceeded its ${RELEASE_SCRIPT_TIMEOUT_MS} ms budget`);
+        }
+        return { ...caseItem, rejected };
+      }),
+    );
+    for (const caseItem of results) {
+      expect(caseItem.rejected).toBeDefined();
+      const stderr = (caseItem.rejected as { stderr?: string }).stderr ?? "";
       expect(stderr).toContain("pack-release:");
-      expect(stderr).toContain(fragment);
+      expect(stderr).toContain(caseItem.fragment);
     }
-    const epochCase = await execFileAsync(BUN_EXECUTABLE, [
-      script,
-      "--version", TEST_VERSION,
-      "--base-url", baseUrl,
-      "--out", join(workDir, "rejected"),
-    ], {
-      cwd: REPOSITORY_ROOT,
-      env: { ...process.env, SOURCE_DATE_EPOCH: "-1" },
-    }).then(() => undefined, (error: { stderr?: string }) => error as unknown);
-    expect(epochCase).toBeDefined();
-    expect((epochCase as { stderr?: string }).stderr ?? "").toContain("SOURCE_DATE_EPOCH");
-  });
+  }, RELEASE_SCRIPT_TIMEOUT_MS + STEP_REPORT_MARGIN_MS);
 
   test("a consumer installs @pohunek/sdk and @pohunek/testkit by URL and imports every entry point", async () => {
     const consumer = await installedConsumer();
