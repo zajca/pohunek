@@ -1063,17 +1063,25 @@ Kandev's hard-won handling:
   `ESC[201~`) so embedded newlines are not treated as premature Enter; send
   the submit byte (`\r`) as a separate write after a short delay so newer TUIs
   do not absorb Enter into paste handling.
-- **Hermes Agent 0.20.0:** the adapter uses bracketed paste and sends submit as
-  a separate `\r` write after 150 ms. The release compatibility gate must
-  contain reviewed real-PTY evidence for the classic interface and either a
-  capture or a recognized local-unavailable diagnosis for the alternate-screen
-  TUI before this support is released. Programmatic input accepts LF and tab
-  but rejects other terminal controls; it is refused while a visible
+- **Hermes Agent 0.20.0:** the Hermes package uses bracketed paste and sends
+  submit as a separate `\r` write after 150 ms. Every release that ships the
+  package needs its compatibility gate to hold reviewed real-PTY evidence for
+  the classic interface and either a capture or a recognized
+  local-unavailable diagnosis for the alternate-screen TUI. Programmatic input
+  accepts LF and tab but rejects other terminal controls
+  (`text_policy = "hermes_safe_text"`); it is refused while a visible
   owner-approval prompt is blocked.
-- **Other agents:** use the agent adapter's framing rules.
+- **Other agents:** use the framing their runtime package declares.
 
-These per-agent input rules live in the agent adapter next to its launch command,
-state manifest, and resume command.
+A runtime package declares its input framing in the `[input]` table of its
+descriptor `runtime.toml`, next to its launch command, detection manifest and
+resume command: `bracketed_paste`, `submit_delay_ms`, `text_policy`
+(`unrestricted` or `hermes_safe_text`) and the optional
+`submit_delay_configurable`, which lets a submit delay configured on the daemon
+for that runtime replace the declared one (for example
+`runtime-packages/codex/runtime.toml`). The daemon parses the table into the
+runtime definition (`crates/daemon/src/agent/host/definition.rs`), and the
+worker input plan below applies it.
 
 Every worker input plan preserves provider framing as two fragments: the body
 fragment owns the provider submit delay and a separate fragment carries the

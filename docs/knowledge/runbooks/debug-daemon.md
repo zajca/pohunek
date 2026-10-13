@@ -358,7 +358,7 @@ For durable notification issues:
    concurrent parent-name swap cannot redirect a managed write. Existing safe
    provider-file modes are preserved; new registration files use `0600`.
 9. If a notification is missing its session link, inspect the hook environment
-   setup. Hook adapters silently drop an invalid `POHUNEK_SESSION_ID` and still
+   setup. The managed hooks silently drop an invalid `POHUNEK_SESSION_ID` and still
    create the notification without linkage.
 10. If duplicate attention notifications appear, compare each record's
     `dedupe_key`, `source.provider`, `source.provider_event`, and `created_at`.

@@ -1201,8 +1201,8 @@ relocating_settings = [                          # optional; refused at launch
   through its launch and active claims instead, for as long as the active
   claim's lease lasts. Every replacement carries an ordering key, and a
   recovered session keeps the key of the reference it recovers. Sequences are compared only within one transport and one runtime generation
-  (the shipped adapters stamp worker claims and public reports from different
-  clocks), so a public report is never stale because of a worker claim or the
+  (worker claims and the public reports of the shipped hook reporters are
+  stamped from different clocks), so a public report is never stale because of a worker claim or the
   other way round, and a recovered or restarted generation starts fresh: its
   first launch claim supersedes the reference it was relaunched with. A report
   older than the stored one of its own transport, an expired or overlong
@@ -2416,18 +2416,18 @@ answer different questions:
 
 ### Provider Notification Hooks
 
-`integration.install` installs durable state and notification hook adapters for
-current Codex and Claude builds only. There is no fallback for older provider
-hook APIs.
+`integration.install` runs the Codex and Claude integration handlers, which
+install durable state and notification hooks for current Codex and Claude
+builds only. There is no fallback for older provider hook APIs.
 
-The state adapter also registers `SubagentStart` and `SubagentStop` for both
-providers. These callbacks target only the owner-private worker endpoint; when
+Both integration handlers also register the state hook for `SubagentStart` and
+`SubagentStop`. These callbacks target only the owner-private worker endpoint; when
 it is unavailable or refuses the claim they exit 0 with no output and record
 the failure in the hook failure trace (see "Hook failure trace" below). They copy only
 lifecycle identifiers and agent type. A Claude `SubagentStop` with no recorded
 start is not a subagent and adds no row, while a Codex one records a completed
-child; see `subagents` under `SessionInfo`. For Claude the state adapter also
-registers the main-agent `Stop` (action `stop`): it sends the worker one
+child; see `subagents` under `SessionInfo`. The Claude integration handler also
+registers the state hook on the main-agent `Stop` (action `stop`): it sends the worker one
 `subagent_snapshot` claim with, for each entry of `background_tasks`, the
 required `id`, `type` and `status`, and the optional fields that sanitize:
 `label` from `description` (every type; control and format characters removed,
@@ -2447,7 +2447,8 @@ sends no label or program at all. The hook sends nothing for a `Stop` with a
 non-empty `agent_id`, a missing or invalid list, a list over 256 entries, or
 input over 1 MiB, and a missing or invalid required field voids the list. A
 worker that predates the claim refuses it and nothing is applied. Codex `Stop`
-carries no task list, so the Codex state adapter registers no `Stop`. The hook
+carries no task list, so the Codex integration handler registers no state hook
+on `Stop`. The hook
 validates its action and Pohunek handshake before reading, rejects oversized
 JSON, and never stages the payload on disk; provider prompts, results,
 messages, and transcript paths are discarded.
@@ -2777,12 +2778,12 @@ notification hook's `Stop` creates `turn_completed`; `StopFailure` creates
 `error`. The separate state hook entry on `Stop` creates no notification; it
 sends only the subagent snapshot to the worker and has no daemon fallback.
 
-When `POHUNEK_SESSION_ID` is valid, hook adapters add
+When `POHUNEK_SESSION_ID` is valid, the managed hooks add
 `attention:<session_id>` to attention events and `turn:<session_id>` to
 `Stop`/`turn_completed` events. Invalid session ids are dropped before either
 `session_id` or `dedupe_key` reaches the daemon.
 
-Hook adapters read at most 64 KiB from provider stdin (1 MiB for the Claude
+The managed hooks read at most 64 KiB from provider stdin (1 MiB for the Claude
 state hook's main-agent `Stop`, whose input carries the final assistant message
 and the task list), validate action and
 environment before reading input, silently drop an invalid `POHUNEK_SESSION_ID`,
