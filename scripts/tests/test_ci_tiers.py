@@ -1080,5 +1080,200 @@ class RuntimePackageBaselineTests(unittest.TestCase):
                     self.assertIn(rebuilt, mismatch.stdout)
 
 
+
+# The version gate (issue #894): `cargo xtask package bump` against the last
+# published release at or below the workspace version.
+FAKE_GH_RELEASES = """#!/bin/sh
+printf '%s\\n' "$*" >> "$FAKE_LOG"
+[ -n "$GH_TOKEN" ] || { echo "gh: no token" >&2; exit 4; }
+[ "$FAKE_GH_LIST_MODE" = fail ] && { echo "api unavailable" >&2; exit 1; }
+cat "$FAKE_TAGS"
+"""
+
+FAKE_CARGO_BUMP = """#!/bin/sh
+printf '%s\\n' "$*" >> "$FAKE_LOG"
+case "$*" in
+    "xtask package bump "*) cat "$FAKE_BUMP"; exit "$FAKE_BUMP_EXIT" ;;
+    *) echo "unexpected cargo $*" >&2; exit 97 ;;
+esac
+"""
+
+
+def bump_job_step(name: str) -> str:
+    return job_steps(workflow_jobs()["package-version-bump"])[name]
+
+
+def run_bump_step(
+    test: unittest.TestCase,
+    name: str,
+    env: dict[str, str],
+    fakes: dict[str, str],
+    inputs: dict[str, str],
+) -> subprocess.CompletedProcess:
+    """Runs one step script of the version gate with fake tools.
+
+    `inputs` are files written into the scratch directory, which `@HOME@` in
+    any env value names. The returned process carries `log` (the fake tools'
+    calls) and `outputs` (the step's `GITHUB_OUTPUT` entries).
+    """
+    tmp = tempfile.TemporaryDirectory()
+    test.addCleanup(tmp.cleanup)
+    home = Path(tmp.name)
+    bin_dir = home / "bin"
+    bin_dir.mkdir()
+    for tool, body in fakes.items():
+        (bin_dir / tool).write_text(body)
+        (bin_dir / tool).chmod(0o755)
+    # The steps run jq and sort from the runner image; link them into the test bin.
+    for tool in ("jq", "sort", "tail"):
+        os.symlink(resolve_runner_tool(tool), bin_dir / tool)
+    runner_temp = home / "runner-temp"
+    runner_temp.mkdir()
+    output = home / "github-output"
+    output.write_text("")
+    log = home / "calls.log"
+    log.write_text("")
+    for file, text in inputs.items():
+        (home / file).write_text(text)
+    completed = subprocess.run(
+        ["bash", "-c", step_script(bump_job_step(name))],
+        env={
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_OUTPUT": str(output),
+            "GITHUB_REPOSITORY": "zajca/pohunek",
+            "PACKAGE_BUMP_RELEASE_LIMIT": workflow_env("PACKAGE_BUMP_RELEASE_LIMIT"),
+            "PACKAGE_BASELINE_FETCH_TIMEOUT": workflow_env("PACKAGE_BASELINE_FETCH_TIMEOUT"),
+            "FAKE_LOG": str(log),
+            **{key: value.replace("@HOME@", str(home)) for key, value in env.items()},
+        },
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=STEP_TIMEOUT_SECONDS,
+    )
+    completed.log = log.read_text()  # type: ignore[attr-defined]
+    completed.outputs = dict(  # type: ignore[attr-defined]
+        line.split("=", 1) for line in output.read_text().splitlines() if "=" in line
+    )
+    return completed
+
+
+class RuntimePackageVersionBumpTests(unittest.TestCase):
+    """The version gate compares against the last published release (issue #894)."""
+
+    JOB = "package-version-bump"
+
+    def test_the_gate_runs_on_pull_requests_and_no_other_job_needs_it(self):
+        jobs = workflow_jobs()
+        condition = re.search(r"(?m)^    if: \$\{\{ (.+) \}\}$", jobs[self.JOB])
+        self.assertIsNotNone(condition)
+        assert condition is not None
+        self.assertEqual(condition.group(1), "github.event_name == 'pull_request'")
+        self.assertIn("    name: package version bump\n", jobs[self.JOB])
+        self.assertIn("      contents: read\n", jobs[self.JOB])
+        for name, body in jobs.items():
+            if name != self.JOB:
+                with self.subTest(job=name):
+                    self.assertNotRegex(body, rf"(?m)^    needs: .*{self.JOB}")
+
+    def test_only_the_release_listing_and_download_read_the_token(self):
+        steps = job_steps(workflow_jobs()[self.JOB])
+        with_token = {name for name, step in steps.items() if "GH_TOKEN" in step}
+        self.assertEqual(with_token, {"Select the last released version", "Fetch the released baseline"})
+        for name, step in steps.items():
+            if "        run: |\n" in step:
+                with self.subTest(step=name):
+                    self.assertNotIn("${{", step_script(step))
+                    self.assertIn("set -euo pipefail", step_script(step))
+
+    def test_the_gate_checks_the_released_catalog_with_the_xtask_command(self):
+        script = re.sub(r"\s*\\\n\s*", " ", step_script(bump_job_step("Check the version bump")))
+        self.assertIn(
+            'cargo xtask package bump --catalog "$RELEASE_DIR/runtime-catalog.json" '
+            '--anchor packaging/runtime-catalog-anchor.json --release-dir "$RELEASE_DIR" '
+            '--version "$VERSION" --json > "$RUNNER_TEMP/package-bump.json"',
+            script,
+        )
+        self.assertRegex(workflow_env("PACKAGE_BUMP_RELEASE_LIMIT"), r"^[1-9][0-9]*$")
+
+    def test_the_last_release_at_or_below_the_workspace_version_is_selected(self):
+        # (workspace version, tags gh lists, expected released version)
+        scenarios = (
+            ("0.34.2", "v0.34.2\nv0.34.1\nv0.33.9\n", "0.34.2"),
+            # Release preparation: the workspace version is not released yet.
+            ("0.34.3", "v0.34.2\nv0.34.1\n", "0.34.2"),
+            # Versions compare numerically, not as text.
+            ("0.34.9", "v0.34.10\nv0.34.2\n", "0.34.2"),
+            ("0.34.2", "v0.34.10\nv0.34.9\nv0.34.2\n", "0.34.2"),
+            # Only plain vX.Y.Z tags count.
+            ("0.34.2", "v0.35.0\nv0.34.2-rc.1\nnightly\nv0.34.1\n", "0.34.1"),
+            ("0.34.2", "v0.35.0\n", ""),
+            ("0.34.2", "", ""),
+        )
+        for version, tags, expected in scenarios:
+            with self.subTest(version=version, tags=tags):
+                completed = run_bump_step(
+                    self,
+                    "Select the last released version",
+                    {"GH_TOKEN": "ghs_fake-token", "VERSION": version, "FAKE_TAGS": "@HOME@/tags.txt"},
+                    {"gh": FAKE_GH_RELEASES},
+                    {"tags.txt": tags},
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(completed.outputs, {"version": expected})
+                self.assertIn("--exclude-drafts --exclude-pre-releases --limit 200 --json tagName", completed.log)
+
+    def test_an_unlisted_release_leaves_the_gate_undecided_with_a_warning(self):
+        completed = run_bump_step(
+            self,
+            "Select the last released version",
+            {
+                "GH_TOKEN": "ghs_fake-token",
+                "VERSION": "0.34.2",
+                "FAKE_TAGS": "@HOME@/tags.txt",
+                "FAKE_GH_LIST_MODE": "fail",
+            },
+            {"gh": FAKE_GH_RELEASES},
+            {"tags.txt": "v0.34.2\n"},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.outputs, {"version": ""})
+        self.assertIn("could not be listed; the version bump gate is undecided", completed.stdout)
+
+    def test_the_gate_fails_on_a_failing_verdict_and_warns_on_an_undecided_one(self):
+        for verdict in ("pass", "undecided", "fail"):
+            with self.subTest(verdict=verdict):
+                exit_code = "2" if verdict == "fail" else "0"
+                report = {"version": "0.34.2", "verdict": verdict, "packages": {}}
+                completed = run_bump_step(
+                    self,
+                    "Check the version bump",
+                    {
+                        "VERSION": "0.34.2",
+                        "RELEASE_DIR": "@HOME@/release",
+                        "FAKE_BUMP": "@HOME@/bump.json",
+                        "FAKE_BUMP_EXIT": exit_code,
+                    },
+                    {"cargo": FAKE_CARGO_BUMP},
+                    {"bump.json": json.dumps(report)},
+                )
+                self.assertEqual(completed.returncode, int(exit_code), completed.stderr)
+                self.assertIn("xtask package bump --catalog", completed.log)
+                self.assertEqual("::warning::" in completed.stdout, verdict == "undecided")
+
+    def test_no_published_release_skips_the_check_with_a_warning(self):
+        completed = run_bump_step(
+            self,
+            "Check the version bump",
+            {"VERSION": "", "RELEASE_DIR": "", "FAKE_BUMP": "@HOME@/bump.json", "FAKE_BUMP_EXIT": "0"},
+            {"cargo": FAKE_CARGO_BUMP},
+            {"bump.json": "{}"},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.log, "")
+        self.assertIn("no published release at or below the workspace version", completed.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

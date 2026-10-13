@@ -280,6 +280,31 @@ repeated `{version}`) fails package validation. A pre-release banner such as
 `codex-cli 0.161.0-rc.1` never matches, so the runtime reports unsupported.
 Verify the real banner of the runtime before declaring the template.
 
+## Versioning official packages
+
+The `version` of an official package's `runtime.toml` names its archive. Two
+different archives under one `package_id@version` cannot be told apart by
+version, so any change to the archive of an official package (its descriptor,
+manifests, hooks, or any other file in `runtime-packages/<p>/`) needs a
+version above every version the last published release shipped for that
+runtime. The pull request job `package version bump` enforces the rule with
+`cargo xtask package bump`: it fails when the archive differs from every
+released archive and the version is not strictly greater than the released
+versions, so `1.0.0` after a released `1.0.0` fails, and so does `0.9.9`.
+
+- Bump the patch number for a fix, the minor number for an additive change such
+  as a newly declared section, and the major number for a change that breaks
+  installed sessions or hosts. Any bump above the released version satisfies
+  the check.
+- A package that is new to the release has no released version to exceed and
+  passes. A package whose archive equals a released one needs no bump.
+- The gate compares with the last published release at or below the workspace
+  version, so it keeps working while the next version is being prepared. When
+  the release catalog cannot be fetched, the job warns and the gate is
+  undecided; a catalog that is present but does not verify fails it. A signed
+  catalog carries an expiry, so once the last release's catalog has expired
+  the gate fails every pull request until a newer release is published.
+
 ## Selecting a package version
 
 `<package>` is a package id. Several versions of one id can be installed side by

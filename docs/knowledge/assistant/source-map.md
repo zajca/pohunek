@@ -178,6 +178,10 @@ Release packaging and contributor verification:
   change, an embedded file, or an unknown path selects every package. The
   per-PR package jobs also run every package without a verified release
   baseline (`package_baseline.rs`).
+- `crates/xtask/src/package_bump.rs` — `cargo xtask package bump`: the version
+  gate over the baseline verdicts; fails a changed package whose version is
+  not above the released versions, and reports `undecided` for an absent
+  catalog.
 - `scripts/test-partitions` — disjoint unit/daemon/relay/cli/relay-db/heavy CI
   shards and exhaustive inventory check. Heavy is the exact complement of the
   fast filter; relay heavy tests (`relay-db`, the only PostgreSQL fixture
@@ -668,7 +672,7 @@ Signed runtime catalog:
 - `crates/package/src/release.rs` — the catalog release block, binary-set digests and per-entry attestation rules.
 - `crates/package/src/release.rs` — the catalog release block, binary-set digests and per-entry attestation rules.
 - `crates/xtask/src/runtime_package.rs` — `cargo xtask package build|verify`.
-- `crates/xtask/src/package_baseline.rs` — `cargo xtask package baseline`: which official packages the signed release `v<version>` proves unchanged, with stable reason codes for the missing ones.
+- `crates/xtask/src/package_baseline.rs` — `cargo xtask package baseline`: which official packages the signed release `v<version>` proves unchanged, with stable reason codes for the missing ones; `evaluate` is shared with `package bump`.
 - `crates/xtask/src/package_evidence.rs` — `package build --evidence-dir`: the archive checksum, manifest projection, provenance input and compatibility vector, refused when the archived bytes, the lock or the matrix differ from the blobs of `HEAD`.
 - `crates/package/src/anchor.rs` — the catalog trust anchor file format and its strict parser.
 - `crates/package/src/sign.rs` — catalog signing for release tooling.

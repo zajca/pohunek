@@ -30,8 +30,12 @@
 //! matrix, trust anchor and the `--version` value) fail the command with a
 //! non-zero exit and nothing on stdout, and the caller treats that as every
 //! package missing.
+//!
+//! `cargo xtask package bump` (`package_bump`) evaluates the same verdicts
+//! through [`evaluate`] and fails the packages whose archive changed without
+//! a version above every released one.
 
-// Rust guideline compliant 2026-10-12
+// Rust guideline compliant 2026-10-13
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -79,12 +83,12 @@ pub(crate) struct Options {
     /// Print only the verdicts as one JSON object on stdout; the report goes
     /// to stderr.
     #[arg(long)]
-    json: bool,
+    pub(crate) json: bool,
 }
 
 /// Why a package has no trusted baseline; JSON spells it as [`Reason::code`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Reason {
+pub(crate) enum Reason {
     /// The catalog file does not exist.
     CatalogAbsent,
     /// The catalog file exists but cannot be read within the size limit.
@@ -128,7 +132,7 @@ enum Reason {
 
 impl Reason {
     /// The stable code CI matches on.
-    fn code(self) -> &'static str {
+    pub(crate) fn code(self) -> &'static str {
         match self {
             Self::CatalogAbsent => "catalog_absent",
             Self::CatalogUnreadable => "catalog_unreadable",
@@ -169,18 +173,20 @@ enum Status {
 
 /// The decision for one package, as printed by `--json`.
 #[derive(Debug, Serialize)]
-struct Outcome {
+pub(crate) struct Outcome {
     verdict: Status,
     /// Why the package is missing; `null` when verified.
-    reason: Option<Reason>,
+    pub(crate) reason: Option<Reason>,
     /// The verified baseline digest; `null` when missing.
     digest: Option<String>,
-    /// The catalog lists another digest of this runtime under the version the
-    /// checkout's descriptor declares: content changed without a version bump.
-    version_not_bumped: bool,
+    /// The catalog lists another digest of this runtime and the checkout's
+    /// version is not strictly above every released version of it (by semver;
+    /// a version that is not semver proves no bump): content changed without
+    /// a version bump.
+    pub(crate) version_not_bumped: bool,
     /// Human explanation, for the report only.
     #[serde(skip)]
-    detail: String,
+    pub(crate) detail: String,
 }
 
 impl Outcome {
@@ -207,11 +213,11 @@ impl Outcome {
 
 /// Every verdict, as printed by `--json`.
 #[derive(Debug, Serialize)]
-struct Verdicts {
+pub(crate) struct Verdicts {
     /// The release the baseline was looked up in.
-    version: String,
+    pub(crate) version: String,
     /// One verdict per official package, by directory name.
-    packages: BTreeMap<String, Outcome>,
+    pub(crate) packages: BTreeMap<String, Outcome>,
 }
 
 /// What the checkout says about one official package.
@@ -237,6 +243,23 @@ struct Checkout {
 
 /// Prints the baseline verdict of every official package.
 pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
+    let verdicts = evaluate(options)?;
+    let report = render_report(&verdicts);
+    if options.json {
+        let json = serde_json::to_string(&verdicts).map_err(XtaskError::Json)?;
+        eprint!("{report}");
+        println!("{json}");
+    } else {
+        print!("{report}");
+    }
+    Ok(())
+}
+
+/// The verdict of every official package of the checkout against `options.version`.
+///
+/// Fails only when the checkout itself is unreadable; see the module
+/// documentation for the rules.
+pub(crate) fn evaluate(options: &Options) -> Result<Verdicts, XtaskError> {
     let cwd = std::env::current_dir().map_err(|source| XtaskError::Io {
         path: PathBuf::from("."),
         source,
@@ -264,19 +287,10 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
         };
         packages.insert(name.clone(), verdict);
     }
-    let verdicts = Verdicts {
+    Ok(Verdicts {
         version: options.version.clone(),
         packages,
-    };
-    let report = render_report(&verdicts);
-    if options.json {
-        let json = serde_json::to_string(&verdicts).map_err(XtaskError::Json)?;
-        eprint!("{report}");
-        println!("{json}");
-    } else {
-        print!("{report}");
-    }
-    Ok(())
+    })
 }
 
 /// Rebuilds every official package and reads its lock and matrix rows.
@@ -378,15 +392,18 @@ fn check_package(
             Reason::DigestMismatch,
             format!("no catalog entry has the rebuilt digest {}", head.digest),
         );
-        verdict.version_not_bumped = entries
+        let released: Vec<&str> = entries
             .iter()
-            .any(|entry| entry.version().as_str() == head.version);
+            .map(|entry| entry.version().as_str())
+            .collect();
+        verdict.version_not_bumped = !is_above_all(&head.version, &released);
         if verdict.version_not_bumped {
             // Writing to a String cannot fail.
             let _ = write!(
                 verdict.detail,
-                "; content changed but version {} was not bumped",
-                head.version
+                "; content changed but version {} is not above the released {}",
+                head.version,
+                released.join(", ")
             );
         }
         return Ok(verdict);
@@ -401,6 +418,21 @@ fn check_package(
         return Ok(verdict);
     }
     Ok(Outcome::verified(head.digest.clone()))
+}
+
+/// Whether `candidate` is a semver version strictly above every version in
+/// `released`.
+///
+/// The catalog and descriptor versions are opaque strings, so a version that
+/// is not semver cannot be ordered and proves no bump. `released` is never
+/// empty at the call site, which requires a catalog entry of the runtime.
+fn is_above_all(candidate: &str, released: &[&str]) -> bool {
+    let Ok(candidate) = semver::Version::parse(candidate) else {
+        return false;
+    };
+    released
+        .iter()
+        .all(|version| semver::Version::parse(version).is_ok_and(|released| candidate > released))
 }
 
 /// Check 3: the released archive must hash to the rebuilt digest.

@@ -13,6 +13,7 @@ mod hermes_mock;
 mod hermes_skill;
 mod package_affected;
 mod package_baseline;
+mod package_bump;
 mod package_evidence;
 mod release;
 mod release_inventory;
@@ -665,6 +666,15 @@ enum PackageAction {
     /// directories equal the release commit. Anything else is `missing` with
     /// a reason code and exits 0; only an unreadable checkout fails.
     Baseline(package_baseline::Options),
+    /// Fail a package whose archive changed without a version above its released versions.
+    ///
+    /// Evaluates the same verdicts as `baseline` for release `v<version>`. A
+    /// package whose archive differs from every released one fails when its
+    /// `runtime.toml` version is not strictly above the released versions
+    /// (semver). A catalog that is absent yields `undecided` and exit 0; a
+    /// catalog that is present but does not verify, or names another release,
+    /// fails. `--json` prints the decisions on stdout; the report goes to stderr.
+    Bump(package_baseline::Options),
 }
 
 #[derive(Debug, Subcommand)]
@@ -762,6 +772,7 @@ fn run_package(action: PackageAction) -> Result<(), XtaskError> {
         }
         PackageAction::Affected(options) => package_affected::run(&options)?,
         PackageAction::Baseline(options) => package_baseline::run(&options)?,
+        PackageAction::Bump(options) => package_bump::run(&options)?,
     }
     Ok(())
 }
