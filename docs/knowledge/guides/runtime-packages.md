@@ -374,7 +374,10 @@ profile with `base = "codex"` (or `"claude"`, `"hermes"`) and no
 --agent codex` (or `claude`) is `runtime_not_installed`; each recovery hint names
 `pohunek plugin install runtime/packages/<runtime>.tar.zst --catalog
 runtime/runtime-catalog.json` (the profile hint then names `plugin profile
-migrate <name>`). `integration status`, `doctor` and `uninstall --agent codex`
+migrate <name>`). When the official package is installed but cannot be loaded,
+the unpinned profile's launch is `runtime_incompatible` instead, and its
+recovery names `pohunek plugin doctor` and then the migration, never the
+install: a reinstall of the same archive is refused. `integration status`, `doctor` and `uninstall --agent codex`
 (or `claude`) still reach the config home of the earlier built-in, so hooks
 pohunek installed there can be reported and removed without the package. A
 foreground `codex`, `claude` or `hermes` in a shell session and one started
@@ -455,14 +458,16 @@ one state:
   `claude` or `hermes` the install of the official package from the release
   archive, for any other base a package that serves it, then
   `pohunek plugin profile migrate <name>`.
-- `package_unavailable`: the profile pins nothing, no installed package serves
-  its base, and an installed package that may serve it cannot be loaded (its
-  root or descriptor fails verification, so the daemon reports no runtime for
-  it). For `codex`, `claude` or `hermes` only an official package counts,
-  because only one can serve an official alias. The repair depends on the
-  fault (a missing root is restored by reinstalling the same archive, a
-  modified one refuses that reinstall), so the detail names
-  `pohunek plugin doctor`; repair the package, then migrate the profile.
+- `package_unavailable`: either the pinned digest is installed but its root or
+  descriptor fails verification, so the daemon reports no runtime for it; or
+  the profile pins nothing, no installed package serves its base, and an
+  installed package that may serve it cannot be loaded. For `codex`, `claude`
+  or `hermes` only an official package counts, because only one can serve an
+  official alias. The repair depends on the fault (a missing root is restored
+  by reinstalling the same archive, a modified one refuses that reinstall), so
+  the detail names `pohunek plugin doctor`. A pinned profile needs only the
+  repair, because it already names the digest; an unpinned one is then
+  migrated.
 - `pin_not_installed`: the pinned digest is not installed.
 - `unreadable`: the file is a symlink or special file, is not owned by you, is
   group- or world-writable, is not valid TOML, or has an invalid `base`,

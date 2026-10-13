@@ -1156,9 +1156,10 @@ fn parse_package_pin(
 ///
 /// A built-in base takes no binding. A package-served base requires one and is
 /// then resolved from exactly the bound digest; an unbound profile naming a
-/// package-served base is refused with the migration command, and so is one
-/// naming an official alias nothing serves, after the install of the official
-/// package it needs first.
+/// package-served base is refused with the migration command. An official
+/// alias nothing serves is refused after the install of the official package
+/// it needs first, or with the doctor when an installed official package
+/// cannot be loaded.
 fn resolve_base(
     name: &str,
     runtimes: &RuntimeHost,
@@ -1177,7 +1178,13 @@ fn resolve_base(
                 "base '{base}' is served by the installed package '{package}' and the profile does not pin it; run `pohunek plugin profile migrate {name}`"
             ),
         )),
-        (None, None) if is_reserved(base) => Err(official_base_not_installed(name, base)),
+        (None, None) if is_reserved(base) => {
+            if runtimes.package_report().official_unavailable() {
+                Err(official_base_unavailable(name, base))
+            } else {
+                Err(official_base_not_installed(name, base))
+            }
+        }
         (None, _) => runtimes.resolve_id(base),
     }
 }
@@ -1190,6 +1197,20 @@ fn official_base_not_installed(name: &str, base: &RuntimeId) -> ProtocolError {
     error.recover = Some(format!(
         "{}, then pin the profile to it with `pohunek plugin profile migrate {name}`",
         protocol::official_package_install_step(base)
+    ));
+    error
+}
+
+/// `runtime/runtime_incompatible` for the profile `name`, whose unpinned
+/// `base` is an official alias nothing serves while an installed official
+/// package cannot be loaded.
+///
+/// The package is installed, so reinstalling its archive is refused by the
+/// root or identity check; the doctor reports the fault and its repair.
+fn official_base_unavailable(name: &str, base: &RuntimeId) -> ProtocolError {
+    let mut error = ProtocolError::runtime_incompatible(base);
+    error.recover = Some(format!(
+        "run `pohunek plugin doctor` and repair the installed official package, then pin the profile to it with `pohunek plugin profile migrate {name}`"
     ));
     error
 }

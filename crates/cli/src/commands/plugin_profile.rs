@@ -246,8 +246,10 @@ enum ProfileState {
     /// The base runtime is not built in and no installed package serves it,
     /// so a launch fails with `runtime_not_installed`.
     PackageNotInstalled,
-    /// The base runtime is not built in, no installed package serves it, and
-    /// an installed package that may serve it cannot be loaded.
+    /// Either the pinned digest is installed but cannot be loaded, or the
+    /// profile pins nothing, its base runtime is not built in, no installed
+    /// package serves it, and an installed package that may serve it cannot be
+    /// loaded.
     PackageUnavailable,
     /// The pinned digest is not installed.
     PinNotInstalled,
@@ -328,6 +330,16 @@ fn unavailable_hint(name: &str, base: &RuntimeId) -> String {
     )
 }
 
+/// The recovery for a profile pinned to a package that is installed but cannot
+/// be loaded.
+///
+/// The pin already names the digest, so migrating would pin the same digest
+/// again; only the repair of the installed package applies.
+fn pinned_unavailable_hint() -> String {
+    "the pinned package is installed but cannot be loaded; run `pohunek plugin doctor` and repair it"
+        .to_owned()
+}
+
 /// Classify the readable profile `name` against the installed packages.
 fn classify(
     name: &str,
@@ -342,6 +354,10 @@ fn classify(
                 Some(info) if &info.package.id == package && serves_base(info) => {
                     (ProfileState::Pinned, None)
                 }
+                Some(info) if info.runtime_id.is_none() => (
+                    ProfileState::PackageUnavailable,
+                    Some(pinned_unavailable_hint()),
+                ),
                 Some(_) => (
                     ProfileState::NeedsMigration,
                     Some("the pinned package does not serve the base runtime".to_owned()),

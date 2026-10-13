@@ -669,7 +669,8 @@ installed, enabled and selected. The daemon compiles none of Codex, Claude Code 
 at all, and disabling or uninstalling the package leaves the alias unserved: a
 host without it answers a bare `codex`, `claude` or `hermes` with
 `agent_profile_not_found`, an unpinned host profile over it with
-`runtime_not_installed`, and `integration.install` for `codex` or `claude` with
+`runtime_not_installed` (`runtime_incompatible` with a doctor recovery while an
+installed official package cannot be loaded), and `integration.install` for `codex` or `claude` with
 `runtime_not_installed`, each with a recovery hint naming
 `pohunek plugin install runtime/packages/<runtime>.tar.zst --catalog
 runtime/runtime-catalog.json` from the extracted release archive (and, for the
@@ -2868,7 +2869,11 @@ not installed or no longer matches its recorded launch binding. A bare
 stays `agent_profile_not_found`. For an official alias nothing serves (`codex`,
 `claude` or `hermes` without its package), that `agent_profile_not_found` and the
 `runtime_not_installed` of an unpinned host profile over the alias carry a
-recovery hint naming the catalog install of the official package.
+recovery hint naming the catalog install of the official package. While an
+installed official package cannot be loaded (after a registry rebuild left it
+out), that unpinned profile's launch is `runtime_incompatible` instead, with
+the recovery `pohunek plugin doctor` and then `pohunek plugin profile migrate
+<name>`; the install is not offered, because the same archive is refused.
 `runtime_builtin_removed` is emitted by resume, fork and mutation of a session
 launched from the built-in runtime of an official alias this daemon does not
 compile in while no package serves the alias; once the official package serves

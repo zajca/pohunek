@@ -13,7 +13,7 @@
 //! or enabled now, because a pin must keep resolving to the content it froze.
 //! Neither ever substitutes another package or a built-in.
 
-// Rust guideline compliant 2026-10-04
+// Rust guideline compliant 2026-10-13
 
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
@@ -116,6 +116,9 @@ pub struct RejectedPackage {
     pub identity: PackageIdentity,
     /// Why it serves no runtime.
     pub reason: PackageRejection,
+    /// Whether the package is catalog-authorized, so it may serve an official
+    /// runtime id.
+    pub official: bool,
 }
 
 /// The outcome of loading every package fresh launches may use.
@@ -582,15 +585,13 @@ impl PackageSource {
             if !record.enabled() || !selected {
                 continue;
             }
+            let official = matches!(record.source(), package::registry::PackageSource::Official);
             match self.store.load_definition(record) {
                 Ok(definition) => {
                     loaded.push(Loaded {
                         digest: record.digest().clone(),
                         identity: record.identity().clone(),
-                        official: matches!(
-                            record.source(),
-                            package::registry::PackageSource::Official
-                        ),
+                        official,
                         definition,
                     });
                 }
@@ -598,6 +599,7 @@ impl PackageSource {
                     digest: record.digest().clone(),
                     identity: record.identity().clone(),
                     reason,
+                    official,
                 }),
             }
         }
@@ -620,6 +622,7 @@ impl PackageSource {
                     digest: entry.digest,
                     identity: entry.identity,
                     reason: PackageRejection::RuntimeIdConflict,
+                    official: entry.official,
                 });
             } else if entry.official {
                 official.push(entry.definition);
