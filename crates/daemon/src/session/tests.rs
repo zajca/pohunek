@@ -1557,12 +1557,11 @@ pub(super) async fn wait_for_file_contains(path: &std::path::Path, needle: &str)
 ///
 /// After a natural exit the exit watcher is the only committer, so this
 /// registry writes nothing more for the exit. After a `stop`, the watcher
-/// that lost the commit to the stop can still be inside its own
-/// `record_exit`, whose conditional write lands after the event and emits
-/// nothing, and it loads its write base separately, so neither the event nor
-/// the store lock orders it before a later write. After a stop a test uses
-/// [`drop_settled`] to open another registry or `Store` over the same file,
-/// or [`stop_settled`] to keep writing through this registry.
+/// that lost the commit to the stop writes nothing, but it can still be
+/// inside its own `record_exit`, holding the registry and reading the store.
+/// After a stop a test uses [`drop_settled`] to open another registry or
+/// `Store` over the same file, or [`stop_settled`] to keep writing through
+/// this registry.
 ///
 /// `events` must be subscribed before the exit commits, or its terminal event
 /// is never received.
@@ -1599,7 +1598,7 @@ pub(super) async fn exit_settled(
 
 /// Waits after a `stop` of session `id` until no task of `registry` but the
 /// caller's handle remains, so an exit watcher that lost the commit to the
-/// stop has made its last write.
+/// stop has ended.
 ///
 /// `registry` must run no other session, and the caller must hold no other
 /// handle to it, or the wait never ends.
@@ -10301,6 +10300,205 @@ async fn procwatch_rebinds_restart_to_new_observed_pid() {
     let _ = registry.stop(&created.id).await;
 }
 
+/// A resumable session whose agent exits with code 3 on its first input line,
+/// and a native-id report of it parked at one point of its commit.
+struct NativeIdExitRace {
+    registry: SessionRegistry,
+    store_path: PathBuf,
+    id: SessionId,
+    /// Receives every event from before the report on.
+    events: tokio::sync::broadcast::Receiver<Event>,
+    /// Settles the session after the assertions on `events`.
+    settle_events: tokio::sync::broadcast::Receiver<Event>,
+    held: crate::runtime::lifecycle::tests::StartGate,
+    reporting: tokio::task::JoinHandle<protocol::SessionReportNativeIdResult>,
+}
+
+impl NativeIdExitRace {
+    /// Starts the report of `native_session_id` and waits until it is parked
+    /// at `at`.
+    async fn start(tag: &str, at: super::NativeIdHold, native_session_id: &str) -> Self {
+        let store_path = temp_store_path(tag);
+        let agents_dir = temp_agents_dir_with(
+            tag,
+            "resumable",
+            "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"read line; exit 3\"]\n",
+        );
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: hermetic_shell(),
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store_path.clone()),
+            agents_dir: Some(agents_dir),
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry
+            .create(resumable_params())
+            .await
+            .expect("create session");
+        let events = registry.subscribe();
+        let settle_events = registry.subscribe();
+        let report = native_report!(&registry;
+            session_id: created.id.clone(),
+            agent: "claude".to_owned(),
+            native_session_id: native_session_id.to_owned(),
+            transcript_path: None,
+        );
+        let held = registry.hold_next_native_id(&created.id, at);
+        let reporting = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.report_native_id(report).await }
+        });
+        held.entered.notified().await;
+        Self {
+            registry,
+            store_path,
+            id: created.id,
+            events,
+            settle_events,
+            held,
+            reporting,
+        }
+    }
+
+    /// Sends the input line that ends the agent, from its own task: a report
+    /// parked inside its commit holds the sessions lock the input needs.
+    fn end_agent(&self) -> tokio::task::JoinHandle<Result<(), protocol::ProtocolError>> {
+        let registry = self.registry.clone();
+        let id = self.id.clone();
+        tokio::spawn(async move { registry.write_input_to_session(&id, "go").await })
+    }
+
+    /// Releases the report and returns its result.
+    async fn release(&mut self) -> protocol::SessionReportNativeIdResult {
+        self.held.release.notify_one();
+        (&mut self.reporting).await.expect("report task joins")
+    }
+
+    /// Waits until no task of the registry remains, then asserts that the
+    /// store holds the agent's terminal outcome exactly as the registry
+    /// shows it, and returns that record.
+    async fn assert_settled_terminal(&mut self) -> crate::store::SessionRecord {
+        stop_settled(&self.registry, &mut self.settle_events, &self.id).await;
+        let record = stored_record(&self.store_path, &self.id);
+        assert_eq!(record.info.state, SessionState::Failed);
+        assert_eq!(record.info.exit_code, Some(3));
+        assert_eq!(record.runtime.state, RuntimeState::Terminal);
+        let memory = self
+            .registry
+            .inspect(&self.id)
+            .await
+            .expect("inspect session");
+        assert_eq!(
+            record.info, memory,
+            "the store holds what the registry shows"
+        );
+        record
+    }
+}
+
+/// A native-id report validated while the session runs, whose commit comes
+/// after an exit committed the terminal state: the report is refused and
+/// never replaces the terminal record.
+#[tokio::test]
+async fn native_id_report_is_refused_once_an_exit_committed() {
+    let mut race = NativeIdExitRace::start(
+        "native-id-refused-after-exit",
+        super::NativeIdHold::Validated,
+        "native-before-exit",
+    )
+    .await;
+    race.end_agent()
+        .await
+        .expect("input task joins")
+        .expect("the input ends the agent");
+    exit_settled(&mut race.events, &race.id).await;
+
+    let reported = race.release().await;
+
+    let record = race.assert_settled_terminal().await;
+    assert!(
+        !reported.recorded,
+        "a report committing after the exit is refused"
+    );
+    assert_eq!(record.info.native_session_id, None);
+}
+
+/// An exit that ends the agent while a native-id report is inside its commit:
+/// no reader sees the report before it is durable, the exit commits after it,
+/// and the terminal record carries the reported reference.
+#[tokio::test]
+async fn exit_during_a_native_id_commit_keeps_the_reported_reference() {
+    let mut race = NativeIdExitRace::start(
+        "native-id-exit-in-commit",
+        super::NativeIdHold::Write,
+        "native-in-commit",
+    )
+    .await;
+    assert!(
+        futures::FutureExt::now_or_never(race.registry.inspect(&race.id)).is_none(),
+        "the updated entry is not observable before its record is durable"
+    );
+    let ending = race.end_agent();
+
+    let reported = race.release().await;
+    ending
+        .await
+        .expect("input task joins")
+        .expect("the input ends the agent");
+    exit_settled(&mut race.events, &race.id).await;
+
+    let record = race.assert_settled_terminal().await;
+    assert!(reported.recorded, "the report committed before the exit");
+    assert_eq!(
+        record.info.native_session_id.as_deref(),
+        Some("native-in-commit"),
+        "the terminal record carries the reported reference"
+    );
+}
+
+/// An exit that commits between a native-id report's commit and its
+/// announcement: the report stays recorded, and no `session_updated` of the
+/// session follows its terminal event.
+#[tokio::test]
+async fn native_id_report_is_not_announced_once_the_session_ended() {
+    let mut race = NativeIdExitRace::start(
+        "native-id-announce-after-exit",
+        super::NativeIdHold::Announce,
+        "native-before-announce",
+    )
+    .await;
+    race.end_agent()
+        .await
+        .expect("input task joins")
+        .expect("the input ends the agent");
+    exit_settled(&mut race.events, &race.id).await;
+
+    let reported = race.release().await;
+
+    assert!(reported.recorded, "the report committed before the exit");
+    // The report has returned, so every event it sends is queued.
+    loop {
+        match race.events.try_recv() {
+            Ok(event) => {
+                let session = &event.payload()["session"]["id"];
+                assert!(
+                    !(event.event() == protocol::event::SESSION_UPDATED
+                        && *session == serde_json::json!(race.id.0)),
+                    "no session_updated follows the terminal event: {event:?}"
+                );
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(error) => panic!("the event receiver keeps up: {error}"),
+        }
+    }
+    let record = race.assert_settled_terminal().await;
+    assert_eq!(
+        record.info.native_session_id.as_deref(),
+        Some("native-before-announce"),
+        "the terminal record carries the reported reference"
+    );
+}
+
 #[tokio::test]
 async fn report_native_id_records_binding_and_updates_info() {
     let store_path = temp_store_path("report");
@@ -10592,8 +10790,8 @@ async fn concurrent_equal_generation_commits_publish_only_the_durable_winner() {
         .expect("preparing runtime")
         .worker_instance_id = None;
     preparing.runtime.worker_instance_id = None;
-    // The registry's own store: its write lock serializes this write against
-    // the late conditional write of an exit watcher that lost to the stop.
+    // The registry's own store, so this write shares its write lock with the
+    // registry's own writers.
     let store = registry.inner.store.clone().expect("registry store");
     assert_eq!(
         store.record_session(&preparing).expect("persist preparing"),
@@ -10820,13 +11018,31 @@ async fn reconnect_persistence_failure_retries_without_orphaning_live_handle() {
         .expect("registry store")
         .fail_next_write_before_rename();
 
-    let failed = registry
+    // A live worker task may change the entry before the adoption commits;
+    // that refusal writes nothing, so the armed store fault stays for the
+    // retry that reaches the write.
+    let mut failed = registry
         .adopt_reconnected_worker(&created.id, &expected, worker.clone())
         .await;
-    assert!(matches!(
-        failed,
-        super::RuntimeTransitionOutcome::RetryablePersistenceFailure(_)
-    ));
+    for _ in 0..CONCURRENT_TRANSITION_RETRY_LIMIT {
+        if !matches!(
+            failed,
+            super::RuntimeTransitionOutcome::RetryableConcurrentChange
+        ) {
+            break;
+        }
+        tokio::task::yield_now().await;
+        failed = registry
+            .adopt_reconnected_worker(&created.id, &expected, worker.clone())
+            .await;
+    }
+    assert!(
+        matches!(
+            failed,
+            super::RuntimeTransitionOutcome::RetryablePersistenceFailure(_)
+        ),
+        "the armed store fault fails the adoption: {failed:?}"
+    );
     assert_eq!(
         registry
             .inspect(&created.id)
@@ -10978,17 +11194,34 @@ async fn lost_transition_retries_precommit_failure_before_single_event() {
         .expect("registry store")
         .fail_next_write_before_rename();
 
-    assert!(matches!(
-        registry
+    // A live worker task may change the entry before the classification
+    // commits; that refusal writes nothing, so the armed store fault stays for
+    // the retry that reaches the write.
+    let mut failed = super::RuntimeTransitionOutcome::RetryableConcurrentChange;
+    for _ in 0..CONCURRENT_TRANSITION_RETRY_LIMIT {
+        failed = registry
             .mark_worker_unavailable(
                 &created.id,
                 &expected,
                 RuntimeState::Lost,
                 crate::session::supervision::RUNTIME_LOST,
             )
-            .await,
-        super::RuntimeTransitionOutcome::RetryablePersistenceFailure(_)
-    ));
+            .await;
+        if !matches!(
+            failed,
+            super::RuntimeTransitionOutcome::RetryableConcurrentChange
+        ) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        matches!(
+            failed,
+            super::RuntimeTransitionOutcome::RetryablePersistenceFailure(_)
+        ),
+        "the armed store fault fails the classification: {failed:?}"
+    );
     assert_eq!(
         registry
             .inspect(&created.id)
@@ -11034,10 +11267,20 @@ async fn exit_transition_retries_precommit_failure_before_single_event() {
         success: true,
     };
 
-    let error = registry
-        .record_exit(&created.id, exit, false, Some(&expected), None)
-        .await
-        .expect_err("precommit exit failure");
+    // A live worker task may change the entry before the exit commits; that
+    // refusal (`Ok(false)`) writes nothing, so the armed store fault stays
+    // for the retry that reaches the write.
+    let mut outcome = Ok(false);
+    for _ in 0..CONCURRENT_TRANSITION_RETRY_LIMIT {
+        outcome = registry
+            .record_exit(&created.id, exit, false, Some(&expected), None)
+            .await;
+        if !matches!(outcome, Ok(false)) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let error = outcome.expect_err("precommit exit failure");
     assert_eq!(error.code, "session_store_failed");
     assert_eq!(
         registry
@@ -11218,8 +11461,9 @@ async fn assert_reconnect_transition_applied(
     expected: &RuntimeWatchIdentity,
     worker: &Worker,
 ) {
-    // A live worker task may commit a same-runtime snapshot between the durable
-    // write and memory compare. Production retries this explicit outcome.
+    // A live worker task may commit a same-runtime snapshot between this
+    // transition's derivation and its commit. Production retries this
+    // explicit outcome.
     for _ in 0..CONCURRENT_TRANSITION_RETRY_LIMIT {
         match registry
             .adopt_reconnected_worker(id, expected, worker.clone())
@@ -16730,6 +16974,123 @@ async fn initial_input_commit_keeps_a_concurrent_natural_exit() {
     assert_eq!(record.info.state, SessionState::Failed, "the exit survives");
     assert_eq!(record.info.exit_code, Some(3));
     assert_eq!(record.runtime.state, RuntimeState::Terminal);
+}
+
+/// A user stop that commits while the exit watcher of the same runtime
+/// still holds a transition derived before the stop: the watcher's commit
+/// finds the session changed and writes nothing, so the stop's terminal record
+/// stays the durable record and a restarted daemon reconciles it as stopped.
+#[tokio::test]
+async fn exit_watcher_never_overwrites_a_stop_that_committed_first() {
+    let daemon = RestartableDaemon::new("stop-exit-race");
+    let (registry, _supervisor) = scripted_registry(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "read line; exit 3"]),
+        ..daemon.config.clone()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let mut events = registry.subscribe();
+    let watcher = registry.hold_next_exit_commit(&created.id);
+    registry
+        .write_input_to_session(&created.id, "go")
+        .await
+        .expect("the input ends the shell");
+    // The watcher has derived a `failed` transition from the running entry.
+    watcher.entered.notified().await;
+
+    let stopped = registry.stop(&created.id).await.expect("stop session");
+    assert!(stopped.stopped, "the stop commits the terminal state");
+    let stop_record = stored_record(&daemon.store_path, &created.id);
+    assert_eq!(stop_record.info.state, SessionState::Stopped);
+    assert_eq!(
+        stop_record.desired_state,
+        crate::store::DesiredState::Stopped
+    );
+    assert_eq!(stop_record.runtime.state, RuntimeState::Terminal);
+
+    watcher.release.notify_one();
+    stop_settled(&registry, &mut events, &created.id).await;
+
+    assert_eq!(
+        stored_record(&daemon.store_path, &created.id),
+        stop_record,
+        "the watcher's transition never replaces the stop's terminal record"
+    );
+    let memory = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert_eq!(memory.state, SessionState::Stopped);
+    drop(registry);
+
+    let restarted = daemon.restart().await;
+    let reconciled = restarted
+        .inspect(&created.id)
+        .await
+        .expect("inspect the reconciled session");
+    assert_eq!(reconciled.state, SessionState::Stopped);
+    assert_eq!(
+        stored_record(&daemon.store_path, &created.id).desired_state,
+        crate::store::DesiredState::Stopped,
+        "reconciliation keeps the stop"
+    );
+}
+
+/// An exit that commits the terminal state a stop's in-memory intent decided,
+/// before that stop persists its intent: the intent never replaces the
+/// terminal record, so the durable record matches the registry.
+#[tokio::test]
+async fn stop_intent_never_overwrites_an_exit_that_committed_first() {
+    let daemon = RestartableDaemon::new("stop-intent-exit-race");
+    let (registry, _supervisor) = scripted_registry(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "read line; exit 3"]),
+        ..daemon.config.clone()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let mut events = registry.subscribe();
+    let mut settle_events = registry.subscribe();
+    let intent = registry.hold_next_stop_intent(&created.id);
+    let stopping = tokio::spawn({
+        let registry = registry.clone();
+        let id = created.id.clone();
+        async move { registry.stop(&id).await }
+    });
+    // The stop has marked the entry as stopping and not yet persisted it.
+    intent.entered.notified().await;
+    registry
+        .write_input_to_session(&created.id, "go")
+        .await
+        .expect("the input ends the shell");
+    exit_settled(&mut events, &created.id).await;
+    let exited = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert_eq!(
+        exited.state,
+        SessionState::Stopped,
+        "the stop intent decides"
+    );
+
+    intent.release.notify_one();
+    let stopped = stopping
+        .await
+        .expect("stop task joins")
+        .expect("the stop of an ended session succeeds");
+    assert!(stopped.stopped, "the exit applied the stop's outcome");
+    stop_settled(&registry, &mut settle_events, &created.id).await;
+
+    let record = stored_record(&daemon.store_path, &created.id);
+    assert_eq!(record.info.state, SessionState::Stopped);
+    assert_eq!(record.transaction, None, "no stop intent outlives the exit");
+    assert_eq!(record.runtime.state, RuntimeState::Terminal);
+    let memory = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert_eq!(
+        record.info, memory,
+        "the store holds what the registry shows"
+    );
 }
 
 /// A create whose initial input was never delivered because its daemon
