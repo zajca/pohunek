@@ -2163,6 +2163,18 @@ async fn a_live_built_in_claude_session_follows_its_package_detector_through_ins
         "the installed package's detector runs without a callback"
     );
 
+    // An own-runtime active agent runs under the pinned definition, so it
+    // follows the package change too.
+    assert!(
+        adopted
+            .registry
+            .report_agent(claude_identity_report(&created.id))
+            .await
+            .recorded,
+        "the own-runtime report is recorded"
+    );
+    assert_eq!(running(&adopted.registry).await, package_config);
+
     adopted
         .registry
         .package_uninstall(uninstall(&package.digest))
@@ -2171,7 +2183,84 @@ async fn a_live_built_in_claude_session_follows_its_package_detector_through_ins
     assert_eq!(
         running(&adopted.registry).await,
         generic,
-        "the uninstalled package's detector is no longer the running one"
+        "the uninstalled package's detector is no longer the running one, even under an own-runtime active agent"
+    );
+    adopted
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the adopted session");
+    adopted
+        .registry
+        .remove(&created.id)
+        .await
+        .expect("remove the adopted session");
+}
+
+/// The generation of the running detector configuration of session `id`.
+async fn detector_generation(registry: &SessionRegistry, id: &protocol::SessionId) -> u64 {
+    let sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get(id).expect("the live session");
+    let generation = entry.detector_config.borrow().generation;
+    generation
+}
+
+#[tokio::test]
+async fn a_nested_agent_of_another_runtime_keeps_its_detector_through_a_package_change() {
+    let tag = "claude-nested-detector";
+    let key = signing_key("root");
+    let dir = temp_dir(tag);
+    let store_path = temp_store_path(tag);
+    let fixture = Fixture::with_anchor_and_store(
+        &format!("{tag}-plugins"),
+        anchor(&[&key], Vec::new()),
+        store_path.clone(),
+    );
+    fixture.write_profile(
+        PROFILE,
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 600\"]\n",
+    );
+    let previous = compiled_in_daemon(&fixture, &store_path);
+    let created = previous
+        .create(protocol::SessionNewParams {
+            agent: PROFILE.to_owned(),
+            cwd: Some(dir),
+            ..params()
+        })
+        .await
+        .expect("a session of the built-in Claude runtime");
+    let adopted = fixture.reopen_with_workers_of(&previous).await;
+    Box::pin(adopted.registry.reconcile_workers())
+        .await
+        .expect("startup reconciliation");
+    let package = real_official(RuntimeId::CLAUDE);
+    install_real_official(&adopted, &adopted.registry, RuntimeId::CLAUDE, &package, 5).await;
+
+    let nested = protocol::SessionReportAgentParams {
+        session_id: created.id.clone(),
+        source: "pohunek:shell".to_owned(),
+        agent: RuntimeId::SHELL.to_owned(),
+        activity: None,
+        seq: None,
+        pid: None,
+        agent_session_id: None,
+        agent_session_path: None,
+    };
+    assert!(
+        adopted.registry.report_agent(nested).await.recorded,
+        "the nested shell agent is recorded"
+    );
+    let owned_generation = detector_generation(&adopted.registry, &created.id).await;
+
+    adopted
+        .registry
+        .package_uninstall(uninstall(&package.digest))
+        .await
+        .expect("uninstall the package");
+    assert_eq!(
+        detector_generation(&adopted.registry, &created.id).await,
+        owned_generation,
+        "a nested agent of another runtime keeps its detector configuration"
     );
     adopted
         .registry

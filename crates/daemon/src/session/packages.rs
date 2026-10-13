@@ -138,7 +138,12 @@ impl SessionRegistry {
             }
             entry.pinned = pinned;
             entry.default_detector_config = config.clone();
-            if entry.active_agent.is_none() {
+            // A nested agent of another runtime owns the running configuration.
+            // An active agent of the session's own runtime (a report or a
+            // process naming it) runs under the pinned definition, so it follows.
+            let own_runtime_active = entry.active_agent.is_some()
+                && entry.info.active_agent_base.as_ref() == Some(&entry.info.agent_base);
+            if entry.active_agent.is_none() || own_runtime_active {
                 super::send_detector_config(entry, config);
             }
         }
