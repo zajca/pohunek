@@ -572,8 +572,9 @@ async fn spawn_server_with_config(
 }
 
 /// [`spawn_server_with_config`] over a plugin root next to `socket` that holds
-/// the official Codex and Claude packages, installed through `package.install`
-/// with a catalog the registry's throwaway trust anchor authorizes.
+/// the official Codex, Claude and Hermes packages, installed through
+/// `package.install` with a catalog the registry's throwaway trust anchor
+/// authorizes.
 async fn spawn_server_serving_official_runtimes(
     socket: &std::path::Path,
     version: &str,

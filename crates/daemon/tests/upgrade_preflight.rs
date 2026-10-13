@@ -4,7 +4,9 @@
 //! v0.33.0 daemon (schema 1) and worker journals of the current schema whose
 //! worker is this test process, so the process table proves it running. A
 //! test whose verdict needs the session's runtime served by this binary
-//! rebinds the fixture's Claude session to a runtime it ships built in.
+//! installs the official packages ([`Host::serving`]) and rebinds the
+//! fixture's Claude session to one of them, pinned to the installed package
+//! ([`served_session_line`]).
 
 #[path = "support/official_runtimes.rs"]
 mod official_runtimes;
@@ -51,13 +53,13 @@ const LEGACY_MARKER_RELEASE: &str = "0.33.0";
 /// `POHUNEK_WORKER_INSTANCE_ID`.
 const INSTANCE_MARKER_RELEASE: &str = "0.33.1";
 
-/// A hook runtime this binary ships built in; [`served_session_line`] rebinds
-/// a fixture session to it so its recovery stays served by the binary under
-/// test.
-const SERVED_BUILTIN: &str = "hermes";
+/// A hook runtime an official package serves; [`served_session_line`] pins a
+/// fixture session to that package, which [`Host::serving`] installs, so its
+/// recovery stays served by the binary under test.
+const SERVED_RUNTIME: &str = "hermes";
 
-/// The hook schema the [`SERVED_BUILTIN`] descriptor declares.
-const SERVED_BUILTIN_HOOK_SCHEMA: &str = "identity-v1";
+/// The hook schema the [`SERVED_RUNTIME`] package descriptor declares.
+const SERVED_RUNTIME_HOOK_SCHEMA: &str = "identity-v1";
 
 /// Edits a journal into one the preflight must refuse.
 type Mutation = fn(&mut Value);
@@ -85,6 +87,16 @@ impl Host {
             workers,
             env,
         }
+    }
+
+    /// A host whose plugin root holds the official packages, so the binary
+    /// under test serves [`SERVED_RUNTIME`] from its package.
+    async fn serving() -> Self {
+        let host = Self::new();
+        official_runtimes::OfficialCatalog::new()
+            .preinstall(&host.inputs().plugins_dir, host.env.root())
+            .await;
+        host
     }
 
     fn write_store(&self, lines: &[Value]) {
@@ -195,11 +207,17 @@ fn session_line(session: &str, worker: &str) -> Value {
     line
 }
 
-/// [`session_line`] rebound to [`SERVED_BUILTIN`], for a judgement that needs
-/// the session's runtime served by the binary under test.
+/// [`session_line`] rebound to [`SERVED_RUNTIME`] and pinned to its official
+/// package, for a judgement that needs the session's runtime served by the
+/// binary under test on a [`Host::serving`].
 fn served_session_line(session: &str, worker: &str) -> Value {
     let mut line = session_line(session, worker);
-    rebind_agent(&mut line, SERVED_BUILTIN);
+    rebind_agent(&mut line, SERVED_RUNTIME);
+    pin_recovery(
+        &mut line,
+        serde_json::to_value(official_runtimes::package_binding(SERVED_RUNTIME))
+            .expect("serialize the package binding"),
+    );
     line
 }
 
@@ -242,9 +260,9 @@ fn verdict_of<'a>(report: &'a PreflightReport, session: &str) -> (&'a Verdict, &
     (&found.verdict, found.code.as_str())
 }
 
-#[test]
-fn clean_sessions_of_an_old_store_are_adoptable_and_nothing_is_written() {
-    let host = Host::new();
+#[tokio::test]
+async fn clean_sessions_of_an_old_store_are_adoptable_and_nothing_is_written() {
+    let host = Host::serving().await;
     host.write_store(&[
         served_session_line("s-1", "w-fixture"),
         served_session_line("s-2", "w-two"),
@@ -277,9 +295,9 @@ fn clean_sessions_of_an_old_store_are_adoptable_and_nothing_is_written() {
     );
 }
 
-#[test]
-fn a_session_record_that_cannot_be_loaded_is_named_and_not_adopted() {
-    let host = Host::new();
+#[tokio::test]
+async fn a_session_record_that_cannot_be_loaded_is_named_and_not_adopted() {
+    let host = Host::serving().await;
     let mut broken = served_session_line("s-1", "w-fixture");
     broken
         .as_object_mut()
@@ -303,9 +321,9 @@ fn a_session_record_that_cannot_be_loaded_is_named_and_not_adopted() {
     );
 }
 
-#[test]
-fn a_recovery_that_cannot_be_mapped_loses_native_recovery() {
-    let host = Host::new();
+#[tokio::test]
+async fn a_recovery_that_cannot_be_mapped_loses_native_recovery() {
+    let host = Host::serving().await;
     let mut line = served_session_line("s-1", "w-fixture");
     line["recovery"]["resume_mode"] = json!("not-a-mode");
     host.write_store(&[line]);
@@ -337,9 +355,9 @@ fn broken_resume_line() -> Value {
     broken
 }
 
-#[test]
-fn an_unreadable_resume_line_loses_recovery_only_when_the_record_depends_on_it() {
-    let host = Host::new();
+#[tokio::test]
+async fn an_unreadable_resume_line_loses_recovery_only_when_the_record_depends_on_it() {
+    let host = Host::serving().await;
     let mut dependent = served_session_line("s-1", "w-fixture");
     dependent["recovery"] = Value::Null;
     host.write_store(&[dependent, broken_resume_line()]);
@@ -353,7 +371,7 @@ fn an_unreadable_resume_line_loses_recovery_only_when_the_record_depends_on_it()
     );
 
     // The record keeps its own complete recovery, which startup adopts with.
-    let host = Host::new();
+    let host = Host::serving().await;
     host.write_store(&[
         served_session_line("s-1", "w-fixture"),
         broken_resume_line(),
@@ -526,9 +544,9 @@ impl Drop for LegacyMarkedChild {
 /// A worker released before `POHUNEK_WORKER_INSTANCE_ID` marks its children
 /// with a name this daemon does not read, so its live runtime is refused
 /// rather than adopted unsweepable; the first marking release is adoptable.
-#[test]
-fn a_live_worker_older_than_the_instance_marker_is_not_adopted() {
-    let host = Host::new();
+#[tokio::test]
+async fn a_live_worker_older_than_the_instance_marker_is_not_adopted() {
+    let host = Host::serving().await;
     host.write_store(&[
         served_session_line("s-1", "w-fixture"),
         served_session_line("s-2", "w-two"),
@@ -608,9 +626,9 @@ fn a_launch_identity_that_contradicts_the_record_is_not_adopted() {
     );
 }
 
-#[test]
-fn a_live_worker_without_a_record_is_unmanaged_and_a_dead_journal_is_not_listed() {
-    let host = Host::new();
+#[tokio::test]
+async fn a_live_worker_without_a_record_is_unmanaged_and_a_dead_journal_is_not_listed() {
+    let host = Host::serving().await;
     host.write_store(&[served_session_line("s-1", "w-fixture")]);
     host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
     host.write_journal("s-2", "w-orphan", &journal("s-2", "w-orphan"));
@@ -670,9 +688,9 @@ fn a_store_the_daemon_would_refuse_is_reported_and_left_untouched() {
     assert_eq!(host.snapshot(), before);
 }
 
-#[test]
-fn a_store_at_the_current_schema_is_up_to_date() {
-    let host = Host::new();
+#[tokio::test]
+async fn a_store_at_the_current_schema_is_up_to_date() {
+    let host = Host::serving().await;
     host.write_store(&[served_session_line("s-1", "w-fixture")]);
     pohunek_daemon::store::migrate_at_startup(&host.store).expect("migrate fixture store");
     host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
@@ -683,9 +701,9 @@ fn a_store_at_the_current_schema_is_up_to_date() {
     assert_eq!(verdict_of(&report, "s-1").0, &Verdict::Adoptable);
 }
 
-#[test]
-fn the_binary_prints_the_report_without_creating_or_changing_anything() {
-    let host = Host::new();
+#[tokio::test]
+async fn the_binary_prints_the_report_without_creating_or_changing_anything() {
+    let host = Host::serving().await;
     host.write_store(&[served_session_line("s-1", "w-fixture")]);
     host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
     let before = host.snapshot();
@@ -730,8 +748,8 @@ fn a_session_whose_runtime_the_record_already_lost_is_not_judged() {
     assert_eq!(report.at_risk().count(), 0);
 }
 
-#[test]
-fn an_unidentified_unreadable_line_taints_every_session_that_may_depend_on_it() {
+#[tokio::test]
+async fn an_unidentified_unreadable_line_taints_every_session_that_may_depend_on_it() {
     for (name, line) in [
         ("invalid json", "this line is not json".to_owned()),
         (
@@ -739,7 +757,7 @@ fn an_unidentified_unreadable_line_taints_every_session_that_may_depend_on_it() 
             json!({ "kind": "resume", "agent": "claude" }).to_string(),
         ),
     ] {
-        let host = Host::new();
+        let host = Host::serving().await;
         let mut dependent = served_session_line("s-1", "w-fixture");
         dependent["recovery"] = Value::Null;
         host.write_store(&[dependent]);
@@ -863,15 +881,16 @@ fn rebind_agent(line: &mut Value, agent: &str) {
     line["recovery"]["agent_base"] = json!(agent);
 }
 
-#[test]
-fn a_built_in_runtime_that_reported_its_identity_is_adoptable_with_or_without_a_journaled_schema() {
+#[tokio::test]
+async fn a_package_runtime_that_reported_its_identity_is_adoptable_with_or_without_a_journaled_schema(
+) {
     for journaled_schema in [false, true] {
-        let host = Host::new();
+        let host = Host::serving().await;
         host.write_store(&[served_session_line("s-1", "w-fixture")]);
         let mut reported = journal("s-1", "w-fixture");
-        with_active_identity(&mut reported, SERVED_BUILTIN);
+        with_active_identity(&mut reported, SERVED_RUNTIME);
         if journaled_schema {
-            reported["hook_schema"] = json!(SERVED_BUILTIN_HOOK_SCHEMA);
+            reported["hook_schema"] = json!(SERVED_RUNTIME_HOOK_SCHEMA);
         }
         host.write_journal("s-1", "w-fixture", &reported);
 
@@ -904,12 +923,12 @@ fn a_runtime_whose_definition_cannot_be_read_stays_unverified() {
     );
 }
 
-#[test]
-fn reading_runtime_definitions_creates_nothing_even_in_an_existing_plugin_root() {
-    let host = Host::new();
+#[tokio::test]
+async fn reading_runtime_definitions_creates_nothing_even_in_an_existing_plugin_root() {
+    let host = Host::serving().await;
     host.write_store(&[served_session_line("s-1", "w-fixture")]);
     let mut reported = journal("s-1", "w-fixture");
-    with_active_identity(&mut reported, SERVED_BUILTIN);
+    with_active_identity(&mut reported, SERVED_RUNTIME);
     host.write_journal("s-1", "w-fixture", &reported);
     let plugins = host.env.state_home().join("pohunek").join("plugins");
     fs::DirBuilder::new()
@@ -944,8 +963,8 @@ fn pin_recovery(line: &mut Value, binding: Value) {
     line["recovery"]["launch_binding"] = binding;
 }
 
-#[test]
-fn a_session_pinned_to_a_runtime_source_this_binary_does_not_serve_loses_recovery() {
+#[tokio::test]
+async fn a_session_pinned_to_a_runtime_source_this_binary_does_not_serve_loses_recovery() {
     // `pi` ships as no built-in runtime of this binary, and no package
     // serves it, so neither pin resolves.
     let unserved = [
@@ -973,7 +992,7 @@ fn a_session_pinned_to_a_runtime_source_this_binary_does_not_serve_loses_recover
         ),
     ];
     for (case, binding) in unserved {
-        let host = Host::new();
+        let host = Host::serving().await;
         let mut line = served_session_line("s-1", "w-fixture");
         rebind_agent(&mut line, "pi");
         pin_recovery(&mut line, binding);
@@ -1029,6 +1048,26 @@ fn built_in_session_line(runtime: &str) -> Value {
     line
 }
 
+/// The launch pins a release that compiled `runtime` in recorded for a session
+/// of its built-in runtime, by name: none (the v0.33.0 record), and the
+/// built-in provenance a v0.34 daemon pins.
+fn built_in_pins(runtime: &str) -> [(&'static str, Option<Value>); 2] {
+    [
+        ("unpinned", None),
+        (
+            "pinned to the built-in",
+            Some(json!({
+                "runtime_id": runtime,
+                "provenance": {
+                    "kind": "builtin",
+                    "package": {"id": format!("pohunek.runtime.{runtime}"), "version": "1.0.0"},
+                    "descriptor_digest": DESCRIPTOR_DIGEST,
+                },
+            })),
+        ),
+    ]
+}
+
 /// A session of `runtime` the v0.33.0 daemon launched from its built-in runtime
 /// loses its recovery on this binary, which ships no built-in `runtime`:
 /// without the official package the pin names a built-in that is gone, and
@@ -1039,41 +1078,48 @@ async fn assert_built_in_session_loses_recovery(runtime: &str) {
         (false, "runtime_builtin_removed"),
         (true, "runtime_served_by_package"),
     ] {
-        let host = Host::new();
-        if preinstalled {
-            official_runtimes::OfficialCatalog::new()
-                .preinstall(&host.inputs().plugins_dir, host.env.root())
-                .await;
+        for (pin, binding) in built_in_pins(runtime) {
+            let case = format!("{runtime} {pin}, package installed: {preinstalled}");
+            let host = Host::new();
+            if preinstalled {
+                official_runtimes::OfficialCatalog::new()
+                    .preinstall(&host.inputs().plugins_dir, host.env.root())
+                    .await;
+            }
+            let mut line = built_in_session_line(runtime);
+            if let Some(binding) = binding {
+                pin_recovery(&mut line, binding);
+            }
+            host.write_store(&[line]);
+            host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
+
+            let report = host.report();
+
+            assert_eq!(
+                verdict_of(&report, "s-1"),
+                (&Verdict::WouldLoseRecovery, CODE_RUNTIME_SOURCE_NOT_SERVED),
+                "{case}: {:?}",
+                report.sessions
+            );
+            let detail = &report
+                .sessions
+                .iter()
+                .find(|verdict| verdict.session_id == "s-1")
+                .expect("the verdict of s-1")
+                .detail;
+            assert!(detail.contains(refusal), "{case}: {detail}");
+            assert!(
+                detail.contains(&format!("`pohunek session new --agent {runtime}`")),
+                "{case}: {detail}"
+            );
+            // Without the package the adopted session refuses input too, which
+            // installing the package before the upgrade avoids.
+            assert_eq!(
+                detail.contains(&release_install_step(runtime)),
+                !preinstalled,
+                "{case}: {detail}"
+            );
         }
-        host.write_store(&[built_in_session_line(runtime)]);
-        host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
-
-        let report = host.report();
-
-        assert_eq!(
-            verdict_of(&report, "s-1"),
-            (&Verdict::WouldLoseRecovery, CODE_RUNTIME_SOURCE_NOT_SERVED),
-            "{runtime}, package installed: {preinstalled}: {:?}",
-            report.sessions
-        );
-        let detail = &report
-            .sessions
-            .iter()
-            .find(|verdict| verdict.session_id == "s-1")
-            .expect("the verdict of s-1")
-            .detail;
-        assert!(detail.contains(refusal), "{runtime}: {detail}");
-        assert!(
-            detail.contains(&format!("`pohunek session new --agent {runtime}`")),
-            "{runtime}: {detail}"
-        );
-        // Without the package the adopted session refuses input too, which
-        // installing the package before the upgrade avoids.
-        assert_eq!(
-            detail.contains(&release_install_step(runtime)),
-            !preinstalled,
-            "{runtime}: {detail}"
-        );
     }
 }
 
@@ -1091,6 +1137,13 @@ async fn a_session_of_the_built_in_claude_loses_recovery_with_or_without_the_off
     assert_built_in_session_loses_recovery("claude").await;
 }
 
+/// A Hermes session the v0.33.0 daemon launched from its built-in runtime
+/// loses its recovery on this binary, which ships no Hermes.
+#[tokio::test]
+async fn a_session_of_the_built_in_hermes_loses_recovery_with_or_without_the_official_package() {
+    assert_built_in_session_loses_recovery("hermes").await;
+}
+
 /// A live session of `runtime` the v0.33.0 daemon launched from its built-in
 /// runtime that cannot resume or fork (a host profile with `[resume]
 /// resumable = false`) still depends on the runtime source: this binary ships
@@ -1100,11 +1153,13 @@ async fn a_session_of_the_built_in_claude_loses_recovery_with_or_without_the_off
 /// instead of `adoptable`; with the package installed the session has nothing
 /// left to lose.
 async fn assert_non_resumable_built_in_session_is_at_risk_only_without_the_package(runtime: &str) {
-    for preinstalled in [false, true] {
-        for keep_recovery in [true, false] {
-            let case = format!(
-                "{runtime}, package installed: {preinstalled}, recovery record kept: {keep_recovery}"
-            );
+    let recoveries = built_in_pins(runtime)
+        .into_iter()
+        .map(|(pin, binding)| (format!("recovery record kept, {pin}"), Some(binding)))
+        .chain(std::iter::once(("no recovery record".to_owned(), None)));
+    for (recovery, kept) in recoveries {
+        for preinstalled in [false, true] {
+            let case = format!("{runtime}, package installed: {preinstalled}, {recovery}");
             let host = Host::new();
             if preinstalled {
                 official_runtimes::OfficialCatalog::new()
@@ -1113,10 +1168,13 @@ async fn assert_non_resumable_built_in_session_is_at_risk_only_without_the_packa
             }
             let mut line = built_in_session_line(runtime);
             line["info"]["capabilities"] = json!({ "resume": false, "fork": false });
-            if keep_recovery {
-                // The v0.33.0 binding of a profile that resumes and forks nothing.
+            if let Some(binding) = &kept {
+                // The binding of a profile that resumes and forks nothing.
                 line["recovery"]["resumable"] = json!(false);
                 line["recovery"]["forkable"] = json!(false);
+                if let Some(binding) = binding {
+                    pin_recovery(&mut line, binding.clone());
+                }
             } else {
                 line["recovery"] = Value::Null;
             }
@@ -1181,4 +1239,11 @@ async fn a_built_in_codex_session_without_native_recovery_is_at_risk_only_withou
 #[tokio::test]
 async fn a_built_in_claude_session_without_native_recovery_is_at_risk_only_without_the_package() {
     assert_non_resumable_built_in_session_is_at_risk_only_without_the_package("claude").await;
+}
+
+/// A live built-in Hermes session without native recovery is at risk only
+/// while no package serves `hermes`.
+#[tokio::test]
+async fn a_built_in_hermes_session_without_native_recovery_is_at_risk_only_without_the_package() {
+    assert_non_resumable_built_in_session_is_at_risk_only_without_the_package("hermes").await;
 }

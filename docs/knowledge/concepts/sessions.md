@@ -970,7 +970,8 @@ parser the descriptor names. A runtime without the declaration contributes no
 root, and a runtime that is not installed contributes nothing: a host without
 the official Codex or Claude Code package observes no transcript tree of that
 agent and does not recognize a `codex` or `claude` process outside pohunek or
-in the foreground of a shell session. Trees of two different runtimes that are the
+in the foreground of a shell session; a `hermes` process is likewise
+recognized only through the Hermes package's detection manifest. Trees of two different runtimes that are the
 same directory or nested in each other are attributed to neither; the daemon
 logs the warning `external.transcript_roots.ambiguous` with code
 `transcripts_ambiguous_owner`.
@@ -1081,8 +1082,9 @@ present it as reconnection. Recovery is rejected for live, reconnecting,
 conflicting, or incompatible runtimes and is never automatic. A removed session
 is gone and cannot be recovered.
 
-Hermes uses the same durable worker model, but only for the local interactive
-terminal backend in the supported 0.20.0 release. Pohunek launches it as
+Hermes, served only by its official package, uses the same durable worker
+model, but only for the local interactive terminal backend in the supported
+0.20.0 release. Pohunek launches it as
 `hermes chat`; when a valid native reference is already present, recovery is
 exactly `hermes chat --resume <reference>`. It never continues ambient Hermes
 state and never reads `state.db`. Before either launch, and before material
@@ -1099,8 +1101,8 @@ boundaries.
 
 Where the native reference comes from is a per-runtime strategy declared in the
 runtime definition's `[native_reference]` table: `hook` (a validated integration
-report, the behavior of the official Codex and Claude Code packages and the
-built-in `hermes`), `assigned` (core
+report, the behavior of the official Codex, Claude Code and Hermes
+packages), `assigned` (core
 generates the reference and passes it at launch) or `none` (no native recovery,
 the `shell` runtime). A runtime package without an integration handler is
 resumable only with `assigned`, which needs an agent CLI that accepts a
@@ -1219,15 +1221,22 @@ of fabricating an unsupported branch. Hermes-backed sessions return the same
 typed unsupported error.
 
 Recovery records written by earlier releases are completed when the daemon
-starts, so an upgrade does not strand a resumable session. The metadata store
-migration maps the flat `resume_mode`/`ref_kind`/`resumable`/`fork_*` fields of
-v0.33.0 onto the session's native-session launch spec with the argv they
-already produced. A v0.33.1 record that kept its native reference but lost its
-launch spec is restored with the spec v0.33.1 compiled in for Claude, Codex
+starts, so every such session stays listed with its recovery record. The
+metadata store migration maps the flat `resume_mode`/`ref_kind`/`resumable`/`fork_*`
+fields of v0.33.0 onto the session's native-session launch spec with the argv
+they already produced. A v0.33.1 record that kept its native reference but lost
+its launch spec is restored with the spec v0.33.1 compiled in for Claude, Codex
 and Hermes, which the migration keeps frozen and never reads from a current
-descriptor (Claude regains fork); for a profile or package runtime the spec is resolved by
-agent name when the record is loaded. The migration never launches anything: a
-restored session stays `lost` until an explicit `session.resume`. A record that
+descriptor (a restored Claude record carries its fork arguments again); for a
+profile or package runtime the spec is resolved by agent name when the record
+is loaded. The migration never launches anything: a restored session stays
+`lost` until an explicit `session.resume`. A record of the built-in Codex,
+Claude Code or Hermes, or of a host profile over one of them, is restored and
+listed, but this daemon compiles none of them in: its resume and fork answer
+`runtime_builtin_removed` while no package serves the alias, and
+`runtime_served_by_package` once the official package serves it (see
+[official aliases](../guides/runtime-packages.md#official-aliases)); the
+migration is a new session. A record that
 cannot be completed (the profile was deleted, no longer runs on the same
 runtime, or declares no native resume) still loads and keeps its place in
 `session list`. The daemon logs `reconcile.native_recovery.unrepairable` at

@@ -42,9 +42,6 @@ const AGENT_NAMES: [&str; 3] = ["codex", "claude", "hermes"];
 /// Who removes an allow-listed occurrence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Owner {
-    /// Compiled descriptor data of the built-in Hermes runtime, which its
-    /// official package replaces.
-    Packages,
     /// Compiled integration handler implementations. A handler is selected by
     /// the id a runtime descriptor names; the Claude and Codex handlers still
     /// own their provider ids, config paths and asset code, which is data of
@@ -62,7 +59,6 @@ enum Owner {
 impl Owner {
     fn issue(self) -> &'static str {
         match self {
-            Self::Packages => "#147",
             Self::Handlers => "handlers",
             Self::Doctor => "#68",
             Self::Data => "data",
@@ -91,15 +87,6 @@ type Entry = (&'static str, Approved, Owner, &'static str);
 type Occurrences = Vec<String>;
 
 const ALLOW_LIST: &[Entry] = &[
-    (
-        "crates/daemon/src/agent/host/builtin.rs",
-        Approved::Lines(&[
-    "\"hermes\" => detect::hermes_manifest(),",
-    "const EMBEDDED_DESCRIPTORS: [&str; 1] = [include_str!(\"../builtin/hermes.toml\")];",
-]),
-        Owner::Packages,
-        "embedded built-in descriptors and their manifest name table",
-    ),
     (
         "crates/daemon/src/agent/host/definition.rs",
         Approved::Lines(&[
@@ -130,48 +117,6 @@ const ALLOW_LIST: &[Entry] = &[
 ]),
         Owner::Data,
         "the Hermes safe-text input policy a descriptor selects by name",
-    ),
-    (
-        "crates/daemon/src/capabilities.rs",
-        Approved::Lines(&[
-    "\"hermes-v1\" => Some(Self::HermesV1),",
-    "&self.hermes_home_path,",
-    ".env(\"HERMES_HOME\", &sandbox.hermes_home_path)",
-    ".env(SEARCH_PATH_VAR, HERMES_PROBE_PATH)",
-    ".expect(\"embedded Hermes compatibility lock must be valid JSON\")",
-    ".strip_prefix(\"Hermes Agent v\")?",
-    "HermesV1,",
-    "Self::HermesV1 => version == supported_hermes_version(),",
-    "Self::HermesV1 => parse_hermes_version(&output).ok_or(ProbeOutcome::Failed),",
-    "Self::HermesV1 => probe_hermes_version(path, timeout, &[]),",
-    "const HERMES_COMPATIBILITY_LOCK: &str =",
-    "const HERMES_PROBE_PATH: &str = \"/usr/bin:/bin\";",
-    "const MAX_HERMES_VERSION_BYTES: usize = 64;",
-    "fn parse_hermes_version(output: &str) -> Option<String> {",
-    "fn probe_hermes_version(",
-    "fn probe_hermes_version_with_clock(",
-    "fn supported_hermes_version() -> &'static str {",
-    "hermes_home_path: PathBuf,",
-    "hermes_home_path: dir.join(\"hermes-home\"),",
-    "if value.is_empty() || value.len() > MAX_HERMES_VERSION_BYTES {",
-    "include_str!(\"../../../compat/hermes/compatibility-lock.json\");",
-    "probe_hermes_version_with_clock(path, timeout, seeded_env, Instant::now)",
-    "serde_json::from_str::<HermesCompatibilityLock>(HERMES_COMPATIBILITY_LOCK)",
-    "struct HermesCompatibilityLock {",
-]),
-        Owner::Packages,
-        "compiled Hermes version probe selected by a descriptor's probe name",
-    ),
-    (
-        "crates/daemon/src/detect/mod.rs",
-        Approved::Lines(&[
-    "(protocol::RuntimeId::HERMES, HERMES_MANIFEST),",
-    ".get_or_init(|| Manifest::parse_str(HERMES_MANIFEST).expect(\"Hermes manifest must parse\"))",
-    "const HERMES_MANIFEST: &str = include_str!(\"manifests/hermes.toml\");",
-    "pub fn hermes_manifest() -> &'static Manifest {",
-]),
-        Owner::Packages,
-        "compiled detection manifests of the built-in descriptors",
     ),
     (
         "crates/daemon/src/doctor.rs",
@@ -481,7 +426,6 @@ fn regenerate_allow_list() {
     for (path, lines) in &found {
         let known = ALLOW_LIST.iter().find(|entry| entry.0 == path);
         let owner = known.map_or("Data", |entry| match entry.2 {
-            Owner::Packages => "Packages",
             Owner::Handlers => "Handlers",
             Owner::Doctor => "Doctor",
             Owner::Data => "Data",

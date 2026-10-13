@@ -281,6 +281,18 @@ jobs:
           POHUNEK_E2E: "1"
           POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd
 
+      # The daemon serves `hermes` only from the official Hermes package; the
+      # e2e installs this archive through the throwaway catalog it trusts.
+      - name: Build the Hermes package and its throwaway catalog for the plugin e2e
+        run: |
+          set -euo pipefail
+          rm -rf target/hermes-e2e
+          mkdir -p target/hermes-e2e
+          scripts/build-hermes-package target/hermes-e2e/hermes.tar.zst
+          cargo xtask hermes throwaway-catalog \
+            --package target/hermes-e2e/hermes.tar.zst \
+            --output-dir target/hermes-e2e/catalog
+
       - name: Hermes plugin e2e against real daemon
         run: bun test sdk/ts/sdk/test/hermes-plugin.e2e.test.ts
         env:
@@ -288,6 +300,8 @@ jobs:
           POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd
           POHUNEK_CLI_BIN: ${{ github.workspace }}/target/debug/pohunek
           POHUNEK_PYTHON_BIN: /usr/bin/python3
+          POHUNEK_HERMES_PACKAGE: ${{ github.workspace }}/target/hermes-e2e/hermes.tar.zst
+          POHUNEK_HERMES_CATALOG_DIR: ${{ github.workspace }}/target/hermes-e2e/catalog
 
   build:
     name: Build the release artifacts

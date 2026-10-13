@@ -233,9 +233,8 @@ async fn a_builtin_base_is_refused() {
     let fixture = Fixture::new("bind-builtin");
     let package = Package::pi();
     install(&fixture, &package).await;
-    // Shell and Hermes stay built in whether or not the binary embeds Codex
-    // and Claude.
-    for base in [protocol::RuntimeId::SHELL, protocol::RuntimeId::HERMES] {
+    // The shell is the only built-in runtime.
+    for base in [protocol::RuntimeId::SHELL] {
         let text = format!("base = \"{base}\"\n");
         let path = fixture.write_profile(PROFILE, &text);
         for digest in [None, Some(&package.digest)] {

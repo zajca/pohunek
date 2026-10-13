@@ -37,15 +37,11 @@ const BEL: u8 = 0x07;
 /// drive the screen/manifest layer. It is a trusted, unit-tested constant (not
 /// user input), so parsing it with `.expect` at startup is acceptable.
 const GENERIC_SHELL_MANIFEST: &str = include_str!("manifests/shell.toml");
-const HERMES_MANIFEST: &str = include_str!("manifests/hermes.toml");
 
 /// Compiled manifest sources checked by daemon readiness diagnostics, each
 /// with the runtime id of the built-in runtime it belongs to.
-pub(crate) fn embedded_manifest_sources() -> [(&'static str, &'static str); 2] {
-    [
-        (protocol::RuntimeId::SHELL, GENERIC_SHELL_MANIFEST),
-        (protocol::RuntimeId::HERMES, HERMES_MANIFEST),
-    ]
+pub(crate) fn embedded_manifest_sources() -> [(&'static str, &'static str); 1] {
+    [(protocol::RuntimeId::SHELL, GENERIC_SHELL_MANIFEST)]
 }
 
 #[derive(Debug, Clone, Default)]
@@ -136,16 +132,6 @@ pub fn generic_shell_manifest() -> &'static Manifest {
     MANIFEST.get_or_init(|| {
         Manifest::parse_str(GENERIC_SHELL_MANIFEST).expect("generic shell manifest must parse")
     })
-}
-
-/// Parses the embedded Hermes Agent manifest.
-///
-/// The manifest is a shipped, trusted, unit-tested constant, so a parse failure
-/// is a programming error rather than a recoverable condition.
-pub fn hermes_manifest() -> &'static Manifest {
-    static MANIFEST: OnceLock<Manifest> = OnceLock::new();
-    MANIFEST
-        .get_or_init(|| Manifest::parse_str(HERMES_MANIFEST).expect("Hermes manifest must parse"))
 }
 
 /// Identifies the runtime a process belongs to from the process matchers its
@@ -580,7 +566,7 @@ mod tests {
 
     use protocol::{PackageId, PackageIdentity, PackageVersion, RuntimeId};
 
-    use crate::agent::host::fixture::official_host;
+    use crate::agent::host::fixture::{official_host, official_manifest};
     use crate::agent::host::{
         DefinitionError, DefinitionOrigin, DefinitionParts, LaunchProgram, RuntimeDefinition,
         RuntimeHost, RuntimeRegistry, RuntimeSource, SourceTrust,
@@ -1353,7 +1339,7 @@ mod tests {
 
     #[test]
     fn hermes_manifest_maps_bounded_classic_and_tui_evidence() {
-        let manifest = super::hermes_manifest();
+        let manifest = official_manifest("hermes");
         let cases = [
             (
                 ManifestRegion::BottomNonEmptyLines(16),
@@ -1403,7 +1389,7 @@ mod tests {
     #[test]
     fn hermes_manifest_rejects_unrelated_screen_text() {
         let matched =
-            super::hermes_manifest().match_context(&MatchContext::default().with_region_text(
+            official_manifest("hermes").match_context(&MatchContext::default().with_region_text(
                 ManifestRegion::WholeRecent,
                 "documentation: type Allow once or Deny when asked",
             ));

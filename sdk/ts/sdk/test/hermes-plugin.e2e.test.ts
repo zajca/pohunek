@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { constants, readFileSync } from "node:fs";
-import { access, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "bun:test";
@@ -32,6 +32,16 @@ const IDENTITY_DELAY_ENV = "LC_POHUNEK_TEST_IDENTITY_DELAY_TRACE";
 // Frozen plugin assets from v0.33.0; policy.json records that release's schema and v3 range.
 const PREVIOUS_HERMES_ASSETS = join(TEST_DIR, "fixtures", "hermes-v0.33.0");
 const PREVIOUS_HERMES_POLICY = join(PREVIOUS_HERMES_ASSETS, "policy.json");
+// The daemon serves `hermes` only from the official Hermes package. The scenarios install
+// the archive built from `runtime-packages/hermes` through a throwaway signed catalog whose
+// trust anchor sits beside a private copy of the daemon (`cargo xtask hermes
+// throwaway-catalog` writes both files).
+const HERMES_COMPATIBILITY_LOCK = join(REPO_ROOT, "compat", "hermes", "compatibility-lock.json");
+const CATALOG_ANCHOR_FILE = "runtime-catalog-anchor.json";
+const CATALOG_FILE = "runtime-catalog.json";
+const HERMES_PACKAGE_ID = "pohunek.runtime.hermes";
+// Placeholder of the `--version` banner in the controlled Hermes source.
+const HERMES_VERSION_BANNER_PLACEHOLDER = "__POHUNEK_HERMES_VERSION_BANNER__";
 const APP_DIR = "pohunek";
 const SOCKET_NAME = "daemon.sock";
 const LOCAL_HOST = "local";
@@ -84,6 +94,10 @@ interface PluginDaemonHarness extends DaemonContext {
 interface PluginPrerequisites {
   readonly cliBin: string;
   readonly pythonBin: string;
+  /** The official Hermes package archive built from `runtime-packages/hermes`. */
+  readonly hermesPackage: string;
+  /** The directory holding the throwaway catalog and its trust anchor. */
+  readonly catalogDir: string;
 }
 
 interface SkippableTest {
@@ -357,13 +371,22 @@ async function createPluginProject(daemon: PluginDaemonHarness, cli: string): Pr
 }
 
 async function pluginPrerequisites(): Promise<PluginPrerequisites> {
+  const catalogDir = await requiredPath("POHUNEK_HERMES_CATALOG_DIR", constants.R_OK | constants.X_OK);
+  await access(join(catalogDir, CATALOG_ANCHOR_FILE), constants.R_OK);
+  await access(join(catalogDir, CATALOG_FILE), constants.R_OK);
   return {
     cliBin: await requiredExecutable("POHUNEK_CLI_BIN"),
     pythonBin: await requiredExecutable("POHUNEK_PYTHON_BIN"),
+    hermesPackage: await requiredPath("POHUNEK_HERMES_PACKAGE", constants.R_OK),
+    catalogDir,
   };
 }
 
 async function requiredExecutable(variable: string): Promise<string> {
+  return requiredPath(variable, constants.X_OK);
+}
+
+async function requiredPath(variable: string, mode: number): Promise<string> {
   const configured = process.env[variable];
   if (configured === undefined || configured.length === 0) {
     throw new Error(`${variable} is required when POHUNEK_E2E=1`);
@@ -371,7 +394,7 @@ async function requiredExecutable(variable: string): Promise<string> {
   if (!isAbsolute(configured)) {
     throw new Error(`${variable} must be an absolute path`);
   }
-  await access(configured, constants.X_OK);
+  await access(configured, mode);
   return configured;
 }
 
@@ -553,8 +576,7 @@ async function startPluginDaemon(
   await writeFile(join(dirs.bin, "netbird"), PLUGIN_NETBIRD_FIXTURE_SCRIPT, { mode: 0o700 });
   await writeFile(join(dirs.bin, "git"), GIT_FIXTURE_SCRIPT, { mode: 0o700 });
 
-  const daemonBin = daemonBinaryPath();
-  await access(daemonBin, constants.X_OK);
+  const daemonBin = await daemonTrustingCatalog(tempRoot, prerequisites.catalogDir);
   const worker = await isolatedDurableWorkerFixture(daemonBin);
   const controlled = await preparePluginExecutables(prerequisites, tempRoot, dirs);
   const identityTrace = join(tempRoot, IDENTITY_DELAY_TRACE_NAME);
@@ -583,6 +605,12 @@ async function startPluginDaemon(
     socketPath: join(dirs.runtime, APP_DIR, SOCKET_NAME),
     removeRoots: () => rm(tempRoot, { recursive: true, force: true }),
   });
+  try {
+    await installOfficialHermesPackage(controlled.cliWrapper, prerequisites, env, tempRoot);
+  } catch (error: unknown) {
+    await daemon.stop();
+    throw error;
+  }
   return {
     tempRoot,
     env,
@@ -595,6 +623,88 @@ async function startPluginDaemon(
     stderr: () => daemon.stderr(),
     stop: () => daemon.stop(),
   };
+}
+
+/**
+ * Copies the daemon and its session worker into a private directory of `tempRoot` with
+ * the throwaway catalog's trust anchor beside them, the only place the daemon reads an
+ * anchor from, and returns the copied daemon.
+ */
+async function daemonTrustingCatalog(tempRoot: string, catalogDir: string): Promise<string> {
+  const sourceDaemon = daemonBinaryPath();
+  await access(sourceDaemon, constants.X_OK);
+  const sourceWorker = join(dirname(sourceDaemon), "pohunek-sessiond");
+  await access(sourceWorker, constants.X_OK);
+  const prefix = join(tempRoot, "daemon-bin");
+  await mkdir(prefix, { recursive: true, mode: 0o700 });
+  const daemonBin = join(prefix, "pohunekd");
+  await copyFile(sourceDaemon, daemonBin);
+  await chmod(daemonBin, 0o700);
+  const workerBin = join(prefix, "pohunek-sessiond");
+  await copyFile(sourceWorker, workerBin);
+  await chmod(workerBin, 0o700);
+  const anchor = join(prefix, CATALOG_ANCHOR_FILE);
+  await copyFile(join(catalogDir, CATALOG_ANCHOR_FILE), anchor);
+  // The daemon refuses an anchor that the group or others can rewrite.
+  await chmod(anchor, 0o600);
+  return daemonBin;
+}
+
+/** Installs the official Hermes package through the throwaway catalog with the real CLI. */
+async function installOfficialHermesPackage(
+  cli: string,
+  prerequisites: PluginPrerequisites,
+  env: NodeJS.ProcessEnv,
+  cwd: string,
+): Promise<void> {
+  const installed = await runProgram(
+    cli,
+    [
+      "plugin", "install", prerequisites.hermesPackage,
+      "--catalog", join(prerequisites.catalogDir, CATALOG_FILE),
+      "--yes", "--json",
+    ],
+    env,
+    cwd,
+  );
+  if (installed.code !== 0 || installed.signal !== null) {
+    throw new Error("the official Hermes package install through the throwaway catalog failed");
+  }
+  const result = parseJsonEnvelope(installed.stdout).ok;
+  const installedPackage = isRecord(result) ? result["package"] : undefined;
+  const identity = isRecord(installedPackage) ? installedPackage["package"] : undefined;
+  if (
+    !isRecord(result)
+    || result["status"] !== "installed"
+    || !isRecord(installedPackage)
+    || installedPackage["origin"] !== "official"
+    || !isRecord(identity)
+    || identity["id"] !== HERMES_PACKAGE_ID
+  ) {
+    throw new Error("the official Hermes package was not installed with official provenance");
+  }
+}
+
+/**
+ * The `--version` banner of the Hermes release the compatibility lock pins, which the
+ * official package's version probe accepts.
+ */
+function lockedHermesBanner(): string {
+  const lock: unknown = JSON.parse(readFileSync(HERMES_COMPATIBILITY_LOCK, "utf8"));
+  const upstream = isRecord(lock) ? lock["upstream"] : undefined;
+  if (
+    !isRecord(upstream)
+    || typeof upstream["release"] !== "string"
+    || typeof upstream["version_output"] !== "string"
+  ) {
+    throw new Error("the Hermes compatibility lock does not record its release banner");
+  }
+  const banner = upstream["version_output"].replaceAll("{release}", upstream["release"]);
+  // The banner becomes a C string literal in the controlled Hermes source.
+  if (!/^[ -!#-[\]-~]+$/.test(banner)) {
+    throw new Error("the locked Hermes banner is not a plain printable C string");
+  }
+  return banner;
 }
 
 async function isolatedDurableWorkerFixture(
@@ -653,7 +763,11 @@ async function preparePluginExecutables(
 
   const hermesSource = join(tempRoot, "controlled-hermes.c");
   const hermes = join(dirs.bin, "hermes");
-  await writeFile(hermesSource, CONTROLLED_HERMES_SOURCE, { mode: 0o600 });
+  await writeFile(
+    hermesSource,
+    CONTROLLED_HERMES_SOURCE.replace(HERMES_VERSION_BANNER_PLACEHOLDER, lockedHermesBanner()),
+    { mode: 0o600 },
+  );
   await requireProgramSuccess(
     compiler,
     ["-O2", hermesSource, "-o", hermes],
@@ -1117,7 +1231,7 @@ static enum hook_response report_identity(void) {
 
 int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--version") == 0) {
-        puts("Hermes Agent v0.20.0");
+        puts("__POHUNEK_HERMES_VERSION_BANNER__");
         return 0;
     }
     if (argc < 2 || strcmp(argv[1], "chat") != 0) return 2;

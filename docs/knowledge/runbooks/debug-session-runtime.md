@@ -610,7 +610,14 @@ a worker exits its PTY cannot be recreated. Stopping the job ends that
 generation's processes and therefore loses the runtime. Use
 `pohunek session stop <session-id>` for an intentional session stop.
 
-For a Hermes runtime, first run `pohunek host inspect local --json`. The runtime
+For a Hermes runtime, first run `pohunek host inspect local --json`. The daemon
+serves `hermes` only from the official Hermes package: without an installed,
+enabled and selected `pohunek.runtime.hermes` package the inventory has no
+`hermes` entry, and `pohunek session new --agent hermes` answers
+`agent_profile_not_found` with a hint that names `pohunek plugin install
+runtime/packages/hermes.tar.zst --catalog runtime/runtime-catalog.json` from an
+extracted Linux daemon archive (macOS has no Hermes package, #929). With the
+package installed, the runtime
 must identify `agent_base: "hermes"`, `version: "0.20.0"`, and
 `supported: true` before starting a new Hermes session. A missing executable
 has no version-policy fields, and a launch answers `agent_binary_missing`; an

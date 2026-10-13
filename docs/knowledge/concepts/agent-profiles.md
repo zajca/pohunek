@@ -9,11 +9,11 @@ intents: [setup, project, debug, help]
 
 # Agent Profiles
 
-An agent name can refer to a base runtime such as `shell`, `hermes`, or
-`codex` and `claude` once their official packages are installed, or to a host
+An agent name can refer to a base runtime such as `shell`, or `codex`,
+`claude` and `hermes` once their official packages are installed, or to a host
 profile resolved by the daemon. A name that is neither is
-`agent_profile_not_found`; for `codex` or `claude` without its package the hint
-names the catalog install of the official package. Profiles define the program,
+`agent_profile_not_found`; for `codex`, `claude` or `hermes` without its
+package the hint names the catalog install of the official package. Profiles define the program,
 arguments, optional environment entries, input behavior, resume behavior, and
 manifest metadata for that host.
 
@@ -46,7 +46,7 @@ client fails closed instead of inventing a fallback set.
 
 `host.inspect.runtimes` is the availability and support decision point. Each
 entry has a user-facing `agent`; optional `agent_base` is the `RuntimeRef` of the runtime
-it launches. For Hermes, `version` and `supported` enforce the pinned 0.20.0 policy:
+it launches. For Hermes, `version` and `supported` enforce the range its package declares (0.20.0 only):
 an unavailable executable omits them, while a detected unparseable or other
 version reports `supported: false`. Launch a runtime only when `available` is true and `supported` is not
 `false`; a present runtime with a version policy (Hermes) always reports
@@ -57,8 +57,8 @@ probe for bare and profile-based Hermes immediately before `session.new` and
 recovery write. A program that does not resolve to an executable, for Hermes
 or any other runtime but a bare host shell, returns `agent_binary_missing` at the
 same point, before any probe runs; that refusal names only the program's file
-name. The probe clears ambient user state and uses private temporary
-HOME, Hermes, XDG, Python-cache, and working directories. Pohunek canonicalizes
+name. The probe clears ambient user state except the launch `PATH` and uses
+private temporary HOME, XDG, temporary and working directories. Pohunek canonicalizes
 the executable once and launches that exact absolute path without another PATH
 lookup. A same-owner replacement of the canonical file between probe and exec
 remains within the documented single-operator trust boundary. A runtime package can declare its own supported range with a data-driven probe
@@ -71,7 +71,7 @@ but treat a present unknown base as display-only.
 
 Hermes profiles use `base = "hermes"`. Their program and fixed arguments may
 wrap the local terminal command, but they cannot enable fork semantics. The
-compiled bare launch is exactly `hermes chat`; a valid native reference resumes
+package's bare launch is exactly `hermes chat`; a valid native reference resumes
 only as `hermes chat --resume <reference>`. The separately selected Hermes
 operator plugin provides lifecycle hooks, typed tools, and a generated skill in
 an isolated profile or custom absolute home; it never reads the profile's
@@ -195,8 +195,8 @@ argument. A `path` reference must still be an absolute path and an `id`
 reference must not begin with `-`; both checks run where the reference is
 recorded and again when it is used.
 
-Specs of the official runtimes (all `id` references; `claude` and `codex` come
-from their official packages, `hermes` and `shell` are built in):
+Specs of the official runtimes (all `id` references; `claude`, `codex` and
+`hermes` come from their official packages, `shell` is built in):
 
 | Base | Resume | Fork |
 |------|--------|------|
@@ -247,8 +247,8 @@ launch binding (runtime id plus where its definition came from). A profile whose
 `invalid_profile`. A recovery binding whose runtime is not installed stays in the
 store, refuses resume and fork with `runtime_not_installed`, and works again once
 the runtime is installed. The exception is a session launched from the built-in
-runtime of an official alias this daemon does not compile in (the built-in Codex
-or Claude Code of an earlier release): it is refused with `runtime_builtin_removed`, and
+runtime of an official alias this daemon does not compile in (the built-in Codex,
+Claude Code or Hermes of an earlier release): it is refused with `runtime_builtin_removed`, and
 installing the official package restores interaction with a live session only,
 never resume or fork (`runtime_served_by_package`). `session stop` and `session rm` still work on such
 a session (or one whose recorded kind is a historical label): they release the
@@ -274,10 +274,10 @@ package = "acme.runtime"                        # the package id
 digest = "sha256:<64 lowercase hex digits>"     # the archive digest to launch from
 ```
 
-- A profile over a built-in base (`shell`, `hermes`) has
+- A profile over the built-in base `shell` has
   neither key; supplying them is `invalid_profile`, as is supplying only one.
-- A profile over `codex` or `claude` needs the keys of its official package,
-  because the daemon compiles neither in. While nothing serves the base, a
+- A profile over `codex`, `claude` or `hermes` needs the keys of its official
+  package, because the daemon compiles none of them in. While nothing serves the base, a
   profile without them is `runtime_not_installed`, and the hint names the
   catalog install and then `pohunek plugin profile migrate <name>`.
 - A profile over a package-served base without the keys is `invalid_profile`.

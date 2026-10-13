@@ -20,10 +20,9 @@ daemon archive of a release carries them under `runtime/packages/`, with the
 signed `runtime/runtime-catalog.json` that authorizes them (see
 [Install official packages from a release](#install-official-packages-from-a-release)).
 The Codex, Claude Code and Hermes packages serve the reserved `codex`, `claude`
-and `hermes` ids only through that catalog. The daemon compiles neither Codex
-nor Claude Code in: `codex` and `claude` are each served by the official package
-or by nothing. The built-in Hermes runtime stays in the daemon and serves
-`hermes` whenever no official package is installed, enabled and selected for it. Recovery steps for verification, trust and
+and `hermes` ids only through that catalog. The daemon compiles none of Codex,
+Claude Code and Hermes in: `codex`, `claude` and `hermes` are each served by
+the official package or by nothing; `shell` is the only built-in runtime. Recovery steps for verification, trust and
 profile pin failures are in the
 [runtime package recovery runbook](../runbooks/runtime-package-recovery.md).
 
@@ -58,11 +57,12 @@ pohunek plugin install runtime/packages/pi.tar.zst --catalog runtime/runtime-cat
 
 Current releases list only the Linux x86_64 glibc and musl targets; the Apple Silicon
 archive carries the catalog and no package. `pohunek doctor` must report the
-`catalog_trust_anchor` check as `ok` first. Installing `codex.tar.zst` or
-`claude.tar.zst` makes the package the only source of that runtime (see
-[Official aliases](#official-aliases)); install its hooks afterwards with
-`pohunek integration install --agent codex` or `--agent claude`. Installing
-`hermes.tar.zst` takes the `hermes` alias over from the built-in at once.
+`catalog_trust_anchor` check as `ok` first. Installing `codex.tar.zst`,
+`claude.tar.zst` or `hermes.tar.zst` makes the package the only source of that
+runtime (see [Official aliases](#official-aliases)); install the Codex or
+Claude hooks afterwards with `pohunek integration install --agent codex` or
+`--agent claude`, and the Hermes operator plugin as the
+[Hermes operator](hermes-operator.md) guide describes.
 `--no-enable` stages a package until `plugin enable`. `docs/install.md` has the complete procedure.
 
 ## Config home
@@ -334,31 +334,32 @@ read counts as incompatible.
 
 ## Official aliases
 
-An official package serves `hermes` in place of the built-in runtime as soon
-as it is installed, enabled and selected; `plugin disable` or `plugin
-uninstall` returns the alias to the built-in. `plugin list` shows the serving
-package: the selected, enabled `official` package whose runtime is the alias;
-without one the built-in serves `hermes`, and nothing serves `codex` or
-`claude`.
+An official package serves `codex`, `claude` or `hermes` as soon as it is
+installed, enabled and selected; `plugin disable` or `plugin uninstall` leaves
+the alias unserved. `plugin list` shows the serving package: the selected,
+enabled `official` package whose runtime is the alias; without one nothing
+serves it.
 
-`codex` and `claude` have no built-in. Without its package, `session new
---agent codex` (or `claude`) is `agent_profile_not_found`, a host profile with
-`base = "codex"` (or `"claude"`) and no `package`/`digest` keys is
-`runtime_not_installed`, and `integration install --agent codex` (or `claude`)
-is `runtime_not_installed`; each recovery hint names
+`codex`, `claude` and `hermes` have no built-in. Without its package, `session
+new --agent codex` (or `claude`, `hermes`) is `agent_profile_not_found`, a host
+profile with `base = "codex"` (or `"claude"`, `"hermes"`) and no
+`package`/`digest` keys is `runtime_not_installed`, and `integration install
+--agent codex` (or `claude`) is `runtime_not_installed`; each recovery hint names
 `pohunek plugin install runtime/packages/<runtime>.tar.zst --catalog
 runtime/runtime-catalog.json` (the profile hint then names `plugin profile
 migrate <name>`). `integration status`, `doctor` and `uninstall --agent codex`
 (or `claude`) still reach the config home of the earlier built-in, so hooks
 pohunek installed there can be reported and removed without the package. A
-foreground `codex` or `claude` in a shell session and one started outside
-pohunek are recognized only through the package's detection manifest and
-`[transcripts]` table, so without the package they are not observed as that
-agent. A session launched from the built-in Codex or Claude of an earlier
-release is refused with `runtime_builtin_removed` on resume, fork and every
-interaction (input, attach, resize, rename, metadata) while nothing serves its
-runtime id; once the package is installed, the live session can be used again
-and resume and fork answer `runtime_served_by_package` as below.
+foreground `codex`, `claude` or `hermes` in a shell session and one started
+outside pohunek are recognized only through the package's detection manifest
+(and the Codex and Claude `[transcripts]` table), so without the package they
+are not observed as that agent. A session launched from the built-in Codex,
+Claude or Hermes of an earlier release is refused with
+`runtime_builtin_removed` on resume, fork and every interaction (input,
+attach, resize, rename, metadata) while nothing serves its runtime id; once the
+package is installed, the live session can be used again and resume and fork
+answer `runtime_served_by_package` as below (a Hermes fork answers
+`agent_fork_unsupported`, because Hermes declares no native fork).
 A session launched from the built-in runtime keeps its binding but cannot be
 resumed or forked while the package serves the alias: the request fails with
 `runtime_served_by_package`. The migration is a new session:
@@ -379,7 +380,7 @@ adopted: the preflight reports `would_not_be_adopted` with
 (`active_identity_provider_invalid`). Stop such a session with the running
 release before the upgrade, or accept losing its runtime. A host profile on
 that base can be pinned with `plugin profile migrate` once the package serves
-the base (`package_profile_base_builtin` before). A migrated schema-1 binding
+the base (`package_profile_target_invalid` before). A migrated schema-1 binding
 stays unpinned, so it is refused the same way.
 
 ## Disable
@@ -438,8 +439,8 @@ one selected, enabled package serving the base; none or several is an error,
 never a guess. The command first asks the daemon for a dry run, prints the
 profile, base, package version, digest, and current pin, and changes nothing
 until repeated with `--yes` (`consent_required` otherwise); the consented call
-names the digest the preview showed. A base served by a built-in is refused
-(`package_profile_base_builtin`), as are a missing profile
+names the digest the preview showed. A base served by a built-in (`shell`) is
+refused (`package_profile_base_builtin`), as are a missing profile
 (`package_profile_not_found`), one the daemon cannot accept as a profile file
 (`package_profile_unusable`: symlink, hard link, wrong owner, group- or
 world-writable, too large, not valid TOML) and one edited while the bind ran

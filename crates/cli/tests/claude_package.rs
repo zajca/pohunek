@@ -3820,8 +3820,8 @@ async fn an_unpinned_claude_profile_names_the_install_and_the_migration() {
 }
 
 /// The assistant picks an available Codex, Claude or Hermes runtime; on a host
-/// without the official packages and without Hermes it finds none, although
-/// a `claude` executable is on `PATH`, and its hint names the package install.
+/// without the official packages it finds none, although a `claude`
+/// executable is on `PATH`, and its hint names the package install.
 #[tokio::test]
 async fn the_assistant_finds_no_capable_agent_without_the_official_packages() {
     let host = CleanHost::start().await;

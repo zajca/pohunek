@@ -56,11 +56,24 @@ const PACKAGE_DIR: &str = "runtime-packages/hermes";
 /// Compatibility lock of the package, relative to the workspace root.
 const LOCK_PATH: &str = "compat/hermes/compatibility-lock.json";
 
-/// Compiled Hermes detection manifest, used as the package parity source.
+/// Where release [`GOLDEN_TAG`] kept the built-in Hermes detection manifest,
+/// relative to the workspace root; the golden's header names it.
 const BUILTIN_MANIFEST: &str = "crates/daemon/src/detect/manifests/hermes.toml";
 
-/// Compiled Hermes descriptor, used as the package parity source.
+/// Where release [`GOLDEN_TAG`] kept the built-in Hermes descriptor, relative
+/// to the workspace root; the golden's header names it.
 const BUILTIN_DESCRIPTOR: &str = "crates/daemon/src/agent/builtin/hermes.toml";
+
+/// Release whose built-in Hermes descriptor and manifest the goldens copy.
+const GOLDEN_TAG: &str = "v0.34.2";
+
+/// Golden copy of [`BUILTIN_DESCRIPTOR`] at [`GOLDEN_TAG`], relative to the
+/// workspace root.
+const GOLDEN_DESCRIPTOR: &str = "compat/hermes/builtin-v0.34/runtime.toml";
+
+/// Golden copy of [`BUILTIN_MANIFEST`] at [`GOLDEN_TAG`], relative to the
+/// workspace root.
+const GOLDEN_MANIFEST: &str = "compat/hermes/builtin-v0.34/detect.toml";
 
 /// Package id the descriptor declares.
 const PACKAGE_ID: &str = "pohunek.runtime.hermes";
@@ -127,6 +140,21 @@ fn read_toml(relative: &str) -> toml::Table {
         .expect("read the TOML file")
         .parse()
         .expect("the file is TOML")
+}
+
+/// Contents of the golden file `golden` below its header.
+///
+/// The header names `source`, the file the golden copies, and [`GOLDEN_TAG`];
+/// the rest of the file is that source's bytes at the tag.
+fn golden_body(golden: &str, source: &str) -> String {
+    let text = fs::read_to_string(workspace_root().join(golden)).expect("read the golden");
+    let header = format!(
+        "# Golden copy of {source} at tag {GOLDEN_TAG}.\n\
+         # Do not edit: the parity tests compare the runtime package with these bytes.\n\n"
+    );
+    text.strip_prefix(&header)
+        .unwrap_or_else(|| panic!("{golden} starts with its header naming {source}"))
+        .to_owned()
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1134,15 +1162,20 @@ async fn the_signed_hermes_package_is_selected_and_failed_installs_preserve_it()
         assert!(runtime.remove("version_probe").is_some());
         table
     };
+    let golden_descriptor: toml::Table = golden_body(GOLDEN_DESCRIPTOR, BUILTIN_DESCRIPTOR)
+        .parse()
+        .expect("the golden descriptor is TOML");
     assert_eq!(
         strip_package_specific_fields(read_toml(&format!("{PACKAGE_DIR}/runtime.toml"))),
-        strip_package_specific_fields(read_toml(BUILTIN_DESCRIPTOR))
+        strip_package_specific_fields(golden_descriptor)
     );
 
-    let package_manifest = fs::read(package_dir().join("detect.toml")).expect("package manifest");
-    let builtin_manifest =
-        fs::read(workspace_root().join(BUILTIN_MANIFEST)).expect("built-in manifest");
-    assert_eq!(package_manifest, builtin_manifest);
+    let package_manifest =
+        fs::read_to_string(package_dir().join("detect.toml")).expect("package manifest");
+    assert_eq!(
+        package_manifest,
+        golden_body(GOLDEN_MANIFEST, BUILTIN_MANIFEST)
+    );
 
     let lock: Value = serde_json::from_slice(
         &fs::read(workspace_root().join(LOCK_PATH)).expect("read compatibility lock"),
@@ -2733,5 +2766,129 @@ async fn sidecar_violations_in_a_signed_package_fail_install() {
 
     select_package(&harness, &digest).await;
     assert_source_findings(&harness, &hermes, false, None, "valid package reselected").await;
+    harness.stop().await;
+}
+
+/// The command that installs the official Hermes package from an extracted
+/// release archive, as a recovery hint names it.
+const RELEASE_INSTALL_COMMAND: &str =
+    "`pohunek plugin install runtime/packages/hermes.tar.zst --catalog runtime/runtime-catalog.json`";
+
+/// System directories the clean host's `PATH` searches after its fake
+/// `hermes`: they hold the shell and `sleep` the fake runs, and no agent
+/// runtime of a test host.
+const SYSTEM_PATH: &str = "/usr/bin:/bin";
+
+/// The daemon serves `hermes` from nothing but the official package. On a host
+/// whose `PATH` finds a `hermes` of the locked release, a bare `session new
+/// --agent hermes` is refused with the release install as the hint and the
+/// assistant finds no capable agent; after the catalog install the same
+/// request launches a session pinned to the package, and the assistant picks
+/// `hermes`.
+#[tokio::test]
+async fn hermes_launches_only_from_the_installed_official_package() {
+    let mut path = ProcessEnv::lock();
+    let fakes = pohunek_test_support::tempdir().expect("create the fake hermes directory");
+    let lock: Value = serde_json::from_slice(
+        &fs::read(workspace_root().join(LOCK_PATH)).expect("read compatibility lock"),
+    )
+    .expect("the compatibility lock is JSON");
+    let release = lock["upstream"]["release"]
+        .as_str()
+        .expect("locked release");
+    let banner = lock["upstream"]["version_output"]
+        .as_str()
+        .expect("locked version output")
+        .replace("{release}", release);
+    write_executable(
+        fakes.path().join("hermes"),
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' '{banner}'; exit 0; fi\nexec sleep 30\n"
+        ),
+    )
+    .expect("write the fake hermes");
+    let mut search = std::ffi::OsString::from(fakes.path());
+    search.push(":");
+    search.push(SYSTEM_PATH);
+    path.set("PATH", search);
+    let key = test_key();
+    let harness = trusted_harness(&key).await;
+    let cwd = harness.env.cwd().to_path_buf();
+    let launch = || async {
+        harness
+            .json(&[
+                "session",
+                "new",
+                "--agent",
+                "hermes",
+                "--cwd",
+                path_str(&cwd),
+            ])
+            .await
+    };
+    let assistant = || async {
+        harness
+            .json(&[
+                "assistant",
+                "--print-prompt",
+                "--no-snapshot",
+                "--degraded",
+                "--no-start-daemon",
+            ])
+            .await
+    };
+
+    let (code, refused) = launch().await;
+    assert_eq!(code, 1, "no runtime serves hermes: {refused}");
+    assert_eq!(
+        refused["err"]["code"], "agent_profile_not_found",
+        "{refused}"
+    );
+    let hint = refused["err"]["recover"].as_str().expect("a recovery hint");
+    assert!(hint.contains(RELEASE_INSTALL_COMMAND), "{hint}");
+    let (code, refused) = assistant().await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(refused["err"]["code"], "no_capable_agent", "{refused}");
+    let hint = refused["err"]["recover"].as_str().expect("a recovery hint");
+    assert!(hint.contains("`hermes`"), "{hint}");
+    assert!(
+        hint.contains("pohunek plugin install runtime/packages/<runtime>.tar.zst --catalog runtime/runtime-catalog.json"),
+        "{hint}"
+    );
+    assert!(!hint.contains("on the daemon's PATH"), "{hint}");
+    // A bare hook install names only the runtimes whose hooks the daemon
+    // installs: the CLI installs the Hermes operator plugin, with its own
+    // target selection.
+    let (code, refused) = harness.json(&["integration", "install"]).await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(
+        refused["err"]["code"], "integration_no_managed_runtime",
+        "{refused}"
+    );
+    let hint = refused["err"]["recover"].as_str().expect("a recovery hint");
+    assert!(!hint.contains("hermes"), "{hint}");
+
+    let (_, digest, _, _) = install_official(&harness, &key).await;
+    let (code, launched) = launch().await;
+    assert_eq!(code, 0, "{launched}");
+    assert_eq!(launched["ok"]["agent_base"], "hermes", "{launched}");
+    let id = launched["ok"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    // The session pins the package digest, so the package cannot go away
+    // under it.
+    let (code, refused) = harness
+        .json(&["plugin", "uninstall", PACKAGE_ID, "--yes"])
+        .await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(refused["err"]["code"], "package_referenced", "{refused}");
+    selected_package(&harness, &digest).await;
+    let (code, picked) = assistant().await;
+    assert_eq!(code, 0, "{picked}");
+    assert_eq!(picked["ok"]["agent"], "hermes", "{picked}");
+
+    let (code, stopped) = harness.json(&["session", "stop", &id]).await;
+    assert_eq!(code, 0, "{stopped}");
     harness.stop().await;
 }

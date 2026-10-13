@@ -1344,14 +1344,13 @@ async fn resume_refuses_a_runtime_it_cannot_resolve_or_whose_pin_does_not_match(
             LaunchPin::Unpinned,
             "agent_kind_unsupported",
         ),
-        // Resolves, but a package pin cannot be served by the built-in.
+        // Resolves, but neither another package's pin nor an unpinned line
+        // (launched from a built-in) is served by the official package.
         (
             RuntimeRef::hermes(),
             package_pin(RuntimeId::HERMES),
             "runtime_not_installed",
         ),
-        // Resolves, but neither another package's pin nor an unpinned line
-        // (launched from a built-in) is served by the official package.
         (
             RuntimeRef::claude(),
             package_pin(RuntimeId::CLAUDE),
@@ -1362,11 +1361,16 @@ async fn resume_refuses_a_runtime_it_cannot_resolve_or_whose_pin_does_not_match(
             LaunchPin::Unpinned,
             "runtime_served_by_package",
         ),
+        (
+            RuntimeRef::hermes(),
+            LaunchPin::Unpinned,
+            "runtime_served_by_package",
+        ),
         // Resolves and the pin matches (unpinned lines resume through a
         // built-in); the binding is then refused only for lacking a native
         // launch spec, which is checked after the runtime.
         (
-            RuntimeRef::hermes(),
+            RuntimeRef::shell(),
             LaunchPin::Unpinned,
             "agent_not_resumable",
         ),
@@ -1506,7 +1510,7 @@ pub(super) fn write_supported_hermes_executable(path: &std::path::Path, launch_b
     write_executable(
         path,
         &format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf '%s\\n' 'Hermes Agent v0.20.0'\n  exit 0\nfi\n{launch_body}"
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf '%s\\n' 'Hermes Agent v0.20.0 (2026.8.3)'\n  exit 0\nfi\n{launch_body}"
         ),
     );
 }
@@ -2982,7 +2986,7 @@ async fn failed_launch_rolls_back_the_bound_worktree() {
 async fn incompatible_hermes_profile_fails_before_session_and_worktree_side_effects() {
     for (case, version_output) in [
         ("missing", None),
-        ("wrong", Some("Hermes Agent v0.21.0")),
+        ("wrong", Some("Hermes Agent v0.21.0 (future)")),
         ("unparseable", Some("unexpected provider output")),
     ] {
         let repo = init_git_repo(&format!("hermes-policy-{case}"));
@@ -11735,7 +11739,7 @@ fn temp_hermes_that_exits_then_resumes(
     let runtime = temp_dir(&format!("{tag}-runtime"));
     let script = runtime.join("hermes");
     let gate = hook_gate(&runtime.join(HERMES_EXIT_GATE));
-    write_hermes_resume_executable(&script, marker, "Hermes Agent v0.20.0");
+    write_hermes_resume_executable(&script, marker, "Hermes Agent v0.20.0 (2026.8.3)");
     let agents = temp_agents_dir_with(
         tag,
         "hermes-test",
@@ -11889,10 +11893,10 @@ async fn fork_of_a_runtime_without_native_fork_fails_before_child_side_effects()
     );
     fs::write(
         agents_dir.join("hermes-test.toml"),
-        format!(
+        pin_official_base(&format!(
             "base = \"hermes\"\nprogram = \"{}\"\nargs = [\"chat\"]\n",
             hermes.display()
-        ),
+        )),
     )
     .expect("write Hermes profile");
     let registry = SessionRegistry::new(SessionRegistryConfig {
@@ -12615,7 +12619,10 @@ async fn incompatible_hermes_resume_has_no_runtime_or_store_side_effects() {
     let marker_before = fs::read_to_string(&marker).expect("fresh launch marker");
     let store_before = fs::read(&store_path).expect("durable session store");
 
-    for version_output in ["Hermes Agent v0.21.0", "unexpected provider output"] {
+    for version_output in [
+        "Hermes Agent v0.21.0 (future)",
+        "unexpected provider output",
+    ] {
         write_hermes_resume_executable(&script, &marker, version_output);
         let error = registry
             .resume(&created.id)
@@ -12699,14 +12706,14 @@ async fn incompatible_hermes_resume_binding_fails_before_recovery_side_effects()
         args: vec!["chat".to_owned()],
         input_rules: crate::store::StoredInputRules::default(),
         native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
-        launch_binding: crate::agent::host::LaunchPin::Unpinned,
+        launch_binding: official_launch_pin(RuntimeId::HERMES),
         native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
         profile_revision: None,
         native_launch_unresolved: false,
     };
 
     for (program, version_output) in [
-        (Some(script.clone()), "Hermes Agent v0.21.0"),
+        (Some(script.clone()), "Hermes Agent v0.21.0 (future)"),
         (Some(script.clone()), "unexpected provider output"),
         (None, "missing"),
     ] {

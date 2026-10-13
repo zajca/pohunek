@@ -1,3 +1,6 @@
+# Golden copy of crates/daemon/src/agent/builtin/hermes.toml at tag v0.34.2.
+# Do not edit: the parity tests compare the runtime package with these bytes.
+
 # Built-in runtime descriptor for Hermes Agent, in the runtime.toml shape.
 #
 # `detect_manifest` names an activity manifest embedded in the daemon.

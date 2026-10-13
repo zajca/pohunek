@@ -207,8 +207,8 @@ const RULES: &[Rule] = &[
     ),
     rule(
         Pattern::Dir("compat/hermes"),
-        Effect::Packages(&["pohunek-daemon", "xtask"]),
-        "Hermes compatibility lock embedded by the daemon; lock and goldens read by xtask",
+        Effect::Packages(&["pohunek-daemon", "pohunek-cli", "xtask"]),
+        "Hermes compatibility lock whose pinned release the fake agents of the daemon's integration tests report to the package version probe, read by pohunek-cli's hermes_package test; lock and goldens read by xtask",
     ),
     reminding(
         Pattern::Dir("crates/protocol/tests/fixtures/compat"),
@@ -242,6 +242,11 @@ const RULES: &[Rule] = &[
         "v0.34.2 built-in Claude Code goldens embedded by the daemon's in-crate compiled-in runtime fixture",
     ),
     rule(
+        Pattern::Dir("compat/hermes/builtin-v0.34"),
+        Effect::Packages(&["pohunek-daemon", "pohunek-cli"]),
+        "v0.34.2 built-in Hermes goldens embedded by the daemon's in-crate compiled-in runtime fixture and compared with the package by pohunek-cli's hermes_package test",
+    ),
+    rule(
         Pattern::Dir("compat/pi"),
         Effect::Packages(&["pohunek-cli", "xtask"]),
         "Pi compatibility lock and captured screens read by pohunek-cli's pi_package and pi_frame_properties tests; lock and npm project read by xtask's upstream staging scenarios",
@@ -258,8 +263,8 @@ const RULES: &[Rule] = &[
     ),
     rule(
         Pattern::Dir("runtime-packages/hermes"),
-        Effect::Packages(&["xtask"]),
-        "Hermes package built by xtask's official lock shape scenario; its operator skill and sidecar are what `hermes generate-skill` and `hermes check-skill` write and check",
+        Effect::Packages(&["pohunek-daemon", "xtask"]),
+        "Hermes package descriptor and detection manifest embedded by the daemon's in-crate official package fixture and built into the package its integration tests install; built by xtask's official lock shape scenario; its operator skill and sidecar are what `hermes generate-skill` and `hermes check-skill` write and check",
     ),
     rule(
         Pattern::Dir("runtime-packages/codex"),
@@ -1048,14 +1053,18 @@ mod tests {
 
     #[test]
     fn embedded_paths_map_to_their_embedding_packages() {
-        let cases: [(&str, &[&str]); 22] = [
+        let cases: [(&str, &[&str]); 23] = [
             (
                 "docs/knowledge/guides/agent-skill.md",
                 &["pohunek-knowledge", "xtask"],
             ),
             (
                 "compat/hermes/compatibility-lock.json",
-                &["pohunek-daemon", "xtask"],
+                &["pohunek-cli", "pohunek-daemon", "xtask"],
+            ),
+            (
+                "compat/hermes/builtin-v0.34/runtime.toml",
+                &["pohunek-cli", "pohunek-daemon", "xtask"],
             ),
             (
                 "compat/codex/subagent-hooks.json",
@@ -1097,11 +1106,11 @@ mod tests {
             ("runtime-packages/pi/runtime.toml", &["pohunek-cli"]),
             (
                 "runtime-packages/hermes/runtime.toml",
-                &["pohunek-cli", "xtask"],
+                &["pohunek-cli", "pohunek-daemon", "xtask"],
             ),
             (
                 "runtime-packages/hermes/operator/cli.py",
-                &["pohunek-cli", "xtask"],
+                &["pohunek-cli", "pohunek-daemon", "xtask"],
             ),
             ("runtime-packages/README.md", &["pohunek-cli"]),
             (

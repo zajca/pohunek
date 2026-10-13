@@ -93,8 +93,8 @@ fn fake_agent() -> String {
     )
 }
 
-/// Installs the official Codex and Claude packages into the plugin root the
-/// daemon of `env` opens, before it starts.
+/// Installs the official Codex, Claude and Hermes packages into the plugin
+/// root the daemon of `env` opens, before it starts.
 fn install_official_packages(env: &TestEnv) {
     let scratch = env.root().join("official-packages");
     fs::create_dir_all(&scratch).expect("create the package scratch directory");

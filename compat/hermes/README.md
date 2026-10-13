@@ -33,6 +33,10 @@ The official Hermes runtime package lives in `runtime-packages/hermes/`
 `[0.20.0, 0.20.1)`, the lock's `supported` range
 (`crates/cli/tests/hermes_package.rs` keeps the two equal). The lock remains
 authoritative for the upstream release and source digest.
+`builtin-v0.34/` holds golden copies of the built-in Hermes descriptor and
+detection manifest of release 0.34.2 (`runtime.toml`, `detect.toml`); the
+daemon compiles no Hermes in, and the package tests compare the package with
+them.
 The reserved `hermes` runtime id can be served by a package only when a signed
 catalog authorizes its digest. Releases attest the package for the Linux
 x86_64 glibc and musl targets of `compat/matrix.json` and ship it with that

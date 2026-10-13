@@ -313,15 +313,22 @@ notification machinery — launched with a materialized offline knowledge
 bundle and a redacted snapshot of live state. No secrets enter the prompt. Its
 automatic preference order is `pohunek-assistant`, `codex`, `claude`, then
 `hermes`; explicit Hermes selection still requires the supported runtime on the
-selected host.
+selected host. Codex, Claude Code and Hermes are served only by their official
+packages: on a host with none of them (and no capable host profile) the
+assistant answers `no_capable_agent`, whose hint names the package install.
 
 ### Hermes Agent and operator plugin
 
-Pohunek manages the local interactive Hermes terminal as `--agent hermes`. Before
-launching, inspect the target host: the `hermes` runtime must be `available`
-and report `version=0.20.0` with `supported=true`.
+Pohunek manages the local interactive Hermes terminal as `--agent hermes`. The
+daemon compiles no Hermes in: only the official `pohunek.runtime.hermes`
+package serves `hermes`, so install it from the extracted Linux daemon archive
+first (the macOS archive carries no runtime package yet, #929). Without it
+`session new --agent hermes` fails with `agent_profile_not_found`, whose hint
+names the install. Before launching, inspect the target host: the `hermes`
+runtime must be `available` and report `version=0.20.0` with `supported=true`.
 
 ```bash
+pohunek plugin install runtime/packages/hermes.tar.zst --catalog runtime/runtime-catalog.json --yes
 pohunek host inspect local --json
 pohunek session new --agent hermes --name "investigate-login-bug"
 ```
@@ -376,8 +383,9 @@ must run; `--host` never turns `integration install` into a remote mutation.
 
 ### Codex and Claude config homes
 
-`--agent` offers the built-in name `hermes`; any other value is a runtime id,
-and `codex` and `claude` are runtime ids: the daemon compiles neither in, so
+`--agent` offers `hermes`, which selects the CLI-run Hermes operator plugin
+lifecycle above; any other value is a runtime id, and `codex` and `claude` are
+runtime ids: the daemon compiles neither in, so
 `integration install --agent codex` or `--agent claude` needs the official
 package of that runtime installed and answers `runtime_not_installed` (with the
 package install as the hint) until it is. `status`, `doctor` and `uninstall`

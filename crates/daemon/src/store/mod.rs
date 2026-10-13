@@ -2406,7 +2406,7 @@ mod tests {
             restricted: false,
         };
         let rules = stored.to_input_rules(
-            crate::agent::host::RuntimeHost::default()
+            crate::agent::host::fixture::official_host()
                 .resolve_ref(&RuntimeRef::hermes())
                 .expect("Hermes resolves")
                 .input_rules(),

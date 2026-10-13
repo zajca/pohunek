@@ -801,20 +801,21 @@ pinned to version 0.20.0 and deliberately excludes its remote, browser,
 desktop, gateway, ACP, and other non-local backends: Pohunek must own the PTY,
 process, worktree, and diff on the same host.
 
-The daemon compiles the shell and Hermes runtimes in. Codex and Claude Code are
-not compiled in: only the official `pohunek.runtime.codex` and
-`pohunek.runtime.claude` packages, installed from the release catalog, serve
-`codex` and `claude`. On a host without the package, a bare `codex` or `claude`
-is `agent_profile_not_found`, a host profile over it that pins no package is
-`runtime_not_installed`, and both hints name the catalog install (and, for the
-profile, `pohunek plugin profile migrate`). A session launched from the
-built-in Codex or Claude Code of an earlier release is refused with
-`runtime_builtin_removed` while nothing serves its runtime id and with
-`runtime_served_by_package` once the package does: it is never rebound, and its
-recovery is a new session. A foreground or unmanaged `codex` or `claude`
-process is attributed only through the installed package's detection manifest
-and `[transcripts]` table, so without the package it is not observed as that
-agent.
+The daemon compiles only the shell runtime in. Codex, Claude Code and Hermes
+are not compiled in: only the official `pohunek.runtime.codex`,
+`pohunek.runtime.claude` and `pohunek.runtime.hermes` packages, installed from
+the release catalog, serve `codex`, `claude` and `hermes`. On a host without
+the package, a bare `codex`, `claude` or `hermes` is `agent_profile_not_found`,
+a host profile over it that pins no package is `runtime_not_installed`, and
+both hints name the catalog install (and, for the profile, `pohunek plugin
+profile migrate`). A session launched from the built-in Codex, Claude Code or
+Hermes of an earlier release is refused with `runtime_builtin_removed` while
+nothing serves its runtime id and with `runtime_served_by_package` once the
+package does (a Hermes fork then answers `agent_fork_unsupported`): it is never
+rebound, and its recovery is a new session. A foreground or unmanaged `codex`,
+`claude` or `hermes` process is attributed only through the installed package's
+detection manifest (and, for Codex and Claude Code, its `[transcripts]` table),
+so without the package it is not observed as that agent.
 
 Runtime responsibilities:
 
@@ -883,12 +884,11 @@ Host profiles over that alias do not resolve then, so their homes are found
 from each profile file's `base` and `[env]` alone, read under the same
 containment and owner checks as a profile load.
 
-The built-in descriptors and the remaining per-agent names are data or work
-owned by other issues. A source-scan test
-(`crates/xtask/tests/no_special_dispatch.rs`) pins every production line under
-`crates/daemon/src` that still names `codex`, `claude` or `hermes`, per file,
-with the issue that removes it (#144 integration handlers, #147 built-in
-packages) or `data`. The external observer takes each transcript root and its
+The remaining per-agent names are data or work owned by other issues. A
+source-scan test (`crates/xtask/tests/no_special_dispatch.rs`) pins every
+production line under `crates/daemon/src` that still names `codex`, `claude`
+or `hermes`, per file, with its owner (`handlers` for the integration handlers,
+#68 for the profile doctor) or `data`. The external observer takes each transcript root and its
 parser from the runtime's `[transcripts]` table
 (`crates/daemon/src/agent/host/transcripts.rs`), so it names no agent. The pin
 is the exact trimmed text of each naming line (a SHA-256 over them for the

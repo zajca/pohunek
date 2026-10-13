@@ -664,13 +664,20 @@ const NO_MANAGED_RUNTIME_CODE: &str = "integration_no_managed_runtime";
 /// `integration_no_managed_runtime`: an install without `agent` has no runtime
 /// to act for on `host`.
 ///
-/// The hint names, for each official alias nothing serves, the install of its
-/// official package and then the install of its hooks by name, because the
-/// official packages are the runtimes whose hooks a fresh host can get.
+/// The hint names, for each official alias nothing serves whose retired
+/// built-in a daemon-run handler keeps, the install of its official package
+/// and then the install of its hooks by name: those are the runtimes whose
+/// hooks a fresh host can get from the daemon. An alias whose hooks the CLI
+/// installs is never named, because a request without `agent` cannot reach
+/// it.
 fn no_managed_runtime(host: &RuntimeHost) -> ProtocolError {
-    let steps: Vec<String> = crate::agent::host::RESERVED_RUNTIME_IDS
+    let steps: Vec<String> = handlers()
         .iter()
-        .filter_map(|id| RuntimeId::parse(id).ok())
+        .filter_map(|entry| match entry {
+            Handler::Daemon(handler) => handler.retired_builtin(),
+            Handler::CliRun(_) => None,
+        })
+        .filter_map(|retired| RuntimeId::parse(retired.runtime_id).ok())
         .filter(|id| host.served_by(id).is_none())
         .map(|id| {
             format!(

@@ -109,8 +109,9 @@ async fn spawn_dual_servers(
 }
 
 /// [`spawn_dual_servers`] whose registry is the production one over a plugin
-/// root next to the socket, holding the official Codex and Claude packages
-/// installed through a catalog its throwaway trust anchor authorizes.
+/// root next to the socket, holding the official Codex, Claude and Hermes
+/// packages installed through a catalog its throwaway trust anchor
+/// authorizes.
 async fn spawn_dual_servers_serving_official_runtimes(
     tag: &str,
     version: &str,
@@ -870,7 +871,10 @@ async fn daemon_doctor_reports_redacted_provider_integration_readiness() {
     }
     std::fs::write(
         agents.join("hermes-work.toml"),
-        "base = \"hermes\"\nprogram = \"/bin/sh\"\n",
+        format!(
+            "base = \"hermes\"\n{}program = \"/bin/sh\"\n",
+            official_runtimes::profile_pin("hermes")
+        ),
     )
     .expect("write Hermes profile");
 
@@ -1338,8 +1342,9 @@ async fn daemon_doctor_bounds_aggregate_version_probes_across_slow_profiles() {
     std::fs::write(
         &slow_runtime,
         format!(
-            "#!/bin/sh\nprintf x >> '{}'\n/bin/sleep 20\nprintf 'Hermes Agent v0.20.0\\n'\n",
-            probe_count.display()
+            "#!/bin/sh\nprintf x >> '{}'\n/bin/sleep 20\nprintf '%s\\n' '{}'\n",
+            probe_count.display(),
+            official_runtimes::supported_banner("hermes")
         ),
     )
     .expect("write blocking version-probe executable");
@@ -1351,7 +1356,8 @@ async fn daemon_doctor_bounds_aggregate_version_probes_across_slow_profiles() {
         std::fs::write(
             agents.join(format!("slow-{index}.toml")),
             format!(
-                "base = \"hermes\"\nprogram = \"{}\"\n[env]\nPATH = \"/bin\"\n",
+                "base = \"hermes\"\n{}program = \"{}\"\n[env]\nPATH = \"/bin\"\n",
+                official_runtimes::profile_pin("hermes"),
                 slow_runtime.display()
             ),
         )
@@ -1362,7 +1368,7 @@ async fn daemon_doctor_bounds_aggregate_version_probes_across_slow_profiles() {
         ..shell_config()
     };
     let (_addr, socket, shutdown, handle) =
-        spawn_dual_servers("doctor-probe-budget", "0.0.0", config).await;
+        spawn_dual_servers_serving_official_runtimes("doctor-probe-budget", "0.0.0", config).await;
     let mut client = connect_unix(&socket).await;
     let payload = ok_payload(
         exchange(
@@ -1546,15 +1552,10 @@ async fn daemon_doctor_reports_embedded_and_override_manifest_health_redacted() 
             .find(|check| check["name"] == name)
             .unwrap_or_else(|| panic!("doctor reports {name}: {payload}"))
     };
-    for runtime in ["shell", "hermes"] {
-        assert_eq!(
-            find(&format!("agent_manifest_embedded_{runtime}"))["status"],
-            "ok"
-        );
-    }
-    // Codex and Claude are served only by their official packages, so the
-    // daemon embeds no manifest of theirs to check.
-    for runtime in ["codex", "claude"] {
+    assert_eq!(find("agent_manifest_embedded_shell")["status"], "ok");
+    // Codex, Claude and Hermes are served only by their official packages, so
+    // the daemon embeds no manifest of theirs to check.
+    for runtime in ["codex", "claude", "hermes"] {
         let name = format!("agent_manifest_embedded_{runtime}");
         assert!(
             checks.iter().all(|check| check["name"] != name.as_str()),
