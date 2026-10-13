@@ -578,6 +578,8 @@ fn workflow_plugin_ids_complete_from_the_installed_store() {
 
 /// `workflow run <plugin> <action>` completes the actions the typed plugin's
 /// installed manifest declares, and none for a plugin `run` would refuse.
+/// Only the action name completes: every later word is the action's own
+/// verbatim argument.
 #[cfg(unix)]
 #[test]
 fn workflow_run_completes_the_actions_of_the_typed_plugin() {
@@ -598,6 +600,14 @@ fn workflow_run_completes_the_actions_of_the_typed_plugin() {
     assert_eq!(
         candidates(&env, &["pohunek", "workflow", "run", "acme.lint", ""]),
         ["check"]
+    );
+    // `--json` belongs to pohunek only before the plugin id.
+    assert_eq!(
+        candidates(
+            &env,
+            &["pohunek", "workflow", "run", "--json", "acme.work", "s"]
+        ),
+        ["status", "sync"]
     );
     assert_eq!(
         candidates(
@@ -626,6 +636,10 @@ fn workflow_run_completes_the_actions_of_the_typed_plugin() {
             "",
         ]
         .as_slice(),
+        // Words after the action name are its arguments, never actions.
+        ["pohunek", "workflow", "run", "acme.work", "overview", "s"].as_slice(),
+        ["pohunek", "workflow", "run", "acme.work", "overview", ""].as_slice(),
+        ["pohunek", "workflow", "run", "acme.work", "--json", "s"].as_slice(),
         ["pohunek", "workflow", "run", "acme.paused", ""].as_slice(),
         ["pohunek", "workflow", "run", "acme.unknown", ""].as_slice(),
         ["pohunek", "workflow", "run", "Not/AnId", ""].as_slice(),

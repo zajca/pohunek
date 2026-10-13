@@ -230,9 +230,12 @@ const WORKFLOW_COMMAND: &str = "workflow";
 /// Name of `pohunek workflow run`, the only workflow subcommand with an action.
 const WORKFLOW_RUN: &str = "run";
 
-/// Ids of the plugin and action arguments of the `pohunek workflow` commands.
+/// Id of the plugin argument of the `pohunek workflow` commands.
 const WORKFLOW_PLUGIN_ARG: &str = "plugin";
-const WORKFLOW_ACTION_ARG: &str = "action";
+
+/// Id of the trailing argument of `pohunek workflow run`: the action name,
+/// then the action's own verbatim arguments.
+const WORKFLOW_CALL_ARG: &str = "call";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct CompletionContext {
@@ -240,7 +243,7 @@ struct CompletionContext {
     /// Package id already typed on the `pohunek plugin` line being completed.
     plugin_package: Option<String>,
     /// Plugin id already typed on the `pohunek workflow run` line being
-    /// completed.
+    /// completed, when the cursor is on the action name.
     workflow_plugin: Option<String>,
     /// The last `--host` value names a host other than this machine, by the
     /// rule `pohunek workflow` refuses with `workflow_local_only`.
@@ -350,8 +353,9 @@ impl ValueCompleter for WorkflowPluginCompleter {
     }
 }
 
-/// Completes the `<ACTION>` argument of `pohunek workflow run` with the actions
-/// of the plugin already typed.
+/// Completes the action name, the first value of the trailing `call` argument
+/// of `pohunek workflow run`, with the actions of the plugin already typed.
+/// Later values are the action's own arguments and complete nothing.
 ///
 /// The actions come from the installed manifest after the plugin's files
 /// verify, the check `workflow run` makes, so a plugin whose files changed
@@ -465,20 +469,26 @@ impl CompletionContext {
     }
 }
 
-/// The plugin id typed after `pohunek workflow run`, if any.
+/// The plugin id of a `pohunek workflow run <plugin>` line whose cursor is
+/// on the action name, if any.
 ///
-/// Positional words are counted after skipping flags and the values of global
-/// value flags, so `--host <name>` anywhere on the line is not mistaken for a
-/// command. A miss only means no action candidates.
+/// Before the plugin id, flags (such as `--json`) and the values of global
+/// value flags are skipped, so `--host <name>` is not mistaken for a command.
+/// Every word after the plugin id is a value of the trailing `call`
+/// argument, so any such word puts the cursor on an action argument. A
+/// non-UTF-8 word or a `--` before the plugin id yields `None`. A miss only
+/// means no action candidates.
 fn workflow_plugin_from_words(words: &[OsString]) -> Option<String> {
     let mut positional = Vec::new();
-    let mut rest = words.iter().skip(1).filter_map(|word| word.to_str());
-    while let Some(word) = rest.next() {
+    let mut index = 1;
+    while index < words.len() {
+        let word = words[index].to_str()?;
+        index += 1;
         if word == "--" {
-            break;
+            return None;
         }
         if GLOBAL_VALUE_FLAGS.contains(&word) {
-            rest.next();
+            index += 1;
         } else if !word.starts_with('-') {
             positional.push(word);
             // `workflow run <plugin>` is all that is matched below; later
@@ -489,7 +499,7 @@ fn workflow_plugin_from_words(words: &[OsString]) -> Option<String> {
         }
     }
     match positional.as_slice() {
-        [WORKFLOW_COMMAND, WORKFLOW_RUN, plugin] => {
+        [WORKFLOW_COMMAND, WORKFLOW_RUN, plugin] if index >= words.len() => {
             PackageId::parse(plugin).ok().map(|id| id.to_string())
         }
         _ => None,
@@ -593,7 +603,7 @@ fn with_workflow_completers(command: Command, context: &CompletionContext) -> Co
             enabled_only,
             remote_host: context.remote_host,
         })),
-        WORKFLOW_ACTION_ARG => arg.add(ArgValueCompleter::new(WorkflowActionCompleter {
+        WORKFLOW_CALL_ARG => arg.add(ArgValueCompleter::new(WorkflowActionCompleter {
             plugin: context.workflow_plugin.clone(),
             remote_host: context.remote_host,
         })),
