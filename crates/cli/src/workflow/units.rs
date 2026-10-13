@@ -406,6 +406,17 @@ pub(crate) fn plan(
     })
 }
 
+/// A failed [`start`] and whether it was undone.
+#[derive(Debug)]
+pub(crate) struct StartFailed {
+    /// Why it failed.
+    pub(crate) error: Error,
+    /// Whether the plugin is disabled with no units, as before the start.
+    /// `false` only when undoing a failed unit install failed too, so the
+    /// plugin may remain enabled or keep units.
+    pub(crate) undone: bool,
+}
+
 /// Marks plugin `id` enabled and installs and starts the units of `plan`,
 /// under the unit lifecycle lock the caller holds. A unit that cannot be
 /// installed removes every unit again and disables the plugin again.
@@ -414,30 +425,47 @@ pub(crate) fn plan(
 ///
 /// Returns [`Error::Units`] when the service manager cannot be reached
 /// (nothing changed) or a unit cannot be installed (rolled back), and the
-/// errors of [`Store::set_enabled`].
+/// errors of [`Store::set_enabled`] when the plugin cannot be marked
+/// enabled (nothing changed): [`Error::Busy`], [`Error::Store`],
+/// [`Error::RootInvalid`] or [`Error::PluginUnknown`].
 pub(crate) async fn start(
     store: &Store,
     context: &Context,
     id: &PackageId,
     plan: &Plan,
-) -> Result<PackageRecord, Error> {
-    let backend = connect(context, &plan.installation, id).await?;
-    let enabled = store.set_enabled(id, true)?;
+) -> Result<PackageRecord, StartFailed> {
+    let unchanged = |error| StartFailed {
+        error,
+        undone: true,
+    };
+    let backend = connect(context, &plan.installation, id)
+        .await
+        .map_err(unchanged)?;
+    let enabled = store.set_enabled(id, true).map_err(unchanged)?;
     for (key, definition) in &plan.units {
         if let Err(error) = backend.install(key, definition).await {
             let mut detail = format!("installing the {key} unit failed: {error}");
+            let mut undone = true;
             for key in plan.units.iter().map(|(key, _definition)| key) {
                 if let Err(error) = backend.remove(key).await {
+                    undone = false;
                     let _ = write!(detail, "; removing the {key} unit failed too: {error}");
                 }
             }
             match store.set_enabled(id, false) {
                 Ok(_record) => detail.push_str("; the plugin was disabled again"),
                 Err(error) => {
-                    let _ = write!(detail, "; disabling the plugin again failed: {error}");
+                    undone = false;
+                    let _ = write!(
+                        detail,
+                        "; disabling the plugin again failed, so it may remain enabled: {error}"
+                    );
                 }
             }
-            return Err(units_failed(id, detail));
+            return Err(StartFailed {
+                error: units_failed(id, detail),
+                undone,
+            });
         }
     }
     Ok(enabled)
@@ -466,7 +494,9 @@ pub(crate) async fn enable(
     let knobs = config::load(store.knobs_path())?;
     let context = host.context()?;
     let plan = plan(context, record.digest(), &manifest, &knobs)?;
-    start(store, context, id, &plan).await
+    start(store, context, id, &plan)
+        .await
+        .map_err(|failed| failed.error)
 }
 
 /// Disables plugin `id`, then stops and removes its units.

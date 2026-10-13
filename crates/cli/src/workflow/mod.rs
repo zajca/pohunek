@@ -305,14 +305,17 @@ pub(crate) enum Error {
     },
 
     /// A fresh install recorded the plugin, but enabling it failed after
-    /// that; the plugin stays installed disabled.
-    #[error("workflow plugin {id} was installed, but enabling it failed, so it stays installed disabled: {source}")]
+    /// that; the plugin stays installed disabled with no units, unless
+    /// undoing the failed enable failed too.
+    #[error("workflow plugin {id} was installed, but enabling it failed, so {}: {source}", if *.undone { "it stays installed disabled with no units" } else { "and undoing that failed too, it may remain enabled or keep units" })]
     InstalledDisabled {
         /// The plugin id.
         id: String,
         /// Why enabling failed; its code is the `cause` of the `--json`
         /// error.
         source: Box<Error>,
+        /// Whether the plugin is disabled with no units.
+        undone: bool,
     },
 
     /// A unit runs another archive than the installed one: residue of an
@@ -510,8 +513,13 @@ impl Error {
                 "the unit is left over from another install; remove it with \
                  `pohunek workflow disable <id>`"
             }
-            Self::InstalledDisabled { .. } => {
-                "run `pohunek workflow enable <id>`; installing the plugin again changes nothing"
+            Self::InstalledDisabled { undone: true, .. } => {
+                "then run `pohunek workflow enable <id>`; installing the plugin again does not \
+                 enable it"
+            }
+            Self::InstalledDisabled { undone: false, .. } => {
+                "then run `pohunek workflow disable <id>` until it succeeds, which removes any \
+                 unit and disables the plugin, and then `pohunek workflow enable <id>`"
             }
             Self::ActionFailed { .. } => {
                 "the action reported a failure; its stderr above says why, and its stdout was \
@@ -534,7 +542,7 @@ impl Error {
     pub(crate) fn recovery(&self) -> String {
         match self {
             Self::InstalledDisabled { source, .. } => {
-                format!("{}; then {}", source.recovery(), self.hint())
+                format!("{}, {}", enable_fix(source), self.hint())
             }
             _ => self.hint().to_owned(),
         }
@@ -572,6 +580,24 @@ impl Error {
             | Self::InstalledDisabled { .. } => ErrorClass::Runtime,
             _ => ErrorClass::Configuration,
         }
+    }
+}
+
+/// What to fix before enabling a plugin again after `cause` stopped its
+/// enable: a clause without a step of its own, since the step to repeat is
+/// the enable.
+fn enable_fix(cause: &Error) -> &'static str {
+    match cause {
+        Error::Busy => "wait for the other workflow command to finish",
+        Error::Units { .. } => "check the user service manager (`systemctl --user` or `launchctl`)",
+        Error::RootInvalid { .. } => {
+            "check the plugin's installed files with `pohunek workflow inspect <id>`"
+        }
+        Error::ServiceNotInstalled { .. } => "check the `pohunek service` installation",
+        Error::Store(_) => {
+            "check that the pohunek state and config directories are owned by you and private"
+        }
+        _ => "fix the cause above",
     }
 }
 

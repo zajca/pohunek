@@ -119,11 +119,20 @@ installation an enabling install is refused before anything is created
 enabling install of a new plugin with units checks the service installation
 and its environment and the `[jobs]` bounds, and takes the unit lifecycle
 lock (`workflow_store_busy` while another enable, disable or uninstall holds
-it), all before it records the plugin. When reaching the service manager or
-installing a unit then fails, the plugin stays installed disabled and the
-command fails with `workflow_installed_disabled`, whose `cause` is the
-failure's own code; `pohunek workflow enable <id>` finishes the job. Installing a recorded archive again never touches its
-units: running jobs and services are neither stopped nor restarted.
+it), all before it records the plugin; for an archive already recorded it
+decides under that lock whether the plugin is still recorded. Three steps
+come after the record is written: reaching the service manager, marking the
+plugin enabled (which needs the store lock, so another workflow command
+holding it gives `workflow_store_busy`), and installing the units. When one
+fails, the command fails with `workflow_installed_disabled`, whose `cause`
+is the failure's own code. Normally everything is undone: the plugin stays
+installed disabled with no units, and after fixing the cause
+`pohunek workflow enable <id>` finishes the job; installing the archive again
+does not enable it. When undoing a failed unit install fails too, the message
+says the plugin may remain enabled or keep units: run
+`pohunek workflow disable <id>` until it succeeds, then enable it. Installing
+a recorded archive again never touches its units: running jobs and services
+are neither stopped nor restarted.
 
 The store keeps one version per plugin id. Installing the recorded archive
 again changes nothing (`already_installed`), unless its installed files are

@@ -563,14 +563,30 @@ async fn install(store: &Store, args: &InstallArgs) -> Result<ExitCode, CliError
     // effect. Only reaching the service manager and installing the units
     // happen after the record is written.
     let mut planned = None;
-    if has_units && !args.no_enable && recorded == Recorded::No {
-        let knobs = config::load(store.knobs_path())?;
-        let context = Context::resolve().map_err(|error| Error::ServiceNotInstalled {
-            reason: error.to_string(),
-        })?;
-        let plan = units::plan(&context, &candidate.digest, &candidate.manifest, &knobs)?;
-        let lock = store.lock_units_creating()?;
-        planned = Some((context, plan, lock));
+    // Held through the record write when the archive was recorded, so an
+    // uninstall cannot remove it in between and turn this install into a
+    // fresh one that nothing enables.
+    let mut held = None;
+    if has_units && !args.no_enable {
+        let recorded = if recorded == Recorded::No {
+            recorded
+        } else {
+            // The store exists, so taking its lock creates nothing.
+            held = store.lock_units()?;
+            store.recorded(&candidate)?
+        };
+        if recorded == Recorded::No {
+            let knobs = config::load(store.knobs_path())?;
+            let context = Context::resolve().map_err(|error| Error::ServiceNotInstalled {
+                reason: error.to_string(),
+            })?;
+            let plan = units::plan(&context, &candidate.digest, &candidate.manifest, &knobs)?;
+            let lock = match held.take() {
+                Some(lock) => lock,
+                None => store.lock_units_creating()?,
+            };
+            planned = Some((context, plan, lock));
+        }
     }
     // A plugin with units is recorded disabled and enabled afterwards, so its
     // units start only once it is enabled. Installing a recorded archive
@@ -584,10 +600,11 @@ async fn install(store: &Store, args: &InstallArgs) -> Result<ExitCode, CliError
         Some((context, plan, _lock)) if fresh => {
             match units::start(store, &context, &identity.id, &plan).await {
                 Ok(record) => package::registry::InstallReport { record, ..report },
-                Err(source) => {
+                Err(failed) => {
                     let error = Error::InstalledDisabled {
                         id: identity.id.to_string(),
-                        source: Box::new(source),
+                        source: Box::new(failed.error),
+                        undone: failed.undone,
                     };
                     return installed_disabled(error, args.json);
                 }
@@ -595,6 +612,7 @@ async fn install(store: &Store, args: &InstallArgs) -> Result<ExitCode, CliError
         }
         _ => report,
     };
+    drop(held);
     let result = Installed {
         status: match report.status {
             InstallStatus::AlreadyInstalled => "already_installed",

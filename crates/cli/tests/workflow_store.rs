@@ -646,6 +646,34 @@ fn an_enabling_install_waits_for_no_unit_lifecycle_lock() {
         "only the other plugin is recorded: {listed:?}"
     );
     assert_eq!(listed[0]["id"], "acme.other", "{listed:?}");
+
+    // An enabling install of a recorded plugin with units decides under the
+    // same lock whether the plugin is still recorded, so an uninstall can
+    // never slip in between; while another command holds the lock it is
+    // refused too.
+    let recorded = workflow_units::Plugin::new("acme.recorded").service("serve", "hang");
+    drop(lock);
+    let recorded_digest = units.install(&recorded);
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(
+            units
+                .env
+                .state_home()
+                .join("pohunek/workflow-plugins/units.lock"),
+        )
+        .expect("open the unit lifecycle lock");
+    lock.lock().expect("hold the unit lifecycle lock");
+    let output = units.install_with(&recorded, &recorded_digest, &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        workflow_units::describe(&output)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("a JSON envelope");
+    assert_eq!(document["err"]["code"], "workflow_store_busy", "{document}");
 }
 
 /// An enabling install whose units cannot be installed keeps the plugin
@@ -680,12 +708,20 @@ fn an_install_whose_enable_fails_stays_installed_disabled() {
     let recover = document["err"]["recover"]
         .as_str()
         .expect("a recovery hint");
-    // The cause's own recovery, then the step that finishes the install.
+    // What to fix for the cause, then the one step to repeat; never a hint
+    // to repeat the install, which would not enable the plugin.
     assert!(
-        recover.contains("check the user service manager"),
+        recover.starts_with("check the user service manager"),
         "{recover}"
     );
-    assert!(recover.contains("pohunek workflow enable"), "{recover}");
+    assert!(
+        recover.contains("then run `pohunek workflow enable"),
+        "{recover}"
+    );
+    assert!(
+        !recover.contains("repeat") && !recover.contains("retry"),
+        "{recover}"
+    );
     assert_eq!(units.listed()[0]["enabled"], false);
 
     let output = units.install_with(&plugin, &digest, &[]);
