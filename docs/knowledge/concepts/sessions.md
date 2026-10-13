@@ -584,14 +584,17 @@ start identity, and raising the mark would refuse a new owner's Stop whose hook
 read its clock just before that inspect. A runtime end needs no mark, because
 the runtime's claims end with it.
 
-Every hook claim is checked against the worker's clock, whatever its kind:
-subagent start, stop and snapshot claims, identity reports and releases,
-notifications, and the background snapshot. Each hook takes its sequence from
-`CLOCK_MONOTONIC` before it connects, so a genuine sequence is never greater
-than the worker's own reading of that clock taken when the claim arrives. A
-claim whose sequence is greater is refused whole with reason `future_sequence`,
-logged as `worker.identity.rejected` at WARN. No tolerance is needed: both
-readings come from the same kernel clock on the same host.
+Claim sequences are not checked against the worker's clock: every claim kind is
+admitted and ordered by its own sequence. The background mark is the one
+exception that uses the clock. Every write of the mark is clamped to the
+worker's own `CLOCK_MONOTONIC` reading at receipt, so the mark never exceeds
+the clock. A runtime package may keep a clock of its own whose readings run
+ahead of the worker's. Without the clamp, one such reading would make every
+later genuine snapshot stale until the runtime ends. With it, a far-future
+snapshot still applies, and the next normal snapshot, ordered after it, replaces
+it. The comparisons keep the unclamped sequence. A genuine snapshot whose hook
+started before a forged claim arrived can be refused as stale; the next turn end
+replaces the forged snapshot.
 
 Bounds the daemon re-checks for stored items are public constants in
 `pohunek-worker-protocol`: `BACKGROUND_TASK_ID_MAX_BYTES` (256),

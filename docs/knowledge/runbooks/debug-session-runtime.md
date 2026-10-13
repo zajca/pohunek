@@ -166,12 +166,10 @@ program, command or background item id:
 
 A release or session-start clear also raises the sequence mark, so a claim the
 reporter began before that clear is `stale_sequence` if it arrives late. An
-`owner_exited` clear does not raise it. A `worker.identity.rejected` warning
-with `identity.reason` `future_sequence` means a hook claim's sequence was
-ahead of the worker's `CLOCK_MONOTONIC` reading at receipt: that is a clock
-mismatch or a forged claim, not a slow hook, because a genuine hook is never
-ahead of the reading. The claim is refused whole, whatever its kind (subagent,
-identity, notification or background snapshot).
+`owner_exited` clear does not raise it. The background mark is clamped to the worker's `CLOCK_MONOTONIC` reading, so a
+claim with a sequence ahead of that clock (for example from a runtime package
+with its own clock) can apply, but it cannot lock the background view: the next
+turn end replaces it.
 
 The snapshot belongs to the process that reported it. A nested Claude inside
 the session reports its own snapshot, which replaces the outer one, and its

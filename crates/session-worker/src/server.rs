@@ -3351,7 +3351,6 @@ where
                 admitted.as_ref().err().copied(),
                 current_runtime.as_deref() == Some(worker_instance_id.as_str()),
                 state.phase == WireRuntimePhase::Running,
-                sequence,
             )
             .or_else(|| (!valid_identity_expiry(&expires_at)).then_some(RejectReason::ClaimExpired))
             .or_else(|| {
@@ -3509,7 +3508,6 @@ where
                 admitted.as_ref().err().copied(),
                 current_runtime.as_deref() == Some(worker_instance_id.as_str()),
                 true,
-                sequence,
             );
             if let Some(reason) = inadmissible {
                 reject_identity(&shared, "identity_release", reason, peer);
@@ -3617,7 +3615,6 @@ where
                 admitted.as_ref().err().copied(),
                 current_runtime.as_deref() == Some(worker_instance_id.as_str()),
                 state.phase == WireRuntimePhase::Running,
-                sequence,
             )
             .or_else(|| {
                 let fields_admitted = admitted.is_ok_and(|schema| {
@@ -3726,7 +3723,6 @@ where
                 admitted.as_ref().err().copied(),
                 current_runtime.as_deref() == Some(worker_instance_id.as_str()),
                 state.phase == WireRuntimePhase::Running,
-                sequence,
             )
             .or_else(|| {
                 let outcome_admitted = admitted.is_ok_and(|schema| {
@@ -3823,7 +3819,6 @@ where
                     admitted.as_ref().err().copied(),
                     current_runtime.as_deref() == Some(worker_instance_id.as_str()),
                     state.phase == WireRuntimePhase::Running,
-                    sequence,
                 );
                 if let Some(reason) = inadmissible {
                     reject_identity(&shared, "notification_create", reason, peer);
@@ -3942,7 +3937,6 @@ async fn apply_subagent_snapshot(
         admitted.as_ref().err().copied(),
         current_runtime.as_deref() == Some(request.worker_instance_id.as_str()),
         state.phase == WireRuntimePhase::Running,
-        request.sequence,
     )
     .or_else(|| {
         let valid = admitted.is_ok_and(HookSchema::admits_subagents)
@@ -4122,7 +4116,7 @@ fn apply_background(
     };
     let items = background::build_items(candidates, previous, occurred_at_ms);
     journal.background_revision = journal.background_revision.saturating_add(1);
-    journal.background_sequence = request.sequence;
+    journal.background_sequence = background::clamp_mark(request.sequence);
     journal.background_owner = Some(BackgroundOwner {
         pid: request.pid,
         start_identity: request.start_identity.to_string(),
@@ -5837,7 +5831,6 @@ fn hook_claim_admissible(
     schema_rejection: Option<RejectReason>,
     runtime_matches: bool,
     phase_running: bool,
-    sequence: u64,
 ) -> Option<RejectReason> {
     if let Some(reason) = schema_rejection {
         return Some(reason);
@@ -5848,28 +5841,7 @@ fn hook_claim_admissible(
     if !phase_running {
         return Some(RejectReason::PhaseNotRunning);
     }
-    // Every hook takes its sequence from `CLOCK_MONOTONIC` before it connects,
-    // and this reading is taken after the claim arrived, so a genuine sequence
-    // is never ahead of it. No tolerance is needed: both readings come from the
-    // same kernel clock on the same host.
-    (sequence > monotonic_nanos()).then_some(RejectReason::FutureSequence)
-}
-
-/// Nanoseconds in one second.
-const NANOS_PER_SECOND: u64 = 1_000_000_000;
-
-/// Reads the worker's `CLOCK_MONOTONIC` in nanoseconds.
-///
-/// This is the clock the state and notify hooks take their claim sequences
-/// from, through `time.clock_gettime_ns(time.CLOCK_MONOTONIC)`. The reading is
-/// used only to refuse sequences ahead of it, so an unrepresentable value
-/// saturates instead of failing.
-fn monotonic_nanos() -> u64 {
-    let time = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
-    u64::try_from(time.tv_sec)
-        .unwrap_or(0)
-        .saturating_mul(NANOS_PER_SECOND)
-        .saturating_add(u64::try_from(time.tv_nsec).unwrap_or(0))
+    None
 }
 
 /// Validates one hook claim end to end and records why it was rejected.

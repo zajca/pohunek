@@ -100,9 +100,6 @@ pub enum RejectReason {
     SubagentClaimInvalid,
     /// The notification claim is not a bounded JSON object.
     NotificationInvalid,
-    /// The claim's sequence is ahead of the worker's own monotonic clock, so it
-    /// cannot come from a hook on this host.
-    FutureSequence,
 }
 
 impl RejectReason {
@@ -127,7 +124,6 @@ impl RejectReason {
             Self::SequenceStale => "sequence_stale",
             Self::SubagentClaimInvalid => "subagent_claim_invalid",
             Self::NotificationInvalid => "notification_invalid",
-            Self::FutureSequence => "future_sequence",
         }
     }
 }

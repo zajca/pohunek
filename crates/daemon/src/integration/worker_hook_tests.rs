@@ -4380,15 +4380,16 @@ for claim in plan:
             run.finish().await;
         }
 
-        /// A claim whose sequence is ahead of the worker's clock is refused whole,
-        /// whatever its kind: a background snapshot, a subagent start and an
-        /// identity report. The refusal is logged with its reason, and a normal
-        /// snapshot later in the same agent still applies.
+        /// A far-future background snapshot applies, and the next normal snapshot
+        /// of the same agent, ordered after it, replaces it. The sequence mark is
+        /// clamped to the worker's clock, so a claim ahead of the clock cannot lock
+        /// the view. Without the clamp the mark would sit at the far-future value
+        /// and the normal snapshot would be stale.
         #[tokio::test]
-        async fn a_claim_ahead_of_the_workers_clock_is_refused_and_later_claims_apply() {
+        async fn a_far_future_background_snapshot_applies_and_the_next_normal_one_replaces_it() {
             let log = EventLog::default();
             let _subscriber = log.install();
-            let root = crate::test_support::scoped_dir("ph-background-future-");
+            let root = crate::test_support::scoped_dir("ph-background-far-future-");
             let client = Client::new(&root);
             let steps = vec![turn(vec![
                 session_hook(None),
@@ -4396,8 +4397,6 @@ for claim in plan:
                     CLAUDE,
                     &json!([
                         {"type": SNAPSHOT, "sequence": FAR_FUTURE_SEQUENCE, "tasks": [shell_task("far-shell", "Far", "cargo test")]},
-                        {"type": START, "sequence": FAR_FUTURE_SEQUENCE, "id": "far-sub"},
-                        {"type": "identity_report", "sequence": FAR_FUTURE_SEQUENCE},
                         {"type": SNAPSHOT, "sequence": "now", "tasks": [shell_task("normal", "Normal", "bacon")]},
                     ]),
                 ),
@@ -4410,12 +4409,7 @@ for claim in plan:
                 .collect();
             assert_eq!(
                 outcomes,
-                [
-                    (SNAPSHOT.to_owned(), false),
-                    (START.to_owned(), false),
-                    ("identity_report".to_owned(), false),
-                    (SNAPSHOT.to_owned(), true),
-                ],
+                [(SNAPSHOT.to_owned(), true), (SNAPSHOT.to_owned(), true)],
                 "{}",
                 log.rendered()
             );
@@ -4426,18 +4420,61 @@ for claim in plan:
                 .map(|item| item.id.as_str())
                 .collect();
             assert_eq!(ids, ["normal"], "{background:?}");
-            let final_state = run.snapshots.last().expect("the final snapshot");
+            assert_eq!(background.revision, 2, "{background:?}");
             assert!(
-                final_state.subagents.is_empty(),
-                "{:?}",
-                final_state.subagents
+                log.named("worker.background.ignored").is_empty(),
+                "{}",
+                log.rendered()
             );
-            let refusals: Vec<String> = log
-                .named("worker.identity.rejected")
-                .iter()
-                .map(|fields| fields["identity.reason"].clone())
+            run.finish().await;
+        }
+
+        /// A far-future identity report and a far-future subagent start are
+        /// admitted, as they were before the worker checked sequences against its
+        /// clock. A worker-side refusal would silently drop them, so this scenario
+        /// fails if one returns.
+        #[tokio::test]
+        async fn far_future_identity_and_subagent_claims_are_admitted() {
+            let log = EventLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-far-future-admitted-");
+            let client = Client::new(&root);
+            let steps = vec![turn(vec![
+                session_hook(None),
+                client.send(
+                    CLAUDE,
+                    &json!([
+                        {"type": START, "sequence": FAR_FUTURE_SEQUENCE, "id": "far-sub"},
+                        {"type": "identity_report", "sequence": FAR_FUTURE_SEQUENCE},
+                    ]),
+                ),
+            ])];
+            let run = replay_checking(&root, steps, None).await;
+            let outcomes: Vec<(String, bool)> = client
+                .answers()
+                .into_iter()
+                .map(|answer| (answer.action, answer.ok))
                 .collect();
-            assert_eq!(refusals, ["future_sequence"; 3], "{}", log.rendered());
+            assert_eq!(
+                outcomes,
+                [
+                    (START.to_owned(), true),
+                    ("identity_report".to_owned(), true)
+                ],
+                "{}",
+                log.rendered()
+            );
+            let last = run.snapshots.last().expect("the final snapshot");
+            assert_eq!(
+                row(last, "far-sub").phase,
+                SubagentPhase::Running,
+                "{last:?}"
+            );
+            assert!(
+                log.named("worker.identity.rejected").is_empty(),
+                "{}",
+                log.rendered()
+            );
             run.finish().await;
         }
 
