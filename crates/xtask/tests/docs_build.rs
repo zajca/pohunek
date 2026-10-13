@@ -3,12 +3,20 @@ use std::path::{Path, PathBuf};
 
 use xtask::{build_docs, build_site, validate_docs, BuildOptions, SiteOptions};
 
+// The committed bundle contains 34 frontmatter-backed concepts (concepts,
+// guides, runbooks, safety rules, the source map, and the system prompt) plus
+// the reserved `index.md` and `log.md` files. The counts are exact so adding or
+// removing a checked Markdown file needs an intentional update here.
+const COMMITTED_KNOWLEDGE_FILES: usize = 36;
+const COMMITTED_KNOWLEDGE_CONCEPTS: usize = 34;
+
 #[test]
 fn validate_docs_reports_committed_bundle() {
     let report = validate_docs(repo_root().join("docs/knowledge")).expect("bundle validates");
 
-    assert!(report.files_checked > 0);
-    assert!(report.concept_count > 0);
+    assert_eq!(report.schema_version, knowledge::CONCEPT_SCHEMA_VERSION);
+    assert_eq!(report.files_checked, COMMITTED_KNOWLEDGE_FILES);
+    assert_eq!(report.concept_count, COMMITTED_KNOWLEDGE_CONCEPTS);
 }
 
 #[test]
