@@ -420,19 +420,22 @@ fn check_package(
     Ok(Outcome::verified(head.digest.clone()))
 }
 
-/// Whether `candidate` is a semver version strictly above every version in
-/// `released`.
+/// Whether `candidate` is a semver version of strictly higher precedence than
+/// every version in `released`.
 ///
 /// The catalog and descriptor versions are opaque strings, so a version that
-/// is not semver cannot be ordered and proves no bump. `released` is never
-/// empty at the call site, which requires a catalog entry of the runtime.
+/// is not semver cannot be ordered and proves no bump. Precedence ignores
+/// build metadata, so `1.0.0+build.1` is no bump over `1.0.0`; the `Ord` of
+/// `semver::Version` would rank it higher. `released` is never empty at the
+/// call site, which requires a catalog entry of the runtime.
 fn is_above_all(candidate: &str, released: &[&str]) -> bool {
     let Ok(candidate) = semver::Version::parse(candidate) else {
         return false;
     };
-    released
-        .iter()
-        .all(|version| semver::Version::parse(version).is_ok_and(|released| candidate > released))
+    released.iter().all(|version| {
+        semver::Version::parse(version)
+            .is_ok_and(|released| candidate.cmp_precedence(&released).is_gt())
+    })
 }
 
 /// Check 3: the released archive must hash to the rebuilt digest.

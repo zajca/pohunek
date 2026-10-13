@@ -1250,6 +1250,23 @@ fn a_catalog_of_another_release_fails_the_bump_gate() {
     assert_eq!(actual["verdict"], json!("fail"));
 }
 
+/// Build metadata does not raise semver precedence, so it is no bump.
+#[test]
+fn a_changed_package_with_only_build_metadata_added_fails_the_bump_gate() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "runtime-packages/codex/runtime.toml",
+        &format!("{}# edited\n", descriptor("codex", "1.0.0+build.1")),
+    );
+    fixture.commit("edit codex and add build metadata to its version");
+    let (status, actual) = fixture.bump();
+    assert_eq!(status.code(), Some(XTASK_FAILURE));
+    assert_eq!(
+        actual["packages"]["codex"],
+        gate("fail", Some("version_not_bumped"))
+    );
+}
+
 #[test]
 fn a_changed_package_with_a_version_that_is_not_semver_fails_the_bump_gate() {
     let fixture = Fixture::new();

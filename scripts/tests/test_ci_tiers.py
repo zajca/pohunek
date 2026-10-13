@@ -1109,12 +1109,14 @@ def run_bump_step(
     env: dict[str, str],
     fakes: dict[str, str],
     inputs: dict[str, str],
+    cwd: Path | None = None,
 ) -> subprocess.CompletedProcess:
     """Runs one step script of the version gate with fake tools.
 
     `inputs` are files written into the scratch directory, which `@HOME@` in
-    any env value names. The returned process carries `log` (the fake tools'
-    calls) and `outputs` (the step's `GITHUB_OUTPUT` entries).
+    any env value names. The step runs in `cwd`, the repository root unless
+    given. The returned process carries `log` (the fake tools' calls) and
+    `outputs` (the step's `GITHUB_OUTPUT` entries).
     """
     tmp = tempfile.TemporaryDirectory()
     test.addCleanup(tmp.cleanup)
@@ -1147,7 +1149,7 @@ def run_bump_step(
             "FAKE_LOG": str(log),
             **{key: value.replace("@HOME@", str(home)) for key, value in env.items()},
         },
-        cwd=ROOT,
+        cwd=cwd or ROOT,
         capture_output=True,
         text=True,
         timeout=STEP_TIMEOUT_SECONDS,
@@ -1223,6 +1225,22 @@ class RuntimePackageVersionBumpTests(unittest.TestCase):
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 self.assertEqual(completed.outputs, {"version": expected})
                 self.assertIn("--exclude-drafts --exclude-pre-releases --limit 200 --json tagName", completed.log)
+
+    def test_the_workspace_version_is_read_for_the_gate(self):
+        completed = run_bump_step(self, "Read the workspace version", {}, {}, {})
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.outputs, {"version": workspace_version()})
+
+    def test_a_failing_version_script_fails_the_step_instead_of_skipping_the_gate(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        script = Path(tmp.name) / "scripts" / "release-workflow" / "version"
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/bin/sh\necho 'unsupported workspace version' >&2\nexit 1\n")
+        script.chmod(0o755)
+        completed = run_bump_step(self, "Read the workspace version", {}, {}, {}, cwd=Path(tmp.name))
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(completed.outputs, {})
 
     def test_an_unlisted_release_leaves_the_gate_undecided_with_a_warning(self):
         completed = run_bump_step(

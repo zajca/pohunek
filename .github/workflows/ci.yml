@@ -1736,12 +1736,15 @@ jobs:
           save-if: false
 
       # The version script is checkout code, so this step runs without the token.
+      # A standalone assignment fails the step when the script fails; inside
+      # `echo` the failure would leave an empty version and skip the gate.
       - name: Read the workspace version
         id: version
         shell: bash
         run: |
           set -euo pipefail
-          echo "version=$(scripts/release-workflow/version rehearsal "")" >> "$GITHUB_OUTPUT"
+          version="$(scripts/release-workflow/version rehearsal "")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       # The last published release at or below the workspace version: the
       # highest `vX.Y.Z` tag among the listed non-draft, non-pre-release

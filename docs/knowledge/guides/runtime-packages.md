@@ -290,7 +290,8 @@ version above every version the last published release shipped for that
 runtime. The pull request job `package version bump` enforces the rule with
 `cargo xtask package bump`: it fails when the archive differs from every
 released archive and the version is not strictly greater than the released
-versions, so `1.0.0` after a released `1.0.0` fails, and so does `0.9.9`.
+versions by semver precedence, so `1.0.0` after a released `1.0.0` fails, and
+so do `0.9.9` and `1.0.0+build.1` (build metadata does not count).
 
 - Bump the patch number for a fix, the minor number for an additive change such
   as a newly declared section, and the major number for a change that breaks
