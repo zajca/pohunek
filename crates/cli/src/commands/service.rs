@@ -14,6 +14,7 @@ use std::process::ExitCode;
 
 use clap::{Subcommand, ValueHint};
 use pohunek_service_config::preflight::{PreflightReport, StoreState};
+use pohunek_service_config::runtimes::EnsureReport;
 
 use crate::commands::render_json;
 use crate::error::CliError;
@@ -344,6 +345,21 @@ fn render_upgrade(report: &report::UpgradeReport) -> String {
     if let Some(error) = &report.gc_error {
         let _ = writeln!(text, "warning: old versions were not cleaned up: {error}");
     }
+    if let Some(runtimes) = &report.runtimes {
+        render_runtimes(&mut text, runtimes);
+    }
+    for integration in &report.integrations {
+        let _ = writeln!(
+            text,
+            "integration {}  {}{}",
+            integration.integration,
+            integration.status,
+            integration
+                .detail
+                .as_ref()
+                .map_or_else(String::new, |detail| format!(": {detail}"))
+        );
+    }
     if let Some(preflight) = &report.preflight {
         if report
             .rolled_back
@@ -356,6 +372,29 @@ fn render_upgrade(report: &report::UpgradeReport) -> String {
         render_preflight(&mut text, preflight, report.accepted_runtime_loss);
     }
     text
+}
+
+/// Lists the official runtime packages and profile pins of the runtime step.
+fn render_runtimes(text: &mut String, runtimes: &EnsureReport) {
+    for package in &runtimes.packages {
+        let _ = writeln!(
+            text,
+            "runtime {}  {} {}  {}",
+            package.runtime,
+            package.package,
+            package.version,
+            format!("{:?}", package.status).to_lowercase()
+        );
+    }
+    for profile in &runtimes.profiles {
+        let _ = writeln!(
+            text,
+            "profile {}  pin to {}  {}",
+            profile.name,
+            profile.base,
+            format!("{:?}", profile.status).to_lowercase()
+        );
+    }
 }
 
 fn render_check(report: &report::CheckReport) -> String {
@@ -822,6 +861,8 @@ mod tests {
             preflight: None,
             accepted_runtime_loss: false,
             config_schema_migration: None,
+            runtimes: None,
+            integrations: Vec::new(),
         });
         assert!(text.contains("pohunek 2.0.0 is already active"), "{text}");
         assert!(!text.contains("upgraded"), "{text}");

@@ -37,6 +37,7 @@ use crate::hermes_integration::policy::{
 use crate::hermes_integration::runner::HermesRunner;
 use crate::hermes_integration::target::{ProfileName, TargetContext, TargetSelection};
 use crate::paths::Paths;
+use crate::service::report::IntegrationReinstall;
 use crate::target::LOCAL_HOST;
 
 /// The maximum number of absolute PATH entries examined for the Hermes binary.
@@ -48,6 +49,8 @@ const MAX_ABSOLUTE_PATH_ENTRIES: usize = 64;
 const HERMES_EXECUTABLE_NAME: &str = "hermes";
 /// The only home environment input used to derive the default Hermes root.
 const HOME_ENVIRONMENT_VARIABLE: &str = "HOME";
+/// The directory of named Hermes profiles below the default Hermes root.
+const HERMES_PROFILES_DIR: &str = "profiles";
 
 /// Agent selector accepted by `integration --agent`.
 ///
@@ -395,6 +398,28 @@ pub(crate) async fn run_install(
     home: &HomeSelectionArgs,
     json: bool,
 ) -> Result<bool, CliError> {
+    let result = install_hooks(paths, agent, home).await?;
+
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        print!("{}", render_install_human(&result));
+    }
+    Ok(result.failed.is_empty())
+}
+
+/// Installs the daemon-backed hook of `agent` through the local daemon and
+/// returns its result without printing it.
+///
+/// # Errors
+///
+/// Returns [`CliError`] if the daemon is unreachable, rejects the request, or
+/// returns an unexpected payload.
+pub(crate) async fn install_hooks(
+    paths: &Paths,
+    agent: Option<HookAgentArg>,
+    home: &HomeSelectionArgs,
+) -> Result<IntegrationInstallResult, CliError> {
     let params = IntegrationInstallParams {
         agent: agent.map(Into::into),
         profile: home.profile.clone(),
@@ -405,15 +430,7 @@ pub(crate) async fn run_install(
     // of any `--host` flag.
     let mut client = Client::connect(LOCAL_HOST, paths).await?;
     require_selector_support(&mut client, params.agent.clone(), home).await?;
-    let result: IntegrationInstallResult =
-        client.call::<method::IntegrationInstall>(params).await?;
-
-    if json {
-        print!("{}", crate::commands::render_json(&result)?);
-    } else {
-        print!("{}", render_install_human(&result));
-    }
-    Ok(result.failed.is_empty())
+    client.call::<method::IntegrationInstall>(params).await
 }
 
 /// Run the read-only Codex and Claude integration status RPC.
@@ -633,18 +650,6 @@ pub(crate) fn hermes_options_require_hermes() -> CliError {
 fn resolve_target(
     options: &HermesOptions,
 ) -> Result<crate::hermes_integration::target::ResolvedTarget, CliError> {
-    let home = env::var_os(HOME_ENVIRONMENT_VARIABLE)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| CliError::MissingEnv {
-            var: HOME_ENVIRONMENT_VARIABLE.to_owned(),
-        })?;
-    let context = TargetContext::new(
-        home.join(".hermes"),
-        home,
-        nearest_git_workspace().into_iter().collect(),
-    )
-    .map_err(hermes_error)?;
     let selection = match (&options.profile, &options.home) {
         (Some(profile), None) => {
             TargetSelection::Profile(ProfileName::new(profile.clone()).map_err(hermes_error)?)
@@ -653,11 +658,269 @@ fn resolve_target(
         (None, None) => {
             return Err(hermes_usage(
                 "select exactly one of `--hermes-profile` or `--hermes-home`",
-            ))
+            ));
         }
         (Some(_), Some(_)) => return Err(hermes_error(HermesError::UnsafeTarget)),
     };
+    resolve_hermes_selection(&env_home()?, selection)
+}
+
+/// Resolves one Hermes home selection below `home`, the user's home directory.
+fn resolve_hermes_selection(
+    home: &Path,
+    selection: TargetSelection,
+) -> Result<crate::hermes_integration::target::ResolvedTarget, CliError> {
+    let context = TargetContext::new(
+        home.join(".hermes"),
+        home.to_path_buf(),
+        nearest_git_workspace().into_iter().collect(),
+    )
+    .map_err(hermes_error)?;
     context.resolve(selection).map_err(hermes_error)
+}
+
+/// The home directory of the process, the one the CLI's own commands use.
+fn env_home() -> Result<PathBuf, CliError> {
+    env::var_os(HOME_ENVIRONMENT_VARIABLE)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| CliError::MissingEnv {
+            var: HOME_ENVIRONMENT_VARIABLE.to_owned(),
+        })
+}
+
+/// The resolved environment an upgrade reinstalls integrations in.
+///
+/// Built from the installation's own resolved paths, so the daemon socket and
+/// the Hermes homes are the ones the rest of the CLI uses, never the process
+/// environment of whoever runs the upgrade.
+#[derive(Debug, Clone)]
+pub struct IntegrationEnv {
+    /// The CLI paths of the daemon connection.
+    pub(crate) paths: Paths,
+    /// The user's home directory, which holds the default Hermes root.
+    pub(crate) home: Option<PathBuf>,
+    /// The application state directory: the Hermes policy lives below it and
+    /// the package store is its `plugins` directory.
+    pub(crate) state_dir: PathBuf,
+}
+
+/// Reinstalls the integrations an upgrade listed, after the new daemon is ready.
+///
+/// Each runtime's daemon-backed hook goes through `integration.install`.
+/// Hermes is reinstalled only in homes that carry the pohunek ownership
+/// marker: the default home and its named profiles are the candidates, and a
+/// home without the marker is reported as a gap with the command that installs
+/// it, because nothing is written into a home this installation does not own.
+///
+/// Failures are reported per integration; the caller never rolls back for them.
+pub(crate) async fn reinstall_after_upgrade(
+    env: &IntegrationEnv,
+    runtimes: &[String],
+    hermes: bool,
+) -> Vec<IntegrationReinstall> {
+    let mut results = Vec::new();
+    for runtime in runtimes {
+        results.push(reinstall_runtime(&env.paths, runtime).await);
+    }
+    if hermes {
+        results.extend(reinstall_hermes_homes(env));
+    }
+    results
+}
+
+/// Installs one runtime's daemon-backed hook and reports its outcome.
+async fn reinstall_runtime(paths: &Paths, runtime: &str) -> IntegrationReinstall {
+    let integration = runtime.to_owned();
+    let agent = match runtime.parse::<HookAgentArg>() {
+        Ok(agent) => agent,
+        Err(error) => {
+            return IntegrationReinstall {
+                integration,
+                status: "failed",
+                detail: Some(error),
+            }
+        }
+    };
+    let selection = HomeSelectionArgs {
+        profile: None,
+        all_profiles: false,
+    };
+    match install_hooks(paths, Some(agent), &selection).await {
+        Ok(result) if result.failed.is_empty() => IntegrationReinstall {
+            integration,
+            status: "installed",
+            detail: None,
+        },
+        Ok(result) => IntegrationReinstall {
+            integration,
+            status: "failed",
+            detail: Some(
+                result
+                    .failed
+                    .iter()
+                    .map(|failure| failure.error.msg.clone())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+        },
+        Err(error) => IntegrationReinstall {
+            integration,
+            status: "failed",
+            detail: Some(error.to_string()),
+        },
+    }
+}
+
+/// What the upgrade does for one Hermes home: report it, or update its plugin.
+#[derive(Debug)]
+pub(crate) enum HermesPlan {
+    /// Nothing is written: a failure to plan, or the gap of a home without the marker.
+    Done(IntegrationReinstall),
+    /// The home carries the marker; its plugin is updated.
+    Update(HermesUpdate),
+}
+
+/// A Hermes home whose plugin the upgrade updates.
+#[derive(Debug)]
+pub(crate) struct HermesUpdate {
+    integration: String,
+    target: crate::hermes_integration::target::ResolvedTarget,
+    policy_path: PathBuf,
+}
+
+/// Plans the Hermes reinstall of every candidate home below `env`.
+fn reinstall_hermes_homes(env: &IntegrationEnv) -> Vec<IntegrationReinstall> {
+    let Some(home) = env.home.as_deref() else {
+        return vec![IntegrationReinstall {
+            integration: "hermes".to_owned(),
+            status: "failed",
+            detail: Some(
+                CliError::MissingEnv {
+                    var: HOME_ENVIRONMENT_VARIABLE.to_owned(),
+                }
+                .to_string(),
+            ),
+        }];
+    };
+    let root = home.join(".hermes");
+    let mut selections = vec![(
+        "hermes".to_owned(),
+        format!("--hermes-home {}", root.display()),
+        TargetSelection::CustomHome(root.clone()),
+    )];
+    for profile in hermes_profile_names(&root.join(HERMES_PROFILES_DIR)) {
+        if let Ok(name) = ProfileName::new(profile.clone()) {
+            selections.push((
+                format!("hermes profile {profile}"),
+                format!("--hermes-profile {profile}"),
+                TargetSelection::Profile(name),
+            ));
+        }
+    }
+    let plugins = env.state_dir.join(pohunek_paths::PLUGINS_SUBDIR);
+    selections
+        .into_iter()
+        .map(|(integration, selector, selection)| {
+            match plan_hermes_home(integration, &selector, selection, home, &env.state_dir) {
+                HermesPlan::Done(result) => result,
+                HermesPlan::Update(update) => execute_hermes_update(&update, &plugins),
+            }
+        })
+        .collect()
+}
+
+/// Names of the directories below a Hermes profiles directory, sorted.
+fn hermes_profile_names(profiles: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(profiles) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Plans the reinstall of one Hermes home: an update when its marker exists,
+/// otherwise the gap that names the command installing it by hand.
+pub(crate) fn plan_hermes_home(
+    integration: String,
+    selector: &str,
+    selection: TargetSelection,
+    home: &Path,
+    state_dir: &Path,
+) -> HermesPlan {
+    let failed = |detail: String| {
+        HermesPlan::Done(IntegrationReinstall {
+            integration: integration.clone(),
+            status: "failed",
+            detail: Some(detail),
+        })
+    };
+    let target = match resolve_hermes_selection(home, selection) {
+        Ok(target) => target,
+        Err(error) => return failed(error.to_string()),
+    };
+    let marker = target.plugin_root().join(assets::MARKER_NAME);
+    let owned = fs::symlink_metadata(&marker).is_ok_and(|metadata| metadata.is_file());
+    if !owned {
+        return HermesPlan::Done(IntegrationReinstall {
+            integration,
+            status: "gap",
+            detail: Some(format!(
+                "no pohunek marker in this home; install it with `pohunek integration hermes install {selector} --access-mode <mode> --allow-host <host>`"
+            )),
+        });
+    }
+    match policy::policy_path(state_dir, &target) {
+        Ok(policy_path) => HermesPlan::Update(HermesUpdate {
+            integration,
+            target,
+            policy_path,
+        }),
+        Err(error) => failed(hermes_error(error).to_string()),
+    }
+}
+
+/// Updates the plugin of a planned Hermes home from the package store at `plugins`.
+fn execute_hermes_update(update: &HermesUpdate, plugins: &Path) -> IntegrationReinstall {
+    let failed = |detail: String| IntegrationReinstall {
+        integration: update.integration.clone(),
+        status: "failed",
+        detail: Some(detail),
+    };
+    let executable = match resolve_hermes_executable(None) {
+        Ok(executable) => executable,
+        Err(error) => return failed(error.to_string()),
+    };
+    let mut runner = match HermesRunner::new(&executable) {
+        Ok(runner) => runner,
+        Err(error) => return failed(hermes_error(error).to_string()),
+    };
+    let bundle = match assets::selected_bundle(plugins, &update.policy_path) {
+        Ok(bundle) => bundle,
+        Err(error) => return failed(hermes_error(error).to_string()),
+    };
+    // The policy is kept as it is on disk: a reinstall changes only the plugin.
+    let policy_path = update.policy_path.clone();
+    match lifecycle::update(
+        &mut runner,
+        &update.target,
+        &update.policy_path,
+        false,
+        &bundle,
+        |_current| Policy::load_private(&policy_path),
+    ) {
+        Ok(_) => IntegrationReinstall {
+            integration: update.integration.clone(),
+            status: "installed",
+            detail: None,
+        },
+        Err(error) => failed(hermes_error(error).to_string()),
+    }
 }
 
 fn hermes_usage(message: &str) -> CliError {
@@ -1902,5 +2165,79 @@ mod tests {
             render_doctor_human(&result),
             "codex: needs attention\n  [error] hook_runtime_macos_shim: stub only\n    fix: run `xcode-select --install`\n  [info] agent_not_installed: absent\n"
         );
+    }
+    /// Plans the Hermes reinstall of `home`'s default root with `marker`
+    /// written into its plugin root or not.
+    fn plan_default_home(home: &Path, state_dir: &Path, with_marker: bool) -> super::HermesPlan {
+        let root = home.join(".hermes");
+        let target = super::resolve_hermes_selection(
+            home,
+            crate::hermes_integration::target::TargetSelection::CustomHome(root.clone()),
+        )
+        .expect("resolve the default Hermes home");
+        if with_marker {
+            fs::create_dir_all(target.plugin_root()).expect("plugin root");
+            fs::write(
+                target
+                    .plugin_root()
+                    .join(crate::hermes_integration::assets::MARKER_NAME),
+                b"{}",
+            )
+            .expect("marker");
+        }
+        super::plan_hermes_home(
+            "hermes".to_owned(),
+            &format!("--hermes-home {}", root.display()),
+            crate::hermes_integration::target::TargetSelection::CustomHome(root),
+            home,
+            state_dir,
+        )
+    }
+
+    #[test]
+    fn a_hermes_home_with_the_pohunek_marker_is_planned_for_an_update() {
+        let temp = pohunek_test_support::tempdir().expect("temporary home");
+        let state_dir = temp.path().join("state").join("pohunek");
+        let plan = plan_default_home(temp.path(), &state_dir, true);
+        let super::HermesPlan::Update(update) = plan else {
+            panic!("a marked home is updated, not reported: {plan:?}");
+        };
+        assert!(update.target.plugin_root().starts_with(temp.path()));
+        assert!(update.policy_path.starts_with(&state_dir));
+    }
+
+    #[test]
+    fn a_hermes_home_without_the_marker_is_a_gap_that_names_the_install_command() {
+        let temp = pohunek_test_support::tempdir().expect("temporary home");
+        let state_dir = temp.path().join("state").join("pohunek");
+        fs::create_dir_all(temp.path().join(".hermes").join("profiles").join("work"))
+            .expect("profile");
+        let plan = plan_default_home(temp.path(), &state_dir, false);
+        let super::HermesPlan::Done(result) = plan else {
+            panic!("an unmarked home is never written: {plan:?}");
+        };
+        assert_eq!(result.status, "gap");
+        let detail = result.detail.expect("gap detail");
+        assert!(
+            detail.contains(&format!(
+                "`pohunek integration hermes install --hermes-home {} ",
+                temp.path().join(".hermes").display()
+            )),
+            "{detail}"
+        );
+        assert!(!temp
+            .path()
+            .join(".hermes")
+            .join(".pohunek-owned.json")
+            .exists());
+    }
+
+    #[test]
+    fn the_reinstall_reads_only_the_homes_it_is_given() {
+        let temp = pohunek_test_support::tempdir().expect("temporary home");
+        let profiles = temp.path().join(".hermes").join("profiles");
+        fs::create_dir_all(profiles.join("work")).expect("profile");
+        fs::write(profiles.join("not-a-dir"), b"x").expect("file");
+        assert_eq!(super::hermes_profile_names(&profiles), ["work"]);
     }
 }

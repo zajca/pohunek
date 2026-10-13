@@ -164,6 +164,7 @@ use pohunek_platform::shell_env::SearchPath;
 use pohunek_platform::supervisor::{
     self, JobDefinition, Namespace, ServiceObservation, ServiceState, WorkerKey,
 };
+use pohunek_service_config::runtimes::EnsureReport;
 use pohunek_service_config::{ServiceConfig, UpgradeSource, SCHEMA_VERSION};
 use protocol::SessionInfo;
 
@@ -176,15 +177,19 @@ use super::error::{supervisor_error, Error, LiveSession, OutdatedWorker};
 use super::layout::{self, Staged};
 use super::preflight::{self, AdoptionPreflight, DaemonPreflight, Gated};
 use super::record::{self, ConfigBackup, Operation, Record, Step, Store, TransactionLock};
+use super::report::IntegrationReinstall;
 use super::report::{
     state_name, InstallReport, JobReport, KeptVersion, PendingReport, SearchPathReport,
     StatusReport, UninstallReport, UpgradeReport, VersionReport, WorkerReport,
 };
 use super::rollback;
+use super::runtimes::{self, CliIntegrations, DaemonRuntimes, IntegrationStep, RuntimeStep};
 use super::settings;
 use super::usage::{Journals, Usage};
 #[cfg(target_os = "linux")]
 use super::verify::UnitVerifier;
+use crate::commands::integration::IntegrationEnv;
+use crate::paths::Paths;
 
 /// Durable metadata `--purge` removes from the data directory.
 ///
@@ -221,6 +226,8 @@ struct LateGate {
     gated: Option<Gated>,
     /// Whether the gate itself failed, which leaves the daemon untouched.
     refused: bool,
+    /// The runtime plan, or the apply, this run carried out.
+    runtimes: Option<EnsureReport>,
 }
 
 /// A test action run just before the adoption preflight of the daemon swap.
@@ -261,6 +268,11 @@ pub struct Engine<'a> {
     /// Judges whether the new daemon adopts the live sessions; the new
     /// daemon's own `upgrade-preflight` in production.
     preflight: Box<dyn AdoptionPreflight>,
+    /// Plans and applies the release's official runtime packages; the
+    /// release's own `pohunekd ensure-official-runtimes` in production.
+    runtimes: Box<dyn RuntimeStep>,
+    /// Reinstalls the integration hooks the release lists once the new daemon serves.
+    integrations: Box<dyn IntegrationStep>,
     /// Whether the operator accepted losing the runtime or native recovery of
     /// the sessions the preflight lists (`--accept-runtime-loss`).
     accept_runtime_loss: bool,
@@ -292,6 +304,8 @@ impl<'a> Engine<'a> {
             ready_timeout: settings::DAEMON_READY_TIMEOUT,
             stop_timeout: settings::SESSION_STOP_TIMEOUT,
             preflight: Box::new(DaemonPreflight),
+            runtimes: Box::new(DaemonRuntimes),
+            integrations: Box::new(CliIntegrations),
             accept_runtime_loss: false,
             #[cfg(target_os = "linux")]
             unit_verifier: UnitVerifier::default(),
@@ -344,6 +358,23 @@ impl<'a> Engine<'a> {
     #[must_use]
     pub fn with_adoption_preflight(mut self, preflight: Box<dyn AdoptionPreflight>) -> Self {
         self.preflight = preflight;
+        self
+    }
+
+    /// Plans and applies the official runtime packages with `runtimes` instead
+    /// of the release's own `pohunekd ensure-official-runtimes`.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_runtime_step(mut self, runtimes: Box<dyn RuntimeStep>) -> Self {
+        self.runtimes = runtimes;
+        self
+    }
+
+    /// Reinstalls the integration hooks with `integrations` instead of the CLI's.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_integration_step(mut self, integrations: Box<dyn IntegrationStep>) -> Self {
+        self.integrations = integrations;
         self
     }
 
@@ -502,6 +533,8 @@ impl<'a> Engine<'a> {
                     config_backup: None,
                     step: Step::Started,
                     rolling_back: false,
+                    runtime_stop: false,
+                    runtime_backup: None,
                 };
                 self.store.save(&record)?;
                 record
@@ -585,6 +618,10 @@ impl<'a> Engine<'a> {
     /// A migration transaction additionally fails closed with
     /// [`Error::ConfigBackup`] when this CLI's backup of the exact pre-upgrade
     /// bytes, or the bytes still on disk, no longer match its journal.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the upgrade reads in transaction order; splitting it would separate the rollback decisions from the steps they depend on"
+    )]
     pub async fn upgrade(&self, from: &Path, version: &str) -> Result<UpgradeReport, Error> {
         let _transaction = self.transaction().await?;
         upgrade_preflight(self.context)?;
@@ -635,6 +672,8 @@ impl<'a> Engine<'a> {
                     .is_some_and(|report| report.accepted_runtime_loss),
                 rolled_back,
                 config_schema_migration: None,
+                runtimes: None,
+                integrations: Vec::new(),
             });
         }
         // A previous-schema source makes this a migration transaction: the record
@@ -652,6 +691,8 @@ impl<'a> Engine<'a> {
                 config_backup: config_backup_of(resume.as_ref(), &source),
                 step: Step::Started,
                 rolling_back: false,
+                runtime_stop: false,
+                runtime_backup: None,
             };
             self.store.save(&record)?;
             record
@@ -669,6 +710,7 @@ impl<'a> Engine<'a> {
             other => other,
         };
         self.settle(&record, result).await?;
+        let (post, integrations) = self.reinstall_integrations(&layout, version).await;
         // The preflight right before the swap is the one that counts.
         let gated = late.gated.or(gated);
         let (removed_versions, kept_versions, gc_error) =
@@ -695,6 +737,8 @@ impl<'a> Engine<'a> {
                 .config_backup
                 .as_ref()
                 .map(|backup| backup.source_schema_version),
+            runtimes: late.runtimes.or(post),
+            integrations,
         })
     }
 
@@ -1038,6 +1082,8 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+        self.run_runtimes(record, layout, late).await?;
+        self.checkpoint(Step::Runtimes)?;
         if replaces_daemon(record.step) {
             let resuming = record.step == Step::Registering;
             self.advance(record, Step::Registering)?;
@@ -1184,6 +1230,105 @@ impl<'a> Engine<'a> {
         self.stop_daemon_for_migration().await
     }
 
+    /// Plans and applies the release's official runtime packages and profile
+    /// pins, stopping the previous daemon only when the plan changes something.
+    ///
+    /// The plan runs first and changes nothing; a refusal ends the step before
+    /// any stop. An apply stops the daemon, journals the stop, backs up the
+    /// state it may change (once, digests journaled before the apply), then
+    /// applies and requires a finished report. A resumed step verifies the
+    /// journaled backup instead of taking a new one, which would capture the
+    /// state after an apply that may have started.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UpgradeRuntimesRefused`] for a refused plan,
+    /// [`Error::UpgradeRuntimesFailed`] for an apply that does not finish, and
+    /// [`Error::RuntimeBackup`] for a backup that cannot be taken or verified.
+    async fn run_runtimes(
+        &self,
+        record: &mut Record,
+        layout: &InstallLayout,
+        late: &mut LateGate,
+    ) -> Result<(), Error> {
+        if record.step >= Step::Runtimes {
+            return Ok(());
+        }
+        let dir = layout
+            .version_dir(&record.version)
+            .ok_or_else(|| Error::Record {
+                path: self.store.path(),
+                detail: format!("version {} has no directory", record.version),
+            })?;
+        let plan = self.runtimes.run(self.context, &dir, true).await?;
+        runtimes::check_plan(&plan)?;
+        if !runtimes::needs_apply(&plan) {
+            late.runtimes = Some(plan);
+            return self.advance(record, Step::Runtimes);
+        }
+        // The stop intent is journaled first, so a rollback that finds it
+        // restarts the previous daemon even if the stop did not return.
+        if !record.runtime_stop {
+            record.runtime_stop = true;
+            self.store.save(record)?;
+        }
+        self.stop_daemon_for_migration().await?;
+        if let Some(backup) = &record.runtime_backup {
+            runtimes::verify_backup(backup, &self.store)?;
+        } else {
+            let captured = runtimes::capture(self.context)?;
+            let files: Vec<Vec<u8>> = captured.iter().map(|file| file.bytes.clone()).collect();
+            self.store.write_runtime_backup(&files)?;
+            record.runtime_backup = Some(runtimes::journal(&captured));
+            self.store.save(record)?;
+        }
+        let applied = self.runtimes.run(self.context, &dir, false).await?;
+        runtimes::check_applied(&dir, &applied)?;
+        late.runtimes = Some(applied);
+        self.advance(record, Step::Runtimes)
+    }
+
+    /// Reads the integration hooks the new daemon's release lists and
+    /// reinstalls them. Runs after the transaction, so a failure here is only
+    /// reported and never rolls the upgrade back.
+    async fn reinstall_integrations(
+        &self,
+        layout: &InstallLayout,
+        version: &str,
+    ) -> (Option<EnsureReport>, Vec<IntegrationReinstall>) {
+        let plan = match layout.version_dir(version) {
+            Some(dir) => self.runtimes.run(self.context, &dir, true).await,
+            None => Err(Error::Record {
+                path: self.store.path(),
+                detail: format!("version {version} has no directory"),
+            }),
+        };
+        match plan {
+            Ok(plan) => {
+                let runtimes: Vec<String> = plan
+                    .integrations
+                    .iter()
+                    .map(|integration| integration.runtime.clone())
+                    .collect();
+                let env = IntegrationEnv {
+                    paths: Paths::from_base(self.context.paths()),
+                    home: self.context.home().map(Path::to_path_buf),
+                    state_dir: self.context.paths().state_dir.clone(),
+                };
+                let results = self.integrations.reinstall(&env, &runtimes).await;
+                (Some(plan), results)
+            }
+            Err(error) => (
+                None,
+                vec![IntegrationReinstall {
+                    integration: "runtime plan".to_owned(),
+                    status: "failed",
+                    detail: Some(error.to_string()),
+                }],
+            ),
+        }
+    }
+
     /// Rolls back a failed transaction or keeps its record for resumption.
     async fn settle(&self, record: &Record, result: Result<(), Error>) -> Result<(), Error> {
         let Err(error) = result else {
@@ -1263,6 +1408,7 @@ impl<'a> Engine<'a> {
                     });
                 }
                 self.mark_rolling_back(record)?;
+                self.restore_runtime_state(record)?;
                 // Install refuses to start while service.toml exists, so any
                 // file present now was written by this transaction.
                 remove_config(&config_path)?;
@@ -1281,11 +1427,18 @@ impl<'a> Engine<'a> {
                     self.rollback_source(record, previous, &config_path)?;
                 }
                 let restarts_previous = rollback_restarts_previous(record);
-                if restarts_previous {
+                // A new daemon may be running and the store is still the one it
+                // left, so judge before stopping it. A runtime backup is restored
+                // before the daemon stops; the gates after the stop judge that
+                // restored state, not the applied one.
+                let new_daemon_may_run = record.step >= Step::Registering
+                    || (record.config_backup.is_some() && record.step >= Step::StopDaemon);
+                if restarts_previous && new_daemon_may_run && record.runtime_backup.is_none() {
                     gated = Some(self.rollback_gate(&layout, previous).await?);
                 }
                 self.mark_rolling_back(record)?;
                 if record.step >= Step::Registering
+                    || record.runtime_stop
                     || (record.config_backup.is_some() && record.step >= Step::StopDaemon)
                 {
                     // A journaled migration stop may not have happened yet;
@@ -1303,10 +1456,11 @@ impl<'a> Engine<'a> {
                 if let Some(hook) = &self.after_rollback_stop {
                     (hook.0)();
                 }
+                self.restore_runtime_state(record)?;
                 if restarts_previous {
                     // The new daemon may have written the store while it was
-                    // stopping. Judge the previous reader again before the
-                    // config restore and daemon start.
+                    // stopping. Judge the previous reader again, on the restored
+                    // state, before the config restore and daemon start.
                     gated = Some(self.rollback_gate(&layout, previous).await?);
                 }
                 let restored = self.restore_rollback_config(record, previous, &config_path)?;
@@ -1345,6 +1499,17 @@ impl<'a> Engine<'a> {
             layout::release_prefix(&layout, &namespace)?;
         }
         Ok(gated)
+    }
+
+    /// Puts back the state files the runtime step backed up, if it backed any up.
+    ///
+    /// Runs after the daemon that may have written them is stopped and before
+    /// the previous daemon starts.
+    fn restore_runtime_state(&self, record: &Record) -> Result<(), Error> {
+        match &record.runtime_backup {
+            Some(backup) => runtimes::restore(self.context, &self.store, backup),
+            None => Ok(()),
+        }
     }
 
     /// Judges a rollback using the previous version's daemon reader.
@@ -2062,6 +2227,7 @@ fn allowed_removal_versions(active: &str, pending: Option<&Record>) -> Vec<Strin
 pub(crate) fn rollback_restarts_previous(record: &Record) -> bool {
     record.operation == Operation::Upgrade
         && (record.step >= Step::Registering
+            || record.runtime_stop
             || (record.config_backup.is_some() && record.step >= Step::StopDaemon))
 }
 
@@ -2497,7 +2663,7 @@ fn config_backup_of(resume: Option<&Record>, source: &UpgradeSource) -> Option<C
 
 /// Hexadecimal SHA-256 of `bytes`, the digest a migration journal binds its
 /// backup to.
-fn config_digest(bytes: &[u8]) -> String {
+pub(super) fn config_digest(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     use std::fmt::Write as _;
 

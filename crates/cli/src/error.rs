@@ -426,6 +426,7 @@ fn service_error_class(error: &crate::service::Error) -> ErrorClass {
         | Error::UnitVerification { .. }
         | Error::UpgradeAtRisk { .. }
         | Error::UpgradeStoreUnusable { .. }
+        | Error::UpgradeRuntimesRefused { .. }
         | Error::LiveSessions { .. } => ErrorClass::Configuration,
         Error::Workflow { class, .. } => *class,
         Error::DaemonNotReady { .. } | Error::Control { .. } => ErrorClass::Daemon,

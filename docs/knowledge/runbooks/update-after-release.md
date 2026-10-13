@@ -639,6 +639,20 @@ proceeds, and the `--json` report carries the full `preflight` object and
 failing `pohunekd`, an unparsable report) fails with
 `service_upgrade_preflight_failed`, which the flag does not override.
 
+### Official runtime packages during an upgrade
+
+After the preflight and before the new daemon starts, the upgrade runs the
+release's `pohunekd ensure-official-runtimes --dry-run`. It plans the official
+runtime packages the host uses and the host profiles pinned to them. A plan
+with refusals fails with `service_upgrade_runtimes_refused` before anything is
+stopped. A plan that changes something stops the old daemon, backs up the
+package registry, the catalog state and the host profiles owner-private, applies
+the plan, and restores the backup when anything fails. Once the new daemon is
+ready, the integration hooks the release lists are reinstalled. A failure there
+is reported and does not roll the upgrade back. A Hermes home without the pohunek
+marker is reported as a gap with the command that installs it; nothing is written
+into it.
+
 ## Move Claude and Codex sessions to the official package before upgrading
 
 A session records the runtime source it was launched from: a built-in runtime

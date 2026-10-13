@@ -22,6 +22,7 @@ use crate::agent::{
 use crate::detect::Manifest;
 use crate::runtime::environment::{base_environment, effective_variable};
 use pohunek_worker_protocol::BaseEnv;
+use protocol::BindingProvenance;
 use protocol::ErrorClass;
 
 /// Frozen structural relaunch snapshot for a session (Part C, C.4).
@@ -217,7 +218,8 @@ impl SessionRegistry {
     ) -> Option<(ReferenceExistence, SessionRef, LaunchEnv)> {
         let launch = binding_native_launch(&binding, &definition);
         let existence = reference_existence(&binding, launch.as_ref(), &definition)?;
-        let Ok(profile) = self.resolve_recovery_profile(&binding, ProfileChange::Refuse) else {
+        let Ok(profile) = self.resolve_recovery_profile(&binding, ProfileChange::Refuse, false)
+        else {
             return None;
         };
         let Ok(reference) = SessionRef::id(&target) else {
@@ -523,7 +525,7 @@ impl SessionRegistry {
             .ok_or_else(|| agent_not_resumable(&binding.agent))?;
         self.hook_recovery_journal_error(&record, &binding, &launch)
             .await?;
-        let relaunch = self.plan_relaunch(&binding, definition, launch, change)?;
+        let relaunch = self.plan_relaunch(&binding, definition, launch, change, false)?;
 
         let info = match self
             .resume_binding_with_registration(
@@ -798,7 +800,7 @@ impl SessionRegistry {
 
         // A fork starts a new process of the runtime, so a runtime with a
         // version probe is probed again before anything is allocated.
-        let relaunch = self.plan_relaunch(&binding, definition, launch, change)?;
+        let relaunch = self.plan_relaunch(&binding, definition, launch, change, true)?;
         let relaunch_pin = host::relaunch_pin(&binding.launch_binding, &relaunch.definition);
         let outdated_hooks = self.outdated_relaunch_warnings(&binding, &relaunch).await;
         let id = Self::allocate_session_id();
@@ -949,6 +951,7 @@ impl SessionRegistry {
         &self,
         binding: &ResumeBinding,
         change: ProfileChange,
+        fork: bool,
     ) -> Result<RecoveryProfile, ProtocolError> {
         let frozen = binding.profile_revision.as_ref();
         let resolved = match self.resolve_recovery_agent(binding) {
@@ -972,7 +975,16 @@ impl SessionRegistry {
         let keys = self.inner.profiles.revision_keys();
         let current = keys.revision(&profile.inputs)?;
         let unchanged = match frozen {
-            Some(frozen) => keys.matches(&profile.inputs, frozen)?,
+            Some(frozen) => {
+                keys.matches(&profile.inputs, frozen)?
+                    || self.adopted_profile_matches(
+                        binding,
+                        &resolved.name,
+                        &resolved.definition,
+                        frozen,
+                        fork,
+                    )?
+            }
             None => false,
         };
         if !unchanged && change == ProfileChange::Refuse {
@@ -990,6 +1002,52 @@ impl SessionRegistry {
             manifest: profile.manifest,
             revision: Some(current),
         })
+    }
+
+    /// Whether a profile whose revision was frozen over a built-in pin still
+    /// matches that revision once the official package adopts the pin.
+    ///
+    /// The frozen revision digests the built-in binding the session stored, so
+    /// the package that now serves the runtime cannot reproduce it. The match
+    /// is accepted only when the definition is the adoption of the pin
+    /// ([`host::adopts`]) and honors the frozen launch for this operation, and
+    /// the profile's pin keys, if any, name that package.
+    fn adopted_profile_matches(
+        &self,
+        binding: &ResumeBinding,
+        name: &str,
+        definition: &RuntimeDefinition,
+        frozen: &ProfileRevision,
+        fork: bool,
+    ) -> Result<bool, ProtocolError> {
+        if !host::adopts(&binding.launch_binding, definition)
+            || recovery_contract(binding, definition, fork).is_err()
+        {
+            return Ok(false);
+        }
+        let (
+            Some(stored),
+            BindingProvenance::Package {
+                package,
+                package_digest,
+            },
+        ) = (
+            binding.launch_binding.binding(),
+            &definition.binding().provenance,
+        )
+        else {
+            return Ok(false);
+        };
+        if binding.program.is_empty() {
+            return Ok(false);
+        }
+        self.inner.profiles.frozen_builtin_matches(
+            name,
+            stored,
+            (&binding.program, &binding.args),
+            (&package.id, package_digest),
+            frozen,
+        )
     }
 
     /// Re-resolves the agent `binding` was launched as.
@@ -1036,13 +1094,14 @@ impl SessionRegistry {
         definition: Arc<RuntimeDefinition>,
         launch: NativeSessionLaunch,
         change: ProfileChange,
+        fork: bool,
     ) -> Result<RelaunchPlan, ProtocolError> {
         let launch = host::relaunch_launch(&binding.launch_binding, &definition, launch);
         // Build the native reference from the field the frozen reference kind
         // names, so a `path`-kind spec applies the absolute-path guard and an
         // `id`-kind spec the leading-dash guard (the documented asymmetry).
         let session_ref = session_ref_from_binding(launch.reference_kind(), binding)?;
-        let profile = self.resolve_recovery_profile(binding, change)?;
+        let profile = self.resolve_recovery_profile(binding, change, fork)?;
         let base_environment = self.launch_base_environment()?;
         let program = binding_program(binding, &definition);
         let launch_path = self.probe_search_path(&definition, profile.env.as_slice())?;
@@ -1143,7 +1202,7 @@ impl SessionRegistry {
         let definition = self.binding_definition(&binding)?;
         let launch = binding_native_launch(&binding, &definition)
             .ok_or_else(|| agent_not_resumable(&binding.agent))?;
-        let relaunch = self.plan_relaunch(&binding, definition, launch, change)?;
+        let relaunch = self.plan_relaunch(&binding, definition, launch, change, false)?;
         let id = SessionId(binding.session_id.clone());
         let guard = self.lock_lifecycle(&id).await;
         let registration = match self.load_durable_session_record(&id).await? {

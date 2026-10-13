@@ -33,12 +33,26 @@ const MAX_CONFIG_BACKUP_BYTES: usize = pohunek_service_config::MAX_CONFIG_BYTES;
 
 /// Version of the record schema; any other version is rejected.
 ///
-/// Version 3 carries [`Record::config_backup`], the migration transaction's
-/// backup description. A record of an earlier version cannot say whether its
-/// `service.toml` was rewritten from the previous release's schema, so it is
-/// refused rather than guessed at. Version 2 carried
-/// [`Record::rolling_back`], which stays.
-pub const SCHEMA_VERSION: u32 = 3;
+/// Version 4 carries the runtime step's journal, [`Record::runtime_stop`] and
+/// [`Record::runtime_backup`], and [`Step::Runtimes`]. Version 3 carries
+/// [`Record::config_backup`], the migration transaction's backup description.
+/// A record of an earlier version cannot say whether its `service.toml` was
+/// rewritten from the previous release's schema, so it is refused rather than
+/// guessed at. Version 2 carried [`Record::rolling_back`], which stays.
+pub const SCHEMA_VERSION: u32 = 4;
+
+/// The record schema before [`SCHEMA_VERSION`].
+///
+/// A record of this version has no runtime journal, so it loads with the
+/// journal empty; its steps keep their meaning under the new step order.
+const PREVIOUS_SCHEMA_VERSION: u32 = 3;
+
+/// Directory of the runtime backup inside the application state directory.
+///
+/// The step copies the files the official package apply may change into it,
+/// owner-private, before the apply runs. Rollback copies them back and the
+/// directory is removed with the record.
+pub const RUNTIME_BACKUP_DIR_NAME: &str = "service-install.runtime-backup";
 
 /// File name of the record inside the application state directory.
 pub const FILE_NAME: &str = "service-install.json";
@@ -142,6 +156,10 @@ pub enum Step {
     Config,
     /// The daemon definition was built and verified.
     Definition,
+    /// The official runtime packages and host profile pins of the release
+    /// are in place. A transaction that stopped the old daemon for it journals
+    /// [`Record::runtime_stop`] and [`Record::runtime_backup`] first.
+    Runtimes,
     /// The service manager call is in flight.
     Registering,
     /// The service manager accepted the definition.
@@ -163,6 +181,7 @@ impl Step {
             Self::StopDaemon => "stop_daemon",
             Self::Config => "config",
             Self::Definition => "definition",
+            Self::Runtimes => "runtimes",
             Self::Registering => "registering",
             Self::Registered => "registered",
             Self::Ready => "ready",
@@ -184,6 +203,42 @@ pub struct ConfigBackup {
     pub source_schema_version: u32,
     /// SHA-256 of the exact pre-upgrade bytes, hexadecimal.
     pub digest: String,
+}
+
+/// The directory of a state file the runtime step may change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeDir {
+    /// The runtime package store, `<state>/plugins`.
+    Plugins,
+    /// The host profiles, `<config>/agents`.
+    Agents,
+}
+
+/// One state file the runtime step may change, as it was before the step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeBackupEntry {
+    /// The directory the file lives in.
+    pub dir: RuntimeDir,
+    /// The file name inside `dir`.
+    pub name: String,
+    /// SHA-256 of the exact bytes before the step, hexadecimal; `None` when
+    /// the file did not exist, so rollback removes the file the step created.
+    pub digest: Option<String>,
+    /// The permission bits of the file before the step, restored exactly.
+    pub mode: u32,
+}
+
+/// The journaled backup of the state files the runtime step may change.
+///
+/// Entry `n` is the backup file `n` in [`RUNTIME_BACKUP_DIR_NAME`]. The
+/// digests bind every backup file to this record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeBackup {
+    /// One entry per state file, in the order the backup wrote them.
+    pub entries: Vec<RuntimeBackupEntry>,
 }
 
 /// One in-flight install or upgrade.
@@ -219,6 +274,19 @@ pub struct Record {
     /// rollback stopped partway describes steps whose effects are undone;
     /// resuming it would skip them. Such a record is only ever rolled back.
     pub rolling_back: bool,
+    /// Whether the runtime step stopped the daemon.
+    ///
+    /// Written before the stop, so a rollback that finds it set restarts the
+    /// previous daemon even when the stop did not return.
+    #[serde(default)]
+    pub runtime_stop: bool,
+    /// The state the runtime step backed up before its apply, when it has.
+    ///
+    /// Written after the backup files are durable and before the apply, so a
+    /// present value means the apply may have started and the backup is the
+    /// only copy of the state before it.
+    #[serde(default)]
+    pub runtime_backup: Option<RuntimeBackup>,
 }
 
 /// Exclusive ownership of the install transaction, released on drop.
@@ -436,7 +504,10 @@ impl Store {
         let version = value
             .get("schema_version")
             .and_then(serde_json::Value::as_u64);
-        if version != Some(u64::from(SCHEMA_VERSION)) {
+        let supported = [SCHEMA_VERSION, PREVIOUS_SCHEMA_VERSION]
+            .into_iter()
+            .any(|known| version == Some(u64::from(known)));
+        if !supported {
             return Err(Error::Record {
                 path: self.path(),
                 detail: format!(
@@ -447,7 +518,11 @@ impl Store {
                 ),
             });
         }
-        serde_json::from_value(value).map(Some).map_err(malformed)
+        let mut record: Record = serde_json::from_value(value).map_err(malformed)?;
+        // The next save writes the current schema, which is what a
+        // previous release refuses by name instead of misreading.
+        record.schema_version = SCHEMA_VERSION;
+        Ok(Some(record))
     }
 
     /// Atomically replaces the record.
@@ -680,7 +755,73 @@ impl Store {
         for name in CLEARED_FILES {
             remove_file(&directory, name)?;
         }
+        super::layout::remove_tree(&directory, RUNTIME_BACKUP_DIR_NAME)?;
         Ok(())
+    }
+
+    /// Returns the path of runtime backup file `index`.
+    #[must_use]
+    pub fn runtime_backup_path(&self, index: usize) -> PathBuf {
+        self.state_dir
+            .join(RUNTIME_BACKUP_DIR_NAME)
+            .join(index.to_string())
+    }
+
+    /// Replaces the whole runtime backup with `files`, one file per index.
+    ///
+    /// The previous backup is removed first, so no file of an earlier
+    /// transaction can be restored by mistake. Every file is written
+    /// atomically at mode `0600`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a filesystem error when the state directory is unsafe or a
+    /// write fails.
+    pub fn write_runtime_backup(&self, files: &[Vec<u8>]) -> Result<(), Error> {
+        let directory = self
+            .open(true)?
+            .expect("open(create = true) always yields a directory");
+        super::layout::remove_tree(&directory, RUNTIME_BACKUP_DIR_NAME)?;
+        let backup = directory
+            .create_child_exclusive(RUNTIME_BACKUP_DIR_NAME, STATE_DIR_MODE)
+            .map_err(|source| fs_error("create the runtime backup directory", source))?;
+        for (index, bytes) in files.iter().enumerate() {
+            let name = index.to_string();
+            let temporary = format!(
+                ".{name}.{}.{}.tmp",
+                std::process::id(),
+                TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            );
+            backup
+                .replace_file(&name, temporary, bytes, FILE_MODE)
+                .map_err(|source| replace_error("write a runtime backup file", source))?;
+        }
+        backup
+            .sync()
+            .map_err(|source| fs_error("synchronize the runtime backup directory", source))
+    }
+
+    /// Reads runtime backup file `index`, bounded by `max_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RuntimeBackup`] when the file is absent or unsafe and
+    /// a filesystem error when the directory is.
+    pub fn read_runtime_backup(&self, index: usize, max_bytes: usize) -> Result<Vec<u8>, Error> {
+        let path = self.runtime_backup_path(index);
+        let directory = self.open(false)?.ok_or_else(|| Error::RuntimeBackup {
+            path: path.clone(),
+            detail: "the state directory is missing".to_owned(),
+        })?;
+        let backup = directory
+            .open_child(RUNTIME_BACKUP_DIR_NAME, STATE_DIR_MODE)
+            .map_err(|source| fs_error("open the runtime backup directory", source))?;
+        backup
+            .read_file(index.to_string(), FILE_MODE, max_bytes)
+            .map_err(|source| Error::RuntimeBackup {
+                path,
+                detail: source.to_string(),
+            })
     }
 
     fn open(&self, create: bool) -> Result<Option<TrustedDir>, Error> {
@@ -832,6 +973,8 @@ mod tests {
             config_backup: None,
             step,
             rolling_back: false,
+            runtime_stop: false,
+            runtime_backup: None,
         }
     }
 
@@ -857,6 +1000,101 @@ mod tests {
         store.clear().expect("clear");
         store.clear().expect("clearing twice is fine");
         assert_eq!(store.load().expect("load cleared"), None);
+    }
+
+    #[test]
+    fn a_schema_3_record_loads_with_an_empty_runtime_journal_and_is_saved_as_schema_4() {
+        let (_root, root) = temp_root();
+        let state = root.as_path().join("state");
+        let store = Store::new(state.clone());
+        store
+            .save(&record(Step::Definition))
+            .expect("create directory");
+        let mut value = serde_json::to_value(record(Step::Definition)).expect("value");
+        value["schema_version"] = 3.into();
+        let object = value.as_object_mut().expect("record object");
+        object.remove("runtime_stop");
+        object.remove("runtime_backup");
+        std::fs::write(state.join(FILE_NAME), value.to_string()).expect("write record");
+
+        let loaded = store.load().expect("load").expect("record");
+        assert_eq!(loaded.schema_version, SCHEMA_VERSION);
+        assert_eq!(loaded.step, Step::Definition);
+        assert!(!loaded.runtime_stop);
+        assert_eq!(loaded.runtime_backup, None);
+
+        store.save(&loaded).expect("save");
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(state.join(FILE_NAME)).expect("read"))
+                .expect("json");
+        assert_eq!(written["schema_version"], SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_runtime_journal_round_trips_and_its_backup_is_removed_with_the_record() {
+        let (_root, root) = temp_root();
+        let state = root.as_path().join("state");
+        let store = Store::new(state.clone());
+        let journal = RuntimeBackup {
+            entries: vec![
+                RuntimeBackupEntry {
+                    dir: RuntimeDir::Plugins,
+                    name: "registry.json".to_owned(),
+                    digest: Some("ab".repeat(32)),
+                    mode: FILE_MODE,
+                },
+                RuntimeBackupEntry {
+                    dir: RuntimeDir::Agents,
+                    name: "claude.toml".to_owned(),
+                    digest: None,
+                    mode: FILE_MODE,
+                },
+            ],
+        };
+        let saved = Record {
+            runtime_stop: true,
+            runtime_backup: Some(journal.clone()),
+            step: Step::Runtimes,
+            ..record(Step::Runtimes)
+        };
+        store.save(&saved).expect("save");
+        assert_eq!(store.load().expect("load"), Some(saved));
+
+        store
+            .write_runtime_backup(&[b"before".to_vec(), Vec::new()])
+            .expect("write backup");
+        assert_eq!(
+            store.read_runtime_backup(0, 64).expect("read"),
+            b"before".to_vec()
+        );
+        assert!(
+            store.read_runtime_backup(0, 3).is_err(),
+            "bounded reads refuse"
+        );
+
+        store.clear().expect("clear");
+        assert!(!state.join(RUNTIME_BACKUP_DIR_NAME).exists());
+        assert_eq!(store.load().expect("load cleared"), None);
+    }
+
+    #[test]
+    fn a_record_of_a_future_schema_is_refused_by_name() {
+        let (_root, root) = temp_root();
+        let state = root.as_path().join("state");
+        let store = Store::new(state.clone());
+        store
+            .save(&record(Step::Started))
+            .expect("create directory");
+        let mut value = serde_json::to_value(record(Step::Started)).expect("value");
+        value["schema_version"] = 5.into();
+        std::fs::write(state.join(FILE_NAME), value.to_string()).expect("write record");
+        let Err(Error::Record { detail, .. }) = store.load() else {
+            panic!("a schema 5 record is refused");
+        };
+        assert!(
+            detail.contains("schema_version 5 is unsupported"),
+            "{detail}"
+        );
     }
 
     #[test]

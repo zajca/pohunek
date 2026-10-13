@@ -164,12 +164,22 @@ once, compare its current revision with the frozen one, and relaunch under that
 single resolution only while they match:
 
 - an edited profile (its text, `[env]`, detection manifest, runtime binding,
-  program or arguments) fails with `agent_profile_changed`;
+  program or arguments) fails with `agent_profile_changed`, except the migration
+  pin described below;
 - a legacy session that never froze a revision fails with the same code;
 - a profile that no longer resolves fails with `agent_profile_missing`;
 - a host that cannot read its revision key fails closed with
   `agent_profile_revision_unavailable`, for `session.new` of a profile-backed
   session too. A session without a profile needs no key and is never compared.
+
+The migration pin is not an edit. When an official package adopts a built-in
+session, `plugin profile migrate` (or `package.bind_profile`) adds the `package`
+and `digest` keys to its profile. The revision is keyed over the profile text
+without those two keys, so a session whose frozen revision was keyed over the profile
+without the pin resumes and forks without the decision when the profile differs
+only by the pin. The rule applies only to a built-in binding the package serves, and never to
+a session whose frozen revision is absent or whose pin is a package pin. Any other
+change to the profile still needs the decision.
 
 This is what keeps a switch of account from taking effect silently: editing a
 profile's `[env]` (for example the config home of a second subscription) makes

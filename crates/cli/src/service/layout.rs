@@ -30,18 +30,22 @@
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions, Permissions};
 use std::io::{self, Read as _, Write as _};
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use package::{parse_anchor, ANCHOR_FILE_NAME, MAX_ANCHOR_BYTES};
+use package::{
+    parse_anchor, ANCHOR_FILE_NAME, MAX_ANCHOR_BYTES, MAX_CATALOG_BYTES, MAX_CATALOG_ENTRIES,
+    MAX_COMPRESSED_BYTES,
+};
 use pohunek_paths::{
     valid_install_version, InstallLayout, DAEMON_EXECUTABLE_NAME, WORKER_EXECUTABLE_NAME,
 };
 use pohunek_platform::filesystem::{EntryKind, FsError, MoveOutcome, StageOutcome, TrustedDir};
 use pohunek_platform::supervisor::Namespace;
+use pohunek_service_config::runtimes::RELEASE_RUNTIME_DIR as RUNTIME_DIR;
 use tokio::io::AsyncReadExt as _;
 
 use super::error::{fs_error, io_error, Error};
@@ -51,6 +55,15 @@ use super::settings::{
 
 /// File name of the CLI in a staging directory, a version directory, and `<prefix>/bin`.
 pub const CLI_NAME: &str = "pohunek";
+
+/// The release's catalog file inside `runtime/`, as `xtask` assembles it.
+const RUNTIME_CATALOG_FILE: &str = "runtime-catalog.json";
+
+/// The `runtime/` subdirectory of the official package archives.
+const RUNTIME_PACKAGES_DIR: &str = "packages";
+
+/// The `runtime/` subdirectory of the official package attestations.
+const RUNTIME_ATTESTATIONS_DIR: &str = "attestations";
 
 /// Every binary a version directory holds.
 pub const BINARIES: [&str; 3] = [CLI_NAME, DAEMON_EXECUTABLE_NAME, WORKER_EXECUTABLE_NAME];
@@ -334,6 +347,7 @@ async fn fill(staging: &TrustedDir, from: &Path, version: &str) -> Result<(), Er
     for binary in BINARIES {
         copy_binary(&from.join(binary), &staging.path().join(binary))?;
     }
+    copy_runtime(from, staging.path())?;
     for binary in BINARIES {
         probe(&staging.path().join(binary), binary, version).await?;
     }
@@ -366,6 +380,8 @@ pub fn publish(layout: &InstallLayout, staged: &Staged, version: &str) -> Result
             if identical? {
                 Ok(false)
             } else {
+                // A version directory is immutable and its daemon reads it as published,
+                // so an existing one must equal the staged tree, runtime/ included.
                 Err(Error::VersionConflict {
                     path: versions.path().join(version),
                 })
@@ -606,6 +622,133 @@ fn sweep(versions: &TrustedDir) -> Result<(), Error> {
     Ok(())
 }
 
+/// Copies the release's `runtime/` tree into `staging` when the release has one.
+///
+/// Only the layout the release assembles is accepted: the catalog, and the
+/// `packages/` and `attestations/` directories holding regular files. Each
+/// file is copied at mode `0644` and bounded by its kind, so the version
+/// directory holds exactly what the step verifies. A release without
+/// `runtime/` (a development build) installs without one.
+fn copy_runtime(from: &Path, staging: &Path) -> Result<(), Error> {
+    let source = from.join(RUNTIME_DIR);
+    let metadata = match std::fs::symlink_metadata(&source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_error("inspect", &source)(error)),
+    };
+    if !metadata.is_dir() {
+        return Err(staged_runtime(&source, "it is not a directory"));
+    }
+    let destination = staging.join(RUNTIME_DIR);
+    create_public_dir(&destination)?;
+    let catalog_limit = u64::try_from(MAX_CATALOG_BYTES).unwrap_or(u64::MAX);
+    copy_runtime_file(
+        &source.join(RUNTIME_CATALOG_FILE),
+        &destination.join(RUNTIME_CATALOG_FILE),
+        catalog_limit,
+    )?;
+    for (name, limit) in [
+        (RUNTIME_PACKAGES_DIR, MAX_COMPRESSED_BYTES),
+        (RUNTIME_ATTESTATIONS_DIR, catalog_limit),
+    ] {
+        copy_runtime_dir(&source.join(name), &destination.join(name), limit)?;
+    }
+    for entry in std::fs::read_dir(&source).map_err(io_error("list", &source))? {
+        let entry = entry.map_err(io_error("list", &source))?;
+        let name = entry.file_name();
+        let known = name == RUNTIME_CATALOG_FILE
+            || name == RUNTIME_PACKAGES_DIR
+            || name == RUNTIME_ATTESTATIONS_DIR;
+        if !known {
+            return Err(staged_runtime(
+                &entry.path(),
+                "it is not part of the runtime layout",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Copies the entries of one `runtime/` subdirectory, when the release has it.
+fn copy_runtime_dir(source: &Path, destination: &Path, limit: u64) -> Result<(), Error> {
+    let metadata = match std::fs::symlink_metadata(source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_error("inspect", source)(error)),
+    };
+    if !metadata.is_dir() {
+        return Err(staged_runtime(source, "it is not a directory"));
+    }
+    create_public_dir(destination)?;
+    let entries = std::fs::read_dir(source).map_err(io_error("list", source))?;
+    let mut count = 0_usize;
+    for entry in entries {
+        let entry = entry.map_err(io_error("list", source))?;
+        count += 1;
+        if count > MAX_CATALOG_ENTRIES {
+            return Err(staged_runtime(
+                source,
+                "it holds more entries than a catalog lists",
+            ));
+        }
+        copy_runtime_file(&entry.path(), &destination.join(entry.file_name()), limit)?;
+    }
+    Ok(())
+}
+
+/// Creates a `0755` directory; the umask would otherwise narrow the mode.
+fn create_public_dir(path: &Path) -> Result<(), Error> {
+    std::fs::DirBuilder::new()
+        .mode(PUBLIC_MODE)
+        .create(path)
+        .map_err(io_error("create", path))?;
+    std::fs::set_permissions(path, Permissions::from_mode(PUBLIC_MODE))
+        .map_err(io_error("set the mode of", path))
+}
+
+/// Copies one regular `runtime/` file of at most `limit` bytes into a new `0644` file.
+fn copy_runtime_file(source: &Path, destination: &Path, limit: u64) -> Result<(), Error> {
+    let metadata = std::fs::symlink_metadata(source).map_err(io_error("inspect", source))?;
+    if !metadata.is_file() {
+        return Err(staged_runtime(source, "it is not a regular file"));
+    }
+    if metadata.len() > limit {
+        return Err(staged_runtime(source, &format!("it exceeds {limit} bytes")));
+    }
+    let mut input = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(source)
+        .map_err(io_error("open", source))?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(ANCHOR_MODE)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(destination)
+        .map_err(io_error("create", destination))?;
+    // Reads at most one byte past the limit, so a file that grows after the
+    // inspection is still refused.
+    let copied = io::copy(&mut (&mut input).take(limit.saturating_add(1)), &mut output)
+        .map_err(io_error("copy into", destination))?;
+    if copied > limit {
+        return Err(staged_runtime(source, &format!("it exceeds {limit} bytes")));
+    }
+    output
+        .set_permissions(Permissions::from_mode(ANCHOR_MODE))
+        .map_err(io_error("set the mode of", destination))?;
+    output
+        .sync_all()
+        .map_err(io_error("synchronize", destination))
+}
+
+fn staged_runtime(path: &Path, detail: &str) -> Error {
+    Error::StagedRuntime {
+        path: path.to_path_buf(),
+        detail: detail.to_owned(),
+    }
+}
+
 /// Streams one regular file into a new `0755` file without following links.
 fn copy_binary(source: &Path, destination: &Path) -> Result<(), Error> {
     let mut input = File::open(source).map_err(|error| {
@@ -824,17 +967,96 @@ fn same_binaries(versions: &TrustedDir, staged: &str, version: &str) -> Result<b
             return Ok(false);
         }
     }
-    match (open_anchor(&staged)?, open_anchor(&existing)?) {
-        (None, None) => Ok(true),
+    let anchors_match = match (open_anchor(&staged)?, open_anchor(&existing)?) {
+        (None, None) => true,
         (Some(mut left), Some(mut right)) => {
             let (left_path, right_path) = (
                 staged.path().join(ANCHOR_FILE_NAME),
                 existing.path().join(ANCHOR_FILE_NAME),
             );
-            same_contents((&mut left, &left_path), (&mut right, &right_path))
+            same_contents((&mut left, &left_path), (&mut right, &right_path))?
+        }
+        _ => false,
+    };
+    Ok(anchors_match && same_runtime(&staged, &existing)?)
+}
+
+/// Compares the `runtime/` trees of two verified version or staging directories.
+///
+/// A missing tree on both sides matches. Every entry is compared through
+/// verified descriptors, so a link or a retyped entry makes the check fail
+/// instead of comparing something else.
+fn same_runtime(staged: &TrustedDir, existing: &TrustedDir) -> Result<bool, Error> {
+    let left = staged
+        .entry_identity(RUNTIME_DIR, EntryKind::Directory)
+        .map_err(|source| version_error(staged.path().join(RUNTIME_DIR), source))?;
+    let right = existing
+        .entry_identity(RUNTIME_DIR, EntryKind::Directory)
+        .map_err(|source| version_error(existing.path().join(RUNTIME_DIR), source))?;
+    match (left, right) {
+        (None, None) => Ok(true),
+        (Some(_), Some(_)) => {
+            let left = staged
+                .open_child(RUNTIME_DIR, PUBLIC_MODE)
+                .map_err(|source| version_error(staged.path().join(RUNTIME_DIR), source))?;
+            let right = existing
+                .open_child(RUNTIME_DIR, PUBLIC_MODE)
+                .map_err(|source| version_error(existing.path().join(RUNTIME_DIR), source))?;
+            same_tree(&left, &right)
         }
         _ => Ok(false),
     }
+}
+
+/// Compares two verified directories entry by entry, recursing into subdirectories.
+fn same_tree(left: &TrustedDir, right: &TrustedDir) -> Result<bool, Error> {
+    let names = |directory: &TrustedDir| -> Result<Vec<std::ffi::OsString>, Error> {
+        let mut names = directory
+            .entry_names()
+            .map_err(|source| fs_error("list runtime tree", source))?;
+        names.sort();
+        Ok(names)
+    };
+    if names(left)? != names(right)? {
+        return Ok(false);
+    }
+    for name in names(left)? {
+        let as_text = name.to_string_lossy().into_owned();
+        let left_path = left.path().join(&name);
+        let right_path = right.path().join(&name);
+        // The entry type is read without following links; the verified open
+        // below then checks the same entry through its descriptor.
+        let left_type = std::fs::symlink_metadata(&left_path)
+            .map_err(io_error("inspect", &left_path))?
+            .file_type();
+        if left_type.is_dir() {
+            let child = |directory: &TrustedDir, path: PathBuf| {
+                directory
+                    .open_child(&name, PUBLIC_MODE)
+                    .map_err(|source| version_error(path, source))
+            };
+            if !same_tree(&child(left, left_path)?, &child(right, right_path)?)? {
+                return Ok(false);
+            }
+            continue;
+        }
+        let (Some(mut left_file), Some(mut right_file)) = (
+            left.open_file(&name, ANCHOR_MODE)
+                .map_err(|source| version_error(left_path.clone(), source))?,
+            right
+                .open_file(&name, ANCHOR_MODE)
+                .map_err(|source| version_error(right_path.clone(), source))?,
+        ) else {
+            return Err(Error::UntrustedVersion {
+                path: left_path,
+                detail: format!("{as_text} is not a regular file"),
+            });
+        };
+        if !same_contents((&mut left_file, &left_path), (&mut right_file, &right_path))? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Opens the catalog trust anchor of a verified version directory for
@@ -1124,6 +1346,86 @@ pub(crate) mod tests {
             .map(|entry| entry.expect("entry").file_name())
             .collect();
         assert_eq!(leftovers, ["1.0.0"], "staging directories are removed");
+    }
+
+    /// Writes a release `runtime/` tree with a catalog and one package archive.
+    fn write_runtime(from: &Path, package: &[u8]) {
+        let runtime = from.join(RUNTIME_DIR);
+        std::fs::create_dir_all(runtime.join(RUNTIME_PACKAGES_DIR)).expect("packages");
+        std::fs::write(runtime.join(RUNTIME_CATALOG_FILE), b"{}").expect("catalog");
+        std::fs::write(
+            runtime.join(RUNTIME_PACKAGES_DIR).join("claude.tar.zst"),
+            package,
+        )
+        .expect("package");
+    }
+
+    #[tokio::test]
+    async fn a_release_runtime_tree_is_installed_and_compared_with_its_version_directory() {
+        let (_root, root) = temp_root();
+        let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
+        let from = stage_dir(root.as_path(), "1.0.0");
+        write_runtime(&from, b"package one");
+
+        let staged = stage(&layout, &from, "1.0.0").await.expect("stage");
+        assert!(publish(&layout, &staged, "1.0.0").expect("publish"));
+        let installed = layout
+            .version_dir("1.0.0")
+            .expect("version dir")
+            .join(RUNTIME_DIR);
+        assert_eq!(
+            std::fs::read(installed.join(RUNTIME_CATALOG_FILE)).expect("catalog"),
+            b"{}"
+        );
+        let package = installed.join(RUNTIME_PACKAGES_DIR).join("claude.tar.zst");
+        let mode = std::fs::metadata(&package)
+            .expect("package")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, ANCHOR_MODE, "runtime files are 0644");
+
+        let again = stage(&layout, &from, "1.0.0").await.expect("stage again");
+        assert!(!publish(&layout, &again, "1.0.0").expect("identical publish"));
+
+        write_runtime(&from, b"package two");
+        let different = stage(&layout, &from, "1.0.0")
+            .await
+            .expect("stage different");
+        assert!(
+            matches!(
+                publish(&layout, &different, "1.0.0"),
+                Err(Error::VersionConflict { .. })
+            ),
+            "a version directory whose runtime tree differs is a conflict"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_runtime_tree_outside_the_release_layout_is_refused_before_anything_is_installed() {
+        let (_root, root) = temp_root();
+        let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
+
+        let from = stage_dir(root.as_path(), "1.0.0");
+        write_runtime(&from, b"package");
+        std::fs::write(from.join(RUNTIME_DIR).join("extra.txt"), b"x").expect("extra");
+        assert!(matches!(
+            stage(&layout, &from, "1.0.0").await,
+            Err(Error::StagedRuntime { .. })
+        ));
+
+        let from = stage_dir(root.as_path(), "1.1.0");
+        write_runtime(&from, b"package");
+        let packages = from.join(RUNTIME_DIR).join(RUNTIME_PACKAGES_DIR);
+        std::fs::remove_file(packages.join("claude.tar.zst")).expect("remove");
+        std::os::unix::fs::symlink("/etc/passwd", packages.join("claude.tar.zst")).expect("link");
+        assert!(matches!(
+            stage(&layout, &from, "1.1.0").await,
+            Err(Error::StagedRuntime { .. })
+        ));
+        assert!(
+            installed_versions(&layout).expect("versions").is_empty(),
+            "nothing was installed"
+        );
     }
 
     /// Publishes `1.0.0` from a source holding `anchor`, if any, and returns

@@ -171,7 +171,7 @@ fn ensure_coexists(
 
 /// Reads, validates, edits and publishes the profile under the lifecycle
 /// authority the caller holds.
-fn bind_profile(
+pub(super) fn bind_profile(
     context: &Context,
     profiles: &ProfileRegistry,
     retained: &RetainedDigests,

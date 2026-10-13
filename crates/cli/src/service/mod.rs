@@ -41,6 +41,7 @@ pub mod preflight;
 pub mod record;
 pub mod report;
 mod rollback;
+pub mod runtimes;
 pub mod settings;
 pub mod usage;
 #[cfg(target_os = "linux")]
@@ -1085,6 +1086,8 @@ mod tests {
             }),
             step: record::Step::Registered,
             rolling_back: false,
+            runtime_stop: false,
+            runtime_backup: None,
         };
         assert_eq!(
             checked_config_migration(&engine::Plan::Resume(record.clone()), &source, "2.0.0"),

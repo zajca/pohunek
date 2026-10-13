@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use pohunek_platform::supervisor::{ServiceObservation, ServiceState};
 use pohunek_service_config::preflight::PreflightReport;
+use pohunek_service_config::runtimes::EnsureReport;
 use serde::Serialize;
 
 use super::usage::JournalRef;
@@ -102,6 +103,26 @@ pub struct UpgradeReport {
     /// A migration stops the daemon before it rewrites `service.toml` and
     /// restores the exact pre-upgrade bytes on rollback.
     pub config_schema_migration: Option<u32>,
+    /// The official runtime report: the plan, or the apply when this run
+    /// applied it. `null` when the step did not run in this invocation.
+    #[serde(default)]
+    pub runtimes: Option<EnsureReport>,
+    /// The integration hooks reinstalled once the new daemon was ready. A
+    /// failure is reported here and never rolls the upgrade back.
+    #[serde(default)]
+    pub integrations: Vec<IntegrationReinstall>,
+}
+
+/// One integration hook reinstalled after an upgrade.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IntegrationReinstall {
+    /// The integration: a runtime id, or `hermes` with its profile.
+    pub integration: String,
+    /// `installed`, `failed`, or `gap`. A gap is a Hermes home without the
+    /// pohunek marker, which the upgrade does not write into.
+    pub status: &'static str,
+    /// The failure, the gap's command, or `null` when installed.
+    pub detail: Option<String>,
 }
 
 /// Result of `pohunek service uninstall`.

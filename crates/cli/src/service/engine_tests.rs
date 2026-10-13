@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -17,12 +18,16 @@ use pohunek_daemon::session::upgrade_preflight::PreflightInputs;
 use pohunek_daemon::store::{
     DesiredState, ProjectRecord, RuntimeRecord, SessionRecord, Store as DaemonStore,
 };
-use pohunek_paths::BasePaths;
+use pohunek_paths::{BasePaths, DAEMON_EXECUTABLE_NAME};
 use pohunek_platform::process::{
     Error as ProcessError, ExitWatch, OwnershipMarkers, ProcessFact, ProcessIdentity, StartIdentity,
 };
 use pohunek_platform::supervisor::{DaemonSupervisor, Operation as Pending, ServiceId, Supervisor};
 use pohunek_service_config::preflight::{StoreState, Verdict};
+use pohunek_service_config::runtimes::{
+    IntegrationAction, PackageAction, PackageStatus, ProfileAction, ProfileStatus, Refusal,
+    UseReason, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, ENSURE_REPORT_VERSION,
+};
 use pohunek_session_worker::RuntimePhase;
 use pohunek_test_support::wait::wait_until;
 use protocol::{
@@ -38,6 +43,7 @@ use crate::service::inherited::Token;
 use crate::service::layout::tests::{anchor_bytes, stage_dir, write_anchor};
 use crate::service::layout::CLI_NAME;
 use crate::service::preflight::Judging;
+use crate::service::runtimes::Running;
 use crate::service::usage::tests::{
     own_identity, spawn_when_exec_free, write_journal, write_live_journal, write_outdated_journal,
     SESSION,
@@ -56,10 +62,11 @@ const DAEMON_PID: Pid = 4_242;
 const FOREIGN_PID: Pid = 7_777;
 
 /// Every step after which a transaction can be interrupted.
-const STEPS: [Step; 7] = [
+const STEPS: [Step; 8] = [
     Step::Binaries,
     Step::Config,
     Step::Definition,
+    Step::Runtimes,
     Step::Registering,
     Step::Registered,
     Step::Ready,
@@ -192,12 +199,178 @@ impl AdoptionPreflight for InProcessPreflight {
     }
 }
 
+/// Stands in for the release's `pohunekd ensure-official-runtimes`.
+///
+/// A plan returns the scripted report; an apply records whether the daemon
+/// was still registered when it ran, writes the state files a real apply
+/// changes, and returns the scripted outcome or fails when asked to.
+#[derive(Debug, Clone)]
+struct RuntimeFake(Arc<Mutex<RuntimeScript>>, Fake);
+
+#[derive(Debug, Default)]
+struct RuntimeScript {
+    /// The plan reported by a dry run.
+    plan: Option<EnsureReport>,
+    /// Whether an apply fails after it changed the state files.
+    fail_apply: bool,
+    /// Every call in order: `plan`, or `apply registered=<bool>`.
+    calls: Vec<String>,
+    /// The daemon job removals made before each dry run, in order.
+    removals_at_plan: Vec<usize>,
+}
+
+impl RuntimeFake {
+    fn new(fake: &Fake) -> Self {
+        Self(Arc::default(), fake.clone())
+    }
+
+    fn script(&self) -> MutexGuard<'_, RuntimeScript> {
+        self.0.lock().expect("runtime script lock")
+    }
+
+    fn plan(&self, plan: EnsureReport) {
+        self.script().plan = Some(plan);
+    }
+
+    fn calls(&self) -> Vec<String> {
+        self.script().calls.clone()
+    }
+
+    /// The daemon job removals before the last two dry runs.
+    fn last_two_removal_counts(&self) -> (usize, usize) {
+        let counts = &self.script().removals_at_plan;
+        let last = counts.len().saturating_sub(2);
+        (counts[last], counts[counts.len() - 1])
+    }
+}
+
+/// The report of a plan or an apply, with `packages` and `profiles`.
+fn runtime_report(
+    dry_run: bool,
+    packages: Vec<PackageAction>,
+    profiles: Vec<ProfileAction>,
+    refusals: Vec<Refusal>,
+) -> EnsureReport {
+    EnsureReport {
+        report_version: ENSURE_REPORT_VERSION,
+        daemon_version: V2.to_owned(),
+        dry_run,
+        packages,
+        profiles,
+        integrations: vec![IntegrationAction {
+            runtime: "claude".to_owned(),
+        }],
+        refusals,
+    }
+}
+
+fn package(status: PackageStatus) -> PackageAction {
+    PackageAction {
+        runtime: "claude".to_owned(),
+        package: "pohunek.runtime.claude".to_owned(),
+        version: V2.to_owned(),
+        digest: "de".repeat(32),
+        status,
+        reasons: vec![UseReason::Profile],
+    }
+}
+
+fn profile(status: ProfileStatus) -> ProfileAction {
+    ProfileAction {
+        name: "work".to_owned(),
+        base: "claude".to_owned(),
+        digest: "de".repeat(32),
+        status,
+    }
+}
+
+/// The plan of a host that needs the package and one profile pin.
+fn installing_plan() -> EnsureReport {
+    runtime_report(
+        true,
+        vec![package(PackageStatus::Install)],
+        vec![profile(ProfileStatus::Bind)],
+        Vec::new(),
+    )
+}
+
+impl RuntimeStep for RuntimeFake {
+    fn run<'a>(&'a self, context: &'a Context, dir: &'a Path, dry_run: bool) -> Running<'a> {
+        Box::pin(async move {
+            if dry_run {
+                let removals = self.1.world().uninstalls;
+                let mut script = self.script();
+                script.calls.push("plan".to_owned());
+                script.removals_at_plan.push(removals);
+                return Ok(script.plan.clone().unwrap_or_else(|| {
+                    runtime_report(
+                        true,
+                        vec![package(PackageStatus::Present)],
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                }));
+            }
+            let registered = self.1.world().registered.is_some();
+            let fail = {
+                let mut script = self.script();
+                script.calls.push(format!("apply registered={registered}"));
+                script.fail_apply
+            };
+            // What a real apply writes: the registry, a new catalog state, and the
+            // pin of the profile.
+            let plugins = context.paths().plugins_dir();
+            std::fs::create_dir_all(&plugins).expect("plugins dir");
+            pohunek_test_support::fs::write_file(plugins.join("registry.json"), "applied registry")
+                .expect("registry");
+            pohunek_test_support::fs::write_file(
+                plugins.join("catalog-state.json"),
+                "applied state",
+            )
+            .expect("catalog state");
+            let agents = context.paths().config_dir.join("agents");
+            if agents.join("work.toml").is_file() {
+                pohunek_test_support::fs::write_file(agents.join("work.toml"), "applied profile")
+                    .expect("profile");
+            }
+            if fail {
+                return Err(Error::UpgradeRuntimesFailed {
+                    binary: dir.join(DAEMON_EXECUTABLE_NAME),
+                    detail: "the fake apply failed after writing".to_owned(),
+                });
+            }
+            Ok(runtime_report(
+                false,
+                vec![package(PackageStatus::Installed)],
+                vec![profile(ProfileStatus::Bound)],
+                Vec::new(),
+            ))
+        })
+    }
+}
+
+/// Reinstalls nothing, so the tests never touch the test host's integrations.
+#[derive(Debug)]
+struct NoIntegrations;
+
+impl IntegrationStep for NoIntegrations {
+    fn reinstall<'a>(
+        &'a self,
+        _env: &'a IntegrationEnv,
+        _runtimes: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Vec<IntegrationReinstall>> + Send + 'a>> {
+        Box::pin(async { Vec::new() })
+    }
+}
+
 /// An engine over `context` and `backend` that observes only this test's
 /// own processes and, on Linux, verifies units with [`ACCEPTING_VERIFIER`].
 fn engine_over<'a>(context: &'a Context, backend: &'a Backend) -> Engine<'a> {
     let mut engine = Engine::new(context, backend);
     engine.inspector = Box::new(OwnProcesses::default());
-    let engine = engine.with_adoption_preflight(Box::new(InProcessPreflight::default()));
+    let engine = engine
+        .with_adoption_preflight(Box::new(InProcessPreflight::default()))
+        .with_integration_step(Box::new(NoIntegrations));
     #[cfg(target_os = "linux")]
     let engine =
         engine.with_unit_verifier(UnitVerifier::default().with_program(ACCEPTING_VERIFIER));
@@ -229,6 +402,8 @@ struct World {
     /// A final store write made while the replacement stops.
     store_on_uninstall: Option<PathBuf>,
     installs: usize,
+    /// Daemon job removals, each of which stops the daemon.
+    uninstalls: usize,
     /// Daemon definition replacements, each of which restarts the daemon.
     replaces: usize,
     sessions: Vec<SessionInfo>,
@@ -354,6 +529,7 @@ impl DaemonSupervisor for Fake {
     fn uninstall(&self) -> Pending<'_, ()> {
         Box::pin(async move {
             let mut world = self.world();
+            world.uninstalls += 1;
             world.registered = None;
             world.running = false;
             if let Some(path) = world.store_on_uninstall.take() {
@@ -570,6 +746,7 @@ struct Harness {
     prefix: PathBuf,
     context: Context,
     fake: Fake,
+    runtimes: RuntimeFake,
     backend: Backend,
 }
 
@@ -600,18 +777,21 @@ impl Harness {
             Box::new(fake.clone()),
             Box::new(fake.clone()),
         );
+        let runtimes = RuntimeFake::new(&fake);
         Self {
             _temp: temp,
             root,
             prefix,
             context,
             fake,
+            runtimes,
             backend,
         }
     }
 
     fn engine(&self) -> Engine<'_> {
-        let mut engine = engine_over(&self.context, &self.backend);
+        let mut engine = engine_over(&self.context, &self.backend)
+            .with_runtime_step(Box::new(self.runtimes.clone()));
         engine.ready_timeout = Duration::from_millis(500);
         engine.stop_timeout = Duration::from_secs(2);
         engine
@@ -1759,6 +1939,305 @@ async fn an_upgrade_interrupted_after_every_step_resumes_or_rolls_back() {
     }
 }
 
+/// Writes a state file owner-private, as the daemon writes its own.
+fn write_private(path: &Path, bytes: &str) {
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("state dir");
+    std::fs::write(path, bytes).expect("state file");
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .expect("mode");
+}
+
+/// The registry and one profile of an installed host, as a daemon left them.
+fn seed_runtime_state(harness: &Harness) {
+    write_private(
+        &harness.context.paths().plugins_dir().join("registry.json"),
+        "before",
+    );
+    write_private(
+        &harness
+            .context
+            .paths()
+            .config_dir
+            .join("agents")
+            .join("work.toml"),
+        "profile before",
+    );
+}
+
+fn runtime_state(harness: &Harness) -> (String, String) {
+    let registry =
+        std::fs::read_to_string(harness.context.paths().plugins_dir().join("registry.json"))
+            .expect("registry");
+    let profile = std::fs::read_to_string(
+        harness
+            .context
+            .paths()
+            .config_dir
+            .join("agents")
+            .join("work.toml"),
+    )
+    .expect("profile");
+    (registry, profile)
+}
+
+#[tokio::test]
+async fn an_upgrade_whose_runtime_plan_is_refused_stops_nothing_and_changes_nothing() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    // The install runs the runtime step too; the calls under test start here.
+    harness.runtimes.script().calls.clear();
+    seed_runtime_state(&harness);
+    harness.runtimes.plan(runtime_report(
+        true,
+        vec![package(PackageStatus::Install)],
+        Vec::new(),
+        vec![Refusal {
+            subject: "claude".to_owned(),
+            code: CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM.to_owned(),
+            detail: "the release lists no package for this platform".to_owned(),
+        }],
+    ));
+
+    let error = harness.upgrade(V2).await.expect_err("the plan is refused");
+    let Error::UpgradeRuntimesRefused { refusals } = &error else {
+        panic!("a refused plan is typed: {error:?}");
+    };
+    assert_eq!(refusals[0].code, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM);
+    assert_eq!(error.code(), "service_upgrade_runtimes_refused");
+    assert_eq!(harness.runtimes.calls(), ["plan"], "no apply ran");
+    assert!(harness.fake.world().running, "the old daemon still runs");
+    assert_eq!(
+        runtime_state(&harness),
+        ("before".to_owned(), "profile before".to_owned())
+    );
+    assert!(!harness
+        .context
+        .paths()
+        .state_dir
+        .join(record::RUNTIME_BACKUP_DIR_NAME)
+        .exists());
+    harness.assert_installed(V1);
+}
+
+#[tokio::test]
+async fn an_upgrade_stops_the_daemon_and_backs_up_before_it_applies_the_runtime_plan() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    // The install runs the runtime step too; the calls under test start here.
+    harness.runtimes.script().calls.clear();
+    seed_runtime_state(&harness);
+    harness.runtimes.plan(installing_plan());
+
+    let report = harness.upgrade(V2).await.expect("upgrade");
+    assert_eq!(
+        harness.runtimes.calls(),
+        ["plan", "apply registered=false", "plan"],
+        "the daemon is stopped when the apply runs, and the post-ready plan follows"
+    );
+    let (before, after) = harness.runtimes.last_two_removal_counts();
+    assert_eq!(after, before + 1, "the apply stops the daemon once");
+    let runtimes = report.runtimes.expect("the apply is reported");
+    assert!(!runtimes.dry_run);
+    assert_eq!(runtimes.packages[0].status, PackageStatus::Installed);
+    assert_eq!(
+        runtime_state(&harness),
+        ("applied registry".to_owned(), "applied profile".to_owned())
+    );
+    assert!(!harness
+        .context
+        .paths()
+        .state_dir
+        .join(record::RUNTIME_BACKUP_DIR_NAME)
+        .exists());
+    harness.assert_installed(V2);
+}
+
+#[tokio::test]
+async fn a_failed_runtime_apply_restores_the_state_it_changed_and_the_previous_daemon() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    // The install runs the runtime step too; the calls under test start here.
+    harness.runtimes.script().calls.clear();
+    seed_runtime_state(&harness);
+    harness.runtimes.plan(installing_plan());
+    harness.runtimes.script().fail_apply = true;
+
+    let error = harness.upgrade(V2).await.expect_err("the apply fails");
+    assert!(
+        matches!(error, Error::UpgradeRuntimesFailed { .. }),
+        "{error:?}"
+    );
+    assert_eq!(
+        runtime_state(&harness),
+        ("before".to_owned(), "profile before".to_owned()),
+        "the registry and the profile are restored byte for byte"
+    );
+    assert!(
+        !harness
+            .context
+            .paths()
+            .plugins_dir()
+            .join("catalog-state.json")
+            .exists(),
+        "a file the apply created is removed"
+    );
+    assert_eq!(harness.pending(), None);
+    harness.assert_installed(V1);
+    assert_eq!(
+        layout::installed_versions(&harness.layout()).expect("versions"),
+        [V1]
+    );
+}
+
+/// Writes a state file with exactly `mode`, as an editor or a copy leaves it.
+fn write_with_mode(path: &Path, bytes: &str, mode: u32) {
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("state dir");
+    std::fs::write(path, bytes).expect("state file");
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(mode))
+        .expect("mode");
+}
+
+fn profile_path(harness: &Harness) -> PathBuf {
+    harness
+        .context
+        .paths()
+        .config_dir
+        .join("agents")
+        .join("work.toml")
+}
+
+fn mode_of(path: &Path) -> u32 {
+    std::os::unix::fs::PermissionsExt::mode(
+        &std::fs::metadata(path).expect("metadata").permissions(),
+    ) & 0o777
+}
+
+#[tokio::test]
+async fn a_group_readable_profile_upgrades_and_a_failed_apply_restores_its_mode() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    harness.runtimes.script().calls.clear();
+    seed_runtime_state(&harness);
+    // An editor's umask leaves a profile readable by others; the daemon
+    // accepts it, so the backup must too.
+    write_with_mode(&profile_path(&harness), "profile before", 0o644);
+    harness.runtimes.plan(installing_plan());
+    harness.runtimes.script().fail_apply = true;
+
+    let error = harness.upgrade(V2).await.expect_err("the apply fails");
+    assert!(
+        matches!(error, Error::UpgradeRuntimesFailed { .. }),
+        "{error:?}"
+    );
+    assert_eq!(
+        runtime_state(&harness),
+        ("before".to_owned(), "profile before".to_owned())
+    );
+    assert_eq!(
+        mode_of(&profile_path(&harness)),
+        0o644,
+        "the mode is restored"
+    );
+    harness.assert_installed(V1);
+}
+
+#[tokio::test]
+async fn a_group_readable_profile_is_applied_by_an_upgrade() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    harness.runtimes.script().calls.clear();
+    seed_runtime_state(&harness);
+    write_with_mode(&profile_path(&harness), "profile before", 0o644);
+    harness.runtimes.plan(installing_plan());
+
+    harness.upgrade(V2).await.expect("upgrade");
+    assert_eq!(runtime_state(&harness).1, "applied profile");
+    harness.assert_installed(V2);
+}
+
+#[tokio::test]
+async fn a_registry_the_package_store_would_not_read_refuses_the_backup_and_keeps_the_daemon() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    harness.runtimes.script().calls.clear();
+    write_with_mode(
+        &harness.context.paths().plugins_dir().join("registry.json"),
+        "before",
+        0o644,
+    );
+    harness.runtimes.plan(installing_plan());
+
+    let error = harness
+        .upgrade(V2)
+        .await
+        .expect_err("the backup is refused");
+    let Error::RuntimeBackup { detail, .. } = &error else {
+        panic!("a registry of another mode is refused: {error:?}");
+    };
+    assert!(detail.contains("0o600"), "{detail}");
+    assert_eq!(harness.runtimes.calls(), ["plan"], "no apply ran");
+    harness.assert_installed(V1);
+    assert_eq!(
+        mode_of(&harness.context.paths().plugins_dir().join("registry.json")),
+        0o644
+    );
+}
+
+#[tokio::test]
+async fn an_empty_runtime_plan_applies_nothing() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    // The install runs the runtime step too; the calls under test start here.
+    harness.runtimes.script().calls.clear();
+    seed_runtime_state(&harness);
+    harness.runtimes.plan(runtime_report(
+        true,
+        vec![package(PackageStatus::Present)],
+        Vec::new(),
+        Vec::new(),
+    ));
+
+    harness.upgrade(V2).await.expect("upgrade");
+    assert_eq!(harness.runtimes.calls(), ["plan", "plan"]);
+    let (before, after) = harness.runtimes.last_two_removal_counts();
+    assert_eq!(before, after, "the daemon is not removed for an empty plan");
+    assert_eq!(
+        runtime_state(&harness),
+        ("before".to_owned(), "profile before".to_owned())
+    );
+    harness.assert_installed(V2);
+}
+
+#[tokio::test]
+async fn an_upgrade_interrupted_after_its_runtime_apply_resumes_without_applying_again() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    // The install runs the runtime step too; the calls under test start here.
+    harness.runtimes.script().calls.clear();
+    seed_runtime_state(&harness);
+    harness.runtimes.plan(installing_plan());
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Runtimes);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted");
+    assert_eq!(harness.runtimes.calls().len(), 2, "plan and apply ran once");
+
+    let report = harness.upgrade(V2).await.expect("resume");
+    assert!(report.resumed);
+    assert_eq!(
+        harness.runtimes.calls()[2..],
+        ["plan".to_owned()],
+        "the resumed transaction does not apply again"
+    );
+    assert_eq!(
+        runtime_state(&harness),
+        ("applied registry".to_owned(), "applied profile".to_owned())
+    );
+    harness.assert_installed(V2);
+}
+
 /// Asserts that `error` keeps a pending install of `V1` at `step`.
 fn assert_incomplete(harness: &Harness, error: &Error, step: Step) {
     let Error::InstallIncomplete {
@@ -1946,7 +2425,9 @@ async fn readiness_requires_the_supervised_job_to_serve_the_socket() {
         ),
         (
             true,
-            format!("daemon socket is served by pid {FOREIGN_PID}; the supervised job has no process"),
+            format!(
+                "daemon socket is served by pid {FOREIGN_PID}; the supervised job has no process"
+            ),
         ),
     ] {
         let harness = Harness::new();

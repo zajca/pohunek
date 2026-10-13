@@ -18996,7 +18996,7 @@ async fn recovery_keeps_an_unchanged_profile_after_its_package_is_disabled() {
 
     packaged.disable_and_reload(&registry);
     let recovered = registry
-        .resolve_recovery_profile(&binding, super::ProfileChange::Refuse)
+        .resolve_recovery_profile(&binding, super::ProfileChange::Refuse, false)
         .expect("the unchanged profile still matches its frozen revision");
 
     assert_eq!(

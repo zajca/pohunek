@@ -373,6 +373,8 @@ async fn pending_migration(
         }),
         step,
         rolling_back: false,
+        runtime_stop: false,
+        runtime_backup: None,
     };
     store.save(&record).expect("journal the migration boundary");
     if !matches!(boundary, MigrationBoundary::StopIntentWithOldDaemon) {
@@ -606,6 +608,8 @@ async fn upgrade_resumes_a_migration_from_its_journaled_state() {
         }),
         step: pohunek_cli::service::record::Step::Started,
         rolling_back: false,
+        runtime_stop: false,
+        runtime_backup: None,
     };
     pohunek_cli::service::record::Store::new(installation.context.paths().state_dir.clone())
         .save(&record)
@@ -668,6 +672,8 @@ async fn upgrade_refuses_a_migration_whose_source_it_cannot_trust() {
         }),
         step: pohunek_cli::service::record::Step::Started,
         rolling_back: false,
+        runtime_stop: false,
+        runtime_backup: None,
     };
     pohunek_cli::service::record::Store::new(installation.context.paths().state_dir.clone())
         .save(&record)

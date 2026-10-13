@@ -159,7 +159,7 @@ fn string_key<'a>(document: &'a DocumentMut, key: &str) -> Result<Option<&'a str
 }
 
 /// The text of `original` with the two pin keys removed.
-fn without_pin(original: &str) -> Result<String, String> {
+pub(crate) fn without_pin(original: &str) -> Result<String, String> {
     let mut document: DocumentMut = original
         .parse()
         .map_err(|error: TomlError| edit_diagnostic(original, &error))?;

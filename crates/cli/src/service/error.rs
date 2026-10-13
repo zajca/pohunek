@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use pohunek_platform::filesystem::FsError;
 use pohunek_platform::supervisor;
 use pohunek_service_config::preflight::SessionVerdict;
+use pohunek_service_config::runtimes::Refusal;
 
 /// One session that blocks an uninstall.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -179,6 +180,15 @@ pub enum Error {
     #[error("staged catalog trust anchor {} is unusable: {detail}", path.display())]
     StagedAnchor {
         /// The staged anchor file.
+        path: PathBuf,
+        /// Why it was refused; never file content.
+        detail: String,
+    },
+
+    /// The staged release `runtime/` tree is present but cannot be installed.
+    #[error("staged runtime tree {} is unusable: {detail}", path.display())]
+    StagedRuntime {
+        /// The staged entry that was refused.
         path: PathBuf,
         /// Why it was refused; never file content.
         detail: String,
@@ -449,6 +459,36 @@ pub enum Error {
         detail: String,
     },
 
+    /// The release's official runtime step refused its plan, so nothing was
+    /// stopped or changed.
+    #[error(
+        "upgrade refused: the official runtime packages cannot be installed: {}",
+        refusals_summary(refusals)
+    )]
+    UpgradeRuntimesRefused {
+        /// Every refusal the plan carries, in report order.
+        refusals: Vec<Refusal>,
+    },
+
+    /// The official runtime step did not produce a usable report, or its
+    /// apply left work undone.
+    #[error("the official runtime step of {} failed: {detail}", binary.display())]
+    UpgradeRuntimesFailed {
+        /// The daemon executable that was asked.
+        binary: PathBuf,
+        /// Why no usable report came back.
+        detail: String,
+    },
+
+    /// A runtime backup file is missing, unsafe, or does not match its digest.
+    #[error("runtime backup {} is invalid: {detail}", path.display())]
+    RuntimeBackup {
+        /// The backup file.
+        path: PathBuf,
+        /// Why it cannot be restored.
+        detail: String,
+    },
+
     /// The previous daemon cannot safely read the store after an upgrade.
     #[error("rollback to {version} refused: metadata store {} is unreadable ({code}): {detail}", path.display())]
     RollbackStoreUnusable {
@@ -605,6 +645,7 @@ impl Error {
             Self::Filesystem { .. } | Self::Io { .. } => "service_io_failed",
             Self::StagedBinary { .. } => "service_staged_binary_missing",
             Self::StagedAnchor { .. } => "service_staged_anchor_invalid",
+            Self::StagedRuntime { .. } => "service_staged_runtime_invalid",
             Self::VersionProbe { .. } => "service_version_probe_failed",
             Self::VersionMismatch { .. } => "service_version_mismatch",
             Self::VersionConflict { .. } => "service_version_conflict",
@@ -628,6 +669,9 @@ impl Error {
             Self::UpgradeAtRisk { .. } => "service_upgrade_sessions_at_risk",
             Self::UpgradeStoreUnusable { .. } => "service_upgrade_store_unusable",
             Self::UpgradePreflightFailed { .. } => "service_upgrade_preflight_failed",
+            Self::UpgradeRuntimesRefused { .. } => "service_upgrade_runtimes_refused",
+            Self::UpgradeRuntimesFailed { .. } => "service_upgrade_runtimes_failed",
+            Self::RuntimeBackup { .. } => "service_runtime_backup_invalid",
             Self::RollbackStoreUnusable { .. } => "service_rollback_store_unusable",
             Self::RollbackAtRisk { .. } => "service_rollback_sessions_at_risk",
             Self::RollbackPreflightFailed { .. } => "service_rollback_preflight_failed",
@@ -646,6 +690,10 @@ impl Error {
 
     /// Recovery hint shown beneath the error, when one applies.
     #[must_use]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per error code, each a single recovery sentence"
+    )]
     pub fn hint(&self) -> Option<&'static str> {
         match self {
             Self::AlreadyInstalled { .. } => {
@@ -664,9 +712,9 @@ impl Error {
             Self::PrefixOwned { .. } => Some(
                 "pass another --prefix, or uninstall the installation of that namespace first; if it no longer exists, delete the named ownership record",
             ),
-            Self::DaemonJobPresent { .. } => Some(
-                "remove the stale daemon job with the service manager, then retry",
-            ),
+            Self::DaemonJobPresent { .. } => {
+                Some("remove the stale daemon job with the service manager, then retry")
+            }
             Self::LiveSessions { .. } => Some(
                 "stop the sessions first, or pass --stop-sessions to stop them as part of uninstall",
             ),
@@ -678,6 +726,15 @@ impl Error {
             ),
             Self::UpgradeStoreUnusable { .. } => Some(
                 "--accept-runtime-loss does not apply: install a pohunek release that reads this store, or restore the store's .pre-schema-<n> backup",
+            ),
+            Self::UpgradeRuntimesRefused { .. } => Some(
+                "the release's official runtime packages cannot be installed or bound as planned; the listed subjects name what to fix, and nothing was changed",
+            ),
+            Self::UpgradeRuntimesFailed { .. } => Some(
+                "run `<staged>/pohunekd ensure-official-runtimes --dry-run` by hand with the same XDG environment to see its output, then retry",
+            ),
+            Self::RuntimeBackup { .. } => Some(
+                "keep the transaction and restore the backed-up runtime state by hand, or rerun the upgrade to take a fresh backup",
             ),
             Self::UpgradePreflightFailed { .. } => Some(
                 "run `<staged>/pohunekd upgrade-preflight` by hand with the same XDG environment to see its error, then retry",
@@ -717,6 +774,9 @@ impl Error {
             Self::VersionMismatch { .. } | Self::StagedBinary { .. } => Some(
                 "pass --from with a directory holding pohunek, pohunekd, and pohunek-sessiond of one build",
             ),
+            Self::StagedRuntime { .. } => Some(
+                "rebuild the release so its runtime/ directory holds only runtime-catalog.json, packages/, and attestations/ regular files, then retry",
+            ),
             Self::StagedAnchor { .. } => Some(
                 "restore runtime-catalog-anchor.json of the build being installed, or remove it to install a development build without a catalog trust anchor",
             ),
@@ -747,6 +807,15 @@ impl Error {
 }
 
 /// The refusal text: one line per session with its verdict, code and evidence.
+/// Lists each runtime refusal as `subject: code (detail)`, separated by `; `.
+fn refusals_summary(refusals: &[Refusal]) -> String {
+    refusals
+        .iter()
+        .map(|refusal| format!("{}: {} ({})", refusal.subject, refusal.code, refusal.detail))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn at_risk_summary(action: &str, sessions: &[SessionVerdict]) -> String {
     let mut text = format!(
         "{action} refused: {} live session(s) have unverified runtime or recovery",

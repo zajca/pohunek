@@ -31,8 +31,8 @@ use pohunek_daemon::procwatch::HostInspector;
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{HostTrustAnchor, SessionRegistry, SessionRegistryConfig};
 use pohunek_test_support::catalog::{
-    attestations_for, catalog_of, host_platform, root_of, signed, test_key, ANY_CORE, RUNTIME_API,
-    WINDOW_END, WINDOW_START,
+    anchor_for, attestations_for, catalog_of, host_platform, root_of, signed, test_key, ANY_CORE,
+    RUNTIME_API, WINDOW_END, WINDOW_START,
 };
 use pohunek_test_support::{worker_binary, workspace_root};
 use protocol::{
@@ -129,6 +129,34 @@ impl OfficialCatalog {
             installed.push((runtime, digest));
         }
         installed
+    }
+
+    /// Writes a release `runtime/` directory below `release` for `runtimes`:
+    /// their archives under `packages/` and the catalog listing them, signed by
+    /// this key. The archives are the bytes `runtime-packages` builds.
+    pub(crate) fn write_release(&self, release: &Path, runtimes: &[&str]) {
+        let packages = release.join("packages");
+        std::fs::create_dir_all(&packages).expect("create the release packages directory");
+        let entries = runtimes
+            .iter()
+            .map(|runtime| {
+                let (bytes, digest) = built_archive(runtime);
+                std::fs::write(packages.join(format!("{runtime}.tar.zst")), &bytes)
+                    .expect("write the release package archive");
+                catalog_entry(runtime, &bytes, &digest)
+            })
+            .collect();
+        std::fs::write(
+            release.join("runtime-catalog.json"),
+            signed(&self.key, catalog_of(CATALOG_SEQUENCE, WINDOW_END, entries)),
+        )
+        .expect("write the release catalog");
+    }
+
+    /// The anchor file bytes that trust this key, for the directory of a daemon
+    /// executable.
+    pub(crate) fn anchor_bytes(&self) -> Vec<u8> {
+        anchor_for(&self.key)
     }
 
     /// Installs the official Codex, Claude and Hermes packages into the plugin root
