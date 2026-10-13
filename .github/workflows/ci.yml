@@ -834,6 +834,7 @@ jobs:
               - 'scripts/release'
               - 'packaging/**'
               - '.github/actions/setup-rust/**'
+              - '.github/actions/setup-sccache/**'
             # Release rehearsal (issue #150): the release workflows, the
             # packaging and assembly tools, the compatibility matrix and locks,
             # the official packages, the consumer suite, and the crates the
@@ -861,6 +862,7 @@ jobs:
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
+              - '.github/actions/setup-sccache/**'
             # Upgrade from the previous release's published binaries to this
             # build with a live session (issue #525): the crates that decide
             # whether a live session survives (public protocol, worker
