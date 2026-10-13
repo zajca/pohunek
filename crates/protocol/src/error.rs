@@ -1270,6 +1270,21 @@ pub fn official_package_install_step(runtime: &RuntimeId) -> String {
     )
 }
 
+/// Package id prefix of the official runtime packages: the official package
+/// of runtime `x` is `pohunek.runtime.x`, as every package under
+/// `runtime-packages/` declares.
+const OFFICIAL_PACKAGE_ID_PREFIX: &str = "pohunek.runtime.";
+
+/// The package id the official package of `runtime` carries.
+///
+/// The installed record of an official package keeps no runtime id, so a
+/// package that cannot be loaded is related to the runtime it would serve by
+/// this id; it only selects a recovery hint, never what a launch runs.
+#[must_use]
+pub fn official_package_id(runtime: &RuntimeId) -> String {
+    format!("{OFFICIAL_PACKAGE_ID_PREFIX}{runtime}")
+}
+
 /// [`official_package_install_step`] without the enable alternative.
 ///
 /// For a caller that has already established that no package of `runtime` is

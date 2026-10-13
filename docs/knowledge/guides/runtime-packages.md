@@ -374,7 +374,8 @@ profile with `base = "codex"` (or `"claude"`, `"hermes"`) and no
 --agent codex` (or `claude`) is `runtime_not_installed`; each recovery hint names
 `pohunek plugin install runtime/packages/<runtime>.tar.zst --catalog
 runtime/runtime-catalog.json` (the profile hint then names `plugin profile
-migrate <name>`). When the official package is installed but cannot be loaded,
+migrate <name>`). When the official package of that runtime (package id
+`pohunek.runtime.<runtime>`) is installed but cannot be loaded,
 the unpinned profile's launch is `runtime_incompatible` instead, and its
 recovery names `pohunek plugin doctor` and then the migration, never the
 install: a reinstall of the same archive is refused. `integration status`, `doctor` and `uninstall --agent codex`

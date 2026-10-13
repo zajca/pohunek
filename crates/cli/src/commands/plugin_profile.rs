@@ -285,11 +285,13 @@ fn is_official_alias(base: &RuntimeId) -> bool {
 ///
 /// The daemon reports no runtime for a package whose root or descriptor fails
 /// to load, so the runtime it would serve is unknown. An official alias is
-/// claimable only by a catalog-authorized package, so only such a package may
-/// serve one.
+/// claimable only by a catalog-authorized package, and only the official
+/// package of that alias may serve it.
 fn may_serve_unloaded(info: &PackageInfo, base: &RuntimeId) -> bool {
     info.runtime_id.is_none()
-        && (!is_official_alias(base) || info.origin == PackageOrigin::Official)
+        && (!is_official_alias(base)
+            || (info.origin == PackageOrigin::Official
+                && info.package.id.as_str() == protocol::official_package_id(base)))
 }
 
 /// The step that pins the profile `name` once its base is served.
@@ -354,7 +356,7 @@ fn classify(
                 Some(info) if &info.package.id == package && serves_base(info) => {
                     (ProfileState::Pinned, None)
                 }
-                Some(info) if info.runtime_id.is_none() => (
+                Some(info) if &info.package.id == package && info.runtime_id.is_none() => (
                     ProfileState::PackageUnavailable,
                     Some(pinned_unavailable_hint()),
                 ),

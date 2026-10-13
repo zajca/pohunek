@@ -58,16 +58,19 @@ pub struct PackageReport {
 }
 
 impl PackageReport {
-    /// Whether an official package was left out of the registry without
-    /// loading, so an official runtime id the registry does not serve may be
-    /// served by it.
+    /// Whether the official package of `runtime` was left out of the registry
+    /// without loading, so it may serve that official runtime id.
     ///
-    /// A runtime id conflict leaves out a package whose root loaded, so it
-    /// does not count: its content is not what failed.
+    /// The package is matched by its official package id. A runtime id
+    /// conflict leaves out a package whose root loaded, so it does not count:
+    /// its content is not what failed.
     #[must_use]
-    pub fn official_unavailable(&self) -> bool {
+    pub fn official_unavailable(&self, runtime: &RuntimeId) -> bool {
+        let id = protocol::official_package_id(runtime);
         self.rejected.iter().any(|rejected| {
-            rejected.official && !matches!(rejected.reason, PackageRejection::RuntimeIdConflict)
+            rejected.official
+                && rejected.identity.id.as_str() == id
+                && !matches!(rejected.reason, PackageRejection::RuntimeIdConflict)
         })
     }
 }

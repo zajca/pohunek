@@ -182,8 +182,9 @@ Codex, Claude Code and Hermes in, so while no official package serves `codex`,
 `agent_profile_not_found`, an unpinned `base = "codex"`, `base = "claude"` or
 `base = "hermes"` profile with `runtime_not_installed`, and both hints name
 `pohunek plugin install runtime/packages/<runtime>.tar.zst --catalog runtime/runtime-catalog.json`
-(`codex`, `claude` or `hermes`) from the current release's archive. When an
-installed official package cannot be loaded (its root or descriptor fails
+(`codex`, `claude` or `hermes`) from the current release's archive. When the
+installed official package of that runtime (`pohunek.runtime.<runtime>`) cannot
+be loaded (its root or descriptor fails
 verification, typically after a registry rebuild), the same unpinned profile
 fails with `runtime_incompatible` instead, and its recovery names
 `pohunek plugin doctor`: run doctor, repair the package it reports as section 1

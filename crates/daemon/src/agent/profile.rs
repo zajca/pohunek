@@ -1179,7 +1179,7 @@ fn resolve_base(
             ),
         )),
         (None, None) if is_reserved(base) => {
-            if runtimes.package_report().official_unavailable() {
+            if runtimes.package_report().official_unavailable(base) {
                 Err(official_base_unavailable(name, base))
             } else {
                 Err(official_base_not_installed(name, base))
