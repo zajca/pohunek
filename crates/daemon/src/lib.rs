@@ -55,6 +55,9 @@ pub use paths::Paths;
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(test)]
+pohunek_test_support::hold_image!();
+
+#[cfg(test)]
 pub(crate) mod test_support {
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
@@ -67,10 +70,14 @@ pub(crate) mod test_support {
     /// A per-test directory, removed with its contents when dropped.
     ///
     /// Dereferences to its path, so callers that take a `&PathBuf` or a path
-    /// reference accept it directly.
+    /// reference accept it directly. Dropping it first ends every process that
+    /// works in the directory, on success and while a panic unwinds, so a
+    /// fixture that fails midway leaves nothing running behind it.
     #[derive(Debug)]
     pub(crate) struct ScopedDir {
         path: std::path::PathBuf,
+        /// Declared before the guard so it drops while the directory exists.
+        _reaper: crate::procwatch::scoped_host::ScopeReaper,
         _guard: tempfile::TempDir,
     }
 
@@ -96,7 +103,7 @@ pub(crate) mod test_support {
 
     std::thread_local! {
         /// Directories of the current test thread, removed when it ends.
-        static THREAD_DIRS: std::cell::RefCell<Vec<tempfile::TempDir>> =
+        static THREAD_DIRS: std::cell::RefCell<Vec<ScopedDir>> =
             const { std::cell::RefCell::new(Vec::new()) };
     }
 
@@ -106,10 +113,9 @@ pub(crate) mod test_support {
     /// tests. The test harness runs every test on a thread of its own, so the
     /// end of that thread is the end of the test.
     pub(crate) fn thread_scoped_dir(prefix: &str) -> std::path::PathBuf {
-        let guard = pohunek_test_support::tempdir_with_prefix(prefix)
-            .expect("create the thread-scoped test directory");
-        let path = guard.path().to_path_buf();
-        THREAD_DIRS.with(|dirs| dirs.borrow_mut().push(guard));
+        let directory = scoped_dir(prefix);
+        let path = directory.path.clone();
+        THREAD_DIRS.with(|dirs| dirs.borrow_mut().push(directory));
         path
     }
 
@@ -163,6 +169,7 @@ pub(crate) mod test_support {
             .expect("create the scoped test directory");
         ScopedDir {
             path: guard.path().to_path_buf(),
+            _reaper: crate::procwatch::scoped_host::ScopeReaper::new(guard.path()),
             _guard: guard,
         }
     }

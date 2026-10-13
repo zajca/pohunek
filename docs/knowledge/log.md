@@ -622,6 +622,17 @@
   `descriptor_invalid`. Documented in the `runtime-packages` guide, the
   `sessions` and `agent-profiles` concepts and the public API.
 
+## Unreleased (2026-10-12, the sweep waits for unreadable candidates, #821)
+
+- The runtime sweep no longer leaves a cleanup unconfirmed because of a hidden
+  process that is only passing: when a pass signals nothing and every remaining
+  candidate is an unreadable-marker process, the daemon re-reads the process
+  table for up to the sweep grace (`sweep.grace_ms`) before it reports those
+  candidates. A process caught between images, or an orphan of a creator that
+  has just exited and is about to follow it, no longer blocks a removal or a
+  lost-runtime cleanup; a candidate that outlives the grace stays listed and the
+  cleanup unconfirmed, exactly as before.
+
 ## Unreleased (2026-10-10, fork lineage decides withheld environments, #795)
 
 - The runtime sweep decides macOS 27 platform binaries by fork lineage instead

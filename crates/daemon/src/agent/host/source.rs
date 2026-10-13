@@ -597,7 +597,8 @@ mod tests {
     fn a_missing_or_unusable_key_is_a_typed_error_never_a_fallback() {
         let agents = scoped("nokey");
         write_profile(&agents, "wrapped", "base = \"shell\"\n");
-        let keyed = registry(&agents, &scoped("nokey-state"));
+        let state = scoped("nokey-state");
+        let keyed = registry(&agents, &state);
         let approved = revision_of(&keyed, "wrapped");
 
         let unkeyed = ProfileRegistry::new(Some(agents.to_path_buf()));
@@ -762,7 +763,8 @@ mod tests {
         let unkeyed = Sha256::digest(home.as_os_str().as_encoded_bytes());
         assert_ne!(id, lower_hex(&unkeyed[..CONFIG_HOME_ID_BYTES]));
         // Another host's key identifies the same directory differently.
-        let other = RevisionKeys::new(Some(private_state("home-id-other").to_path_buf()));
+        let other_state = private_state("home-id-other");
+        let other = RevisionKeys::new(Some(other_state.to_path_buf()));
         assert_ne!(id, other.config_home_id(home).expect("another host"));
     }
 

@@ -14515,14 +14515,18 @@ async fn record_runtime_for_removal(
 }
 
 /// An independent marked process that the removal sweep can observe.
+///
+/// It runs the holding image rather than a platform binary, whose environment
+/// macOS 27 withholds, so its markers read back on every host.
 struct RemovalMarkedProcess(std::process::Child);
 
 impl RemovalMarkedProcess {
     async fn spawn(worker_instance_id: &str, session_id: Option<&str>) -> Self {
-        let mut command = pohunek_test_support::process_env::command("/bin/cat");
+        let mut command = pohunek_test_support::hold::command();
         command
-            .stdin(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .env_remove("POHUNEK_SESSION_ID")
             .env("POHUNEK_WORKER_INSTANCE_ID", worker_instance_id);
         if let Some(session_id) = session_id {

@@ -761,7 +761,11 @@ chain reaches a non-launchd creator older than the worker, is ignored and not
 reported. Every other hidden process stays an unreadable candidate and keeps
 cleanup unconfirmed: one created after the worker by launchd, an orphan that
 re-executed after its creator died, and one whose creator exited after the
-worker started. The daemon uses the journaled number only when the journal was
+worker started. Those processes are not reported at once: while only such
+unreadable processes remain, the sweep re-reads the process table for up to the
+sweep grace (`sweep.grace_ms`), so one that is caught between images or about to
+exit does not leave the cleanup unconfirmed; a candidate that outlives the grace
+is listed. The daemon uses the journaled number only when the journal was
 written in the boot the host reports now, because creation numbers restart at
 reboot, and several journals of one runtime bound it only when they agree. Every
 journal-backed sweep passes it; the sweep of a runtime absent from its journal

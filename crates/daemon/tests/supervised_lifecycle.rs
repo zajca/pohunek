@@ -19,7 +19,9 @@
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-10-12
+
+pohunek_test_support::hold_image!();
 
 mod supervised;
 
@@ -420,6 +422,15 @@ async fn crashed_worker_is_lost_swept_and_never_restarted() {
 )]
 async fn stale_refused_socket_without_job_recovers_but_silent_job_stays_conflict() {
     let fixture = Installation::new(Settings::default()).await;
+    // The silent job is a platform shell, whose environment macOS 27 withholds
+    // and which launchd creates as a child of its own. The sweep of the lost
+    // runtime below can prove such a process foreign only by its fork lineage,
+    // which does so only for a process created before the runtime's worker; a
+    // shell started after the worker is one it cannot tell from an orphan of
+    // the runtime. The job therefore starts before any worker of this test.
+    let key = WorkerKey::new("s-4200", "siln2345").expect("silent generation");
+    let logs = backend::worker_logs(&fixture.paths, &fixture.namespace(), &key);
+    let silent_process = start_running(&fixture, &*fixture.workers, logs, &key).await;
     fixture.start_daemon().await;
     let lost = fixture.new_session("lost-after-manager-outage").await.id.0;
     let lost_before = fixture.snapshot(&lost).await;
@@ -473,8 +484,7 @@ async fn stale_refused_socket_without_job_recovers_but_silent_job_stays_conflict
     // A separate record names a real native job with the right generation,
     // but the same refused socket condition. This job may still become a
     // worker, so reconciliation must preserve conflict and must not sweep it.
-    let silent = "s-4200";
-    let key = WorkerKey::new(silent, "siln2345").expect("silent generation");
+    let silent = key.session_id();
     fixture.seed_record(
         silent,
         pohunek_daemon::store::RuntimeRecord {
@@ -497,8 +507,6 @@ async fn stale_refused_socket_without_job_recovers_but_silent_job_stays_conflict
         .expect("private silent worker directory");
     let silent_socket = silent_dir.join(pohunek_paths::WORKER_SOCKET_NAME);
     drop(UnixListener::bind(&silent_socket).expect("bind a stale silent socket"));
-    let logs = backend::worker_logs(&fixture.paths, &fixture.namespace(), &key);
-    let silent_process = start_running(&fixture, &*fixture.workers, logs, &key).await;
 
     fixture.start_daemon().await;
     fixture

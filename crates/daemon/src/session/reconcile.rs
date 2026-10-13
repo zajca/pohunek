@@ -16546,7 +16546,7 @@ handler = "codex-hook-v1"
         use nix::sys::signal::{kill, Signal};
         use nix::unistd::Pid;
         use pohunek_platform::supervisor::{DefinitionFacts, ServiceId, ServiceState};
-        use pohunek_test_support::wait::{poll_until as wait_until_sync, wait_until};
+        use pohunek_test_support::wait::wait_until;
         use pohunek_test_support::worker_binary;
         use protocol::{RuntimeState, SessionId, SessionInfo};
 
@@ -16555,7 +16555,7 @@ handler = "codex-hook-v1"
         };
         use super::temp_root;
         use crate::procwatch::readable_host::ReadableHost;
-        use crate::procwatch::scoped_host::ScopedHost;
+        use crate::procwatch::scoped_host::{ScopeReaper, ScopedHost};
         use crate::procwatch::{Error, HostInspector, ProcessInspector};
         use crate::runtime::lifecycle::tests::{JobScript, ScriptedSupervisor};
         use crate::runtime::lifecycle::{
@@ -16581,16 +16581,52 @@ handler = "codex-hook-v1"
         }
 
         fn fixture(connect: Duration) -> Fixture {
-            fixture_over(connect, "sleep", |_root| Arc::new(ReadableHost::new()))
+            fixture_over(connect, Workload::Held, |_root| {
+                Arc::new(ReadableHost::new())
+            })
+        }
+
+        /// What the PTY of a fixture runs: a hangup-ignoring descendant that
+        /// records its PID, and the main process that stays alive beside it.
+        #[derive(Clone, Copy)]
+        enum Workload {
+            /// The test binary re-run as the holding image. The kernel exposes
+            /// its environment on every host, so the sweep selects it by the
+            /// runtime marker even where it withholds the environment of
+            /// platform binaries.
+            Held,
+            /// A platform binary (`program` is its absolute path), for the
+            /// scenarios whose subject is the sweep of processes whose
+            /// environment the kernel may withhold.
+            Platform(&'static str),
+        }
+
+        impl Workload {
+            /// The shell script the PTY runs, recording the descendant's PID in
+            /// `pid_file`.
+            fn script(self, pid_file: &std::path::Path) -> String {
+                let (descendant, main) = match self {
+                    Self::Held => {
+                        let hold = pohunek_test_support::hold::shell_words();
+                        (format!("exec {hold}"), format!("exec {hold}"))
+                    }
+                    Self::Platform(program) => (
+                        format!("exec {program} 300"),
+                        format!("while :; do {program} 1; done"),
+                    ),
+                };
+                format!(
+                    "trap '' HUP; (trap '' HUP; {descendant}) & echo $! > {}; {main}",
+                    pid_file.display()
+                )
+            }
         }
 
         /// A fixture whose registry observes the host through the inspector
         /// `host` builds for the fixture's directory.
-        ///
-        /// The PTY runs `sleep_program` for its descendant and its heartbeat.
         fn fixture_over(
             connect: Duration,
-            sleep_program: &str,
+            workload: Workload,
             host: impl FnOnce(&std::path::Path) -> Arc<dyn ProcessInspector>,
         ) -> Fixture {
             let root = temp_root();
@@ -16609,10 +16645,7 @@ handler = "codex-hook-v1"
                 .with_environment_source(crate::test_support::thread_environment_source());
             supervision.sweep_grace = SWEEP_GRACE;
             let marker_pid_file = root.join("descendant.pid");
-            let script = format!(
-                "trap '' HUP; (trap '' HUP; exec {sleep_program} 300) & echo $! > {}; while :; do {sleep_program} 1; done",
-                marker_pid_file.display()
-            );
+            let script = workload.script(&marker_pid_file);
             let launcher = SubprocessWorkerLauncher::new();
             let supervisor = Arc::new(ScriptedSupervisor::over(launcher.clone()));
             let registry = SessionRegistry::new_with_launcher_and_inspector(
@@ -17093,69 +17126,6 @@ handler = "codex-hook-v1"
             }
         }
 
-        /// Kills every process working in a scenario's directory when the
-        /// scenario ends, so a runtime the sweep left alive does not outlive it,
-        /// and returns only once none of them runs.
-        ///
-        /// The scenario's processes are found by their working directory, so the
-        /// reaper must drop while that directory exists.
-        struct ScopeReaper(ScopedHost);
-
-        impl ScopeReaper {
-            fn new(directory: &std::path::Path) -> Self {
-                Self(ScopedHost::new(directory))
-            }
-
-            /// Identities of the scenario's processes that still run.
-            ///
-            /// # Errors
-            ///
-            /// Returns the inspection failure: a process table or liveness read
-            /// that failed proves nothing about whether the processes exited. A
-            /// process that exits during the read is not running.
-            fn running(&self) -> Result<Vec<crate::procwatch::ProcessIdentity>, Error> {
-                let mut running = Vec::new();
-                for fact in self.0.same_user_processes()? {
-                    let identity = fact.identity();
-                    match self.0.is_running(identity) {
-                        Ok(true) => running.push(identity),
-                        Ok(false) => {}
-                        Err(error) if error.is_race() => {}
-                        Err(error) => return Err(error),
-                    }
-                }
-                Ok(running)
-            }
-
-            /// PIDs of the processes that still run in the scenario's directory.
-            fn pids(&self) -> BTreeSet<u32> {
-                self.running()
-                    .expect("inspect the scenario's processes")
-                    .into_iter()
-                    .map(|identity| identity.pid)
-                    .collect()
-            }
-        }
-
-        impl Drop for ScopeReaper {
-            /// Signals every running process of the scenario again until a
-            /// listing finds none: a process that forked before it was signalled
-            /// shows up in the next listing. A failed inspection is retried and
-            /// never counts as an exit, so a persistent failure ends in the hang
-            /// guard instead of a teardown that reports success.
-            fn drop(&mut self) {
-                wait_until_sync("the scenario's processes to exit", || {
-                    let running = self.running().ok()?;
-                    for identity in &running {
-                        if let Ok(raw) = i32::try_from(identity.pid) {
-                            let _signalled = kill(Pid::from_raw(raw), Signal::SIGKILL);
-                        }
-                    }
-                    running.is_empty().then_some(())
-                });
-            }
-        }
-
         /// A scenario's real-host registry with its bystanders: one started
         /// before the worker, and a tree (a shell and its child) started after
         /// it by the test process, which is older than the worker.
@@ -17178,9 +17148,10 @@ handler = "codex-hook-v1"
 
         impl Scene {
             async fn start() -> Self {
-                let fixture = fixture_over(LONG_CONNECT, "/bin/sleep", |root| {
-                    Arc::new(ScopedHost::new(root))
-                });
+                let fixture =
+                    fixture_over(LONG_CONNECT, Workload::Platform("/bin/sleep"), |root| {
+                        Arc::new(ScopedHost::new(root))
+                    });
                 let scope = ScopeReaper::new(&fixture.root);
                 let mut bystanders = Bystanders::default();
                 let earlier = bystanders.start(&fixture.root, "/bin/sleep", &["300"]);
@@ -18388,6 +18359,9 @@ handler = "codex-hook-v1"
             {
                 entry.procwatch_cancel.cancel();
             }
+            if child_pid != 0 {
+                end_worker_runtime(child_pid, &journal_path).await;
+            }
             task.abort();
 
             let adoptable = verdict == Some(Verdict::Adoptable);
@@ -18487,6 +18461,29 @@ handler = "codex-hook-v1"
         );
         assert_eq!(unreadable.verdict, Verdict::WouldNotBeAdopted);
         assert_eq!(unreadable.code, "identity_process_inspection_failed");
+    }
+
+    /// Ends the PTY root of an in-process worker and waits until the worker has
+    /// journaled the end.
+    ///
+    /// The worker records the exit of its PTY root from tasks that outlive the
+    /// worker's `serve` task, so aborting that task leaves them able to write the
+    /// terminal journal later; one that runs after the fixture directory was
+    /// removed recreates the directory. Ending the root first and waiting for the
+    /// terminal record leaves no writer behind.
+    async fn end_worker_runtime(child_pid: u32, journal_path: &Path) {
+        let child = i32::try_from(child_pid).expect("a PTY root PID fits");
+        // The root may already have exited; either way the journal ends terminal.
+        let _ended = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        wait_until("the worker journals the end of its PTY root", || async {
+            let journal: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(journal_path).ok()?).ok()?;
+            (journal["phase"] == "terminal").then_some(())
+        })
+        .await;
     }
 
     /// Session of the differential cases.

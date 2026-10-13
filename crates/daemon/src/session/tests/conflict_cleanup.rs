@@ -12,6 +12,7 @@ use pohunek_session_worker::{Journal, JournalRecord, RuntimePhase, WorkerOrigin}
 use protocol::{RuntimeGeneration, RuntimeState, SessionId, SessionRuntime};
 
 use super::{hermetic_shell, temp_dir, UnreadableCandidateHost, UNREADABLE_CANDIDATE_PID};
+use crate::procwatch::readable_host::ReadableHost;
 use crate::procwatch::{HostInspector, ProcessIdentity, ProcessInspector};
 use crate::runtime::lifecycle::tests::{InspectStep, JobScript, ScriptedSupervisor};
 use crate::runtime::WorkerLauncher;
@@ -38,8 +39,13 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// A fixture whose registry sees the host through [`ReadableHost`]: the
+    /// journal names no spawn id, so a process whose environment the kernel
+    /// withholds (every platform binary on macOS 27, and so most of a loaded
+    /// host) could not be told apart from the dead generation's and would keep
+    /// the cleanup unconfirmed.
     async fn new(journal_runtime: &str) -> Self {
-        Self::new_over(journal_runtime, Arc::new(HostInspector::new())).await
+        Self::new_over(journal_runtime, Arc::new(ReadableHost::new())).await
     }
 
     async fn new_over(
@@ -154,7 +160,7 @@ impl Fixture {
             &self.runtime_root,
             &self.state_root,
             launcher,
-            Arc::new(HostInspector::new()),
+            Arc::new(ReadableHost::new()),
         )
     }
 
