@@ -607,12 +607,13 @@ Runtime package archive format:
 - `crates/cli/src/workflow/mod.rs` — workflow error codes, classes and recovery hints.
 - `crates/cli/src/workflow/manifest.rs` — the strict `workflow.toml` schema, size cap and argv rules.
 - `crates/cli/src/workflow/store.rs` — the workflow registry root, per-plugin state and config directories, install, uninstall and purge.
-- `crates/cli/src/workflow/runner.rs` — `workflow run`: refusals, the child's argv, cwd and exact environment, the context JSON, deadline, output caps, signal handling and outcome precedence.
+- `crates/cli/src/workflow/runner.rs` — `workflow run`: refusals, the child's argv, cwd and exact environment, the context JSON, deadline, output caps, signal handling, outcome precedence, and the `--json` stdout capture and its single-document check.
 - `crates/cli/src/workflow/config.rs` — the owner knobs `<config>/pohunek/workflow.toml`: tables, defaults, ranges and the file safety rule.
 - `crates/cli/src/workflow/runlog.rs` — the per-plugin `logs/runs.jsonl` record and its outcomes.
 - `crates/paths/src/lib.rs` — `WORKFLOW_PLUGINS_SUBDIR`, `WORKFLOW_PLUGIN_STATE_SUBDIR` and `WORKFLOW_PLUGIN_CONFIG_SUBDIR`.
 - `crates/cli/tests/workflow_store.rs` — consent, digest, hostile-manifest, tampered-root, local-only and lifecycle scenarios through the real binary.
 - `crates/cli/tests/workflow_run.rs` — `workflow run` scenarios through the real binary: exact environment and origin pair (with a real `pohunekd` session), refusals, deadline, output cap, interruption, slow output consumer, redaction, context and owner knobs.
+- `crates/cli/tests/workflow_run_json.rs` — `workflow run --json` and verbatim-argument scenarios through the real binary: byte-exact `ok`, invalid, failed, cut and capped output as single error envelopes, refusals as envelopes, and every argument after the action reaching it unchanged.
 - `docs/knowledge/guides/workflow-plugins.md`
 - `docs/knowledge/runbooks/runtime-package-recovery.md` — recovery from failed package verification, refused official installs, and disabled, removed or damaged pinned packages.
 - `docs/architecture.md` — "Runtime Packages and Trust": the package classes and the same-UID owner trust boundary.

@@ -3122,8 +3122,13 @@ pohunek workflow enable acme.work --json
 pohunek workflow disable acme.work --json
 pohunek workflow uninstall acme.work --purge --json
 pohunek workflow uninstall acme.work --remove-modified --json
-pohunek workflow run acme.work overview -- --since 1d
+pohunek workflow run acme.work overview --since 1d
+pohunek workflow run --json acme.work overview --since 1d
 ```
+
+`workflow run [--json] <plugin> <action> [<args>...]` passes every argument
+after `<action>` to the action verbatim, including `--json`, `--`, `-h`,
+`--host` and empty strings; pohunek's own options go before `<plugin>`.
 
 Every `--json` result is one standard CLI process envelope. The `ok` payloads:
 
@@ -3135,6 +3140,10 @@ Every `--json` result is one standard CLI process envelope. The `ok` payloads:
 - `inspect`: `{plugin, description, files_dir, state_dir, config_dir,
   actions: [{name, argv, args, timeout_ms?, max_output_bytes?}]}`. `argv[0]`
   is resolved to an absolute path; `args` is `none` or `passthrough`.
+- `run`: the action's stdout, which must be exactly one JSON document (JSON
+  whitespace around it is allowed and dropped), placed as `ok` byte for byte:
+  key order, number spelling and inner whitespace are the action's own. It is
+  printed only when the action exited 0.
 - `uninstall`: `{plugin, purged, purge?, warnings?, state_dir, config_dir}`.
   `plugin` is `null` when `--purge` removed only the directories of an id that
   has no record. `purge` is `{state_dir, config_dir}`, each `removed` or
@@ -3147,7 +3156,11 @@ Every `--json` result is one standard CLI process envelope. The `ok` payloads:
 A `plugin` is `{id, version, digest, enabled, installed_at_unix_seconds}`.
 
 Typed errors use the standard `{class, code, msg, recover?}` shape and never
-contain an argv value, an environment value or manifest text:
+contain an argv value, an environment value, manifest text or a byte of an
+action's output. `workflow_action_failed` adds `exit_code` (the action's exit
+code, or 128 plus the signal number) and, when a signal ended the action,
+`signal`; these fields belong to the CLI envelope, not to the protocol's
+error type:
 
 | Code | Class | Meaning |
 |---|---|---|
@@ -3168,7 +3181,7 @@ contain an argv value, an environment value or manifest text:
 | `workflow_config_invalid` | `configuration` | `<config>/pohunek/workflow.toml` is unsafe (not an owner-only `0600` regular file in a directory others cannot write), unreadable, not of the knobs schema, or holds an out-of-range value; nothing was run. |
 | `workflow_plugin_disabled` | `configuration` | The plugin is disabled; nothing was run. |
 | `workflow_action_unknown` | `configuration` | The manifest declares no action of the name; nothing was run. |
-| `workflow_action_args_refused` | `configuration` | Arguments after `--` were given to an action declaring `args = "none"`; the message counts them and names no value; nothing was run. |
+| `workflow_action_args_refused` | `configuration` | Arguments after the action name were given to an action declaring `args = "none"`; the message counts them and names no value; nothing was run. |
 | `workflow_origin_incomplete` | `configuration` | Exactly one of `POHUNEK_SESSION_ID` and `POHUNEK_DAEMON_ID` is set; nothing was run. |
 | `workflow_timeout_refused` | `configuration` | The action declares a `timeout_ms` above `limits.action_timeout_max_ms`; nothing was run. |
 | `workflow_context_too_large` | `configuration` | The context JSON is larger than `limits.max_context_bytes`; nothing was run. |
@@ -3178,21 +3191,26 @@ contain an argv value, an environment value or manifest text:
 | `workflow_action_timeout` | `runtime` | The action did not finish before its deadline and its group was stopped. |
 | `workflow_output_limit` | `runtime` | Stdout or stderr passed its cap and the group was stopped; bytes past the cap were not shown. |
 | `workflow_action_interrupted` | `runtime` | The CLI received `SIGINT`, `SIGTERM` or `SIGHUP` and stopped the action's group. |
+| `workflow_action_failed` | `runtime` | `run --json` only: the action exited non-zero or was ended by a signal the CLI did not send; carries `exit_code` and `signal?`; its stdout was not printed. |
+| `workflow_output_incomplete` | `runtime` | `run --json` only: the action exited 0, but a process that left its group still held stdout open, so the capture was never judged. |
+| `workflow_output_invalid` | `runtime` | `run --json` only: the action exited 0, but its stdout is empty, not JSON (including nesting deeper than 128 levels), ends inside its document, or has data after it. |
 
-`workflow run` has no `--json` result yet; before `--`, `--json` is a usage
-error (`cli_usage`). It streams the action's stdout and stderr, each up to its
-cap, and exits with:
+`workflow run` streams the action's stdout and stderr, each up to its cap.
+With `--json` it captures stdout up to the same cap instead, still streams
+stderr, and prints exactly one envelope on stdout. In both modes it exits
+with:
 
 | Exit status | When |
 |---|---|
-| the action's status | The action exited by itself; 128 plus the signal number when a signal it was not sent by the CLI ended it. |
+| the action's status | The action exited by itself; 128 plus the signal number when a signal it was not sent by the CLI ended it. With `--json` a non-zero status is reported as `workflow_action_failed`. |
 | 124 | `workflow_action_timeout`. |
 | 125 | `workflow_output_limit`. |
 | 128 plus the signal number | `workflow_action_interrupted`. |
-| 1 | Any other workflow error, including every refusal. |
+| 1 | Any other workflow error, including every refusal, `workflow_output_incomplete` and `workflow_output_invalid`. |
 
 When several apply, an output stream over its cap wins over a received
-signal, which wins over the deadline. The action's environment, its
+signal, which wins over the deadline; with `--json`, after a zero exit, a cut
+stdout wins over stdout that is not one JSON document. The action's environment, its
 `POHUNEK_PLUGIN_CONTEXT` JSON (schema 1), the content-free run log
 `<state>/pohunek/workflow-plugin-state/<id>/logs/runs.jsonl` and the owner
 knobs `<config>/pohunek/workflow.toml` are specified in

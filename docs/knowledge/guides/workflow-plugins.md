@@ -2,7 +2,7 @@
 type: Guide
 id: guide/workflow-plugins
 title: Workflow plugins
-description: What a workflow plugin is, the workflow.toml manifest, installing a plugin pinned by its digest with pohunek workflow, running its actions with pohunek workflow run (environment, context, limits, run log, owner knobs), and the same-UID owner trust boundary.
+description: What a workflow plugin is, the workflow.toml manifest, installing a plugin pinned by its digest with pohunek workflow, running its actions with pohunek workflow run (verbatim arguments, --json results, environment, context, limits, run log, owner knobs), and the same-UID owner trust boundary.
 source_kind: manual
 intents: [setup, update, debug, help]
 ---
@@ -27,13 +27,12 @@ pohunek workflow inspect acme.work [--json]
 pohunek workflow disable acme.work
 pohunek workflow enable acme.work
 pohunek workflow uninstall acme.work [--purge] [--remove-modified]
-pohunek workflow run acme.work overview [-- <args>...]
+pohunek workflow run [--json] acme.work overview [<args>...]
 ```
 
-Event reactions, periodic jobs, long-running services, `--json` for
-`workflow run`, and shell completion of plugin ids are not yet available; the
-manifest refuses the reaction, job and service tables until they ship (#148,
-#325, #326).
+Event reactions, periodic jobs, long-running services, and shell completion
+of plugin ids are not yet available; the manifest refuses the reaction, job
+and service tables until they ship (#148, #325, #326).
 
 ## The archive and its manifest
 
@@ -156,14 +155,15 @@ later store changes retry removing it, best effort.
 
 ## Running an action
 
-`pohunek workflow run <plugin> <action> [-- <args>...]` runs one declared
-action in text mode and exits with the action's own status (128 plus the
-signal number when a signal ended it). Arguments after `--` are appended to
-argv verbatim when the action declares `args = "passthrough"`; with
-`args = "none"` any extra argument is refused with
-`workflow_action_args_refused`. `--json` is not yet available for
-`workflow run`: before `--` it is a usage error (`cli_usage`), and after `--`
-it is an ordinary argument for the action.
+`pohunek workflow run [--json] <plugin> <action> [<args>...]` runs one
+declared action and exits with the action's own status (128 plus the signal
+number when a signal ended it). Every argument after `<action>` belongs to the
+action and is appended to argv verbatim, including `--json`, `--`, `-h`,
+`--host` and empty strings, when the action declares `args = "passthrough"`;
+with `args = "none"` any extra argument is refused with
+`workflow_action_args_refused`. pohunek's own options, `--json` and the
+global `--host`, therefore go before `<plugin>`
+(`pohunek workflow run --json acme.work overview --since 1d`).
 
 Before anything starts, the plugin's installed files are verified again, and
 the run is refused when the plugin is unknown (`workflow_plugin_unknown`),
@@ -174,6 +174,34 @@ disabled (`workflow_plugin_disabled`), tampered with
 above the owner ceiling (`workflow_timeout_refused`), or the context is
 larger than its cap (`workflow_context_too_large`). A refused run starts
 nothing.
+
+### `--json` results
+
+With `--json`, stdout is captured instead of shown, up to the same cap, and
+stderr still streams to the terminal. The context's `output` is `json`, so the
+action can choose its format. The command prints exactly one CLI process
+envelope on stdout:
+
+- The action exited 0 and its stdout is exactly one JSON document, with JSON
+  whitespace allowed around it: `ok` is that document byte for byte (key
+  order, number spelling and inner whitespace are kept), and the exit status
+  is 0.
+- The action exited non-zero or was ended by a signal the CLI did not send:
+  `workflow_action_failed` with `exit_code` (the action's code, or 128 plus
+  the signal number) and `signal` when a signal ended it. The CLI exits with
+  `exit_code`, the same status as in text mode, and prints none of the
+  action's stdout.
+- The action exited 0 but its stdout is empty, is not JSON, ends inside its
+  document, or has data after it: `workflow_output_invalid`, exit status 1.
+  Nesting deeper than 128 levels is reported as not JSON.
+- The action exited 0 but a process that left its group still held stdout
+  open (see below): `workflow_output_incomplete`, exit status 1. The capture
+  is never judged, because that process could still add to it.
+- Every other error (refusals, `workflow_output_limit`,
+  `workflow_action_timeout`, `workflow_action_interrupted`, …) is an error
+  envelope with the exit status the table below gives.
+
+No error envelope holds any byte of the action's output.
 
 The action runs without a shell. argv is the installed `files/<argv0>` (or
 the absolute host path) followed by the manifest arguments and any passed
@@ -213,10 +241,11 @@ Nothing else is passed: no `PATH`, locale, `TERM`, tokens,
 {"schema":1,
  "plugin":{"id":"acme.work","version":"1.2.0","digest":"sha256:…"},
  "invocation":{"kind":"action","name":"overview","run_id":"01K…"},
- "output":"text",
+ "output":"text|json",
  "cli":{"version":"0.34.2","protocol":{"minimum":3,"maximum":4}}}
 ```
 
+`output` is `json` for `workflow run --json` and `text` otherwise.
 `run_id` is a ULID, also written to the run log. `cli.protocol` is the public
 protocol range the running CLI speaks. A context larger than
 `limits.max_context_bytes` refuses the run (`workflow_context_too_large`); it
@@ -250,15 +279,21 @@ that is still open is held by such an escaped descendant: after one second
 not spent waiting for your consumer, whether the descendant writes or not,
 the CLI stops waiting for the stream, keeps the run's outcome, and prints
 `warning: the stdout of action … was cut` (or `stderr`) without any of the
-stream's bytes.
+stream's bytes. With `--json` a cut stdout instead fails a run whose action
+exited 0 with `workflow_output_incomplete`.
 
 When several apply, the outcome is decided in this order: an output stream
 over its cap, then a signal the CLI received, then the deadline, then a
-failure to observe the action, then the action's own exit status.
+failure to observe the action, then the action's own exit status; with
+`--json` a zero status is then followed by a cut stdout, then stdout that is
+not exactly one JSON document.
 
 | Result | Error code | Exit status |
 |---|---|---|
 | The action exited | none | the action's status |
+| `--json`: the action exited non-zero or by a signal | `workflow_action_failed` | the action's status |
+| `--json`: stdout was cut | `workflow_output_incomplete` | 1 |
+| `--json`: stdout is not exactly one JSON document | `workflow_output_invalid` | 1 |
 | Output over its cap | `workflow_output_limit` | 125 |
 | The CLI received a signal | `workflow_action_interrupted` | 128 plus the signal number |
 | The deadline passed | `workflow_action_timeout` | 124 |
@@ -287,11 +322,12 @@ rotated, owner-private family (`runs.jsonl`, `runs.jsonl.1`, …):
 ```
 
 `outcome` is `ok`, `exit_nonzero`, `timeout`, `output_limit`, `interrupted`,
-`spawn_failed`, `failed` or `refused`. `error_code` is present when the run
+`spawn_failed`, `failed`, `refused`, or, with `--json` after a zero exit,
+`output_incomplete` or `output_invalid`. `error_code` is present when the run
 ended with an error and holds that error's code. `exit_code` or `signal`
 describes how the action's process ended. `name` is present only when it is an
-action the verified manifest declares. Byte counts are the bytes shown, at
-most the cap. A record never holds an argv value, an environment value, the
+action the verified manifest declares. Byte counts are the bytes shown (with
+`--json`, the bytes captured), at most the cap. A record never holds an argv value, an environment value, the
 context or any output byte, and neither do the CLI's error messages. A run
 whose log cannot be opened is refused with `workflow_run_log_failed`; a
 record that cannot be written after a run is reported as a warning on stderr.

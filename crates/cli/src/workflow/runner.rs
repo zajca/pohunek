@@ -13,13 +13,18 @@
 //!
 //! Stdout and stderr stream to this process's own stdout and stderr, each up
 //! to its cap, however slowly their consumer reads, unless this process is
-//! signalled. Once the group is gone, a pipe that a descendant outside the
+//! signalled. In JSON mode stdout is captured instead, up to the same cap,
+//! and the run succeeds only when the child exits zero and the capture is
+//! exactly one JSON document, which is handed back byte for byte. Once the group is gone, a pipe that a descendant outside the
 //! group keeps open is cut after [`OUTPUT_IDLE`] of time not spent writing to
 //! that consumer, whether the descendant writes or not, with a content-free
-//! warning. A run ends in one outcome, decided in this order: an output
-//! stream that passed its cap (`output_limit`), a terminating signal this
-//! process received (`interrupted`), the deadline (`timeout`), a failure to
-//! observe the child (`failed`), then the child's own status. Every outcome
+//! warning; in JSON mode a cut stdout fails the run instead. A run ends in
+//! one outcome, decided in this order: an output stream that passed its cap
+//! (`output_limit`), a terminating signal this process received
+//! (`interrupted`), the deadline (`timeout`), a failure to observe the child
+//! (`failed`), then the child's own status; in JSON mode a zero status is
+//! followed by a cut stdout (`output_incomplete`), then a capture that is not
+//! exactly one JSON document (`output_invalid`). Every outcome
 //! but a normal exit stops the group with `SIGTERM`, the owner's grace (which
 //! ends early when the direct child exits), then `SIGKILL`; after a normal
 //! exit the rest of the group is killed. Each run of
@@ -30,7 +35,7 @@
 // Rust guideline compliant 2026-10-13
 
 use std::ffi::OsString;
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -43,6 +48,7 @@ use protocol::{
     PackageDigest, PackageId, PackageVersion, ProtocolVersionRange, ENV_DAEMON_ID, ENV_SESSION_ID,
 };
 use serde::Serialize;
+use serde_json::value::RawValue;
 
 use super::config::Knobs;
 use super::manifest::ArgsMode;
@@ -56,9 +62,6 @@ use crate::process::bounded::{
 
 /// Invocation kind of `workflow run`, in the context and the run log.
 const KIND_ACTION: &str = "action";
-
-/// Output mode of a text-mode run, in the context.
-const OUTPUT_TEXT: &str = "text";
 
 /// Schema of the context JSON.
 const CONTEXT_SCHEMA: u32 = 1;
@@ -92,6 +95,35 @@ const ENV_PLUGIN_CONTEXT: &str = "POHUNEK_PLUGIN_CONTEXT";
 /// The canonical path of the running `pohunek`.
 const ENV_CLI: &str = "POHUNEK_CLI";
 
+/// How `workflow run` delivers the action's stdout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Output {
+    /// Stdout streams to this process's stdout.
+    Text,
+    /// Stdout is captured and must be exactly one JSON document.
+    Json,
+}
+
+impl Output {
+    /// The mode's name in the context's `output` field.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+        }
+    }
+}
+
+/// How a run that was not refused or stopped ended.
+#[derive(Debug)]
+pub(crate) enum Completed {
+    /// A text-mode run whose child ended by itself, zero or not.
+    Exited(ExitStatus),
+    /// A JSON-mode run whose child exited zero with exactly one JSON
+    /// document on stdout, without the whitespace around it.
+    Document(Box<RawValue>),
+}
+
 /// One `workflow run` request.
 #[derive(Debug)]
 pub(crate) struct Invocation<'a> {
@@ -101,6 +133,8 @@ pub(crate) struct Invocation<'a> {
     pub(crate) action: &'a str,
     /// Extra arguments, passed verbatim when the action accepts them.
     pub(crate) args: &'a [OsString],
+    /// How the action's stdout is delivered.
+    pub(crate) output: Output,
 }
 
 /// Everything a checked run needs; built before anything is started.
@@ -188,8 +222,10 @@ struct ContextCli {
     protocol: ProtocolVersionRange,
 }
 
-/// Runs `invocation` under `knobs` and returns the status of a child that
-/// ended by itself, zero or not.
+/// Runs `invocation` under `knobs` and returns how a run that was not
+/// refused or stopped ended: in text mode the status of a child that ended by
+/// itself, zero or not; in JSON mode the document of a child that exited
+/// zero.
 ///
 /// # Errors
 ///
@@ -200,7 +236,10 @@ struct ContextCli {
 /// [`Error::OriginIncomplete`], [`Error::TimeoutRefused`],
 /// [`Error::ContextTooLarge`]), or a run that ended early
 /// ([`Error::SpawnFailed`], [`Error::OutputLimit`], [`Error::Interrupted`],
-/// [`Error::ActionTimeout`], [`Error::RunFailed`]).
+/// [`Error::ActionTimeout`], [`Error::RunFailed`]); in JSON mode also a
+/// child that exited non-zero ([`Error::ActionFailed`]), a stdout cut before
+/// it ended ([`Error::OutputIncomplete`]) or a capture that is not exactly
+/// one JSON document ([`Error::OutputInvalid`]).
 ///
 /// # Panics
 ///
@@ -210,7 +249,7 @@ pub(crate) fn run_action(
     store: &Store,
     knobs: &Knobs,
     invocation: &Invocation<'_>,
-) -> Result<ExitStatus, Error> {
+) -> Result<Completed, Error> {
     let id = invocation.plugin;
     let installed = store
         .installed(id)?
@@ -306,7 +345,7 @@ fn prepare(
             name,
             run_id,
         },
-        output: OUTPUT_TEXT,
+        output: invocation.output.name(),
         cli: ContextCli {
             version: env!("CARGO_PKG_VERSION"),
             protocol: protocol::CLIENT_PROTOCOL_VERSIONS,
@@ -385,6 +424,43 @@ struct Observed {
     overflowed: [bool; 2],
     /// Whether reading an output stream failed.
     read_failed: bool,
+    /// The run's output mode.
+    output: Output,
+    /// The captured stdout of a JSON-mode run; `None` in text mode.
+    captured: Option<Captured>,
+}
+
+/// The captured stdout of a JSON-mode run.
+enum Captured {
+    /// The stream ended; every byte up to the cap.
+    Whole(Vec<u8>),
+    /// The stream did not end: a process outside the group held it open, or
+    /// the drain was stopped. Its bytes are never used.
+    Cut,
+}
+
+/// Where the capped stdout reader puts the action's stdout.
+enum Sink {
+    /// This process's stdout, in text mode.
+    Stream(io::Stdout),
+    /// Memory, in JSON mode; the capped reader bounds it to the stdout cap.
+    Capture(Vec<u8>),
+}
+
+impl Write for Sink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Stream(stdout) => stdout.write(buf),
+            Self::Capture(buffer) => buffer.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Stream(stdout) => stdout.flush(),
+            Self::Capture(_) => Ok(()),
+        }
+    }
 }
 
 /// Starts the checked run, waits for it, and records how it ended.
@@ -394,7 +470,7 @@ fn execute(
     knobs: &Knobs,
     invocation: &Invocation<'_>,
     prepared: &Prepared,
-) -> Result<ExitStatus, Error> {
+) -> Result<Completed, Error> {
     let (mut child, mut interrupts) = match start(store, invocation, prepared) {
         Ok(started) => started,
         Err(cause) => {
@@ -413,7 +489,11 @@ fn execute(
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         unreachable!("both output streams were configured as pipes");
     };
-    let (stdout_tally, stdout_done) = spawn_capped_reader(stdout, io::stdout(), prepared.caps[0]);
+    let sink = match invocation.output {
+        Output::Text => Sink::Stream(io::stdout()),
+        Output::Json => Sink::Capture(Vec::new()),
+    };
+    let (stdout_tally, stdout_done) = spawn_capped_reader(stdout, sink, prepared.caps[0]);
     let (stderr_tally, stderr_done) = spawn_capped_reader(stderr, io::stderr(), prepared.caps[1]);
     let mut received = None;
     let ended = supervise_child(
@@ -434,47 +514,53 @@ fn execute(
         received = received.or_else(|| interrupts.poll());
         received.is_some()
     };
-    let drained = [
-        (
-            "stdout",
-            drain_capped(&stdout_done, &stdout_tally, OUTPUT_IDLE, &mut stop)
-                .map(|drain| matches!(drain, Drain::Idle)),
-        ),
-        (
-            "stderr",
-            drain_capped(&stderr_done, &stderr_tally, OUTPUT_IDLE, &mut stop)
-                .map(|drain| matches!(drain, Drain::Idle)),
-        ),
-    ];
+    let stdout_drain = drain_capped(&stdout_done, &stdout_tally, OUTPUT_IDLE, &mut stop);
+    let stderr_drain = drain_capped(&stderr_done, &stderr_tally, OUTPUT_IDLE, &mut stop);
     let mut read_failed = false;
-    for (stream, drained) in drained {
-        match drained {
-            Ok(false) => {}
-            // An escaped descendant holds the pipe open: the stream is cut,
-            // the run keeps its outcome, and the cut is reported without any
-            // of the stream's bytes.
-            Ok(true) => eprintln!(
-                "warning: the {stream} of action {} of workflow plugin {} was cut: a process \
-                 that left the action's process group still holds it open",
-                prepared.name,
-                prepared.record.identity().id
-            ),
-            Err(_lost) => read_failed = true,
+    let mut captured = None;
+    match stdout_drain {
+        Ok(Drain::Ended(Sink::Capture(bytes))) => captured = Some(Captured::Whole(bytes)),
+        // A cut capture is never parsed: the bytes a process outside the
+        // group may still write would belong to the same document.
+        Ok(Drain::Idle | Drain::Stopped) if invocation.output == Output::Json => {
+            captured = Some(Captured::Cut);
         }
+        Ok(Drain::Idle) => cut_warning("stdout", prepared),
+        Ok(Drain::Ended(Sink::Stream(_)) | Drain::Stopped) => {}
+        Err(_lost) => read_failed = true,
+    }
+    match stderr_drain {
+        Ok(Drain::Ended(_) | Drain::Stopped) => {}
+        Ok(Drain::Idle) => cut_warning("stderr", prepared),
+        Err(_lost) => read_failed = true,
     }
     let observed = Observed {
         ended,
         received,
         overflowed: [stdout_tally.overflowed(), stderr_tally.overflowed()],
         read_failed,
+        output: invocation.output,
+        captured,
     };
-    let (outcome, result) = classify(prepared, &observed);
     let status = observed.ended.as_ref().ok().map(|ended| ended.status);
+    let (outcome, result) = classify(prepared, observed);
     let bytes = [stdout_tally.delivered(), stderr_tally.delivered()];
     let name = Some(prepared.name.as_str());
     let error = result.as_ref().err();
     run.append(&prepared.record, name, outcome, status, error, bytes);
     result
+}
+
+/// Reports that an escaped descendant holds an output pipe open, so the
+/// stream is cut; the run keeps its outcome and none of the stream's bytes
+/// are shown.
+fn cut_warning(stream: &str, prepared: &Prepared) {
+    eprintln!(
+        "warning: the {stream} of action {} of workflow plugin {} was cut: a process \
+         that left the action's process group still holds it open",
+        prepared.name,
+        prepared.record.identity().id
+    );
 }
 
 /// Spawns the action with its streams piped; `Err` is the cause of a spawn
@@ -511,8 +597,9 @@ fn start(
 }
 
 /// Decides the outcome of a started run, in the documented precedence:
-/// output limit, interruption, deadline, observation failure, exit status.
-fn classify(prepared: &Prepared, observed: &Observed) -> (Outcome, Result<ExitStatus, Error>) {
+/// output limit, interruption, deadline, observation failure, exit status;
+/// in JSON mode a zero exit status is then judged by its capture.
+fn classify(prepared: &Prepared, observed: Observed) -> (Outcome, Result<Completed, Error>) {
     let id = prepared.record.identity().id.to_string();
     let action = prepared.name.clone();
     if let Some(index) = observed
@@ -538,24 +625,82 @@ fn classify(prepared: &Prepared, observed: &Observed) -> (Outcome, Result<ExitSt
             Err(Error::Interrupted { id, action, signal }),
         );
     }
-    match &observed.ended {
-        Ok(ended) if ended.cut == Some(Cut::Deadline) => (
-            Outcome::Timeout,
-            Err(Error::ActionTimeout {
-                id,
-                action,
-                timeout_ms: prepared.timeout_ms,
-            }),
-        ),
-        Ok(ended) if !observed.read_failed => {
-            let outcome = if ended.status.success() {
+    let status = match &observed.ended {
+        Ok(ended) if ended.cut == Some(Cut::Deadline) => {
+            return (
+                Outcome::Timeout,
+                Err(Error::ActionTimeout {
+                    id,
+                    action,
+                    timeout_ms: prepared.timeout_ms,
+                }),
+            );
+        }
+        Ok(ended) if !observed.read_failed => ended.status,
+        _ => return (Outcome::Failed, Err(Error::RunFailed { id, action })),
+    };
+    let captured = match (observed.output, observed.captured) {
+        (Output::Text, _) => {
+            let outcome = if status.success() {
                 Outcome::Ok
             } else {
                 Outcome::ExitNonzero
             };
-            (outcome, Ok(ended.status))
+            return (outcome, Ok(Completed::Exited(status)));
         }
-        _ => (Outcome::Failed, Err(Error::RunFailed { id, action })),
+        (Output::Json, Some(captured)) => captured,
+        // A JSON-mode run without a capture was not observed in full.
+        (Output::Json, None) => return (Outcome::Failed, Err(Error::RunFailed { id, action })),
+    };
+    if !status.success() {
+        return (
+            Outcome::ExitNonzero,
+            Err(Error::ActionFailed { id, action, status }),
+        );
+    }
+    let bytes = match captured {
+        Captured::Whole(bytes) => bytes,
+        Captured::Cut => {
+            return (
+                Outcome::OutputIncomplete,
+                Err(Error::OutputIncomplete { id, action }),
+            );
+        }
+    };
+    match parse_document(&bytes) {
+        Ok(document) => (Outcome::Ok, Ok(Completed::Document(document))),
+        Err(reason) => (
+            Outcome::OutputInvalid,
+            Err(Error::OutputInvalid { id, action, reason }),
+        ),
+    }
+}
+
+/// Parses captured stdout as exactly one JSON document, with JSON whitespace
+/// allowed around it; `Err` is a content-free reason.
+///
+/// The document is kept as its own bytes, so key order, number spelling and
+/// inner whitespace reach the caller unchanged. The parser rejects nesting
+/// deeper than its recursion limit of 128 levels.
+fn parse_document(bytes: &[u8]) -> Result<Box<RawValue>, &'static str> {
+    let error = match serde_json::from_slice::<Box<RawValue>>(bytes) {
+        Ok(document) => return Ok(document),
+        Err(error) => error,
+    };
+    if bytes
+        .iter()
+        .all(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+    {
+        return Err("it is empty");
+    }
+    if error.is_eof() {
+        return Err("it ends inside its JSON document");
+    }
+    let mut documents = serde_json::Deserializer::from_slice(bytes).into_iter::<Box<RawValue>>();
+    if matches!(documents.next(), Some(Ok(_))) {
+        Err("it has more data after its first JSON document")
+    } else {
+        Err("it is not JSON")
     }
 }
 
