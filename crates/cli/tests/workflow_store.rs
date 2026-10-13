@@ -14,10 +14,15 @@ use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Output, Stdio};
 
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
 use package::{build_archive, read_archive, ArchiveEntry, Limits, PackageDigest};
+use pohunek_cli::service::definition::identity_config;
+use pohunek_cli::service::VERSION;
 use pohunek_test_support::env::TestEnv;
+use pohunek_test_support::wait::poll_until;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
@@ -734,6 +739,101 @@ fn an_install_whose_enable_fails_stays_installed_disabled() {
     let document: Value = serde_json::from_slice(&output.stdout).expect("a JSON envelope");
     assert_eq!(document["ok"]["status"], "already_installed", "{document}");
     assert_eq!(document["ok"]["plugin"]["enabled"], false, "{document}");
+}
+
+/// Another version than this CLI, recorded for the installation.
+const OTHER_VERSION: &str = "0.0.1";
+
+/// Restart delay a refused service is paced with: longer than the scenario
+/// runs, so the stop request always arrives during the pacing. The owner
+/// knob only sets the wait, so a larger value changes nothing else.
+const REFUSAL_PACING_MS: u64 = 60_000;
+
+/// Enabling a plugin with units refuses an installation recorded for another
+/// version of pohunek, before any unit is written: that version's trampoline
+/// may not exist, so the units would never run.
+#[test]
+fn enabling_refuses_an_installation_of_another_version() {
+    assert_ne!(VERSION, OTHER_VERSION);
+    let units = workflow_units::UnitEnv::new(|env| env.root().join("units"));
+    let plugin = workflow_units::Plugin::new(PLUGIN_ID).service("serve", "hang");
+    units.install(&plugin);
+    let prefix = units.env.root().join("prefix");
+    identity_config(&units.context, &prefix, OTHER_VERSION)
+        .expect("the installation configuration")
+        .write(&units.context.config_path())
+        .expect("record the other version");
+
+    let output = units
+        .command(&["workflow", "enable", PLUGIN_ID, "--json"])
+        .output()
+        .expect("run pohunek workflow enable");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        workflow_units::describe(&output)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("a JSON envelope");
+    assert_eq!(
+        document["err"]["code"], "workflow_service_not_installed",
+        "{document}"
+    );
+    let message = document["err"]["msg"].as_str().expect("a message");
+    assert!(
+        message.contains(OTHER_VERSION) && message.contains(VERSION),
+        "{message}"
+    );
+    assert_eq!(units.listed()[0]["enabled"], false);
+    assert!(
+        units
+            .context
+            .supervisor_dir()
+            .read_dir()
+            .map_or(true, |mut entries| entries.next().is_none()),
+        "no unit was written"
+    );
+}
+
+/// A stop request that arrives while a refused service is paced before its
+/// next start ends the trampoline as stopped: it exits 0, as for a run the
+/// service manager stops, so the unit is not recorded as failed. The refusal
+/// is recorded first, so the request reaches the pacing.
+#[test]
+fn a_stop_during_a_refused_services_pacing_exits_cleanly() {
+    let units = workflow_units::UnitEnv::new(|env| env.root().join("units"));
+    let paced = format!("restart_max_ms = {REFUSAL_PACING_MS}");
+    let knobs = workflow_units::KNOBS.replace("restart_max_ms = 2000", &paced);
+    assert!(knobs.contains(&paced), "the knob was set");
+    units.knobs(&knobs);
+    // Installed disabled, so the trampoline refuses the service and paces it.
+    let plugin = workflow_units::Plugin::new(PLUGIN_ID).service("serve", "hang");
+    let digest = units.install(&plugin);
+
+    let trampoline = units
+        .exec(PLUGIN_ID, digest.as_str(), "service", "serve")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the trampoline");
+    poll_until("the refusal to be recorded", || {
+        units
+            .records(PLUGIN_ID)
+            .iter()
+            .any(|record| record["outcome"] == "refused")
+            .then_some(())
+    });
+    let pid = Pid::from_raw(i32::try_from(trampoline.id()).expect("a PID"));
+    kill(pid, Signal::SIGTERM).expect("signal the trampoline");
+    let output = trampoline
+        .wait_with_output()
+        .expect("wait for the trampoline");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        workflow_units::describe(&output)
+    );
 }
 
 #[test]

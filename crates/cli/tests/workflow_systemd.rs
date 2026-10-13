@@ -38,3 +38,5 @@ systemd_scenario!(a_stopped_unit_ends_its_run_cleanly);
 systemd_scenario!(a_job_outside_changed_bounds_is_refused_when_it_runs);
 systemd_scenario!(a_refused_uninstall_leaves_the_units_running);
 systemd_scenario!(installing_again_leaves_running_units_alone);
+systemd_scenario!(disable_stops_the_units_of_a_modified_plugin);
+systemd_scenario!(uninstall_stops_the_units_of_a_modified_plugin);

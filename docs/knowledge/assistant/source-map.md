@@ -610,7 +610,7 @@ Runtime package archive format:
 - `crates/cli/src/commands/workflow.rs` — `pohunek workflow list|inspect|install|enable|disable|uninstall|run` and the hidden `__exec`, the consent review, the `--json` payloads and the `run` exit statuses.
 - `crates/cli/src/workflow/mod.rs` — workflow error codes, classes and recovery hints.
 - `crates/cli/src/workflow/manifest.rs` — the strict `workflow.toml` schema, size cap and argv rules.
-- `crates/cli/src/workflow/store.rs` — the workflow registry root, per-plugin state and config directories, install, uninstall and purge.
+- `crates/cli/src/workflow/store.rs` — the workflow registry root, per-plugin state and config directories, install, uninstall and purge, and the per-plugin unit records of jobs and services.
 - `crates/cli/src/workflow/runner.rs` — `workflow run`: refusals, the child's argv, cwd and exact environment, the context JSON, deadline, output caps, signal handling, outcome precedence, and the `--json` stdout capture and its single-document check.
 - `crates/cli/src/workflow/config.rs` — the owner knobs `<config>/pohunek/workflow.toml`: tables, defaults, ranges and the file safety rule.
 - `crates/cli/src/workflow/runlog.rs` — the per-plugin `logs/runs.jsonl` record and its outcomes.

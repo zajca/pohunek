@@ -11,10 +11,13 @@
 
 // Rust guideline compliant 2026-10-13
 
+use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
 use std::process::Stdio;
 
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
+use pohunek_cli::workflow_units::{disable_plugin, uninstall_plugin};
 use pohunek_platform::supervisor::{PluginUnitKey, PluginUnitKind, ServiceState};
 use pohunek_test_support::wait::{poll_until, wait_until};
 use serde_json::Value;
@@ -23,8 +26,8 @@ use crate::workflow_units::native::{
     self, manager_variable, set_manager_variable, unset_manager_variable,
 };
 use crate::workflow_units::{
-    assert_alternating, describe, variable_names, wait_gone, Managed, Plugin, DIRECT_KNOBS, KNOBS,
-    SUPERVISED_ENVIRONMENT, TICK_OUTPUT,
+    assert_alternating, describe, variable_names, wait_gone, Managed, Plugin, UnitEnv,
+    DIRECT_KNOBS, KNOBS, SUPERVISED_ENVIRONMENT, TICK_OUTPUT,
 };
 
 /// Runs a scenario waits for before it counts a schedule as repeating.
@@ -485,6 +488,79 @@ pub(crate) async fn a_stopped_unit_ends_its_run_cleanly() {
     for record in records {
         assert_eq!(record["outcome"], "interrupted", "{record}");
     }
+}
+
+/// Changes the installed `bin/crash` program of the one plugin the
+/// installation holds, so its root fails verification while its units keep
+/// running. Its content is changed rather than removed, so the root is
+/// modified and not missing.
+fn modify_installed_program(units: &UnitEnv) {
+    let packages = units
+        .env
+        .state_home()
+        .join("pohunek/workflow-plugins/packages");
+    let mut roots = fs::read_dir(&packages)
+        .expect("the plugin store")
+        .map(|entry| entry.expect("a store entry").path());
+    let root = roots.next().expect("one installed plugin root");
+    assert!(roots.next().is_none(), "one installed plugin root");
+    let program = root.join("files/bin/crash");
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o600))
+        .expect("make the installed program writable");
+    fs::write(&program, "#!/bin/sh\nexit 4\n").expect("modify the installed program");
+}
+
+/// Disabling a plugin whose installed files fail verification stops its
+/// running service and removes its unit files and loaded units. The units
+/// are found through the unit record, so the command reports no warning that
+/// they could not be listed.
+pub(crate) async fn disable_stops_the_units_of_a_modified_plugin() {
+    let mut managed = Managed::new(KNOBS);
+    let plugin = Plugin::new("acme.modified").service("serve", "hang");
+    let id = plugin.id.clone();
+    managed.enable(&plugin).await;
+    let child = managed.units.pid(&id, "serve", "child");
+    modify_installed_program(&managed.units);
+
+    let warnings = disable_plugin(&managed.units.context, &id)
+        .await
+        .expect("disable the plugin");
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert!(
+        managed.unit_files().is_empty(),
+        "{:?}",
+        managed.unit_files()
+    );
+    assert!(managed.loaded().is_empty(), "{:?}", managed.loaded());
+    wait_gone(child);
+}
+
+/// Uninstalling a plugin whose installed files fail verification with
+/// `--remove-modified --purge` stops its service and removes its units
+/// before the plugin record and its directories go.
+pub(crate) async fn uninstall_stops_the_units_of_a_modified_plugin() {
+    let mut managed = Managed::new(KNOBS);
+    let plugin = Plugin::new("acme.gone").service("serve", "hang");
+    let id = plugin.id.clone();
+    managed.enable(&plugin).await;
+    let child = managed.units.pid(&id, "serve", "child");
+    modify_installed_program(&managed.units);
+
+    let warnings = uninstall_plugin(&managed.units.context, &id, true, true)
+        .await
+        .expect("uninstall the plugin");
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert!(
+        managed.unit_files().is_empty(),
+        "{:?}",
+        managed.unit_files()
+    );
+    assert!(managed.loaded().is_empty(), "{:?}", managed.loaded());
+    wait_gone(child);
+    assert!(
+        !managed.units.state_dir(&id).exists(),
+        "the purge removed the state directory"
+    );
 }
 
 /// The value of a variable planted in the service manager's environment.

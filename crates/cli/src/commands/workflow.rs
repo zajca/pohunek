@@ -451,36 +451,10 @@ async fn uninstall(
     remove_modified: bool,
     json: bool,
 ) -> Result<(), CliError> {
-    let mut warnings = Vec::new();
-    // The unit lock spans the record check, the unit removal and the
-    // record removal, because an enabling install of a plugin with
-    // units takes it before it records the plugin. A missing store
-    // root holds no record, but an enabling install can create the
-    // root right after a check, so without `--purge` the id is refused
-    // as unknown here, as an existing store without the record does.
-    // `--purge` also removes state and config directories outside the
-    // store root, so it cannot stop at a missing root; it takes the
-    // lock in creating mode instead.
-    let lock = if purge {
-        store.lock_units_creating()?
-    } else {
-        match store.lock_units()? {
-            Some(lock) => lock,
-            None => {
-                return Err(Error::PluginUnknown {
-                    id: plugin.to_string(),
-                }
-                .into());
-            }
-        }
-    };
-    if store.installed(plugin)?.is_some() {
-        let mut host = Host::resolve_lazily();
-        units::retire(store, &mut host, plugin, remove_modified, &mut warnings).await?;
-    }
-    let removal = store.uninstall(plugin, purge, remove_modified)?;
-    drop(lock);
-    warnings.extend(removal.warnings);
+    // Units stop and their unit record empties before the plugin record goes;
+    // see `units::uninstall` for the lock and the refusals.
+    let mut host = Host::resolve_lazily();
+    let removal = units::uninstall(store, &mut host, plugin, purge, remove_modified).await?;
     let result = Uninstalled {
         plugin: removal.record.as_ref().map(PluginInfo::from),
         purged: removal.purged.is_some(),
@@ -488,7 +462,7 @@ async fn uninstall(
             state_dir: state,
             config_dir: config,
         }),
-        warnings,
+        warnings: removal.warnings,
         state_dir: store.state_dir(plugin),
         config_dir: store.config_dir(plugin),
     };

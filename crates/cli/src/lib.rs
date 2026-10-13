@@ -25,7 +25,9 @@ mod workflow;
 /// directory a test chooses.
 pub mod workflow_units {
     #[doc(inline)]
-    pub use crate::workflow::units::{disable_plugin, enable_plugin, LifecycleError};
+    pub use crate::workflow::units::{
+        disable_plugin, enable_plugin, uninstall_plugin, LifecycleError,
+    };
 }
 
 use std::path::PathBuf;

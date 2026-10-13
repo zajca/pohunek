@@ -155,18 +155,22 @@ pub(crate) fn execute(request: &Request) -> ExitCode {
             let status = run(request, &store, &knobs, &mut interrupts);
             // A service that ran waits its backoff before its next run; a
             // refused one is paced here instead.
-            if status == Status::Refused && request.kind == PluginUnitKind::Service {
-                pace(Some(&knobs), &mut interrupts);
-            }
+            let status = if status == Status::Refused && request.kind == PluginUnitKind::Service {
+                pace(Some(&knobs), &mut interrupts).map_or(status, Status::Stopped)
+            } else {
+                status
+            };
             status.into_exit()
         }
         Err(refusal) => {
             let (error, knobs) = *refusal;
             eprintln!("workflow {unit} of plugin {id} was refused: {error}");
-            if request.kind == PluginUnitKind::Service {
-                pace(knobs.as_ref(), &mut interrupts);
-            }
-            ExitCode::from(REFUSED_EXIT)
+            let status = if request.kind == PluginUnitKind::Service {
+                pace(knobs.as_ref(), &mut interrupts).map_or(Status::Refused, Status::Stopped)
+            } else {
+                Status::Refused
+            };
+            status.into_exit()
         }
     }
 }
@@ -560,10 +564,11 @@ fn wait(delay: Duration, interrupts: &mut Interrupts) -> Option<i32> {
 }
 
 /// Paces a refused service by the owner's longest restart delay, or its
-/// documented default when the knobs could not be read.
-fn pace(knobs: Option<&Knobs>, interrupts: &mut Interrupts) {
+/// documented default when the knobs could not be read. Returns the stop
+/// signal that ended the pacing early, if one arrived.
+fn pace(knobs: Option<&Knobs>, interrupts: &mut Interrupts) -> Option<i32> {
     let delay = knobs.map_or(DEFAULT_RESTART_MAX_MS, |knobs| {
         knobs.services.restart_max_ms
     });
-    let _stopped = wait(Duration::from_millis(delay), interrupts);
+    wait(Duration::from_millis(delay), interrupts)
 }

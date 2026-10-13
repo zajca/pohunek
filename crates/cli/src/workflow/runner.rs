@@ -514,7 +514,27 @@ pub(crate) fn run_supervised(
             id: plugin.to_string(),
         })?;
     match prepare_unit(store, knobs, plugin, unit, &installed, &run.id) {
-        Ok(prepared) => execute(run, store, knobs, &invocation, &prepared, interrupts),
+        Ok(prepared) => {
+            // Verification takes time, and a stop request that arrived during it
+            // must end the run before its child is started.
+            if let Some(signal) = interrupts.poll() {
+                let error = Error::Interrupted {
+                    id: plugin.to_string(),
+                    action: prepared.name.clone(),
+                    signal,
+                };
+                run.append(
+                    &installed,
+                    Some(prepared.name.as_str()),
+                    Outcome::Interrupted,
+                    None,
+                    Some(&error),
+                    [0; 2],
+                );
+                return Err(error);
+            }
+            execute(run, store, knobs, &invocation, &prepared, interrupts)
+        }
         Err((error, name)) => {
             run.append(
                 &installed,

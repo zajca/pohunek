@@ -114,8 +114,9 @@ is created until you repeat the command with `--yes`; until then it fails with
 `consent_required`. `--no-enable` installs the plugin disabled. A plugin with
 jobs or services is enabled as `pohunek workflow enable` enables it (see
 [Jobs and services](#jobs-and-services)); without a `pohunek service`
-installation an enabling install is refused before anything is created
-(`workflow_service_not_installed`), and `--no-enable` still installs it. An
+installation of this pohunek version an enabling install is refused before
+anything is created (`workflow_service_not_installed`), and `--no-enable` still
+installs it. An
 enabling install of a new plugin with units checks the service installation
 and its environment and the `[jobs]` bounds, and takes the unit lifecycle
 lock (`workflow_store_busy` while another enable, disable or uninstall holds
@@ -441,26 +442,35 @@ actions never touch the service manager.
 
 - `enable` verifies the plugin's files, refuses a job whose `every_s` is
   below `jobs.min_interval_s` or whose `timeout_ms` is above
-  `jobs.timeout_max_ms` (`workflow_unit_refused`, nothing changed), marks the
-  plugin enabled, then installs, enables for login and starts every unit. If a
-  unit cannot be installed, every unit is removed again, the plugin is
-  disabled again, and the command fails with `workflow_units_failed`.
+  `jobs.timeout_max_ms` (`workflow_unit_refused`, nothing changed), and
+  refuses an installation recorded for another pohunek version
+  (`workflow_service_not_installed`, nothing changed; its message names both
+  versions). The units run this CLI's trampoline, so `pohunek service install`
+  from this version, or an upgrade of the installation to it, is the
+  recovery. It then marks the plugin enabled, records the names of its units,
+  then installs, enables for login and starts every unit. If a unit cannot be
+  installed, every unit is removed again, the recorded names are forgotten,
+  the plugin is disabled again, and the command fails with
+  `workflow_units_failed`.
   Enabling an enabled plugin replaces its units, which also applies a changed
   `jobs.check_period_s`.
 - `disable` marks the plugin disabled first, so no further run starts, then
   stops every unit (a running job or service is stopped as described in
   [Deadlines, output caps and stopping](#deadlines-output-caps-and-stopping))
-  and removes it. When the plugin's installed files fail verification its
-  units cannot be listed: the plugin is still disabled, a warning says so,
-  and a unit left behind refuses every run (a unit names the archive it was
-  installed for, and the trampoline verifies it first). Recording the
-  installed units, so that such units can be removed too, is planned with
-  the status command (#326).
+  and removes it. The units are the ones the plugin's unit record names and,
+  when its installed files verify, the ones its manifest declares. So a
+  plugin whose installed files fail verification still has its running units
+  stopped and removed, and its record is forgotten once every unit is gone.
+  Only a plugin whose files fail verification and that has no unit record
+  gets a warning instead: no unit can be named, and a unit left behind
+  refuses every run (the trampoline verifies the archive first).
 - `uninstall` first applies its own refusals (`--remove-modified` on files
   that verify fails with `workflow_root_intact`, and so on), which change
   nothing; it then marks the plugin disabled and removes every unit before it
-  removes the plugin. While a unit cannot be removed, for example because the
-  service manager is unreachable, uninstall fails with `workflow_units_failed`
+  removes the plugin. `--remove-modified` therefore stops the units of a
+  plugin whose files were modified, as `disable` does. While a unit cannot be
+  removed, for example because the service manager is unreachable, uninstall
+  fails with `workflow_units_failed`
   (or `workflow_service_not_installed` when the recorded installation is
   unusable) and the plugin stays installed, disabled; repeat it once the
   cause is fixed.
@@ -468,14 +478,19 @@ actions never touch the service manager.
   Without a `pohunek service` installation, `disable` and `uninstall` still
   look for the plugin's units, in the namespace and unit directory a
   `pohunek service install` would record for this user and these roots, and
-  remove them. When that service manager cannot be reached, or has no domain
+  remove them. They accept an installation of any version: removing a unit
+  does not run the trampoline. When that service manager cannot be reached, or has no domain
   for this user (launchd over SSH), they say so in a warning instead of
   failing: a unit left behind refuses every run, because the trampoline needs
   a verified `pohunek service` installation.
 
 All three hold `<state>/pohunek/workflow-plugins/units.lock` for their whole
 run and are safe to repeat; a command that finds it held fails with
-`workflow_store_busy`. A unit's name is
+`workflow_store_busy`. The names of a plugin's units are kept in
+`<state>/pohunek/workflow-plugins/units/<id>.json` from before the first unit
+is installed until every one is removed; the file is deleted when none
+remain. A record that cannot be read or is invalid fails the command with
+`workflow_store_failed`, and never reads as "no units". A unit's name is
 `pohunek-<ns>-wf-<h12>-<j|s>-<name>.service` (plus a `.timer` for a job) on
 systemd and `io.github.zajca.pohunek.<ns>.wf.<h12>.<j|s>.<name>` on launchd,
 where `<h12>` is the first 12 hex characters of SHA-256 over the plugin id,

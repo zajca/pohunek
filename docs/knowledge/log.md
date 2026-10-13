@@ -39,7 +39,18 @@
   failure after that leaves it installed disabled
   (`workflow_installed_disabled`, with the failure's code as `cause`, and
   a message that says whether undoing the failed enable succeeded). A job outside the `[jobs]` bounds is
-  refused at run time too. Run records gain the kinds `job` and
+  refused at run time too.
+- Each plugin with units keeps the names of its units in a unit record under
+  the store root. `disable` and `uninstall` stop and remove the recorded units
+  as well as the manifest's, so a plugin whose installed files fail
+  verification no longer leaves running units behind; `uninstall` refuses to
+  remove the plugin record while units are still recorded.
+- `enable` refuses an installation recorded for another pohunek version
+  (`workflow_service_not_installed`, naming both versions), since its units
+  would run that version's trampoline.
+- A stop request that arrives while the trampoline verifies a unit ends the run
+  before its child starts. A stop request during a refused service's restart
+  pacing ends the trampoline as stopped (exit 0), not as a refusal. Run records gain the kinds `job` and
   `service` and the field `backoff_ms`.
 - New owner knobs `[jobs]` (`timeout_default_ms`, `timeout_max_ms`,
   `min_interval_s`, `check_period_s`) and `[services]`

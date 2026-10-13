@@ -10,29 +10,37 @@
 //! ([`super::supervised`]) decides every run.
 //!
 //! - **Enable** verifies the plugin, refuses a job outside the owner's
-//!   `[jobs]` bounds, marks the plugin enabled, then installs and starts every
-//!   unit. A failure removes every unit again and marks the plugin disabled.
-//!   The registry goes first because a unit starts at once and its
-//!   trampoline refuses to run a disabled plugin.
+//!   `[jobs]` bounds, marks the plugin enabled, records the names of its units
+//!   in the plugin's unit record, then installs and starts every unit. A
+//!   failure removes every unit again, forgets their names and marks the
+//!   plugin disabled. The registry goes first because a unit starts at once
+//!   and its trampoline refuses to run a disabled plugin.
 //! - **Disable** marks the plugin disabled first, so the trampoline refuses
 //!   from then on, then stops and removes every unit.
 //! - **Uninstall** first applies the store's own refusals, then marks the
 //!   plugin disabled and removes every unit before the plugin's record, so a
 //!   later failure leaves a disabled plugin without units.
 //!
+//! Disable and uninstall stop the units named by the unit record and, when
+//! the installed files verify, the units the manifest declares. The record is
+//! what finds the units of a plugin whose files fail verification, so those
+//! units stop too. The record is forgotten only after every one of its units
+//! was removed or reported absent.
+//!
 //! All three hold the store's unit lifecycle lock and are safe to repeat. A
 //! plugin that declares neither jobs nor services never reaches the service
 //! manager, and needs no `pohunek service` installation. Enable requires
-//! one. Disable and uninstall without one still look for the plugin's units
-//! in the namespace and unit directory this process derives, the ones a
+//! one, of this CLI's version, because the units run its trampoline. Disable
+//! and uninstall without one still look for the plugin's units in the
+//! namespace and unit directory this process derives, the ones a
 //! `pohunek service install` would record, because nothing yet stops the
 //! service from being uninstalled while plugin units exist. When that
 //! service manager cannot be reached they warn instead: a unit left behind
-//! refuses every run, since the trampoline needs a verified installation.
-//! Units that cannot be listed, because the installed files fail
-//! verification, are reported as a warning too. An enabling install of a new
-//! plugin checks its [`plan`] first and holds the lock from before the
-//! plugin is recorded until its units run ([`start`]).
+//! refuses every run, since the trampoline needs a verified installation,
+//! and the record is kept. A warning also names units that cannot be found at
+//! all: the installed files fail verification and no unit record exists. An
+//! enabling install of a new plugin checks its [`plan`] first and holds the
+//! lock from before the plugin is recorded until its units run ([`start`]).
 
 // Rust guideline compliant 2026-10-13
 
@@ -53,11 +61,11 @@ use protocol::{PackageDigest, PackageId};
 use super::config::{self, Knobs, MAX_KILL_GRACE_MS, SUPERVISED_MARGIN_MS};
 use super::manifest::{Job, Manifest};
 use super::runner::kind_name;
-use super::store::Store;
+use super::store::{Removal, Store, UnitKind, UnitName};
 use super::Error;
 use crate::paths::WorkflowDirs;
 use crate::service::layout::CLI_NAME;
-use crate::service::{settings, Context};
+use crate::service::{settings, Context, VERSION};
 
 /// Hidden `pohunek workflow` subcommand every unit runs.
 pub(crate) const TRAMPOLINE: &str = "__exec";
@@ -141,6 +149,31 @@ pub(crate) fn require_installation(context: &Context) -> Result<Installation, Er
     })
 }
 
+/// Refuses an installation recorded for another version than this CLI.
+///
+/// The units run `<prefix>/bin/pohunek workflow __exec`, and only the
+/// installed version's trampoline is known to match this CLI. Units installed
+/// for another version could never run, so enabling refuses until the
+/// installation is this version.
+///
+/// # Errors
+///
+/// Returns [`Error::ServiceNotInstalled`] naming both versions and the
+/// recovery.
+fn require_same_version(installation: &Installation) -> Result<(), Error> {
+    let recorded = installation.config.active_version();
+    if recorded == VERSION {
+        return Ok(());
+    }
+    Err(Error::ServiceNotInstalled {
+        reason: format!(
+            "the recorded pohunek service installation is version {recorded}, but this pohunek \
+             is version {VERSION}; install the service from this version with \
+             `pohunek service install`, or upgrade the installation to it"
+        ),
+    })
+}
+
 /// The host facts the unit operations need, resolved only when a plugin
 /// declares units, so actions-only plugins work without them.
 #[derive(Debug)]
@@ -175,19 +208,17 @@ impl Host {
     }
 }
 
-/// The unit keys of every job and service `manifest` declares.
-fn keys(id: &PackageId, manifest: &Manifest) -> Vec<PluginUnitKey> {
-    let jobs = manifest.jobs.keys().map(|name| (PluginUnitKind::Job, name));
-    let services = manifest
-        .services
-        .keys()
-        .map(|name| (PluginUnitKind::Service, name));
-    jobs.chain(services)
-        .map(|(kind, name)| {
-            PluginUnitKey::new(id.as_str(), kind, name.as_str())
-                .expect("manifest names fit the unit name grammar")
-        })
-        .collect()
+/// The names of every job and service `manifest` declares.
+fn manifest_units(manifest: &Manifest) -> Vec<UnitName> {
+    let jobs = manifest.jobs.keys().map(|name| UnitName {
+        kind: UnitKind::Job,
+        name: name.clone(),
+    });
+    let services = manifest.services.keys().map(|name| UnitName {
+        kind: UnitKind::Service,
+        name: name.clone(),
+    });
+    jobs.chain(services).collect()
 }
 
 /// Refuses a job of `manifest` outside the owner's `[jobs]` bounds.
@@ -232,6 +263,14 @@ pub(crate) fn check_job(id: &PackageId, name: &str, job: &Job, knobs: &Knobs) ->
     }
 }
 
+/// A unit of a plan: its record name, platform key and definition.
+#[derive(Debug)]
+struct PlannedUnit {
+    name: UnitName,
+    key: PluginUnitKey,
+    definition: PluginUnitDefinition,
+}
+
 /// Builds every unit definition of `record`'s `manifest`, refusing a job
 /// outside the owner's `[jobs]` bounds before anything changes.
 fn definitions(
@@ -241,7 +280,7 @@ fn definitions(
     installation: &Installation,
     environment: &BTreeMap<String, String>,
     home: &Path,
-) -> Result<Vec<(PluginUnitKey, PluginUnitDefinition)>, Error> {
+) -> Result<Vec<PlannedUnit>, Error> {
     let id = &manifest.identity.id;
     check_bounds(manifest, knobs)?;
     let mut units = Vec::new();
@@ -293,7 +332,14 @@ fn definitions(
                     id: id.to_string(),
                     detail: format!("the {} {name} unit is invalid: {error}", kind_name(kind)),
                 })?;
-            Ok((key, definition))
+            Ok(PlannedUnit {
+                name: UnitName {
+                    kind: UnitKind::of(kind),
+                    name: name.clone(),
+                },
+                key,
+                definition,
+            })
         })
         .collect()
 }
@@ -370,7 +416,14 @@ fn units_failed(id: &PackageId, detail: String) -> Error {
 #[derive(Debug)]
 pub(crate) struct Plan {
     installation: Installation,
-    units: Vec<(PluginUnitKey, PluginUnitDefinition)>,
+    units: Vec<PlannedUnit>,
+}
+
+impl Plan {
+    /// The names of the units, as the unit record lists them.
+    fn names(&self) -> Vec<UnitName> {
+        self.units.iter().map(|unit| unit.name.clone()).collect()
+    }
 }
 
 /// Checks everything installing the units of `manifest` (archive `digest`)
@@ -389,6 +442,7 @@ pub(crate) fn plan(
     knobs: &Knobs,
 ) -> Result<Plan, Error> {
     let installation = require_installation(context)?;
+    require_same_version(&installation)?;
     let environment =
         context
             .service_environment()
@@ -417,9 +471,10 @@ pub(crate) struct StartFailed {
     pub(crate) undone: bool,
 }
 
-/// Marks plugin `id` enabled and installs and starts the units of `plan`,
-/// under the unit lifecycle lock the caller holds. A unit that cannot be
-/// installed removes every unit again and disables the plugin again.
+/// Marks plugin `id` enabled, records the names of the units of `plan`, and
+/// installs and starts those units, under the unit lifecycle lock the caller
+/// holds. A unit that cannot be installed removes every unit again, forgets
+/// their names and disables the plugin again.
 ///
 /// # Errors
 ///
@@ -428,7 +483,8 @@ pub(crate) struct StartFailed {
 /// plugin cannot be marked enabled, [`Error::Busy`], [`Error::RootInvalid`]
 /// and [`Error::PluginUnknown`] change nothing; any other
 /// [`Store::set_enabled`] error may follow a committed flag, so the plugin is
-/// disabled again and `undone` reports whether that succeeded.
+/// disabled again and `undone` reports whether that succeeded. A unit record
+/// that cannot be written is refused before any unit is installed.
 pub(crate) async fn start(
     store: &Store,
     context: &Context,
@@ -456,14 +512,29 @@ pub(crate) async fn start(
             return Err(StartFailed { error, undone });
         }
     };
-    for (key, definition) in &plan.units {
-        if let Err(error) = backend.install(key, definition).await {
-            let mut detail = format!("installing the {key} unit failed: {error}");
+    let names = plan.names();
+    // The names are recorded before the first install, so no installed unit is
+    // missing from the record, even when the process stops in between.
+    if let Err(error) = store.record_units(id, &names) {
+        let undone = store.set_enabled(id, false).is_ok();
+        return Err(StartFailed { error, undone });
+    }
+    for unit in &plan.units {
+        if let Err(error) = backend.install(&unit.key, &unit.definition).await {
+            let mut detail = format!("installing the {} unit failed: {error}", unit.key);
             let mut undone = true;
-            for key in plan.units.iter().map(|(key, _definition)| key) {
+            for key in plan.units.iter().map(|unit| &unit.key) {
                 if let Err(error) = backend.remove(key).await {
                     undone = false;
                     let _ = write!(detail, "; removing the {key} unit failed too: {error}");
+                }
+            }
+            // The record keeps the names when a unit may still exist, so a
+            // later disable or uninstall still stops it.
+            if undone {
+                if let Err(error) = store.forget_units(id, &names) {
+                    undone = false;
+                    let _ = write!(detail, "; the unit record could not be updated: {error}");
                 }
             }
             match store.set_enabled(id, false) {
@@ -515,8 +586,8 @@ pub(crate) async fn enable(
 
 /// Disables plugin `id`, then stops and removes its units.
 ///
-/// Returns the updated record and warnings about units that could not be
-/// listed because the installed files fail verification.
+/// Returns the updated record and warnings about units that cannot be found:
+/// the installed files fail verification and no unit record names any unit.
 ///
 /// # Errors
 ///
@@ -560,12 +631,61 @@ pub(crate) async fn retire(
     remove_units(store, host, id, warnings).await
 }
 
+/// Uninstalls plugin `id` under the unit lifecycle lock: retires its units
+/// when the plugin is recorded, or removes the units its unit record still
+/// names when it is not, then removes the record and, with `purge`, its
+/// directories. The lock is taken in creating mode with `purge`, since
+/// purging removes directories outside the store root.
+///
+/// # Errors
+///
+/// Returns [`Error::PluginUnknown`] when there is no store and no `purge`,
+/// [`Error::Busy`], and the errors of [`retire`] and [`Store::uninstall`].
+pub(crate) async fn uninstall(
+    store: &Store,
+    host: &mut Host,
+    id: &PackageId,
+    purge: bool,
+    remove_modified: bool,
+) -> Result<Removal, Error> {
+    let lock = if purge {
+        Some(store.lock_units_creating()?)
+    } else {
+        store.lock_units()?
+    };
+    let Some(lock) = lock else {
+        return Err(Error::PluginUnknown { id: id.to_string() });
+    };
+    let mut warnings = Vec::new();
+    if store.installed(id)?.is_some() {
+        retire(store, host, id, remove_modified, &mut warnings).await?;
+    } else if !store.recorded_units(id)?.is_empty() {
+        // Units recorded for a plugin that is no longer recorded are still
+        // stopped and removed, so the unit record can always be emptied.
+        remove_units(store, host, id, &mut warnings).await?;
+    }
+    // The unit record goes with the plugin record only once it is empty, so
+    // a unit that is still recorded keeps the plugin recorded too.
+    if !store.recorded_units(id)?.is_empty() {
+        return Err(units_failed(
+            id,
+            "its units are still recorded, so the plugin was kept".to_owned(),
+        ));
+    }
+    let mut removal = store.uninstall(id, purge, remove_modified)?;
+    drop(lock);
+    warnings.append(&mut removal.warnings);
+    removal.warnings = warnings;
+    Ok(removal)
+}
+
 /// Removes the units of plugin `id`, under the unit lifecycle lock the
 /// caller holds.
 ///
-/// The units are looked up in the recorded installation's namespace, or,
-/// without a `service.toml`, in the namespace this process derives (see the
-/// module documentation).
+/// The units are the ones the unit record names and, when the installed files
+/// verify, the ones the manifest declares. They are looked up in the recorded
+/// installation's namespace, or, without a `service.toml`, in the namespace
+/// this process derives (see the module documentation).
 ///
 /// # Errors
 ///
@@ -576,29 +696,36 @@ async fn remove_units(
     id: &PackageId,
     warnings: &mut Vec<String>,
 ) -> Result<(), Error> {
-    let unlisted = match store.inspect(id) {
-        Ok((_record, _root, manifest)) if !manifest.has_units() => return Ok(()),
-        Ok((_record, _root, manifest)) => Ok(manifest),
+    let recorded = store.recorded_units(id)?;
+    // `Ok(None)`: the plugin is not recorded, so only the unit record names
+    // its units.
+    let manifest = match store.inspect(id) {
+        Ok((_record, _root, manifest)) => Ok(Some(manifest)),
+        Err(Error::PluginUnknown { .. }) => Ok(None),
         Err(Error::RootInvalid { cause, .. }) => Err(cause.to_string()),
         Err(Error::DescriptorInvalid(invalid)) => Err(invalid.to_string()),
         Err(error) => return Err(error),
     };
+    let mut names = recorded;
+    if let Ok(Some(manifest)) = &manifest {
+        names.extend(manifest_units(manifest));
+    }
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
+        if let Err(cause) = &manifest {
+            warnings.push(unlisted_warning(cause));
+        }
+        return Ok(());
+    }
     let installation = host
         .context()
-        .and_then(|context| installation_at(context.paths(), context.uid()));
-    let manifest = match (unlisted, installation) {
-        (Err(cause), _) => {
-            warnings.push(unlisted_warning(&cause));
-            return Ok(());
-        }
-        (Ok(_manifest), Err(error)) => return Err(error),
-        (Ok(manifest), Ok(Some(installation))) => {
-            let context = host.context()?;
-            let backend = connect(context, &installation, id).await?;
-            return remove_keys(backend.as_ref(), id, &manifest).await;
-        }
-        (Ok(manifest), Ok(None)) => manifest,
-    };
+        .and_then(|context| installation_at(context.paths(), context.uid()))?;
+    if let Some(installation) = installation {
+        let context = host.context()?;
+        let backend = connect(context, &installation, id).await?;
+        return remove_names(store, backend.as_ref(), id, &names).await;
+    }
     let context = host.context()?;
     let namespace = context
         .namespace()
@@ -621,7 +748,8 @@ async fn remove_units(
         }
     };
     let mut failures = Vec::new();
-    for key in keys(id, &manifest) {
+    for unit in &names {
+        let key = unit.key(id)?;
         match backend.remove(&key).await {
             Ok(()) => {}
             // A manager without this user's domain or bus, such as launchd
@@ -637,37 +765,48 @@ async fn remove_units(
             Err(error) => failures.push(format!("removing the {key} unit failed: {error}")),
         }
     }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(units_failed(id, failures.join("; ")))
-    }
+    finish_removal(store, id, &names, &failures)
 }
 
-/// Removes every unit `manifest` declares through `backend`.
-async fn remove_keys(
+/// Removes every unit of `names` through `backend`, then forgets them.
+async fn remove_names(
+    store: &Store,
     backend: &dyn PluginUnits,
     id: &PackageId,
-    manifest: &Manifest,
+    names: &[UnitName],
 ) -> Result<(), Error> {
     let mut failures = Vec::new();
-    for key in keys(id, manifest) {
+    for unit in names {
+        let key = unit.key(id)?;
         if let Err(error) = backend.remove(&key).await {
             failures.push(format!("removing the {key} unit failed: {error}"));
         }
     }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(units_failed(id, failures.join("; ")))
-    }
+    finish_removal(store, id, names, &failures)
 }
 
-/// The warning for units that could not be listed.
+/// Forgets `names` in the unit record once every one was removed. A failed
+/// removal is reported and keeps the record, so a later removal finds the
+/// units again.
+fn finish_removal(
+    store: &Store,
+    id: &PackageId,
+    names: &[UnitName],
+    failures: &[String],
+) -> Result<(), Error> {
+    if !failures.is_empty() {
+        return Err(units_failed(id, failures.join("; ")));
+    }
+    store.forget_units(id, names)
+}
+
+/// The warning for a plugin whose units cannot be found: its installed files
+/// fail verification and no unit record names any unit.
 fn unlisted_warning(cause: &str) -> String {
     format!(
         "the plugin's jobs and services could not be listed because its installed files \
-         fail verification ({cause}); a unit left behind refuses every run"
+         fail verification ({cause}) and no unit record names them; a unit left behind \
+         refuses every run"
     )
 }
 
@@ -713,16 +852,46 @@ pub async fn enable_plugin(context: &Context, plugin: &str) -> Result<(), Lifecy
 
 /// Disables workflow plugin `plugin` of `context`'s installation and removes
 /// its units from `context`'s unit directory, exactly as
-/// `pohunek workflow disable` does for the context it resolves.
+/// `pohunek workflow disable` does for the context it resolves. Returns the
+/// warnings the command prints.
 ///
 /// # Errors
 ///
 /// Returns the code and message `pohunek workflow disable` reports.
-pub async fn disable_plugin(context: &Context, plugin: &str) -> Result<(), LifecycleError> {
+pub async fn disable_plugin(
+    context: &Context,
+    plugin: &str,
+) -> Result<Vec<String>, LifecycleError> {
     let id = parse_id(plugin)?;
     let store = store_of(context)?;
-    disable(&store, &mut Host::given(context.clone()), &id).await?;
-    Ok(())
+    let (_record, warnings) = disable(&store, &mut Host::given(context.clone()), &id).await?;
+    Ok(warnings)
+}
+
+/// Uninstalls workflow plugin `plugin` of `context`'s installation, exactly as
+/// `pohunek workflow uninstall` does for the context it resolves. Returns the
+/// warnings the command prints.
+///
+/// # Errors
+///
+/// Returns the code and message `pohunek workflow uninstall` reports.
+pub async fn uninstall_plugin(
+    context: &Context,
+    plugin: &str,
+    purge: bool,
+    remove_modified: bool,
+) -> Result<Vec<String>, LifecycleError> {
+    let id = parse_id(plugin)?;
+    let store = store_of(context)?;
+    let removal = uninstall(
+        &store,
+        &mut Host::given(context.clone()),
+        &id,
+        purge,
+        remove_modified,
+    )
+    .await?;
+    Ok(removal.warnings)
 }
 
 fn parse_id(plugin: &str) -> Result<PackageId, LifecycleError> {
