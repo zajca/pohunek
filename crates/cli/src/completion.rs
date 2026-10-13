@@ -2,9 +2,11 @@
 //!
 //! Static scripts are generated entirely from the clap command tree. Dynamic
 //! scripts register clap's environment completer, which augments `--host` and
-//! session-target arguments with bounded live lookups. Completion failures are
-//! deliberately silent: pressing Tab must never turn a missing daemon, stale
-//! mesh state, or invalid local environment into shell noise.
+//! session-target arguments with bounded live lookups, and workflow plugin ids
+//! and actions with bounded reads of the local workflow plugin store.
+//! Completion failures are deliberately silent: pressing Tab must never turn a
+//! missing daemon, stale mesh state, an unusable store, or invalid local
+//! environment into shell noise.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -14,17 +16,21 @@ use std::iter;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use clap::{Command, CommandFactory, ValueEnum};
 use clap_complete::engine::ValueCompleter;
 use clap_complete::{ArgValueCompleter, CompleteEnv, CompletionCandidate};
+use package::registry::PackageRecord;
 use pohunek_client::{Client, ClientOptions};
 use protocol::{HostRecord, PackageId, PackageInfo, SessionInfo, SessionListParams};
 use serde::Serialize;
 
 use crate::error::CliError;
 use crate::paths::Paths;
+use crate::target::is_local_host;
+use crate::workflow::store::Store;
 use crate::{Cli, LOCAL_HOST};
 
 /// Environment variable used by clap's dynamic completion protocol.
@@ -215,11 +221,30 @@ const PACKAGE_DIGEST_PREFIX: &str = "sha256:";
 /// Flags of `pohunek plugin` whose next word is a value, never a package id.
 const PLUGIN_VALUE_FLAGS: [&str; 4] = ["--digest", "--version", "--sha256", "--catalog"];
 
+/// Flags valid at every command level whose next word is their value.
+const GLOBAL_VALUE_FLAGS: [&str; 1] = ["--host"];
+
+/// Name of the `pohunek workflow` command group.
+const WORKFLOW_COMMAND: &str = "workflow";
+
+/// Name of `pohunek workflow run`, the only workflow subcommand with an action.
+const WORKFLOW_RUN: &str = "run";
+
+/// Ids of the plugin and action arguments of the `pohunek workflow` commands.
+const WORKFLOW_PLUGIN_ARG: &str = "plugin";
+const WORKFLOW_ACTION_ARG: &str = "action";
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct CompletionContext {
     explicit_host: Option<String>,
     /// Package id already typed on the `pohunek plugin` line being completed.
     plugin_package: Option<String>,
+    /// Plugin id already typed on the `pohunek workflow run` line being
+    /// completed.
+    workflow_plugin: Option<String>,
+    /// The last `--host` value names a host other than this machine, by the
+    /// rule `pohunek workflow` refuses with `workflow_local_only`.
+    remote_host: bool,
 }
 
 /// Completes the `<PACKAGE>` argument of `pohunek plugin` with installed ids.
@@ -297,6 +322,74 @@ impl ValueCompleter for ProfileNameCompleter {
     }
 }
 
+/// Completes the `<PLUGIN>` argument of `pohunek workflow` with the ids of the
+/// installed workflow plugins.
+///
+/// Reads only the store's registry record, through the same lock-free read
+/// `workflow list` uses; it creates, locks and writes nothing. A line with a
+/// remote `--host` offers nothing, since the command refuses it.
+#[derive(Clone, Copy, Debug)]
+struct WorkflowPluginCompleter {
+    /// Offer only enabled plugins: `workflow run` refuses a disabled one.
+    enabled_only: bool,
+    remote_host: bool,
+}
+
+impl ValueCompleter for WorkflowPluginCompleter {
+    fn complete(&self, current: &OsStr) -> Vec<CompletionCandidate> {
+        let Some(current) = current.to_str().filter(|_| !self.remote_host) else {
+            return Vec::new();
+        };
+        let current = current.to_owned();
+        let enabled_only = self.enabled_only;
+        run_blocking_bounded(move || {
+            let records = workflow_store()?.list().ok()?;
+            Some(workflow_plugin_candidates(&records, enabled_only, &current))
+        })
+        .unwrap_or_default()
+    }
+}
+
+/// Completes the `<ACTION>` argument of `pohunek workflow run` with the actions
+/// of the plugin already typed.
+///
+/// The actions come from the installed manifest after the plugin's files
+/// verify, the check `workflow run` makes, so a plugin whose files changed
+/// after install offers none. A disabled plugin, or a line with a remote
+/// `--host`, offers none either.
+#[derive(Clone, Debug)]
+struct WorkflowActionCompleter {
+    plugin: Option<String>,
+    remote_host: bool,
+}
+
+impl ValueCompleter for WorkflowActionCompleter {
+    fn complete(&self, current: &OsStr) -> Vec<CompletionCandidate> {
+        if self.remote_host {
+            return Vec::new();
+        }
+        let (Some(current), Some(plugin)) = (current.to_str(), self.plugin.as_deref()) else {
+            return Vec::new();
+        };
+        let Ok(plugin) = PackageId::parse(plugin) else {
+            return Vec::new();
+        };
+        let current = current.to_owned();
+        run_blocking_bounded(move || {
+            let (record, _root, manifest) = workflow_store()?.inspect(&plugin).ok()?;
+            record.enabled().then(|| {
+                manifest
+                    .actions
+                    .keys()
+                    .filter(|name| name.starts_with(&current))
+                    .map(CompletionCandidate::new)
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct HostCompleter;
 
@@ -340,6 +433,9 @@ impl CompletionContext {
 
     fn from_words(words: &[OsString]) -> Self {
         let mut explicit_host = None;
+        // The raw last `--host` value; a non-UTF-8 value is kept lossily, so it
+        // never reads as the local host.
+        let mut last_host: Option<String> = None;
         let mut index = 1;
         while index < words.len() {
             let word = words[index].to_string_lossy();
@@ -348,7 +444,11 @@ impl CompletionContext {
             }
             if let Some(host) = word.strip_prefix("--host=") {
                 explicit_host = valid_host(host).then(|| host.to_owned());
+                last_host = Some(host.to_owned());
             } else if word == "--host" {
+                if let Some(value) = words.get(index + 1) {
+                    last_host = Some(value.to_string_lossy().into_owned());
+                }
                 if let Some(host) = words.get(index + 1).and_then(|value| value.to_str()) {
                     explicit_host = valid_host(host).then(|| host.to_owned());
                     index += 1;
@@ -359,7 +459,40 @@ impl CompletionContext {
         Self {
             explicit_host,
             plugin_package: plugin_package_from_words(words),
+            workflow_plugin: workflow_plugin_from_words(words),
+            remote_host: last_host.is_some_and(|host| !is_local_host(&host)),
         }
+    }
+}
+
+/// The plugin id typed after `pohunek workflow run`, if any.
+///
+/// Positional words are counted after skipping flags and the values of global
+/// value flags, so `--host <name>` anywhere on the line is not mistaken for a
+/// command. A miss only means no action candidates.
+fn workflow_plugin_from_words(words: &[OsString]) -> Option<String> {
+    let mut positional = Vec::new();
+    let mut rest = words.iter().skip(1).filter_map(|word| word.to_str());
+    while let Some(word) = rest.next() {
+        if word == "--" {
+            break;
+        }
+        if GLOBAL_VALUE_FLAGS.contains(&word) {
+            rest.next();
+        } else if !word.starts_with('-') {
+            positional.push(word);
+            // `workflow run <plugin>` is all that is matched below; later
+            // words are the action and its arguments.
+            if positional.len() == 3 {
+                break;
+            }
+        }
+    }
+    match positional.as_slice() {
+        [WORKFLOW_COMMAND, WORKFLOW_RUN, plugin] => {
+            PackageId::parse(plugin).ok().map(|id| id.to_string())
+        }
+        _ => None,
     }
 }
 
@@ -391,6 +524,7 @@ fn plugin_package_from_words(words: &[OsString]) -> Option<String> {
 fn dynamic_command(context: CompletionContext) -> Command {
     let host_context = context.clone();
     let plugin_context = context.clone();
+    let workflow_context = context.clone();
     let target_context = context;
     Cli::command()
         .mut_arg("host", |arg| arg.add(ArgValueCompleter::new(HostCompleter)))
@@ -401,6 +535,11 @@ fn dynamic_command(context: CompletionContext) -> Command {
         .mut_subcommand("plugin", move |command| {
             command.mut_subcommands(move |subcommand| {
                 with_plugin_completers(subcommand, &plugin_context)
+            })
+        })
+        .mut_subcommand(WORKFLOW_COMMAND, move |command| {
+            command.mut_subcommands(move |subcommand| {
+                with_workflow_completers(subcommand, &workflow_context)
             })
         })
         .mut_subcommand("integration", |command| {
@@ -443,6 +582,23 @@ fn with_plugin_completers(command: Command, context: &CompletionContext) -> Comm
             _ => arg,
         })
         .mut_subcommands(move |subcommand| with_plugin_completers(subcommand, &nested))
+}
+
+/// Adds the plugin and action completers to one `pohunek workflow` subcommand,
+/// keyed on argument ids so a subcommand without them is left unchanged.
+fn with_workflow_completers(command: Command, context: &CompletionContext) -> Command {
+    let enabled_only = command.get_name() == WORKFLOW_RUN;
+    command.mut_args(|arg| match arg.get_id().as_str() {
+        WORKFLOW_PLUGIN_ARG => arg.add(ArgValueCompleter::new(WorkflowPluginCompleter {
+            enabled_only,
+            remote_host: context.remote_host,
+        })),
+        WORKFLOW_ACTION_ARG => arg.add(ArgValueCompleter::new(WorkflowActionCompleter {
+            plugin: context.workflow_plugin.clone(),
+            remote_host: context.remote_host,
+        })),
+        _ => arg,
+    })
 }
 
 fn with_target_completer(command: Command, context: &CompletionContext) -> Command {
@@ -637,6 +793,38 @@ fn package_digest_candidates(
     candidates
 }
 
+/// The workflow plugin store of this user; `None` when its paths cannot be
+/// resolved.
+fn workflow_store() -> Option<Store> {
+    Paths::workflow_dirs().ok().map(Store::new)
+}
+
+/// Plugin id candidates, sorted, each with its version and whether it is
+/// disabled as help.
+fn workflow_plugin_candidates(
+    records: &[PackageRecord],
+    enabled_only: bool,
+    current: &str,
+) -> Vec<CompletionCandidate> {
+    let mut candidates: Vec<_> = records
+        .iter()
+        .filter(|record| record.enabled() || !enabled_only)
+        .filter(|record| record.identity().id.as_str().starts_with(current))
+        .map(|record| {
+            let identity = record.identity();
+            let help = if record.enabled() {
+                identity.version.to_string()
+            } else {
+                format!("{} (disabled)", identity.version)
+            };
+            CompletionCandidate::new(identity.id.as_str()).help(Some(help.into()))
+        })
+        .collect();
+    candidates.sort_by(|left, right| left.get_value().cmp(right.get_value()));
+    candidates.dedup_by(|left, right| left.get_value() == right.get_value());
+    candidates
+}
+
 fn host_names(records: &[HostRecord]) -> Vec<String> {
     let mut hosts = completion_hosts(records)
         .into_iter()
@@ -724,6 +912,29 @@ fn valid_session_id(value: &str) -> bool {
             .any(|character| character.is_control() || character.is_whitespace())
 }
 
+/// Runs blocking filesystem work of a completer on its own thread and waits at
+/// most [`COMPLETION_DEADLINE`] for its result.
+///
+/// A blocking read cannot be cancelled, so work still running at the deadline
+/// is left on its thread; the completion process exits once clap has printed
+/// the candidates, which ends it. Store reads write nothing, so abandoning one
+/// leaves no partial state.
+fn run_blocking_bounded<F, T>(work: F) -> Option<T>
+where
+    F: FnOnce() -> Option<T> + Send + 'static,
+    T: Send + 'static,
+{
+    // One slot, so the worker's send never blocks after the caller gave up.
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .spawn(move || {
+            // The receiver is gone when the deadline passed; nothing waits.
+            drop(sender.send(work()));
+        })
+        .ok()?;
+    receiver.recv_timeout(COMPLETION_DEADLINE).ok().flatten()
+}
+
 fn run_bounded<F, T>(future: F) -> Option<T>
 where
     F: Future<Output = Option<T>> + Send + 'static,
@@ -779,7 +990,8 @@ mod tests {
             CompletionContext::from_words(&words),
             CompletionContext {
                 explicit_host: Some("host-b".to_owned()),
-                plugin_package: None,
+                remote_host: true,
+                ..CompletionContext::default()
             }
         );
     }
@@ -789,7 +1001,10 @@ mod tests {
         let words = ["pohunek", "--host", "../peer"].map(OsString::from);
         assert_eq!(
             CompletionContext::from_words(&words),
-            CompletionContext::default()
+            CompletionContext {
+                remote_host: true,
+                ..CompletionContext::default()
+            }
         );
     }
 
@@ -797,7 +1012,7 @@ mod tests {
     fn qualified_target_overrides_selected_host() {
         let context = CompletionContext {
             explicit_host: Some("host-a".to_owned()),
-            plugin_package: None,
+            ..CompletionContext::default()
         };
         assert_eq!(
             target_scope("host-b/s-4", &context),

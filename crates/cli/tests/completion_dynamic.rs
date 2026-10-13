@@ -9,14 +9,17 @@
 //! The lookup deadline is covered on virtual time by the in-process daemon
 //! scenarios; this file covers what only a process shows: the candidates the
 //! installed command tree offers, the exit status, and that nothing is printed
-//! besides candidates.
+//! besides candidates. Workflow plugin scenarios install real archives with
+//! `pohunek workflow install` and complete them from the on-disk store.
 
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 
+use package::{build_archive, read_archive, ArchiveEntry, Limits, PackageDigest};
 use pohunek_test_support::env::TestEnv;
 
 #[cfg(unix)]
@@ -403,4 +406,352 @@ fn session_wait_until_completes_turn_kinds_in_a_comma_list() {
         );
         assert_eq!(String::from_utf8_lossy(&output.stderr), "", "{words:?}");
     }
+}
+
+/// Damage a scenario does to the installed store of `env`; the digest names
+/// the installed plugin.
+type StoreDamage = fn(&TestEnv, &PackageDigest);
+
+/// Store root of the workflow plugins of `env`.
+fn workflow_store(env: &TestEnv) -> PathBuf {
+    env.state_home().join("pohunek/workflow-plugins")
+}
+
+/// A valid workflow plugin manifest of `id` declaring `actions`, each running
+/// the archive's `bin/tool`.
+fn workflow_manifest(id: &str, actions: &[&str]) -> String {
+    let mut document = format!(
+        "schema = 1\n\n[plugin]\nid = \"{id}\"\nversion = \"1.0.0\"\ndescription = \"Completion fixture\"\n"
+    );
+    for action in actions {
+        write!(
+            document,
+            "\n[actions.{action}]\nargv = [\"bin/tool\", \"{action}\"]\n"
+        )
+        .expect("format into a String");
+    }
+    document
+}
+
+/// Builds a workflow plugin archive of `id` with `actions`, installs it with
+/// `pohunek workflow install --yes` (plus `extra`), and returns its digest.
+fn install_workflow(env: &TestEnv, id: &str, actions: &[&str], extra: &[&str]) -> PackageDigest {
+    let files = [
+        ArchiveEntry {
+            path: "bin/tool".to_owned(),
+            contents: b"#!/bin/sh\nexit 0\n".to_vec(),
+            executable: true,
+        },
+        ArchiveEntry {
+            path: "workflow.toml".to_owned(),
+            contents: workflow_manifest(id, actions).into_bytes(),
+            executable: false,
+        },
+    ];
+    let bytes = build_archive(&files, &Limits::DEFAULT).expect("the archive builds");
+    let digest = read_archive(&bytes, &Limits::DEFAULT)
+        .expect("the archive reads")
+        .digest()
+        .clone();
+    let archive = env.root().join(format!("{id}.tar.zst"));
+    fs::write(&archive, bytes).expect("write the archive");
+    let output = env
+        .command(pohunek_test_support::bin_exe("pohunek"))
+        .args(["workflow", "install"])
+        .arg(&archive)
+        .args(["--sha256", digest.as_str(), "--yes", "--json"])
+        .args(extra)
+        .output()
+        .expect("run workflow install");
+    assert!(output.status.success(), "install {id}: {output:?}");
+    digest
+}
+
+/// Runs a bash completion request that must succeed silently on stderr and
+/// returns its value candidates, one per line.
+///
+/// Flags clap offers beside the values for an empty word are dropped: no
+/// plugin id or action name starts with `-`.
+fn candidates(env: &TestEnv, words: &[&str]) -> Vec<String> {
+    let output = complete_bash(env, words);
+    assert!(output.status.success(), "{words:?}: {output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "",
+        "{words:?} printed an error"
+    );
+    String::from_utf8(output.stdout)
+        .expect("UTF-8 candidates")
+        .lines()
+        .filter(|line| !line.starts_with('-'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Every entry below `dir` with its mode and size, so a scenario can show a
+/// completion request changed nothing in the workflow store.
+#[cfg(unix)]
+fn tree(dir: &std::path::Path) -> Vec<(PathBuf, u32, u64)> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        let metadata = fs::symlink_metadata(&next).expect("stat a store entry");
+        found.push((next.clone(), metadata.permissions().mode(), metadata.len()));
+        if metadata.is_dir() {
+            pending.extend(
+                fs::read_dir(&next)
+                    .expect("list a store directory")
+                    .map(|entry| entry.expect("store entry").path()),
+            );
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Workflow plugin commands that name an installed plugin complete its id from
+/// the store; `run` offers only enabled plugins, since it refuses disabled ones.
+#[cfg(unix)]
+#[test]
+fn workflow_plugin_ids_complete_from_the_installed_store() {
+    let env = TestEnv::new().expect("private completion environment");
+    install_workflow(&env, "acme.work", &["overview", "sync"], &[]);
+    install_workflow(&env, "acme.lint", &["check"], &[]);
+    install_workflow(&env, "acme.paused", &["report"], &["--no-enable"]);
+    install_workflow(&env, "other.tool", &["build"], &[]);
+    let store = tree(&workflow_store(&env));
+
+    for subcommand in ["inspect", "enable", "disable", "uninstall"] {
+        assert_eq!(
+            candidates(&env, &["pohunek", "workflow", subcommand, "acme."]),
+            ["acme.lint", "acme.paused", "acme.work"],
+            "{subcommand}"
+        );
+    }
+    assert_eq!(
+        candidates(&env, &["pohunek", "workflow", "run", "acme."]),
+        ["acme.lint", "acme.work"],
+        "run offers only enabled plugins"
+    );
+    assert_eq!(
+        candidates(&env, &["pohunek", "workflow", "inspect", "acme.w"]),
+        ["acme.work"]
+    );
+    assert_eq!(
+        candidates(
+            &env,
+            &["pohunek", "--host", "local", "workflow", "run", "o"]
+        ),
+        ["other.tool"]
+    );
+    assert!(candidates(&env, &["pohunek", "workflow", "inspect", "zzz"]).is_empty());
+    // Workflow commands refuse a remote `--host` with `workflow_local_only`,
+    // so a line naming one offers no local plugin.
+    for words in [
+        ["pohunek", "--host", "build-box", "workflow", "run", "o"].as_slice(),
+        [
+            "pohunek",
+            "--host=build-box",
+            "workflow",
+            "inspect",
+            "acme.",
+        ]
+        .as_slice(),
+        [
+            "pohunek",
+            "workflow",
+            "enable",
+            "--host",
+            "build-box",
+            "acme.",
+        ]
+        .as_slice(),
+    ] {
+        assert!(candidates(&env, words).is_empty(), "{words:?}");
+    }
+    assert_eq!(
+        tree(&workflow_store(&env)),
+        store,
+        "completion changed the store"
+    );
+}
+
+/// `workflow run <plugin> <action>` completes the actions the typed plugin's
+/// installed manifest declares, and none for a plugin `run` would refuse.
+#[cfg(unix)]
+#[test]
+fn workflow_run_completes_the_actions_of_the_typed_plugin() {
+    let env = TestEnv::new().expect("private completion environment");
+    install_workflow(&env, "acme.work", &["overview", "sync", "status"], &[]);
+    install_workflow(&env, "acme.lint", &["check"], &[]);
+    install_workflow(&env, "acme.paused", &["report"], &["--no-enable"]);
+    let store = tree(&workflow_store(&env));
+
+    assert_eq!(
+        candidates(&env, &["pohunek", "workflow", "run", "acme.work", ""]),
+        ["overview", "status", "sync"]
+    );
+    assert_eq!(
+        candidates(&env, &["pohunek", "workflow", "run", "acme.work", "s"]),
+        ["status", "sync"]
+    );
+    assert_eq!(
+        candidates(&env, &["pohunek", "workflow", "run", "acme.lint", ""]),
+        ["check"]
+    );
+    assert_eq!(
+        candidates(
+            &env,
+            &[
+                "pohunek",
+                "--host",
+                "local",
+                "workflow",
+                "run",
+                "acme.lint",
+                "c"
+            ]
+        ),
+        ["check"]
+    );
+    for words in [
+        // `workflow_local_only` refuses a remote `--host`.
+        [
+            "pohunek",
+            "--host",
+            "build-box",
+            "workflow",
+            "run",
+            "acme.lint",
+            "",
+        ]
+        .as_slice(),
+        ["pohunek", "workflow", "run", "acme.paused", ""].as_slice(),
+        ["pohunek", "workflow", "run", "acme.unknown", ""].as_slice(),
+        ["pohunek", "workflow", "run", "Not/AnId", ""].as_slice(),
+    ] {
+        assert!(candidates(&env, words).is_empty(), "{words:?}");
+    }
+    assert_eq!(
+        tree(&workflow_store(&env)),
+        store,
+        "completion changed the store"
+    );
+}
+
+/// A missing, corrupt, unsafe or tampered store completes nothing it cannot
+/// trust, prints nothing, exits successfully, and is left as found.
+#[cfg(unix)]
+#[test]
+fn workflow_completion_over_a_missing_or_unusable_store_is_silent() {
+    let ids = ["pohunek", "workflow", "inspect", ""];
+    let actions = ["pohunek", "workflow", "run", "acme.work", ""];
+
+    let env = TestEnv::new().expect("private completion environment");
+    assert!(candidates(&env, &ids).is_empty());
+    assert!(candidates(&env, &actions).is_empty());
+    assert!(
+        !env.state_home().join("pohunek").exists(),
+        "completion created the store"
+    );
+
+    // Each case starts from a store whose plugin completes, so its empty
+    // output comes from the damage, not from the setup.
+    let damaged: [(&str, StoreDamage); 3] = [
+        ("corrupt registry", |env, _digest| {
+            fs::write(workflow_store(env).join("registry.json"), b"{ not json")
+                .expect("corrupt the registry");
+        }),
+        ("unsafe store root", |env, _digest| {
+            fs::set_permissions(workflow_store(env), fs::Permissions::from_mode(0o755))
+                .expect("widen the store root");
+        }),
+        ("tampered manifest", |env, digest| {
+            let hex = digest.as_str().trim_start_matches("sha256:");
+            fs::write(
+                workflow_store(env)
+                    .join("packages")
+                    .join(hex)
+                    .join("files/workflow.toml"),
+                workflow_manifest("acme.work", &["overview", "injected"]),
+            )
+            .expect("tamper with the installed manifest");
+        }),
+    ];
+    for (case, damage) in damaged {
+        let env = TestEnv::new().expect("private completion environment");
+        let digest = install_workflow(&env, "acme.work", &["overview"], &[]);
+        assert_eq!(candidates(&env, &ids), ["acme.work"], "{case}");
+        assert_eq!(candidates(&env, &actions), ["overview"], "{case}");
+
+        damage(&env, &digest);
+        let store = tree(&workflow_store(&env));
+        let found = candidates(&env, &actions);
+        assert!(found.is_empty(), "{case} offered actions {found:?}");
+        if case == "tampered manifest" {
+            // The registry still lists the plugin; only its files are refused.
+            assert_eq!(candidates(&env, &ids), ["acme.work"], "{case}");
+        } else {
+            assert!(candidates(&env, &ids).is_empty(), "{case}");
+        }
+        assert_eq!(
+            tree(&workflow_store(&env)),
+            store,
+            "{case} changed the store"
+        );
+    }
+}
+
+/// Generating or installing a completion script reads no workflow store: the
+/// script carries no installed plugin id or action, and an absent store stays
+/// absent.
+#[cfg(unix)]
+#[test]
+fn completion_scripts_do_no_workflow_store_io() {
+    let command = |env: &TestEnv, arguments: &[&str]| {
+        let output = env
+            .command(pohunek_test_support::bin_exe("pohunek"))
+            .args(arguments)
+            .output()
+            .expect("run pohunek");
+        assert!(output.status.success(), "{arguments:?}: {output:?}");
+        assert!(output.stderr.is_empty(), "{arguments:?}: {output:?}");
+        String::from_utf8(output.stdout).expect("UTF-8 output")
+    };
+
+    let env = TestEnv::new().expect("private completion environment");
+    install_workflow(&env, "acme.probeplugin", &["probeaction"], &[]);
+    // Positive control: the dynamic completer does see the installed plugin.
+    assert_eq!(
+        candidates(&env, &["pohunek", "workflow", "run", "acme.probe"]),
+        ["acme.probeplugin"]
+    );
+    let store = tree(&workflow_store(&env));
+    for shell in ["bash", "zsh", "fish"] {
+        for arguments in [
+            ["completions", shell].as_slice(),
+            ["completions", shell, "--dynamic"].as_slice(),
+        ] {
+            let script = command(&env, arguments);
+            for installed in ["probeplugin", "probeaction"] {
+                assert!(!script.contains(installed), "{arguments:?} has {installed}");
+            }
+        }
+    }
+    assert_eq!(
+        tree(&workflow_store(&env)),
+        store,
+        "a script read changed the store"
+    );
+
+    let env = TestEnv::new().expect("private completion environment");
+    for shell in ["bash", "zsh", "fish"] {
+        command(&env, &["completions", shell]);
+        command(&env, &["setup", "completions", shell]);
+        command(&env, &["setup", "completions", shell, "--dynamic"]);
+    }
+    assert!(
+        !workflow_store(&env).exists(),
+        "script generation created the workflow store"
+    );
 }
