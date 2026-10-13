@@ -309,7 +309,10 @@ async fn the_shell_is_never_claimable_even_through_a_catalog() {
         .await
         .expect_err("the shell");
 
-    assert_eq!(refused, PackageErrorKind::RuntimeNotClaimable);
+    // A catalog that names the shell fails verification, so the archive it
+    // lists is never decoded.
+    assert_eq!(refused, PackageErrorKind::Untrusted);
+    assert!(!fixture.root(&package.digest).exists());
     assert!(is_builtin(&fixture, RuntimeId::SHELL));
 }
 
