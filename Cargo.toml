@@ -85,7 +85,7 @@ sha1 = "0.10"
 # Pure-Rust zstd codec: the package archive builder and reader stay C-free so MUSL
 # release builds need no C toolchain, and the encoder output is pinned by the
 # exact version so the canonical archive bytes stay reproducible.
-ruzstd = "=0.9.0"
+ruzstd = "=0.9.1"
 thiserror = "2"
 toml = "0.8"
 toml_edit = "0.22"
