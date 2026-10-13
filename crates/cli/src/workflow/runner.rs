@@ -220,6 +220,9 @@ pub(crate) struct Run {
     arg_count: usize,
     /// The restart delay a service run waited, for its record.
     pub(crate) backoff_ms: Option<u64>,
+    /// How long the started child ran, from its spawn until it ended; `None`
+    /// when no child was started.
+    pub(crate) child_lifetime: Option<Duration>,
 }
 
 impl Run {
@@ -250,6 +253,7 @@ impl Run {
             started: Instant::now(),
             arg_count,
             backoff_ms: None,
+            child_lifetime: None,
         })
     }
 
@@ -807,6 +811,7 @@ fn execute(
             received.is_some()
         },
     );
+    run.child_lifetime = Some(now.elapsed());
     // A signal while the output drains ends the drain and makes the run
     // `interrupted`, as it does while the child runs.
     let mut stop = || {

@@ -320,7 +320,6 @@ fn run(request: &Request, store: &Store, knobs: &Knobs, interrupts: &mut Interru
         Ok(Ready::Skip(status)) => return status,
         Err(error) => return refuse(&mut run, &error),
     };
-    let started = Instant::now();
     let result = run_supervised(&mut run, store, knobs, id, &unit, interrupts);
     let status = match &result {
         Ok(Completed::Exited(status)) => Status::Ran(crate::service::exit_code(*status)),
@@ -333,8 +332,11 @@ fn run(request: &Request, store: &Store, knobs: &Knobs, interrupts: &mut Interru
     if let Err(error) = &result {
         eprintln!("workflow {kind} {} of plugin {id}: {error}", request.name);
     }
+    // Stability is the child's own lifetime: preparing the run and draining
+    // its output do not count, and a run that never started a child is short.
     if let (Some(failures), Status::Ran(_)) = (backoff, status) {
-        save_backoff(request, knobs, &state, failures, started.elapsed());
+        let ran = run.child_lifetime.unwrap_or(Duration::ZERO);
+        save_backoff(request, knobs, &state, failures, ran);
     }
     status
 }

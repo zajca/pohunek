@@ -703,6 +703,10 @@ async fn remove_units(
     warnings: &mut Vec<String>,
 ) -> Result<(), Error> {
     let recorded = store.recorded_units(id)?;
+    // Units are recorded before they are installed, so recorded units may be
+    // running: their removal must be confirmed. Units only the manifest names
+    // were never installed by this record's lifecycle.
+    let confirm = !recorded.is_empty();
     // `Ok(None)`: the plugin is not recorded, so only the unit record names
     // its units.
     let manifest = match store.inspect(id) {
@@ -745,9 +749,20 @@ async fn remove_units(
              left behind refuses every run"
         )
     };
+    let unconfirmed = |cause: &dyn std::fmt::Display| {
+        units_failed(
+            id,
+            format!(
+                "no pohunek service installation is recorded and the service manager could \
+                 not be reached ({cause}), so the recorded units were not removed and stay \
+                 recorded"
+            ),
+        )
+    };
     let backend = match connect_namespace(context, namespace, settings::LAUNCHCTL_COMMAND, id).await
     {
         Ok(backend) => backend,
+        Err(error) if confirm => return Err(unconfirmed(&error)),
         Err(error) => {
             warnings.push(unreachable(&error));
             return Ok(());
@@ -765,6 +780,9 @@ async fn remove_units(
                 | supervisor::Error::Unavailable { .. }
                 | supervisor::Error::Timeout { .. }),
             ) => {
+                if confirm {
+                    return Err(unconfirmed(&error));
+                }
                 warnings.push(unreachable(&error));
                 return Ok(());
             }

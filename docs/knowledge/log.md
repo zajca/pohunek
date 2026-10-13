@@ -75,6 +75,13 @@
   (`/private/tmp/pohunek-<uid>`), and leaves it out of the run's environment;
   before, every run of such an installation was refused after
   `launchctl setenv XDG_RUNTIME_DIR`.
+- A service's restart backoff counts the child's own lifetime, from its spawn
+  until it ends, so verification and output draining never make an
+  immediately failing service look stable; a run that started no child is
+  short.
+- Without a recorded `pohunek service` installation, `disable` and `uninstall`
+  fail with `workflow_units_failed` and keep the unit record when the service
+  manager cannot be reached while units are recorded.
 - Known limit on macOS: when `__exec` itself is killed with `SIGKILL`, the
   run's process group can survive the unit; a later start can run alongside it
   and `disable` and `uninstall` do not find it. The guide documents it; a

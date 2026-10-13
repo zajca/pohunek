@@ -3139,9 +3139,10 @@ Every `--json` result is one standard CLI process envelope. The `ok` payloads:
 - `list`: `{plugins: [plugin...]}`.
 - `enable` and `disable`: the updated `plugin`, plus `warnings` from
   `disable` when it could not list the units of a plugin whose files fail
-  verification, or when no `pohunek service` installation is recorded and
-  the service manager could not be reached to look for leftover units. Each
-  warning says so; a unit left behind refuses every run.
+  verification and no unit record names any unit, or when no `pohunek service`
+  installation is recorded, no unit is recorded, and the service manager could
+  not be reached to look for leftover units. Each warning says so; a unit left
+  behind refuses every run.
 - `inspect`: `{plugin, description, files_dir, state_dir, config_dir,
   actions: [{name, argv, args, timeout_ms?, max_output_bytes?}],
   jobs?: [{name, argv, every_s, timeout_ms?}], services?: [{name, argv}]}`.
@@ -3205,7 +3206,7 @@ CLI envelope, not to the protocol's error type:
 | `workflow_output_invalid` | `runtime` | `run --json` only: the action exited 0, but its stdout is empty, not JSON (including arrays and objects nested deeper than 126 levels, so the envelope stays within the 127 levels serde_json's default parser accepts), ends inside its document, or has data after it. |
 | `workflow_service_not_installed` | `configuration` | The plugin declares jobs or services, and no verified `pohunek service` installation (its `service.toml` and `<prefix>/bin/pohunek`) describes this process, or the installation records another pohunek version than this CLI, whose units would run a trampoline this CLI cannot vouch for; the message names both versions and the recovery (`pohunek service install` from this version, or an upgrade to it). `enable` and an enabling `install` change nothing; a `disable` or `uninstall` has already marked the plugin disabled when its recorded installation turns out to be unusable, and the plugin stays installed disabled. `disable` and `uninstall` accept an installation of any version. |
 | `workflow_unit_refused` | `configuration` | A job's `every_s` is below `jobs.min_interval_s` or its `timeout_ms` above `jobs.timeout_max_ms`; nothing was changed or run. |
-| `workflow_units_failed` | `runtime` | The service manager did not install or remove a unit. After a failed enable every unit was removed and the plugin disabled again; after a failed disable the plugin stays disabled; a failed uninstall keeps the plugin installed, disabled. An uninstall whose unit record still names units keeps the plugin record too. |
+| `workflow_units_failed` | `runtime` | The service manager did not install or remove a unit. After a failed enable every unit was removed and the plugin disabled again; after a failed disable the plugin stays disabled; a failed uninstall keeps the plugin installed, disabled. Without a recorded `pohunek service` installation, a disable or uninstall that cannot reach the service manager while units are recorded fails this way and keeps the unit record. An uninstall whose unit record still names units keeps the plugin record too. |
 | `workflow_installed_disabled` | `runtime` | `install --yes` only: the new plugin was recorded, but a step after that failed: reaching the service manager (`cause` `workflow_units_failed`), marking the plugin enabled (`workflow_store_busy` while another workflow command holds the store lock, `workflow_root_invalid`, or `workflow_store_failed`; for a failure that may have written the flag, the plugin is disabled again first), or installing a unit (`workflow_units_failed`). `cause` is that failure's code. When every step was undone the plugin stays installed disabled with no units and the message says so: fix the cause, then run `pohunek workflow enable <id>`. When undoing the failed step failed too (a unit install, or clearing a flag that may have been written), the message says the plugin may remain enabled or keep units: run `pohunek workflow disable <id>` until it succeeds, then `pohunek workflow enable <id>`. Every check that can refuse an enabling install, and the unit lifecycle lock, come before the record is written. |
 | `workflow_unit_stale` | `runtime` | A unit names another archive than the installed one; it was refused and recorded. |
 | `workflow_unit_unknown` | `configuration` | The installed manifest declares no job or service of the unit's name; nothing was run. |

@@ -479,10 +479,11 @@ actions never touch the service manager.
   look for the plugin's units, in the namespace and unit directory a
   `pohunek service install` would record for this user and these roots, and
   remove them. They accept an installation of any version: removing a unit
-  does not run the trampoline. When that service manager cannot be reached, or has no domain
-  for this user (launchd over SSH), they say so in a warning instead of
-  failing: a unit left behind refuses every run, because the trampoline needs
-  a verified `pohunek service` installation.
+  does not run the trampoline. When that service manager cannot be reached, or
+  has no domain for this user (launchd over SSH), while the unit record names
+  units, they fail with `workflow_units_failed` and keep the record: those
+  units may be running, and marking the plugin disabled does not stop a
+  running service. With no recorded units they say so in a warning instead.
 
 All three hold `<state>/pohunek/workflow-plugins/units.lock` for their whole
 run and are safe to repeat; a command that finds it held fails with

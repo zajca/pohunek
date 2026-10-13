@@ -760,10 +760,11 @@ fn record_size_service(index: usize) -> String {
 }
 
 /// A unit record that lists as many units as a large manifest declares is
-/// read: disabling the plugin reads its record and keeps it, with a warning,
-/// because no service manager is reachable. The hermetic environment has no
-/// session bus, and the installation's `service.toml` is removed so the
-/// namespace this process derives is the one looked up.
+/// read, and recorded units whose removal cannot be confirmed fail the
+/// disable: no service manager is reachable, so the units may still run, and
+/// the record is kept. The hermetic environment has no session bus, and the
+/// installation's `service.toml` is removed so the namespace this process
+/// derives is the one looked up.
 #[test]
 fn a_unit_record_of_a_large_manifest_is_read() {
     let names: Vec<String> = (0..RECORD_SIZE_SERVICES).map(record_size_service).collect();
@@ -803,16 +804,24 @@ fn a_unit_record_of_a_large_manifest_is_read() {
         .expect("run pohunek workflow disable");
     assert_eq!(
         output.status.code(),
-        Some(0),
+        Some(1),
         "{}",
         workflow_units::describe(&output)
     );
     let document: Value = serde_json::from_slice(&output.stdout).expect("a JSON envelope");
-    assert_eq!(document["ok"]["enabled"], false, "{document}");
-    let warnings = document["ok"]["warnings"].to_string();
-    assert!(
-        warnings.contains("no pohunek service installation is recorded"),
+    assert_eq!(
+        document["err"]["code"], "workflow_units_failed",
         "{document}"
+    );
+    let message = document["err"]["msg"].as_str().expect("a message");
+    assert!(
+        message.contains("the recorded units were not removed and stay recorded"),
+        "{document}"
+    );
+    assert_eq!(
+        units.listed()[0]["enabled"],
+        false,
+        "the plugin is disabled"
     );
     assert!(
         record_path.exists(),
