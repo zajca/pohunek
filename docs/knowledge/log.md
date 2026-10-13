@@ -127,6 +127,19 @@
   and `disable` and `uninstall` do not find it. The guide documents it; a
   reconcile mechanism is a follow-up.
 
+## Unreleased (2026-10-13, identity sequences ordered per process, #879)
+
+- The worker orders identity claims and releases per reported process (pid and
+  kernel start identity): a report must be newer than every claim and release
+  accepted for that same process, and reports of different processes are never
+  compared. A descendant's report of its own process, even at
+  `sequence = u64::MAX`, no longer makes the launch root's later reports stale,
+  so the root still establishes the launch identity and updates its native
+  reference. Across processes the latest accepted claim is the active identity.
+- `docs/public-api.md`, the runtime packages guide and the sessions concept
+  state the per-process order; the sequence contract is a value strictly
+  increasing across every hook event that reports the same process.
+
 ## Unreleased (2026-10-13, workflow run --json and verbatim arguments, #325)
 
 - `pohunek workflow run [--json] <plugin> <action> [<args>...]`: every

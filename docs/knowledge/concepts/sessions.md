@@ -1197,11 +1197,15 @@ launch process and sequence for the worker's active identity), a stale or
 refused one leaves the stored reference alone, and an assigned value never
 replaces a reported one, also across a daemon restart. Sequences are compared per
 transport (worker claim or public report) and per runtime generation, so one
-clock never makes the other stale. Inside the worker, the claims of every
-reporter in a session share one ordering, so the shipped Codex and Claude hooks
-stamp their worker claims from the system-wide monotonic clock in nanoseconds
-(`CLOCK_MONOTONIC`) and a nested agent's claim never makes the launch agent's
-later claim stale. A recovered
+clock never makes the other stale. Inside the worker, identity claims and
+releases are ordered per reported process (pid and kernel start identity): a
+report must be newer than every claim and release accepted for that same
+process, and reports of different processes are never compared, so a nested
+agent's claim, even at `u64::MAX`, never makes the launch agent's later claim
+stale. Across processes the latest accepted claim is the active identity. Each
+hook event runs a fresh interpreter for the same agent process, so the shipped
+Codex and Claude hooks stamp their worker claims from the system-wide
+monotonic clock in nanoseconds (`CLOCK_MONOTONIC`). A recovered
 generation's first claim supersedes the reference it was relaunched with. The worker journals the latest
 reference of the verified launch process apart from the active claim's lease, so
 a switch made while the daemon was down survives the lease, and every

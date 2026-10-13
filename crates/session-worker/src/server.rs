@@ -156,6 +156,17 @@ const AGENTLESS_TASK_TYPES: &[&str] = &["shell", "monitor", "MCP task"];
 /// next snapshot and settle at the earliest on the one after it, so the bound
 /// trades a few dozen bytes against that delay.
 const SNAPSHOT_REPORTER_CAPACITY: usize = 16;
+/// Most reporting processes whose newest identity claim or release sequence
+/// is remembered.
+///
+/// Identity reports are ordered per process, so each reporter needs its own
+/// mark. A session meets few agent processes, but a descendant can fork any
+/// number of reporters, so the least recently accepted one is forgotten
+/// beyond this bound. Only that process's own older report, delivered late,
+/// can then be admitted again; the journaled active identity, release, and
+/// launch reference keep the marks of their processes regardless. The bound
+/// keeps the table to a few hundred bytes; raising it only narrows that window.
+const IDENTITY_REPORTER_CAPACITY: usize = 16;
 /// Maximum script bytes read and hashed while freezing and rechecking a launch
 /// entrypoint.
 ///
@@ -637,6 +648,8 @@ struct State {
     /// Unjournaled evidence about journaled subagents that subagent snapshots
     /// reconcile against.
     subagent_evidence: SubagentEvidence,
+    /// Newest identity sequence of each recently reporting process.
+    identity_marks: IdentityMarks,
 }
 
 impl State {
@@ -656,6 +669,7 @@ impl State {
             journal,
             orphan_stops: OrphanStops::default(),
             subagent_evidence: SubagentEvidence::default(),
+            identity_marks: IdentityMarks::default(),
         }
     }
 }
@@ -3784,7 +3798,16 @@ where
                     start_identity,
                     root_identity.pid,
                 ) && root_report_from_root(&shared, peer, pid, &root_identity);
-                let sequence_valid = identity_sequence_is_fresh(&state.journal, sequence);
+                let reporting = Reporter {
+                    pid,
+                    start_identity,
+                };
+                let sequence_valid = identity_sequence_is_fresh(
+                    &state.journal,
+                    &state.identity_marks,
+                    reporting,
+                    sequence,
+                );
                 // The background snapshot follows its reporting process, so an
                 // admitted, process-valid report clears it even when the identity
                 // rules below refuse the report.
@@ -3878,6 +3901,7 @@ where
                     journal.updated_at = timestamp();
                     persist(shared.journal.clone(), journal.clone()).await?;
                     state.journal = journal;
+                    state.identity_marks.record(reporting, sequence);
                     if let Some(reason) = background_cleared {
                         log_background_cleared(&shared, reason);
                     }
@@ -3940,21 +3964,24 @@ where
                         .is_some_and(|owner| {
                             owner.pid == pid && owner.start_identity == start_identity.to_string()
                         });
-                let released_process = if process_valid {
+                let reporting = Reporter {
+                    pid,
+                    start_identity,
+                };
+                let fresh = process_valid
+                    && identity_sequence_is_fresh(
+                        &state.journal,
+                        &state.identity_marks,
+                        reporting,
+                        sequence,
+                    );
+                let released_process = if fresh {
                     state
                         .journal
                         .active_identity
                         .as_ref()
                         .filter(|active| {
-                            active.provider == provider
-                                && active.process.pid == pid
-                                && active.process.start_identity == start_identity.to_string()
-                                && sequence > active.sequence
-                                && state
-                                    .journal
-                                    .active_identity_release
-                                    .as_ref()
-                                    .is_none_or(|release| sequence > release.sequence)
+                            active.provider == provider && is_reporter(&active.process, reporting)
                         })
                         .map(|active| active.process.clone())
                 } else {
@@ -3973,23 +4000,30 @@ where
                     journal.updated_at = timestamp();
                     persist(shared.journal.clone(), journal.clone()).await?;
                     state.journal = journal;
+                    state.identity_marks.record(reporting, sequence);
                     if background_cleared {
                         log_background_cleared(&shared, "release");
                     }
                     (true, false, current_runtime, None)
-                } else if owner_released {
-                    // The identity release was not accepted, for example after a
-                    // `clear` release whose session start never arrived. The owner
-                    // still ends its snapshot.
-                    let mut journal = state.journal.clone();
-                    if background::clear_at(&mut journal, sequence) {
-                        journal.updated_at = timestamp();
-                        persist(shared.journal.clone(), journal.clone()).await?;
-                        state.journal = journal;
-                        log_background_cleared(&shared, "release");
-                    }
-                    (false, false, current_runtime, None)
                 } else {
+                    // A fresh release of a process that is not active ends no
+                    // identity, but it still makes that process's earlier claims
+                    // stale when they are delivered after it.
+                    if fresh {
+                        state.identity_marks.record(reporting, sequence);
+                    }
+                    if owner_released {
+                        // The identity release was not accepted, for example after a
+                        // `clear` release whose session start never arrived. The owner
+                        // still ends its snapshot.
+                        let mut journal = state.journal.clone();
+                        if background::clear_at(&mut journal, sequence) {
+                            journal.updated_at = timestamp();
+                            persist(shared.journal.clone(), journal.clone()).await?;
+                            state.journal = journal;
+                            log_background_cleared(&shared, "release");
+                        }
+                    }
                     (false, false, current_runtime, None)
                 }
             }
@@ -5502,11 +5536,50 @@ impl OrphanStops {
     }
 }
 
-/// The agent process that reported a subagent claim.
+/// The agent process that reported a hook claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Reporter {
     pid: u32,
     start_identity: u64,
+}
+
+/// Newest identity claim or release sequence of each recently reporting
+/// process, for at most [`IDENTITY_REPORTER_CAPACITY`] processes.
+///
+/// The marks are kept in worker memory only: a worker process bootstraps its
+/// own journal and serves one runtime, so they never need to outlive it.
+#[derive(Debug, Default)]
+struct IdentityMarks {
+    /// `(reporter, sequence)`, least recently accepted first.
+    marks: VecDeque<(Reporter, u64)>,
+}
+
+impl IdentityMarks {
+    /// Newest accepted sequence of `reporter`, if remembered.
+    fn get(&self, reporter: Reporter) -> Option<u64> {
+        self.marks
+            .iter()
+            .find(|(process, _)| *process == reporter)
+            .map(|(_, sequence)| *sequence)
+    }
+
+    /// Remembers an accepted claim or release of `reporter` at `sequence`.
+    ///
+    /// The reporter becomes the most recent one, keeping its greatest
+    /// sequence; the least recent is forgotten beyond the bound.
+    fn record(&mut self, reporter: Reporter, sequence: u64) {
+        let position = self
+            .marks
+            .iter()
+            .position(|(process, _)| *process == reporter);
+        let latest = position
+            .and_then(|index| self.marks.remove(index))
+            .map_or(sequence, |(_, recorded)| recorded.max(sequence));
+        if self.marks.len() >= IDENTITY_REPORTER_CAPACITY {
+            self.marks.pop_front();
+        }
+        self.marks.push_back((reporter, latest));
+    }
 }
 
 /// Unjournaled evidence about one journaled subagent.
@@ -6094,16 +6167,50 @@ const fn wire_subagent_phase(phase: JournalSubagentPhase) -> WireSubagentPhase {
     }
 }
 
-fn identity_sequence_is_fresh(journal: &JournalRecord, sequence: u64) -> bool {
-    let active_is_fresh = journal
-        .active_identity
-        .as_ref()
-        .is_none_or(|active| sequence > active.sequence);
-    active_is_fresh
-        && journal
+/// Whether an identity claim or release of `reporter` at `sequence` is newer
+/// than every earlier accepted claim and release of that same process.
+///
+/// Reports of different processes are never ordered against each other, so no
+/// process's sequence can make another process's report stale; the latest
+/// accepted claim is the active identity. The process's mark is the remembered
+/// one together with the journaled active identity, release, and launch
+/// reference of that process, which outlive the bounded memory.
+fn identity_sequence_is_fresh(
+    journal: &JournalRecord,
+    marks: &IdentityMarks,
+    reporter: Reporter,
+    sequence: u64,
+) -> bool {
+    let journaled = [
+        journal
+            .active_identity
+            .as_ref()
+            .map(|active| (&active.process, active.sequence)),
+        journal
             .active_identity_release
             .as_ref()
-            .is_none_or(|release| sequence > release.sequence)
+            .map(|release| (&release.process, release.sequence)),
+        journal
+            .native_reference_claim
+            .as_ref()
+            .map(|reference| (&reference.process, reference.sequence)),
+    ];
+    marks
+        .get(reporter)
+        .into_iter()
+        .chain(
+            journaled
+                .into_iter()
+                .flatten()
+                .filter(|(process, _)| is_reporter(process, reporter))
+                .map(|(_, mark)| mark),
+        )
+        .all(|mark| sequence > mark)
+}
+
+/// Whether the journaled `process` is the process `reporter`.
+fn is_reporter(process: &ChildIdentity, reporter: Reporter) -> bool {
+    process.pid == reporter.pid && process.start_identity == reporter.start_identity.to_string()
 }
 
 fn valid_identity_expiry(value: &str) -> bool {
@@ -7180,8 +7287,8 @@ mod tests {
         validate_observation_request, validate_terminal_snapshot_dimensions,
         validate_terminal_snapshot_response, write_data_error, write_observation_page,
         write_output_chunks, write_runtime_output_event, write_terminal_chunks, Connection,
-        ControlInputId, DataGrant, ObservationGrant, ObservationWaitOutcome, PrefixStream,
-        TokenState, WireTerminalSnapshot, ATTACH_INPUT_PREFIX,
+        ControlInputId, DataGrant, IdentityMarks, ObservationGrant, ObservationWaitOutcome,
+        PrefixStream, Reporter, TokenState, WireTerminalSnapshot, ATTACH_INPUT_PREFIX,
     };
     use pohunek_worker_protocol::{
         self as protocol, AttachStart, Capability, ControlCode, ControlError, ControlMessage,
@@ -8100,9 +8207,14 @@ mod tests {
             sequence: 8,
         });
 
-        assert!(!identity_sequence_is_fresh(&journal, 7));
-        assert!(!identity_sequence_is_fresh(&journal, 8));
-        assert!(identity_sequence_is_fresh(&journal, 9));
+        let marks = IdentityMarks::default();
+        let released = Reporter {
+            pid: 11,
+            start_identity: 110,
+        };
+        assert!(!identity_sequence_is_fresh(&journal, &marks, released, 7));
+        assert!(!identity_sequence_is_fresh(&journal, &marks, released, 8));
+        assert!(identity_sequence_is_fresh(&journal, &marks, released, 9));
     }
 
     // Needs a descendant that keeps the PTY open after the root exits. Darwin

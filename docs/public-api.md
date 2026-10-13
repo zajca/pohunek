@@ -992,17 +992,27 @@ imported identities, the provider set, the field set and the outcomes (a
 failed or cancelled subagent needs the `outcome` field) to the imported
 subagents, and the nested-provider rule to identities and releases. The
 sequence order itself is checked by the worker only, because the inspect
-snapshot carries no claim sequence for subagents. The worker orders the
-identity claims and releases of all reporting processes of a session by one
-sequence: a claim or release must be newer than the session's latest accepted
-claim and release. The sequence contract of a worker claim is therefore the
-host's system-wide monotonic clock in nanoseconds (`CLOCK_MONOTONIC`), strictly
-increasing within the reporting process. Every hook event runs its own
-short-lived interpreter, so the shipped Codex and Claude hooks read the clock
-with Python's `time.clock_gettime_ns(time.CLOCK_MONOTONIC)` rather than
+snapshot carries no claim sequence for subagents. The worker orders identity
+claims and releases per reported process (its pid and kernel start identity):
+a claim or release must be newer than every claim and release the worker
+accepted for that same process, and reports naming different processes are
+never compared, so a report naming one process, even at `u64::MAX`, cannot
+make a report naming another process stale. A hook reaches the worker as a
+descendant of the agent it reports, so under `NamedForProvider` a descendant's
+report naming an ancestor is that ancestor's report and is ordered with it;
+under `FrozenRootEntrypoint` only the root itself may name the root. Across
+processes the latest accepted claim, in arrival order at the worker, is the
+active identity, and the worker's imported active claim carries that process's
+own sequence, which can be lower than the previous import's. The launch
+process's native reference is ordered only by reports naming the launch
+process. The sequence contract of a worker
+claim is therefore a value strictly increasing across every hook event that
+reports the same process. Every hook event runs its own short-lived
+interpreter, so the shipped Codex and Claude hooks read the host's system-wide
+monotonic clock in nanoseconds (`CLOCK_MONOTONIC`) with Python's
+`time.clock_gettime_ns(time.CLOCK_MONOTONIC)` rather than
 `time.monotonic_ns()`, which is defined only within one process (Apple's
-Python 3.9 on macOS counts it from interpreter start); a nested agent's claim
-therefore never makes the launch agent's later claim stale. The Hermes reporter
+Python 3.9 on macOS counts it from interpreter start). The Hermes reporter
 stamps its claims in its long-lived plugin process from `time.monotonic_ns()`,
 kept strictly increasing by a counter. The launch-process rule decides which process may
 set the launch identity, and the worker alone applies it; the daemon holds an
