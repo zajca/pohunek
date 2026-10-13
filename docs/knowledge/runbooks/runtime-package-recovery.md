@@ -223,6 +223,18 @@ Run `pohunek plugin profile list` (implemented in
   command to run:
   `pohunek plugin profile migrate <name>` previews the pin and changes nothing
   until it is repeated with `--yes`.
+- `package_not_installed`: the profile pins nothing and no installed package
+  serves its base, which is not the built-in `shell`, so launches fail with
+  `runtime_not_installed`. Install the package the detail names (for `codex`,
+  `claude` or `hermes` the official package from the release archive), then
+  pin the profile with `pohunek plugin profile migrate <name> --yes`.
+- `package_unavailable`: no installed package serves the base, but an
+  installed one that may serve it cannot be loaded. The migration refuses a
+  faulted package (`package_profile_target_invalid`), and the repair depends
+  on the fault: a missing root is restored by reinstalling the same archive,
+  a modified one refuses that reinstall (`package_root_invalid`). Run
+  `pohunek plugin doctor` and repair the package it names as section 1
+  describes, then migrate the profile.
 - `pin_not_installed`: the pinned digest is not installed. Reinstall that
   exact archive, or pin the profile to an installed version with
   `pohunek plugin profile migrate <name> --digest <digest> --yes`.
@@ -244,6 +256,7 @@ again.
 
 1. `pohunek plugin doctor` prints `No problems found` and exits with status 0.
 2. `pohunek plugin profile list` shows no profile in `needs_migration`,
-   `pin_not_installed` or `unreadable`.
+   `package_not_installed`, `package_unavailable`, `pin_not_installed` or
+   `unreadable`.
 3. `pohunek host inspect local --json` lists the runtime as installed and
    supported; a profile whose pin cannot resolve is reported unavailable there.
