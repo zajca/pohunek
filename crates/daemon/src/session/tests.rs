@@ -10300,69 +10300,202 @@ async fn procwatch_rebinds_restart_to_new_observed_pid() {
     let _ = registry.stop(&created.id).await;
 }
 
-/// A native-id report accepted while the session runs, whose commit comes
-/// after an exit committed the terminal state: the report is not recorded and
-/// never replaces the terminal record, so the store holds what the registry
-/// shows.
+/// A resumable session whose agent exits with code 3 on its first input line,
+/// and a native-id report of it parked at one point of its commit.
+struct NativeIdExitRace {
+    registry: SessionRegistry,
+    store_path: PathBuf,
+    id: SessionId,
+    /// Receives every event from before the report on.
+    events: tokio::sync::broadcast::Receiver<Event>,
+    /// Settles the session after the assertions on `events`.
+    settle_events: tokio::sync::broadcast::Receiver<Event>,
+    held: crate::runtime::lifecycle::tests::StartGate,
+    reporting: tokio::task::JoinHandle<protocol::SessionReportNativeIdResult>,
+}
+
+impl NativeIdExitRace {
+    /// Starts the report of `native_session_id` and waits until it is parked
+    /// at `at`.
+    async fn start(tag: &str, at: super::NativeIdHold, native_session_id: &str) -> Self {
+        let store_path = temp_store_path(tag);
+        let agents_dir = temp_agents_dir_with(
+            tag,
+            "resumable",
+            "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"read line; exit 3\"]\n",
+        );
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: hermetic_shell(),
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store_path.clone()),
+            agents_dir: Some(agents_dir),
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry
+            .create(resumable_params())
+            .await
+            .expect("create session");
+        let events = registry.subscribe();
+        let settle_events = registry.subscribe();
+        let report = native_report!(&registry;
+            session_id: created.id.clone(),
+            agent: "claude".to_owned(),
+            native_session_id: native_session_id.to_owned(),
+            transcript_path: None,
+        );
+        let held = registry.hold_next_native_id(&created.id, at);
+        let reporting = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.report_native_id(report).await }
+        });
+        held.entered.notified().await;
+        Self {
+            registry,
+            store_path,
+            id: created.id,
+            events,
+            settle_events,
+            held,
+            reporting,
+        }
+    }
+
+    /// Sends the input line that ends the agent, from its own task: a report
+    /// parked inside its commit holds the sessions lock the input needs.
+    fn end_agent(&self) -> tokio::task::JoinHandle<Result<(), protocol::ProtocolError>> {
+        let registry = self.registry.clone();
+        let id = self.id.clone();
+        tokio::spawn(async move { registry.write_input_to_session(&id, "go").await })
+    }
+
+    /// Releases the report and returns its result.
+    async fn release(&mut self) -> protocol::SessionReportNativeIdResult {
+        self.held.release.notify_one();
+        (&mut self.reporting).await.expect("report task joins")
+    }
+
+    /// Waits until no task of the registry remains, then asserts that the
+    /// store holds the agent's terminal outcome exactly as the registry
+    /// shows it, and returns that record.
+    async fn assert_settled_terminal(&mut self) -> crate::store::SessionRecord {
+        stop_settled(&self.registry, &mut self.settle_events, &self.id).await;
+        let record = stored_record(&self.store_path, &self.id);
+        assert_eq!(record.info.state, SessionState::Failed);
+        assert_eq!(record.info.exit_code, Some(3));
+        assert_eq!(record.runtime.state, RuntimeState::Terminal);
+        let memory = self
+            .registry
+            .inspect(&self.id)
+            .await
+            .expect("inspect session");
+        assert_eq!(
+            record.info, memory,
+            "the store holds what the registry shows"
+        );
+        record
+    }
+}
+
+/// A native-id report validated while the session runs, whose commit comes
+/// after an exit committed the terminal state: the report is refused and
+/// never replaces the terminal record.
 #[tokio::test]
-async fn native_id_report_never_overwrites_an_exit_that_committed_first() {
-    let store_path = temp_store_path("native-id-exit-race");
-    let agents_dir = temp_agents_dir_with(
-        "native-id-exit-race",
-        "resumable",
-        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"read line; exit 3\"]\n",
-    );
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: hermetic_shell(),
-        stop_grace: Duration::from_millis(50),
-        store_path: Some(store_path.clone()),
-        agents_dir: Some(agents_dir),
-        ..SessionRegistryConfig::default()
-    });
-    let created = registry
-        .create(resumable_params())
+async fn native_id_report_is_refused_once_an_exit_committed() {
+    let mut race = NativeIdExitRace::start(
+        "native-id-refused-after-exit",
+        super::NativeIdHold::Validated,
+        "native-before-exit",
+    )
+    .await;
+    race.end_agent()
         .await
-        .expect("create session");
-    let mut events = registry.subscribe();
-    let mut settle_events = registry.subscribe();
-    let report = native_report!(&registry;
-        session_id: created.id.clone(),
-        agent: "claude".to_owned(),
-        native_session_id: "native-before-exit".to_owned(),
-        transcript_path: None,
-    );
-    let held = registry.hold_next_native_id_commit(&created.id);
-    let reporting = tokio::spawn({
-        let registry = registry.clone();
-        async move { registry.report_native_id(report).await }
-    });
-    // The report has validated its runtime and process against the live worker.
-    held.entered.notified().await;
-    registry
-        .write_input_to_session(&created.id, "go")
-        .await
+        .expect("input task joins")
         .expect("the input ends the agent");
-    exit_settled(&mut events, &created.id).await;
+    exit_settled(&mut race.events, &race.id).await;
 
-    held.release.notify_one();
-    let reported = reporting.await.expect("report task joins");
-    stop_settled(&registry, &mut settle_events, &created.id).await;
+    let reported = race.release().await;
 
-    let record = stored_record(&store_path, &created.id);
-    assert_eq!(record.info.state, SessionState::Failed);
-    assert_eq!(record.info.exit_code, Some(3));
-    assert_eq!(record.runtime.state, RuntimeState::Terminal);
-    let memory = registry
-        .inspect(&created.id)
-        .await
-        .expect("inspect session");
-    assert_eq!(
-        record.info, memory,
-        "the store holds what the registry shows"
-    );
+    let record = race.assert_settled_terminal().await;
     assert!(
         !reported.recorded,
-        "a report committing after the exit is ignored"
+        "a report committing after the exit is refused"
+    );
+    assert_eq!(record.info.native_session_id, None);
+}
+
+/// An exit that ends the agent while a native-id report is inside its commit:
+/// no reader sees the report before it is durable, the exit commits after it,
+/// and the terminal record carries the reported reference.
+#[tokio::test]
+async fn exit_during_a_native_id_commit_keeps_the_reported_reference() {
+    let mut race = NativeIdExitRace::start(
+        "native-id-exit-in-commit",
+        super::NativeIdHold::Write,
+        "native-in-commit",
+    )
+    .await;
+    assert!(
+        futures::FutureExt::now_or_never(race.registry.inspect(&race.id)).is_none(),
+        "the updated entry is not observable before its record is durable"
+    );
+    let ending = race.end_agent();
+
+    let reported = race.release().await;
+    ending
+        .await
+        .expect("input task joins")
+        .expect("the input ends the agent");
+    exit_settled(&mut race.events, &race.id).await;
+
+    let record = race.assert_settled_terminal().await;
+    assert!(reported.recorded, "the report committed before the exit");
+    assert_eq!(
+        record.info.native_session_id.as_deref(),
+        Some("native-in-commit"),
+        "the terminal record carries the reported reference"
+    );
+}
+
+/// An exit that commits between a native-id report's commit and its
+/// announcement: the report stays recorded, and no `session_updated` of the
+/// session follows its terminal event.
+#[tokio::test]
+async fn native_id_report_is_not_announced_once_the_session_ended() {
+    let mut race = NativeIdExitRace::start(
+        "native-id-announce-after-exit",
+        super::NativeIdHold::Announce,
+        "native-before-announce",
+    )
+    .await;
+    race.end_agent()
+        .await
+        .expect("input task joins")
+        .expect("the input ends the agent");
+    exit_settled(&mut race.events, &race.id).await;
+
+    let reported = race.release().await;
+
+    assert!(reported.recorded, "the report committed before the exit");
+    // The report has returned, so every event it sends is queued.
+    loop {
+        match race.events.try_recv() {
+            Ok(event) => {
+                let session = &event.payload()["session"]["id"];
+                assert!(
+                    !(event.event() == protocol::event::SESSION_UPDATED
+                        && *session == serde_json::json!(race.id.0)),
+                    "no session_updated follows the terminal event: {event:?}"
+                );
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(error) => panic!("the event receiver keeps up: {error}"),
+        }
+    }
+    let record = race.assert_settled_terminal().await;
+    assert_eq!(
+        record.info.native_session_id.as_deref(),
+        Some("native-before-announce"),
+        "the terminal record carries the reported reference"
     );
 }
 

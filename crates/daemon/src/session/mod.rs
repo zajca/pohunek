@@ -640,9 +640,10 @@ struct SessionRegistryInner {
     /// intent commit.
     #[cfg(test)]
     stop_intent_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
-    /// Holds the next accepted native-id report before its commit.
+    /// Holds the next native-id report at the named point of its commit.
     #[cfg(test)]
-    native_id_commit_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    native_id_hold:
+        std::sync::Mutex<Option<(NativeIdHold, crate::runtime::lifecycle::tests::StartGate)>>,
     /// Holds the next create between its delivered input and the commit.
     #[cfg(test)]
     initial_input_commit_hold:
@@ -1016,6 +1017,19 @@ impl RuntimeWatchIdentity {
                 && runtime.runtime_generation == self.generation
         })
     }
+}
+
+/// A point of a native-id report where a test can hold it.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeIdHold {
+    /// Validated against its worker, before its commit.
+    Validated,
+    /// Inside its commit, with the entry updated and the sessions lock held,
+    /// before the durable write.
+    Write,
+    /// Committed, before it is announced.
+    Announce,
 }
 
 /// Outcome of [`SessionRegistry::commit_intent`].
@@ -1758,7 +1772,7 @@ impl SessionRegistry {
                 #[cfg(test)]
                 stop_intent_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
-                native_id_commit_hold: std::sync::Mutex::new(None),
+                native_id_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 initial_input_commit_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
@@ -2459,12 +2473,13 @@ impl SessionRegistry {
         }
     }
 
-    /// Arms a hold that parks the next accepted native-id report of session
-    /// `id` before its commit.
+    /// Arms a hold that parks the next native-id report of session `id` at
+    /// `at`.
     #[cfg(test)]
-    pub(crate) fn hold_next_native_id_commit(
+    pub(crate) fn hold_next_native_id(
         &self,
         id: &SessionId,
+        at: NativeIdHold,
     ) -> crate::runtime::lifecycle::tests::StartGate {
         let gate = crate::runtime::lifecycle::tests::StartGate {
             session_id: Some(id.0.clone()),
@@ -2473,23 +2488,24 @@ impl SessionRegistry {
         };
         *self
             .inner
-            .native_id_commit_hold
+            .native_id_hold
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate.clone());
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((at, gate.clone()));
         gate
     }
 
-    /// Parks an accepted native-id report before its commit when a test
-    /// armed the hold.
+    /// Parks a native-id report at `at` when a test armed the hold there.
     #[cfg(test)]
-    async fn hold_native_id_commit(&self, id: &SessionId) {
-        let gate = self
+    async fn park_native_id(&self, id: &SessionId, at: NativeIdHold) {
+        let held = self
             .inner
-            .native_id_commit_hold
+            .native_id_hold
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take_if(|gate| gate.session_id.as_deref().is_none_or(|held| held == id.0));
-        if let Some(gate) = gate {
+            .take_if(|(point, gate)| {
+                *point == at && gate.session_id.as_deref().is_none_or(|held| held == id.0)
+            });
+        if let Some((_, gate)) = held {
             gate.entered.notify_one();
             gate.release.notified().await;
         }
@@ -3061,7 +3077,7 @@ impl SessionRegistry {
         };
 
         #[cfg(test)]
-        self.hold_native_id_commit(&session_id).await;
+        Box::pin(self.park_native_id(&session_id, NativeIdHold::Validated)).await;
         let mut committed = false;
         for _ in 0..MAX_RUNTIME_TRANSITION_COMMIT_ATTEMPTS {
             let durable_base = match self.load_durable_session_record(&session_id).await {
@@ -3126,11 +3142,12 @@ impl SessionRegistry {
                 }
             }
             entry.info.updated_at = timestamp_now();
+            #[cfg(test)]
+            Box::pin(self.park_native_id(&session_id, NativeIdHold::Write)).await;
             let record = Self::session_record(&session_id, entry, entry.desired_state, None);
             let durable_base = durable_base.unwrap_or_else(|| record.clone());
-            let Err(error) = self
-                .write_session_record_if_current(durable_base, record)
-                .await
+            let Err(error) =
+                Box::pin(self.write_session_record_if_current(durable_base, record)).await
             else {
                 committed = true;
                 break;
@@ -3151,6 +3168,8 @@ impl SessionRegistry {
             debug!(session_id = %session_id.0, "session kept changing while persisting a native-id report; ignoring report");
             return not_recorded;
         }
+        #[cfg(test)]
+        Box::pin(self.park_native_id(&session_id, NativeIdHold::Announce)).await;
         // Persist from the now-current in-memory state (a resize that landed
         // first is reflected, not clobbered).
         self.persist_resume_binding(&session_id).await;
