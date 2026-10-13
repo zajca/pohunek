@@ -10,12 +10,12 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::io;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{symlink, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
-#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
@@ -32,7 +32,7 @@ use tempfile::TempDir;
 use crate::upstream_stage::run_bounded;
 use crate::upstream_stage::{
     check_inputs, host_key, read_lock, stage_upstream, verify_stage, Fault, Outcome, StageError,
-    Tools, POSIX_VERIFY,
+    StageSummary, Tools, INSTALL_TIMEOUT, NPM_CI_ATTEMPTS, POSIX_VERIFY,
 };
 use crate::XtaskError;
 
@@ -105,6 +105,7 @@ impl Fixture {
         Tools {
             npm: Some(self.dir.path().join("tools").join("npm")),
             path: TOOL_PATH.into(),
+            install_limit: INSTALL_TIMEOUT,
         }
     }
 
@@ -249,7 +250,7 @@ impl Fixture {
         let script = format!(
             "#!/bin/sh\n\
              printf '%s\\n' \"$@\" > '{log}/args'\n\
-             env | sed 's/=.*//' | sort > '{log}/env-names'\n\
+             env | sed 's/=.*//' | grep -v '^\\(PWD\\|SHLVL\\|_\\)$' | sort > '{log}/env-names'\n\
              printf '%s\\n' \"$npm_config_registry\" > '{log}/registry'\n\
              {failure}\n\
              cp -R '{tree}/node_modules' node_modules\n",
@@ -259,8 +260,30 @@ impl Fixture {
         write_executable(tools.join("npm"), script).expect("shim");
     }
 
-    fn run_stage(&self) -> Result<crate::upstream_stage::StageSummary, XtaskError> {
-        stage_upstream(&self.root(), RUNTIME, &self.out(), &self.tools())
+    fn run_stage(&self) -> Result<StageSummary, XtaskError> {
+        stage_upstream(
+            &self.root(),
+            RUNTIME,
+            &self.out(),
+            &self.tools(),
+            &mut io::sink(),
+        )
+    }
+
+    /// Stages with `install_limit` as the limit of all `npm ci` attempts, and
+    /// returns the result with the diagnostics written for failed attempts.
+    fn run_stage_with_limit(
+        &self,
+        install_limit: Duration,
+    ) -> (Result<StageSummary, XtaskError>, String) {
+        let mut tools = self.tools();
+        tools.install_limit = install_limit;
+        let mut diagnostics = Vec::new();
+        let result = stage_upstream(&self.root(), RUNTIME, &self.out(), &tools, &mut diagnostics);
+        (
+            result,
+            String::from_utf8(diagnostics).expect("diagnostics are UTF-8"),
+        )
     }
 
     fn staged(&self) -> PathBuf {
@@ -420,18 +443,11 @@ fn npm_runs_with_a_scrubbed_environment_and_the_lockfile_registry() {
     drop(env);
 
     let names = fs::read_to_string(fixture.log("env-names")).expect("env names");
-    let names: Vec<&str> = names.lines().collect();
-    for leaked in ["NPM_TOKEN", "NODE_AUTH_TOKEN", "npm_config__authtoken"] {
-        assert!(!names.contains(&leaked), "{leaked} reached npm");
-    }
-    for required in [
-        "PATH",
-        "HOME",
-        "npm_config_userconfig",
-        "npm_config_globalconfig",
-    ] {
-        assert!(names.contains(&required), "{required} is set for npm");
-    }
+    let mut names: Vec<&str> = names.lines().collect();
+    names.sort_unstable();
+    let mut expected = NPM_ENV_NAMES;
+    expected.sort_unstable();
+    assert_eq!(names, expected, "npm gets exactly the scrubbed environment");
     assert_eq!(
         fs::read_to_string(fixture.log("registry")).expect("registry"),
         format!("{REGISTRY}\n"),
@@ -1166,6 +1182,7 @@ fn an_escaped_stdout_holder_cannot_extend_the_probe_deadline() {
         Duration::from_secs(1),
         true,
         4096,
+        "fakert",
         "test probe",
     );
     let pid: i32 = fs::read_to_string(&pid_file)
@@ -1177,24 +1194,178 @@ fn an_escaped_stdout_holder_cannot_extend_the_probe_deadline() {
     assert_background_process_stopped(&pid_file);
 
     match result {
-        Err(XtaskError::UpstreamStage(StageError::Command { step, outcome })) => {
-            assert_eq!((step, outcome), ("test probe", Outcome::TimedOut));
+        Err(XtaskError::UpstreamStage(StageError::Command {
+            runtime,
+            step,
+            outcome,
+        })) => {
+            assert_eq!(
+                (runtime.as_str(), step, outcome),
+                ("fakert", "test probe", Outcome::TimedOut)
+            );
         }
         other => panic!("expected a bounded probe timeout, got {other:?}"),
+    }
+}
+
+/// Names of the variables `npm ci` receives. The shim drops `PWD`, `SHLVL` and
+/// `_`, which the shell running it adds on its own.
+const NPM_ENV_NAMES: [&str; 14] = [
+    "HOME",
+    "PATH",
+    "TMPDIR",
+    "npm_config_cache",
+    "npm_config_fetch_retries",
+    "npm_config_fetch_retry_factor",
+    "npm_config_fetch_retry_maxtimeout",
+    "npm_config_fetch_retry_mintimeout",
+    "npm_config_fetch_timeout",
+    "npm_config_globalconfig",
+    "npm_config_logs_dir",
+    "npm_config_registry",
+    "npm_config_update_notifier",
+    "npm_config_userconfig",
+];
+
+/// Shell lines of a shim that counts its runs in `attempts` and fails with
+/// `failure` on the attempts `should_fail` selects, before it installs.
+fn counting_shim(attempts: &Path, fail_when: &str, failure: &str) -> String {
+    format!(
+        "count=$(cat '{attempts}' 2>/dev/null || echo 0)\n\
+         count=$((count + 1))\n\
+         printf '%s\\n' \"$count\" > '{attempts}'\n\
+         if {fail_when}; then\n{failure}\nfi",
+        attempts = attempts.display(),
+    )
+}
+
+/// The attempts a counting shim ran.
+fn attempts_run(fixture: &Fixture) -> u32 {
+    fs::read_to_string(fixture.log("attempts"))
+        .expect("the shim counted its runs")
+        .trim()
+        .parse()
+        .expect("numeric count")
+}
+
+/// The `npm ci` failure of a staging that did not succeed.
+fn npm_ci_failure(result: Result<StageSummary, XtaskError>) -> StageError {
+    match result {
+        Err(XtaskError::UpstreamStage(error)) => error,
+        other => panic!("expected an npm ci failure, got {other:?}"),
     }
 }
 
 #[test]
 fn a_failing_install_reports_npm_and_leaves_nothing() {
     let fixture = Fixture::new();
-    fixture.write_shim("exit 3");
-    match fixture.run_stage() {
-        Err(XtaskError::UpstreamStage(StageError::Command { step, outcome })) => {
-            assert_eq!((step, outcome), ("npm ci", Outcome::Exit(Some(3))));
-        }
-        other => panic!("expected an npm failure, got {other:?}"),
+    fixture.write_shim(&counting_shim(&fixture.log("attempts"), "true", "exit 3"));
+    let (result, diagnostics) = fixture.run_stage_with_limit(INSTALL_TIMEOUT);
+    assert_eq!(
+        npm_ci_failure(result).to_string(),
+        format!("npm ci of `{RUNTIME}` exited with code 3")
+    );
+    // Without a network code in npm's log the failure is not transient.
+    assert_eq!(attempts_run(&fixture), 1);
+    assert!(diagnostics.contains("npm wrote no debug log"));
+    assert_eq!(fixture.out().read_dir().unwrap().count(), 0);
+}
+
+#[test]
+fn a_stalled_install_is_cut_at_the_limit_and_its_log_names_the_package() {
+    let fixture = Fixture::new();
+    fixture.write_shim(
+        "printf '%s\\n' '7 silly tarball no local data for dep@https://registry.example.test/dep/-/dep-4.5.6.tgz' \
+           > \"$npm_config_logs_dir/2026-debug-0.log\"\n\
+         sleep 600",
+    );
+    let (result, diagnostics) = fixture.run_stage_with_limit(Duration::from_secs(2));
+    assert_eq!(
+        npm_ci_failure(result).to_string(),
+        format!("npm ci of `{RUNTIME}` exceeded its time limit")
+    );
+    assert!(
+        diagnostics.contains(&format!(
+            "[{RUNTIME}] npm ci attempt 1 of {NPM_CI_ATTEMPTS} failed: npm ci of `{RUNTIME}` exceeded its time limit"
+        )),
+        "the failed attempt is named with its runtime: {diagnostics}"
+    );
+    assert!(
+        diagnostics.contains("[fakert] 7 silly tarball no local data for dep@https://registry.example.test/dep/-/dep-4.5.6.tgz"),
+        "the log tail names what npm was fetching: {diagnostics}"
+    );
+    assert!(
+        !diagnostics.contains("attempt 2"),
+        "a timeout is not retried: {diagnostics}"
+    );
+}
+
+#[test]
+fn a_network_failure_is_retried_and_the_retry_replaces_the_failed_attempt() {
+    let fixture = Fixture::new();
+    fixture.write_shim(&counting_shim(
+        &fixture.log("attempts"),
+        "[ \"$count\" -eq 1 ]",
+        "  touch stray-file\n\
+           printf '%s\\n' '1 error code EIDLETIMEOUT' > \"$npm_config_logs_dir/2026-debug-0.log\"\n\
+           exit 1",
+    ));
+    let (result, diagnostics) = fixture.run_stage_with_limit(INSTALL_TIMEOUT);
+    result.expect("the second attempt stages");
+    assert_eq!(attempts_run(&fixture), 2);
+    assert!(diagnostics.contains(&format!(
+        "[{RUNTIME}] npm ci attempt 1 of {NPM_CI_ATTEMPTS} failed"
+    )));
+    assert!(
+        diagnostics.contains("[fakert] 1 error code EIDLETIMEOUT"),
+        "the failed attempt's log tail is printed: {diagnostics}"
+    );
+    assert!(
+        !fixture.stage().join("lib").join("stray-file").exists(),
+        "the second attempt starts from the committed project"
+    );
+    fixture.verify().expect("the retried stage verifies");
+}
+
+#[test]
+fn a_persistent_network_failure_stops_after_the_attempt_budget() {
+    let fixture = Fixture::new();
+    fixture.write_shim(&counting_shim(
+        &fixture.log("attempts"),
+        "true",
+        "  printf '%s\\n' '1 error code EIDLETIMEOUT' > \"$npm_config_logs_dir/2026-debug-0.log\"\n\
+           exit 1",
+    ));
+    let (result, diagnostics) = fixture.run_stage_with_limit(INSTALL_TIMEOUT);
+    assert_eq!(
+        npm_ci_failure(result).to_string(),
+        format!("npm ci of `{RUNTIME}` exited with code 1")
+    );
+    assert_eq!(attempts_run(&fixture), NPM_CI_ATTEMPTS);
+    for attempt in 1..=NPM_CI_ATTEMPTS {
+        assert!(
+            diagnostics.contains(&format!(
+                "[{RUNTIME}] npm ci attempt {attempt} of {NPM_CI_ATTEMPTS} failed"
+            )),
+            "attempt {attempt} is reported: {diagnostics}"
+        );
     }
     assert_eq!(fixture.out().read_dir().unwrap().count(), 0);
+}
+
+#[test]
+fn a_failure_without_a_network_code_is_not_retried() {
+    let fixture = Fixture::new();
+    fixture.write_shim(&counting_shim(
+        &fixture.log("attempts"),
+        "true",
+        "  printf '%s\\n' '1 error code E404' > \"$npm_config_logs_dir/2026-debug-0.log\"\n\
+           exit 1",
+    ));
+    let (result, diagnostics) = fixture.run_stage_with_limit(INSTALL_TIMEOUT);
+    npm_ci_failure(result);
+    assert_eq!(attempts_run(&fixture), 1);
+    assert!(!diagnostics.contains("attempt 2"), "{diagnostics}");
 }
 
 #[test]
@@ -1482,6 +1653,7 @@ fn the_hermes_lock_is_staged_by_its_provisioner_at_a_direct_shebang_path() {
     let tools = Tools {
         npm: None,
         path: TOOL_PATH.into(),
+        install_limit: INSTALL_TIMEOUT,
     };
     // uv wraps a shebang line longer than 127 bytes, or one with a space.
     for unusable in [
@@ -1489,7 +1661,7 @@ fn the_hermes_lock_is_staged_by_its_provisioner_at_a_direct_shebang_path() {
         out.path().join("with space"),
     ] {
         refused(
-            stage_upstream(&root, "hermes", &unusable, &tools),
+            stage_upstream(&root, "hermes", &unusable, &tools, &mut io::sink()),
             "out",
             Fault::IndirectShebang,
         );
@@ -1645,8 +1817,14 @@ impl Provisioned {
         write_executable(self.script(), script).expect("provisioner");
     }
 
-    fn run_stage(&self) -> Result<crate::upstream_stage::StageSummary, XtaskError> {
-        stage_upstream(&self.root(), PROVISIONED, &self.out(), &provisioner_tools())
+    fn run_stage(&self) -> Result<StageSummary, XtaskError> {
+        stage_upstream(
+            &self.root(),
+            PROVISIONED,
+            &self.out(),
+            &provisioner_tools(),
+            &mut io::sink(),
+        )
     }
 
     fn staged(&self) -> PathBuf {
@@ -1689,6 +1867,7 @@ fn provisioner_tools() -> Tools {
     Tools {
         npm: None,
         path: TOOL_PATH.into(),
+        install_limit: INSTALL_TIMEOUT,
     }
 }
 
@@ -1884,8 +2063,14 @@ fn a_stage_reached_through_a_symlinked_parent_verifies() {
     fs::create_dir(fixture.out()).expect("out");
     let linked = fixture.dir.path().join("linked-out");
     symlink(fixture.out(), &linked).expect("symlinked parent");
-    let summary = stage_upstream(&fixture.root(), PROVISIONED, &linked, &provisioner_tools())
-        .expect("stage through the symlinked parent");
+    let summary = stage_upstream(
+        &fixture.root(),
+        PROVISIONED,
+        &linked,
+        &provisioner_tools(),
+        &mut io::sink(),
+    )
+    .expect("stage through the symlinked parent");
     let real = fs::canonicalize(fixture.stage()).expect("real stage");
     assert_eq!(summary.stage, real);
     let entry = fs::read_to_string(real.join("venv/bin/fakepy")).expect("entrypoint");
@@ -1960,7 +2145,7 @@ fn a_failed_provisioned_stage_leaves_nothing() {
     let fixture = Provisioned::new();
     fixture.write_provisioner("", ENTRY_BODY, "exit 3");
     match fixture.run_stage() {
-        Err(XtaskError::UpstreamStage(StageError::Command { step, outcome })) => {
+        Err(XtaskError::UpstreamStage(StageError::Command { step, outcome, .. })) => {
             assert_eq!((step, outcome), ("provisioner", Outcome::Exit(Some(3))));
         }
         other => panic!("expected a provisioner failure, got {other:?}"),
@@ -2130,7 +2315,13 @@ fn a_provisioner_lock_is_checked_before_its_script_runs() {
     let fixture = Provisioned::new();
     let spaced = fixture.out().join("with space");
     refused(
-        stage_upstream(&fixture.root(), PROVISIONED, &spaced, &provisioner_tools()),
+        stage_upstream(
+            &fixture.root(),
+            PROVISIONED,
+            &spaced,
+            &provisioner_tools(),
+            &mut io::sink(),
+        ),
         "out",
         Fault::IndirectShebang,
     );
