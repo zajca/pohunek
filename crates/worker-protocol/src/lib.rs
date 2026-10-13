@@ -44,8 +44,8 @@ pub use control::{
     ActiveIdentityClaim, AttachStart, BackgroundItem, BackgroundKind, BackgroundSnapshot,
     BackgroundStatus, Capability, ControlCode, ControlError, ControlEvent, ControlMessage,
     ControlRequest, ControlResponse, ControlTypeError, Dimensions, EventKind, ExitStatus,
-    Initialize, InitializeLimits, InputFragment, InputPlan, InspectSnapshot, LaunchIdentity,
-    OutputGap, ProcessIdentity, ReleasedIdentityClaim, ReportedLaunchIdentity,
+    Initialize, InitializeLimits, InputFragment, InputPlan, InputPolicy, InspectSnapshot,
+    LaunchIdentity, OutputGap, ProcessIdentity, ReleasedIdentityClaim, ReportedLaunchIdentity,
     ReportedNativeReference, RequestKind, ResizeRequest, ResponseKind, RuntimePhase, RuntimeScope,
     StopPolicy, StopRequest, StreamMode, SubagentPhase, SubagentSnapshot, WriteAck,
     BACKGROUND_AGENT_TYPE_MAX_BYTES, BACKGROUND_LABEL_MAX_BYTES, BACKGROUND_MAX_ITEMS,
@@ -82,6 +82,6 @@ pub use token::{TokenClaims, TokenError, TokenVault};
 #[doc(inline)]
 pub use version::{
     negotiate, Version, VersionError, VersionRange, ATTACH_SNAPSHOT_VERSION,
-    BASE_ENVIRONMENT_VERSION, CONTROL_PLANE_OBSERVATION_VERSION, CURRENT_VERSION, PREVIOUS_VERSION,
-    SUBAGENT_OBSERVATION_VERSION, SUPPORTED_RANGE,
+    BASE_ENVIRONMENT_VERSION, CONTROL_PLANE_OBSERVATION_VERSION, CURRENT_VERSION,
+    INPUT_STALL_VERSION, PREVIOUS_VERSION, SUBAGENT_OBSERVATION_VERSION, SUPPORTED_RANGE,
 };

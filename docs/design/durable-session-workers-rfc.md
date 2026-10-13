@@ -861,6 +861,16 @@ started by a service manager carries that manager's environment, which
 describes the worker's supervision rather than the user's session, so the
 worker never forwards its own environment to the child.
 
+From worker protocol version 7, `Initialize` also carries `input_policy`
+(`InputPolicy`, `crates/worker-protocol/src/control.rs`): the input stall bound
+from `input.write_stall_timeout_ms` in `service.toml`. A control input plan that
+gets no byte accepted for that long, or cannot start writing within it because
+attached input holds the PTY writer, fails with `InputStalled`, and the rest of
+its plan is not written. Attached-stream input stays unbounded, as in a real
+terminal. The worker sends `InputStalled` only on a connection
+that negotiated version 7 and reports the same stall as `RuntimeFault` to a
+version-6 peer. A worker initialized without the field keeps unbounded writes.
+
 Before spawn, the worker builds the child environment on an empty base:
 `BaseEnv`, then its own `TERM`, then the profile environment, then the reserved
 `POHUNEK_*` session values. A profile cannot override reserved values. It then

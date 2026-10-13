@@ -548,8 +548,8 @@ async fn upgrade_migrates_a_schema_three_config_keeping_its_input_timing() {
     })
     .await;
 
-    // The recorded input timings survive; the turn-wait timings the schema-3
-    // file lacks are the documented defaults.
+    // The recorded input timings survive; the write stall bound and the
+    // turn-wait timings the schema-3 file lacks are the documented defaults.
     let current = pohunek_service_config::ServiceConfig::load(&installation.context.config_path())
         .expect("current schema");
     assert_eq!(current.active_version(), new);
@@ -558,6 +558,7 @@ async fn upgrade_migrates_a_schema_three_config_keeping_its_input_timing() {
         InputTiming {
             initial_startup_grace: std::time::Duration::from_secs(9),
             submit_delay: std::time::Duration::from_millis(275),
+            write_stall_timeout: DEFAULT_INPUT_TIMING.write_stall_timeout,
         }
     );
     assert_eq!(current.wait_timing(), DEFAULT_WAIT_TIMING);

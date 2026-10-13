@@ -38,7 +38,7 @@ pub use error::WorkerError;
 #[doc(inline)]
 pub use identity::RejectReason;
 #[doc(inline)]
-pub use input::{InputError, InputFragment, InputPlan, WriteCoordinator};
+pub use input::{InputError, InputFragment, InputPlan, InputWriter, WriteCoordinator};
 #[doc(inline)]
 pub use journal::{
     ActiveIdentity, ChildIdentity, Journal, JournalError, JournalRecord, LaunchIdentity,

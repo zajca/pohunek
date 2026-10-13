@@ -10,7 +10,7 @@
 //! # Schema
 //!
 //! ```toml
-//! schema_version = 4
+//! schema_version = 5
 //! prefix = "/home/u/.local"                       # absolute install prefix
 //! active_version = "0.31.6"                       # <prefix>/libexec/pohunek/<version>
 //!
@@ -37,6 +37,7 @@
 //! [input]                                         # milliseconds, 1..=600000
 //! initial_startup_grace_ms = 5000
 //! submit_delay_ms = 150
+//! write_stall_timeout_ms = 3000
 //!
 //! [waits]                                          # milliseconds, 5000..=3600000
 //! turn_default_ms = 300000                         # at most turn_max_ms
@@ -57,9 +58,10 @@
 //!
 //! A normal load accepts only [`SCHEMA_VERSION`]. The installer reads the
 //! previous schemas through [`ServiceConfig::load_upgrade_source`], which
-//! assigns the documented defaults to the tables those schemas lack: schema 2
-//! has neither `[input]` nor `[waits]`, schema 3 has no `[waits]`. Every
-//! value a previous file records is kept.
+//! assigns the documented defaults to the keys those schemas lack: schema 2
+//! has neither `[input]` nor `[waits]`, schema 3 has no `[waits]` and no
+//! `input.write_stall_timeout_ms`, and schema 4 has no
+//! `input.write_stall_timeout_ms`. Every value a previous file records is kept.
 //!
 //! `environment.search_path` is the executable search path the installer
 //! resolved (see `pohunek_platform::shell_env`) and hands to the daemon job as
@@ -103,7 +105,7 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-10-12
+// Rust guideline compliant 2026-10-13
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -133,15 +135,24 @@ pub use error::ConfigError;
 /// A file with any other value is rejected before its keys are interpreted,
 /// so an older binary never half-understands a newer installation and a newer
 /// binary never reads a file that lacks keys it requires. Version 3 holds
-/// `[input]` and version 4 `[waits]`; schemas 2 and 3 are read only through
+/// `[input]`; version 4 adds `[waits]`; version 5 adds
+/// `input.write_stall_timeout_ms`. Schemas 2, 3 and 4 are read only through
 /// [`ServiceConfig::load_upgrade_source`].
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Input timings written on fresh installs and assigned explicitly when
-/// upgrading a schema-2 service file, which has no input timing keys.
+/// upgrading a schema-2, schema-3 or schema-4 service file, which lack some
+/// input keys.
+///
+/// The write stall bound is 3000 ms, below the 5 s default request timeout of
+/// the client (`pohunek-client`). A fire-and-forget `session.input` caller then
+/// receives the typed `session_input_stalled` error before its own timeout
+/// fires. A reading agent drains its input within microseconds, so 3 s without
+/// a single accepted byte means the reader is stuck, not slow.
 pub const DEFAULT_INPUT_TIMING: InputTiming = InputTiming {
     initial_startup_grace: Duration::from_secs(5),
     submit_delay: Duration::from_millis(150),
+    write_stall_timeout: Duration::from_millis(3000),
 };
 
 /// Turn-wait timings written on fresh installs, assigned when upgrading a
@@ -301,6 +312,13 @@ pub struct InputTiming {
     pub initial_startup_grace: Duration,
     /// Delay between Claude's input body and separate submit write.
     pub submit_delay: Duration,
+    /// Longest time one control input write may wait without the PTY accepting a byte.
+    ///
+    /// Restarted after every accepted byte, so it bounds a stalled reader, not
+    /// the total duration of a long input. A reader that never drains its
+    /// terminal would otherwise block the write, and every request queued
+    /// behind it, indefinitely.
+    pub write_stall_timeout: Duration,
 }
 
 /// Turn-wait timings recorded in `[waits]`, in whole milliseconds.
@@ -465,6 +483,10 @@ impl ServiceConfig {
             spec.input_timing.initial_startup_grace,
         )?;
         validate_duration("input.submit_delay_ms", spec.input_timing.submit_delay)?;
+        validate_duration(
+            "input.write_stall_timeout_ms",
+            spec.input_timing.write_stall_timeout,
+        )?;
         validate_wait_timing(spec.wait_timing)?;
         if !(MIN_OPEN_FILES..=MAX_OPEN_FILES).contains(&spec.open_files) {
             return Err(ConfigError::OutOfRange {
@@ -512,20 +534,21 @@ impl ServiceConfig {
         parse(path, &read_config_text(path)?)
     }
 
-    /// Reads a current, schema-3, or schema-2 service file for an installer upgrade.
+    /// Reads a current, schema-4, schema-3, or schema-2 service file for an installer upgrade.
     ///
-    /// Schema 2 has no `[input]` or `[waits]` table and schema 3 no
-    /// `[waits]`. This method supplies the documented [`DEFAULT_INPUT_TIMING`]
-    /// and [`DEFAULT_WAIT_TIMING`] explicitly for the missing tables and keeps
-    /// every recorded value; normal daemon and worker loads still require
-    /// every key of the current schema. The caller must preserve the source
+    /// Schema 2 has no `[input]` or `[waits]` table, schema 3 no `[waits]`
+    /// and no `input.write_stall_timeout_ms`, and schema 4 no
+    /// `input.write_stall_timeout_ms`. This method supplies the documented
+    /// [`DEFAULT_INPUT_TIMING`] and [`DEFAULT_WAIT_TIMING`] explicitly for
+    /// the missing keys and tables and keeps every recorded value; normal
+    /// daemon and worker loads still require every key of the current schema. The caller must preserve the source
     /// schema across the transaction and restore it if the old daemon is
     /// restarted on rollback.
     ///
     /// # Errors
     ///
     /// Returns the same trust and validation errors as [`Self::load`], and
-    /// [`ConfigError::UnsupportedSchema`] for schemas other than 2, 3, or
+    /// [`ConfigError::UnsupportedSchema`] for schemas other than 2, 3, 4, or
     /// [`SCHEMA_VERSION`].
     pub fn load_upgrade_source(path: &Path) -> Result<UpgradeSource, ConfigError> {
         Self::load_upgrade_source_bytes(path, read_config_text(path)?.as_bytes())
@@ -543,7 +566,7 @@ impl ServiceConfig {
     ///
     /// Returns [`ConfigError::Parse`] for bytes that are not UTF-8, invalid
     /// TOML, or a missing, unknown, or mistyped key, and
-    /// [`ConfigError::UnsupportedSchema`] for schemas other than 2, 3, or
+    /// [`ConfigError::UnsupportedSchema`] for schemas other than 2, 3, 4, or
     /// [`SCHEMA_VERSION`].
     pub fn load_upgrade_source_bytes(
         path: &Path,
@@ -614,6 +637,7 @@ impl ServiceConfig {
             input: RawInput {
                 initial_startup_grace_ms: millis(self.input_timing.initial_startup_grace),
                 submit_delay_ms: millis(self.input_timing.submit_delay),
+                write_stall_timeout_ms: millis(self.input_timing.write_stall_timeout),
             },
             waits: RawWaits::from(self.wait_timing),
             limits: RawLimits {
@@ -846,7 +870,23 @@ struct RawConfigV3 {
     deadlines: RawDeadlines,
     environment: RawEnvironment,
     sweep: RawSweep,
-    input: RawInput,
+    input: RawInputWithoutStall,
+    limits: RawLimits,
+}
+
+/// Exact on-disk schema-4 shape accepted only for an explicit upgrade.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfigV4 {
+    schema_version: u32,
+    prefix: String,
+    active_version: String,
+    namespace: RawNamespace,
+    deadlines: RawDeadlines,
+    environment: RawEnvironment,
+    sweep: RawSweep,
+    input: RawInputWithoutStall,
+    waits: RawWaits,
     limits: RawLimits,
 }
 
@@ -907,7 +947,20 @@ struct RawSweep {
 /// On-disk `[input]` table in milliseconds.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the `_ms` suffix is the documented on-disk unit of every key"
+)]
 struct RawInput {
+    initial_startup_grace_ms: u64,
+    submit_delay_ms: u64,
+    write_stall_timeout_ms: u64,
+}
+
+/// On-disk `[input]` table of schemas 3 and 4, which has no write stall bound.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInputWithoutStall {
     initial_startup_grace_ms: u64,
     submit_delay_ms: u64,
 }
@@ -983,12 +1036,34 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 input: RawInput {
                     initial_startup_grace_ms: millis(DEFAULT_INPUT_TIMING.initial_startup_grace),
                     submit_delay_ms: millis(DEFAULT_INPUT_TIMING.submit_delay),
+                    write_stall_timeout_ms: millis(DEFAULT_INPUT_TIMING.write_stall_timeout),
                 },
                 waits: RawWaits::from(DEFAULT_WAIT_TIMING),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 2);
             Ok((config_from_raw(raw)?, 2))
+        }
+        Some(toml::Value::Integer(4)) => {
+            let previous: RawConfigV4 = toml::from_str(text).map_err(parse_error)?;
+            let raw = RawConfig {
+                schema_version: SCHEMA_VERSION,
+                prefix: previous.prefix,
+                active_version: previous.active_version,
+                namespace: previous.namespace,
+                deadlines: previous.deadlines,
+                environment: previous.environment,
+                sweep: previous.sweep,
+                input: RawInput {
+                    initial_startup_grace_ms: previous.input.initial_startup_grace_ms,
+                    submit_delay_ms: previous.input.submit_delay_ms,
+                    write_stall_timeout_ms: millis(DEFAULT_INPUT_TIMING.write_stall_timeout),
+                },
+                waits: previous.waits,
+                limits: previous.limits,
+            };
+            debug_assert_eq!(previous.schema_version, 4);
+            Ok((config_from_raw(raw)?, 4))
         }
         Some(toml::Value::Integer(3)) => {
             let previous: RawConfigV3 = toml::from_str(text).map_err(parse_error)?;
@@ -1000,7 +1075,11 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 deadlines: previous.deadlines,
                 environment: previous.environment,
                 sweep: previous.sweep,
-                input: previous.input,
+                input: RawInput {
+                    initial_startup_grace_ms: previous.input.initial_startup_grace_ms,
+                    submit_delay_ms: previous.input.submit_delay_ms,
+                    write_stall_timeout_ms: millis(DEFAULT_INPUT_TIMING.write_stall_timeout),
+                },
                 waits: RawWaits::from(DEFAULT_WAIT_TIMING),
                 limits: previous.limits,
             };
@@ -1045,6 +1124,7 @@ fn config_from_raw(raw: RawConfig) -> Result<ServiceConfig, ConfigError> {
         input_timing: InputTiming {
             initial_startup_grace: Duration::from_millis(raw.input.initial_startup_grace_ms),
             submit_delay: Duration::from_millis(raw.input.submit_delay_ms),
+            write_stall_timeout: Duration::from_millis(raw.input.write_stall_timeout_ms),
         },
         wait_timing: WaitTiming {
             turn_default: Duration::from_millis(raw.waits.turn_default_ms),

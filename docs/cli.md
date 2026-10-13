@@ -167,7 +167,10 @@ pohunek session wait s-01J00000000000000000000000 \
 A waited input refuses a blocked agent with `session_agent_blocked`: an approval
 is pending and belongs to the operator. `session_input_timeout` means delivery
 or the target activity did not arrive before the deadline; the text may already
-have been delivered, so inspect the session instead of resending it. See
+have been delivered, so inspect the session instead of resending it.
+`session_input_stalled` means the agent stopped reading its terminal: the PTY
+accepted no byte for `input.write_stall_timeout_ms` (service.toml, 3000 ms by
+default), and part of the text may already have reached the agent. See
 [sessions](knowledge/concepts/sessions.md) for the full wait contract.
 
 Every `--json` success is one document shaped as

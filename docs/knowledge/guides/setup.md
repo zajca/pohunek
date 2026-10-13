@@ -54,17 +54,28 @@ registers one daemon job: the systemd user unit
 `pohunek-<ns>-daemon.service` plus the slice `pohunek-<ns>-sessions.slice` on
 Linux, or the launchd agent
 `~/Library/LaunchAgents/io.github.zajca.pohunek.<ns>.daemon.plist` on macOS.
-The owner-private `service.toml` records `[input] initial_startup_grace_ms =
-5000` and `submit_delay_ms = 150` on a fresh install. These host-wide
-values control the maximum wait for an input-ready agent at `session new` and
-the delay between the prompt body and its separate submit write. Neither names
-a runtime: the submit delay applies exactly to the runtimes whose own runtime
-descriptor marks that delay configurable (Claude opts in; its descriptor value
-150 is replaced; the others keep their descriptor value). Both keys are whole
-milliseconds in `1..=600000`; a missing key, a value outside the
-range, or an unknown key makes the daemon refuse startup with the named
-configuration error. The startup grace ends early when the agent signals an
-editable prompt or enables bracketed paste; it only delays silent startups.
+The owner-private `service.toml` (schema 5) records `[input]`
+`initial_startup_grace_ms = 5000`, `submit_delay_ms = 150` and
+`write_stall_timeout_ms = 3000` on a fresh
+install. These host-wide values control the maximum wait for an input-ready
+agent at `session new`, the delay between the prompt body and its separate
+submit write, and the longest time one `session.input` or initial input write
+may wait without the agent reading a byte (attached terminal input is not
+bounded). The submit delay names no runtime: it applies exactly
+to the runtimes whose own runtime descriptor marks that delay configurable
+(Claude opts in; its descriptor value 150 is replaced; the others keep their
+descriptor value). All three keys are whole milliseconds in `1..=600000`; a
+missing key, a value outside the range, or an unknown key makes the daemon
+refuse startup with the named configuration error. The startup grace ends
+early when the agent signals an editable prompt or enables bracketed paste; it
+only delays silent startups.
+The write stall bound restarts after every byte the PTY accepts, so it bounds a
+stalled reader, not a long input. A write that exceeds it fails with
+`session_input_stalled`, possibly after part of the input was written; a
+`session new` with initial input then removes the session. The 3000 ms default
+stays below the client's 5 s request deadline, so a fire-and-forget caller gets
+the typed error instead of `request_timeout`; a reading agent drains its input
+in microseconds, so 3 s without one accepted byte means the reader is stuck.
 The daemon reads edits when it starts, so restart the service to apply them.
 The file also records `[waits] turn_default_ms = 300000` and `turn_max_ms =
 1800000` on a fresh install: the timeout of a `session.wait_turn` call that
@@ -106,7 +117,8 @@ already gone). Upgrades use
 `pohunek service upgrade`; `pohunek service status` shows the daemon job,
 versions, and workers. When the installed `service.toml` is a previous
 release's schema (schema 2, which predates the `[input]` and `[waits]`
-tables, or schema 3, which predates `[waits]`), the upgrade
+tables, schema 3, which predates `[waits]`, or schema 4, which predates
+`input.write_stall_timeout_ms`), the upgrade
 is a configuration migration: the upgrade first saves the exact pre-upgrade
 bytes owner-private next to its transaction record and journals their
 digest, stops the daemon job before it rewrites `service.toml` (a previous

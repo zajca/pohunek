@@ -956,10 +956,10 @@ fn verified_connection(context: &Context) -> Result<(Namespace, Duration), Error
 /// Loads the installation recorded at `context.config_path()` and verifies
 /// its namespace inputs against the running process.
 ///
-/// The read is the upgrade-source read: a previous release's schema-2 or
-/// schema-3 installation is reported, connected to, checked, and uninstalled by this
-/// version like a current one, while schemas this binary neither writes nor
-/// upgrades from stay refused.
+/// The read is the upgrade-source read: a previous release's schema-2, schema-3
+/// or schema-4 installation is reported, connected to, checked, and uninstalled
+/// by this version like a current one, while schemas this binary neither writes
+/// nor upgrades from stay refused.
 ///
 /// # Errors
 ///

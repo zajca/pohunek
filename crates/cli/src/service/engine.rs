@@ -38,11 +38,11 @@
 //!
 //! # Config migration
 //!
-//! A `service.toml` written by a previous release (`schema_version` 2 or 3,
+//! A `service.toml` written by a previous release (`schema_version` 2, 3 or 4,
 //! in contrast to this crate's [`SCHEMA_VERSION`]) is read only at the
 //! upgrade boundary, through `ServiceConfig::load_upgrade_source`, which
-//! assigns the documented defaults to the tables that schema lacks (input
-//! and turn-wait timings) explicitly. Its upgrade is a dedicated
+//! assigns the documented defaults to the keys that schema lacks (input
+//! timings, the write stall bound, and turn-wait timings) explicitly. Its upgrade is a dedicated
 //! migration flavor of the transaction, journaled in the record's
 //! `config_backup` (`source_schema_version` and the SHA-256 of the exact
 //! pre-upgrade bytes), with two consequences for ordering:
@@ -593,8 +593,9 @@ impl<'a> Engine<'a> {
         let gated = self.adoption_gate(&plan, from, version).await?;
         let (resume, rolled_back) = self.resolve_plan(plan).await?;
         // The file is read as an upgrade source, so a previous release's
-        // schema-2 or schema-3 installation upgrades into this one instead of being
-        // refused: the migration below carries its exact bytes and schema.
+        // schema-2, schema-3 or schema-4 installation upgrades into this one
+        // instead of being refused: the migration below carries its exact bytes
+        // and schema.
         let source = load_config_for_upgrade(&config_path)?.ok_or(Error::NotInstalled {
             path: config_path.clone(),
         })?;
@@ -752,8 +753,8 @@ impl<'a> Engine<'a> {
         let registered = self.resolve_uninstall_pending(options, &mut report).await?;
         let config_path = self.context.config_path();
         // The uninstall reads the installed configuration as an upgrade
-        // source, so it removes a previous release's schema-2 or schema-3 installation
-        // with this version as well, without a migration.
+        // source, so it removes a previous release's schema-2, schema-3 or
+        // schema-4 installation with this version as well, without a migration.
         let config = match (
             load_config_for_upgrade(&config_path)?.map(|source| source.config),
             &registered,

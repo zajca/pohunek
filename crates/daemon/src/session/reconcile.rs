@@ -6094,11 +6094,11 @@ mod tests {
     use pohunek_worker_protocol::AncestryMatcher;
     use pohunek_worker_protocol::{
         ActiveIdentityClaim, ControlCode, ControlError, ControlMessage, ControlReader,
-        ControlResponse, ControlWriter, Dimensions, Initialize, InitializeLimits, InspectSnapshot,
-        LaunchIdentity, ProcessIdentity, ReleasedIdentityClaim, ReportedLaunchIdentity,
-        ResponseKind, RuntimePhase as WorkerRuntimePhase, SecretEnv, SessionId as WorkerSessionId,
-        StopPolicy, SubagentField, SubagentPhase, SubagentSnapshot, TransactionId, Version,
-        WorkerId, WorkerInstanceId,
+        ControlResponse, ControlWriter, Dimensions, Initialize, InitializeLimits, InputPolicy,
+        InspectSnapshot, LaunchIdentity, ProcessIdentity, ReleasedIdentityClaim,
+        ReportedLaunchIdentity, ResponseKind, RuntimePhase as WorkerRuntimePhase, SecretEnv,
+        SessionId as WorkerSessionId, StopPolicy, SubagentField, SubagentPhase, SubagentSnapshot,
+        TransactionId, Version, WorkerId, WorkerInstanceId,
     };
     use protocol::{
         AgentActivity, CwdSource, ForkCwdMode, ProcessStartIdentity, ReportSequence,
@@ -7808,6 +7808,7 @@ while os.getppid() == parent:
                 ),
                 limits: InitializeLimits::new(1_000_000, 100_000, 128, 60_000).expect("limits"),
                 stop_policy: StopPolicy::new(100).expect("stop policy"),
+                input_policy: Some(InputPolicy::new(100).expect("input policy")),
                 hook_protocol_version: Version::new(1).expect("version"),
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),
                 hook_schema: Some("identity-subagent-v1".to_owned()),
@@ -8219,6 +8220,7 @@ while os.getppid() == parent:
                 ),
                 limits: InitializeLimits::new(1_000_000, 100_000, 128, 60_000).expect("limits"),
                 stop_policy: StopPolicy::new(100).expect("stop policy"),
+                input_policy: Some(InputPolicy::new(100).expect("input policy")),
                 hook_protocol_version: Version::new(1).expect("version"),
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),
                 hook_schema: Some("identity-v1".to_owned()),
@@ -9086,6 +9088,7 @@ while os.getppid() == parent:
                 ),
                 limits: InitializeLimits::new(1_000_000, 100_000, 128, 60_000).expect("limits"),
                 stop_policy: StopPolicy::new(100).expect("stop policy"),
+                input_policy: Some(InputPolicy::new(100).expect("input policy")),
                 hook_protocol_version: Version::new(1).expect("version"),
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),
                 hook_schema: Some("identity-subagent-v1".to_owned()),

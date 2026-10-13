@@ -15,7 +15,7 @@ use thiserror::Error;
 use crate::{
     BaseEnv, DaemonId, DataToken, LeaseChallenge, LeaseId, RequestId, SecretBytes, SecretEnv,
     SessionId, StreamId, TransactionId, Version, VersionRange, WorkerId, WorkerInstanceId, WriteId,
-    BASE_ENVIRONMENT_VERSION,
+    BASE_ENVIRONMENT_VERSION, INPUT_STALL_VERSION,
 };
 
 /// Features a daemon or worker may negotiate.
@@ -133,6 +133,9 @@ pub enum ControlTypeError {
     /// A stop grace period was zero.
     #[error("stop grace period must be nonzero")]
     InvalidStopPolicy,
+    /// An input stall bound was zero.
+    #[error("input stall bound must be nonzero")]
+    InvalidInputPolicy,
     /// An input plan contained no fragments or only empty fragments.
     #[error("input plan must contain at least one nonempty fragment")]
     EmptyInputPlan,
@@ -142,6 +145,17 @@ pub enum ControlTypeError {
         if *required { "present" } else { "absent" }
     )]
     BaseEnvironmentMismatch {
+        /// Protocol version negotiated for the connection.
+        version: Version,
+        /// Whether that version requires the field.
+        required: bool,
+    },
+    /// An `Initialize` input policy did not match the negotiated version.
+    #[error(
+        "worker protocol {version} requires the input policy to be {}",
+        if *required { "present" } else { "absent" }
+    )]
+    InputPolicyMismatch {
         /// Protocol version negotiated for the connection.
         version: Version,
         /// Whether that version requires the field.
@@ -389,6 +403,49 @@ impl<'de> Deserialize<'de> for StopPolicy {
     }
 }
 
+/// Bounds how long PTY input may wait for the child to read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct InputPolicy {
+    /// Longest time one input write may go without the PTY accepting a byte.
+    stall_ms: u64,
+}
+
+impl InputPolicy {
+    /// Creates a nonzero input stall bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlTypeError::InvalidInputPolicy`] when `stall_ms` is zero.
+    pub const fn new(stall_ms: u64) -> Result<Self, ControlTypeError> {
+        if stall_ms == 0 {
+            Err(ControlTypeError::InvalidInputPolicy)
+        } else {
+            Ok(Self { stall_ms })
+        }
+    }
+
+    /// Returns the input stall bound in milliseconds.
+    #[must_use]
+    pub const fn stall_ms(self) -> u64 {
+        self.stall_ms
+    }
+}
+
+impl<'de> Deserialize<'de> for InputPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireInputPolicy {
+            stall_ms: u64,
+        }
+
+        let policy = WireInputPolicy::deserialize(deserializer)?;
+        Self::new(policy.stall_ms).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Supplies the one-shot worker launch plan.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Initialize {
@@ -426,6 +483,13 @@ pub struct Initialize {
     pub limits: InitializeLimits,
     /// Explicit process-group stop policy.
     pub stop_policy: StopPolicy,
+    /// PTY input stall bound.
+    ///
+    /// Present exactly when the negotiated version is at least
+    /// [`INPUT_STALL_VERSION`]; the wire omits it when absent so a
+    /// version-six peer neither sends nor sees it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_policy: Option<InputPolicy>,
     /// Worker-local identity-hook protocol version.
     pub hook_protocol_version: Version,
     /// Public daemon RPC protocol version the managed child's provider hooks
@@ -459,6 +523,7 @@ impl Debug for Initialize {
             .field("base_environment", &self.base_environment)
             .field("limits", &self.limits)
             .field("stop_policy", &self.stop_policy)
+            .field("input_policy", &self.input_policy)
             .field("hook_protocol_version", &self.hook_protocol_version)
             .field("public_protocol_version", &self.public_protocol_version)
             .field("hook_schema", &self.hook_schema)
@@ -467,25 +532,28 @@ impl Debug for Initialize {
 }
 
 impl Initialize {
-    /// Checks that the base environment presence matches `version`.
+    /// Checks that the version-gated fields match `version`.
     ///
     /// Serde accepts `Initialize` independently of the negotiated version, so
-    /// both peers call this after negotiation: from
-    /// [`BASE_ENVIRONMENT_VERSION`] the field is required, below it the field
-    /// must be absent.
+    /// both peers call this after negotiation: the base environment is
+    /// required from [`BASE_ENVIRONMENT_VERSION`] and the input policy from
+    /// [`INPUT_STALL_VERSION`]; below its version each field must be absent.
     ///
     /// # Errors
     ///
-    /// Returns [`ControlTypeError::BaseEnvironmentMismatch`] when the field is
-    /// missing for a version that requires it, or present for one that does
-    /// not know it.
+    /// Returns [`ControlTypeError::BaseEnvironmentMismatch`] or
+    /// [`ControlTypeError::InputPolicyMismatch`] when a field is missing for a
+    /// version that requires it, or present for one that does not know it.
     pub fn check_version(&self, version: Version) -> Result<(), ControlTypeError> {
         let required = version >= BASE_ENVIRONMENT_VERSION;
-        if self.base_environment.is_some() == required {
-            Ok(())
-        } else {
-            Err(ControlTypeError::BaseEnvironmentMismatch { version, required })
+        if self.base_environment.is_some() != required {
+            return Err(ControlTypeError::BaseEnvironmentMismatch { version, required });
         }
+        let required = version >= INPUT_STALL_VERSION;
+        if self.input_policy.is_some() != required {
+            return Err(ControlTypeError::InputPolicyMismatch { version, required });
+        }
+        Ok(())
     }
 }
 
@@ -1154,6 +1222,11 @@ pub enum ControlCode {
     WorkerFeatureUnavailable,
     /// A bounded observation request exceeded worker policy.
     ObservationLimitExceeded,
+    /// PTY input made no progress within the input stall bound.
+    ///
+    /// Part of the plan may already have reached the child. Sent only on
+    /// connections that negotiated at least [`INPUT_STALL_VERSION`].
+    InputStalled,
 }
 
 /// Describes output evicted before a requested cursor.
@@ -1290,6 +1363,7 @@ mod tests {
             ),
             limits: InitializeLimits::new(1024, 1024, 32, 60_000).expect("valid limits"),
             stop_policy: StopPolicy::new(5_000).expect("valid policy"),
+            input_policy: Some(InputPolicy::new(3_000).expect("valid policy")),
             hook_protocol_version: CURRENT_VERSION,
             public_protocol_version: 1,
             hook_schema: None,
@@ -1306,26 +1380,38 @@ mod tests {
     }
 
     #[test]
-    fn initialize_requires_the_base_environment_from_version_six() {
-        let v6 = initialize("value");
-        v6.check_version(BASE_ENVIRONMENT_VERSION)
-            .expect("version six carries the base environment");
+    fn initialize_gates_its_fields_on_the_negotiated_version() {
+        let v7 = initialize("value");
+        v7.check_version(INPUT_STALL_VERSION)
+            .expect("version seven carries the base environment and the input policy");
         assert_eq!(
-            v6.check_version(crate::PREVIOUS_VERSION),
-            Err(ControlTypeError::BaseEnvironmentMismatch {
-                version: crate::PREVIOUS_VERSION,
+            v7.check_version(BASE_ENVIRONMENT_VERSION),
+            Err(ControlTypeError::InputPolicyMismatch {
+                version: BASE_ENVIRONMENT_VERSION,
                 required: false,
             })
         );
 
-        let v5 = Initialize {
-            base_environment: None,
+        let v6 = Initialize {
+            input_policy: None,
             ..initialize("value")
         };
-        v5.check_version(crate::PREVIOUS_VERSION)
-            .expect("version five omits the base environment");
+        v6.check_version(BASE_ENVIRONMENT_VERSION)
+            .expect("version six carries only the base environment");
         assert_eq!(
-            v5.check_version(BASE_ENVIRONMENT_VERSION),
+            v6.check_version(INPUT_STALL_VERSION),
+            Err(ControlTypeError::InputPolicyMismatch {
+                version: INPUT_STALL_VERSION,
+                required: true,
+            })
+        );
+
+        let without_base = Initialize {
+            base_environment: None,
+            ..v6
+        };
+        assert_eq!(
+            without_base.check_version(BASE_ENVIRONMENT_VERSION),
             Err(ControlTypeError::BaseEnvironmentMismatch {
                 version: BASE_ENVIRONMENT_VERSION,
                 required: true,

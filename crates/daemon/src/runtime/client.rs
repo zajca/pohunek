@@ -17,7 +17,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-13
 
 /// Prefix for daemon-generated, producer-scoped control input identifiers.
 const INPUT_WRITE_ID_PREFIX: &str = "input";
@@ -445,7 +445,8 @@ impl Worker {
     /// A worker that negotiated a version below
     /// [`pohunek_worker_protocol::BASE_ENVIRONMENT_VERSION`] does not know the
     /// base environment, so it is removed from `initialize` before sending; at
-    /// or above that version it is required.
+    /// or above that version it is required. The input policy is removed the
+    /// same way below [`pohunek_worker_protocol::INPUT_STALL_VERSION`].
     ///
     /// # Errors
     ///
@@ -459,6 +460,9 @@ impl Worker {
         let mut inner = self.inner.lock().await;
         if inner.selected_version < pohunek_worker_protocol::BASE_ENVIRONMENT_VERSION {
             initialize.base_environment = None;
+        }
+        if inner.selected_version < pohunek_worker_protocol::INPUT_STALL_VERSION {
+            initialize.input_policy = None;
         }
         initialize
             .check_version(inner.selected_version)
@@ -1383,6 +1387,17 @@ mod tests {
                 .expect("stop grace fits u64"),
             )
             .expect("stop policy"),
+            input_policy: Some(
+                pohunek_worker_protocol::InputPolicy::new(
+                    u64::try_from(
+                        crate::session::SessionRegistryConfig::default()
+                            .input_write_stall_timeout
+                            .as_millis(),
+                    )
+                    .expect("input stall bound fits u64"),
+                )
+                .expect("input policy"),
+            ),
             hook_protocol_version: pohunek_worker_protocol::CURRENT_VERSION,
             public_protocol_version: protocol::PROTOCOL_VERSION.get(),
             hook_schema: None,

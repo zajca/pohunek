@@ -28,7 +28,7 @@ use pohunek_platform::supervisor::{
 };
 use pohunek_service_config::{ConfigSpec, Deadlines, ServiceConfig};
 use pohunek_worker_protocol::{
-    BaseEnv, Dimensions, Initialize, InitializeLimits, LaunchIdentity, SecretEnv,
+    BaseEnv, Dimensions, Initialize, InitializeLimits, InputPolicy, LaunchIdentity, SecretEnv,
     SessionId as WorkerSessionId, StopPolicy, TransactionId, Version,
     DEFAULT_ENVIRONMENT_ALLOWLIST,
 };
@@ -720,6 +720,7 @@ impl Fixture {
             )
             .expect("limits"),
             stop_policy: StopPolicy::new(250).expect("stop policy"),
+            input_policy: Some(InputPolicy::new(3000).expect("input policy")),
             hook_protocol_version: Version::new(1).expect("hook protocol version"),
             public_protocol_version: PROTOCOL_VERSION.get(),
             hook_schema: None,

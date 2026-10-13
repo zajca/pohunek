@@ -1,6 +1,6 @@
 //! Public-API tests for loading, validating, writing, and verifying `service.toml`.
 
-// Rust guideline compliant 2026-09-30
+// Rust guideline compliant 2026-10-13
 
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
@@ -11,14 +11,14 @@ use pohunek_platform::filesystem::FsError;
 use pohunek_platform::shell_env::SearchPath;
 use pohunek_platform::supervisor::Namespace;
 use pohunek_service_config::{
-    ConfigError, ConfigSpec, Deadlines, ServiceConfig, WaitTiming, DEFAULT_INPUT_TIMING,
-    DEFAULT_WAIT_TIMING, MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES, MAX_DEADLINE, MAX_PATTERN_BYTES,
-    MAX_SEARCH_PATH_BYTES,
+    ConfigError, ConfigSpec, Deadlines, InputTiming, ServiceConfig, WaitTiming,
+    DEFAULT_INPUT_TIMING, DEFAULT_WAIT_TIMING, MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES,
+    MAX_DEADLINE, MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES,
 };
 use tempfile::TempDir;
 
 /// The schema example from the crate contract.
-const GOLDEN: &str = r#"schema_version = 4
+const GOLDEN: &str = r#"schema_version = 5
 prefix = "/home/u/.local"
 active_version = "0.31.6"
 
@@ -46,6 +46,7 @@ grace_ms = 5000
 [input]
 initial_startup_grace_ms = 5000
 submit_delay_ms = 150
+write_stall_timeout_ms = 3000
 
 [waits]
 turn_default_ms = 300000
@@ -56,7 +57,7 @@ open_files = 8192
 "#;
 
 /// Every required key and the `namespace` table, as a missing-field diagnostic names them.
-const REQUIRED_KEYS: [&str; 23] = [
+const REQUIRED_KEYS: [&str; 24] = [
     "schema_version",
     "prefix",
     "active_version",
@@ -75,6 +76,7 @@ const REQUIRED_KEYS: [&str; 23] = [
     "input",
     "initial_startup_grace_ms",
     "submit_delay_ms",
+    "write_stall_timeout_ms",
     "waits",
     "turn_default_ms",
     "turn_max_ms",
@@ -476,14 +478,14 @@ fn other_schema_versions_are_rejected_before_their_keys() {
     let fixture = Fixture::new();
     let newer = replace(
         GOLDEN,
-        "schema_version = 4",
-        "schema_version = 5\nfuture_key = true",
+        "schema_version = 5",
+        "schema_version = 6\nfuture_key = true",
     );
     assert!(matches!(
         fixture.load(&newer),
-        Err(ConfigError::UnsupportedSchema { found: 5 })
+        Err(ConfigError::UnsupportedSchema { found: 6 })
     ));
-    let zero = replace(GOLDEN, "schema_version = 4", "schema_version = 0");
+    let zero = replace(GOLDEN, "schema_version = 5", "schema_version = 0");
     assert!(matches!(
         fixture.load(&zero),
         Err(ConfigError::UnsupportedSchema { found: 0 })
@@ -549,14 +551,15 @@ fn upgrade_source_explicitly_migrates_schema_two_to_required_input_keys() {
             & 0o777,
         0o600
     );
-    source.config.write(&path).expect("write schema 4");
-    let current = ServiceConfig::load_upgrade_source(&path).expect("schema 4 upgrade source");
-    assert_eq!(current.source_schema_version, 4);
+    source.config.write(&path).expect("write current schema");
+    let current = ServiceConfig::load_upgrade_source(&path).expect("current schema upgrade source");
+    assert_eq!(current.source_schema_version, 5);
     assert_eq!(current.config, source.config);
     let migrated = fs::read_to_string(&path).expect("read migrated config");
     for line in [
-        "schema_version = 4",
+        "schema_version = 5",
         "submit_delay_ms = 150",
+        "write_stall_timeout_ms = 3000",
         "turn_default_ms = 300000",
         "turn_max_ms = 1800000",
     ] {
@@ -575,6 +578,110 @@ fn upgrade_source_explicitly_migrates_schema_two_to_required_input_keys() {
     assert!(matches!(
         ServiceConfig::load(&path),
         Err(ConfigError::UnsupportedSchema { found: 2 })
+    ));
+}
+
+/// Frozen schema-4 shape exactly as the previous writer emitted it: `[input]`
+/// has no stall bound. Its `[input]` and `[waits]` values differ from the
+/// defaults, so a migration that reset them would show.
+const SCHEMA_FOUR_GOLDEN: &str = r#"# Pohunek service configuration, written by `pohunek service install`.
+# Every key is required; unknown keys are rejected.
+
+schema_version = 4
+prefix = "/home/u/.local"
+active_version = "0.34.2"
+
+[namespace]
+uid = 1000
+state_root = "/home/u/.local/state/pohunek"
+runtime_root = "/run/user/1000/pohunek"
+
+[deadlines]
+worker_connect_ms = 10000
+worker_initialize_ms = 45000
+launchctl_command_ms = 10000
+worker_exit_timeout_ms = 30000
+daemon_exit_timeout_ms = 30000
+daemon_restart_throttle_ms = 5000
+
+[environment]
+search_path = ["/usr/bin"]
+allowlist = ["PATH", "HOME", "LANG", "LC_*", "XDG_*"]
+
+[sweep]
+grace_ms = 5000
+
+[input]
+initial_startup_grace_ms = 9000
+submit_delay_ms = 275
+
+[waits]
+turn_default_ms = 120000
+turn_max_ms = 2700000
+
+[limits]
+open_files = 8192
+"#;
+
+#[test]
+fn upgrade_source_migrates_schema_four_keeping_its_values_and_adding_the_stall_default() {
+    let fixture = Fixture::new();
+    let previous = SCHEMA_FOUR_GOLDEN.to_owned();
+    let path = fixture.write(&previous, 0o600);
+    assert!(matches!(
+        ServiceConfig::load(&path),
+        Err(ConfigError::UnsupportedSchema { found: 4 })
+    ));
+    let source = ServiceConfig::load_upgrade_source(&path).expect("schema 3 upgrade source");
+    assert_eq!(source.source_schema_version, 4);
+    assert_eq!(source.config.active_version(), "0.34.2");
+    assert_eq!(
+        source.config.input_timing(),
+        InputTiming {
+            initial_startup_grace: Duration::from_secs(9),
+            submit_delay: Duration::from_millis(275),
+            write_stall_timeout: DEFAULT_INPUT_TIMING.write_stall_timeout,
+        }
+    );
+    assert_eq!(
+        source.config.wait_timing(),
+        WaitTiming {
+            turn_default: Duration::from_mins(2),
+            turn_max: Duration::from_mins(45),
+        }
+    );
+    assert_eq!(source.original_bytes(), previous.as_bytes());
+
+    let backup = fixture.root.join("upgrade-backup/service.toml");
+    source.write_original(&backup).expect("save private backup");
+    assert_eq!(fs::read(&backup).expect("read backup"), previous.as_bytes());
+
+    source.config.write(&path).expect("write current schema");
+    let migrated = fs::read_to_string(&path).expect("read migrated config");
+    for line in [
+        "schema_version = 5",
+        "initial_startup_grace_ms = 9000",
+        "submit_delay_ms = 275",
+        "write_stall_timeout_ms = 3000",
+        "turn_default_ms = 120000",
+        "turn_max_ms = 2700000",
+    ] {
+        assert!(migrated.contains(line), "{line} missing from {migrated}");
+    }
+    assert_eq!(
+        ServiceConfig::load(&path).expect("migrated file loads"),
+        source.config
+    );
+
+    let saved = ServiceConfig::load_upgrade_source(&backup).expect("verified backup");
+    assert_eq!(saved.source_schema_version, 4);
+    saved
+        .write_original(&path)
+        .expect("rollback exact schema 4");
+    assert_eq!(fs::read(&path).expect("read rollback"), previous.as_bytes());
+    assert!(matches!(
+        ServiceConfig::load(&path),
+        Err(ConfigError::UnsupportedSchema { found: 4 })
     ));
 }
 
@@ -633,6 +740,10 @@ fn upgrade_source_migrates_schema_three_keeping_input_and_adding_default_waits()
         Duration::from_millis(275)
     );
     assert_eq!(
+        source.config.input_timing().write_stall_timeout,
+        DEFAULT_INPUT_TIMING.write_stall_timeout
+    );
+    assert_eq!(
         source.config.wait_timing(),
         WaitTiming {
             turn_default: Duration::from_mins(5),
@@ -645,12 +756,13 @@ fn upgrade_source_migrates_schema_three_keeping_input_and_adding_default_waits()
     source.write_original(&backup).expect("save private backup");
     assert_eq!(fs::read(&backup).expect("read backup"), previous.as_bytes());
 
-    source.config.write(&path).expect("write schema 4");
+    source.config.write(&path).expect("write current schema");
     let migrated = fs::read_to_string(&path).expect("read migrated config");
     for line in [
-        "schema_version = 4",
+        "schema_version = 5",
         "initial_startup_grace_ms = 9000",
         "submit_delay_ms = 275",
+        "write_stall_timeout_ms = 3000",
         "[waits]",
         "turn_default_ms = 300000",
         "turn_max_ms = 1800000",
@@ -718,12 +830,12 @@ fn upgrade_source_rejects_invalid_previous_shape_and_unsupported_schema() {
         }
     }
     fixture.write(
-        &replace(GOLDEN, "schema_version = 4", "schema_version = 5"),
+        &replace(GOLDEN, "schema_version = 5", "schema_version = 6"),
         0o600,
     );
     assert!(matches!(
         ServiceConfig::load_upgrade_source(&path),
-        Err(ConfigError::UnsupportedSchema { found: 5 })
+        Err(ConfigError::UnsupportedSchema { found: 6 })
     ));
 }
 
@@ -759,6 +871,10 @@ fn durations_are_bounded() {
             "input.initial_startup_grace_ms",
         ),
         ("submit_delay_ms = 150", "input.submit_delay_ms"),
+        (
+            "write_stall_timeout_ms = 3000",
+            "input.write_stall_timeout_ms",
+        ),
     ] {
         let name = line.split(" = ").next().expect("key");
         for value in [0, max + 1] {
@@ -1483,7 +1599,7 @@ fn invalid_search_paths_are_rejected_without_quoting_the_value() {
 fn a_schema_one_file_is_rejected_with_an_actionable_error() {
     let fixture = Fixture::new();
     let without_search_path = GOLDEN
-        .replacen("schema_version = 4", "schema_version = 1", 1)
+        .replacen("schema_version = 5", "schema_version = 1", 1)
         .lines()
         .filter(|line| !line.starts_with("search_path = "))
         .collect::<Vec<_>>()
