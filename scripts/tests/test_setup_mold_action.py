@@ -16,6 +16,7 @@ import subprocess
 import tarfile
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -36,6 +37,20 @@ TLS_FLAGS = {"--tlsv1.2"}
 SCRIPT_TIMEOUT_SECONDS = 60
 # How often the server loop re-checks its stop flag while waiting for a client.
 ACCEPT_POLL_SECONDS = 0.05
+# Transfer limits the tests substitute for the action's production values, so a
+# stalled transfer ends in about a second. Each name is an env value of the install step.
+TRANSFER_LIMITS_FOR_TESTS = {
+    "DOWNLOAD_CONNECT_TIMEOUT_SECONDS": "1",
+    "DOWNLOAD_STALL_BYTES_PER_SECOND": "1024",
+    "DOWNLOAD_STALL_SECONDS": "1",
+    "DOWNLOAD_MAX_TIME_SECONDS": "2",
+    "DOWNLOAD_RETRY_MAX_TIME_SECONDS": "3",
+}
+# A stalled run ends after at most retry-max-time plus max-time; this bound
+# leaves room for process start-up and is far below SCRIPT_TIMEOUT_SECONDS.
+STALL_RUN_BOUND_SECONDS = 20
+# Content-Length the stalling server declares; it never sends that many bytes.
+STALL_DECLARED_LENGTH = 1048576
 
 
 def action_run_script() -> str:
@@ -116,6 +131,70 @@ class ReleaseServer:
                 connection.sendall(head + self.body)
 
 
+class StallingServer:
+    """Accepts every connection and then stalls it.
+
+    With `partial` None the server sends nothing. Otherwise it sends headers
+    declaring STALL_DECLARED_LENGTH bytes followed by `partial`, then stops.
+    Connections stay open until the server exits, so only the client's own
+    limits can end an attempt.
+    """
+
+    def __init__(self, partial: bytes | None):
+        self.partial = partial
+        self.connections = 0
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen()
+        self.listener.settimeout(ACCEPT_POLL_SECONDS)
+        self.stopped = threading.Event()
+        self.port = self.listener.getsockname()[1]
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.held: list[socket.socket] = []
+        self.handlers: list[threading.Thread] = []
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stopped.set()
+        self.thread.join(timeout=SCRIPT_TIMEOUT_SECONDS)
+        self.listener.close()
+        for connection in self.held:
+            connection.close()
+        for handler in self.handlers:
+            handler.join(timeout=SCRIPT_TIMEOUT_SECONDS)
+
+    def _serve(self):
+        while not self.stopped.is_set():
+            try:
+                connection, _ = self.listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            self.connections += 1
+            self.held.append(connection)
+            handler = threading.Thread(target=self._hold, args=(connection,), daemon=True)
+            self.handlers.append(handler)
+            handler.start()
+
+    def _hold(self, connection: socket.socket):
+        try:
+            connection.recv(65536)
+            if self.partial is not None:
+                head = (
+                    "HTTP/1.1 200 OK\r\n"
+                    f"Content-Length: {STALL_DECLARED_LENGTH}\r\n"
+                    "Connection: close\r\n\r\n"
+                ).encode()
+                connection.sendall(head + self.partial)
+            self.stopped.wait()
+        except OSError:
+            return
+
+
 CURL_SHIM = """#!/usr/bin/env python3
 import os
 import sys
@@ -139,7 +218,7 @@ os.execv({curl!r}, [{curl!r}] + out)
 
 
 class SetupMoldActionTests(unittest.TestCase):
-    def run_action(self, server: ReleaseServer, sha256: str):
+    def run_action(self, server, sha256: str):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             shims = tmp / "shims"
@@ -172,6 +251,7 @@ class SetupMoldActionTests(unittest.TestCase):
                 "DOWNLOAD_RETRIES": action_env("DOWNLOAD_RETRIES"),
                 "DOWNLOAD_RETRY_DELAY_SECONDS": "0",
                 "TEST_SERVER_PORT": str(server.port),
+                **TRANSFER_LIMITS_FOR_TESTS,
             }
             result = subprocess.run(
                 ["bash", "-c", action_run_script()],
@@ -180,21 +260,55 @@ class SetupMoldActionTests(unittest.TestCase):
                 text=True,
                 timeout=SCRIPT_TIMEOUT_SECONDS,
             )
-            return result, (runner_temp / "mold" / "bin" / "mold").exists()
+            path_entries = github_path.read_text() if github_path.exists() else ""
+            return result, (runner_temp / "mold" / "bin" / "mold").exists(), path_entries
 
     def test_connection_resets_are_retried(self):
         body = mold_archive()
         with ReleaseServer(body, resets=2) as server:
-            result, installed = self.run_action(server, hashlib.sha256(body).hexdigest())
+            result, installed, _ = self.run_action(server, hashlib.sha256(body).hexdigest())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(MOLD_BANNER, result.stdout)
         self.assertTrue(installed)
         self.assertEqual(server.connections, 3)
 
+    def run_stalled(self, partial):
+        body = mold_archive()
+        started = time.monotonic()
+        with StallingServer(partial) as server:
+            result, installed, path_entries = self.run_action(server, hashlib.sha256(body).hexdigest())
+            connections = server.connections
+        elapsed = time.monotonic() - started
+        output = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0, output)
+        self.assertIn("::error::setup-mold: download of", output)
+        self.assertLess(elapsed, STALL_RUN_BOUND_SECONDS)
+        self.assertFalse(installed)
+        # Nothing reaches GITHUB_PATH, so no later step finds a mold on PATH.
+        self.assertEqual(path_entries, "")
+        # The timeout (curl exit 28) is retried, not treated as final.
+        self.assertGreaterEqual(connections, 2)
+
+    def test_server_that_never_sends_headers_fails_with_an_error(self):
+        self.run_stalled(None)
+
+    def test_server_that_stalls_mid_body_fails_with_an_error(self):
+        self.run_stalled(mold_archive()[:1000])
+
+    def test_limits_are_named_env_values_passed_to_curl(self):
+        script = action_run_script()
+        action = ACTION.read_text()
+        for name in TRANSFER_LIMITS_FOR_TESTS:
+            with self.subTest(name=name):
+                self.assertRegex(action, rf"(?m)^ {{8}}{name}: \"[0-9]+\"$")
+                self.assertIn(f'"${name}"', script)
+        for flag in ("--connect-timeout", "--speed-limit", "--speed-time", "--max-time", "--retry-max-time"):
+            self.assertIn(flag, script)
+
     def test_hash_mismatch_fails_before_extraction(self):
         body = mold_archive()
         with ReleaseServer(body, resets=0) as server:
-            result, installed = self.run_action(server, "0" * 64)
+            result, installed, _ = self.run_action(server, "0" * 64)
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(installed)
 
