@@ -15,6 +15,7 @@ mod completion;
 mod error;
 mod hermes_integration;
 mod paths;
+mod process;
 pub mod service;
 mod target;
 

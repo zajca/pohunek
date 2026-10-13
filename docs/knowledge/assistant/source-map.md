@@ -709,6 +709,7 @@ Hermes operator plugin and managed lifecycle:
 - `crates/cli/src/hermes_integration/policy.rs`
 - `crates/cli/src/hermes_integration/lifecycle.rs`
 - `crates/cli/src/hermes_integration/runner.rs`
+- `crates/cli/src/process/bounded.rs` — the bounded child lifecycle the Hermes runner spawns through: own process group, inherited descriptors closed, deadline kill, and capped output.
 - `crates/cli/src/hermes_integration/assets.rs`
 - `crates/cli/src/hermes_integration/doctor.rs`
 - `crates/cli/src/hermes_integration/skill.rs`
