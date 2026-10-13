@@ -607,6 +607,7 @@ Runtime package archive format:
 - `docs/knowledge/guides/pi-package.md`
 - `docs/knowledge/guides/codex-package.md`
 - `docs/knowledge/guides/claude-package.md`
+- `docs/knowledge/guides/hermes-package.md`
 - `runtime-packages/README.md` — layout convention of the official package sources.
 - `runtime-packages/pi/runtime.toml` — Pi runtime descriptor (assigned reference for launches and forks, existence check with the session-dir variable and the refused flag and settings, version probe).
 - `runtime-packages/pi/detect.toml` — Pi detection manifest verified against real screens.
@@ -628,6 +629,10 @@ Runtime package archive format:
 - `compat/claude/builtin-v0.34/` — golden copies of the built-in Claude descriptor and detection manifest of release 0.34.2.
 - `crates/cli/tests/claude_package.rs` — pure package tests (descriptor and manifest parity with the v0.34.2 built-in goldens up to the enumerated #613 rule changes), catalog-installed package launch and version-probe tests, the opt-in real-Claude tests and the screen capture.
 - `crates/cli/tests/support/messages_stub.rs` — loopback Messages-API stub used instead of a model provider.
+- `runtime-packages/hermes/runtime.toml` — Hermes runtime descriptor (the built-in Hermes descriptor with a `semver-line-v1` version probe and the package's own detection manifest).
+- `runtime-packages/hermes/detect.toml` — Hermes detection manifest, equal to the built-in one.
+- `runtime-packages/hermes/operator.toml` — closed sidecar of the Hermes operator plugin payload in `runtime-packages/hermes/operator/`.
+- `crates/cli/tests/hermes_package.rs` — catalog-installed Hermes package tests (descriptor and manifest parity with the built-in Hermes files, the version probe, operator installs from the selected package and the source errors) and the opt-in real-Hermes session test.
 - `crates/cli/tests/support/process_guard.rs` — process cleanup shared by the real-agent package tests.
 - `crates/cli/tests/support/plugin_harness.rs` — real-daemon harness shared by the package tests.
 - `crates/test-support/src/catalog.rs` — throwaway signing key, trust anchor and signed catalog helpers (feature `catalog`) shared by the catalog install tests of the CLI and the daemon.
@@ -705,7 +710,7 @@ Hermes operator plugin and managed lifecycle:
 - `crates/cli/src/hermes_integration/assets.rs`
 - `crates/cli/src/hermes_integration/doctor.rs`
 - `crates/cli/src/hermes_integration/skill.rs`
-- `compat/hermes/operator/plugin.yaml`
+- `runtime-packages/hermes/operator/plugin.yaml`
 - `crates/cli/src/hermes_integration/assets/pohunek/__init__.py`
 - `crates/cli/src/hermes_integration/assets/pohunek/cli.py`
 - `crates/cli/src/hermes_integration/assets/pohunek/hooks.py`

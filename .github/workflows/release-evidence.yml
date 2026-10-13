@@ -9,8 +9,9 @@ name: Release evidence
 #   plan              the (runtime x target) rows from compat/matrix.json (jq)
 #   consumer          the release consumer test executable, built once
 #   rows              one job per row: extracts the binaries from the daemon
-#                     ARCHIVE, stages the pinned upstream, runs the consumer
-#                     out of process and emits attestation-<runtime>-<target>.json
+#                     ARCHIVE, stages the pinned upstream (npm, or a provisioner
+#                     script with Python and uv), runs the consumer out of
+#                     process and emits attestation-<runtime>-<target>.json
 #   attest            build provenance for every producer artifact (release only)
 #   assemble          verifies provenance with `gh attestation verify`, then
 #                     `cargo xtask release assemble` signs the catalog with the
@@ -187,6 +188,22 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ needs.plan.outputs.node }}
+
+      # A lock whose `upstream.kind` is `provisioner` stages its upstream with
+      # a repository script that builds a Python environment with uv: the
+      # script needs python3 for its helper programs and uv, and the
+      # environment runs the pinned CPython the script downloads and verifies,
+      # never this interpreter. No uv cache is kept between runs.
+      - name: Install Python for provisioned upstreams
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv for provisioned upstreams
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: false
 
       - name: Build xtask
         run: cargo build --locked -p xtask
@@ -539,6 +556,22 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ needs.plan.outputs.node }}
+
+      # A lock whose `upstream.kind` is `provisioner` stages its upstream with
+      # a repository script that builds a Python environment with uv: the
+      # script needs python3 for its helper programs and uv, and the
+      # environment runs the pinned CPython the script downloads and verifies,
+      # never this interpreter. No uv cache is kept between runs.
+      - name: Install Python for provisioned upstreams
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv for provisioned upstreams
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: false
 
       - name: Build xtask
         run: cargo build --locked -p xtask

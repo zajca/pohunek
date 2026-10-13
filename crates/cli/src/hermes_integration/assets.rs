@@ -28,40 +28,41 @@ pub(crate) const MARKER_VERSION: u32 = 3;
 /// The generated marker is deliberately not self-checksummed.
 pub(crate) const MARKER_NAME: &str = ".pohunek-owned.json";
 /// Closed operator sidecar embedded into the CLI for verification at install time.
-const OPERATOR_MANIFEST: &[u8] = include_bytes!("../../../../compat/hermes/operator.toml");
+const OPERATOR_MANIFEST: &[u8] =
+    include_bytes!("../../../../runtime-packages/hermes/operator.toml");
 /// Payload files available to the closed operator manifest.
 const OPERATOR_PAYLOAD: [(&str, &[u8]); 8] = [
     (
         "plugin.yaml",
-        include_bytes!("../../../../compat/hermes/operator/plugin.yaml"),
+        include_bytes!("../../../../runtime-packages/hermes/operator/plugin.yaml"),
     ),
     (
         "__init__.py",
-        include_bytes!("../../../../compat/hermes/operator/__init__.py"),
+        include_bytes!("../../../../runtime-packages/hermes/operator/__init__.py"),
     ),
     (
         "cli.py",
-        include_bytes!("../../../../compat/hermes/operator/cli.py"),
+        include_bytes!("../../../../runtime-packages/hermes/operator/cli.py"),
     ),
     (
         "hooks.py",
-        include_bytes!("../../../../compat/hermes/operator/hooks.py"),
+        include_bytes!("../../../../runtime-packages/hermes/operator/hooks.py"),
     ),
     (
         "policy.py",
-        include_bytes!("../../../../compat/hermes/operator/policy.py"),
+        include_bytes!("../../../../runtime-packages/hermes/operator/policy.py"),
     ),
     (
         "redact.py",
-        include_bytes!("../../../../compat/hermes/operator/redact.py"),
+        include_bytes!("../../../../runtime-packages/hermes/operator/redact.py"),
     ),
     (
         "tools.py",
-        include_bytes!("../../../../compat/hermes/operator/tools.py"),
+        include_bytes!("../../../../runtime-packages/hermes/operator/tools.py"),
     ),
     (
         "skills/pohunek/SKILL.md",
-        include_bytes!("../../../../compat/hermes/operator/skills/pohunek/SKILL.md"),
+        include_bytes!("../../../../runtime-packages/hermes/operator/skills/pohunek/SKILL.md"),
     ),
 ];
 /// The reporter stays embedded and owned exclusively by the core CLI.

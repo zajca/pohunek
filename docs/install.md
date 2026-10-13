@@ -202,6 +202,7 @@ pohunek-daemon-<version>-<target>/
   runtime/packages/pi.tar.zst        official Pi package
   runtime/packages/codex.tar.zst     official Codex package
   runtime/packages/claude.tar.zst    official Claude Code package
+  runtime/packages/hermes.tar.zst    official Hermes Agent package
   runtime/attestations/<runtime>-<target>.json
 ```
 
@@ -248,12 +249,13 @@ archive again; keep the archive and catalog (or the release assets): restoring a
 installation needs the same files, and an official archive can be restored only
 while the daemon still runs the release whose catalog authorized it. The upstream agent itself is not part of the package: it
 must be on the daemon's `PATH` in the range the package declares (see the
-[Pi](knowledge/guides/pi-package.md), [Codex](knowledge/guides/codex-package.md)
-and [Claude Code](knowledge/guides/claude-package.md) package guides), or the
+[Pi](knowledge/guides/pi-package.md), [Codex](knowledge/guides/codex-package.md),
+[Claude Code](knowledge/guides/claude-package.md) and
+[Hermes](knowledge/guides/hermes-package.md) package guides), or the
 runtime reports itself unsupported.
 
-`codex` and `claude` are reserved runtime ids that only a catalog-authorized
-package may serve. The daemon compiles no Codex in, so Codex is available only
+`codex`, `claude` and `hermes` are reserved runtime ids that only a
+catalog-authorized package may serve. The daemon compiles no Codex in, so Codex is available only
 once its package is installed:
 
 ```bash
@@ -285,8 +287,8 @@ work and continue in a new session. Install the Codex package on the earlier
 release before upgrading so that live Codex sessions stay usable.
 
 The first installed version of a package is enabled and selected, so
-installing `claude.tar.zst` takes the id over from the built-in runtime at
-once:
+installing `claude.tar.zst` or `hermes.tar.zst` takes the id over from the
+built-in runtime at once:
 
 - an existing session launched from the built-in runtime can no longer be
   resumed or forked (`runtime_served_by_package`) until the package is disabled

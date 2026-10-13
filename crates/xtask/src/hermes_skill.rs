@@ -15,9 +15,9 @@ use toml_edit::{value, DocumentMut};
 use crate::{create_dir_all, XtaskError};
 
 pub(crate) const SOURCE_PATH: &str = "docs/knowledge/guides/hermes-operator.md";
-pub(crate) const GENERATED_PATH: &str = "compat/hermes/operator/skills/pohunek/SKILL.md";
-const PLUGIN_PATH: &str = "compat/hermes/operator/plugin.yaml";
-const SIDECAR_PATH: &str = "compat/hermes/operator.toml";
+pub(crate) const GENERATED_PATH: &str = "runtime-packages/hermes/operator/skills/pohunek/SKILL.md";
+const PLUGIN_PATH: &str = "runtime-packages/hermes/operator/plugin.yaml";
+const SIDECAR_PATH: &str = "runtime-packages/hermes/operator.toml";
 const SKILL_NAME: &str = "pohunek";
 const SKILL_DESCRIPTION: &str =
     "Safely observe and operate Pohunek sessions through registered tools.";
@@ -370,11 +370,11 @@ mod tests {
         fs::create_dir_all(guide_path.parent().expect("guide parent"))
             .expect("fixture guide parent");
         fs::write(&guide_path, source()).expect("write fixture guide");
-        let plugin_path = root.join("compat/hermes/operator/plugin.yaml");
+        let plugin_path = root.join("runtime-packages/hermes/operator/plugin.yaml");
         fs::create_dir_all(plugin_path.parent().expect("plugin parent"))
             .expect("fixture plugin parent");
         fs::write(&plugin_path, plugin()).expect("write fixture plugin");
-        let sidecar_path = root.join("compat/hermes/operator.toml");
+        let sidecar_path = root.join("runtime-packages/hermes/operator.toml");
         fs::write(
             &sidecar_path,
             "schema = 1\n\n[[payload]]\npath = \"skills/pohunek/SKILL.md\"\nsha256 = \"stale\"\n",
@@ -406,11 +406,11 @@ mod tests {
         fs::write(&guide_path, &changed_source).expect("change source guide");
         crate::run(["hermes", "generate-skill"]).expect("run public generator command");
 
-        let generated_path = root.join("compat/hermes/operator/skills/pohunek/SKILL.md");
+        let generated_path = root.join("runtime-packages/hermes/operator/skills/pohunek/SKILL.md");
         let generated = fs::read(&generated_path).expect("read embedded payload target");
         let generated_text = String::from_utf8(generated.clone()).expect("generated UTF-8");
         assert!(generated_text.ends_with("# Hermes operator\n\nSafely use `pohunek_sessions`.\n"));
-        let sidecar_path = root.join("compat/hermes/operator.toml");
+        let sidecar_path = root.join("runtime-packages/hermes/operator.toml");
         let sidecar = fs::read_to_string(&sidecar_path).expect("read fixture sidecar");
         let expected_digest = format!("{:x}", Sha256::digest(&generated));
         assert!(sidecar.contains(&format!("sha256 = \"{expected_digest}\"")));

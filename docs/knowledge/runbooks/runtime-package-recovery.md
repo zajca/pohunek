@@ -197,10 +197,10 @@ from the current release's archive.
   catalog authorized it; after a daemon upgrade, release the lost digest and
   install the current release's package as section 1 step 4 describes.
 - `runtime_served_by_package`: the session was launched from the built-in
-  Codex or Claude runtime, and an official package serves that id now. For
-  Claude, disable or uninstall the official package to resume it from the
-  built-in, or start a new session on the package. For Codex there is no
-  built-in to return to: start a new session on the package.
+  Codex, Claude or Hermes runtime, and an official package serves that id now.
+  For Claude and Hermes, disable or uninstall the official package to resume
+  it from the built-in, or start a new session on the package. For Codex there
+  is no built-in to return to: start a new session on the package.
 - `runtime_builtin_removed`: the session was launched from the built-in Codex
   runtime of an earlier release, which this daemon does not compile in, and no
   package serves `codex`. Resume, fork and every interaction (input, attach,

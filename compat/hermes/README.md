@@ -10,7 +10,8 @@ rather than repeat `0.20.0` in another mutable source.
 The lock has the shape of the other official-package locks
 (`compat/<runtime>/compatibility-lock.json`), so `cargo xtask compat attest`
 and `compat verify` read it through `--lock` like any other lock, and
-`compat matrix-check` reads it once `runtime-packages/hermes/` exists:
+`compat matrix-check` reads it for the official package in
+`runtime-packages/hermes/`:
 
 | Field | Meaning |
 | --- | --- |
@@ -25,38 +26,37 @@ and `compat verify` read it through `--lock` like any other lock, and
 exact SHA-256, so any lock edit changes both digests and the CI runtime cache
 key, which hashes the lock.
 
-`package/` contains a production-format local package fixture under validation,
-not a published or released package. Its descriptor uses the data-driven
+The official Hermes runtime package lives in `runtime-packages/hermes/`
+(`runtime.toml`, `detect.toml`, `operator.toml`, `operator/`; see
+`docs/knowledge/guides/hermes-package.md`). Its descriptor uses the data-driven
 `semver-line-v1` probe for the locked banner and limits support to
 `[0.20.0, 0.20.1)`, the lock's `supported` range
 (`crates/cli/tests/hermes_package.rs` keeps the two equal). The lock remains
 authoritative for the upstream release and source digest.
 The reserved `hermes` runtime id can be served by a package only when a signed
-catalog authorizes its digest. Hermes is not in the published catalog, and no
-Hermes release package artifact exists yet.
+catalog authorizes its digest. Releases attest the package for the Linux
+x86_64 glibc and musl targets of `compat/matrix.json` and ship it with that
+catalog in every Linux daemon archive; the macOS daemon archive carries no
+runtime package.
 
-`operator.toml` and `operator/` are the closed S3 fixture for the allowlisted
-Hermes operator payload. The CLI embeds and verifies this exact sidecar and its
-payload before installing; the core-owned `_pohunek_reporter.py` remains outside
-the sidecar and is embedded separately. This fixture does not create a
-`runtime-packages/hermes/` release inventory.
+The package's `operator.toml` is the closed sidecar of the allowlisted Hermes
+operator payload in its `operator/` directory. The CLI verifies the sidecar and
+its payload before installing; the core-owned `_pohunek_reporter.py` remains
+outside the sidecar and is embedded separately. When an official Hermes package
+is installed, enabled, selected and catalog-authorized, the CLI installs the
+plugin from that package. The CLI also embeds this sidecar and payload and uses
+that copy only as the transitional source when no Hermes package is installed.
 
 The skill payload is generated from `docs/knowledge/guides/hermes-operator.md`.
 Run `cargo xtask hermes generate-skill` after changing that guide; the command
-writes the embedded payload under `operator/` and refreshes its `operator.toml`
-checksum. `cargo xtask hermes check-skill` and `cargo xtask docs check` verify
-that exact embedded payload and checksum.
-
-The S3 package-backed contract places the closed sidecar at `operator.toml` in
-the root of an installed Hermes runtime package and its exact allowlisted files
-at `operator/<path>` alongside `runtime.toml` and `detect.toml`. The selected
-package record must be enabled and catalog-authorized. The S5 release inventory
-will provide the official package; until then the CLI keeps the embedded S3
-sidecar as its source when no Hermes package is installed.
+writes `runtime-packages/hermes/operator/skills/pohunek/SKILL.md` and refreshes
+its checksum in `runtime-packages/hermes/operator.toml`. `cargo xtask hermes
+check-skill` and `cargo xtask docs check` verify that exact payload and
+checksum.
 
 Run the model-free CI gate with an installed pinned executable on `PATH`,
 the directory of built Pohunek binaries, and the Hermes runtime package
-archive built from this directory:
+archive built from `runtime-packages/hermes/`:
 
 ```bash
 scripts/build-hermes-package /abs/hermes.tar.zst
@@ -66,10 +66,8 @@ cargo xtask hermes compatibility --bin-dir ABS_BIN_DIR --package /abs/hermes.tar
 `ABS_BIN_DIR` must be an absolute directory holding `pohunek`, `pohunekd`, and
 `pohunek-sessiond`, each a canonical regular executable with no symlink
 components or group/world-write permissions. `scripts/build-hermes-package`
-copies `package/runtime.toml`, `package/detect.toml`, `operator.toml`, and
-`operator/` into one package directory and builds it with `cargo xtask package
-build`. For local diagnosis, `--hermes-bin <path>` selects another Hermes
-executable.
+builds `runtime-packages/hermes/` with `cargo xtask package build`. For local
+diagnosis, `--hermes-bin <path>` selects another Hermes executable.
 
 The gate installs the operator plugin from that package, the way an operator
 host does, and never through a source switch. It refuses an archive whose
@@ -136,10 +134,12 @@ the anchor that trusts the catalog's signer. It copies the three binaries into
 a private prefix with that anchor beside the daemon, starts the daemon with a
 clean isolated home, installs the package with `pohunek plugin install
 --catalog`, and requires every installed-state `integration` result to report
-the package and its digest as the provenance. Until Hermes ships in the release
-catalog, CI and the release workflows build the package with
-`scripts/build-hermes-package` and write the catalog and anchor with `cargo
-xtask hermes throwaway-catalog`, whose signing key is random and never written.
+the package and its digest as the provenance. CI and the release workflows run
+this smoke on daemon archives that carry no signed release catalog (CI's
+development archives, and the release build's archives before assembly adds
+the catalog), so they build the package with `scripts/build-hermes-package`
+and write the catalog and anchor with `cargo xtask hermes throwaway-catalog`,
+whose signing key is random and never written.
 The smoke resolves symlinked temporary parents (macOS `/tmp` and `/var/tmp`)
 before validating them. The harness resolves symlinks in its isolation root so redaction matches
 the paths child processes print, and uses `en_US.UTF-8` where macOS lacks

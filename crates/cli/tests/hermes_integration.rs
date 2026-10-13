@@ -20,6 +20,19 @@ use pohunek_test_support::env::TestEnv;
 use protocol::{Request, Response, RuntimeRef, PROTOCOL_VERSION};
 use serde_json::{json, Value};
 
+/// Directory of the official Hermes package, relative to the workspace root.
+/// The CLI embeds its operator payload; the tests read the same files at run
+/// time instead of embedding them a second time.
+const HERMES_PACKAGE_DIR: &str = "runtime-packages/hermes";
+
+/// One file of the official Hermes package, by its path inside the package.
+fn hermes_package_file(relative: &str) -> Vec<u8> {
+    let path = pohunek_test_support::workspace_root()
+        .join(HERMES_PACKAGE_DIR)
+        .join(relative);
+    fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+}
+
 struct Fixture {
     env: TestEnv,
     root: PathBuf,
@@ -162,7 +175,7 @@ esac"#,
     assert_eq!(
         fs::read(plugin_root.join("skills/pohunek/SKILL.md"))
             .expect("read installed operator skill"),
-        include_bytes!("../../../compat/hermes/operator/skills/pohunek/SKILL.md").as_slice(),
+        hermes_package_file("operator/skills/pohunek/SKILL.md"),
         "CLI installation must use the sidecar-checked embedded operator payload"
     );
 }
@@ -287,18 +300,18 @@ esac"#,
         &fs::read(plugin_root.join(".pohunek-owned.json")).expect("read ownership marker"),
     )
     .expect("parse ownership marker");
-    let operator_manifest = include_bytes!("../../../compat/hermes/operator.toml");
+    let operator_manifest = hermes_package_file("operator.toml");
     assert_eq!(marker["version"], 3);
     assert_eq!(marker["source"], "embedded");
     assert_eq!(
         marker["operator_sha256"],
         format!(
             "{:x}",
-            <sha2::Sha256 as sha2::Digest>::digest(operator_manifest)
+            <sha2::Sha256 as sha2::Digest>::digest(&operator_manifest)
         )
     );
     let sidecar: toml::Value =
-        toml::from_str(std::str::from_utf8(operator_manifest).expect("sidecar UTF-8"))
+        toml::from_str(std::str::from_utf8(&operator_manifest).expect("sidecar UTF-8"))
             .expect("parse closed operator sidecar");
     let payload = sidecar["payload"].as_array().expect("payload list");
     assert_eq!(payload.len(), 8, "the sidecar pins the exact S3 payload");

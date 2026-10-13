@@ -196,12 +196,12 @@ const RULES: &[Rule] = &[
         "knowledge bundle embedded by pohunek-knowledge's build script and read by xtask tests",
     ),
     rule(
-        Pattern::File("compat/hermes/operator.toml"),
+        Pattern::File("runtime-packages/hermes/operator.toml"),
         Effect::Packages(&["pohunek-cli"]),
         "Hermes operator manifest embedded by pohunek-cli's Hermes integration",
     ),
     rule(
-        Pattern::Dir("compat/hermes/operator"),
+        Pattern::Dir("runtime-packages/hermes/operator"),
         Effect::Packages(&["pohunek-cli"]),
         "Hermes operator payload embedded by pohunek-cli's Hermes integration",
     ),
@@ -254,7 +254,12 @@ const RULES: &[Rule] = &[
     rule(
         Pattern::Dir("runtime-packages"),
         Effect::Packages(&["pohunek-cli"]),
-        "official runtime package sources built and parsed by pohunek-cli's pi_package, pi_frame_properties, codex_package and claude_package tests; the Claude test also reads the built-in Claude files the daemon embeds",
+        "official runtime package sources built and parsed by pohunek-cli's pi_package, pi_frame_properties, codex_package, claude_package, hermes_package and hermes_integration tests; the Claude test also reads the built-in Claude files the daemon embeds",
+    ),
+    rule(
+        Pattern::Dir("runtime-packages/hermes"),
+        Effect::Packages(&["xtask"]),
+        "Hermes package built by xtask's official lock shape scenario; its operator skill and sidecar are what `hermes generate-skill` and `hermes check-skill` write and check",
     ),
     rule(
         Pattern::Dir("runtime-packages/codex"),
@@ -1043,7 +1048,7 @@ mod tests {
 
     #[test]
     fn embedded_paths_map_to_their_embedding_packages() {
-        let cases: [(&str, &[&str]); 20] = [
+        let cases: [(&str, &[&str]); 22] = [
             (
                 "docs/knowledge/guides/agent-skill.md",
                 &["pohunek-knowledge", "xtask"],
@@ -1090,6 +1095,14 @@ mod tests {
                 &["pohunek-cli", "pohunek-daemon"],
             ),
             ("runtime-packages/pi/runtime.toml", &["pohunek-cli"]),
+            (
+                "runtime-packages/hermes/runtime.toml",
+                &["pohunek-cli", "xtask"],
+            ),
+            (
+                "runtime-packages/hermes/operator/cli.py",
+                &["pohunek-cli", "xtask"],
+            ),
             ("runtime-packages/README.md", &["pohunek-cli"]),
             (
                 "scripts/tests/smoke-hermes-plugin-release.sh",

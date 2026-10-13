@@ -115,7 +115,13 @@ release consumer executable, and runs the consumer once per shipped package in
 a network- and PID-isolated namespace (`unshare` through a user namespace, or
 `sudo -n unshare` with a `setpriv` drop; no un-isolated fallback). The runtimes
 are the `runtime/packages/*.tar.zst` the archive carries; a shipped package
-without a staged upstream fails. Each consumer report must name the catalog
+without a staged upstream fails. `scripts/release-workflow/run-smoke` stages
+every runtime of `compat/matrix.json` once and keeps an untouched copy, and
+before each Linux daemon archive restores every runtime from that copy at the
+same absolute path and checks it with `cargo xtask compat verify-stage`: a
+consumer may write into the stage it ran from (a provisioned Python upstream
+writes bytecode and state files), and the smoke refuses a stage that differs
+from its manifests. Each consumer report must name the catalog
 entry's package digest and the SHA-256 of the archive's own binaries. The
 procedure and its limits are in `docs/development.md` ("Archive smoke").
 
@@ -143,7 +149,10 @@ archive (`cargo xtask package build --evidence-dir`); no release job downloads
 it, so it is never a release input or asset.
 The evidence workflow plans the rows from `compat/matrix.json` with `jq`; every
 row extracts the binaries from the daemon ARCHIVE of its target, stages the pinned
-upstream and runs the consumer suite, then `compat attest` writes
+upstream (with npm, or for a lock whose `upstream.kind` is `provisioner`, such
+as Hermes, with the repository script it names, for which the `rows` and
+`smoke` jobs install Python and uv) and runs the consumer suite, then
+`compat attest` writes
 `attestation-<runtime>-<target>.json`. The row also writes the wall clock and
 outcome of the consumer run as a one-testcase JUnit report
 (`matrix-junit-<runtime>-<target>` artifact, uploaded also when the run fails);

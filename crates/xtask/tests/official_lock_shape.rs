@@ -40,8 +40,8 @@ const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 /// Hermes release the checked-in lock pins (`compat/hermes/README.md`).
 const HERMES_RELEASE: &str = "0.20.0";
 
-/// Directory of the Hermes package descriptor in this workspace.
-const HERMES_PACKAGE_DIR: &str = "compat/hermes/package";
+/// Directory of the official Hermes package in this workspace.
+const HERMES_PACKAGE_DIR: &str = "runtime-packages/hermes";
 
 fn lock_relative(runtime: &str) -> String {
     format!("compat/{runtime}/compatibility-lock.json")
