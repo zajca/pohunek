@@ -13,8 +13,8 @@
 # the copied daemon is started, the package is installed with
 # `pohunek plugin install --catalog`, and the Hermes integration lifecycle then
 # runs against it. Every installed-state result must report the package with
-# the archive's digest as its provenance (`source=package`); an install from
-# the CLI's embedded copy fails the smoke.
+# the archive's digest as its provenance (`source=package`); an install that
+# records `source=embedded` (an older CLI's compiled copy) fails the smoke.
 #
 # This script deliberately creates every mutable path below one temporary root.
 # It never downloads Hermes, Python/Node dependencies, plugins, or models, and
@@ -248,7 +248,7 @@ require_package_provenance() {
   local action="$1" compact="$2"
   local expected="\"provenance\":{\"source\":\"package\",\"package_id\":\"$PACKAGE_ID\",\"package_digest\":\"$package_digest\"}"
   if [[ "$compact" == *'"provenance":{"source":"embedded"}'* ]]; then
-    fail "integration $action reported source=embedded: the operator assets came from the CLI's embedded copy, not from the Hermes package"
+    fail "integration $action reported source=embedded: the operator assets came from an older CLI's compiled copy, not from the Hermes package"
   fi
   if [[ "$compact" != *"$expected"* ]]; then
     fail "integration $action did not report the installed Hermes package $package_digest as its provenance"

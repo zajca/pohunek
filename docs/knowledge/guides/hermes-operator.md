@@ -24,21 +24,25 @@ Linux daemon archives; the macOS daemon archive carries no runtime packages.
 The package preserves the built-in launch and detection contract and supports
 only the locked 0.20.0 release. Its `operator.toml` closes the allowlist for
 the operator payload in `operator/`; the CLI verifies its paths and digests
-before installation. When an official Hermes package is
-installed, enabled, and selected, Pohunek loads the operator plugin and its
-generated skill from that package. The copies compiled into the CLI are
-transitional fallbacks for hosts without an installed official package. The
-generic hook reporter remains exclusively core-owned and is embedded
-separately by Pohunek.
+before installation. Pohunek loads the operator plugin and its generated skill
+only from the installed, enabled, and selected official package; the CLI
+carries no copy of them. The generic hook reporter is exclusively core-owned:
+the CLI compiles it in and installs it beside the package's operator payload.
 
-The operator assets use the selected, enabled official `pohunek.runtime.hermes`
-package when one is installed. Before that package is available, Pohunek uses
-the transitional copy embedded in the CLI. A present but unusable package never
-falls back to the embedded copy: `integration install` and `update` refuse with
-a typed source error and change nothing, `integration status` and `doctor`
+`integration install` and `update` therefore need the official
+`pohunek.runtime.hermes` package. Install it from an extracted Linux release
+archive with
+`pohunek plugin install runtime/packages/hermes.tar.zst --catalog runtime/runtime-catalog.json`.
+The macOS daemon archive carries no runtime package, so a macOS host has no
+source for the operator plugin until darwin packages are attested
+([#929](https://github.com/zajca/pohunek/issues/929)). Without a usable package, `integration install` and `update` refuse with a
+typed source error and change nothing, `integration status` and `doctor`
 report the same code in `package_source_error`, and `doctor` fails its
 `asset_source` check with that code's recovery hint:
 
+- `hermes_package_not_installed`: no Hermes package is installed. Install the
+  official package from its signed catalog, then retry. `integration uninstall`
+  needs no package.
 - `hermes_package_not_selected`: a Hermes package is installed, but no enabled,
   catalog-authorized version is selected. Enable and select the intended
   official version with `pohunek plugin enable` and `pohunek plugin select`, or
@@ -49,16 +53,14 @@ report the same code in `package_source_error`, and `doctor` fails its
   `pohunek plugin doctor` and reinstall it from its signed catalog.
 - `hermes_package_registry_unreadable`: the runtime package registry cannot be
   read safely. Run `pohunek plugin doctor` and repair the registry.
-- `hermes_package_source_missing`: the install records a package source, and no
-  Hermes package is installed. Reinstall and select the official package from
-  its signed catalog, or uninstall the integration.
 
 `package_source_missing=true` means the install records a package source and no
-usable selected package exists. Such an install is never reported as
-`outdated`, because no update could apply. `integration uninstall` verifies
-ownership from the marker and the installed bytes, so it succeeds without the
-package. Restore a missing or corrupt package from its signed catalog after
-clearing any session or profile pins, then re-run `integration doctor`. When the
+usable selected package exists. An install is never reported as `outdated`
+while the source is unusable, because no update could apply. `integration
+uninstall` verifies ownership from the marker and the installed bytes, so it
+succeeds without the package. Restore a missing or corrupt package from its
+signed catalog after clearing any session or profile pins, then re-run
+`integration doctor`. When the
 selected package or version differs from the recorded source, status shows
 `outdated=true` and `integration update` replaces the assets from the selected
 source.
@@ -66,11 +68,17 @@ source.
 Every `integration` result for Hermes reports in `provenance` the source the
 installed plugin's ownership marker records:
 `{"source":"package","package_id":"pohunek.runtime.hermes","package_digest":"sha256:<hex>"}`
-for a package-backed install, `{"source":"embedded"}` for the copy compiled
-into the CLI, and `null` when no managed plugin is installed (also after
-`uninstall`). It names the recorded source, not the currently selected one:
-compare `package_digest` with the `digest` of `pohunek plugin list --json` to
-see which version is installed.
+for a package-backed install, `{"source":"embedded"}` for an install an older
+CLI rendered from the copy it carried, and `null` when no managed plugin is
+installed (also after `uninstall`). It names the recorded source, not the
+currently selected one: compare `package_digest` with the `digest` of
+`pohunek plugin list --json` to see which version is installed.
+
+An `embedded` install is never migrated automatically. Without a package,
+status and doctor report `hermes_package_not_installed` with its install hint,
+and `integration uninstall` still removes it. After the official package is
+installed, status reports it `outdated=true`, and `integration update` with the
+original target rewrites it from the package with `source=package`.
 
 The Hermes operator plugin is an owner-private, Pohunek-managed integration. It
 is not a same-user sandbox: the daemon remains authoritative for its public API,
@@ -146,8 +154,9 @@ pohunek integration uninstall --agent hermes \
 `update` is a Hermes-only action; asking for it with Codex or Claude returns a
 typed unsupported-action error. For Codex and Claude, daemon-backed status
 reports the complete managed install contract, `doctor` diagnoses it, and
-`uninstall` removes only the managed assets. Bare status selects both daemon-managed agents;
-Codex and Claude status honors the effective global `--host`, while explicit
+`uninstall` removes only the managed assets. Bare status reports every runtime
+the daemon serves through a daemon-run hook handler; Hermes is reported only
+with `--agent hermes`. Codex and Claude status honors the effective global `--host`, while explicit
 Hermes status keeps its local target and executable flags. For remote
 Codex/Claude reports, run any suggested `integration install` directly on the
 named daemon host; adding `--host` does not make installation remote:

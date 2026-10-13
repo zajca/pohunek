@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { constants, readFileSync } from "node:fs";
-import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "bun:test";
@@ -23,14 +23,9 @@ const E2E_ENABLED = process.env["POHUNEK_E2E"] === "1";
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(TEST_DIR, "../../../..");
-const HERMES_PLUGIN_ASSETS = join(
-  REPO_ROOT,
-  "crates",
-  "cli",
-  "src",
-  "hermes_integration",
-  "assets",
-);
+// The current plugin is the official Hermes package's operator payload plus the core hook
+// reporter the CLI installs beside it; each scenario assembles that layout under `pohunek/`.
+const HERMES_OPERATOR_PAYLOAD = join(REPO_ROOT, "runtime-packages", "hermes", "operator");
 const HERMES_PLUGIN_FIXTURE = join(TEST_DIR, "fixtures", "hermes-plugin-e2e.py");
 const IDENTITY_DELAY_TRACE_NAME = "identity-delay-trace.log";
 const IDENTITY_DELAY_ENV = "LC_POHUNEK_TEST_IDENTITY_DELAY_TRACE";
@@ -55,7 +50,12 @@ const REMOTE_HOST = "plugin-remote.netbird.test";
 const CONTROLLED_HERMES_IDENTITY_RETRY_ATTEMPTS = 40;
 const CONTROLLED_HERMES_IDENTITY_TOTAL_CEILING_MS = 2_000;
 const HERMES_REPORTER_SOURCE = join(
-  HERMES_PLUGIN_ASSETS,
+  REPO_ROOT,
+  "crates",
+  "cli",
+  "src",
+  "hermes_integration",
+  "assets",
   "pohunek",
   "_pohunek_reporter.py",
 );
@@ -101,7 +101,7 @@ const pluginDaemonTest: SkippableTest = process.platform === "linux"
   : skippableTest.skip;
 
 pluginDaemonTest(
-  "embedded Hermes plugin tools control a real durable shell session",
+  "Hermes operator plugin tools control a real durable shell session",
   async () => {
     const prerequisites = await pluginPrerequisites();
     await withTimeout(
@@ -147,6 +147,15 @@ pluginDaemonTest(
   },
   PLUGIN_E2E_TIMEOUT_MS + BUN_TEST_TIMEOUT_BACKSTOP_MARGIN_MS,
 );
+
+/** Assembles the current plugin the fixture loads as `<root>/current-hermes-assets/pohunek/`. */
+async function assembleCurrentHermesAssets(root: string): Promise<string> {
+  const assets = join(root, "current-hermes-assets");
+  const plugin = join(assets, "pohunek");
+  await cp(HERMES_OPERATOR_PAYLOAD, plugin, { recursive: true });
+  await cp(HERMES_REPORTER_SOURCE, join(plugin, "_pohunek_reporter.py"));
+  return assets;
+}
 
 async function runHermesPluginScenario(
   daemon: PluginDaemonHarness,
@@ -261,7 +270,7 @@ async function runHermesPluginScenario(
     [
       HERMES_PLUGIN_FIXTURE,
       "--assets-dir",
-      previousRelease ? PREVIOUS_HERMES_ASSETS : HERMES_PLUGIN_ASSETS,
+      previousRelease ? PREVIOUS_HERMES_ASSETS : await assembleCurrentHermesAssets(daemon.tempRoot),
       "--policy",
       policyPath,
       "--project-id",

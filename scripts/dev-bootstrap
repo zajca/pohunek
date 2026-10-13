@@ -215,7 +215,7 @@ HYPERFINE_MIN_VERSION = (1, 9, 0)
 # has been linked with in CI; CI itself pins a newer release (`MOLD_VERSION`
 # in .github/workflows/ci.yml). A local mold is optional and only links.
 MOLD_MIN_VERSION = (2, 30, 0)
-# The embedded Hermes plugin uses syntax and typing features from Python 3.10
+# The Hermes operator plugin uses syntax and typing features from Python 3.10
 # (`MINIMUM_VERSION` in crates/cli/src/hermes_integration/test_python.rs).
 HERMES_PYTHON_MIN_VERSION = (3, 10, 0)
 # Environment variable naming the interpreter explicitly (`INTERPRETER_ENV`).

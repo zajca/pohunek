@@ -4,7 +4,7 @@
 //! this module. This module never launches Hermes; `HermesControl` is the
 //! narrow boundary the fixed runner implements later.
 
-// Rust guideline compliant 2026-10-12
+// Rust guideline compliant 2026-10-13
 
 #![expect(
     clippy::map_err_ignore,
@@ -117,19 +117,19 @@ impl<'a> InstallRequest<'a> {
         }
     }
 
-    /// Creates a test request that installs the embedded sidecar.
+    /// Creates a test request that installs the package-directory fixture bundle.
     ///
     /// The snapshot is leaked so a temporary request can borrow it, which keeps
-    /// the production request free of an owned fallback source.
+    /// the production request free of an owned source.
     #[cfg(test)]
-    pub(crate) fn embedded(
+    pub(crate) fn fixture(
         target: &'a ResolvedTarget,
         policy_path: &'a Path,
         policy: &'a Policy,
         confirm_modified: bool,
     ) -> Self {
         let bundle = Box::leak(Box::new(
-            assets::embedded_bundle(policy_path).expect("embedded test bundle"),
+            super::test_package::bundle(policy_path).expect("package fixture bundle"),
         ));
         Self::new(target, policy_path, policy, confirm_modified, bundle)
     }
@@ -192,9 +192,9 @@ const PACKAGE_DIGEST_PREFIX: &str = "sha256:";
 /// The immutable source an installed plugin's ownership marker records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Provenance {
-    /// Rendered from the sidecar compiled into the CLI. Version 1 and 2
-    /// markers record no source and predate package-backed installs, so they
-    /// read as this source.
+    /// Rendered from an operator payload that a CLI binary carried. Version 1
+    /// and 2 markers record no source and no package, so they read as this
+    /// source. Install and update never write it.
     Embedded,
     /// Rendered from the selected official runtime package.
     Package {
@@ -264,20 +264,12 @@ fn install_with(
     validate_request_target(request.target, request.policy_path)?;
     let bundle = request.bundle;
     let assets = &bundle.assets;
-    let desired =
-        assets::ownership_for_bundle(request.target.hermes_home(), request.policy_path, bundle)?;
+    let desired = assets::ownership(request.target.hermes_home(), request.policy_path, bundle)?;
     let marker = assets::marker_bytes(&desired)?;
     assets::parse_marker(&marker)?;
     let provenance = Provenance::of(&desired);
     let policy_bytes = request.policy.to_json()?;
     let existing = installed(request.target, request.policy_path, Some(bundle))?;
-    // A package-backed install never silently moves to the embedded sidecar.
-    if existing
-        .as_ref()
-        .is_some_and(|installed| package_source_missing(&installed.ownership, Some(bundle)))
-    {
-        return Err(Error::PackageSourceMissing);
-    }
     if existing.as_ref().is_some_and(|value| value.modified) && !request.confirm_modified {
         return Err(Error::ConfirmationRequired);
     }
@@ -498,11 +490,7 @@ pub(crate) fn inspect(
     source: Result<&assets::Bundle, &Error>,
 ) -> Result<LifecycleState, Error> {
     let mut state = inspect_tree(control, target, policy_path, source.ok())?;
-    state.package_source_error = match source {
-        Err(error) => Some(error.clone()),
-        Ok(_) if state.package_source_missing => Some(Error::PackageSourceMissing),
-        Ok(_) => None,
-    };
+    state.package_source_error = source.err().cloned();
     Ok(state)
 }
 
@@ -537,10 +525,9 @@ fn inspect_tree(
     })
 }
 
-/// Whether the marker records a package source that `source` cannot supply.
+/// Whether the marker records a package source while no usable package is selected.
 fn package_source_missing(ownership: &Ownership, source: Option<&assets::Bundle>) -> bool {
-    ownership.source.as_deref() == Some(assets::PACKAGE_SOURCE)
-        && source.is_none_or(|bundle| bundle.package_id.is_none())
+    ownership.source.as_deref() == Some(assets::PACKAGE_SOURCE) && source.is_none()
 }
 
 #[derive(Debug)]
@@ -822,21 +809,19 @@ fn installed(
         expected_bundle.map(|bundle| bundle.assets.as_slice()),
     )?;
     let modified = managed_modified(root, &ownership)? || has_unmanaged_entries(root, &ownership)?;
-    // A lost package source leaves nothing an update could apply, so it is
-    // reported as source loss and never as an outdated install.
-    let outdated = expected_bundle
-        .filter(|_| !package_source_missing(&ownership, expected_bundle))
-        .is_some_and(|bundle| {
-            let assets_outdated = bundle
-                .assets
-                .iter()
-                .any(|asset| ownership.assets.get(asset.path()) != Some(&asset.checksum()));
-            let provenance_outdated = ownership.operator_sha256.as_deref()
-                != Some(bundle.manifest_sha256.as_str())
-                || ownership.package_id != bundle.package_id
-                || ownership.package_digest != bundle.package_digest;
-            assets_outdated || provenance_outdated
-        });
+    // Without a usable source nothing could apply an update, so an install is
+    // never reported as outdated then.
+    let outdated = expected_bundle.is_some_and(|bundle| {
+        let assets_outdated = bundle
+            .assets
+            .iter()
+            .any(|asset| ownership.assets.get(asset.path()) != Some(&asset.checksum()));
+        let provenance_outdated = ownership.operator_sha256.as_deref()
+            != Some(bundle.manifest_sha256.as_str())
+            || ownership.package_id.as_deref() != Some(bundle.package_id.as_str())
+            || ownership.package_digest.as_deref() != Some(bundle.package_digest.as_str());
+        assets_outdated || provenance_outdated
+    });
     Ok(Some(Installed {
         ownership,
         modified,
@@ -1579,16 +1564,17 @@ mod tests {
     };
     use crate::hermes_integration::runner::HermesRunner;
     use crate::hermes_integration::target::{ProfileName, TargetContext, TargetSelection};
+    use crate::hermes_integration::test_package;
 
     static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
-    /// Inspects against the embedded sidecar, the source these fixtures install.
-    fn inspect_embedded(
+    /// Inspects against the package fixture bundle, the source these fixtures install.
+    fn inspect_fixture(
         control: &mut impl HermesControl,
         target: &ResolvedTarget,
         policy_path: &Path,
     ) -> Result<LifecycleState, Error> {
-        let bundle = assets::embedded_bundle(policy_path)?;
+        let bundle = test_package::bundle(policy_path)?;
         inspect(control, target, policy_path, Ok(&bundle))
     }
 
@@ -1874,16 +1860,16 @@ mod tests {
     #[test]
     fn activated_marker_retains_private_mode_and_canonical_contents() {
         let (root, target, policy_path, _policy) = setup("activated-marker");
-        let rendered = assets::render(&policy_path).expect("rendered assets");
+        let bundle = test_package::bundle(&policy_path).expect("package fixture bundle");
         let ownership =
-            assets::ownership(target.hermes_home(), &policy_path, &rendered).expect("ownership");
+            assets::ownership(target.hermes_home(), &policy_path, &bundle).expect("ownership");
         let parent = target.plugin_root().parent().expect("plugin parent");
         ensure_private_tree(target.hermes_home(), parent).expect("private parent");
         let stage = root.0.join("stage");
         fs::create_dir(&stage).expect("stage directory");
         fs::set_permissions(&stage, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
             .expect("private stage");
-        write_stage(&mut NativeFileOps, &stage, &rendered, &ownership).expect("write stage");
+        write_stage(&mut NativeFileOps, &stage, &bundle.assets, &ownership).expect("write stage");
         fs::rename(stage, target.plugin_root()).expect("activate stage");
         let marker = target.plugin_root().join(MARKER_NAME);
         validate_private_file(&marker, Error::InvalidMarker).expect("private marker");
@@ -1897,7 +1883,7 @@ mod tests {
     #[test]
     fn installs_idempotently_and_reports_private_modes() {
         let (_root, target, policy_path, policy) = setup("install");
-        let request = InstallRequest::embedded(&target, &policy_path, &policy, false);
+        let request = InstallRequest::fixture(&target, &policy_path, &policy, false);
         let mut hermes = ControlledHermes::default();
         let first = install(&mut hermes, &request).expect("install");
         assert!(hermes.saw_staged_policy);
@@ -1912,7 +1898,10 @@ mod tests {
                 package_source_error: None,
                 stale_stage: false,
                 stale_backup: false,
-                provenance: Some(Provenance::Embedded),
+                provenance: Some(Provenance::Package {
+                    id: assets::PACKAGE_ID.to_owned(),
+                    digest: format!("{PACKAGE_DIGEST_PREFIX}{}", request.bundle.package_digest),
+                }),
             }
         );
         assert_eq!(
@@ -1940,7 +1929,7 @@ mod tests {
         let mut hermes = ControlledHermes::default();
         install(
             &mut hermes,
-            &InstallRequest::embedded(&target, &policy_path, &policy, false),
+            &InstallRequest::fixture(&target, &policy_path, &policy, false),
         )
         .expect("install");
         let note = target.plugin_root().join("operator-note.txt");
@@ -1950,13 +1939,13 @@ mod tests {
         assert_eq!(
             install(
                 &mut hermes,
-                &InstallRequest::embedded(&target, &policy_path, &policy, false),
+                &InstallRequest::fixture(&target, &policy_path, &policy, false),
             ),
             Err(Error::ConfirmationRequired)
         );
         let state = install(
             &mut hermes,
-            &InstallRequest::embedded(&target, &policy_path, &policy, true),
+            &InstallRequest::fixture(&target, &policy_path, &policy, true),
         )
         .expect("confirmed update");
         assert!(state.modified);
@@ -1972,7 +1961,7 @@ mod tests {
         let mut hermes = ControlledHermes::default();
         install(
             &mut hermes,
-            &InstallRequest::embedded(&target, &policy_path, &policy, false),
+            &InstallRequest::fixture(&target, &policy_path, &policy, false),
         )
         .expect("initial install");
         let full = Policy::new(PolicyInput {
@@ -1991,7 +1980,7 @@ mod tests {
         .expect("full policy");
         install(
             &mut hermes,
-            &InstallRequest::embedded(&target, &policy_path, &full, false),
+            &InstallRequest::fixture(&target, &policy_path, &full, false),
         )
         .expect("access mode update");
         let value: serde_json::Value =
@@ -2039,7 +2028,7 @@ mod tests {
         .expect("policy");
         install(
             &mut ControlledHermes::default(),
-            &InstallRequest::embedded(&target, &policy_path, &policy, false),
+            &InstallRequest::fixture(&target, &policy_path, &policy, false),
         )
         .expect("install custom target");
         for path in [
@@ -2076,7 +2065,7 @@ mod tests {
         assert_eq!(
             install(
                 &mut ControlledHermes::default(),
-                &InstallRequest::embedded(&target, &policy_path, &policy, false),
+                &InstallRequest::fixture(&target, &policy_path, &policy, false),
             ),
             Err(Error::Collision)
         );
@@ -2088,23 +2077,23 @@ mod tests {
         let mut hermes = ControlledHermes::default();
         install(
             &mut hermes,
-            &InstallRequest::embedded(&target, &policy_path, &policy, false),
+            &InstallRequest::fixture(&target, &policy_path, &policy, false),
         )
         .expect("install");
-        let assets = assets::render(&policy_path).expect("assets");
+        let bundle = test_package::bundle(&policy_path).expect("package fixture bundle");
         let wrong = policy_path
             .parent()
             .expect("policy parent")
             .join("other.json");
         let ownership =
-            assets::ownership(target.hermes_home(), &wrong, &assets).expect("ownership");
+            assets::ownership(target.hermes_home(), &wrong, &bundle).expect("ownership");
         fs::write(
             target.plugin_root().join(MARKER_NAME),
             assets::marker_bytes(&ownership).expect("marker"),
         )
         .expect("replace marker");
         assert_eq!(
-            inspect_embedded(&mut hermes, &target, &policy_path),
+            inspect_fixture(&mut hermes, &target, &policy_path),
             Err(Error::InvalidMarker)
         );
     }
@@ -2122,7 +2111,7 @@ mod tests {
         assert_eq!(
             install(
                 &mut ControlledHermes::default(),
-                &InstallRequest::embedded(&target, &policy_path, &policy, false),
+                &InstallRequest::fixture(&target, &policy_path, &policy, false),
             ),
             Err(Error::Collision)
         );
@@ -2141,7 +2130,7 @@ mod tests {
         assert_eq!(
             install_with(
                 &mut hermes,
-                &InstallRequest::embedded(&target, &policy_path, &policy, false),
+                &InstallRequest::fixture(&target, &policy_path, &policy, false),
                 &mut files,
             ),
             Err(Error::Collision)
@@ -2164,7 +2153,7 @@ mod tests {
         assert_eq!(
             install_with(
                 &mut hermes,
-                &InstallRequest::embedded(&target, &policy_path, &policy, false),
+                &InstallRequest::fixture(&target, &policy_path, &policy, false),
                 &mut files,
             ),
             Err(Error::RecoveryRequired)
@@ -2287,7 +2276,7 @@ mod tests {
     #[test]
     fn rolls_back_after_validation_or_enable_failure() {
         let (_root, target, policy_path, policy) = setup("rollback");
-        let request = InstallRequest::embedded(&target, &policy_path, &policy, false);
+        let request = InstallRequest::fixture(&target, &policy_path, &policy, false);
         let mut invalid = ControlledHermes {
             fail_validation: true,
             ..ControlledHermes::default()
@@ -2365,7 +2354,7 @@ esac"#,
         assert_eq!(
             install(
                 &mut runner,
-                &InstallRequest::embedded(&target, &policy_path, &policy, false),
+                &InstallRequest::fixture(&target, &policy_path, &policy, false),
             ),
             Err(Error::HermesCommand)
         );
@@ -2398,7 +2387,7 @@ esac"#,
     #[test]
     fn status_failure_leaves_no_prepared_transaction() {
         let (_root, target, policy_path, policy) = setup("status-failure");
-        let request = InstallRequest::embedded(&target, &policy_path, &policy, false);
+        let request = InstallRequest::fixture(&target, &policy_path, &policy, false);
         let mut hermes = ControlledHermes {
             fail_status: true,
             ..ControlledHermes::default()
@@ -2417,7 +2406,7 @@ esac"#,
             let mut hermes = ControlledHermes::default();
             install(
                 &mut hermes,
-                &InstallRequest::embedded(&target, &policy_path, &policy, false),
+                &InstallRequest::fixture(&target, &policy_path, &policy, false),
             )
             .expect("initial install");
             let original_tool =
@@ -2427,7 +2416,7 @@ esac"#,
             assert_eq!(
                 install_with(
                     &mut hermes,
-                    &InstallRequest::embedded(&target, &policy_path, &policy, false),
+                    &InstallRequest::fixture(&target, &policy_path, &policy, false),
                     &mut files,
                 ),
                 Err(Error::Io {
@@ -2470,7 +2459,7 @@ esac"#,
         let mut hermes = ControlledHermes::default();
         install(
             &mut hermes,
-            &InstallRequest::embedded(&target, &policy_path, &policy, false),
+            &InstallRequest::fixture(&target, &policy_path, &policy, false),
         )
         .expect("initial install");
         let original_tool = fs::read(target.plugin_root().join("tools.py")).expect("original tool");
@@ -2484,7 +2473,7 @@ esac"#,
         }
         install(
             &mut hermes,
-            &InstallRequest::embedded(&target, &policy_path, &policy, false),
+            &InstallRequest::fixture(&target, &policy_path, &policy, false),
         )
         .expect("random transaction name bypasses predictable reservations");
         assert_eq!(
@@ -2506,7 +2495,7 @@ esac"#,
         let mut hermes = ControlledHermes::default();
         install(
             &mut hermes,
-            &InstallRequest::embedded(&target, &policy_path, &policy, false),
+            &InstallRequest::fixture(&target, &policy_path, &policy, false),
         )
         .expect("initial install");
         // Stage writes and activation moves precede committed backup cleanup.
@@ -2514,7 +2503,7 @@ esac"#,
         assert_eq!(
             install_with(
                 &mut hermes,
-                &InstallRequest::embedded(&target, &policy_path, &policy, false),
+                &InstallRequest::fixture(&target, &policy_path, &policy, false),
                 &mut files,
             ),
             Err(Error::RecoveryRequired)
@@ -2540,7 +2529,7 @@ esac"#,
         };
         install(
             &mut hermes,
-            &InstallRequest::embedded(&target, &policy_path, &policy, false),
+            &InstallRequest::fixture(&target, &policy_path, &policy, false),
         )
         .expect("install");
         fs::remove_file(&policy_path).expect("remove external policy before uninstall");
@@ -2576,7 +2565,7 @@ esac"#,
             let mut hermes = ControlledHermes::default();
             install(
                 &mut hermes,
-                &InstallRequest::embedded(&target, &policy_path, &policy, false),
+                &InstallRequest::fixture(&target, &policy_path, &policy, false),
             )
             .expect("initial install");
             let original_tool =
@@ -2612,7 +2601,7 @@ esac"#,
         let mut hermes = ControlledHermes::default();
         install(
             &mut hermes,
-            &InstallRequest::embedded(&target, &policy_path, &policy, false),
+            &InstallRequest::fixture(&target, &policy_path, &policy, false),
         )
         .expect("initial install");
         // The second move fails, then the first restore move fails.
@@ -2748,20 +2737,21 @@ esac"#,
     }
 
     #[test]
-    fn install_writes_exactly_the_embedded_assets_below_the_isolated_target() {
-        let (root, target, policy_path, policy) = setup("embedded-install");
+    fn install_writes_exactly_the_bundle_assets_below_the_isolated_target() {
+        let (root, target, policy_path, policy) = setup("bundle-install");
         install(
             &mut ControlledHermes::default(),
-            &InstallRequest::embedded(&target, &policy_path, &policy, false),
+            &InstallRequest::fixture(&target, &policy_path, &policy, false),
         )
-        .expect("install from embedded assets");
-        let rendered = assets::render(&policy_path).expect("embedded assets");
-        let mut expected: BTreeMap<String, Vec<u8>> = rendered
+        .expect("install from the package fixture bundle");
+        let bundle = test_package::bundle(&policy_path).expect("package fixture bundle");
+        let mut expected: BTreeMap<String, Vec<u8>> = bundle
+            .assets
             .iter()
             .map(|asset| (asset.path().to_owned(), asset.bytes().to_vec()))
             .collect();
         let ownership =
-            assets::ownership(target.hermes_home(), &policy_path, &rendered).expect("ownership");
+            assets::ownership(target.hermes_home(), &policy_path, &bundle).expect("ownership");
         expected.insert(
             MARKER_NAME.to_owned(),
             assets::marker_bytes(&ownership).expect("marker"),
@@ -2796,7 +2786,7 @@ esac"#,
         let mut hermes = ControlledHermes::default();
         install(
             &mut hermes,
-            &InstallRequest::embedded(&target, &policy_path, &policy, false),
+            &InstallRequest::fixture(&target, &policy_path, &policy, false),
         )
         .expect("install");
         fs::write(target.plugin_root().join("operator-note.txt"), b"keep").expect("unrelated");
@@ -2825,7 +2815,7 @@ esac"#,
         let mut hermes = ControlledHermes::default();
         install(
             &mut hermes,
-            &InstallRequest::embedded(&target, &policy_path, &policy, false),
+            &InstallRequest::fixture(&target, &policy_path, &policy, false),
         )
         .expect("install");
         fs::write(target.plugin_root().join("tools.py"), b"modified").expect("modify");
@@ -2854,21 +2844,23 @@ esac"#,
         let mut hermes = ControlledHermes::default();
         install(
             &mut hermes,
-            &InstallRequest::embedded(&target, &policy_path, &policy, false),
+            &InstallRequest::fixture(&target, &policy_path, &policy, false),
         )
         .expect("install");
         let parent = target.plugin_root().parent().expect("parent");
         let stale = parent.join(format!("{STAGE_PREFIX}stale"));
         fs::rename(target.plugin_root(), &stale).expect("move stage");
-        let assets = assets::render(&policy_path).expect("assets");
-        let lifecycle = inspect_embedded(&mut hermes, &target, &policy_path).expect("inspect");
+        let assets = test_package::bundle(&policy_path)
+            .expect("package fixture bundle")
+            .assets;
+        let lifecycle = inspect_fixture(&mut hermes, &target, &policy_path).expect("inspect");
         assert!(lifecycle.stale_stage);
         assert!(!lifecycle.installed);
         fs::rename(&stale, target.plugin_root()).expect("restore plugin");
         let backup = parent.join(format!("{BACKUP_PREFIX}stale"));
         fs::rename(target.plugin_root(), &backup).expect("move backup");
         let backup_state =
-            inspect_embedded(&mut hermes, &target, &policy_path).expect("backup inspect");
+            inspect_fixture(&mut hermes, &target, &policy_path).expect("backup inspect");
         assert!(backup_state.stale_backup);
         fs::rename(&backup, target.plugin_root()).expect("restore backup");
         let policy_stage = policy_path
@@ -2879,7 +2871,7 @@ esac"#,
         fs::set_permissions(&policy_stage, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
             .expect("private policy stage");
         assert!(
-            inspect_embedded(&mut hermes, &target, &policy_path)
+            inspect_fixture(&mut hermes, &target, &policy_path)
                 .expect("policy stale inspect")
                 .stale_stage
         );
@@ -2887,7 +2879,7 @@ esac"#,
         let link = root.0.join("link-policy.json");
         symlink(&policy_path, &link).expect("symlink");
         assert_eq!(
-            inspect_embedded(&mut hermes, &target, &link),
+            inspect_fixture(&mut hermes, &target, &link),
             Err(Error::UnsafePolicyPath)
         );
         assert_eq!(assets.len(), assets::ASSET_COUNT);
@@ -2910,10 +2902,10 @@ esac"#,
         let (_root, target, policy_path, policy) = setup("concurrent-update");
         install(
             &mut ControlledHermes::default(),
-            &InstallRequest::embedded(&target, &policy_path, &policy, false),
+            &InstallRequest::fixture(&target, &policy_path, &policy, false),
         )
         .expect("install initial policy");
-        let bundle = assets::embedded_bundle(&policy_path).expect("embedded bundle");
+        let bundle = test_package::bundle(&policy_path).expect("package fixture bundle");
         let (loaded_tx, loaded_rx) = std::sync::mpsc::sync_channel(0);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
 

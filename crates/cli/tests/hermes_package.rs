@@ -18,13 +18,14 @@ use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 
 use package::{build_archive, read_archive, ArchiveEntry, CatalogEntry, Limits, PackageDigest};
 use pohunek_daemon::agent::host::{definition_from_archive, HandlerId, ProbeVersion};
 use pohunek_daemon::catalog_anchor::CatalogTrust;
 use pohunek_daemon::session::HostTrustAnchor;
 use pohunek_test_support::bin_exe;
+use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::fs::write_executable;
 use pohunek_test_support::process_env::ProcessEnv;
 use pohunek_test_support::wait::{guard, wait_until};
@@ -51,10 +52,6 @@ use pohunek_test_support::catalog::{
 
 /// Directory of the package, relative to the workspace root.
 const PACKAGE_DIR: &str = "runtime-packages/hermes";
-
-/// Directory of the closed operator sidecar and its payload: the package
-/// directory itself.
-const SIDECAR_DIR: &str = PACKAGE_DIR;
 
 /// Compatibility lock of the package, relative to the workspace root.
 const LOCK_PATH: &str = "compat/hermes/compatibility-lock.json";
@@ -86,7 +83,7 @@ const OPERATOR_PAYLOAD: [&str; 8] = [
     "skills/pohunek/SKILL.md",
 ];
 
-/// Operator skill path whose packaged bytes differ from the CLI's embedded copy.
+/// Operator skill path whose fixture bytes differ from the package directory's copy.
 const SKILL_PATH: &str = "skills/pohunek/SKILL.md";
 
 /// Line appended to the packaged skill so installed bytes identify their source.
@@ -94,6 +91,12 @@ const PACKAGE_SKILL_LINE: &str = "\n<!-- packaged by the hermes_package fixture 
 
 /// Placeholder the operator `__init__.py` must contain exactly once.
 const POLICY_TOKEN: &str = "__POHUNEK_POLICY_PATH__";
+
+/// Error code of every Hermes operator action that needs a package while none is installed.
+const NOT_INSTALLED: &str = "hermes_package_not_installed";
+
+/// Name of the ownership marker in the managed plugin root.
+const MARKER_NAME: &str = ".pohunek-owned.json";
 
 /// Explicit opt-in for the real pinned Hermes package scenario.
 const REAL_HERMES_VARIABLE: &str = "POHUNEK_HERMES_E2E";
@@ -119,10 +122,6 @@ fn package_dir() -> PathBuf {
     workspace_root().join(PACKAGE_DIR)
 }
 
-fn sidecar_dir() -> PathBuf {
-    workspace_root().join(SIDECAR_DIR)
-}
-
 fn read_toml(relative: &str) -> toml::Table {
     fs::read_to_string(workspace_root().join(relative))
         .expect("read the TOML file")
@@ -134,9 +133,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// The operator payload file the CLI embeds, read from the package directory.
-fn embedded_operator_file(path: &str) -> Vec<u8> {
-    fs::read(sidecar_dir().join("operator").join(path)).expect("read embedded operator payload")
+/// One operator payload file as the package directory holds it.
+fn operator_file(path: &str) -> Vec<u8> {
+    fs::read(package_dir().join("operator").join(path)).expect("read operator payload")
 }
 
 fn entry_mut<'a>(entries: &'a mut [ArchiveEntry], path: &str) -> &'a mut ArchiveEntry {
@@ -184,7 +183,7 @@ fn package_entries() -> Vec<ArchiveEntry> {
     for (path, file) in [
         ("detect.toml", root.join("detect.toml")),
         ("runtime.toml", root.join("runtime.toml")),
-        ("operator.toml", sidecar_dir().join("operator.toml")),
+        ("operator.toml", root.join("operator.toml")),
     ] {
         entries.push(ArchiveEntry {
             path: path.to_owned(),
@@ -195,11 +194,11 @@ fn package_entries() -> Vec<ArchiveEntry> {
     for path in OPERATOR_PAYLOAD {
         entries.push(ArchiveEntry {
             path: format!("operator/{path}"),
-            contents: embedded_operator_file(path),
+            contents: operator_file(path),
             executable: false,
         });
     }
-    let mut skill = embedded_operator_file(SKILL_PATH);
+    let mut skill = operator_file(SKILL_PATH);
     skill.extend_from_slice(PACKAGE_SKILL_LINE.as_bytes());
     replace_operator_file(&mut entries, SKILL_PATH, skill);
     entries
@@ -304,6 +303,50 @@ async fn selected_package(harness: &Harness, digest: &PackageDigest) {
     assert_eq!(package["enabled"], true, "{listed}");
     assert_eq!(package["selected"], true, "{listed}");
     assert_eq!(package["digest"], digest.as_str(), "{listed}");
+}
+
+/// Removes one installed Hermes package version from the registry.
+async fn uninstall_package(harness: &Harness, digest: &PackageDigest) {
+    let (code, removed) = harness
+        .json(&[
+            "plugin",
+            "uninstall",
+            PACKAGE_ID,
+            "--digest",
+            digest.as_str(),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "remove Hermes package: {removed:#}");
+}
+
+/// Installs `bytes` again through a fresh signed catalog `sequence`.
+async fn reinstall_package(
+    harness: &Harness,
+    key: &ed25519_dalek::SigningKey,
+    sequence: u64,
+    bytes: &[u8],
+    digest: &PackageDigest,
+) {
+    let archive = write_archive(harness, &format!("hermes-{sequence}.tar.zst"), bytes);
+    let catalog = write_catalog(
+        harness,
+        key,
+        sequence,
+        vec![catalog_entry(PACKAGE_VERSION, digest)],
+    );
+    let (code, installed) = harness
+        .json(&[
+            "plugin",
+            "install",
+            path_str(&archive),
+            "--catalog",
+            path_str(&catalog),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "reinstall Hermes package: {installed:#}");
+    assert_eq!(installed["ok"]["package"]["digest"], digest.as_str());
 }
 
 /// Writes a profile pinned to the installed package and an isolated probe binary.
@@ -659,10 +702,10 @@ struct HermesFixture {
 }
 
 impl HermesFixture {
-    fn new(harness: &Harness) -> Self {
-        let hermes_home = harness.env.home().join(".hermes");
-        let install_bin = harness.env.root().join("hermes-install/venv/bin");
-        let python_bin = harness.env.root().join("hermes-install/python/bin");
+    fn new(env: &TestEnv) -> Self {
+        let hermes_home = env.home().join(".hermes");
+        let install_bin = env.root().join("hermes-install/venv/bin");
+        let python_bin = env.root().join("hermes-install/python/bin");
         for directory in [
             hermes_home.join("profiles/default"),
             hermes_home.join("profiles"),
@@ -690,8 +733,8 @@ impl HermesFixture {
             .expect("link contained Hermes Python runtime");
 
         let plugin_root = hermes_home.join("plugins/operators/pohunek");
-        let state_file = harness.env.root().join("hermes-plugin-state");
-        let enable_failure = harness.env.root().join("fail-hermes-enable");
+        let state_file = env.root().join("hermes-plugin-state");
+        let enable_failure = env.root().join("fail-hermes-enable");
         fs::write(&state_file, "disabled\n").expect("initialize Hermes plugin state");
         let hermes_bin = install_bin.join("hermes");
         write_executable(
@@ -710,7 +753,7 @@ impl HermesFixture {
         Self {
             hermes_home,
             plugin_root,
-            policy_dir: harness.env.state_home().join("pohunek/policies/hermes"),
+            policy_dir: env.state_home().join("pohunek/policies/hermes"),
             hermes_bin,
             pohunek_bin: bin_exe("pohunek"),
             enable_failure,
@@ -863,10 +906,46 @@ impl HermesFixture {
     }
 
     fn marker(&self) -> Value {
-        serde_json::from_slice(
-            &fs::read(self.plugin_root.join(".pohunek-owned.json")).expect("read marker"),
+        serde_json::from_slice(&fs::read(self.plugin_root.join(MARKER_NAME)).expect("read marker"))
+            .expect("parse marker")
+    }
+
+    /// Rewrites the ownership marker in the shape a CLI that rendered the
+    /// operator payload from its own binary wrote: marker `version` 1 records
+    /// the eight-file inventory without the core reporter (whose file is
+    /// removed) and no operator digest, version 2 records no `source`, version
+    /// 3 records `source=embedded`, and none records a package. The asset
+    /// checksums stay those of the installed files.
+    fn write_embedded_marker(&self, version: u64) {
+        let mut marker = self.marker();
+        if version == 1 {
+            marker = previous_inventory_marker(&marker);
+            let reporter = self.plugin_root.join("_pohunek_reporter.py");
+            if reporter.exists() {
+                fs::remove_file(reporter).expect("remove the reporter absent from version 1");
+            }
+        }
+        let fields = marker.as_object_mut().expect("marker object");
+        fields.remove("package_id");
+        fields.remove("package_digest");
+        fields.insert("version".to_owned(), Value::from(version));
+        match version {
+            1 => {}
+            2 => {
+                fields.remove("source");
+            }
+            3 => {
+                fields.insert("source".to_owned(), Value::from("embedded"));
+            }
+            _ => panic!("no embedded marker version {version}"),
+        }
+        let path = self.plugin_root.join(MARKER_NAME);
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&marker).expect("serialize marker"),
         )
-        .expect("parse marker")
+        .expect("write embedded marker");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private marker");
     }
 
     /// The canonical path of the only policy file, which the installer derives
@@ -1004,6 +1083,43 @@ async fn assert_source_hint(harness: &Harness, hermes: &HermesFixture, code: &st
         refused["recover"].as_str().expect("recovery hint"),
         "{doctor:#}"
     );
+}
+
+/// With no Hermes package installed, install and update refuse with the typed
+/// error and change nothing, status and doctor report it, and its hint names
+/// the official package install.
+async fn assert_package_not_installed(
+    harness: &Harness,
+    hermes: &HermesFixture,
+    recorded_package: bool,
+    context: &str,
+) {
+    let refused = hermes
+        .refuses_install_and_update(harness, NOT_INSTALLED, context)
+        .await;
+    assert_source_findings(
+        harness,
+        hermes,
+        recorded_package,
+        Some(NOT_INSTALLED),
+        context,
+    )
+    .await;
+    assert_eq!(refused["class"], "configuration", "{context}: {refused:#}");
+    let install_step = protocol::official_package_install_only_step(&RuntimeId::hermes());
+    assert!(
+        refused["recover"]
+            .as_str()
+            .is_some_and(|hint| hint.starts_with(&install_step)),
+        "{context}: the hint names the official package install: {refused:#}"
+    );
+    assert!(
+        !refused["recover"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("plugin enable")),
+        "{context}: no installed package exists to enable: {refused:#}"
+    );
+    assert_source_hint(harness, hermes, NOT_INSTALLED).await;
 }
 
 /// Verifies the installed official Hermes package and its failure boundaries.
@@ -1270,8 +1386,8 @@ if os.environ.get('HERMES_TEST_CHILD_PROBE') == '1' and not any(arg in ('--versi
     );
     assert_ne!(
         installed_skill,
-        embedded_operator_file(SKILL_PATH),
-        "the embedded skill is not installed for the real Hermes"
+        operator_file(SKILL_PATH),
+        "the installed skill comes from the fixture archive, not the package directory"
     );
     let mut plugin_list = hermes_cli(&harness, &hermes_bin, &hermes_home, &path, &provider);
     plugin_list.args(["plugins", "list", "--json"]);
@@ -1584,7 +1700,7 @@ async fn package_backed_install_writes_the_selected_package_bytes() {
     let key = test_key();
     let harness = trusted_harness(&key).await;
     let (_, digest, _, _) = install_official(&harness, &key).await;
-    let hermes = HermesFixture::new(&harness);
+    let hermes = HermesFixture::new(&harness.env);
     hermes.refuses_unowned_collision(&harness).await;
 
     let installed = hermes.install(&harness).await;
@@ -1610,8 +1726,8 @@ async fn package_backed_install_writes_the_selected_package_bytes() {
     );
     assert_ne!(
         installed_skill,
-        embedded_operator_file(SKILL_PATH),
-        "the embedded skill is not installed"
+        operator_file(SKILL_PATH),
+        "the installed skill comes from the fixture archive, not the package directory"
     );
     for path in OPERATOR_PAYLOAD
         .iter()
@@ -1684,7 +1800,7 @@ async fn an_unusable_selection_without_an_install_is_a_typed_source_error() {
     let key = test_key();
     let harness = trusted_harness(&key).await;
     let (_, digest, _, _) = install_official(&harness, &key).await;
-    let hermes = HermesFixture::new(&harness);
+    let hermes = HermesFixture::new(&harness.env);
 
     let mut alternate = package_entries();
     set_version(&mut alternate, "1.0.1");
@@ -1818,7 +1934,7 @@ async fn losing_the_recorded_package_refuses_update_without_mutation() {
     let key = test_key();
     let harness = trusted_harness(&key).await;
     let (_, digest, _, _) = install_official(&harness, &key).await;
-    let hermes = HermesFixture::new(&harness);
+    let hermes = HermesFixture::new(&harness.env);
     hermes.install(&harness).await;
 
     let (code, disabled) = harness
@@ -1859,26 +1975,16 @@ async fn losing_the_recorded_package_refuses_update_without_mutation() {
     assert_damaged_roots_are_refused(&harness, &hermes, &digest).await;
     assert_source_findings(&harness, &hermes, false, None, "repaired package root").await;
 
-    let (code, removed) = harness
-        .json(&[
-            "plugin",
-            "uninstall",
-            PACKAGE_ID,
-            "--digest",
-            digest.as_str(),
-            "--yes",
-        ])
-        .await;
-    assert_eq!(code, 0, "remove package source: {removed:#}");
+    uninstall_package(&harness, &digest).await;
     assert_source_findings(
         &harness,
         &hermes,
         true,
-        Some("hermes_package_source_missing"),
+        Some(NOT_INSTALLED),
         "removed package",
     )
     .await;
-    let marker_before = fs::read(hermes.plugin_root.join(".pohunek-owned.json")).expect("marker");
+    let marker_before = fs::read(hermes.plugin_root.join(MARKER_NAME)).expect("marker");
     let policy_before = fs::read(hermes.policy_path()).expect("policy");
     let before = hermes.disk();
     let mut update = hermes.args("update");
@@ -1887,8 +1993,8 @@ async fn losing_the_recorded_package_refuses_update_without_mutation() {
         .refused(
             &harness,
             &update,
-            "hermes_package_source_missing",
-            "update cannot switch a package install to embedded assets",
+            NOT_INSTALLED,
+            "update refuses without the recorded package",
         )
         .await;
     assert_eq!(
@@ -1897,14 +2003,14 @@ async fn losing_the_recorded_package_refuses_update_without_mutation() {
         "the source-loss refusal changed nothing"
     );
     assert_eq!(
-        fs::read(hermes.plugin_root.join(".pohunek-owned.json")).expect("marker"),
+        fs::read(hermes.plugin_root.join(MARKER_NAME)).expect("marker"),
         marker_before
     );
     assert_eq!(
         fs::read(hermes.policy_path()).expect("policy"),
         policy_before
     );
-    assert_source_hint(&harness, &hermes, "hermes_package_source_missing").await;
+    assert_source_hint(&harness, &hermes, NOT_INSTALLED).await;
 
     let (code, uninstalled) = harness.json(&hermes.args("uninstall")).await;
     assert_eq!(
@@ -1920,66 +2026,16 @@ async fn losing_the_recorded_package_refuses_update_without_mutation() {
     harness.stop().await;
 }
 
-/// An embedded install becomes outdated once a package exists; update switches sources.
+/// Update moves a package-backed install to a newly selected package version.
 #[tokio::test]
-async fn update_moves_an_install_to_the_newly_selected_source() {
+async fn update_moves_an_install_to_the_newly_selected_package() {
     let key = test_key();
     let harness = trusted_harness(&key).await;
-    let hermes = HermesFixture::new(&harness);
-
-    let installed = hermes.install(&harness).await;
-    assert_eq!(installed["provenance"], embedded_provenance());
-    let marker = hermes.marker();
-    assert_eq!(marker["source"], "embedded");
-    assert!(marker.get("package_digest").is_none());
-    assert_eq!(
-        fs::read(hermes.plugin_root.join(SKILL_PATH)).expect("installed skill"),
-        embedded_operator_file(SKILL_PATH)
-    );
-    let status = hermes.status(&harness).await;
-    assert_eq!(status["outdated"], false, "{status:#}");
-    assert_source_findings(&harness, &hermes, false, None, "embedded install").await;
-
     let (_, first, _, _) = install_official(&harness, &key).await;
-    let status = hermes.status(&harness).await;
-    assert_eq!(
-        status["outdated"], true,
-        "a selected package outdates embedded assets"
-    );
-    assert_reported_provenance(
-        &harness,
-        &hermes,
-        &embedded_provenance(),
-        "a selected package does not change the recorded source before update",
-    )
-    .await;
-    assert_source_findings(
-        &harness,
-        &hermes,
-        false,
-        None,
-        "embedded install, package D1",
-    )
-    .await;
-    let doctor = hermes.doctor(&harness).await;
-    assert_eq!(check(&doctor, "asset_current").0, "fail", "{doctor:#}");
-    assert!(
-        check(&doctor, "asset_current")
-            .1
-            .contains("selected source"),
-        "{doctor:#}"
-    );
-    assert_update_reports(&harness, &hermes, &package_provenance(&first), "package D1").await;
-    let marker = hermes.marker();
-    assert_eq!(marker["source"], "package");
-    assert_eq!(
-        marker["package_digest"],
-        first.as_str().trim_start_matches("sha256:")
-    );
-    assert_eq!(
-        fs::read(hermes.plugin_root.join(SKILL_PATH)).expect("installed skill"),
-        entry(&package_entries(), &format!("operator/{SKILL_PATH}"))
-    );
+    let hermes = HermesFixture::new(&harness.env);
+    let installed = hermes.install(&harness).await;
+    assert_eq!(installed["provenance"], package_provenance(&first));
+    assert_source_findings(&harness, &hermes, false, None, "package D1").await;
     assert_eq!(hermes.status(&harness).await["outdated"], false);
 
     let mut second = package_entries();
@@ -2017,17 +2073,601 @@ async fn update_moves_an_install_to_the_newly_selected_source() {
     harness.stop().await;
 }
 
+/// Runs `pohunek <arguments> --json` in `env` without a daemon and returns
+/// the exit code and the JSON document on stdout.
+async fn json_without_daemon(env: &TestEnv, arguments: &[&str]) -> (i32, Value) {
+    let mut command = env.tokio_command(bin_exe("pohunek"));
+    command.args(arguments).arg("--json");
+    let output = guard("the pohunek binary to finish", command.output())
+        .await
+        .expect("run the pohunek binary");
+    let document = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "stdout of {arguments:?} is one JSON document ({error}): {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    (output.status.code().expect("exit code"), document)
+}
+
+/// On a host where no daemon ever created the package registry, install and
+/// update refuse with the typed error, status and doctor report it, and none
+/// of them creates the registry or writes a plugin or policy file.
+async fn assert_no_registry_is_not_installed() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let hermes = HermesFixture::new(&env);
+    let registry_root = env.state_home().join("pohunek/plugins");
+    assert!(
+        !registry_root.exists(),
+        "no daemon ran, so no registry exists"
+    );
+    let untouched = hermes.disk();
+    let (code, refused) = json_without_daemon(&env, &hermes.install_args()).await;
+    assert_eq!(code, 1, "install without a registry: {refused:#}");
+    assert_eq!(refused["err"]["code"], NOT_INSTALLED, "{refused:#}");
+    assert_eq!(refused["err"]["class"], "configuration", "{refused:#}");
+    let hint = refused["err"]["recover"].as_str().expect("recovery hint");
+    assert!(
+        hint.starts_with(&protocol::official_package_install_only_step(
+            &RuntimeId::hermes()
+        )),
+        "{refused:#}"
+    );
+    let (code, refused_update) = json_without_daemon(&env, &hermes.args("update")).await;
+    assert_eq!(code, 1, "update without a registry: {refused_update:#}");
+    assert_eq!(
+        refused_update["err"]["code"], NOT_INSTALLED,
+        "{refused_update:#}"
+    );
+    assert_eq!(refused_update["err"]["recover"], refused["err"]["recover"]);
+    let (code, status) = json_without_daemon(&env, &hermes.args("status")).await;
+    assert_eq!(code, 0, "status without a registry: {status:#}");
+    assert_eq!(status["ok"]["installed"], false, "{status:#}");
+    assert_eq!(
+        status["ok"]["package_source_error"], NOT_INSTALLED,
+        "{status:#}"
+    );
+    assert_eq!(status["ok"]["package_source_missing"], false, "{status:#}");
+    let (code, doctor) = json_without_daemon(&env, &hermes.args("doctor")).await;
+    assert_eq!(code, 1, "doctor without a registry fails: {doctor:#}");
+    assert_eq!(check(&doctor["ok"], "asset_source"), ("fail", hint));
+    assert_eq!(hermes.disk(), untouched, "no registry: nothing was written");
+    assert!(
+        !registry_root.exists(),
+        "the CLI never creates the package registry"
+    );
+}
+
+/// Without an installed Hermes package no operator plugin is installed: the
+/// CLI has no other source for the operator payload.
+#[tokio::test]
+async fn without_a_hermes_package_install_refuses_and_writes_nothing() {
+    assert_no_registry_is_not_installed().await;
+
+    let key = test_key();
+    let harness = trusted_harness(&key).await;
+    let hermes = HermesFixture::new(&harness.env);
+    let untouched = hermes.disk();
+    assert!(
+        untouched.plugins.is_empty() && untouched.policies.is_empty(),
+        "the fixture starts without plugin or policy files: {untouched:?}"
+    );
+    assert_package_not_installed(
+        &harness,
+        &hermes,
+        false,
+        "an empty registry the daemon created",
+    )
+    .await;
+    assert_eq!(hermes.disk(), untouched, "no package: nothing was written");
+
+    let (_, digest, _, _) = install_official(&harness, &key).await;
+    uninstall_package(&harness, &digest).await;
+    assert_package_not_installed(
+        &harness,
+        &hermes,
+        false,
+        "the registry holds no Hermes package",
+    )
+    .await;
+    assert_eq!(
+        hermes.disk(),
+        untouched,
+        "a registry without Hermes: nothing was written"
+    );
+    harness.stop().await;
+}
+
+/// An install whose marker records the operator payload of the CLI binary
+/// (marker version 1 or 2, or version 3 with `source=embedded`) stays manageable
+/// without a package: status and doctor report the missing package with its
+/// install hint, `update` moves it to the package once one is installed, and
+/// `uninstall` needs no package.
+#[tokio::test]
+async fn an_embedded_install_reports_the_missing_package_and_moves_to_it_on_update() {
+    let key = test_key();
+    let harness = trusted_harness(&key).await;
+    let (bytes, digest, _, _) = install_official(&harness, &key).await;
+    let hermes = HermesFixture::new(&harness.env);
+    hermes.install(&harness).await;
+    uninstall_package(&harness, &digest).await;
+
+    // Version 1 drops the core reporter file, so it comes last.
+    for version in [3, 2, 1] {
+        hermes.write_embedded_marker(version);
+        let context = format!("embedded marker v{version} without a package");
+        assert_reported_provenance(&harness, &hermes, &embedded_provenance(), &context).await;
+        let status = hermes.status(&harness).await;
+        assert_eq!(status["installed"], true, "{context}: {status:#}");
+        assert_eq!(status["modified"], false, "{context}: {status:#}");
+        assert_package_not_installed(&harness, &hermes, false, &context).await;
+    }
+
+    reinstall_package(&harness, &key, 2, &bytes, &digest).await;
+    let status = hermes.status(&harness).await;
+    assert_eq!(
+        status["outdated"], true,
+        "a selected package outdates an embedded install: {status:#}"
+    );
+    assert_source_findings(&harness, &hermes, false, None, "embedded install, package").await;
+    let doctor = hermes.doctor(&harness).await;
+    let (current, hint) = check(&doctor, "asset_current");
+    assert_eq!(current, "fail", "{doctor:#}");
+    assert!(hint.contains("selected source"), "{doctor:#}");
+    assert_update_reports(
+        &harness,
+        &hermes,
+        &package_provenance(&digest),
+        "update moves an embedded install to the package",
+    )
+    .await;
+    let marker = hermes.marker();
+    assert_eq!(marker["version"], 3);
+    assert_eq!(marker["source"], "package");
+    assert_eq!(marker["package_id"], PACKAGE_ID);
+    assert_eq!(
+        marker["package_digest"],
+        digest.as_str().trim_start_matches("sha256:")
+    );
+    assert_eq!(hermes.status(&harness).await["outdated"], false);
+
+    hermes.write_embedded_marker(2);
+    uninstall_package(&harness, &digest).await;
+    assert_reported_provenance(
+        &harness,
+        &hermes,
+        &embedded_provenance(),
+        "embedded marker v2 before uninstall",
+    )
+    .await;
+    let (code, uninstalled) = harness.json(&hermes.args("uninstall")).await;
+    assert_eq!(
+        code, 0,
+        "an embedded install uninstalls without the package: {uninstalled:#}"
+    );
+    assert_eq!(
+        uninstalled["ok"]["provenance"],
+        Value::Null,
+        "{uninstalled:#}"
+    );
+    assert!(!hermes.plugin_root.exists());
+    assert!(
+        !hermes.disk().policies.keys().any(|path| path
+            .extension()
+            .is_some_and(|extension| extension == "json")),
+        "uninstall removes the managed policy"
+    );
+    harness.stop().await;
+}
+
+/// Runs `pohunek` with an ambient `HERMES_HOME` the lifecycle must not read.
+async fn run_isolated(harness: &Harness, ambient: &Path, arguments: &[&str]) -> Output {
+    let mut command = harness.env.tokio_command(bin_exe("pohunek"));
+    command.env("HERMES_HOME", ambient).args(arguments);
+    guard("the pohunek binary to finish", command.output())
+        .await
+        .expect("run the pohunek binary")
+}
+
+/// The `ok` object of a successful JSON envelope.
+fn ok_of(output: &Output) -> Value {
+    assert!(
+        output.status.success(),
+        "status={:?}, stdout={}, stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse JSON envelope");
+    envelope["ok"].clone()
+}
+
+/// The `err` object of a failed JSON envelope.
+fn err_of(output: &Output) -> Value {
+    assert!(
+        !output.status.success(),
+        "expected command failure, stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let envelope: Value =
+        serde_json::from_slice(&output.stdout).expect("parse JSON error envelope");
+    envelope["err"].clone()
+}
+
+/// Writes `marker` as the private ownership marker at `path`.
+fn write_marker(path: &Path, marker: &Value) {
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(marker).expect("serialize marker"),
+    )
+    .expect("write marker");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private marker");
+}
+
+/// Rewrites `marker` into the eight-file inventory of marker version 1, which
+/// records no provenance and no core reporter.
+fn previous_inventory_marker(marker: &Value) -> Value {
+    let mut previous = marker.clone();
+    previous["version"] = Value::from(1);
+    let fields = previous.as_object_mut().expect("marker object");
+    for field in ["operator_sha256", "source", "package_id", "package_digest"] {
+        fields.remove(field);
+    }
+    previous["assets"]
+        .as_object_mut()
+        .expect("asset map")
+        .remove("_pohunek_reporter.py");
+    previous
+}
+
+/// The package-backed operator lifecycle through the `pohunek` binary against
+/// a controlled Hermes, with an ambient `HERMES_HOME` that must not be read:
+/// status, wildcard confirmation, install, policy damage, update, provenance
+/// drift, invalid markers, modified assets, an older release's assets, the
+/// previous eight-file inventory, the core reporter, and confirmed uninstall.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the lifecycle contract is exercised as one complete isolated sequence"
+)]
+async fn the_package_backed_hermes_lifecycle_is_isolated_and_model_free() {
+    let key = test_key();
+    let harness = trusted_harness(&key).await;
+    let (_, digest, _, _) = install_official(&harness, &key).await;
+    let hermes = HermesFixture::new(&harness.env);
+    let ambient = harness.env.root().join("ambient-must-not-be-read");
+    let plugin_root = hermes.plugin_root.clone();
+    let marker_path = plugin_root.join(MARKER_NAME);
+    let with_json = |action: &str| {
+        let mut arguments = hermes.args(action);
+        arguments.push("--json");
+        arguments
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<String>>()
+    };
+    let status_json = with_json("status");
+    let status_json: Vec<&str> = status_json.iter().map(String::as_str).collect();
+    let doctor_json = with_json("doctor");
+    let doctor_json: Vec<&str> = doctor_json.iter().map(String::as_str).collect();
+    let update_json = with_json("update");
+    let update_json: Vec<&str> = update_json.iter().map(String::as_str).collect();
+    let uninstall_json = with_json("uninstall");
+    let uninstall_json: Vec<&str> = uninstall_json.iter().map(String::as_str).collect();
+
+    let absent = ok_of(&run_isolated(&harness, &ambient, &status_json).await);
+    assert_eq!(absent["installed"], false);
+
+    let mut wildcard = hermes.args("install");
+    wildcard.extend([
+        "--pohunek-bin",
+        path_str(&hermes.pohunek_bin),
+        "--access-mode",
+        "manage",
+        "--allow-host",
+        "*",
+        "--json",
+    ]);
+    assert_eq!(
+        err_of(&run_isolated(&harness, &ambient, &wildcard).await)["code"],
+        "hermes_wildcard_confirmation_required"
+    );
+
+    let mut install = hermes.install_args();
+    install.push("--json");
+    let installed = ok_of(&run_isolated(&harness, &ambient, &install).await);
+    assert_eq!(installed["installed"], true);
+    assert_eq!(installed["modified"], false);
+    assert!(!plugin_root.join("__pycache__").exists());
+    let marker = hermes.marker();
+    let package = package_entries();
+    let operator_manifest = entry(&package, "operator.toml");
+    assert_eq!(marker["version"], 3);
+    assert_eq!(marker["source"], "package");
+    assert_eq!(
+        marker["package_digest"],
+        digest.as_str().trim_start_matches("sha256:")
+    );
+    assert_eq!(marker["operator_sha256"], sha256_hex(operator_manifest));
+    let sidecar: toml::Value =
+        toml::from_str(std::str::from_utf8(operator_manifest).expect("sidecar UTF-8"))
+            .expect("parse closed operator sidecar");
+    let payload = sidecar["payload"].as_array().expect("payload list");
+    assert_eq!(payload.len(), 8, "the sidecar pins the exact payload");
+    assert!(payload.iter().all(|record| {
+        record["path"]
+            .as_str()
+            .is_some_and(|path| path != "_pohunek_reporter.py")
+    }));
+    assert_eq!(
+        marker["assets"].as_object().expect("marker assets").len(),
+        9
+    );
+
+    let status_text = run_isolated(&harness, &ambient, &hermes.args("status")).await;
+    assert!(
+        status_text.status.success(),
+        "status={:?}, stdout={}, stderr={}",
+        status_text.status.code(),
+        String::from_utf8_lossy(&status_text.stdout),
+        String::from_utf8_lossy(&status_text.stderr)
+    );
+    let status_text = String::from_utf8(status_text.stdout).expect("status text");
+    assert!(status_text.contains("installed=true, enabled=true, modified=false"));
+    assert!(status_text.contains(&format!("source: package {PACKAGE_ID} {}", digest.as_str())));
+    let status = ok_of(&run_isolated(&harness, &ambient, &status_json).await);
+    assert_eq!(status["modified"], false);
+    assert_eq!(status["outdated"], false);
+
+    let policy_path = hermes.policy_path();
+    let policy_bytes = fs::read(&policy_path).expect("read installed policy");
+    fs::remove_file(&policy_path).expect("remove policy for status check");
+    assert_eq!(
+        err_of(&run_isolated(&harness, &ambient, &status_json).await)["code"],
+        "hermes_io_failed"
+    );
+    fs::write(&policy_path, b"{invalid-policy").expect("write corrupt policy");
+    fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o600)).expect("policy mode");
+    assert_eq!(
+        err_of(&run_isolated(&harness, &ambient, &status_json).await)["code"],
+        "hermes_invalid_policy"
+    );
+    fs::write(&policy_path, policy_bytes).expect("restore installed policy");
+    fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o600)).expect("policy mode");
+
+    let mut full = update_json.clone();
+    full.splice(full.len() - 1..full.len() - 1, ["--access-mode", "full"]);
+    let update = ok_of(&run_isolated(&harness, &ambient, &full).await);
+    assert_eq!(update["modified"], false);
+    assert_eq!(update["access_mode"], "full");
+
+    // Sidecar provenance drift keeps the installed payload intact but requires
+    // the operator-visible update path to refresh its ownership marker.
+    let clean_marker_bytes = fs::read(&marker_path).expect("read clean ownership marker");
+    let clean_marker: Value =
+        serde_json::from_slice(&clean_marker_bytes).expect("parse clean ownership marker");
+    let installed_files = clean_marker["assets"]
+        .as_object()
+        .expect("managed asset map")
+        .keys()
+        .map(|relative| {
+            (
+                relative.clone(),
+                fs::read(plugin_root.join(relative)).expect("read installed asset"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let policy_before_invalid_markers = fs::read(&policy_path).expect("read installed policy");
+
+    let mut stale_provenance = clean_marker.clone();
+    let operator_digest = stale_provenance["operator_sha256"]
+        .as_str()
+        .expect("operator digest")
+        .to_owned();
+    let replacement = if operator_digest.starts_with('0') {
+        '1'
+    } else {
+        '0'
+    };
+    stale_provenance["operator_sha256"] =
+        Value::from(format!("{replacement}{}", &operator_digest[1..]));
+    write_marker(&marker_path, &stale_provenance);
+    let stale_status = ok_of(&run_isolated(&harness, &ambient, &status_json).await);
+    assert_eq!(stale_status["outdated"], true);
+    assert_eq!(stale_status["modified"], false);
+    let stale_doctor = run_isolated(&harness, &ambient, &doctor_json).await;
+    assert!(!stale_doctor.status.success());
+    let stale_doctor: Value =
+        serde_json::from_slice(&stale_doctor.stdout).expect("parse stale doctor envelope");
+    assert_eq!(check(&stale_doctor["ok"], "asset_current").0, "fail");
+    assert_eq!(
+        ok_of(&run_isolated(&harness, &ambient, &update_json).await)["modified"],
+        false
+    );
+    let restored_status = ok_of(&run_isolated(&harness, &ambient, &status_json).await);
+    assert_eq!(restored_status["outdated"], false);
+    assert_eq!(restored_status["modified"], false);
+
+    for description in ["missing digest", "invalid digest"] {
+        let mut invalid_marker = clean_marker.clone();
+        if description == "missing digest" {
+            invalid_marker
+                .as_object_mut()
+                .expect("ownership marker object")
+                .remove("operator_sha256");
+        } else {
+            invalid_marker["operator_sha256"] = Value::from("invalid-digest");
+        }
+        write_marker(&marker_path, &invalid_marker);
+        assert_eq!(
+            err_of(&run_isolated(&harness, &ambient, &status_json).await)["code"],
+            "hermes_invalid_marker",
+            "status rejects a marker with {description}"
+        );
+        assert_eq!(
+            err_of(&run_isolated(&harness, &ambient, &update_json).await)["code"],
+            "hermes_invalid_marker",
+            "update rejects a marker with {description}"
+        );
+        for (relative, expected) in &installed_files {
+            assert_eq!(
+                fs::read(plugin_root.join(relative))
+                    .expect("read asset after invalid marker rejection"),
+                expected.as_slice(),
+                "invalid marker rejection preserves {relative}"
+            );
+        }
+        assert_eq!(
+            fs::read(&policy_path).expect("read policy after invalid marker rejection"),
+            policy_before_invalid_markers,
+            "invalid marker rejection preserves the installed policy"
+        );
+    }
+    fs::write(&marker_path, &clean_marker_bytes).expect("restore clean ownership marker");
+    fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o600)).expect("marker mode");
+
+    fs::write(plugin_root.join("tools.py"), b"# explicitly modified\n")
+        .expect("mutate managed plugin");
+    assert_eq!(
+        err_of(&run_isolated(&harness, &ambient, &update_json).await)["code"],
+        "hermes_modified_confirmation_required"
+    );
+    let mut confirmed_update = update_json.clone();
+    confirmed_update.insert(confirmed_update.len() - 1, "--confirm-modified");
+    assert_eq!(
+        ok_of(&run_isolated(&harness, &ambient, &confirmed_update).await)["modified"],
+        true
+    );
+    assert_eq!(
+        ok_of(&run_isolated(&harness, &ambient, &status_json).await)["modified"],
+        false
+    );
+
+    // An untouched install written by an older release: the assets and the
+    // ownership marker agree with each other but not with the selected package.
+    let older_tools = [
+        fs::read(plugin_root.join("tools.py")).expect("read tools"),
+        b"\n# written by an older release\n".to_vec(),
+    ]
+    .concat();
+    fs::write(plugin_root.join("tools.py"), &older_tools).expect("older asset");
+    fs::set_permissions(
+        plugin_root.join("tools.py"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("asset mode");
+    let mut marker = hermes.marker();
+    marker["assets"]["tools.py"] = Value::from(sha256_hex(&older_tools));
+    write_marker(&marker_path, &marker);
+    let outdated = ok_of(&run_isolated(&harness, &ambient, &status_json).await);
+    assert_eq!(outdated["outdated"], true);
+    assert_eq!(outdated["modified"], false);
+    let outdated_doctor = run_isolated(&harness, &ambient, &hermes.args("doctor")).await;
+    let doctor_text = String::from_utf8_lossy(&outdated_doctor.stdout).into_owned()
+        + String::from_utf8_lossy(&outdated_doctor.stderr).as_ref();
+    assert!(
+        doctor_text.contains("asset_current"),
+        "the doctor names the failing check: {doctor_text}"
+    );
+    // The command the doctor recommends, with the original target flags and no
+    // install-only options, is accepted and clears the outdated state.
+    assert!(
+        doctor_text.contains("pohunek integration update --agent hermes"),
+        "{doctor_text}"
+    );
+    assert_eq!(
+        ok_of(&run_isolated(&harness, &ambient, &update_json).await)["modified"],
+        false
+    );
+    assert_eq!(
+        ok_of(&run_isolated(&harness, &ambient, &status_json).await)["outdated"],
+        false
+    );
+
+    // The eight-file inventory of marker version 1 remains readable for a safe
+    // update and uninstall, but is always outdated.
+    let reporter_path = plugin_root.join("_pohunek_reporter.py");
+    let previous_marker = previous_inventory_marker(&hermes.marker());
+    fs::remove_file(&reporter_path).expect("remove reporter absent from previous inventory");
+    write_marker(&marker_path, &previous_marker);
+    let previous_status = ok_of(&run_isolated(&harness, &ambient, &status_json).await);
+    assert_eq!(previous_status["outdated"], true);
+    assert_eq!(previous_status["modified"], false);
+    let mut arbitrary_inventory = previous_marker.clone();
+    arbitrary_inventory["assets"]["arbitrary.py"] = Value::from("0".repeat(64));
+    write_marker(&marker_path, &arbitrary_inventory);
+    assert_eq!(
+        err_of(&run_isolated(&harness, &ambient, &status_json).await)["code"],
+        "hermes_invalid_marker"
+    );
+    write_marker(&marker_path, &previous_marker);
+    assert_eq!(
+        ok_of(&run_isolated(&harness, &ambient, &update_json).await)["modified"],
+        false
+    );
+    assert_eq!(
+        ok_of(&run_isolated(&harness, &ambient, &status_json).await)["outdated"],
+        false
+    );
+
+    let doctor = ok_of(&run_isolated(&harness, &ambient, &doctor_json).await);
+    assert_eq!(doctor["doctor"]["ok"], true, "{doctor:#}");
+    assert_eq!(
+        doctor["doctor"]["checks"].as_array().map(Vec::len),
+        Some(17)
+    );
+
+    fs::write(&reporter_path, b"# private reporter mutation sentinel\n")
+        .expect("mutate the reserved core reporter asset");
+    assert_eq!(
+        ok_of(&run_isolated(&harness, &ambient, &status_json).await)["modified"],
+        true,
+        "status treats a changed core reporter as a modified managed asset"
+    );
+    let reporter_doctor = run_isolated(&harness, &ambient, &doctor_json).await;
+    let reporter_doctor_text = String::from_utf8_lossy(&reporter_doctor.stdout).into_owned()
+        + String::from_utf8_lossy(&reporter_doctor.stderr).as_ref();
+    let reporter_doctor: Value =
+        serde_json::from_slice(&reporter_doctor.stdout).expect("parse reporter doctor output");
+    assert_eq!(reporter_doctor["ok"]["doctor"]["ok"], false);
+    assert_eq!(check(&reporter_doctor["ok"], "asset_integrity").0, "fail");
+    assert!(
+        !reporter_doctor_text.contains("private reporter mutation sentinel"),
+        "doctor does not expose modified reporter contents"
+    );
+
+    fs::write(plugin_root.join("hooks.py"), b"# explicitly modified\n")
+        .expect("mutate managed plugin before uninstall");
+    let previous_uninstall_marker = previous_inventory_marker(&hermes.marker());
+    fs::remove_file(&reporter_path).expect("remove asset absent from previous inventory");
+    write_marker(&marker_path, &previous_uninstall_marker);
+    assert_eq!(
+        err_of(&run_isolated(&harness, &ambient, &uninstall_json).await)["code"],
+        "hermes_modified_confirmation_required"
+    );
+    fs::remove_file(&policy_path).expect("remove the original external policy before uninstall");
+    let mut confirmed_uninstall = uninstall_json.clone();
+    confirmed_uninstall.insert(confirmed_uninstall.len() - 1, "--confirm-modified");
+    let uninstalled = ok_of(&run_isolated(&harness, &ambient, &confirmed_uninstall).await);
+    assert_eq!(uninstalled["installed"], false);
+    assert!(
+        !ambient.exists(),
+        "the lifecycle never touched the ambient Hermes home"
+    );
+    harness.stop().await;
+}
+
 /// Signed packages whose sidecar contract is violated never reach the plugin tree.
 #[tokio::test]
 async fn sidecar_violations_in_a_signed_package_fail_install() {
     let key = test_key();
     let harness = trusted_harness(&key).await;
     let (_, digest, _, _) = install_official(&harness, &key).await;
-    let hermes = HermesFixture::new(&harness);
+    let hermes = HermesFixture::new(&harness.env);
     hermes.install(&harness).await;
 
     let init_path = "__init__.py";
-    let init = String::from_utf8(embedded_operator_file(init_path)).expect("init UTF-8");
+    let init = String::from_utf8(operator_file(init_path)).expect("init UTF-8");
     assert_eq!(init.matches(POLICY_TOKEN).count(), 1);
     let mut cases: Vec<(&str, Vec<ArchiveEntry>)> = Vec::new();
 

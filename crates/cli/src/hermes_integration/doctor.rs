@@ -4,7 +4,7 @@
 //! fixed local runner. It neither reads Hermes state databases nor contacts an
 //! allowed remote host.
 
-// Rust guideline compliant 2026-10-12
+// Rust guideline compliant 2026-10-13
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Read as _;
@@ -124,7 +124,7 @@ pub(crate) struct Diagnosis {
     pub(crate) provenance: Option<lifecycle::Provenance>,
 }
 
-/// Inspects one installation against the embedded sidecar, the unit fixture source.
+/// Inspects one installation against the package fixture bundle, the unit fixture source.
 #[must_use]
 #[cfg(test)]
 pub(crate) fn inspect(
@@ -132,7 +132,7 @@ pub(crate) fn inspect(
     target: &ResolvedTarget,
     policy_path: &Path,
 ) -> Report {
-    let bundle = assets::embedded_bundle(policy_path).expect("embedded test bundle");
+    let bundle = super::test_package::bundle(policy_path).expect("package fixture bundle");
     diagnose(runner, target, policy_path, Ok(&bundle)).report
 }
 
@@ -440,7 +440,7 @@ mod tests {
 
     use super::*;
     use crate::hermes_integration::target::{ProfileName, TargetContext, TargetSelection};
-    use crate::hermes_integration::test_python;
+    use crate::hermes_integration::{test_package, test_python};
 
     const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
     const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -586,14 +586,14 @@ mod tests {
 
     fn write_plugin_tree(root: &Path, hermes_home: &Path, policy: &Path) {
         create_private_directory(root);
-        let rendered = assets::render(policy).expect("render plugin assets");
-        for asset in &rendered {
+        let bundle = test_package::bundle(policy).expect("package fixture bundle");
+        for asset in &bundle.assets {
             let destination = root.join(asset.path());
             create_private_directory_tree(root, destination.parent().expect("asset parent"));
             fs::write(&destination, asset.bytes()).expect("write managed asset");
             set_mode(&destination, PRIVATE_FILE_MODE);
         }
-        let ownership = assets::ownership(hermes_home, policy, &rendered).expect("ownership");
+        let ownership = assets::ownership(hermes_home, policy, &bundle).expect("ownership");
         let marker = root.join(assets::MARKER_NAME);
         fs::write(
             &marker,
@@ -705,8 +705,9 @@ mod tests {
             assets::parse_marker(&fs::read(&marker_path).expect("read marker")).expect("marker");
         // The older asset still loads, so the installed probe runs and the only
         // difference from this release is the recorded checksum.
-        let mut older_bytes = assets::render(&older.policy)
-            .expect("render assets")
+        let mut older_bytes = test_package::bundle(&older.policy)
+            .expect("package fixture bundle")
+            .assets
             .into_iter()
             .find(|asset| asset.path() == "tools.py")
             .expect("tools asset")

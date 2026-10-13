@@ -60,17 +60,23 @@ aliases](runtime-packages.md#official-aliases)). `pohunek integration install
 from the selected package and reports `provenance` `source=package` with the
 package digest.
 
+The package is the only source of the operator plugin: the CLI carries no
+copy of its payload, and `pohunek integration install|update --agent hermes`
+without an installed package fails with `hermes_package_not_installed`, whose
+recovery hint names the install command above.
+
 macOS has no Hermes package row: the Apple Silicon daemon archive carries the
 signed catalog and no runtime package
-([#929](https://github.com/zajca/pohunek/issues/929)).
+([#929](https://github.com/zajca/pohunek/issues/929)), so a macOS host cannot
+install the operator plugin until darwin packages are attested.
 
 Until the built-in is removed
 ([#147](https://github.com/zajca/pohunek/issues/147)), the built-in Hermes
-descriptor, detection manifest and `hermes-v1` version parser serve `hermes` on
-a host that has no installed, enabled and selected official package, and the
-CLI keeps a compiled copy of this directory's operator payload as the
-transitional source for such a host; an integration installed from it reports
-`provenance` `source=embedded`.
+descriptor, detection manifest and `hermes-v1` version parser serve `hermes`
+sessions on a host that has no installed, enabled and selected official
+package. An operator plugin that an older CLI installed from its compiled copy
+reports `provenance` `source=embedded`; `integration update` moves it to the
+package.
 
 ## What the package declares
 
@@ -121,7 +127,8 @@ unlisted, missing or altered file, or a policy-path placeholder in
 `__init__.py` that is absent or repeated, fails with `hermes_invalid_asset`
 (the [Hermes operator](hermes-operator.md) guide lists the source errors).
 The package carries no hook reporter script: the reporter
-`_pohunek_reporter.py` is core-owned and embedded in the CLI.
+`_pohunek_reporter.py` is core-owned, compiled into the CLI, and installed
+beside the operator payload.
 
 `operator/skills/pohunek/SKILL.md` is generated from
 `docs/knowledge/guides/hermes-operator.md`. `cargo xtask hermes
@@ -146,11 +153,21 @@ digest.
   - `package_backed_install_writes_the_selected_package_bytes`: the installed
     plugin, its provenance and its policy binding come from the selected
     package.
+  - `without_a_hermes_package_install_refuses_and_writes_nothing`: with no
+    registry and with a registry that holds no Hermes package, install and
+    update refuse with `hermes_package_not_installed` and write nothing.
+  - `an_embedded_install_reports_the_missing_package_and_moves_to_it_on_update`:
+    a version 1, 2 or 3 marker with no package source reports the missing package
+    in status and doctor, moves to the package on `integration update`, and
+    uninstalls without a package.
   - `an_unusable_selection_without_an_install_is_a_typed_source_error`,
     `losing_the_recorded_package_refuses_update_without_mutation` and
-    `update_moves_an_install_to_the_newly_selected_source`: the source errors,
-    and the move from the embedded copy to a package source on `integration
-    update`.
+    `update_moves_an_install_to_the_newly_selected_package`: the other source
+    errors, and the move between package versions on `integration update`.
+  - `the_package_backed_hermes_lifecycle_is_isolated_and_model_free`: the
+    complete operator lifecycle through the `pohunek` binary, including policy
+    damage, provenance drift, invalid and earlier markers, modified assets and
+    a confirmed uninstall.
   - `sidecar_violations_in_a_signed_package_fail_install`: a signed package
     whose sidecar contract is violated never reaches the plugin tree.
 - `a_real_hermes_turn_uses_the_selected_package_and_public_session_screen` is

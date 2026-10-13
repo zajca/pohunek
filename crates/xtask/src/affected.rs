@@ -198,12 +198,12 @@ const RULES: &[Rule] = &[
     rule(
         Pattern::File("runtime-packages/hermes/operator.toml"),
         Effect::Packages(&["pohunek-cli"]),
-        "Hermes operator manifest embedded by pohunek-cli's Hermes integration",
+        "Hermes operator manifest rendered as the package fixture bundle by pohunek-cli's Hermes integration tests",
     ),
     rule(
         Pattern::Dir("runtime-packages/hermes/operator"),
         Effect::Packages(&["pohunek-cli"]),
-        "Hermes operator payload embedded by pohunek-cli's Hermes integration",
+        "Hermes operator payload read at run time by pohunek-cli's Hermes integration tests and plugin runtime suite",
     ),
     rule(
         Pattern::Dir("compat/hermes"),
@@ -254,7 +254,7 @@ const RULES: &[Rule] = &[
     rule(
         Pattern::Dir("runtime-packages"),
         Effect::Packages(&["pohunek-cli"]),
-        "official runtime package sources built and parsed by pohunek-cli's pi_package, pi_frame_properties, codex_package, claude_package, hermes_package and hermes_integration tests",
+        "official runtime package sources built and parsed by pohunek-cli's pi_package, pi_frame_properties, codex_package, claude_package and hermes_package tests, and read by its Hermes plugin suites and the package fixture bundle of its hermes_integration module tests",
     ),
     rule(
         Pattern::Dir("runtime-packages/hermes"),

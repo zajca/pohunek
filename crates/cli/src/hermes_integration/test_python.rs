@@ -17,7 +17,7 @@ const INTERPRETER_ENV: &str = "POHUNEK_PYTHON_BIN";
 const SYSTEM_INTERPRETER: &str = "/usr/bin/python3";
 /// Executable name searched in each absolute `PATH` directory.
 const INTERPRETER_NAME: &str = "python3";
-/// The embedded plugin uses syntax and typing features from Python 3.10.
+/// The operator plugin uses syntax and typing features from Python 3.10.
 const MINIMUM_VERSION: (u8, u8) = (3, 10);
 /// The staged validator imports `yaml`, which the pinned Hermes runtime provides.
 const PROBE_MODULE: &str = "yaml";
@@ -31,7 +31,7 @@ static INTERPRETER: OnceLock<PathBuf> = OnceLock::new();
 /// The interpreter passes the production runtime policy
 /// ([`validate_runtime`]: canonical file owned by root or the current user,
 /// no group or other write bit, effective execute permission, safe
-/// ancestors) and can import the embedded plugin's requirements.
+/// ancestors) and can import the operator plugin's requirements.
 ///
 /// # Panics
 ///

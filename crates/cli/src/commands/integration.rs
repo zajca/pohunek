@@ -764,8 +764,9 @@ fn new_policy(
         (None, None) => env::current_exe().map_err(HermesError::from)?,
     };
     // Policies always use the range of the shape this binary prints, exactly the
-    // current version, so updates repair drift that
-    // `assets/pohunek/cli.py::_validate_envelope` rejects as `pohunek_cli_incompatible`.
+    // current version, so updates repair drift that the operator plugin's
+    // `cli.py::_validate_envelope` (`runtime-packages/hermes/operator/`) rejects
+    // as `pohunek_cli_incompatible`.
     let versions = protocol::CURRENT_PROTOCOL_VERSIONS;
     let protocol_min =
         i32::try_from(versions.minimum().get()).map_err(|_error| HermesError::InvalidPolicy)?;
@@ -1064,7 +1065,8 @@ struct HermesResult {
 #[derive(Debug, Serialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
 enum HermesProvenance {
-    /// Rendered from the sidecar compiled into the CLI.
+    /// Rendered from an operator payload that a CLI binary carried; reported
+    /// from existing markers only.
     Embedded,
     /// Rendered from the selected official runtime package.
     Package {

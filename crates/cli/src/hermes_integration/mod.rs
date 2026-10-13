@@ -2,7 +2,7 @@
 //!
 //! This internal module owns the fail-closed Hermes plugin lifecycle.
 
-// Rust guideline compliant 2026-08-06
+// Rust guideline compliant 2026-10-13
 
 pub(crate) mod assets;
 pub(crate) mod doctor;
@@ -12,5 +12,7 @@ pub(crate) mod policy;
 pub(crate) mod runner;
 pub(crate) mod skill;
 pub(crate) mod target;
+#[cfg(test)]
+pub(crate) mod test_package;
 #[cfg(test)]
 pub(crate) mod test_python;

@@ -1,6 +1,20 @@
-// Rust guideline compliant 2026-10-12
+// Rust guideline compliant 2026-10-13
 
 use std::io::ErrorKind;
+use std::sync::LazyLock;
+
+use protocol::{official_package_install_only_step, RuntimeId};
+
+/// Recovery for [`Error::PackageNotInstalled`]: the official package install
+/// step, plus the one action that needs no package. A disabled installed
+/// package is `PackageNotSelected`, so the hint offers no enable step. Built
+/// once because the install step is formatted.
+static PACKAGE_NOT_INSTALLED_HINT: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{}, then retry; `pohunek integration uninstall --agent hermes` with the original `--hermes-profile` or `--hermes-home` works without the package",
+        official_package_install_only_step(&RuntimeId::hermes())
+    )
+});
 
 /// A redacted failure while validating Hermes integration inputs.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -44,15 +58,15 @@ pub(crate) enum Error {
     /// The selected operator source failed integrity or the closed sidecar contract.
     #[error("Hermes plugin asset manifest is invalid")]
     InvalidAsset,
+    /// No official Hermes runtime package is installed, so no operator source exists.
+    #[error("no Hermes runtime package is installed")]
+    PackageNotInstalled,
     /// The runtime package registry could not be opened or read safely.
     #[error("the runtime package registry is unreadable")]
     PackageRegistryUnreadable,
     /// A Hermes package is installed, but no enabled official version is selected.
     #[error("no enabled official Hermes package is selected")]
     PackageNotSelected,
-    /// The marker records a package source, and no Hermes package is installed.
-    #[error("the Hermes operator package source is unavailable")]
-    PackageSourceMissing,
     /// A directory exists but was not created by this lifecycle.
     #[error("Hermes plugin directory is not owned by Pohunek")]
     Collision,
@@ -100,7 +114,7 @@ pub(crate) enum Error {
 impl Error {
     /// Returns a payload-free recovery hint for this failure.
     #[must_use]
-    pub(crate) const fn recovery_hint(&self) -> &'static str {
+    pub(crate) fn recovery_hint(&self) -> &'static str {
         match self {
             Self::UnsafeTarget | Self::RelativePath => {
                 "select an explicit, private Hermes profile or custom home"
@@ -120,16 +134,14 @@ impl Error {
             }
             Self::UnsafePolicyPath => "select a Pohunek configuration root outside the plugin tree",
             Self::InvalidAsset => {
-                "verify the selected Hermes package with `pohunek plugin doctor` and reinstall it from its signed catalog, or update Pohunek if its embedded assets are invalid"
+                "verify the selected Hermes package with `pohunek plugin doctor` and reinstall it from its signed catalog"
             }
+            Self::PackageNotInstalled => PACKAGE_NOT_INSTALLED_HINT.as_str(),
             Self::PackageRegistryUnreadable => {
                 "run `pohunek plugin doctor` and repair the owner-private runtime package registry before retrying"
             }
             Self::PackageNotSelected => {
                 "enable and select an official `pohunek.runtime.hermes` version with `pohunek plugin enable` and `pohunek plugin select`, or install one from its signed catalog"
-            }
-            Self::PackageSourceMissing => {
-                "reinstall and select the official Hermes package from its signed catalog before updating, or uninstall the integration"
             }
             Self::Collision => "choose a profile without an unrelated `pohunek` plugin",
             Self::InvalidMarker => "repair or manually preserve the affected plugin directory",

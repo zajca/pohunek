@@ -35,8 +35,8 @@ SHA-256 before it installs the plugin.
   `crates/cli/tests/pi_package.rs` and the `pi-package` CI job).
 - A package never carries the hook reporter scripts of an agent integration: the
   integration handler it names is compiled core code that owns them. An
-  operator plugin payload is not a reporter; the Hermes reporter stays
-  core-owned and embedded in the CLI.
+  operator plugin payload is not a reporter; the Hermes reporter is core-owned
+  and compiled into the CLI, which installs it beside the package's payload.
 
 Packages: [`pi`](pi) (Pi coding agent 1.0.x; install steps in
 `docs/install.md`), [`codex`](codex) (Codex 0.160.x; serves the reserved

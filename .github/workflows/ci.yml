@@ -290,13 +290,6 @@ jobs:
       - name: Measure session worker resources
         run: cargo test --locked -p pohunek-session-worker --test resources -- --nocapture
 
-      # Exercise the issue-#96 Hermes filesystem lifecycle natively as well.
-      - name: Check Hermes filesystem lifecycle
-        run: cargo check --locked -p pohunek-cli --lib
-
-      - name: Test Hermes filesystem lifecycle
-        run: cargo test --locked -p pohunek-cli --lib hermes_integration::lifecycle::tests
-
       # Issue #100: every launchd suite needs the logged-in GUI session's
       # `gui/<uid>` domain. Its absence is a hard failure, never a skip.
       - name: Require the launchd gui domain
@@ -330,6 +323,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p pohunek-daemon
 
+      # The whole CLI suite runs natively, including the Hermes operator
+      # filesystem lifecycle of issue #96: its transaction tests in the library
+      # and the package-backed lifecycle scenarios of tests/hermes_package.rs,
+      # which install the Hermes package through a throwaway signed catalog.
       - name: Test CLI
         # Independent suites: report each even when an earlier one failed.
         if: ${{ !cancelled() }}

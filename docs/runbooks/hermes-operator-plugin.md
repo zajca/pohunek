@@ -10,6 +10,20 @@ remain under the operator's control.
 - Use a matching Pohunek CLI, daemon, and `pohunek-sessiond` release on the
   host. Install the daemon archive as a set so the worker remains beside the
   daemon.
+- Install the official Hermes runtime package before the plugin. The plugin's
+  operator payload comes only from the installed, enabled and selected
+  `pohunek.runtime.hermes` package; without it `integration install` and
+  `update` fail with `hermes_package_not_installed` and change nothing. From an
+  extracted Linux daemon archive:
+
+  ```bash
+  pohunek plugin install runtime/packages/hermes.tar.zst \
+    --catalog runtime/runtime-catalog.json
+  ```
+
+  The macOS daemon archive carries no runtime package, so a macOS host cannot
+  install the plugin until darwin packages are attested
+  ([#929](https://github.com/zajca/pohunek/issues/929)).
 - The Hermes executable must be the pinned supported release. Do not allow an
   installer or smoke test to download Hermes, Node packages, plugins, or model
   providers.
@@ -100,6 +114,7 @@ edit plugin files, Hermes YAML, or the policy by hand.
 | Version, CLI compatibility, tool, skill, or hook registration | Install matching binaries, then run `integration update` for the same target. |
 | Ownership, checksum, policy permission, stale stage, or stale backup | Preserve the finding, review the selected target, then run `integration update`; use `--confirm-modified` only after verifying intentional changes. |
 | Plugin not enabled | Run `integration update`; it uses the supported Hermes plugin command rather than editing general YAML. |
+| `asset_source` fails with `hermes_package_not_installed` | Install the official Hermes package from its signed catalog, then run `integration update`. An install whose `provenance` is `embedded` came from an older CLI's compiled copy; it is never migrated automatically, `integration uninstall` removes it without the package, and `integration update` after the package install rewrites it with `source=package`. |
 | Host or access-mode denial | Change the explicit policy through `integration update`, not via a tool or a file edit. |
 | Output gap or runtime change | Discard the stale cursor; read a fresh screen/newest tail and continue only with returned runtime coordinates. |
 | Wait timeout | Treat it as bounded no change. Reissue a short wait or let a human attach; do not claim a terminal outcome. |
