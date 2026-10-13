@@ -46,8 +46,8 @@ mod hold;
 #[cfg(unix)]
 #[doc(inline)]
 pub use sweep::{
-    sweep_runtime, SkipReason, Skipped, SweepError, SweepReport, SweepRequest, MAX_SWEEP_GRACE,
-    MAX_WORKER_INSTANCE_ID_BYTES,
+    survey_runtime, sweep_runtime, SkipReason, Skipped, SweepError, SweepReport, SweepRequest,
+    SweepSurvey, MAX_SWEEP_GRACE, MAX_WORKER_INSTANCE_ID_BYTES,
 };
 
 #[cfg(target_os = "macos")]

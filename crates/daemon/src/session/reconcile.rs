@@ -430,6 +430,10 @@ struct JournalOutcome {
     exit_code: Option<i32>,
     signal: Option<String>,
     success: bool,
+    /// The worker force-closed the PTY output before it reached EOF; absent,
+    /// and so `false`, in a previous release's journal.
+    #[serde(default)]
+    output_forced_closed: bool,
 }
 
 #[derive(Debug)]
@@ -2976,6 +2980,9 @@ impl SessionRegistry {
         let stopped_by_intent = record.desired_state != DesiredState::Running;
         if let Some(outcome) = evidence.outcome {
             record.info.exit_code = outcome.exit_code;
+            if outcome.output_forced_closed {
+                super::note_output_force_closed(&mut record.info);
+            }
             record.info.state = if stopped_by_intent {
                 SessionState::Stopped
             } else if outcome.success && outcome.signal.is_none() {
@@ -3166,12 +3173,32 @@ impl SessionRegistry {
             snapshot,
             reported_hook_schema(snapshot.hook_schema.as_deref()),
         );
+        // An exited runtime has completed any stop it was asked for; a durable
+        // stop intent decides the outcome even when the worker saw the root exit
+        // before the stop request. A lost runtime proves nothing about its
+        // transaction, so that one stays for the next reconciliation.
+        let exited = snapshot.phase == RuntimePhase::Exited;
+        if exited {
+            record.transaction = None;
+        }
+        let stopped_by_intent = exited && record.desired_state != DesiredState::Running;
         if let Some(exit) = &snapshot.exit {
             record.info.exit_code = exit.code;
-            record.info.state = if exit.stopped_by_user {
+            record.info.state = if exit.stopped_by_user || stopped_by_intent {
                 SessionState::Stopped
             } else if exit.code == Some(0) && exit.signal.is_none() {
                 SessionState::Done
+            } else {
+                SessionState::Failed
+            };
+            record.info.state_source = StateSource::Process;
+            if exit.output_forced_closed {
+                super::note_output_force_closed(&mut record.info);
+            }
+        } else if exited {
+            // The wire does not require an exit status with `Exited`.
+            record.info.state = if stopped_by_intent {
+                SessionState::Stopped
             } else {
                 SessionState::Failed
             };
@@ -3930,6 +3957,9 @@ impl SessionRegistry {
                 terminal.transaction = None;
                 terminal.info.state = SessionState::Stopped;
                 terminal.info.exit_code = exit.code;
+                if exit.output_forced_closed {
+                    super::note_output_force_closed(&mut terminal.info);
+                }
                 terminal
                     .info
                     .runtime
@@ -6910,6 +6940,7 @@ while os.getppid() == parent:
                 exit_code: Some(0),
                 signal: None,
                 success: true,
+                output_forced_closed: false,
             }),
             subagents: Vec::new(),
             hook_schema: None,
@@ -7099,6 +7130,7 @@ while os.getppid() == parent:
                 exit_code: Some(0),
                 signal: None,
                 success: true,
+                output_forced_closed: false,
             }),
             subagents: Vec::new(),
             hook_schema: None,
@@ -7870,6 +7902,7 @@ while os.getppid() == parent:
             branch: None,
             worktree_path: None,
             warnings: Vec::new(),
+            output_force_closed: false,
             metadata: BTreeMap::new(),
             created_at: created_at.clone(),
             updated_at: created_at,
@@ -8492,6 +8525,7 @@ while os.getppid() == parent:
             success: true,
             exited_at: "2026-07-23T00:01:00Z".to_owned(),
             reason: "natural_exit".to_owned(),
+            output_forced_closed: false,
         });
         let mut journal_value = serde_json::to_value(&journal).expect("serialize journal fixture");
         journal_value["subagent_revision"] = serde_json::json!(4);
@@ -9252,6 +9286,7 @@ while os.getppid() == parent:
                 branch: None,
                 worktree_path: None,
                 warnings: Vec::new(),
+                output_force_closed: false,
                 metadata: BTreeMap::new(),
                 created_at: created_at.clone(),
                 updated_at: created_at,
@@ -10763,6 +10798,7 @@ handler = "codex-hook-v1"
             branch: None,
             worktree_path: None,
             warnings: Vec::new(),
+            output_force_closed: false,
             metadata: BTreeMap::new(),
             created_at: created_at.clone(),
             updated_at: created_at,
@@ -11737,6 +11773,7 @@ handler = "codex-hook-v1"
                         success: true,
                         exited_at: "2026-09-24T00:01:00Z".to_owned(),
                         reason: "natural_exit".to_owned(),
+                        output_forced_closed: false,
                     });
                 },
             );

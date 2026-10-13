@@ -696,6 +696,36 @@ wire counters (`runtime_generation`, output offsets, terminal watermarks, hook
 sequences, and subagent revisions) are canonical unsigned decimal strings so JavaScript clients do
 not lose precision.
 
+A stop whose PTY output cannot drain still ends the session. When a process
+outside the session's process group (for example a `setsid` helper) keeps the
+terminal open past the stop deadline, the worker force-closes the output,
+reaps the root, and records the root's exit. The session reaches `stopped`
+with that exit and its session info has `output_force_closed` set to `true`,
+because output the helper wrote after the close is not retained. Before the
+session ends, the worker terminates every process still carrying the runtime's
+`POHUNEK_WORKER_INSTANCE_ID` marker and waits until none is left (`SIGTERM`,
+then `SIGKILL` after the stop grace), so a helper cannot keep writing once the
+session is resumable or its worktree is released. A same-user process whose
+environment cannot be read (a non-dumpable or setgid program, or one caught
+between images) and that started after the worker could belong to the runtime:
+the worker re-reads the process table for up to the stop grace, and if such a
+process is still there it is never signalled and the cleanup stays unconfirmed.
+Linux has no fork-lineage proof, so a long-lived foreign process of that kind
+also keeps the cleanup open. A process that scrubs its environment carries no
+marker and cannot be found. If the root's exit cannot be observed, nothing is
+invented and the stop fails; if the runtime's processes cannot be proven gone,
+the runtime is faulted instead of ended, the stop fails with
+`worker_operation_failed`, and the daemon handles it as a lost runtime
+(`runtime_lost_cleanup_unconfirmed` when its own sweep cannot confirm either).
+The worker log names each process that kept the cleanup open.
+
+The same applies when the root exits on its own and such a helper keeps the
+terminal open past the drain window: the worker force-closes the output, sweeps
+the runtime's marked processes, and the session ends `done` or `failed` with
+the root's exit and `output_force_closed` set, or its runtime becomes `lost`
+when the cleanup cannot be confirmed. Either way, a helper that carries the
+runtime's marker does not outlive the runtime.
+
 `lost` means the worker or host runtime is gone and the PTY cannot be
 reattached. `conflict` means discovery found ambiguous or mismatched live
 identity; Pohunek quarantines it and does not kill a worker automatically. A

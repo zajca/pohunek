@@ -664,6 +664,14 @@ pub struct ExitStatus {
     pub stopped_by_user: bool,
     /// Millisecond Unix timestamp recorded by the worker.
     pub exited_at_ms: u64,
+    /// Whether the PTY output was force-closed before it reached EOF.
+    ///
+    /// A process outside the root's process group held the PTY open past the
+    /// stop deadline, so output written after the close is not retained. The
+    /// exit itself is exact. A status without the field, as a previous
+    /// release's worker sends it, reads as `false`.
+    #[serde(default)]
+    pub output_forced_closed: bool,
 }
 
 /// Lifecycle of one provider-managed subagent in the worker snapshot.

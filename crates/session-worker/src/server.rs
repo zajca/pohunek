@@ -19,8 +19,9 @@ use pohunek_platform::filesystem::{
     AdvisoryLock, EntryIdentity, EntryKind, FsError, MoveOutcome, StageOutcome, TrustedDir,
 };
 use pohunek_platform::process::{
-    Error as PlatformProcessError, HostInspector, ProcessIdentity as OsProcessIdentity,
-    ProcessInspector, StartIdentity,
+    survey_runtime, sweep_runtime, Error as PlatformProcessError, HostInspector, ProcessCoalitions,
+    ProcessIdentity as OsProcessIdentity, ProcessInspector, SkipReason, Skipped, SpawnId,
+    StartIdentity, SweepReport, SweepRequest, MAX_SWEEP_GRACE,
 };
 use pohunek_worker_protocol as protocol;
 use pohunek_worker_protocol::is_task_text;
@@ -90,6 +91,24 @@ const ORPHAN_STOP_CAPACITY: usize = 64;
 /// A quarter second keeps the runtime publicly draining without either a busy
 /// loop or a long recovery delay once the journal becomes writable again.
 const TERMINAL_JOURNAL_RETRY_DELAY: Duration = Duration::from_millis(250);
+/// Upper bound on marker-sweep passes for one force-closed runtime.
+///
+/// A pass selects its targets before signalling, so a process forked during
+/// the pass is only found by the next one. Three passes absorb a short fork
+/// chain; a runtime that still yields targets after that is unconfirmed
+/// instead of being swept forever.
+const MAX_RUNTIME_SWEEP_PASSES: usize = 3;
+/// Liveness polling interval inside one sweep's grace windows, and the pause
+/// between passes of an unreadable-marker settle window.
+///
+/// Clamped to the grace. 50 ms notices an exit promptly without busy-reading
+/// the process table.
+const RUNTIME_SWEEP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Most processes one unconfirmed cleanup names, in its error and its events.
+///
+/// Eight identify the blockers on a busy host while keeping the fault detail
+/// the daemon receives and the log bounded; the error counts the rest.
+const MAX_LOGGED_CLEANUP_BLOCKERS: usize = 8;
 /// Maximum accepted provider-native subagent identifier length.
 ///
 /// The same bound the daemon re-checks for background task ids.
@@ -2059,25 +2078,51 @@ async fn coordinate_runtime_completion(
             return;
         }
     };
-    let next_output_offset = match completion {
-        OutputCompletion::Eof { next_offset } => next_offset,
-        OutputCompletion::ForcedClosed { next_offset } => {
+    let (next_output_offset, output_forced_closed) = match completion {
+        OutputCompletion::Eof { next_offset } => (next_offset, false),
+        OutputCompletion::ForcedClosed { next_offset } => (next_offset, true),
+    };
+    if output_forced_closed {
+        event!(
+            name: "worker.pty.output.forced_close",
+            Level::WARN,
+            process.pid = pty.identity().pid,
+            "PTY output was force-closed; the runtime's processes are swept before it ends",
+        );
+    }
+    // The stop that sealed a forced close already reaped the root, so finishing
+    // it reports the forced close again; that is not a fault. The root exit is
+    // known here, so the runtime ends with it.
+    match pty.finish_natural().await {
+        Ok(_) => {}
+        Err(PtyError::OutputForcedClosed) if output_forced_closed => {}
+        Err(error) => {
+            mark_runtime_faulted(&shared, worker_instance_id, WorkerError::Pty(error)).await;
+            shared.shutdown.cancel();
+            return;
+        }
+    }
+    // A forced close means a process outside the root's group still holds the
+    // PTY slave and was never signalled. The runtime only ends once every
+    // process carrying its marker is proven gone; otherwise it is faulted and
+    // the daemon's lost-runtime handling takes over.
+    if output_forced_closed {
+        if let Err(error) = confirm_forced_close_cleanup(&shared, &worker_instance_id).await {
             mark_runtime_faulted_at_offset(
                 &shared,
                 worker_instance_id,
-                WorkerError::Pty(PtyError::OutputForcedClosed),
-                Some(next_offset),
+                error,
+                Some(next_output_offset),
             )
             .await;
             shared.shutdown.cancel();
             return;
         }
-    };
-    if let Err(error) = pty.finish_natural().await {
-        mark_runtime_faulted(&shared, worker_instance_id, WorkerError::Pty(error)).await;
-        shared.shutdown.cancel();
-        return;
     }
+    let status = ExitStatus {
+        output_forced_closed,
+        ..status
+    };
     let Some(retention) = retry_runtime_completion(
         &shared,
         &exit,
@@ -2098,6 +2143,354 @@ async fn coordinate_runtime_completion(
         () = tokio::time::sleep(retention) => shared.shutdown.cancel(),
         () = shared.shutdown.cancelled() => {}
     }
+}
+
+/// Confirms that no process of this worker's force-closed runtime is left.
+///
+/// Builds the sweep scope from the worker's own identity and its journaled
+/// lineage and coalition proofs, and bounds the sweep by the session's stop
+/// grace; see [`confirm_runtime_cleanup`].
+///
+/// # Errors
+///
+/// Returns [`WorkerError::RuntimeCleanup`] when the cleanup stays unconfirmed.
+async fn confirm_forced_close_cleanup(
+    shared: &Shared,
+    worker_instance_id: &WorkerInstanceId,
+) -> Result<(), WorkerError> {
+    let (grace, worker_spawn, worker_coalitions) = {
+        let state = shared.state.lock().await;
+        (
+            state.stop_grace,
+            state.journal.worker_spawn_id.clone(),
+            state.journal.worker_coalitions.clone(),
+        )
+    };
+    let scope = CleanupScope {
+        session_id: shared.session_id.as_str(),
+        worker_instance_id,
+        worker_start: StartIdentity::new(shared.worker_process.start_identity),
+        // A spawn id or coalition pair that does not parse only withholds its
+        // proof, which leaves more processes unconfirmed, never fewer.
+        worker_spawn: worker_spawn.and_then(|value| value.parse::<SpawnId>().ok()),
+        worker_coalitions: worker_coalitions
+            .and_then(|value| value.parse::<ProcessCoalitions>().ok()),
+    };
+    confirm_runtime_cleanup(&HostInspector::new(), &scope, grace).await
+}
+
+/// The runtime a forced-close cleanup sweeps, and the worker that owned it.
+#[derive(Debug)]
+struct CleanupScope<'a> {
+    /// Session whose worker-marked children without an instance marker keep
+    /// the cleanup unconfirmed.
+    session_id: &'a str,
+    /// Runtime whose marked processes are swept.
+    worker_instance_id: &'a WorkerInstanceId,
+    /// This worker's start identity; an unreadable-marker process that
+    /// started before it is foreign to the runtime.
+    worker_start: StartIdentity,
+    /// This worker's creation number, on a host that reports fork lineage.
+    worker_spawn: Option<SpawnId>,
+    /// This worker's kernel coalitions, on a host that reports them.
+    worker_coalitions: Option<ProcessCoalitions>,
+}
+
+/// Sweeps every process marked with the runtime and confirms none is left.
+///
+/// Runs [`sweep_runtime`] until a pass attributes no process to the runtime,
+/// at most [`MAX_RUNTIME_SWEEP_PASSES`] times. `grace` bounds each wait
+/// between `SIGTERM` and `SIGKILL` and is capped at [`MAX_SWEEP_GRACE`]. When
+/// a pass leaves only processes whose markers cannot be read, the sweep
+/// re-reads the process table for up to that same grace (see
+/// [`settle_unreadable`]), as the daemon's lost-runtime sweep does, and an
+/// unreadable-marker process still present afterwards keeps the cleanup
+/// unconfirmed.
+///
+/// Only processes that carry the runtime marker, or that the fork lineage
+/// proves descend from this worker, can be found; on a host that reports
+/// coalitions, an unreadable-marker process outside both of this worker's
+/// coalitions is foreign. A process that scrubs its
+/// environment on a host without lineage is invisible to this sweep, the same
+/// limit the daemon's lost-runtime sweep has.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::RuntimeCleanup`] when the sweep cannot run, aborts,
+/// leaves a signalled process running, skips the worker itself, or still
+/// attributes processes to the runtime after the last pass.
+async fn confirm_runtime_cleanup(
+    inspector: &dyn ProcessInspector,
+    scope: &CleanupScope<'_>,
+    grace: Duration,
+) -> Result<(), WorkerError> {
+    let unconfirmed = |detail: String| WorkerError::RuntimeCleanup {
+        runtime_id: scope.worker_instance_id.to_string(),
+        detail,
+    };
+    let grace = grace.min(MAX_SWEEP_GRACE);
+    let request = SweepRequest::new(
+        scope.worker_instance_id.as_str(),
+        rustix::process::geteuid().as_raw(),
+        grace,
+        RUNTIME_SWEEP_POLL_INTERVAL.min(grace),
+    )
+    .map_err(|error| unconfirmed(error.to_string()))?
+    .with_runtime_session(scope.session_id)
+    .with_worker_start_identity(Some(scope.worker_start))
+    .with_worker_spawn_id(scope.worker_spawn)
+    .with_worker_coalitions(scope.worker_coalitions);
+    // Passes that signalled or decided; the pauses of an unreadable-marker
+    // settle window are not counted.
+    let mut passes = 0;
+    let mut settle_until: Option<tokio::time::Instant> = None;
+    loop {
+        let pass = passes + 1;
+        let report = sweep_runtime(inspector, &request)
+            .await
+            .map_err(|error| unconfirmed(format!("sweep pass {pass} aborted: {error}")))?;
+        let only_unreadable = leaves_only_unreadable(&report);
+        let settling = only_unreadable && settle_unreadable(&mut settle_until, grace).await;
+        log_cleanup_pass(scope, pass, settling, &report);
+        if settling {
+            continue;
+        }
+        if !report.is_complete() {
+            return Err(unconfirmed(format!(
+                "{} signalled process(es) were still running after pass {pass}",
+                report.unconfirmed.len()
+            )));
+        }
+        if report
+            .skipped
+            .iter()
+            .any(|skipped| skipped.reason == SkipReason::CurrentProcess)
+        {
+            return Err(unconfirmed(
+                "the sweep selected the worker process itself".to_owned(),
+            ));
+        }
+        // An unreadable-marker process that could still belong to the runtime
+        // counts as selected, like every other skip.
+        let selected = report.terminated.len()
+            + report.killed.len()
+            + report.unconfirmed.len()
+            + report.skipped.len();
+        if selected == 0 {
+            return Ok(());
+        }
+        passes += 1;
+        if only_unreadable {
+            let blockers = cleanup_blockers(&[], &report.skipped);
+            log_cleanup_blockers(inspector, scope, &blockers);
+            return Err(unconfirmed(format!(
+                "processes of the runtime remained after {passes} sweep pass(es): {}",
+                describe_blockers(&blockers)
+            )));
+        }
+        // The last signalling pass may have ended the last process; only a
+        // look without signals tells whether anything is left.
+        if passes >= MAX_RUNTIME_SWEEP_PASSES {
+            return verify_runtime_cleanup(inspector, &request, scope, grace, &mut settle_until)
+                .await;
+        }
+    }
+}
+
+/// Decides a cleanup after its last signalling pass, sending no signal.
+///
+/// Surveys the process table: nothing attributed to the runtime and nothing
+/// skipped confirms the cleanup. When only unreadable-marker processes remain,
+/// the survey repeats while the cleanup's settle window is open (see
+/// [`settle_unreadable`]); anything else left keeps the cleanup unconfirmed.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::RuntimeCleanup`] when the survey cannot run or a
+/// process of the runtime, or one that could belong to it, is left.
+async fn verify_runtime_cleanup(
+    inspector: &dyn ProcessInspector,
+    request: &SweepRequest,
+    scope: &CleanupScope<'_>,
+    grace: Duration,
+    settle_until: &mut Option<tokio::time::Instant>,
+) -> Result<(), WorkerError> {
+    let unconfirmed = |detail: String| WorkerError::RuntimeCleanup {
+        runtime_id: scope.worker_instance_id.to_string(),
+        detail,
+    };
+    loop {
+        let survey = survey_runtime(inspector, request)
+            .map_err(|error| unconfirmed(format!("cleanup verification aborted: {error}")))?;
+        let only_unreadable = survey.attributed.is_empty()
+            && !survey.skipped.is_empty()
+            && survey
+                .skipped
+                .iter()
+                .all(|skipped| skipped.reason == SkipReason::MarkersUnreadable);
+        let settling = only_unreadable && settle_unreadable(settle_until, grace).await;
+        event!(
+            name: "worker.runtime.sweep.verify",
+            Level::INFO,
+            worker_instance_id = scope.worker_instance_id.as_str(),
+            sweep.attributed = survey.attributed.len(),
+            sweep.skipped = survey.skipped.len(),
+            sweep.settling = settling,
+            "verified the cleanup of a force-closed runtime",
+        );
+        if survey.is_empty() {
+            return Ok(());
+        }
+        if settling {
+            continue;
+        }
+        let blockers = cleanup_blockers(&survey.attributed, &survey.skipped);
+        log_cleanup_blockers(inspector, scope, &blockers);
+        return Err(unconfirmed(format!(
+            "processes of the runtime remained after the last sweep pass: {}",
+            describe_blockers(&blockers)
+        )));
+    }
+}
+
+/// A process that keeps a cleanup open, with why it does.
+#[derive(Debug)]
+struct Blocker {
+    identity: OsProcessIdentity,
+    /// The skip reason, or `Attributed` for a process the sweep would signal.
+    reason: String,
+}
+
+/// Lists the blockers of a deciding pass or survey.
+fn cleanup_blockers(attributed: &[OsProcessIdentity], skipped: &[Skipped]) -> Vec<Blocker> {
+    attributed
+        .iter()
+        .map(|identity| Blocker {
+            identity: *identity,
+            reason: "Attributed".to_owned(),
+        })
+        .chain(skipped.iter().map(|skipped| Blocker {
+            identity: skipped.identity,
+            reason: format!("{:?}", skipped.reason),
+        }))
+        .collect()
+}
+
+/// Whether a sweep pass signalled nothing and skipped only processes whose
+/// ownership markers could not be read.
+fn leaves_only_unreadable(report: &SweepReport) -> bool {
+    !report.skipped.is_empty()
+        && report.terminated.is_empty()
+        && report.killed.is_empty()
+        && report.unconfirmed.is_empty()
+        && report
+            .skipped
+            .iter()
+            .all(|skipped| skipped.reason == SkipReason::MarkersUnreadable)
+}
+
+/// Pauses one poll interval while the settle window of the unreadable-marker
+/// processes is open, and reports whether it paused.
+///
+/// The window opens at the first call and lasts `grace`. Nothing was signalled
+/// when only such processes remain, so repeating the sweep at once would read
+/// the same table: the process is caught between images, or an orphan about
+/// to exit. The caller leaves the cleanup unconfirmed once the window closed.
+async fn settle_unreadable(
+    settle_until: &mut Option<tokio::time::Instant>,
+    grace: Duration,
+) -> bool {
+    let deadline = *settle_until.get_or_insert_with(|| tokio::time::Instant::now() + grace);
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return false;
+    }
+    tokio::time::sleep(RUNTIME_SWEEP_POLL_INTERVAL.min(remaining)).await;
+    true
+}
+
+fn log_cleanup_pass(scope: &CleanupScope<'_>, pass: usize, settling: bool, report: &SweepReport) {
+    event!(
+        name: "worker.runtime.sweep.pass",
+        Level::INFO,
+        worker_instance_id = scope.worker_instance_id.as_str(),
+        sweep.pass = pass,
+        sweep.terminated = report.terminated.len(),
+        sweep.killed = report.killed.len(),
+        sweep.unconfirmed = report.unconfirmed.len(),
+        sweep.skipped = report.skipped.len(),
+        sweep.settling = settling,
+        "swept the processes of a force-closed runtime",
+    );
+}
+
+/// Names each process that kept the cleanup of a force-closed runtime open.
+///
+/// One event per skipped process, at most [`MAX_LOGGED_CLEANUP_BLOCKERS`]: its
+/// identity next to this worker's, the skip reason, the command name, whether
+/// it still runs, and the outcome of a fresh marker read. That is what tells a
+/// process between images, an exited or unreaped one, and a foreign
+/// non-dumpable one apart.
+fn log_cleanup_blockers(
+    inspector: &dyn ProcessInspector,
+    scope: &CleanupScope<'_>,
+    blockers: &[Blocker],
+) {
+    for blocker in blockers.iter().take(MAX_LOGGED_CLEANUP_BLOCKERS) {
+        let pid = blocker.identity.pid;
+        let comm = match inspector.process(pid) {
+            Ok(Some(fact)) if fact.start_identity == blocker.identity.start_identity => fact.comm,
+            Ok(_) => "exited".to_owned(),
+            Err(error) => format!("unreadable: {error}"),
+        };
+        let markers = match inspector.ownership_markers(pid) {
+            Ok(_) => "readable".to_owned(),
+            Err(error) => error.to_string(),
+        };
+        let running = match inspector.is_running(blocker.identity) {
+            Ok(true) => "running".to_owned(),
+            Ok(false) => "exited".to_owned(),
+            Err(error) => format!("unknown: {error}"),
+        };
+        event!(
+            name: "worker.runtime.sweep.blocker",
+            Level::WARN,
+            worker_instance_id = scope.worker_instance_id.as_str(),
+            process.pid = pid,
+            process.start_identity = blocker.identity.start_identity.get(),
+            process.comm = %comm,
+            worker.start_identity = scope.worker_start.get(),
+            sweep.skip_reason = %blocker.reason,
+            sweep.markers = %markers,
+            process.state = %running,
+            "a process kept the cleanup of a force-closed runtime unconfirmed",
+        );
+    }
+}
+
+/// Lists the blockers of a cleanup for its error.
+///
+/// Only numbers and the reason: the detail reaches the daemon in the runtime
+/// fault, so no command name or environment value of a foreign process is
+/// included; the worker log names the command.
+fn describe_blockers(blockers: &[Blocker]) -> String {
+    let mut listed: Vec<String> = blockers
+        .iter()
+        .take(MAX_LOGGED_CLEANUP_BLOCKERS)
+        .map(|blocker| {
+            format!(
+                "pid {} (start {}, {})",
+                blocker.identity.pid, blocker.identity.start_identity, blocker.reason
+            )
+        })
+        .collect();
+    if blockers.len() > MAX_LOGGED_CLEANUP_BLOCKERS {
+        listed.push(format!(
+            "and {} more",
+            blockers.len() - MAX_LOGGED_CLEANUP_BLOCKERS
+        ));
+    }
+    listed.join(", ")
 }
 
 async fn wait_for_output_completion(
@@ -2123,10 +2516,11 @@ async fn wait_for_output_completion(
                     let state = shared.state.lock().await;
                     state.stop_grace
                 };
-                match pty.stop("natural-drain-timeout", grace).await {
-                    Ok(_) | Err(PtyError::OutputForcedClosed) => {}
-                    Err(error) => return Err(WorkerError::Pty(error)),
-                }
+                // A forced close is not an error: the sealed completion read
+                // below records it and the root's exit is known.
+                pty.stop("natural-drain-timeout", grace)
+                    .await
+                    .map_err(WorkerError::Pty)?;
                 pty.output_completion().ok_or_else(|| {
                     WorkerError::Protocol(
                         "PTY cleanup returned without sealing output completion".to_owned(),
@@ -2211,6 +2605,7 @@ async fn commit_runtime_completion(
         } else {
             "natural_exit".to_owned()
         },
+        output_forced_closed: status.output_forced_closed,
     });
     journal.next_output_offset = next_output_offset;
     journal.updated_at = timestamp();
@@ -6110,6 +6505,7 @@ fn exit_status(exit: &Exit, stopped_by_user: bool) -> ExitStatus {
         signal: exit.signal.as_deref().and_then(signal_number),
         stopped_by_user,
         exited_at_ms: unix_ms(),
+        output_forced_closed: false,
     }
 }
 
@@ -7942,11 +8338,12 @@ mod tests {
     // leader exits, so this scenario exists only on Linux.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn escaped_pty_holder_faults_with_the_exact_final_output_offset() {
+    async fn escaped_pty_holder_ends_with_the_exit_and_the_exact_final_output_offset() {
         let directory = BarrierDirectory::new();
         let ready = directory.path().join("escaped-ready");
-        // The escaped holder never closes the PTY, so the runtime always faults at
-        // the same final offset; these windows only keep the test fast.
+        // The escaped holder never closes the PTY, so the runtime always ends with
+        // the root's exit at the same final offset; these windows only keep the
+        // test fast.
         let config = crate::WorkerConfig {
             post_exit_drain_timeout: Duration::from_millis(50),
             stop_grace: Duration::from_millis(50),
@@ -8010,16 +8407,23 @@ mod tests {
             worker_instance_id,
         );
 
-        pohunek_test_support::wait::wait_until("the forced-close fault", || async {
-            (server.shared.state.lock().await.phase == super::WireRuntimePhase::Faulted)
+        pohunek_test_support::wait::wait_until("the forced-close terminal commit", || async {
+            (server.shared.state.lock().await.phase == super::WireRuntimePhase::Exited)
                 .then_some(())
         })
         .await;
         let final_offset = pty.output().next_offset();
-        let journal = server.shared.journal.load().expect("load fault journal");
-        assert_eq!(journal.phase, super::JournalPhase::Faulted);
+        let journal = server.shared.journal.load().expect("load terminal journal");
+        assert_eq!(journal.phase, super::JournalPhase::Terminal);
         assert_eq!(journal.next_output_offset, final_offset);
         assert!(final_offset > 0);
+        let outcome = journal
+            .outcome
+            .expect("the terminal journal records the exit");
+        assert!(outcome.output_forced_closed);
+        let state = server.shared.state.lock().await;
+        let exit = state.exit.as_ref().expect("the exit is published");
+        assert!(exit.output_forced_closed);
     }
 
     #[tokio::test]
@@ -8038,6 +8442,7 @@ mod tests {
             signal: None,
             stopped_by_user: false,
             exited_at_ms: 100,
+            output_forced_closed: false,
         };
         let shared = std::sync::Arc::clone(&server.shared);
         let completion = super::retry_runtime_completion(

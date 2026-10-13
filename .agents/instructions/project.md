@@ -34,7 +34,9 @@ rule. The current state of each place is stated separately.
   is additive (no schema bump): the journal of an N-1 worker lacks it, and its
   lost runtime is swept without the fork-lineage proof. The same holds for the
   optional field `worker_coalitions`, which lets the sweep dismiss processes
-  the kernel places in other coalitions than the worker's.
+  the kernel places in other coalitions than the worker's. The optional outcome
+  field `output_forced_closed` (also on the private `ExitStatus`) is additive
+  the same way: an N-1 worker's outcome lacks it and reads as `false`.
 - **Public-protocol clients.** Contract: a protocol change keeps the previous
   version served through adapters on both sides of the connection. An adapter
   translates shape only. A semantic change raises `MIN_PROTOCOL_VERSION` too
