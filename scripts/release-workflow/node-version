@@ -21,7 +21,7 @@ matrix=$1
 
 versions=$(jq -r '[.rows[].runtime] | unique | .[]' "$matrix" | while IFS= read -r runtime; do
     case $runtime in
-        '' | *[!a-z0-9_-]*) fail "invalid runtime id: $runtime" ;;
+        ('' | *[!a-z0-9_-]*) fail "invalid runtime id: $runtime" ;;
     esac
     lock=compat/$runtime/compatibility-lock.json
     [ -f "$lock" ] || fail "no compatibility lock for runtime $runtime"

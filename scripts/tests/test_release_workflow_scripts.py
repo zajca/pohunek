@@ -581,12 +581,17 @@ class AssembleRefusalTests(unittest.TestCase):
         self.commit = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True
         ).stdout.strip()
+        tools = self.directory / "tools"
+        tools.mkdir()
+        self.xtask = tools / "xtask"
+        self.xtask.write_text("#!/bin/sh\nexit 0\n")
+        self.xtask.chmod(0o755)
 
     def assemble(self, mode: str, **extra: str):
         env = {
             "VERSION": "1.0.0",
             "COMMIT": self.commit,
-            "XTASK": "/bin/true",
+            "XTASK": str(self.xtask),
             "RUNNER_TEMP": str(self.directory),
         }
         env.update(extra)
@@ -618,7 +623,7 @@ class AssembleRefusalTests(unittest.TestCase):
             str(self.directory / "trust"),
             "1",
             self.commit,
-            env={"XTASK": "/bin/true", "GITHUB_REF_TYPE": "tag"},
+            env={"XTASK": str(self.xtask), "GITHUB_REF_TYPE": "tag"},
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("never derived for a tag", result.stderr)

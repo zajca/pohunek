@@ -67,7 +67,7 @@ def write_shim(directory, name, text):
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix="pohunek-signing-"))
+        self.root = Path(tempfile.mkdtemp(prefix="pohunek-signing-")).resolve()
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.tools = self.root / "tools"
         self.tools.mkdir()

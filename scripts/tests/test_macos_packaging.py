@@ -39,8 +39,8 @@ SHIM = """#!/bin/sh
 set -eu
 tool=$(basename "$0")
 case "$tool $1" in
-  "otool -l") exec cat "$2.otool-l" ;;
-  "otool -L") exec cat "$2.otool-L" ;;
+  "otool -l") exec cat "$2.otool-load" ;;
+  "otool -L") exec cat "$2.otool-libs" ;;
   "lipo -archs") exec cat "$2.archs" ;;
   "strings -a") [ ! -f "$2.strings-fails" ] || exit 1; exec cat "$2.strings" ;;
 esac
@@ -82,8 +82,8 @@ class AuditTest(unittest.TestCase):
         load = LOAD_COMMANDS.format(minos=minos)
         if rpath:
             load += "Load command 2\n      cmd LC_RPATH\n  cmdsize 32\n     path {} (offset 12)\n".format(rpath)
-        (self.tree / (name + ".otool-l")).write_text(load)
-        (self.tree / (name + ".otool-L")).write_text(
+        (self.tree / (name + ".otool-load")).write_text(load)
+        (self.tree / (name + ".otool-libs")).write_text(
             libraries if libraries is not None else LIBRARIES.format(name=name)
         )
         (self.tree / (name + ".archs")).write_text(archs + "\n")
@@ -139,7 +139,7 @@ class AuditTest(unittest.TestCase):
         result = self.audit("--minimum-os", "15.0", self.binary("ok", minos="15.0"))
         self.assertEqual(result.returncode, 0, result.stderr)
         none = self.binary("none")
-        (self.tree / "none.otool-l").write_text("Load command 1\n      cmd LC_SEGMENT_64\n")
+        (self.tree / "none.otool-load").write_text("Load command 1\n      cmd LC_SEGMENT_64\n")
         result = self.audit(none)
         self.assertEqual(result.returncode, 1)
         self.assertIn("no macOS deployment target", result.stderr)
@@ -209,12 +209,12 @@ class AuditTest(unittest.TestCase):
 
     def test_a_binary_for_another_apple_platform_fails(self):
         path = self.binary("ios")
-        (self.tree / "ios.otool-l").write_text(LOAD_COMMANDS.format(minos="14.0").replace("platform 1", "platform 2"))
+        (self.tree / "ios.otool-load").write_text(LOAD_COMMANDS.format(minos="14.0").replace("platform 1", "platform 2"))
         result = self.audit(path)
         self.assertEqual(result.returncode, 1)
         self.assertIn("built for platform '2', not macOS", result.stderr)
         named = self.binary("named")
-        (self.tree / "named.otool-l").write_text(LOAD_COMMANDS.format(minos="14.0").replace("platform 1", "platform MACOS"))
+        (self.tree / "named.otool-load").write_text(LOAD_COMMANDS.format(minos="14.0").replace("platform 1", "platform MACOS"))
         self.assertEqual(self.audit(named).returncode, 0)
 
     def test_a_failing_strings_tool_fails_the_audit(self):
