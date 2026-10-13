@@ -1090,6 +1090,15 @@ fn start_on_previous(run: Run, previous: Cli, head: Cli) -> (Upgrade, Runtime, u
     (upgrade, before, daemon)
 }
 
+/// Removes the probe package directory `dir`, if it exists.
+fn remove_probe(dir: &Path) {
+    match fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("remove {}: {error}", dir.display()),
+    }
+}
+
 impl Upgrade {
     /// The head links a package directory, so the head daemon builds an
     /// archive of the head's package format and installs it. Across a format
@@ -1099,6 +1108,8 @@ impl Upgrade {
     /// unreserved runtime, which a linked package may claim.
     fn assert_head_links_a_package_of_its_format(&self) {
         let dir = self.run.home.join(PROBE_DIRECTORY);
+        // A run that stopped before its cleanup leaves the directory behind.
+        remove_probe(&dir);
         fs::DirBuilder::new()
             .mode(0o700)
             .create(&dir)
@@ -1111,6 +1122,8 @@ impl Upgrade {
         let linked = self
             .head
             .json(&["plugin", "link", &path, "--yes", "--json"]);
+        // `plugin link` copied the directory into the package store.
+        remove_probe(&dir);
         let info = &linked["package"];
         assert_eq!(info["package"]["id"], PROBE_PACKAGE_ID, "{linked}");
         let digest = info["digest"].as_str().expect("the linked digest");
