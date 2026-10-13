@@ -335,10 +335,11 @@ A separate plugin-unit contract installs persistent workflow plugin units, each
 keyed by plugin, kind, and name: a periodic job or a long-running service
 restarted after every exit. A job's runs never overlap and start about one
 interval apart. The interval is awake time counted from the unit's activation
-within one service-manager lifetime: it pauses while the host sleeps and starts
-over at every login, so wall-clock cadence (catching up a daily job on a host
-that is never awake that long) belongs to the caller, which keeps its own
-last-run record and skips runs that are not due yet. Intervals, timer
+within one service-manager lifetime: it pauses while the host sleeps (launchd
+skips a firing due during sleep) and starts over at every login, so
+wall-clock cadence (catching up a daily job on a host that is never awake
+that long) belongs to the caller, which keeps its own last-run record and
+skips runs that are not due yet. Intervals, timer
 accuracy, and restart delays are whole seconds of at least one second, the
 granularity both native managers express. The native run bound and restart
 delay are backstops; the caller enforces the real run and restart policy.
@@ -351,9 +352,28 @@ files `pohunek-<ns>-wf-<plugin-hash>-<j|s>-<name>.service`: a job is
 `OnActiveSec=` and `OnUnitInactiveSec=` (the next run one interval after the
 previous one ended); a service is `Type=exec` with `Restart=always` and
 `RestartSec=` waited after each exit. Both disable start rate limiting and
-kill the whole control group. Worker discovery never matches these names, so
-it neither adopts nor sweeps them. No command installs plugin units yet; the
-launchd backend and the CLI that drives both are ordered work in #326.
+kill the whole control group. macOS implements it with LaunchAgents
+`~/Library/LaunchAgents/io.github.zajca.pohunek.<ns>.wf.<plugin-hash>.<j|s>.<name>.plist`
+in the `gui/<uid>` domain, written and replaced through the same crash-safe
+registration as the daemon agent: a job has `StartInterval` set to the
+interval, `RunAtLoad=false` (the first run one interval after load, then the
+load-relative cadence), and `ThrottleInterval` of one second, because launchd
+otherwise spawns a job at most every 10 s; a service has `KeepAlive=true`
+and its restart delay as `ThrottleInterval`. launchd skips an interval firing
+while a run is active and never runs two processes of one label, so runs
+never overlap. A unit's process is matched by its executable, exact argv,
+and the `XPC_SERVICE_NAME` entry launchd sets to the label, so two
+installations running the same argv never act on each other's processes.
+launchd has no key that bounds a running job and reports a job's exit
+status only in `launchctl print` text, which the backend never parses, so on
+macOS the executable a unit runs is the only run bound and the caller's own
+run record is the only failure record; `ExitTimeOut` bounds a stop, after
+which the backend kills the rest of the job's process group captured before
+the stop. Stopping a unit boots it out but keeps its definition,
+so it runs again at the next login until it is removed. Worker discovery
+never matches these names or labels, so it neither adopts nor sweeps them. No
+command installs plugin units yet; the CLI that drives both backends is
+ordered work in #326.
 
 The shared contract crate compiles and tests natively on Apple Silicon Darwin
 with a macOS 14 deployment target. Intel Macs are outside the current release

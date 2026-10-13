@@ -446,7 +446,8 @@ Daemon, sessions, integrations, and project state:
 - `crates/platform/src/supervisor/namespace.rs` — installation namespace,
   launchd labels, systemd unit names, and workflow plugin unit names.
 - `crates/platform/src/supervisor/launchd/` — launchd backend (`/bin/launchctl`
-  status table, plist rendering, worker and daemon agents).
+  status table, plist rendering, worker and daemon agents, and workflow plugin
+  unit LaunchAgents).
 - `crates/platform/src/supervisor/systemd.rs` — systemd transient-unit backend,
   the daemon unit/slice installer, and the workflow plugin unit installer.
 - `crates/platform/src/shell_env/` — executable search-path policy: bounded

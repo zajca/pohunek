@@ -34,7 +34,7 @@ pub mod systemd;
 #[doc(inline)]
 pub use namespace::{Namespace, PluginUnitKey, PluginUnitKind, WorkerKey};
 
-// Rust guideline compliant 2026-10-12
+// Rust guideline compliant 2026-10-13
 
 /// Longest accepted service identifier.
 ///
@@ -539,16 +539,17 @@ pub enum Activation {
     /// A periodic job: runs start about `every` apart and never overlap.
     ///
     /// `every` is awake time counted from the unit's activation within one
-    /// service-manager lifetime: the count pauses while the host sleeps and
-    /// starts over whenever the manager starts the unit again, such as at the
+    /// service-manager lifetime: the count pauses while the host sleeps (or,
+    /// on launchd, a firing due during sleep is skipped) and starts over
+    /// whenever the manager starts the unit again, such as at the
     /// next login. An interval longer than the host's awake time per
     /// session may therefore never elapse; a caller that needs wall-clock
     /// cadence keeps its own last-run record, uses a short interval, and
     /// skips runs that are not due yet. Whether the first run starts at
     /// activation and whether `every` counts from a run's start or its end
     /// are backend details. The definition's start timeout is a native
-    /// backstop where the backend has one; the caller enforces the real run
-    /// bound.
+    /// backstop where the backend has one (launchd has none); the caller
+    /// enforces the real run bound.
     Interval {
         /// Approximate spacing of runs.
         every: Duration,
@@ -691,8 +692,12 @@ pub trait PluginUnits: std::fmt::Debug + Send + Sync {
     /// A service reports its own state. A job reports
     /// [`ServiceState::Failed`] while its last run failed,
     /// [`ServiceState::Running`] while its schedule is armed, and
-    /// [`ServiceState::Stopped`] otherwise. Fails with [`Error::NotFound`] when
-    /// the set is not installed.
+    /// [`ServiceState::Stopped`] otherwise. [`ServiceState::Failed`] comes
+    /// only from a manager that reports a failure without its human-readable
+    /// output being parsed; launchd does not, so its backend never reports it
+    /// and callers keep their own record of run outcomes. Evidence that fits
+    /// more than one state is [`ServiceState::Unknown`]. Fails with
+    /// [`Error::NotFound`] when the set is not installed.
     fn state<'a>(&'a self, key: &'a PluginUnitKey) -> Operation<'a, ServiceState>;
 }
 
