@@ -2,10 +2,10 @@
 # installed by pohunek
 # managed by pohunek; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
-# POHUNEK_INTEGRATION_ID=claude
+# POHUNEK_INTEGRATION_ID=@POHUNEK_AGENT_ID@
 # POHUNEK_INTEGRATION_VERSION=14
 #
-# Claude notification hook. Fire-and-forget: any missing handshake env, missing
+# @POHUNEK_AGENT_NAME@ notification hook. Fire-and-forget: any missing handshake env, missing
 # python3, invalid input, or socket failure is a silent no-op (exit 0) so the
 # hook can never break the agent.
 
@@ -24,7 +24,7 @@ esac
   { [ -n "${POHUNEK_SOCKET_PATH:-}" ] && [ -n "${POHUNEK_PROTOCOL_VERSION:-}" ]; } || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
 # BEGIN agent-pid
-# Claude runs a hook command as `/bin/sh -c "sh '<this script>' <action>"`. A
+# @POHUNEK_AGENT_NAME@ runs a hook command as `/bin/sh -c "sh '<this script>' <action>"`. A
 # shell that does not exec its last command (dash) stays between the agent and
 # this script, so the agent is the parent of that wrapper shell, not `$PPID`.
 # Only a parent whose full command line contains exactly that hook invocation,
@@ -51,7 +51,7 @@ esac
 # size disrupt the agent process.
 MAX_HOOK_INPUT_BYTES=65536
 
-hook_input_file="$(mktemp "${TMPDIR:-/tmp}/pohunek-claude-notify.XXXXXX" 2>/dev/null)" || exit 0
+hook_input_file="$(mktemp "${TMPDIR:-/tmp}/pohunek-@POHUNEK_AGENT_ID@-notify.XXXXXX" 2>/dev/null)" || exit 0
 trap 'rm -f "$hook_input_file"' EXIT HUP INT TERM
 head -c "$MAX_HOOK_INPUT_BYTES" >"$hook_input_file" 2>/dev/null || true
 
@@ -66,7 +66,7 @@ import socket
 import sys
 import time
 
-AGENT = "claude"
+AGENT = "@POHUNEK_AGENT_ID@"
 MAX_HOOK_INPUT_CHARS = 65536
 MAX_SESSION_ID_BYTES = 512
 SAFE_ID_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:@")
@@ -88,36 +88,36 @@ NOTIFICATION_MATCHERS = {
     "permission_prompt": {
         "kind": "approval_required",
         "severity": "action_required",
-        "title": "Claude approval required",
-        "body": "Claude is waiting for approval.",
+        "title": "@POHUNEK_AGENT_NAME@ approval required",
+        "body": "@POHUNEK_AGENT_NAME@ is waiting for approval.",
         "attention": True,
     },
     "elicitation_dialog": {
         "kind": "approval_required",
         "severity": "action_required",
-        "title": "Claude response required",
-        "body": "Claude is waiting for approval.",
+        "title": "@POHUNEK_AGENT_NAME@ response required",
+        "body": "@POHUNEK_AGENT_NAME@ is waiting for approval.",
         "attention": True,
     },
     "auth_success": {
         "kind": "system",
         "severity": "success",
-        "title": "Claude authentication succeeded",
-        "body": "Claude reported successful authentication.",
+        "title": "@POHUNEK_AGENT_NAME@ authentication succeeded",
+        "body": "@POHUNEK_AGENT_NAME@ reported successful authentication.",
         "attention": False,
     },
     "elicitation_complete": {
         "kind": "system",
         "severity": "info",
-        "title": "Claude elicitation completed",
-        "body": "Claude completed an elicitation flow.",
+        "title": "@POHUNEK_AGENT_NAME@ elicitation completed",
+        "body": "@POHUNEK_AGENT_NAME@ completed an elicitation flow.",
         "attention": False,
     },
     "elicitation_response": {
         "kind": "system",
         "severity": "info",
-        "title": "Claude elicitation response",
-        "body": "Claude received an elicitation response.",
+        "title": "@POHUNEK_AGENT_NAME@ elicitation response",
+        "body": "@POHUNEK_AGENT_NAME@ received an elicitation response.",
         "attention": False,
     },
 }
@@ -127,8 +127,8 @@ EVENTS = {
         "provider_event": "Stop",
         "kind": "turn_completed",
         "severity": "info",
-        "title": "Claude turn completed",
-        "body": "Claude completed an agent turn.",
+        "title": "@POHUNEK_AGENT_NAME@ turn completed",
+        "body": "@POHUNEK_AGENT_NAME@ completed an agent turn.",
         "attention": False,
         "matcher": None,
     },
@@ -136,8 +136,8 @@ EVENTS = {
         "provider_event": "StopFailure",
         "kind": "error",
         "severity": "error",
-        "title": "Claude stop hook failed",
-        "body": "Claude reported a stop hook failure.",
+        "title": "@POHUNEK_AGENT_NAME@ stop hook failed",
+        "body": "@POHUNEK_AGENT_NAME@ reported a stop hook failure.",
         "attention": False,
         "matcher": None,
     },

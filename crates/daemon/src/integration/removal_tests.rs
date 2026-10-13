@@ -605,11 +605,11 @@ fn doctor_flags_a_stale_hook_that_reads_the_old_environment_name() {
     let variants = [
         (
             "same version marker",
-            state_asset_reading_the_runtime_id_name(CLAUDE_HOOK_ASSET),
+            state_asset_reading_the_runtime_id_name(&CLAUDE_HOOK_ASSET),
         ),
         (
             "previous version marker",
-            state_asset_reading_the_runtime_id_name(CLAUDE_HOOK_ASSET)
+            state_asset_reading_the_runtime_id_name(&CLAUDE_HOOK_ASSET)
                 .replace(&expected_version_marker(), &stale_version),
         ),
     ];
@@ -656,11 +656,11 @@ fn doctor_flags_a_stale_hook_that_reports_the_old_wire_key() {
     let variants = [
         (
             "same version marker",
-            state_asset_reporting_runtime_id(CLAUDE_HOOK_ASSET),
+            state_asset_reporting_runtime_id(&CLAUDE_HOOK_ASSET),
         ),
         (
             "previous version marker",
-            state_asset_reporting_runtime_id(CLAUDE_HOOK_ASSET)
+            state_asset_reporting_runtime_id(&CLAUDE_HOOK_ASSET)
                 .replace(&expected_version_marker(), &stale_version),
         ),
     ];

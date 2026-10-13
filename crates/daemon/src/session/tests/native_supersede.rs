@@ -128,8 +128,7 @@ const RUNTIME: &str = "bash";
 /// Rewrites the real Claude state adapter to report as the fixture runtime, so
 /// the identity protocol exercised is the shipped one.
 fn pi_adapter(dir: &std::path::Path) -> PathBuf {
-    let source = pohunek_test_support::manifest_dir()
-        .join("src/integration/assets/claude/pohunek-agent-state.sh");
+    let source = crate::integration::runnable_script("claude", "pohunek-agent-state.sh");
     let script = fs::read_to_string(&source).expect("read the Claude state adapter");
     let adapted = script.replacen(
         "agent = \"claude\"\n",

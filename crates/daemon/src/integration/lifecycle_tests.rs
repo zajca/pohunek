@@ -436,11 +436,11 @@ fn installed_assets_match_the_embedded_scripts_with_owner_only_write_modes() {
     for (path, expected) in [
         (
             claude.join("hooks").join(STATE_HOOK_INSTALL_NAME),
-            CLAUDE_HOOK_ASSET,
+            CLAUDE_HOOK_ASSET.as_str(),
         ),
         (
             claude.join("hooks").join(NOTIFY_HOOK_INSTALL_NAME),
-            CLAUDE_NOTIFY_HOOK_ASSET,
+            CLAUDE_NOTIFY_HOOK_ASSET.as_str(),
         ),
         (
             codex.join(STATE_HOOK_INSTALL_NAME),
@@ -779,8 +779,8 @@ fn hooks_reach_a_worker_socket_resolved_at_the_darwin_staged_limit() {
 #[test]
 fn hook_assets_hold_no_node_or_bun_executable_exceptions() {
     for asset in [
-        CLAUDE_HOOK_ASSET,
-        CLAUDE_NOTIFY_HOOK_ASSET,
+        CLAUDE_HOOK_ASSET.as_str(),
+        CLAUDE_NOTIFY_HOOK_ASSET.as_str(),
         CODEX_HOOK_ASSET.as_str(),
         CODEX_NOTIFY_HOOK_ASSET.as_str(),
     ] {

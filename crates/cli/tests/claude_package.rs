@@ -3482,6 +3482,69 @@ async fn the_signed_catalog_install_serves_claude_with_official_provenance() {
     fixture.finish().await;
 }
 
+/// Independent recordings of the installed Claude reporter scripts, relative to
+/// the workspace root; the rendered templates must reproduce them byte for
+/// byte.
+const REPORTER_GOLDEN_DIR: &str = "crates/daemon/src/integration/reporter_golden";
+
+/// File names of the Claude reporter scripts in the hook directory.
+const REPORTER_SCRIPTS: [&str; 2] = ["pohunek-agent-state.sh", "pohunek-agent-notify.sh"];
+
+/// The Claude handler renders its reporter scripts from the core-owned
+/// template: `integration install --agent claude` writes the recorded scripts
+/// byte for byte, and status and doctor report them as the current assets.
+#[tokio::test]
+async fn the_claude_integration_installs_the_recorded_reporter_scripts() {
+    let key = test_key();
+    let anchor = HostTrustAnchor::new(vec![root_of(&key, WINDOW_START, WINDOW_END)], Vec::new())
+        .expect("the test trust anchor");
+    let harness = Harness::start_with_trust(CatalogTrust::Loaded(anchor)).await;
+    install_package(&harness, &key).await;
+    let claude_home = harness.env.home().join(".claude");
+    fs::create_dir_all(&claude_home).expect("create the Claude home");
+
+    let (code, installed) = harness
+        .json(&["integration", "install", "--agent", "claude"])
+        .await;
+    assert_eq!(code, 0, "{installed}");
+    for script in REPORTER_SCRIPTS {
+        let golden = workspace_root()
+            .join(REPORTER_GOLDEN_DIR)
+            .join(format!("claude-{script}"));
+        assert_eq!(
+            fs::read(claude_home.join("hooks").join(script)).expect("read the installed script"),
+            fs::read(&golden).expect("read the recorded script"),
+            "{script} differs from {}",
+            golden.display()
+        );
+    }
+    let (code, status) = harness
+        .json(&["integration", "status", "--agent", "claude"])
+        .await;
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(status["ok"]["agents"][0]["state"], "current", "{status}");
+    let (code, doctor) = harness
+        .json(&["integration", "doctor", "--agent", "claude"])
+        .await;
+    assert_eq!(code, 0, "{doctor}");
+    let diagnosis = &doctor["ok"]["agents"][0];
+    assert_eq!(diagnosis["agent"], "claude", "{doctor}");
+    assert_eq!(diagnosis["ok"], true, "{doctor}");
+    assert_eq!(diagnosis["status"]["state"], "current", "{doctor}");
+    assert_eq!(
+        diagnosis["status"]["warnings"],
+        Value::Array(Vec::new()),
+        "{doctor}"
+    );
+    let findings = diagnosis["findings"].as_array().expect("findings");
+    assert!(
+        findings.iter().all(|finding| finding["severity"] == "info"),
+        "only informational findings: {doctor}"
+    );
+
+    harness.stop().await;
+}
+
 /// Writes an executable `claude` into a directory of its own below `root` that
 /// answers `--version` with `banner` and otherwise idles, and returns its path.
 fn write_fake_claude(root: &Path, directory: &str, banner: &str) -> PathBuf {
