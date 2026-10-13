@@ -251,7 +251,8 @@ impl SessionRegistry {
                 RuntimeExit {
                     exit_code: None,
                     success: false,
-                },
+                }
+                .into(),
                 &terminal_base,
             )
             .await

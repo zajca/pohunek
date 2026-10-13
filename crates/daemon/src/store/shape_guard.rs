@@ -41,6 +41,7 @@ const SHAPE_SNAPSHOTS: &[(u32, &str)] = &[
     (6, include_str!("fixtures/shape/schema-6.txt")),
     (7, include_str!("fixtures/shape/schema-7.txt")),
     (8, include_str!("fixtures/shape/schema-8.txt")),
+    (9, include_str!("fixtures/shape/schema-9.txt")),
 ];
 
 /// A profile revision: 64 lowercase hex digits.
@@ -248,6 +249,7 @@ fn session_json() -> Value {
         }
     });
     record["info"]["background"] = background_json();
+    record["info"]["output_force_closed"] = json!(true);
     record
 }
 
@@ -385,6 +387,7 @@ fn assert_every_field_is_reviewed(
         branch: _,
         worktree_path: _,
         warnings,
+        output_force_closed: _,
         metadata: _,
         created_at: _,
         updated_at: _,

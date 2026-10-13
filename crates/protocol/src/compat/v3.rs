@@ -318,6 +318,7 @@ fn session_info(
     if matches!(direction, Direction::ToLegacy) {
         object.remove("native_last_activity_at");
         object.remove("background");
+        object.remove("output_force_closed");
         if let Some(Value::Array(warnings)) = object.get_mut("warnings") {
             warnings.retain(|warning| {
                 warning

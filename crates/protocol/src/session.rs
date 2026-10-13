@@ -2585,6 +2585,16 @@ pub struct SessionInfo {
     /// when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<SessionWarning>,
+    /// Whether the session's PTY output was force-closed when its runtime
+    /// ended: a process outside the session's process group kept the terminal
+    /// open past the stop deadline or past the drain after the root's own
+    /// exit. The session still ended with its root's exit; output the holder
+    /// wrote after the close is not retained. Set only on a terminal session
+    /// whose exit was observed, and omitted from the wire form when false. The
+    /// protocol 3 adapter drops it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(optional, as = "Option<bool>"))]
+    pub output_force_closed: bool,
     /// Metadata set at creation or updated via `session.set_metadata`.
     /// Owner-controlled; must not contain secrets.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -3244,6 +3254,7 @@ mod tests {
             branch: None,
             worktree_path: None,
             warnings: Vec::new(),
+            output_force_closed: false,
             metadata: BTreeMap::new(),
             created_at: "2026-01-01T00:00:00Z".to_owned(),
             updated_at: "2026-01-01T00:00:00Z".to_owned(),

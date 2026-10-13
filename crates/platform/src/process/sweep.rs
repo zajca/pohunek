@@ -330,6 +330,23 @@ impl SweepReport {
     }
 }
 
+/// Processes a sweep of one runtime would act on, observed without a signal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepSurvey {
+    /// Processes attributed to the runtime, which a sweep would signal.
+    pub attributed: Vec<ProcessIdentity>,
+    /// Processes a sweep would leave alone, with the reason.
+    pub skipped: Vec<Skipped>,
+}
+
+impl SweepSurvey {
+    /// Returns whether no process is attributed to the runtime or skipped.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.attributed.is_empty() && self.skipped.is_empty()
+    }
+}
+
 /// Typed runtime-sweep failure.
 #[derive(Debug, thiserror::Error)]
 pub enum SweepError {
@@ -411,6 +428,40 @@ pub async fn sweep_runtime(
         deliver,
     )
     .await
+}
+
+/// Classifies the same-user processes as [`sweep_runtime`] does, signalling
+/// nothing.
+///
+/// A caller that ran its last signalling pass uses it to decide whether
+/// anything of the runtime is left: every process the sweep would signal is
+/// `attributed`, and every process it would leave alone is `skipped` with the
+/// reason, the calling process included as [`SkipReason::CurrentProcess`].
+///
+/// # Errors
+///
+/// Returns [`SweepError::ForeignOwner`] when the request's owner is not the
+/// effective user, and [`SweepError::Inspection`] when process evidence cannot
+/// be read; its progress is empty, as nothing was signalled.
+pub fn survey_runtime(
+    inspector: &dyn ProcessInspector,
+    request: &SweepRequest,
+) -> Result<SweepSurvey, SweepError> {
+    let effective_uid = rustix::process::geteuid().as_raw();
+    if request.owner_uid != effective_uid {
+        return Err(SweepError::ForeignOwner {
+            owner_uid: request.owner_uid,
+            effective_uid,
+        });
+    }
+    let mut report = SweepReport::default();
+    match select_targets(inspector, request, std::process::id(), &mut report) {
+        Ok(attributed) => Ok(SweepSurvey {
+            attributed,
+            skipped: report.skipped,
+        }),
+        Err(fault) => Err(fault.into_error(SweepReport::default())),
+    }
 }
 
 /// Result of one identity-checked signal attempt.

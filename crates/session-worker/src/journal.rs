@@ -157,6 +157,14 @@ pub struct RuntimeOutcome {
     pub exited_at: String,
     /// Worker-classified terminal reason.
     pub reason: String,
+    /// Whether the PTY output was force-closed before it reached EOF.
+    ///
+    /// A journal without the field, as a previous release's worker writes
+    /// it, reads as `false`. A previous release's daemon ignores the field:
+    /// its journal reader rejects only an unknown schema version, never an
+    /// unknown field.
+    #[serde(default)]
+    pub output_forced_closed: bool,
 }
 
 /// Immutable launch provider identity.
