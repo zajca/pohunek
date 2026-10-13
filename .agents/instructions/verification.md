@@ -352,6 +352,9 @@ whose ownership markers the product must read runs the test binary as the holdin
 (`pohunek_test_support::hold`, declared with `hold_image!`; it returns at once under a
 plain `--ignored` run) instead of a platform binary, because macOS 27 withholds the
 environment of `/bin/sh`, `/bin/cat` and `/bin/sleep`.
+A copy of a shell image used as a fixture interpreter goes through
+`pohunek_test_support::fs::copy_shell_image`, because macOS 27 kills a copy of a platform binary on
+launch; the helper re-signs the copy ad hoc only when the kernel killed it.
 `crates/xtask/tests/hermetic_scan.rs` enforces all of this in test code with no
 baseline. A case where the host state is the subject carries
 `// hermetic-allowed: #<issue> <reason>` on or directly above its line; the

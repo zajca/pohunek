@@ -1,4 +1,5 @@
-//! File writers that never leave a write descriptor in this process.
+//! File writers that never leave a write descriptor in this process, and the
+//! shell-image copy that starts on every host.
 //!
 //! A test process starts children from several threads at once. A file written
 //! in-process with [`std::fs::write`] is open for writing until the write
@@ -141,6 +142,109 @@ pub fn write_executable(path: impl AsRef<Path>, content: impl AsRef<[u8]>) -> Re
             )
         },
     )
+}
+
+/// Copies the shell image `source` to `destination`, so the copy starts on
+/// every host.
+///
+/// The copy is made by a child `cp`, for the same reason [`write_file`] writes
+/// through a child. macOS 27 kills a copy of a platform binary such as
+/// `/bin/sh` or `/bin/bash` when it starts. The copy is probed by running
+/// `destination -c true`, and only a copy the kernel killed is re-signed ad
+/// hoc, the signature every non-platform executable on macOS carries; a copy
+/// that runs as copied is never modified, and no other host re-signs anything.
+///
+/// # Errors
+///
+/// Returns an error naming the path when the copy, the probe or the signing
+/// fails, when the copy exits non-zero without a signal (it is not a usable
+/// shell), or when it is still killed after signing.
+///
+/// # Examples
+///
+/// ```
+/// use std::process::Command;
+///
+/// let dir = pohunek_test_support::tempdir()?;
+/// let shell = dir.path().join("shell");
+/// pohunek_test_support::fs::copy_shell_image("/bin/sh", &shell)?;
+/// assert!(Command::new(&shell).args(["-c", "true"]).status()?.success());
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn copy_shell_image(source: impl AsRef<Path>, destination: impl AsRef<Path>) -> Result<()> {
+    let (source, destination) = (source.as_ref(), destination.as_ref());
+    run_tool(
+        crate::process_env::command("cp")
+            .arg("--")
+            .arg(source)
+            .arg(destination),
+        &format!("copying {} to {}", source.display(), destination.display()),
+    )?;
+    #[cfg(target_os = "macos")]
+    if killed_on_launch(destination)? {
+        run_tool(
+            crate::process_env::command("codesign")
+                .args(["--force", "--sign", "-"])
+                .arg(destination),
+            &format!("ad-hoc signing {}", destination.display()),
+        )?;
+        if killed_on_launch(destination)? {
+            return Err(Error::other(format!(
+                "{} is killed on launch even after ad-hoc signing",
+                destination.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Runs `command` and fails with `what` and the child's stderr when it does
+/// not exit successfully.
+fn run_tool(command: &mut Command, what: &str) -> Result<()> {
+    let output = command
+        .output()
+        .map_err(|error| Error::new(error.kind(), format!("{what}: {error}")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(Error::other(format!(
+        "{what} failed ({}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
+}
+
+/// Whether the kernel kills the shell at `path` when it starts: runs it with
+/// `-c true` and reports a termination by signal.
+///
+/// # Errors
+///
+/// Returns an error when the image cannot be spawned, or exits non-zero
+/// without a signal.
+#[cfg(target_os = "macos")]
+fn killed_on_launch(path: &Path) -> Result<bool> {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let probe = crate::process_env::command(&path.to_string_lossy())
+        .args(["-c", "true"])
+        .output()
+        .map_err(|error| {
+            Error::new(
+                error.kind(),
+                format!("starting {}: {error}", path.display()),
+            )
+        })?;
+    if probe.status.signal().is_some() {
+        return Ok(true);
+    }
+    if probe.status.success() {
+        return Ok(false);
+    }
+    Err(Error::other(format!(
+        "{} fails `-c true`: {}",
+        path.display(),
+        String::from_utf8_lossy(&probe.stderr).trim()
+    )))
 }
 
 #[cfg(test)]
