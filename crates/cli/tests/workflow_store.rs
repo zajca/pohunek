@@ -12,7 +12,9 @@
 
 use std::fmt::Write as _;
 use std::fs;
-use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::DirBuilderExt as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 
@@ -745,10 +747,12 @@ fn an_install_whose_enable_fails_stays_installed_disabled() {
 /// entry of 32 bytes (name, fixed fields and comma) for a manifest entry of
 /// 24 bytes, so 2100 services put the record past 64 KiB while the manifest
 /// stays well under its own 64 KiB limit.
+#[cfg(target_os = "linux")]
 const RECORD_SIZE_SERVICES: usize = 2100;
 
 /// The `index`-th service name of [`RECORD_SIZE_SERVICES`]: three lowercase
 /// letters, unique for every index below 26^3.
+#[cfg(target_os = "linux")]
 fn record_size_service(index: usize) -> String {
     let letter = |digit: usize| char::from(b'a' + u8::try_from(digit % 26).expect("below 26"));
     format!(
@@ -764,7 +768,9 @@ fn record_size_service(index: usize) -> String {
 /// disable: no service manager is reachable, so the units may still run, and
 /// the record is kept. The hermetic environment has no session bus, and the
 /// installation's `service.toml` is removed so the namespace this process
-/// derives is the one looked up.
+/// derives is the one looked up. Linux only: there the hermetic environment
+/// reaches no user manager, while a macOS runner's launchd domain answers.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_unit_record_of_a_large_manifest_is_read() {
     let names: Vec<String> = (0..RECORD_SIZE_SERVICES).map(record_size_service).collect();
