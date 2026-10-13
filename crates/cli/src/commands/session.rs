@@ -1870,17 +1870,23 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
         .max()
         .unwrap_or(0)
         .max("BRANCH".len());
+    let background_width = sessions
+        .iter()
+        .map(|s| background_count_label(s).len())
+        .max()
+        .unwrap_or(0)
+        .max("BACKGROUND".len());
 
     let mut output = String::new();
     let _ = writeln!(
         output,
-        "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<8}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {:<9}  CWD",
-        "ID", "NAME", "AGENT", "ORIGIN", "STATE", "ACTIVITY", "SOURCE", "PID", "SIZE", "PROJECT", "BRANCH", "WARN", "SUBAGENTS",
+        "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<8}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {:<9}  {:<background_width$}  CWD",
+        "ID", "NAME", "AGENT", "ORIGIN", "STATE", "ACTIVITY", "SOURCE", "PID", "SIZE", "PROJECT", "BRANCH", "WARN", "SUBAGENTS", "BACKGROUND",
     );
     for session in sessions {
         let _ = writeln!(
             output,
-            "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<8}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {:<9}  {}",
+            "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<8}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {:<9}  {:<background_width$}  {}",
             session.id.0,
             name_label(session),
             session_agent_label(session),
@@ -1894,6 +1900,7 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
             branch_label(session),
             warn_count_label(session),
             subagent_count_label(session),
+            background_count_label(session),
             session.cwd.display(),
         );
     }
@@ -2001,13 +2008,83 @@ fn subagent_count_label(info: &SessionInfo) -> String {
     if info.subagents.is_empty() {
         return "-".to_owned();
     }
-    let running = info
-        .subagents
+    format!("{}/{}", running_subagent_count(info), info.subagents.len())
+}
+
+fn running_subagent_count(info: &SessionInfo) -> usize {
+    info.subagents
         .iter()
         .filter(|subagent| subagent.lifecycle == SubagentLifecycle::Running)
-        .count();
-    format!("{running}/{}", info.subagents.len())
+        .count()
 }
+
+/// The inspect rows that summarize the background snapshot.
+fn background_summary_rows(info: &SessionInfo, now_ms: u64) -> [(&'static str, String); 2] {
+    let items = info.background.as_ref().map_or_else(
+        || "<none>".to_owned(),
+        |background| background.items.len().to_string(),
+    );
+    let observed = info.background.as_ref().map_or_else(
+        || "<none>".to_owned(),
+        |background| {
+            format!(
+                "{} ago",
+                format_age(now_ms.saturating_sub(background.observed_at_ms))
+            )
+        },
+    );
+    [
+        ("background_items", items),
+        ("background_observed", observed),
+    ]
+}
+
+/// Background column value: compact per-code counts in [`BACKGROUND_CODES`]
+/// order. `-` means no snapshot has been reported; a valid empty snapshot
+/// shows `0`, because it says no background task runs.
+fn background_count_label(info: &SessionInfo) -> String {
+    let Some(background) = info.background.as_ref() else {
+        return "-".to_owned();
+    };
+    if background.items.is_empty() {
+        return "0".to_owned();
+    }
+    let parts: Vec<String> = BACKGROUND_CODES
+        .iter()
+        .filter_map(|(kinds, code)| {
+            let count = background
+                .items
+                .iter()
+                .filter(|item| kinds.contains(&item.kind))
+                .count();
+            (count > 0).then(|| format!("{count}{code}"))
+        })
+        .collect();
+    parts.join(" ")
+}
+
+/// Single-letter codes of the BACKGROUND column, in display order.
+///
+/// Each code covers the listed kinds. The `o` row lists every kind without a
+/// letter of its own, so every snapshot item is counted exactly once.
+const BACKGROUND_CODES: &[(&[protocol::BackgroundKind], char)] = &[
+    (&[protocol::BackgroundKind::Subagent], 'a'),
+    (&[protocol::BackgroundKind::Shell], 's'),
+    (&[protocol::BackgroundKind::Monitor], 'm'),
+    (&[protocol::BackgroundKind::Workflow], 'w'),
+    (&[protocol::BackgroundKind::Teammate], 't'),
+    (
+        &[
+            protocol::BackgroundKind::McpTask,
+            protocol::BackgroundKind::Dream,
+            protocol::BackgroundKind::AutoModeScan,
+            protocol::BackgroundKind::MemoryImport,
+            protocol::BackgroundKind::CloudSession,
+            protocol::BackgroundKind::Other,
+        ],
+        'o',
+    ),
+];
 
 fn origin_label(info: &SessionInfo) -> &'static str {
     if is_external_session(info) {
@@ -2086,11 +2163,7 @@ fn render_inspect_human(info: &SessionInfo) -> String {
         ("warnings", warn_count_label(info)),
         (
             "subagents_running",
-            info.subagents
-                .iter()
-                .filter(|subagent| subagent.lifecycle == SubagentLifecycle::Running)
-                .count()
-                .to_string(),
+            running_subagent_count(info).to_string(),
         ),
         ("subagents_recent", info.subagents.len().to_string()),
         ("created_at", info.created_at.clone()),
@@ -2100,21 +2173,8 @@ fn render_inspect_human(info: &SessionInfo) -> String {
             info.exit_code.map_or_else(none, |code| code.to_string()),
         ),
     ];
-    if let Some(active_agent) = &info.active_agent {
-        rows.insert(3, ("active_agent", active_agent.clone()));
-    }
-    if let Some(active_base) = &info.active_agent_base {
-        rows.insert(4, ("active_base", agent_kind_label(active_base).to_owned()));
-    }
-    if let Some(active_pid) = info.active_agent_pid {
-        rows.insert(5, ("active_pid", active_pid.to_string()));
-    }
-    if let Some(active_id) = &info.active_agent_session_id {
-        rows.insert(6, ("active_native_session_id", active_id.clone()));
-    }
-    if let Some(active_path) = &info.active_agent_session_path {
-        rows.insert(7, ("active_native_session_path", active_path.clone()));
-    }
+    rows.extend(background_summary_rows(info, now_ms()));
+    insert_active_agent_rows(&mut rows, info);
     if has_worktree_drift(info) {
         rows.push(("worktree_drift", "yes".to_owned()));
     }
@@ -2130,11 +2190,31 @@ fn render_inspect_human(info: &SessionInfo) -> String {
     for (field, value) in &rows {
         let _ = writeln!(output, "{field:<width$}  {value}");
     }
-    append_inspect_details(&mut output, info);
+    append_inspect_details(&mut output, info, now_ms());
     output
 }
 
-fn append_inspect_details(output: &mut String, info: &SessionInfo) {
+/// Inserts the active nested-agent rows after the launch identity rows, in
+/// their fixed display order, each only when the session reports it.
+fn insert_active_agent_rows(rows: &mut Vec<(&'static str, String)>, info: &SessionInfo) {
+    if let Some(active_agent) = &info.active_agent {
+        rows.insert(3, ("active_agent", active_agent.clone()));
+    }
+    if let Some(active_base) = &info.active_agent_base {
+        rows.insert(4, ("active_base", agent_kind_label(active_base).to_owned()));
+    }
+    if let Some(active_pid) = info.active_agent_pid {
+        rows.insert(5, ("active_pid", active_pid.to_string()));
+    }
+    if let Some(active_id) = &info.active_agent_session_id {
+        rows.insert(6, ("active_native_session_id", active_id.clone()));
+    }
+    if let Some(active_path) = &info.active_agent_session_path {
+        rows.insert(7, ("active_native_session_path", active_path.clone()));
+    }
+}
+
+fn append_inspect_details(output: &mut String, info: &SessionInfo, now_ms: u64) {
     // Each non-fatal warning is detailed below the table so a worktree session
     // surfaces exactly what happened and what was done instead.
     for warning in &info.warnings {
@@ -2148,17 +2228,142 @@ fn append_inspect_details(output: &mut String, info: &SessionInfo) {
             let _ = writeln!(*output, "  detail: {detail}");
         }
     }
+    let items: &[protocol::BackgroundItem] = info
+        .background
+        .as_ref()
+        .map_or(&[], |background| background.items.as_slice());
     for subagent in &info.subagents {
-        let kind = subagent.agent_type.as_deref().unwrap_or("agent");
-        let _ = writeln!(
+        let kind = terminal_text(subagent.agent_type.as_deref().unwrap_or("agent"));
+        let label = items
+            .iter()
+            .find(|item| is_subagent_item_of(item, &subagent.id))
+            .and_then(|item| item.label.as_deref());
+        let _ = write!(
             *output,
-            "subagent [{}:{}]: {} {}",
+            "subagent [{}:{}]: {} {} started {} ago",
             agent_kind_label(&subagent.provider),
-            subagent.id,
+            terminal_text(&subagent.id),
             kind,
             subagent_lifecycle_label(subagent.lifecycle),
+            format_age(now_ms.saturating_sub(subagent.started_at_ms)),
+        );
+        if let Some(label) = label {
+            let _ = write!(*output, " label: {}", terminal_text(label));
+        }
+        let _ = writeln!(*output);
+    }
+    // A subagent item with a matching subagent row is shown on that row, so
+    // only the remaining items get a background line.
+    for item in items.iter().filter(|item| {
+        !info
+            .subagents
+            .iter()
+            .any(|subagent| is_subagent_item_of(item, &subagent.id))
+    }) {
+        let program = item
+            .program
+            .as_deref()
+            .map_or_else(|| "-".to_owned(), terminal_text);
+        let label = item
+            .label
+            .as_deref()
+            .map_or_else(|| "-".to_owned(), terminal_text);
+        let _ = writeln!(
+            *output,
+            "background [{}]: {} {} {} first seen >= {}",
+            background_kind_label(item),
+            background_status_label(item.status),
+            program,
+            label,
+            format_age(now_ms.saturating_sub(item.first_seen_ms)),
         );
     }
+}
+
+/// Whether a snapshot item describes the subagent row with `subagent_id`.
+fn is_subagent_item_of(item: &protocol::BackgroundItem, subagent_id: &str) -> bool {
+    item.kind == protocol::BackgroundKind::Subagent && item.id == subagent_id
+}
+
+/// Kind column of an inspect background line; provider strings outside the
+/// closed kind set are shown after a colon.
+fn background_kind_label(item: &protocol::BackgroundItem) -> String {
+    let kind = match item.kind {
+        protocol::BackgroundKind::Subagent => "subagent",
+        protocol::BackgroundKind::Workflow => "workflow",
+        protocol::BackgroundKind::Shell => "shell",
+        protocol::BackgroundKind::Monitor => "monitor",
+        protocol::BackgroundKind::McpTask => "mcp_task",
+        protocol::BackgroundKind::Teammate => "teammate",
+        protocol::BackgroundKind::Dream => "dream",
+        protocol::BackgroundKind::AutoModeScan => "auto_mode_scan",
+        protocol::BackgroundKind::MemoryImport => "memory_import",
+        protocol::BackgroundKind::CloudSession => "cloud_session",
+        protocol::BackgroundKind::Other => "other",
+    };
+    match (&item.kind, &item.provider_kind) {
+        (protocol::BackgroundKind::Other, Some(provider_kind)) => {
+            format!("{kind}:{}", terminal_text(provider_kind))
+        }
+        _ => kind.to_owned(),
+    }
+}
+
+const fn background_status_label(status: protocol::BackgroundStatus) -> &'static str {
+    match status {
+        protocol::BackgroundStatus::Running => "running",
+        protocol::BackgroundStatus::Pending => "pending",
+        protocol::BackgroundStatus::Other => "other",
+    }
+}
+
+/// Milliseconds per second, the base of the compact age labels.
+const MS_PER_SECOND: u64 = 1_000;
+/// Compact age label boundaries: a label switches to the next unit at these
+/// counts, so `59s` is followed by `1m`. Only display; no protocol value
+/// depends on them.
+const SECONDS_PER_MINUTE: u64 = 60;
+const SECONDS_PER_HOUR: u64 = 3_600;
+const SECONDS_PER_DAY: u64 = 86_400;
+
+/// Compact age of an elapsed duration in milliseconds, such as `45s`, `3m`,
+/// `2h` or `1d`.
+fn format_age(age_ms: u64) -> String {
+    let seconds = age_ms / MS_PER_SECOND;
+    if seconds < SECONDS_PER_MINUTE {
+        format!("{seconds}s")
+    } else if seconds < SECONDS_PER_HOUR {
+        format!("{}m", seconds / SECONDS_PER_MINUTE)
+    } else if seconds < SECONDS_PER_DAY {
+        format!("{}h", seconds / SECONDS_PER_HOUR)
+    } else {
+        format!("{}d", seconds / SECONDS_PER_DAY)
+    }
+}
+
+/// Current Unix time in milliseconds; 0 when the clock is before the epoch.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// Escape a provider-supplied text value for a terminal line.
+///
+/// Labels and programs come from a daemon that may be older, newer or remote,
+/// so each unsafe code point is printed as its `\u{...}` escape.
+fn terminal_text(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    for character in text.chars() {
+        if pohunek_worker_protocol::is_hidden_or_separator(character) {
+            output.extend(character.escape_unicode());
+        } else {
+            output.push(character);
+        }
+    }
+    output
 }
 
 const fn subagent_lifecycle_label(lifecycle: SubagentLifecycle) -> &'static str {
@@ -2838,11 +3043,12 @@ mod tests {
             "BRANCH",
             "WARN",
             "SUBAGENTS",
+            "BACKGROUND",
             "CWD",
         ] {
             assert!(header.contains(column), "header missing {column}: {header}");
         }
-        // Columns: ID NAME AGENT ORIGIN STATE ACTIVITY SOURCE PID SIZE PROJECT BRANCH WARN SUBAGENTS CWD.
+        // Columns: ID NAME AGENT ORIGIN STATE ACTIVITY SOURCE PID SIZE PROJECT BRANCH WARN SUBAGENTS BACKGROUND CWD.
         assert_eq!(
             list_row(&output, "s-42"),
             vec![
@@ -2859,6 +3065,7 @@ mod tests {
                 "-", // BRANCH
                 "-", // WARN
                 "-", // SUBAGENTS
+                "-", // BACKGROUND
                 "/workspace/project",
             ]
         );
@@ -2896,7 +3103,7 @@ mod tests {
 
         let output = render_list_human(&[session]);
         let row = list_row(&output, "s-42");
-        // Columns: ID NAME AGENT ORIGIN STATE ACTIVITY SOURCE PID SIZE PROJECT BRANCH WARN SUBAGENTS CWD.
+        // Columns: ID NAME AGENT ORIGIN STATE ACTIVITY SOURCE PID SIZE PROJECT BRANCH WARN SUBAGENTS BACKGROUND CWD.
         assert_eq!(
             row[9], "login-ui",
             "project column shows the label: {row:?}"
@@ -2904,7 +3111,7 @@ mod tests {
         assert_eq!(row[10], "feature/login", "branch column: {row:?}");
         assert_eq!(row[11], "1", "warning-count column: {row:?}");
         assert_eq!(
-            row[13], "/data/worktrees/s-42-project-feature-login",
+            row[14], "/data/worktrees/s-42-project-feature-login",
             "cwd is the worktree path: {row:?}"
         );
     }
@@ -2945,8 +3152,8 @@ mod tests {
         let inspect = render_inspect_human(&session);
         assert!(has_row(&inspect, "subagents_running", "1"));
         assert!(has_row(&inspect, "subagents_recent", "2"));
-        assert!(inspect.contains("subagent [claude:child-running]: Explore running"));
-        assert!(inspect.contains("subagent [codex:child-done]: agent completed"));
+        assert!(inspect.contains("subagent [claude:child-running]: Explore running started "));
+        assert!(inspect.contains("subagent [codex:child-done]: agent completed started "));
     }
 
     /// Whether the rendered field/value table contains a `field value` row,
