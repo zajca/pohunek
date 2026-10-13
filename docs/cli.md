@@ -60,7 +60,7 @@ port is retained.
 | `pohunek project actions / action / prompt` | Resolve per-project launch recipes and prompt templates. |
 | `pohunek host discover / list / inspect` | Find NetBird peers running daemons (standalone cache; `--refresh`) and query live capabilities. |
 | `pohunek host governance inspect <host>` | Read the safe stable host identity and local governance state; `--json` preserves explicit absence and canonical revisions. It does not mutate enrollment or ownership. |
-| `pohunek completions <bash\|zsh\|fish>` | Print static shell completion; add `--dynamic` for bounded host/session candidates. |
+| `pohunek completions <bash\|zsh\|fish>` | Print static shell completion; add `--dynamic` for bounded host/session, package and workflow plugin candidates. |
 | `pohunek notifications list / watch` | Inspect or stream the durable inbox; `--all-hosts` fans out. |
 | `pohunek notifications read / ack / archive / delete` | Drive one record's lifecycle (`host/id` targets a specific host). |
 | `pohunek notifications policy / retention` | Per-kind policy for the default flags or any runtime id (`--provider default\|<runtime-id>`; `default` is always the base flags, even if a runtime is named `default`), retention pruning (`--dry-run` / `--apply`). |
@@ -119,6 +119,18 @@ source and the default is local. Missing daemons, unavailable overlays, name
 collisions, and timeouts produce no shell diagnostics or unsafe fallback
 candidates. The setup command does not edit shell startup files; for Zsh it
 prints the `fpath` step required before `compinit`.
+
+Dynamic completion also completes workflow plugins from the local store,
+without the daemon: installed plugin ids for `workflow inspect`, `enable`,
+`disable`, `uninstall` and `run` (`run` offers only enabled plugins), and for
+`workflow run <id>` the actions that plugin's installed `workflow.toml`
+declares. Actions come only from a plugin whose installed files verify, as
+`run` requires. These lookups read the store's registry and, for actions,
+verify the selected plugin's installed files (the same check `run` makes)
+within the same deadline; they create, lock and write nothing, and a
+missing, corrupt or unsafe store completes nothing silently. A line with a
+remote `--host` completes no workflow plugin, since the command refuses it with
+`workflow_local_only`. Static scripts never read the store.
 
 ### Automation and bounded observation
 

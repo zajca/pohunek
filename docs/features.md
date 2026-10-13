@@ -76,7 +76,8 @@ positioning; [architecture.md](architecture.md) is the authoritative design.
   under its existing XDG state directory.
 - **Shell completion**: generate static Bash, Zsh, or Fish completion from the
   clap command tree. An explicit `--dynamic` mode adds bounded, failure-silent
-  host and session-target lookup without starting a daemon.
+  host, session-target, package and workflow plugin lookup without starting a
+  daemon.
 
 **Projects and worktree isolation**
 

@@ -30,9 +30,16 @@ pohunek workflow uninstall acme.work [--purge] [--remove-modified]
 pohunek workflow run [--json] acme.work overview [<args>...]
 ```
 
-Event reactions, periodic jobs, long-running services, and shell completion
-of plugin ids are not yet available; the manifest refuses the reaction, job
-and service tables until they ship (#148, #325, #326).
+Event reactions, periodic jobs and long-running services are not yet
+available; the manifest refuses the reaction, job and service tables until
+they ship (#148, #326).
+
+With dynamic shell completion (`pohunek setup completions <shell> --dynamic`),
+Tab completes installed plugin ids for `inspect`, `enable`, `disable`,
+`uninstall` and `run` (`run` offers only enabled plugins), and after
+`workflow run <id>` the actions of that plugin. A plugin whose installed files
+fail verification offers no actions. Completion only reads the store, within
+its short deadline, and stays silent when the store is missing or unusable.
 
 ## The archive and its manifest
 
