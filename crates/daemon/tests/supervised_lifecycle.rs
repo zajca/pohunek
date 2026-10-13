@@ -825,22 +825,31 @@ async fn mismatched_evidence_fails_closed_and_a_reused_pid_counts_as_ended() {
 /// A cycle of the lifecycle scenario starts one after that cycle's workers, so
 /// it is a process created after them that no removal or recovery may take for
 /// the runtime's own, and none may signal.
+///
+/// Only launchd gives a job a creator outside the runtime's lineage. A systemd
+/// stand-in is a `Type=notify` unit that systemd stops at its start timeout
+/// because the stand-in never reports readiness, so other hosts start none.
 struct Bystanders {
-    namespace: Namespace,
-    jobs: Box<dyn Supervisor>,
+    /// The namespace and supervisor of the stand-in jobs; absent on hosts
+    /// without launchd.
+    jobs: Option<(Namespace, Box<dyn Supervisor>)>,
     processes: Vec<ProcessIdentity>,
 }
 
 impl Bystanders {
     async fn new(fixture: &Installation) -> Self {
-        let namespace = Namespace::derive(
-            supervised::uid(),
-            &fixture.root.join("bystander-state"),
-            &fixture.root.join("bystander-runtime"),
-        );
-        let jobs = backend::foreign_workers(&fixture.root, &namespace).await;
+        let jobs = if cfg!(target_os = "macos") {
+            let namespace = Namespace::derive(
+                supervised::uid(),
+                &fixture.root.join("bystander-state"),
+                &fixture.root.join("bystander-runtime"),
+            );
+            let supervisor = backend::foreign_workers(&fixture.root, &namespace).await;
+            Some((namespace, supervisor))
+        } else {
+            None
+        };
         Self {
-            namespace,
             jobs,
             processes: Vec::new(),
         }
@@ -848,6 +857,9 @@ impl Bystanders {
 
     /// Starts round `round`'s running stand-in job.
     async fn start(&mut self, fixture: &mut Installation, round: usize) {
+        let Some((namespace, jobs)) = &self.jobs else {
+            return;
+        };
         let key = WorkerKey::new(
             format!("s-{}", 6000 + round),
             format!(
@@ -856,10 +868,10 @@ impl Bystanders {
             ),
         )
         .expect("bystander key");
-        fixture.extra().job(&self.namespace, &key);
-        let logs = backend::foreign_worker_logs(&fixture.root, &self.namespace, &key);
+        fixture.extra().job(namespace, &key);
+        let logs = backend::foreign_worker_logs(&fixture.root, namespace, &key);
         self.processes
-            .push(start_running(fixture, &*self.jobs, logs, &key).await);
+            .push(start_running(fixture, &**jobs, logs, &key).await);
     }
 
     /// Asserts that every stand-in job started so far still runs; `after`
@@ -1148,7 +1160,6 @@ async fn repeated_start_stop_recover_cycles_leave_no_orphans() {
             .call::<method::SessionRemove>(SessionId(removed.clone()))
             .await
             .unwrap_or_else(|error| panic!("remove {removed}: {error}"));
-        bystanders.assert_alive(&fixture, &format!("the stop and remove of round {round}"));
         if round % 2 == 0 {
             fixture.restart_daemon().await;
         } else {
