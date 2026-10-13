@@ -2273,3 +2273,161 @@ async fn a_nested_agent_of_another_runtime_keeps_its_detector_through_a_package_
         .await
         .expect("remove the adopted session");
 }
+
+/// A host profile over the built-in Claude runtime that names its own
+/// detection manifest, which overrides the runtime's.
+const TUNED_PROFILE: &str = "tuned";
+
+#[tokio::test]
+async fn an_own_runtime_report_naming_a_profile_keeps_its_manifest_override_through_a_package_change(
+) {
+    let tag = "claude-tuned-detector";
+    let key = signing_key("root");
+    let dir = temp_dir(tag);
+    let store_path = temp_store_path(tag);
+    let fixture = Fixture::with_anchor_and_store(
+        &format!("{tag}-plugins"),
+        anchor(&[&key], Vec::new()),
+        store_path.clone(),
+    );
+    fs::create_dir_all(fixture.agents.join("manifests")).expect("the manifests directory");
+    fs::write(
+        fixture.agents.join("manifests").join("tuned.toml"),
+        OFFICIAL_MANIFEST,
+    )
+    .expect("the override manifest");
+    fixture.write_profile(
+        TUNED_PROFILE,
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 600\"]\nmanifest = \"tuned\"\n",
+    );
+    let previous = compiled_in_daemon(&fixture, &store_path);
+    let created = previous
+        .create(protocol::SessionNewParams {
+            agent: TUNED_PROFILE.to_owned(),
+            cwd: Some(dir),
+            ..params()
+        })
+        .await
+        .expect("a session of the tuned profile");
+    let adopted = fixture.reopen_with_workers_of(&previous).await;
+    Box::pin(adopted.registry.reconcile_workers())
+        .await
+        .expect("startup reconciliation");
+    let running = |registry: &SessionRegistry| {
+        let registry = registry.clone();
+        let id = created.id.clone();
+        async move {
+            let sessions = registry.inner.sessions.lock().await;
+            let entry = sessions.get(&id).expect("the live session");
+            let config = entry.detector_config.borrow().config.clone();
+            detector_debug(&config)
+        }
+    };
+    // The profile resolves only through the runtime a package serves, so the
+    // override is the default once the package is installed.
+    let package = real_official(RuntimeId::CLAUDE);
+    install_real_official(&adopted, &adopted.registry, RuntimeId::CLAUDE, &package, 5).await;
+    let served = adopted
+        .registry
+        .inner
+        .profiles
+        .runtimes()
+        .resolve_id(&RuntimeId::parse(RuntimeId::CLAUDE).expect("runtime id"))
+        .expect("the package serves claude");
+    let override_config = running(&adopted.registry).await;
+    assert_ne!(
+        override_config,
+        detector_debug(&crate::detect::DetectorConfig::for_definition(&served)),
+        "the override differs from the package manifest"
+    );
+    assert_ne!(
+        override_config,
+        detector_debug(&crate::detect::DetectorConfig::generic_shell()),
+        "the override differs from the generic shell manifest"
+    );
+
+    // The session's own profile is the active agent: the report names it.
+    let report = protocol::SessionReportAgentParams {
+        session_id: created.id.clone(),
+        source: "pohunek:tuned".to_owned(),
+        agent: TUNED_PROFILE.to_owned(),
+        activity: None,
+        seq: None,
+        pid: None,
+        agent_session_id: None,
+        agent_session_path: None,
+    };
+    assert!(
+        adopted.registry.report_agent(report).await.recorded,
+        "the own-profile report is recorded"
+    );
+
+    // A different version of the package becomes the pinned definition.
+    install_version(
+        &adopted,
+        &adopted.registry,
+        RuntimeId::CLAUDE,
+        &claude_next_version_without_fork(),
+        "1.0.2",
+        6,
+    )
+    .await;
+    assert_eq!(
+        running(&adopted.registry).await,
+        override_config,
+        "the active own-profile agent keeps its manifest override through the package change"
+    );
+    adopted
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the adopted session");
+    adopted
+        .registry
+        .remove(&created.id)
+        .await
+        .expect("remove the adopted session");
+}
+
+/// The official Claude package without fork, one version above the real one:
+/// the next release of the same package identity.
+fn claude_next_version_without_fork() -> Package {
+    let mut entries = crate::agent::host::fixture::official_package_entries(RuntimeId::CLAUDE);
+    let descriptor = String::from_utf8(entries[0].contents.clone()).expect("UTF-8 descriptor");
+    let forking =
+        "[fork]\nsupported = true\nargs = [\"--resume\", \"{reference}\", \"--fork-session\"]\n";
+    let (_, version) = crate::agent::host::fixture::official_package_identity(RuntimeId::CLAUDE);
+    let release = format!("version = \"{version}\"");
+    assert!(descriptor.contains(forking), "the descriptor forks");
+    assert!(
+        descriptor.contains(&release),
+        "the descriptor declares its version"
+    );
+    entries[0].contents = descriptor
+        .replacen(&release, "version = \"1.0.2\"", 1)
+        .replace(forking, "[fork]\nsupported = false\n")
+        .into_bytes();
+    Package::from_entries(&entries)
+}
+
+/// Installs `package` for `alias` at `version` through `registry`, with a
+/// catalog signed by the test root.
+async fn install_version(
+    fixture: &Fixture,
+    registry: &SessionRegistry,
+    alias: &str,
+    package: &Package,
+    version: &str,
+    sequence: u64,
+) {
+    let (package_id, _) = crate::agent::host::fixture::official_package_identity(alias);
+    let key = signing_key("root");
+    let document = signed_by(
+        &key,
+        catalog(sequence, vec![entry(package, &package_id, alias, version)]),
+    );
+    registry
+        .package_install(catalog_install(fixture, package, &document, false))
+        .await
+        .expect("official install");
+}
