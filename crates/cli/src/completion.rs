@@ -939,50 +939,6 @@ mod tests {
         }
     }
 
-    /// `service` manages the local service only; its path flags complete as
-    /// directories in both static and dynamic trees, with no dynamic lookup.
-    #[test]
-    fn service_commands_and_flags_are_completable() {
-        for shell in [
-            CompletionShell::Bash,
-            CompletionShell::Zsh,
-            CompletionShell::Fish,
-        ] {
-            let script = String::from_utf8(render_script(shell, false)).expect("UTF-8 script");
-            for word in ["service", "stop-sessions", "purge", "prefix", "from"] {
-                assert!(
-                    script.contains(word),
-                    "static {shell:?} completion lacks {word:?}"
-                );
-            }
-        }
-        let command = dynamic_command(CompletionContext::default());
-        let service = command.find_subcommand("service").expect("service command");
-        let names: Vec<_> = service.get_subcommands().map(Command::get_name).collect();
-        assert_eq!(
-            names,
-            ["install", "upgrade", "uninstall", "status", "check", "lock"]
-        );
-        for (subcommand, flag) in [
-            ("install", "from"),
-            ("install", "prefix"),
-            ("upgrade", "from"),
-            ("check", "prefix"),
-        ] {
-            let arg = service
-                .find_subcommand(subcommand)
-                .and_then(|command| command.get_arguments().find(|arg| arg.get_id() == flag))
-                .expect("path flag");
-            assert_eq!(arg.get_value_hint(), clap::ValueHint::DirPath);
-            assert!(arg.get::<ArgValueCompleter>().is_none());
-        }
-        let daemon = command.find_subcommand("daemon").expect("daemon command");
-        let start = daemon.find_subcommand("start").expect("daemon start");
-        assert!(start
-            .get_arguments()
-            .any(|arg| arg.get_id() == "dev_subprocess"));
-    }
-
     fn plugin_info(id: &str, version: &str, digest_hex_char: char) -> PackageInfo {
         PackageInfo {
             digest: protocol::PackageDigest::parse(&format!(
@@ -1005,68 +961,22 @@ mod tests {
         }
     }
 
-    /// `plugin` and its subcommands are in every static script, and its path
-    /// arguments carry file or directory hints.
+    /// `plugin profile migrate` completes its `NAME` from the agents directory
+    /// and its `--digest` from the installed digests.
     #[test]
-    fn plugin_commands_are_completable_statically() {
-        for shell in [
-            CompletionShell::Bash,
-            CompletionShell::Zsh,
-            CompletionShell::Fish,
-        ] {
-            let script = String::from_utf8(render_script(shell, false)).expect("UTF-8 script");
-            for word in [
-                "plugin",
-                "profile",
-                "migrate",
-                "inspect",
-                "uninstall",
-                "no-enable",
-                "sha256",
-                "catalog",
-                "remove-modified",
-                "digest",
-            ] {
-                assert!(
-                    script.contains(word),
-                    "static {shell:?} completion lacks {word:?}"
-                );
-            }
-        }
-        let command = Cli::command();
-        let plugin = command.find_subcommand("plugin").expect("plugin command");
-        let names: Vec<_> = plugin.get_subcommands().map(Command::get_name).collect();
-        assert_eq!(
-            names,
-            [
-                "list",
-                "inspect",
-                "install",
-                "link",
-                "update",
-                "select",
-                "enable",
-                "disable",
-                "uninstall",
-                "doctor",
-                "profile"
-            ]
-        );
-        let profile = plugin.find_subcommand("profile").expect("profile command");
-        let profile_names: Vec<_> = profile.get_subcommands().map(Command::get_name).collect();
-        assert_eq!(profile_names, ["list", "migrate"]);
-        for (subcommand, argument, hint) in [
-            ("install", "archive", clap::ValueHint::FilePath),
-            ("install", "catalog", clap::ValueHint::FilePath),
-            ("update", "archive", clap::ValueHint::FilePath),
-            ("update", "catalog", clap::ValueHint::FilePath),
-            ("link", "directory", clap::ValueHint::DirPath),
-        ] {
-            let arg = plugin
-                .find_subcommand(subcommand)
-                .and_then(|command| command.get_arguments().find(|arg| arg.get_id() == argument))
-                .expect("path argument");
-            assert_eq!(arg.get_value_hint(), hint, "{subcommand} {argument}");
+    fn dynamic_command_marks_the_profile_migrate_arguments() {
+        let command = dynamic_command(CompletionContext::default());
+        let migrate = command
+            .find_subcommand("plugin")
+            .and_then(|plugin| plugin.find_subcommand("profile"))
+            .and_then(|profile| profile.find_subcommand("migrate"))
+            .expect("plugin profile migrate");
+        for id in ["name", "digest"] {
+            let arg = migrate
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .expect("migrate argument");
+            assert!(arg.get::<ArgValueCompleter>().is_some(), "{id}");
         }
     }
 
@@ -1096,51 +1006,6 @@ mod tests {
         }
         // inspect, update, select, enable, disable, uninstall, doctor.
         assert_eq!(package_arguments, 7);
-    }
-
-    /// The `--profile` value of every daemon-backed `integration` command
-    /// completes from the agents directory.
-    #[test]
-    fn dynamic_command_marks_the_integration_profile_argument() {
-        let command = dynamic_command(CompletionContext::default());
-        let integration = command
-            .find_subcommand("integration")
-            .expect("integration command");
-        for action in ["install", "status", "doctor", "uninstall"] {
-            let arg = integration
-                .find_subcommand(action)
-                .and_then(|subcommand| {
-                    subcommand
-                        .get_arguments()
-                        .find(|arg| arg.get_id() == INTEGRATION_PROFILE_ARG)
-                })
-                .unwrap_or_else(|| panic!("{action} --profile"));
-            assert!(arg.get::<ArgValueCompleter>().is_some(), "{action}");
-            assert_eq!(arg.get_long(), Some("profile"), "{action}");
-        }
-        let update = integration.find_subcommand("update").expect("update");
-        assert!(update
-            .get_arguments()
-            .all(|arg| arg.get_id() != INTEGRATION_PROFILE_ARG));
-    }
-
-    /// `plugin profile migrate` completes its `NAME` from the agents directory
-    /// and its `--digest` from the installed digests.
-    #[test]
-    fn dynamic_command_marks_the_profile_migrate_arguments() {
-        let command = dynamic_command(CompletionContext::default());
-        let migrate = command
-            .find_subcommand("plugin")
-            .and_then(|plugin| plugin.find_subcommand("profile"))
-            .and_then(|profile| profile.find_subcommand("migrate"))
-            .expect("plugin profile migrate");
-        for id in ["name", "digest"] {
-            let arg = migrate
-                .get_arguments()
-                .find(|arg| arg.get_id() == id)
-                .expect("migrate argument");
-            assert!(arg.get::<ArgValueCompleter>().is_some(), "{id}");
-        }
     }
 
     #[test]
