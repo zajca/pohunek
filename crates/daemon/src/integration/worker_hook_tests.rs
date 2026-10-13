@@ -6082,8 +6082,11 @@ with open(gate_path, encoding="ascii") as gate:
     /// Claude launch root that reports itself and a background snapshot from
     /// `CLOCK_MONOTONIC`, waits for one gate line, takes a second snapshot's
     /// sequence, has a forked descendant report its own process from a clock
-    /// of its own that reads far lower, then delivers that second snapshot,
-    /// and waits for a second gate line before it exits.
+    /// of its own, then delivers that second snapshot, and waits for a second
+    /// gate line before it exits. The argument after the gate and results
+    /// paths is `below` (the descendant's clock reads far below the root's)
+    /// or `above` (it reads just above the root's first snapshot and below
+    /// the second).
     const BACKGROUND_SWITCH: &str = r#"
 import datetime
 import json
@@ -6092,10 +6095,12 @@ import socket
 import sys
 import time
 
-gate_path, results_path = sys.argv[1:3]
+gate_path, results_path, mode = sys.argv[1:4]
 failure_path = results_path + ".failure"
-# The descendant's own clock: far below any CLOCK_MONOTONIC reading of the root.
-DESCENDANT_SEQUENCE = 10
+# The descendant's own clock in `below` mode: far below any CLOCK_MONOTONIC
+# reading of the root. In `above` mode it reads just above the root's first
+# snapshot and below the snapshot the root delivers late.
+DESCENDANT_SEQUENCE_BELOW = 10
 
 def record_failure(kind, value, trace):
     # The test reads this file, so the reporter never dies without a reason.
@@ -6146,19 +6151,21 @@ def now():
     return time.clock_gettime_ns(time.CLOCK_MONOTONIC)
 
 report("root_first", now())
+first_snapshot = now()
 send("root_snapshot", {
     "type": "subagent_snapshot",
-    "sequence": now(),
+    "sequence": first_snapshot,
     "tasks": [{"id": "shell-1", "type": "shell", "status": "running", "label": "Test watch", "program": "cargo"}],
 })
 with open(gate_path, encoding="ascii") as gate:
     gate.readline()
 # A snapshot the root takes before the switch and delivers after it.
-pending = now()
+pending = max(now(), first_snapshot + 2)
+descendant_sequence = DESCENDANT_SEQUENCE_BELOW if mode == "below" else first_snapshot + 1
 child = os.fork()
 if child == 0:
     try:
-        report("descendant_low", DESCENDANT_SEQUENCE)
+        report("descendant_low", descendant_sequence)
     except BaseException:
         record_failure(*sys.exc_info())
         os._exit(1)
@@ -6181,14 +6188,28 @@ with open(gate_path, encoding="ascii") as gate:
     /// snapshot taken before that report but delivered after it stays stale.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_accepted_report_of_another_process_clears_the_background_whatever_its_clock() {
-        let root = crate::test_support::scoped_dir("ph-background-switch-");
+        assert_switch_clears_the_background("below").await;
+    }
+
+    /// The same holds when the other process's clock reads above the stored
+    /// background mark but below the owner's late snapshot: the clear raises
+    /// the mark to the worker's own clock, not to that process's sequence.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_late_owner_snapshot_stays_stale_after_a_switch_ordered_above_the_mark() {
+        assert_switch_clears_the_background("above").await;
+    }
+
+    /// Runs [`BACKGROUND_SWITCH`] in `mode` and checks the background is
+    /// cleared and stays cleared.
+    async fn assert_switch_clears_the_background(mode: &str) {
+        let root = crate::test_support::scoped_dir(&format!("ph-background-switch-{mode}-"));
         let FrozenRoot {
             worker,
             task,
             mut gate,
             results,
             ..
-        } = start_named_root(&root, BACKGROUND_SWITCH, &[]).await;
+        } = start_named_root(&root, BACKGROUND_SWITCH, &[mode.to_owned()]).await;
 
         let responses = frozen_root_responses(&results, 2).await;
         assert_eq!(responses["root_first"]["ok"], json!(true), "{responses:?}");
@@ -6228,7 +6249,10 @@ with open(gate_path, encoding="ascii") as gate:
 
         std::io::Write::write_all(&mut gate, b"done\n").expect("release the reporter");
         worker
-            .stop(TransactionId::new("transaction-background-switch-stop").expect("transaction id"))
+            .stop(
+                TransactionId::new(format!("transaction-background-switch-{mode}"))
+                    .expect("transaction id"),
+            )
             .await
             .expect("stop the PTY");
         drop(worker);

@@ -1215,7 +1215,8 @@ PTY root and the launch process fill the bound (16), a further process's report
 is refused with reason `identity_reporters_exhausted` until one exits. Before
 the launch identity exists, a launch agent's report with a native reference is
 still verified as a launch claim at the bound and kept only when it
-establishes the launch identity. Each
+establishes the launch identity; a deferred verification keeps only its
+pending launch claim, so the retry can still establish it. Each
 hook event runs a fresh interpreter for the same agent process, so the shipped
 Codex and Claude hooks stamp their worker claims from the system-wide
 monotonic clock in nanoseconds (`CLOCK_MONOTONIC`). A recovered

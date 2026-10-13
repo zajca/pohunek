@@ -1016,7 +1016,9 @@ from a further process is refused (`ok: false`, logged as
 `worker.identity.rejected` with reason `identity_reporters_exhausted`) until
 one of them exits. Before the launch identity exists, a launch agent's report
 with a native reference is verified as a launch claim even then, and is kept
-only when it establishes the launch identity, which pins its process. The sequence contract of a worker
+only when it establishes the launch identity, which pins its process; when the
+verification is deferred, only its pending launch claim is kept, so the retry
+can still establish it. The sequence contract of a worker
 claim is therefore a value strictly increasing across every hook event that
 reports the same process. Every hook event runs its own short-lived
 interpreter, so the shipped Codex and Claude hooks read the host's system-wide

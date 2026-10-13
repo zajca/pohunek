@@ -3853,6 +3853,7 @@ where
                         peer,
                     );
                 }
+                let mut deferred_claims = None;
                 let admitted = if process_valid && sequence_valid && (room || beyond_bound) {
                     let mut journal = state.journal.clone();
                     let process = ChildIdentity {
@@ -3869,28 +3870,31 @@ where
                         native_reference: native_reference.clone(),
                     });
                     journal.active_identity_release = None;
-                    let background_cleared = match background_clear {
-                        Some(reason) => {
-                            background::clear_at(&mut journal, sequence).then_some(reason)
-                        }
-                        // Accepted as the active identity, a report of another
-                        // process clears the owner's snapshot whatever its own clock
-                        // reads. That clock is not ordered against the owner's, so
-                        // the worker's own clock is the barrier: an owner snapshot
-                        // taken before this report arrived is stale.
-                        None => report_background_clear(
-                            &journal,
-                            pid,
-                            start_identity,
-                            sequence,
-                            session_source.as_deref(),
-                            true,
-                        )
+                    // Accepted as the active identity, a report of another process
+                    // clears the owner's snapshot whatever its own clock reads.
+                    // That clock is not ordered against the owner's, so the
+                    // worker's own clock is the barrier: an owner snapshot taken
+                    // before this report arrived is stale. The owner's own session
+                    // start is ordered by its sequence.
+                    let background_cleared = background_clear
+                        .or_else(|| {
+                            report_background_clear(
+                                &journal,
+                                pid,
+                                start_identity,
+                                sequence,
+                                session_source.as_deref(),
+                                true,
+                            )
+                        })
                         .and_then(|reason| {
-                            background::clear_at(&mut journal, background::monotonic_nanos())
-                                .then_some(reason)
-                        }),
-                    };
+                            let barrier = if reason == AGENT_CHANGED {
+                                background::monotonic_nanos()
+                            } else {
+                                sequence
+                            };
+                            background::clear_at(&mut journal, barrier).then_some(reason)
+                        });
                     if let (Some(reference_kind), Some(native_reference), Some(launch_base)) = (
                         reference_kind,
                         native_reference,
@@ -3934,7 +3938,15 @@ where
                             RejectReason::IdentityReportersExhausted,
                             peer,
                         );
-                        launch_identity_status = LaunchClaimStatus::NotApplicable;
+                        // A launch claim whose verification was deferred keeps its
+                        // bounded pending entry, so the retry can still establish
+                        // the launch identity and pin the process; nothing else of
+                        // the report is kept.
+                        if launch_identity_status == LaunchClaimStatus::Pending {
+                            deferred_claims = Some(journal.pending_launch_claims);
+                        } else {
+                            launch_identity_status = LaunchClaimStatus::NotApplicable;
+                        }
                         None
                     } else {
                         Some((journal, background_cleared))
@@ -3957,15 +3969,19 @@ where
                         None,
                     )
                 } else {
-                    if background_clear.is_some() {
-                        let mut journal = state.journal.clone();
-                        if background::clear_at(&mut journal, sequence) {
-                            journal.updated_at = timestamp();
-                            persist(shared.journal.clone(), journal.clone()).await?;
-                            state.journal = journal;
-                            if let Some(reason) = background_clear {
-                                log_background_cleared(&shared, reason);
-                            }
+                    let mut journal = state.journal.clone();
+                    let deferred = deferred_claims.is_some();
+                    if let Some(claims) = deferred_claims {
+                        journal.pending_launch_claims = claims;
+                    }
+                    let cleared =
+                        background_clear.is_some() && background::clear_at(&mut journal, sequence);
+                    if deferred || cleared {
+                        journal.updated_at = timestamp();
+                        persist(shared.journal.clone(), journal.clone()).await?;
+                        state.journal = journal;
+                        if let (true, Some(reason)) = (cleared, background_clear) {
+                            log_background_cleared(&shared, reason);
                         }
                     }
                     (false, false, current_runtime, None)
@@ -4553,6 +4569,10 @@ fn background_candidates(shared: &Shared, request: &SnapshotRequest) -> Vec<Cand
     candidates
 }
 
+/// The background clear reason of a report from a process other than the
+/// snapshot's owner.
+const AGENT_CHANGED: &str = "agent_changed";
+
 /// Why an admitted, process-valid identity report clears the background
 /// snapshot, if it does.
 ///
@@ -4575,13 +4595,13 @@ fn report_background_clear(
     let owner = journal.background_owner.as_ref()?;
     let is_owner = owner.pid == pid && owner.start_identity == start_identity.to_string();
     if !is_owner && accepted {
-        return Some("agent_changed");
+        return Some(AGENT_CHANGED);
     }
     if journal.background_sequence >= sequence {
         return None;
     }
     if !is_owner {
-        Some("agent_changed")
+        Some(AGENT_CHANGED)
     } else if matches!(session_source, Some("startup" | "resume")) {
         Some("session_start")
     } else {

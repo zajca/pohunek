@@ -146,7 +146,8 @@
   the launch identity exists, a launch agent's report with a native reference
   is verified as a launch claim even at the bound and kept only when it
   establishes the launch identity, so a full table cannot keep a descendant
-  launch process from being pinned. A release answered `ok: false` still
+  launch process from being pinned; a deferred verification keeps only its
+  pending launch claim for the retry. A release answered `ok: false` still
   orders its process's later claims.
 - A report of another process accepted as the active identity clears the
   background owner's snapshot (`agent_changed`) whatever its sequence, since
