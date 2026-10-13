@@ -12,7 +12,7 @@
 
 use std::fmt::Write as _;
 use std::fs;
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 
@@ -739,6 +739,85 @@ fn an_install_whose_enable_fails_stays_installed_disabled() {
     let document: Value = serde_json::from_slice(&output.stdout).expect("a JSON envelope");
     assert_eq!(document["ok"]["status"], "already_installed", "{document}");
     assert_eq!(document["ok"]["plugin"]["enabled"], false, "{document}");
+}
+
+/// Services in the record-size scenario. Three-letter names give a record
+/// entry of 32 bytes (name, fixed fields and comma) for a manifest entry of
+/// 24 bytes, so 2100 services put the record past 64 KiB while the manifest
+/// stays well under its own 64 KiB limit.
+const RECORD_SIZE_SERVICES: usize = 2100;
+
+/// The `index`-th service name of [`RECORD_SIZE_SERVICES`]: three lowercase
+/// letters, unique for every index below 26^3.
+fn record_size_service(index: usize) -> String {
+    let letter = |digit: usize| char::from(b'a' + u8::try_from(digit % 26).expect("below 26"));
+    format!(
+        "{}{}{}",
+        letter(index / (26 * 26)),
+        letter(index / 26),
+        letter(index)
+    )
+}
+
+/// A unit record that lists as many units as a large manifest declares is
+/// read: disabling the plugin reads its record and keeps it, with a warning,
+/// because no service manager is reachable. The hermetic environment has no
+/// session bus, and the installation's `service.toml` is removed so the
+/// namespace this process derives is the one looked up.
+#[test]
+fn a_unit_record_of_a_large_manifest_is_read() {
+    let names: Vec<String> = (0..RECORD_SIZE_SERVICES).map(record_size_service).collect();
+    let units = workflow_units::UnitEnv::new(|env| env.root().join("units"));
+    let plugin = workflow_units::Plugin::new(PLUGIN_ID).compact_services(&names);
+    units.install(&plugin);
+    fs::remove_file(units.context.config_path()).expect("remove the installation record");
+
+    let units_dir = units
+        .env
+        .state_home()
+        .join("pohunek/workflow-plugins/units");
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&units_dir)
+        .expect("create the unit record directory");
+    let entries: Vec<Value> = names
+        .iter()
+        .map(|name| serde_json::json!({ "kind": "service", "name": name }))
+        .collect();
+    let record = serde_json::to_vec(&serde_json::json!({ "units": entries }))
+        .expect("serialize the unit record");
+    assert!(
+        record.len() > 64 * 1024,
+        "the record is {} bytes",
+        record.len()
+    );
+    let record_path = units_dir.join(format!("{PLUGIN_ID}.json"));
+    fs::write(&record_path, &record).expect("write the unit record");
+    fs::set_permissions(&record_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod the unit record");
+
+    let output = units
+        .command(&["workflow", "disable", PLUGIN_ID, "--json"])
+        .output()
+        .expect("run pohunek workflow disable");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        workflow_units::describe(&output)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("a JSON envelope");
+    assert_eq!(document["ok"]["enabled"], false, "{document}");
+    let warnings = document["ok"]["warnings"].to_string();
+    assert!(
+        warnings.contains("no pohunek service installation is recorded"),
+        "{document}"
+    );
+    assert!(
+        record_path.exists(),
+        "the unit record is kept while its units cannot be reached"
+    );
 }
 
 /// Another version than this CLI, recorded for the installation.

@@ -136,6 +136,17 @@ impl Plugin {
         self
     }
 
+    /// Declares every name in `names` as a service running `bin/hang`, one
+    /// line each in a single `[services]` table, so a manifest with many
+    /// services stays small enough for its size bound.
+    pub(crate) fn compact_services(mut self, names: &[String]) -> Self {
+        self.tables.push_str("\n[services]\n");
+        for name in names {
+            let _ = writeln!(self.tables, "{name}.argv = [\"bin/hang\"]");
+        }
+        self
+    }
+
     fn manifest(&self) -> String {
         format!(
             "schema = 1\n\n[plugin]\nid = \"{}\"\nversion = \"1.0.0\"\n\
@@ -168,18 +179,44 @@ pub(crate) struct UnitEnv {
     pub(crate) context: Context,
 }
 
+/// Where an installation's application runtime root comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeRoot {
+    /// The hermetic `XDG_RUNTIME_DIR`, which the installation pins in its
+    /// units' bootstrap environment.
+    Environment,
+    /// The platform default, with `XDG_RUNTIME_DIR` unset: what an install
+    /// from a shell without that variable records. The units do not pin it.
+    PlatformDefault,
+}
+
 impl UnitEnv {
     /// Creates the environment, records `service.toml` for it and installs
     /// this build's CLI as `<prefix>/bin/pohunek`. `unit_dir` chooses where
     /// the plugin units go.
     pub(crate) fn new(unit_dir: impl FnOnce(&TestEnv) -> PathBuf) -> Self {
+        Self::with_runtime(unit_dir, RuntimeRoot::Environment)
+    }
+
+    /// Like [`UnitEnv::new`], with the installation's runtime root chosen by
+    /// `runtime`.
+    pub(crate) fn with_runtime(
+        unit_dir: impl FnOnce(&TestEnv) -> PathBuf,
+        runtime: RuntimeRoot,
+    ) -> Self {
         let env = TestEnv::new().expect("create the hermetic test environment");
         let os = |path: &Path| Some(path.as_os_str().to_owned());
+        let (runtime_var, runtime_base) = match runtime {
+            RuntimeRoot::Environment => {
+                (os(env.runtime_dir()), Some(env.runtime_dir().to_path_buf()))
+            }
+            RuntimeRoot::PlatformDefault => (None, None),
+        };
         let paths = BasePaths::resolve_for(
             Platform::current().expect("supported platform"),
             nix::unistd::Uid::effective().as_raw(),
             &PathEnv {
-                xdg_runtime_dir: os(env.runtime_dir()),
+                xdg_runtime_dir: runtime_var,
                 xdg_data_home: os(env.data_home()),
                 xdg_state_home: os(env.state_home()),
                 xdg_cache_home: os(env.cache_home()),
@@ -188,12 +225,20 @@ impl UnitEnv {
             },
         )
         .expect("resolve the hermetic paths");
+        if runtime == RuntimeRoot::PlatformDefault {
+            // The installation verifies its runtime root, which must exist.
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&paths.runtime_dir)
+                .expect("create the default runtime root");
+        }
         let supervisor_dir = unit_dir(&env);
         let context = Context::new(
             paths,
             nix::unistd::Uid::effective().as_raw(),
             Some(env.home().to_path_buf()),
-            Some(env.runtime_dir().to_path_buf()),
+            runtime_base,
             supervisor_dir,
             pohunek_test_support::bin_exe("pohunek"),
         );
@@ -483,8 +528,14 @@ pub(crate) struct Managed {
 impl Managed {
     /// A fresh installation with `knobs`.
     pub(crate) fn new(knobs: &str) -> Self {
+        Self::with_runtime(knobs, RuntimeRoot::Environment)
+    }
+
+    /// Like [`Managed::new`], with the installation's runtime root chosen by
+    /// `runtime`.
+    pub(crate) fn with_runtime(knobs: &str, runtime: RuntimeRoot) -> Self {
         native::require_manager();
-        let units = UnitEnv::new(native::unit_dir);
+        let units = UnitEnv::with_runtime(native::unit_dir, runtime);
         units.knobs(knobs);
         let namespace = units
             .context

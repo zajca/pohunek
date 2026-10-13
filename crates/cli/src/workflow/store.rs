@@ -83,12 +83,18 @@ const UNIT_RECORDS_DIR: &str = "units";
 /// Mode of the unit record directory and files: owner-only, like the registry.
 const UNIT_RECORD_FILE_MODE: u32 = 0o600;
 
-/// Largest unit record read or written. A record lists the names of one
-/// manifest's jobs and services, and a manifest is capped at
-/// [`MAX_MANIFEST_BYTES`](manifest::MAX_MANIFEST_BYTES), so no valid record
-/// comes close to this bound; it only stops a damaged file from being read
-/// without limit.
-const MAX_UNIT_RECORD_BYTES: usize = 64 * 1024;
+/// Largest unit record read or written: three times
+/// [`MAX_MANIFEST_BYTES`](manifest::MAX_MANIFEST_BYTES).
+///
+/// A record entry for a service is `{"kind":"service","name":"<name>"}` plus
+/// its separating comma: 29 bytes beyond the name. Inside a `[services]`
+/// table the shortest manifest line for the same unit is
+/// `<name>.argv=["/x"]` and its newline: 13 bytes beyond the name. The worst
+/// ratio, a one-character name, is 30 to 14 bytes, so a record is at most
+/// about 2.15 times its manifest plus the 12-byte `{"units":[]}` wrapper; a
+/// job entry carries fewer bytes and its manifest line more. Three times
+/// the manifest bound covers every accepted manifest with margin.
+const MAX_UNIT_RECORD_BYTES: usize = 3 * MAX_MANIFEST_BYTES;
 
 /// Staging prefix of a unit record file removed in place; the staged name is
 /// `.unit-record-<name>+<random hex>`.

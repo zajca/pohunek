@@ -13,11 +13,12 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
+use std::path::PathBuf;
 use std::process::Stdio;
 
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use pohunek_cli::workflow_units::{disable_plugin, uninstall_plugin};
+use pohunek_cli::workflow_units::{disable_plugin, enable_plugin, uninstall_plugin};
 use pohunek_platform::supervisor::{PluginUnitKey, PluginUnitKind, ServiceState};
 use pohunek_test_support::wait::{poll_until, wait_until};
 use serde_json::Value;
@@ -355,6 +356,67 @@ pub(crate) async fn installing_again_leaves_running_units_alone() {
         "the service restarted"
     );
     assert_eq!(managed.unit_files(), managed.names(&id));
+}
+
+/// A file restored to `bytes` when dropped, so the teardown of a scenario
+/// that damaged it can still disable its plugin.
+struct RestoredFile {
+    path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+impl Drop for RestoredFile {
+    fn drop(&mut self) {
+        if let Err(error) = fs::write(&self.path, &self.bytes) {
+            eprintln!("could not restore {}: {error}", self.path.display());
+        }
+    }
+}
+
+/// Enabling an enabled plugin whose unit record is damaged fails before
+/// anything changes: the command reports `workflow_store_failed`, the plugin
+/// stays enabled and its running unit keeps running.
+pub(crate) async fn re_enabling_with_a_damaged_unit_record_changes_nothing() {
+    let mut managed = Managed::new(KNOBS);
+    let plugin = Plugin::new("acme.damaged").service("serve", "hang");
+    let id = plugin.id.clone();
+    managed.enable(&plugin).await;
+    let child = managed.units.pid(&id, "serve", "child");
+    let units_before = managed.unit_files();
+
+    let record = managed
+        .units
+        .env
+        .state_home()
+        .join("pohunek/workflow-plugins/units")
+        .join(format!("{id}.json"));
+    let valid = fs::read(&record).expect("read the unit record");
+    let _restored = RestoredFile {
+        path: record.clone(),
+        bytes: valid,
+    };
+    fs::write(&record, b"{\"units\": not json").expect("damage the unit record");
+
+    let error = enable_plugin(&managed.units.context, &id)
+        .await
+        .expect_err("enabling with a damaged unit record is refused");
+    assert_eq!(error.code, "workflow_store_failed", "{}", error.message);
+    assert_eq!(
+        managed.units.listed()[0]["enabled"],
+        true,
+        "{:?}",
+        managed.units.listed()
+    );
+    assert_eq!(managed.unit_files(), units_before);
+    assert_eq!(
+        managed.units.pid(&id, "serve", "child"),
+        child,
+        "the service restarted"
+    );
+    assert!(
+        kill(child, None).is_ok(),
+        "the service run is still running"
+    );
 }
 
 /// A job started by the service manager gets exactly the supervised

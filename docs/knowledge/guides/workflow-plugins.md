@@ -537,6 +537,12 @@ service manager adds to its own environment (`systemctl --user
 set-environment`, `launchctl setenv`) and any inherited `POHUNEK_SOCKET_PATH`,
 `POHUNEK_CONFIG_DIR` or `POHUNEK_ENV` never reach the job or service.
 
+On macOS, an `XDG_RUNTIME_DIR` that `launchctl setenv` puts into the agent's
+environment is ignored by `__exec` when the installation uses the default
+runtime root (`/private/tmp/pohunek-<uid>`), because the units do not pin
+that variable. Any other installation resolves the variable as set, and a
+runtime root that does not match the recorded one refuses every run.
+
 A stop request (`SIGTERM`, `SIGINT` or `SIGHUP`) to `__exec` stops the run's
 process group within `limits.kill_grace_ms` and is recorded as
 `interrupted`; one that arrives while a service waits its backoff ends the
@@ -552,6 +558,14 @@ by `SIGTERM`, so a unit its service manager stopped reads as stopped, not
 failed; 128 plus the signal number for a stop by `SIGINT` or `SIGHUP`; and 1
 for a refusal. launchd keeps no failed state for a unit; on systemd a stopped
 job or service is `inactive`.
+
+That `SIGKILL` case differs on macOS. A supervised child runs in its own
+process group there. If `__exec` itself is killed with `SIGKILL` (not the
+`SIGTERM` launchd sends to stop a unit), launchd's cleanup covers only the
+trampoline's own group, so the run's process group can survive the unit. A
+later start of the unit can then run alongside it, and `disable` and
+`uninstall` do not find that process. Stop such a process yourself. On systemd
+the unit's final `SIGKILL` reaches every process of the unit.
 
 ## Local only
 

@@ -64,6 +64,20 @@
   removed first.
 - A failure while marking a fresh plugin enabled that may have written the flag
   disables it again before `workflow_installed_disabled` is reported.
+- `enable` records a plugin's unit names before it marks the plugin enabled.
+  When the unit record cannot be written, the command fails with
+  `workflow_store_failed` and changes nothing: an enabled plugin whose units
+  keep running stays enabled instead of being disabled.
+- The unit record is bounded at three times the manifest limit (192 KiB), so the
+  record of a manifest at its size limit with short service names is read.
+- On macOS, `__exec` ignores an inherited `XDG_RUNTIME_DIR` when the
+  installation records the default runtime root
+  (`/private/tmp/pohunek-<uid>`); before, every run of such an installation was
+  refused after `launchctl setenv XDG_RUNTIME_DIR`.
+- Known limit on macOS: when `__exec` itself is killed with `SIGKILL`, the
+  run's process group can survive the unit; a later start can run alongside it
+  and `disable` and `uninstall` do not find it. The guide documents it; a
+  reconcile mechanism is a follow-up.
 
 ## Unreleased (2026-10-13, workflow run --json and verbatim arguments, #325)
 

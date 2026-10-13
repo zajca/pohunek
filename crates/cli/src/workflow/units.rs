@@ -10,11 +10,13 @@
 //! ([`super::supervised`]) decides every run.
 //!
 //! - **Enable** verifies the plugin, refuses a job outside the owner's
-//!   `[jobs]` bounds, marks the plugin enabled, records the names of its units
-//!   in the plugin's unit record, then installs and starts every unit. A
-//!   failure removes every unit again, forgets their names and marks the
-//!   plugin disabled. The registry goes first because a unit starts at once
-//!   and its trampoline refuses to run a disabled plugin.
+//!   `[jobs]` bounds, records the names of its units in the plugin's unit
+//!   record, marks the plugin enabled, then installs and starts every unit. A
+//!   failed record write changes nothing. A failure to install a unit removes
+//!   every unit again, forgets their names and marks the plugin disabled. The
+//!   names are recorded first so no unit runs unrecorded, and the flag is set
+//!   before the units, because a unit starts at once and its trampoline
+//!   refuses to run a disabled plugin.
 //! - **Disable** marks the plugin disabled first, so the trampoline refuses
 //!   from then on, then stops and removes every unit.
 //! - **Uninstall** first applies the store's own refusals, then marks the
@@ -471,20 +473,27 @@ pub(crate) struct StartFailed {
     pub(crate) undone: bool,
 }
 
-/// Marks plugin `id` enabled, records the names of the units of `plan`, and
+/// Records the names of the units of `plan`, marks plugin `id` enabled, and
 /// installs and starts those units, under the unit lifecycle lock the caller
 /// holds. A unit that cannot be installed removes every unit again, forgets
 /// their names and disables the plugin again.
 ///
+/// The names are recorded before the flag is written, so a plugin that is
+/// already enabled and has running units never reaches a state where its
+/// units are unrecorded. A name recorded for a unit that is never installed
+/// is harmless: a later removal finds it absent and forgets it.
+///
 /// # Errors
 ///
 /// Returns [`Error::Units`] when the service manager cannot be reached
-/// (nothing changed) or a unit cannot be installed (rolled back). When the
-/// plugin cannot be marked enabled, [`Error::Busy`], [`Error::RootInvalid`]
-/// and [`Error::PluginUnknown`] change nothing; any other
-/// [`Store::set_enabled`] error may follow a committed flag, so the plugin is
-/// disabled again and `undone` reports whether that succeeded. A unit record
-/// that cannot be written is refused before any unit is installed.
+/// (nothing changed) or a unit cannot be installed (rolled back). A unit
+/// record that cannot be read or written fails with its [`Error::Store`]
+/// error, `undone` set and the flag untouched. When the flag cannot be written,
+/// [`Error::Busy`], [`Error::RootInvalid`] and [`Error::PluginUnknown`] leave
+/// the flag as it was, with `undone` set; the names recorded before it stay,
+/// which is safe for the reason above. Any other [`Store::set_enabled`] error
+/// may follow a committed flag, so the plugin is disabled again and `undone`
+/// reports whether that succeeded.
 pub(crate) async fn start(
     store: &Store,
     context: &Context,
@@ -498,6 +507,10 @@ pub(crate) async fn start(
     let backend = connect(context, &plan.installation, id)
         .await
         .map_err(unchanged)?;
+    let names = plan.names();
+    // The record is written before the flag, so a failure here leaves the
+    // plugin's state as it was.
+    store.record_units(id, &names).map_err(unchanged)?;
     // Busy, an unknown plugin and an unverifiable root refuse before the flag
     // is written. Any other error may follow a committed write, so the flag is
     // cleared again; `set_enabled(false)` is Ok for a plugin already disabled,
@@ -512,13 +525,6 @@ pub(crate) async fn start(
             return Err(StartFailed { error, undone });
         }
     };
-    let names = plan.names();
-    // The names are recorded before the first install, so no installed unit is
-    // missing from the record, even when the process stops in between.
-    if let Err(error) = store.record_units(id, &names) {
-        let undone = store.set_enabled(id, false).is_ok();
-        return Err(StartFailed { error, undone });
-    }
     for unit in &plan.units {
         if let Err(error) = backend.install(&unit.key, &unit.definition).await {
             let mut detail = format!("installing the {} unit failed: {error}", unit.key);

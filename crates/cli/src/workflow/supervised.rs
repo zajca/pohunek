@@ -48,9 +48,10 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use pohunek_paths::BasePaths;
+use pohunek_paths::{BasePaths, PathEnv, Platform};
 use pohunek_platform::filesystem::{FileLock, FsError, LockKind, TrustedDir};
 use pohunek_platform::supervisor::{PluginUnitKey, PluginUnitKind};
+use pohunek_service_config::ServiceConfig;
 use protocol::{PackageDigest, PackageId};
 use serde::{Deserialize, Serialize};
 
@@ -363,14 +364,52 @@ fn save_backoff(
 
 /// The installed `<prefix>/bin/pohunek` of a verified service installation.
 fn installed_cli() -> Result<PathBuf, Error> {
-    let paths = BasePaths::resolve().map_err(|error| Error::ServiceNotInstalled {
-        reason: error.to_string(),
-    })?;
-    installation_at(&paths, nix::unistd::Uid::effective().as_raw())?
+    let uid = nix::unistd::Uid::effective().as_raw();
+    let paths = trampoline_paths(uid)?;
+    installation_at(&paths, uid)?
         .map(|installation| installation.cli)
         .ok_or_else(|| Error::ServiceNotInstalled {
             reason: "no service.toml exists".to_owned(),
         })
+}
+
+/// The base paths the trampoline runs with, resolved from its environment.
+///
+/// launchd merges its own environment into a unit's, and a unit pins every
+/// root except `XDG_RUNTIME_DIR` when the installation uses the macOS default
+/// runtime root. On macOS, a set `XDG_RUNTIME_DIR` is therefore ignored when
+/// the recorded installation names that default root for this uid, so the
+/// trampoline finds the installation it was installed into. Any other case
+/// resolves as the environment says, and a mismatch is refused by
+/// `installation_at`.
+fn trampoline_paths(uid: u32) -> Result<BasePaths, Error> {
+    let not_installed = |reason: String| Error::ServiceNotInstalled { reason };
+    let platform = Platform::current().map_err(|error| not_installed(error.to_string()))?;
+    let env = PathEnv::capture();
+    let resolve = |env: &PathEnv| {
+        BasePaths::resolve_for(platform, uid, env).map_err(|error| not_installed(error.to_string()))
+    };
+    if platform != Platform::MacOs || env.xdg_runtime_dir.is_none() {
+        return resolve(&env);
+    }
+    // The config root does not depend on the runtime root, so the recorded
+    // file is found through the default paths. An inherited variable that
+    // is itself invalid is not consulted when the default root is recorded.
+    let default = resolve(&PathEnv {
+        xdg_runtime_dir: None,
+        ..env.clone()
+    })?;
+    let recorded_default = ServiceConfig::load_upgrade_source(&pohunek_service_config::file_path(
+        &default,
+    ))
+    .is_ok_and(|source| {
+        source.config.uid() == uid && source.config.runtime_root() == default.runtime_dir
+    });
+    if recorded_default {
+        Ok(default)
+    } else {
+        resolve(&env)
+    }
 }
 
 /// Whether a locked unit runs now.

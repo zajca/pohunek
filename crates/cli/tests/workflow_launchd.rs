@@ -16,6 +16,9 @@ mod workflow_scenarios;
 #[path = "support/workflow_units.rs"]
 mod workflow_units;
 
+use pohunek_test_support::wait::wait_until;
+use workflow_units::{native, Managed, Plugin, RuntimeRoot, KNOBS};
+
 macro_rules! launchd_scenario {
     ($name:ident) => {
         #[tokio::test(flavor = "multi_thread")]
@@ -39,3 +42,48 @@ launchd_scenario!(a_refused_uninstall_leaves_the_units_running);
 launchd_scenario!(installing_again_leaves_running_units_alone);
 launchd_scenario!(disable_stops_the_units_of_a_modified_plugin);
 launchd_scenario!(uninstall_stops_the_units_of_a_modified_plugin);
+
+/// A launchd user-session variable, removed again when the guard drops, also
+/// when the scenario fails.
+struct ManagerVariable(&'static str);
+
+impl ManagerVariable {
+    fn set(name: &'static str, value: &str) -> Self {
+        native::set_manager_variable(name, value);
+        Self(name)
+    }
+}
+
+impl Drop for ManagerVariable {
+    fn drop(&mut self) {
+        native::unset_manager_variable(self.0);
+    }
+}
+
+/// An `XDG_RUNTIME_DIR` that launchd merges into a unit's environment does
+/// not refuse the runs of an installation that uses the macOS default
+/// runtime root: the units do not pin that variable, and the trampoline
+/// resolves the recorded default root instead, so the first job run is
+/// recorded as completed.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inherited_runtime_dir_does_not_refuse_runs_of_the_default_root() {
+    let mut managed = Managed::with_runtime(KNOBS, RuntimeRoot::PlatformDefault);
+    let conflicting = managed
+        .units
+        .env
+        .runtime_dir()
+        .to_str()
+        .expect("a UTF-8 runtime directory")
+        .to_owned();
+    let _variable = ManagerVariable::set("XDG_RUNTIME_DIR", &conflicting);
+    let plugin = Plugin::new("acme.runtime").job("tick", "tick", 1);
+    let id = plugin.id.clone();
+    managed.enable(&plugin).await;
+
+    wait_until("the first job run", || async {
+        (!managed.units.unit_records(&id, "job", "tick").is_empty()).then_some(())
+    })
+    .await;
+    let records = managed.units.unit_records(&id, "job", "tick");
+    assert_eq!(records[0]["outcome"], "ok", "{records:?}");
+}
