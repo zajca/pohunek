@@ -93,13 +93,21 @@ byte-identical.
 `release-inventory.sha256` lists every file of the bundle except itself as
 `<64 hex>  <name>` (`sha256sum -c` format), names without directories, sorted.
 It is the exact list the publisher uploads. `cargo xtask release
-verify-inventory --dir <bundle> [--now <seconds>]` requires the directory to
-hold exactly the listed regular files with the listed digests, verifies the
-top-level catalog against the anchor inside every daemon archive (at `--now`,
-default the current time), and requires each daemon archive to carry that
-catalog, the binary set the catalog names for its target and exactly the
-packages and attestations the catalog lists for that target, byte-identical to
-the top-level files.
+verify-inventory --dir <bundle> --anchor <file> [--now <seconds>]` requires
+the directory to hold exactly the listed regular files with the listed
+digests, requires every daemon archive to ship exactly the `--anchor` file
+(otherwise a trust-anchor mismatch), verifies the top-level catalog against
+that anchor (at `--now`, default the current time), and requires each daemon
+archive to carry that catalog, the binary set the catalog names for its
+target and exactly the packages and attestations the catalog lists for that
+target, byte-identical to the top-level files. The anchor comes from the
+caller, never from the bundle: a bundle built by someone else ships its own
+anchor and a catalog signed under it. Each top-level package archive must
+match the digest of that verified catalog before it is decompressed and read,
+so a tampered package is refused as a package-archive mismatch without
+reaching the decoder. The release workflow passes the anchor it assembled
+with (`packaging/runtime-catalog-anchor.json`, or the rehearsal's throwaway
+anchor).
 
 ## Failure behavior
 
@@ -161,7 +169,7 @@ it is timing evidence only, never a release input. `attest` attests every produc
 `release-evidence.yml`, signer and source digest equal to the release commit,
 source ref equal to the tag, GitHub-hosted runners only), collects the flat input
 directory and runs `cargo xtask release assemble` with the commit time from
-`git log`, then `verify-inventory`. `attest-bundle` attests every file of the
+`git log`, then `verify-inventory` with the same `--anchor`. `attest-bundle` attests every file of the
 bundle, `smoke` runs `packaging/smoke-archive` on every Linux daemon archive
 with the isolation strategy a probe step proved available, and `verdict` fails
 unless exactly the jobs of the mode succeeded (a skipped job counts as success

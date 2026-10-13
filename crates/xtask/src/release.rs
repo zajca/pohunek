@@ -259,13 +259,16 @@ pub(crate) enum ReleaseAction {
     Assemble(AssembleArgs),
     /// Verify a release bundle directory against its inventory.
     ///
-    /// Recomputes `release-inventory.sha256` against the directory and
-    /// re-verifies the catalog against the trust anchor inside every daemon
-    /// archive.
+    /// Recomputes `release-inventory.sha256` against the directory, requires
+    /// every daemon archive to ship exactly the `--anchor` file and verifies
+    /// the catalog against it.
     VerifyInventory {
         /// Bundle directory.
         #[arg(long, value_name = "DIR")]
         dir: PathBuf,
+        /// The trust anchor file the daemon archives must ship.
+        #[arg(long, value_name = "FILE")]
+        anchor: PathBuf,
         /// Unix second to verify the catalog at; defaults to the current time.
         #[arg(long, value_name = "SECONDS")]
         now: Option<u64>,
@@ -318,12 +321,13 @@ pub(crate) fn run(action: ReleaseAction, root: &Path) -> Result<(), XtaskError> 
                 summary.files, summary.sequence
             );
         }
-        ReleaseAction::VerifyInventory { dir, now } => {
+        ReleaseAction::VerifyInventory { dir, anchor, now } => {
+            let anchor = read_anchor(&anchor)?;
             let now = match now {
                 Some(now) => now,
                 None => crate::catalog::unix_now()?,
             };
-            let summary = verify_bundle(&dir, now)?;
+            let summary = verify_bundle(&dir, &anchor, now)?;
             println!(
                 "release verify-inventory ok: {} files, {} daemon archives",
                 summary.files, summary.daemon_archives
@@ -434,11 +438,7 @@ fn assemble(args: &AssembleArgs, root: &Path) -> Result<AssembleSummary, XtaskEr
     {
         return Err(refuse(InputClass::Matrix, Fault::Unexpected, &row.target));
     }
-    let anchor = read_input(
-        &args.anchor,
-        u64::try_from(package::MAX_ANCHOR_BYTES).unwrap_or(u64::MAX),
-    )?;
-    check_anchor(&anchor)?;
+    let anchor = read_anchor(&args.anchor)?;
 
     let output = &args.output;
     ensure_output_free(output)?;
@@ -505,7 +505,7 @@ fn assemble(args: &AssembleArgs, root: &Path) -> Result<AssembleSummary, XtaskEr
         repack_daemon(&repack, tree)?;
     }
     write_inventory(&bundle)?;
-    let summary = verify_bundle(&bundle, args.commit_time)?;
+    let summary = verify_bundle(&bundle, &anchor, args.commit_time)?;
 
     fs::set_permissions(&bundle, fs::Permissions::from_mode(PUBLIC_DIR_MODE))
         .map_err(io_error(&bundle))?;
@@ -520,13 +520,18 @@ fn assemble(args: &AssembleArgs, root: &Path) -> Result<AssembleSummary, XtaskEr
     })
 }
 
-/// Requires the anchor bytes to be a valid trust anchor.
-fn check_anchor(bytes: &[u8]) -> Result<(), XtaskError> {
-    package::parse_anchor(bytes)
+/// Reads the anchor file at `path` and requires it to be a valid trust
+/// anchor.
+fn read_anchor(path: &Path) -> Result<Vec<u8>, XtaskError> {
+    let bytes = read_input(
+        path,
+        u64::try_from(package::MAX_ANCHOR_BYTES).unwrap_or(u64::MAX),
+    )?;
+    package::parse_anchor(&bytes)
         .map_err(XtaskError::Anchor)?
         .trust_anchor()
         .map_err(|error| XtaskError::Anchor(package::AnchorFileError::Anchor(error)))?;
-    Ok(())
+    Ok(bytes)
 }
 
 /// Requires `output` to be absent or an empty directory.
