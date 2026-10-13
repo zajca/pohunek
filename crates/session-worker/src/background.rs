@@ -288,6 +288,34 @@ pub(crate) fn clear(journal: &mut JournalRecord) -> bool {
 /// hook that began before the clear and delivers late cannot restore the
 /// snapshot it was ordered before.
 pub(crate) fn clear_at(journal: &mut JournalRecord, at: u64) -> bool {
-    journal.background_sequence = journal.background_sequence.max(at);
+    journal.background_sequence = journal.background_sequence.max(clamp_mark(at));
     clear(journal)
+}
+
+/// Nanoseconds in one second.
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+
+/// Caps a claim sequence at the worker's own `CLOCK_MONOTONIC` reading.
+///
+/// The background mark is written with the clamped value, never with a claim's
+/// raw sequence. A hook takes its sequence from a monotonic clock, but a
+/// runtime package may keep a clock of its own, and its readings can run ahead
+/// of the worker's. Without the clamp, one such value would make every later
+/// genuine claim stale until the runtime ends. With it, the mark is never above
+/// the clock, so the next genuine claim, ordered after the forged one arrived,
+/// is newer and replaces the snapshot. Comparisons always use the unclamped
+/// claim sequence.
+pub(crate) fn clamp_mark(sequence: u64) -> u64 {
+    sequence.min(monotonic_nanos())
+}
+
+/// Reads the worker's `CLOCK_MONOTONIC` in nanoseconds, the clock the hooks take
+/// their sequences from through `time.clock_gettime_ns(time.CLOCK_MONOTONIC)`.
+/// The reading saturates instead of failing on an unrepresentable value.
+pub(crate) fn monotonic_nanos() -> u64 {
+    let time = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    u64::try_from(time.tv_sec)
+        .unwrap_or(0)
+        .saturating_mul(NANOS_PER_SECOND)
+        .saturating_add(u64::try_from(time.tv_nsec).unwrap_or(0))
 }
