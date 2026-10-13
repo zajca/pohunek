@@ -32,10 +32,13 @@ multi-team control plane without replacing either owner path.
 - CLI-first; Rust daemon + Rust CLI.
 - Daemon owns PTYs; clients attach/detach. Agents run PTY/TUI-first.
 - Codex, Claude Code, and the local interactive Hermes Agent runtime are
-  first-class. Hermes is pinned to version 0.20.0. Its operator plugin is
-  installed explicitly per profile or custom owner-private home; it provides
-  typed tools, generated skill, and best-effort lifecycle reporting without
-  reading Hermes `state.db`.
+  first-class, each served only by its official runtime package from the signed
+  release catalog; only `shell` is built in, and macOS daemons ship no runtime
+  package yet (#929). Hermes is pinned to version 0.20.0. Its operator plugin
+  comes from the installed Hermes package and is installed explicitly per
+  profile or custom owner-private home; it provides typed tools, generated
+  skill, and best-effort lifecycle reporting without reading Hermes
+  `state.db`.
 - Remote transport is **direct over NetBird**, not an SSH bridge.
 - Discovery is **tokenless NetBird-local** + live capability query (no signed
   manifests, no mesh crypto).

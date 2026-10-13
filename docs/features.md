@@ -12,10 +12,17 @@ positioning; [architecture.md](architecture.md) is the authoritative design.
   terminal crashes, daemon restart, daemon failure, and daemon binary upgrade.
   Attach from any terminal with `pohunek attach`, detach with `Ctrl-]`, and
   reattach later. Multiple clients can attach to one session.
-- Codex, Claude Code, and Hermes Agent are first-class agents (plus plain
-  `shell`), with
-  per-host **agent profiles** that define the program, arguments, environment,
-  and input rules for custom runtimes (e.g. `claude-otel`).
+- Codex, Claude Code, and Hermes Agent are first-class agents, each served
+  only by its official runtime package (`pohunek.runtime.codex`,
+  `pohunek.runtime.claude`, `pohunek.runtime.hermes`) installed from the signed
+  release catalog with `pohunek plugin install`; only plain `shell` is built
+  in. The Linux x86_64 daemon archives ship the three packages; the macOS
+  archive ships none until darwin packages are attested
+  ([#929](https://github.com/zajca/pohunek/issues/929)). Without its package a
+  bare `codex`, `claude` or `hermes` is `agent_profile_not_found` and a host
+  profile over it is `runtime_not_installed`. Per-host **agent profiles**
+  define the program, arguments, environment, and input rules for custom
+  runtimes (e.g. `claude-otel`).
 - Hermes Agent `0.20.0` is supported only through its local interactive terminal
   backend. Docker, SSH, browser, desktop, gateway, ACP, and other Hermes
   backends are outside Pohunek's PTY ownership model. The selected Hermes

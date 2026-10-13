@@ -44,7 +44,7 @@ Last reconciled: 2026-10-12.
 | **Phase 5 / Milestone 12 — launcher chassis** | `session list --filter`; `session new --input` (atomic launch). The rofi/sway launcher scripts live in `zajca/pohunek-work`. | [`phases/05`](phases/05-rofi-sway-launcher.md) |
 | **Universal Assistant (P0–P11)** | `pohunek assistant`, the embedded knowledge bundle, the hook write gate, `cargo xtask eval`, and `cargo xtask docs site` with offline docs in each release tarball. | [`design/universal-assistant-plan.md`](design/universal-assistant-plan.md) |
 | **Track S — Public API + SDKs** | S.1 Rust SDK (`crates/client`); S.2 versioned public API with version negotiation ([`public-api.md`](public-api.md)); S.3 TypeScript SDK (`sdk/ts/`) with `ts-rs` generated types, a CI drift check, and a WebSocket transport tested against the loopback relay in `@pohunek/testkit`. | `crates/client`, `sdk/ts/` |
-| **Track H — Hermes runtime and operator plugin** | Local Hermes Agent runtime pinned to `0.20.0` in Pohunek-owned PTYs, exact native resume, and the operator plugin for a selected Hermes profile with an external access policy. | [operator guide](knowledge/guides/hermes-operator.md), [runbook](runbooks/hermes-operator-plugin.md), [migration](migrations/hermes-operator-plugin.md) |
+| **Track H — Hermes runtime and operator plugin** | Local Hermes Agent runtime pinned to `0.20.0` in Pohunek-owned PTYs, exact native resume, and the operator plugin for a selected Hermes profile with an external access policy. Both are served only by the official `pohunek.runtime.hermes` package (#147, Linux x86_64; macOS none until #929). | [operator guide](knowledge/guides/hermes-operator.md), [runbook](runbooks/hermes-operator-plugin.md), [migration](migrations/hermes-operator-plugin.md) |
 | **Track B / Track D — browser control center and native desktop app** | Browser M1 (multi-host sessions workspace, notifications inbox, in-browser terminal) and the Iced desktop control plane are clients maintained in `zajca/pohunek-work`. Core keeps the shared contracts: the protocol, both SDKs, `crates/prompt` (`pohunek prompt render`), opaque `link.*` session metadata, and `session new --input`. The browser M2/M3 plan to grow into a public multi-user backend is superseded by the [team-relay RFC](design/team-relay-control-plane-rfc.md). | [`phases/04`](phases/04-browser-control-center.md), [Track B plan](design/track-b-web-control-center-plan-2026-07-22.md), [Track D design](design/track-d-native-app.md) |
 | **Test performance milestone** | Milestone "Test performance" (13/13 closed) and project 3 (13/13 Done). | [milestone 1](https://github.com/zajca/pohunek/milestone/1) |
 
@@ -87,7 +87,10 @@ catalog signing (#150), the official Pi package (#538), the official Codex
 and the decision that core consumes no plugin data in v1 (#480). Open:
 
 - Hermes package [#147](https://github.com/zajca/pohunek/issues/147) — in
-  progress (PR #839 merged 2026-10-11; issue open).
+  progress: the package with its operator payload (PRs #829–#935, moved to
+  `runtime-packages/hermes` in #944), the operator plugin installed only from
+  the package (#947), and the removal of the compiled-in Hermes (#964) merged
+  by 2026-10-13; the issue stays open for its documentation closure.
 - Package CI and compatibility matrix
   [#149](https://github.com/zajca/pohunek/issues/149) and package
   documentation [#151](https://github.com/zajca/pohunek/issues/151) — blocked
