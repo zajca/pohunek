@@ -58,14 +58,16 @@ On a host without the package nothing serves `codex`:
   the package's `detect.toml` and `[transcripts]` table.
 - A session the built-in Codex of an earlier release launched is refused on
   resume, fork and every interaction (input, attach, resize, rename, metadata)
-  with `runtime_builtin_removed`, whose hint names the install and a new
-  session; only stop and remove still work. With the package installed, the
-  live session can be used again, and resume and fork answer
-  `runtime_served_by_package`: a session is never rebound to another runtime
-  source. `pohunekd upgrade-preflight` reports such a session as
-  `would_lose_recovery` (`runtime_source_not_served`) whether or not it could
-  resume, and without the package its detail says every interaction is refused
-  until the package is installed.
+  with `runtime_builtin_removed`, whose hint names the install; only stop and
+  remove still work. With the package installed, the package adopts the session,
+  live or stopped, and resume and fork run through it when it honors the
+  session's recovery contract (same native reference kind, hook-reported
+  reference; fork also needs fork support). A session whose contract the package
+  cannot honor answers `runtime_served_by_package`, and no command rebinds the
+  session to another runtime source. `pohunekd upgrade-preflight` reports an adoptable
+  session as `adoptable`, and a session that no package adopts as
+  `would_lose_recovery` (`runtime_source_not_served`); without the package its
+  detail says every interaction is refused until the package is installed.
 
 ## What the package declares
 

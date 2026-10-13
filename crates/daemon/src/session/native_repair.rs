@@ -42,10 +42,10 @@ impl SessionRegistry {
             binding.native_launch_unresolved = false;
             return NativeRepair::NotNeeded;
         }
-        // The spec comes only from the runtime source the binding's pin names,
-        // so a package serving the runtime id now never writes its spec into
-        // a binding of another source; the binding stays marked and is
-        // retried on the next load.
+        // The spec comes only from the runtime source the binding's pin names; an
+        // official package that adopts a built-in pin is that source (`launch::adopts`).
+        // A binding whose source is not served stays marked and is retried on the
+        // next load.
         let pinned = match self
             .inner
             .profiles

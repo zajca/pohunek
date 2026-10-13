@@ -208,56 +208,81 @@ fn native_evidence_unavailable(
 }
 
 impl SessionRegistry {
-    /// Adds verified native-reference last activity to public response copies.
+    /// The activity lookup of a listed session's native reference: where its
+    /// transcript is checked, the reference and the profile environment that
+    /// resolves the store. `None` when the reference cannot be looked up.
+    fn native_activity_lookup(
+        &self,
+        (target, binding, definition): (String, ResumeBinding, Arc<RuntimeDefinition>),
+    ) -> Option<(ReferenceExistence, SessionRef, LaunchEnv)> {
+        let launch = binding_native_launch(&binding, &definition);
+        let existence = reference_existence(&binding, launch.as_ref(), &definition)?;
+        let Ok(profile) = self.resolve_recovery_profile(&binding, ProfileChange::Refuse) else {
+            return None;
+        };
+        let Ok(reference) = SessionRef::id(&target) else {
+            return None;
+        };
+        Some((existence, reference, profile.env))
+    }
+
+    /// Adds verified native-reference last activity to public response copies,
+    /// and clears the resume and fork capabilities of each listed session that
+    /// its recovery would refuse, so a response never advertises an operation
+    /// the daemon refuses.
     ///
     /// A runtime whose descriptor declares the conversation store reports the
     /// verified modification time of the reference's transcript, so list and
     /// inspect responses can lead with the freshest common knowledge. Store
     /// records keep this field unset: transcript activity changes outside
     /// the daemon, so a cached value would give clients a stale recovery time.
+    ///
+    /// Each listed session resolves its recovery definition once; the
+    /// capabilities and the activity both read that result. The frozen
+    /// capabilities stay the upper bound: a capability is only ever cleared,
+    /// never set. Nothing is persisted.
     pub(crate) async fn enrich_native_activity(&self, sessions: &mut [SessionInfo]) {
-        let bindings = {
+        let runtimes = self.inner.profiles.runtimes();
+        let candidates = {
             let entries = self.inner.sessions.lock().await;
             sessions
                 .iter()
                 .map(|info| {
-                    info.native_session_id
-                        .is_some()
+                    let recoverable = info.capabilities.resume
+                        || info.capabilities.fork
+                        || info.native_session_id.is_some();
+                    recoverable
                         .then(|| entries.get(&info.id))
                         .flatten()
                         .map(|entry| Self::resume_binding_from_entry(&info.id, entry))
                 })
                 .collect::<Vec<_>>()
         };
-        if bindings.iter().all(Option::is_none) {
+        let mut lookup_inputs = Vec::with_capacity(sessions.len());
+        for (info, candidate) in sessions.iter_mut().zip(candidates) {
+            let Some(binding) = candidate else {
+                lookup_inputs.push(None);
+                continue;
+            };
+            let definition = recovery_definition(runtimes, &binding).ok();
+            clear_refused_capabilities(info, &binding, definition.as_ref());
+            lookup_inputs.push(
+                info.native_session_id
+                    .clone()
+                    .zip(definition)
+                    .map(|(target, definition)| (target, binding, definition)),
+            );
+        }
+        let lookups = lookup_inputs
+            .into_iter()
+            .map(|input| self.native_activity_lookup(input?))
+            .collect::<Vec<_>>();
+        if lookups.iter().all(Option::is_none) {
             return;
         }
         let Ok(base_environment) = self.launch_base_environment() else {
             return;
         };
-        let lookups = sessions
-            .iter()
-            .zip(bindings)
-            .map(|(info, binding)| {
-                let (Some(binding), Some(target)) = (binding, info.native_session_id.as_deref())
-                else {
-                    return None;
-                };
-                let Ok(definition) = self.binding_definition(&binding) else {
-                    return None;
-                };
-                let launch = binding_native_launch(&binding, &definition);
-                let existence = reference_existence(&binding, launch.as_ref(), &definition)?;
-                let Ok(profile) = self.resolve_recovery_profile(&binding, ProfileChange::Refuse)
-                else {
-                    return None;
-                };
-                let Ok(reference) = SessionRef::id(target) else {
-                    return None;
-                };
-                Some((existence, reference, profile.env))
-            })
-            .collect::<Vec<_>>();
         let sessions_len = sessions.len();
         let modified = tokio::task::spawn_blocking(move || {
             let mut groups: Vec<ActivityGroup> = Vec::new();
@@ -682,33 +707,17 @@ impl SessionRegistry {
         ))
     }
 
-    /// Resolves the runtime a binding relaunches with and checks that it may
-    /// serve the binding's frozen launch pin.
-    ///
-    /// A package pin resolves from exactly its package digest, verified again
-    /// now, whatever the registry currently selects. A runtime that is not
-    /// installed, or that no longer matches the pin, refuses the relaunch; the
-    /// stored binding is left untouched so it resumes once the runtime is
-    /// available again. A built-in pin of an official alias this daemon does
-    /// not compile in never resumes: no built-in comes back, and the package
-    /// that serves the alias is no stand-in for it.
+    /// Resolves the runtime a binding relaunches with (see
+    /// [`recovery_definition`]).
     ///
     /// # Errors
     ///
-    /// Returns `agent_kind_unsupported` for a value that is not a runtime id,
-    /// `runtime_builtin_removed` for a built-in or unpinned snapshot of an
-    /// official alias nothing serves, `runtime_served_by_package` for one an
-    /// official package serves, `runtime_not_installed` for any other
-    /// unresolvable or mismatching runtime and `runtime_incompatible` for a
-    /// pinned package whose root fails verification.
+    /// Returns the [`recovery_definition`] errors.
     fn binding_definition(
         &self,
         binding: &ResumeBinding,
     ) -> Result<Arc<RuntimeDefinition>, ProtocolError> {
-        self.inner
-            .profiles
-            .runtimes()
-            .resolve_pinned(&binding.agent_base, &binding.launch_binding)
+        recovery_definition(self.inner.profiles.runtimes(), binding)
     }
 
     async fn persist_failed_recovery_rollback(&self, id: &SessionId) {
@@ -771,6 +780,7 @@ impl SessionRegistry {
             .clone()
             .filter(NativeSessionLaunch::supports_fork)
             .ok_or_else(agent_fork_unsupported)?;
+        recovery_contract(&binding, &definition, true)?;
         self.hook_recovery_journal_error(&record, &binding, &launch)
             .await?;
         let change = ProfileChange::requested(params.accept_profile_change);
@@ -778,6 +788,7 @@ impl SessionRegistry {
         // A fork starts a new process of the runtime, so a runtime with a
         // version probe is probed again before anything is allocated.
         let relaunch = self.plan_relaunch(&binding, definition, launch, change)?;
+        let relaunch_pin = host::relaunch_pin(&binding.launch_binding, &relaunch.definition);
         let outdated_hooks = self.outdated_relaunch_warnings(&binding, &relaunch).await;
         let id = Self::allocate_session_id();
         self.ensure_worker_socket(&id)?;
@@ -824,7 +835,7 @@ impl SessionRegistry {
             program,
             args: binding.args.clone(),
             native: Some(launch),
-            launch_binding: binding.launch_binding.clone(),
+            launch_binding: relaunch_pin,
             reference_provenance: if fork_reference.is_some() {
                 NativeReferenceProvenance::Assigned
             } else {
@@ -1179,6 +1190,7 @@ impl SessionRegistry {
         verify_recovery_reference(&binding, &relaunch).await?;
         #[cfg(test)]
         self.hold_recovery(&id).await;
+        let relaunch_pin = host::relaunch_pin(&binding.launch_binding, &relaunch.definition);
         let RelaunchPlan {
             launch,
             session_ref,
@@ -1216,7 +1228,7 @@ impl SessionRegistry {
             program,
             args: binding.args.clone(),
             native: Some(launch),
-            launch_binding: binding.launch_binding.clone(),
+            launch_binding: relaunch_pin,
             reference_provenance: binding.native_reference_provenance,
             profile_revision: revision,
         };
@@ -1395,12 +1407,86 @@ fn reference_existence(
     }
 }
 
+/// Clears the resume and fork capabilities of a listed session that the
+/// recovery `definition` (`None` when it does not resolve) would refuse. A
+/// capability is never set here.
+fn clear_refused_capabilities(
+    info: &mut SessionInfo,
+    binding: &ResumeBinding,
+    definition: Option<&Arc<RuntimeDefinition>>,
+) {
+    let resume = info.capabilities.resume
+        && definition
+            .is_some_and(|definition| binding_native_launch(binding, definition).is_some());
+    let fork = info.capabilities.fork
+        && resume
+        && definition
+            .is_some_and(|definition| recovery_contract(binding, definition, true).is_ok());
+    info.capabilities.resume = resume;
+    info.capabilities.fork = fork;
+}
+
 fn binding_program(binding: &ResumeBinding, definition: &RuntimeDefinition) -> String {
     if binding.program.is_empty() {
         definition.program().as_str().to_owned()
     } else {
         binding.program.clone()
     }
+}
+
+/// Resolves the definition a resume of `binding` launches from: the runtime
+/// its launch pin names, which a package serves only when it is the
+/// adoption of an official alias (`host::adopts`) that honors the frozen
+/// launch.
+///
+/// The stored binding is never changed here, so a refusal leaves the session
+/// resumable once the runtime is served again.
+///
+/// # Errors
+///
+/// Returns `agent_kind_unsupported` for a value that is not a runtime id,
+/// `runtime_builtin_removed` for a built-in or unpinned snapshot of an
+/// official alias nothing serves, `runtime_served_by_package` for a built-in
+/// pin an official package serves without honoring the frozen launch,
+/// `runtime_not_installed` for any other unresolvable or mismatching runtime
+/// and `runtime_incompatible` for a pinned package whose root fails
+/// verification.
+pub(super) fn recovery_definition(
+    runtimes: &host::RuntimeHost,
+    binding: &ResumeBinding,
+) -> Result<Arc<RuntimeDefinition>, ProtocolError> {
+    let definition = runtimes.resolve_pinned(&binding.agent_base, &binding.launch_binding)?;
+    recovery_contract(binding, &definition, false)?;
+    Ok(definition)
+}
+
+/// Checks that `definition` honors the launch `binding` froze for a resume,
+/// or for a fork when `fork` is set (see [`host::honors_frozen_launch`]).
+///
+/// A fork needs fork support in the frozen spec, which is the spec fork
+/// launches from, and in `definition`.
+///
+/// # Errors
+///
+/// Returns `agent_fork_unsupported` for a fork the frozen spec does not
+/// support, and `runtime_served_by_package` for an adopted package that does
+/// not honor the frozen launch.
+pub(super) fn recovery_contract(
+    binding: &ResumeBinding,
+    definition: &RuntimeDefinition,
+    fork: bool,
+) -> Result<(), ProtocolError> {
+    let frozen = if fork {
+        let frozen = binding
+            .native_launch
+            .clone()
+            .filter(NativeSessionLaunch::supports_fork)
+            .ok_or_else(agent_fork_unsupported)?;
+        Some(frozen)
+    } else {
+        binding_native_launch(binding, definition)
+    };
+    host::honors_frozen_launch(&binding.launch_binding, definition, frozen.as_ref(), fork)
 }
 
 /// Return the native-session launch spec frozen into a persisted binding.

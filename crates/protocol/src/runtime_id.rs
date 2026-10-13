@@ -790,7 +790,7 @@ mod tests {
         assert!(!error.msg.contains('/'));
         let recover = error.recover.as_deref().expect("a recovery hint");
         assert!(recover.contains("`pohunek session new --agent codex`"));
-        assert!(recover.contains("cannot be rebound"));
+        assert!(recover.contains("cannot be adopted by the package"));
         assert!(!recover.contains("disable"));
         let json = serde_json::to_string(&error).expect("serialize");
         assert_eq!(

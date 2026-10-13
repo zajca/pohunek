@@ -3293,9 +3293,10 @@ impl SessionRegistry {
     /// against the definition the session was launched from, not the
     /// registry's current selection; every other name resolves normally.
     ///
-    /// The definition comes from [`SessionEntry::pinned`], fixed at launch or
-    /// adoption, so callbacks and process recognition of one session follow
-    /// one rule until a daemon restart adopts it again.
+    /// The definition comes from [`SessionEntry::pinned`], derived at launch,
+    /// at adoption and again after each package change, so callbacks and
+    /// process recognition of one session follow the registry's current
+    /// serving source.
     ///
     /// # Errors
     ///
@@ -3356,7 +3357,7 @@ impl SessionRegistry {
                 session_id = %id.0,
                 agent = %agent,
                 runtime = %agent_kind_label(runtime),
-                "{report} names the session's runtime, whose launch source was not served when this daemon adopted the session (replaced, missing or failing verification); ignoring until a daemon restart adopts it from a served source"
+                "{report} names the session's runtime, whose launch source is not served now (replaced, missing or failing verification); ignoring until the registry serves it again"
             ),
         }
     }

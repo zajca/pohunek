@@ -76,7 +76,7 @@ fn native_report_expiry() -> String {
         .expect("format native report expiry")
 }
 
-async fn native_report_params(
+pub(crate) async fn native_report_params(
     registry: &SessionRegistry,
     session_id: SessionId,
     agent: String,

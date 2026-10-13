@@ -281,7 +281,11 @@ impl SessionRegistry {
                     warn!(%error, "the sessions that pin packages cannot be listed");
                     PackageErrorKind::RegistryFailed
                 })?;
-            blocking(move || work(&context, &retained)).await
+            let outcome = blocking(move || work(&context, &retained)).await;
+            // Every transaction may have rebuilt the registry, so live adopted
+            // sessions follow whichever package serves their runtime now.
+            registry.refresh_adopted_pins().await;
+            outcome
         })
         .await
         .map_err(|_join_error| PackageErrorKind::RegistryFailed)?

@@ -28,7 +28,7 @@ use crate::agent::host::ServedBy;
 use crate::procwatch::HostInspector;
 use crate::session::procwatch::OwnRuntime;
 use crate::session::tests::{
-    durable_recovery, hermetic_shell, params, temp_dir, temp_store_path,
+    durable_recovery, hermetic_shell, native_report_params, params, temp_dir, temp_store_path,
     write_supported_hermes_executable,
 };
 use crate::session::upgrade_preflight::{self, PreflightInputs};
@@ -128,7 +128,7 @@ fn assert_migration_refusal(refused: &protocol::ProtocolError, alias: &str) {
         hint.contains(&format!("`pohunek session new --agent {alias}`")),
         "{hint}"
     );
-    assert!(hint.contains("cannot be rebound"), "{hint}");
+    assert!(hint.contains("cannot be adopted by the package"), "{hint}");
     for stale in [
         "disable",
         "uninstall",
@@ -647,7 +647,7 @@ fn assert_removed_built_in_refusal(
         "{alias} {operation}: {hint}"
     );
     assert!(
-        hint.contains("cannot be rebound"),
+        hint.contains("adopted by it"),
         "{alias} {operation}: {hint}"
     );
 }
@@ -1499,4 +1499,417 @@ async fn assert_transition_rules(
         }
     }
     drop(sessions);
+}
+
+// Adoption: an official package with the identity of a built-in runtime serves
+// the sessions that built-in launched, and only those launches it honors.
+
+/// The conversation a built-in Claude session reports in these tests.
+const CONVERSATION: &str = "native-claude-1";
+
+/// Package id and version the official package of `alias` declares.
+fn official_identity(alias: &str) -> (&'static str, &'static str) {
+    match alias {
+        RuntimeId::CLAUDE => ("pohunek.runtime.claude", "1.0.1"),
+        RuntimeId::CODEX => ("pohunek.runtime.codex", "1.0.0"),
+        RuntimeId::HERMES => ("pohunek.runtime.hermes", "1.0.0"),
+        other => panic!("{other} has no official package"),
+    }
+}
+
+/// The official package of `alias` as its own descriptor and detection
+/// manifest ship it, the bytes `plugin install` receives.
+fn real_official(alias: &str) -> Package {
+    Package::from_entries(&crate::agent::host::fixture::official_package_entries(
+        alias,
+    ))
+}
+
+/// Installs `package`, the official package of `alias`, through `registry` with
+/// a catalog signed by the test root.
+async fn install_real_official(
+    fixture: &Fixture,
+    registry: &SessionRegistry,
+    alias: &str,
+    package: &Package,
+    sequence: u64,
+) {
+    let (package_id, version) = official_identity(alias);
+    let key = signing_key("root");
+    let document = signed_by(
+        &key,
+        catalog(sequence, vec![entry(package, package_id, alias, version)]),
+    );
+    registry
+        .package_install(catalog_install(fixture, package, &document, false))
+        .await
+        .expect("official install");
+}
+
+/// The resume and fork flags `session list` reports for session `id`.
+async fn listed_recovery(registry: &SessionRegistry, id: &protocol::SessionId) -> (bool, bool) {
+    let mut list = registry.list().await;
+    registry.enrich_native_activity(&mut list).await;
+    let info = list
+        .iter()
+        .find(|info| info.id.0 == id.0)
+        .unwrap_or_else(|| panic!("{} is listed", id.0));
+    (info.capabilities.resume, info.capabilities.fork)
+}
+
+/// Rewrites the durable recovery binding of session `id` through `edit`, as an
+/// older release or a damaged record would have stored it.
+fn edit_durable_recovery(
+    store_path: &Path,
+    id: &protocol::SessionId,
+    edit: impl FnOnce(&mut crate::store::ResumeBinding),
+) {
+    let store = crate::store::Store::new(store_path.to_path_buf());
+    let mut record = store
+        .load_sessions()
+        .expect("durable sessions")
+        .into_iter()
+        .find(|record| record.session_id == id.0)
+        .expect("the session record");
+    edit(record.recovery.as_mut().expect("a recovery binding"));
+    store
+        .record_session(&record)
+        .expect("write the session record");
+}
+
+/// A stopped session of the built-in Claude runtime, launched by a daemon that
+/// compiles it in, whose conversation that daemon recorded.
+struct StoppedClaude {
+    fixture: Fixture,
+    store_path: PathBuf,
+    id: protocol::SessionId,
+}
+
+async fn stopped_built_in_claude(tag: &str) -> StoppedClaude {
+    let key = signing_key("root");
+    let dir = temp_dir(tag);
+    let store_path = temp_store_path(tag);
+    let fixture = Fixture::with_anchor_and_store(
+        &format!("{tag}-plugins"),
+        anchor(&[&key], Vec::new()),
+        store_path.clone(),
+    );
+    // Claude keeps its conversations below `CLAUDE_CONFIG_DIR`; the profile
+    // points it at a directory the test owns, which the reference check reads.
+    let config_home = fixture.dir.join("claude-home");
+    let conversations = config_home.join("projects").join("work");
+    fs::create_dir_all(&conversations).expect("the conversation directory");
+    fs::write(conversations.join(format!("{CONVERSATION}.jsonl")), b"{}\n")
+        .expect("the conversation");
+    fixture.write_profile(
+        PROFILE,
+        &format!(
+            "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 600\"]\n\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+            config_home.display()
+        ),
+    );
+    let previous = compiled_in_daemon(&fixture, &store_path);
+    let created = previous
+        .create(protocol::SessionNewParams {
+            agent: PROFILE.to_owned(),
+            cwd: Some(dir),
+            ..params()
+        })
+        .await
+        .expect("a session of the built-in Claude runtime");
+    let report = native_report_params(
+        &previous,
+        created.id.clone(),
+        RuntimeId::CLAUDE.to_owned(),
+        CONVERSATION.to_owned(),
+        None,
+    )
+    .await;
+    assert!(previous.report_native_id(report).await.recorded);
+    previous.stop(&created.id).await.expect("stop the session");
+    StoppedClaude {
+        fixture,
+        store_path,
+        id: created.id,
+    }
+}
+
+/// Restarts the daemon over `fixture`'s state and reconciles its workers.
+async fn restart(fixture: &Fixture) -> Fixture {
+    let restarted = fixture.reopen();
+    Box::pin(restarted.registry.reconcile_workers())
+        .await
+        .expect("startup reconciliation");
+    restarted
+}
+
+#[tokio::test]
+async fn a_stopped_built_in_claude_session_resumes_through_the_official_package_and_pins_it() {
+    let session = stopped_built_in_claude("claude-adopt-resume").await;
+    let package = real_official(RuntimeId::CLAUDE);
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        &package,
+        5,
+    )
+    .await;
+    let restarted = restart(&session.fixture).await;
+    assert_eq!(
+        listed_recovery(&restarted.registry, &session.id).await,
+        (true, true),
+        "the package adopts the session, so it lists as resumable and forkable"
+    );
+
+    // The host profile over the built-in changed its base runtime's launch
+    // binding, so its revision moves with the adoption; the owner accepts that
+    // change the way `--accept-profile-change` does.
+    let resumed = restarted
+        .registry
+        .resume_with(&session.id, crate::session::ProfileChange::Accept)
+        .await
+        .expect("the package adopts the built-in session");
+    assert_eq!(
+        resumed.runtime.as_ref().map(|runtime| runtime.state),
+        Some(protocol::RuntimeState::Live)
+    );
+    match durable_recovery(&session.store_path, &session.id)
+        .launch_binding
+        .binding()
+        .map(|binding| &binding.provenance)
+    {
+        Some(protocol::BindingProvenance::Package { package_digest, .. }) => {
+            assert_eq!(package_digest, &package.digest);
+        }
+        other => panic!("the relaunch records the package pin, not {other:?}"),
+    }
+    restarted
+        .registry
+        .remove(&session.id)
+        .await
+        .expect("remove the resumed session");
+}
+
+#[tokio::test]
+async fn a_built_in_claude_session_is_not_listed_as_resumable_while_no_package_serves_it() {
+    let session = stopped_built_in_claude("claude-no-package").await;
+    let restarted = restart(&session.fixture).await;
+    assert_eq!(
+        listed_recovery(&restarted.registry, &session.id).await,
+        (false, false)
+    );
+    let resumed = restarted
+        .registry
+        .resume(&session.id)
+        .await
+        .expect_err("nothing serves the built-in the session was launched from");
+    assert_eq!(resumed.code, "runtime_builtin_removed", "{resumed:?}");
+    let forked = restarted
+        .registry
+        .fork(fork_params(&session.id))
+        .await
+        .expect_err("nothing serves the built-in the session was launched from");
+    assert_eq!(forked.code, "runtime_builtin_removed", "{forked:?}");
+}
+
+#[tokio::test]
+async fn an_unpinned_built_in_claude_session_is_never_resumed_through_the_package() {
+    let session = stopped_built_in_claude("claude-unpinned").await;
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        &real_official(RuntimeId::CLAUDE),
+        5,
+    )
+    .await;
+    edit_durable_recovery(&session.store_path, &session.id, |binding| {
+        binding.launch_binding = crate::agent::host::LaunchPin::Unpinned;
+    });
+    let restarted = restart(&session.fixture).await;
+    assert_eq!(
+        listed_recovery(&restarted.registry, &session.id).await,
+        (false, false)
+    );
+    let resumed = restarted
+        .registry
+        .resume(&session.id)
+        .await
+        .expect_err("an unpinned session names no built-in to adopt");
+    assert_eq!(resumed.code, "runtime_served_by_package", "{resumed:?}");
+    let forked = restarted
+        .registry
+        .fork(fork_params(&session.id))
+        .await
+        .expect_err("an unpinned session names no built-in to adopt");
+    assert_eq!(forked.code, "runtime_served_by_package", "{forked:?}");
+}
+
+#[tokio::test]
+async fn a_built_in_claude_session_is_refused_when_the_package_does_not_honor_its_frozen_launch() {
+    let session = stopped_built_in_claude("claude-frozen-mismatch").await;
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        &real_official(RuntimeId::CLAUDE),
+        5,
+    )
+    .await;
+    // The built-in froze an id-kind reference; a path-kind spec is one the
+    // package cannot honor.
+    edit_durable_recovery(&session.store_path, &session.id, |binding| {
+        binding.native_launch = Some(
+            crate::agent::NativeSessionLaunch::from_templates(
+                crate::agent::SessionRefKind::Path,
+                &["--resume", "{reference}"],
+                Some(&["--resume", "{reference}", "--fork-session"]),
+            )
+            .expect("a valid path-kind spec"),
+        );
+    });
+    let restarted = restart(&session.fixture).await;
+    assert_eq!(
+        listed_recovery(&restarted.registry, &session.id).await,
+        (false, false)
+    );
+    let resumed = restarted
+        .registry
+        .resume(&session.id)
+        .await
+        .expect_err("the package does not honor the frozen reference kind");
+    assert_eq!(resumed.code, "runtime_served_by_package", "{resumed:?}");
+    let forked = restarted
+        .registry
+        .fork(fork_params(&session.id))
+        .await
+        .expect_err("the package does not honor the frozen reference kind");
+    assert_eq!(forked.code, "runtime_served_by_package", "{forked:?}");
+}
+
+/// A stopped session of the built-in `alias` that has no fork, launched by a
+/// daemon that compiles it in, once the official package of `alias` serves it,
+/// neither lists as forkable nor forks through the package.
+async fn assert_built_in_session_without_fork_stays_unforkable(alias: &'static str) {
+    let tag = format!("alias-{alias}-no-fork");
+    let key = signing_key("root");
+    let dir = temp_dir(&tag);
+    let store_path = temp_store_path(&tag);
+    let fixture = Fixture::with_anchor_and_store(
+        &format!("{tag}-plugins"),
+        anchor(&[&key], Vec::new()),
+        store_path.clone(),
+    );
+    fixture.write_profile(
+        PROFILE,
+        &format!("base = \"{alias}\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n"),
+    );
+    let created = launch_on_a_compiled_in_daemon(&fixture, &store_path, dir).await;
+    assert!(
+        !created.capabilities.fork,
+        "the built-in {alias} has no fork"
+    );
+    install_real_official(&fixture, &fixture.registry, alias, &real_official(alias), 5).await;
+    let restarted = restart(&fixture).await;
+    assert!(
+        !listed_recovery(&restarted.registry, &created.id).await.1,
+        "{alias}: the listing does not advertise a fork"
+    );
+    let forked = restarted
+        .registry
+        .fork(fork_params(&created.id))
+        .await
+        .expect_err("the built-in has no fork to adopt");
+    assert_eq!(forked.code, "agent_fork_unsupported", "{alias}: {forked:?}");
+}
+
+#[tokio::test]
+async fn a_built_in_codex_session_stays_unforkable_once_the_package_adopts_it() {
+    assert_built_in_session_without_fork_stays_unforkable(RuntimeId::CODEX).await;
+}
+
+#[tokio::test]
+async fn a_built_in_hermes_session_stays_unforkable_once_the_package_adopts_it() {
+    assert_built_in_session_without_fork_stays_unforkable(RuntimeId::HERMES).await;
+}
+
+/// The identity report a Claude hook sends for session `id`.
+fn claude_identity_report(id: &protocol::SessionId) -> protocol::SessionReportAgentParams {
+    protocol::SessionReportAgentParams {
+        session_id: id.clone(),
+        source: "pohunek:claude".to_owned(),
+        agent: RuntimeId::CLAUDE.to_owned(),
+        activity: None,
+        seq: None,
+        pid: None,
+        agent_session_id: Some(CONVERSATION.to_owned()),
+        agent_session_path: None,
+    }
+}
+
+#[tokio::test]
+async fn a_live_built_in_claude_session_takes_its_callbacks_once_a_package_is_installed_while_running(
+) {
+    let tag = "claude-live-callbacks";
+    let key = signing_key("root");
+    let dir = temp_dir(tag);
+    let store_path = temp_store_path(tag);
+    let fixture = Fixture::with_anchor_and_store(
+        &format!("{tag}-plugins"),
+        anchor(&[&key], Vec::new()),
+        store_path.clone(),
+    );
+    fixture.write_profile(
+        PROFILE,
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 600\"]\n",
+    );
+    let previous = compiled_in_daemon(&fixture, &store_path);
+    let created = previous
+        .create(protocol::SessionNewParams {
+            agent: PROFILE.to_owned(),
+            cwd: Some(dir),
+            ..params()
+        })
+        .await
+        .expect("a session of the built-in Claude runtime");
+    let adopted = fixture.reopen_with_workers_of(&previous).await;
+    Box::pin(adopted.registry.reconcile_workers())
+        .await
+        .expect("startup reconciliation");
+    assert!(
+        !adopted
+            .registry
+            .report_agent(claude_identity_report(&created.id))
+            .await
+            .recorded,
+        "no package serves the built-in yet, so its callbacks are not attributed"
+    );
+
+    install_real_official(
+        &adopted,
+        &adopted.registry,
+        RuntimeId::CLAUDE,
+        &real_official(RuntimeId::CLAUDE),
+        5,
+    )
+    .await;
+    assert!(
+        adopted
+            .registry
+            .report_agent(claude_identity_report(&created.id))
+            .await
+            .recorded,
+        "the installed package serves the live session's runtime"
+    );
+    adopted
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the adopted session");
+    adopted
+        .registry
+        .remove(&created.id)
+        .await
+        .expect("remove the adopted session");
 }

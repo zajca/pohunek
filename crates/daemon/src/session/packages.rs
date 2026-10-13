@@ -56,6 +56,37 @@ impl SessionRegistry {
         self.inner.profiles.runtimes().reload()
     }
 
+    /// Re-derives the pinned definition of each live session launched from a
+    /// built-in runtime an official package may adopt, after the runtime
+    /// registry was rebuilt, so callbacks and observation follow the package
+    /// that serves the runtime now.
+    ///
+    /// Other pins keep their definition: a package pin resolves from its own
+    /// digest and does not change with the registry.
+    pub(super) async fn refresh_adopted_pins(&self) {
+        let runtimes = self.inner.profiles.runtimes();
+        let mut sessions = self.inner.sessions.lock().await;
+        for entry in sessions.values_mut() {
+            let adoptable = entry
+                .snapshot
+                .launch_binding
+                .binding()
+                .is_some_and(|binding| {
+                    matches!(
+                        binding.provenance,
+                        protocol::BindingProvenance::Builtin {
+                            package: Some(_),
+                            ..
+                        }
+                    )
+                });
+            if adoptable {
+                entry.pinned = runtimes
+                    .pinned_definition(&entry.info.agent_base, &entry.snapshot.launch_binding);
+            }
+        }
+    }
+
     /// Package digests that a live, lost or resumable session was launched
     /// from, or that a host profile pins.
     ///
@@ -177,6 +208,7 @@ impl SessionRegistry {
                 Ok(()) | Err(RegistryError::RemovalIncomplete | RegistryError::CommitUncertain)
             );
             let reload = committed.then(|| runtimes.reload());
+            registry.refresh_adopted_pins().await;
             removal?;
             match reload {
                 Some(Err(error)) => Err(PackageUninstallError::Reload(error)),

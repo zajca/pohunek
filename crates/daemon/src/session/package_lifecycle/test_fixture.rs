@@ -253,9 +253,11 @@ impl Fixture {
             .worker_runtime_root
             .clone()
             .zip(config.worker_state_root.clone());
+        // The restarted daemon trusts the catalogs this fixture's daemon trusts,
+        // so a package installed through it is authorized the same way.
         Self::at(
             self.dir.clone(),
-            CatalogTrust::Absent,
+            self.registry.inner.config.catalog_trust.clone(),
             self.store_path.clone(),
             roots,
         )

@@ -93,15 +93,18 @@ On a host without the package nothing serves `hermes`:
 - A session the built-in Hermes of an earlier release launched (pinned, or a
   v0.33.0 record without a launch binding) is refused on resume, fork and
   every interaction (input, attach, resize, rename, metadata) with
-  `runtime_builtin_removed`, whose hint names the install and a new session
-  with `pohunek session new --agent hermes`; only stop and remove still work.
-  With the package installed, the live session can be used again, resume
-  answers `runtime_served_by_package` and fork `agent_fork_unsupported`: a
-  session is never rebound to another runtime source. Without the package,
-  `pohunekd upgrade-preflight` reports every live built-in Hermes session as
-  `would_lose_recovery` (`runtime_source_not_served`) whether or not it could
-  resume. No earlier release archive carries this package, so such a session
-  cannot be moved onto it before the upgrade: finish or stop it first.
+  `runtime_builtin_removed`, whose hint names the install; only stop and remove
+  still work. With the package installed, the package adopts the session, live
+  or stopped, and serves its input again. Resume runs through the package when it
+  honors the session's recovery contract; fork answers `agent_fork_unsupported`,
+  because Hermes declares no native fork. A session whose contract the package
+  cannot honor answers `runtime_served_by_package`, and no command rebinds the
+  session to another runtime source. A v0.33.0 record without a launch binding answers it
+  as well. Without the package, `pohunekd upgrade-preflight` reports every live
+  built-in Hermes session as `would_lose_recovery` (`runtime_source_not_served`)
+  whether or not it could resume. No earlier release archive carries this
+  package, so such a session cannot be moved onto it before the upgrade: finish
+  or stop it first.
 - Uninstalling or disabling the package leaves `hermes` unserved.
 
 An operator plugin that an older CLI installed from its compiled copy

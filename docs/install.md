@@ -299,13 +299,18 @@ Code or Hermes until darwin packages are attested (#929). A `claude`, `codex` or
 agent without its package.
 
 A session launched from the built-in Claude Code, Codex or Hermes of an earlier
-release is not resumed or forked by this daemon. Without the package every
-interaction with it (input, attach, resize, rename, metadata) is refused too
+release is not served by this daemon. Without the package every interaction with
+it (input, attach, resize, rename, metadata) is refused too
 (`runtime_builtin_removed`; only stop and remove work), so its work cannot be
-finished until the package is installed. With the package it can be used again
-but still not resumed or forked (`runtime_served_by_package`; a fork of a Hermes
-session answers `agent_fork_unsupported`, because Hermes has no native fork),
-so finish its work and continue in a new session. Install the Claude Code and
+finished until the package is installed. With the official package installed,
+the package adopts the session, live or stopped, whatever its version, and
+serves its input again. Resume and fork then run through the package, and the
+relaunched run is pinned to the package digest. A session whose recovery the
+package cannot honor (its native reference kind, a hook-reported reference, or
+fork support for a fork), and a session record of v0.33.0 that names no package,
+answer `runtime_served_by_package`, and its work continues in a new session. A
+fork of a Hermes session answers `agent_fork_unsupported`, because Hermes has no
+native fork. Install the Claude Code and
 Codex packages on the earlier release before upgrading so that live sessions
 stay usable. No earlier release archive carries the Hermes package, so finish or
 stop built-in Hermes sessions before upgrading; the upgrade preflight reports a

@@ -692,28 +692,34 @@ catalog that names `shell` or does not authorize the alias for the archive is
 official package whose `runtime_id` is that alias in `package.list` and
 `package.inspect`; no such package means nothing serves it.
 
-A session launched from the built-in runtime of an alias that a package serves
-now cannot be resumed or forked: the request is refused with
+A session launched from the built-in runtime of an official alias this daemon
+does not compile in (the built-in Codex, Claude Code or Hermes of an earlier
+release, pinned or from a record without a launch binding) while nothing serves
+the alias is refused with `runtime/runtime_builtin_removed` on resume, fork and
+every mutation (input, attach, resize, rename, metadata); only stop and remove
+still work. Its recovery hint names the official package install and the
+new-session fallback. Once the official package serves the alias, it adopts a
+session whose launch pin names that package id, live or stopped; the package
+version may differ. The adopted session accepts input again, and resume and fork
+run through the package when it honors the session's recovery contract (the same
+native reference kind, a hook-reported reference, and for fork, fork support in
+both the frozen spec and the package). The relaunched run is pinned to the
+package digest. A session whose contract the package cannot honor, and a
+session record that names no package, are refused with
 `runtime/runtime_served_by_package`, whose recovery hint names the one
 migration (start a new session with `pohunek session new --agent <runtime>`,
-which the official package serves; a session is never rebound to another
-runtime source), and the stored binding is kept unchanged. A session launched
-from the built-in runtime of an official alias this daemon does not compile in
-(the built-in Codex, Claude Code or Hermes of an earlier release, pinned or
-from a record without a launch binding) while nothing serves the alias is
-refused with
-`runtime/runtime_builtin_removed` on resume, fork and every mutation (input,
-attach, resize, rename, metadata); only stop and remove still work. Its
-recovery hint names the official package install and a new session. Once the
-package is installed, a live session can be used again, while resume and fork
-answer `runtime/runtime_served_by_package` (a fork of a Hermes session answers
-`agent_fork_unsupported`, because Hermes declares no native fork). A session pinned to a runtime
+which the official package serves; no command rebinds the session to another
+runtime source), and the stored binding is kept unchanged. A fork of a Hermes
+session answers `agent_fork_unsupported`, because Hermes declares no native fork.
+`session list` reports resume and fork as false for any session that resume or
+fork would refuse. A session pinned to a runtime
 source the daemon does not serve otherwise (a built-in of a runtime id that is
 not an official alias, a package digest that is not installed) is refused with
 `runtime/runtime_not_installed`. Stop and remove still work. A session the
 daemon launched keeps the definition it was launched from while that daemon
-runs; a session adopted at startup whose pin the daemon does not serve is
-observed only through its launch-time facts: the generic shell manifest (a
+runs. A built-in pin that the installed official package adopts is served by
+that package, live or stopped. A session adopted at startup whose pin the daemon
+does not serve is observed only through its launch-time facts: the generic shell manifest (a
 manifest override of the session's host profile still applies), the input
 framing persisted at launch, and the hook schema its worker journaled. Hook
 reports and processes naming its own runtime are not attributed through the
@@ -1318,7 +1324,9 @@ Important fields:
   native-session launch spec (reference kind, resume argv, optional fork argv),
   so `fork` is `true` only when `resume` is `true`. Clients must use these flags
   instead of inferring provider behavior from `agent` or `agent_base`. Records
-  that predate the field load both flags as `false`. Host profiles declare the
+  that predate the field load both flags as `false`. `session list` reports a flag
+  as `false` when resume or fork would refuse that session at the time of the
+  list, even though the frozen value is `true`. Host profiles declare the
   spec in `[resume]` (`reference_kind`, `args`, optional `fork_args`, accepted only on
   bases whose runtime declares a native fork, such as `claude`); see the
   agent-profiles concept page.
@@ -1485,10 +1493,10 @@ mutation with `runtime_not_installed` (or `agent_kind_unsupported` for a
 historical label), and resumes again once the runtime is installed. The
 exception is a session launched from the built-in runtime of an official alias
 this daemon does not compile in (the built-in Codex, Claude Code or Hermes of
-an earlier release): it is refused with `runtime/runtime_builtin_removed`, and
-installing the official
-package restores interaction with a live session only, never resume or fork
-(`runtime/runtime_served_by_package`).
+an earlier release): it is refused with `runtime/runtime_builtin_removed` while
+no package serves the alias. The official package then adopts the session and
+resume and fork run through it when the recovery contract is honored; otherwise
+they are refused with `runtime/runtime_served_by_package`.
 `session.stop` and `session.remove` (also
 `session.remove_accepting_unconfirmed`) are the exceptions: they only release
 what the session owns and need no runtime definition, so the owner can end the
@@ -2121,10 +2129,11 @@ live session whose worker journal names a release before 0.33.1, or no release,
 is `would_not_be_adopted` with code `worker_marker_legacy`. A live session that
 can resume or fork natively and whose launch pin names a runtime source the new
 binary does not serve (resolved as resume resolves it, against that binary's
-built-in runtimes and the installed packages: a built-in it does not ship, a
-built-in an official package serves in place of, or a package digest that is
-not installed) is `would_lose_recovery` with code `runtime_source_not_served`;
-its `detail` names the resume error and the migration to a new session. Every
+built-in runtimes and the installed packages: a built-in it does not ship, or a
+package digest that is not installed) is `would_lose_recovery` with code
+`runtime_source_not_served`; its `detail` names the resume error and the
+migration to a new session. A built-in pin that the official package serving its
+alias adopts is `adoptable` instead. Every
 live session, whether or not it can resume, is also judged with the mutation
 guard: one whose runtime resolves nowhere on the new binary (a built-in it does
 not compile in while no package serves the alias, `runtime_builtin_removed`, or
@@ -2903,9 +2912,10 @@ the recovery `pohunek plugin doctor` and then `pohunek plugin profile migrate
 <name>`; the install is not offered, because the same archive is refused.
 `runtime_builtin_removed` is emitted by resume, fork and mutation of a session
 launched from the built-in runtime of an official alias this daemon does not
-compile in while no package serves the alias; once the official package serves
-it, resume and fork answer `runtime_served_by_package` (fork of a Hermes session:
-`agent_fork_unsupported`). `runtime_incompatible` is emitted when a
+compile in while no package serves the alias. Once the official package serves
+it, the package adopts the session, and resume and fork answer
+`runtime_served_by_package` only when the recovery contract is not honored
+(fork of a Hermes session: `agent_fork_unsupported`). `runtime_incompatible` is emitted when a
 runtime package is installed but its root is missing, modified or contradicts
 the session's pin, for fresh launch, resume, fork and integration changes (the
 message names only the runtime id). `agent_profile_revision_stale` and `agent_profile_revision_invalid` are emitted only by the relay-selected launch

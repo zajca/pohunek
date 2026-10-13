@@ -357,11 +357,12 @@ impl RuntimeHost {
     ///
     /// Returns `agent_kind_unsupported` for a value that is not a runtime id,
     /// `runtime_served_by_package` for a built-in or unpinned snapshot of an
-    /// official alias a package serves, `runtime_builtin_removed` for a
-    /// built-in or unpinned snapshot of an official alias nothing serves,
-    /// `runtime_not_installed` for any other runtime or package that is not
-    /// installed or does not match the pin, and `runtime_incompatible` for a
-    /// pinned package whose root fails verification.
+    /// official alias a package serves that does not adopt it,
+    /// `runtime_builtin_removed` for a built-in or unpinned snapshot of an
+    /// official alias nothing serves, `runtime_not_installed` for any other
+    /// runtime or package that is not installed or does not match the pin, and
+    /// `runtime_incompatible` for a pinned package whose root fails
+    /// verification.
     pub fn resolve_pinned(
         &self,
         reference: &RuntimeRef,
@@ -481,13 +482,14 @@ impl RuntimeHost {
     ///
     /// It is the definition [`Self::resolve_pinned`] resumes the session from,
     /// so a session is observed only through the runtime source its pin
-    /// names. A package pin resolves from exactly its digest, verified again;
-    /// a built-in or unpinned snapshot resolves only to a built-in of the same
-    /// package identity the registry serves now. A pin this daemon does not
-    /// serve (a built-in it does not ship, a built-in an official package
-    /// replaced, or a package digest that is not installed) is an error, and
-    /// callers fall back to the launch-time facts the session persisted and
-    /// the generic shell manifest, never to whatever serves the runtime id now.
+    /// names. A package pin resolves from exactly its digest, verified again.
+    /// A built-in pin resolves to a built-in of the same package identity, or
+    /// to the official package of that identity that adopts it. A pin this
+    /// daemon does not serve (a built-in it does not ship, a built-in an
+    /// official package of another identity replaced, or a package digest
+    /// that is not installed) is an error, and callers fall back to the
+    /// launch-time facts the session persisted and the generic shell manifest,
+    /// never to whatever serves the runtime id now.
     ///
     /// # Errors
     ///
@@ -551,8 +553,8 @@ impl RuntimeHost {
     ///
     /// A session was launched from the built-in when its pin names it, or when
     /// it carries no pin, which only a built-in serves (see [`check_pin`]). A
-    /// package serving the alias is not a stand-in for the built-in, so the
-    /// refusal names the install and a new session.
+    /// package serving the alias is checked against the pin, so the refusal
+    /// only applies while nothing serves the alias.
     fn removed_builtin(&self, runtime_id: &RuntimeId, pin: &LaunchPin) -> Option<ProtocolError> {
         let built_in = match pin {
             LaunchPin::Unpinned => true,

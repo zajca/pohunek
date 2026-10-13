@@ -1040,10 +1040,12 @@ fn release_install_step(runtime: &str) -> String {
 
 /// The v0.33.0 fixture session as the record of a session of `runtime`; the
 /// fixture itself is a Claude session, so `claude` keeps the record unmodified.
+/// Codex and Hermes never forked, so their record is not forkable.
 fn built_in_session_line(runtime: &str) -> Value {
     let mut line = session_line("s-1", "w-fixture");
     if runtime != "claude" {
         rebind_agent(&mut line, runtime);
+        line["recovery"]["forkable"] = json!(false);
     }
     line
 }
@@ -1069,15 +1071,12 @@ fn built_in_pins(runtime: &str) -> [(&'static str, Option<Value>); 2] {
 }
 
 /// A session of `runtime` the v0.33.0 daemon launched from its built-in runtime
-/// loses its recovery on this binary, which ships no built-in `runtime`:
-/// without the official package the pin names a built-in that is gone, and
-/// with the package the package serves `runtime` in place of the built-in the
-/// session was launched from. Either way the migration is a new session.
-async fn assert_built_in_session_loses_recovery(runtime: &str) {
-    for (preinstalled, refusal) in [
-        (false, "runtime_builtin_removed"),
-        (true, "runtime_served_by_package"),
-    ] {
+/// is adopted by the official package of the same identity only when it is
+/// pinned to the built-in and the package honors the launch it froze. Without
+/// the package the pin names a built-in that is gone. An unpinned record is
+/// never adopted, so the package that serves the alias is no stand-in for it.
+async fn assert_built_in_session_is_adopted_only_when_pinned(runtime: &str) {
+    for preinstalled in [false, true] {
         for (pin, binding) in built_in_pins(runtime) {
             let case = format!("{runtime} {pin}, package installed: {preinstalled}");
             let host = Host::new();
@@ -1095,6 +1094,15 @@ async fn assert_built_in_session_loses_recovery(runtime: &str) {
 
             let report = host.report();
 
+            if preinstalled && pin == "pinned to the built-in" {
+                assert_eq!(
+                    verdict_of(&report, "s-1"),
+                    (&Verdict::Adoptable, CODE_ADOPTABLE),
+                    "{case}: {:?}",
+                    report.sessions
+                );
+                continue;
+            }
             assert_eq!(
                 verdict_of(&report, "s-1"),
                 (&Verdict::WouldLoseRecovery, CODE_RUNTIME_SOURCE_NOT_SERVED),
@@ -1107,6 +1115,11 @@ async fn assert_built_in_session_loses_recovery(runtime: &str) {
                 .find(|verdict| verdict.session_id == "s-1")
                 .expect("the verdict of s-1")
                 .detail;
+            let refusal = if preinstalled {
+                "runtime_served_by_package"
+            } else {
+                "runtime_builtin_removed"
+            };
             assert!(detail.contains(refusal), "{case}: {detail}");
             assert!(
                 detail.contains(&format!("`pohunek session new --agent {runtime}`")),
@@ -1123,35 +1136,73 @@ async fn assert_built_in_session_loses_recovery(runtime: &str) {
     }
 }
 
-/// A Codex session the v0.33.0 daemon launched from its built-in runtime loses
-/// its recovery on this binary, which ships no Codex.
+/// A Claude session the v0.33.0 daemon launched from its built-in runtime is
+/// adopted by the installed official package only when the package honors the
+/// reference kind the session froze; a path-kind reference is refused.
 #[tokio::test]
-async fn a_session_of_the_built_in_codex_loses_recovery_with_or_without_the_official_package() {
-    assert_built_in_session_loses_recovery("codex").await;
+async fn a_built_in_claude_session_whose_frozen_reference_kind_the_package_does_not_honor_loses_recovery(
+) {
+    let host = Host::new();
+    official_runtimes::OfficialCatalog::new()
+        .preinstall(&host.inputs().plugins_dir, host.env.root())
+        .await;
+    let mut line = built_in_session_line("claude");
+    let (_pin, binding) = built_in_pins("claude")
+        .into_iter()
+        .find(|(pin, _)| *pin == "pinned to the built-in")
+        .expect("the pinned record");
+    pin_recovery(&mut line, binding.expect("the pin"));
+    line["recovery"]["ref_kind"] = json!("path");
+    host.write_store(&[line]);
+    host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
+
+    let report = host.report();
+
+    assert_eq!(
+        verdict_of(&report, "s-1"),
+        (&Verdict::WouldLoseRecovery, CODE_RUNTIME_SOURCE_NOT_SERVED),
+        "{:?}",
+        report.sessions
+    );
+    let detail = &report.sessions[0].detail;
+    assert!(detail.contains("runtime_served_by_package"), "{detail}");
+    assert!(
+        detail.contains("`pohunek session new --agent claude`"),
+        "{detail}"
+    );
 }
 
-/// The unmodified Claude session record the v0.33.0 daemon wrote loses its
-/// recovery on this binary, which ships no Claude.
+/// The Codex session record the v0.33.0 daemon wrote is adopted by the
+/// installed official package only when pinned to the built-in.
 #[tokio::test]
-async fn a_session_of_the_built_in_claude_loses_recovery_with_or_without_the_official_package() {
-    assert_built_in_session_loses_recovery("claude").await;
+async fn a_session_of_the_built_in_codex_is_adopted_only_when_pinned_and_the_package_is_installed()
+{
+    assert_built_in_session_is_adopted_only_when_pinned("codex").await;
 }
 
-/// A Hermes session the v0.33.0 daemon launched from its built-in runtime
-/// loses its recovery on this binary, which ships no Hermes.
+/// The unmodified Claude session record the v0.33.0 daemon wrote is adopted by
+/// the installed official package only when pinned to the built-in.
 #[tokio::test]
-async fn a_session_of_the_built_in_hermes_loses_recovery_with_or_without_the_official_package() {
-    assert_built_in_session_loses_recovery("hermes").await;
+async fn a_session_of_the_built_in_claude_is_adopted_only_when_pinned_and_the_package_is_installed()
+{
+    assert_built_in_session_is_adopted_only_when_pinned("claude").await;
+}
+
+/// The Hermes session record the v0.33.0 daemon wrote is adopted by the
+/// installed official package only when pinned to the built-in.
+#[tokio::test]
+async fn a_session_of_the_built_in_hermes_is_adopted_only_when_pinned_and_the_package_is_installed()
+{
+    assert_built_in_session_is_adopted_only_when_pinned("hermes").await;
 }
 
 /// A live session of `runtime` the v0.33.0 daemon launched from its built-in
 /// runtime that cannot resume or fork (a host profile with `[resume]
 /// resumable = false`) still depends on the runtime source: this binary ships
 /// no built-in `runtime`, so without the official package every interaction
-/// with the adopted session is refused, and installing the package restores
-/// interaction only, never resume or fork. The preflight reports that loss
-/// instead of `adoptable`; with the package installed the session has nothing
-/// left to lose.
+/// with the adopted session is refused. The preflight reports that loss
+/// instead of `adoptable`. With the package installed the session is adopted
+/// and has no resume or fork to lose.
 async fn assert_non_resumable_built_in_session_is_at_risk_only_without_the_package(runtime: &str) {
     let recoveries = built_in_pins(runtime)
         .into_iter()
@@ -1213,14 +1264,10 @@ async fn assert_non_resumable_built_in_session_is_at_risk_only_without_the_packa
                 detail.contains(&release_install_step(runtime)),
                 "{case}: {detail}"
             );
-            // The install restores interaction only: resume and fork are
-            // never tied to it.
+            // The install restores interaction; resume and fork follow only
+            // when the package honors the frozen launch.
             assert!(
-                detail.contains("resume and fork stay refused even after that install"),
-                "{case}: {detail}"
-            );
-            assert!(
-                !detail.contains("resume and fork are refused until"),
+                detail.contains("resume and fork run through it when it honors the launch"),
                 "{case}: {detail}"
             );
         }

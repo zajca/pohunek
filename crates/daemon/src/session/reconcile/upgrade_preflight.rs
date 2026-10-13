@@ -44,6 +44,7 @@ use super::{
 use crate::agent::host::{BuiltinSource, PackageSource, PackageStore, RuntimeHost};
 use crate::procwatch::ProcessInspector;
 use crate::runtime::lifecycle::IDENTITY_MISMATCH;
+use crate::session::resume::{recovery_contract, recovery_definition};
 use crate::session::{runtime_hook_schema, HookSchemaLookup};
 use crate::session::{DesiredState, Generation, SessionRecord};
 use crate::store::{
@@ -811,23 +812,22 @@ fn judge_runtime_source(candidate: &SessionRecord, runtimes: &RuntimeHost) -> Op
     let error = runtimes.ensure_session_runtime(agent_base, &pin).err()?;
     let runtime = agent_base.as_wire();
     let outcome = match agent_base.launchable() {
-        // The package that serves the alias then is no stand-in for the
-        // built-in the session was launched from (`check_pin`).
+        // Nothing serves the alias, so only the official package of the built-in's
+        // package identity can serve the session (`launch::adopts`).
         Ok(runtime_id) if error.code == "runtime_builtin_removed" => format!(
             "every interaction with the session (input, attach, resize, rename, metadata) is \
-             refused until you {}, and resume and fork stay refused even after that install \
-             (`runtime_served_by_package`), because a session cannot be rebound to another \
-             runtime source; install the package with the running release before the upgrade \
-             to keep the session usable, finish the work in it, and continue in a new session \
-             started with `pohunek session new --agent {runtime}`",
+             refused until you {}; the official package then adopts the session, and resume \
+             and fork run through it when it honors the launch the session froze (otherwise \
+             they answer `runtime_served_by_package` and the work continues in a new session \
+             started with `pohunek session new --agent {runtime}`)",
             protocol::official_package_install_step(runtime_id)
         ),
         _ => format!(
             "every interaction with the session (input, attach, resize, rename, metadata) and \
              resume and fork are refused until the runtime it was launched from is installed \
-             and enabled again; a session cannot be rebound to another runtime source, so \
-             otherwise continue in a new session started with `pohunek session new --agent \
-             {runtime}` once this daemon serves that runtime"
+             and enabled again; otherwise the session cannot be resumed through another \
+             runtime source, so continue in a new session started with `pohunek session new \
+             --agent {runtime}` once this daemon serves that runtime"
         ),
     };
     Some((
@@ -845,29 +845,34 @@ fn judge_runtime_source(candidate: &SessionRecord, runtimes: &RuntimeHost) -> Op
 /// The session's launch pin must name a runtime source the new daemon serves:
 /// resume and fork resolve exactly that source, and nothing else stands in.
 ///
-/// The pin is resolved as resume resolves it, against the built-in runtimes
-/// of this binary and the packages installed now, so a built-in an official
-/// package serves in place of and a package digest that is not installed each
-/// lose the session's recovery. A session without native resume or fork has
-/// no recovery to lose. A runtime source no interaction is served from is
-/// judged first, by [`judge_runtime_source`].
+/// The pin is resolved as resume resolves it ([`recovery_definition`]), against
+/// the built-in runtimes of this binary and the packages installed now, so a
+/// package digest that is not installed and a package that does not honor the
+/// frozen launch each lose the session's recovery, and a fork the package
+/// does not honor is judged the same way ([`recovery_contract`]). A session
+/// without native resume or fork has no recovery to lose. A runtime source no
+/// interaction is served from is judged first, by [`judge_runtime_source`].
 fn judge_pin(candidate: &SessionRecord, runtimes: &RuntimeHost) -> Option<Judgement> {
     let binding = candidate.recovery.as_ref()?;
     let capabilities = &candidate.info.capabilities;
     if !capabilities.resume && !capabilities.fork {
         return None;
     }
-    let error = runtimes
-        .resolve_pinned(&binding.agent_base, &binding.launch_binding)
-        .err()?;
+    let error = match recovery_definition(runtimes, binding) {
+        Err(error) => error,
+        Ok(definition) if capabilities.fork => {
+            recovery_contract(binding, &definition, true).err()?
+        }
+        Ok(_) => return None,
+    };
     let runtime = binding.agent_base.as_wire();
     Some((
         Verdict::WouldLoseRecovery,
         CODE_RUNTIME_SOURCE_NOT_SERVED,
         format!(
             "the session was launched from a runtime source this daemon does not serve ({}: \
-             {}), so the worker is adopted but resume and fork are refused; a session cannot \
-             be rebound to another runtime source, so finish the work in the live session and \
+             {}), so the worker is adopted but its recovery is refused; a session cannot \
+             be resumed through another runtime source, so finish the work in the live session and \
              continue in a new session started with `pohunek session new --agent {runtime}` \
              while this daemon serves that runtime, or upgrade with --accept-runtime-loss",
             error.code, error.msg

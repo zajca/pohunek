@@ -221,11 +221,15 @@ impl ProtocolError {
 
     /// The canonical `runtime/runtime_served_by_package` error.
     ///
-    /// The session was launched from the built-in runtime of `runtime`, which
-    /// an official runtime package serves now. Nothing is launched and the
-    /// stored session keeps its binding: no other provenance stands in for
-    /// the one it was launched from, and no operation rebinds a session to
-    /// another runtime source. The recovery hint names the one migration: a
+    /// The session was launched from the built-in runtime of `runtime`, and an
+    /// official runtime package serves that runtime, but the session cannot be
+    /// adopted by it. Either the session record names no package (an unpinned
+    /// record of an earlier release), or the package does not honor the
+    /// session's recovery binding (its native reference kind, a hook-reported
+    /// reference, or fork support for a fork). Nothing is launched by this
+    /// refusal and the stored session keeps its binding; a relaunch under a
+    /// package that adopts the session re-pins it to that package only when
+    /// the relaunch succeeds. The recovery hint names the one migration: a
     /// new session of the runtime, which the package serves. The identity is
     /// a validated [`RuntimeId`], so echoing it is safe.
     #[must_use]
@@ -234,10 +238,10 @@ impl ProtocolError {
             ErrorClass::Runtime,
             "runtime_served_by_package",
             format!(
-                "runtime `{runtime}` is served by an official package now, but the session was launched from the built-in runtime"
+                "runtime `{runtime}` is served by an official package, but the package does not honor the recovery binding of the session, which was launched from the built-in runtime"
             ),
             Some(format!(
-                "start a new session with `pohunek session new --agent {runtime}`, which the official package serves; a session cannot be rebound to another runtime source"
+                "start a new session with `pohunek session new --agent {runtime}`, which the official package serves; this session cannot be adopted by the package"
             )),
         )
     }
@@ -247,11 +251,11 @@ impl ProtocolError {
     /// The session was launched from the built-in runtime of the official
     /// alias `runtime`, which this daemon does not compile in, and no package
     /// serves the alias. Nothing is launched and the stored session keeps its
-    /// binding. Installing the official package does not make the session
-    /// resumable: a session is never rebound to another runtime source, and
-    /// the package then answers resume and fork with
-    /// [`Self::runtime_served_by_package`]. The recovery hint therefore names
-    /// the install and a new session. The identity is a validated
+    /// binding. Installing the official package adopts the session: the
+    /// package then serves its input and, when it honors the session's
+    /// recovery binding, its resume and fork. Otherwise the package answers
+    /// with [`Self::runtime_served_by_package`]. The recovery hint names the
+    /// install and the new-session fallback. The identity is a validated
     /// [`RuntimeId`], so echoing it is safe.
     #[must_use]
     pub fn runtime_builtin_removed(runtime: &RuntimeId) -> Self {
@@ -262,7 +266,7 @@ impl ProtocolError {
                 "runtime `{runtime}` is not built into this daemon, and the session was launched from that built-in runtime"
             ),
             Some(format!(
-                "{}; a live session accepts input again once the package serves `{runtime}`, but a session cannot be rebound to another runtime source, so continue the work in a new session with `pohunek session new --agent {runtime}`",
+                "{}; once the package serves `{runtime}`, the session is adopted by it and resumes through it, and a live session accepts input again; if the package cannot honor the session's recovery binding, continue the work in a new session with `pohunek session new --agent {runtime}`",
                 official_package_install_step(runtime)
             )),
         )

@@ -301,6 +301,21 @@ fn official_entries(official: &OfficialPackage) -> [package::ArchiveEntry; 2] {
     ]
 }
 
+/// The archive entries of the official package of `runtime` as
+/// [`OfficialFixtureSource`] serves it: the package's own descriptor and
+/// detection manifest, with the version probe dropped for Codex and Claude.
+///
+/// # Panics
+///
+/// Panics when `runtime` is not `codex`, `claude` or `hermes`.
+pub(crate) fn official_package_entries(runtime: &str) -> [package::ArchiveEntry; 2] {
+    let official = OFFICIAL_PACKAGES
+        .iter()
+        .find(|official| official.runtime == runtime)
+        .unwrap_or_else(|| panic!("{runtime} is not an official fixture runtime"));
+    official_entries(official)
+}
+
 /// Parses `official` with its version probe dropped unless the fixture keeps
 /// it.
 ///
