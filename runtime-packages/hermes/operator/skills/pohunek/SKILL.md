@@ -31,10 +31,10 @@ or worktree.
 build it, attest it on Linux x86_64 (glibc and musl), and ship it with the
 signed catalog entry that authorizes the reserved `hermes` runtime id in the
 Linux daemon archives; the macOS daemon archive carries no runtime packages.
-The package preserves the built-in launch and detection contract and supports
-only the locked 0.20.0 release. Its `operator.toml` closes the allowlist for
-the operator payload in `operator/`; the CLI verifies its paths and digests
-before installation. Pohunek loads the operator plugin and its generated skill
+The package carries the Hermes launch, resume and detection contract
+(`runtime.toml`, `detect.toml`) and supports only the locked 0.20.0 release.
+Its `operator.toml` closes the allowlist for the operator payload in
+`operator/`; the CLI verifies its paths and digests before installation. Pohunek loads the operator plugin and its generated skill
 only from the installed, enabled, and selected official package; the CLI
 carries no copy of them. The generic hook reporter is exclusively core-owned:
 the CLI compiles it in and installs it beside the package's operator payload.
