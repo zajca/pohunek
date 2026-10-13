@@ -218,29 +218,7 @@ impl Fixture {
     /// Seals `tree` as `<name>` into the inputs with the real packaging
     /// scripts and writes its checksum file.
     fn seal(&self, parent: &Path, name: &str, component: &str, target: &str) {
-        let (signing, minimum): (&str, Option<&str>) = if target == MAC {
-            ("adhoc", Some(MINIMUM_MACOS))
-        } else {
-            ("none", None)
-        };
-        let tree = parent.join(name);
-        let mut arguments: Vec<&OsStr> = vec![
-            tree.as_os_str(),
-            OsStr::new(component),
-            OsStr::new(VERSION),
-            OsStr::new(target),
-            OsStr::new(signing),
-        ];
-        arguments.extend(minimum.map(OsStr::new));
-        script("write-manifest", &arguments);
-        script(
-            "archive",
-            &[
-                parent.as_os_str(),
-                OsStr::new(name),
-                self.inputs().as_os_str(),
-            ],
-        );
+        seal_into(parent, name, component, target, &self.inputs());
     }
 
     fn write_daemon(&self, daemon: &Daemon<'_>) {
@@ -417,6 +395,30 @@ impl Fixture {
     }
 }
 
+/// Seals `<parent>/<name>` as `<out>/<name>.tar.gz` with the real packaging
+/// scripts and writes its checksum file next to it.
+fn seal_into(parent: &Path, name: &str, component: &str, target: &str, out: &Path) {
+    let (signing, minimum): (&str, Option<&str>) = if target == MAC {
+        ("adhoc", Some(MINIMUM_MACOS))
+    } else {
+        ("none", None)
+    };
+    let tree = parent.join(name);
+    let mut arguments: Vec<&OsStr> = vec![
+        tree.as_os_str(),
+        OsStr::new(component),
+        OsStr::new(VERSION),
+        OsStr::new(target),
+        OsStr::new(signing),
+    ];
+    arguments.extend(minimum.map(OsStr::new));
+    script("write-manifest", &arguments);
+    script(
+        "archive",
+        &[parent.as_os_str(), OsStr::new(name), out.as_os_str()],
+    );
+}
+
 fn names_in(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(dir)
         .expect("list")
@@ -539,15 +541,7 @@ fn a_complete_set_assembles_a_verifiable_reproducible_bundle() {
         "sha256sum -c rejected the inventory"
     );
 
-    crate::run([
-        "release".to_owned(),
-        "verify-inventory".into(),
-        "--dir".into(),
-        first.display().to_string(),
-        "--now".into(),
-        COMMIT_TIME.to_string(),
-    ])
-    .expect("verify-inventory");
+    verify_inventory(&fixture, &first).expect("verify-inventory");
 
     let verified = crate::catalog::verify(
         &first.join("runtime-catalog.json"),
@@ -910,12 +904,22 @@ fn assembled() -> (Fixture, PathBuf) {
     (fixture, bundle)
 }
 
-fn verify_inventory(bundle: &Path) -> Result<(), XtaskError> {
+/// Runs `release verify-inventory` on `bundle` with the fixture's anchor
+/// pinned.
+fn verify_inventory(fixture: &Fixture, bundle: &Path) -> Result<(), XtaskError> {
+    verify_inventory_with(bundle, &fixture.path("anchor.json"))
+}
+
+/// Runs `release verify-inventory` on `bundle` with the anchor file `anchor`
+/// pinned.
+fn verify_inventory_with(bundle: &Path, anchor: &Path) -> Result<(), XtaskError> {
     crate::run([
         "release".to_owned(),
         "verify-inventory".into(),
         "--dir".into(),
         bundle.display().to_string(),
+        "--anchor".into(),
+        anchor.display().to_string(),
         "--now".into(),
         COMMIT_TIME.to_string(),
     ])
@@ -937,32 +941,32 @@ fn expect_inventory_refusal(result: Result<(), XtaskError>, class: InputClass, f
 
 #[test]
 fn the_inventory_check_refuses_a_changed_a_missing_and_an_extra_file() {
-    let (_fixture, bundle) = assembled();
+    let (fixture, bundle) = assembled();
     let sdk = bundle.join(format!("pohunek-ts-sdk-{VERSION}.tgz"));
     let original = fs::read(&sdk).expect("read");
     fs::write(&sdk, b"changed").expect("write");
     expect_inventory_refusal(
-        verify_inventory(&bundle),
+        verify_inventory(&fixture, &bundle),
         InputClass::Inventory,
         Fault::ChecksumMismatch,
     );
     fs::remove_file(&sdk).expect("rm");
     expect_inventory_refusal(
-        verify_inventory(&bundle),
+        verify_inventory(&fixture, &bundle),
         InputClass::Inventory,
         Fault::Missing,
     );
     fs::write(&sdk, original).expect("restore");
     fs::write(bundle.join("stray.txt"), "x").expect("write");
     expect_inventory_refusal(
-        verify_inventory(&bundle),
+        verify_inventory(&fixture, &bundle),
         InputClass::Inventory,
         Fault::Unexpected,
     );
     fs::remove_file(bundle.join("stray.txt")).expect("rm");
     fs::create_dir(bundle.join("subdir")).expect("mkdir");
     expect_inventory_refusal(
-        verify_inventory(&bundle),
+        verify_inventory(&fixture, &bundle),
         InputClass::Inventory,
         Fault::NotRegularFile,
     );
@@ -970,7 +974,7 @@ fn the_inventory_check_refuses_a_changed_a_missing_and_an_extra_file() {
 
 #[test]
 fn the_inventory_check_refuses_a_catalog_the_archives_do_not_carry() {
-    let (_fixture, bundle) = assembled();
+    let (fixture, bundle) = assembled();
     // A re-sealed inventory does not make a replaced catalog acceptable.
     let catalog = bundle.join("runtime-catalog.json");
     let mut bytes = fs::read(&catalog).expect("read");
@@ -978,14 +982,14 @@ fn the_inventory_check_refuses_a_catalog_the_archives_do_not_carry() {
     fs::write(&catalog, bytes).expect("write");
     crate::release_inventory::write_inventory(&bundle).expect("reseal");
     assert!(
-        verify_inventory(&bundle).is_err(),
+        verify_inventory(&fixture, &bundle).is_err(),
         "a catalog the archives do not carry was accepted"
     );
 }
 
 #[test]
 fn the_inventory_check_refuses_a_package_that_differs_from_the_catalog() {
-    let (_fixture, bundle) = assembled();
+    let (fixture, bundle) = assembled();
     let runtime = &runtimes()[0];
     let package = bundle.join(format!("pohunek-runtime-{runtime}-{VERSION}.tar.zst"));
     let other = &runtimes()[1];
@@ -996,7 +1000,7 @@ fn the_inventory_check_refuses_a_package_that_differs_from_the_catalog() {
     .expect("swap");
     crate::release_inventory::write_inventory(&bundle).expect("reseal");
     expect_inventory_refusal(
-        verify_inventory(&bundle),
+        verify_inventory(&fixture, &bundle),
         InputClass::PackageArchive,
         Fault::Mismatch,
     );
@@ -1004,7 +1008,7 @@ fn the_inventory_check_refuses_a_package_that_differs_from_the_catalog() {
 
 #[test]
 fn the_inventory_check_refuses_a_package_by_digest_before_decoding_it() {
-    let (_fixture, bundle) = assembled();
+    let (fixture, bundle) = assembled();
     let runtime = &runtimes()[0];
     let package = bundle.join(format!("pohunek-runtime-{runtime}-{VERSION}.tar.zst"));
     // Bytes the archive reader refuses as soon as it decodes them: had the
@@ -1019,9 +1023,101 @@ fn the_inventory_check_refuses_a_package_by_digest_before_decoding_it() {
     fs::write(&package, tampered).expect("tamper");
     crate::release_inventory::write_inventory(&bundle).expect("reseal");
     expect_inventory_refusal(
-        verify_inventory(&bundle),
+        verify_inventory(&fixture, &bundle),
         InputClass::PackageArchive,
         Fault::Mismatch,
+    );
+}
+
+/// Rewrites the assembled `bundle` into one an attacker publishes: every
+/// daemon archive ships an anchor of the stranger key and a catalog that key
+/// signed, whose first entry names the digest of `payload`, and that entry's
+/// package file holds `payload`. The bundle is internally consistent, so only
+/// a check against an anchor from outside the bundle can refuse it.
+fn forge_bundle(fixture: &Fixture, bundle: &Path, payload: &[u8]) {
+    let anchor_path = fixture.path("stranger-anchor.json");
+    anchor_to(
+        &[RootSpec::new(
+            &fixture.path("keys/stranger.pub"),
+            ROOT_WINDOW.0,
+            ROOT_WINDOW.1,
+        )],
+        &[],
+        &anchor_path,
+    )
+    .expect("stranger anchor");
+    let anchor = fs::read(&anchor_path).expect("read anchor");
+
+    let document: serde_json::Value = serde_json::from_slice(
+        &fs::read(bundle.join("runtime-catalog.json")).expect("read catalog"),
+    )
+    .expect("catalog json");
+    let mut body = document["catalog"].clone();
+    let entry = &mut body["entries"][0];
+    let runtime = entry["runtime_id"].as_str().expect("runtime id").to_owned();
+    entry["digest"] = format!("sha256:{}", sha256_bytes(payload)).into();
+    let unsigned = fixture.path("forged-unsigned.json");
+    fs::write(&unsigned, serde_json::to_vec_pretty(&body).expect("body")).expect("write");
+    let signed = fixture.path("forged-catalog.json");
+    crate::run([
+        "catalog".to_owned(),
+        "sign".into(),
+        "--catalog".into(),
+        unsigned.display().to_string(),
+        "--key-file".into(),
+        fixture.path("keys/stranger.key").display().to_string(),
+        "--key-id".into(),
+        Fixture::key_id(STRANGER_SEED),
+        "--output".into(),
+        signed.display().to_string(),
+    ])
+    .expect("sign forged catalog");
+    let catalog = fs::read(&signed).expect("read forged catalog");
+    fs::write(bundle.join("runtime-catalog.json"), &catalog).expect("write catalog");
+    fs::write(
+        bundle.join(format!("pohunek-runtime-{runtime}-{VERSION}.tar.zst")),
+        payload,
+    )
+    .expect("write payload");
+
+    for target in [GNU, MUSL, MAC] {
+        let name = format!("pohunek-daemon-{VERSION}-{target}");
+        let scratch = fixture.path("forged").join(target);
+        let top = extract(&bundle.join(format!("{name}.tar.gz")), &scratch);
+        fs::write(top.join("runtime-catalog-anchor.json"), &anchor).expect("anchor");
+        fs::write(top.join("runtime").join("runtime-catalog.json"), &catalog).expect("catalog");
+        fs::remove_file(top.join("MANIFEST")).expect("rm manifest");
+        seal_into(&scratch, &name, "daemon", target, bundle);
+    }
+    crate::release_inventory::write_inventory(bundle).expect("reseal");
+}
+
+#[test]
+fn the_inventory_check_refuses_a_bundle_that_ships_another_anchor_before_decoding() {
+    let (fixture, bundle) = assembled();
+    // Bytes the archive reader refuses as soon as it decodes them: had the
+    // check decoded the package, the refusal would be this decoder error.
+    let payload = b"not a zstd frame".as_slice();
+    match package::read_archive(payload, &package::Limits::DEFAULT) {
+        Err(package::ArchiveError::DigestMismatch) | Ok(_) => {
+            panic!("the payload must fail to decode")
+        }
+        Err(_decode) => {}
+    }
+    forge_bundle(&fixture, &bundle, payload);
+    expect_inventory_refusal(
+        verify_inventory(&fixture, &bundle),
+        InputClass::Anchor,
+        Fault::Mismatch,
+    );
+    // The forgery is consistent under its own anchor: pinned to that anchor,
+    // the signed catalog authorizes the payload and the reader decodes it.
+    assert!(
+        matches!(
+            verify_inventory_with(&bundle, &fixture.path("stranger-anchor.json")),
+            Err(XtaskError::Package(package::ArchiveError::ZstdHeader))
+        ),
+        "the forged bundle is not consistent under the stranger anchor"
     );
 }
 

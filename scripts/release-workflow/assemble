@@ -19,7 +19,8 @@
 #            (scripts/release-workflow/rehearsal-trust) against the throwaway
 #            anchor the rehearsal archives were staged with; no secret exists.
 #
-# After assembling, the bundle is re-checked with `release verify-inventory`.
+# After assembling, the bundle is re-checked with `release verify-inventory`
+# against the same anchor.
 
 set -eu
 
@@ -106,4 +107,4 @@ esac
     --key-file "$key_file" \
     --key-id "$key_id" \
     --output "$output"
-"$XTASK" release verify-inventory --dir "$output"
+"$XTASK" release verify-inventory --dir "$output" --anchor "$anchor"

@@ -3,8 +3,10 @@
 //! `release-inventory.sha256` lists every file of a release bundle except
 //! itself in `sha256sum -c` format, sorted by name. It is the exact list the
 //! publisher uploads and verifies. [`verify_bundle`] recomputes it against the
-//! directory and cross-checks the signed catalog against the bytes of the
-//! daemon archives, the package archives and the attestations in the bundle.
+//! directory, requires every daemon archive to ship the owner-pinned trust
+//! anchor, and cross-checks the catalog signed under that anchor against the
+//! bytes of the daemon archives, the package archives and the attestations in
+//! the bundle.
 
 // Rust guideline compliant 2026-10-13
 
@@ -137,15 +139,22 @@ pub(crate) struct BundleSummary {
     pub(crate) daemon_archives: usize,
 }
 
-/// Verifies the release bundle in `dir` at time `now`.
+/// Verifies the release bundle in `dir` against the trust anchor file bytes
+/// `anchor` at time `now`.
 ///
 /// The inventory must list exactly the directory's regular files, each with
-/// its digest. The top-level catalog must verify against the trust anchor
-/// inside every daemon archive, and each daemon archive must carry that
-/// catalog, the binary set the catalog names for its target, and exactly the
-/// package archives and attestations the catalog lists for that target, byte
-/// for byte equal to the bundle's top-level files.
-pub(crate) fn verify_bundle(dir: &Path, now: u64) -> Result<BundleSummary, XtaskError> {
+/// its digest. Every daemon archive must ship exactly `anchor`; the bundle is
+/// self-describing, so an anchor read only from inside it would let whoever
+/// built the bundle choose the key its catalog is checked against. The
+/// top-level catalog must verify against `anchor`, and each daemon archive
+/// must carry that catalog, the binary set the catalog names for its target,
+/// and exactly the package archives and attestations the catalog lists for
+/// that target, byte for byte equal to the bundle's top-level files.
+pub(crate) fn verify_bundle(
+    dir: &Path,
+    anchor: &[u8],
+    now: u64,
+) -> Result<BundleSummary, XtaskError> {
     let listed = read_inventory(dir)?;
     let present: BTreeSet<String> = list_files(dir)?
         .into_iter()
@@ -194,7 +203,7 @@ pub(crate) fn verify_bundle(dir: &Path, now: u64) -> Result<BundleSummary, Xtask
         .tempdir_in(scratch_parent.unwrap_or_else(|| Path::new(".")))
         .map_err(io_error(dir))?;
     for archive in &daemons {
-        check_daemon_archive(dir, archive, &catalog, scratch.path(), now)?;
+        check_daemon_archive(dir, archive, anchor, &catalog, scratch.path(), now)?;
     }
     Ok(BundleSummary {
         files: listed.len(),
@@ -202,10 +211,12 @@ pub(crate) fn verify_bundle(dir: &Path, now: u64) -> Result<BundleSummary, Xtask
     })
 }
 
-/// Cross-checks one daemon archive of the bundle against the bundle's catalog.
+/// Cross-checks one daemon archive of the bundle against the pinned `anchor`
+/// and the bundle's catalog.
 fn check_daemon_archive(
     dir: &Path,
     archive: &str,
+    anchor: &[u8],
     catalog: &[u8],
     scratch: &Path,
     now: u64,
@@ -225,11 +236,15 @@ fn check_daemon_archive(
         return Err(refuse(InputClass::Manifest, Fault::Mismatch, archive));
     }
 
-    let anchor = read_input(
+    let shipped = read_input(
         &top.join(ANCHOR_FILE),
         u64::try_from(package::MAX_ANCHOR_BYTES).unwrap_or(u64::MAX),
-    )?;
-    let verified = verify_bytes(catalog, &anchor, None, now)?;
+    )
+    .map_err(|_cause| refuse(InputClass::Anchor, Fault::Missing, archive))?;
+    if shipped != anchor {
+        return Err(refuse(InputClass::Anchor, Fault::Mismatch, archive));
+    }
+    let verified = verify_bytes(catalog, anchor, None, now)?;
     let bundled = top.join(BUNDLE_DIR).join(CATALOG_FILE);
     let bundled_catalog = read_input(
         &bundled,
@@ -268,7 +283,8 @@ fn check_daemon_archive(
             max_package_bytes(),
         )
         .map_err(|_cause| refuse(InputClass::PackageArchive, Fault::Missing, runtime))?;
-        // The signed digest authorizes the raw bytes before the decoder sees
+        // The catalog verified against the owner-pinned anchor authorizes
+        // this digest, and the raw bytes must match it before the decoder sees
         // them: a bundle may be one the developer downloaded.
         read_archive_with_digest(&package_bytes, entry.digest(), &Limits::DEFAULT).map_err(
             |error| match error {

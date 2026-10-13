@@ -530,7 +530,8 @@ enum TopCommand {
     /// `assemble` recomputes every digest from the producer artifacts and
     /// writes the signed catalog, the final daemon archives and the
     /// inventory only when everything verified; `verify-inventory` checks a
-    /// bundle directory against its inventory and catalog. A signing key is
+    /// bundle directory against its inventory, the trust anchor named by
+    /// `--anchor` and the catalog signed under it. A signing key is
     /// read only from the file named by `--key-file`.
     Release {
         #[command(subcommand)]

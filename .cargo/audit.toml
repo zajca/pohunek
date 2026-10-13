@@ -20,8 +20,10 @@ ignore = [
     # owner reach the decoder; `plugin link` decodes only the frame the pinned
     # encoder just produced from the owner's directory. The xtask readers are
     # build and release tools that never run inside the daemon. `release
-    # verify-inventory` authorizes each package archive against its signed
-    # catalog digest before decoding. The readers that take an operator-named
+    # verify-inventory` requires every daemon archive to ship the anchor the
+    # operator pins with `--anchor`, verifies the catalog under it, and
+    # decodes a package archive only after its raw digest equals that
+    # catalog's entry. The readers that take an operator-named
     # archive to compute its digest (`compat attest`/`verify`, `catalog
     # build`, `release assemble`, the Hermes package host) have no
     # trusted digest before they decode and are meant for archives the
