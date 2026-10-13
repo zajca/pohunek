@@ -154,7 +154,7 @@ async fn start_agent_session(harness: &Harness) -> (String, PathBuf) {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("private directory");
     }
     let interpreter = agent_dir.join(AGENT_INTERPRETER);
-    fs::copy(
+    pohunek_test_support::fs::copy_shell_image(
         fs::canonicalize("/bin/sh").expect("resolve the shell"),
         &interpreter,
     )

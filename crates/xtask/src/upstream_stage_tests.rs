@@ -1629,7 +1629,7 @@ impl Provisioned {
             "env | sed 's/=.*//' | sort > \"$(dirname \"$0\")/../../log/env-names\"\n",
             "root=$1\n[ ! -e \"$root\" ] || exit 4\nmkdir -m 0700 \"$root\"\n",
             "mkdir -p \"$root/venv/bin\" \"$root/venv/lib/site\"\n",
-            "cp /bin/sh \"$root/venv/bin/python\"\n",
+            &copy_shell("$root/venv/bin/python"),
             "{ printf '%s\\n' \"",
             shebang,
             "\"; cat <<'ENTRY'\n",
@@ -1668,6 +1668,20 @@ impl Provisioned {
             .unwrap_or_default();
         assert!(left.is_empty(), "{context}: left {left:?}");
     }
+}
+
+/// Provisioner commands that copy the host shell to `destination` (a shell
+/// word) as a launchable interpreter image.
+///
+/// macOS 27 kills a copy of a platform binary on launch. The copy is probed by
+/// running it, and only a copy that fails the probe is re-signed ad hoc, the
+/// signature every non-platform executable on macOS carries; the provisioner
+/// fails when `codesign` cannot help, and a host whose copy runs never calls it.
+fn copy_shell(destination: &str) -> String {
+    format!(
+        "cp /bin/sh \"{destination}\"\n\
+         \"{destination}\" -c : 2>/dev/null || codesign --force --sign - \"{destination}\"\n"
+    )
 }
 
 /// Tools of a provisioned stage: no npm, the fixture's tool search path.
@@ -1851,7 +1865,7 @@ fn an_entrypoint_naming_the_venv_python3_stages_and_verifies() {
     fixture.write_provisioner(
         "#!$root/venv/bin/python3",
         ENTRY_BODY,
-        "cp /bin/sh \"$root/venv/bin/python3\"",
+        &copy_shell("$root/venv/bin/python3"),
     );
     let summary = fixture.run_stage().expect("stage the python3 entrypoint");
     let entry = fs::read_to_string(fixture.stage().join("venv/bin/fakepy")).expect("entrypoint");
@@ -1886,7 +1900,7 @@ fn a_stage_reached_through_a_symlinked_parent_verifies() {
 #[test]
 fn an_entrypoint_naming_another_recorded_python_is_refused() {
     let fixture = Provisioned::new();
-    fixture.write_provisioner("", ENTRY_BODY, "cp /bin/sh \"$root/venv/bin/python3.12\"");
+    fixture.write_provisioner("", ENTRY_BODY, &copy_shell("$root/venv/bin/python3.12"));
     let stage = fixture.staged();
     let other = fs::canonicalize(stage.join("venv/bin/python3.12")).expect("python3.12");
     write_executable(
@@ -1978,7 +1992,7 @@ fn a_failed_provisioned_stage_leaves_nothing() {
                 f.write_provisioner(
                     "#!$root/venv/bin/python3.12",
                     ENTRY_BODY,
-                    "cp /bin/sh \"$root/venv/bin/python3.12\"",
+                    &copy_shell("$root/venv/bin/python3.12"),
                 );
             },
             "bin/fakepy",

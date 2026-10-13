@@ -84,63 +84,6 @@ default = ".codex"
     RuntimeHost::new(RuntimeRegistry::from_sources(&[&builtin, &official]).expect("runtime host"))
 }
 
-/// Installs a private copy of the `source` Bash image at `program`, named for
-/// the provider the fixture agent stands in for.
-///
-/// macOS 27 kills a copy of a platform binary (`/bin/bash`) on launch. The
-/// copy is probed by running it, and only a copy the kernel killed is re-signed
-/// ad hoc, the signature every non-platform executable on macOS carries; a copy
-/// that runs as copied is never modified. The `health_socket` integration test
-/// keeps its own copy of this helper because an integration-test crate cannot
-/// reach the library's `#[cfg(test)]` modules and the shared test-support
-/// crates are owned elsewhere.
-fn install_fixture_agent_image(source: &std::path::Path, program: &std::path::Path) {
-    fs::copy(source, program).expect("copy fixture agent image");
-    #[cfg(target_os = "macos")]
-    if image_killed_on_launch(program) {
-        let signed = pohunek_test_support::process_env::command("codesign")
-            .args(["--force", "--sign", "-"])
-            .arg(program)
-            .output()
-            .expect("run codesign on the fixture agent image");
-        assert!(
-            signed.status.success(),
-            "ad-hoc signing the fixture agent image failed: {}",
-            String::from_utf8_lossy(&signed.stderr)
-        );
-        assert!(
-            !image_killed_on_launch(program),
-            "the fixture agent image is killed on launch even after ad-hoc signing"
-        );
-    }
-}
-
-/// Whether the kernel kills `program` when it starts: runs `program -c true`
-/// and reports a termination by signal.
-///
-/// # Panics
-///
-/// Panics when the image cannot be spawned or exits non-zero without a signal,
-/// which means it is not a usable shell.
-#[cfg(target_os = "macos")]
-fn image_killed_on_launch(program: &std::path::Path) -> bool {
-    use std::os::unix::process::ExitStatusExt as _;
-
-    let probe = pohunek_test_support::process_env::command(&program.to_string_lossy())
-        .args(["-c", "true"])
-        .output()
-        .expect("spawn the fixture agent image");
-    if probe.status.signal().is_some() {
-        return true;
-    }
-    assert!(
-        probe.status.success(),
-        "the fixture agent image fails `-c true`: {}",
-        String::from_utf8_lossy(&probe.stderr)
-    );
-    false
-}
-
 /// A launch backed by a real worker, official-shaped Codex hook and store.
 struct Rig {
     registry: SessionRegistry,
@@ -182,7 +125,8 @@ impl Rig {
         );
         let program = if verified_launch {
             let copied = dir.join("codex");
-            install_fixture_agent_image(&native_supersede::bash_path(), &copied);
+            pohunek_test_support::fs::copy_shell_image(native_supersede::bash_path(), &copied)
+                .expect("copy the fixture agent image");
             copied
         } else {
             native_supersede::bash_path()
