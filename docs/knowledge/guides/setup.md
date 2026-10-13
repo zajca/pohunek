@@ -68,7 +68,10 @@ descriptor value). All three keys are whole milliseconds in `1..=600000`; a
 missing key, a value outside the range, or an unknown key makes the daemon
 refuse startup with the named configuration error. The startup grace ends
 early when the agent signals an editable prompt or enables bracketed paste; it
-only delays silent startups.
+only delays silent startups. For
+a runtime that declares `ready = "screen_idle"` (Claude) only the rendered
+prompt box ends it, and a session still unready at the end of the grace fails
+with `session_input_not_ready`.
 The write stall bound restarts after every byte the PTY accepts, so it bounds a
 stalled reader, not a long input. A write that exceeds it fails with
 `session_input_stalled`, possibly after part of the input was written; a

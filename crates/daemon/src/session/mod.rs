@@ -32,7 +32,7 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 use ulid::Ulid;
 
-use crate::agent::host::{self, RuntimeDefinition, RuntimeHost};
+use crate::agent::host::{self, InputReadiness, RuntimeDefinition, RuntimeHost};
 use crate::agent::{
     agent_fork_unsupported, agent_not_resumable, build_pty_command, fork_pty_command_from_launch,
     resume_pty_command_from_launch, InputRules, LaunchCommand, LaunchOpts,
@@ -2289,7 +2289,9 @@ impl SessionRegistry {
     ///
     /// # Errors
     ///
-    /// Returns the delivery or persistence error after the rollback.
+    /// Returns the readiness error when the agent declared readiness did not
+    /// show before the deadline, or the delivery or persistence error, after
+    /// the rollback.
     async fn complete_create(
         &self,
         info: SessionInfo,
@@ -2318,8 +2320,13 @@ impl SessionRegistry {
         // the bytes are not delivered to a stdin reader that has not yet
         // entered raw/bracketed-paste mode (and would drop or mis-frame
         // them). Bounded, so a silent agent can never wedge `session.new`.
-        self.await_initial_input_readiness(&info.id, extended_input_ready_wait)
-            .await;
+        if let Err(error) = self
+            .await_initial_input_readiness(&info.id, extended_input_ready_wait)
+            .await
+        {
+            self.rollback_failed_initial_input(&info.id).await;
+            return Err(error);
+        }
         let delivered = match self.write_input_to_session(&info.id, &input).await {
             Ok(()) => self.commit_initial_input(&info.id).await,
             Err(error) => Err(error),
@@ -2921,29 +2928,43 @@ impl SessionRegistry {
     /// Wait for a freshly spawned agent to expose its input reader before a
     /// `session.new --input` prompt is injected, capped at
     /// [`SessionRegistryConfig::initial_input_startup_grace`].
+    ///
+    /// For a [`InputReadiness::BracketedPaste`] session an unobserved
+    /// readiness is not an error: the prompt is written once the wait ends,
+    /// because a silent agent may still read it. For a [`InputReadiness::ScreenIdle`]
+    /// session the wait gets the full configured grace, since its readiness
+    /// has no silent-reader fallback, and an unobserved readiness fails with
+    /// `session_input_not_ready` so nothing is written to an unready prompt.
+    ///
+    /// # Errors
+    ///
+    /// Returns `session_input_not_ready` for a `ScreenIdle` session whose
+    /// readiness was not observed before the deadline or the daemon shut down.
     async fn await_initial_input_readiness(
         &self,
         session_id: &SessionId,
         extended_input_ready_wait: bool,
-    ) {
-        let grace = if extended_input_ready_wait {
-            self.inner.config.initial_input_startup_grace
-        } else {
-            self.inner
-                .config
-                .initial_input_startup_grace
-                .min(pohunek_service_config::COMPAT_INITIAL_INPUT_STARTUP_GRACE)
-        };
-        if grace.is_zero() {
-            return;
-        }
-        let mut input_ready = {
+    ) -> Result<(), ProtocolError> {
+        let (mut input_ready, readiness) = {
             let sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get(session_id) else {
-                return;
+                return Ok(());
             };
-            entry.input_ready.clone()
+            (
+                entry.input_ready.clone(),
+                entry.default_detector_config.input_readiness,
+            )
         };
+        let strict = readiness == InputReadiness::ScreenIdle;
+        let configured = self.inner.config.initial_input_startup_grace;
+        let grace = if extended_input_ready_wait || strict {
+            configured
+        } else {
+            configured.min(pohunek_service_config::COMPAT_INITIAL_INPUT_STARTUP_GRACE)
+        };
+        if grace.is_zero() && !strict {
+            return Ok(());
+        }
         let shutdown = self.inner.daemon_shutdown.clone();
         let _ = tokio::time::timeout(grace, async {
             let mut detector_open = true;
@@ -2959,6 +2980,20 @@ impl SessionRegistry {
             }
         })
         .await;
+        if !strict || *input_ready.borrow() {
+            return Ok(());
+        }
+        let activity = self.current_activity(session_id).await.map_or_else(
+            || "none".to_owned(),
+            |activity| format!("{activity:?}").to_lowercase(),
+        );
+        Err(runtime_error(
+            "session_input_not_ready",
+            format!(
+                "agent did not show an editable prompt within {} ms (last activity: {activity}); nothing was sent, raise input.initial_startup_grace_ms if the agent starts slowly",
+                grace.as_millis()
+            ),
+        ))
     }
 
     /// Roll back a session whose initial `--input` could not be delivered or
@@ -6366,6 +6401,7 @@ fn detector_config_for_resolved_agent(resolved: &ResolvedAgent) -> DetectorConfi
     {
         Some(manifest) => DetectorConfig {
             manifest: Some(manifest),
+            input_readiness: resolved.definition.input_readiness(),
             ..DetectorConfig::default()
         },
         None => DetectorConfig::for_definition(&resolved.definition),

@@ -13796,6 +13796,7 @@ fn acme_definition(submit_delay_configurable: bool, prompt_arg: bool) -> Runtime
         program: LaunchProgram::Fixed("acme".to_owned()),
         default_args: Vec::new(),
         input_rules: InputRules::unrestricted(true, Duration::from_millis(150)),
+        input_readiness: crate::agent::host::InputReadiness::BracketedPaste,
         submit_delay_configurable,
         manifest: Arc::new(crate::detect::generic_shell_manifest().clone()),
         native: None,

@@ -85,8 +85,9 @@ On a host without the package nothing serves `claude`:
 
 The package is version `1.0.1`. Every descriptor fact below equals the
 built-in Claude descriptor release 0.34.2 shipped (package version `1.0.0`),
-except the version probe and the transcript tree (`[transcripts]`), which that
-descriptor does not declare. The detection manifest is the v0.34.2 built-in one
+except the version probe, the transcript tree (`[transcripts]`) and the input
+readiness (`[input] ready`), which that descriptor does not declare. The
+detection manifest is the v0.34.2 built-in one
 plus the rules of #613 ([below](#detection-beyond-the-built-in-manifest)). The
 package tests
 compare the package with golden copies of that descriptor and its detection
@@ -99,6 +100,15 @@ enumerated captured frames may read differently.
   separate Enter written 150 ms later, and a submit delay the daemon is
   configured with for this runtime replaces the 150 ms
   (`submit_delay_configurable = true`).
+- Readiness: `ready = "screen_idle"`. Claude enables bracketed paste before its
+  prompt box accepts a paste, and pastes sent until the box renders are dropped
+  (probe: a paste 0, 200 or 500 ms after the `ESC[?2004h` enable was lost, a
+  paste right after the first `❯` render was accepted in 6 of 6 runs). Only the
+  rendered prompt box, the `live_prompt_box` rule of the detection manifest,
+  starts the initial input. A session whose prompt box does not render within
+  the host's `initial_startup_grace_ms` fails `session.new` with
+  `session_input_not_ready` and is rolled back; the initial input is not
+  written. Daemons of release 0.34.x reject a descriptor that carries `ready`.
 - Version: `version_probe = { parser = "semver-line-v1", args = ["--version"],
   min = "2.1.289", below = "2.2.0", line = "{version} (Claude Code)" }`.
   `claude --version` prints `2.1.289 (Claude Code)` on standard output; any

@@ -106,6 +106,19 @@ impl Manifest {
         regions
     }
 
+    /// Whether a rule reports idle from screen text, the evidence an
+    /// `input.ready = "screen_idle"` runtime needs before its prompt is written.
+    #[must_use]
+    pub fn has_screen_idle_rule(&self) -> bool {
+        self.rules.iter().any(|rule| {
+            rule.activity == AgentActivity::Idle
+                && !matches!(
+                    rule.region,
+                    ManifestRegion::OscTitle | ManifestRegion::OscProgress
+                )
+        })
+    }
+
     /// Returns process matchers when this manifest declares `[process]`.
     #[must_use]
     pub fn process_matchers(&self) -> Option<&ProcessMatchers> {

@@ -11,7 +11,7 @@ use std::time::Duration;
 use protocol::RuntimeId;
 
 use super::definition::{
-    DefinitionError, DefinitionOrigin, DefinitionParts, Integration, LaunchProgram,
+    DefinitionError, DefinitionOrigin, DefinitionParts, InputReadiness, Integration, LaunchProgram,
     RuntimeDefinition,
 };
 use super::registry::{RuntimeSource, SourceTrust};
@@ -71,6 +71,7 @@ impl BuiltinSource {
             program: LaunchProgram::HostShell(self.shell_program.clone()),
             default_args: Vec::new(),
             input_rules: InputRules::unrestricted(false, Duration::ZERO),
+            input_readiness: InputReadiness::BracketedPaste,
             submit_delay_configurable: false,
             manifest: Arc::new(detect::generic_shell_manifest().clone()),
             native: None,

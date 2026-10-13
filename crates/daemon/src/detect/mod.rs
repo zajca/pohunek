@@ -8,9 +8,9 @@
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use protocol::{AgentActivity, DetectionRegionPreview, RuntimeRef, StateSource};
+use protocol::{AgentActivity, DetectionRegionPreview, ProtocolError, RuntimeRef, StateSource};
 
-use crate::agent::host::{RuntimeDefinition, RuntimeHost};
+use crate::agent::host::{InputReadiness, RuntimeDefinition, RuntimeHost};
 use crate::procwatch::ProcessFact;
 
 mod machine;
@@ -48,6 +48,8 @@ pub(crate) fn embedded_manifest_sources() -> [(&'static str, &'static str); 1] {
 pub struct DetectorConfig {
     pub detection: DetectionConfig,
     pub manifest: Option<Manifest>,
+    /// Which evidence makes the detector report editable input as ready.
+    pub input_readiness: InputReadiness,
 }
 
 impl DetectorConfig {
@@ -57,6 +59,7 @@ impl DetectorConfig {
         Self {
             detection: DetectionConfig::default(),
             manifest: Some(generic_shell_manifest().clone()),
+            input_readiness: InputReadiness::default(),
         }
     }
 
@@ -73,7 +76,8 @@ impl DetectorConfig {
 
     /// Detector config for a session launched with `pin`: the override
     /// manifest when there is one, else the manifest of the definition the pin
-    /// resolves to, else the generic shell manifest.
+    /// resolves to, else the generic shell manifest. An override manifest keeps
+    /// the readiness of the definition the pin resolves to.
     #[must_use]
     pub fn for_pinned(
         host: &RuntimeHost,
@@ -85,6 +89,7 @@ impl DetectorConfig {
             Some(manifest) => Self {
                 detection: DetectionConfig::default(),
                 manifest: Some(manifest),
+                input_readiness: readiness_of(host.definition_for_pin(base, pin)),
             },
             None => host.definition_for_pin(base, pin).map_or_else(
                 |_unresolved| Self::generic_shell(),
@@ -93,12 +98,14 @@ impl DetectorConfig {
         }
     }
 
-    /// Production detector config driven by `definition`'s manifest.
+    /// Production detector config driven by `definition`'s manifest and
+    /// input readiness.
     #[must_use]
     pub fn for_definition(definition: &RuntimeDefinition) -> Self {
         Self {
             detection: DetectionConfig::default(),
             manifest: Some((**definition.manifest()).clone()),
+            input_readiness: definition.input_readiness(),
         }
     }
 
@@ -117,10 +124,22 @@ impl DetectorConfig {
             Some(manifest) => Self {
                 detection: DetectionConfig::default(),
                 manifest: Some(manifest),
+                input_readiness: readiness_of(host.resolve_ref(base)),
             },
             None => Self::for_agent(host, base),
         }
     }
+}
+
+/// The input readiness of a resolved definition, or the default when the
+/// reference does not resolve.
+fn readiness_of(
+    definition: Result<std::sync::Arc<RuntimeDefinition>, ProtocolError>,
+) -> InputReadiness {
+    definition.map_or_else(
+        |_unresolved| InputReadiness::default(),
+        |definition| definition.input_readiness(),
+    )
 }
 
 /// Parses the embedded generic shell manifest.
@@ -169,6 +188,7 @@ pub struct Detector {
     screen: ScreenTracker,
     state: StateMachine,
     manifest: Option<Manifest>,
+    input_readiness: InputReadiness,
     latest_title: Option<String>,
     latest_progress: Option<String>,
     latest_cwd_hint: Option<String>,
@@ -184,6 +204,7 @@ impl Detector {
             screen: ScreenTracker::new(rows, cols),
             state: StateMachine::new(started_at, config.detection),
             manifest: config.manifest,
+            input_readiness: config.input_readiness,
             latest_title: None,
             latest_progress: None,
             latest_cwd_hint: None,
@@ -243,13 +264,17 @@ impl Detector {
     /// Whether terminal output identifies an editable agent input reader.
     #[must_use]
     pub fn input_ready(&self) -> bool {
-        self.screen.bracketed_paste()
-            || self
-                .manifest_evidence(ContextFreshness::all())
+        let screen_idle = || {
+            self.manifest_evidence(ContextFreshness::all())
                 .is_some_and(|evidence| {
                     evidence.activity == AgentActivity::Idle
                         && evidence.source == StateSource::Screen
                 })
+        };
+        match self.input_readiness {
+            InputReadiness::BracketedPaste => self.screen.bracketed_paste() || screen_idle(),
+            InputReadiness::ScreenIdle => screen_idle(),
+        }
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
@@ -260,6 +285,7 @@ impl Detector {
     pub fn reconfigure(&mut self, now: Instant, config: DetectorConfig) {
         self.state = StateMachine::new(now, config.detection);
         self.manifest = config.manifest;
+        self.input_readiness = config.input_readiness;
         self.process_activity.reset();
         self.state.clear_pending();
         self.needs_visible_recheck = true;
@@ -600,6 +626,7 @@ mod tests {
     /// through the manifest layer just like in the live daemon.
     fn config() -> DetectorConfig {
         DetectorConfig {
+            input_readiness: crate::agent::host::InputReadiness::default(),
             detection: DetectionConfig {
                 recheck_after: Duration::from_millis(100),
                 confirmations: 1,
@@ -613,6 +640,7 @@ mod tests {
 
     fn debounce_config() -> DetectorConfig {
         DetectorConfig {
+            input_readiness: crate::agent::host::InputReadiness::default(),
             detection: DetectionConfig {
                 recheck_after: Duration::from_millis(100),
                 confirmations: 3,
@@ -1420,6 +1448,7 @@ mod tests {
                 program: LaunchProgram::Fixed("acme".to_owned()),
                 default_args: Vec::new(),
                 input_rules: InputRules::unrestricted(false, Duration::ZERO),
+                input_readiness: crate::agent::host::InputReadiness::BracketedPaste,
                 submit_delay_configurable: false,
                 manifest: Arc::new(manifest(self.manifest_source)),
                 native: None,

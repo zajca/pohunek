@@ -291,6 +291,21 @@ impl Integration {
     }
 }
 
+/// When the daemon may write a launch's initial prompt into the agent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InputReadiness {
+    /// Bracketed paste is enabled on screen, or the manifest reports idle from
+    /// screen evidence. Silent agents fall back to the startup grace.
+    #[default]
+    BracketedPaste,
+    /// Only the manifest's screen-sourced idle evidence counts. For an agent
+    /// that enables bracketed paste before its prompt accepts input, which
+    /// would otherwise let the prompt be written too early and dropped.
+    /// Without that evidence by the grace deadline, the launch fails and
+    /// nothing is written.
+    ScreenIdle,
+}
+
 /// Unvalidated inputs of a [`RuntimeDefinition`].
 #[derive(Debug, Clone)]
 pub struct DefinitionParts {
@@ -306,6 +321,8 @@ pub struct DefinitionParts {
     pub default_args: Vec<String>,
     /// Input framing and safety rules.
     pub input_rules: InputRules,
+    /// When the initial prompt may be written.
+    pub input_readiness: InputReadiness,
     /// Whether the daemon's configured submit delay replaces the descriptor's.
     pub submit_delay_configurable: bool,
     /// Activity detection manifest.
@@ -332,6 +349,7 @@ pub struct RuntimeDefinition {
     program: LaunchProgram,
     default_args: Vec<String>,
     input_rules: InputRules,
+    input_readiness: InputReadiness,
     submit_delay_configurable: bool,
     manifest: Arc<Manifest>,
     native: Option<NativeSessionLaunch>,
@@ -355,7 +373,9 @@ impl RuntimeDefinition {
     /// # Errors
     ///
     /// Returns a [`DefinitionError`] for an empty or oversized label, program
-    /// or argument, a control character in any of them, or too many arguments.
+    /// or argument, a control character in any of them, too many arguments, or
+    /// a `ScreenIdle` readiness whose manifest has no idle rule on a screen
+    /// region, since the readiness would then never be observed.
     pub fn new(parts: DefinitionParts) -> Result<Self, DefinitionError> {
         let DefinitionParts {
             runtime_id,
@@ -364,6 +384,7 @@ impl RuntimeDefinition {
             program,
             default_args,
             input_rules,
+            input_readiness,
             submit_delay_configurable,
             manifest,
             native,
@@ -374,6 +395,12 @@ impl RuntimeDefinition {
         } = parts;
         validate_version_probe(version_probe_parser.as_ref(), version_probe_policy.as_ref())?;
         validate_identity_invariants(&runtime_id, &origin, &program)?;
+        if input_readiness == InputReadiness::ScreenIdle && !manifest.has_screen_idle_rule() {
+            return Err(DefinitionError::Field {
+                field: "input.ready",
+                reason: "screen_idle requires a manifest idle rule on a screen region",
+            });
+        }
         validate_integration(integration.as_ref(), &origin)?;
         validate_label(&display_name, "runtime.name")?;
         validate_token(program.as_str(), "runtime.program")?;
@@ -437,6 +464,7 @@ impl RuntimeDefinition {
             program,
             default_args,
             input_rules,
+            input_readiness,
             submit_delay_configurable,
             manifest,
             native,
@@ -552,6 +580,7 @@ impl RuntimeDefinition {
             raw.input.bracketed_paste,
             Duration::from_millis(raw.input.submit_delay_ms),
         );
+        let input_readiness = raw.input.ready.into_readiness();
         let (native, hook_existence) = raw.native_and_existence()?;
         let config_home = raw
             .config_home
@@ -570,6 +599,7 @@ impl RuntimeDefinition {
             program: LaunchProgram::Fixed(raw.runtime.program),
             default_args: raw.runtime.args,
             input_rules,
+            input_readiness,
             submit_delay_configurable: raw.input.submit_delay_configurable,
             manifest,
             native,
@@ -641,6 +671,12 @@ impl RuntimeDefinition {
     #[must_use]
     pub fn input_rules(&self) -> InputRules {
         self.input_rules
+    }
+
+    /// When the initial prompt of a launch may be written.
+    #[must_use]
+    pub fn input_readiness(&self) -> InputReadiness {
+        self.input_readiness
     }
 
     /// Whether the daemon's configured submit delay replaces the descriptor's.
@@ -902,9 +938,9 @@ fn text_policy_name(policy: InputTextPolicy) -> &'static str {
 ///
 /// The set is deliberately limited to what changes how a session launches,
 /// frames input, and resumes or forks. Display text, the detection manifest,
-/// the version-probe parser and the integration handler are excluded: they do
-/// not alter a launch, and the digest never claims to authenticate package
-/// contents.
+/// the input readiness, the version-probe parser and the integration handler
+/// are excluded: they do not alter a launch, and the digest never claims to
+/// authenticate package contents.
 #[derive(Serialize)]
 struct DescriptorFacts<'a> {
     domain: &'static str,
@@ -1052,6 +1088,27 @@ struct RawInput {
     /// Absent means the descriptor's delay is final.
     #[serde(default)]
     submit_delay_configurable: bool,
+    /// Absent means bracketed-paste readiness.
+    #[serde(default)]
+    ready: RawInputReadiness,
+}
+
+/// Readiness names accepted in `[input]`.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawInputReadiness {
+    #[default]
+    BracketedPaste,
+    ScreenIdle,
+}
+
+impl RawInputReadiness {
+    fn into_readiness(self) -> InputReadiness {
+        match self {
+            Self::BracketedPaste => InputReadiness::BracketedPaste,
+            Self::ScreenIdle => InputReadiness::ScreenIdle,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
