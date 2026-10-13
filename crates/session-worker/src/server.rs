@@ -3800,7 +3800,14 @@ where
                 let pinned = identity_pins(&root_identity, state.journal.launch_identity.as_ref());
                 let room = process_valid
                     && sequence_valid
-                    && admit_reporter(&shared, &mut state.identity_marks, reporting, &pinned, peer);
+                    && admit_reporter(
+                        &shared,
+                        "identity_report",
+                        &mut state.identity_marks,
+                        reporting,
+                        &pinned,
+                        peer,
+                    );
                 // The background snapshot follows its reporting process, so an
                 // admitted, process-valid report clears it even when the identity
                 // rules below refuse the report.
@@ -3970,7 +3977,14 @@ where
                         reporting,
                         sequence,
                     )
-                    && admit_reporter(&shared, &mut state.identity_marks, reporting, &pinned, peer);
+                    && admit_reporter(
+                        &shared,
+                        "identity_release",
+                        &mut state.identity_marks,
+                        reporting,
+                        &pinned,
+                        peer,
+                    );
                 let released_process = if fresh {
                     state
                         .journal
@@ -5632,7 +5646,8 @@ fn identity_pins(root: &ProcessIdentity, launch: Option<&LaunchIdentity>) -> Vec
     .collect()
 }
 
-/// Whether `reporter` may be given an identity mark, logging a refusal.
+/// Whether `reporter` may be given an identity mark, logging a refusal of
+/// `operation`.
 ///
 /// A report from a process without a mark is refused with
 /// [`RejectReason::IdentityReportersExhausted`] when the marks of live,
@@ -5640,6 +5655,7 @@ fn identity_pins(root: &ProcessIdentity, launch: Option<&LaunchIdentity>) -> Vec
 /// live process's order intact, where evicting a mark would not.
 fn admit_reporter(
     shared: &Shared,
+    operation: &'static str,
     marks: &mut IdentityMarks,
     reporter: Reporter,
     pinned: &[Reporter],
@@ -5654,7 +5670,7 @@ fn admit_reporter(
     if !admitted {
         reject_identity(
             shared,
-            "identity_reporter",
+            operation,
             RejectReason::IdentityReportersExhausted,
             peer,
         );
