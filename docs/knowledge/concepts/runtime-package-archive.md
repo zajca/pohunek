@@ -72,8 +72,12 @@ digest, and only then is anything decompressed.
 | One file | 16 MiB |
 | zstd window | 8 MiB |
 
-Decompression writes at most `min(64 MiB, compressed size x 100)` bytes before
-it stops, so a decompression bomb costs bounded memory. `build_archive`
+Decompression writes at most `min(64 MiB, compressed size x 100)` bytes of
+output before it stops. The zstd decoder in use does not bound the memory of a
+single decoded block (RUSTSEC-2026-0344, tracked in #969), so the daemon decodes
+only archives whose raw digest is already authorized by `--sha256` or by a
+verified catalog, and `plugin link` decodes only the archive it just built from
+the owner's directory. `build_archive`
 re-reads its own output under the same limits, so a built archive is always one
 the reader accepts.
 
