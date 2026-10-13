@@ -640,6 +640,9 @@ struct SessionRegistryInner {
     /// intent commit.
     #[cfg(test)]
     stop_intent_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Holds the next accepted native-id report before its commit.
+    #[cfg(test)]
+    native_id_commit_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
     /// Holds the next create between its delivered input and the commit.
     #[cfg(test)]
     initial_input_commit_hold:
@@ -1755,6 +1758,8 @@ impl SessionRegistry {
                 #[cfg(test)]
                 stop_intent_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
+                native_id_commit_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
                 initial_input_commit_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 undelivered_conversion_hold: std::sync::Mutex::new(None),
@@ -2454,6 +2459,42 @@ impl SessionRegistry {
         }
     }
 
+    /// Arms a hold that parks the next accepted native-id report of session
+    /// `id` before its commit.
+    #[cfg(test)]
+    pub(crate) fn hold_next_native_id_commit(
+        &self,
+        id: &SessionId,
+    ) -> crate::runtime::lifecycle::tests::StartGate {
+        let gate = crate::runtime::lifecycle::tests::StartGate {
+            session_id: Some(id.0.clone()),
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        *self
+            .inner
+            .native_id_commit_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate.clone());
+        gate
+    }
+
+    /// Parks an accepted native-id report before its commit when a test
+    /// armed the hold.
+    #[cfg(test)]
+    async fn hold_native_id_commit(&self, id: &SessionId) {
+        let gate = self
+            .inner
+            .native_id_commit_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_if(|gate| gate.session_id.as_deref().is_none_or(|held| held == id.0));
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
     /// Parks a create before its initial input when a test armed the hold.
     #[cfg(test)]
     async fn hold_initial_input(&self, id: &SessionId) {
@@ -3019,14 +3060,22 @@ impl SessionRegistry {
             }
         };
 
-        let (
-            info,
-            record,
-            previous_ordering,
-            previous_native_id,
-            previous_native_path,
-            previous_provenance,
-        ) = {
+        #[cfg(test)]
+        self.hold_native_id_commit(&session_id).await;
+        let mut committed = false;
+        for _ in 0..MAX_RUNTIME_TRANSITION_COMMIT_ATTEMPTS {
+            let durable_base = match self.load_durable_session_record(&session_id).await {
+                Ok(record) => record,
+                Err(error) => {
+                    debug!(session_id = %session_id.0, error = %error, "failed to read the record of a native-id report; ignoring report");
+                    return not_recorded;
+                }
+            };
+            // The entry is checked, updated, and persisted under one sessions
+            // lock, so a terminal transition that committed after the report
+            // was validated refuses it, and one that commits later starts
+            // from the updated entry. An update whose write fails is undone
+            // before the lock is released, so it is never observed.
             let mut sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get_mut(&session_id) else {
                 return not_recorded;
@@ -3054,6 +3103,7 @@ impl SessionRegistry {
             let previous_native_id = entry.info.native_session_id.clone();
             let previous_native_path = entry.info.native_session_path.clone();
             let previous_provenance = entry.snapshot.reference_provenance;
+            let previous_updated_at = entry.info.updated_at.clone();
             entry.snapshot.reference_provenance = NativeReferenceProvenance::Reported;
             entry.last_native_report = Some(NativeIdentityReport::accepting_public(
                 entry.last_native_report.as_ref(),
@@ -3076,40 +3126,44 @@ impl SessionRegistry {
                 }
             }
             entry.info.updated_at = timestamp_now();
-            (
-                entry.info.clone(),
-                Self::session_record(&session_id, entry, entry.desired_state, None),
-                previous_ordering,
-                previous_native_id,
-                previous_native_path,
-                previous_provenance,
-            )
-        };
-        if let Err(error) = self.write_session_record(record).await {
-            debug!(session_id = %session_id.0, error = %error, "failed to persist native-id ordering; ignoring report");
-            let mut sessions = self.inner.sessions.lock().await;
-            if let Some(entry) = sessions.get_mut(&session_id) {
-                let accepted = NativeIdentityReport::accepting_public(
-                    previous_ordering.as_ref(),
-                    params.worker_instance_id(),
-                    params.pid(),
-                    params.pid_start_identity().get(),
-                    params.sequence().get(),
-                    observed_worker_sequence,
-                );
-                if entry.last_native_report.as_ref() == Some(&accepted) {
-                    entry.last_native_report = previous_ordering;
-                    entry.info.native_session_id = previous_native_id;
-                    entry.info.native_session_path = previous_native_path;
-                    entry.snapshot.reference_provenance = previous_provenance;
-                }
+            let record = Self::session_record(&session_id, entry, entry.desired_state, None);
+            let durable_base = durable_base.unwrap_or_else(|| record.clone());
+            let Err(error) = self
+                .write_session_record_if_current(durable_base, record)
+                .await
+            else {
+                committed = true;
+                break;
+            };
+            entry.last_native_report = previous_ordering;
+            entry.info.native_session_id = previous_native_id;
+            entry.info.native_session_path = previous_native_path;
+            entry.snapshot.reference_provenance = previous_provenance;
+            entry.info.updated_at = previous_updated_at;
+            drop(sessions);
+            if error.code != "session_record_commit_stale" {
+                debug!(session_id = %session_id.0, error = %error, "failed to persist native-id ordering; ignoring report");
+                return not_recorded;
             }
+            tokio::task::yield_now().await;
+        }
+        if !committed {
+            debug!(session_id = %session_id.0, "session kept changing while persisting a native-id report; ignoring report");
             return not_recorded;
         }
         // Persist from the now-current in-memory state (a resize that landed
         // first is reflected, not clobbered).
         self.persist_resume_binding(&session_id).await;
-        self.emit(event::SESSION_UPDATED, &info);
+        // Announced under the sessions lock, so the update never follows the
+        // event of a transition that ended the session after this commit.
+        let sessions = self.inner.sessions.lock().await;
+        if let Some(entry) = sessions
+            .get(&session_id)
+            .filter(|entry| !is_terminal(entry.info.state))
+        {
+            self.emit(event::SESSION_UPDATED, &entry.info);
+        }
+        drop(sessions);
         SessionReportNativeIdResult { recorded: true }
     }
 
@@ -3957,8 +4011,8 @@ impl SessionRegistry {
     /// written.
     ///
     /// `busy_code` is the error code of the exhaustion after the retry bound
-    /// and of an entry that no longer carries the intent: the stop keeps its
-    /// historical `session_stop_intent_busy`.
+    /// and of an entry that no longer carries the intent: the stop reports
+    /// `session_stop_intent_busy`.
     async fn commit_intent(
         &self,
         id: &SessionId,

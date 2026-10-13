@@ -10300,6 +10300,72 @@ async fn procwatch_rebinds_restart_to_new_observed_pid() {
     let _ = registry.stop(&created.id).await;
 }
 
+/// A native-id report accepted while the session runs, whose commit comes
+/// after an exit committed the terminal state: the report is not recorded and
+/// never replaces the terminal record, so the store holds what the registry
+/// shows.
+#[tokio::test]
+async fn native_id_report_never_overwrites_an_exit_that_committed_first() {
+    let store_path = temp_store_path("native-id-exit-race");
+    let agents_dir = temp_agents_dir_with(
+        "native-id-exit-race",
+        "resumable",
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"read line; exit 3\"]\n",
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        agents_dir: Some(agents_dir),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(resumable_params())
+        .await
+        .expect("create session");
+    let mut events = registry.subscribe();
+    let mut settle_events = registry.subscribe();
+    let report = native_report!(&registry;
+        session_id: created.id.clone(),
+        agent: "claude".to_owned(),
+        native_session_id: "native-before-exit".to_owned(),
+        transcript_path: None,
+    );
+    let held = registry.hold_next_native_id_commit(&created.id);
+    let reporting = tokio::spawn({
+        let registry = registry.clone();
+        async move { registry.report_native_id(report).await }
+    });
+    // The report has validated its runtime and process against the live worker.
+    held.entered.notified().await;
+    registry
+        .write_input_to_session(&created.id, "go")
+        .await
+        .expect("the input ends the agent");
+    exit_settled(&mut events, &created.id).await;
+
+    held.release.notify_one();
+    let reported = reporting.await.expect("report task joins");
+    stop_settled(&registry, &mut settle_events, &created.id).await;
+
+    let record = stored_record(&store_path, &created.id);
+    assert_eq!(record.info.state, SessionState::Failed);
+    assert_eq!(record.info.exit_code, Some(3));
+    assert_eq!(record.runtime.state, RuntimeState::Terminal);
+    let memory = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert_eq!(
+        record.info, memory,
+        "the store holds what the registry shows"
+    );
+    assert!(
+        !reported.recorded,
+        "a report committing after the exit is ignored"
+    );
+}
+
 #[tokio::test]
 async fn report_native_id_records_binding_and_updates_info() {
     let store_path = temp_store_path("report");
@@ -10995,17 +11061,34 @@ async fn lost_transition_retries_precommit_failure_before_single_event() {
         .expect("registry store")
         .fail_next_write_before_rename();
 
-    assert!(matches!(
-        registry
+    // A live worker task may change the entry before the classification
+    // commits; that refusal writes nothing, so the armed store fault stays for
+    // the retry that reaches the write.
+    let mut failed = super::RuntimeTransitionOutcome::RetryableConcurrentChange;
+    for _ in 0..CONCURRENT_TRANSITION_RETRY_LIMIT {
+        failed = registry
             .mark_worker_unavailable(
                 &created.id,
                 &expected,
                 RuntimeState::Lost,
                 crate::session::supervision::RUNTIME_LOST,
             )
-            .await,
-        super::RuntimeTransitionOutcome::RetryablePersistenceFailure(_)
-    ));
+            .await;
+        if !matches!(
+            failed,
+            super::RuntimeTransitionOutcome::RetryableConcurrentChange
+        ) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        matches!(
+            failed,
+            super::RuntimeTransitionOutcome::RetryablePersistenceFailure(_)
+        ),
+        "the armed store fault fails the classification: {failed:?}"
+    );
     assert_eq!(
         registry
             .inspect(&created.id)
@@ -11051,10 +11134,20 @@ async fn exit_transition_retries_precommit_failure_before_single_event() {
         success: true,
     };
 
-    let error = registry
-        .record_exit(&created.id, exit, false, Some(&expected), None)
-        .await
-        .expect_err("precommit exit failure");
+    // A live worker task may change the entry before the exit commits; that
+    // refusal (`Ok(false)`) writes nothing, so the armed store fault stays
+    // for the retry that reaches the write.
+    let mut outcome = Ok(false);
+    for _ in 0..CONCURRENT_TRANSITION_RETRY_LIMIT {
+        outcome = registry
+            .record_exit(&created.id, exit, false, Some(&expected), None)
+            .await;
+        if !matches!(outcome, Ok(false)) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let error = outcome.expect_err("precommit exit failure");
     assert_eq!(error.code, "session_store_failed");
     assert_eq!(
         registry
