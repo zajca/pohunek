@@ -7,7 +7,13 @@ holds exactly what its archive holds, nothing else:
 runtime-packages/<runtime>/
   runtime.toml   runtime descriptor (schema 1, runtime_api 1)
   detect.toml    detection manifest named by `detect_manifest`
+  operator.toml  optional: closed sidecar listing the operator plugin payload
+  operator/      optional: the operator plugin payload, exactly the files the sidecar lists
 ```
+
+`operator.toml` and `operator/` exist only in a package that ships an operator
+plugin for its agent (Hermes); the core CLI verifies every listed path and
+SHA-256 before it installs the plugin.
 
 - The directory name is the runtime id; the package id is
   `pohunek.runtime.<runtime>`.
@@ -23,16 +29,22 @@ runtime-packages/<runtime>/
   signed catalog (`pohunek plugin install --catalog`) authorizes it.
 - Every package ships with an always-running test that parses its directory
   through the daemon's install path, pins its supported range to its lock, and
-  runs its manifest on the captured screens, and with an opt-in test that
-  drives the real agent through the installed package (see
+  runs its manifest on the captured screens (the Hermes manifest is instead
+  required to equal the built-in one byte for byte), and with an opt-in test
+  that drives the real agent through the installed package (see
   `crates/cli/tests/pi_package.rs` and the `pi-package` CI job).
 - A package never carries the hook reporter scripts of an agent integration: the
-  integration handler it names is compiled core code that owns them.
+  integration handler it names is compiled core code that owns them. An
+  operator plugin payload is not a reporter; the Hermes reporter stays
+  core-owned and embedded in the CLI.
 
 Packages: [`pi`](pi) (Pi coding agent 1.0.x; install steps in
-`docs/install.md`) and [`codex`](codex) (Codex 0.160.x; serves the reserved
+`docs/install.md`), [`codex`](codex) (Codex 0.160.x; serves the reserved
 `codex` id only through the signed catalog that every Linux daemon archive ships
-since 0.34.2; see `docs/knowledge/guides/codex-package.md`) and
+since 0.34.2; see `docs/knowledge/guides/codex-package.md`),
 [`claude`](claude) (Claude Code 2.1.x from 2.1.289; serves the reserved `claude`
 id only through the same signed catalog; see
-`docs/knowledge/guides/claude-package.md`).
+`docs/knowledge/guides/claude-package.md`) and [`hermes`](hermes) (Hermes Agent
+0.20.0 with its operator plugin payload; serves the reserved `hermes` id only
+through the signed catalog that every Linux daemon archive ships; see
+`docs/knowledge/guides/hermes-package.md`).

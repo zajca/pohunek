@@ -13,6 +13,14 @@
 # packaging/smoke-archive runs each Linux daemon archive of the bundle in a
 # network namespace. The stage, the temp tree and the consumer copy lie outside
 # the checkout, as smoke-archive requires.
+#
+# A consumer may write into the stage it ran from (a provisioned Python
+# upstream writes bytecode and state files), and smoke-archive refuses a stage
+# that differs from its manifests. The untouched stage is therefore copied
+# aside once, and before each archive every runtime is restored from that copy
+# at the same absolute path and checked with `compat verify-stage`. The stage
+# never moves: a provisioned environment names its interpreter by absolute
+# path.
 
 set -eu
 
@@ -36,15 +44,31 @@ cp -- "$CONSUMER" "$consumer_copy"
 chmod 0755 "$consumer_copy"
 
 stage=$RUNNER_TEMP/smoke-stage
+pristine=$RUNNER_TEMP/smoke-stage-pristine
 [ ! -e "$stage" ] || fail "stage exists: $stage"
+[ ! -e "$pristine" ] || fail "pristine stage copy exists: $pristine"
+runtimes=$(jq -r '[.rows[].runtime] | unique | .[]' compat/matrix.json) \
+    || fail "cannot read the runtimes of compat/matrix.json"
+[ -n "$runtimes" ] || fail "compat/matrix.json names no runtime"
+for runtime in $runtimes; do
+    case $runtime in
+        *[!a-z0-9_-]*) fail "invalid runtime id: $runtime" ;;
+    esac
+done
 mkdir -p "$stage"
-jq -r '[.rows[].runtime] | unique | .[]' compat/matrix.json | while IFS= read -r runtime; do
+for runtime in $runtimes; do
     "$XTASK" compat stage-upstream --runtime "$runtime" --out "$stage"
 done
+cp -a -- "$stage" "$pristine"
 
 found=0
 for archive in "$bundle"/pohunek-daemon-"$VERSION"-*-linux-*.tar.gz; do
     [ -f "$archive" ] || continue
+    for runtime in $runtimes; do
+        rm -rf -- "${stage:?}/$runtime"
+        cp -a -- "$pristine/$runtime" "$stage/$runtime"
+        "$XTASK" compat verify-stage --runtime "$runtime" --dir "$stage"
+    done
     packaging/smoke-archive --archive "$archive" --stage "$stage" --consumer "$consumer_copy" --isolation "$ISOLATION"
     found=$((found + 1))
 done

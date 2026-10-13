@@ -228,10 +228,12 @@ jobs:
           printf 'bin=%s\n' "$hermes_bin" >> "$GITHUB_OUTPUT"
 
       # The gate and the packaged smoke install the operator plugin from the
-      # Hermes runtime package through the archive's own daemon. Until Hermes
-      # ships in the release catalog, the package is built from compat/hermes
-      # and authorized by a throwaway catalog whose anchor only the smoke's
-      # private prefix trusts; the archive's production anchor is untouched.
+      # Hermes runtime package through the archive's own daemon. This archive
+      # does not carry the signed release catalog yet (the evidence workflow
+      # assembles it), so the package is built here from
+      # runtime-packages/hermes and authorized by a throwaway catalog whose
+      # anchor only the smoke's private prefix trusts; the archive's
+      # production anchor is untouched.
       - name: Verify packaged daemon against pinned Hermes
         if: ${{ inputs.mode == 'release' && matrix.component == 'daemon' }}
         shell: bash

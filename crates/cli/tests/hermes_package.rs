@@ -1,4 +1,4 @@
-//! The production-format Hermes package fixture (`compat/hermes/package`) and
+//! The official Hermes runtime package (`runtime-packages/hermes`) and
 //! the Hermes operator lifecycle that takes its assets from that package.
 //!
 //! Every scenario builds package archives, installs them through the CLI and
@@ -49,11 +49,12 @@ use pohunek_test_support::catalog::{
     WINDOW_END, WINDOW_START,
 };
 
-/// Directory of the package fixture, relative to the workspace root.
-const PACKAGE_DIR: &str = "compat/hermes/package";
+/// Directory of the package, relative to the workspace root.
+const PACKAGE_DIR: &str = "runtime-packages/hermes";
 
-/// Directory of the closed operator sidecar, relative to the workspace root.
-const SIDECAR_DIR: &str = "compat/hermes";
+/// Directory of the closed operator sidecar and its payload: the package
+/// directory itself.
+const SIDECAR_DIR: &str = PACKAGE_DIR;
 
 /// Compatibility lock of the package, relative to the workspace root.
 const LOCK_PATH: &str = "compat/hermes/compatibility-lock.json";
@@ -133,7 +134,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// The operator payload file the CLI embeds, read from its source fixture.
+/// The operator payload file the CLI embeds, read from the package directory.
 fn embedded_operator_file(path: &str) -> Vec<u8> {
     fs::read(sidecar_dir().join("operator").join(path)).expect("read embedded operator payload")
 }
@@ -176,7 +177,7 @@ fn set_version(entries: &mut [ArchiveEntry], version: &str) {
         .into_bytes();
 }
 
-/// The package fixture as archive entries, with a distinguishable operator skill.
+/// The package as archive entries, with a distinguishable operator skill.
 fn package_entries() -> Vec<ArchiveEntry> {
     let root = package_dir();
     let mut entries = Vec::new();
@@ -187,7 +188,7 @@ fn package_entries() -> Vec<ArchiveEntry> {
     ] {
         entries.push(ArchiveEntry {
             path: path.to_owned(),
-            contents: fs::read(file).expect("read package fixture file"),
+            contents: fs::read(file).expect("read package file"),
             executable: false,
         });
     }
@@ -1055,7 +1056,7 @@ async fn the_signed_hermes_package_is_selected_and_failed_installs_preserve_it()
 
 /// Runs one pinned Hermes turn through the selected official package and the public PTY API.
 #[tokio::test]
-#[ignore = "needs provisioned Hermes; set POHUNEK_HERMES_E2E=1 and POHUNEK_HERMES_BIN, then use --ignored"]
+#[ignore = "needs a real `hermes` from a provisioned stage; set POHUNEK_HERMES_E2E=1 and POHUNEK_HERMES_BIN, then use --ignored"]
 #[expect(
     clippy::too_many_lines,
     reason = "one end-to-end scenario asserts the package-to-screen boundary"

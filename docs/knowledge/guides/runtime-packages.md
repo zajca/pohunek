@@ -14,16 +14,16 @@ session) to the host. `pohunek plugin` manages the packages installed on the
 machine the daemon runs on. See the
 [runtime package archive](../concepts/runtime-package-archive.md) for the file
 format and the [runtime catalog](../concepts/runtime-catalog.md) for official
-trust. The official packages are [Pi](pi-package.md), [Codex](codex-package.md)
-and [Claude Code](claude-package.md). Every Linux daemon archive of a release
-carries them under `runtime/packages/`, with the signed
-`runtime/runtime-catalog.json` that authorizes them (see
+trust. The official packages are [Pi](pi-package.md), [Codex](codex-package.md),
+[Claude Code](claude-package.md) and [Hermes](hermes-package.md). Every Linux
+daemon archive of a release carries them under `runtime/packages/`, with the
+signed `runtime/runtime-catalog.json` that authorizes them (see
 [Install official packages from a release](#install-official-packages-from-a-release)).
-The Codex and Claude Code packages serve the reserved `codex` and `claude` ids
-only through that catalog. The daemon compiles no Codex in: `codex` is served
-by its official package or by nothing. The built-in Claude and Hermes runtimes
-stay in the daemon and serve their ids whenever no official package is
-installed, enabled and selected for them. Recovery steps for verification, trust and
+The Codex, Claude Code and Hermes packages serve the reserved `codex`, `claude`
+and `hermes` ids only through that catalog. The daemon compiles no Codex in:
+`codex` is served by its official package or by nothing. The built-in Claude
+and Hermes runtimes stay in the daemon and serve their ids whenever no official
+package is installed, enabled and selected for them. Recovery steps for verification, trust and
 profile pin failures are in the
 [runtime package recovery runbook](../runbooks/runtime-package-recovery.md).
 
@@ -58,8 +58,9 @@ pohunek plugin install runtime/packages/pi.tar.zst --catalog runtime/runtime-cat
 
 Current releases list only the Linux x86_64 glibc and musl targets; the Apple Silicon
 archive carries the catalog and no package. `pohunek doctor` must report the
-`catalog_trust_anchor` check as `ok` first. Installing `codex.tar.zst` or
-`claude.tar.zst` takes the alias over from the built-in at once (see
+`catalog_trust_anchor` check as `ok` first. Installing `codex.tar.zst`,
+`claude.tar.zst` or `hermes.tar.zst` takes the alias over from the built-in at
+once (see
 [Official aliases](#official-aliases)); `--no-enable` stages the package until
 `plugin enable`. `docs/install.md` has the complete procedure.
 

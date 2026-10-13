@@ -19,6 +19,14 @@
       "target": "x86_64-unknown-linux-musl"
     },
     {
+      "runtime": "hermes",
+      "target": "x86_64-unknown-linux-gnu"
+    },
+    {
+      "runtime": "hermes",
+      "target": "x86_64-unknown-linux-musl"
+    },
+    {
       "runtime": "pi",
       "target": "x86_64-unknown-linux-gnu"
     },

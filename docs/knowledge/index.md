@@ -40,7 +40,10 @@ Start here:
   package source (the only source of `codex`), its parity with the built-in
   Codex runtime of release 0.34.2, and the gaps found
   against a real Codex; the [Claude Code runtime
-  package](guides/claude-package.md) does the same for Claude Code.
+  package](guides/claude-package.md) does the same for Claude Code; the
+  [Hermes runtime package](guides/hermes-package.md) documents the official
+  Hermes package with its operator plugin payload, where releases ship it, and
+  how its tests, CI and the release keep it honest.
   [Environment and executable resolution](guides/environment-resolution.md)
   documents the macOS `PATH` policy. The
   [Hermes operator](guides/hermes-operator.md) documents the managed plugin,

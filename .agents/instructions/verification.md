@@ -110,8 +110,12 @@ constraints and rationale, not live delivery state.
 CI uses three execution tiers (issue #477). Pull requests always run the
 required Linux checks. On PRs, macOS platform contracts run when their input
 filter matches; the package job runs on `macos-15` only for packaging,
-install-acceptance, launchd-service, or relevant workflow inputs; and Hermes
-and SDK macOS jobs run for their own narrow input filters. A change to
+install-acceptance, launchd-service, or relevant workflow inputs; the Hermes
+macOS job runs for its narrow input filter or whenever the runtime package
+selection did not succeed or selects the Hermes package, which every core
+change does; and the SDK macOS job runs for its own narrow input filter. The
+Linux `hermes-package` job follows the package selection like the other
+runtime package jobs. A change to
 `.github/workflows/ci.yml` selects all four macOS jobs. A push to
 `main` runs the main tier: platform contracts, the
 `macos-15` package job, Hermes macOS, and SDK macOS, alongside the Linux jobs
@@ -245,8 +249,8 @@ so an archive runs from any absolute path (the CI test jobs check out into
 `env!("CARGO_MANIFEST_DIR")` in test code (an xtask scan test enforces it).
 `archive.include` in `.config/nextest.toml` makes archive creation fail when
 `pohunek-sessiond` is missing, so daemon tests never run without their worker.
-`build-bins` remains a separate default-feature build for the SDK and Hermes
-jobs, because the archive's `--all-features` build enables cli's `test-util`.
+`build-bins` remains a separate default-feature build for the SDK job, because
+the archive's `--all-features` build enables cli's `test-util`.
 In CI, the Postgres-backed
 relay job is gated by a paths filter and does not run (its PostgreSQL service
 never starts) for non-relay changes.
@@ -612,7 +616,8 @@ model-free compatibility gate (`cargo xtask hermes compatibility
 `pohunekd`, and `pohunek-sessiond`) exercises the pinned CLI and plugin surface:
 list/enable/disable, supported tool/skill/hook registration, profile/home target
 resolution, and Hermes integration install/status/doctor/uninstall. It installs
-the Hermes runtime package `ARCHIVE` (built by `scripts/build-hermes-package`)
+the Hermes runtime package `ARCHIVE` (built from `runtime-packages/hermes` by
+`scripts/build-hermes-package`)
 through the copied daemon with a throwaway signed catalog, and fails unless
 every installed-state lifecycle result reports that package's digest as its
 provenance (`source=embedded` fails). It must use

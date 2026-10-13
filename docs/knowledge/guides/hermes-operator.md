@@ -17,14 +17,14 @@ from an ambient Hermes conversation. Hermes native fork is unsupported, so a
 fork request returns typed unsupported data instead of creating a child session
 or worktree.
 
-`compat/hermes/package/` is a production-format local package fixture under
-validation, not a published or released package. It preserves the built-in
-launch and detection contract and supports only the locked 0.20.0 release. The
-reserved `hermes` runtime id requires authorization by a signed catalog;
-Hermes is not in the published catalog, and no Hermes release package artifact
-exists yet. `compat/hermes/operator.toml` closes the allowlist for the local
-operator payload fixture in `compat/hermes/operator/`; the CLI verifies its
-paths and digests before installation. When an official Hermes package is
+`runtime-packages/hermes/` is the official Hermes runtime package. Releases
+build it, attest it on Linux x86_64 (glibc and musl), and ship it with the
+signed catalog entry that authorizes the reserved `hermes` runtime id in the
+Linux daemon archives; the macOS daemon archive carries no runtime packages.
+The package preserves the built-in launch and detection contract and supports
+only the locked 0.20.0 release. Its `operator.toml` closes the allowlist for
+the operator payload in `operator/`; the CLI verifies its paths and digests
+before installation. When an official Hermes package is
 installed, enabled, and selected, Pohunek loads the operator plugin and its
 generated skill from that package. The copies compiled into the CLI are
 transitional fallbacks for hosts without an installed official package. The

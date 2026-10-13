@@ -203,8 +203,8 @@ pohunek attach <session-id>                 # Ctrl-] detaches, the agent keeps r
 
 [docs/install.md](docs/install.md) covers archive verification, what the login
 service installs, upgrades, the first worktree-isolated session, and runtime
-packages: the official Pi, Codex, and Claude Code packages that each Linux
-daemon archive carries under `runtime/packages/` with the signed
+packages: the official Pi, Codex, Claude Code, and Hermes packages that each
+Linux daemon archive carries under `runtime/packages/` with the signed
 `runtime/runtime-catalog.json`, and third-party packages trusted by an explicit
 digest.
 

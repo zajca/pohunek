@@ -66,7 +66,8 @@ env:
   # its worker.
   # Job `build-bins` stays a separate default-feature build: the archive
   # compiles with --all-features, which enables cli's `test-util` seams, and
-  # the SDK e2e and Hermes compatibility jobs must exercise shipped binaries.
+  # the SDK e2e job must exercise shipped binaries. The Hermes jobs build their
+  # binaries with default features in-job for the same reason.
   # Compile cache (issue #164): Swatinem/rust-cache is the only compile-cache
   # layer. Each Rust job restores the entry of its job type (`shared-key`:
   # clippy, test-debug, bins, release, xtask, docs, hack, nightly-udeps,
@@ -671,7 +672,6 @@ jobs:
       macos: ${{ steps.filter.outputs.macos }}
       macos_package: ${{ steps.filter.outputs.macos_package }}
       sdk_macos: ${{ steps.filter.outputs.sdk_macos }}
-      hermes: ${{ steps.filter.outputs.hermes }}
       hermes_macos: ${{ steps.filter.outputs.hermes_macos }}
       docs_ts: ${{ steps.filter.outputs.docs_ts }}
       release: ${{ steps.filter.outputs.release }}
@@ -774,24 +774,18 @@ jobs:
               - '.github/workflows/ci.yml'
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
-            # Pinned Hermes compatibility provisioning + runtime check
-            # (issue #125): gate on the locked runtime metadata, the full CLI
-            # surface (the gate drives the CLI parser/dispatch, not just the
-            # hermes_integration module), the xtask tree (its lib.rs owns the
-            # `TopCommand::Hermes` dispatch that drives the harness), the
-            # provisioner and its test, and the dependency graph the pinned
-            # run links against (portable-pty, vt100, clap, ...). The paths
-            # and protocol crates are included because `pohunek integration`
-            # resolves its install home via `pohunek_paths::state_home()` and
-            # negotiates via `pohunek_protocol` types
-            # (`SUPPORTED_PROTOCOL_VERSIONS`, `IntegrationRecovery`). The
-            # `hermes-compatibility` (Linux) uses this broad source filter.
-            # The macOS job has a separate narrow PR filter below; both run on
-            # main and nightly.
+            # Narrow PR filter of the pinned Hermes compatibility job on macOS
+            # (issue #125): the locked runtime metadata, the Hermes package,
+            # the CLI's Hermes integration, the Hermes harness of xtask, the
+            # provisioner, the package and smoke scripts and their tests. On
+            # pull requests the job also runs whenever the runtime package
+            # selection selects the Hermes package, which every core change
+            # and every file of the package does; main and nightly always run
+            # it. The Linux `hermes-package` job follows the selection only.
             hermes_macos:
               - 'compat/hermes/**'
+              - 'runtime-packages/hermes/**'
               - 'crates/cli/src/hermes_integration/**'
-              - 'crates/cli/tests/hermes_package.rs'
               - 'crates/cli/tests/support/hermes_provider.rs'
               - 'crates/worker-protocol/src/hook_schema.rs'
               - 'crates/xtask/src/hermes*.rs'
@@ -805,39 +799,6 @@ jobs:
               - 'scripts/tests/fixtures/smoke-*'
               - 'sdk/ts/sdk/test/e2e.test.ts'
               - 'sdk/ts/sdk/test/hermes-plugin.e2e.test.ts'
-              - '.github/workflows/ci.yml'
-              - 'rust-toolchain.toml'
-              - '.github/actions/setup-rust/**'
-            # Linux Hermes compatibility keeps the broader source filter: Linux
-            # runner capacity is not the constrained macOS budget. It also
-            # drives a real pinned Hermes session through the package and runs
-            # the release consumer suite for Hermes, so the daemon, the session
-            # worker and its launch rule, those tests' support code and the
-            # consumer build script are inputs too.
-            hermes:
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'compat/hermes/**'
-              - 'crates/cli/**'
-              - 'crates/daemon/**'
-              - 'crates/package/**'
-              - 'crates/session-worker/**'
-              - 'crates/worker-protocol/**'
-              - 'crates/terminal/**'
-              - 'crates/platform/**'
-              - 'crates/test-support/**'
-              - 'crates/paths/**'
-              - 'crates/protocol/**'
-              - 'crates/xtask/Cargo.toml'
-              - 'crates/xtask/src/**'
-              - 'scripts/provision-hermes-compat'
-              - 'scripts/tests/provision-hermes-compat.sh'
-              - 'packaging/**'
-              - 'scripts/build-hermes-package'
-              - 'scripts/release-workflow/build-consumer'
-              - 'scripts/smoke-hermes-plugin-release'
-              - 'scripts/tests/smoke-hermes-plugin-release.sh'
-              - 'scripts/tests/fixtures/smoke-*'
               - '.github/workflows/ci.yml'
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
@@ -1253,7 +1214,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Designated `xtask` saver: the xtask binary plus the ts-rs export
-          # test builds, a superset of what hermes-compatibility restores.
+          # test builds, a superset of what package-selection restores.
           shared-key: xtask
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -1262,17 +1223,25 @@ jobs:
         env:
           RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
 
-  hermes-compatibility:
+  # Official Hermes runtime package against the pinned, locked Hermes
+  # release. `compat stage-upstream` stages the runtime with the provisioner
+  # that `compat/hermes/compatibility-lock.json` selects, the package is built
+  # from runtime-packages/hermes with `cargo xtask package build`, and the job
+  # runs the model-free compatibility gate and a real pinned Hermes session
+  # through the installed package against a loopback provider. It builds the
+  # binaries it tests, so like the other package jobs it depends only on the
+  # package selection.
+  hermes-package:
     name: pinned Hermes compatibility (model-free)
     runs-on: ubuntu-latest
-    needs: [build-bins, changes]
-    if: ${{ needs.build-bins.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.hermes == 'true') }}
+    needs: package-selection
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.package-selection.result != 'success' || needs.package-selection.outputs.hermes != 'false') }}
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
-    # The real Hermes session builds the CLI integration tests with the daemon
-    # and session worker on top of the xtask cache; the Pi and Codex package
-    # jobs need about the same build, so this keeps their 30 minutes plus room
-    # for the Hermes provisioning and compatibility gate.
+    # The job builds the daemon, the session worker, the CLI and its
+    # integration tests; the Pi and Codex package jobs need about the same
+    # build, so this keeps their 30 minutes plus room for the Hermes
+    # provisioning and compatibility gate.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -1326,9 +1295,13 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # Restore only: ts-drift saves `xtask`.
-          shared-key: xtask
-          save-if: false
+          shared-key: hermes-package
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-nextest
 
       - name: Check fail-closed Hermes provisioning
         run: scripts/tests/provision-hermes-compat.sh
@@ -1377,15 +1350,14 @@ jobs:
           # group-writable framework builds the harness refuses.
           printf 'python=%s\n' "${hermes_bin%/*}/python" >> "$GITHUB_OUTPUT"
 
-      - name: Download built binaries
-        uses: actions/download-artifact@v4
-        with:
-          name: pohunek-bins
-          path: target/debug
+      # The binaries under test, built as the `build-bins` job builds them.
+      - name: Build daemon, session worker, and CLI
+        run: cargo build --locked -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli
 
       # Later cargo steps rebuild binaries in target/debug (the session worker,
       # and `pohunek` with test-only features for the integration tests), so
-      # the release consumer gets this copy of the `build-bins` set.
+      # the release consumer gets this copy of the default-feature binaries
+      # built above.
       - name: Keep the built binaries for the release consumer
         shell: bash
         run: |
@@ -1395,18 +1367,49 @@ jobs:
           cp target/debug/pohunek target/debug/pohunekd target/debug/pohunek-sessiond "$bins/"
           chmod 0755 "$bins/pohunek" "$bins/pohunekd" "$bins/pohunek-sessiond"
 
-      # The gate installs the operator plugin from the Hermes runtime package
-      # through the downloaded daemon, so the archive is built from
-      # compat/hermes in this job.
-      - name: Build the Hermes runtime package
+      # The gate installs the operator plugin from this archive through the
+      # daemon built above.
+      - name: Build the package deterministically
         id: package
         shell: bash
         run: |
           set -euo pipefail
-          archive="$RUNNER_TEMP/hermes-package/hermes.tar.zst"
-          mkdir -p "${archive%/*}"
-          scripts/build-hermes-package "$archive"
-          printf 'archive=%s\n' "$archive" >> "$GITHUB_OUTPUT"
+          cargo xtask package verify runtime-packages/hermes
+          cargo xtask package build runtime-packages/hermes --output "$RUNNER_TEMP/hermes.tar.zst" \
+            --evidence-dir "$RUNNER_TEMP/package-evidence-hermes"
+          echo "archive=$RUNNER_TEMP/hermes.tar.zst" >> "$GITHUB_OUTPUT"
+
+      # Uploaded right after the build, so the evidence of the archive under
+      # test survives a failing gate or test run.
+      - name: Upload the package evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-evidence-hermes
+          path: ${{ runner.temp }}/package-evidence-hermes
+          if-no-files-found: error
+
+      # A verified baseline means the selector rebuilt this package from this
+      # commit and got the digest of the released archive, so the archive
+      # under test must be the released one. A different digest means two
+      # builds of identical inputs disagree: the package build is not
+      # reproducible, and the job fails. The digest is read only from a
+      # successful selection.
+      - name: Match the release baseline
+        shell: bash
+        env:
+          BASELINE_DIGEST: ${{ needs.package-selection.result == 'success' && needs.package-selection.outputs.hermes_baseline_digest || '' }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BASELINE_DIGEST" ]; then
+            echo "No verified release baseline for hermes; the rebuilt archive has nothing to match."
+            exit 0
+          fi
+          actual="sha256:$(sha256sum "$RUNNER_TEMP/hermes.tar.zst" | cut -d' ' -f1)"
+          if [ "$actual" != "$BASELINE_DIGEST" ]; then
+            echo "::error::the rebuilt hermes archive is $actual but the verified release baseline is $BASELINE_DIGEST: the package build is not reproducible"
+            exit 1
+          fi
+          echo "The rebuilt hermes archive is the released baseline $actual."
 
       - name: Check pinned Hermes compatibility
         shell: bash
@@ -1438,13 +1441,19 @@ jobs:
 
       # One real pinned Hermes turn through the selected package and the public
       # session commands against a loopback model. Only the test receives the
-      # provisioned executable path; PATH stays the runner's.
+      # provisioned executable path; PATH stays the runner's. The `package`
+      # nextest profile runs the binary serially with a per-test timeout and
+      # writes a JUnit report. nextest writes it only when the run ends, so a
+      # report the build cache restored under target/ is removed first and
+      # never stands in for this run.
       - name: Drive a real pinned Hermes session through the package
         env:
           POHUNEK_HERMES_E2E: "1"
           POHUNEK_HERMES_BIN: ${{ steps.hermes.outputs.bin }}
           POHUNEK_PYTHON_BIN: ${{ steps.hermes.outputs.python }}
-        run: cargo test --locked -p pohunek-cli --test hermes_package -- --include-ignored --test-threads 1
+        run: |
+          rm -f target/nextest/package/junit.xml
+          cargo nextest run --locked --profile package -p pohunek-cli --test hermes_package --run-ignored all --test-threads 1
 
       # The session test wrote into the stage it used; the release consumer
       # runs on another fresh restore of the untouched copy at the same
@@ -1464,8 +1473,9 @@ jobs:
       # scripts/release-workflow/run-row calls it: a throwaway catalog for the
       # archive, a scrubbed environment, the stage's bin directory first on
       # PATH, a short root outside any Git checkout (socket path length; the
-      # CLI refuses a Hermes home inside a Git workspace), and the unchanged
-      # `build-bins` binaries kept before any cargo step of this job. It
+      # CLI refuses a Hermes home inside a Git workspace), and the
+      # default-feature binaries this job built, copied aside before any later
+      # cargo step rebuilt them. It
       # installs the package, installs the operator plugin from it, and drives
       # one turn, stop and resume against the loopback model
       # (docs/development.md, "Release consumer suite"). The report must name
@@ -1521,6 +1531,18 @@ jobs:
             ${{ hashFiles('crates/xtask/src/upstream_stage.rs') }}-
             ${{ hashFiles('.github/workflows/ci.yml') }}
 
+      - name: Summarize flaky tests
+        if: always()
+        run: python3 scripts/junit-flaky-summary --label "hermes package" target/nextest/package/junit.xml
+
+      - name: Upload the package test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-junit-hermes
+          path: target/nextest/package/junit.xml
+          if-no-files-found: warn
+
   # Runtime package selection for pull requests (issue #149). `cargo xtask
   # package affected` classifies every file the pull request changes against
   # its base commit: a file of `runtime-packages/<p>/` or `compat/<p>/` selects
@@ -1551,9 +1573,11 @@ jobs:
       pi: ${{ steps.select.outputs.pi }}
       codex: ${{ steps.select.outputs.codex }}
       claude: ${{ steps.select.outputs.claude }}
+      hermes: ${{ steps.select.outputs.hermes }}
       pi_baseline_digest: ${{ steps.select.outputs.pi_baseline_digest }}
       codex_baseline_digest: ${{ steps.select.outputs.codex_baseline_digest }}
       claude_baseline_digest: ${{ steps.select.outputs.claude_baseline_digest }}
+      hermes_baseline_digest: ${{ steps.select.outputs.hermes_baseline_digest }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1656,7 +1680,7 @@ jobs:
           {
             echo "packages=$(jq -c '.packages' <<<"$selection")"
             echo "core_changed=$core_changed"
-            for package in pi codex claude; do
+            for package in pi codex claude hermes; do
               changed="$(jq -r --arg package "$package" '.packages | index($package) != null' <<<"$selection")"
               digest="$(jq -r --arg package "$package" '.packages[$package] // {} | if .verdict == "verified" and ((.digest // "") | test("^sha256:[0-9a-f]{64}$")) then .digest else "" end' <<<"$baseline")"
               if [ "$core_changed" = true ] || [ "$changed" = true ] || [ -z "$digest" ]; then
@@ -2085,15 +2109,17 @@ jobs:
           path: target/nextest/package/junit.xml
           if-no-files-found: warn
 
-  # Native Apple Silicon counterpart of `hermes-compatibility`. It provisions
+  # Native Apple Silicon counterpart of `hermes-package`. It provisions
   # the same locked Hermes runtime under the runner's /bin/bash 3.2 and BSD
   # userland, then runs the model-free compatibility gate and the packaged
   # plugin smoke natively. Every missing prerequisite fails the job; nothing
   # is skipped.
   hermes-compatibility-macos:
     name: pinned Hermes compatibility (macOS arm64, model-free)
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && needs.changes.outputs.hermes_macos == 'true') }}
-    needs: changes
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && (needs.changes.outputs.hermes_macos == 'true' || needs.package-selection.result != 'success' || needs.package-selection.outputs.hermes != 'false'))) }}
+    # `package-selection` runs on pull requests only; `!cancelled()` keeps
+    # its skip on push, schedule and dispatch from skipping this job.
+    needs: [changes, package-selection]
     runs-on: macos-15
     env:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
@@ -2242,8 +2268,8 @@ jobs:
           printf 'dir=%s\n' "$packaged_dir" >> "$GITHUB_OUTPUT"
 
       # The gate and the smoke install the operator plugin from the Hermes
-      # runtime package, built here from compat/hermes. The smoke's catalog is
-      # signed with a throwaway key that only its anchor trusts.
+      # runtime package, built here from runtime-packages/hermes. The smoke's
+      # catalog is signed with a throwaway key that only its anchor trusts.
       - name: Build the Hermes runtime package and its throwaway catalog
         id: package
         shell: /bin/bash {0}
@@ -2333,9 +2359,8 @@ jobs:
             ${{ hashFiles('crates/xtask/src/upstream_stage.rs') }}-
             ${{ hashFiles('.github/workflows/ci.yml') }}
 
-  # Build the three runnable binaries exactly once. The SDK e2e and pinned
-  # Hermes jobs reuse this artifact instead of each rebuilding Rust, which used
-  # to cost a full duplicate build per job (issue #122).
+  # Build the three runnable binaries exactly once. The SDK e2e job reuses
+  # this artifact instead of rebuilding Rust (issue #122).
   build-bins:
     name: build bins (pohunekd + pohunek-sessiond + pohunek)
     runs-on: ubuntu-latest

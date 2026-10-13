@@ -162,7 +162,7 @@ report, uploaded as `matrix-junit-<runtime>-<target>`. `scripts/ci-timings junit
 reads all of them.
 
 The official runtime package jobs (`pi-package`, `codex-package`,
-`claude-package`) take their pull-request selection from
+`claude-package`, `hermes-package`) take their pull-request selection from
 `cargo xtask package affected [--base REF] [--json]`, which the
 `package-selection` CI job runs against the pull request's base commit. It
 collects changed files like `cargo xtask affected` (committed diff against the
@@ -377,14 +377,15 @@ provisioned stage (`cargo xtask compat stage-upstream --runtime hermes`); a
 used stage is not stable, so every run starts from a pristine copy that
 `compat verify-stage` accepted.
 
-CI runs the Hermes driver in row mode in the `hermes-compatibility` job, after
-the real Hermes session test: it restores and verifies the pristine stage,
-builds the consumer with `scripts/release-workflow/build-consumer`, and runs it
-the way `run-row` does (a scrubbed environment, the stage's `bin` first on
-`PATH`, a short root outside any Git checkout) against the `build-bins`
-binaries, copied aside before any cargo step of the job rebuilds
-`target/debug`, and the archive `scripts/build-hermes-package` built from
-`compat/hermes`; the report must name that archive's digest.
+CI runs the Hermes driver in row mode in the `hermes-package` job, after the
+real Hermes session test: it restores and verifies the pristine stage, builds
+the consumer with `scripts/release-workflow/build-consumer`, and runs it the
+way `run-row` does (a scrubbed environment, the stage's `bin` first on `PATH`,
+a short root outside any Git checkout) against the default-feature binaries the
+job built, copied aside before a later cargo step rebuilds `target/debug`, and
+the archive the job built from `runtime-packages/hermes`; the report must name
+that archive's digest. The release rows and the archive smoke run the same
+driver on the release binaries and the released Hermes package.
 
 ## Archive smoke
 
@@ -490,7 +491,8 @@ assembles and publishes the release in one fixed flow:
    archives. No macOS job uses secrets or a protected environment.
 2. **Evidence** (`release-evidence.yml`, reusable): one job per
    (runtime x target) row of `compat/matrix.json` extracts the binaries from the
-   daemon ARCHIVE, stages the pinned upstream, runs the out-of-process consumer
+   daemon ARCHIVE, stages the pinned upstream (npm, or a provisioner script,
+   for which the job installs Python and uv), runs the out-of-process consumer
    suite and emits `attestation-<runtime>-<target>.json`, plus
    `junit-<runtime>-<target>.xml` with the timed consumer run (written also when
    the consumer fails, uploaded as `matrix-junit-<runtime>-<target>`, never a
@@ -528,13 +530,15 @@ pipeline. The offline docs, the README, and the reference
 pages under `docs/` are bundled into every native component archive. Daemon archives also contain
 `packaging/smoke-hermes-plugin-release`. Release automation provisions the
 source-locked Hermes runtime without provider credentials, extracts each daemon
-archive, builds the Hermes runtime package with `scripts/build-hermes-package`,
-runs the model-free compatibility gate against the extracted binaries and that
-package, and executes the packaged smoke script. The smoke takes the extracted
-daemon archive, the package archive, a signed catalog that authorizes it, and
-the anchor that trusts the catalog's signer; until Hermes ships in the release
-catalog, `cargo xtask hermes throwaway-catalog` writes that catalog and anchor
-with a random signing key that is never stored. Operators can repeat the same
+archive, builds the Hermes runtime package from `runtime-packages/hermes` with
+`scripts/build-hermes-package`, runs the model-free compatibility gate against
+the extracted binaries and that package, and executes the packaged smoke
+script. The smoke takes the extracted daemon archive, the package archive, a
+signed catalog that authorizes it, and the anchor that trusts the catalog's
+signer; these archives are smoked before assembly adds the signed release
+catalog, and the macOS archive never carries a package, so `cargo xtask hermes
+throwaway-catalog` writes that catalog and anchor with a random signing key
+that is never stored. Operators can repeat the same
 script with an explicitly supplied, preinstalled pinned Hermes executable. It
 copies the binaries into a private prefix with the anchor beside the daemon,
 starts the daemon in an isolated temporary profile/state, installs the package

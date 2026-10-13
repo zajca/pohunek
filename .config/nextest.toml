@@ -88,9 +88,9 @@ retries = { backoff = "fixed", count = 2, delay = "1s" }
 path = "junit.xml"
 
 # Runtime package jobs of ci.yml (`pi-package`, `codex-package`,
-# `claude-package`): one `<runtime>_package` test binary with its ignored
-# real-upstream tests, which drive a real runtime through PTYs, a real daemon
-# and a session worker.
+# `claude-package`, `hermes-package`): one `<runtime>_package` test binary with
+# its ignored real-upstream tests, which drive a real runtime through PTYs, a
+# real daemon and a session worker.
 [profile.package]
 inherits = "default"
 # One test at a time: the test daemons observe the host's process table, so a

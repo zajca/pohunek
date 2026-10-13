@@ -104,8 +104,8 @@ MACOS_PATH_OWNERSHIP = {
         "filter": "hermes_macos",
         "pr": {
             "compat/hermes/**",
+            "runtime-packages/hermes/**",
             "crates/cli/src/hermes_integration/**",
-            "crates/cli/tests/hermes_package.rs",
             "crates/cli/tests/support/hermes_provider.rs",
             "crates/worker-protocol/src/hook_schema.rs",
             "crates/xtask/src/hermes*.rs",
@@ -224,7 +224,12 @@ def filter_names() -> list[str]:
 
 # Runtime package jobs and the package each one drives (issue #149). The
 # selector job decides which of them a pull request runs; nothing else may.
-PACKAGE_JOBS = {"pi-package": "pi", "codex-package": "codex", "claude-package": "claude"}
+PACKAGE_JOBS = {
+    "pi-package": "pi",
+    "codex-package": "codex",
+    "claude-package": "claude",
+    "hermes-package": "hermes",
+}
 PACKAGE_SELECTOR = "package-selection"
 PACKAGE_SELECT_COMMAND = 'cargo xtask package affected --base "$BASE_SHA" --json'
 
@@ -449,20 +454,20 @@ class RuntimePackageSelectionTests(unittest.TestCase):
             ("push", False, "skipped", {}, True),
             ("schedule", False, "skipped", {}, True),
             ("workflow_dispatch", False, "skipped", {}, True),
-            ("pull_request", False, "success", {"pi": "true", "codex": "true", "claude": "true"}, True),
+            ("pull_request", False, "success", {"pi": "true", "codex": "true", "claude": "true", "hermes": "true"}, True),
             # A selection that did not succeed runs every package, whatever
             # outputs it set before failing.
             ("pull_request", False, "failure", {}, True),
-            ("pull_request", False, "failure", {"pi": "false", "codex": "false", "claude": "false"}, True),
+            ("pull_request", False, "failure", {"pi": "false", "codex": "false", "claude": "false", "hermes": "false"}, True),
             ("pull_request", False, "skipped", {}, True),
-            ("pull_request", False, "cancelled", {"pi": "false", "codex": "false", "claude": "false"}, True),
+            ("pull_request", False, "cancelled", {"pi": "false", "codex": "false", "claude": "false", "hermes": "false"}, True),
             # A successful selection with a missing or malformed output runs the package.
             ("pull_request", False, "success", {}, True),
-            ("pull_request", False, "success", {"pi": "", "codex": "", "claude": ""}, True),
-            ("pull_request", False, "success", {"pi": "no", "codex": "0", "claude": "yes"}, True),
+            ("pull_request", False, "success", {"pi": "", "codex": "", "claude": "", "hermes": ""}, True),
+            ("pull_request", False, "success", {"pi": "no", "codex": "0", "claude": "yes", "hermes": "n"}, True),
             # GitHub compares strings case-insensitively, so any casing of false excludes.
-            ("pull_request", False, "success", {"pi": "False", "codex": "FALSE", "claude": "False"}, False),
-            ("pull_request", True, "success", {"pi": "true", "codex": "true", "claude": "true"}, False),
+            ("pull_request", False, "success", {"pi": "False", "codex": "FALSE", "claude": "False", "hermes": "fAlSe"}, False),
+            ("pull_request", True, "success", {"pi": "true", "codex": "true", "claude": "true", "hermes": "true"}, False),
         )
         for job, package in PACKAGE_JOBS.items():
             expression = self.condition(job)
@@ -631,10 +636,12 @@ SELECTOR_STEPS = (
 # Verdicts of `cargo xtask package baseline --json` captured from the real
 # release v0.34.2: a checkout of the tag verifies every package with the
 # digests of the released archives, and a checkout whose packages changed after
-# the release reports `digest_mismatch`.
+# the release reports `digest_mismatch`. v0.34.2 ships no Hermes package, so
+# the Hermes digest is a synthetic, well-formed stand-in for a verified one.
 RELEASED_DIGESTS = {
     "claude": "sha256:bc3c11cfee1ab3807996e1053e5898438abac5c9561f2beb577aaddf3cabcbab",
     "codex": "sha256:371c19be10a35d4a424a65376769f9bc5ae13f1039c40e5f2c53336c1d256d66",
+    "hermes": "sha256:" + hashlib.sha256(b"synthetic hermes release baseline").hexdigest(),
     "pi": "sha256:446451ead20ef978c19b406949eb01a7d29c9a498b4de8eb76c2b3e5e3c1fd53",
 }
 
@@ -981,8 +988,9 @@ class RuntimePackageBaselineTests(unittest.TestCase):
                 self.assertEqual(run.result, "success", run.stderr)
                 self.assertTrue(run.runs("pi-package"))
                 self.assertEqual(run.outputs["pi_baseline_digest"], "")
-                self.assertFalse(run.runs("codex-package"))
-                self.assertFalse(run.runs("claude-package"))
+                for job in PACKAGE_JOBS:
+                    if job != "pi-package":
+                        self.assertFalse(run.runs(job), job)
 
     def test_package_conditions_read_only_the_selection_result_and_their_own_output(self):
         for job, package in PACKAGE_JOBS.items():
