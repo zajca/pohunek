@@ -30,6 +30,18 @@ runs:
         # to building without sccache. The sha256 check below guards the bytes.
         DOWNLOAD_RETRIES: "5"
         DOWNLOAD_RETRY_DELAY_SECONDS: "2"
+        # Transfer limits. --retry only counts attempts that return, so a server
+        # that accepts and then stalls would hang the job without these. The
+        # asset is about 9.7 MB: 1 KiB/s sustained for 30 s is a stall, and 120 s
+        # per attempt leaves room for a slow download. Retries stop starting
+        # after 300 s, so the worst case is about 300 s + 120 s before fallback.
+        # The cache only affects cost, so the job gives up rather than wait.
+        # curl exit 28 (timeout) is retried through --retry-all-errors.
+        DOWNLOAD_CONNECT_TIMEOUT_SECONDS: "15"
+        DOWNLOAD_STALL_BYTES_PER_SECOND: "1024"
+        DOWNLOAD_STALL_SECONDS: "30"
+        DOWNLOAD_MAX_TIME_SECONDS: "120"
+        DOWNLOAD_RETRY_MAX_TIME_SECONDS: "300"
       run: |
         set -euo pipefail
         # GitHub does not enforce `required: true` on composite inputs.
@@ -70,6 +82,11 @@ runs:
         if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
           --retry "$DOWNLOAD_RETRIES" --retry-all-errors \
           --retry-delay "$DOWNLOAD_RETRY_DELAY_SECONDS" \
+          --retry-max-time "$DOWNLOAD_RETRY_MAX_TIME_SECONDS" \
+          --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT_SECONDS" \
+          --speed-limit "$DOWNLOAD_STALL_BYTES_PER_SECOND" \
+          --speed-time "$DOWNLOAD_STALL_SECONDS" \
+          --max-time "$DOWNLOAD_MAX_TIME_SECONDS" \
           --output "$dest/$archive" \
           "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/$archive"; then
           fallback "download of $archive failed"
