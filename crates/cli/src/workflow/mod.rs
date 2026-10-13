@@ -7,6 +7,11 @@
 //! Trust is the archive digest the owner supplies at install time.
 //! [`runner`] runs one declared action under the owner limits of [`config`]
 //! and appends a record to the plugin's run log ([`runlog`]).
+//!
+//! Declared jobs and services run as units of the user's service manager:
+//! [`units`] installs and removes them when a plugin is enabled, disabled or
+//! uninstalled, and every unit runs the hidden `pohunek workflow __exec`
+//! trampoline ([`supervised`]), which owns every run decision.
 
 // Rust guideline compliant 2026-10-13
 
@@ -15,6 +20,8 @@ pub(crate) mod manifest;
 pub(crate) mod runlog;
 pub(crate) mod runner;
 pub(crate) mod store;
+pub(crate) mod supervised;
+pub(crate) mod units;
 
 use std::io::ErrorKind;
 use std::process::ExitStatus;
@@ -269,6 +276,51 @@ pub(crate) enum Error {
         reason: &'static str,
     },
 
+    /// The plugin declares jobs or services, but no `pohunek service`
+    /// installation provides the executable their units run.
+    #[error("workflow plugin jobs and services need the pohunek service installation: {reason}")]
+    ServiceNotInstalled {
+        /// What is missing or does not match, by path or key only.
+        reason: String,
+    },
+
+    /// A declared job or service is outside the owner's `[jobs]` bounds.
+    #[error("{unit} of workflow plugin {id} {reason}; nothing was changed")]
+    UnitRefused {
+        /// The plugin id.
+        id: String,
+        /// `job <name>` or `service <name>`.
+        unit: String,
+        /// The bound it breaks, naming the knob.
+        reason: String,
+    },
+
+    /// The service manager did not complete a unit operation.
+    #[error("the service manager units of workflow plugin {id} failed: {detail}")]
+    Units {
+        /// The plugin id.
+        id: String,
+        /// What was attempted, what failed, and what was rolled back.
+        detail: String,
+    },
+
+    /// A unit runs another archive than the installed one: residue of an
+    /// earlier installation.
+    #[error("a unit of workflow plugin {id} names another archive than the installed one; nothing was run")]
+    UnitStale {
+        /// The plugin id.
+        id: String,
+    },
+
+    /// The installed manifest declares no job or service of the unit's name.
+    #[error("workflow plugin {id} declares no {unit}; nothing was run")]
+    UnitUnknown {
+        /// The plugin id.
+        id: String,
+        /// `job <name>` or `service <name>`, the name escaped.
+        unit: String,
+    },
+
     /// The CLI received a terminating signal while the action ran.
     #[error("action {action} of workflow plugin {id} was stopped because pohunek received signal {signal}")]
     Interrupted {
@@ -311,6 +363,11 @@ impl Error {
             Self::ActionTimeout { .. } => "workflow_action_timeout",
             Self::OutputLimit { .. } => "workflow_output_limit",
             Self::Interrupted { .. } => "workflow_action_interrupted",
+            Self::ServiceNotInstalled { .. } => "workflow_service_not_installed",
+            Self::UnitRefused { .. } => "workflow_unit_refused",
+            Self::Units { .. } => "workflow_units_failed",
+            Self::UnitStale { .. } => "workflow_unit_stale",
+            Self::UnitUnknown { .. } => "workflow_unit_unknown",
             Self::ActionFailed { .. } => "workflow_action_failed",
             Self::OutputIncomplete { .. } => "workflow_output_incomplete",
             Self::OutputInvalid { .. } => "workflow_output_invalid",
@@ -421,6 +478,26 @@ impl Error {
                  one that applied"
             }
             Self::Interrupted { .. } => "run the action again when it may finish",
+            Self::ServiceNotInstalled { .. } => {
+                "install the service with `pohunek service install`, or install the plugin \
+                 with --no-enable"
+            }
+            Self::UnitRefused { .. } => {
+                "raise the named knob in workflow.toml, or ask the plugin author for a value \
+                 within it"
+            }
+            Self::Units { .. } => {
+                "check the user service manager (`systemctl --user` or `launchctl`), then repeat \
+                 the command; it is safe to repeat"
+            }
+            Self::UnitStale { .. } => {
+                "the unit is left over from another install; remove it with \
+                 `pohunek workflow disable <id>`, or `pohunek workflow enable <id>` to replace it"
+            }
+            Self::UnitUnknown { .. } => {
+                "the unit is left over from another install; remove it with \
+                 `pohunek workflow disable <id>`"
+            }
             Self::ActionFailed { .. } => {
                 "the action reported a failure; its stderr above says why, and its stdout was \
                  not printed"
@@ -454,7 +531,9 @@ impl Error {
             | Self::Interrupted { .. }
             | Self::ActionFailed { .. }
             | Self::OutputIncomplete { .. }
-            | Self::OutputInvalid { .. } => ErrorClass::Runtime,
+            | Self::OutputInvalid { .. }
+            | Self::Units { .. }
+            | Self::UnitStale { .. } => ErrorClass::Runtime,
             _ => ErrorClass::Configuration,
         }
     }

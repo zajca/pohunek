@@ -13,6 +13,32 @@
 - The rule is in the runtime packages guide; the archive concept describes
   `version_not_bumped` and the bump decisions.
 
+## Unreleased (2026-10-13, workflow plugin jobs and services, #326)
+
+- `workflow.toml` accepts `[jobs.<name>]` (`argv`, `every_s`, optional
+  `timeout_ms`) and `[services.<name>]` (`argv`); the consent review and
+  `inspect` show them.
+- `pohunek workflow enable` installs and starts one user service manager unit
+  per job and service (systemd user units, launchd agents) of the
+  `pohunek service` installation; `disable` and `uninstall` stop and remove
+  them. New error codes: `workflow_service_not_installed`,
+  `workflow_unit_refused`, `workflow_units_failed`, `workflow_unit_stale`,
+  `workflow_unit_unknown`.
+- Every unit runs the hidden `pohunek workflow __exec`, which refuses residue
+  units, records `overlap_skipped` while a run is active, runs a job once its
+  wall-clock `every_s` has passed, applies a service's restart backoff, never
+  forwards the origin pair or the service manager's environment, and stops
+  the run's process group on `SIGTERM`, then exits 0 so a unit its service
+  manager stopped reads as stopped (the run is recorded `interrupted`).
+  systemd plugin units use `KillMode=mixed`, so a stop signals only the
+  trampoline; the final `SIGKILL` still reaches every remaining process.
+  Uninstall is refused while a unit cannot be removed. Run records gain the kinds `job` and
+  `service` and the field `backoff_ms`.
+- New owner knobs `[jobs]` (`timeout_default_ms`, `timeout_max_ms`,
+  `min_interval_s`, `check_period_s`) and `[services]`
+  (`restart_initial_ms`, `restart_max_ms`, `stable_after_ms`).
+- The architecture concept says which login units exist besides the daemon.
+
 ## Unreleased (2026-10-13, workflow run --json and verbatim arguments, #325)
 
 - `pohunek workflow run [--json] <plugin> <action> [<args>...]`: every

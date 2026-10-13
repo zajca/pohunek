@@ -3137,10 +3137,14 @@ Every `--json` result is one standard CLI process envelope. The `ok` payloads:
   `already_installed` or `root_restored`. `warnings` is present when the
   plugin was recorded but the store could not confirm the change is durable.
 - `list`: `{plugins: [plugin...]}`.
-- `enable` and `disable`: the updated `plugin`.
+- `enable` and `disable`: the updated `plugin`, plus `warnings` when
+  `disable` could not list the units of a plugin whose files fail
+  verification.
 - `inspect`: `{plugin, description, files_dir, state_dir, config_dir,
-  actions: [{name, argv, args, timeout_ms?, max_output_bytes?}]}`. `argv[0]`
-  is resolved to an absolute path; `args` is `none` or `passthrough`.
+  actions: [{name, argv, args, timeout_ms?, max_output_bytes?}],
+  jobs?: [{name, argv, every_s, timeout_ms?}], services?: [{name, argv}]}`.
+  `argv[0]` is resolved to an absolute path; `args` is `none` or
+  `passthrough`; `jobs` and `services` are present when declared.
 - `run`: the action's stdout, which must be exactly one JSON document (JSON
   whitespace around it is allowed and dropped), placed as `ok` byte for byte:
   key order, number spelling and inner whitespace are the action's own. It is
@@ -3195,6 +3199,11 @@ error type:
 | `workflow_action_failed` | `runtime` | `run --json` only: the action exited non-zero or was ended by a signal the CLI did not send; carries `exit_code` and `signal?`; its stdout was not printed. |
 | `workflow_output_incomplete` | `runtime` | `run --json` only: the action exited 0, but a process that left its group still held stdout open, so the capture was never judged. |
 | `workflow_output_invalid` | `runtime` | `run --json` only: the action exited 0, but its stdout is empty, not JSON (including arrays and objects nested deeper than 126 levels, so the envelope stays within the 127 levels serde_json's default parser accepts), ends inside its document, or has data after it. |
+| `workflow_service_not_installed` | `configuration` | The plugin declares jobs or services, and no verified `pohunek service` installation (its `service.toml` and `<prefix>/bin/pohunek`) describes this process; nothing was changed. |
+| `workflow_unit_refused` | `configuration` | A job's `every_s` is below `jobs.min_interval_s` or its `timeout_ms` above `jobs.timeout_max_ms`; nothing was changed or run. |
+| `workflow_units_failed` | `runtime` | The service manager did not install or remove a unit. After a failed enable every unit was removed and the plugin disabled again; after a failed disable the plugin stays disabled; a failed uninstall keeps the plugin installed. |
+| `workflow_unit_stale` | `runtime` | A unit names another archive than the installed one; it was refused and recorded. |
+| `workflow_unit_unknown` | `configuration` | The installed manifest declares no job or service of the unit's name; nothing was run. |
 
 `workflow run` streams the action's stdout and stderr, each up to its cap.
 With `--json` it captures stdout up to the same cap instead, still streams
@@ -3216,8 +3225,10 @@ stdout wins over stdout that is not one JSON document. The action's environment,
 `<state>/pohunek/workflow-plugin-state/<id>/logs/runs.jsonl` and the owner
 knobs `<config>/pohunek/workflow.toml` are specified in
 `docs/knowledge/guides/workflow-plugins.md`, which also holds the manifest and
-trust rules. Event reactions, periodic jobs and services are not yet
-available.
+trust rules, and the plugin units of jobs and services: each runs the hidden
+`pohunek workflow __exec <id> <digest> job|service <name>`, an entry point
+of the service manager units, not a command to call. Event reactions are not
+yet available.
 
 ## Hermes Operator Plugin CLI
 

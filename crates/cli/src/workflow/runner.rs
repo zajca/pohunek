@@ -1,4 +1,5 @@
-//! Runs one declared action of an installed, enabled workflow plugin.
+//! Runs one declared action of an installed, enabled workflow plugin, and the
+//! supervised runs of its jobs and services.
 //!
 //! Before anything starts, the plugin's files are verified again and the run
 //! is refused when the plugin is disabled or tampered with, the action is
@@ -31,19 +32,26 @@
 //! an installed plugin, refused or not, appends one record to its run log,
 //! except a run refused before the log could be opened: invalid owner knobs
 //! (they set the log's retention) or a log that cannot be opened.
+//!
+//! A supervised run ([`run_supervised`]) of a job or service follows the same
+//! rules with three differences: it never forwards the session origin pair,
+//! whatever this process's environment holds, because a service manager's
+//! environment is not a session's; `POHUNEK_CLI` is the installed
+//! `<prefix>/bin/pohunek` its unit runs; and both output streams are
+//! discarded without a cap and only counted. A service has no deadline.
 
 // Rust guideline compliant 2026-10-13
 
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::os::unix::process::ExitStatusExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use futures::FutureExt as _;
 use package::registry::PackageRecord;
-use pohunek_platform::supervisor::BOOTSTRAP_ENV_ALLOWLIST;
+use pohunek_platform::supervisor::{PluginUnitKind, BOOTSTRAP_ENV_ALLOWLIST};
 use protocol::{
     PackageDigest, PackageId, PackageVersion, ProtocolVersionRange, ENV_DAEMON_ID, ENV_SESSION_ID,
 };
@@ -62,6 +70,20 @@ use crate::process::bounded::{
 
 /// Invocation kind of `workflow run`, in the context and the run log.
 const KIND_ACTION: &str = "action";
+
+/// Invocation kind of a supervised job run.
+const KIND_JOB: &str = "job";
+
+/// Invocation kind of a supervised service run.
+const KIND_SERVICE: &str = "service";
+
+/// How far ahead a service run's deadline lies: a service has none and runs
+/// until it exits or is stopped.
+///
+/// A century is beyond any host's uptime and still representable as an
+/// [`Instant`] on every supported platform, whose monotonic clocks count
+/// from boot.
+const NO_DEADLINE: Duration = Duration::from_hours(100 * 365 * 24);
 
 /// Schema of the context JSON.
 const CONTEXT_SCHEMA: u32 = 1;
@@ -95,22 +117,35 @@ const ENV_PLUGIN_CONTEXT: &str = "POHUNEK_PLUGIN_CONTEXT";
 /// The canonical path of the running `pohunek`.
 const ENV_CLI: &str = "POHUNEK_CLI";
 
-/// How `workflow run` delivers the action's stdout.
+/// How a run delivers the child's stdout and stderr.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Output {
     /// Stdout streams to this process's stdout.
     Text,
     /// Stdout is captured and must be exactly one JSON document.
     Json,
+    /// Both streams are discarded without a cap and only counted; the mode
+    /// of supervised runs.
+    Discard,
 }
 
 impl Output {
-    /// The mode's name in the context's `output` field.
-    fn name(self) -> &'static str {
+    /// The mode's name in the context's `output` field; only actions have
+    /// one.
+    fn name(self) -> Option<&'static str> {
         match self {
-            Self::Text => "text",
-            Self::Json => "json",
+            Self::Text => Some("text"),
+            Self::Json => Some("json"),
+            Self::Discard => None,
         }
+    }
+}
+
+/// The run log name of a unit kind.
+pub(crate) fn kind_name(kind: PluginUnitKind) -> &'static str {
+    match kind {
+        PluginUnitKind::Job => KIND_JOB,
+        PluginUnitKind::Service => KIND_SERVICE,
     }
 }
 
@@ -122,6 +157,21 @@ pub(crate) enum Completed {
     /// A JSON-mode run whose child exited zero with exactly one JSON
     /// document on stdout, without the whitespace around it.
     Document(Box<RawValue>),
+}
+
+/// One supervised run of a declared job or service.
+#[derive(Debug)]
+pub(crate) struct Supervised<'a> {
+    /// Whether the unit is a job or a service.
+    pub(crate) kind: PluginUnitKind,
+    /// The declared name, valid under the manifest's name grammar.
+    pub(crate) name: &'a str,
+    /// The archive digest the unit names; another selected digest refuses
+    /// the run.
+    pub(crate) digest: &'a PackageDigest,
+    /// The installed `<prefix>/bin/pohunek`, given to the child as
+    /// `POHUNEK_CLI`.
+    pub(crate) cli: &'a Path,
 }
 
 /// One `workflow run` request.
@@ -143,25 +193,78 @@ struct Prepared {
     name: String,
     argv: Vec<String>,
     files: PathBuf,
-    timeout_ms: u64,
+    /// The deadline; `None` for a service, which has none.
+    timeout_ms: Option<u64>,
     caps: [u64; 2],
     context: String,
     origin: Option<(OsString, OsString)>,
+    /// `POHUNEK_CLI`; `None` names the running executable.
+    cli: Option<PathBuf>,
 }
 
 /// The run log and the facts every record of this run shares.
-struct Run {
+#[derive(Debug)]
+pub(crate) struct Run {
     log: RunLog,
     ts: String,
     id: String,
+    kind: &'static str,
     started: Instant,
     arg_count: usize,
+    /// The restart delay a service run waited, for its record.
+    pub(crate) backoff_ms: Option<u64>,
 }
 
 impl Run {
+    /// Opens the run log of plugin `id` for one run of `kind` and stamps the
+    /// run's start.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RunLog`] when the clock cannot be formatted or the
+    /// run log cannot be opened.
+    pub(crate) fn open(
+        store: &Store,
+        knobs: &Knobs,
+        id: &PackageId,
+        kind: &'static str,
+        arg_count: usize,
+    ) -> Result<Self, Error> {
+        let ts = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|error| Error::RunLog {
+                detail: error.to_string(),
+            })?;
+        Ok(Self {
+            log: RunLog::open(&store.state_dir(id), knobs.logs)?,
+            ts,
+            id: ulid::Ulid::new().to_string(),
+            kind,
+            started: Instant::now(),
+            arg_count,
+            backoff_ms: None,
+        })
+    }
+
+    /// Starts the run's clock and start time over, for a run that waited
+    /// before it started.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RunLog`] when the clock cannot be formatted.
+    pub(crate) fn restart_clock(&mut self) -> Result<(), Error> {
+        self.ts = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|error| Error::RunLog {
+                detail: error.to_string(),
+            })?;
+        self.started = Instant::now();
+        Ok(())
+    }
+
     /// Appends this run's record; a failed append is reported on stderr,
     /// since the run itself already happened or was refused.
-    fn append(
+    pub(crate) fn append(
         &mut self,
         record: &PackageRecord,
         name: Option<&str>,
@@ -173,7 +276,7 @@ impl Run {
         let entry = Record {
             ts: self.ts.clone(),
             run_id: &self.id,
-            kind: KIND_ACTION,
+            kind: self.kind,
             name,
             version: &record.identity().version,
             digest: record.digest(),
@@ -185,6 +288,7 @@ impl Run {
             stdout_bytes: bytes[0],
             stderr_bytes: bytes[1],
             arg_count: self.arg_count,
+            backoff_ms: self.backoff_ms,
         };
         if let Err(error) = self.log.append(&entry) {
             eprintln!("warning: {error}");
@@ -198,7 +302,8 @@ struct Context<'a> {
     schema: u32,
     plugin: ContextPlugin<'a>,
     invocation: ContextInvocation<'a>,
-    output: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<&'static str>,
     cli: ContextCli,
 }
 
@@ -254,20 +359,19 @@ pub(crate) fn run_action(
     let installed = store
         .installed(id)?
         .ok_or_else(|| Error::PluginUnknown { id: id.to_string() })?;
-    let ts = time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .map_err(|error| Error::RunLog {
-            detail: error.to_string(),
-        })?;
-    let mut run = Run {
-        log: RunLog::open(&store.state_dir(id), knobs.logs)?,
-        ts,
-        id: ulid::Ulid::new().to_string(),
-        started: Instant::now(),
-        arg_count: invocation.args.len(),
-    };
+    let mut run = Run::open(store, knobs, id, KIND_ACTION, invocation.args.len())?;
     match prepare(store, knobs, invocation, &installed, &run.id) {
-        Ok(prepared) => execute(&mut run, store, knobs, invocation, &prepared),
+        Ok(prepared) => match Interrupts::new() {
+            Ok(mut interrupts) => execute(
+                &mut run,
+                store,
+                knobs,
+                invocation,
+                &prepared,
+                &mut interrupts,
+            ),
+            Err(error) => Err(spawn_failed(&mut run, &prepared, error.kind())),
+        },
         Err((error, name)) => {
             let name = name.as_deref();
             run.append(
@@ -328,6 +432,7 @@ fn prepare(
         Some(requested) => requested,
         None => limits.action_timeout_default_ms,
     };
+    let timeout_ms = Some(timeout_ms);
     let declared = action.max_output_bytes.map_or(u64::MAX, u64::from);
     let caps = [
         limits.max_stdout_bytes.min(declared),
@@ -369,6 +474,163 @@ fn prepare(
         caps,
         context,
         origin,
+        cli: None,
+    })
+}
+
+/// Runs the declared job or service `unit` of the plugin `run` logs for,
+/// without a session origin and with both output streams discarded, and
+/// returns the status of a child that ended by itself, zero or not.
+///
+/// `interrupts` must be registered before the caller started waiting, so a
+/// stop request that arrives at any point ends the run.
+///
+/// # Errors
+///
+/// Returns a refusal ([`Error::PluginUnknown`], [`Error::UnitStale`],
+/// [`Error::PluginDisabled`], [`Error::RootInvalid`],
+/// [`Error::UnitUnknown`], [`Error::UnitRefused`],
+/// [`Error::ContextTooLarge`]) or a run that ended early
+/// ([`Error::SpawnFailed`], [`Error::Interrupted`], [`Error::ActionTimeout`],
+/// [`Error::RunFailed`]); every one is recorded in the run log.
+pub(crate) fn run_supervised(
+    run: &mut Run,
+    store: &Store,
+    knobs: &Knobs,
+    plugin: &PackageId,
+    unit: &Supervised<'_>,
+    interrupts: &mut Interrupts,
+) -> Result<Completed, Error> {
+    let invocation = Invocation {
+        plugin,
+        action: unit.name,
+        args: &[],
+        output: Output::Discard,
+    };
+    let installed = store
+        .installed(plugin)?
+        .ok_or_else(|| Error::PluginUnknown {
+            id: plugin.to_string(),
+        })?;
+    match prepare_unit(store, knobs, plugin, unit, &installed, &run.id) {
+        Ok(prepared) => execute(run, store, knobs, &invocation, &prepared, interrupts),
+        Err((error, name)) => {
+            run.append(
+                &installed,
+                name.as_deref(),
+                Outcome::Refused,
+                None,
+                Some(&error),
+                [0; 2],
+            );
+            Err(error)
+        }
+    }
+}
+
+/// Applies every refusal rule of a supervised run; on failure returns the
+/// error and the unit name when the verified manifest declares it.
+fn prepare_unit(
+    store: &Store,
+    knobs: &Knobs,
+    plugin: &PackageId,
+    unit: &Supervised<'_>,
+    installed: &PackageRecord,
+    run_id: &str,
+) -> Result<Prepared, (Error, Option<String>)> {
+    let id = plugin.to_string();
+    if installed.digest() != unit.digest {
+        return Err((Error::UnitStale { id }, None));
+    }
+    if !installed.enabled() {
+        return Err((Error::PluginDisabled { id }, None));
+    }
+    let (record, root, manifest) = store.inspect(plugin).map_err(|error| (error, None))?;
+    if !record.enabled() || record.digest() != unit.digest {
+        return Err((Error::PluginDisabled { id }, None));
+    }
+    let kind = kind_name(unit.kind);
+    let unknown = || {
+        (
+            Error::UnitUnknown {
+                id: id.clone(),
+                unit: format!("{kind} {:?}", unit.name),
+            },
+            None,
+        )
+    };
+    let (name, argv, timeout_ms) = match unit.kind {
+        PluginUnitKind::Job => {
+            let (name, job) = manifest.jobs.get_key_value(unit.name).ok_or_else(unknown)?;
+            let jobs = &knobs.jobs;
+            let timeout_ms = match job.timeout_ms.map(u64::from) {
+                Some(requested) if requested > jobs.timeout_max_ms => {
+                    return Err((
+                        Error::UnitRefused {
+                            id,
+                            unit: format!("{kind} {name}"),
+                            reason: format!(
+                                "declares timeout_ms {requested}, above jobs.timeout_max_ms {}",
+                                jobs.timeout_max_ms
+                            ),
+                        },
+                        Some(name.clone()),
+                    ));
+                }
+                Some(requested) => requested,
+                None => jobs.timeout_default_ms,
+            };
+            (name, &job.argv, Some(timeout_ms))
+        }
+        PluginUnitKind::Service => {
+            let (name, service) = manifest
+                .services
+                .get_key_value(unit.name)
+                .ok_or_else(unknown)?;
+            (name, &service.argv, None)
+        }
+    };
+    let context = serde_json::to_string(&Context {
+        schema: CONTEXT_SCHEMA,
+        plugin: ContextPlugin {
+            id: &record.identity().id,
+            version: &record.identity().version,
+            digest: record.digest(),
+        },
+        invocation: ContextInvocation { kind, name, run_id },
+        output: None,
+        cli: ContextCli {
+            version: env!("CARGO_PKG_VERSION"),
+            protocol: protocol::CLIENT_PROTOCOL_VERSIONS,
+        },
+    })
+    .expect("the context holds only strings and integers, which always serialize");
+    let max = knobs.limits.max_context_bytes;
+    if u64::try_from(context.len()).unwrap_or(u64::MAX) > max {
+        return Err((
+            Error::ContextTooLarge {
+                id,
+                bytes: context.len(),
+                max,
+            },
+            Some(name.clone()),
+        ));
+    }
+    let files = root.files_path().to_path_buf();
+    Ok(Prepared {
+        argv: super::manifest::resolve_argv(argv, &files),
+        record,
+        name: name.clone(),
+        files,
+        timeout_ms,
+        // Discarded streams cost nothing to keep reading, and a cap would
+        // eventually stop a long-running service that logs to stdout.
+        caps: [u64::MAX; 2],
+        context,
+        // A service manager's environment is not a session's, so its origin
+        // markers are never forwarded.
+        origin: None,
+        cli: Some(unit.cli.to_path_buf()),
     })
 }
 
@@ -439,28 +701,48 @@ enum Captured {
     Cut,
 }
 
-/// Where the capped stdout reader puts the action's stdout.
+/// Where a capped reader puts one of the child's streams.
 enum Sink {
     /// This process's stdout, in text mode.
     Stream(io::Stdout),
+    /// This process's stderr, in text and JSON mode.
+    Errors(io::Stderr),
     /// Memory, in JSON mode; the capped reader bounds it to the stdout cap.
     Capture(Vec<u8>),
+    /// Nowhere, in discard mode.
+    Discard(io::Sink),
 }
 
 impl Write for Sink {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             Self::Stream(stdout) => stdout.write(buf),
+            Self::Errors(stderr) => stderr.write(buf),
             Self::Capture(buffer) => buffer.write(buf),
+            Self::Discard(sink) => sink.write(buf),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Self::Stream(stdout) => stdout.flush(),
-            Self::Capture(_) => Ok(()),
+            Self::Errors(stderr) => stderr.flush(),
+            Self::Capture(_) | Self::Discard(_) => Ok(()),
         }
     }
+}
+
+/// Records and returns the spawn failure of a checked run.
+fn spawn_failed(run: &mut Run, prepared: &Prepared, cause: io::ErrorKind) -> Error {
+    let error = Error::SpawnFailed {
+        id: prepared.record.identity().id.to_string(),
+        action: prepared.name.clone(),
+        cause,
+    };
+    let name = Some(prepared.name.as_str());
+    let outcome = Outcome::SpawnFailed;
+    run.append(&prepared.record, name, outcome, None, Some(&error), [0; 2]);
+    error
 }
 
 /// Starts the checked run, waits for it, and records how it ended.
@@ -470,31 +752,29 @@ fn execute(
     knobs: &Knobs,
     invocation: &Invocation<'_>,
     prepared: &Prepared,
+    interrupts: &mut Interrupts,
 ) -> Result<Completed, Error> {
-    let (mut child, mut interrupts) = match start(store, invocation, prepared) {
-        Ok(started) => started,
-        Err(cause) => {
-            let error = Error::SpawnFailed {
-                id: prepared.record.identity().id.to_string(),
-                action: prepared.name.clone(),
-                cause,
-            };
-            let name = Some(prepared.name.as_str());
-            let outcome = Outcome::SpawnFailed;
-            run.append(&prepared.record, name, outcome, None, Some(&error), [0; 2]);
-            return Err(error);
-        }
+    let mut child = match start(store, invocation, prepared) {
+        Ok(child) => child,
+        Err(cause) => return Err(spawn_failed(run, prepared, cause)),
     };
-    let deadline = Instant::now() + Duration::from_millis(prepared.timeout_ms);
+    let now = Instant::now();
+    let deadline = prepared
+        .timeout_ms
+        .map_or(now.checked_add(NO_DEADLINE), |timeout_ms| {
+            now.checked_add(Duration::from_millis(timeout_ms))
+        })
+        .expect("a deadline at most a century ahead is representable");
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         unreachable!("both output streams were configured as pipes");
     };
-    let sink = match invocation.output {
-        Output::Text => Sink::Stream(io::stdout()),
-        Output::Json => Sink::Capture(Vec::new()),
+    let (sink, errors) = match invocation.output {
+        Output::Text => (Sink::Stream(io::stdout()), Sink::Errors(io::stderr())),
+        Output::Json => (Sink::Capture(Vec::new()), Sink::Errors(io::stderr())),
+        Output::Discard => (Sink::Discard(io::sink()), Sink::Discard(io::sink())),
     };
     let (stdout_tally, stdout_done) = spawn_capped_reader(stdout, sink, prepared.caps[0]);
-    let (stderr_tally, stderr_done) = spawn_capped_reader(stderr, io::stderr(), prepared.caps[1]);
+    let (stderr_tally, stderr_done) = spawn_capped_reader(stderr, errors, prepared.caps[1]);
     let mut received = None;
     let ended = supervise_child(
         &mut child,
@@ -526,7 +806,7 @@ fn execute(
             captured = Some(Captured::Cut);
         }
         Ok(Drain::Idle) => cut_warning("stdout", prepared),
-        Ok(Drain::Ended(Sink::Stream(_)) | Drain::Stopped) => {}
+        Ok(Drain::Ended(_) | Drain::Stopped) => {}
         Err(_lost) => read_failed = true,
     }
     match stderr_drain {
@@ -569,10 +849,13 @@ fn start(
     store: &Store,
     invocation: &Invocation<'_>,
     prepared: &Prepared,
-) -> Result<(Child, Interrupts), io::ErrorKind> {
-    let cli = std::env::current_exe()
-        .and_then(std::fs::canonicalize)
-        .map_err(|error| error.kind())?;
+) -> Result<Child, io::ErrorKind> {
+    let cli = match &prepared.cli {
+        Some(cli) => cli.clone(),
+        None => std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .map_err(|error| error.kind())?,
+    };
     let (program, fixed) = prepared
         .argv
         .split_first()
@@ -581,7 +864,6 @@ fn start(
     // failure would only show as a non-zero exit; a missing or
     // non-executable program is reported as a spawn failure instead.
     executable_file(program)?;
-    let interrupts = Interrupts::new().map_err(|error| error.kind())?;
     let mut command = Command::new(program);
     command
         .args(fixed)
@@ -592,8 +874,7 @@ fn start(
         .stderr(Stdio::piped());
     build_environment(&mut command, store, prepared, &cli);
     configure_child(&mut command, descriptor_scan_bound());
-    let child = command.spawn().map_err(|error| error.kind())?;
-    Ok((child, interrupts))
+    command.spawn().map_err(|error| error.kind())
 }
 
 /// Decides the outcome of a started run, in the documented precedence:
@@ -632,7 +913,7 @@ fn classify(prepared: &Prepared, observed: Observed) -> (Outcome, Result<Complet
                 Err(Error::ActionTimeout {
                     id,
                     action,
-                    timeout_ms: prepared.timeout_ms,
+                    timeout_ms: prepared.timeout_ms.unwrap_or(u64::MAX),
                 }),
             );
         }
@@ -640,7 +921,7 @@ fn classify(prepared: &Prepared, observed: Observed) -> (Outcome, Result<Complet
         _ => return (Outcome::Failed, Err(Error::RunFailed { id, action })),
     };
     let captured = match (observed.output, observed.captured) {
-        (Output::Text, _) => {
+        (Output::Text | Output::Discard, _) => {
             let outcome = if status.success() {
                 Outcome::Ok
             } else {
@@ -764,13 +1045,26 @@ fn executable_file(program: &str) -> Result<(), io::ErrorKind> {
 /// The terminating signals this process handles while an action runs, so
 /// the action's group is stopped instead of being left behind: the child is
 /// in a group of its own, so a terminal's `Ctrl-C` reaches only this process.
-struct Interrupts {
+///
+/// Registration replaces the default action of the signals for the rest of
+/// the process's life, and a stream sees only signals that arrive after it
+/// was created, so a caller that waits before the run registers first.
+#[derive(Debug)]
+pub(crate) struct Interrupts {
     streams: Vec<(i32, tokio::signal::unix::Signal)>,
 }
 
 impl Interrupts {
     /// Registers `SIGINT`, `SIGTERM` and `SIGHUP` with the CLI's runtime.
-    fn new() -> io::Result<Self> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of a registration the runtime refused.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a Tokio runtime.
+    pub(crate) fn new() -> io::Result<Self> {
         use tokio::signal::unix::{signal, SignalKind};
 
         let mut streams = Vec::new();
@@ -785,7 +1079,7 @@ impl Interrupts {
     }
 
     /// A signal received since the last poll, without waiting.
-    fn poll(&mut self) -> Option<i32> {
+    pub(crate) fn poll(&mut self) -> Option<i32> {
         self.streams
             .iter_mut()
             .find_map(|(number, stream)| stream.recv().now_or_never().flatten().map(|()| *number))

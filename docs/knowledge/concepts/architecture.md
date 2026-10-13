@@ -107,8 +107,14 @@ by the same lifecycle engine on both targets: systemd transient units
 (`pohunek-<ns>-worker-<session-id>-<generation>.service` in
 `pohunek-<ns>-sessions.slice`) on Linux, and launchd jobs
 (`io.github.zajca.pohunek.<ns>.worker.<session-id>.<generation>`) whose
-definitions stay in a private state directory on macOS. The daemon is the only
-login service (`pohunek service install`). `<ns>` is derived from the user ID
+definitions stay in a private state directory on macOS. The daemon is the
+login service of pohunek itself (`pohunek service install`); the only other
+login units are the jobs and services of enabled workflow plugins
+(`pohunek-<ns>-wf-*` units, `io.github.zajca.pohunek.<ns>.wf.*` agents), which
+run the CLI's `pohunek workflow __exec` trampoline, never the daemon, and which
+worker discovery never adopts (see the
+[workflow plugins guide](../guides/workflow-plugins.md#jobs-and-services)).
+`<ns>` is derived from the user ID
 and the canonical state and runtime roots, so separate installations never
 adopt or retire each other's jobs. Workers live for the login session: closing
 a terminal or locking the screen is safe, while logout or reboot ends them and

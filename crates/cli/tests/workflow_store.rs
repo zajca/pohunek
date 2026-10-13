@@ -23,6 +23,8 @@ use sha2::{Digest as _, Sha256};
 
 #[path = "support/plugin_harness.rs"]
 mod plugin_harness;
+#[path = "support/workflow_units.rs"]
+mod workflow_units;
 
 use plugin_harness::{path_str, Harness};
 
@@ -427,17 +429,232 @@ fn an_archive_that_also_carries_runtime_toml_is_refused() {
 }
 
 #[test]
-fn a_jobs_table_is_refused_until_jobs_ship() {
+fn a_reactions_table_is_refused_until_reactions_ship() {
     let fixture = Fixture::new();
     let document = format!(
-        "{}\n[jobs.poll]\nevery_s = 300\nargv = [\"bin/work\", \"{SENTINEL}\"]\n",
+        "{}\n[reactions.on_stop]\nevents = [\"session_stopped\"]\nargv = [\"bin/work\", \"{SENTINEL}\"]\n",
         manifest("1.0.0", "bin/work")
     );
-    let message = fixture.refused_manifest("jobs", &plugin_files(&document));
+    let message = fixture.refused_manifest("reactions", &plugin_files(&document));
     assert!(
         message.contains("does not match the manifest schema"),
-        "[jobs] table: {message}"
+        "[reactions] table: {message}"
     );
+}
+
+/// A manifest with one job and one service besides the action.
+fn unit_manifest() -> String {
+    format!(
+        "{}\n[jobs.poll]\nevery_s = 300\ntimeout_ms = 120000\nargv = [\"bin/work\", \"poll\"]\n\n\
+         [services.notify]\nargv = [\"bin/work\", \"notify\"]\n",
+        manifest("1.0.0", "bin/work")
+    )
+}
+
+#[test]
+fn hostile_jobs_and_services_are_refused() {
+    let fixture = Fixture::new();
+    let base = manifest("1.0.0", "bin/work");
+    for (case, table, needle) in [
+        (
+            "job without every_s",
+            format!("[jobs.poll]\nargv = [\"bin/work\", \"{SENTINEL}\"]\n"),
+            "does not match the manifest schema",
+        ),
+        (
+            "job with an unknown key",
+            format!(
+                "[jobs.poll]\nevery_s = 60\nshell = true\nargv = [\"bin/work\", \"{SENTINEL}\"]\n"
+            ),
+            "does not match the manifest schema",
+        ),
+        (
+            "job interval above a week",
+            format!("[jobs.poll]\nevery_s = 604801\nargv = [\"bin/work\", \"{SENTINEL}\"]\n"),
+            "job poll: every_s must be at most 604800 seconds",
+        ),
+        (
+            "job with a zero interval",
+            format!("[jobs.poll]\nevery_s = 0\nargv = [\"bin/work\", \"{SENTINEL}\"]\n"),
+            "does not match the manifest schema",
+        ),
+        (
+            "service with a bare argv[0]",
+            format!("[services.notify]\nargv = [\"work\", \"{SENTINEL}\"]\n"),
+            "service notify: argv[0] is a bare command name",
+        ),
+        (
+            "service with a job key",
+            format!("[services.notify]\nevery_s = 60\nargv = [\"bin/work\", \"{SENTINEL}\"]\n"),
+            "does not match the manifest schema",
+        ),
+        (
+            "service name outside the grammar",
+            format!("[services.Notify]\nargv = [\"bin/work\", \"{SENTINEL}\"]\n"),
+            "an action, job or service name is not",
+        ),
+    ] {
+        let document = format!("{base}\n{table}");
+        let message = fixture.refused_manifest(case, &plugin_files(&document));
+        assert!(message.contains(needle), "{case}: {message}");
+    }
+}
+
+#[test]
+fn jobs_and_services_are_reviewed_installed_and_inspected() {
+    let fixture = Fixture::new();
+    let (archive, digest) = fixture.archive("units", &plugin_files(&unit_manifest()));
+    let review = fixture.run(&[
+        "workflow",
+        "install",
+        path_str(&archive),
+        "--sha256",
+        digest.as_str(),
+    ]);
+    assert_eq!(review.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&review.stdout);
+    let files = fixture.package_root(&digest).join("files");
+    let program = path_str(&files.join("bin/work")).to_owned();
+    for needle in [
+        "Jobs (each runs periodically as you".to_owned(),
+        "  poll  (every 300 s)".to_owned(),
+        format!("argv: [\"{program}\", \"poll\"]"),
+        "requested timeout: 120000 ms".to_owned(),
+        "Services (each runs continuously as you".to_owned(),
+        format!("argv: [\"{program}\", \"notify\"]"),
+    ] {
+        assert!(text.contains(&needle), "{needle:?} in the review:\n{text}");
+    }
+    assert!(
+        !fixture.store_root().exists(),
+        "the review installed nothing"
+    );
+
+    let (code, document) = fixture.install(&archive, &digest, &["--yes", "--no-enable"]);
+    assert_eq!(code, 0, "{document}");
+    assert_eq!(document["ok"]["plugin"]["enabled"], false, "{document}");
+    let (code, document) = fixture.json(&["workflow", "inspect", PLUGIN_ID]);
+    assert_eq!(code, 0, "{document}");
+    let inspected = &document["ok"];
+    assert_eq!(inspected["jobs"][0]["name"], "poll", "{document}");
+    assert_eq!(inspected["jobs"][0]["every_s"], 300, "{document}");
+    assert_eq!(inspected["jobs"][0]["timeout_ms"], 120_000, "{document}");
+    assert_eq!(
+        inspected["jobs"][0]["argv"][0],
+        program.as_str(),
+        "{document}"
+    );
+    assert_eq!(inspected["services"][0]["name"], "notify", "{document}");
+    assert_eq!(inspected["services"][0]["argv"][1], "notify", "{document}");
+}
+
+#[test]
+fn jobs_and_services_need_the_service_installation() {
+    let fixture = Fixture::new();
+    let (archive, digest) = fixture.archive("units", &plugin_files(&unit_manifest()));
+
+    // An enabling install is refused before any effect.
+    let (code, document) = fixture.install(&archive, &digest, &["--yes"]);
+    assert_eq!(code, 1, "{document}");
+    assert_eq!(
+        document["err"]["code"], "workflow_service_not_installed",
+        "{document}"
+    );
+    assert!(
+        !fixture.store_root().exists(),
+        "the refusal created the store"
+    );
+
+    let (code, document) = fixture.install(&archive, &digest, &["--yes", "--no-enable"]);
+    assert_eq!(code, 0, "{document}");
+    let (code, document) = fixture.json(&["workflow", "enable", PLUGIN_ID]);
+    assert_eq!(code, 1, "{document}");
+    assert_eq!(
+        document["err"]["code"], "workflow_service_not_installed",
+        "{document}"
+    );
+    assert_eq!(
+        fixture.listed()[0]["enabled"],
+        false,
+        "enable changed nothing"
+    );
+
+    // Without a service installation there are no units to remove.
+    let (code, document) = fixture.json(&["workflow", "disable", PLUGIN_ID]);
+    assert_eq!(code, 0, "{document}");
+    assert!(document["ok"].get("warnings").is_none(), "{document}");
+    let (code, document) = fixture.json(&["workflow", "uninstall", PLUGIN_ID]);
+    assert_eq!(code, 0, "{document}");
+    assert!(fixture.listed().is_empty(), "{document}");
+}
+
+#[test]
+fn a_job_outside_the_owner_bounds_is_refused_before_any_effect() {
+    // A recorded service installation, so only the job bounds refuse; the
+    // refusal comes before any service manager is contacted.
+    let units = workflow_units::UnitEnv::new(|env| env.root().join("units"));
+    units.knobs("[jobs]\nmin_interval_s = 60\n");
+    // Where `pohunek workflow enable` itself puts units: the systemd user
+    // unit directory of its config home, or its home's `LaunchAgents`.
+    let unit_dirs = [
+        units.env.config_home().join("systemd/user"),
+        units.env.home().join("Library/LaunchAgents"),
+    ];
+    let plugin = workflow_units::Plugin::new(PLUGIN_ID).job("poll", "tick", 30);
+    let digest = units.install(&plugin);
+    let refused = |output: &Output| {
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}",
+            workflow_units::describe(output)
+        );
+        let document: Value = serde_json::from_slice(&output.stdout).expect("a JSON envelope");
+        assert_eq!(
+            document["err"]["code"], "workflow_unit_refused",
+            "{document}"
+        );
+        let message = document["err"]["msg"].as_str().expect("a message");
+        assert!(
+            message.contains("job poll") && message.contains("below jobs.min_interval_s 60"),
+            "{message}"
+        );
+    };
+    refused(
+        &units
+            .command(&["workflow", "enable", PLUGIN_ID, "--json"])
+            .output()
+            .expect("run pohunek workflow enable"),
+    );
+    assert_eq!(
+        units.listed()[0]["enabled"],
+        false,
+        "the refusal changed nothing"
+    );
+    for dir in &unit_dirs {
+        assert!(!dir.exists(), "{} was created", dir.display());
+    }
+
+    // An enabling install of the same archive in a fresh store is refused
+    // before the store exists.
+    let fresh = workflow_units::UnitEnv::new(|env| env.root().join("units"));
+    fresh.knobs("[jobs]\nmin_interval_s = 60\n");
+    let archive = units.env.root().join(format!("{PLUGIN_ID}.tar.zst"));
+    refused(
+        &fresh
+            .command(&[
+                "workflow",
+                "install",
+                path_str(&archive),
+                "--sha256",
+                digest.as_str(),
+                "--yes",
+                "--json",
+            ])
+            .output()
+            .expect("run pohunek workflow install"),
+    );
+    assert!(fresh.listed().is_empty(), "the refusal installed nothing");
 }
 
 #[test]

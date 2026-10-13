@@ -1339,8 +1339,9 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
         self.assertEqual(status, 1, output)
         self.assertIn(
             "ci-only  launchd-suite: the launchd suites (crates/platform/tests/launchd.rs, "
-            "crates/daemon/tests/supervised_lifecycle.rs, crates/cli/tests/service_launchd.rs "
-            "and crates/cli/tests/service_upgrade.rs) run only on macOS (ci-only)",
+            "crates/daemon/tests/supervised_lifecycle.rs, crates/cli/tests/service_launchd.rs, "
+            "crates/cli/tests/service_upgrade.rs and crates/cli/tests/workflow_launchd.rs) "
+            "run only on macOS (ci-only)",
             output,
         )
 
@@ -1436,7 +1437,8 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
                           "-p pohunek-daemon --test systemd_durable_worker",
                           "-p pohunek-cli --test service_systemd",
                           "-p pohunek-daemon --test supervised_lifecycle",
-                          "-p pohunek-cli --test service_upgrade"):
+                          "-p pohunek-cli --test service_upgrade",
+                          "-p pohunek-cli --test workflow_systemd"):
                 self.assertIn(f"`{suite}`", focused[1]["note"])
             # The other OS's suites are reported once, as the ci-only row.
             self.assertEqual(
@@ -1453,6 +1455,7 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
             self.assertIn("crates/daemon/tests/supervised_lifecycle.rs", focused[2]["note"])
             self.assertIn("crates/cli/tests/service_launchd.rs", focused[3]["note"])
             self.assertIn("crates/cli/tests/service_upgrade.rs", focused[3]["note"])
+            self.assertIn("crates/cli/tests/workflow_launchd.rs", focused[3]["note"])
         else:
             self.assertEqual(focused, [])
 

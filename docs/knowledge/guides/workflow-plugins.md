@@ -2,7 +2,7 @@
 type: Guide
 id: guide/workflow-plugins
 title: Workflow plugins
-description: What a workflow plugin is, the workflow.toml manifest, installing a plugin pinned by its digest with pohunek workflow, running its actions with pohunek workflow run (verbatim arguments, --json results, environment, context, limits, run log, owner knobs), and the same-UID owner trust boundary.
+description: What a workflow plugin is, the workflow.toml manifest, installing a plugin pinned by its digest with pohunek workflow, running its actions with pohunek workflow run (verbatim arguments, --json results, environment, context, limits, run log, owner knobs), its periodic jobs and long-running services as user service manager units, and the same-UID owner trust boundary.
 source_kind: manual
 intents: [setup, update, debug, help]
 ---
@@ -11,8 +11,10 @@ intents: [setup, update, debug, help]
 
 A workflow plugin is a bundle of owner tooling, such as a work-overview tool
 that joins an issue tracker, a code host and pohunek sessions into one table.
-It declares named **actions** as argv arrays and acts on pohunek only through
-the public CLI or SDK, like any script the owner runs. It is not a runtime
+It declares named **actions** as argv arrays, and optionally periodic
+**jobs** and long-running **services** that your user service manager runs
+while the plugin is enabled. It acts on pohunek only through the public CLI or
+SDK, like any script the owner runs. It is not a runtime
 package: the daemon never loads, lists or runs it, and it cannot extend the
 daemon, the session worker, protocol methods, overlay transports or any user
 interface.
@@ -30,9 +32,8 @@ pohunek workflow uninstall acme.work [--purge] [--remove-modified]
 pohunek workflow run [--json] acme.work overview [<args>...]
 ```
 
-Event reactions, periodic jobs and long-running services are not yet
-available; the manifest refuses the reaction, job and service tables until
-they ship (#148, #326).
+Event reactions are not yet available; the manifest refuses the reaction
+table until it ships (#148).
 
 With dynamic shell completion (`pohunek setup completions <shell> --dynamic`),
 Tab completes installed plugin ids for `inspect`, `enable`, `disable`,
@@ -63,13 +64,21 @@ argv = ["bin/work", "overview"]
 args = "passthrough"        # or "none" (the default): extra arguments refused
 timeout_ms = 30000          # optional
 max_output_bytes = 1048576  # optional
+
+[jobs.poll]                 # job name: same grammar as an action name
+argv = ["bin/work", "poll"]
+every_s = 300               # wall-clock seconds from one run's start to the next
+timeout_ms = 120000         # optional
+
+[services.notifier]         # service name: same grammar
+argv = ["bin/work", "notify"]
 ```
 
 Rules, each checked at install time:
 
 - The manifest is at most 64 KiB, checked before it is parsed. Every table
-  refuses unknown keys, so `[reactions]`, `[jobs]` and `[services]` are refused
-  today. At least one action is required. The description is 1 to 1024 bytes.
+  refuses unknown keys, so `[reactions]` is refused today. At least one
+  action, job or service is required. The description is 1 to 1024 bytes.
 - `argv` has 1 to 64 entries of at most 4096 bytes each, with no NUL byte. No
   shell ever interprets it.
 - `argv[0]` is either a package path to an executable file of the archive
@@ -79,9 +88,13 @@ Rules, each checked at install time:
   even when the archive has a file of that name, because no `PATH` is
   searched. A path with `.`, `..` or empty segments is refused, and so is a
   package path that is missing from the archive or lacks the executable bit.
+- The argv rules apply to jobs and services too. A job's `every_s` is 1 to
+  604800 (one week).
 - `timeout_ms` and `max_output_bytes`, when present, must be positive. They
   are checked against the owner limits when the action runs (see
-  [Owner knobs](#owner-knobs)), not at install time.
+  [Owner knobs](#owner-knobs)), not at install time. A job's `every_s` and
+  `timeout_ms` are checked against the `[jobs]` knobs when the plugin is
+  enabled and again when the job runs.
 
 A refused manifest fails with `workflow_descriptor_invalid`. The message names
 the broken rule and, where it applies, a line number, the action name (which
@@ -95,9 +108,14 @@ Trust is the archive digest you supply with `--sha256` (`sha256:<64 hex>` or
 the bare hex `sha256sum` prints). There is no catalog for workflow plugins.
 Install reads the archive, checks its digest (`workflow_digest_mismatch`
 otherwise) and validates the manifest, then prints the id, version, digest,
-and every action's argv with `argv[0]` resolved to its absolute path. Nothing
+and every action's, job's and service's argv with `argv[0]` resolved to its
+absolute path, with each job's interval and requested timeout. Nothing
 is created until you repeat the command with `--yes`; until then it fails with
-`consent_required`. `--no-enable` installs the plugin disabled.
+`consent_required`. `--no-enable` installs the plugin disabled. A plugin with
+jobs or services is enabled as `pohunek workflow enable` enables it (see
+[Jobs and services](#jobs-and-services)); without a `pohunek service`
+installation an enabling install is refused before anything is created
+(`workflow_service_not_installed`), and `--no-enable` still installs it.
 
 The store keeps one version per plugin id. Installing the recorded archive
 again changes nothing (`already_installed`), unless its installed files are
@@ -330,9 +348,13 @@ rotated, owner-private family (`runs.jsonl`, `runs.jsonl.1`, …):
  "duration_ms":412,"stdout_bytes":1830,"stderr_bytes":0,"arg_count":1}
 ```
 
-`outcome` is `ok`, `exit_nonzero`, `timeout`, `output_limit`, `interrupted`,
-`spawn_failed`, `failed`, `refused`, or, with `--json` after a zero exit,
-`output_incomplete` or `output_invalid`. `error_code` is present when the run
+`kind` is `action` for `workflow run`, and `job` or `service` for a run of a
+unit (see [Jobs and services](#jobs-and-services)). `outcome` is `ok`,
+`exit_nonzero`, `timeout`, `output_limit`, `interrupted`, `spawn_failed`,
+`failed`, `refused`, `overlap_skipped` (a unit run skipped because the
+previous run of the same unit was still active), or, with `--json` after a
+zero exit, `output_incomplete` or `output_invalid`. A service run also has
+`backoff_ms`, the restart delay it waited before it started. `error_code` is present when the run
 ended with an error and holds that error's code. `exit_code` or `signal`
 describes how the action's process ended. `name` is present only when it is an
 action the verified manifest declares. Byte counts are the bytes shown (with
@@ -365,18 +387,135 @@ max_context_bytes = 65536             # 1..=98304 (96 KiB hard maximum)
 [logs]
 run_log_file_bytes = 1048576          # 4096..=67108864
 run_log_files = 4                     # 1..=64, the active file included
+
+[jobs]
+timeout_default_ms = 60000            # 1..=timeout_max_ms; a job without timeout_ms
+timeout_max_ms = 300000               # 1..=510000; a larger timeout_ms is refused
+min_interval_s = 60                   # 1..=604800; a shorter every_s is refused
+check_period_s = 60                   # 1..=3600; how often a job's timer checks
+
+[services]
+restart_initial_ms = 1000             # 1..=restart_max_ms
+restart_max_ms = 300000               # 1..=86400000
+stable_after_ms = 60000               # 1..=86400000
 ```
 
 The values shown are the defaults. The context cap's hard maximum of 96 KiB
 keeps `POHUNEK_PLUGIN_CONTEXT` below the length Linux allows for one
-environment string. Tables for reactions, jobs and services arrive with those
-features and are refused until then.
+environment string. `jobs.timeout_max_ms` is at most 510000 ms: a unit's
+service manager start timeout is ten minutes, and a job run keeps 60 s for the
+longest kill grace and 30 s for its own checks below it, so the run is always
+recorded as `timeout` before the service manager would kill it. Every knob is
+read again at each run except `jobs.check_period_s`, which is written into a
+job's timer when the plugin is enabled: run `pohunek workflow enable` again
+after changing it. The reactions table arrives with that feature and is
+refused until then.
+
+## Jobs and services
+
+A plugin's jobs and services run as units of your user service manager:
+systemd user units on Linux, launchd agents on macOS. They need the
+`pohunek service` installation: every unit runs its `<prefix>/bin/pohunek`,
+in the same namespace and unit directory as the daemon unit, so
+`pohunek workflow enable` of a plugin with jobs or services fails with
+`workflow_service_not_installed` without one. Plugins that declare only
+actions never touch the service manager.
+
+- `enable` verifies the plugin's files, refuses a job whose `every_s` is
+  below `jobs.min_interval_s` or whose `timeout_ms` is above
+  `jobs.timeout_max_ms` (`workflow_unit_refused`, nothing changed), marks the
+  plugin enabled, then installs, enables for login and starts every unit. If a
+  unit cannot be installed, every unit is removed again, the plugin is
+  disabled again, and the command fails with `workflow_units_failed`.
+  Enabling an enabled plugin replaces its units, which also applies a changed
+  `jobs.check_period_s`.
+- `disable` marks the plugin disabled first, so no further run starts, then
+  stops every unit (a running job or service is stopped as described in
+  [Deadlines, output caps and stopping](#deadlines-output-caps-and-stopping))
+  and removes it. When the plugin's installed files fail verification its
+  units cannot be listed: the plugin is still disabled, a warning says so,
+  and a unit left behind refuses every run (a unit names the archive it was
+  installed for, and the trampoline verifies it first). Recording the
+  installed units, so that such units can be removed too, is planned with
+  the status command (#326).
+- `uninstall` removes every unit before it removes the plugin. While a unit
+  cannot be removed, for example because the service manager is unreachable,
+  uninstall is refused with `workflow_units_failed` and the plugin stays
+  installed; repeat it once the service manager answers.
+- Without a `pohunek service` installation, `disable` and `uninstall` find no
+  units to remove.
+
+All three hold `<state>/pohunek/workflow-plugins/units.lock` for their whole
+run and are safe to repeat; a command that finds it held fails with
+`workflow_store_busy`. A unit's name is
+`pohunek-<ns>-wf-<h12>-<j|s>-<name>.service` (plus a `.timer` for a job) on
+systemd and `io.github.zajca.pohunek.<ns>.wf.<h12>.<j|s>.<name>` on launchd,
+where `<h12>` is the first 12 hex characters of SHA-256 over the plugin id,
+so a job and a service may share a name.
+
+### Each run
+
+Every unit runs the hidden
+`pohunek workflow __exec <id> <digest> job|service <name>`, which decides
+each run the same way on both platforms:
+
+1. A unit of a plugin that is no longer installed is refused with a message
+   on stderr; there is no run log to record it in. A unit naming another
+   archive than the installed one (`workflow_unit_stale`) or a disabled
+   plugin is refused and recorded.
+2. A non-blocking lock on `locks/<kind>-<name>.lock` in the plugin's state
+   directory is taken. When an earlier run of the same unit still holds it,
+   the run is recorded as `overlap_skipped` and nothing starts. The service
+   managers never start an active job twice either.
+3. A job's timer fires every `jobs.check_period_s` (or every `every_s` when
+   that is shorter). The job keeps the wall-clock start of its last run in
+   `schedule/job-<name>.json` and runs only when `every_s` has passed since
+   then (within one second), so a long interval follows the wall clock
+   across suspend and logins, and a due job starts at most about one check
+   period late. A check that is not due exits without a record.
+4. A service keeps its count of short runs in `backoff/service-<name>.json`.
+   Before each run it waits `restart_initial_ms`, doubled for every further
+   short run, at most `restart_max_ms`; the first start waits nothing. A run
+   of at least `stable_after_ms` starts the count over. Any exit counts,
+   including status 0.
+5. The plugin's files are verified again, and the job or service must be one
+   the installed manifest declares (`workflow_unit_unknown` otherwise). The
+   run starts as an action does, with these differences: its deadline is the
+   job's `timeout_ms` or `jobs.timeout_default_ms`, and a service has none;
+   its stdout and stderr are discarded without a cap and only counted in the
+   run record; and the context's `invocation.kind` is `job` or `service`,
+   with no `output` field.
+
+The environment is the one described under [Environment](#environment),
+built from an empty one, with two differences: the session origin pair is
+never passed, because a service manager's environment is not a session's;
+and `POHUNEK_CLI` is the installed `<prefix>/bin/pohunek`. Whatever the
+service manager adds to its own environment (`systemctl --user
+set-environment`, `launchctl setenv`) and any inherited `POHUNEK_SOCKET_PATH`,
+`POHUNEK_CONFIG_DIR` or `POHUNEK_ENV` never reach the job or service.
+
+A stop request (`SIGTERM`, `SIGINT` or `SIGHUP`) to `__exec` stops the run's
+process group within `limits.kill_grace_ms` and is recorded as
+`interrupted`; one that arrives while a service waits its backoff ends the
+wait at once. Both service managers stop a unit by sending `SIGTERM` to
+`__exec` alone (systemd units use `KillMode=mixed`), so `__exec` stops the
+run's process group itself and records the stop as `interrupted`. A unit's
+native stop timeout is 90 s, above the longest kill grace; on systemd the
+final `SIGKILL` then reaches every process still left in the unit.
+A refused service waits `restart_max_ms` before it exits, so the service
+manager's restart does not spin. The exit status is the run's own (124 for
+`timeout`); 0 for `overlap_skipped`, a job that is not due, and a run stopped
+by `SIGTERM`, so a unit its service manager stopped reads as stopped, not
+failed; 128 plus the signal number for a stop by `SIGINT` or `SIGHUP`; and 1
+for a refusal. launchd keeps no failed state for a unit; on systemd a stopped
+job or service is `inactive`.
 
 ## Local only
 
 Every `pohunek workflow` command works on this user's files and never contacts
-a daemon. A remote `--host` fails with `workflow_local_only` before any file is
-read or written.
+a daemon; `enable`, `disable` and `uninstall` of a plugin with jobs or
+services also use this user's service manager. A remote `--host` fails with
+`workflow_local_only` before any file is read or written.
 
 ## Trust boundary
 
@@ -386,7 +525,8 @@ read your files and use every public owner API, including the CLI and the SDK,
 as any same-user process can. That is the same owner trust boundary as a
 third-party runtime package, not a sandbox. The minimal environment,
 deadlines and caps of `workflow run` bound what the CLI forwards and how long
-it waits; they do not confine the plugin. Install only plugins whose source
+it waits; they do not confine the plugin. An enabled plugin's jobs and
+services run without you, at every login, until you disable it. Install only plugins whose source
 you trust, and review the argv the consent step prints.
 
 Error codes: `workflow_local_only`, `workflow_archive_invalid`,
@@ -400,4 +540,6 @@ Error codes: `workflow_local_only`, `workflow_archive_invalid`,
 `workflow_origin_incomplete`, `workflow_timeout_refused`,
 `workflow_context_too_large`, `workflow_run_log_failed`,
 `workflow_spawn_failed`, `workflow_run_failed`, `workflow_action_timeout`,
-`workflow_output_limit`, `workflow_action_interrupted`.
+`workflow_output_limit`, `workflow_action_interrupted`,
+`workflow_service_not_installed`, `workflow_unit_refused`,
+`workflow_units_failed`, `workflow_unit_stale`, `workflow_unit_unknown`.

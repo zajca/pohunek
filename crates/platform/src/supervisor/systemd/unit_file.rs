@@ -25,6 +25,22 @@ const DAEMON_WANTED_BY: &str = "default.target";
 /// `ExecStart=` prefix that passes argv to the process without `$`
 /// substitution (`systemd.service(5)`, "Command lines").
 const NO_ENV_EXPAND_PREFIX: &str = ":";
+/// `KillMode` of the daemon unit: stopping it signals every process of its
+/// control group.
+const DAEMON_KILL_MODE: &str = "control-group";
+
+/// `KillMode` of workflow plugin service units.
+///
+/// `mixed` sends the stop's `SIGTERM` to the main process only, the
+/// `pohunek workflow __exec` trampoline, which stops the plugin's process
+/// group itself within the owner's kill grace and records the run as
+/// stopped; the final `SIGKILL` still reaches every process left in the
+/// control group, so nothing outlives the unit. With `control-group` the
+/// plugin could die before the trampoline saw its own signal, and the stop
+/// would read as the plugin's failure. launchd likewise signals only a job's
+/// main process.
+const PLUGIN_KILL_MODE: &str = "mixed";
+
 /// Description prefix of workflow plugin units, followed by the unit key.
 const PLUGIN_DESCRIPTION: &str = "Pohunek workflow plugin unit";
 /// Target that starts a plugin service at login once the unit is enabled.
@@ -95,7 +111,7 @@ pub fn render_daemon_unit(definition: &JobDefinition) -> Result<String, Error> {
     let service = Section::new("Service")
         .entry("Type", "notify")
         .entry("NotifyAccess", "main");
-    let service = job_entries(service, definition)?;
+    let service = job_entries(service, definition, DAEMON_KILL_MODE)?;
     Ok(render(&[
         Section::new("Unit").entry("Description", DAEMON_DESCRIPTION),
         service,
@@ -105,8 +121,8 @@ pub fn render_daemon_unit(definition: &JobDefinition) -> Result<String, Error> {
 
 /// Renders the service unit of one workflow plugin unit.
 ///
-/// Both kinds disable start rate limiting and keep the whole control group in
-/// `KillMode`. An [`Activation::Interval`] job is `Type=oneshot` without an
+/// Both kinds disable start rate limiting and use `KillMode=mixed` (see
+/// [`PLUGIN_KILL_MODE`]). An [`Activation::Interval`] job is `Type=oneshot` without an
 /// `[Install]` section, so only its timer starts it, and its start timeout
 /// is the native backstop on each run: `RuntimeMaxSec=` has no effect on
 /// `Type=oneshot` (`systemd.service(5)`), while `TimeoutStartSec=` covers the
@@ -134,6 +150,7 @@ pub(crate) fn render_plugin_service(
     let service = job_entries(
         Section::new("Service").entry("Type", kind),
         definition.job(),
+        PLUGIN_KILL_MODE,
     )?;
     Ok(match definition.activation() {
         Activation::Interval { .. } => render(&[unit, service]),
@@ -172,8 +189,13 @@ pub(crate) fn render_plugin_timer(
 }
 
 /// Appends the command, environment, restart, timeout, kill, and file-limit
-/// entries every service rendered from a [`JobDefinition`] shares.
-fn job_entries(mut service: Section, definition: &JobDefinition) -> Result<Section, Error> {
+/// entries every service rendered from a [`JobDefinition`] shares, with
+/// `kill_mode` as its `KillMode`.
+fn job_entries(
+    mut service: Section,
+    definition: &JobDefinition,
+    kill_mode: &str,
+) -> Result<Section, Error> {
     let mut command = Vec::with_capacity(definition.arguments().len() + 1);
     command.push(exec_word(path_str(definition.executable())?)?);
     for argument in definition.arguments() {
@@ -206,7 +228,7 @@ fn job_entries(mut service: Section, definition: &JobDefinition) -> Result<Secti
     Ok(service
         .entry("TimeoutStartSec", time_span(definition.start_timeout()))
         .entry("TimeoutStopSec", time_span(definition.exit_timeout()))
-        .entry("KillMode", "control-group")
+        .entry("KillMode", kill_mode)
         .entry("LimitNOFILE", definition.open_files().to_string()))
 }
 

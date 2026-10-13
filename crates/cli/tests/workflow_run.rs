@@ -811,7 +811,15 @@ fn knobs_are_strict_and_their_defaults_apply_without_a_file() {
     let recorded = fixture.records().len();
     for (text, needle) in [
         ("[limits]\nkill_grace = 1\n", "unknown key"),
-        ("[jobs]\ntimeout_max_ms = 1\n", "unknown key"),
+        ("[reactions]\nqueue_depth = 1\n", "unknown key"),
+        (
+            "[jobs]\ntimeout_max_ms = 510001\n",
+            "jobs.timeout_max_ms must be in 1..=510000",
+        ),
+        (
+            "[services]\nrestart_initial_ms = 9\nrestart_max_ms = 8\n",
+            "services.restart_initial_ms must be in 1..=8",
+        ),
         (
             "[limits]\nkill_grace_ms = 60001\n",
             "limits.kill_grace_ms must be in 0..=60000",

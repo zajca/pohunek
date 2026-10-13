@@ -62,6 +62,13 @@ const LOCK_NAME: &str = "store.lock";
 /// Mode of the store lock file: owner-only, like the registry's files.
 const LOCK_FILE_MODE: u32 = 0o600;
 
+/// Name of the unit lifecycle lock in the store root.
+///
+/// Enable, disable and uninstall hold it across the registry change and the
+/// service manager operations, which the store lock cannot cover because
+/// each registry change takes and releases that one itself.
+const UNITS_LOCK_NAME: &str = "units.lock";
+
 /// Warning when the registry record is gone but the installed files remain.
 ///
 /// The registry leaves undeletable residue under a `.collect-*` name in
@@ -503,6 +510,32 @@ impl Store {
         let registry = self.existing()?.ok_or_else(|| unknown(id))?;
         let record = self.installed(id)?.ok_or_else(|| unknown(id))?;
         Ok((registry, record))
+    }
+
+    /// Takes the unit lifecycle lock of an existing store; `None` when there
+    /// is no store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Busy`] while another enable, disable or uninstall
+    /// holds it, and [`Error::Store`] when the store is unsafe.
+    pub(crate) fn lock_units(&self) -> Result<Option<FileLock>, Error> {
+        match TrustedDir::open_absolute(&self.dirs.root, PRIVATE_DIR_MODE) {
+            Ok(root) => root
+                .lock_file(UNITS_LOCK_NAME, LOCK_FILE_MODE, LockKind::Exclusive)
+                .map(Some)
+                .map_err(|error| match error {
+                    FsError::LockContended { .. } => Error::Busy,
+                    other => fs(&other),
+                }),
+            Err(error) if error.io_kind() == Some(ErrorKind::NotFound) => Ok(None),
+            Err(error) => Err(fs(&error)),
+        }
+    }
+
+    /// The knobs file path.
+    pub(crate) fn knobs_path(&self) -> &Path {
+        &self.dirs.knobs
     }
 
     /// Takes the store lock, creating the store root when it is missing.

@@ -552,6 +552,11 @@ impl DaemonSupervisor for SystemdDaemon {
 /// [`SystemdPluginUnits::connect`], next to the daemon unit. Errors about one
 /// unit set report the service unit name as the service ID.
 ///
+/// Both kinds use `KillMode=mixed`: a stop sends `SIGTERM` to the unit's main
+/// process only, and `SIGKILL` to every remaining process once that process
+/// ended or the stop timeout passed, so the main process can stop its own
+/// descendants first.
+///
 /// A periodic job is a `Type=oneshot` service started only by its enabled
 /// timer. The timer's first run starts `every` after the timer is activated
 /// (`OnActiveSec=`) and each later run `every` after the previous run ended

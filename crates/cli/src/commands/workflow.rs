@@ -14,6 +14,11 @@
 //! status 1 like every other failed command. With `--json`, stdout carries
 //! exactly one envelope: the action's document byte for byte as `ok`, or the
 //! error, which never holds output bytes.
+//!
+//! A plugin's jobs and services run as units of the user's service manager:
+//! enabling it installs and starts them, disabling or uninstalling it stops
+//! and removes them (see [`crate::workflow::units`]). Each unit runs the
+//! hidden `__exec` subcommand ([`crate::workflow::supervised`]).
 
 // Rust guideline compliant 2026-10-13
 
@@ -23,8 +28,9 @@ use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Args, Subcommand, ValueHint};
+use clap::{Args, Subcommand, ValueEnum, ValueHint};
 use package::registry::{InstallStatus, PackageRecord};
+use pohunek_platform::supervisor::PluginUnitKind;
 use protocol::{PackageDigest, PackageId, PackageVersion};
 use serde::Serialize;
 
@@ -32,10 +38,13 @@ use crate::commands::plugin::{self, print_output, sanitize, summary};
 use crate::commands::{render_json, render_json_error_with};
 use crate::error::CliError;
 use crate::paths::Paths;
+use crate::service::Context;
 use crate::target::is_local_host;
-use crate::workflow::manifest::{Action as Declared, ArgsMode, Manifest};
+use crate::workflow::manifest::{resolve_argv, Action as Declared, ArgsMode, Manifest};
 use crate::workflow::runner::{run_action, Completed, Invocation, Output};
 use crate::workflow::store::{read_candidate, Candidate, Purged, Recorded, Store};
+use crate::workflow::supervised::{self, Request};
+use crate::workflow::units::{self, Host};
 use crate::workflow::{config, Error};
 
 /// Exit status of a run stopped at its deadline: the status GNU `timeout`
@@ -80,7 +89,11 @@ pub(crate) enum Action {
     /// installed until you repeat the command with `--yes`.
     Install(InstallArgs),
 
-    /// Allow the plugin's actions to run.
+    /// Allow the plugin's actions to run, and install and start its jobs and
+    /// services as units of your service manager.
+    ///
+    /// A plugin that declares jobs or services needs the `pohunek service`
+    /// installation, whose `bin/pohunek` the units run.
     Enable {
         /// Plugin id.
         #[arg(value_name = "PLUGIN")]
@@ -90,7 +103,8 @@ pub(crate) enum Action {
         json: bool,
     },
 
-    /// Block the plugin's actions from running.
+    /// Block the plugin's actions from running, and stop and remove its jobs
+    /// and services.
     Disable {
         /// Plugin id.
         #[arg(value_name = "PLUGIN")]
@@ -136,7 +150,8 @@ pub(crate) enum Action {
         call: Vec<OsString>,
     },
 
-    /// Remove an installed plugin.
+    /// Remove an installed plugin, after stopping and removing its jobs and
+    /// services.
     ///
     /// The plugin's state and config directories are kept unless `--purge`
     /// is given; `--purge` also removes the directories an earlier uninstall
@@ -156,6 +171,33 @@ pub(crate) enum Action {
         #[arg(long)]
         json: bool,
     },
+
+    /// Run one job or service of a plugin; the entry point of its service
+    /// manager unit, never typed by hand.
+    #[command(name = "__exec", hide = true)]
+    Exec {
+        /// Plugin id.
+        #[arg(value_name = "PLUGIN")]
+        plugin: PackageId,
+        /// The archive digest the unit was installed for.
+        #[arg(value_name = "DIGEST", value_parser = plugin::parse_archive_digest)]
+        digest: PackageDigest,
+        /// Whether the unit is a job or a service.
+        #[arg(value_name = "KIND")]
+        kind: UnitKind,
+        /// The declared job or service name.
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+}
+
+/// The kind of a unit, as `__exec` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum UnitKind {
+    /// A periodic job.
+    Job,
+    /// A long-running service.
+    Service,
 }
 
 impl Action {
@@ -169,6 +211,7 @@ impl Action {
             | Self::Uninstall { json, .. }
             | Self::Run { json, .. } => *json,
             Self::Install(args) => args.json,
+            Self::Exec { .. } => false,
         }
     }
 }
@@ -216,6 +259,23 @@ impl From<&PackageRecord> for PluginInfo {
     }
 }
 
+/// One declared job with `argv[0]` resolved to an absolute path.
+#[derive(Debug, Serialize)]
+struct JobInfo {
+    name: String,
+    argv: Vec<String>,
+    every_s: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_ms: Option<u64>,
+}
+
+/// One declared service with `argv[0]` resolved to an absolute path.
+#[derive(Debug, Serialize)]
+struct ServiceInfo {
+    name: String,
+    argv: Vec<String>,
+}
+
 /// One declared action with `argv[0]` resolved to an absolute path.
 #[derive(Debug, Serialize)]
 struct ActionInfo {
@@ -236,6 +296,10 @@ struct Details {
     state_dir: PathBuf,
     config_dir: PathBuf,
     actions: Vec<ActionInfo>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    jobs: Vec<JobInfo>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    services: Vec<ServiceInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -256,6 +320,15 @@ struct Installed {
     plugin: PluginInfo,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<&'static str>,
+}
+
+/// The result of `enable` and `disable`.
+#[derive(Debug, Serialize)]
+struct Toggled {
+    #[serde(flatten)]
+    plugin: PluginInfo,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -282,12 +355,37 @@ struct PurgeInfo {
 ///
 /// Returns [`CliError`] when the host is not local, the archive or manifest
 /// is refused, consent is missing, the plugin is unknown, or the store fails.
-pub(crate) fn run(action: Action, host: &str) -> Result<ExitCode, CliError> {
+pub(crate) async fn run(action: Action, host: &str) -> Result<ExitCode, CliError> {
     if !is_local_host(host) {
         return Err(Error::LocalOnly {
             host: host.to_owned(),
         }
         .into());
+    }
+    if let Action::Exec {
+        plugin,
+        digest,
+        kind,
+        name,
+    } = action
+    {
+        let request = Request {
+            plugin,
+            digest,
+            kind: match kind {
+                UnitKind::Job => PluginUnitKind::Job,
+                UnitKind::Service => PluginUnitKind::Service,
+            },
+            name,
+        };
+        // A service runs for as long as it lives; handing this worker's
+        // scheduler to another thread keeps the runtime delivering the stop
+        // signals the trampoline polls for, however few workers the host has.
+        // The trampoline resolves the store itself, so every failure it meets
+        // is paced like a refusal.
+        return Ok(tokio::task::block_in_place(|| {
+            supervised::execute(&request)
+        }));
     }
     let dirs = Paths::workflow_dirs()?;
     let knobs_path = dirs.knobs.clone();
@@ -307,7 +405,7 @@ pub(crate) fn run(action: Action, host: &str) -> Result<ExitCode, CliError> {
             };
             print_output(json, &result, || render_inspect(&result))?;
         }
-        Action::Install(args) => install(&store, &args)?,
+        Action::Install(args) => install(&store, &args).await?,
         Action::Run { json, plugin, call } => {
             let knobs = config::load(&knobs_path)?;
             let (action, args) = call.split_first().expect("clap requires the action name");
@@ -322,15 +420,33 @@ pub(crate) fn run(action: Action, host: &str) -> Result<ExitCode, CliError> {
             };
             return run_exit(run_action(&store, &knobs, &invocation), json);
         }
-        Action::Enable { plugin, json } => set_enabled(&store, &plugin, true, json)?,
-        Action::Disable { plugin, json } => set_enabled(&store, &plugin, false, json)?,
+        Action::Enable { plugin, json } => {
+            let record = units::enable(&store, &mut Host::resolve_lazily(), &plugin).await?;
+            print_toggled(json, &record, Vec::new(), "Enabled")?;
+        }
+        Action::Disable { plugin, json } => {
+            let (record, warnings) =
+                units::disable(&store, &mut Host::resolve_lazily(), &plugin).await?;
+            print_toggled(json, &record, warnings, "Disabled")?;
+        }
+        Action::Exec { .. } => unreachable!("the trampoline returned above"),
         Action::Uninstall {
             plugin,
             purge,
             remove_modified,
             json,
         } => {
+            let mut warnings = Vec::new();
+            // The unit lock spans the unit removal and the record removal;
+            // without a store there is nothing of either.
+            let lock = store.lock_units()?;
+            if lock.is_some() && store.installed(&plugin)?.is_some() {
+                units::remove_units(&store, &mut Host::resolve_lazily(), &plugin, &mut warnings)
+                    .await?;
+            }
             let removal = store.uninstall(&plugin, purge, remove_modified)?;
+            drop(lock);
+            warnings.extend(removal.warnings);
             let result = Uninstalled {
                 plugin: removal.record.as_ref().map(PluginInfo::from),
                 purged: removal.purged.is_some(),
@@ -338,7 +454,7 @@ pub(crate) fn run(action: Action, host: &str) -> Result<ExitCode, CliError> {
                     state_dir: state,
                     config_dir: config,
                 }),
-                warnings: removal.warnings,
+                warnings,
                 state_dir: store.state_dir(&plugin),
                 config_dir: store.config_dir(&plugin),
             };
@@ -402,13 +518,26 @@ struct Failed {
     signal: Option<i32>,
 }
 
-fn set_enabled(store: &Store, id: &PackageId, enabled: bool, json: bool) -> Result<(), CliError> {
-    let record = PluginInfo::from(&store.set_enabled(id, enabled)?);
-    let verb = if enabled { "Enabled" } else { "Disabled" };
-    print_output(json, &record, || format!("{verb} {}\n", line(&record)))
+fn print_toggled(
+    json: bool,
+    record: &PackageRecord,
+    warnings: Vec<String>,
+    verb: &str,
+) -> Result<(), CliError> {
+    let result = Toggled {
+        plugin: PluginInfo::from(record),
+        warnings,
+    };
+    print_output(json, &result, || {
+        let mut text = format!("{verb} {}\n", line(&result.plugin));
+        for warning in &result.warnings {
+            let _ = writeln!(text, "warning: {warning}");
+        }
+        text
+    })
 }
 
-fn install(store: &Store, args: &InstallArgs) -> Result<(), CliError> {
+async fn install(store: &Store, args: &InstallArgs) -> Result<(), CliError> {
     let candidate = read_candidate(&args.archive, &args.sha256)?;
     let identity = &candidate.manifest.identity;
     // Unlocked and read-only: it only shapes the review; install checks again
@@ -427,7 +556,31 @@ fn install(store: &Store, args: &InstallArgs) -> Result<(), CliError> {
         }
         .into());
     }
-    let (report, warning) = store.install(&candidate, !args.no_enable)?;
+    let has_units = candidate.manifest.has_units();
+    let mut host = Host::resolve_lazily();
+    if has_units && !args.no_enable && recorded == Recorded::No {
+        // Units need the service installation and jobs within the owner's
+        // bounds; refuse before any effect.
+        units::check_bounds(&candidate.manifest, &config::load(store.knobs_path())?)?;
+        let context = Context::resolve().map_err(|error| Error::ServiceNotInstalled {
+            reason: error.to_string(),
+        })?;
+        units::require_installation(&context)?;
+        host = Host::given(context);
+    }
+    // A plugin with units is recorded disabled and enabled afterwards, so its
+    // units start only once it is enabled.
+    let (report, warning) = store.install(&candidate, !args.no_enable && !has_units)?;
+    let refresh = match report.status {
+        InstallStatus::AlreadyInstalled | InstallStatus::RootRestored => report.record.enabled(),
+        _ => !args.no_enable,
+    };
+    let report = if has_units && refresh {
+        let record = units::enable(store, &mut host, &identity.id).await?;
+        package::registry::InstallReport { record, ..report }
+    } else {
+        report
+    };
     let result = Installed {
         status: match report.status {
             InstallStatus::AlreadyInstalled => "already_installed",
@@ -453,7 +606,27 @@ fn install(store: &Store, args: &InstallArgs) -> Result<(), CliError> {
 
 fn details(store: &Store, manifest: &Manifest, files: &Path) -> Details {
     let id = &manifest.identity.id;
+    let jobs = manifest
+        .jobs
+        .iter()
+        .map(|(name, job)| JobInfo {
+            name: name.clone(),
+            argv: resolve_argv(&job.argv, files),
+            every_s: job.every_s.get(),
+            timeout_ms: job.timeout_ms.map(u64::from),
+        })
+        .collect();
+    let services = manifest
+        .services
+        .iter()
+        .map(|(name, service)| ServiceInfo {
+            name: name.clone(),
+            argv: resolve_argv(&service.argv, files),
+        })
+        .collect();
     Details {
+        jobs,
+        services,
         description: manifest.description.clone(),
         files_dir: files.to_path_buf(),
         state_dir: store.state_dir(id),
@@ -498,7 +671,9 @@ fn render_details(text: &mut String, details: &Details) {
     let _ = writeln!(text, "  files:       {}", details.files_dir.display());
     let _ = writeln!(text, "  state dir:   {}", details.state_dir.display());
     let _ = writeln!(text, "  config dir:  {}", details.config_dir.display());
-    let _ = writeln!(text, "Actions (each runs as you, without a shell):");
+    if !details.actions.is_empty() {
+        let _ = writeln!(text, "Actions (each runs as you, without a shell):");
+    }
     for action in &details.actions {
         let extra = match action.args {
             ArgsMode::None => "refused",
@@ -513,6 +688,30 @@ fn render_details(text: &mut String, details: &Details) {
         if let Some(bytes) = action.max_output_bytes {
             let _ = writeln!(text, "    requested output cap: {bytes} bytes");
         }
+    }
+    if !details.jobs.is_empty() {
+        let _ = writeln!(
+            text,
+            "Jobs (each runs periodically as you, without a shell, while the plugin is enabled):"
+        );
+    }
+    for job in &details.jobs {
+        let _ = writeln!(text, "  {}  (every {} s)", job.name, job.every_s);
+        let _ = writeln!(text, "    argv: {:?}", job.argv);
+        if let Some(timeout) = job.timeout_ms {
+            let _ = writeln!(text, "    requested timeout: {timeout} ms");
+        }
+    }
+    if !details.services.is_empty() {
+        let _ = writeln!(
+            text,
+            "Services (each runs continuously as you, without a shell, while the plugin is \
+             enabled, and restarts when it exits):"
+        );
+    }
+    for service in &details.services {
+        let _ = writeln!(text, "  {}", service.name);
+        let _ = writeln!(text, "    argv: {:?}", service.argv);
     }
 }
 

@@ -281,6 +281,7 @@ SYSTEMD_SUITE_FILES = (
     ("pohunek-cli", "crates/cli/tests/service_systemd.rs"),
     ("pohunek-daemon", "crates/daemon/tests/supervised_lifecycle.rs"),
     ("pohunek-cli", "crates/cli/tests/service_upgrade.rs"),
+    ("pohunek-cli", "crates/cli/tests/workflow_systemd.rs"),
 )
 SYSTEMD_SUITES = word_list(file for _, file in SYSTEMD_SUITE_FILES)
 # The `<suite>` of each real-systemd suite, as the CI job selects it.
@@ -294,7 +295,8 @@ LAUNCHD_SUITE_FILES = (
     ("pohunek-platform", ("crates/platform/tests/launchd.rs",)),
     ("pohunek-daemon", ("crates/daemon/tests/supervised_lifecycle.rs",)),
     ("pohunek-cli", ("crates/cli/tests/service_launchd.rs",
-                     "crates/cli/tests/service_upgrade.rs")),
+                     "crates/cli/tests/service_upgrade.rs",
+                     "crates/cli/tests/workflow_launchd.rs")),
 )
 LAUNCHD_SUITES = word_list(
     file for _, files in LAUNCHD_SUITE_FILES for file in files

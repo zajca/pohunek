@@ -39,9 +39,10 @@ The real-systemd suites (`crates/platform/tests/systemd.rs`,
 `crates/daemon/tests/systemd_durable_worker.rs`,
 `crates/cli/tests/service_systemd.rs`,
 `crates/daemon/tests/supervised_lifecycle.rs`,
-`crates/cli/tests/service_upgrade.rs`) are `#[ignore]`d on Linux and need
+`crates/cli/tests/service_upgrade.rs`,
+`crates/cli/tests/workflow_systemd.rs`) are `#[ignore]`d on Linux and need
 `POHUNEK_SYSTEMD_E2E=1` plus a running user manager; the Linux CI job
-`real systemd supervision` runs all five with `--ignored --test-threads 1`
+`real systemd supervision` runs all six with `--ignored --test-threads 1`
 after building the daemon, worker, and CLI binaries. Run them locally the same
 way (`POHUNEK_DAEMON_BIN`, `POHUNEK_WORKER_BIN`, and `POHUNEK_CLI_BIN` point the
 suites at the built binaries). The `upgrade from the previous release` CI job (`.github/workflows/upgrade.yml`,
@@ -518,7 +519,7 @@ checks, which the script lists and never runs: `focused` commands for the
 inner loop (rust `cargo xtask affected` and `cargo t -p <crate>`; sdk the Bun
 gates; scripts the `scripts/tests` unittests; macos-lint
 `scripts/darwin-check`; relay-db `python3 scripts/test-partitions run
-relay-db`; native the binary build, then the five real-systemd suites on
+relay-db`; native the binary build, then the six real-systemd suites on
 Linux, or the `pohunek-platform`, `pohunek-daemon` and `pohunek-cli` tests
 that drive launchd on macOS), a `final` pointer to the gate set in
 `.agents/skills/gates/SKILL.md` and this guide (never a copy), and `ci-only`

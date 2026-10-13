@@ -20,6 +20,14 @@ pub mod service;
 mod target;
 mod workflow;
 
+/// Enables and disables workflow plugins with service manager units against
+/// an explicit service [`Context`](service::Context), such as one whose unit
+/// directory a test chooses.
+pub mod workflow_units {
+    #[doc(inline)]
+    pub use crate::workflow::units::{disable_plugin, enable_plugin, LifecycleError};
+}
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -1893,7 +1901,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         Commands::Workflow { action } => {
             // The workflow store is local-only; the global `--host` is checked
             // before any filesystem access.
-            commands::workflow::run(action, &global_host)
+            commands::workflow::run(action, &global_host).await
         }
         Commands::Health { json } | Commands::Status { json } => {
             let paths = Paths::resolve()?;

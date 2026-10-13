@@ -80,7 +80,10 @@ fn require_e2e() {
 /// notifies and sleeps; `exec-other` replaces itself with another program
 /// before ever notifying. The plugin unit modes record a `start` line in the
 /// marker file, then: `job` records its argv[0] next to the marker, sleeps the
-/// given time, records `end`, and exits successfully; `crash` exits with status 3; `serve` sleeps.
+/// given time, records `end`, and exits successfully; `crash` exits with status 3; `serve` sleeps;
+/// `serve-with-descendant` also leaves a descendant in a process group of its own that records
+/// each `SIGTERM` it receives in `<marker>.term` and its PID in `<marker>.descendant`, then
+/// sleeps.
 #[test]
 #[ignore = "fixture entry point; does work only inside a unit started by these tests"]
 fn fixture_entry() {
@@ -135,6 +138,32 @@ fn fixture_entry() {
         "crash" => {
             record_run("start");
             std::process::exit(3);
+        }
+        "serve-with-descendant" => {
+            use std::os::unix::process::CommandExt as _;
+
+            let marker = record_run("start");
+            // A descendant in a process group of its own that records every
+            // `SIGTERM` it receives and outlives the fixture unless killed.
+            // timing-allowed: #326 the descendant's own lifetime; no scenario waits on this sleep
+            let mut descendant = Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "trap 'echo term >> \"$0\"' TERM; /usr/bin/sleep 300 & wait; wait",
+                    &format!("{}.term", marker.display()),
+                ])
+                .process_group(0)
+                .spawn()
+                .expect("spawn the descendant");
+            std::fs::write(
+                format!("{}.descendant", marker.display()),
+                descendant.id().to_string(),
+            )
+            .expect("record the descendant");
+            // timing-allowed: #326 the fixture's own lifetime; no scenario waits on this sleep, it ends when the scenario stops the unit
+            std::thread::sleep(FIXTURE_LIFETIME);
+            descendant.kill().expect("kill the descendant");
+            descendant.wait().expect("reap the descendant");
         }
         "serve" => {
             record_run("start");
@@ -1257,7 +1286,7 @@ async fn a_plugin_job_timer_fires_repeatedly() {
     );
     let expected = [
         ("Type", "oneshot".to_owned()),
-        ("KillMode", "control-group".to_owned()),
+        ("KillMode", "mixed".to_owned()),
         ("Restart", "no".to_owned()),
         ("TimeoutStartUSec", "1min".to_owned()),
         ("StartLimitIntervalUSec", "0".to_owned()),
@@ -1377,7 +1406,7 @@ async fn a_crashing_plugin_service_is_restarted() {
         ("Restart", "always"),
         ("RestartUSec", "1s"),
         ("StartLimitIntervalUSec", "0"),
-        ("KillMode", "control-group"),
+        ("KillMode", "mixed"),
     ];
     for (key, value) in expected {
         assert_eq!(
@@ -1386,6 +1415,56 @@ async fn a_crashing_plugin_service_is_restarted() {
             "service property {key}"
         );
     }
+
+    plugin
+        .units
+        .remove(&key)
+        .await
+        .expect("remove plugin service");
+}
+
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn stopping_a_plugin_unit_signals_its_main_process_and_kills_the_rest() {
+    require_e2e();
+    let mut plugin = PluginInstallation::new().await;
+    let key = PluginUnitKey::new("acme.work", PluginUnitKind::Service, "parent")
+        .expect("valid plugin unit key");
+    plugin.track(&key);
+    let marker = plugin.marker("parent");
+    let spec = plugin_job(
+        plugin.root(),
+        "serve-with-descendant",
+        &marker,
+        Duration::ZERO,
+    );
+    plugin
+        .units
+        .install(&key, &restarting_service(spec, JOB_INTERVAL))
+        .await
+        .expect("install plugin service");
+    let main = wait_for_marks(&marker, |marks| count(marks, true) >= 1).await[0].pid;
+    let record = PathBuf::from(format!("{}.descendant", marker.display()));
+    let descendant: u32 = wait::wait_until("the descendant to be recorded", || async {
+        std::fs::read_to_string(&record).ok()?.parse().ok()
+    })
+    .await;
+
+    plugin.units.stop(&key).await.expect("stop plugin service");
+    for pid in [main, descendant] {
+        assert!(
+            std::fs::metadata(format!("/proc/{pid}")).is_err(),
+            "process {pid} outlived the stop"
+        );
+    }
+    assert!(
+        !PathBuf::from(format!("{}.term", marker.display())).exists(),
+        "the stop's SIGTERM reached a process other than the main one"
+    );
+    assert_eq!(
+        plugin.units.state(&key).await.expect("service state"),
+        ServiceState::Stopped
+    );
 
     plugin
         .units
