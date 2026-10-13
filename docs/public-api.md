@@ -685,7 +685,7 @@ runtimes. A runtime id served by a
 loaded package of a different package id is a conflict. A claim of an alias by
 an explicit-digest or linked package is answered with
 `package_runtime_not_claimable`, and so is a descriptor that names `shell`; a
-catalog that does not authorize the alias for the archive is
+catalog that names `shell` or does not authorize the alias for the archive is
 `package_untrusted`. The package that serves an alias is the selected, enabled
 official package whose `runtime_id` is that alias in `package.list` and
 `package.inspect`; no such package means the built-in serves it, or nothing

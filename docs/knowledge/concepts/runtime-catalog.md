@@ -137,7 +137,10 @@ rejected before any signature is considered.
   serve the id (see the runtime packages guide):
   `VerifiedCatalog::authorize(package_id, runtime_id, digest)` returns
   `Official` only for an entry matching all three, and `NotAuthorized`
-  otherwise (including revoked digests).
+  otherwise (including revoked digests). The package and runtime ids come from
+  the descriptor inside the archive, so the daemon first requires an
+  unrevoked entry with the raw archive digest (`package_untrusted` otherwise)
+  and only then decompresses the archive and makes this decision.
 - A runtime id maps to exactly one package id and the reverse. `(package_id,
   version)` and `digest` are each unique. Platforms are a non-empty set of
   `[a-z0-9._-]` names.

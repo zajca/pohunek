@@ -656,8 +656,8 @@ async fn assert_failed_installs_preserve_selection(
         .await;
     assert_eq!(code, 1, "{refused}");
     assert_eq!(
-        refused["err"]["code"], "package_archive_invalid",
-        "{refused}"
+        refused["err"]["code"], "package_untrusted",
+        "bytes the catalog does not list are refused before decoding: {refused}"
     );
     selected_package(harness, digest).await;
 }

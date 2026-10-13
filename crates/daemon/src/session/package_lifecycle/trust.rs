@@ -1,7 +1,7 @@
 //! Official-package trust: the host trust anchor, catalog verification and the
 //! core and platform compatibility of a catalog entry.
 
-// Rust guideline compliant 2026-10-04
+// Rust guideline compliant 2026-10-13
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -109,6 +109,33 @@ pub(super) fn verify_catalog_document(
         warn!(%error, "a package catalog was refused");
         PackageErrorKind::Untrusted
     })
+}
+
+/// Checks that the verified catalog lists the raw archive `digest` and does
+/// not revoke it.
+///
+/// The archive is decompressed only after this check passes. The package and
+/// runtime ids come from the descriptor inside the archive, so
+/// [`authorize_official`] completes the decision after decoding.
+///
+/// # Errors
+///
+/// Returns [`PackageErrorKind::Untrusted`] when no entry carries `digest` or
+/// the catalog revokes it.
+pub(super) fn require_listed(
+    catalog: &VerifiedCatalog,
+    digest: &PackageDigest,
+) -> Result<(), PackageErrorKind> {
+    let listed = !catalog.is_digest_revoked(digest)
+        && catalog
+            .entries()
+            .iter()
+            .any(|entry| entry.digest() == digest);
+    if listed {
+        Ok(())
+    } else {
+        Err(PackageErrorKind::Untrusted)
+    }
 }
 
 /// Checks that the verified catalog authorizes the package as official and

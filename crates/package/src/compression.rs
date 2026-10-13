@@ -4,7 +4,7 @@
 //! reproducible from a pinned dependency version and release builds stay free
 //! of a C toolchain.
 
-// Rust guideline compliant 2026-10-04
+// Rust guideline compliant 2026-10-13
 
 use std::io::Read as _;
 
@@ -29,8 +29,10 @@ pub(crate) fn encode(tar: &[u8]) -> Vec<u8> {
 /// Decompresses exactly one zstd frame, refusing to produce more than the
 /// size and expansion-ratio limits allow.
 ///
-/// The output buffer never grows past the limit, so a decompression bomb costs
-/// at most `limit` bytes of memory before it is rejected.
+/// The output buffer never grows past the limit. The `ruzstd` decoder itself
+/// does not bound the size of one decoded block (RUSTSEC-2026-0344), so only
+/// bytes whose raw digest a trust source already authorized reach this
+/// function. @TODO drop this precondition after #969 moves to a fixed decoder.
 pub(crate) fn decode(bytes: &[u8], limits: &Limits) -> Result<Vec<u8>, ArchiveError> {
     let compressed_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     let ratio_cap = compressed_len.saturating_mul(limits.max_expansion_ratio);

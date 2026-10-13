@@ -155,8 +155,10 @@ The checks are in `crates/daemon/src/session/package_lifecycle/trust.rs` and
    the anchor, a signer outside its validity window or revoked, an expired
    catalog, a catalog older than the newest one this host has accepted, and a
    catalog with no entry binding this package id, runtime id, version and
-   digest. Signature, signer validity, expiry and high-water refusals are
-   logged as an `a package catalog was refused` warning; a catalog without an
+   digest. A file whose digest the catalog does not list at all, such as a
+   damaged download of a listed archive, is refused with this code before it
+   is decompressed. Signature, signer validity, expiry and high-water refusals
+   are logged as an `a package catalog was refused` warning; a catalog without an
    entry binding this package id, runtime id, version and digest is refused
    without a log line. Check that the catalog and the package archive come from the same
    extracted release archive. Do not pair an archive with the catalog of

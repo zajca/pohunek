@@ -11,6 +11,8 @@
 //!   form is rejected with a typed [`ArchiveError`] that never echoes archive
 //!   content.
 //! - [`PackageDigest`] (SHA-256 of the archive bytes) authenticates an archive.
+//!   [`archive_digest`] computes it without decompressing, so a caller can
+//!   authorize the digest before [`read_archive_with_digest`] decodes anything.
 //! - [`parse_anchor`] reads the trust anchor file of a release bundle and
 //!   [`sign_catalog`] signs a catalog for release tooling.
 //! - [`verify_catalog`] authenticates the signed runtime catalog that
@@ -34,7 +36,7 @@
 //! `docs/knowledge/concepts/runtime-package-archive.md` and
 //! `docs/knowledge/concepts/runtime-catalog.md`.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-13
 
 #![forbid(unsafe_code)]
 
@@ -73,7 +75,8 @@ pub use anchor::{
     MAX_ANCHOR_BYTES,
 };
 pub use archive::{
-    build_archive, read_archive, read_archive_with_digest, ArchiveEntry, VerifiedArchive,
+    archive_digest, build_archive, read_archive, read_archive_with_digest, ArchiveEntry,
+    VerifiedArchive,
 };
 pub use catalog::{
     catalog_signing_message, check_catalog, key_record_signing_message, verify_catalog,
