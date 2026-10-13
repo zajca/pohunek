@@ -6,14 +6,14 @@
 //! directory and cross-checks the signed catalog against the bytes of the
 //! daemon archives, the package archives and the attestations in the bundle.
 
-// Rust guideline compliant 2026-10-08
+// Rust guideline compliant 2026-10-13
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use package::read_archive;
-use package::Limits;
+use package::read_archive_with_digest;
+use package::{ArchiveError, Limits};
 
 use crate::attestation::{binary_set_digest, executable_hashes};
 use crate::catalog::{io_error, read_input, verify_bytes, write_output};
@@ -268,11 +268,16 @@ fn check_daemon_archive(
             max_package_bytes(),
         )
         .map_err(|_cause| refuse(InputClass::PackageArchive, Fault::Missing, runtime))?;
-        let archived =
-            read_archive(&package_bytes, &Limits::DEFAULT).map_err(XtaskError::Package)?;
-        if archived.digest() != entry.digest() {
-            return Err(refuse(InputClass::PackageArchive, Fault::Mismatch, runtime));
-        }
+        // The signed digest authorizes the raw bytes before the decoder sees
+        // them: a bundle may be one the developer downloaded.
+        read_archive_with_digest(&package_bytes, entry.digest(), &Limits::DEFAULT).map_err(
+            |error| match error {
+                ArchiveError::DigestMismatch => {
+                    refuse(InputClass::PackageArchive, Fault::Mismatch, runtime)
+                }
+                other => XtaskError::Package(other),
+            },
+        )?;
         for attestation in entry.attestations() {
             let file = attestation_name(runtime, &attestation.platform);
             let bytes = read_input(&dir.join(&file), MAX_ATTESTATION_BYTES)

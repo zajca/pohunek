@@ -1003,6 +1003,29 @@ fn the_inventory_check_refuses_a_package_that_differs_from_the_catalog() {
 }
 
 #[test]
+fn the_inventory_check_refuses_a_package_by_digest_before_decoding_it() {
+    let (_fixture, bundle) = assembled();
+    let runtime = &runtimes()[0];
+    let package = bundle.join(format!("pohunek-runtime-{runtime}-{VERSION}.tar.zst"));
+    // Bytes the archive reader refuses as soon as it decodes them: had the
+    // check decoded the package, the refusal would be this decoder error.
+    let tampered = b"not a zstd frame".as_slice();
+    match package::read_archive(tampered, &package::Limits::DEFAULT) {
+        Err(package::ArchiveError::DigestMismatch) | Ok(_) => {
+            panic!("the tampered bytes must fail to decode")
+        }
+        Err(_decode) => {}
+    }
+    fs::write(&package, tampered).expect("tamper");
+    crate::release_inventory::write_inventory(&bundle).expect("reseal");
+    expect_inventory_refusal(
+        verify_inventory(&bundle),
+        InputClass::PackageArchive,
+        Fault::Mismatch,
+    );
+}
+
+#[test]
 fn a_symlinked_input_is_refused_before_it_is_read() {
     let fixture = Fixture::new();
     let name = format!("pohunek-ts-sdk-{VERSION}.tgz");

@@ -19,8 +19,13 @@ ignore = [
     # then decodes, so only bytes whose package may already run code as the
     # owner reach the decoder; `plugin link` decodes only the frame the pinned
     # encoder just produced from the owner's directory. The xtask readers are
-    # build and release tools that never run inside the daemon and decode the
-    # archives the developer or release CI built. Upgrading changes the encoder
+    # build and release tools that never run inside the daemon. `release
+    # verify-inventory` authorizes each package archive against its signed
+    # catalog digest before decoding. The readers that take an operator-named
+    # archive to compute its digest (`compat attest`/`verify`, `catalog
+    # build`, `release assemble`, the Hermes package host) have no
+    # trusted digest before they decode and are meant for archives the
+    # developer or release CI built. Upgrading changes the encoder
     # output, so it is a package format migration: remove this ignore when #969
     # moves to ruzstd >= 0.9.1.
     "RUSTSEC-2026-0344",

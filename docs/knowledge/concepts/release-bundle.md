@@ -99,7 +99,9 @@ top-level catalog against the anchor inside every daemon archive (at `--now`,
 default the current time), and requires each daemon archive to carry that
 catalog, the binary set the catalog names for its target and exactly the
 packages and attestations the catalog lists for that target, byte-identical to
-the top-level files.
+the top-level files. Each top-level package archive must match its signed
+catalog digest before it is decompressed and read, so a tampered package is
+refused as a package-archive mismatch without reaching the decoder.
 
 ## Failure behavior
 

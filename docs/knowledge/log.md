@@ -34,6 +34,13 @@
 - `docs/cli.md`, `docs/features.md` and the `setup` and `workflow-plugins`
   guides describe it.
 
+## Unreleased (2026-10-13, verify-inventory checks package digests before decoding, #972)
+
+- `cargo xtask release verify-inventory` compares each top-level package
+  archive with its signed catalog digest before decompressing it, so a
+  tampered package is refused as a package-archive mismatch without reaching
+  the decoder (`concepts/release-bundle.md`).
+
 ## Unreleased (2026-10-13, Hermes docs match the package-only runtime, #147)
 
 - The Hermes operator guide (and the operator skill generated from it) states
