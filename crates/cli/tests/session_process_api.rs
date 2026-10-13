@@ -1245,6 +1245,14 @@ const PLUGIN_COMMAND_CASES: &[(&[&str], &str)] = &[
         protocol::method::SESSION_SCREEN,
     ),
     (
+        &["session", "screen", "local/s-fixture-1", "--json"],
+        protocol::method::SESSION_SCREEN,
+    ),
+    (
+        &["--host", "", "session", "screen", SESSION_ID, "--json"],
+        protocol::method::SESSION_SCREEN,
+    ),
+    (
         &["session", "read", SESSION_ID, "--json"],
         protocol::method::SESSION_READ,
     ),
@@ -1322,10 +1330,8 @@ fn plugin_commands_have_binary_level_json_and_wire_parity() {
         let ok = assert_json_success(&output);
         assert!(!ok.is_null(), "success payload for {expected_method}");
         assert_typed_session_json(expected_method, &ok);
-        assert_eq!(
-            requests.last().expect("captured command request").method(),
-            *expected_method
-        );
+        let command = requests.last().expect("captured command request");
+        assert_eq!(command.method(), *expected_method);
         if matches!(
             *expected_method,
             protocol::method::SESSION_NEW | protocol::method::SESSION_RUNTIME_INVENTORY
@@ -1337,7 +1343,59 @@ fn plugin_commands_have_binary_level_json_and_wire_parity() {
                 protocol::method::SESSION_LIST
             );
         }
+        if !matches!(
+            *expected_method,
+            protocol::method::SESSION_NEW
+                | protocol::method::SESSION_LIST
+                | protocol::method::SESSION_RUNTIME_INVENTORY
+        ) {
+            // The canned fixture response names `SESSION_ID` whatever the
+            // request carried, so only the captured params show the parsed target.
+            assert_eq!(requested_session_id(command), SESSION_ID, "{args:?}");
+        }
     }
+}
+
+/// The session a captured command request names, decoded from the typed
+/// params of its method.
+fn requested_session_id(request: &Request) -> String {
+    fn decode<T: serde::de::DeserializeOwned>(request: &Request) -> T {
+        serde_json::from_value(request.params().clone())
+            .unwrap_or_else(|error| panic!("{} typed params: {error}", request.method()))
+    }
+    let session_id = match request.method() {
+        protocol::method::SESSION_INSPECT => decode::<protocol::SessionId>(request),
+        protocol::method::SESSION_FORK => decode::<protocol::SessionForkParams>(request).session_id,
+        protocol::method::SESSION_SCREEN => decode::<protocol::SessionScreenParams>(request)
+            .session_id()
+            .clone(),
+        protocol::method::SESSION_READ => decode::<protocol::SessionReadParams>(request)
+            .session_id()
+            .clone(),
+        protocol::method::SESSION_INPUT => {
+            decode::<protocol::SessionInputParams>(request).session_id
+        }
+        protocol::method::SESSION_OUTPUT => decode::<protocol::SessionOutputParams>(request)
+            .session_id()
+            .clone(),
+        protocol::method::SESSION_WAIT => decode::<protocol::SessionWaitParams>(request)
+            .session_id()
+            .clone(),
+        protocol::method::SESSION_RESUME => decode::<protocol::SessionResumeParams>(request)
+            .session_id()
+            .clone(),
+        protocol::method::SESSION_RESIZE => {
+            decode::<protocol::SessionResizeParams>(request).session_id
+        }
+        protocol::method::SESSION_SET_METADATA => {
+            decode::<protocol::SessionSetMetadataParams>(request).session_id
+        }
+        protocol::method::SESSION_RENAME => {
+            decode::<protocol::SessionRenameParams>(request).session_id
+        }
+        other => panic!("{other} names no single session"),
+    };
+    session_id.0
 }
 
 fn assert_typed_session_json(method: &str, ok: &Value) {
@@ -1758,7 +1816,7 @@ fn fake_netbird_resolution_reaches_tcp_fixture_with_origin_pair() {
     pohunek_test_support::fs::write_file(
         &netbird,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' '{{\"peers\":{{\"details\":[{{\"fqdn\":\"fixture-remote.netbird.test\",\"netbirdIp\":\"{netbird_ip}\",\"status\":\"Connected\"}}]}}}}'\n"
+            "#!/bin/sh\nprintf '%s\\n' '{{\"peers\":{{\"details\":[{{\"fqdn\":\"fixture-remote.netbird.test\",\"netbirdIp\":\"{netbird_ip}\",\"publicKey\":\"a/real+netbird@key==\",\"status\":\"Connected\"}}]}}}}'\n"
         ),
     )
     .expect("write fake netbird");
@@ -1788,9 +1846,38 @@ fn fake_netbird_resolution_reaches_tcp_fixture_with_origin_pair() {
         let ok = assert_json_success(&output);
         assert_eq!(ok["session_id"], SESSION_ID, "selector {selector}");
     }
+    let peer = pohunek_client::ExternalIdentity::peer_id("a/real+netbird@key==")
+        .expect("stable peer identity")
+        .selector();
+    let route = pohunek_client::remote_host_with_port(&format!("netbird:{peer}"), remote_port)
+        .expect("canonical remote route");
+    let target = format!("{route}/{SESSION_ID}");
+    let output = home
+        .command()
+        .env("PATH", &path)
+        .env("LD_PRELOAD", &connect_redirect)
+        .env("POHUNEK_TEST_CONNECT_CAPTURE", &connect_capture)
+        .env("POHUNEK_REMOTE_PORT", remote_port.to_string())
+        .env(protocol::ENV_SESSION_ID, private_session)
+        .env(protocol::ENV_DAEMON_ID, private_daemon)
+        .args(["session", "screen", &target, "--json"])
+        .output()
+        .expect("run CLI with a provider-qualified target");
+    let ok = assert_json_success(&output);
+    assert_eq!(ok["session_id"], SESSION_ID);
+
     let requests = tcp_fixture.finish();
     let local_requests = local_fixture.finish();
-    assert!(requests.len() >= 6, "every selector reaches TCP fixture");
+    assert!(requests.len() >= 8, "every selector reaches TCP fixture");
+    let screens = requests
+        .iter()
+        .filter(|request| request.method() == protocol::method::SESSION_SCREEN)
+        .map(requested_session_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        screens, [SESSION_ID; 4],
+        "every selector and the provider-qualified target name the session"
+    );
     for request in requests {
         assert_eq!(
             request.origin_session_id().map(|id| id.0.as_str()),
@@ -1809,7 +1896,7 @@ fn fake_netbird_resolution_reaches_tcp_fixture_with_origin_pair() {
             .lines()
             .filter(|line| *line == expected_target)
             .count()
-            >= 6,
+            >= 8,
         "every CLI connection must target the fake NetBird address before the test-only redirect"
     );
 }
