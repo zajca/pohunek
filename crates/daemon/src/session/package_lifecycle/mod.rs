@@ -3,9 +3,11 @@
 //! Every mutation validates first, records second and reloads third, all under
 //! the exclusive package lifecycle guard so a fresh launch can never interleave:
 //!
-//! 1. the archive is verified and its `runtime.toml` parsed from the archive
-//!    entries in memory, so nothing is extracted or recorded for a package the
-//!    daemon would refuse to load;
+//! 1. the raw archive digest is authorized, by the owner's explicit digest or
+//!    by a verified catalog that lists it, before any byte is decompressed;
+//!    the archive is then verified and its `runtime.toml` parsed from the
+//!    archive entries in memory, so nothing is extracted or recorded for a
+//!    package the daemon would refuse to load;
 //! 2. trust and the runtime-id claim rules are decided from the descriptor, not
 //!    from anything the caller says about the package;
 //! 3. the registry records the change and the runtime registry is rebuilt.
@@ -16,7 +18,7 @@
 //! Reads take no guard: the registry record is replaced atomically, so a read
 //! sees one committed state.
 
-// Rust guideline compliant 2026-10-12
+// Rust guideline compliant 2026-10-13
 
 mod bind;
 mod error;
@@ -34,8 +36,8 @@ use package::registry::{
     RegistryState, RetainedDigests,
 };
 use package::{
-    read_archive, read_archive_with_digest, Limits, LocalTrust, LocalTrustError, PackageDigest,
-    VerifiedCatalog, MAX_CATALOG_BYTES,
+    archive_digest, read_archive, read_archive_with_digest, Limits, LocalTrust, LocalTrustError,
+    PackageDigest, VerifiedCatalog, MAX_CATALOG_BYTES,
 };
 use protocol::{
     BindingProvenance, PackageChangeResult, PackageDoctorResult, PackageErrorKind, PackageFinding,
@@ -807,24 +809,102 @@ fn declared_identity(definition: &RuntimeDefinition) -> Result<PackageIdentity, 
 }
 
 /// Verifies and authorizes an archive file under `trust` without writing.
+///
+/// The raw archive digest is authorized before the archive is decompressed,
+/// so bytes that neither the owner's digest nor a verified catalog vouches for
+/// never reach the zstd decoder.
 fn prepare_archive(
     context: &Context,
     path: &str,
     trust: &PackageTrust,
 ) -> Result<Prepared, PackageErrorKind> {
-    let limits = Limits::DEFAULT;
-    let anchor = match trust {
-        PackageTrust::Catalog { .. } => Some(context.catalog_anchor()?),
-        PackageTrust::ExplicitDigest { .. } => None,
-    };
-    let bytes = read_archive_file(path, &limits)?;
-    let archive = match trust {
-        PackageTrust::ExplicitDigest { digest } => {
-            read_archive_with_digest(&bytes, digest, &limits)
-        }
-        PackageTrust::Catalog { .. } => read_archive(&bytes, &limits),
+    match trust {
+        PackageTrust::ExplicitDigest { digest } => prepare_local(path, digest),
+        PackageTrust::Catalog { catalog_path } => prepare_official(context, path, catalog_path),
     }
-    .map_err(|error| {
+}
+
+/// Prepares an archive the owner trusts by its exact digest `pinned`.
+fn prepare_local(path: &str, pinned: &PackageDigest) -> Result<Prepared, PackageErrorKind> {
+    let limits = Limits::DEFAULT;
+    let bytes = read_archive_file(path, &limits)?;
+    let (digest, definition, identity) = read_authorized(&bytes, pinned, &limits)?;
+    LocalTrust::ExplicitDigest(pinned.clone())
+        .authorize(definition.runtime_id(), &digest)
+        .map_err(|error| match error {
+            LocalTrustError::ReservedRuntime => PackageErrorKind::RuntimeNotClaimable,
+            LocalTrustError::DigestMismatch => PackageErrorKind::ArchiveInvalid,
+        })?;
+    Ok(Prepared {
+        bytes,
+        digest,
+        definition,
+        identity,
+        authority: Authority::Local,
+        source: RecordSource::ExplicitDigest,
+        catalog: None,
+    })
+}
+
+/// Prepares an archive that the signed catalog at `catalog_path` authorizes as
+/// official.
+///
+/// The verified catalog must list the raw archive digest before the archive is
+/// decoded; the identity the decoded descriptor declares must then match a
+/// listed entry that supports this core version and platform.
+fn prepare_official(
+    context: &Context,
+    path: &str,
+    catalog_path: &str,
+) -> Result<Prepared, PackageErrorKind> {
+    let limits = Limits::DEFAULT;
+    let anchor = context.catalog_anchor()?;
+    let bytes = read_archive_file(path, &limits)?;
+    let max = u64::try_from(MAX_CATALOG_BYTES).unwrap_or(u64::MAX);
+    let document = read_regular_file(catalog_path, max)
+        .map_err(|_failure| PackageErrorKind::SourceUnreadable)?;
+    let state: CatalogState = context
+        .store
+        .registry()
+        .catalog_state()
+        .map_err(|error| registry_kind(&error))?;
+    let verified = trust::verify_catalog_document(&document, anchor, &state, unix_now()?)?;
+    let raw = archive_digest(&bytes).map_err(|error| {
+        warn!(%error, "a package archive digest cannot be computed");
+        PackageErrorKind::ArchiveInvalid
+    })?;
+    trust::require_listed(&verified, &raw)?;
+    let (digest, definition, identity) = read_authorized(&bytes, &raw, &limits)?;
+    trust::authorize_official(
+        &verified,
+        &identity,
+        definition.runtime_id(),
+        &digest,
+        &trust::core_version()?,
+        &trust::host_platform()?,
+    )?;
+    Ok(Prepared {
+        bytes,
+        digest,
+        definition,
+        identity,
+        authority: Authority::Official,
+        source: RecordSource::Official,
+        catalog: Some(verified),
+    })
+}
+
+/// Reads archive `bytes` whose digest `authorized` a trust source already
+/// accepted, and parses the descriptor they carry.
+///
+/// The digest is compared before decompression, so bytes that differ from the
+/// authorized digest are refused without being decoded.
+fn read_authorized(
+    bytes: &[u8],
+    authorized: &PackageDigest,
+    limits: &Limits,
+) -> Result<(PackageDigest, RuntimeDefinition, PackageIdentity), PackageErrorKind> {
+    let archive = read_archive_with_digest(bytes, authorized, limits).map_err(|error| {
         warn!(%error, "a package archive was refused");
         PackageErrorKind::ArchiveInvalid
     })?;
@@ -834,48 +914,7 @@ fn prepare_archive(
         rejection_kind(&rejection)
     })?;
     let identity = declared_identity(&definition)?;
-
-    let (authority, source, catalog) = match (trust, anchor) {
-        (PackageTrust::ExplicitDigest { digest: pinned }, _) => {
-            LocalTrust::ExplicitDigest(pinned.clone())
-                .authorize(definition.runtime_id(), &digest)
-                .map_err(|error| match error {
-                    LocalTrustError::ReservedRuntime => PackageErrorKind::RuntimeNotClaimable,
-                    LocalTrustError::DigestMismatch => PackageErrorKind::ArchiveInvalid,
-                })?;
-            (Authority::Local, RecordSource::ExplicitDigest, None)
-        }
-        (PackageTrust::Catalog { catalog_path }, Some(anchor)) => {
-            let max = u64::try_from(MAX_CATALOG_BYTES).unwrap_or(u64::MAX);
-            let document = read_regular_file(catalog_path, max)
-                .map_err(|_failure| PackageErrorKind::SourceUnreadable)?;
-            let state: CatalogState = context
-                .store
-                .registry()
-                .catalog_state()
-                .map_err(|error| registry_kind(&error))?;
-            let verified = trust::verify_catalog_document(&document, anchor, &state, unix_now()?)?;
-            trust::authorize_official(
-                &verified,
-                &identity,
-                definition.runtime_id(),
-                &digest,
-                &trust::core_version()?,
-                &trust::host_platform()?,
-            )?;
-            (Authority::Official, RecordSource::Official, Some(verified))
-        }
-        (PackageTrust::Catalog { .. }, None) => return Err(PackageErrorKind::TrustUnavailable),
-    };
-    Ok(Prepared {
-        bytes,
-        digest,
-        definition,
-        identity,
-        authority,
-        source,
-        catalog,
-    })
+    Ok((digest, definition, identity))
 }
 
 /// Archives and validates a developer directory.

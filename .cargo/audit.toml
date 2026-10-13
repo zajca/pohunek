@@ -12,4 +12,16 @@ ignore = [
     # wayland-scanner accepts quick-xml >= 0.41.0.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # ruzstd 0.9.0 can expand one block of a tiny frame to gigabytes inside the
+    # decoder, before the package crate's expansion limits see any output. Every
+    # production reader of archive bytes authorizes their raw digest first (the
+    # owner's explicit digest or an entry of a verified signed catalog) and only
+    # then decodes, so only bytes whose package may already run code as the
+    # owner reach the decoder; `plugin link` decodes only the frame the pinned
+    # encoder just produced from the owner's directory. The xtask readers are
+    # build and release tools that never run inside the daemon and decode the
+    # archives the developer or release CI built. Upgrading changes the encoder
+    # output, so it is a package format migration: remove this ignore when #969
+    # moves to ruzstd >= 0.9.1.
+    "RUSTSEC-2026-0344",
 ]

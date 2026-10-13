@@ -5,7 +5,7 @@
 //! blocks and nothing else. The reader rebuilds the canonical header for every
 //! entry it parses and requires the actual header to match byte for byte.
 
-// Rust guideline compliant 2026-10-04
+// Rust guideline compliant 2026-10-13
 
 use std::collections::HashSet;
 
@@ -165,7 +165,7 @@ fn read_checked(
             limit: limits.max_compressed_bytes,
         });
     }
-    let digest = digest_of(bytes)?;
+    let digest = archive_digest(bytes)?;
     if expected.is_some_and(|expected| *expected != digest) {
         return Err(ArchiveError::DigestMismatch);
     }
@@ -182,7 +182,19 @@ fn read_checked(
 /// Lowercase hexadecimal digits, as the `sha256:` digest syntax requires.
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
-fn digest_of(bytes: &[u8]) -> Result<PackageDigest, ArchiveError> {
+/// Computes the [`PackageDigest`] of raw archive bytes without decompressing them.
+///
+/// A caller that must authorize an archive before reading it looks this digest
+/// up in its trust source first, then passes the authorized digest to
+/// [`read_archive_with_digest`], so bytes nobody vouches for never reach the
+/// zstd decoder.
+///
+/// # Errors
+///
+/// Returns [`ArchiveError::DigestEncoding`] when the computed hash does not
+/// form a valid package digest, which only a defect in the digest syntax
+/// would cause.
+pub fn archive_digest(bytes: &[u8]) -> Result<PackageDigest, ArchiveError> {
     let hash = Sha256::digest(bytes);
     let mut text = String::from("sha256:");
     for byte in hash {

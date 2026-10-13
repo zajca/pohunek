@@ -9,7 +9,7 @@
 //! end. Signing keys are generated inside each test process from random bytes
 //! and never leave it.
 
-// Rust guideline compliant 2026-10-06
+// Rust guideline compliant 2026-10-13
 
 #![cfg(unix)]
 
@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use package::{
-    build_archive, read_archive, AnchorFile, ArchiveEntry, CatalogEntry, Limits, PackageDigest,
-    ANCHOR_FILE_NAME, MAX_ANCHOR_BYTES,
+    archive_digest, build_archive, read_archive, AnchorFile, ArchiveEntry, CatalogEntry, Limits,
+    PackageDigest, ANCHOR_FILE_NAME, MAX_ANCHOR_BYTES,
 };
 use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::fs::{write_executable, write_file};
@@ -46,6 +46,9 @@ const PROGRAM: &str = "/bin/sh";
 
 /// Name of the daemon executable copied into the scenario's directory.
 const DAEMON_NAME: &str = "pohunekd";
+
+/// Bytes that are not a zstd frame: the decoder refuses them immediately.
+const NOT_AN_ARCHIVE: &[u8] = b"these bytes are not a zstd frame";
 
 const DETECT_MANIFEST: &str = r#"[[rules]]
 id = "idle_prompt"
@@ -777,6 +780,65 @@ async fn a_catalog_that_does_not_verify_installs_nothing() {
     // the host in a state that blocks a good one.
     let path = install.write("good.json", &good);
     let (code, document) = install.install_catalog(&built, &path).await;
+    assert_eq!(code, 0, "{document}");
+    assert_eq!(
+        document["ok"]["package"]["origin"], "official",
+        "{document}"
+    );
+}
+
+#[tokio::test]
+async fn bytes_a_valid_catalog_does_not_list_are_refused_before_they_are_decoded() {
+    let key = test_key();
+    let install = Install::start(&Anchor::File {
+        bytes: anchor_for(&key),
+        mode: 0o644,
+    })
+    .await;
+    let built = install.archive("1.0.0");
+    let platform = host_platform();
+    let catalog = install.write(
+        "runtime-catalog.json",
+        &signed(
+            &key,
+            catalog_of(
+                1,
+                WINDOW_END,
+                vec![entry_for(&built, "1.0.0", &platform, ANY_CORE)],
+            ),
+        ),
+    );
+    let unlisted = Built {
+        path: install.write("unlisted.tar.zst", NOT_AN_ARCHIVE),
+        digest: archive_digest(NOT_AN_ARCHIVE).expect("raw digest"),
+    };
+
+    // Trust refuses the unlisted digest; the bytes never reach the decoder,
+    // which would report an invalid archive.
+    let outcome = install.install_catalog(&unlisted, &catalog).await;
+    install.assert_refused(outcome, "package_untrusted").await;
+
+    // Once a verified catalog lists the same bytes, they pass trust and the
+    // decoder refuses them.
+    let listing = install.write(
+        "listing-catalog.json",
+        &signed(
+            &key,
+            catalog_of(
+                2,
+                WINDOW_END,
+                vec![entry_for(&unlisted, "1.0.0", &platform, ANY_CORE)],
+            ),
+        ),
+    );
+    let outcome = install.install_catalog(&unlisted, &listing).await;
+    install
+        .assert_refused(outcome, "package_archive_invalid")
+        .await;
+
+    // The refusals recorded no trust state: the first catalog still installs
+    // the archive it lists.
+    let (code, document) = install.install_catalog(&built, &catalog).await;
     assert_eq!(code, 0, "{document}");
     assert_eq!(
         document["ok"]["package"]["origin"], "official",

@@ -149,7 +149,8 @@ digest.
     range equal to `compat/hermes/compatibility-lock.json`, the probe accepting
     the locked banner and refusing `Hermes Agent v0.20.1 (future)`, and a
     `--sha256` install (`package_runtime_not_claimable`) and a corrupt archive
-    (`package_archive_invalid`) that leave the selection unchanged.
+    whose digest the catalog does not list (`package_untrusted`, refused before
+    decoding) that leave the selection unchanged.
   - `package_backed_install_writes_the_selected_package_bytes`: the installed
     plugin, its provenance and its policy binding come from the selected
     package.

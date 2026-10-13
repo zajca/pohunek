@@ -228,8 +228,11 @@ launch on that machine, so it is never a remote operation.
   `catalog_trust_anchor` check as `warn` or `fail` respectively. Only a package
   whose catalog entry binds its package id, runtime id and digest may serve
   `codex`, `claude` or `hermes`; a catalog that authorizes a different id,
-  package or digest for the archive is refused (`package_untrusted`). Installs
-  trusted by `--sha256` are unaffected.
+  package or digest for the archive is refused (`package_untrusted`). The
+  daemon looks the archive's digest up in the verified catalog before it
+  decompresses anything, so bytes the catalog does not list, a corrupted copy
+  of a listed archive included, are refused with `package_untrusted` without
+  being decoded. Installs trusted by `--sha256` are unaffected.
 - `link <dir>` copies a developer directory. The copy is installed disabled and
   unselected, and is recorded with the `link` origin.
 

@@ -394,9 +394,13 @@ and is reported by the host (package-pinned sessions are then incompatible).
   interleave with it.
 - Install and link validate the package in memory (`runtime.toml` parsed from
   the verified archive) before anything is extracted; the package identity (id
-  and version) comes from the descriptor. `package.link` copies a developer
-  directory into content-addressed storage and installs it disabled and
-  unselected; the directory itself is never loaded.
+  and version) comes from the descriptor. An installed archive is decoded only
+  after its raw digest is authorized: trust `explicit_digest` compares it with
+  the supplied digest, and trust `catalog` requires a verified catalog to list
+  it (else `package_untrusted`), so bytes nobody vouches for never reach the
+  zstd decoder. `package.link` copies a developer directory into
+  content-addressed storage and installs it disabled and unselected; the
+  directory itself is never loaded.
 - Claim rules: `shell` is never claimable. An official alias (a reserved runtime
   id other than `shell`) is served only by a package the signed catalog
   authorizes as official for that exact package id, runtime id and digest; it
