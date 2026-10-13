@@ -159,7 +159,10 @@ its process is not active still orders that process's later claims. The worker
 keeps every live reporter's sequence and never evicts it; when live reporting
 processes other than the PTY root and the launch process fill its bound (16), a
 further process's report is refused with reason
-`identity_reporters_exhausted` until one of them exits. A claim's sequence must therefore be
+`identity_reporters_exhausted` until one of them exits (an exited process its
+parent has not reaped no longer counts). The launch process's own report with a
+native reference is verified as a launch claim even at the bound, and kept when
+it establishes the launch identity. A claim's sequence must therefore be
 strictly increasing across every hook event that reports the same process. The
 core Codex and Claude hooks run a short-lived interpreter per event, so they
 read the host's system-wide monotonic clock in nanoseconds (`CLOCK_MONOTONIC`)

@@ -3798,16 +3798,38 @@ where
                     sequence,
                 );
                 let pinned = identity_pins(&root_identity, state.journal.launch_identity.as_ref());
+                // Before the launch identity exists only the PTY root is pinned,
+                // and under the named-for-provider rule the launch process can be
+                // one of its descendants, so a report that may establish the
+                // launch identity is not refused for the reporter bound before
+                // its claim is verified.
+                let launch_candidate = state.journal.launch_identity.is_none()
+                    && reference_kind.is_some()
+                    && native_reference.is_some()
+                    && state.launch_agent_base.as_deref() == Some(provider.as_str());
                 let room = process_valid
                     && sequence_valid
-                    && admit_reporter(
-                        &shared,
-                        "identity_report",
-                        &mut state.identity_marks,
-                        reporting,
-                        &pinned,
-                        peer,
-                    );
+                    && if launch_candidate {
+                        state.identity_marks.make_room(
+                            reporting,
+                            &pinned,
+                            shared.config.identity_reporters,
+                            reporter_exited,
+                        )
+                    } else {
+                        admit_reporter(
+                            &shared,
+                            "identity_report",
+                            &mut state.identity_marks,
+                            reporting,
+                            &pinned,
+                            peer,
+                        )
+                    };
+                // A launch candidate beyond the bound is kept only when its claim
+                // establishes the launch identity, which pins the reporter, so the
+                // unpinned marks stay within the bound.
+                let beyond_bound = process_valid && sequence_valid && launch_candidate && !room;
                 // The background snapshot follows its reporting process, so an
                 // admitted, process-valid report clears it even when the identity
                 // rules below refuse the report.
@@ -3830,20 +3852,7 @@ where
                         peer,
                     );
                 }
-                if !process_valid || !sequence_valid || !room {
-                    if background_clear.is_some() {
-                        let mut journal = state.journal.clone();
-                        if background::clear_at(&mut journal, sequence) {
-                            journal.updated_at = timestamp();
-                            persist(shared.journal.clone(), journal.clone()).await?;
-                            state.journal = journal;
-                            if let Some(reason) = background_clear {
-                                log_background_cleared(&shared, reason);
-                            }
-                        }
-                    }
-                    (false, false, current_runtime, None)
-                } else {
+                let admitted = if process_valid && sequence_valid && (room || beyond_bound) {
                     let mut journal = state.journal.clone();
                     let process = ChildIdentity {
                         pid,
@@ -3898,6 +3907,22 @@ where
                             )?;
                         }
                     }
+                    if beyond_bound && launch_identity_status != LaunchClaimStatus::Accepted {
+                        reject_identity(
+                            &shared,
+                            "identity_report",
+                            RejectReason::IdentityReportersExhausted,
+                            peer,
+                        );
+                        launch_identity_status = LaunchClaimStatus::NotApplicable;
+                        None
+                    } else {
+                        Some((journal, background_cleared))
+                    }
+                } else {
+                    None
+                };
+                if let Some((mut journal, background_cleared)) = admitted {
                     journal.updated_at = timestamp();
                     persist(shared.journal.clone(), journal.clone()).await?;
                     state.journal = journal;
@@ -3911,6 +3936,19 @@ where
                         current_runtime,
                         None,
                     )
+                } else {
+                    if background_clear.is_some() {
+                        let mut journal = state.journal.clone();
+                        if background::clear_at(&mut journal, sequence) {
+                            journal.updated_at = timestamp();
+                            persist(shared.journal.clone(), journal.clone()).await?;
+                            state.journal = journal;
+                            if let Some(reason) = background_clear {
+                                log_background_cleared(&shared, reason);
+                            }
+                        }
+                    }
+                    (false, false, current_runtime, None)
                 }
             }
         }
@@ -5680,11 +5718,16 @@ fn admit_reporter(
 
 /// Whether `reporter` has exited, or its pid names a different process.
 ///
-/// A failed inspection counts as alive, so an uncertain answer keeps the mark.
+/// An exited process its parent has not reaped yet keeps its identity but
+/// can never report again, so it counts as exited. A failed inspection counts
+/// as alive, so an uncertain answer keeps the mark.
 fn reporter_exited(reporter: Reporter) -> bool {
-    match HostInspector::new().identity(reporter.pid) {
-        Ok(Some(identity)) => identity.start_identity.get() != reporter.start_identity,
-        Ok(None) => true,
+    let identity = OsProcessIdentity {
+        pid: reporter.pid,
+        start_identity: StartIdentity::new(reporter.start_identity),
+    };
+    match HostInspector::new().is_running(identity) {
+        Ok(running) => !running,
         Err(_error) => false,
     }
 }

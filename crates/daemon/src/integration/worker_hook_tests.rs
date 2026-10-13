@@ -6083,11 +6083,13 @@ with open(gate_path, encoding="ascii") as gate:
     /// process that stays alive and reports its own process as a nested Claude
     /// agent on command.
     ///
-    /// Arguments after the gate and results paths: the scenario (`late_claim`
-    /// or `full_table`) and the worker's identity-reporter bound. The root
-    /// reports as Hermes, stamped from `CLOCK_MONOTONIC`. Each report appends
-    /// `{"step", "response"}` to the results file; the reporter waits for one
-    /// gate line before it exits.
+    /// Arguments after the gate and results paths: the scenario
+    /// (`late_claim`, `full_table`, `zombie_table` or `launch_beyond_bound`)
+    /// and the worker's identity-reporter bound; `launch_beyond_bound` also
+    /// takes the image the launch process runs. Except in
+    /// `launch_beyond_bound` the root first reports as Hermes, stamped from
+    /// `CLOCK_MONOTONIC`. Each report appends `{"step", "response"}` to the
+    /// results file; the reporter waits for one gate line before it exits.
     const LIVE_REPORTERS: &str = r#"
 import datetime
 import json
@@ -6133,16 +6135,18 @@ def send(step, request):
     with open(results_path, "a", encoding="utf-8") as handle:
         handle.write(json.dumps({"step": step, "response": response}) + "\n")
 
-def report(step, provider, sequence):
+def report(step, provider, sequence, reference=True):
     expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=30)
-    send(step, {
+    request = {
         "type": "identity_report",
         "provider": provider,
         "sequence": sequence,
         "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
-        "reference_kind": "id",
-        "native_reference": step.replace("_", "-"),
-    })
+    }
+    if reference:
+        request["reference_kind"] = "id"
+        request["native_reference"] = step.replace("_", "-")
+    send(step, request)
 
 def release(step, provider, sequence):
     send(step, {"type": "identity_release", "provider": provider, "sequence": sequence})
@@ -6164,7 +6168,12 @@ class Live:
                     kind, step, sequence = line.split()
                     if kind == "exit":
                         break
-                    (report if kind == "report" else release)(step, "claude", int(sequence))
+                    if kind == "report":
+                        report(step, "claude", int(sequence))
+                    elif kind == "bare":
+                        report(step, "claude", int(sequence), reference=False)
+                    else:
+                        release(step, "claude", int(sequence))
                     acks.write("ok\n")
                     acks.flush()
             except BaseException:
@@ -6191,11 +6200,33 @@ class Live:
         if os.waitstatus_to_exitcode(status) != 0:
             raise RuntimeError("live reporter failed")
 
+    def exit_unreaped(self):
+        """Ends the process but leaves it a zombie until `reap`."""
+        self.commands.write("exit - 0\n")
+        self.commands.flush()
+        # WNOWAIT returns once the process has exited without reaping it.
+        os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOWAIT)
+
+    def reap(self):
+        _, status = os.waitpid(self.pid, 0)
+        if os.waitstatus_to_exitcode(status) != 0:
+            raise RuntimeError("live reporter failed")
+
 def from_root(step):
     report(step, "hermes", time.clock_gettime_ns(time.CLOCK_MONOTONIC))
 
 live = []
-from_root("root_first")
+zombies = []
+if scenario == "launch_process":
+    # The launch process the root started: it reports with a native
+    # reference, acknowledges on stdout and lives until stdin closes.
+    report("launch_report", "claude", 400)
+    sys.stdout.write("ok\n")
+    sys.stdout.flush()
+    sys.stdin.read()
+    sys.exit(0)
+if scenario != "launch_beyond_bound":
+    from_root("root_first")
 if scenario == "late_claim":
     released = Live()
     live.append(released)
@@ -6220,12 +6251,50 @@ elif scenario == "full_table":
     from_root("root_update")
     live.pop(0).exit()
     extra.run("report", "extra_after_exit", 301)
+elif scenario == "zombie_table":
+    for index in range(bound):
+        filler = Live()
+        live.append(filler)
+        filler.run("report", f"filler_{index}", 300)
+    extra = Live()
+    live.append(extra)
+    extra.run("report", "extra_refused", 300)
+    zombie = live.pop(0)
+    zombie.exit_unreaped()
+    zombies.append(zombie)
+    extra.run("report", "extra_after_zombie", 301)
+elif scenario == "launch_beyond_bound":
+    # Reports without a native reference never claim the launch identity, so
+    # these fill the bound while no launch process exists yet.
+    for index in range(bound):
+        filler = Live()
+        live.append(filler)
+        filler.run("bare", f"filler_{index}", 300)
+    import subprocess
+    launch_image = sys.argv[5]
+    launch = subprocess.Popen(
+        [launch_image, sys.argv[0], gate_path, results_path, "launch_process", str(bound)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    if launch.stdout.readline() != "ok\n":
+        raise RuntimeError("the launch process did not report")
+    extra = Live()
+    live.append(extra)
+    extra.run("bare", "extra_refused", 300)
 else:
     raise RuntimeError(f"unknown scenario {scenario}")
 with open(gate_path, encoding="ascii") as gate:
     gate.readline()
 for process in live:
     process.exit()
+for process in zombies:
+    process.reap()
+if scenario == "launch_beyond_bound":
+    launch.stdin.close()
+    if launch.wait() != 0:
+        raise RuntimeError("the launch process failed")
 "#;
 
     /// A released process that is still alive cannot become active again
@@ -6331,6 +6400,124 @@ for process in live:
         std::io::Write::write_all(&mut gate, b"done\n").expect("release the reporter");
         worker
             .stop(TransactionId::new("transaction-full-reporters-stop").expect("transaction id"))
+            .await
+            .expect("stop the PTY");
+        drop(worker);
+        task.abort();
+    }
+
+    /// An exited reporter its parent has not reaped yet can never report
+    /// again, so its mark makes room in a full reporter table.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_zombie_reporter_makes_room_in_a_full_reporter_table() {
+        let root = crate::test_support::scoped_dir("ph-zombie-reporters-");
+        let bound = WorkerConfig::new().identity_reporters;
+        let FrozenRoot {
+            worker,
+            task,
+            mut gate,
+            results,
+            ..
+        } = start_frozen_root(
+            &root,
+            LIVE_REPORTERS,
+            &["zombie_table".to_owned(), bound.to_string()],
+        )
+        .await;
+
+        let responses = frozen_root_responses(&results, bound + 3).await;
+        assert_eq!(
+            responses["extra_refused"]["ok"],
+            json!(false),
+            "a further live process is refused at the bound: {responses:?}"
+        );
+        assert_eq!(
+            responses["extra_after_zombie"]["ok"],
+            json!(true),
+            "an unreaped exited reporter's mark makes room: {responses:?}"
+        );
+
+        std::io::Write::write_all(&mut gate, b"done\n").expect("release the reporter");
+        worker
+            .stop(TransactionId::new("transaction-zombie-reporters-stop").expect("transaction id"))
+            .await
+            .expect("stop the PTY");
+        drop(worker);
+        task.abort();
+    }
+
+    /// Before the launch identity exists, a full reporter table does not keep
+    /// the named-for-provider launch process from establishing it, even when
+    /// that process is a descendant of the PTY root; a further reporter is
+    /// still refused afterwards.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_full_reporter_table_admits_the_launch_process_descendant() {
+        let root = crate::test_support::scoped_dir("ph-launch-beyond-bound-");
+        let bound = WorkerConfig::new().identity_reporters;
+        // The PTY root runs the interpreter under its own name, so only the
+        // copy named `claude` it starts is the designated launch process.
+        let launch_image = root.join("claude");
+        std::fs::copy(python_image(), &launch_image).expect("copy the interpreter image");
+        let script = root.join("launcher-reporter.py");
+        std::fs::write(&script, LIVE_REPORTERS).expect("write the reporter script");
+        let mut launch = initialize(
+            &root,
+            "",
+            protocol::PROTOCOL_VERSION.get(),
+            "identity-subagent-v1",
+        );
+        launch.executable = PathBuf::from(python_image());
+        let FrozenRoot {
+            worker,
+            task,
+            mut gate,
+            results,
+            ..
+        } = start_reporter_root(
+            &root,
+            launch,
+            script.clone(),
+            Some(&script),
+            &[
+                "launch_beyond_bound".to_owned(),
+                bound.to_string(),
+                launch_image.display().to_string(),
+            ],
+        )
+        .await;
+
+        let responses = frozen_root_responses(&results, bound + 2).await;
+        for index in 0..bound {
+            assert_eq!(
+                responses[&format!("filler_{index}")]["ok"],
+                json!(true),
+                "{responses:?}"
+            );
+        }
+        assert_eq!(
+            responses["launch_report"],
+            json!({"ok": true, "launch_identity_accepted": true, "launch_identity_status": "accepted"}),
+            "the launch process establishes the launch identity: {responses:?}"
+        );
+        assert_eq!(
+            responses["extra_refused"]["ok"],
+            json!(false),
+            "the bound still refuses a further process: {responses:?}"
+        );
+        let snapshot = worker.inspect().await.expect("inspect");
+        let pty_root = snapshot.child_process.expect("the PTY root");
+        let launch = snapshot.launch_identity.expect("the launch identity");
+        assert_ne!(
+            launch.process, pty_root,
+            "the launch process is a descendant"
+        );
+        assert_eq!(launch.native_reference, "launch-report");
+
+        std::io::Write::write_all(&mut gate, b"done\n").expect("release the reporter");
+        worker
+            .stop(
+                TransactionId::new("transaction-launch-beyond-bound-stop").expect("transaction id"),
+            )
             .await
             .expect("stop the PTY");
         drop(worker);

@@ -1206,10 +1206,13 @@ stale. Across processes the latest accepted claim is the active identity. A
 release answered `ok: false` (its process is not active) still orders that
 process's later claims. The worker keeps every live reporter's sequence, never
 evicting it, so a released process cannot become active again through its own
-older claim delivered late. Marks of exited processes are pruned when room is
-needed; when live reporters other than the PTY root and the launch process
-fill the bound (16), a further process's report is refused with reason
-`identity_reporters_exhausted` until one exits. Each
+older claim delivered late. Marks of exited processes, unreaped ones
+included, are pruned when room is needed; when live reporters other than the
+PTY root and the launch process fill the bound (16), a further process's report
+is refused with reason `identity_reporters_exhausted` until one exits. Before
+the launch identity exists, a launch agent's report with a native reference is
+still verified as a launch claim at the bound and kept only when it
+establishes the launch identity. Each
 hook event runs a fresh interpreter for the same agent process, so the shipped
 Codex and Claude hooks stamp their worker claims from the system-wide
 monotonic clock in nanoseconds (`CLOCK_MONOTONIC`). A recovered

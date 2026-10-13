@@ -1008,12 +1008,15 @@ process's native reference is ordered only by reports naming the launch
 process. A release answered `ok: false` because its process is not the active
 identity still orders that process's later-delivered claims. The worker
 remembers the sequence of every live reporting process and never evicts one:
-the mark of a process that exited, or whose pid now names another start
-identity, is pruned when room is needed, and the PTY root and the launch
-process are always kept. When live reporting processes besides those two fill
-the worker's bound (16), a report from a further process is refused
-(`ok: false`, logged as `worker.identity.rejected` with reason
-`identity_reporters_exhausted`) until one of them exits. The sequence contract of a worker
+the mark of a process that exited (including one its parent has not reaped
+yet), or whose pid now names another start identity, is pruned when room is
+needed, and the PTY root and the launch process are always kept. When live
+reporting processes besides those two fill the worker's bound (16), a report
+from a further process is refused (`ok: false`, logged as
+`worker.identity.rejected` with reason `identity_reporters_exhausted`) until
+one of them exits. Before the launch identity exists, a launch agent's report
+with a native reference is verified as a launch claim even then, and is kept
+only when it establishes the launch identity, which pins its process. The sequence contract of a worker
 claim is therefore a value strictly increasing across every hook event that
 reports the same process. Every hook event runs its own short-lived
 interpreter, so the shipped Codex and Claude hooks read the host's system-wide
