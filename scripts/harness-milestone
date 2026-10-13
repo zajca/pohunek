@@ -118,11 +118,15 @@ esac
 }
 
 # A build tree can reach tens of GB: it must live on the big disk, never on
-# tmpfs (OOM kill) or under $HOME. There is no override: test fixtures place
-# their stand-in checkout beside a writable non-/tmp, non-$HOME base instead.
+# tmpfs (OOM kill) or under $HOME. Paths are compared in canonical form since
+# git reports the worktree parent resolved (e.g., /private/tmp on macOS where
+# /tmp is a symlink). Test fixtures place their stand-in checkout beside a
+# writable non-/tmp, non-$HOME base instead.
 worktree_check=$worktrees/$slug
+tmp_canonical=$(cd /tmp 2>/dev/null && pwd -P) || tmp_canonical=/tmp
+home_canonical=$(cd "$HOME" 2>/dev/null && pwd -P) || home_canonical=$HOME
 case "$worktree_check" in
-    /tmp/* | "$HOME"/*)
+    /tmp/* | "$tmp_canonical"/* | "$HOME"/* | "$home_canonical"/*)
         echo "error: worktree parent must not be /tmp or \$HOME: $worktree_check" >&2
         exit 1
         ;;

@@ -86,7 +86,7 @@ class HarnessMilestoneCase(unittest.TestCase):
     def setUp(self):
         self.base = Path(
             tempfile.mkdtemp(prefix="pohunek-harness-milestone-", dir=str(FIXTURE_BASE_PARENT))
-        )
+        ).resolve()
         self.addCleanup(self._cleanup)
         self.tools = self.base / "bin"
         self.tools.mkdir(parents=True)
@@ -422,13 +422,14 @@ class HarnessMilestoneCase(unittest.TestCase):
     def test_disk_guard_refuses_a_tmp_fixture_root(self):
         # From a /tmp-placed stand-in the real (override-free) script must
         # refuse to start before creating anything.
-        tmp_base = Path(tempfile.mkdtemp(prefix="pohunek-hm-guard-"))
+        tmp_base = Path(tempfile.mkdtemp(prefix="pohunek-hm-guard-", dir="/tmp"))
         self.addCleanup(shutil.rmtree, tmp_base, ignore_errors=True)
         repo = tmp_base / "primary"
         repo.mkdir()
         subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True, capture_output=True)
         subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@e.invalid"], check=True, capture_output=True)
         subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config", "commit.gpgsign", "false"], check=True, capture_output=True)
         (repo / ".github").mkdir()
         (repo / ".github" / "agent-workflow.json").write_text(json.dumps(DEFAULT_CONFIG))
         task = repo / ".lh-harness" / "workflows" / "milestone-build.md"

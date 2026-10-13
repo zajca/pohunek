@@ -412,7 +412,7 @@ class WorktreeCliFixture:
     def setUp(self):
         temp = tempfile.TemporaryDirectory(prefix="worktree-new-cli-")
         self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name)
+        self.root = Path(temp.name).resolve()
         self.repo = self.root / "pohunek"
         self.repo.mkdir()
         self.env = dict(os.environ)

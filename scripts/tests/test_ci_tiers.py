@@ -3,7 +3,9 @@
 from pathlib import Path
 import hashlib
 import json
+import os
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -684,6 +686,21 @@ exit 0
 """
 
 
+def resolve_runner_tool(name: str) -> str:
+    """Resolve a tool that the workflow step runs on ubuntu-latest (GNU coreutils).
+
+    Symlinks the tool into a test bin directory so it's available in the
+    restricted PATH. On Linux this finds the real tool; on macOS the test
+    fails with a clear message if the tool is absent.
+    """
+    tool_path = shutil.which(name)
+    if tool_path is None:
+        raise AssertionError(
+            f"{name} is required: the workflow step runs it on ubuntu-latest (GNU coreutils)"
+        )
+    return tool_path
+
+
 # Seconds a hanging fake `gh` sleeps, and the download limit the hang scenario
 # sets: far apart, so only the limit can end the download in time.
 FAKE_GH_HANG_SECONDS = 20
@@ -733,6 +750,9 @@ class SelectorRun:
         for name, body in (("cargo", FAKE_CARGO), ("gh", FAKE_GH)):
             (bin_dir / name).write_text(body)
             (bin_dir / name).chmod(0o755)
+        # Link timeout from the host so the workflow step can use it
+        timeout_real = resolve_runner_tool("timeout")
+        os.symlink(timeout_real, bin_dir / "timeout")
         self.log = self.home / "calls.log"
         self.log.write_text("")
         (self.home / "affected.json").write_text(json.dumps(affected))
@@ -1035,10 +1055,16 @@ class RuntimePackageBaselineTests(unittest.TestCase):
                     archive.write_bytes(b"rebuilt package archive bytes")
                     rebuilt = "sha256:" + hashlib.sha256(archive.read_bytes()).hexdigest()
 
+                    bin_dir = Path(tmp) / "bin"
+                    bin_dir.mkdir()
+                    # Link sha256sum from the host so the workflow step can use it
+                    sha256sum_real = resolve_runner_tool("sha256sum")
+                    os.symlink(sha256sum_real, bin_dir / "sha256sum")
+
                     def check(digest: str) -> subprocess.CompletedProcess:
                         return subprocess.run(
                             ["bash", "-c", script],
-                            env={"PATH": "/usr/bin:/bin", "RUNNER_TEMP": str(runner_temp), "BASELINE_DIGEST": digest},
+                            env={"PATH": f"{bin_dir}:/usr/bin:/bin", "RUNNER_TEMP": str(runner_temp), "BASELINE_DIGEST": digest},
                             capture_output=True,
                             text=True,
                             timeout=STEP_TIMEOUT_SECONDS,
