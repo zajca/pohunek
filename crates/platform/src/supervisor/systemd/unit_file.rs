@@ -1,4 +1,6 @@
-//! Renders the persistent systemd unit files of one installation.
+//! Renders the persistent systemd unit files of one installation: the daemon
+//! service, the sessions slice, and the service and timer units of workflow
+//! plugins.
 //!
 //! Files are built from typed sections whose values pass through one escaping
 //! function per value grammar (`systemd.syntax(7)`, `systemd.service(5)`), so a
@@ -8,9 +10,11 @@
 use std::path::Path;
 use std::time::Duration;
 
-use super::super::{Error, JobDefinition, RestartPolicy};
+use super::super::{
+    Activation, Error, JobDefinition, PluginUnitDefinition, PluginUnitKey, RestartPolicy,
+};
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-10-12
 
 /// Description of the daemon unit shown by `systemctl --user status`.
 const DAEMON_DESCRIPTION: &str = "Pohunek host control plane";
@@ -18,6 +22,22 @@ const DAEMON_DESCRIPTION: &str = "Pohunek host control plane";
 const SESSIONS_DESCRIPTION: &str = "Pohunek durable session workers";
 /// Target that starts the daemon at login once the unit is enabled.
 const DAEMON_WANTED_BY: &str = "default.target";
+/// `ExecStart=` prefix that passes argv to the process without `$`
+/// substitution (`systemd.service(5)`, "Command lines").
+const NO_ENV_EXPAND_PREFIX: &str = ":";
+/// Description prefix of workflow plugin units, followed by the unit key.
+const PLUGIN_DESCRIPTION: &str = "Pohunek workflow plugin unit";
+/// Target that starts a plugin service at login once the unit is enabled.
+const PLUGIN_SERVICE_WANTED_BY: &str = "default.target";
+/// Target that arms a plugin job's timer at login once the timer is enabled.
+const PLUGIN_TIMER_WANTED_BY: &str = "timers.target";
+/// `StartLimitIntervalSec=` value that disables start rate limiting.
+///
+/// Under the default limit (5 starts per 10 s) a timer with a short interval
+/// skips runs until the window rolls over, and a restarting service is parked
+/// in `failed` for good; pacing belongs to the definition's interval and
+/// delay and to the caller's own backoff.
+const NO_START_LIMIT: &str = "0";
 
 /// One `[Section]` with its ordered `Key=value` entries.
 #[derive(Debug)]
@@ -72,15 +92,101 @@ fn render(sections: &[Section]) -> String {
 /// unit file, such as a control character or a working directory ending in
 /// whitespace or a backslash.
 pub fn render_daemon_unit(definition: &JobDefinition) -> Result<String, Error> {
+    let service = Section::new("Service")
+        .entry("Type", "notify")
+        .entry("NotifyAccess", "main");
+    let service = job_entries(service, definition)?;
+    Ok(render(&[
+        Section::new("Unit").entry("Description", DAEMON_DESCRIPTION),
+        service,
+        Section::new("Install").entry("WantedBy", DAEMON_WANTED_BY),
+    ]))
+}
+
+/// Renders the service unit of one workflow plugin unit.
+///
+/// Both kinds disable start rate limiting and keep the whole control group in
+/// `KillMode`. An [`Activation::Interval`] job is `Type=oneshot` without an
+/// `[Install]` section, so only its timer starts it, and its start timeout
+/// is the native backstop on each run: `RuntimeMaxSec=` has no effect on
+/// `Type=oneshot` (`systemd.service(5)`), while `TimeoutStartSec=` covers the
+/// whole run.
+/// An [`Activation::Service`] is `Type=exec` with `Restart=always` and is
+/// wanted by `default.target`. The key's alphabet needs no escaping in the
+/// description.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidDefinition`] when a value cannot be expressed in a
+/// unit file, such as a control character or a working directory ending in
+/// whitespace or a backslash.
+pub(crate) fn render_plugin_service(
+    key: &PluginUnitKey,
+    definition: &PluginUnitDefinition,
+) -> Result<String, Error> {
+    let unit = Section::new("Unit")
+        .entry("Description", format!("{PLUGIN_DESCRIPTION} {key}"))
+        .entry("StartLimitIntervalSec", NO_START_LIMIT);
+    let kind = match definition.activation() {
+        Activation::Interval { .. } => "oneshot",
+        Activation::Service => "exec",
+    };
+    let service = job_entries(
+        Section::new("Service").entry("Type", kind),
+        definition.job(),
+    )?;
+    Ok(match definition.activation() {
+        Activation::Interval { .. } => render(&[unit, service]),
+        Activation::Service => render(&[
+            unit,
+            service,
+            Section::new("Install").entry("WantedBy", PLUGIN_SERVICE_WANTED_BY),
+        ]),
+    })
+}
+
+/// Renders the timer scheduling one periodic plugin job on `service_unit`.
+///
+/// `OnActiveSec=` runs the job `every` after the timer starts and
+/// `OnUnitInactiveSec=` `every` after each run ends; a run still active when
+/// the timer elapses is never started a second time. `AccuracySec=` replaces
+/// systemd's one-minute default, which would delay short intervals. The timer
+/// is wanted by `timers.target`, so enabling it arms the schedule at login.
+/// The key's alphabet and the derived unit name need no escaping.
+#[must_use]
+pub(crate) fn render_plugin_timer(
+    key: &PluginUnitKey,
+    service_unit: &str,
+    every: Duration,
+    accuracy: Duration,
+) -> String {
+    render(&[
+        Section::new("Unit").entry("Description", format!("{PLUGIN_DESCRIPTION} {key}")),
+        Section::new("Timer")
+            .entry("Unit", service_unit)
+            .entry("OnActiveSec", time_span(every))
+            .entry("OnUnitInactiveSec", time_span(every))
+            .entry("AccuracySec", time_span(accuracy)),
+        Section::new("Install").entry("WantedBy", PLUGIN_TIMER_WANTED_BY),
+    ])
+}
+
+/// Appends the command, environment, restart, timeout, kill, and file-limit
+/// entries every service rendered from a [`JobDefinition`] shares.
+fn job_entries(mut service: Section, definition: &JobDefinition) -> Result<Section, Error> {
     let mut command = Vec::with_capacity(definition.arguments().len() + 1);
     command.push(exec_word(path_str(definition.executable())?)?);
     for argument in definition.arguments() {
         command.push(exec_word(argument)?);
     }
-    let mut service = Section::new("Service")
-        .entry("Type", "notify")
-        .entry("NotifyAccess", "main")
-        .entry("ExecStart", command.join(" "))
+    // The `:` prefix (systemd 242, below the supported minimum) turns off
+    // `$VAR`, `${VAR}`, and `$$` substitution, which systemd otherwise applies
+    // to every argv word including argv[0] (but not to the program path).
+    service = service
+        .entry(
+            "ExecStart",
+            format!("{NO_ENV_EXPAND_PREFIX}{}", command.join(" ")),
+        )
         .entry(
             "WorkingDirectory",
             plain_path(definition.working_directory())?,
@@ -93,17 +199,15 @@ pub fn render_daemon_unit(definition: &JobDefinition) -> Result<String, Error> {
         RestartPolicy::OnFailure { throttle } => service
             .entry("Restart", "on-failure")
             .entry("RestartSec", time_span(throttle)),
+        RestartPolicy::Always { delay } => service
+            .entry("Restart", "always")
+            .entry("RestartSec", time_span(delay)),
     };
-    service = service
+    Ok(service
         .entry("TimeoutStartSec", time_span(definition.start_timeout()))
         .entry("TimeoutStopSec", time_span(definition.exit_timeout()))
         .entry("KillMode", "control-group")
-        .entry("LimitNOFILE", definition.open_files().to_string());
-    Ok(render(&[
-        Section::new("Unit").entry("Description", DAEMON_DESCRIPTION),
-        service,
-        Section::new("Install").entry("WantedBy", DAEMON_WANTED_BY),
-    ]))
+        .entry("LimitNOFILE", definition.open_files().to_string()))
 }
 
 /// Renders the slice grouping this installation's worker units.
@@ -141,15 +245,14 @@ fn reject_control(field: &str, value: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Quotes one `ExecStart=` word.
+/// Quotes one `ExecStart=` word of a command carrying the `:` prefix.
 ///
 /// systemd expands specifiers over the whole line, then splits and C-unescapes
-/// quoted words, then substitutes `$VAR` per word. Escaping `\` and `"` keeps
-/// the word intact, `%%` survives specifier expansion as `%`, and `$$`
-/// survives environment substitution as `$`. Quoting every word also keeps a
-/// lone `;` from separating commands.
+/// quoted words; the `:` prefix leaves `$` alone. Escaping `\` and `"` keeps
+/// the word intact and `%%` survives specifier expansion as `%`. Quoting every
+/// word also keeps a lone `;` from separating commands.
 fn exec_word(value: &str) -> Result<String, Error> {
-    reject_control("ExecStart argument", value)?;
+    reject_control("ExecStart word", value)?;
     let mut word = String::with_capacity(value.len() + 2);
     word.push('"');
     for character in value.chars() {
@@ -157,7 +260,6 @@ fn exec_word(value: &str) -> Result<String, Error> {
             '\\' => word.push_str("\\\\"),
             '"' => word.push_str("\\\""),
             '%' => word.push_str("%%"),
-            '$' => word.push_str("$$"),
             other => word.push(other),
         }
     }
@@ -265,7 +367,7 @@ mod tests {
              [Service]\n\
              Type=notify\n\
              NotifyAccess=main\n\
-             ExecStart=\"/home/u/.local/libexec/pohunek/1.2.3/pohunekd\" \"--service-config\" \"/home/u/.config/pohunek/service.toml\"\n\
+             ExecStart=:\"/home/u/.local/libexec/pohunek/1.2.3/pohunekd\" \"--service-config\" \"/home/u/.config/pohunek/service.toml\"\n\
              WorkingDirectory=/home/u\n\
              Environment=\"HOME=/home/u\"\n\
              Environment=\"XDG_STATE_HOME=/home/u/state \\\"q\\\" 100%% \\\\x\"\n\
@@ -303,7 +405,7 @@ mod tests {
         spec.executable = PathBuf::from("/opt/100%/$HOME/pohunekd");
         let rendered =
             render_daemon_unit(&JobDefinition::new(spec).expect("valid")).expect("renderable");
-        assert!(rendered.contains("\nExecStart=\"/opt/100%%/$$HOME/pohunekd\"\n"));
+        assert!(rendered.contains("\nExecStart=:\"/opt/100%%/$HOME/pohunekd\"\n"));
     }
 
     #[test]
@@ -315,8 +417,8 @@ mod tests {
             ("back\\slash", "\"back\\\\slash\""),
             ("100%", "\"100%%\""),
             ("%h", "\"%%h\""),
-            ("$HOME", "\"$$HOME\""),
-            ("${HOME}", "\"$${HOME}\""),
+            ("$HOME", "\"$HOME\""),
+            ("${HOME}", "\"${HOME}\""),
             (";", "\";\""),
             ("'single'", "\"'single'\""),
             ("\\n", "\"\\\\n\""),

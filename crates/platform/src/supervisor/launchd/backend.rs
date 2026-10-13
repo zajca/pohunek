@@ -17,7 +17,7 @@ use crate::filesystem::TrustedDir;
 use crate::process::{DarwinInspector, Pid, ProcessFact, ProcessIdentity, ProcessInspector as _};
 use rustix::process::{kill_process, Pid as NativePid, Signal};
 
-// Rust guideline compliant 2026-09-28
+// Rust guideline compliant 2026-10-12
 
 /// PID of launchd; every job launchd spawns is its direct child.
 const LAUNCHD_PID: Pid = 1;
@@ -451,6 +451,9 @@ impl LaunchdDaemon {
             RestartPolicy::OnFailure { .. } => Ok(()),
             RestartPolicy::Never => Err(Error::InvalidDefinition {
                 detail: "the daemon agent must restart after a failure".to_owned(),
+            }),
+            RestartPolicy::Always { .. } => Err(Error::InvalidDefinition {
+                detail: "the daemon agent must stay stopped after a clean exit".to_owned(),
             }),
         }
     }

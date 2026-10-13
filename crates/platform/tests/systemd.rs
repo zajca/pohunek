@@ -9,10 +9,12 @@
 //! its command line, so the unit's main process is a `Type=notify` program
 //! whose executable and argv match `ExecStart` exactly.
 //!
-//! The daemon test writes into the real user manager's runtime unit directory
-//! (`$XDG_RUNTIME_DIR/systemd/user`), because a user manager loads persistent
-//! units only from its search path. Its unit names embed the unique
-//! namespace, and the guard disables and removes them.
+//! The daemon and workflow plugin unit tests write into the real user
+//! manager's runtime unit directory (`$XDG_RUNTIME_DIR/systemd/user`), because
+//! a user manager loads persistent units only from its search path. Their unit
+//! names embed the unique namespace, and the guard disables and removes them.
+//! Plugin unit fixtures append `start`/`end` lines to a marker file, so the
+//! tests observe every run the manager starts.
 #![cfg(target_os = "linux")]
 
 use std::collections::BTreeMap;
@@ -22,12 +24,14 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use pohunek_platform::supervisor::systemd::{
-    render_daemon_unit, render_sessions_slice, SystemdDaemon, SystemdSupervisor,
+    render_daemon_unit, render_sessions_slice, SystemdDaemon, SystemdPluginUnits, SystemdSupervisor,
 };
 use pohunek_platform::supervisor::{
-    DaemonSupervisor, Error, JobDefinition, JobSpec, Namespace, RestartPolicy, ServiceId,
-    ServiceObservation, ServiceState, Supervisor, WorkerKey,
+    Activation, DaemonSupervisor, Error, JobDefinition, JobSpec, Namespace, PluginUnitDefinition,
+    PluginUnitKey, PluginUnitKind, PluginUnits, RestartPolicy, ServiceId, ServiceObservation,
+    ServiceState, Supervisor, WorkerKey,
 };
+use pohunek_test_support::wait;
 use tempfile::TempDir;
 
 mod support;
@@ -44,6 +48,21 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const FIXTURE_LIFETIME: Duration = Duration::from_secs(300);
 /// Session ID shared by the tests; namespaces keep them apart.
 const SESSION: &str = "s-01KYAPVPFVHD56Z69B9CX3XWN2";
+/// Command-line prefix naming the marker file a plugin unit fixture appends to.
+const MARKER_ARGUMENT: &str = "pohunek-systemd-marker=";
+/// Command-line prefix naming how long a `job` fixture run sleeps, in ms.
+const SLEEP_ARGUMENT: &str = "pohunek-systemd-sleep-ms=";
+/// Interval of the periodic plugin job fixtures.
+const JOB_INTERVAL: Duration = Duration::from_secs(1);
+/// Timer accuracy of the periodic plugin job fixtures; the smallest the
+/// contract accepts.
+const JOB_ACCURACY: Duration = Duration::from_secs(1);
+/// Runs observed before a schedule or restart loop counts as repeating.
+///
+/// More than systemd's default start limit (5 starts per 10 s): a restarting
+/// service that keeps that limit is parked in `failed` before reaching it,
+/// and a timer that keeps it skips runs until the window rolls over.
+const REPEATED_RUNS: usize = 8;
 
 fn require_e2e() {
     assert_eq!(
@@ -53,13 +72,15 @@ fn require_e2e() {
     );
 }
 
-/// Unit main process used by every worker test.
+/// Unit main process used by every worker and plugin unit test.
 ///
 /// Modes: `ready` notifies and sleeps; `never-ready` sleeps without notifying;
 /// `ready-then-fail` notifies and exits with status 3; `stubborn-descendants`
 /// starts a child and a grandchild that ignore `SIGHUP` and `SIGTERM`, then
 /// notifies and sleeps; `exec-other` replaces itself with another program
-/// before ever notifying.
+/// before ever notifying. The plugin unit modes record a `start` line in the
+/// marker file, then: `job` records its argv[0] next to the marker, sleeps the
+/// given time, records `end`, and exits successfully; `crash` exits with status 3; `serve` sleeps.
 #[test]
 #[ignore = "fixture entry point; does work only inside a unit started by these tests"]
 fn fixture_entry() {
@@ -99,8 +120,68 @@ fn fixture_entry() {
             descendants.kill().expect("kill stubborn child");
             descendants.wait().expect("reap stubborn child");
         }
+        "job" => {
+            let marker = record_run("start");
+            let argv0 = std::env::args_os().next().expect("argv[0]");
+            std::fs::write(argv0_record(&marker), argv0.as_encoded_bytes())
+                .expect("record argv[0]");
+            let sleep = argument(SLEEP_ARGUMENT)
+                .parse()
+                .expect("numeric sleep milliseconds");
+            // timing-allowed: #326 the run's own length, which the scenarios measure real systemd timers against; no scenario waits on this sleep
+            std::thread::sleep(Duration::from_millis(sleep));
+            append_line(&marker, "end");
+        }
+        "crash" => {
+            record_run("start");
+            std::process::exit(3);
+        }
+        "serve" => {
+            record_run("start");
+            // timing-allowed: #326 the fixture's own lifetime; no scenario waits on this sleep, it ends when the scenario stops the unit
+            std::thread::sleep(FIXTURE_LIFETIME);
+        }
         other => panic!("unknown fixture mode {other}"),
     }
+}
+
+/// Returns the file a `job` fixture records its argv[0] in.
+fn argv0_record(marker: &Path) -> PathBuf {
+    let mut record = marker.as_os_str().to_owned();
+    record.push(".argv0");
+    PathBuf::from(record)
+}
+
+fn argument(prefix: &str) -> String {
+    std::env::args()
+        .find_map(|argument| argument.strip_prefix(prefix).map(str::to_owned))
+        .unwrap_or_else(|| panic!("fixture argument {prefix} is missing"))
+}
+
+/// Appends one `<kind> <pid> <unix-nanos>` line to the marker file and
+/// returns its path.
+fn record_run(kind: &str) -> PathBuf {
+    let marker = PathBuf::from(argument(MARKER_ARGUMENT));
+    append_line(&marker, kind);
+    marker
+}
+
+fn append_line(marker: &Path, kind: &str) {
+    use std::io::Write as _;
+
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_nanos();
+    // One `write` of a short line to an `O_APPEND` file is atomic, so lines of
+    // concurrent runs could interleave only as whole lines.
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(marker)
+        .expect("open marker file")
+        .write_all(format!("{kind} {} {at}\n", std::process::id()).as_bytes())
+        .expect("append marker line");
 }
 
 fn notify_ready() {
@@ -734,6 +815,16 @@ async fn daemon_unit_installs_replaces_inspects_and_uninstalls() {
         .join("wd a\\s b\\\\c \"q\" 'r' 100%");
     std::fs::create_dir(&working_directory).expect("working directory");
     spec.working_directory = working_directory.clone();
+    // systemd substitutes `$` in argv[0] unless the command opts out, and the
+    // daemon's observations require argv[0] to equal the recorded executable.
+    let bin = installation.root.path().join("bin${HOME}$$%h");
+    std::fs::create_dir(&bin).expect("dollar-bearing directory");
+    spec.executable = bin.join("fixture");
+    std::fs::copy(
+        std::env::current_exe().expect("test executable"),
+        &spec.executable,
+    )
+    .expect("copy fixture executable");
     let definition = JobDefinition::new(spec.clone()).expect("valid definition");
     let rendered_dir = installation.root.path().join("rendered");
     std::fs::create_dir(&rendered_dir).expect("render directory");
@@ -756,6 +847,17 @@ async fn daemon_unit_installs_replaces_inspects_and_uninstalls() {
     assert!(matches!(daemon.inspect().await, Err(Error::NotFound(_))));
     let replaced = daemon.replace(&definition).await;
     assert!(matches!(replaced, Err(Error::NotFound(_))), "{replaced:?}");
+    // A daemon restarting after a clean exit could never stop itself.
+    let mut always = spec.clone();
+    always.restart = RestartPolicy::Always {
+        delay: Duration::from_secs(1),
+    };
+    let always = JobDefinition::new(always).expect("valid definition");
+    assert!(matches!(
+        daemon.install(&always).await,
+        Err(Error::InvalidDefinition { .. })
+    ));
+    assert!(!unit_dir.join(&daemon_unit).exists());
 
     daemon.install(&definition).await.expect("install daemon");
     let first = wait_for_daemon(&daemon, |observation| {
@@ -934,4 +1036,777 @@ async fn daemon_uninstall_stops_only_empty_namespace_slices() {
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
+}
+
+/// One line of a plugin unit fixture's marker file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Mark {
+    start: bool,
+    pid: u32,
+    at: u128,
+}
+
+fn read_marks(marker: &Path) -> Vec<Mark> {
+    match std::fs::read_to_string(marker) {
+        Ok(text) => text
+            .lines()
+            .map(|line| {
+                let mut fields = line.split(' ');
+                let (Some(kind), Some(pid), Some(at), None) =
+                    (fields.next(), fields.next(), fields.next(), fields.next())
+                else {
+                    panic!("malformed marker line {line:?}");
+                };
+                Mark {
+                    start: match kind {
+                        "start" => true,
+                        "end" => false,
+                        other => panic!("unknown marker kind {other}"),
+                    },
+                    pid: pid.parse().expect("numeric PID"),
+                    at: at.parse().expect("numeric timestamp"),
+                }
+            })
+            .collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("read marker file: {error}"),
+    }
+}
+
+/// Waits until `accept` holds for the marker file's lines.
+async fn wait_for_marks(marker: &Path, accept: impl Fn(&[Mark]) -> bool) -> Vec<Mark> {
+    wait::wait_until("the expected fixture runs in the marker file", || {
+        let marks = read_marks(marker);
+        let accepted = accept(&marks);
+        async move { accepted.then_some(marks) }
+    })
+    .await
+}
+
+fn count(marks: &[Mark], start: bool) -> usize {
+    marks.iter().filter(|mark| mark.start == start).count()
+}
+
+/// A namespace plus the plugin unit backend writing into the user manager's
+/// runtime unit directory.
+struct PluginInstallation {
+    installation: Installation,
+    units: SystemdPluginUnits,
+    unit_dir: PathBuf,
+}
+
+impl PluginInstallation {
+    async fn new() -> Self {
+        let installation = Installation::new();
+        let unit_dir = user_unit_dir();
+        let units = SystemdPluginUnits::connect(
+            installation.namespace.clone(),
+            unit_dir.clone(),
+            CALL_TIMEOUT,
+        )
+        .await
+        .expect("connect to the systemd user manager");
+        Self {
+            installation,
+            units,
+            unit_dir,
+        }
+    }
+
+    /// Registers the unit set of `key` with the cleanup guard and returns
+    /// its service and timer unit names.
+    fn track(&mut self, key: &PluginUnitKey) -> (String, String) {
+        let namespace = &self.installation.namespace;
+        let service = namespace.plugin_service_unit(key);
+        let timer = namespace.plugin_timer_unit(key);
+        let (_, units) = self
+            .installation
+            .cleanup
+            .unit_dir
+            .get_or_insert_with(|| (self.unit_dir.clone(), Vec::new()));
+        units.extend([timer.clone(), service.clone()]);
+        (service, timer)
+    }
+
+    fn root(&self) -> &Path {
+        self.installation.root.path()
+    }
+
+    fn marker(&self, name: &str) -> PathBuf {
+        self.root().join(format!("{name}.marks"))
+    }
+
+    /// Returns every loaded unit, active or not, of this namespace's plugin
+    /// units.
+    fn loaded_plugin_units(&self) -> Vec<String> {
+        let output = Command::new("systemctl")
+            .args(["--user", "list-units", "--all", "--plain", "--no-legend"])
+            .arg(format!("pohunek-{}-wf-*", self.installation.namespace))
+            .output()
+            .expect("run systemctl list-units");
+        assert!(output.status.success(), "systemctl list-units failed");
+        String::from_utf8(output.stdout)
+            .expect("UTF-8 unit list")
+            .lines()
+            .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
+            .collect()
+    }
+
+    /// Returns the files of this namespace's plugin units in the unit
+    /// directory.
+    fn plugin_unit_files(&self) -> Vec<String> {
+        let prefix = format!("pohunek-{}-wf-", self.installation.namespace);
+        let mut files: Vec<String> = std::fs::read_dir(&self.unit_dir)
+            .expect("read unit directory")
+            .map(|entry| {
+                entry
+                    .expect("unit directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with(&prefix))
+            .collect();
+        files.sort();
+        files
+    }
+
+    async fn wait_for_state(&self, key: &PluginUnitKey, accept: impl Fn(ServiceState) -> bool) {
+        let accept = &accept;
+        wait::wait_until("the plugin unit state", move || async move {
+            let state = self.units.state(key).await.expect("plugin unit state");
+            accept(state).then_some(())
+        })
+        .await;
+    }
+}
+
+/// A plugin unit job running a fixture mode with bootstrap-only environment.
+fn plugin_job(root: &Path, mode: &str, marker: &Path, sleep: Duration) -> JobSpec {
+    let mut spec = fixture_spec(root, mode);
+    spec.arguments.extend([
+        format!("{MARKER_ARGUMENT}{}", marker.display()),
+        format!("{SLEEP_ARGUMENT}{}", sleep.as_millis()),
+    ]);
+    spec
+}
+
+fn interval_job(spec: JobSpec) -> PluginUnitDefinition {
+    PluginUnitDefinition::new(
+        JobDefinition::new(spec).expect("valid job definition"),
+        Activation::Interval {
+            every: JOB_INTERVAL,
+            accuracy: JOB_ACCURACY,
+        },
+    )
+    .expect("valid plugin job")
+}
+
+fn restarting_service(mut spec: JobSpec, delay: Duration) -> PluginUnitDefinition {
+    spec.restart = RestartPolicy::Always { delay };
+    PluginUnitDefinition::new(
+        JobDefinition::new(spec).expect("valid service definition"),
+        Activation::Service,
+    )
+    .expect("valid plugin service")
+}
+
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn a_plugin_job_timer_fires_repeatedly() {
+    require_e2e();
+    let mut plugin = PluginInstallation::new().await;
+    let key = PluginUnitKey::new("acme.work", PluginUnitKind::Job, "poll")
+        .expect("valid plugin unit key");
+    let (service, timer) = plugin.track(&key);
+    let marker = plugin.marker("poll");
+    let definition = interval_job(plugin_job(plugin.root(), "job", &marker, Duration::ZERO));
+
+    plugin
+        .units
+        .install(&key, &definition)
+        .await
+        .expect("install plugin job");
+    let marks = wait_for_marks(&marker, |marks| count(marks, false) >= REPEATED_RUNS).await;
+    let pids: std::collections::BTreeSet<u32> = marks.iter().map(|mark| mark.pid).collect();
+    assert!(pids.len() >= REPEATED_RUNS, "every run is its own process");
+    assert_eq!(
+        plugin.units.state(&key).await.expect("job state"),
+        ServiceState::Running,
+        "an armed schedule whose runs succeed is running"
+    );
+
+    analyze_verify(&plugin.unit_dir.join(&service));
+    analyze_verify(&plugin.unit_dir.join(&timer));
+    assert_eq!(unit_file_state(&timer), "enabled");
+    assert_eq!(
+        unit_file_state(&service),
+        "static",
+        "only the timer starts a job"
+    );
+    let properties = show(
+        &service,
+        &[
+            "Type",
+            "KillMode",
+            "Restart",
+            "TimeoutStartUSec",
+            "StartLimitIntervalUSec",
+            "Environment",
+        ],
+    );
+    let expected = [
+        ("Type", "oneshot".to_owned()),
+        ("KillMode", "control-group".to_owned()),
+        ("Restart", "no".to_owned()),
+        ("TimeoutStartUSec", "1min".to_owned()),
+        ("StartLimitIntervalUSec", "0".to_owned()),
+        (
+            "Environment",
+            format!("XDG_STATE_HOME={}", plugin.root().join("state").display()),
+        ),
+    ];
+    for (key, value) in expected {
+        assert_eq!(properties.get(key), Some(&value), "service property {key}");
+    }
+    assert_eq!(
+        show(&timer, &["AccuracyUSec"])
+            .get("AccuracyUSec")
+            .map(String::as_str),
+        Some("1s")
+    );
+
+    plugin.units.remove(&key).await.expect("remove plugin job");
+}
+
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn an_active_plugin_job_is_never_started_twice() {
+    /// Each run outlasts several intervals, so the timer elapses while it is
+    /// still active.
+    const RUN_LENGTH: Duration = Duration::from_secs(3);
+    /// Completed runs whose windows are compared.
+    const RUNS: usize = 3;
+
+    require_e2e();
+    let mut plugin = PluginInstallation::new().await;
+    let key = PluginUnitKey::new("acme.work", PluginUnitKind::Job, "slow")
+        .expect("valid plugin unit key");
+    plugin.track(&key);
+    let marker = plugin.marker("slow");
+    let definition = interval_job(plugin_job(plugin.root(), "job", &marker, RUN_LENGTH));
+
+    plugin
+        .units
+        .install(&key, &definition)
+        .await
+        .expect("install plugin job");
+    let marks = wait_for_marks(&marker, |marks| count(marks, false) >= RUNS).await;
+
+    // Pair every run's start with its end, then require the runs to follow
+    // each other: no run starts before the previous one ended.
+    let mut windows: Vec<(u128, Option<u128>)> = marks
+        .iter()
+        .filter(|mark| mark.start)
+        .map(|start| {
+            let end = marks
+                .iter()
+                .find(|mark| !mark.start && mark.pid == start.pid)
+                .map(|end| end.at);
+            (start.at, end)
+        })
+        .collect();
+    windows.sort_unstable();
+    for pair in windows.windows(2) {
+        let ((_, previous_end), (next_start, _)) = (pair[0], pair[1]);
+        let previous_end = previous_end.expect("only the last run may still be active");
+        assert!(next_start >= previous_end, "runs overlap: {windows:?}");
+    }
+    let ended = windows.iter().filter(|(_, end)| end.is_some()).count();
+    assert!(ended >= RUNS, "{windows:?}");
+
+    plugin.units.remove(&key).await.expect("remove plugin job");
+}
+
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn a_crashing_plugin_service_is_restarted() {
+    /// Pacing of restarts; the shortest the contract accepts.
+    const RESTART_DELAY: Duration = Duration::from_secs(1);
+
+    require_e2e();
+    let mut plugin = PluginInstallation::new().await;
+    let key = PluginUnitKey::new("acme.work", PluginUnitKind::Service, "notifier")
+        .expect("valid plugin unit key");
+    let (service, timer) = plugin.track(&key);
+    let marker = plugin.marker("notifier");
+    let definition = restarting_service(
+        plugin_job(plugin.root(), "crash", &marker, Duration::ZERO),
+        RESTART_DELAY,
+    );
+
+    plugin
+        .units
+        .install(&key, &definition)
+        .await
+        .expect("install plugin service");
+    let marks = wait_for_marks(&marker, |marks| count(marks, true) >= REPEATED_RUNS).await;
+    let pids: std::collections::BTreeSet<u32> = marks.iter().map(|mark| mark.pid).collect();
+    assert!(pids.len() >= REPEATED_RUNS, "every start is a new process");
+    let state = plugin.units.state(&key).await.expect("service state");
+    assert_ne!(state, ServiceState::Failed, "systemd keeps restarting it");
+
+    analyze_verify(&plugin.unit_dir.join(&service));
+    assert!(
+        !plugin.unit_dir.join(&timer).exists(),
+        "a service has no timer"
+    );
+    assert_eq!(unit_file_state(&service), "enabled");
+    let properties = show(
+        &service,
+        &[
+            "Type",
+            "Restart",
+            "RestartUSec",
+            "StartLimitIntervalUSec",
+            "KillMode",
+        ],
+    );
+    let expected = [
+        ("Type", "exec"),
+        ("Restart", "always"),
+        ("RestartUSec", "1s"),
+        ("StartLimitIntervalUSec", "0"),
+        ("KillMode", "control-group"),
+    ];
+    for (key, value) in expected {
+        assert_eq!(
+            properties.get(key).map(String::as_str),
+            Some(value),
+            "service property {key}"
+        );
+    }
+
+    plugin
+        .units
+        .remove(&key)
+        .await
+        .expect("remove plugin service");
+}
+
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn a_plugin_job_run_is_stopped_at_its_timeout() {
+    /// Bound on one run; the fixture would otherwise sleep for minutes.
+    const RUN_TIMEOUT: Duration = Duration::from_secs(2);
+
+    require_e2e();
+    let mut plugin = PluginInstallation::new().await;
+    let key = PluginUnitKey::new("acme.work", PluginUnitKind::Job, "wedged")
+        .expect("valid plugin unit key");
+    let (service, _) = plugin.track(&key);
+    let marker = plugin.marker("wedged");
+    let mut spec = plugin_job(plugin.root(), "serve", &marker, Duration::ZERO);
+    spec.start_timeout = RUN_TIMEOUT;
+    spec.exit_timeout = Duration::from_secs(1);
+
+    plugin
+        .units
+        .install(&key, &interval_job(spec))
+        .await
+        .expect("install plugin job");
+    let first = wait_for_marks(&marker, |marks| count(marks, true) >= 1).await[0];
+    // The result is read together with the failed state, before the next
+    // run resets it one interval later.
+    let units = &plugin.units;
+    let key = &key;
+    let service = &service;
+    let result = wait::wait_until("the timed-out run's failure", move || async move {
+        (units.state(key).await.expect("job state") == ServiceState::Failed)
+            .then(|| show(service, &["Result"]).remove("Result"))
+            .flatten()
+    })
+    .await;
+    assert_eq!(
+        result, "timeout",
+        "the manager stopped the run at its bound"
+    );
+    assert!(
+        std::fs::metadata(format!("/proc/{}", first.pid)).is_err(),
+        "the timed-out run outlived its bound"
+    );
+
+    plugin.units.remove(key).await.expect("remove plugin job");
+}
+
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn removed_plugin_units_leave_nothing_and_workers_never_see_them() {
+    require_e2e();
+    let mut plugin = PluginInstallation::new().await;
+    // A unit named `worker` sits closest to the worker glob.
+    let job = PluginUnitKey::new("acme.work", PluginUnitKind::Job, "worker")
+        .expect("valid plugin unit key");
+    let service = PluginUnitKey::new("acme.work", PluginUnitKind::Service, "notifier")
+        .expect("valid plugin unit key");
+    let (job_service, job_timer) = plugin.track(&job);
+    let (service_unit, _) = plugin.track(&service);
+    let job_marker = plugin.marker("worker");
+    let service_marker = plugin.marker("notifier");
+    plugin
+        .units
+        .install(
+            &job,
+            &interval_job(plugin_job(
+                plugin.root(),
+                "job",
+                &job_marker,
+                Duration::ZERO,
+            )),
+        )
+        .await
+        .expect("install plugin job");
+    plugin
+        .units
+        .install(
+            &service,
+            &restarting_service(
+                plugin_job(plugin.root(), "serve", &service_marker, Duration::ZERO),
+                Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("install plugin service");
+    wait_for_marks(&job_marker, |marks| count(marks, false) >= 1).await;
+    wait_for_marks(&service_marker, |marks| count(marks, true) >= 1).await;
+    plugin
+        .wait_for_state(&service, |state| state == ServiceState::Running)
+        .await;
+
+    // Worker discovery of the same namespace neither adopts nor rejects them.
+    let supervisor = plugin.installation.supervisor().await;
+    let discovery = supervisor.discover_units().await.expect("discover workers");
+    assert!(discovery.observations.is_empty(), "{discovery:?}");
+    assert!(discovery.rejected_units.is_empty(), "{discovery:?}");
+    assert!(!discovery.incomplete);
+    assert!(supervisor
+        .discover_strict()
+        .await
+        .expect("strict discovery")
+        .is_empty());
+
+    for key in [&job, &service] {
+        plugin.units.stop(key).await.expect("stop plugin unit");
+        assert_eq!(
+            plugin.units.state(key).await.expect("stopped state"),
+            ServiceState::Stopped,
+            "{key}"
+        );
+        plugin.units.start(key).await.expect("start plugin unit");
+        plugin
+            .wait_for_state(key, |state| state == ServiceState::Running)
+            .await;
+    }
+    assert_eq!(
+        show(&service_unit, &["ActiveState"])["ActiveState"],
+        "active"
+    );
+
+    for key in [&job, &service] {
+        plugin.units.remove(key).await.expect("remove plugin unit");
+    }
+    assert!(plugin.plugin_unit_files().is_empty());
+    for unit in [&job_service, &job_timer, &service_unit] {
+        assert_ne!(unit_file_state(unit), "enabled", "{unit}");
+    }
+    wait::wait_until("no loaded plugin unit", || {
+        let gone = plugin.loaded_plugin_units().is_empty();
+        async move { gone.then_some(()) }
+    })
+    .await;
+    for key in [&job, &service] {
+        assert!(matches!(
+            plugin.units.state(key).await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            plugin.units.start(key).await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            plugin.units.stop(key).await,
+            Err(Error::NotFound(_))
+        ));
+        plugin
+            .units
+            .remove(key)
+            .await
+            .expect("removal is idempotent");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn plugin_unit_names_stay_bounded_and_safe() {
+    /// Longest unit name a plugin unit key accepts.
+    const LONGEST_NAME: usize = 64;
+    /// Longest native unit name; the service ID bound.
+    const LONGEST_UNIT: usize = 128;
+
+    require_e2e();
+    let mut plugin = PluginInstallation::new().await;
+    // The plugin ID carries every character a unit name must never hold; it
+    // reaches systemd only as its hash.
+    let hostile = "acme/../$HOME %h;\"q\"\\ \u{17e}\n.@";
+    let plugin_id = hostile.repeat(4_096 / hostile.len());
+    assert!(plugin_id.len() <= 4_096);
+    let name: String = std::iter::once('j')
+        .chain("_9".chars().cycle().take(LONGEST_NAME - 1))
+        .collect();
+    assert_eq!(name.len(), LONGEST_NAME);
+    let key = PluginUnitKey::new(&plugin_id, PluginUnitKind::Job, name.clone())
+        .expect("longest valid key");
+    let (service, timer) = plugin.track(&key);
+    let marker = plugin.marker("longest");
+
+    for (plugin_id, name) in [
+        ("acme.work", format!("{name}x")),
+        ("acme.work", "Upper".to_owned()),
+        ("acme.work", "has.dot".to_owned()),
+        ("acme.work", "has-dash".to_owned()),
+        ("acme.work", "a/b".to_owned()),
+        ("acme.work", "a@b".to_owned()),
+        ("acme.work", "%h".to_owned()),
+        ("acme.work", "9lead".to_owned()),
+        ("acme.work", "_lead".to_owned()),
+        ("acme.work", String::new()),
+        ("", "poll".to_owned()),
+        (&"x".repeat(4_097), "poll".to_owned()),
+    ] {
+        assert!(
+            matches!(
+                PluginUnitKey::new(plugin_id, PluginUnitKind::Job, name.clone()),
+                Err(Error::InvalidServiceId(_))
+            ),
+            "accepted {name:?}"
+        );
+    }
+
+    assert!(
+        plugin.plugin_unit_files().is_empty(),
+        "a rejected key writes nothing"
+    );
+
+    plugin
+        .units
+        .install(
+            &key,
+            &interval_job(plugin_job(plugin.root(), "job", &marker, Duration::ZERO)),
+        )
+        .await
+        .expect("install the longest plugin unit");
+    for unit in [&service, &timer] {
+        assert!(unit.len() <= LONGEST_UNIT, "{unit}");
+        assert!(
+            unit.bytes().all(|byte| byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || b"-_.".contains(&byte)),
+            "{unit}"
+        );
+        ServiceId::parse(unit.as_str()).expect("unit names are valid service IDs");
+        analyze_verify(&plugin.unit_dir.join(unit));
+    }
+    let mut expected = vec![service.clone(), timer.clone()];
+    expected.sort();
+    assert_eq!(plugin.plugin_unit_files(), expected);
+    wait_for_marks(&marker, |marks| count(marks, false) >= 1).await;
+    assert_eq!(
+        plugin.units.state(&key).await.expect("job state"),
+        ServiceState::Running
+    );
+
+    plugin.units.remove(&key).await.expect("remove plugin job");
+    assert!(plugin.plugin_unit_files().is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn plugin_unit_durations_and_kinds_are_refused_before_install() {
+    require_e2e();
+    let mut plugin = PluginInstallation::new().await;
+    let key = PluginUnitKey::new("acme.work", PluginUnitKind::Job, "poll").expect("valid key");
+    plugin.track(&key);
+    let marker = plugin.marker("poll");
+
+    // Both backends express plugin unit durations only in whole seconds of
+    // at least one second.
+    let job_spec = || plugin_job(plugin.root(), "job", &marker, Duration::ZERO);
+    for (every, accuracy) in [
+        (Duration::from_millis(1_500), JOB_ACCURACY),
+        (Duration::from_millis(500), Duration::from_millis(500)),
+        (Duration::from_nanos(1), Duration::from_nanos(1)),
+        (JOB_INTERVAL, Duration::from_millis(100)),
+        (JOB_INTERVAL, Duration::from_secs(2)),
+    ] {
+        assert!(
+            matches!(
+                PluginUnitDefinition::new(
+                    JobDefinition::new(job_spec()).expect("valid job"),
+                    Activation::Interval { every, accuracy },
+                ),
+                Err(Error::InvalidDefinition { .. })
+            ),
+            "accepted every {every:?} accuracy {accuracy:?}"
+        );
+    }
+    for delay in [Duration::from_millis(200), Duration::from_millis(1_500)] {
+        let mut spec = job_spec();
+        spec.restart = RestartPolicy::Always { delay };
+        assert!(
+            matches!(
+                PluginUnitDefinition::new(
+                    JobDefinition::new(spec).expect("valid job"),
+                    Activation::Service,
+                ),
+                Err(Error::InvalidDefinition { .. })
+            ),
+            "accepted restart delay {delay:?}"
+        );
+    }
+    // A definition of the other kind never installs under a job key.
+    let other_kind = restarting_service(job_spec(), Duration::from_secs(1));
+    assert!(matches!(
+        plugin.units.install(&key, &other_kind).await,
+        Err(Error::InvalidDefinition { .. })
+    ));
+    assert!(
+        plugin.plugin_unit_files().is_empty(),
+        "a refused definition writes nothing"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn a_job_and_a_service_of_one_name_coexist() {
+    require_e2e();
+    let mut plugin = PluginInstallation::new().await;
+    let job = PluginUnitKey::new("acme.work", PluginUnitKind::Job, "sync").expect("valid key");
+    let service =
+        PluginUnitKey::new("acme.work", PluginUnitKind::Service, "sync").expect("valid key");
+    let (job_service, job_timer) = plugin.track(&job);
+    let (service_unit, _) = plugin.track(&service);
+    let job_marker = plugin.marker("sync-job");
+    let replaced_marker = plugin.marker("sync-job-replaced");
+    let service_marker = plugin.marker("sync-service");
+
+    plugin
+        .units
+        .install(
+            &job,
+            &interval_job(plugin_job(
+                plugin.root(),
+                "job",
+                &job_marker,
+                Duration::ZERO,
+            )),
+        )
+        .await
+        .expect("install plugin job");
+    plugin
+        .units
+        .install(
+            &service,
+            &restarting_service(
+                plugin_job(plugin.root(), "serve", &service_marker, Duration::ZERO),
+                Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("install plugin service of the same name");
+    wait_for_marks(&job_marker, |marks| count(marks, false) >= 1).await;
+    let serving = wait_for_marks(&service_marker, |marks| count(marks, true) >= 1).await[0];
+    let mut expected = vec![job_service.clone(), job_timer.clone(), service_unit.clone()];
+    expected.sort();
+    assert_eq!(plugin.plugin_unit_files(), expected);
+
+    // Replacing the job's definition takes effect and leaves the service
+    // process alone.
+    plugin
+        .units
+        .install(
+            &job,
+            &interval_job(plugin_job(
+                plugin.root(),
+                "job",
+                &replaced_marker,
+                Duration::ZERO,
+            )),
+        )
+        .await
+        .expect("replace the plugin job");
+    wait_for_marks(&replaced_marker, |marks| count(marks, false) >= 1).await;
+    assert!(
+        std::fs::metadata(format!("/proc/{}", serving.pid)).is_ok(),
+        "replacing the job stopped the service"
+    );
+
+    // Removing the service leaves the job's schedule running.
+    plugin
+        .units
+        .remove(&service)
+        .await
+        .expect("remove plugin service");
+    let runs = count(&read_marks(&replaced_marker), false);
+    wait_for_marks(&replaced_marker, |marks| count(marks, false) > runs).await;
+    let mut expected = vec![job_service, job_timer];
+    expected.sort();
+    assert_eq!(plugin.plugin_unit_files(), expected);
+    assert!(matches!(
+        plugin.units.state(&service).await,
+        Err(Error::NotFound(_))
+    ));
+    assert_eq!(
+        plugin.units.state(&job).await.expect("job state"),
+        ServiceState::Running
+    );
+
+    plugin.units.remove(&job).await.expect("remove plugin job");
+    assert!(plugin.plugin_unit_files().is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn dollar_signs_reach_a_plugin_unit_verbatim() {
+    require_e2e();
+    let mut plugin = PluginInstallation::new().await;
+    let key = PluginUnitKey::new("acme.work", PluginUnitKind::Job, "dollar").expect("valid key");
+    plugin.track(&key);
+    // systemd never substitutes `$` in the program path but does in every
+    // argv word, argv[0] included, unless the command opts out; `%` is a
+    // specifier everywhere. All of them must reach the process unchanged.
+    let directory = plugin.root().join("bin$HOME${HOME}$$%h");
+    std::fs::create_dir(&directory).expect("dollar-bearing directory");
+    let executable = directory.join("fixture");
+    std::fs::copy(
+        std::env::current_exe().expect("test executable"),
+        &executable,
+    )
+    .expect("copy fixture executable");
+    let marker = plugin.root().join("marks-$HOME-${HOME}-$$-%h");
+    let mut spec = plugin_job(plugin.root(), "job", &marker, Duration::ZERO);
+    spec.executable = executable.clone();
+
+    plugin
+        .units
+        .install(&key, &interval_job(spec))
+        .await
+        .expect("install plugin job");
+    wait_for_marks(&marker, |marks| count(marks, false) >= 1).await;
+    assert_eq!(
+        std::fs::read_to_string(argv0_record(&marker)).expect("recorded argv[0]"),
+        executable.to_str().expect("UTF-8 executable"),
+        "argv[0] is the program path, unexpanded"
+    );
+
+    plugin.units.remove(&key).await.expect("remove plugin job");
 }

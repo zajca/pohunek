@@ -331,6 +331,30 @@ D-Bus; macOS implements it through `/bin/launchctl` `bootstrap`, `bootout`, and
 never sees unit names, labels, D-Bus paths, or raw `MainPID` semantics. Worker
 readiness and authority still come from the private worker handshake.
 
+A separate plugin-unit contract installs persistent workflow plugin units, each
+keyed by plugin, kind, and name: a periodic job or a long-running service
+restarted after every exit. A job's runs never overlap and start about one
+interval apart. The interval is awake time counted from the unit's activation
+within one service-manager lifetime: it pauses while the host sleeps and starts
+over at every login, so wall-clock cadence (catching up a daily job on a host
+that is never awake that long) belongs to the caller, which keeps its own
+last-run record and skips runs that are not due yet. Intervals, timer
+accuracy, and restart delays are whole seconds of at least one second, the
+granularity both native managers express. The native run bound and restart
+delay are backstops; the caller enforces the real run and restart policy.
+Each unit is enabled for login, and the unit definition adds only the
+bootstrap roots to the environment, never `PATH`; the user service manager
+still passes its own environment block to the process, so the executable a
+unit runs clears what it must not forward. Linux implements it with user unit
+files `pohunek-<ns>-wf-<plugin-hash>-<j|s>-<name>.service`: a job is
+`Type=oneshot`, bounded by `TimeoutStartSec=`, plus a `.timer` with
+`OnActiveSec=` and `OnUnitInactiveSec=` (the next run one interval after the
+previous one ended); a service is `Type=exec` with `Restart=always` and
+`RestartSec=` waited after each exit. Both disable start rate limiting and
+kill the whole control group. Worker discovery never matches these names, so
+it neither adopts nor sweeps them. No command installs plugin units yet; the
+launchd backend and the CLI that drives both are ordered work in #326.
+
 The shared contract crate compiles and tests natively on Apple Silicon Darwin
 with a macOS 14 deployment target. Intel Macs are outside the current release
 scope. The secure runtime-path and portable filesystem contract also runs

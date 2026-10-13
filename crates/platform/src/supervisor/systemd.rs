@@ -3,9 +3,12 @@
 //! [`SystemdSupervisor`] starts every worker generation as a transient
 //! service `pohunek-<ns>-worker-<session-id>-<generation>.service` through
 //! `StartTransientUnit` on the session bus, so no unit file or template is
-//! installed per worker. [`SystemdDaemon`] owns the only persistent units: the
-//! daemon service and the sessions slice, written to the user unit directory
-//! and enabled for login.
+//! installed per worker. The persistent units live in the user unit directory
+//! and are enabled for login: [`SystemdDaemon`] owns the daemon service and the
+//! sessions slice, and [`SystemdPluginUnits`] owns the workflow plugin units
+//! `pohunek-<ns>-wf-<plugin-hash>-<kind>-<name>.service` (`<kind>` is `j` for
+//! a periodic job, `s` for a service) and, for a job, the `.timer` of the same
+//! stem.
 //!
 //! # Supported systemd
 //!
@@ -84,8 +87,9 @@ use zbus::proxy::CacheProperties;
 use zbus::zvariant::{OwnedObjectPath, Value};
 
 use super::{
-    DaemonSupervisor, DefinitionFacts, Error, JobDefinition, Namespace, Operation, RestartPolicy,
-    ServiceId, ServiceObservation, ServiceState, Supervisor, WorkerKey, MAX_JOB_TIMEOUT,
+    Activation, DaemonSupervisor, DefinitionFacts, Error, JobDefinition, Namespace, Operation,
+    PluginUnitDefinition, PluginUnitKey, PluginUnitKind, PluginUnits, RestartPolicy, ServiceId,
+    ServiceObservation, ServiceState, Supervisor, WorkerKey, MAX_JOB_TIMEOUT,
 };
 use crate::filesystem::{EntryKind, FsError, StageOutcome, TrustedDir};
 use crate::process::{Error as ProcessError, LinuxInspector, ProcessIdentity, ProcessInspector};
@@ -94,8 +98,9 @@ mod unit_file;
 
 #[doc(inline)]
 pub use unit_file::{render_daemon_unit, render_sessions_slice};
+use unit_file::{render_plugin_service, render_plugin_timer};
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-10-12
 
 const DESTINATION: &str = "org.freedesktop.systemd1";
 const MANAGER_PATH: &str = "/org/freedesktop/systemd1";
@@ -445,6 +450,7 @@ impl DaemonSupervisor for SystemdDaemon {
         Box::pin(async move {
             const OPERATION: &str = "install";
 
+            validate_daemon_restart(definition)?;
             let unit = render_daemon_unit(definition)?;
             let name = self.namespace.daemon_unit();
             if self.is_active(&name).await? {
@@ -466,6 +472,7 @@ impl DaemonSupervisor for SystemdDaemon {
         Box::pin(async move {
             const OPERATION: &str = "replace";
 
+            validate_daemon_restart(definition)?;
             let unit = render_daemon_unit(definition)?;
             let name = self.namespace.daemon_unit();
             let present = open_unit_dir(&self.unit_dir, false)?
@@ -536,6 +543,296 @@ impl DaemonSupervisor for SystemdDaemon {
             }
             Ok(())
         })
+    }
+}
+
+/// The persistent workflow plugin units of one installation.
+///
+/// Unit files live in the systemd user unit directory passed to
+/// [`SystemdPluginUnits::connect`], next to the daemon unit. Errors about one
+/// unit set report the service unit name as the service ID.
+///
+/// A periodic job is a `Type=oneshot` service started only by its enabled
+/// timer. The timer's first run starts `every` after the timer is activated
+/// (`OnActiveSec=`) and each later run `every` after the previous run ended
+/// (`OnUnitInactiveSec=`), both on the monotonic clock, which pauses during
+/// suspend; activation happens again at every start of the user manager. The
+/// job's start timeout is its `TimeoutStartSec=`, which bounds the whole run of
+/// a `Type=oneshot` service. A long-running service is a `Type=exec` service
+/// enabled for login with `Restart=always` and `RestartSec=` set to the delay,
+/// which systemd waits after each exit.
+#[derive(Debug, Clone)]
+pub struct SystemdPluginUnits {
+    bus: Bus,
+    namespace: Namespace,
+    unit_dir: PathBuf,
+}
+
+/// The unit names of one plugin unit set.
+#[derive(Debug, Clone)]
+struct PluginUnitNames {
+    service: String,
+    /// The timer of a job; a service has none.
+    timer: Option<String>,
+    id: ServiceId,
+}
+
+impl PluginUnitNames {
+    /// Returns the unit that activates the set: a job's timer or the service.
+    fn activation(&self) -> &str {
+        self.timer.as_deref().unwrap_or(&self.service)
+    }
+
+    /// Returns every unit of the set, the timer first.
+    fn units(&self) -> impl Iterator<Item = &str> {
+        self.timer
+            .as_deref()
+            .into_iter()
+            .chain(std::iter::once(self.service.as_str()))
+    }
+}
+
+impl SystemdPluginUnits {
+    /// Connects to the current user's session bus for plugin unit management.
+    ///
+    /// `unit_dir` must be the absolute systemd user unit directory; it is
+    /// created with mode `0755` when missing, and writes are refused when it or
+    /// an ancestor owned by the user is group- or world-writable, as for
+    /// [`SystemdDaemon::connect`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidDefinition`] for a relative `unit_dir` and
+    /// [`Error::Unavailable`] when the session bus cannot be reached.
+    pub async fn connect(
+        namespace: Namespace,
+        unit_dir: PathBuf,
+        call_timeout: Duration,
+    ) -> Result<Self, Error> {
+        if !unit_dir.is_absolute() {
+            return Err(Error::InvalidDefinition {
+                detail: "the systemd user unit directory must be absolute".to_owned(),
+            });
+        }
+        Ok(Self {
+            bus: Bus::connect(call_timeout).await?,
+            namespace,
+            unit_dir,
+        })
+    }
+
+    fn names(&self, key: &PluginUnitKey) -> PluginUnitNames {
+        let service = self.namespace.plugin_service_unit(key);
+        let id = ServiceId::parse(service.as_str())
+            .expect("plugin unit names are bounded and use the service ID alphabet");
+        PluginUnitNames {
+            timer: (key.kind() == PluginUnitKind::Job)
+                .then(|| self.namespace.plugin_timer_unit(key)),
+            service,
+            id,
+        }
+    }
+
+    /// Reports whether any unit file of the set exists.
+    fn installed(&self, names: &PluginUnitNames) -> Result<bool, Error> {
+        const OPERATION: &str = "inspect_unit_file";
+
+        let Some(directory) = open_unit_dir(&self.unit_dir, false)? else {
+            return Ok(false);
+        };
+        for name in names.units() {
+            if directory
+                .entry_identity(name, EntryKind::RegularFile)
+                .map_err(|source| fs_error(OPERATION, source))?
+                .is_some()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Stops the timer, then the service, and waits until both ended.
+    ///
+    /// The timer goes first so it cannot start a new run in between. Units
+    /// the manager has not loaded are already stopped.
+    async fn stop_set(
+        &self,
+        names: &PluginUnitNames,
+        operation: &'static str,
+    ) -> Result<(), Error> {
+        if let Some(timer) = &names.timer {
+            self.bus.stop_timer(timer, operation).await?;
+        }
+        match self
+            .bus
+            .stop_and_settle(&names.service, &names.id, operation)
+            .await
+        {
+            Ok(()) | Err(Error::NotFound(_)) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl PluginUnits for SystemdPluginUnits {
+    fn install<'a>(
+        &'a self,
+        key: &'a PluginUnitKey,
+        definition: &'a PluginUnitDefinition,
+    ) -> Operation<'a, ()> {
+        Box::pin(async move {
+            const OPERATION: &str = "install_plugin_unit";
+
+            if definition.kind() != key.kind() {
+                return Err(Error::InvalidDefinition {
+                    detail: "the definition's kind differs from the unit key's".to_owned(),
+                });
+            }
+            let names = self.names(key);
+            let service = render_plugin_service(key, definition)?;
+            let timer = match (definition.activation(), &names.timer) {
+                (Activation::Interval { every, accuracy }, Some(timer)) => Some((
+                    timer,
+                    render_plugin_timer(key, &names.service, every, accuracy),
+                )),
+                _ => None,
+            };
+            let directory = open_unit_dir(&self.unit_dir, true)?
+                .ok_or_else(|| Error::NotFound(names.id.clone()))?;
+            // A replaced set is stopped first, so no process or run of the
+            // previous definition outlives the rewrite.
+            self.stop_set(&names, OPERATION).await?;
+            write_unit(&directory, &names.service, &service)?;
+            if let Some((name, contents)) = &timer {
+                write_unit(&directory, name, contents)?;
+            }
+            self.bus.reload(OPERATION).await?;
+            let manager = self.bus.manager(OPERATION).await?;
+            let _changes: (bool, Vec<(String, String, String)>) = manager
+                .call("EnableUnitFiles", &(vec![names.activation()], false, true))
+                .await
+                .map_err(|source| unit_error(OPERATION, &names.id, source))?;
+            let _job: OwnedObjectPath = manager
+                .call("StartUnit", &(names.activation(), START_MODE))
+                .await
+                .map_err(|source| unit_error(OPERATION, &names.id, source))?;
+            Ok(())
+        })
+    }
+
+    fn start<'a>(&'a self, key: &'a PluginUnitKey) -> Operation<'a, ()> {
+        Box::pin(async move {
+            const OPERATION: &str = "start_plugin_unit";
+
+            let names = self.names(key);
+            if !self.installed(&names)? {
+                return Err(Error::NotFound(names.id));
+            }
+            let _job: OwnedObjectPath = self
+                .bus
+                .manager(OPERATION)
+                .await?
+                .call("StartUnit", &(names.activation(), START_MODE))
+                .await
+                .map_err(|source| unit_error(OPERATION, &names.id, source))?;
+            Ok(())
+        })
+    }
+
+    fn stop<'a>(&'a self, key: &'a PluginUnitKey) -> Operation<'a, ()> {
+        Box::pin(async move {
+            const OPERATION: &str = "stop_plugin_unit";
+
+            let names = self.names(key);
+            if !self.installed(&names)? {
+                return Err(Error::NotFound(names.id));
+            }
+            self.stop_set(&names, OPERATION).await
+        })
+    }
+
+    fn remove<'a>(&'a self, key: &'a PluginUnitKey) -> Operation<'a, ()> {
+        Box::pin(async move {
+            const OPERATION: &str = "remove_plugin_unit";
+
+            let names = self.names(key);
+            self.stop_set(&names, OPERATION).await?;
+            let manager = self.bus.manager(OPERATION).await?;
+            for name in names.units() {
+                match manager
+                    .call::<_, _, Vec<(String, String, String)>>(
+                        "DisableUnitFiles",
+                        &(vec![name], false),
+                    )
+                    .await
+                {
+                    Ok(_changes) => {}
+                    Err(source) if classify(&source) == Fault::Missing => {}
+                    Err(source) => return Err(bus_error(OPERATION, source)),
+                }
+            }
+            if let Some(directory) = open_unit_dir(&self.unit_dir, false)? {
+                for name in names.units() {
+                    remove_unit(&directory, name)?;
+                }
+            }
+            self.bus.reload(OPERATION).await?;
+            // A unit left failed stays loaded after its file is gone until
+            // its failure is reset.
+            for name in names.units() {
+                match manager.call::<_, _, ()>("ResetFailedUnit", &(name,)).await {
+                    Ok(()) => {}
+                    Err(source) if classify(&source) == Fault::Missing => {}
+                    Err(source) => return Err(bus_error(OPERATION, source)),
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn state<'a>(&'a self, key: &'a PluginUnitKey) -> Operation<'a, ServiceState> {
+        Box::pin(async move {
+            const OPERATION: &str = "plugin_unit_state";
+
+            let names = self.names(key);
+            if !self.installed(&names)? {
+                return Err(Error::NotFound(names.id));
+            }
+            let service = self.bus.active_state(&names.service, OPERATION).await?;
+            let Some(timer) = &names.timer else {
+                // An installed service the manager has not loaded is inactive.
+                return Ok(service.map_or(ServiceState::Stopped, |(active, sub)| {
+                    portable_state(&active, &sub)
+                }));
+            };
+            let timer = self.bus.active_state(timer, OPERATION).await?;
+            let is = |state: &Option<(String, String)>, expected: &str| {
+                state.as_ref().is_some_and(|(active, _)| active == expected)
+            };
+            Ok(if is(&service, "failed") || is(&timer, "failed") {
+                ServiceState::Failed
+            } else if is(&timer, "active") {
+                ServiceState::Running
+            } else {
+                ServiceState::Stopped
+            })
+        })
+    }
+}
+
+/// Requires the daemon to restart only after a failure, as the launchd daemon
+/// agent does: a never-restarting daemon stays down after a crash, and one
+/// restarting after a clean exit could never be stopped by its own shutdown.
+fn validate_daemon_restart(definition: &JobDefinition) -> Result<(), Error> {
+    match definition.restart() {
+        RestartPolicy::OnFailure { .. } => Ok(()),
+        RestartPolicy::Never => Err(Error::InvalidDefinition {
+            detail: "the daemon unit must restart after a failure".to_owned(),
+        }),
+        RestartPolicy::Always { .. } => Err(Error::InvalidDefinition {
+            detail: "the daemon unit must stay stopped after a clean exit".to_owned(),
+        }),
     }
 }
 
@@ -756,6 +1053,73 @@ impl Bus {
             Ok(_job) => Ok(()),
             Err(source) if classify(&source) == Fault::Missing => Ok(()),
             Err(source) => Err(bus_error(operation, source)),
+        }
+    }
+
+    /// Reads `ActiveState` and `SubState` of a loaded unit; `None` when the
+    /// manager has not loaded it.
+    async fn active_state(
+        &self,
+        name: &str,
+        operation: &'static str,
+    ) -> Result<Option<(String, String)>, Error> {
+        let path = match self.get_unit(name).await {
+            Ok(path) => path,
+            Err(source) if classify(&source) == Fault::Missing => return Ok(None),
+            Err(source) => return Err(bus_error(operation, source)),
+        };
+        let unit = self.proxy(path, UNIT_INTERFACE, operation).await?;
+        let mut states = Vec::with_capacity(2);
+        for property in ["ActiveState", "SubState"] {
+            match unit.get_property::<String>(property).await {
+                Ok(state) => states.push(state),
+                Err(source) if classify(&source) == Fault::Missing => return Ok(None),
+                Err(source) => return Err(bus_error(operation, source)),
+            }
+        }
+        let sub = states.pop().expect("two states were read");
+        let active = states.pop().expect("two states were read");
+        Ok(Some((active, sub)))
+    }
+
+    /// Stops one timer and waits until it has ended.
+    ///
+    /// A timer runs no process, so ending is immediate; the wait only orders
+    /// the stop before later calls. A timer the manager has not loaded is
+    /// already stopped, and one left `failed` is reset.
+    async fn stop_timer(&self, name: &str, operation: &'static str) -> Result<(), Error> {
+        if self.active_state(name, operation).await?.is_none() {
+            return Ok(());
+        }
+        let manager = self.manager(operation).await?;
+        match manager
+            .call::<_, _, OwnedObjectPath>("StopUnit", &(name, STOP_MODE))
+            .await
+        {
+            Ok(_job) => {}
+            Err(source) if classify(&source) == Fault::Missing => return Ok(()),
+            Err(source) => return Err(bus_error(operation, source)),
+        }
+        let deadline = Instant::now() + SETTLE_MARGIN;
+        loop {
+            match self.active_state(name, operation).await? {
+                None => return Ok(()),
+                Some((active, _)) if is_ended(&active) => {
+                    if active == "failed" {
+                        match manager.call::<_, _, ()>("ResetFailedUnit", &(name,)).await {
+                            Ok(()) => {}
+                            Err(source) if classify(&source) == Fault::Missing => {}
+                            Err(source) => return Err(bus_error(operation, source)),
+                        }
+                    }
+                    return Ok(());
+                }
+                Some(_) => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::Timeout { operation });
+            }
+            async_io::Timer::after(SETTLE_POLL_INTERVAL).await;
         }
     }
 

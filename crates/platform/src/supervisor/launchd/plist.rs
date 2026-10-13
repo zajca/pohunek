@@ -10,6 +10,8 @@
 //! - [`RestartPolicy::OnFailure`] (the daemon agent): `KeepAlive` with
 //!   `SuccessfulExit=false` and `ThrottleInterval`, the launchd equivalent of
 //!   systemd `Restart=on-failure` with `RestartSec`.
+//! - [`RestartPolicy::Always`] is refused: no launchd job this module
+//!   renders restarts after a clean exit.
 //!
 //! `ProcessType` is omitted, which selects launchd's Standard class: the
 //! Background class throttles interactive agents and Interactive is reserved
@@ -22,7 +24,7 @@ use ::plist::{Dictionary, Integer, Value};
 
 use super::super::{DefinitionFacts, Error, JobDefinition, RestartPolicy};
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-10-12
 
 /// Largest definition file read back from disk.
 ///
@@ -63,7 +65,7 @@ pub(crate) enum ParseError {
 /// Returns [`Error::InvalidDefinition`] when a string holds a character that
 /// XML 1.0 cannot carry unchanged: C0 controls other than tab and line feed,
 /// carriage return (parsers normalize it to line feed), and the noncharacters
-/// U+FFFE and U+FFFF.
+/// U+FFFE and U+FFFF, and for a [`RestartPolicy::Always`] definition.
 pub(crate) fn render(label: &str, definition: &JobDefinition) -> Result<Vec<u8>, Error> {
     let mut job = Dictionary::new();
     job.insert("Label".to_owned(), string("Label", label)?);
@@ -74,11 +76,19 @@ pub(crate) fn render(label: &str, definition: &JobDefinition) -> Result<Vec<u8>,
     }
     job.insert("ProgramArguments".to_owned(), Value::Array(program));
     job.insert("RunAtLoad".to_owned(), Value::Boolean(true));
-    if let RestartPolicy::OnFailure { throttle } = definition.restart() {
-        let mut keep_alive = Dictionary::new();
-        keep_alive.insert("SuccessfulExit".to_owned(), Value::Boolean(false));
-        job.insert("KeepAlive".to_owned(), Value::Dictionary(keep_alive));
-        job.insert("ThrottleInterval".to_owned(), seconds(throttle));
+    match definition.restart() {
+        RestartPolicy::Never => {}
+        RestartPolicy::OnFailure { throttle } => {
+            let mut keep_alive = Dictionary::new();
+            keep_alive.insert("SuccessfulExit".to_owned(), Value::Boolean(false));
+            job.insert("KeepAlive".to_owned(), Value::Dictionary(keep_alive));
+            job.insert("ThrottleInterval".to_owned(), seconds(throttle));
+        }
+        RestartPolicy::Always { .. } => {
+            return Err(Error::InvalidDefinition {
+                detail: "a launchd job never restarts after a clean exit".to_owned(),
+            });
+        }
     }
     let mut environment = Dictionary::new();
     for (key, value) in definition.environment() {
