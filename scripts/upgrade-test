@@ -58,9 +58,8 @@
 # download, before anything is built and before any account is created.
 #
 # Stages: resolve and download the previous release (checksum verified) ->
-# build the test binary from this checkout -> build the target binaries and
-# the head's Claude package archive from --head-dir -> run the test in the
-# throwaway account. When the target's
+# build the test binary from this checkout -> build the target binaries from
+# --head-dir -> run the test in the throwaway account. When the target's
 # version equals the previous release's, the target is built with a
 # `+upgrade.<commit>` build-metadata suffix (Cargo.toml and Cargo.lock are
 # restored afterwards): an upgrade to an identical version is a no-op.
@@ -80,10 +79,6 @@ readonly JOURNAL_LINES=400
 # Files of the previous daemon archive's `runtime/` the test installs the
 # official Claude package from.
 readonly PREVIOUS_RUNTIME_FILES=(packages/claude.tar.zst runtime-catalog.json)
-# Package directory of the head checkout the head's Claude archive is built from.
-readonly HEAD_CLAUDE_PACKAGE_DIR="runtime-packages/claude"
-# File name of that archive in the head staging directory.
-readonly HEAD_CLAUDE_ARCHIVE="claude.tar.zst"
 # Upper bound, in half-second polls, on the throwaway account's session bus
 # socket appearing after its user manager is started. A hang guard, not a
 # tuned value: a healthy manager creates the socket within a few seconds.
@@ -523,13 +518,6 @@ for binary in "${BINARIES[@]}"; do
   [ -x "$source_path" ] || fail "cargo did not build $binary in $head_dir"
   cp "$source_path" "$staging/head/$binary"
 done
-# The head's own Claude package archive, which the head CLI installs after the
-# upgrade; it is of the head's package format, which can differ from the
-# previous release's.
-info "building the head's Claude package archive"
-(cd "$head_dir" && cargo xtask package build "$HEAD_CLAUDE_PACKAGE_DIR" \
-  -o "$staging/head/$HEAD_CLAUDE_ARCHIVE" >/dev/null) ||
-  fail "cannot build the head's Claude package archive in $head_dir"
 restore_manifests
 [ "$("$staging/head/pohunek" --version)" = "pohunek $head_version" ] ||
   fail "the head pohunek does not report $head_version"
@@ -585,7 +573,6 @@ as_user \
   "POHUNEK_PREVIOUS_BIN_DIR=$staging/previous" \
   "POHUNEK_PREVIOUS_RUNTIME_DIR=$staging/previous/runtime" \
   "POHUNEK_HEAD_BIN_DIR=$staging/head" \
-  "POHUNEK_HEAD_CLAUDE_ARCHIVE=$staging/head/$HEAD_CLAUDE_ARCHIVE" \
   "POHUNEK_UPGRADE_ARTIFACTS_DIR=$out_dir" \
   "$staging/release_upgrade" --ignored --exact "$TEST_NAME" --nocapture --test-threads 1 || status=$?
 

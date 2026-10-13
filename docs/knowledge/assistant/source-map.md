@@ -195,8 +195,7 @@ Release packaging and contributor verification:
 - `scripts/upgrade-test` — the upgrade test: downloads the previous release's
   Linux daemon archive (checksum verified), requires its
   `runtime/packages/claude.tar.zst` and an unexpired signed catalog (v0.34.2 or
-  later), builds the target binaries and the head's Claude package archive,
-  and runs
+  later), builds the target binaries, and runs
   `crates/cli/tests/release_upgrade.rs` as a throwaway local account with its
   own systemd user manager. The test installs the Claude package with the
   previous release, starts its session from the package, and checks the

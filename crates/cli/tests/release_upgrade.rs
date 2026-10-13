@@ -39,9 +39,6 @@
 //!   `runtime-catalog.json` (v0.34.2 is the first release that ships both);
 //! - `POHUNEK_HEAD_BIN_DIR`: the same three binaries of this build, with a
 //!   version that differs from the previous release;
-//! - `POHUNEK_HEAD_CLAUDE_ARCHIVE`: the official Claude package archive built
-//!   from this build's checkout, which the head CLI installs next to the
-//!   previous release's package after the upgrade;
 //! - `POHUNEK_UPGRADE_ARTIFACTS_DIR`: writable directory receiving the
 //!   previous release's store, journals, `service.toml`, and `--json` outputs.
 //!
@@ -50,8 +47,9 @@
 //! from the raw bytes and its descriptor from a plain zstd and tar decode, and
 //! never hands it to the strict canonical reader. Installed packages keep
 //! working across such an upgrade, because the registry keeps verified roots,
-//! never archive bytes; the head then installs its own archive under its own
-//! digest while the session stays pinned to the previous one.
+//! never archive bytes. After the upgrade the head links a small package
+//! directory, so its daemon builds and installs an archive of the head's own
+//! format, while the session stays pinned to the previous package.
 //!
 //! Results of both CLIs are read as untyped JSON and only the fields named
 //! below are consulted, so a schema difference between the releases cannot
@@ -111,6 +109,53 @@ const VERSION_LINE_PARSER: &str = "semver-line-v1";
 /// Placeholder of the release inside a `semver-line-v1` `line` template.
 const VERSION_PLACEHOLDER: &str = "{version}";
 
+/// Directory under `HOME` the head links as a probe package.
+const PROBE_DIRECTORY: &str = "upgrade-probe";
+
+/// Package id of the probe package.
+const PROBE_PACKAGE_ID: &str = "pohunek.upgrade.probe";
+
+/// Detect manifest path of the probe package.
+const PROBE_DETECT_PATH: &str = "detect.toml";
+
+/// Descriptor of the probe package: an unreserved runtime that is never
+/// launched, only installed.
+const PROBE_DESCRIPTOR: &str = r#"schema = 1
+id = "pohunek.upgrade.probe"
+version = "0.1.0"
+runtime_api = 1
+
+[runtime]
+id = "upgrade-probe"
+name = "Upgrade probe"
+program = "upgrade-probe-agent"
+args = []
+detect_manifest = "detect.toml"
+prompt_arg = false
+
+[input]
+bracketed_paste = false
+submit_delay_ms = 0
+text_policy = "unrestricted"
+
+[resume]
+supported = false
+
+[fork]
+supported = false
+
+[native_reference]
+strategy = "none"
+"#;
+
+/// Detect manifest of the probe package.
+const PROBE_DETECT: &str = r#"[[rules]]
+id = "idle_prompt"
+state = "idle"
+priority = 100
+region = "whole_recent"
+any = [{ contains = "ready" }]
+"#;
 /// Host profile name of the fake agent.
 const PROFILE: &str = "fake-claude";
 
@@ -295,7 +340,6 @@ struct Run {
     previous_dir: PathBuf,
     previous_runtime_dir: PathBuf,
     head_dir: PathBuf,
-    head_claude_archive: PathBuf,
     artifacts: PathBuf,
 }
 
@@ -323,7 +367,6 @@ impl Run {
             previous_dir: path("POHUNEK_PREVIOUS_BIN_DIR"),
             previous_runtime_dir: path("POHUNEK_PREVIOUS_RUNTIME_DIR"),
             head_dir: path("POHUNEK_HEAD_BIN_DIR"),
-            head_claude_archive: path("POHUNEK_HEAD_CLAUDE_ARCHIVE"),
             artifacts: path("POHUNEK_UPGRADE_ARTIFACTS_DIR"),
         }
     }
@@ -1048,32 +1091,33 @@ fn start_on_previous(run: Run, previous: Cli, head: Cli) -> (Upgrade, Runtime, u
 }
 
 impl Upgrade {
-    /// The head CLI installs the Claude package built from this build's
-    /// checkout, an archive of this build's package format, trusted by its
-    /// digest. Across a format change it is another archive than the previous
-    /// release's and installs next to it, while the session stays pinned to
-    /// the previous digest: both digests are installed afterwards.
-    fn assert_head_installs_its_own_package(&self) {
-        let archive = &self.run.head_claude_archive;
-        let bytes =
-            fs::read(archive).unwrap_or_else(|error| panic!("read {}: {error}", archive.display()));
-        let digest = archive_digest(&bytes).expect("the archive digest");
-        let path = archive.display().to_string();
-        let installed = self.head.json(&[
-            "plugin",
-            "install",
-            &path,
-            "--sha256",
-            digest.as_str(),
-            "--yes",
-            "--json",
-        ]);
-        let info = &installed["package"];
-        assert_eq!(info["digest"], digest.as_str(), "{installed}");
-        assert_eq!(info["package"]["id"], CLAUDE_PACKAGE_ID, "{installed}");
+    /// The head links a package directory, so the head daemon builds an
+    /// archive of the head's package format and installs it. Across a format
+    /// change that is the first archive of the new format on this host; it
+    /// installs next to the previous release's package, which the session
+    /// stays pinned to, and both are listed afterwards. The probe serves an
+    /// unreserved runtime, which a linked package may claim.
+    fn assert_head_links_a_package_of_its_format(&self) {
+        let dir = self.run.home.join(PROBE_DIRECTORY);
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .unwrap_or_else(|error| panic!("create {}: {error}", dir.display()));
+        fs::write(dir.join(PACKAGE_DESCRIPTOR), PROBE_DESCRIPTOR)
+            .expect("write the probe descriptor");
+        fs::write(dir.join(PROBE_DETECT_PATH), PROBE_DETECT)
+            .expect("write the probe detect manifest");
+        let path = dir.display().to_string();
+        let linked = self
+            .head
+            .json(&["plugin", "link", &path, "--yes", "--json"]);
+        let info = &linked["package"];
+        assert_eq!(info["package"]["id"], PROBE_PACKAGE_ID, "{linked}");
+        let digest = info["digest"].as_str().expect("the linked digest");
+        assert_ne!(digest, self.digest, "{linked}");
         let listed = self.head.json(&["plugin", "list", "--json"]);
         let text = listed.to_string();
-        for expected in [digest.as_str(), self.digest.as_str()] {
+        for expected in [digest, self.digest.as_str()] {
             assert!(
                 text.contains(expected),
                 "{expected} is not installed: {listed}"
@@ -1321,7 +1365,7 @@ fn previous_release_session_survives_the_upgrade_to_head() {
     upgrade.upgrade();
     let after = upgrade.assert_adopted(&before, daemon_before);
     upgrade.assert_session_works();
-    upgrade.assert_head_installs_its_own_package();
+    upgrade.assert_head_links_a_package_of_its_format();
     upgrade.assert_previous_client(&after);
     upgrade.assert_stop_and_resume(&after);
     upgrade.assert_previous_client_creates_with_input();

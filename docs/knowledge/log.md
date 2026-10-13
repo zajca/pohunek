@@ -221,8 +221,8 @@
   a test pins that the v0.34.2 archive is refused.
 - The release upgrade test takes the previous release's archive digest from
   its raw bytes and its descriptor from a plain decode, and after the upgrade
-  the head CLI installs the head's own Claude archive (built by
-  `scripts/upgrade-test`) next to the pinned package.
+  the head links a probe package directory, so its daemon installs an archive
+  of the head's format next to the pinned package.
 - `concepts/runtime-package-archive.md` describes the format generations.
 
 ## Unreleased (2026-10-13, workflow run --json and verbatim arguments, #325)
