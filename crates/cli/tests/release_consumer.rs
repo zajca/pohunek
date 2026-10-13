@@ -16,9 +16,9 @@
 //! The remaining tests are hermetic regression scenarios of the harness
 //! guards; they need no upstream and no model, only this build's binaries.
 
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
-// Rust guideline compliant 2026-10-08
+// Rust guideline compliant 2026-10-13
 
 use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::wait::poll_until;
@@ -956,12 +956,30 @@ check = "none"
     const FAKE_SLEEP_SECONDS: &str = "7351";
 
     /// Whether a live process runs exactly `sleep 7351`.
+    #[cfg(target_os = "linux")]
     fn fake_sleep_alive() -> bool {
         let wanted = format!("sleep\0{FAKE_SLEEP_SECONDS}\0").into_bytes();
         fs::read_dir("/proc")
             .expect("/proc")
             .flatten()
             .any(|entry| fs::read(entry.path().join("cmdline")).is_ok_and(|argv| argv == wanted))
+    }
+
+    /// Whether a live process runs exactly `sleep 7351`.
+    #[cfg(target_os = "macos")]
+    fn fake_sleep_alive() -> bool {
+        use pohunek_platform::process::{HostInspector, ProcessInspector as _};
+        use std::ffi::OsStr;
+
+        let inspector = HostInspector::new();
+        let processes = inspector
+            .same_user_processes()
+            .expect("list the same-user processes");
+        processes.iter().any(|fact| {
+            fact.cmdline.len() == 2
+                && Path::new(&fact.cmdline[0]).file_name() == Some(OsStr::new("sleep"))
+                && fact.cmdline[1] == FAKE_SLEEP_SECONDS
+        })
     }
 
     #[test]
@@ -1222,9 +1240,18 @@ check = "none"
         // The handle is still owned, so dropping the host kills and reaps it.
         assert_eq!(host.daemon_pid, pid);
         drop(host);
+        #[cfg(target_os = "linux")]
         pohunek_test_support::wait::poll_until("the stand-in to be gone", || {
             (!Path::new(&format!("/proc/{pid}")).exists()).then_some(())
         });
+        #[cfg(target_os = "macos")]
+        {
+            use pohunek_platform::process::{HostInspector, ProcessInspector as _};
+            let inspector = HostInspector::new();
+            pohunek_test_support::wait::poll_until("the stand-in to be gone", || {
+                matches!(inspector.identity(pid), Ok(None)).then_some(())
+            });
+        }
     }
 
     // ---- the catalog install ----------------------------------------------

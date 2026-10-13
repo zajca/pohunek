@@ -310,8 +310,9 @@ What a run does: copies the three binaries into
 what `pohunekd --version` and `pohunek --version` both report) and hashes them;
 starts `pohunekd` as a subprocess (worker supervision as direct children) in a
 hermetic XDG environment with the upstream's directory in front of `PATH`;
-checks through `/proc/<pid>/exe` that the daemon and the worker execute the
-layout copies and that the executed image hashes to the installed bytes; runs
+verifies that the daemon and the worker execute the layout copies and that the
+executed image hashes to the installed bytes (on Linux through `/proc/<pid>/exe`,
+on macOS through the host process inspector); runs
 every command as the layout's `pohunek` subprocess: `plugin install --catalog`,
 `plugin list`/`inspect` (official, enabled, selected), the driver's
 `integration install` when it has one, `host inspect local`
