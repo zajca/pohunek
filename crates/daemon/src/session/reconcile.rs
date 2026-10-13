@@ -11846,8 +11846,10 @@ handler = "codex-hook-v1"
             (identity.pid, identity.start_identity.get())
         }
 
-        /// A hangup-ignoring process marked with `worker_instance_id`, reparented away
-        /// from the test process so its exit is observable without reaping.
+        /// The holding image re-run as a hangup-ignoring process marked with the given
+        /// markers, whose environment the kernel exposes on every host (unlike a
+        /// platform binary such as `/bin/sleep` on macOS 27), reparented away from the
+        /// test process so its exit is observable without reaping.
         struct Marked(u32);
 
         impl Marked {
@@ -11858,7 +11860,13 @@ handler = "codex-hook-v1"
             /// Like [`Self::spawn`] with exactly the given environment markers.
             fn spawn_with(markers: &[(&str, &str)]) -> Self {
                 let output = std::process::Command::new("/bin/sh")
-                    .args(["-c", "trap '' HUP; sleep 60 >/dev/null 2>&1 & echo $!"])
+                    .args([
+                        "-c",
+                        &format!(
+                            "trap '' HUP; {} & echo $!",
+                            pohunek_test_support::hold::shell_words()
+                        ),
+                    ])
                     .envs(markers.iter().copied())
                     .output()
                     .expect("spawn marked process");
