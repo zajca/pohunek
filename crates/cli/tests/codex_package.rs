@@ -11,7 +11,7 @@
 //! so nothing else serves it. The real-Codex tests additionally drive an actual
 //! `codex` binary; see their documentation for the opt-in.
 
-// Rust guideline compliant 2026-10-12
+// Rust guideline compliant 2026-10-13
 
 #![cfg(unix)]
 
@@ -98,7 +98,10 @@ const GOLDEN_MANIFEST_NAME: &str = "codex";
 const PACKAGE_ID: &str = "pohunek.runtime.codex";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.0.0";
+const PACKAGE_VERSION: &str = "1.1.0";
+
+/// Package version the golden built-in descriptor declares.
+const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
 
 fn package_dir() -> PathBuf {
     workspace_root().join(PACKAGE_DIR)
@@ -324,11 +327,20 @@ fn the_package_descriptor_preserves_every_builtin_codex_fact() {
 }
 
 /// The same facts as data: the package descriptor and the golden built-in
-/// descriptor are equal tables once the manifest reference, the version probe
-/// and the transcript tree, the fields that differ by design, are removed.
+/// descriptor are equal tables once the package version, the manifest
+/// reference, the version probe and the transcript tree, the fields that differ
+/// by design, are removed. The package version is above the golden's because
+/// the package declares the transcript tree.
 #[test]
 fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
-    let strip = |mut table: toml::Table| {
+    let strip = |mut table: toml::Table, version: &str| {
+        assert_eq!(
+            table
+                .remove("version")
+                .as_ref()
+                .and_then(toml::Value::as_str),
+            Some(version)
+        );
         let runtime = table
             .get_mut("runtime")
             .and_then(toml::Value::as_table_mut)
@@ -337,7 +349,10 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
         runtime.remove("version_probe");
         table
     };
-    let mut package = strip(read_toml(&format!("{PACKAGE_DIR}/runtime.toml")));
+    let mut package = strip(
+        read_toml(&format!("{PACKAGE_DIR}/runtime.toml")),
+        PACKAGE_VERSION,
+    );
     for section in [
         "input",
         "resume",
@@ -356,7 +371,7 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
         !golden.contains_key("transcripts"),
         "v0.34.2 declares no transcript tree"
     );
-    assert_eq!(package, strip(golden));
+    assert_eq!(package, strip(golden, GOLDEN_PACKAGE_VERSION));
 }
 
 /// The manifest file is the golden built-in manifest of release v0.34.2: same

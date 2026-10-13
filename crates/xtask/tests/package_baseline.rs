@@ -1,4 +1,5 @@
-//! Scenarios for `cargo xtask package baseline` driven through the real binary.
+//! Scenarios for `cargo xtask package baseline` and `cargo xtask package bump`
+//! driven through the real binary.
 //!
 //! Each scenario builds a Git repository with the layout the verifier reads
 //! (`runtime-packages/<p>/`, `compat/<p>/` with a lock, an npm lock and a
@@ -7,20 +8,21 @@
 //! owner-private signing key (`catalog public-key`, `catalog anchor`), the
 //! package archives (`package build`), hand-written attestations and the
 //! signed catalog (`catalog build`, `catalog sign`). The scenario then changes
-//! one input and runs `package baseline --json` in the repository.
+//! one input and runs `package baseline --json` or `package bump --json` in
+//! the repository.
 //!
 //! Expected verdicts are written out from the verification rules, never
 //! computed by the code under test. A verified digest is the SHA-256 of the
 //! published archive file, hashed here.
 
-// Rust guideline compliant 2026-10-12
+// Rust guideline compliant 2026-10-13
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{ExitStatus, Output};
 
 use pohunek_test_support::env::TestEnv;
 use serde_json::{json, Value};
@@ -514,12 +516,33 @@ impl Fixture {
         self.baseline_for(VERSION)
     }
 
+    /// Runs `package bump --json` for [`VERSION`]; returns the exit status and
+    /// the one-line report on stdout, which the command prints before it fails.
+    fn bump(&self) -> (ExitStatus, Value) {
+        self.bump_for(VERSION)
+    }
+
+    fn bump_for(&self, version: &str) -> (ExitStatus, Value) {
+        let output = self.verify_output("bump", version, true);
+        let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+        assert_eq!(stdout.lines().count(), 1, "one JSON line: {stdout:?}");
+        (
+            output.status,
+            serde_json::from_str(&stdout).expect("gate JSON"),
+        )
+    }
+
     fn baseline_output(&self, version: &str, json: bool) -> Output {
+        self.verify_output("baseline", version, json)
+    }
+
+    /// Runs the `package` subcommand `action` against the published release.
+    fn verify_output(&self, action: &str, version: &str, json: bool) -> Output {
         let catalog = self.catalog();
         let release_dir = self.release_dir();
         let mut args: Vec<&dyn AsRef<std::ffi::OsStr>> = vec![
             &"package",
-            &"baseline",
+            &action,
             &"--catalog",
             &catalog,
             &"--anchor",
@@ -1075,5 +1098,187 @@ fn an_ignored_file_in_a_compatibility_directory_is_missing() {
                 ("pi", missing("changed_since_release")),
             ]
         )
+    );
+}
+
+/// A gate verdict for one package, as `package bump --json` prints it.
+fn gate(verdict: &str, reason: Option<&str>) -> Value {
+    json!({ "verdict": verdict, "reason": reason })
+}
+
+/// The bump report of the fixture release with the overall `verdict`.
+fn gate_report(verdict: &str, packages: &[(&str, Value)]) -> Value {
+    let mut report = verdicts(VERSION, packages);
+    report["verdict"] = json!(verdict);
+    report
+}
+
+#[test]
+fn an_unchanged_checkout_passes_the_bump_gate() {
+    let fixture = Fixture::new();
+    let (status, actual) = fixture.bump();
+    assert!(status.success(), "{status}");
+    assert_eq!(
+        actual,
+        gate_report("pass", &PACKAGES.map(|name| (name, gate("pass", None))),)
+    );
+}
+
+#[test]
+fn a_changed_package_with_a_bumped_version_passes_the_bump_gate() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "runtime-packages/codex/runtime.toml",
+        &format!("{}# edited\n", descriptor("codex", "1.0.1")),
+    );
+    fixture.commit("edit codex and bump its version");
+    let (status, actual) = fixture.bump();
+    assert!(status.success(), "{status}");
+    assert_eq!(
+        actual,
+        gate_report("pass", &PACKAGES.map(|name| (name, gate("pass", None))),)
+    );
+}
+
+#[test]
+fn a_changed_package_without_a_version_bump_fails_the_bump_gate() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "runtime-packages/codex/runtime.toml",
+        &format!("{}# edited\n", descriptor("codex", "1.0.0")),
+    );
+    fixture.commit("edit codex without a version bump");
+    let (status, actual) = fixture.bump();
+    assert_eq!(status.code(), Some(XTASK_FAILURE));
+    assert_eq!(
+        actual,
+        gate_report(
+            "fail",
+            &[
+                ("claude", gate("pass", None)),
+                ("codex", gate("fail", Some("version_not_bumped"))),
+                ("pi", gate("pass", None)),
+            ],
+        )
+    );
+}
+
+#[test]
+fn a_changed_package_below_the_released_version_fails_the_bump_gate() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "runtime-packages/codex/runtime.toml",
+        &format!("{}# edited\n", descriptor("codex", "0.9.9")),
+    );
+    fixture.commit("edit codex and lower its version");
+    let (status, actual) = fixture.bump();
+    assert_eq!(status.code(), Some(XTASK_FAILURE));
+    assert_eq!(
+        actual,
+        gate_report(
+            "fail",
+            &[
+                ("claude", gate("pass", None)),
+                ("codex", gate("fail", Some("version_not_bumped"))),
+                ("pi", gate("pass", None)),
+            ],
+        )
+    );
+}
+
+#[test]
+fn a_package_new_to_the_release_passes_the_bump_gate() {
+    let fixture = Fixture::new();
+    fixture.add_package("hermes");
+    fixture.commit("add hermes");
+    let (status, actual) = fixture.bump();
+    assert!(status.success(), "{status}");
+    assert_eq!(
+        actual,
+        gate_report(
+            "pass",
+            &[
+                ("claude", gate("pass", None)),
+                ("codex", gate("pass", None)),
+                ("hermes", gate("pass", None)),
+                ("pi", gate("pass", None)),
+            ],
+        )
+    );
+}
+
+#[test]
+fn an_absent_catalog_leaves_the_bump_gate_undecided() {
+    let fixture = Fixture::new();
+    std::fs::remove_file(fixture.catalog()).expect("remove catalog");
+    let (status, actual) = fixture.bump();
+    assert!(status.success(), "{status}");
+    assert_eq!(
+        actual,
+        gate_report(
+            "undecided",
+            &PACKAGES.map(|name| (name, gate("undecided", Some("catalog_absent")))),
+        )
+    );
+}
+
+#[test]
+fn a_catalog_that_does_not_verify_fails_the_bump_gate() {
+    let fixture = Fixture::new();
+    let other = fixture.new_key("other");
+    fixture.write_anchor(&other.public, 1, WINDOW_END);
+    let (status, actual) = fixture.bump();
+    assert_eq!(status.code(), Some(XTASK_FAILURE));
+    assert_eq!(
+        actual,
+        gate_report(
+            "fail",
+            &PACKAGES.map(|name| (name, gate("fail", Some("catalog_unverified")))),
+        )
+    );
+}
+
+#[test]
+fn a_catalog_of_another_release_fails_the_bump_gate() {
+    let fixture = Fixture::new();
+    let (status, actual) = fixture.bump_for("1.2.4");
+    assert_eq!(status.code(), Some(XTASK_FAILURE));
+    assert_eq!(
+        actual["packages"]["codex"],
+        gate("fail", Some("release_mismatch"))
+    );
+    assert_eq!(actual["verdict"], json!("fail"));
+}
+
+/// Build metadata does not raise semver precedence, so it is no bump.
+#[test]
+fn a_changed_package_with_only_build_metadata_added_fails_the_bump_gate() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "runtime-packages/codex/runtime.toml",
+        &format!("{}# edited\n", descriptor("codex", "1.0.0+build.1")),
+    );
+    fixture.commit("edit codex and add build metadata to its version");
+    let (status, actual) = fixture.bump();
+    assert_eq!(status.code(), Some(XTASK_FAILURE));
+    assert_eq!(
+        actual["packages"]["codex"],
+        gate("fail", Some("version_not_bumped"))
+    );
+}
+
+#[test]
+fn a_changed_package_with_a_version_that_is_not_semver_fails_the_bump_gate() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "runtime-packages/codex/runtime.toml",
+        &format!("{}# edited\n", descriptor("codex", "1.1")),
+    );
+    fixture.commit("edit codex and use a two-part version");
+    let (status, actual) = fixture.bump();
+    assert_eq!(status.code(), Some(XTASK_FAILURE));
+    assert_eq!(
+        actual["packages"]["codex"],
+        gate("fail", Some("version_not_bumped"))
     );
 }

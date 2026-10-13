@@ -100,6 +100,12 @@ env:
   # seconds; two minutes leaves room for slow requests and larger packages. A
   # download that runs out of time counts as failed: every package job runs.
   PACKAGE_BASELINE_FETCH_TIMEOUT: 120s
+  # Releases listed by `package-version-bump` to find the last released
+  # version at or below the workspace version. `gh release list` returns the
+  # newest releases first, and the wanted release is the newest one at or
+  # below the workspace version; 200 is far more releases than are published
+  # between two workspace version bumps.
+  PACKAGE_BUMP_RELEASE_LIMIT: 200
 
 jobs:
   platform-contracts:
@@ -1690,6 +1696,134 @@ jobs:
               echo "${package}_baseline_digest=$digest"
             done
           } >> "$GITHUB_OUTPUT"
+
+  # Version gate of the official packages (issue #894). `cargo xtask package
+  # bump` fails a pull request that changes a package's archive without a
+  # version above the released versions of that runtime. It compares against
+  # the last published release at or below the workspace version, not the
+  # workspace version itself, so the gate keeps working while a release is
+  # being prepared. A violation or an unverifiable catalog fails the job. A
+  # release that cannot be listed or downloaded only leaves the gate undecided,
+  # with a warning: an outage must not block every pull request, and a catalog
+  # that is present is never accepted without its verification. No package job
+  # needs this job.
+  package-version-bump:
+    name: package version bump
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: read
+    env:
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The release commit of the baseline has to be in the history.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install mold linker
+        uses: ./.github/actions/setup-mold
+        with:
+          version: ${{ env.MOLD_VERSION }}
+          sha256: ${{ env.MOLD_SHA256 }}
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: xtask
+          save-if: false
+
+      # The version script is checkout code, so this step runs without the token.
+      # A standalone assignment fails the step when the script fails; inside
+      # `echo` the failure would leave an empty version and skip the gate.
+      - name: Read the workspace version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(scripts/release-workflow/version rehearsal "")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # The last published release at or below the workspace version: the
+      # highest `vX.Y.Z` tag among the listed non-draft, non-pre-release
+      # releases whose version does not exceed the workspace version. Empty
+      # when there is none or the listing fails. This step runs only `gh` and
+      # system tools, never checkout code, with the run's read-only token.
+      - name: Select the last released version
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if ! tags="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases \
+            --limit "$PACKAGE_BUMP_RELEASE_LIMIT" --json tagName --jq '.[].tagName')"; then
+            echo "::warning::the releases of $GITHUB_REPOSITORY could not be listed; the version bump gate is undecided"
+            tags=""
+          fi
+          released=""
+          while IFS= read -r tag; do
+            [[ "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]] || continue
+            candidate="${BASH_REMATCH[1]}"
+            # `sort -V` keeps the candidate at or below the workspace version
+            # only when it sorts last of the two (equal versions included).
+            [ "$(printf '%s\n%s\n' "$candidate" "$VERSION" | sort -V | tail -n 1)" = "$VERSION" ] || continue
+            if [ -z "$released" ] || [ "$(printf '%s\n%s\n' "$released" "$candidate" | sort -V | tail -n 1)" = "$candidate" ]; then
+              released="$candidate"
+            fi
+          done <<< "$tags"
+          echo "version=$released" >> "$GITHUB_OUTPUT"
+
+      # The catalog of the released version, the only release file the gate
+      # reads: a changed package is judged by the catalog's entries, and an
+      # unchanged one passes whatever its archive says. A download that fails
+      # or exceeds PACKAGE_BASELINE_FETCH_TIMEOUT leaves the directory empty,
+      # which the gate reports as undecided; the download never fails the job.
+      - name: Fetch the released baseline
+        id: fetch
+        if: ${{ steps.release.outputs.version != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/package-bump-baseline"
+          mkdir -p "$dir"
+          if ! timeout "$PACKAGE_BASELINE_FETCH_TIMEOUT" gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" --dir "$dir" \
+            --pattern runtime-catalog.json; then
+            echo "::warning::release v$VERSION catalog could not be downloaded within $PACKAGE_BASELINE_FETCH_TIMEOUT; the version bump gate is undecided"
+            rm -rf "$dir"
+            mkdir -p "$dir"
+          fi
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      # Checkout code runs here, without the token. The command exits non-zero
+      # for a failing package, for a catalog that does not verify and for an
+      # unreadable checkout; an absent catalog exits 0 with the `undecided`
+      # verdict, which is reported as a warning.
+      - name: Check the version bump
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_DIR: ${{ steps.fetch.outputs.dir }}
+        run: |
+          set -euo pipefail
+          if [ -z "$VERSION" ]; then
+            echo "::warning::no published release at or below the workspace version; the version bump gate is undecided"
+            exit 0
+          fi
+          cargo xtask package bump --catalog "$RELEASE_DIR/runtime-catalog.json" \
+            --anchor packaging/runtime-catalog-anchor.json --release-dir "$RELEASE_DIR" \
+            --version "$VERSION" --json > "$RUNNER_TEMP/package-bump.json"
+          if [ "$(jq -r '.verdict' "$RUNNER_TEMP/package-bump.json")" = undecided ]; then
+            echo "::warning::the catalog of release v$VERSION is absent; the version bump gate is undecided"
+          fi
 
   # Official Pi runtime package against the real, locked Pi release. The job
   # installs the npm tree pinned by `compat/pi/npm/package-lock.json`,

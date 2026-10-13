@@ -88,6 +88,7 @@ cargo xtask package build <dir> -o <archive.tar.zst> [--evidence-dir <D>]
 cargo xtask package verify <dir>
 cargo xtask package affected [--base REF] [--json]
 cargo xtask package baseline --catalog FILE --anchor FILE --release-dir DIR --version X.Y.Z [--json]
+cargo xtask package bump --catalog FILE --anchor FILE --release-dir DIR --version X.Y.Z [--json]
 ```
 
 `build` writes the canonical archive of a package directory (regular files
@@ -214,8 +215,21 @@ prints one object on stdout and the human report on stderr:
 
 `digest` is the verified baseline digest (`null` when missing).
 `version_not_bumped` is `true` when the catalog lists another digest of the
-runtime under the version the checkout's `runtime.toml` declares: the content
-changed without a version bump. It is reported, not refused.
+runtime and the version the checkout's `runtime.toml` declares is not strictly
+above every released version of that runtime (semver; a version that is not
+semver proves no bump): the content changed without a version bump, or with a
+lower version. `baseline` reports it and does not refuse; the bump gate below
+refuses it.
+
+`cargo xtask package bump` takes the same verdicts and decides each package:
+`fail` with `version_not_bumped`; `pass` for a verified package, a package new
+to the release (no released entry of its runtime) and a package whose archive
+equals a released one; `undecided` when the catalog file is absent (the
+download failed). A catalog that is present but does not verify against the
+anchor now, or names another release or sequence, fails with its catalog
+reason. The overall `verdict` is the most severe package decision (`fail`,
+then `undecided`, then `pass`). The command exits 2 only for `fail`; `--json`
+prints the decisions on stdout.
 
 A verified baseline proves the package inputs only. The attestations bind the
 release's own binary sets, not the candidate core, so a baseline never replaces
@@ -231,6 +245,17 @@ selector, which runs every package job. The selector also passes each verified
 digest to the package job, which requires its rebuilt archive to hash to it: a
 difference is a non-reproducible build and fails the job. Release and
 rehearsal workflows never run `baseline`; a tag builds and tests every package.
+
+The `package version bump` job of `ci.yml` runs `bump` on pull requests. It
+compares with the highest published release `vX.Y.Z` (non-draft,
+non-pre-release, listed by `gh release list`) whose version does not exceed the
+workspace version, so a workspace version that is being prepared still compares
+with the release that shipped. The job warns and leaves the gate undecided when
+no such release is listed, when its `runtime-catalog.json` cannot be downloaded
+within `PACKAGE_BASELINE_FETCH_TIMEOUT`, or when the catalog is absent; it fails
+on a `fail` verdict. It downloads only the catalog: a changed package is judged
+by the catalog's entries, and an unchanged one passes. An empty download
+directory is `undecided`, never `pass`.
 
 ## Install and verify a package root
 

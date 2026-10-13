@@ -585,7 +585,8 @@ The per-pull-request package job in `ci.yml` needs the runtime in the
 `<runtime>_baseline_digest`, a "Match the release baseline" step after its
 evidence upload, and an entry in `PACKAGE_JOBS` of
 `scripts/tests/test_ci_tiers.py`, which fails until every `runtime-packages/`
-directory has all of them.
+directory has all of them. The `package-version-bump` job needs nothing per
+runtime: it checks every official package against the last published release.
 
 The structure of the workflows (one writer, the OIDC jobs, the secret, pinned
 actions, asset names against the policy) is pinned by
