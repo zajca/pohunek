@@ -1005,7 +1005,15 @@ processes the latest accepted claim, in arrival order at the worker, is the
 active identity, and the worker's imported active claim carries that process's
 own sequence, which can be lower than the previous import's. The launch
 process's native reference is ordered only by reports naming the launch
-process. The sequence contract of a worker
+process. A release answered `ok: false` because its process is not the active
+identity still orders that process's later-delivered claims. The worker
+remembers the sequence of every live reporting process and never evicts one:
+the mark of a process that exited, or whose pid now names another start
+identity, is pruned when room is needed, and the PTY root and the launch
+process are always kept. When live reporting processes besides those two fill
+the worker's bound (16), a report from a further process is refused
+(`ok: false`, logged as `worker.identity.rejected` with reason
+`identity_reporters_exhausted`) until one of them exits. The sequence contract of a worker
 claim is therefore a value strictly increasing across every hook event that
 reports the same process. Every hook event runs its own short-lived
 interpreter, so the shipped Codex and Claude hooks read the host's system-wide

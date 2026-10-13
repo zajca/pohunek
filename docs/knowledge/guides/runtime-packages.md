@@ -154,7 +154,12 @@ kernel start identity): a claim or release must carry a sequence newer than
 every claim and release the worker accepted for that same process. Reports of
 different processes are never compared, so a nested agent's claim, even at
 `u64::MAX`, never makes the launch agent's later claim stale; the latest
-accepted claim is the active identity. A claim's sequence must therefore be
+accepted claim is the active identity. A release answered `ok: false` because
+its process is not active still orders that process's later claims. The worker
+keeps every live reporter's sequence and never evicts it; when live reporting
+processes other than the PTY root and the launch process fill its bound (16), a
+further process's report is refused with reason
+`identity_reporters_exhausted` until one of them exits. A claim's sequence must therefore be
 strictly increasing across every hook event that reports the same process. The
 core Codex and Claude hooks run a short-lived interpreter per event, so they
 read the host's system-wide monotonic clock in nanoseconds (`CLOCK_MONOTONIC`)

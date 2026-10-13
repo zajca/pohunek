@@ -43,6 +43,16 @@ pub(crate) const DEFAULT_MAX_SNAPSHOT_BYTES: usize = DEFAULT_CONTROL_LINE_BYTES;
 const DEFAULT_LAUNCH_CLAIM_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// Bounds deferred claims from concurrent provider descendants.
 const DEFAULT_PENDING_LAUNCH_CLAIMS: usize = 16;
+/// Default bound on the live processes, besides the PTY root and the launch
+/// process, whose identity sequence the worker remembers.
+///
+/// A session meets a handful of agent processes (a main agent, its restarts,
+/// agents nested in it). Each mark is a few dozen bytes. Exceeding the bound
+/// refuses identity reports from further live processes until one exits, so
+/// it must stay well above a session's real nesting.
+const DEFAULT_IDENTITY_REPORTERS: usize = 16;
+/// Hard cap on remembered identity reporters, matching the launch-claim cap.
+const MAX_IDENTITY_REPORTERS: usize = 64;
 /// Default ceiling for one forwarded daemon notification exchange.
 ///
 /// Hooks wait on the worker, so the bound keeps a stalled daemon from holding
@@ -155,6 +165,9 @@ pub struct WorkerConfig {
     pub launch_claim_retry_interval: Duration,
     /// Maximum retained unverified launch claims.
     pub pending_launch_claims: usize,
+    /// Maximum live reporting processes, besides the PTY root and the launch
+    /// process, whose identity sequence is remembered.
+    pub identity_reporters: usize,
     /// Maximum time one notification forwarded to the daemon may take.
     pub notification_forward_timeout: Duration,
     /// Maximum serialized size of one forwarded notification's parameters.
@@ -184,6 +197,7 @@ impl WorkerConfig {
             max_snapshot_bytes: DEFAULT_MAX_SNAPSHOT_BYTES,
             launch_claim_retry_interval: DEFAULT_LAUNCH_CLAIM_RETRY_INTERVAL,
             pending_launch_claims: DEFAULT_PENDING_LAUNCH_CLAIMS,
+            identity_reporters: DEFAULT_IDENTITY_REPORTERS,
             notification_forward_timeout: DEFAULT_NOTIFICATION_FORWARD_TIMEOUT,
             max_notification_params_bytes: DEFAULT_MAX_NOTIFICATION_PARAMS_BYTES,
         }
@@ -203,6 +217,11 @@ impl WorkerConfig {
             "pending_launch_claims",
             self.pending_launch_claims,
             MAX_PENDING_LAUNCH_CLAIMS,
+        )?;
+        validate_count(
+            "identity_reporters",
+            self.identity_reporters,
+            MAX_IDENTITY_REPORTERS,
         )?;
         validate_duration("initialize_deadline", self.initialize_deadline)?;
         validate_bytes("history_bytes", self.history_bytes, MAX_HISTORY_BYTES)?;

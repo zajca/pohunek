@@ -136,6 +136,14 @@
   `sequence = u64::MAX`, no longer makes the launch root's later reports stale,
   so the root still establishes the launch identity and updates its native
   reference. Across processes the latest accepted claim is the active identity.
+- The worker keeps the sequence of every live reporting process and never
+  evicts it, so a released process cannot become active again through its own
+  older claim delivered late. Marks of exited processes are pruned when room is
+  needed; the PTY root and the launch process are always kept. When live
+  reporters besides those two fill the bound (16), a further process's report
+  is refused with the new reason `identity_reporters_exhausted` until one
+  exits. A release answered `ok: false` still orders its process's later
+  claims.
 - `docs/public-api.md`, the runtime packages guide and the sessions concept
   state the per-process order; the sequence contract is a value strictly
   increasing across every hook event that reports the same process.

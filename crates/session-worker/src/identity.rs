@@ -48,7 +48,7 @@
 //!
 //! [`crate::LeaseOwner`]: crate::LeaseOwner
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-13
 
 use pohunek_platform::peer;
 use pohunek_platform::process::{
@@ -96,6 +96,9 @@ pub enum RejectReason {
     ClaimExpired,
     /// The claim's sequence is not ahead of the recorded ordering.
     SequenceStale,
+    /// The reporting process has no identity mark, and the marks of live
+    /// reporting processes already fill the worker's bound.
+    IdentityReportersExhausted,
     /// The subagent claim carries identifiers outside the accepted shape.
     SubagentClaimInvalid,
     /// The notification claim is not a bounded JSON object.
@@ -122,6 +125,7 @@ impl RejectReason {
             Self::PhaseNotRunning => "phase_not_running",
             Self::ClaimExpired => "claim_expired",
             Self::SequenceStale => "sequence_stale",
+            Self::IdentityReportersExhausted => "identity_reporters_exhausted",
             Self::SubagentClaimInvalid => "subagent_claim_invalid",
             Self::NotificationInvalid => "notification_invalid",
         }
@@ -315,6 +319,7 @@ mod tests {
             RejectReason::PhaseNotRunning,
             RejectReason::ClaimExpired,
             RejectReason::SequenceStale,
+            RejectReason::IdentityReportersExhausted,
             RejectReason::SubagentClaimInvalid,
             RejectReason::NotificationInvalid,
         ]

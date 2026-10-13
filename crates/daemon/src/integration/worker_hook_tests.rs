@@ -6078,4 +6078,262 @@ with open(gate_path, encoding="ascii") as gate:
         let reporter = start_named_root(&root, OWN_SEQUENCE_REPORTER, &["claude".to_owned()]).await;
         assert_own_sequence_never_starves_the_root(reporter).await;
     }
+
+    /// Launch root that drives live descendant reporters, each a forked
+    /// process that stays alive and reports its own process as a nested Claude
+    /// agent on command.
+    ///
+    /// Arguments after the gate and results paths: the scenario (`late_claim`
+    /// or `full_table`) and the worker's identity-reporter bound. The root
+    /// reports as Hermes, stamped from `CLOCK_MONOTONIC`. Each report appends
+    /// `{"step", "response"}` to the results file; the reporter waits for one
+    /// gate line before it exits.
+    const LIVE_REPORTERS: &str = r#"
+import datetime
+import json
+import os
+import socket
+import sys
+import time
+
+gate_path, results_path, scenario, bound = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+failure_path = results_path + ".failure"
+
+def record_failure(kind, value, trace):
+    # The test reads this file, so the reporter never dies without a reason.
+    import traceback
+    with open(failure_path, "w", encoding="utf-8") as handle:
+        handle.write("".join(traceback.format_exception(kind, value, trace)))
+
+sys.excepthook = record_failure
+
+def start_identity(pid):
+    with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
+        return int(handle.read().rsplit(")", 1)[1].split()[19])
+
+def send(step, request):
+    pid = os.getpid()
+    request = {
+        "runtime_id": os.environ["POHUNEK_WORKER_INSTANCE_ID"],
+        "pid": pid,
+        "start_identity": start_identity(pid),
+        **request,
+    }
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(os.environ["POHUNEK_WORKER_SOCKET_PATH"])
+    client.sendall((json.dumps(request) + "\n").encode())
+    received = b""
+    while b"\n" not in received:
+        chunk = client.recv(4096)
+        if not chunk:
+            raise RuntimeError(f"worker closed the socket before a full response line: {received!r}")
+        received += chunk
+    client.close()
+    response = json.loads(received.split(b"\n", 1)[0])
+    with open(results_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"step": step, "response": response}) + "\n")
+
+def report(step, provider, sequence):
+    expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=30)
+    send(step, {
+        "type": "identity_report",
+        "provider": provider,
+        "sequence": sequence,
+        "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
+        "reference_kind": "id",
+        "native_reference": step.replace("_", "-"),
+    })
+
+def release(step, provider, sequence):
+    send(step, {"type": "identity_release", "provider": provider, "sequence": sequence})
+
+class Live:
+    """A forked descendant that stays alive and reports itself on command."""
+
+    def __init__(self):
+        commands_read, commands_write = os.pipe()
+        acks_read, acks_write = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(commands_write)
+            os.close(acks_read)
+            commands = os.fdopen(commands_read, "r", encoding="ascii")
+            acks = os.fdopen(acks_write, "w", encoding="ascii")
+            try:
+                for line in commands:
+                    kind, step, sequence = line.split()
+                    if kind == "exit":
+                        break
+                    (report if kind == "report" else release)(step, "claude", int(sequence))
+                    acks.write("ok\n")
+                    acks.flush()
+            except BaseException:
+                record_failure(*sys.exc_info())
+                os._exit(1)
+            os._exit(0)
+        os.close(commands_read)
+        os.close(acks_write)
+        self.pid = pid
+        self.commands = os.fdopen(commands_write, "w", encoding="ascii")
+        self.acks = os.fdopen(acks_read, "r", encoding="ascii")
+
+    def run(self, kind, step, sequence):
+        self.commands.write(f"{kind} {step} {sequence}\n")
+        self.commands.flush()
+        if self.acks.readline() != "ok\n":
+            raise RuntimeError(f"live reporter step {step} failed")
+
+    def exit(self):
+        # An explicit command, because later forks hold this pipe open too.
+        self.commands.write("exit - 0\n")
+        self.commands.flush()
+        _, status = os.waitpid(self.pid, 0)
+        if os.waitstatus_to_exitcode(status) != 0:
+            raise RuntimeError("live reporter failed")
+
+def from_root(step):
+    report(step, "hermes", time.clock_gettime_ns(time.CLOCK_MONOTONIC))
+
+live = []
+from_root("root_first")
+if scenario == "late_claim":
+    released = Live()
+    live.append(released)
+    released.run("report", "released_claim", 100)
+    released.run("release", "released_release", 110)
+    other = Live()
+    live.append(other)
+    other.run("report", "other_claim", 200)
+    for index in range(bound):
+        filler = Live()
+        live.append(filler)
+        filler.run("report", f"filler_{index}", 300)
+    released.run("report", "released_late", 105)
+elif scenario == "full_table":
+    for index in range(bound):
+        filler = Live()
+        live.append(filler)
+        filler.run("report", f"filler_{index}", 300)
+    extra = Live()
+    live.append(extra)
+    extra.run("report", "extra_refused", 300)
+    from_root("root_update")
+    live.pop(0).exit()
+    extra.run("report", "extra_after_exit", 301)
+else:
+    raise RuntimeError(f"unknown scenario {scenario}")
+with open(gate_path, encoding="ascii") as gate:
+    gate.readline()
+for process in live:
+    process.exit()
+"#;
+
+    /// A released process that is still alive cannot become active again
+    /// through its own older claim delivered late, however many other
+    /// processes report in between: the worker keeps a live process's
+    /// sequence instead of evicting it, so the late claim is stale.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_released_process_stays_released_under_reporter_pressure() {
+        let root = crate::test_support::scoped_dir("ph-live-released-");
+        let bound = WorkerConfig::new().identity_reporters;
+        let FrozenRoot {
+            worker,
+            task,
+            mut gate,
+            results,
+            ..
+        } = start_frozen_root(
+            &root,
+            LIVE_REPORTERS,
+            &["late_claim".to_owned(), bound.to_string()],
+        )
+        .await;
+
+        let responses = frozen_root_responses(&results, bound + 5).await;
+        for step in [
+            "root_first",
+            "released_claim",
+            "released_release",
+            "other_claim",
+        ] {
+            assert_eq!(responses[step]["ok"], json!(true), "{step}: {responses:?}");
+        }
+        assert_eq!(
+            responses["released_late"]["ok"],
+            json!(false),
+            "the released process's older claim is stale: {responses:?}"
+        );
+        let snapshot = worker.inspect().await.expect("inspect");
+        assert_ne!(
+            snapshot
+                .active_identity
+                .and_then(|active| active.native_reference),
+            Some("released-late".to_owned()),
+            "the released process is not active again"
+        );
+
+        std::io::Write::write_all(&mut gate, b"done\n").expect("release the reporter");
+        worker
+            .stop(TransactionId::new("transaction-live-released-stop").expect("transaction id"))
+            .await
+            .expect("stop the PTY");
+        drop(worker);
+        task.abort();
+    }
+
+    /// When live reporting processes fill the worker's bound, a report from a
+    /// further process is refused while the launch root's reports are still
+    /// accepted, and room returns once a reporter exits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_full_reporter_table_refuses_a_new_process_but_never_the_root() {
+        let root = crate::test_support::scoped_dir("ph-full-reporters-");
+        let bound = WorkerConfig::new().identity_reporters;
+        let FrozenRoot {
+            worker,
+            task,
+            mut gate,
+            results,
+            ..
+        } = start_frozen_root(
+            &root,
+            LIVE_REPORTERS,
+            &["full_table".to_owned(), bound.to_string()],
+        )
+        .await;
+
+        let responses = frozen_root_responses(&results, bound + 4).await;
+        for index in 0..bound {
+            assert_eq!(
+                responses[&format!("filler_{index}")]["ok"],
+                json!(true),
+                "{responses:?}"
+            );
+        }
+        assert_eq!(
+            responses["extra_refused"]["ok"],
+            json!(false),
+            "a further live process is refused at the bound: {responses:?}"
+        );
+        assert_eq!(
+            responses["root_update"]["ok"],
+            json!(true),
+            "the root is never refused for the bound: {responses:?}"
+        );
+        assert_eq!(
+            responses["extra_after_exit"]["ok"],
+            json!(true),
+            "an exited reporter's mark makes room: {responses:?}"
+        );
+        let snapshot = worker.inspect().await.expect("inspect");
+        let reference = snapshot.native_reference.expect("the journaled reference");
+        assert_eq!(reference.native_reference, "root-update");
+
+        std::io::Write::write_all(&mut gate, b"done\n").expect("release the reporter");
+        worker
+            .stop(TransactionId::new("transaction-full-reporters-stop").expect("transaction id"))
+            .await
+            .expect("stop the PTY");
+        drop(worker);
+        task.abort();
+    }
 }
