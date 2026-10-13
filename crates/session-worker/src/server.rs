@@ -418,6 +418,7 @@ impl Server {
             timestamp(),
         );
         record.worker_spawn_id = own_spawn_id();
+        record.worker_coalitions = own_coalitions();
         journal.write(&record)?;
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         let (initialized_tx, _) = watch::channel(false);
@@ -6451,6 +6452,38 @@ fn own_spawn_id() -> Option<String> {
                 error.type = "process_inspection",
                 error.message = %error,
                 "worker spawn id could not be read; journaling none: {{error.message}}",
+            );
+            None
+        }
+    }
+}
+
+/// Reads the worker's own kernel coalitions for the journal.
+///
+/// They let a later runtime sweep leave out the processes the host withholds
+/// the environment of when the kernel puts them in other coalitions than the
+/// worker's. Like the spawn id they only speed up cleanup, so a host without
+/// coalitions yields `None` silently and any other read failure yields `None`
+/// with a warning; neither stops the worker from starting.
+fn own_coalitions() -> Option<String> {
+    match HostInspector::new().coalitions(std::process::id()) {
+        Ok(Some(coalitions)) => Some(coalitions.to_string()),
+        Ok(None) => {
+            event!(
+                name: "worker.coalitions.unreadable",
+                Level::WARN,
+                "worker process vanished while reading its coalitions; journaling none",
+            );
+            None
+        }
+        Err(PlatformProcessError::Unavailable { .. }) => None,
+        Err(error) => {
+            event!(
+                name: "worker.coalitions.unreadable",
+                Level::WARN,
+                error.type = "process_inspection",
+                error.message = %error,
+                "worker coalitions could not be read; journaling none: {{error.message}}",
             );
             None
         }

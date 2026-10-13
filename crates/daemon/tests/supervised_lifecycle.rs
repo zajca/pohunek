@@ -422,15 +422,6 @@ async fn crashed_worker_is_lost_swept_and_never_restarted() {
 )]
 async fn stale_refused_socket_without_job_recovers_but_silent_job_stays_conflict() {
     let fixture = Installation::new(Settings::default()).await;
-    // The silent job is a platform shell, whose environment macOS 27 withholds
-    // and which launchd creates as a child of its own. The sweep of the lost
-    // runtime below can prove such a process foreign only by its fork lineage,
-    // which does so only for a process created before the runtime's worker; a
-    // shell started after the worker is one it cannot tell from an orphan of
-    // the runtime. The job therefore starts before any worker of this test.
-    let key = WorkerKey::new("s-4200", "siln2345").expect("silent generation");
-    let logs = backend::worker_logs(&fixture.paths, &fixture.namespace(), &key);
-    let silent_process = start_running(&fixture, &*fixture.workers, logs, &key).await;
     fixture.start_daemon().await;
     let lost = fixture.new_session("lost-after-manager-outage").await.id.0;
     let lost_before = fixture.snapshot(&lost).await;
@@ -484,7 +475,12 @@ async fn stale_refused_socket_without_job_recovers_but_silent_job_stays_conflict
     // A separate record names a real native job with the right generation,
     // but the same refused socket condition. This job may still become a
     // worker, so reconciliation must preserve conflict and must not sweep it.
-    let silent = key.session_id();
+    // The silent job is a platform shell that launchd creates, as a job of its
+    // own, after the lost worker. Its environment is withheld on macOS 27 and
+    // its fork lineage ends at launchd, so only its coalitions tell it from an
+    // orphan of the lost runtime.
+    let silent = "s-4200";
+    let key = WorkerKey::new(silent, "siln2345").expect("silent generation");
     fixture.seed_record(
         silent,
         pohunek_daemon::store::RuntimeRecord {
@@ -507,6 +503,8 @@ async fn stale_refused_socket_without_job_recovers_but_silent_job_stays_conflict
         .expect("private silent worker directory");
     let silent_socket = silent_dir.join(pohunek_paths::WORKER_SOCKET_NAME);
     drop(UnixListener::bind(&silent_socket).expect("bind a stale silent socket"));
+    let logs = backend::worker_logs(&fixture.paths, &fixture.namespace(), &key);
+    let silent_process = start_running(&fixture, &*fixture.workers, logs, &key).await;
 
     fixture.start_daemon().await;
     fixture
@@ -821,6 +819,156 @@ async fn mismatched_evidence_fails_closed_and_a_reused_pid_counts_as_ended() {
     .await;
 }
 
+/// Stand-in jobs of another installation namespace, which launchd creates as
+/// jobs of their own, platform processes among them.
+///
+/// A cycle of the lifecycle scenario starts one after that cycle's workers, so
+/// it is a process created after them that no removal or recovery may take for
+/// the runtime's own, and none may signal.
+///
+/// Only launchd gives a job a creator outside the runtime's lineage. A systemd
+/// stand-in is a `Type=notify` unit that systemd stops at its start timeout
+/// because the stand-in never reports readiness, so other hosts start none.
+struct Bystanders {
+    /// The namespace and supervisor of the stand-in jobs; absent on hosts
+    /// without launchd.
+    jobs: Option<(Namespace, Box<dyn Supervisor>)>,
+    processes: Vec<ProcessIdentity>,
+}
+
+impl Bystanders {
+    async fn new(fixture: &Installation) -> Self {
+        let jobs = if cfg!(target_os = "macos") {
+            let namespace = Namespace::derive(
+                supervised::uid(),
+                &fixture.root.join("bystander-state"),
+                &fixture.root.join("bystander-runtime"),
+            );
+            let supervisor = backend::foreign_workers(&fixture.root, &namespace).await;
+            Some((namespace, supervisor))
+        } else {
+            None
+        };
+        Self {
+            jobs,
+            processes: Vec::new(),
+        }
+    }
+
+    /// Starts round `round`'s running stand-in job.
+    async fn start(&mut self, fixture: &mut Installation, round: usize) {
+        let Some((namespace, jobs)) = &self.jobs else {
+            return;
+        };
+        let key = WorkerKey::new(
+            format!("s-{}", 6000 + round),
+            format!(
+                "byst{}345",
+                char::from(b'a' + u8::try_from(round).expect("small round"))
+            ),
+        )
+        .expect("bystander key");
+        fixture.extra().job(namespace, &key);
+        let logs = backend::foreign_worker_logs(&fixture.root, namespace, &key);
+        self.processes
+            .push(start_running(fixture, &**jobs, logs, &key).await);
+    }
+
+    /// Asserts that every stand-in job started so far still runs; `after`
+    /// names the step that just finished.
+    fn assert_alive(&self, fixture: &Installation, after: &str) {
+        for process in &self.processes {
+            assert!(
+                fixture.is_running(*process),
+                "{after} signalled an unrelated job of another installation"
+            );
+        }
+    }
+}
+
+/// Reason of a proven worker crash whose marker sweep left a process it could not
+/// attribute.
+#[cfg(target_os = "macos")]
+const RUNTIME_LOST_CLEANUP_UNCONFIRMED: &str = "runtime_lost_cleanup_unconfirmed";
+
+/// Agent command whose only descendant is a platform binary that outlives its
+/// creator: the shell that forked it ends with the worker's PTY, so neither the
+/// process's environment (withheld on macOS 27) nor its fork lineage attributes
+/// it, and only its coalitions could.
+#[cfg(target_os = "macos")]
+fn orphaning_agent_script(probe: &std::path::Path) -> String {
+    format!(
+        "p='{}'; s=\"$POHUNEK_SESSION_ID\"; \
+         (trap '' HUP TERM; exec /bin/sleep 100000) & echo $! > \"$p/$s.orphan\"; \
+         while IFS= read -r line; do :; done",
+        supervised::path_string(probe)
+    )
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_orphaned_platform_process_of_the_runtime_is_attributed_by_what_the_host_exposes() {
+    use pohunek_platform::process::{Error, HostInspector, ProcessInspector as _};
+
+    let fixture = Installation::new(Settings::default()).await;
+    let profile = format!(
+        "base = \"shell\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", {}]\n",
+        toml::Value::String(orphaning_agent_script(&fixture.probe))
+    );
+    let profile_path = fixture
+        .paths
+        .config_dir
+        .join("agents")
+        .join(format!("{}.toml", supervised::AGENT));
+    std::fs::write(&profile_path, profile).expect("write the orphaning agent profile");
+    std::fs::set_permissions(&profile_path, std::fs::Permissions::from_mode(0o600))
+        .expect("keep the orphaning agent profile private");
+
+    fixture.start_daemon().await;
+    let session = fixture.new_session("orphaning").await.id.0;
+    let before = fixture.snapshot(&session).await;
+    let pid_file = fixture.probe.join(format!("{session}.orphan"));
+    let orphan_pid = eventually("the orphan's PID file", || async {
+        std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+    })
+    .await;
+    let orphan = fixture.identity(orphan_pid).expect("the orphan runs");
+    // Whether the host withholds the environment of the platform binary,
+    // read from the live orphan itself.
+    let withheld = matches!(
+        HostInspector::new().ownership_markers(orphan_pid),
+        Err(Error::Unobservable { .. } | Error::PermissionDenied { .. })
+    );
+
+    signal(before.worker.pid, Signal::SIGKILL);
+    fixture.wait_gone(before.worker, "crashed worker").await;
+    if withheld {
+        // The orphan shares the worker's coalitions, so no coalition evidence
+        // dismisses it, and nothing else attributes it: the cleanup stays
+        // unconfirmed and the process is neither signalled nor dismissed.
+        fixture
+            .wait_reason(
+                &session,
+                RuntimeState::Lost,
+                RUNTIME_LOST_CLEANUP_UNCONFIRMED,
+            )
+            .await;
+        assert!(
+            fixture.is_running(orphan),
+            "a process the sweep could not attribute was signalled"
+        );
+    } else {
+        // A host that exposes the environment attributes the orphan by its
+        // marker, so the sweep ends it and the cleanup is confirmed.
+        fixture
+            .wait_reason(&session, RuntimeState::Lost, RUNTIME_LOST)
+            .await;
+        fixture.wait_gone(orphan, "the orphan of the runtime").await;
+    }
+}
+
 /// An unrelated process that takes over a crashed worker's journaled PID.
 struct Decoy(std::process::Child);
 
@@ -949,7 +1097,8 @@ async fn unavailable_manager_kills_nothing_until_it_answers_again() {
     ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"
 )]
 async fn repeated_start_stop_recover_cycles_leave_no_orphans() {
-    let fixture = Installation::new(Settings::default()).await;
+    let mut fixture = Installation::new(Settings::default()).await;
+    let mut bystanders = Bystanders::new(&fixture).await;
     let recovered = "s-5000";
     fixture.install_claude_package().await;
     fixture.seed_record(
@@ -998,6 +1147,8 @@ async fn repeated_start_stop_recover_cycles_leave_no_orphans() {
                 .await;
         }
 
+        bystanders.start(&mut fixture, round).await;
+
         let mut client = fixture.client().await;
         for session in [&stopped, recovered] {
             client
@@ -1021,6 +1172,10 @@ async fn repeated_start_stop_recover_cycles_leave_no_orphans() {
             .wait_gone(snapshots[1].worker, "removed session's worker")
             .await;
         assert_only_current_jobs(&fixture, &namespace, kept.values(), round).await;
+        bystanders.assert_alive(
+            &fixture,
+            &format!("the daemon restart or kill of round {round}"),
+        );
     }
     stays("no orphan job reappears", SETTLED, || async {
         fixture.job_ids().await == sorted_ids(&kept.values().cloned().collect::<Vec<_>>())

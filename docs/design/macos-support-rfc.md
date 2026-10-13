@@ -75,10 +75,16 @@ creation number, a withheld-environment process is:
 - dismissed, and not reported, only when its own number is below the worker's
   or its chain reaches a non-launchd creator older than the worker;
 - otherwise left alone and reported as an unreadable candidate, and the cleanup
-  stays unconfirmed (fail closed): a process created after the worker by
-  launchd, an orphan that re-executed after its creator died, and a process
-  whose creator exited after the worker started and is absent from the
-  process table.
+  stays unconfirmed (fail closed): an orphan that re-executed after its
+  creator died, and a process whose creator exited after the worker started
+  and is absent from the process table;
+- dismissed, and not reported, when its lineage is open and the kernel puts it
+  in a resource coalition and a jetsam coalition (`PROC_PIDCOALITIONINFO`) that
+  both differ from the worker's, as a job launchd started after the worker
+  does. A descendant keeps the worker's coalitions across fork, exec,
+  `setsid` and reparenting, and an unprivileged process cannot move into
+  another job's coalition. Equal or unreadable coalitions prove nothing, and a
+  lineage descendant whose coalitions differ is skipped, never selected.
 
 Under a session-marker requirement a lineage-proven descendant is skipped as
 session-unverified, because its session marker cannot be read. Only a host that
@@ -87,9 +93,10 @@ start-time ordering only. Darwin start identities stay wall-clock tokens that
 do not order process starts, so they play no part in the decision.
 
 The worker journals its creation number as the optional `worker_spawn_id`
-(decimal string). The daemon passes it to the sweep only when it parses and the
-journal's boot identity equals the boot identity the host reports now, because
-creation numbers restart at reboot; several journals of one runtime bound it only
+(decimal string) and its coalitions as the optional `worker_coalitions`
+(`<resource>:<jetsam>` decimals). The daemon passes each to the sweep only when
+it parses and the journal's boot identity equals the boot identity the host
+reports now, because creation and coalition numbers restart at reboot; several journals of one runtime bound it only
 when they agree on the number. Every journal-backed sweep (lost-runtime
 reconciliation, stop and removal) passes it. The sweep of a runtime absent from
 its journal, which requires the removed session's ID in a process's markers,

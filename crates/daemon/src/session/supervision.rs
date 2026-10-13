@@ -15,8 +15,8 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use pohunek_platform::process::{
-    sweep_runtime, HostInspector, ProcessIdentity, ProcessInspector, SkipReason, SpawnId,
-    StartIdentity, SweepReport, SweepRequest,
+    sweep_runtime, HostInspector, ProcessCoalitions, ProcessIdentity, ProcessInspector, SkipReason,
+    SpawnId, StartIdentity, SweepReport, SweepRequest,
 };
 use pohunek_platform::supervisor::{
     Error as SupervisorError, ServiceId, ServiceObservation, WorkerKey,
@@ -223,6 +223,10 @@ pub(super) struct JournalWorker<'a> {
     /// Kernel creation number of the worker process, as recorded; absent when
     /// the worker's host reported no lineage or the journal predates the field.
     pub(super) spawn_id: Option<&'a str>,
+    /// Kernel coalitions of the worker process as `<resource>:<jetsam>`, as
+    /// recorded; absent when the worker's host has none or the journal predates
+    /// the field.
+    pub(super) coalitions: Option<&'a str>,
     /// Runtime (PTY) identifier after initialization; its processes carry it
     /// as their ownership marker.
     pub(super) worker_instance_id: Option<&'a str>,
@@ -244,37 +248,53 @@ impl JournalWorker<'_> {
     /// The facts of this journal that bound which processes the worker's
     /// runtime can own, as the sweep of that runtime consumes them.
     ///
-    /// The start identity is the recorded one when it parses. The spawn id is
-    /// the recorded one only when it parses and the worker recorded it in the
-    /// boot the host reports now: creation numbers restart at every reboot, so
-    /// a number from another boot could coincide with the creator number of an
-    /// unrelated process. A boot the host cannot name counts as another boot.
+    /// The start identity is the recorded one when it parses. The spawn id and
+    /// the coalitions are the recorded ones only when they parse and the worker
+    /// recorded them in the boot the host reports now: the numbers restart at
+    /// every reboot, so one from another boot could coincide with the number of
+    /// an unrelated process. A boot the host cannot name counts as another boot.
     pub(super) fn bounds(&self) -> WorkerBounds {
         let start_identity = self.identity().ok().map(|identity| identity.start_identity);
-        let Some(recorded) = self.spawn_id else {
-            return WorkerBounds {
-                start_identity,
-                spawn_id: None,
-            };
+        let same_boot = || {
+            HostInspector::new()
+                .boot_identity()
+                .is_ok_and(|current| current.as_str() == self.boot_identity)
         };
-        let spawn_id = match recorded.parse::<SpawnId>() {
-            Ok(spawn_id) => Some(spawn_id),
-            Err(error) => {
-                tracing::warn!(
-                    session_id = self.session_id,
-                    worker_id = self.worker_id,
-                    error = %error,
-                    "worker journal spawn id is malformed; the runtime sweep ignores it"
-                );
-                None
+        let spawn_id = self
+            .spawn_id
+            .and_then(|recorded| match recorded.parse::<SpawnId>() {
+                Ok(spawn_id) => Some(spawn_id),
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = self.session_id,
+                        worker_id = self.worker_id,
+                        error = %error,
+                        "worker journal spawn id is malformed; the runtime sweep ignores it"
+                    );
+                    None
+                }
+            });
+        let coalitions = self.coalitions.and_then(|recorded| {
+            match recorded.parse::<ProcessCoalitions>() {
+                Ok(coalitions) => Some(coalitions),
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = self.session_id,
+                        worker_id = self.worker_id,
+                        error = %error,
+                        "worker journal coalitions are malformed; the runtime sweep ignores them"
+                    );
+                    None
+                }
             }
-        };
-        let same_boot = HostInspector::new()
-            .boot_identity()
-            .is_ok_and(|current| current.as_str() == self.boot_identity);
+        });
+        // Creation and coalition numbers restart at every reboot, so only the
+        // ones recorded in the current boot are kept.
+        let same_boot = (spawn_id.is_some() || coalitions.is_some()) && same_boot();
         WorkerBounds {
             start_identity,
             spawn_id: spawn_id.filter(|_| same_boot),
+            coalitions: coalitions.filter(|_| same_boot),
         }
     }
 }
@@ -282,9 +302,9 @@ impl JournalWorker<'_> {
 /// What a lost worker's journal proves about the processes of its runtime.
 ///
 /// Each field is absent when the journal lacks it, cannot be interpreted, or
-/// (for the spawn id) was recorded in another boot. An absent field proves
-/// nothing, and the sweep then treats every process whose ownership markers
-/// it cannot read as possibly the runtime's.
+/// (for the spawn id and the coalitions) was recorded in another boot. An
+/// absent field proves nothing, and the sweep then treats every process whose
+/// ownership markers it cannot read as possibly the runtime's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) struct WorkerBounds {
     /// Start identity of the worker process instance. A same-user process
@@ -295,6 +315,10 @@ pub(super) struct WorkerBounds {
     /// sweep prove membership or exclusion of an unreadable-marker process by
     /// fork lineage, on hosts that report one.
     pub(super) spawn_id: Option<SpawnId>,
+    /// Kernel coalitions of the worker in the current boot. They let the sweep
+    /// prove that an unreadable-marker process whose lineage is open is not a
+    /// descendant, on hosts that report coalitions.
+    pub(super) coalitions: Option<ProcessCoalitions>,
 }
 
 impl WorkerBounds {
@@ -302,6 +326,7 @@ impl WorkerBounds {
     pub(super) const NONE: Self = Self {
         start_identity: None,
         spawn_id: None,
+        coalitions: None,
     };
 
     /// Keeps each bound only when `other` carries the same one.
@@ -314,6 +339,9 @@ impl WorkerBounds {
                 .start_identity
                 .filter(|start| other.start_identity == Some(*start)),
             spawn_id: self.spawn_id.filter(|spawn| other.spawn_id == Some(*spawn)),
+            coalitions: self
+                .coalitions
+                .filter(|coalitions| other.coalitions == Some(*coalitions)),
         }
     }
 }
@@ -528,7 +556,8 @@ fn sweep_request(
         Ok(request) => request
             .with_runtime_session(session_id)
             .with_worker_start_identity(bounds.start_identity)
-            .with_worker_spawn_id(bounds.spawn_id),
+            .with_worker_spawn_id(bounds.spawn_id)
+            .with_worker_coalitions(bounds.coalitions),
         Err(error) => {
             tracing::warn!(session_id, worker_instance_id, error = %error, "lost runtime cannot be swept");
             return None;

@@ -647,7 +647,10 @@ states the contract and then the current state.
   optional journal field `worker_spawn_id` (the worker's kernel creation number,
   decimal string) is additive and needs no schema bump; the journal of a worker
   started by the previous release lacks it, and the runtime sweep then has no
-  fork-lineage proof for processes whose environment the kernel withholds.
+  fork-lineage proof for processes whose environment the kernel withholds. The
+  optional field `worker_coalitions` (the worker's kernel resource and jetsam
+  coalitions, `<resource>:<jetsam>` decimals) is additive in the same way; its
+  absence leaves those processes decided by lineage alone.
 - **Public-protocol clients.** The contract: a protocol change keeps the
   previous version served through adapters, so the advertised range is
   `MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION` with a minimum below the maximum.

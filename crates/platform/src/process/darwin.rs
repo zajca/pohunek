@@ -11,7 +11,7 @@
 //! `PRIV_GLOBAL_PROC_INFO` privilege that only root holds, and such a refusal is
 //! reported as a denial rather than as absence.
 
-// Rust guideline compliant 2026-10-10
+// Rust guideline compliant 2026-10-12
 
 use std::io;
 use std::os::fd::AsFd;
@@ -25,8 +25,8 @@ use super::darwin_layout::{
     ArgumentRegion, LayoutError,
 };
 use super::{
-    BootIdentity, Error, ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessIdentity,
-    ProcessInspector, ProcessLineage, SpawnId, StartIdentity,
+    BootIdentity, CoalitionId, Error, ExitWatch, OwnershipMarkers, Pid, ProcessCoalitions,
+    ProcessFact, ProcessIdentity, ProcessInspector, ProcessLineage, SpawnId, StartIdentity,
 };
 
 /// Bounds consecutive empty kqueue drains after a readiness notification.
@@ -85,6 +85,10 @@ impl ProcessInspector for DarwinInspector {
 
     fn lineage(&self, pid: Pid) -> Result<Option<ProcessLineage>, Error> {
         read_lineage(pid, native::effective_uid(), "inspect_process_lineage")
+    }
+
+    fn coalitions(&self, pid: Pid) -> Result<Option<ProcessCoalitions>, Error> {
+        read_coalitions(pid, native::effective_uid(), "inspect_process_coalitions")
     }
 
     fn parent_pid(&self, pid: Pid) -> Result<Option<Pid>, Error> {
@@ -368,6 +372,45 @@ fn read_lineage(
     }))
 }
 
+/// Reads the coalitions of one process, bracketed by its start identity.
+///
+/// The record is served only if the process still has the identity it had
+/// before the read, so it describes one process and never a process that
+/// reused the id.
+fn read_coalitions(
+    pid: Pid,
+    euid: u32,
+    operation: &'static str,
+) -> Result<Option<ProcessCoalitions>, Error> {
+    let Some(initial) = read_bsd_fact(pid, euid, operation)? else {
+        return Ok(None);
+    };
+    let raw = match native::coalition_info(native_pid(pid, operation)?) {
+        Ok(raw) => raw,
+        Err(error) if is_process_race(&error) => return Ok(None),
+        Err(error) if is_permission_denied(&error) => {
+            // The same reasoning as for the lineage record: ownership tells a
+            // vanished or re-credentialed process from a denial on one the
+            // caller still owns.
+            return match read_ownership(pid, euid, operation)? {
+                Ownership::SameUser => Err(Error::from_io(operation, error)),
+                Ownership::OtherUser | Ownership::Gone => Ok(None),
+            };
+        }
+        Err(source) => return Err(Error::from_io(operation, source)),
+    };
+    let Some(current) = read_bsd_fact(pid, euid, operation)? else {
+        return Ok(None);
+    };
+    if current.start_identity != initial.start_identity {
+        return Ok(None);
+    }
+    Ok(Some(ProcessCoalitions {
+        resource: CoalitionId::new(raw.resource),
+        jetsam: CoalitionId::new(raw.jetsam),
+    }))
+}
+
 /// Fails unless the exact identity is still the process behind its id.
 fn require_identity(
     expected: ProcessIdentity,
@@ -563,6 +606,20 @@ mod native {
     /// Width of `struct proc_uniqidentifierinfo`, which the kernel writes in full.
     const UNIQUE_RECORD_BYTES: usize = 56;
 
+    /// `PROC_PIDCOALITIONINFO` from XNU `bsd/sys/proc_info.h`.
+    ///
+    /// The flavor is declared in the kernel's private header, so neither the
+    /// SDK nor `libc` exports it. It serves the coalitions of any process the
+    /// caller owns, including a restricted platform binary that withholds its
+    /// environment.
+    const PROC_PIDCOALITIONINFO: libc::c_int = 20;
+
+    /// Width of `struct proc_pidcoalitioninfo`, which the kernel writes in full.
+    const COALITION_RECORD_BYTES: usize = 40;
+
+    /// Coalition types the kernel numbers in one record: resource and jetsam.
+    const COALITION_TYPES: usize = 2;
+
     /// Caps the process table read in one inventory pass.
     ///
     /// Darwin's `kern.maxproc` is well below this on every supported machine,
@@ -675,6 +732,32 @@ mod native {
     // A transcription slip in the mirrored record must fail the build rather
     // than read a field from the wrong offset.
     const _: () = assert!(size_of::<ProcUniqIdentifierInfo>() == UNIQUE_RECORD_BYTES);
+
+    /// Coalition numbers of one process copied out of `proc_pidinfo`.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct RawCoalitionInfo {
+        pub(super) resource: u64,
+        pub(super) jetsam: u64,
+    }
+
+    /// `struct proc_pidcoalitioninfo` from XNU `bsd/sys/proc_info.h`, which no
+    /// public header exports.
+    ///
+    /// The declaration mirrors the kernel field order and widths: one coalition
+    /// number per type (resource, then jetsam) and three reserved words that
+    /// carry the layout.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ProcPidCoalitionInfo {
+        coalition_id: [u64; COALITION_TYPES],
+        _reserved1: u64,
+        _reserved2: u64,
+        _reserved3: u64,
+    }
+
+    // A transcription slip in the mirrored record must fail the build rather
+    // than read a field from the wrong offset.
+    const _: () = assert!(size_of::<ProcPidCoalitionInfo>() == COALITION_RECORD_BYTES);
 
     /// Outcome of draining one kqueue after a readiness notification.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -821,6 +904,44 @@ mod native {
         Ok(RawUniqueInfo {
             unique_id: info.p_uniqueid,
             parent_unique_id: info.p_puniqueid,
+        })
+    }
+
+    /// Reads the coalitions of one process id.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating-system error, or `InvalidData` when the kernel
+    /// wrote fewer bytes than the structure it documents.
+    pub(super) fn coalition_info(pid: i32) -> io::Result<RawCoalitionInfo> {
+        let size = buffer_length(size_of::<ProcPidCoalitionInfo>())?;
+        let mut info = MaybeUninit::<ProcPidCoalitionInfo>::zeroed();
+        // SAFETY: `proc_pidinfo` writes at most `size` bytes, and `info` is a
+        // live, correctly aligned allocation of exactly `size` bytes.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                PROC_PIDCOALITIONINFO,
+                0,
+                info.as_mut_ptr().cast::<libc::c_void>(),
+                size,
+            )
+        };
+        if written <= 0 {
+            return Err(last_os_error());
+        }
+        if written != size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "coalition record is shorter than the kernel structure",
+            ));
+        }
+        // SAFETY: the kernel wrote the whole record, and the structure is plain
+        // integer data, so every byte pattern it can write is a valid value.
+        let info = unsafe { info.assume_init() };
+        Ok(RawCoalitionInfo {
+            resource: info.coalition_id[0],
+            jetsam: info.coalition_id[1],
         })
     }
 
@@ -1346,6 +1467,21 @@ mod tests {
         Fixture(command.spawn().expect("spawn holder fixture"), env)
     }
 
+    /// Kills a holder that is not a child of the test, such as one a fixture
+    /// shell started in the background, even when an assertion fails.
+    struct OrphanReaper(Pid);
+
+    impl Drop for OrphanReaper {
+        fn drop(&mut self) {
+            let pid = i32::try_from(self.0)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw);
+            if let Some(pid) = pid {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+        }
+    }
+
     /// Spawns `program` directly, without a shell, so its image is the one
     /// the kernel reports for the process.
     fn spawn_image(program: &Path, args: &[&str]) -> Fixture {
@@ -1854,6 +1990,7 @@ mod tests {
                 })
         });
 
+        let _nested_reaper = OrphanReaper(nested.pid);
         let nested_markers = observable_markers(inspector, nested.pid);
         assert_eq!(nested_markers.session_id.as_deref(), Some("inner-session"));
         assert_eq!(
