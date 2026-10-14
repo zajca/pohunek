@@ -81,6 +81,11 @@
       "conclusion": "success"
     },
     {
+      "name": "macOS tier packages (arm64)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
       "name": "Pi runtime package (locked release, model-free)",
       "status": "completed",
       "conclusion": "success"

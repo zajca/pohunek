@@ -17,12 +17,20 @@ cargo xtask hermes compatibility --bin-dir ABS --package /abs/hermes.tar.zst  # 
 ```
 
 The `platform contracts (arm64)` CI job runs natively on Apple Silicon macOS
-with `MACOSX_DEPLOYMENT_TARGET=14.0`: it checks, lints, and tests
-`pohunek-platform` (including the real-launchd suite `tests/launchd.rs`),
-`pohunek-paths`, `pohunek-session-worker`, `pohunek-service-config`,
-`pohunek-daemon`, and `pohunek-cli`, and fails hard when the runner's
-`gui/<uid>` launchd domain is absent. It also runs the macOS contributor path
-first: the `scripts/tests/test_dev_bootstrap.py` scenarios under the runner's
+with `MACOSX_DEPLOYMENT_TARGET=14.0`. It lints nine packages with one clippy
+run: `pohunek-platform` (including the real-launchd suite `tests/launchd.rs`),
+`pohunek-paths`, `pohunek-worker-protocol`, `pohunek-session-worker`,
+`pohunek-service-config`, `pohunek-test-support`, `pohunek-daemon`,
+`pohunek-cli`, and `pohunek-hostcheck`. Their tests come from one nextest
+archive built with `--profile macos`: `scripts/test-partitions --archive-file
+<archive> check-macos --scope lane` proves each test is selected exactly once,
+and `run-macos` runs them. The `macos` profile in `.config/nextest.toml` runs
+five threads, retries twice for diagnosis (a flaky result still fails the run),
+and serializes the tests that drive the shared `gui/<uid>` launchd domain. The
+job runs the lane packages' doctests natively (nextest runs none), runs the
+APFS foreign-owner test as root from the extracted archive, and fails hard when
+the runner's `gui/<uid>` launchd domain is absent. It also runs the macOS
+contributor path first: the `scripts/tests/test_dev_bootstrap.py` scenarios under the runner's
 `python3` (>= 3.11, checked) and `scripts/dev-bootstrap --json --path native`,
 which must report `launchd-gui-domain` as `ok`. Linux clippy never compiles the
 launchd backend or any other `cfg(target_os = "macos")` code, so lint it from
@@ -35,6 +43,11 @@ cc` supplies the macOS libc headers a Linux host lacks. It only checks, so a
 green run says the macOS code compiles and lints, not that it behaves; the CI
 job `macOS lint from Linux (aarch64-apple-darwin clippy)` runs the same
 script on every pull request, and the native jobs stay the behavior evidence.
+The `macOS tier packages (arm64)` job covers the other macOS packages,
+`pohunek-client`, `pohunek-netbird`, `pohunek-package`, and `xtask`, with
+`run-macos-tier` from a 13-package archive. `check-macos --scope all` checks
+the full set. It never runs on a pull request: only pushes, the daily schedule,
+and `main` or `nightly` dispatches start it.
 The real-systemd suites (`crates/platform/tests/systemd.rs`,
 `crates/daemon/tests/systemd_durable_worker.rs`,
 `crates/cli/tests/service_systemd.rs`,
@@ -118,8 +131,8 @@ macOS job runs only for its narrow input filter, never because the runtime
 package selection picked Hermes; and the SDK macOS job runs for its own narrow
 input filter. The Linux `hermes-package` job follows the package selection like
 the other runtime package jobs. A change to
-`.github/workflows/ci.yml` selects all four macOS jobs. A push to
-`main` runs the main tier: platform contracts, the
+`.github/workflows/ci.yml` selects all four pull-request macOS jobs. A push to
+`main` runs the main tier: platform contracts, the macOS tier packages, the
 `macos-15` package job, Hermes macOS, and SDK macOS, alongside the Linux jobs
 selected on main. PR and main runs cancel superseded runs on the same ref. A
 daily 05:00 UTC nightly run includes the main tier, the required `macos-14`

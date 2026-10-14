@@ -6,6 +6,7 @@
   "required_jobs": {
     "main": [
       "platform contracts (arm64)",
+      "macOS tier packages (arm64)",
       "macOS package install and upgrade (macos-15)",
       "fmt + clippy",
       "macOS lint from Linux (aarch64-apple-darwin clippy)",
@@ -56,6 +57,7 @@
     ],
     "nightly": [
       "platform contracts (arm64)",
+      "macOS tier packages (arm64)",
       "macOS package install and upgrade (macos-15)",
       "fmt + clippy",
       "macOS lint from Linux (aarch64-apple-darwin clippy)",

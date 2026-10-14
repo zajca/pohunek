@@ -89,6 +89,9 @@ launchd suites, from the logged-in GUI session, because an SSH-only session
 has no such domain. The `macos-lint` rows are `not-applicable` there:
 `scripts/darwin-check` lints natively. The `platform contracts (arm64)` CI job
 runs the `dev-bootstrap` scenarios and this native check on the macOS runner.
+The `macOS tier packages (arm64)` job runs the macOS tests of the packages the
+lane does not, on main and nightly only; `scripts/test-partitions` documents
+the selections.
 
 ## Gates
 
