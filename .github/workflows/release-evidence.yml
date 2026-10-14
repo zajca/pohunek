@@ -558,7 +558,7 @@ jobs:
       - name: Download the consumer executable
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: release-consumer
+          name: release-consumer-Linux
           path: ${{ runner.temp }}/consumer
 
       # The upstream runtimes are Node programs: the version is the highest

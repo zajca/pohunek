@@ -720,6 +720,7 @@ class SigningTests(ReleaseWorkflowFiles):
         self.assertIn("scripts/release-workflow/rehearsal-trust", rehearsal_macos)
         self.assertIn("packaging/macos/package --adhoc-release", rehearsal_macos)
         self.assertIn("name: macos-signed-${{ matrix.component }}", rehearsal_macos)
+        self.assertIn("mkdir -p dist", rehearsal_macos)
         self.assertNotIn("rehearsal-trust", self.release)
 
     def test_provenance_of_every_input_is_verified_before_signing(self):
@@ -926,6 +927,10 @@ class AssetNameTests(ReleaseWorkflowFiles):
                 self.assertIn(name, consumed)
         # `release-bundle` must stay outside every `release-*` download pattern.
         self.assertNotRegex(self.release + self.evidence + self.build, r"pattern: release-")
+        # Consumer artifacts must include the OS suffix; smoke runs on ubuntu and must
+        # download release-consumer-Linux specifically, not a bare release-consumer.
+        smoke = self.evidence_jobs["smoke"]
+        self.assertIn("name: release-consumer-Linux", smoke)
 
     def test_the_package_evidence_is_uploaded_and_never_consumed(self):
         # Builder evidence is in-house JSON outside the release policy: it is

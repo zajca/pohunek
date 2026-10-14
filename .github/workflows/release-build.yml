@@ -459,6 +459,7 @@ jobs:
           # commit yields the same archive bytes.
           SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           export SOURCE_DATE_EPOCH
+          mkdir -p dist
           packaging/macos/package --stage-release "$COMPONENT" "$VERSION" \
             "${{ steps.build.outputs.bindir }}" target/pohunek-docs dist
           # Ad-hoc sign, verify, and archive; runs no program from the tree.
