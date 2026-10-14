@@ -1167,8 +1167,9 @@ async fn the_signed_hermes_package_is_selected_and_failed_installs_preserve_it()
         .expect("the golden descriptor is TOML");
     let mut package =
         strip_package_specific_fields(read_toml(&format!("{PACKAGE_DIR}/runtime.toml")));
-    // `ready` is the one key the package declares that the v0.34 built-in
-    // descriptor does not: the built-in relied on the bracketed-paste enable signal.
+    // `ready` and `startup_grace_ms` are the keys the package declares that the
+    // v0.34 built-in descriptor does not: the built-in relied on the
+    // bracketed-paste enable signal and on the host's grace alone.
     let input = package
         .get_mut("input")
         .and_then(toml::Value::as_table_mut)
@@ -1177,6 +1178,13 @@ async fn the_signed_hermes_package_is_selected_and_failed_installs_preserve_it()
         input.remove("ready").as_ref().and_then(toml::Value::as_str),
         Some("screen_idle"),
         "the rendered Hermes prompt is its only input readiness signal"
+    );
+    assert!(
+        input
+            .remove("startup_grace_ms")
+            .and_then(|grace| grace.as_integer())
+            .is_some_and(|grace| grace > 0),
+        "Hermes declares the grace a first start after install needs"
     );
     assert_eq!(package, strip_package_specific_fields(golden_descriptor));
 

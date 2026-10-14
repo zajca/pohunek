@@ -3510,6 +3510,100 @@ async fn hermes_initial_input_waits_past_its_startup_input_flush() {
     let _ = handle.await;
 }
 
+/// The Hermes package declares a startup grace longer than the host's, so a
+/// Hermes whose prompt renders after the host's grace has passed still gets
+/// the initial input of a client that opted into the extended wait, once. An
+/// older client keeps the host's grace, and its launch is refused at that
+/// grace with nothing written.
+#[tokio::test]
+async fn hermes_initial_input_waits_for_its_declared_startup_grace() {
+    let socket = temp_socket("hermes-slow-start");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let received = socket.dir.join("received.bin");
+    let script = socket.dir.join("hermes-slow-start.py");
+    let screen_hex = HERMES_IDLE_PROMPT_SCREEN
+        .bytes()
+        .map(|byte| format!("\\x{byte:02x}"))
+        .collect::<Vec<_>>()
+        .concat();
+    std::fs::write(
+        &script,
+        format!(
+            r#"import os
+import termios
+import time
+import tty
+
+time.sleep({delay})
+os.write(1, b"{screen_hex}")
+os.write(1, b"\x1b[?2004h")
+tty.setraw(0, termios.TCSANOW)
+with open({received:?}, "wb") as capture:
+    while True:
+        chunk = os.read(0, 4096)
+        if not chunk:
+            break
+        capture.write(chunk)
+        capture.flush()
+"#,
+            delay = (UNRENDERED_PROMPT_GRACE * 2).as_secs_f64(),
+            received = received.display().to_string(),
+        ),
+    )
+    .expect("write slowly starting Hermes stub");
+    write_official_profile(&agents_dir, "hermes", "hermesslowstart", &script);
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        initial_input_startup_grace: UNRENDERED_PROMPT_GRACE,
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+    let mut params = session_params(&socket);
+    "hermesslowstart".clone_into(&mut params.agent);
+    params.input = Some("hello Hermes".to_owned());
+    params.extended_input_ready_wait = Some(true);
+    let created: SessionInfo = serde_json::from_value(ok_payload(
+        create_session_with_params(&mut control, params).await,
+    ))
+    .expect("hermes session info");
+    let bytes = read_file_until(&received, b"hello Hermes").await;
+    assert_eq!(
+        bytes
+            .windows(b"hello Hermes".len())
+            .filter(|window| *window == b"hello Hermes")
+            .count(),
+        1,
+        "the initial input is delivered exactly once"
+    );
+    let stop_req = Request::make(
+        "hermes-slow-start-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+            .expect("stop result");
+    std::fs::remove_file(&received).expect("clear the first session's capture");
+
+    let mut params = session_params(&socket);
+    "hermesslowstart".clone_into(&mut params.agent);
+    params.input = Some("hello Hermes".to_owned());
+    let error = err_payload(create_session_with_params(&mut control, params).await);
+    assert_eq!(error.code, "session_input_not_ready");
+    let captured = std::fs::read(&received).unwrap_or_default();
+    assert!(
+        captured.is_empty(),
+        "the older client's input was written into a prompt that had not rendered"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
 /// Pi declares that only its idle editor frame shows readiness, so a Pi that
 /// enables bracketed paste and never draws that frame gets no initial input:
 /// an older client's launch is refused and rolled back as for Claude.

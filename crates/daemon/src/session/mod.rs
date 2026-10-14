@@ -394,7 +394,9 @@ pub struct SessionRegistryConfig {
     /// spawned agent to show an editable prompt or enable bracketed paste
     /// before injecting a `session.new --input` prompt. The wait short-circuits
     /// on that readiness evidence; a silent agent receives input after this
-    /// bound. `Duration::ZERO` injects immediately.
+    /// bound. `Duration::ZERO` injects immediately. For a client that opts
+    /// into the extended wait, a runtime that declares a longer
+    /// `[input] startup_grace_ms` waits that long instead.
     pub initial_input_startup_grace: Duration,
     /// Longest time one control input write (`session.input` or initial
     /// input) may wait without the child reading a byte. A write that exceeds
@@ -3030,7 +3032,9 @@ impl SessionRegistry {
 
     /// Wait for a freshly spawned agent to expose its input reader before a
     /// `session.new --input` prompt is injected, capped at
-    /// [`SessionRegistryConfig::initial_input_startup_grace`].
+    /// [`SessionRegistryConfig::initial_input_startup_grace`], or, for a
+    /// client that opted into the extended wait, at the longer startup grace
+    /// the session's runtime declares ([`RuntimeDefinition::startup_grace`]).
     ///
     /// For a [`InputReadiness::BracketedPaste`] session an unobserved
     /// readiness is not an error: the prompt is written once the wait ends,
@@ -3048,7 +3052,7 @@ impl SessionRegistry {
         session_id: &SessionId,
         extended_input_ready_wait: bool,
     ) -> Result<(), ProtocolError> {
-        let (input_ready, readiness) = {
+        let (input_ready, readiness, runtime_grace) = {
             let sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get(session_id) else {
                 return Ok(());
@@ -3056,11 +3060,19 @@ impl SessionRegistry {
             (
                 entry.input_ready.clone(),
                 entry.default_detector_config.input_readiness,
+                entry
+                    .pinned
+                    .as_ref()
+                    .and_then(|definition| definition.startup_grace()),
             )
         };
         let strict = readiness == InputReadiness::ScreenIdle;
         let configured = self.inner.config.initial_input_startup_grace;
-        let grace = if extended_input_ready_wait || strict {
+        // Only a client that opted into the extended wait has a response budget
+        // for a runtime's longer declared grace.
+        let grace = if extended_input_ready_wait {
+            runtime_grace.map_or(configured, |runtime| runtime.max(configured))
+        } else if strict {
             configured
         } else {
             configured.min(pohunek_service_config::COMPAT_INITIAL_INPUT_STARTUP_GRACE)
