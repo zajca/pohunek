@@ -1003,7 +1003,12 @@ never compared, so a report naming one process, even at `u64::MAX`, cannot
 make a report naming another process stale. A hook reaches the worker as a
 descendant of the agent it reports, so under `NamedForProvider` a descendant's
 report naming an ancestor is that ancestor's report and is ordered with it;
-under `FrozenRootEntrypoint` only the root itself may name the root. Across
+under `FrozenRootEntrypoint` only the root itself may name the root. This
+binding is not an authentication boundary: every process in the agent's PTY
+subtree runs as the owner, so under `NamedForProvider` any process the launch
+process starts can file the launch process's report, and only `FrozenRootEntrypoint` (`identity-v1`) binds
+the root's report to the root's own kernel peer (see the trust boundary in the
+[architecture](architecture.md)). Across
 processes the latest accepted claim, in arrival order at the worker, is the
 active identity, and the worker's imported active claim carries that process's
 own sequence, which can be lower than the previous import's. The launch

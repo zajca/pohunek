@@ -1194,6 +1194,19 @@ Trust boundary:
   proves which bytes were installed and who published them; it does not
   restrict what they launch. A package gains nothing a same-user process does
   not already have.
+- **The agent's process tree is not an identity boundary.** Every process in
+  an agent's PTY subtree runs as the owner, so a process the agent or one of
+  its tools starts can already do anything the agent can. Under
+  `NamedForProvider` the worker accepts a descendant's report naming the launch
+  process as that process's report, because the Codex and Claude Code hooks are
+  such descendants and cannot be told apart from another one; the rule orders
+  and attributes reports, it does not authenticate them. Only
+  `FrozenRootEntrypoint` (`identity-v1`) binds the root's report to the root's
+  own kernel peer. Under every schema the worker refuses a report from a
+  process that is neither the process it names nor a descendant of it
+  (`peer_outside_subject`). Authenticated agent
+  identity is tracked in [#52](https://github.com/zajca/pohunek/issues/52) and
+  isolated runtime profiles in [#88](https://github.com/zajca/pohunek/issues/88).
 - **No package code inside the daemon or the session worker.** The daemon
   reads package data into a definition. Integration handlers, hook schemas and
   the reporter scripts the handlers install are compiled core code selected by

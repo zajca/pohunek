@@ -1260,8 +1260,14 @@ a report naming the root from any other process, a descendant included, is
 refused, and it accepts the root's report only while the root still runs the
 exact entrypoint and shebang interpreter the worker froze before spawning it.
 Every later conversation id of the root is verified the same way before it is
-journaled. The rule requires the entrypoint's shebang interpreter to run the
-script itself. An interpreter that re-executes another image, such as a macOS
+journaled. Only this rule binds the root's report to the root's own kernel
+peer. Under `NamedForProvider` a hook reports as a descendant of the launch
+process, and a descendant's report naming the launch process counts as that
+process's report; every process in the agent's PTY subtree runs as the owner,
+so this rule attributes reports and does not authenticate them. Under every
+schema the worker refuses a report from a process that is neither the process
+it names nor a descendant of it (`peer_outside_subject`). The rule requires
+the entrypoint's shebang interpreter to run the script itself. An interpreter that re-executes another image, such as a macOS
 framework Python stub or an `xcrun` shim like `/usr/bin/python3`, leaves the
 session without a launch identity: every claim is refused as
 `image_mismatch` or `cmdline_mismatch` (a `worker.launch_identity.rejected`
