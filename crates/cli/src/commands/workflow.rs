@@ -300,6 +300,16 @@ struct ServiceInfo {
     argv: Vec<String>,
 }
 
+/// One declared event reaction with `argv[0]` resolved to an absolute path.
+#[derive(Debug, Serialize)]
+struct ReactionInfo {
+    name: String,
+    events: Vec<String>,
+    argv: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_ms: Option<u64>,
+}
+
 /// One declared action with `argv[0]` resolved to an absolute path.
 #[derive(Debug, Serialize)]
 struct ActionInfo {
@@ -324,6 +334,8 @@ struct Details {
     jobs: Vec<JobInfo>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     services: Vec<ServiceInfo>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    reactions: Vec<ReactionInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -725,9 +737,20 @@ fn details(store: &Store, manifest: &Manifest, files: &Path) -> Details {
             argv: resolve_argv(&service.argv, files),
         })
         .collect();
+    let reactions = manifest
+        .reactions
+        .iter()
+        .map(|(name, reaction)| ReactionInfo {
+            name: name.clone(),
+            events: reaction.events.clone(),
+            argv: resolve_argv(&reaction.argv, files),
+            timeout_ms: reaction.timeout_ms.map(u64::from),
+        })
+        .collect();
     Details {
         jobs,
         services,
+        reactions,
         description: manifest.description.clone(),
         files_dir: files.to_path_buf(),
         state_dir: store.state_dir(id),
@@ -813,6 +836,26 @@ fn render_details(text: &mut String, details: &Details) {
     for service in &details.services {
         let _ = writeln!(text, "  {}", service.name);
         let _ = writeln!(text, "    argv: {:?}", service.argv);
+    }
+    if !details.reactions.is_empty() {
+        let _ = writeln!(
+            text,
+            "Reactions (each runs as you, without a shell, once per matching daemon event \
+             while the plugin is enabled):"
+        );
+    }
+    for reaction in &details.reactions {
+        // Event names come from the protocol's event table, so they need no escaping.
+        let _ = writeln!(
+            text,
+            "  {}  (on {})",
+            reaction.name,
+            reaction.events.join(", ")
+        );
+        let _ = writeln!(text, "    argv: {:?}", reaction.argv);
+        if let Some(timeout) = reaction.timeout_ms {
+            let _ = writeln!(text, "    requested timeout: {timeout} ms");
+        }
     }
 }
 

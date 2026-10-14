@@ -222,6 +222,36 @@ async fn session_created_reaches_the_reaction_with_no_origin_pair() {
     assert_eq!(origin, "absent");
 }
 
+/// While an enabled plugin's reactions keep the dispatcher unit installed,
+/// `service uninstall` is refused with that plugin's disable command, the
+/// step that removes the dispatcher.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn service_uninstall_names_the_enabled_plugin_that_reacts() {
+    let mut managed = Managed::new(KNOBS);
+    let plugin = Plugin::new(PLUGIN).reaction("on_created", &["session_created"], "react");
+    managed.enable(&plugin).await;
+
+    let output = managed
+        .units
+        .command(&["service", "uninstall", "--json"])
+        .output()
+        .expect("run pohunek service uninstall");
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    let document: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|_| panic!("a JSON envelope: {}", describe(&output)));
+    assert_eq!(
+        document["err"]["code"], "workflow_units_installed",
+        "{document}"
+    );
+    let message = document["err"]["msg"].as_str().expect("a message");
+    assert!(
+        message.contains(&format!("run `pohunek workflow disable {PLUGIN}` first")),
+        "{document}"
+    );
+    assert!(!message.contains("dispatcher"), "{document}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
 async fn a_full_queue_drops_events_and_keeps_delivering_later_ones() {

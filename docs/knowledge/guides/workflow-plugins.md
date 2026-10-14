@@ -110,8 +110,10 @@ Trust is the archive digest you supply with `--sha256` (`sha256:<64 hex>` or
 the bare hex `sha256sum` prints). There is no catalog for workflow plugins.
 Install reads the archive, checks its digest (`workflow_digest_mismatch`
 otherwise) and validates the manifest, then prints the id, version, digest,
-and every action's, job's and service's argv with `argv[0]` resolved to its
-absolute path, with each job's interval and requested timeout. Nothing
+and every action's, job's, service's and reaction's argv with `argv[0]`
+resolved to its absolute path, with each job's interval and requested timeout
+and each reaction's events and requested timeout; `inspect` shows the same
+(`reactions[]` with `name`, `events`, `argv` and `timeout_ms?` in `--json`). Nothing
 is created until you repeat the command with `--yes`; until then it fails with
 `consent_required`. `--no-enable` installs the plugin disabled. A plugin with
 jobs, services or reactions is enabled as `pohunek workflow enable` enables it
@@ -481,14 +483,19 @@ actions never touch the service manager.
   unusable) and the plugin stays installed, disabled; repeat it once the
   cause is fixed.
 - `pohunek service uninstall` refuses with `workflow_units_installed` while
-  any plugin's unit record names a unit. The check runs before the service
+  any plugin's unit record names a unit or the reaction dispatcher unit is
+  recorded. The check runs before the service
   manager is contacted and changes nothing. It takes `units.lock` (a unit
   command running at the same time makes it fail with `workflow_store_busy`)
   and keeps it until the uninstall ends (creating the workflow store's lock
   file when no store exists yet), so a `workflow enable` or enabling install
   meanwhile fails with `workflow_store_busy` instead of recording units. Its
   message names each such plugin with the `pohunek workflow disable <id>` that
-  stops it. A unit record that cannot be read refuses it with
+  stops it, and for the dispatcher each enabled plugin that declares a
+  reaction or whose files fail verification. When no enabled plugin keeps the
+  dispatcher (its removal failed when the last one was disabled), it names
+  every installed plugin: the disable of any plugin removes the dispatcher. A
+  unit record that cannot be read refuses it with
   `workflow_store_failed`. The operator order is: `pohunek workflow disable <id>`
   for each named plugin (or `pohunek workflow uninstall <id>`), then
   `pohunek service uninstall`.

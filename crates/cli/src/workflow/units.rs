@@ -621,17 +621,7 @@ pub(crate) async fn sync_dispatcher(
     id: &PackageId,
 ) -> Result<(), Error> {
     let recorded = store.dispatcher_recorded()?;
-    let mut reacting = false;
-    for record in store.list()? {
-        if !record.enabled() {
-            continue;
-        }
-        match store.inspect(&record.identity().id) {
-            Ok((_record, _root, manifest)) => reacting |= !manifest.reactions.is_empty(),
-            // An unverifiable plugin may react, so the recorded state is kept.
-            Err(_error) => reacting |= recorded,
-        }
-    }
+    let reacting = !reacting_plugins(store, recorded)?.is_empty();
     let installation = if reacting || recorded {
         let installation = require_installation(context)?;
         require_same_version(&installation)?;
@@ -670,6 +660,32 @@ pub(crate) async fn sync_dispatcher(
                 format!("installing the dispatcher unit failed: {error}"),
             )
         })
+}
+
+/// The enabled plugins that keep the reaction dispatcher unit installed: those
+/// whose manifest declares a reaction and, while the unit is `recorded`, those
+/// whose installed files fail verification, since they may react.
+///
+/// # Errors
+///
+/// Returns [`Error::Store`] when the plugin list cannot be read.
+fn reacting_plugins(store: &Store, recorded: bool) -> Result<Vec<PackageId>, Error> {
+    let mut reacting = Vec::new();
+    for record in store.list()? {
+        if !record.enabled() {
+            continue;
+        }
+        let id = &record.identity().id;
+        let reacts = match store.inspect(id) {
+            Ok((_record, _root, manifest)) => !manifest.reactions.is_empty(),
+            // An unverifiable plugin may react, so the recorded state is kept.
+            Err(_error) => recorded,
+        };
+        if reacts {
+            reacting.push(id.clone());
+        }
+    }
+    Ok(reacting)
 }
 
 /// The dispatcher unit: a service running `<prefix>/bin/pohunek workflow
@@ -996,8 +1012,15 @@ impl From<Error> for LifecycleError {
     }
 }
 
-/// Refuses while any workflow plugin has recorded units, so a service
-/// uninstall never strands units that run the installation it would remove.
+/// Refuses while any workflow plugin has recorded units or the reaction
+/// dispatcher unit is recorded, so a service uninstall never strands units
+/// that run the installation it would remove.
+///
+/// The refusal names the plugins whose disable removes those units: each
+/// plugin with recorded units and each enabled plugin that keeps the
+/// dispatcher installed. A recorded dispatcher that no enabled plugin keeps
+/// (its removal failed when the last one was disabled) is removed by the
+/// disable of any installed plugin, so every installed plugin is named then.
 ///
 /// Returns the unit lifecycle lock, held from before the records are read; the
 /// caller keeps it until the uninstall is done, so no enable can record units
@@ -1008,22 +1031,37 @@ impl From<Error> for LifecycleError {
 /// # Errors
 ///
 /// Returns [`Error::Busy`] while another unit lifecycle command holds the lock,
-/// [`Error::Store`] when a unit record cannot be read, and
-/// [`Error::UnitsInstalled`] naming the plugins with recorded units.
+/// [`Error::Store`] when a unit record or the plugin list cannot be read or a
+/// recorded dispatcher has no installed plugin to remove it, and
+/// [`Error::UnitsInstalled`] naming the plugins to disable.
 pub(crate) fn check_no_units(context: &Context) -> Result<FileLock, Error> {
     let store = store_of(context)?;
     let lock = store.lock_units_creating()?;
-    let mut plugins: Vec<String> = store
-        .plugins_with_units()?
-        .iter()
-        .map(ToString::to_string)
-        .collect();
+    let mut plugins = store.plugins_with_units()?;
     if store.dispatcher_recorded()? {
-        plugins.push("the reaction dispatcher".to_owned());
+        let mut keeping = reacting_plugins(&store, true)?;
+        if keeping.is_empty() {
+            keeping = store
+                .list()?
+                .iter()
+                .map(|record| record.identity().id.clone())
+                .collect();
+        }
+        if keeping.is_empty() {
+            return Err(Error::Store(
+                "the reaction dispatcher unit is recorded, but no workflow plugin is installed \
+                 whose disable would remove it"
+                    .to_owned(),
+            ));
+        }
+        plugins.extend(keeping);
     }
     if plugins.is_empty() {
         return Ok(lock);
     }
+    let mut plugins: Vec<String> = plugins.iter().map(ToString::to_string).collect();
+    plugins.sort();
+    plugins.dedup();
     Err(Error::UnitsInstalled { plugins })
 }
 

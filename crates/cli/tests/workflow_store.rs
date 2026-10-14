@@ -589,6 +589,74 @@ fn jobs_and_services_are_reviewed_installed_and_inspected() {
     assert_eq!(inspected["services"][0]["argv"][1], "notify", "{document}");
 }
 
+/// A manifest of plugin [`PLUGIN_ID`] that declares one reaction and nothing
+/// else, so the reaction is all the consent review can show.
+fn reaction_only_manifest() -> String {
+    format!(
+        r#"schema = 1
+
+[plugin]
+id = "{PLUGIN_ID}"
+version = "1.0.0"
+description = "Work overview"
+
+[reactions.on_stop]
+events = ["session_stopped", "session_runtime_lost"]
+argv = ["bin/work", "react", "{SENTINEL}"]
+timeout_ms = 30000
+"#
+    )
+}
+
+/// The consent review and `inspect` show a reaction's events and argv, so a
+/// plugin that only reacts is never installed without its command shown.
+#[test]
+fn reactions_are_reviewed_installed_and_inspected() {
+    let fixture = Fixture::new();
+    let (archive, digest) = fixture.archive("reactions", &plugin_files(&reaction_only_manifest()));
+    let review = fixture.run(&[
+        "workflow",
+        "install",
+        path_str(&archive),
+        "--sha256",
+        digest.as_str(),
+    ]);
+    assert_eq!(review.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&review.stdout);
+    let files = fixture.package_root(&digest).join("files");
+    let program = path_str(&files.join("bin/work")).to_owned();
+    for needle in [
+        "Reactions (each runs as you, without a shell, once per matching daemon event".to_owned(),
+        "  on_stop  (on session_stopped, session_runtime_lost)".to_owned(),
+        format!("argv: [\"{program}\", \"react\", \"{SENTINEL}\"]"),
+        "requested timeout: 30000 ms".to_owned(),
+    ] {
+        assert!(text.contains(&needle), "{needle:?} in the review:\n{text}");
+    }
+
+    let (code, document) = fixture.install(&archive, &digest, &["--yes", "--no-enable"]);
+    assert_eq!(code, 0, "{document}");
+    let (code, document) = fixture.json(&["workflow", "inspect", PLUGIN_ID]);
+    assert_eq!(code, 0, "{document}");
+    let reaction = &document["ok"]["reactions"][0];
+    assert_eq!(reaction["name"], "on_stop", "{document}");
+    assert_eq!(
+        reaction["events"],
+        serde_json::json!(["session_stopped", "session_runtime_lost"]),
+        "{document}"
+    );
+    assert_eq!(reaction["argv"][0], program.as_str(), "{document}");
+    assert_eq!(reaction["argv"][2], SENTINEL, "{document}");
+    assert_eq!(reaction["timeout_ms"], 30_000, "{document}");
+    let inspected = fixture.run(&["workflow", "inspect", PLUGIN_ID]);
+    assert_eq!(inspected.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&inspected.stdout);
+    assert!(
+        text.contains("  on_stop  (on session_stopped, session_runtime_lost)"),
+        "{text}"
+    );
+}
+
 #[test]
 fn jobs_and_services_need_the_service_installation() {
     let fixture = Fixture::new();
@@ -1924,6 +1992,16 @@ fn write_unit_record(units: &workflow_units::UnitEnv, contents: &[u8]) -> PathBu
     record_path
 }
 
+/// Records the reaction dispatcher unit as installed in `units`' store, as
+/// enabling a plugin with reactions does, and returns the record's path.
+#[cfg(target_os = "linux")]
+fn write_dispatcher_record(units: &workflow_units::UnitEnv) -> PathBuf {
+    let record_path = write_unit_record(units, br#"{"units":[]}"#);
+    let dispatcher = record_path.with_file_name("REACTIONS.json");
+    fs::rename(&record_path, &dispatcher).expect("rename the record to the dispatcher record");
+    dispatcher
+}
+
 /// Everything a refused `service uninstall` must leave as it found it: the
 /// installation record, the plugin list and the unit files.
 #[cfg(target_os = "linux")]
@@ -1995,6 +2073,39 @@ fn service_uninstall_is_refused_while_plugin_units_are_recorded() {
         document["err"]["code"], "workflow_units_installed",
         "{document}"
     );
+}
+
+/// A recorded reaction dispatcher refuses `service uninstall` with the
+/// disable command of an installed plugin, which brings the dispatcher in
+/// line with the enabled plugins, never with the dispatcher as a plugin id.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_recorded_dispatcher_refuses_the_service_uninstall_with_a_plugin_to_disable() {
+    let units = workflow_units::UnitEnv::new(|env| env.root().join("units"));
+    let plugin =
+        workflow_units::Plugin::new(PLUGIN_ID).reaction("on_stop", &["session_stopped"], "react");
+    units.install(&plugin);
+    let record = write_dispatcher_record(&units);
+    let before = installation_snapshot(&units);
+
+    let (code, document) = service_uninstall(&units);
+    assert_eq!(code, Some(1), "{document}");
+    assert_eq!(
+        document["err"]["code"], "workflow_units_installed",
+        "{document}"
+    );
+    let message = document["err"]["msg"].as_str().expect("a message");
+    assert!(
+        message.contains(&format!("run `pohunek workflow disable {PLUGIN_ID}` first")),
+        "{document}"
+    );
+    assert!(!message.contains("dispatcher"), "{document}");
+    assert_eq!(
+        installation_snapshot(&units),
+        before,
+        "the refusal changed something"
+    );
+    assert!(record.exists(), "the refusal removed the dispatcher record");
 }
 
 /// A unit record that cannot be read refuses `service uninstall` as well:
