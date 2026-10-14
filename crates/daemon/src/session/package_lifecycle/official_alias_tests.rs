@@ -767,6 +767,34 @@ async fn a_built_in_hermes_session_is_refused_as_removed_until_the_package_serve
     assert_built_in_session_is_refused_as_removed_until_the_package_serves(RuntimeId::HERMES).await;
 }
 
+/// The worker journals of session `id` in `registry`'s worker state root, which
+/// record how a runtime ended, for a failure that finds a session no longer live.
+fn worker_journals(registry: &SessionRegistry, id: &protocol::SessionId) -> String {
+    let Some(state_root) = registry.inner.config.worker_state_root.as_ref() else {
+        return "no worker state root".to_owned();
+    };
+    let directory = state_root.join(&id.0);
+    match fs::read_dir(&directory) {
+        Ok(entries) => entries
+            .map(|entry| match entry {
+                Ok(entry) => {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    match fs::read_to_string(entry.path()) {
+                        Ok(journal) => format!("{name}: {journal}"),
+                        Err(error) => format!("{name}: unreadable: {error}"),
+                    }
+                }
+                Err(error) => format!("unreadable entry: {error}"),
+            })
+            .collect::<Vec<_>>()
+            .join(" | "),
+        Err(error) => format!(
+            "worker journals unreadable at {}: {error}",
+            directory.display()
+        ),
+    }
+}
+
 /// A live session of the official alias `alias` a previous release launched
 /// from its built-in runtime, adopted by a daemon that serves no `alias`:
 /// input is refused as a removed built-in, and once the official package
@@ -809,7 +837,10 @@ async fn assert_adopted_built_in_session_takes_input_only_once_the_package_serve
         .expect("the live session survives the restart");
     assert_eq!(
         live.runtime.as_ref().map(|runtime| runtime.state),
-        Some(protocol::RuntimeState::Live)
+        Some(protocol::RuntimeState::Live),
+        "{:?}; {}",
+        live.runtime,
+        worker_journals(&adopted.registry, &created.id)
     );
     let input = || protocol::SessionInputParams {
         session_id: created.id.clone(),
@@ -949,7 +980,10 @@ async fn adopt(launched: &LaunchedHermes) -> Fixture {
         .expect("the live session survives the restart");
     assert_eq!(
         adopted.runtime.as_ref().map(|runtime| runtime.state),
-        Some(protocol::RuntimeState::Live)
+        Some(protocol::RuntimeState::Live),
+        "{:?}; {}",
+        adopted.runtime,
+        worker_journals(&restarted.registry, &launched.created.id)
     );
     restarted
 }
