@@ -159,10 +159,8 @@ pub enum PtyError {
     /// Opening the PTY failed.
     #[error("failed to allocate PTY: {0}")]
     Allocate(String),
-    /// The launch working directory is not an existing directory.
-    ///
-    /// Checked before spawning because the PTY layer would otherwise start the
-    /// child in `$HOME` without reporting an error.
+    /// The launch working directory is not an existing directory: the child's
+    /// `chdir` failed with `ENOENT` or `ENOTDIR` and the directory is absent.
     #[error("launch working directory is not an existing directory")]
     CwdMissing,
     /// Spawning the child failed.
@@ -281,6 +279,49 @@ pub(crate) enum RootObservation {
 struct SpawnGuard {
     child: Option<Box<dyn PtyChild + Send + Sync>>,
     process_group: Option<i32>,
+}
+
+/// Classifies a failed child spawn.
+///
+/// The child's `chdir` reports a missing directory as `ENOENT` or `ENOTDIR`,
+/// and a program inside a removed directory fails its resolution with
+/// `NotFound` before any `chdir`. Both also mean a missing program, so the
+/// launch is a missing directory only when the spawn failed that way and the
+/// directory is confirmed absent. Any other failure keeps its own error: a
+/// directory that exists but cannot be entered, or a fork or exec failure
+/// under load, is a spawn failure, never a missing directory.
+fn spawn_error(command: &Command, source: &io::Error) -> PtyError {
+    let errno = source.raw_os_error();
+    let not_found = source.kind() == io::ErrorKind::NotFound || errno == Some(libc::ENOTDIR);
+    if not_found && cwd_is_missing(&command.cwd) {
+        return PtyError::CwdMissing;
+    }
+    event!(
+        name: "worker.pty.spawn.failed",
+        Level::WARN,
+        path = %command.cwd.display(),
+        error.type = "io",
+        error.code = errno,
+        error.message = %source,
+        "PTY child spawn failed: {{error.message}}",
+    );
+    let program = Path::new(&command.program);
+    PtyError::Spawn {
+        message: "process launch failed".to_owned(),
+        not_found: program.is_absolute() && !program.exists(),
+    }
+}
+
+/// Whether `cwd` is confirmed not to be a directory: it does not exist, a path
+/// component is not a directory, or it is not a directory itself. A `stat`
+/// that fails for another reason (permission, resources) confirms nothing.
+fn cwd_is_missing(cwd: &Path) -> bool {
+    match std::fs::metadata(cwd) {
+        Ok(metadata) => !metadata.is_dir(),
+        Err(error) => {
+            error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ENOTDIR)
+        }
+    }
 }
 
 /// Holds startup threads until every fallible ownership handoff succeeds.
@@ -453,18 +494,8 @@ impl PtyOwner {
         let output = OutputHub::new(history_bytes, subscriber_bytes, command.rows, command.cols)?;
         let output_order = Arc::new(Mutex::new(()));
 
-        // A spawn failure is reported as a missing directory only when the
-        // directory is gone, because `ENOENT` also means a missing program.
-        let child = child_spawn::spawn_pty_child(&command, &tty_name).map_err(|_source| {
-            if !command.cwd.is_dir() {
-                return PtyError::CwdMissing;
-            }
-            let program = Path::new(&command.program);
-            PtyError::Spawn {
-                message: "process launch failed".to_owned(),
-                not_found: program.is_absolute() && !program.exists(),
-            }
-        })?;
+        let child = child_spawn::spawn_pty_child(&command, &tty_name)
+            .map_err(|source| spawn_error(&command, &source))?;
         let mut child = SpawnGuard::new(Box::new(child));
         let pid = child
             .child

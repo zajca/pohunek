@@ -69,6 +69,18 @@ fn spawn(command: Command) -> Result<PtyOwner, PtyError> {
     )
 }
 
+/// Gives the owner back `rwx` on a directory when dropped, so the temporary
+/// tree stays removable even when the scenario panics.
+struct Unlock<'a>(&'a Path);
+
+impl Drop for Unlock<'_> {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
 /// Opens a descriptor at or above `minimum` that the child would inherit.
 fn inheritable_descriptor(minimum: libc::c_int) -> OwnedFd {
     let fd = rustix::io::fcntl_dupfd_cloexec(
@@ -141,6 +153,60 @@ async fn a_missing_working_directory_refuses_the_launch() {
     assert!(
         !home.path().join("ran").exists(),
         "no process may run when the working directory is missing"
+    );
+}
+
+/// A program inside a missing working directory fails its resolution before
+/// any `chdir`, and the launch is still refused as a missing directory.
+#[tokio::test]
+async fn a_program_inside_a_missing_working_directory_reports_the_directory_missing() {
+    let home = tempdir().expect("home directory");
+    let missing: PathBuf = home.path().join("worktree-removed");
+    let command = Command {
+        program: missing
+            .join("bin")
+            .join("agent")
+            .to_string_lossy()
+            .into_owned(),
+        ..shell_command("touch \"$HOME/ran\"", &missing, home.path())
+    };
+
+    let error = spawn(command).expect_err("a missing working directory must refuse the spawn");
+
+    assert!(matches!(error, PtyError::CwdMissing), "{error:?}");
+}
+
+/// A working directory that exists but cannot be entered fails the launch as
+/// a spawn failure, not as a missing directory, and starts no process.
+#[tokio::test]
+async fn an_existing_working_directory_that_cannot_be_entered_is_not_reported_missing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempdir().expect("home directory");
+    let locked = home.path().join("locked");
+    let cwd = locked.join("worktree");
+    std::fs::create_dir_all(&cwd).expect("create the working directory");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+        .expect("make the parent unsearchable");
+    let unlock = Unlock(&locked);
+
+    let result = spawn(shell_command("touch \"$HOME/ran\"", &cwd, home.path()));
+    drop(unlock);
+
+    let error = result.expect_err("an unsearchable working directory refuses the spawn");
+    assert!(
+        matches!(
+            error,
+            PtyError::Spawn {
+                not_found: false,
+                ..
+            }
+        ),
+        "an existing directory is not reported missing: {error:?}"
+    );
+    assert!(
+        !home.path().join("ran").exists(),
+        "no process may run when the working directory cannot be entered"
     );
 }
 
