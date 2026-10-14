@@ -78,7 +78,7 @@ instead of competing with them.
 ### Runtime plugin packages — [#139](https://github.com/zajca/pohunek/issues/139) (milestone C, project 5)
 
 Runtimes become signed, content-addressed packages installed per host; only
-`shell` stays built in. **37/45.** Landed: the accepted RFC (#152), the
+`shell` stays built in. **37/46.** Landed: the accepted RFC (#152), the
 `RuntimeId` protocol and generic runtime host (#140), the authenticated package
 registry (#141), the CLI lifecycle and profile migration (#143), generic hook
 schemas and integration activation (#144), digest-bound package releases with
@@ -90,7 +90,9 @@ consumes no plugin data in v1 (#480). Open:
 
 - Follow-ups #868, #870, #899, #911 and #1003.
 - One-step host setup and upgrade to the official packages (#1011, #1013).
-- macOS workflow plugin child cleanup after a `SIGKILL`ed trampoline (#1019).
+- Workflow plugin follow-ups: macOS child cleanup after a `SIGKILL`ed
+  trampoline (#1019), and reactions in the install review and the service
+  uninstall refusal (#1061).
 
 Guide: [`knowledge/guides/runtime-packages.md`](knowledge/guides/runtime-packages.md).
 
