@@ -8084,7 +8084,7 @@ while os.getppid() == parent:
         .expect("valid stale native report");
         assert!(
             !replacement
-                .report_native_id(stale_native_report)
+                .report_as_root(stale_native_report)
                 .await
                 .recorded,
             "replacement daemon must reject a sequence below the persisted ordering tombstone"

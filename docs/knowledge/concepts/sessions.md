@@ -1284,10 +1284,13 @@ when the launch agent reports a newer verified conversation. Only the
 `SessionStart` identity report carries a conversation
 id; a subagent's `SubagentStart` and `SubagentStop` reports and Claude's
 main-`Stop` subagent snapshot are separate claim types that never touch the
-reference. The worker's launch-process rule
-does not cover the daemon's public `session.report_native_id` fallback, which
-keeps its own runtime, process-identity, ordering and expiry checks; that gap is
-tracked separately.
+reference. The daemon's public `session.report_native_id` fallback is attested
+against the kernel peer of its local connection: only the session's PTY root
+itself is admitted, so a descendant of the root reporting the root's pid and
+start identity is refused with `native_report_unattested` and records nothing.
+A session on the `identity-v1` schema refuses that method for every report, the
+root included, so its native reference comes only from the worker. Its runtime,
+process-identity, ordering and expiry checks still apply to an admitted report.
 The official Pi package is the worked example: see the [Pi runtime package](../guides/pi-package.md).
 
 `session.fork` creates a new pohunek session id and PTY from the source session's

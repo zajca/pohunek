@@ -812,21 +812,21 @@ async fn a_public_report_replaces_the_assigned_reference_in_sequence_order_and_r
         report.pid_start_identity += 1;
     })
     .await;
-    assert!(!rig.registry.report_native_id(wrong_start).await.recorded);
+    assert!(!rig.registry.report_as_root(wrong_start).await.recorded);
     let wrong_pid = public_report(&rig, "forged-pid", |report| report.pid = 1).await;
-    assert!(!rig.registry.report_native_id(wrong_pid).await.recorded);
+    assert!(!rig.registry.report_as_root(wrong_pid).await.recorded);
     let wrong_worker = public_report(&rig, "forged-worker", |report| {
         report.worker_instance_id = "another-worker-instance".to_owned();
     })
     .await;
-    assert!(!rig.registry.report_native_id(wrong_worker).await.recorded);
+    assert!(!rig.registry.report_as_root(wrong_worker).await.recorded);
     let expired = public_report(&rig, "expired", |report| {
         report.expires_at = (OffsetDateTime::now_utc() - time::Duration::seconds(5))
             .format(&Rfc3339)
             .expect("format expiry");
     })
     .await;
-    assert!(!rig.registry.report_native_id(expired).await.recorded);
+    assert!(!rig.registry.report_as_root(expired).await.recorded);
     rig.assert_held(
         &rig.registry,
         &rig.assigned,
@@ -836,7 +836,7 @@ async fn a_public_report_replaces_the_assigned_reference_in_sequence_order_and_r
 
     // `/clear` twice: each valid report replaces value and provenance.
     let first = public_report(&rig, "conversation-one", |_| {}).await;
-    assert!(rig.registry.report_native_id(first).await.recorded);
+    assert!(rig.registry.report_as_root(first).await.recorded);
     rig.assert_held(
         &rig.registry,
         "conversation-one",
@@ -844,7 +844,7 @@ async fn a_public_report_replaces_the_assigned_reference_in_sequence_order_and_r
     )
     .await;
     let second = public_report(&rig, "conversation-two", |_| {}).await;
-    assert!(rig.registry.report_native_id(second).await.recorded);
+    assert!(rig.registry.report_as_root(second).await.recorded);
     rig.assert_held(
         &rig.registry,
         "conversation-two",
@@ -866,7 +866,7 @@ async fn a_public_report_replaces_the_assigned_reference_in_sequence_order_and_r
         report.sequence = accepted.sequence.expect("public mark") - 1;
     })
     .await;
-    assert!(!rig.registry.report_native_id(stale).await.recorded);
+    assert!(!rig.registry.report_as_root(stale).await.recorded);
     rig.assert_held(
         &rig.registry,
         "conversation-two",
@@ -1032,7 +1032,7 @@ async fn recovery_checks_an_assigned_reference_but_trusts_a_reported_one() {
     )
     .await;
     let report = public_report(&second, "conversation-without-file", |_| {}).await;
-    assert!(second.registry.report_native_id(report).await.recorded);
+    assert!(second.registry.report_as_root(report).await.recorded);
     second.exit(&second.registry).await;
     second
         .registry
@@ -1234,7 +1234,7 @@ async fn worker_and_public_reports_are_ordered_within_their_own_clock() {
     // Public first, then the worker: the adapter's worker clock is far ahead
     // of its public one, and neither blocks the other.
     let public = public_report(&rig, "public-one", |_| {}).await;
-    assert!(rig.registry.report_native_id(public).await.recorded);
+    assert!(rig.registry.report_as_root(public).await.recorded);
     held("public-one").await;
     rig.report("worker-two").await;
     let old_claim = rig.snapshot(&rig.registry).await;
@@ -1251,7 +1251,7 @@ async fn worker_and_public_reports_are_ordered_within_their_own_clock() {
     // The worker, then the public fallback with a smaller number.
     let public = public_report(&rig, "public-three", |_| {}).await;
     assert!(
-        rig.registry.report_native_id(public).await.recorded,
+        rig.registry.report_as_root(public).await.recorded,
         "a public report is not stale because the worker clock reads larger"
     );
     held("public-three").await;
@@ -1278,7 +1278,7 @@ async fn worker_and_public_reports_are_ordered_within_their_own_clock() {
         report.sequence = accepted.sequence.expect("public mark");
     })
     .await;
-    assert!(!rig.registry.report_native_id(stale).await.recorded);
+    assert!(!rig.registry.report_as_root(stale).await.recorded);
 
     rig.report("worker-four").await;
     assert_eq!(
@@ -1294,10 +1294,10 @@ async fn worker_and_public_reports_are_ordered_within_their_own_clock() {
         report.sequence = accepted.sequence.expect("public mark");
     })
     .await;
-    assert!(!rig.registry.report_native_id(late).await.recorded);
+    assert!(!rig.registry.report_as_root(late).await.recorded);
     held("worker-four").await;
     let public = public_report(&rig, "public-five", |_| {}).await;
-    assert!(rig.registry.report_native_id(public).await.recorded);
+    assert!(rig.registry.report_as_root(public).await.recorded);
     held("public-five").await;
     rig.finish(&rig.registry).await;
 }
@@ -1528,7 +1528,7 @@ async fn run_history(seed: u64, history: &[Step]) {
             Step::PublicReport => {
                 let next = name("public");
                 let report = public_report(&rig, &next, |_| {}).await;
-                assert!(rig.registry.report_native_id(report).await.recorded, "{at}");
+                assert!(rig.registry.report_as_root(report).await.recorded, "{at}");
                 latest = next;
             }
             Step::StalePublicReport => {
@@ -1549,10 +1549,7 @@ async fn run_history(seed: u64, history: &[Step]) {
                         report.sequence = mark.expect("filtered");
                     })
                     .await;
-                    assert!(
-                        !rig.registry.report_native_id(report).await.recorded,
-                        "{at}"
-                    );
+                    assert!(!rig.registry.report_as_root(report).await.recorded, "{at}");
                 }
             }
             Step::ReplayOlderSnapshot => {
@@ -1656,7 +1653,7 @@ async fn run_history(seed: u64, history: &[Step]) {
                 });
                 let next = name("zero");
                 let report = public_report(&rig, &next, |report| report.sequence = 0).await;
-                let recorded = rig.registry.report_native_id(report).await.recorded;
+                let recorded = rig.registry.report_as_root(report).await.recorded;
                 assert_eq!(recorded, first_public, "{at}");
                 if recorded {
                     latest = next;
@@ -2089,7 +2086,7 @@ impl Rig {
         self.block_worker_imports(true);
         self.report(claim).await;
         let report = public_report(self, public, |_| {}).await;
-        assert!(self.registry.report_native_id(report).await.recorded);
+        assert!(self.registry.report_as_root(report).await.recorded);
     }
 }
 

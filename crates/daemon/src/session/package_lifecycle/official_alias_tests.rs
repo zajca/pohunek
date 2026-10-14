@@ -1640,7 +1640,7 @@ async fn stopped_built_in_claude(tag: &str) -> StoppedClaude {
         None,
     )
     .await;
-    assert!(previous.report_native_id(report).await.recorded);
+    assert!(previous.report_as_root(report).await.recorded);
     previous.stop(&created.id).await.expect("stop the session");
     StoppedClaude {
         fixture,

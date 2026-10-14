@@ -1183,7 +1183,10 @@ only origin-session exceptions are the lifecycle reports
 
 Hooks run only in a Pohunek-managed Hermes process. They use a short bounded
 local Unix-socket attempt, prefer worker-private identity reporting, and fall
-back to the hardened local public native-ID method. They never start a
+back to the local public native-ID method, which accepts a report only from the
+session's PTY root (see the attestation rule in the public API); the Hermes
+reporter runs in the agent process, but its `identity-v1` session refuses that
+method for every report, so the worker socket records the reference. They never start a
 subprocess, access the network or Hermes `state.db`, emit terminal output, or
 copy prompt/tool/output payloads. A failed hook is counted and swallowed, so
 process and screen detection remain the daemon's fallback. `on_session_end` is
@@ -1544,8 +1547,11 @@ that remain are cheap, free-by-default, or inherited:
   and `session.input` with `plugin_self_target_denied`. Read-only observation is allowed. The lifecycle
   reports `session.report_agent`, `session.release_agent`, and
   `session.report_native_id` are also deliberately allowed: managed hooks must
-  report their own session, and the public native-id method is the necessary
-  local fallback when the owner-private worker claim cannot be delivered. The
+  report their own session. The public `session.report_native_id` method
+  attests its caller with the kernel peer of the local connection: it admits
+  only the session's PTY root itself, and refuses every report of an
+  `identity-v1` session, so a hook's fallback to it is refused and the
+  owner-private worker claim is the route for a native reference. The
   pair is atomic and is copied to dedicated wait connections. This narrowly
   prevents an in-session automation client from invoking those nine mutations
   against the PTY that hosts it, but it is not authentication: any same-user

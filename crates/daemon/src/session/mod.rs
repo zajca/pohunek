@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use pohunek_service_config::preflight::CODE_WORKER_MARKER_LEGACY;
+use pohunek_worker_protocol::LaunchProcess;
 use protocol::{
     event, ActivityRevision, AgentActivity, AgentStateEvent, AttachEvent, BackgroundStateEvent,
     CwdSource, ErrorClass, Event, ProjectRemoveResult, ProtocolError, RuntimeId,
@@ -63,6 +64,7 @@ use crate::worktree::{
     canonical_or_original, run_hook, HookContext, HookEvent, HookStderrCapture, HookStderrTail,
     WorktreeCleanup, WorktreeManager, WorktreeRequest,
 };
+use native_attestation::{attest_report_caller, unattested, NativeReportRefusal};
 use reconcile::LossClassification;
 
 mod attach;
@@ -72,6 +74,7 @@ mod diff;
 mod hooks;
 mod input;
 mod lag;
+mod native_attestation;
 mod native_repair;
 mod observation;
 mod package_lifecycle;
@@ -83,6 +86,7 @@ mod profile_freeze_tests;
 mod profile_pin_tests;
 mod read;
 mod reconcile;
+pub use native_attestation::ControlPeer;
 pub use reconcile::upgrade_preflight;
 mod resume;
 mod retention;
@@ -3138,6 +3142,17 @@ impl SessionRegistry {
     /// (so `inspect`/`list` show it), and persists native recovery metadata.
     /// Reports for an unknown or already-terminal session are ignored, not
     /// errors (the hook fires-and-forgets).
+    ///
+    /// The caller is attested first, against `peer`, the kernel peer of the
+    /// connection that sent the report; `None` for a connection that has none.
+    /// A caller that is not the session's PTY root is refused with an error
+    /// rather than an ignored report, and so is any report for a session whose
+    /// hook schema takes its launch identity only from the worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`native_report_unattested`](native_attestation::UNATTESTED_CODE)
+    /// when the caller fails the attestation.
     #[expect(
         clippy::too_many_lines,
         reason = "ordered identity validation is kept linear so every rejection precedes persistence"
@@ -3145,9 +3160,13 @@ impl SessionRegistry {
     pub async fn report_native_id(
         &self,
         params: SessionReportNativeIdParams,
-    ) -> SessionReportNativeIdResult {
-        let not_recorded = SessionReportNativeIdResult { recorded: false };
+        peer: Option<&ControlPeer>,
+    ) -> Result<SessionReportNativeIdResult, ProtocolError> {
+        let not_recorded = Ok(SessionReportNativeIdResult { recorded: false });
         let session_id = params.session_id().clone();
+        if let Err(refusal) = attest_report_caller(peer, &params) {
+            return Err(unattested(&session_id, refusal));
+        }
         if !identity_claim_expiry_is_valid(params.expires_at()) {
             debug!(session_id = %session_id.0, "expired or overlong native-id report; ignoring");
             return not_recorded;
@@ -3181,16 +3200,26 @@ impl SessionRegistry {
             debug!(session_id = %session_id.0, "native-id report provider mismatch; ignoring");
             return not_recorded;
         }
-        if !self
-            .hook_report_admitted(
+        let schema = match self
+            .session_hook_admission(
                 &session_id,
                 pohunek_worker_protocol::HookAction::IdentityReport,
                 &expected_base,
-                "native-id report",
             )
             .await
         {
-            return not_recorded;
+            Some(Ok(schema)) => schema,
+            Some(Err(denial)) => {
+                debug!(session_id = %session_id.0, ?denial, "native-id report refused by the hook schema; ignoring");
+                return not_recorded;
+            }
+            None => return not_recorded,
+        };
+        if schema.launch_process == LaunchProcess::FrozenRootEntrypoint {
+            return Err(unattested(
+                &session_id,
+                NativeReportRefusal::FrozenRootSchema,
+            ));
         }
         let worker_snapshot = match worker.inspect().await {
             Ok(snapshot) => snapshot,
@@ -3259,6 +3288,11 @@ impl SessionRegistry {
             // from the updated entry. An update whose write fails is undone
             // before the lock is released, so it is never observed.
             let mut sessions = self.inner.sessions.lock().await;
+            // The caller is attested again under the lock, right before the
+            // entry changes, so a socket handed over since the first check is refused.
+            if let Err(refusal) = attest_report_caller(peer, &params) {
+                return Err(unattested(&session_id, refusal));
+            }
             let Some(entry) = sessions.get_mut(&session_id) else {
                 return not_recorded;
             };
@@ -3349,7 +3383,24 @@ impl SessionRegistry {
             self.emit(event::SESSION_UPDATED, &entry.info);
         }
         drop(sessions);
-        SessionReportNativeIdResult { recorded: true }
+        Ok(SessionReportNativeIdResult { recorded: true })
+    }
+
+    /// [`SessionRegistry::report_native_id`] for a caller that is the session's
+    /// PTY root: the peer is built from the pid and start identity the report
+    /// names, so the production rules run unchanged.
+    #[cfg(test)]
+    pub(crate) async fn report_as_root(
+        &self,
+        params: SessionReportNativeIdParams,
+    ) -> SessionReportNativeIdResult {
+        let root = ControlPeer::for_test(ProcessIdentity {
+            pid: params.pid(),
+            start_identity: crate::procwatch::StartIdentity::new(params.pid_start_identity().get()),
+        });
+        self.report_native_id(params, Some(&root))
+            .await
+            .expect("a report from the session's PTY root is attested")
     }
 
     /// Resolves the agent a callback of session `id` names. A name that is the
@@ -6382,11 +6433,25 @@ impl SessionRegistry {
         action: pohunek_worker_protocol::HookAction,
         provider: &str,
     ) -> Result<(), pohunek_worker_protocol::HookDenial> {
+        match self.session_hook_admission(id, action, provider).await {
+            None => Ok(()),
+            Some(admission) => admission.map(|_schema| ()),
+        }
+    }
+
+    /// The hook schema that admits `action` from `provider` on session `id`,
+    /// or the denial. `None` when the session is unknown.
+    async fn session_hook_admission(
+        &self,
+        id: &SessionId,
+        action: pohunek_worker_protocol::HookAction,
+        provider: &str,
+    ) -> Option<
+        Result<&'static pohunek_worker_protocol::HookSchema, pohunek_worker_protocol::HookDenial>,
+    > {
         let (agent_base, pinned, pin, worker) = {
             let sessions = self.inner.sessions.lock().await;
-            let Some(entry) = sessions.get(id) else {
-                return Ok(());
-            };
+            let entry = sessions.get(id)?;
             let worker = match &entry.runtime {
                 RuntimeHandle::Worker(worker) => Some(worker.clone()),
                 RuntimeHandle::Unavailable(_) => None,
@@ -6405,13 +6470,12 @@ impl SessionRegistry {
                 None => self.session_hook_schema(&agent_base, &pin),
             },
         };
-        pohunek_worker_protocol::admit_hook(
+        Some(pohunek_worker_protocol::admit_hook(
             schema,
             action,
             provider,
             Some(agent_kind_label(&agent_base)),
-        )
-        .map(|_schema| ())
+        ))
     }
 
     /// Whether the hook schema of session `id` admits `action` from

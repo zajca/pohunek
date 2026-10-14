@@ -44,6 +44,9 @@ const OUTPUT_MAX_BYTES: u32 = 4096;
 /// Error codes that mean the daemon could not read the request's shape.
 const SHAPE_ERROR_CODES: &[&str] = &["bad_request", "version_mismatch", "method_not_found"];
 
+/// Refusal a replayed native-id report from a hook that is not the PTY root receives.
+const UNATTESTED_CODE: &str = "native_report_unattested";
+
 /// Consumer recordings: (file name, contents).
 const CONSUMER_FIXTURES: &[(&str, &str)] = &[
     (
@@ -886,6 +889,11 @@ fn assert_accepted(file: &str, label: &str, name: &str, sent: &Value, response: 
             integer_seq || !SHAPE_ERROR_CODES.contains(&code),
             "the daemon refused the shape: {context}"
         );
+        // A replayed native-id report comes from a hook that is not the session's
+        // PTY root, so the daemon answers its typed attestation refusal.
+        if name == method::SESSION_REPORT_NATIVE_ID {
+            assert_eq!(code, UNATTESTED_CODE, "{context}");
+        }
     }
     if MUST_SUCCEED.contains(&name) {
         assert!(response.get("ok").is_some(), "{context}");
@@ -1058,6 +1066,17 @@ async fn prebump_state_hooks_report_through_the_daemon_socket() {
             for (request, reply) in &exchanges {
                 assert_hook_exchange(version, request, reply);
             }
+            // The hook runs as a child of this test process and reports its
+            // parent as the agent, and the relay that forwards it is this same
+            // process. The attestation therefore passes, and the existing process
+            // check answers `recorded: false`: the session's PTY root is a
+            // different process.
+            assert_eq!(
+                exchanges[1].1["ok"]["recorded"],
+                json!(false),
+                "{agent} v{version}: {}",
+                exchanges[1].1
+            );
             let native = &exchanges[1].0["params"];
             let key = if version == PREVIOUS_VERSION {
                 "runtime_id"

@@ -816,8 +816,48 @@ async fn composite_wait_short_circuits_ended_lost_and_disappeared_runtimes() {
     }
 }
 
+/// Python helpers the identity reporters of these tests share: the kernel
+/// start identity of a process, and one request and response round trip with
+/// the worker socket.
 #[cfg(unix)]
-const LIVE_IDENTITY_REPORTER: &str = r#"import datetime
+const WORKER_IDENTITY_HELPERS: &str = r#"import json
+import os
+import socket
+import sys
+
+def process_start_identity(pid):
+    if sys.platform == "darwin":
+        # `struct proc_bsdinfo` from `proc_pidinfo(PROC_PIDTBSDINFO)`: the
+        # kernel start time the worker encodes as microseconds.
+        import ctypes
+        import struct
+
+        libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        buffer = ctypes.create_string_buffer(136)
+        assert libsystem.proc_pidinfo(pid, 3, ctypes.c_uint64(0), buffer, 136) == 136
+        seconds, microseconds = struct.unpack_from("=QQ", buffer, 120)
+        return seconds * 1_000_000 + microseconds
+    with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
+        fields = handle.read().rsplit(")", 1)[1].split()
+    return int(fields[19])
+
+def send(request):
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(os.environ["POHUNEK_WORKER_SOCKET_PATH"])
+    client.sendall((json.dumps(request) + "\n").encode())
+    received = b""
+    while b"\n" not in received:
+        chunk = client.recv(4096)
+        if not chunk:
+            raise RuntimeError(f"worker closed the socket before a full response line: {received!r}")
+        received += chunk
+    response = json.loads(received.split(b"\n", 1)[0])
+    client.close()
+    return response["ok"] is True
+"#;
+
+#[cfg(unix)]
+const LIVE_IDENTITY_REPORTER_HEAD: &str = r#"import datetime
 import json
 import os
 import socket
@@ -846,40 +886,14 @@ sys.excepthook = record_failure
 def wait_for_test():
     gate.readline()
 
-def process_start_identity(pid):
-    if sys.platform == "darwin":
-        # `struct proc_bsdinfo` from `proc_pidinfo(PROC_PIDTBSDINFO)`: the
-        # kernel start time the worker encodes as microseconds.
-        import ctypes
-        import struct
+"#;
 
-        libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
-        buffer = ctypes.create_string_buffer(136)
-        assert libsystem.proc_pidinfo(pid, 3, ctypes.c_uint64(0), buffer, 136) == 136
-        seconds, microseconds = struct.unpack_from("=QQ", buffer, 120)
-        return seconds * 1_000_000 + microseconds
-    with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
-        fields = handle.read().rsplit(")", 1)[1].split()
-    return int(fields[19])
-
-start_identity = process_start_identity(pid)
+#[cfg(unix)]
+const LIVE_IDENTITY_REPORTER_TAIL: &str = r#"start_identity = process_start_identity(pid)
 # Worker claim sequences are the host CLOCK_MONOTONIC in nanoseconds; the worker
 # refuses a claim ahead of its own reading of that clock.
 sequence = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
 
-def send(request):
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    client.connect(os.environ["POHUNEK_WORKER_SOCKET_PATH"])
-    client.sendall((json.dumps(request) + "\n").encode())
-    received = b""
-    while b"\n" not in received:
-        chunk = client.recv(4096)
-        if not chunk:
-            raise RuntimeError(f"worker closed the socket before a full response line: {received!r}")
-        received += chunk
-    response = json.loads(received.split(b"\n", 1)[0])
-    client.close()
-    return response["ok"] is True
 
 report = {
     "type": "identity_report",
@@ -932,11 +946,21 @@ os._exit(0)
 "#;
 
 #[cfg(unix)]
+fn live_identity_reporter() -> String {
+    [
+        LIVE_IDENTITY_REPORTER_HEAD,
+        WORKER_IDENTITY_HELPERS,
+        LIVE_IDENTITY_REPORTER_TAIL,
+    ]
+    .concat()
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn worker_identity_changes_project_live_into_the_logical_session() {
     let root = temp_dir("live-worker-identity-projection");
     let reporter = root.join("identity_reporter.py");
-    std::fs::write(&reporter, LIVE_IDENTITY_REPORTER).expect("write identity reporter");
+    std::fs::write(&reporter, live_identity_reporter()).expect("write identity reporter");
     let gate_path = root.join("identity-steps.gate");
     let mut gate = hook_gate(&gate_path);
     let agents_dir = temp_agents_dir_with(
@@ -1671,6 +1695,7 @@ async fn wait_for_line_count(path: &std::path::Path, expected: usize) -> String 
     .await
 }
 
+#[cfg(target_os = "linux")]
 async fn wait_for_resume_binding_removed(registry: &SessionRegistry, id: &SessionId) {
     wait_until(&format!("resume binding removal for {}", id.0), || async {
         let bindings = registry
@@ -4337,7 +4362,7 @@ async fn session_stop_hook_reports_stopped_done_and_failed_reasons_once() {
             .await
             .expect("create session");
         let recorded = registry
-            .report_native_id(native_report!(&registry;
+            .report_as_root(native_report!(&registry;
                 session_id: created.id.clone(),
                 agent: "claude".to_owned(),
                 native_session_id: format!("native-{tag}"),
@@ -10351,7 +10376,7 @@ impl NativeIdExitRace {
         let held = registry.hold_next_native_id(&created.id, at);
         let reporting = tokio::spawn({
             let registry = registry.clone();
-            async move { registry.report_native_id(report).await }
+            async move { registry.report_as_root(report).await }
         });
         held.entered.notified().await;
         Self {
@@ -10523,7 +10548,7 @@ async fn report_native_id_records_binding_and_updates_info() {
     assert_eq!(created.native_session_id, None);
 
     let result = registry
-        .report_native_id(native_report!(&registry;
+        .report_as_root(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-abc".to_owned(),
@@ -10582,7 +10607,7 @@ async fn concurrent_session_writes_cannot_regress_native_ordering() {
         .expect("create session");
     assert!(
         registry
-            .report_native_id(native_report!(&registry;
+            .report_as_root(native_report!(&registry;
                 session_id: created.id.clone(),
                 agent: "claude".to_owned(),
                 native_session_id: "native-initial".to_owned(),
@@ -11733,7 +11758,7 @@ async fn report_native_id_ignores_reports_from_a_different_agent_base() {
         .expect("create claude session");
 
     let claude_report = registry
-        .report_native_id(native_report!(&registry;
+        .report_as_root(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "claude-native".to_owned(),
@@ -11743,7 +11768,7 @@ async fn report_native_id_ignores_reports_from_a_different_agent_base() {
     assert!(claude_report.recorded);
 
     let codex_report = registry
-        .report_native_id(native_report!(&registry;
+        .report_as_root(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "codex".to_owned(),
             native_session_id: "codex-thread".to_owned(),
@@ -11820,7 +11845,7 @@ async fn report_native_id_rejects_stale_expired_and_mismatched_claims() {
     let valid_expiry = native_report_expiry();
 
     let first = registry
-        .report_native_id(claim(
+        .report_as_root(claim(
             created.id.clone(),
             coordinates.worker_instance_id(),
             coordinates.pid_start_identity(),
@@ -11881,7 +11906,7 @@ async fn report_native_id_rejects_stale_expired_and_mismatched_claims() {
             "native-wrong-session",
         ),
     ] {
-        assert!(!registry.report_native_id(rejected).await.recorded);
+        assert!(!registry.report_as_root(rejected).await.recorded);
     }
 
     let inspected = registry
@@ -11984,11 +12009,17 @@ fn write_claude_transcript(claude_home: &std::path::Path, reference: &str) {
 fn temp_hermes_that_exits_then_resumes(
     tag: &str,
     marker: &std::path::Path,
+    native_reference: Option<&str>,
 ) -> (PathBuf, PathBuf, fs::File) {
     let runtime = temp_dir(&format!("{tag}-runtime"));
     let script = runtime.join("hermes");
     let gate = hook_gate(&runtime.join(HERMES_EXIT_GATE));
-    write_hermes_resume_executable(&script, marker, "Hermes Agent v0.20.0 (2026.8.3)");
+    write_hermes_resume_executable(
+        &script,
+        marker,
+        "Hermes Agent v0.20.0 (2026.8.3)",
+        native_reference,
+    );
     let agents = temp_agents_dir_with(
         tag,
         "hermes-test",
@@ -12005,27 +12036,154 @@ fn temp_hermes_that_exits_then_resumes(
 #[cfg(unix)]
 const HERMES_EXIT_GATE: &str = "exit.gate";
 
-/// Writes the Hermes test executable: `--version` reports `version_output`, the
-/// first run waits for one line on the [`HERMES_EXIT_GATE`] FIFO beside it, and
-/// `--resume` runs stay alive.
+/// Python body of the Hermes test executable, run behind its shebang.
+///
+/// `VERSION`, `MARKER`, `GATE` and `REFERENCE` are set by [`hermes_stub_source`]
+/// ahead of this body, and the identity helpers come from
+/// [`WORKER_IDENTITY_HELPERS`]. Every run appends its arguments to the marker
+/// file, one `<argument>` line each. `--resume` runs stay alive. A fresh run
+/// with a reference reports it in process before it waits for one line on the
+/// gate.
+#[cfg(unix)]
+const HERMES_STUB_BODY: &str = r#"args = sys.argv[1:]
+if args[:1] == ["--version"]:
+    print(VERSION)
+    raise SystemExit(0)
+with open(MARKER, "a", encoding="utf-8") as marker:
+    for argument in args:
+        marker.write(f"<{argument}>\n")
+if "--resume" in args:
+    time.sleep(30)
+    raise SystemExit(0)
+
+def record_failure(kind, value, trace):
+    # The test reads this file, so the stub never dies without a reason.
+    import traceback
+    with open(GATE + ".failure", "w", encoding="utf-8") as handle:
+        handle.write("".join(traceback.format_exception(kind, value, trace)))
+
+sys.excepthook = record_failure
+
+def report_native_reference(reference):
+    pid = os.getpid()
+    request = {
+        "type": "identity_report",
+        "runtime_id": os.environ["POHUNEK_WORKER_INSTANCE_ID"],
+        "provider": "hermes",
+        "pid": pid,
+        "start_identity": process_start_identity(pid),
+        # Worker claim sequences are the host CLOCK_MONOTONIC in nanoseconds.
+        "sequence": time.clock_gettime_ns(time.CLOCK_MONOTONIC),
+        # Well inside the worker's expiry ceiling, so the claim is still valid
+        # when the worker reads it.
+        "expires_at": (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=30)).isoformat().replace("+00:00", "Z"),
+        "reference_kind": "id",
+        "native_reference": reference,
+    }
+    assert send(request) is True, "the worker refused the Hermes identity report"
+
+if REFERENCE is not None:
+    report_native_reference(REFERENCE)
+with open(GATE, encoding="ascii") as gate:
+    gate.readline()
+"#;
+
+/// Source of the Hermes test executable, without its shebang line.
+#[cfg(unix)]
+fn hermes_stub_source(
+    marker: &std::path::Path,
+    gate: &std::path::Path,
+    version_output: &str,
+    native_reference: Option<&str>,
+) -> String {
+    // JSON string literals are valid Python string literals for these values.
+    let literal = |value: &str| serde_json::to_string(value).expect("string literal");
+    let reference = native_reference.map_or_else(|| "None".to_owned(), literal);
+    [
+        WORKER_IDENTITY_HELPERS.to_owned(),
+        "import datetime\nimport time\n\n".to_owned(),
+        format!(
+            "MARKER = {}\nGATE = {}\nVERSION = {}\nREFERENCE = {reference}\n\n",
+            literal(&marker.display().to_string()),
+            literal(&gate.display().to_string()),
+            literal(version_output),
+        ),
+        HERMES_STUB_BODY.to_owned(),
+    ]
+    .concat()
+}
+
+/// Canonical path of the `python3` on `PATH`, named by the Hermes stub's shebang.
+///
+/// The frozen-root rule compares the image the kernel runs, so the shebang names
+/// the resolved path, and an interpreter path with whitespace cannot be named
+/// by a single-path shebang.
+#[cfg(unix)]
+fn canonical_python3() -> PathBuf {
+    let path = std::env::var_os("PATH").expect("PATH is set");
+    let found = std::env::split_paths(&path)
+        .map(|dir| dir.join("python3"))
+        .find(|candidate| candidate.is_file())
+        .expect("python3 is on PATH");
+    let canonical = fs::canonicalize(&found).expect("canonicalize python3");
+    assert!(
+        !canonical
+            .display()
+            .to_string()
+            .contains(char::is_whitespace),
+        "the interpreter cannot be named by a single-path shebang: {}",
+        canonical.display()
+    );
+    canonical
+}
+
+/// Writes the Hermes test executable as a Python script behind an absolute,
+/// argument-free shebang: `--version` reports `version_output`, and a fresh run
+/// reports `native_reference` through the worker when one is given.
 #[cfg(unix)]
 fn write_hermes_resume_executable(
     script: &std::path::Path,
     marker: &std::path::Path,
     version_output: &str,
+    native_reference: Option<&str>,
 ) {
     let gate = script
         .parent()
         .expect("script directory")
         .join(HERMES_EXIT_GATE);
-    write_executable(
-        script,
-        &format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf '%s\\n' '{version_output}'\n  exit 0\nfi\n{}case \" $* \" in *\" --resume \"*) sleep 30 ;; *) read _ < '{}'; exit 0 ;; esac\n",
-            append_launch_record(marker, "printf '<%s>\\n' \"$@\""),
-            gate.display(),
-        ),
+    let source = format!(
+        "#!{}\n{}",
+        canonical_python3().display(),
+        hermes_stub_source(marker, &gate, version_output, native_reference)
     );
+    write_executable(script, &source);
+}
+
+/// Waits until the registry shows `reference` as the native reference of
+/// session `id`, and fails with the stub's own traceback when the stub reports
+/// that the worker refused its identity report.
+#[cfg(target_os = "linux")]
+async fn wait_for_hermes_native_reference(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    script: &std::path::Path,
+    reference: &str,
+) {
+    let failure = script
+        .parent()
+        .expect("script directory")
+        .join(format!("{HERMES_EXIT_GATE}.failure"));
+    wait_until(
+        "the Hermes native reference to reach the registry",
+        || async {
+            if let Ok(text) = fs::read_to_string(&failure) {
+                panic!("the Hermes stub failed: {text}");
+            }
+            let info = registry.inspect(id).await.ok()?;
+            (info.native_session_id.as_deref() == Some(reference)).then_some(())
+        },
+    )
+    .await;
 }
 
 fn resumable_params() -> SessionNewParams {
@@ -12080,7 +12238,7 @@ async fn fork_live_claude_session_mints_new_id_and_builds_fork_argv() {
         .expect("create forkable session");
     assert_eq!(created.state, SessionState::Running);
     let recorded = registry
-        .report_native_id(native_report!(&registry;
+        .report_as_root(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-live".to_owned(),
@@ -12234,7 +12392,7 @@ async fn non_resumable_claude_profile_has_neither_resume_nor_fork() {
         .expect("live runtime id");
 
     let result = registry
-        .report_native_id(native_report!(&registry;
+        .report_as_root(native_report!(&registry;
             session_id: created.id.clone(),
             worker_instance_id: worker_instance_id,
             agent: "claude".to_owned(),
@@ -12334,7 +12492,7 @@ async fn report_native_id_path_profile_stores_path_and_ignores_wire_agent() {
         .expect("create path-profile session");
 
     let result = registry
-        .report_native_id(native_report!(&registry;
+        .report_as_root(native_report!(&registry;
             session_id: created.id.clone(),
             // Wire agent is a base-kind literal (what the hook reports); ignored
             // for ref-kind selection.
@@ -12448,7 +12606,7 @@ async fn resume_binding_never_persists_profile_env_secrets() {
         .await
         .expect("create env-profile session");
     let result = registry
-        .report_native_id(native_report!(&registry;
+        .report_as_root(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-xyz".to_owned(),
@@ -12484,7 +12642,7 @@ async fn legacy_harness_exit_during_daemon_shutdown_keeps_recovery_binding() {
         .await
         .expect("create session");
     let recorded = registry
-        .report_native_id(native_report!(&registry;
+        .report_as_root(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-shutdown".to_owned(),
@@ -12563,7 +12721,7 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
         .await
         .expect("create session");
     let recorded = registry
-        .report_native_id(native_report!(&registry;
+        .report_as_root(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-manual".to_owned(),
@@ -12752,12 +12910,15 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
     let _ = registry.stop(&created.id).await;
 }
 
-#[cfg(unix)]
+// Linux only: on macOS /usr/bin/python3 and framework Pythons re-exec another image, which the
+// frozen-root launch rule refuses by design (docs/knowledge/concepts/sessions.md, "Which process may report the conversation id").
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn hermes_resume_reuses_logical_session_with_exact_argv_and_new_generation() {
     let marker = temp_dir("hermes-resume-marker").join("argv.txt");
-    let (agents_dir, _script, mut exit_gate) =
-        temp_hermes_that_exits_then_resumes("hermes-resume", &marker);
+    let native_reference = "native id with spaces + symbols";
+    let (agents_dir, script, mut exit_gate) =
+        temp_hermes_that_exits_then_resumes("hermes-resume", &marker, Some(native_reference));
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
@@ -12772,18 +12933,7 @@ async fn hermes_resume_reuses_logical_session_with_exact_argv_and_new_generation
         })
         .await
         .expect("create Hermes session");
-    let native_reference = "native id with spaces + symbols";
-    assert!(
-        registry
-            .report_native_id(native_report!(&registry;
-                session_id: created.id.clone(),
-                agent: "hermes".to_owned(),
-                native_session_id: native_reference.to_owned(),
-                transcript_path: None,
-            ))
-            .await
-            .recorded
-    );
+    wait_for_hermes_native_reference(&registry, &created.id, &script, native_reference).await;
     exit_gate
         .write_all(b"go\n")
         .expect("release the Hermes exit gate");
@@ -12825,12 +12975,18 @@ async fn hermes_resume_reuses_logical_session_with_exact_argv_and_new_generation
     let _ = registry.stop(&resumed.id).await;
 }
 
-#[cfg(unix)]
+// Linux only: on macOS /usr/bin/python3 and framework Pythons re-exec another image, which the
+// frozen-root launch rule refuses by design (docs/knowledge/concepts/sessions.md, "Which process may report the conversation id").
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn incompatible_hermes_resume_has_no_runtime_or_store_side_effects() {
     let marker = temp_dir("hermes-policy-resume-marker").join("argv.txt");
-    let (agents_dir, script, mut exit_gate) =
-        temp_hermes_that_exits_then_resumes("hermes-policy-resume", &marker);
+    let native_reference = "native-policy-test";
+    let (agents_dir, script, mut exit_gate) = temp_hermes_that_exits_then_resumes(
+        "hermes-policy-resume",
+        &marker,
+        Some(native_reference),
+    );
     let store_path = temp_store_path("hermes-policy-resume");
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: hermetic_shell(),
@@ -12846,17 +13002,7 @@ async fn incompatible_hermes_resume_has_no_runtime_or_store_side_effects() {
         })
         .await
         .expect("create supported Hermes session");
-    assert!(
-        registry
-            .report_native_id(native_report!(&registry;
-                session_id: created.id.clone(),
-                agent: "hermes".to_owned(),
-                native_session_id: "native-policy-test".to_owned(),
-                transcript_path: None,
-            ))
-            .await
-            .recorded
-    );
+    wait_for_hermes_native_reference(&registry, &created.id, &script, native_reference).await;
     exit_gate
         .write_all(b"go\n")
         .expect("release the Hermes exit gate");
@@ -12872,7 +13018,7 @@ async fn incompatible_hermes_resume_has_no_runtime_or_store_side_effects() {
         "Hermes Agent v0.21.0 (future)",
         "unexpected provider output",
     ] {
-        write_hermes_resume_executable(&script, &marker, version_output);
+        write_hermes_resume_executable(&script, &marker, version_output, None);
         let error = registry
             .resume(&created.id)
             .await
@@ -12968,7 +13114,7 @@ async fn incompatible_hermes_resume_binding_fails_before_recovery_side_effects()
     ] {
         let mut candidate = binding.clone();
         if let Some(program) = program {
-            write_hermes_resume_executable(&program, &marker, version_output);
+            write_hermes_resume_executable(&program, &marker, version_output, None);
             candidate.program = program.display().to_string();
         } else {
             candidate.program = missing.display().to_string();
@@ -13004,7 +13150,7 @@ async fn incompatible_hermes_resume_binding_fails_before_recovery_side_effects()
 async fn hermes_resume_without_native_reference_fails_before_relaunch() {
     let marker = temp_dir("hermes-no-reference-marker").join("argv.txt");
     let (agents_dir, _script, mut exit_gate) =
-        temp_hermes_that_exits_then_resumes("hermes-no-reference", &marker);
+        temp_hermes_that_exits_then_resumes("hermes-no-reference", &marker, None);
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
@@ -13066,7 +13212,7 @@ async fn a_hostile_native_id_refuses_recovery_without_launching() {
         .expect("create session");
     assert!(
         registry
-            .report_native_id(native_report!(&registry;
+            .report_as_root(native_report!(&registry;
                 session_id: created.id.clone(),
                 agent: "claude".to_owned(),
                 native_session_id: hostile.to_owned(),
@@ -13140,7 +13286,7 @@ async fn pi_shaped_profile_resumes_and_forks_through_the_frozen_spec() {
     let reference = "/work/with space/$(touch pwned);|.jsonl";
     assert!(
         registry
-            .report_native_id(native_report!(&registry;
+            .report_as_root(native_report!(&registry;
                 session_id: created.id.clone(),
                 agent: "claude".to_owned(),
                 native_session_id: "ignored-for-path-kind".to_owned(),
@@ -13295,7 +13441,7 @@ async fn set_metadata_after_capture_updates_persisted_binding() {
         .await
         .expect("create session");
     let recorded = registry
-        .report_native_id(native_report!(&registry;
+        .report_as_root(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-metadata".to_owned(),
@@ -13471,7 +13617,7 @@ async fn resume_after_profile_edit_and_resize_uses_original_snapshot() {
         .await
         .expect("create editable profile session");
     let recorded = registry
-        .report_native_id(native_report!(&registry;
+        .report_as_root(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-edit-resize".to_owned(),
@@ -13579,7 +13725,7 @@ async fn resume_binding_persists_project_context_for_restart() {
 
     // Capturing the native id persists the resume binding from live state.
     let recorded = registry
-        .report_native_id(native_report!(&registry;
+        .report_as_root(native_report!(&registry;
             session_id: info.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-resume".to_owned(),
@@ -13624,7 +13770,7 @@ async fn concurrent_resize_and_recapture_keep_store_consistent_with_memory() {
         .await
         .expect("create session");
     let recorded = registry
-        .report_native_id(native_report!(&registry;
+        .report_as_root(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-concurrent".to_owned(),
@@ -13647,7 +13793,7 @@ async fn concurrent_resize_and_recapture_keep_store_consistent_with_memory() {
         let id = created.id.clone();
         tokio::spawn(async move {
             registry
-                .report_native_id(native_report!(&registry;
+                .report_as_root(native_report!(&registry;
                     session_id: id,
                     agent: "claude".to_owned(),
                     native_session_id: "native-concurrent".to_owned(),
@@ -13694,7 +13840,7 @@ async fn resize_then_stop_leaves_no_binding() {
         .await
         .expect("create session");
     let recorded = registry
-        .report_native_id(native_report!(&registry;
+        .report_as_root(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-resize-stop".to_owned(),
@@ -13737,7 +13883,7 @@ async fn report_native_id_ignores_unknown_invalid_and_terminal() {
 
     // Unknown session id.
     let unknown = registry
-        .report_native_id(native_report!(&registry;
+        .report_as_root(native_report!(&registry;
             session_id: SessionId("s-missing".to_owned()),
             agent: "claude".to_owned(),
             native_session_id: "native-1".to_owned(),
@@ -13765,7 +13911,7 @@ async fn report_native_id_ignores_unknown_invalid_and_terminal() {
     // Terminal session.
     let _ = registry.stop(&created.id).await;
     let terminal = registry
-        .report_native_id(native_report!(&registry;
+        .report_as_root(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "shell".to_owned(),
             native_session_id: "native-late".to_owned(),
@@ -17549,7 +17695,7 @@ async fn terminal_resumable_session(
         .expect("create session");
     let reference = format!("native-{}", created.id.0);
     let recorded = registry
-        .report_native_id(native_report!(registry;
+        .report_as_root(native_report!(registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: reference.clone(),
@@ -18256,7 +18402,7 @@ async fn a_report_labels_the_reference_it_writes_reported() {
         .expect("create session");
     assert!(
         registry
-            .report_native_id(native_report!(&registry;
+            .report_as_root(native_report!(&registry;
                 session_id: created.id.clone(),
                 agent: "pi".to_owned(),
                 native_session_id: "reported-conversation".to_owned(),
@@ -20248,7 +20394,7 @@ async fn a_fork_over_outdated_hook_assets_carries_a_hook_warning() {
         .await
         .expect("create");
     let recorded = registry
-        .report_native_id(native_report!(&registry;
+        .report_as_root(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-fork".to_owned(),
@@ -20303,7 +20449,7 @@ async fn a_resume_over_outdated_hook_assets_carries_a_hook_warning() {
         .await
         .expect("create session");
     let recorded = registry
-        .report_native_id(native_report!(&registry;
+        .report_as_root(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-resume".to_owned(),
@@ -20400,7 +20546,7 @@ async fn a_fork_of_a_profile_named_after_its_runtime_checks_the_profile_home() {
     install_shadowing_profile_hooks(&registry);
     let created = create_in(&registry, "claude", &dir).await.expect("create");
     let recorded = registry
-        .report_native_id(native_report!(&registry;
+        .report_as_root(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: SHADOW_NATIVE_REFERENCE.to_owned(),
@@ -20466,7 +20612,7 @@ async fn a_resume_of_a_profile_named_after_its_runtime_checks_the_profile_home()
         .await
         .expect("create");
     let recorded = registry
-        .report_native_id(native_report!(&registry;
+        .report_as_root(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: SHADOW_NATIVE_REFERENCE.to_owned(),

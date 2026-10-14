@@ -54,7 +54,7 @@ use pohunek_platform::filesystem::{
 
 use crate::error::DaemonError;
 use crate::governance::HostGovernanceService;
-use crate::session::{RedeemedAttach, RedeemedRuntime, SessionRegistry};
+use crate::session::{ControlPeer, RedeemedAttach, RedeemedRuntime, SessionRegistry};
 
 #[cfg(not(test))]
 use handler::Dispatch;
@@ -264,6 +264,10 @@ impl ControlServer {
                         Ok((stream, _addr)) => {
                             let state = state.clone();
                             tokio::spawn(async move {
+                                // The peer is read from the accepted socket before any request
+                                // byte is parsed, so it names the process that connected.
+                                let peer = ControlPeer::capture(&stream).map(Arc::new);
+                                let state = state.with_control_peer(peer);
                                 if let Err(err) = Box::pin(serve_connection(stream, state)).await {
                                     warn!(error = %err, "control connection ended with error");
                                 }
