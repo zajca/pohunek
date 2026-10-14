@@ -251,6 +251,7 @@ fn session_info() -> SessionInfo {
         branch: None,
         worktree_path: None,
         warnings: Vec::new(),
+        capability_refusals: None,
         output_force_closed: false,
         created_at: "2026-09-24T00:00:00Z".to_owned(),
         updated_at: "2026-09-24T00:00:00Z".to_owned(),

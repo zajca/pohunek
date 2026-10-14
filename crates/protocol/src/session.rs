@@ -2430,6 +2430,38 @@ pub struct SessionCapabilities {
     pub fork: bool,
 }
 
+/// Typed reasons the session's recovery resolution refuses an operation its
+/// frozen [`SessionCapabilities`] allow.
+///
+/// Each code is the error code `session.resume` or `session.fork` returns for
+/// that resolution, derived from the same check that clears the matching
+/// capability in a list or inspect response. Refusals that depend on the
+/// session's current state or on one request are not listed. Unlike the capability
+/// object, this object is open: a newer daemon may add operations.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionCapabilityRefusals.ts"))]
+pub struct SessionCapabilityRefusals {
+    /// Error code `session.resume` refuses with when the recovery resolution
+    /// refuses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub resume: Option<String>,
+    /// Error code `session.fork` refuses with when the recovery resolution
+    /// refuses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub fork: Option<String>,
+}
+
+impl SessionCapabilityRefusals {
+    /// Whether no operation is refused.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.resume.is_none() && self.fork.is_none()
+    }
+}
+
 /// Summary returned by session lifecycle methods and published by events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -2449,6 +2481,12 @@ pub struct SessionInfo {
     /// Session-specific mutation capabilities frozen when the session started.
     #[serde(default)]
     pub capabilities: SessionCapabilities,
+    /// Why the daemon refuses a capability the frozen [`Self::capabilities`]
+    /// allow, set only on list and inspect responses whose capability it
+    /// cleared. Stored records and events never carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub capability_refusals: Option<SessionCapabilityRefusals>,
     /// Owner-set display name, or `None` when the session is shown by its id.
     /// Set at `session.new` and changed via `session.rename`; cosmetic only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3254,6 +3292,7 @@ mod tests {
             branch: None,
             worktree_path: None,
             warnings: Vec::new(),
+            capability_refusals: None,
             output_force_closed: false,
             metadata: BTreeMap::new(),
             created_at: "2026-01-01T00:00:00Z".to_owned(),

@@ -159,6 +159,7 @@ export type { SessionAttachParams } from "./SessionAttachParams";
 export type { SessionAttachResult } from "./SessionAttachResult";
 export type { SessionBackground } from "./SessionBackground";
 export type { SessionCapabilities } from "./SessionCapabilities";
+export type { SessionCapabilityRefusals } from "./SessionCapabilityRefusals";
 export type { SessionDetachParams } from "./SessionDetachParams";
 export type { SessionDetachResult } from "./SessionDetachResult";
 export type { SessionDetectionParams } from "./SessionDetectionParams";

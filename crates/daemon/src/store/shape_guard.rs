@@ -387,6 +387,7 @@ fn assert_every_field_is_reviewed(
         branch: _,
         worktree_path: _,
         warnings,
+        capability_refusals: _,
         output_force_closed: _,
         metadata: _,
         created_at: _,

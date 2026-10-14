@@ -1569,6 +1569,22 @@ async fn listed_recovery(registry: &SessionRegistry, id: &protocol::SessionId) -
     (info.capabilities.resume, info.capabilities.fork)
 }
 
+/// The resume and fork refusal codes `session list` reports for session `id`.
+async fn listed_refusals(
+    registry: &SessionRegistry,
+    id: &protocol::SessionId,
+) -> (Option<String>, Option<String>) {
+    let mut list = registry.list().await;
+    registry.enrich_native_activity(&mut list).await;
+    let refusals = list
+        .into_iter()
+        .find(|info| info.id.0 == id.0)
+        .unwrap_or_else(|| panic!("{} is listed", id.0))
+        .capability_refusals
+        .unwrap_or_default();
+    (refusals.resume, refusals.fork)
+}
+
 /// Rewrites the durable recovery binding of session `id` through `edit`, as an
 /// older release or a damaged record would have stored it.
 fn edit_durable_recovery(
@@ -1676,6 +1692,10 @@ async fn a_stopped_built_in_claude_session_resumes_through_the_official_package_
         (true, true),
         "the package adopts the session, so it lists as resumable and forkable"
     );
+    assert_eq!(
+        listed_refusals(&restarted.registry, &session.id).await,
+        (None, None)
+    );
 
     // The host profile over the built-in changed its base runtime's launch
     // binding, so its revision moves with the adoption; the owner accepts that
@@ -1726,6 +1746,11 @@ async fn a_built_in_claude_session_is_not_listed_as_resumable_while_no_package_s
         .await
         .expect_err("nothing serves the built-in the session was launched from");
     assert_eq!(forked.code, "runtime_builtin_removed", "{forked:?}");
+    assert_eq!(
+        listed_refusals(&restarted.registry, &session.id).await,
+        (Some(resumed.code), Some(forked.code)),
+        "the listing names the codes resume and fork refuse with"
+    );
 }
 
 #[tokio::test]
@@ -1759,6 +1784,11 @@ async fn an_unpinned_built_in_claude_session_is_never_resumed_through_the_packag
         .await
         .expect_err("an unpinned session names no built-in to adopt");
     assert_eq!(forked.code, "runtime_served_by_package", "{forked:?}");
+    assert_eq!(
+        listed_refusals(&restarted.registry, &session.id).await,
+        (Some(resumed.code), Some(forked.code)),
+        "the listing names the codes resume and fork refuse with"
+    );
 }
 
 #[tokio::test]
@@ -1801,6 +1831,11 @@ async fn a_built_in_claude_session_is_refused_when_the_package_does_not_honor_it
         .await
         .expect_err("the package does not honor the frozen reference kind");
     assert_eq!(forked.code, "runtime_served_by_package", "{forked:?}");
+    assert_eq!(
+        listed_refusals(&restarted.registry, &session.id).await,
+        (Some(resumed.code), Some(forked.code)),
+        "the listing names the codes resume and fork refuse with"
+    );
 }
 
 /// A stopped session of the built-in `alias` that has no fork, launched by a
@@ -1995,6 +2030,11 @@ async fn assert_adopted_resume_refuses_a_changed_root(
     assert_eq!(
         listed_recovery(&restarted.registry, &session.id).await,
         (false, false)
+    );
+    assert_eq!(
+        listed_refusals(&restarted.registry, &session.id).await,
+        (Some(code.to_owned()), Some(code.to_owned())),
+        "fork resolves the same changed root first"
     );
     assert_eq!(
         fs::read(&session.store_path).expect("read the store"),

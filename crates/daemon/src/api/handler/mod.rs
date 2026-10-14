@@ -600,6 +600,7 @@ mod tests {
             branch: None,
             worktree_path: Some(path),
             warnings: Vec::new(),
+            capability_refusals: None,
             output_force_closed: false,
             created_at: "2026-06-23T00:00:00Z".to_owned(),
             updated_at: "2026-06-23T00:00:00Z".to_owned(),

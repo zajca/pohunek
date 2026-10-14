@@ -563,7 +563,15 @@ where
         let dispatch = handler::dispatch_line(&line, &state, negotiated_version);
         let dispatch = match &watched_request {
             Some(request) => {
-                match dispatch_until_hangup(dispatch, &mut framed, &mut pending, request).await? {
+                // Boxed: the future holds the whole request dispatch.
+                match Box::pin(dispatch_until_hangup(
+                    dispatch,
+                    &mut framed,
+                    &mut pending,
+                    request,
+                ))
+                .await?
+                {
                     Some(dispatch) => dispatch,
                     None => return Ok(()),
                 }

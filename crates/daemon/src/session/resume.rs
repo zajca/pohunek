@@ -229,9 +229,11 @@ impl SessionRegistry {
     }
 
     /// Adds verified native-reference last activity to public response copies,
-    /// and clears the resume and fork capabilities of each listed session that
-    /// its recovery would refuse, so a response never advertises an operation
-    /// the daemon refuses.
+    /// and clears the resume and fork capabilities of each listed session whose
+    /// recovery resolution refuses them, naming the refusal codes, so a
+    /// response never advertises an operation that resolution refuses. Refusals
+    /// that depend on the session's state or on one request are left to the
+    /// operation.
     ///
     /// A runtime whose descriptor declares the conversation store reports the
     /// verified modification time of the reference's transcript, so list and
@@ -266,8 +268,9 @@ impl SessionRegistry {
                 lookup_inputs.push(None);
                 continue;
             };
-            let definition = recovery_definition(runtimes, &binding).ok();
+            let definition = recovery_definition(runtimes, &binding);
             clear_refused_capabilities(info, &binding, definition.as_ref());
+            let definition = definition.ok();
             lookup_inputs.push(
                 info.native_session_id
                     .clone()
@@ -1477,22 +1480,36 @@ fn reference_existence(
 }
 
 /// Clears the resume and fork capabilities of a listed session that the
-/// recovery `definition` (`None` when it does not resolve) would refuse. A
+/// recovery `definition` would refuse, and records the error code each
+/// refused operation returns in [`SessionInfo::capability_refusals`]. A
 /// capability is never set here.
+///
+/// The checks follow [`SessionRegistry::resume_with`] and
+/// [`SessionRegistry::fork`] past their frozen capability gate: both resolve
+/// the definition first, then resume needs a native launch spec and fork the
+/// fork contract.
 fn clear_refused_capabilities(
     info: &mut SessionInfo,
     binding: &ResumeBinding,
-    definition: Option<&Arc<RuntimeDefinition>>,
+    definition: Result<&Arc<RuntimeDefinition>, &ProtocolError>,
 ) {
-    let resume = info.capabilities.resume
-        && definition
-            .is_some_and(|definition| binding_native_launch(binding, definition).is_some());
-    let fork = info.capabilities.fork
-        && resume
-        && definition
-            .is_some_and(|definition| recovery_contract(binding, definition, true).is_ok());
-    info.capabilities.resume = resume;
-    info.capabilities.fork = fork;
+    let resume = info.capabilities.resume.then(|| {
+        let definition = definition.map_err(|error| error.code.clone())?;
+        binding_native_launch(binding, definition)
+            .map(drop)
+            .ok_or_else(|| agent_not_resumable(&binding.agent).code)
+    });
+    let fork = info.capabilities.fork.then(|| {
+        let definition = definition.map_err(|error| error.code.clone())?;
+        recovery_contract(binding, definition, true).map_err(|error| error.code)
+    });
+    info.capabilities.resume = matches!(resume, Some(Ok(())));
+    info.capabilities.fork = matches!(fork, Some(Ok(())));
+    let refusals = protocol::SessionCapabilityRefusals {
+        resume: resume.and_then(Result::err),
+        fork: fork.and_then(Result::err),
+    };
+    info.capability_refusals = (!refusals.is_empty()).then_some(refusals);
 }
 
 fn binding_program(binding: &ResumeBinding, definition: &RuntimeDefinition) -> String {
