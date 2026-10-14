@@ -3385,6 +3385,51 @@ async fn a_spent_probe_budget_reports_a_missing_runtime_without_a_probe_as_missi
 }
 
 #[tokio::test]
+async fn a_stopped_session_whose_resume_projection_contradicts_its_record_is_judged_as_resume_runs_it(
+) {
+    let session = stopped_built_in_claude("preflight-contradicting-projection").await;
+    let package = real_official(RuntimeId::CLAUDE);
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        &package,
+        5,
+    )
+    .await;
+    bind_claude_profile(&session.fixture).await;
+    // The resume projection now names another agent than the record. A stopped
+    // session keeps its own recovery when the projection contradicts it.
+    let store = crate::store::Store::new(session.store_path.clone());
+    let mut projection = durable_recovery(&session.store_path, &session.id);
+    projection.agent = "contradicting-agent".to_owned();
+    store
+        .record_resume(&projection)
+        .expect("write the contradicting projection");
+
+    let (verdict, code) =
+        stopped_preflight_verdict(&session.fixture, &session.store_path, &session.id);
+    let restarted = restart(&session.fixture).await;
+    let resumed = restarted
+        .registry
+        .resume_with(&session.id, crate::session::ProfileChange::Refuse)
+        .await
+        .expect("resume uses the session's own recovery");
+
+    assert_eq!(verdict, Verdict::Adoptable, "{code}");
+    assert_eq!(code, pohunek_service_config::preflight::CODE_ADOPTABLE);
+    assert_eq!(
+        resumed.runtime.as_ref().map(|runtime| runtime.state),
+        Some(protocol::RuntimeState::Live)
+    );
+    restarted
+        .registry
+        .remove(&session.id)
+        .await
+        .expect("remove the resumed session");
+}
+
+#[tokio::test]
 async fn a_frozen_revision_keyed_by_another_host_is_not_accepted_for_an_adopted_profile() {
     let session = stopped_built_in_claude("claude-forged-revision").await;
     let package = real_official(RuntimeId::CLAUDE);

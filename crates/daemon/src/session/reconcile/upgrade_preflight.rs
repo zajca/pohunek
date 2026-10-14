@@ -583,13 +583,18 @@ fn judge_stopped(
     let mut candidate = record.clone();
     if let Some(binding) = facts.binding.cloned() {
         if let Err(reason) = merge_persisted_recovery(&mut candidate, binding) {
-            return Some((
-                Verdict::WouldLoseRecovery,
-                reason.to_owned(),
-                "the record contradicts its stored resume binding, so native recovery is not \
-                 restored from it"
-                    .to_owned(),
-            ));
+            // Reconciliation refuses a contradiction only for a running record;
+            // a stopped record keeps its own recovery, which resume then uses.
+            if candidate.desired_state == DesiredState::Running {
+                return Some((
+                    Verdict::WouldLoseRecovery,
+                    reason.to_owned(),
+                    "the record contradicts its stored resume binding, so native recovery is not \
+                     restored from it"
+                        .to_owned(),
+                ));
+            }
+            candidate = record.clone();
         }
     }
     let capabilities = &candidate.info.capabilities;
