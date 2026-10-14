@@ -903,6 +903,16 @@ fn the_folder_trust_rule_needs_the_dialog_heading_at_the_top_of_the_screen() {
         screen_activity(&definition, &dialog(&folder_trust), 80),
         Some(AgentActivity::Blocked)
     );
+    // Moving the selection to the second choice keeps the dialog blocked.
+    let second_selected = folder_trust.map(|line| match line {
+        "\u{203a} 1. Trust and continue" => "  1. Trust and continue",
+        "  2. Back to Agent Command Center" => "\u{203a} 2. Back to Agent Command Center",
+        other => other,
+    });
+    assert_eq!(
+        screen_activity(&definition, &dialog(&second_selected), 80),
+        Some(AgentActivity::Blocked)
+    );
 
     // A reply that quotes the question and both choices is not the dialog
     // without its heading line, nor is the dialog below the first sixteen lines.

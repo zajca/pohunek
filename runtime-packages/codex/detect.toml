@@ -67,7 +67,7 @@ all = [
   { line_regex = ['(?i)^\s*folder access\s*$'] },
   { line_regex = ['(?i)^\s*trust this folder\?'] },
   { line_regex = ['(?i)^\s*(?:›|❯)?\s*1\.\s*trust and continue\s*$'] },
-  { line_regex = ['(?i)^\s*2\.\s*back to agent command\b'] },
+  { line_regex = ['(?i)^\s*(?:›|❯)?\s*2\.\s*back to agent command\b'] },
 ]
 
 [[rules]]
