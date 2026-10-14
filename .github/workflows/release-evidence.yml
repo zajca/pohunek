@@ -21,8 +21,9 @@ name: Release evidence
 #   attest-bundle     build provenance for every file of the final bundle
 #                     (release only)
 #   smoke             stages the upstreams, then runs packaging/smoke-archive
-#                     on every Linux daemon archive of the bundle in a network
-#                     namespace
+#                     on every Linux daemon archive in a network namespace and
+#                     the Apple Silicon daemon archive on macos-15 under
+#                     sandbox-exec after verify-signed --adhoc
 #   verdict           fails unless exactly the jobs of the chosen mode succeeded
 #                     (a skipped job would otherwise let a caller proceed)
 #
@@ -524,17 +525,26 @@ jobs:
 
   # The network-isolated archive smoke on the final bundle: every Linux daemon
   # archive installs every official package offline and runs the consumer
-  # against the staged, hash-verified upstream. The first step proves which
-  # isolation strategy the runner allows; the smoke uses exactly that one and
-  # never runs un-isolated.
+  # against the staged, hash-verified upstream. The Apple Silicon daemon
+  # archive also runs on macos-15 under sandbox-exec after verify-signed
+  # --adhoc. The first step proves which isolation strategy the runner allows;
+  # the smoke uses exactly that one and never runs un-isolated.
   smoke:
-    name: Archive smoke (network-isolated)
+    name: Archive smoke (network-isolated, ${{ matrix.os }})
     needs: [plan, assemble, assemble-rehearsal, consumer]
     if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && (needs.assemble.result == 'success' || needs.assemble-rehearsal.result == 'success') }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            smoke_target: ""
+          - os: macos-15
+            smoke_target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -546,7 +556,7 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: release-row
+          shared-key: ${{ runner.os == 'Linux' && 'release-row' || format('release-row-{0}', runner.os) }}
           save-if: false
 
       - name: Download the release bundle
@@ -558,7 +568,7 @@ jobs:
       - name: Download the consumer executable
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: release-consumer-Linux
+          name: release-consumer-${{ runner.os }}
           path: ${{ runner.temp }}/consumer
 
       # The upstream runtimes are Node programs: the version is the highest
@@ -596,12 +606,13 @@ jobs:
           set -euo pipefail
           echo "strategy=$(scripts/release-workflow/probe-isolation)" >> "$GITHUB_OUTPUT"
 
-      - name: Run the archive smoke on every Linux daemon archive
+      - name: Run the archive smoke on the daemon archives of this OS
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
           ISOLATION: ${{ steps.isolation.outputs.strategy }}
           CONSUMER: ${{ runner.temp }}/consumer/release_consumer
+          SMOKE_TARGET: ${{ matrix.smoke_target }}
         run: |
           set -euo pipefail
           XTASK="$PWD/target/debug/xtask" scripts/release-workflow/run-smoke "$RUNNER_TEMP/bundle"

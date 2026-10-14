@@ -21,10 +21,6 @@ remain under the operator's control.
   pohunek plugin install runtime/packages/hermes.tar.zst \
     --catalog runtime/runtime-catalog.json
   ```
-
-  The macOS daemon archive carries no runtime package, so a macOS host cannot
-  install the plugin until darwin packages are attested
-  ([#929](https://github.com/zajca/pohunek/issues/929)).
 - The Hermes executable must be the pinned supported release. Do not allow an
   installer or smoke test to download Hermes, Node packages, plugins, or model
   providers.

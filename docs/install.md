@@ -19,10 +19,9 @@ Daemon archives contain `pohunekd`, `pohunek-sessiond`, `pohunek`, and the
 `runtime-catalog-anchor.json`, the runtime-catalog trust anchor that the daemon
 reads from the directory of its executable. CLI and relay archives do not
 contain it. A release daemon archive also carries a `runtime/` directory with
-the signed `runtime-catalog.json` and, for the targets with attested official
-runtime packages, `runtime/packages/<runtime>.tar.zst` and
-`runtime/attestations/<runtime>-<target>.json` (the Apple Silicon archive carries the
-catalog and no package). The `MANIFEST` covers these files.
+the signed `runtime-catalog.json` and, for the Linux x86_64 targets and the
+Apple Silicon target, `runtime/packages/<runtime>.tar.zst` and
+`runtime/attestations/<runtime>-<target>.json`. The `MANIFEST` covers these files.
 Every CLI, daemon, and relay archive is packed deterministically
 (members sorted, root-owned, stamped with the tagged commit time) and carries a
 `MANIFEST` with the SHA-256 of every member; the daemon installer verifies
@@ -35,7 +34,8 @@ public macOS support is declared only when the final native acceptance gate
 `pohunek-cli-<v>-aarch64-apple-darwin.tar.gz` and
 `pohunek-daemon-<v>-aarch64-apple-darwin.tar.gz`, each with a `.sha256`. They are
 ad-hoc signed (the `MANIFEST` says `signing adhoc`), not notarized, and carry no
-Developer ID. A build made with `packaging/macos/package --development` is
+Developer ID. The daemon archive carries the signed runtime catalog and the
+official runtime packages, as the Linux daemon archives do. A build made with `packaging/macos/package --development` is
 unsigned, named `...-unsigned-development`, and never released. The install,
 upgrade, rollback, uninstall, log, logout/reboot, and Gatekeeper procedures are
 in the [macOS install runbook](knowledge/runbooks/install-on-macos.md).
@@ -181,13 +181,12 @@ pohunek attach <session-id>        # Ctrl-] detaches, the agent keeps running
 `pohunek setup` reports every requirement it cannot meet with one next step:
 an agent that is not on the service `PATH`, a config home that does not exist
 yet (Claude Code creates `~/.claude`, Codex `~/.codex`, on their first run), or
-a platform whose release carries no package for a runtime. The Apple Silicon
-archive carries no runtime package yet (#929), so on macOS the official
-runtimes are such gaps. Run `pohunek setup` again after you install an agent:
-it installs only what is missing, and on a ready host it changes nothing. The
-[CLI reference](cli.md#host-setup) describes each step, and the sections below
-cover the same steps one at a time (`pohunek service install`, `pohunek plugin
-install`, `pohunek integration install`).
+a platform whose release carries no package for a runtime. Run `pohunek setup`
+again after you install an agent: it installs only what is missing, and on a
+ready host it changes nothing. The [CLI reference](cli.md#host-setup) describes
+each step, and the sections below cover the same steps one at a time
+(`pohunek service install`, `pohunek plugin install`, `pohunek integration
+install`).
 
 For an isolated feature branch, let the daemon create a dedicated worktree. To
 run Codex there, install its package and then its hooks the same way;
@@ -221,8 +220,8 @@ pohunek-daemon-<version>-<target>/
 The same catalog and package archives are also published as separate release
 assets (`runtime-catalog.json`, `pohunek-runtime-<runtime>-<version>.tar.zst`).
 Every catalog entry pins its package to exactly the core version of its release
-(`core = "=<version>"`). Current releases list only the Linux x86_64 glibc and musl
-targets; the Apple Silicon archive carries the catalog and no package.
+(`core = "=<version>"`). Current releases list the Linux x86_64 glibc and musl
+targets and the Apple Silicon target.
 
 1. Install or upgrade the daemon from this same archive with
    `./packaging/install-daemon.sh`. A catalog from a release other than the
@@ -296,9 +295,8 @@ host profile with `base = "hermes"` and no package pin with
 lifecycle (`pohunek integration ... --agent hermes`) runs in the CLI against a
 named Hermes profile; see the
 [Hermes operator](knowledge/guides/hermes-operator.md) guide. The catalog lists
-the three packages for the Linux x86_64 targets only and the Apple Silicon
-archive carries no package, so a macOS daemon has no source of Codex, Claude
-Code or Hermes until darwin packages are attested (#929). A `claude`, `codex` or
+the three packages for the Linux x86_64 targets and the Apple Silicon target.
+A `claude`, `codex` or
 `hermes` started in a shell session or outside pohunek is not recognized as that
 agent without its package.
 
@@ -346,8 +344,7 @@ the package install. A plugin an earlier CLI installed from its compiled copy
 (`provenance` `source=embedded`) is not migrated automatically: status and
 doctor report the missing package, `integration uninstall` still removes it,
 and `integration update` moves it to the package once the package is
-installed. The Apple Silicon archive carries no package, so a macOS host cannot
-install the plugin until darwin packages are attested (#929).
+installed.
 
 To prepare first, install with `--no-enable` and run
 `pohunek plugin enable <package-id>` when you are ready to switch. `pohunek

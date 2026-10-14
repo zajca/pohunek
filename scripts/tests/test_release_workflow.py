@@ -825,6 +825,11 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
         )
         self.assertIn("ISOLATION: ${{ steps.isolation.outputs.strategy }}", smoke)
         self.assertIn("--isolation", (SCRIPTS / "run-smoke").read_text())
+        # Smoke is a matrix job with ubuntu-latest and macos-15
+        self.assertIn("    strategy:\n      fail-fast: false\n      matrix:\n        include:", smoke)
+        self.assertIn("          - os: ubuntu-latest\n            smoke_target: \"\"", smoke)
+        self.assertIn("          - os: macos-15\n            smoke_target: aarch64-apple-darwin", smoke)
+        self.assertIn("SMOKE_TARGET: ${{ matrix.smoke_target }}", smoke)
 
     def test_the_consumer_test_name_matches_the_smoke(self):
         pattern = r"consumer_test=(\S+)"
@@ -927,10 +932,10 @@ class AssetNameTests(ReleaseWorkflowFiles):
                 self.assertIn(name, consumed)
         # `release-bundle` must stay outside every `release-*` download pattern.
         self.assertNotRegex(self.release + self.evidence + self.build, r"pattern: release-")
-        # Consumer artifacts must include the OS suffix; smoke runs on ubuntu and must
-        # download release-consumer-Linux specifically, not a bare release-consumer.
+        # Consumer artifacts must include the OS suffix; smoke runs on ubuntu and
+        # macos and must download release-consumer-${{ runner.os }} specifically.
         smoke = self.evidence_jobs["smoke"]
-        self.assertIn("name: release-consumer-Linux", smoke)
+        self.assertIn("name: release-consumer-${{ runner.os }}", smoke)
 
     def test_the_package_evidence_is_uploaded_and_never_consumed(self):
         # Builder evidence is in-house JSON outside the release policy: it is

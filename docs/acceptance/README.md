@@ -33,9 +33,7 @@ session workers (see `docs/design/macos-support-rfc.md`, "Worker lifetime"):
   `/usr/bin/python3` for the evidence helper.
 - At least one agent profile with native resume whose session-capture hook is
   installed. `claude`, `codex` and `hermes` are served only by their official
-  packages, which the Apple Silicon release archive does not carry yet (#929);
-  on such a host use a package runtime with native resume that you install
-  yourself. Its captured native session reference is what makes explicit
+  packages from the release archive. Its captured native session reference is what makes explicit
   recovery possible; shell sessions have no native resume.
 - "Reopen windows when logging back in" unticked for the logout and reboot
   phases, so no terminal restores an old attach by itself.
