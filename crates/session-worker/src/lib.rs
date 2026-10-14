@@ -6,16 +6,19 @@
 //! directly; [`Server`] exposes the private owner-only Unix protocol used by
 //! `pohunekd`.
 
-// Two helpers in `pty` opt back in with a localized `#[expect(unsafe_code)]`
-// and document the invariant they rely on: `portable-pty` exposes the PTY
-// master only as a raw descriptor, and Darwin's `TIOCOUTQ` query is reachable
-// only through rustix's unsafe typed `ioctl`. The rest of the crate stays free
-// of unsafe code.
+// Three helpers opt back in with a localized `#[expect(unsafe_code)]` and
+// document the invariant they rely on. Two live in `pty`: `portable-pty` exposes
+// the PTY master only as a raw descriptor, and Darwin's `TIOCOUTQ` query is
+// reachable only through rustix's unsafe typed `ioctl`. One lives in
+// `child_spawn`: `std::process::Command::pre_exec` is unsafe, and the child-side
+// session setup needs libc calls with no safe wrapper. The rest of the crate
+// stays free of unsafe code.
 #![deny(unsafe_code)]
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-10-14
 
 mod background;
+mod child_spawn;
 mod config;
 mod error;
 mod identity;
