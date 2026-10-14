@@ -57,6 +57,13 @@ graceful stop first lets in-flight creates finish, including delivery of a
 whose prompt was not delivered before the daemon stopped is removed at the next
 start, worktree included, since the prompt was never stored.
 
+A session never starts outside its working directory. Before the worker spawns
+the agent, it checks that the launch cwd is still a directory; when the worktree
+was removed after binding, the launch is refused with `session_cwd_missing`,
+nothing is started, and the failed create is compensated as above. The daemon
+logs the bind, each removal with its reason, and a failed or timed-out
+post-create or pre-remove hook at WARN, without the hook's output.
+
 Removing a worktree that a live session still uses is refused with the typed
 `worktree_in_use` error; the same code is reserved for `session.remove` when
 other active delegated tasks use the session's worktree. Stop the sessions or

@@ -32,14 +32,15 @@ use protocol::{
     NotificationKindPolicy, NotificationListParams, NotificationListResult, NotificationPolicy,
     NotificationPolicyParams, NotificationPolicyResult, NotificationRetentionParams,
     NotificationRetentionResult, NotificationSeverity, NotificationSource, NotificationStatus,
-    NotificationUpdateParams, NotificationUpdateResult, ProcessStartIdentity, ReportSequence,
-    Request as ProtocolRequest, Response, RuntimeId, RuntimeRef, SessionAttachParams,
-    SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId, SessionInfo,
-    SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams,
-    SessionNewParams, SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult,
-    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
-    SessionResizeResult, SessionState, SessionStopResult, StateSource, TerminalDimensions,
-    WorktreeRemoveParams, WorktreeRemoveResult, ENV_DAEMON_ID, ENV_SESSION_ID, PROTOCOL_VERSION,
+    NotificationUpdateParams, NotificationUpdateResult, ProcessStartIdentity, ProjectInfo,
+    ProjectShowResult, ReportSequence, Request as ProtocolRequest, Response, RuntimeId, RuntimeRef,
+    SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
+    SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter,
+    SessionListParams, SessionNewParams, SessionRemoveResult, SessionReportAgentParams,
+    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult, SessionWarningKind,
+    StateSource, TerminalDimensions, WorktreeRemoveParams, WorktreeRemoveResult, ENV_DAEMON_ID,
+    ENV_SESSION_ID, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
@@ -4593,6 +4594,177 @@ async fn two_sessions_on_one_repo_get_distinct_worktrees() {
     assert!(
         !cleaned_store.contains("\"kind\":\"worktree\""),
         "session.remove drops exact worktree ownership bindings: {cleaned_store}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Writes a host-global `post-create` hook into `config_dir` and returns the
+/// config directory for [`SessionRegistryConfig::config_dir`].
+fn host_post_create_hook(socket: &TestSocket, body: &str) -> PathBuf {
+    let config_dir = socket.dir.join("config");
+    std::fs::create_dir_all(config_dir.join("hooks")).expect("create host hook directory");
+    write_executable(&config_dir.join("hooks/post-create"), body);
+    config_dir
+}
+
+/// A failing `post-create` hook is a non-fatal `hook` warning: the session is
+/// created, its worktree is kept, and its agent runs inside that worktree.
+#[tokio::test]
+async fn a_failing_post_create_hook_keeps_the_session_in_its_worktree() {
+    let repo = init_git_repo();
+    let worktree_root = temp_dir("hook-fail-wt-root");
+    let socket = temp_socket("hook-fail-worktree");
+    let config_dir = host_post_create_hook(&socket, "#!/bin/sh\nexit 1\n");
+    let store_path = temp_dir("hook-fail-store").join("metadata.jsonl");
+    let pwd_file = socket.dir.join("agent-pwd.txt");
+    let script = format!("pwd -P > '{}'; exec sleep 30", pwd_file.display());
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", script.as_str()]),
+        worktree_root: Some(worktree_root.to_path_buf()),
+        store_path: Some(store_path),
+        config_dir: Some(config_dir),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut control = connect(&socket).await;
+    let created: SessionInfo = serde_json::from_value(ok_payload(
+        create_worktree_session(
+            &mut control,
+            RuntimeRef::shell(),
+            repo.cwd().to_path_buf(),
+            "b",
+        )
+        .await,
+    ))
+    .expect("session info");
+    let worktree = created.worktree_path.clone().expect("worktree bound");
+    assert_eq!(created.cwd, worktree);
+    assert_eq!(created.branch.as_deref(), Some("b"));
+
+    let [warning] = created.warnings.as_slice() else {
+        panic!("exactly one hook warning expected: {:?}", created.warnings);
+    };
+    assert_eq!(warning.kind, SessionWarningKind::Hook);
+    assert!(
+        warning.message.contains("post-create"),
+        "warning names the failing event: {}",
+        warning.message
+    );
+
+    // The agent reports its own working directory. Comparing against the
+    // canonical path keeps the check valid where `/var` is a symlink to `/private/var`.
+    let expected = std::fs::canonicalize(&worktree).expect("canonical worktree path");
+    let recorded = read_file_until(&pwd_file, expected.to_string_lossy().as_bytes()).await;
+    assert_eq!(
+        String::from_utf8_lossy(&recorded).trim_end(),
+        expected.to_string_lossy(),
+        "the agent ran inside its worktree"
+    );
+
+    let remove_req = Request::make(
+        "hook-fail-remove",
+        method::SESSION_REMOVE,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let removed: SessionRemoveResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &remove_req).await))
+            .expect("remove result");
+    assert!(removed.removed);
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// A worktree that disappears between its bind and the agent spawn fails the
+/// create with `session_cwd_missing`: no session is left behind, no worktree
+/// binding is kept, and the agent never starts (in `$HOME` or anywhere else).
+#[tokio::test]
+async fn a_worktree_removed_before_the_agent_starts_fails_closed() {
+    let repo = init_git_repo();
+    let worktree_root = temp_dir("cwd-missing-wt-root");
+    let store_path_dir = temp_dir("cwd-missing-store");
+    let store_path = store_path_dir.join("metadata.jsonl");
+    let socket = temp_socket("cwd-missing-worktree");
+    // The hook deletes the worktree it runs in, reproducing a worktree that
+    // vanishes between the bind and the spawn.
+    let config_dir = host_post_create_hook(&socket, "#!/bin/sh\nrm -rf \"$(pwd -P)\"\nexit 0\n");
+    let started = socket.dir.join("agent-started");
+    let script = format!("touch '{}'; exec sleep 30", started.display());
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", script.as_str()]),
+        worktree_root: Some(worktree_root.to_path_buf()),
+        store_path: Some(store_path.clone()),
+        config_dir: Some(config_dir),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut control = connect(&socket).await;
+    let error = err_payload(
+        create_worktree_session(
+            &mut control,
+            RuntimeRef::shell(),
+            repo.cwd().to_path_buf(),
+            "b",
+        )
+        .await,
+    );
+    assert_eq!(error.code, "session_cwd_missing");
+    assert_eq!(error.class, ErrorClass::Runtime);
+
+    let list = Request::make("cwd-missing-list", method::SESSION_LIST, Value::Null);
+    let sessions: Vec<SessionInfo> =
+        serde_json::from_value(ok_payload(exchange(&mut control, &list).await))
+            .expect("list sessions");
+    assert!(
+        sessions.is_empty(),
+        "the refused session must not stay listed: {sessions:?}"
+    );
+
+    assert!(
+        !started.exists(),
+        "the agent must not start when its worktree is missing"
+    );
+
+    // A store that was never written has no bindings at all.
+    let bindings = std::fs::read_to_string(&store_path).unwrap_or_default();
+    assert!(
+        !bindings.contains("\"kind\":\"worktree\""),
+        "the refused create drops its worktree binding: {bindings}"
+    );
+
+    // `project.show` lists the worktrees git reports for the repository. None
+    // may remain under the worktree root.
+    let added = Request::make(
+        "cwd-missing-project-add",
+        method::PROJECT_ADD,
+        serde_json::json!({ "path": repo.cwd() }),
+    );
+    let project: ProjectInfo =
+        serde_json::from_value(ok_payload(exchange(&mut control, &added).await))
+            .expect("project info");
+    let show = Request::make(
+        "cwd-missing-project-show",
+        method::PROJECT_SHOW,
+        serde_json::json!({ "reference": project.id }),
+    );
+    let shown: ProjectShowResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &show).await))
+            .expect("project show result");
+    assert!(
+        !shown.worktrees.is_empty(),
+        "project.show lists the repository's own worktree"
+    );
+    assert!(
+        shown
+            .worktrees
+            .iter()
+            .all(|worktree| !worktree.path.starts_with(&worktree_root)),
+        "no worktree may stay listed under the root: {:?}",
+        shown.worktrees
     );
 
     let _ = shutdown.send(());

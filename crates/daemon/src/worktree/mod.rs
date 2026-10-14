@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 use protocol::{
     ErrorClass, ProtocolError, SessionRetentionHold, SessionWarning, SessionWarningKind,
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::store::{Store, StoreMutation, WorktreeBinding, WorktreeStatus};
 use crate::time::now_rfc3339;
@@ -335,11 +335,18 @@ impl WorktreeManager {
         // Reuse / recreate / refuse-foreign decision (Kandev tryReuseExisting).
         // `Some(bound)` means an owned, valid worktree was reused — return it as-is;
         // `None` means proceed to the fresh-create path below.
-        if let Some(bound) = self.check_existing_worktree(req, &repository, &path, &slug)? {
-            return Ok(bound);
-        }
-
-        self.create_and_bind(req, repository, path, slug)
+        let bound = match self.check_existing_worktree(req, &repository, &path, &slug)? {
+            Some(bound) => bound,
+            None => self.create_and_bind(req, repository, path, slug)?,
+        };
+        info!(
+            session_id = %req.session_id,
+            branch = %req.branch,
+            path = %bound.path.display(),
+            reused = bound.reused,
+            "worktree bound"
+        );
+        Ok(bound)
     }
 
     /// Resolve the reuse / recreate / refuse-foreign decision for an existing path
@@ -630,6 +637,12 @@ impl WorktreeManager {
                     "git worktree remove failed during cleanup; dropping binding anyway"
                 );
             }) {
+                info!(
+                    session_id = %session_id,
+                    path = %binding.path.display(),
+                    reason = "session removed",
+                    "worktree removed"
+                );
                 cleanup.removed += 1;
             } else {
                 cleanup.failed += 1;
@@ -684,6 +697,12 @@ impl WorktreeManager {
                 self.store
                     .remove_worktree_binding(&binding)
                     .map_err(|err| store_error("drop worktree binding", &err))?;
+                info!(
+                    session_id = %session_id,
+                    path = %binding.path.display(),
+                    reason = "create compensation",
+                    "worktree removed"
+                );
                 cleanup.removed += 1;
             } else {
                 cleanup.failed += 1;
@@ -1818,6 +1837,12 @@ fn run_one_hook(
     let interpreter = match crate::agent::trusted_program(SETUP_SCRIPT_INTERPRETER) {
         Ok(interpreter) => interpreter,
         Err(err) => {
+            warn!(
+                script = %script.display(),
+                error = %err,
+                event = event.as_env(),
+                "hook could not be spawned"
+            );
             warnings.push(hook_warning(
                 event,
                 format!("failed to spawn {}: {err}", script.display()),
@@ -1843,6 +1868,12 @@ fn run_one_hook(
     let mut child = match builder.spawn() {
         Ok(child) => child,
         Err(err) => {
+            warn!(
+                script = %script.display(),
+                error = %err,
+                event = event.as_env(),
+                "hook could not be spawned"
+            );
             warnings.push(hook_warning(
                 event,
                 format!("failed to spawn {}: {err}", script.display()),
@@ -1854,7 +1885,12 @@ fn run_one_hook(
     match wait_with_timeout(&mut child, timeout) {
         SetupOutcome::Exited(status) if status.success() => {}
         SetupOutcome::Exited(status) => {
-            debug!(script = %script.display(), %status, event = event.as_env(), "hook failed");
+            warn!(
+                script = %script.display(),
+                %status,
+                event = event.as_env(),
+                "hook exited with a failure status"
+            );
             warnings.push(hook_warning(
                 event,
                 format!("{} exited with status {status}", script.display()),
@@ -1877,6 +1913,12 @@ fn run_one_hook(
             ));
         }
         SetupOutcome::WaitError(err) => {
+            warn!(
+                script = %script.display(),
+                error = %err,
+                event = event.as_env(),
+                "hook wait failed"
+            );
             warnings.push(hook_warning(
                 event,
                 format!("failed to wait for {}: {err}", script.display()),

@@ -1,6 +1,6 @@
 //! Serves the private daemon-worker Unix protocol.
 
-// Rust guideline compliant 2026-10-13
+// Rust guideline compliant 2026-10-14
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::OsString;
@@ -1331,6 +1331,7 @@ async fn initialize_request(
         hook_schema,
         initialize.public_protocol_version,
         &initialize.dimensions,
+        selected,
     )
     .await?;
     shared.initialized_tx.send_replace(true);
@@ -1373,6 +1374,10 @@ fn freeze_launch_rule(
 /// The child can report its identity as soon as it runs, and a hook claim is
 /// admitted only in `Running`. Holding the lock across the spawn makes every
 /// claim wait for the commit instead of racing it and being refused.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each parameter is a distinct field committed with the runtime"
+)]
 async fn spawn_running(
     shared: &Shared,
     command: Command,
@@ -1381,10 +1386,12 @@ async fn spawn_running(
     hook_schema: Option<&'static HookSchema>,
     public_protocol_version: u32,
     dimensions: &Dimensions,
+    version: Version,
 ) -> Result<(PtyOwner, WireProcessIdentity), ControlError> {
     let (pty, child_process, committed) = {
         let mut state = shared.state.lock().await;
-        let pty = spawn_pty(command, config)?;
+        let pty =
+            spawn_pty(command, config).map_err(|error| launch_control_error(error, version))?;
         let child_process = wire_identity(pty.identity())?;
         state.phase = WireRuntimePhase::Running;
         state.stop_grace = config.stop_grace;
@@ -1424,7 +1431,7 @@ async fn pause_after_starting(shared: &Shared) {
     }
 }
 
-fn spawn_pty(command: Command, config: &WorkerConfig) -> Result<PtyOwner, ControlError> {
+fn spawn_pty(command: Command, config: &WorkerConfig) -> Result<PtyOwner, PtyError> {
     PtyOwner::spawn(
         command,
         config.history_bytes,
@@ -1432,7 +1439,23 @@ fn spawn_pty(command: Command, config: &WorkerConfig) -> Result<PtyOwner, Contro
         config.input_dedup_entries,
         config.input_stall,
     )
-    .map_err(|error| control_error(ControlCode::RuntimeFault, error, false))
+}
+
+/// Maps a PTY spawn failure to the code the negotiated peer can decode.
+fn launch_control_error(error: PtyError, version: Version) -> ControlError {
+    match error {
+        missing @ PtyError::CwdMissing => {
+            // A v6 peer cannot decode `LaunchCwdMissing`, so it receives the same
+            // refusal as a runtime fault with the identical sanitized message.
+            let code = if version >= protocol::LAUNCH_CWD_CHECK_VERSION {
+                ControlCode::LaunchCwdMissing
+            } else {
+                ControlCode::RuntimeFault
+            };
+            control_error(code, missing, false)
+        }
+        other => control_error(ControlCode::RuntimeFault, other, false),
+    }
 }
 
 async fn open_data_request(

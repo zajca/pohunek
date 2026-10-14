@@ -1,6 +1,6 @@
 //! Owns one PTY master and its managed process identity.
 
-// Rust guideline compliant 2026-10-13
+// Rust guideline compliant 2026-10-14
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -159,6 +159,12 @@ pub enum PtyError {
     /// Opening the PTY failed.
     #[error("failed to allocate PTY: {0}")]
     Allocate(String),
+    /// The launch working directory is not an existing directory.
+    ///
+    /// Checked before spawning because the PTY layer would otherwise start the
+    /// child in `$HOME` without reporting an error.
+    #[error("launch working directory is not an existing directory")]
+    CwdMissing,
     /// Spawning the child failed.
     #[error("failed to spawn PTY command: {message}")]
     Spawn {
@@ -472,6 +478,11 @@ impl PtyOwner {
         let output = OutputHub::new(history_bytes, subscriber_bytes, command.rows, command.cols)?;
         let output_order = Arc::new(Mutex::new(()));
 
+        // The PTY layer replaces a cwd that is not a directory with `$HOME` and
+        // spawns anyway, so the directory is verified before any process exists.
+        if !command.cwd.is_dir() {
+            return Err(PtyError::CwdMissing);
+        }
         let child = pair.slave.spawn_command(builder).map_err(|_source| {
             let program = Path::new(&command.program);
             PtyError::Spawn {
