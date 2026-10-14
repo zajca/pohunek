@@ -264,10 +264,11 @@ collect_diagnostics() {
     "$layout_home/.local/state/pohunek" >"$out/transaction.txt" 2>&1
   # The daemon log and the session logs record the hook reports and session
   # events the daemon handled; the journals above carry neither. Only those
-  # two log families are read, each tail capped in lines and bytes.
+  # two log families are read, each tail capped in lines and then in bytes,
+  # keeping the newest bytes.
   as_user sh -c 'find "$1" -maxdepth 1 -type f \( -name pohunekd.jsonl -o -name "pohunek-session-*.jsonl" \) -exec sh -c "$4" sh "$2" "$3" {} +' sh \
     "$layout_home/.local/state/pohunek/logs" "$JOURNAL_LINES" "$LOG_TAIL_BYTES" \
-    'lines=$1; bytes=$2; shift 2; for f do echo "== $f"; tail -n "$lines" "$f" | head -c "$bytes"; echo; done' \
+    'lines=$1; bytes=$2; shift 2; for f do echo "== $f"; tail -n "$lines" "$f" | tail -c "$bytes"; echo; done' \
     >"$out/logs.txt" 2>&1
   if [ "$current_user" = false ] && [ "$created_account" = 1 ]; then
     priv systemctl status "user@$uid.service" --no-pager >"$out/user-manager-status.txt" 2>&1
