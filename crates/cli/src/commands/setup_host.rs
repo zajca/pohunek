@@ -30,6 +30,7 @@
 // Rust guideline compliant 2026-10-14
 
 use std::fmt::{self, Write as _};
+use std::fs;
 use std::future::Future;
 use std::io::{self, IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -78,6 +79,9 @@ const RELEASE_ARCHIVE_SUFFIX: &str = ".tar.zst";
 
 /// Runtime id whose Hermes homes the CLI reinstalls itself, offline.
 const HERMES_RUNTIME: &str = "hermes";
+
+/// Directory of the default Hermes home below the user's home directory.
+const HERMES_HOME_DIR: &str = ".hermes";
 
 /// Hook status of a home setup attempted and could not install.
 const HOOK_FAILED: &str = "failed";
@@ -327,6 +331,21 @@ fn integration_env(context: &Context) -> IntegrationEnv {
     }
 }
 
+/// Whether the plan installs or keeps the official Hermes package.
+fn serves_hermes(plan: &EnsureReport) -> bool {
+    plan.packages
+        .iter()
+        .any(|package| package.runtime == HERMES_RUNTIME)
+}
+
+/// Whether the default Hermes home, `$HOME/.hermes`, is a directory. Its
+/// named profiles live below it, so without it there is no home to plan.
+fn hermes_home_exists(env: &IntegrationEnv) -> bool {
+    env.home.as_deref().is_some_and(|home| {
+        fs::symlink_metadata(home.join(HERMES_HOME_DIR)).is_ok_and(|metadata| metadata.is_dir())
+    })
+}
+
 /// The note for a catalog that is to be recorded but that no step of this
 /// run records: an installed service, and no official package to install.
 /// A fresh install records the catalog itself, through its runtime step.
@@ -408,12 +427,12 @@ async fn plan_in(
             })
         })
         .collect::<Result<Vec<_>, CliError>>()?;
-    let hermes_homes = if previewed
-        .integrations
-        .iter()
-        .any(|integration| integration.runtime == HERMES_RUNTIME)
-    {
-        hermes_home_plan(&integration_env(context))
+    // The release step lists no Hermes home: the Hermes package declares none,
+    // and its plugin is installed by this CLI. So the homes are planned here
+    // whenever the plan serves Hermes and its default home exists.
+    let env = integration_env(context);
+    let hermes_homes = if serves_hermes(&previewed) && hermes_home_exists(&env) {
+        hermes_home_plan(&env)
     } else {
         Vec::new()
     };

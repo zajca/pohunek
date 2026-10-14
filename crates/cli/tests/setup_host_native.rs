@@ -88,9 +88,21 @@ fn report(integrations: &Value) -> EnsureReport {
     .expect("a planner report of this layout")
 }
 
-/// The Hermes integration a planner report lists.
-fn hermes() -> Value {
-    json!([{ "runtime": "hermes", "profile": null }])
+/// A planner report in which the official Hermes package is present, the
+/// way the release step plans a host whose `hermes` program it detected. It
+/// lists no Hermes home: setup plans those itself.
+fn hermes_report() -> EnsureReport {
+    planned(
+        &json!([{
+            "runtime": "hermes",
+            "package": "hermes-agent",
+            "version": "1.0.0",
+            "digest": format!("sha256:{}", "b".repeat(64)),
+            "status": "present",
+            "reasons": ["detected"],
+        }]),
+        &json!([]),
+    )
 }
 
 /// The release directory of the installation: this build's binaries.
@@ -142,6 +154,36 @@ async fn installed_at_this_version(installation: &Installation) -> bool {
     status.installed && status.active_version.as_deref() == Some(VERSION)
 }
 
+/// A Hermes home on a host whose plan serves no Hermes package is neither
+/// planned nor touched: setup installs Hermes hooks only for a planned Hermes.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn a_hermes_home_without_a_planned_hermes_package_is_left_alone() {
+    let installation = Installation::new();
+    let release = release(&installation);
+    let planner = ScriptedPlanner::new(vec![report(&json!([]))]);
+    let home = unmarked_hermes_home(&installation);
+    let home_before = snapshot(&home);
+
+    let host_plan = plan(&installation.context, &release, &planner)
+        .await
+        .expect("plan the host");
+    assert!(
+        host_plan.preview.hermes_homes.is_empty(),
+        "no Hermes home is planned without a planned Hermes package"
+    );
+
+    let outcome = apply(&installation.context, host_plan, &planner)
+        .await
+        .expect("setup applies");
+    assert!(outcome.verdict.hook_gaps.is_empty());
+    assert!(outcome.verdict.hooks_failed.is_empty());
+    assert_eq!(snapshot(&home), home_before, "the Hermes home is untouched");
+}
+
 /// With a Hermes home that has no pohunek marker, setup applies, leaves the
 /// home byte-for-byte as it was, reports the gap with its install command,
 /// passes the verdict, and keeps an existing config file.
@@ -153,7 +195,7 @@ async fn installed_at_this_version(installation: &Installation) -> bool {
 async fn unmarked_hermes_home_is_a_gap_and_existing_config_is_kept() {
     let installation = Installation::new();
     let release = release(&installation);
-    let planner = ScriptedPlanner::new(vec![report(&hermes())]);
+    let planner = ScriptedPlanner::new(vec![hermes_report()]);
     let home = unmarked_hermes_home(&installation);
     fs::create_dir_all(home.join("profiles").join("work")).expect("unmarked profile home");
     let home_before = snapshot(&home);
@@ -242,7 +284,7 @@ async fn a_plan_that_changes_after_the_install_stops_then_converges_on_rerun() {
     let release = release(&installation);
     // The preview shows no integrations; the plan read after the install
     // lists Hermes, and it keeps listing it once the cause is fixed.
-    let planner = ScriptedPlanner::new(vec![report(&json!([])), report(&hermes())]);
+    let planner = ScriptedPlanner::new(vec![report(&json!([])), hermes_report()]);
     let host_plan = plan(&installation.context, &release, &planner)
         .await
         .expect("plan the host");
@@ -310,7 +352,7 @@ async fn a_plan_that_changes_after_the_install_stops_then_converges_on_rerun() {
 async fn a_second_setup_on_a_configured_host_is_a_no_op() {
     let installation = Installation::new();
     let release = release(&installation);
-    let planner = ScriptedPlanner::new(vec![report(&hermes())]);
+    let planner = ScriptedPlanner::new(vec![hermes_report()]);
     let home = unmarked_hermes_home(&installation);
 
     let first = plan(&installation.context, &release, &planner)
@@ -488,7 +530,7 @@ async fn a_verdict_plan_that_drops_a_previewed_runtime_fails_and_names_it() {
 async fn a_hermes_home_that_vanishes_after_the_preview_fails_and_a_new_one_is_untouched() {
     let installation = Installation::new();
     let release = release(&installation);
-    let planner = ScriptedPlanner::new(vec![report(&hermes())]);
+    let planner = ScriptedPlanner::new(vec![hermes_report()]);
     let home = unmarked_hermes_home(&installation);
     let profiles = home.join("profiles");
     fs::create_dir_all(profiles.join("work")).expect("previewed profile home");
@@ -538,7 +580,7 @@ async fn a_hermes_home_that_vanishes_after_the_preview_fails_and_a_new_one_is_un
 async fn an_unreadable_profiles_directory_is_reported_in_the_preview() {
     let installation = Installation::new();
     let release = release(&installation);
-    let planner = ScriptedPlanner::new(vec![report(&hermes())]);
+    let planner = ScriptedPlanner::new(vec![hermes_report()]);
     let home = unmarked_hermes_home(&installation);
     let profiles = home.join("profiles");
     fs::create_dir_all(profiles.join("work")).expect("profile home");
@@ -591,7 +633,7 @@ fn catalog_report(catalog: &str) -> EnsureReport {
 async fn a_marked_hermes_home_unmarked_after_the_preview_fails_the_verdict() {
     let installation = Installation::new();
     let release = release(&installation);
-    let planner = ScriptedPlanner::new(vec![report(&hermes())]);
+    let planner = ScriptedPlanner::new(vec![hermes_report()]);
     unmarked_hermes_home(&installation);
     let home = installation.root.join("home");
     fs::create_dir_all(hermes_marker(&home).parent().expect("plugin root")).expect("plugin root");
