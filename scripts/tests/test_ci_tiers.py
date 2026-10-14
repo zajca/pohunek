@@ -676,6 +676,12 @@ class MacosLanePackageSetTests(unittest.TestCase):
         # it under its own name, which the summary and the upload read.
         for step, report in ((harness, "harness"), (package, "package")):
             with self.subTest(report=report):
+                script = step_script(step)
+                self.assertLess(
+                    script.index("rm -f target/nextest/macos/junit.xml || exit 1\n"),
+                    script.index("cargo nextest run"),
+                    "a report left by an earlier run must not pass as this run's",
+                )
                 self.assertIn(
                     f'cp target/nextest/macos/junit.xml "$RUNNER_TEMP/hermes-junit/{report}.xml" || status=1\n',
                     step,

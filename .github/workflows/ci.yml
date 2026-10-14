@@ -2372,12 +2372,14 @@ jobs:
 
       # Every xtask lib test whose name contains `hermes`, one process each.
       # Each run keeps its JUnit report under its own name, because both runs
-      # of this job write the macos profile's single report path.
+      # of this job write the macos profile's single report path; that path is
+      # cleared first, so a run that writes no report copies none.
       - name: Test Hermes harness natively
         shell: /bin/bash {0}
         run: |
           set -uo pipefail
           mkdir -p "$RUNNER_TEMP/hermes-junit"
+          rm -f target/nextest/macos/junit.xml || exit 1
           cargo nextest run --locked --profile macos -p xtask --lib -E 'test(hermes)'
           status=$?
           cp target/nextest/macos/junit.xml "$RUNNER_TEMP/hermes-junit/harness.xml" || status=1
@@ -2496,6 +2498,7 @@ jobs:
         run: |
           set -uo pipefail
           mkdir -p "$RUNNER_TEMP/hermes-junit"
+          rm -f target/nextest/macos/junit.xml || exit 1
           cargo nextest run --locked --profile macos -p pohunek-cli --test hermes_package --run-ignored all --test-threads 1
           status=$?
           cp target/nextest/macos/junit.xml "$RUNNER_TEMP/hermes-junit/package.xml" || status=1
