@@ -1,6 +1,6 @@
 //! Startup adoption of durable session workers.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -761,6 +761,9 @@ impl SessionRegistry {
     /// This never invokes provider-native resume. An absent, conflicting, or
     /// incompatible runtime remains visible with an explicit runtime state.
     ///
+    /// Afterwards every private temporary directory without a record or a
+    /// resume binding is deleted.
+    ///
     /// # Errors
     ///
     /// Returns a store error when logical records cannot be loaded. Individual
@@ -782,6 +785,11 @@ impl SessionRegistry {
             .into_iter()
             .map(|binding| (binding.session_id.clone(), binding))
             .collect::<HashMap<_, _>>();
+        let known_sessions = records
+            .iter()
+            .map(|record| record.session_id.clone())
+            .chain(resume_bindings.keys().cloned())
+            .collect::<HashSet<_>>();
 
         let lifecycle = self.lifecycle().ok();
         let (mut discovered, socket_failure) = match self.discover_workers(&records).await {
@@ -859,6 +867,7 @@ impl SessionRegistry {
             }
         }))
         .await;
+        self.delete_orphaned_session_tmpdirs(known_sessions).await;
         Ok(())
     }
 

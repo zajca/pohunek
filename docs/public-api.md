@@ -2080,7 +2080,11 @@ any worker starts. A stop keeps the directory and a resume of the same session
 reuses it (recreating it when it is gone); a fork gets its own. Every removal
 (`session.remove`, retention, a rolled-back create) deletes it with everything
 an agent left in it; a delete that fails is logged with its path and leaves
-the removal itself successful. Ambient `POHUNEK_*`
+the removal itself successful. Daemon startup deletes every entry below
+`session-tmp` that is not the directory of a session with a record or a
+resume binding, which a crash, a failed delete, or a reset store leaves behind;
+an entry it cannot delete, such as a symlink, is logged and kept, and startup
+continues. Ambient `POHUNEK_*`
 markers coming from the daemon or the profile are stripped first, so only the
 worker's authoritative reserved values reach the child. Service-manager
 variables (`NOTIFY_SOCKET`, `WATCHDOG_*`, `INVOCATION_ID`, `JOURNAL_STREAM`,
