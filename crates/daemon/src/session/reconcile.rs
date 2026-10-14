@@ -11964,6 +11964,151 @@ handler = "codex-hook-v1"
             supervisor: Arc<ScriptedSupervisor>,
         }
 
+        /// The fixture's view of the host: every inspection of `inner`, with the
+        /// process table narrowed to the processes working in the fixture
+        /// directory.
+        ///
+        /// The scenarios of this binary run concurrently and mark their
+        /// stand-ins with the same kinds of markers, some for the same session
+        /// id, so a sweep that enumerated the whole host could end or count
+        /// another scenario's stand-in.
+        #[derive(Debug)]
+        struct FixtureProcesses {
+            inner: Arc<dyn ProcessInspector>,
+            /// Canonical fixture directory.
+            scope: PathBuf,
+        }
+
+        impl FixtureProcesses {
+            fn new(inner: Arc<dyn ProcessInspector>, directory: &Path) -> Self {
+                Self {
+                    inner,
+                    scope: std::fs::canonicalize(directory).expect("canonical fixture directory"),
+                }
+            }
+
+            /// Whether `pid` works in the fixture directory or below it.
+            ///
+            /// A process whose working directory cannot be read is not the
+            /// fixture's: every stand-in proves at start that its directory
+            /// reads under the fixture (see [`Marked::spawn_with`]), and the
+            /// directory outlives the scenario, so only another scenario's or an
+            /// unrelated process can fail the read.
+            fn in_scope(&self, pid: crate::procwatch::Pid) -> bool {
+                self.inner.cwd(pid).is_ok_and(|cwd| {
+                    std::fs::canonicalize(&cwd)
+                        .unwrap_or(cwd)
+                        .starts_with(&self.scope)
+                })
+            }
+        }
+
+        impl ProcessInspector for FixtureProcesses {
+            fn identity(
+                &self,
+                pid: crate::procwatch::Pid,
+            ) -> Result<Option<crate::procwatch::ProcessIdentity>, crate::procwatch::Error>
+            {
+                self.inner.identity(pid)
+            }
+
+            fn is_running(
+                &self,
+                identity: crate::procwatch::ProcessIdentity,
+            ) -> Result<bool, crate::procwatch::Error> {
+                self.inner.is_running(identity)
+            }
+
+            fn lineage(
+                &self,
+                pid: crate::procwatch::Pid,
+            ) -> Result<Option<pohunek_platform::process::ProcessLineage>, crate::procwatch::Error>
+            {
+                self.inner.lineage(pid)
+            }
+
+            fn coalitions(
+                &self,
+                pid: crate::procwatch::Pid,
+            ) -> Result<Option<pohunek_platform::process::ProcessCoalitions>, crate::procwatch::Error>
+            {
+                self.inner.coalitions(pid)
+            }
+
+            fn parent_pid(
+                &self,
+                pid: crate::procwatch::Pid,
+            ) -> Result<Option<crate::procwatch::Pid>, crate::procwatch::Error> {
+                self.inner.parent_pid(pid)
+            }
+
+            fn process(
+                &self,
+                pid: crate::procwatch::Pid,
+            ) -> Result<Option<crate::procwatch::ProcessFact>, crate::procwatch::Error>
+            {
+                self.inner.process(pid)
+            }
+
+            fn same_user_processes(
+                &self,
+            ) -> Result<Vec<crate::procwatch::ProcessFact>, crate::procwatch::Error> {
+                Ok(self
+                    .inner
+                    .same_user_processes()?
+                    .into_iter()
+                    .filter(|fact| self.in_scope(fact.pid))
+                    .collect())
+            }
+
+            fn descendants(
+                &self,
+                root: crate::procwatch::Pid,
+            ) -> Result<Vec<crate::procwatch::ProcessFact>, crate::procwatch::Error> {
+                self.inner.descendants(root)
+            }
+
+            fn descendant_identities(
+                &self,
+                root: crate::procwatch::ProcessIdentity,
+            ) -> Result<Vec<crate::procwatch::ProcessIdentity>, crate::procwatch::Error>
+            {
+                self.inner.descendant_identities(root)
+            }
+
+            fn cwd(&self, pid: crate::procwatch::Pid) -> Result<PathBuf, crate::procwatch::Error> {
+                self.inner.cwd(pid)
+            }
+
+            fn executable(
+                &self,
+                pid: crate::procwatch::Pid,
+            ) -> Result<Option<PathBuf>, crate::procwatch::Error> {
+                self.inner.executable(pid)
+            }
+
+            fn exit_watch(
+                &self,
+                identity: crate::procwatch::ProcessIdentity,
+            ) -> Result<crate::procwatch::ExitWatch, crate::procwatch::Error> {
+                self.inner.exit_watch(identity)
+            }
+
+            fn ownership_markers(
+                &self,
+                pid: crate::procwatch::Pid,
+            ) -> Result<crate::procwatch::OwnershipMarkers, crate::procwatch::Error> {
+                self.inner.ownership_markers(pid)
+            }
+
+            fn foreground_process_group(
+                &self,
+                root_pid: crate::procwatch::Pid,
+            ) -> Result<Option<crate::procwatch::Pid>, crate::procwatch::Error> {
+                self.inner.foreground_process_group(root_pid)
+            }
+        }
+
         fn fixture(inspector: Arc<dyn ProcessInspector>) -> Fixture {
             fixture_with(inspector, None)
         }
@@ -12059,7 +12204,7 @@ handler = "codex-hook-v1"
                     &crate::agent::host::BuiltinSource::from_host_environment(),
                 ),
                 Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>,
-                inspector,
+                Arc::new(FixtureProcesses::new(inspector, &root)),
             );
             Fixture {
                 root,
@@ -12246,15 +12391,22 @@ handler = "codex-hook-v1"
         /// markers, whose environment the kernel exposes on every host (unlike a
         /// platform binary such as `/bin/sleep` on macOS 27), reparented away from the
         /// test process so its exit is observable without reaping.
-        struct Marked(u32);
+        ///
+        /// It works in the fixture directory it is started in, which is what puts
+        /// it in that fixture's view of the host (see [`FixtureProcesses`]), and it
+        /// is checked and signalled only by the identity captured at start.
+        struct Marked(u32, crate::procwatch::ProcessIdentity);
 
         impl Marked {
-            fn spawn(worker_instance_id: &str) -> Self {
-                Self::spawn_with(&[("POHUNEK_WORKER_INSTANCE_ID", worker_instance_id)])
+            fn spawn(directory: &Path, worker_instance_id: &str) -> Self {
+                Self::spawn_with(
+                    directory,
+                    &[("POHUNEK_WORKER_INSTANCE_ID", worker_instance_id)],
+                )
             }
 
             /// Like [`Self::spawn`] with exactly the given environment markers.
-            fn spawn_with(markers: &[(&str, &str)]) -> Self {
+            fn spawn_with(directory: &Path, markers: &[(&str, &str)]) -> Self {
                 let output = std::process::Command::new("/bin/sh")
                     .args([
                         "-c",
@@ -12263,6 +12415,7 @@ handler = "codex-hook-v1"
                             pohunek_test_support::hold::shell_words()
                         ),
                     ])
+                    .current_dir(directory)
                     .envs(markers.iter().copied())
                     .output()
                     .expect("spawn marked process");
@@ -12271,13 +12424,19 @@ handler = "codex-hook-v1"
                     .trim()
                     .parse()
                     .expect("numeric pid");
-                Self(pid)
+                let host = HostInspector::new();
+                let identity = host
+                    .identity(pid)
+                    .expect("inspect the marked process")
+                    .expect("the marked process runs");
+                assert_in_fixture_view(pid, directory);
+                Self(pid, identity)
             }
 
             fn alive(&self) -> bool {
                 HostInspector::new()
-                    .identity(self.0)
-                    .is_ok_and(|identity| identity.is_some())
+                    .is_running(self.1)
+                    .expect("inspect the marked process")
             }
 
             async fn wait_gone(&self) {
@@ -12293,11 +12452,26 @@ handler = "codex-hook-v1"
             }
         }
 
+        /// Asserts that `pid` works in `directory`, the fixture directory.
+        ///
+        /// The fixture sees exactly the processes whose working directory reads
+        /// under its own, so a process it could not see would make every
+        /// assertion about it vacuous.
+        fn assert_in_fixture_view(pid: u32, directory: &Path) {
+            let cwd = HostInspector::new()
+                .cwd(pid)
+                .expect("read the process's working directory");
+            assert!(
+                std::fs::canonicalize(&cwd)
+                    .unwrap_or(cwd)
+                    .starts_with(std::fs::canonicalize(directory).expect("canonical directory")),
+                "process {pid} works in its fixture directory"
+            );
+        }
+
         impl Drop for Marked {
             fn drop(&mut self) {
-                let _ = pohunek_test_support::process_env::command("kill")
-                    .args(["-KILL", &self.0.to_string()])
-                    .status();
+                crate::procwatch::scoped_host::kill_if_current(&HostInspector::new(), self.1);
             }
         }
 
@@ -12324,7 +12498,7 @@ handler = "codex-hook-v1"
         #[tokio::test]
         async fn present_job_without_a_reachable_worker_is_ambiguous_and_untouched() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
-            let marked = Marked::spawn("runtime-s-301");
+            let marked = Marked::spawn(&fixture.root, "runtime-s-301");
             persist_record(&fixture.root, "s-301", Some("runtime-s-301"));
             write_live_journal(&fixture.root, "s-301", dead_worker(), Some("runtime-s-301"));
             fixture.supervisor.script_job(
@@ -12349,8 +12523,8 @@ handler = "codex-hook-v1"
         #[tokio::test]
         async fn ended_job_with_a_dead_worker_sweeps_exactly_its_runtime_and_is_lost() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
-            let lost = Marked::spawn("runtime-s-302");
-            let bystander = Marked::spawn("runtime-s-302-other");
+            let lost = Marked::spawn(&fixture.root, "runtime-s-302");
+            let bystander = Marked::spawn(&fixture.root, "runtime-s-302-other");
             persist_record(&fixture.root, "s-302", Some("runtime-s-302"));
             write_live_journal(
                 &fixture.root,
@@ -12373,6 +12547,39 @@ handler = "codex-hook-v1"
             lost.wait_gone().await;
             assert!(bystander.alive(), "another runtime is never swept");
             assert_eq!(fixture.supervisor.retired(), vec![id]);
+        }
+
+        #[tokio::test]
+        async fn a_sweep_never_reaches_a_stand_in_of_another_fixture_with_the_same_marker() {
+            // Scenarios run concurrently, and two of them can mark stand-ins for
+            // the same runtime; each fixture sweeps only its own.
+            let other = fixture(Arc::new(RetryInspector::default()));
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let lost = Marked::spawn(&fixture.root, "runtime-s-399");
+            let other_runtime = Marked::spawn(&other.root, "runtime-s-399");
+            persist_record(&fixture.root, "s-399", Some("runtime-s-399"));
+            write_live_journal(
+                &fixture.root,
+                "s-399",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-399"),
+            );
+            let id = service_id("s-399", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-399").await;
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            lost.wait_gone().await;
+            assert!(
+                other_runtime.alive(),
+                "another fixture's stand-in is never swept"
+            );
         }
 
         /// Rewrites the persisted journal of `session_id`'s worker as raw JSON.
@@ -12401,7 +12608,7 @@ handler = "codex-hook-v1"
         ) {
             let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_id = format!("runtime-{session_id}");
-            let marked = Marked::spawn(&runtime_id);
+            let marked = Marked::spawn(&fixture.root, &runtime_id);
             persist_record(&fixture.root, session_id, Some(&runtime_id));
             write_live_journal(
                 &fixture.root,
@@ -12504,6 +12711,11 @@ handler = "codex-hook-v1"
                 warnings
             });
             let hook_pid = super::wait_for_pid_file(&pid_file).await;
+            let hook = HostInspector::new()
+                .identity(hook_pid)
+                .expect("inspect the hook")
+                .expect("the hook runs");
+            assert_in_fixture_view(hook_pid, &fixture.root);
             persist_record(&fixture.root, "s-312", Some("runtime-s-312"));
             write_live_journal(
                 &fixture.root,
@@ -12522,11 +12734,9 @@ handler = "codex-hook-v1"
 
             let runtime = runtime_of(&fixture.registry, "s-312").await;
             let hook_alive = HostInspector::new()
-                .identity(hook_pid)
-                .is_ok_and(|identity| identity.is_some());
-            let _ = pohunek_test_support::process_env::command("kill")
-                .args(["-KILL", &hook_pid.to_string()])
-                .status();
+                .is_running(hook)
+                .expect("inspect the hook");
+            crate::procwatch::scoped_host::kill_if_current(&HostInspector::new(), hook);
             let _warnings = runner.await.expect("hook runner joins");
             assert_eq!(runtime.state, RuntimeState::Lost);
             assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
@@ -12542,16 +12752,22 @@ handler = "codex-hook-v1"
         async fn crash_next_to_a_descendant_without_an_instance_marker_keeps_the_cleanup_unconfirmed(
         ) {
             let fixture = fixture(Arc::new(RetryInspector::default()));
-            let legacy = Marked::spawn_with(&[
-                ("POHUNEK_SESSION_ID", "s-310"),
-                ("POHUNEK_WORKER_ID", "worker-s-310"),
-                ("POHUNEK_RUNTIME_ID", "runtime-s-310"),
-            ]);
-            let other_session = Marked::spawn_with(&[
-                ("POHUNEK_SESSION_ID", "s-310-other"),
-                ("POHUNEK_WORKER_ID", "worker-s-310-other"),
-                ("POHUNEK_RUNTIME_ID", "runtime-s-310"),
-            ]);
+            let legacy = Marked::spawn_with(
+                &fixture.root,
+                &[
+                    ("POHUNEK_SESSION_ID", "s-310"),
+                    ("POHUNEK_WORKER_ID", "worker-s-310"),
+                    ("POHUNEK_RUNTIME_ID", "runtime-s-310"),
+                ],
+            );
+            let other_session = Marked::spawn_with(
+                &fixture.root,
+                &[
+                    ("POHUNEK_SESSION_ID", "s-310-other"),
+                    ("POHUNEK_WORKER_ID", "worker-s-310-other"),
+                    ("POHUNEK_RUNTIME_ID", "runtime-s-310"),
+                ],
+            );
             persist_record(&fixture.root, "s-310", Some("runtime-s-310"));
             write_live_journal(
                 &fixture.root,
@@ -12590,7 +12806,7 @@ handler = "codex-hook-v1"
             inspector.fail_enumeration(true);
             let fixture =
                 fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
-            let marked = Marked::spawn("runtime-s-303");
+            let marked = Marked::spawn(&fixture.root, "runtime-s-303");
             persist_record(&fixture.root, "s-303", Some("runtime-s-303"));
             write_live_journal(&fixture.root, "s-303", dead_worker(), Some("runtime-s-303"));
 
@@ -12613,7 +12829,7 @@ handler = "codex-hook-v1"
             inspector.fail_markers(true);
             let fixture =
                 fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
-            let marked = Marked::spawn("runtime-s-306");
+            let marked = Marked::spawn(&fixture.root, "runtime-s-306");
             persist_record(&fixture.root, "s-306", Some("runtime-s-306"));
             write_live_journal(&fixture.root, "s-306", dead_worker(), Some("runtime-s-306"));
 
@@ -12648,7 +12864,7 @@ handler = "codex-hook-v1"
             inspector.fail_markers(true);
             let fixture =
                 fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
-            let marked = Marked::spawn("runtime-s-395");
+            let marked = Marked::spawn(&fixture.root, "runtime-s-395");
             for session_id in SESSIONS {
                 let runtime = format!("runtime-{session_id}");
                 persist_record(&fixture.root, session_id, Some(&runtime));
@@ -12683,7 +12899,7 @@ handler = "codex-hook-v1"
         #[tokio::test]
         async fn mismatched_job_definition_fails_closed() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
-            let marked = Marked::spawn("runtime-s-304");
+            let marked = Marked::spawn(&fixture.root, "runtime-s-304");
             persist_record(&fixture.root, "s-304", Some("runtime-s-304"));
             write_live_journal(&fixture.root, "s-304", dead_worker(), Some("runtime-s-304"));
             fixture.supervisor.script_job(
@@ -12800,11 +13016,14 @@ handler = "codex-hook-v1"
                     .await;
             persist_record(&fixture.root, "s-320", Some(worker_instance_id.as_str()));
             drop(controller);
-            let legacy_child = Marked::spawn_with(&[
-                ("POHUNEK_SESSION_ID", "s-320"),
-                ("POHUNEK_WORKER_ID", "worker-s-320"),
-                ("POHUNEK_RUNTIME_ID", worker_instance_id.as_str()),
-            ]);
+            let legacy_child = Marked::spawn_with(
+                &fixture.root,
+                &[
+                    ("POHUNEK_SESSION_ID", "s-320"),
+                    ("POHUNEK_WORKER_ID", "worker-s-320"),
+                    ("POHUNEK_RUNTIME_ID", worker_instance_id.as_str()),
+                ],
+            );
             rewrite_journal(&fixture.root, "s-320", "worker-s-320", |journal| {
                 journal.insert("version".to_owned(), "0.33.0".into());
             });
@@ -13077,7 +13296,7 @@ handler = "codex-hook-v1"
         #[tokio::test]
         async fn unavailable_supervisor_keeps_the_session_reconnecting_and_retries() {
             let fixture = fixture_retrying(Arc::new(RetryInspector::default()));
-            let marked = Marked::spawn("runtime-s-309");
+            let marked = Marked::spawn(&fixture.root, "runtime-s-309");
             persist_record(&fixture.root, "s-309", Some("runtime-s-309"));
             write_live_journal(
                 &fixture.root,
@@ -14551,7 +14770,7 @@ handler = "codex-hook-v1"
         #[tokio::test]
         async fn removal_intent_with_a_terminal_journal_waits_for_a_confirmed_sweep() {
             let (fixture, inspector) = unreadable_marker_fixture();
-            let marked = Marked::spawn("runtime-s-378");
+            let marked = Marked::spawn(&fixture.root, "runtime-s-378");
             let record = persist_removal_intent(&fixture.root, "s-378", Some("runtime-s-378"));
             seed_removal_leftovers(&fixture.root, &record);
             write_terminal_journal(&fixture.root, "s-378", "runtime-s-378");
@@ -14579,7 +14798,7 @@ handler = "codex-hook-v1"
         #[tokio::test]
         async fn removal_intent_whose_job_ended_waits_for_a_confirmed_sweep() {
             let (fixture, inspector) = unreadable_marker_fixture();
-            let marked = Marked::spawn("runtime-s-379");
+            let marked = Marked::spawn(&fixture.root, "runtime-s-379");
             let record = persist_removal_intent(&fixture.root, "s-379", Some("runtime-s-379"));
             seed_removal_leftovers(&fixture.root, &record);
             write_live_journal(&fixture.root, "s-379", dead_worker(), Some("runtime-s-379"));
@@ -14604,9 +14823,9 @@ handler = "codex-hook-v1"
         #[tokio::test]
         async fn removal_sweeps_every_runtime_of_its_generation() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
-            let recorded_runtime = Marked::spawn("runtime-s-380");
-            let journaled_runtime = Marked::spawn("runtime-s-380-journaled");
-            let bystander = Marked::spawn("runtime-s-380-other");
+            let recorded_runtime = Marked::spawn(&fixture.root, "runtime-s-380");
+            let journaled_runtime = Marked::spawn(&fixture.root, "runtime-s-380-journaled");
+            let bystander = Marked::spawn(&fixture.root, "runtime-s-380-other");
             persist_record(&fixture.root, "s-380", Some("runtime-s-380"));
             write_live_journal(&fixture.root, "s-380", dead_worker(), Some("runtime-s-380"));
             // A second journal of the generation names a runtime the record
@@ -14643,7 +14862,7 @@ handler = "codex-hook-v1"
             let inspector = Arc::new(RetryInspector::default());
             let fixture =
                 fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
-            let marked = Marked::spawn("runtime-s-381");
+            let marked = Marked::spawn(&fixture.root, "runtime-s-381");
             persist_record(&fixture.root, "s-381", Some("runtime-s-381"));
             write_live_journal(&fixture.root, "s-381", dead_worker(), Some("runtime-s-381"));
             let id = service_id("s-381", TEST_GENERATION);
@@ -14793,7 +15012,7 @@ handler = "codex-hook-v1"
         #[tokio::test]
         async fn ambiguous_generation_whose_job_ends_becomes_a_proven_crash() {
             let fixture = fixture_retrying(Arc::new(RetryInspector::default()));
-            let marked = Marked::spawn("runtime-s-320");
+            let marked = Marked::spawn(&fixture.root, "runtime-s-320");
             persist_record(&fixture.root, "s-320", Some("runtime-s-320"));
             write_live_journal(
                 &fixture.root,
@@ -14956,7 +15175,7 @@ handler = "codex-hook-v1"
         #[tokio::test]
         async fn failed_journal_scan_is_ambiguous_until_a_scan_succeeds() {
             let fixture = fixture_retrying(Arc::new(RetryInspector::default()));
-            let marked = Marked::spawn("runtime-s-330");
+            let marked = Marked::spawn(&fixture.root, "runtime-s-330");
             persist_record(&fixture.root, "s-330", Some("runtime-s-330"));
             write_live_journal(
                 &fixture.root,
@@ -14994,7 +15213,7 @@ handler = "codex-hook-v1"
         #[tokio::test]
         async fn failed_runtime_root_enumeration_is_ambiguous_until_it_succeeds() {
             let fixture = fixture_retrying(Arc::new(RetryInspector::default()));
-            let marked = Marked::spawn("runtime-s-331");
+            let marked = Marked::spawn(&fixture.root, "runtime-s-331");
             persist_record(&fixture.root, "s-331", Some("runtime-s-331"));
             write_live_journal(
                 &fixture.root,
@@ -15080,7 +15299,7 @@ handler = "codex-hook-v1"
         #[tokio::test]
         async fn loaded_job_without_a_process_is_decided_by_its_journaled_worker() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
-            let marked = Marked::spawn("runtime-s-334");
+            let marked = Marked::spawn(&fixture.root, "runtime-s-334");
             persist_record(&fixture.root, "s-334", Some("runtime-s-334"));
             write_live_journal(
                 &fixture.root,
@@ -15815,7 +16034,7 @@ handler = "codex-hook-v1"
             recorded: Option<&str>,
         ) -> ConflictedSession {
             let instance = format!("runtime-{session}");
-            let worker = Marked::spawn(&instance);
+            let worker = Marked::spawn(&fixture.root, &instance);
             let identity = host_identity(worker.0);
             let record =
                 persist_record(&fixture.root, session, Some(recorded.unwrap_or(&instance)));
@@ -16373,10 +16592,13 @@ handler = "codex-hook-v1"
             let conflicted = conflicted_session(&fixture, "s-5236").await;
             // A worker child of the session without a worker-instance marker
             // cannot be attributed, so the sweep leaves it unconfirmed.
-            let unmarked = Marked::spawn_with(&[
-                ("POHUNEK_SESSION_ID", "s-5236"),
-                ("POHUNEK_WORKER_ID", "worker-s-5236"),
-            ]);
+            let unmarked = Marked::spawn_with(
+                &fixture.root,
+                &[
+                    ("POHUNEK_SESSION_ID", "s-5236"),
+                    ("POHUNEK_WORKER_ID", "worker-s-5236"),
+                ],
+            );
 
             let error = fixture
                 .registry
@@ -16419,7 +16641,7 @@ handler = "codex-hook-v1"
         #[tokio::test]
         async fn a_stop_never_sweeps_a_runtime_the_journal_does_not_name() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
-            let victim = Marked::spawn("runtime-s-5260-other-session");
+            let victim = Marked::spawn(&fixture.root, "runtime-s-5260-other-session");
             let conflicted = conflicted_session_recording(
                 &fixture,
                 "s-5260",
@@ -16533,10 +16755,13 @@ handler = "codex-hook-v1"
             let fixture = fixture(Arc::new(RetryInspector::default()));
             // A worker child of the session without a worker-instance marker
             // cannot be attributed, so the sweep leaves it unconfirmed.
-            let unmarked = Marked::spawn_with(&[
-                ("POHUNEK_SESSION_ID", "s-5270"),
-                ("POHUNEK_WORKER_ID", "worker-s-5270"),
-            ]);
+            let unmarked = Marked::spawn_with(
+                &fixture.root,
+                &[
+                    ("POHUNEK_SESSION_ID", "s-5270"),
+                    ("POHUNEK_WORKER_ID", "worker-s-5270"),
+                ],
+            );
             persist_stop_intent(&fixture.root, "s-5270", Some("runtime-s-5270"));
             write_terminal_journal(&fixture.root, "s-5270", "runtime-s-5270");
 
@@ -16889,10 +17114,13 @@ handler = "codex-hook-v1"
             let fixture = fixture(Arc::new(RetryInspector::default()));
             // A worker child of the session without a worker-instance marker
             // cannot be attributed, so the sweep leaves it unconfirmed.
-            let unmarked = Marked::spawn_with(&[
-                ("POHUNEK_SESSION_ID", "s-5233"),
-                ("POHUNEK_WORKER_ID", "worker-s-5233"),
-            ]);
+            let unmarked = Marked::spawn_with(
+                &fixture.root,
+                &[
+                    ("POHUNEK_SESSION_ID", "s-5233"),
+                    ("POHUNEK_WORKER_ID", "worker-s-5233"),
+                ],
+            );
             let conflicted = interrupted_stop(&fixture, "s-5233").await;
 
             Box::pin(fixture.registry.reconcile_workers())
