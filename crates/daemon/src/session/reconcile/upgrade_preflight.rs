@@ -573,8 +573,11 @@ fn judge_stopped_sessions(dry: &DryRun, judging: &Judging<'_>) -> Vec<SessionVer
     verdicts
 }
 
-/// Judges one stopped session that keeps native resume or fork, or `None` for
-/// a session without either, which has no recovery to lose.
+/// Judges one stopped session. A session without native resume or fork is still
+/// judged on its migration outcome: the previous release may have resumed it
+/// from the stored reference, and startup can fail to repair that reference.
+/// Any other session without a recovery binding, or without either capability,
+/// has no recovery to lose and gives `None`.
 fn judge_stopped(
     record: &SessionRecord,
     facts: &Facts<'_>,
@@ -597,9 +600,15 @@ fn judge_stopped(
             candidate = record.clone();
         }
     }
+    candidate.recovery.as_ref()?;
     let capabilities = &candidate.info.capabilities;
-    if candidate.recovery.is_none() || (!capabilities.resume && !capabilities.fork) {
-        return None;
+    if !capabilities.resume && !capabilities.fork {
+        return match facts.recovery {
+            RecoveryOutcome::Lost | RecoveryOutcome::NeedsRegistry => {
+                recovery_loss(facts, &candidate, judging)
+            }
+            RecoveryOutcome::Preserved => None,
+        };
     }
     Some(match recovery_loss(facts, &candidate, judging) {
         Some(loss) => loss,

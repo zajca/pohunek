@@ -12,6 +12,7 @@
 // Rust guideline compliant 2026-10-12
 
 use pohunek_service_config::preflight::PROBE_BUDGET;
+use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -3476,5 +3477,127 @@ async fn a_frozen_revision_keyed_by_another_host_is_not_accepted_for_an_adopted_
     assert_eq!(
         refused_resume_code(&restarted.registry, &session.id).await,
         "agent_profile_changed"
+    );
+}
+
+/// Writes the damaged v0.33.1 fixture as a stopped session of profile `official`
+/// whose runtime has ended, then migrates it as the head daemon does at startup.
+/// Its binding needs the runtime registry to complete, so the migration leaves
+/// the resume and fork flags false.
+fn write_damaged_profile_store(store_path: &std::path::Path) {
+    let damaged = include_str!("../../store/fixtures/v0.33.1-damaged/metadata.jsonl");
+    let mut body = String::new();
+    for line in damaged.lines() {
+        let mut value: serde_json::Value = serde_json::from_str(line).expect("the fixture line");
+        if value["kind"] == "session" {
+            value["runtime"] = serde_json::json!({"state": "lost"});
+            value["desired_state"] = serde_json::json!("stopped");
+            value["info"]["agent"] = serde_json::json!("official");
+            value["recovery"]["agent"] = serde_json::json!("official");
+        }
+        writeln!(body, "{value}").expect("write to a string");
+    }
+    std::fs::write(store_path, body).expect("write the store");
+    std::fs::set_permissions(store_path, std::fs::Permissions::from_mode(0o600))
+        .expect("secure the store");
+    crate::store::Store::new(store_path.to_path_buf())
+        .migrate_to_current()
+        .expect("migrate the legacy store");
+}
+
+#[tokio::test]
+async fn a_damaged_profile_session_the_head_cannot_repair_is_reported_as_a_loss() {
+    damaged_profile_session_loss(false).await;
+}
+
+#[tokio::test]
+async fn a_damaged_profile_session_the_head_cannot_repair_is_reported_as_a_loss_with_the_package() {
+    damaged_profile_session_loss(true).await;
+}
+
+/// The previous release, with its built-in runtimes compiled in, resumes and forks
+/// the session once its startup repairs the binding. The head cannot repair it,
+/// so the preflight must report the loss on the store as it stands before the
+/// upgrade, not only on the store after the previous release touched it.
+async fn damaged_profile_session_loss(installed: bool) {
+    let key = signing_key("root");
+    let tag = format!("damaged-profile-loss-{installed}");
+    let store_path = temp_store_path(&tag);
+    let fixture = Fixture::with_anchor_and_store(
+        &format!("{tag}-plugins"),
+        anchor(&[&key], Vec::new()),
+        store_path.clone(),
+    );
+    fixture.write_profile("official", "base = \"claude\"\n");
+    write_damaged_profile_store(&store_path);
+    let id = protocol::SessionId("s-fixture-session".to_owned());
+    let at_rest = crate::store::Store::new(store_path.clone())
+        .load_sessions()
+        .expect("load the store at rest")
+        .into_iter()
+        .find(|record| record.session_id == id.0)
+        .expect("the session at rest");
+    assert_eq!(
+        at_rest.info.capabilities,
+        protocol::SessionCapabilities {
+            resume: false,
+            fork: false
+        },
+        "the migration leaves the unresolved binding's flags false"
+    );
+
+    let previous_store = temp_store_path(&format!("{tag}-previous"));
+    std::fs::copy(&store_path, &previous_store).expect("copy the store for the previous release");
+    let previous = compiled_in_daemon(&fixture, &previous_store);
+    Box::pin(previous.reconcile_workers())
+        .await
+        .expect("the previous release reconciles the store");
+    assert_eq!(
+        listed_recovery(&previous, &id).await,
+        (true, true),
+        "the previous release resumes and forks the session"
+    );
+
+    if installed {
+        let package = real_official(RuntimeId::CLAUDE);
+        install_real_official(&fixture, &fixture.registry, RuntimeId::CLAUDE, &package, 5).await;
+    }
+    let inputs = preflight_inputs(&fixture, &fixture.registry, &store_path);
+    let report = upgrade_preflight::run(&inputs, &HostInspector::new());
+    let verdict = report
+        .stopped_sessions
+        .iter()
+        .find(|verdict| verdict.session_id == id.0);
+    assert!(
+        matches!(verdict, Some(verdict) if verdict.verdict == Verdict::WouldLoseRecovery),
+        "the preflight reports the recovery the head cannot restore: {:?}",
+        report.stopped_sessions
+    );
+
+    let restarted = restart(&fixture).await;
+    let info = restarted
+        .registry
+        .inspect(&id)
+        .await
+        .expect("the session is listed");
+    assert!(
+        info.warnings
+            .iter()
+            .any(|warning| warning.message.contains("native recovery is unavailable")),
+        "startup reports the recovery as unavailable: {:?}",
+        info.warnings
+    );
+    assert_eq!(
+        restarted
+            .registry
+            .resume_with(&id, crate::session::ProfileChange::Refuse)
+            .await
+            .expect_err("resume refuses the session")
+            .code,
+        if installed {
+            "runtime_served_by_package"
+        } else {
+            "runtime_builtin_removed"
+        }
     );
 }
