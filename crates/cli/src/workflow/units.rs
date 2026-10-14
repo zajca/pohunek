@@ -612,9 +612,9 @@ fn dispatcher_key() -> PluginUnitKey {
 /// # Errors
 ///
 /// Returns [`Error::ServiceNotInstalled`] when the unit must be installed or
-/// removed and no usable installation exists, [`Error::Units`] when the
-/// service manager refuses, or [`Error::Store`] when the record cannot be
-/// written.
+/// removed and no usable installation exists, or must be installed and the
+/// installation records another version, [`Error::Units`] when the service
+/// manager refuses, or [`Error::Store`] when the record cannot be written.
 pub(crate) async fn sync_dispatcher(
     store: &Store,
     context: &Context,
@@ -624,7 +624,11 @@ pub(crate) async fn sync_dispatcher(
     let reacting = !reacting_plugins(store, recorded)?.is_empty();
     let installation = if reacting || recorded {
         let installation = require_installation(context)?;
-        require_same_version(&installation)?;
+        // Removing the unit runs no trampoline, so any version may remove it,
+        // as `disable` and `uninstall` remove plugin units.
+        if reacting {
+            require_same_version(&installation)?;
+        }
         Some(installation)
     } else {
         None

@@ -33,6 +33,8 @@ use pohunek_test_support::{bin_exe, worker_binary};
 use serde_json::Value;
 
 use crate::workflow_units::{native, Managed, Plugin, KNOBS};
+use pohunek_cli::service::definition::identity_config;
+use pohunek_cli::service::VERSION;
 use pohunek_platform::supervisor::{PluginUnitKey, PluginUnitKind};
 
 /// Plugin id of every scenario.
@@ -46,6 +48,9 @@ const CONTEXT_PREFIX: &str = "context.";
 
 /// Origin files of the fixture reaction.
 const ORIGIN_PREFIX: &str = "origin.";
+
+/// Another version than this CLI, recorded for the installation.
+const OTHER_VERSION: &str = "0.0.1";
 
 /// Marker file that makes the fixture reaction sleep per run.
 const SLOW_MARKER: &str = "slow";
@@ -250,6 +255,37 @@ async fn service_uninstall_names_the_enabled_plugin_that_reacts() {
         "{document}"
     );
     assert!(!message.contains("dispatcher"), "{document}");
+}
+
+/// Disabling the last plugin with reactions removes the dispatcher unit even
+/// when the service installation records another pohunek version: removing
+/// a unit runs no trampoline, as for a plugin's own units.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+async fn disabling_removes_the_dispatcher_under_an_installation_of_another_version() {
+    assert_ne!(VERSION, OTHER_VERSION);
+    let mut managed = Managed::new(KNOBS);
+    let plugin = Plugin::new(PLUGIN).reaction("on_created", &["session_created"], "react");
+    managed.enable(&plugin).await;
+    let record = managed
+        .units
+        .env
+        .state_home()
+        .join("pohunek/workflow-plugins/units/REACTIONS.json");
+    assert!(record.exists(), "enabling recorded the dispatcher unit");
+    identity_config(
+        &managed.units.context,
+        &managed.units.env.root().join("prefix"),
+        OTHER_VERSION,
+    )
+    .expect("the installation configuration")
+    .write(&managed.units.context.config_path())
+    .expect("record the other version");
+
+    // In process, like `enable`: the CLI's own child has no bus to the real
+    // user manager in the hermetic environment.
+    managed.disable(PLUGIN).await;
+    assert!(!record.exists(), "the dispatcher unit is still recorded");
 }
 
 #[tokio::test(flavor = "multi_thread")]

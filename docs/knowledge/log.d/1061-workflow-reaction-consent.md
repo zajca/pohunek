@@ -10,3 +10,6 @@
   or every installed plugin when none keeps the dispatcher) instead of a
   `pohunek workflow disable the reaction dispatcher` command that does not
   exist.
+- Disabling or uninstalling the last plugin with reactions removes the
+  dispatcher unit under a service installation of any version, as for a
+  plugin's own units; only installing the dispatcher needs this version.

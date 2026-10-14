@@ -3259,9 +3259,10 @@ Every `--json` result is one standard CLI process envelope. The `ok` payloads:
   behind refuses every run.
 - `inspect`: `{plugin, description, files_dir, state_dir, config_dir,
   actions: [{name, argv, args, timeout_ms?, max_output_bytes?}],
-  jobs?: [{name, argv, every_s, timeout_ms?}], services?: [{name, argv}]}`.
-  `argv[0]` is resolved to an absolute path; `args` is `none` or
-  `passthrough`; `jobs` and `services` are present when declared.
+  jobs?: [{name, argv, every_s, timeout_ms?}], services?: [{name, argv}],
+  reactions?: [{name, events, argv, timeout_ms?}]}`. `argv[0]` is resolved to
+  an absolute path; `args` is `none` or `passthrough`; `jobs`, `services` and
+  `reactions` are present when declared.
 - `run`: the action's stdout, which must be exactly one JSON document (JSON
   whitespace around it is allowed and dropped), placed as `ok` byte for byte:
   key order, number spelling and inner whitespace are the action's own. It is
