@@ -154,6 +154,7 @@ async fn unmarked_hermes_home_is_a_gap_and_existing_config_is_kept() {
     let release = release(&installation);
     let planner = ScriptedPlanner::new(vec![report(&hermes())]);
     let home = unmarked_hermes_home(&installation);
+    fs::create_dir_all(home.join("profiles").join("work")).expect("unmarked profile home");
     let home_before = snapshot(&home);
     fs::create_dir_all(config_dir(&installation)).expect("config dir");
     let attach = config_dir(&installation).join("attach.conf");
@@ -162,9 +163,27 @@ async fn unmarked_hermes_home_is_a_gap_and_existing_config_is_kept() {
     let host_plan = plan(&installation.context, &release, &planner)
         .await
         .expect("plan the host");
-    assert!(matches!(host_plan.service, ServiceStep::Install { .. }));
-    assert_eq!(host_plan.hook_gaps.len(), 1, "one unmarked Hermes home");
-    let gap = host_plan.hook_gaps[0].detail.clone().unwrap_or_default();
+    assert!(matches!(
+        host_plan.preview.service,
+        ServiceStep::Install { .. }
+    ));
+    assert_eq!(
+        host_plan.preview.hermes_homes.len(),
+        2,
+        "the default home and one profile home are both planned"
+    );
+    assert!(
+        host_plan
+            .preview
+            .hermes_homes
+            .iter()
+            .all(|home| home.status == "gap"),
+        "both are unmarked, so both are gaps"
+    );
+    let gap = host_plan.preview.hermes_homes[0]
+        .detail
+        .clone()
+        .unwrap_or_default();
     assert!(
         gap.contains("pohunek integration hermes install"),
         "the gap names its install command: {gap}"
@@ -174,7 +193,7 @@ async fn unmarked_hermes_home_is_a_gap_and_existing_config_is_kept() {
         .await
         .expect("setup applies");
     assert!(outcome.verdict.hooks_failed.is_empty(), "no hook failed");
-    assert_eq!(outcome.verdict.hook_gaps.len(), 1, "the gap is reported");
+    assert_eq!(outcome.verdict.hook_gaps.len(), 2, "both gaps are reported");
     assert!(outcome.verdict.packages_missing.is_empty());
     assert_eq!(outcome.verdict.health, "ok");
     assert_eq!(
@@ -229,8 +248,8 @@ async fn a_plan_that_changes_after_the_install_stops_then_converges_on_rerun() {
         "names the installed version: {message}"
     );
     assert!(
-        message.contains("nothing else was changed"),
-        "states what was left alone: {message}"
+        message.contains("Nothing else was changed.") && message.contains("Changes made:"),
+        "states what was changed and what was left alone: {message}"
     );
     assert!(error
         .recover()
@@ -249,14 +268,14 @@ async fn a_plan_that_changes_after_the_install_stops_then_converges_on_rerun() {
         .await
         .expect("the re-run plans");
     assert_eq!(
-        rerun.service,
+        rerun.preview.service,
         ServiceStep::Present,
         "the re-run takes the present step"
     );
     let converged = apply(&installation.context, rerun, &planner)
         .await
         .expect("the re-run converges");
-    assert_eq!(converged.service, ServiceStep::Present);
+    assert_eq!(converged.preview.service, ServiceStep::Present);
     assert!(
         converged
             .applied
@@ -297,7 +316,7 @@ async fn a_second_setup_on_a_configured_host_is_a_no_op() {
     let second_plan = plan(&installation.context, &release, &planner)
         .await
         .expect("second plan");
-    assert_eq!(second_plan.service, ServiceStep::Present);
+    assert_eq!(second_plan.preview.service, ServiceStep::Present);
     let second = apply(&installation.context, second_plan, &planner)
         .await
         .expect("second setup applies");
@@ -310,7 +329,11 @@ async fn a_second_setup_on_a_configured_host_is_a_no_op() {
         "no config file is rewritten"
     );
     assert_eq!(second.config.skipped.len(), 3);
-    assert_eq!(second.verdict.hook_gaps.len(), 1);
+    assert_eq!(
+        second.verdict.hook_gaps.len(),
+        1,
+        "the default home is still a gap"
+    );
     assert!(second.verdict.hooks_failed.is_empty());
     assert_eq!(
         snapshot(&home),
@@ -321,5 +344,126 @@ async fn a_second_setup_on_a_configured_host_is_a_no_op() {
         snapshot(&config_dir(&installation)),
         config_after_first,
         "the config directory is unchanged"
+    );
+}
+
+/// A planner report with the given packages and profiles and no integrations.
+fn planned(packages: &Value, profiles: &Value) -> EnsureReport {
+    serde_json::from_value(json!({
+        "report_version": 1,
+        "daemon_version": VERSION,
+        "dry_run": true,
+        "packages": packages,
+        "catalog": "unavailable",
+        "profiles": profiles,
+        "integrations": [],
+        "refusals": [],
+    }))
+    .expect("a planner report of this layout")
+}
+
+/// A Claude package the release lists, with the given planned status.
+fn claude(status: &str) -> Value {
+    json!([{
+        "runtime": "claude",
+        "package": "claude-code",
+        "version": "1.0.0",
+        "digest": format!("sha256:{}", "a".repeat(64)),
+        "status": status,
+        "reasons": ["profile"],
+    }])
+}
+
+/// An unpinned profile over the Claude runtime, to be pinned.
+fn unpinned_profile() -> Value {
+    json!([{
+        "name": "consumer",
+        "base": "claude",
+        "digest": format!("sha256:{}", "a".repeat(64)),
+        "status": "bind",
+    }])
+}
+
+/// A host with no service and an unpinned profile over an official runtime.
+///
+/// The install engine runs the release's runtime step for that profile, which
+/// installs the package and pins the profile, so the plan read after the
+/// install no longer lists them. The scripted planner reproduces that
+/// transition: the preview shows the package to install and the profile to
+/// pin, and the plan after the install shows the package present and the
+/// profile gone. The install engine itself is not scripted: this release has
+/// no catalog for the package, so the engine's own runtime step does nothing
+/// here. Setup must accept the transition and must not install or pin again,
+/// which an attempt would show, because it would need an archive this release
+/// does not carry.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn an_install_engine_transition_is_accepted_without_reapplying() {
+    let installation = Installation::new();
+    let release = release(&installation);
+    let preview = planned(&claude("install"), &unpinned_profile());
+    let after = planned(&claude("present"), &json!([]));
+    let planner = ScriptedPlanner::new(vec![preview, after.clone(), after]);
+
+    let host_plan = plan(&installation.context, &release, &planner)
+        .await
+        .expect("plan the host");
+    let outcome = apply(&installation.context, host_plan, &planner)
+        .await
+        .expect("setup accepts the install engine's transition");
+    assert!(outcome
+        .applied
+        .iter()
+        .any(|line| *line == format!("service: installed version {VERSION}")));
+    assert!(
+        outcome
+            .applied
+            .iter()
+            .all(|line| !line.starts_with("package claude:")
+                && !line.starts_with("profile consumer:")),
+        "setup does not install or pin again: {:?}",
+        outcome.applied
+    );
+    assert!(outcome.verdict.packages_missing.is_empty());
+    assert!(outcome.verdict.packages_unexpected.is_empty());
+    assert!(outcome.verdict.profiles_pending.is_empty());
+    assert_eq!(outcome.verdict.health, "ok");
+}
+
+/// A runtime the preview planned that the plan after the apply omits fails
+/// the verdict and is named. The service stays installed and the changes made
+/// before the stop are listed.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn a_verdict_plan_that_drops_a_previewed_runtime_fails_and_names_it() {
+    let installation = Installation::new();
+    let release = release(&installation);
+    let preview = planned(&claude("present"), &json!([]));
+    let after_install = planned(&claude("present"), &json!([]));
+    let verdict_plan = planned(&json!([]), &json!([]));
+    let planner = ScriptedPlanner::new(vec![preview, after_install, verdict_plan]);
+
+    let host_plan = plan(&installation.context, &release, &planner)
+        .await
+        .expect("plan the host");
+    let error = apply(&installation.context, host_plan, &planner)
+        .await
+        .expect_err("the verdict fails");
+    assert_eq!(error.code(), "setup_incomplete");
+    let message = error.to_string();
+    assert!(
+        message.contains("runtimes not present after the apply: claude"),
+        "the verdict names the dropped runtime: {message}"
+    );
+    assert!(message.contains("Changes made: service: installed version"));
+    assert!(
+        installed_at_this_version(&installation).await,
+        "the service is kept"
     );
 }

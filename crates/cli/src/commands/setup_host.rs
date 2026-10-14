@@ -3,26 +3,28 @@
 //! The run has six steps, in this order:
 //!
 //! 1. Service: without an installed service the release binaries next to the
-//!    running `pohunek` are installed. The same version is kept as it is. A
-//!    different installed version is a gap; setup never upgrades.
+//!    running `pohunek` are installed. The install engine runs the release's
+//!    runtime step itself, for the runtimes its profiles, sessions and
+//!    integrations use, and reports what it applied. The same version is kept
+//!    as it is. A different installed version is a gap; setup never upgrades.
 //! 2. Plan: the release's `pohunekd ensure-official-runtimes --dry-run --detect`
 //!    reads the catalog and reports the packages, profiles, integrations and
 //!    gaps. It only reads, so it runs before the preview and before any write.
-//! 3. Preview and consent: every effect and gap is shown first. `--yes` runs
-//!    unattended; without a terminal or with `--json` the run is refused.
-//! 4. Apply, online through the daemon's RPCs: packages, profile pins, hooks.
+//! 3. Preview and consent: every effect and gap is shown first, and the
+//!    `--json` result carries the same preview. `--yes` runs unattended;
+//!    without a terminal or with `--json` the run is refused.
+//! 4. Apply: after a fresh install the plan is read again and must match the
+//!    preview, modulo exactly the transitions the install engine performs.
+//!    Setup then applies what remains over the daemon's RPCs, installs the
+//!    hooks, and writes the missing config files.
 //! 5. Config: the non-forcing `setup config` writer; existing files are kept.
-//! 6. Verdict: a second plan, the daemon's health and `doctor`.
+//! 6. Verdict: a third plan must carry every previewed runtime as present,
+//!    no refusal, and no pending profile pin; the hooks and `doctor` must pass.
 //!
-//! Before a fresh install the plan reads the staged release directory, and
-//! after the install it must reproduce that plan from the installed version
-//! directory. A difference stops the run after the service install and before
-//! any package, profile, hook or config write. The installed service is kept,
-//! and a re-run plans from it, so the stop is a state to converge from.
-//!
-//! Hook gaps (a Hermes home without the pohunek marker) never fail the run:
-//! setup does not choose a Hermes access policy for the owner, so such a home
-//! is reported with the command that installs it, and nothing is written there.
+//! A failure after the first change keeps the finished steps and names them.
+//! A stop after the service install names the install's own changes. Hermes
+//! homes without the pohunek marker are gaps: setup does not choose a Hermes
+//! access policy for the owner and writes nothing into them.
 
 // Rust guideline compliant 2026-10-14
 
@@ -45,7 +47,7 @@ use serde::Serialize;
 use crate::client::Client;
 use crate::commands::doctor;
 use crate::commands::health;
-use crate::commands::integration::{hermes_home_gaps, reinstall_after_upgrade, IntegrationEnv};
+use crate::commands::integration::{hermes_home_plan, reinstall_after_upgrade, IntegrationEnv};
 use crate::commands::setup::{config_files, install_config, ConfigResult};
 use crate::error::CliError;
 use crate::paths::Paths;
@@ -74,7 +76,7 @@ const RELEASE_ARCHIVE_SUFFIX: &str = ".tar.zst";
 /// Runtime id whose Hermes homes the CLI reinstalls itself, offline.
 const HERMES_RUNTIME: &str = "hermes";
 
-/// Hook status of a home that setup attempted and could not install.
+/// Hook status of a home setup attempted and could not install.
 const HOOK_FAILED: &str = "failed";
 
 /// Hook status of a home setup leaves alone: a gap with its install command.
@@ -85,6 +87,12 @@ const CONFIRM_ANSWERS: [&str; 2] = ["y", "yes"];
 
 /// Question asked once after the preview, on the terminal's error stream.
 const CONFIRM_PROMPT: &str = "Apply this plan? [y/N] ";
+
+/// Package status the install engine leaves a package in once it installed it.
+const ENGINE_INSTALLED: &str = "installed";
+
+/// Profile status the install engine leaves a profile in once it pinned it.
+const ENGINE_BOUND: &str = "bound";
 
 /// Reads the release planner's report for a directory: the release's
 /// `pohunekd ensure-official-runtimes --dry-run --detect`.
@@ -123,11 +131,49 @@ pub enum ServiceStep {
     Present,
 }
 
+/// One config file the run writes or keeps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfigPreview {
+    /// The file's path.
+    pub path: String,
+    /// Whether the file already exists, in which case the run keeps it.
+    pub exists: bool,
+}
+
+/// Everything a run will do, as the owner sees it before any write.
+///
+/// The Hermes homes are every home the apply acts on: a `update` for a home
+/// with the pohunek marker, a `gap` with its install command for a home
+/// without it, and `failed` for a home that cannot be planned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Preview {
+    /// The service step.
+    pub service: ServiceStep,
+    /// The planned packages.
+    pub packages: Vec<PackageAction>,
+    /// The planned profile pins.
+    pub profiles: Vec<ProfileAction>,
+    /// The planned integrations.
+    pub integrations: Vec<IntegrationAction>,
+    /// The daemon's gaps.
+    pub gaps: Vec<Gap>,
+    /// Every Hermes home the apply acts on, with its planned state.
+    pub hermes_homes: Vec<IntegrationReinstall>,
+    /// The config files, each with whether it exists.
+    pub config: Vec<ConfigPreview>,
+}
+
 /// The final checks of a run.
 #[derive(Debug, Serialize)]
 pub struct Verdict {
-    /// Runtimes whose previewed package is not present after the apply.
+    /// Previewed runtimes that are not present in the plan read after the apply.
     pub packages_missing: Vec<String>,
+    /// Runtimes the plan read after the apply lists but the preview did not.
+    pub packages_unexpected: Vec<String>,
+    /// Profiles the preview pins that the plan read after the apply still lists.
+    pub profiles_pending: Vec<String>,
+    /// Refusals of the plan read after the apply.
+    pub refusals: Vec<String>,
     /// Hook homes setup attempted and could not install.
     pub hooks_failed: Vec<String>,
     /// Hook homes left as gaps, each with the command that installs it.
@@ -141,18 +187,10 @@ pub struct Verdict {
 /// What a completed run did and found.
 #[derive(Debug, Serialize)]
 pub struct SetupReport {
-    /// The service step that ran.
-    pub service: ServiceStep,
-    /// One line per change made: the package, profile and hook outcomes.
+    /// The preview the owner was shown, in full.
+    pub preview: Preview,
+    /// One line per change made, in order.
     pub applied: Vec<String>,
-    /// The previewed packages, as previewed.
-    pub packages: Vec<PackageAction>,
-    /// The previewed profile pins, as previewed.
-    pub profiles: Vec<ProfileAction>,
-    /// The previewed integrations, as previewed.
-    pub integrations: Vec<IntegrationAction>,
-    /// The daemon's gaps, as previewed.
-    pub gaps: Vec<Gap>,
     /// The outcome of every integration hook setup attempted.
     pub hooks: Vec<IntegrationReinstall>,
     /// The config files written and kept.
@@ -165,17 +203,15 @@ pub struct SetupReport {
 #[derive(Debug)]
 pub struct HostPlan {
     /// The service step the plan assumes.
-    pub service: ServiceStep,
+    service: ServiceStep,
     /// The release directory the plan was read from.
-    pub dir: PathBuf,
+    dir: PathBuf,
     /// The `PATH` the daemon job runs with.
-    pub search_path: String,
-    /// What the release daemon reported for `dir`.
-    pub report: EnsureReport,
-    /// Each config file with whether it already exists.
-    pub config_files: Vec<(PathBuf, bool)>,
-    /// The hook homes setup leaves as gaps, known before anything is written.
-    pub hook_gaps: Vec<IntegrationReinstall>,
+    search_path: String,
+    /// What the release planner reported for `dir`.
+    previewed: EnsureReport,
+    /// The preview shown to the owner.
+    pub preview: Preview,
 }
 
 /// Why a host setup step stopped, with its stable code and next step.
@@ -226,7 +262,7 @@ pub async fn plan(
 /// # Errors
 ///
 /// Returns [`SetupError`] when a step fails or the verdict is not met. A
-/// failure after the first change keeps the finished steps.
+/// failure after the first change names the changes already made.
 pub async fn apply(
     context: &Context,
     plan: HostPlan,
@@ -242,7 +278,8 @@ pub async fn apply(
 /// Returns [`CliError::SetupConsentRequired`] without `--yes` when no
 /// confirmation can be asked, [`CliError::SetupDeclined`] when the owner says
 /// no, [`CliError::SetupBlocked`] before any change, and
-/// [`CliError::SetupIncomplete`] when a step after the first change fails.
+/// [`CliError::SetupIncomplete`] or [`CliError::SetupInstalledOnly`] when a
+/// step after the first change fails.
 pub(crate) async fn run(yes: bool, json: bool) -> Result<(), CliError> {
     if !yes && (json || !io::stdin().is_terminal()) {
         return Err(CliError::SetupConsentRequired);
@@ -321,44 +358,56 @@ async fn plan_in(
             search.to_env_value(),
         )
     };
-    let report = planner.plan(context, &dir, &search_path).await?;
-    if !report.refusals.is_empty() {
+    let previewed = planner.plan(context, &dir, &search_path).await?;
+    if !previewed.refusals.is_empty() {
         return Err(CliError::SetupBlocked {
-            detail: refusal_text(&report.refusals),
+            detail: refusal_text(&previewed.refusals),
         });
     }
-    let config_files = config_files(&paths_of(context))
+    let config = config_files(&paths_of(context))
         .into_iter()
         .map(|(path, _default)| {
             let exists = path.try_exists()?;
-            Ok((path, exists))
+            Ok(ConfigPreview {
+                path: path.display().to_string(),
+                exists,
+            })
         })
         .collect::<Result<Vec<_>, CliError>>()?;
-    let hook_gaps = if report
+    let hermes_homes = if previewed
         .integrations
         .iter()
         .any(|integration| integration.runtime == HERMES_RUNTIME)
     {
-        hermes_home_gaps(&integration_env(context))
+        hermes_home_plan(&integration_env(context))
     } else {
         Vec::new()
+    };
+    let preview = Preview {
+        service: service.clone(),
+        packages: previewed.packages.clone(),
+        profiles: previewed.profiles.clone(),
+        integrations: previewed.integrations.clone(),
+        gaps: previewed.gaps.clone(),
+        hermes_homes,
+        config,
     };
     Ok(HostPlan {
         service,
         dir,
         search_path,
-        report,
-        config_files,
-        hook_gaps,
+        previewed,
+        preview,
     })
 }
 
 /// Applies a previewed plan, step by step, and runs the final checks.
 ///
+/// Errors after the first change carry the changes made so far.
+///
 /// # Errors
 ///
-/// Returns [`CliError::SetupIncomplete`] when a step fails or the verdict is
-/// not met, and the errors of the service and daemon calls.
+/// Returns the errors of the steps, each with the changes made before it.
 async fn apply_in(
     context: &Context,
     plan: HostPlan,
@@ -368,35 +417,77 @@ async fn apply_in(
         service,
         dir,
         search_path,
-        report: previewed,
-        ..
+        previewed,
+        preview,
     } = plan;
     let mut applied = Vec::new();
-    let service_step = service.clone();
-    let (dir, search_path) = match service {
+    let steps = apply_steps(
+        context,
+        service,
+        dir,
+        search_path,
+        &previewed,
+        &mut applied,
+        planner,
+    )
+    .await;
+    match steps {
+        Ok((hooks, config, verdict)) => Ok(SetupReport {
+            preview,
+            applied,
+            hooks,
+            config,
+            verdict,
+        }),
+        Err(error) => Err(with_changes(error, applied)),
+    }
+}
+
+/// Attaches the changes made before `error` to it.
+fn with_changes(error: CliError, applied: Vec<String>) -> CliError {
+    match error {
+        installed_only @ CliError::SetupInstalledOnly { .. } => installed_only,
+        CliError::SetupIncomplete { detail, .. } => CliError::SetupIncomplete { detail, applied },
+        error if applied.is_empty() => error,
+        error => CliError::SetupIncomplete {
+            detail: error.to_string(),
+            applied,
+        },
+    }
+}
+
+/// The steps after the preview: the service, the remaining RPCs, the hooks,
+/// the config and the verdict.
+///
+/// # Errors
+///
+/// Returns the error of the first step that fails.
+async fn apply_steps(
+    context: &Context,
+    service: ServiceStep,
+    dir: PathBuf,
+    search_path: String,
+    previewed: &EnsureReport,
+    applied: &mut Vec<String>,
+    planner: &dyn ReleasePlanner,
+) -> Result<(Vec<IntegrationReinstall>, ConfigResult, Verdict), CliError> {
+    let (dir, search_path, remaining) = match service {
         ServiceStep::Install { from } => {
-            install_service(
-                context,
-                &PathBuf::from(from),
-                &previewed,
-                &mut applied,
-                planner,
-            )
-            .await?
+            install_service(context, Path::new(&from), previewed, applied, planner).await?
         }
-        ServiceStep::Present => (dir, search_path),
+        ServiceStep::Present => (dir, search_path, previewed.clone()),
     };
 
     let paths = paths_of(context);
     let mut client = Client::connect(LOCAL_HOST, &paths).await?;
-    apply_packages_and_profiles(&mut client, &dir, &previewed, &mut applied).await?;
+    apply_remaining(&mut client, &dir, &remaining, applied).await?;
 
     let env = integration_env(context);
-    let hermes = previewed
+    let hermes = remaining
         .integrations
         .iter()
         .any(|integration| integration.runtime == HERMES_RUNTIME);
-    let others: Vec<IntegrationAction> = previewed
+    let others: Vec<IntegrationAction> = remaining
         .integrations
         .iter()
         .filter(|integration| integration.runtime != HERMES_RUNTIME)
@@ -410,79 +501,185 @@ async fn apply_in(
     let config = install_config(&paths, false)?;
 
     let after = planner.plan(context, &dir, &search_path).await?;
-    let verdict = verdict(&paths, &after, &hooks).await?;
-    Ok(SetupReport {
-        service: service_step,
-        applied,
-        packages: previewed.packages,
-        profiles: previewed.profiles,
-        integrations: previewed.integrations,
-        gaps: previewed.gaps,
-        hooks,
-        config,
-        verdict,
-    })
+    let verdict = verdict(&paths, previewed, &after, &hooks).await?;
+    Ok((hooks, config, verdict))
 }
 
-/// Installs this release as the service, then checks that the installed
-/// release plans what the preview showed.
+/// Installs this release as the service and reads the plan of the installed
+/// version, which must match the preview modulo the transitions the install
+/// engine performed.
 ///
-/// Returns the installed version directory and the `PATH` of its daemon job.
+/// Returns the installed version directory, its `PATH`, and the plan to apply
+/// the rest from.
 ///
 /// # Errors
 ///
-/// Returns [`CliError::SetupInstalledOnly`] when the installed plan differs
-/// from the preview, and the errors of the install and the plan.
+/// Returns [`CliError::SetupInstalledOnly`] when the plan read after the
+/// install does not match the preview, and the errors of the install and the
+/// plan.
 async fn install_service(
     context: &Context,
     from: &Path,
     previewed: &EnsureReport,
     applied: &mut Vec<String>,
     planner: &dyn ReleasePlanner,
-) -> Result<(PathBuf, String), CliError> {
+) -> Result<(PathBuf, String, EnsureReport), CliError> {
     let installed = service::install_in(context, Some(from.to_path_buf()), None).await?;
     applied.push(format!("service: installed version {}", installed.version));
+    applied.extend(engine_changes(installed.runtimes.as_ref()));
     let version_dir = installed
         .daemon_executable
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| CliError::SetupIncomplete {
             detail: "the installed daemon has no version directory".to_owned(),
+            applied: Vec::new(),
         })?;
     let installed_search = installed_search_path(context).await?;
     let after = planner
         .plan(context, &version_dir, &installed_search)
         .await?;
-    if after.packages != previewed.packages
-        || after.profiles != previewed.profiles
-        || after.integrations != previewed.integrations
-        || after.gaps != previewed.gaps
-        || !after.refusals.is_empty()
-    {
+    if let Err(detail) = check_transitions(previewed, &after) {
         return Err(CliError::SetupInstalledOnly {
             version: installed.version,
             prefix: installed.prefix,
-            detail: "the release plan read after the install differs from the preview".to_owned(),
+            applied: applied.clone(),
+            detail,
         });
     }
-    Ok((version_dir, installed_search))
+    Ok((version_dir, installed_search, after))
 }
 
-/// Installs the previewed packages and pins the previewed profiles over the
+/// The changes the install engine's runtime step made, as the install report
+/// names them: the packages it installed and the profiles it pinned.
+fn engine_changes(runtimes: Option<&EnsureReport>) -> Vec<String> {
+    let Some(report) = runtimes else {
+        return Vec::new();
+    };
+    let mut changes = Vec::new();
+    for package in &report.packages {
+        if wire_name(&package.status) == ENGINE_INSTALLED {
+            changes.push(format!("package {}: installed", package.runtime));
+        }
+    }
+    for profile in &report.profiles {
+        if wire_name(&profile.status) == ENGINE_BOUND {
+            changes.push(format!("profile {}: bound", profile.name));
+        }
+    }
+    changes
+}
+
+/// Checks that the plan read after a fresh install matches the preview.
+///
+/// The install engine may have installed a previewed package (`install` ->
+/// `present`) and pinned a previewed profile (which then leaves the plan).
+/// Everything else must match: the same runtimes, packages, versions, digests
+/// and reasons, the same integrations and gaps, and no refusal. A package or
+/// profile still to do is kept, and setup applies it.
+///
+/// # Errors
+///
+/// Returns the first difference, as the message the stop reports.
+fn check_transitions(previewed: &EnsureReport, after: &EnsureReport) -> Result<(), String> {
+    if !after.refusals.is_empty() {
+        return Err(format!(
+            "the plan read after the install refuses: {}",
+            refusal_text(&after.refusals)
+        ));
+    }
+    if previewed.integrations != after.integrations {
+        return Err("the integrations differ from the preview".to_owned());
+    }
+    if previewed.gaps != after.gaps {
+        return Err("the gaps differ from the preview".to_owned());
+    }
+    for package in &after.packages {
+        let Some(shown) = previewed
+            .packages
+            .iter()
+            .find(|shown| shown.runtime == package.runtime)
+        else {
+            return Err(format!(
+                "runtime {} is planned after the install but was not previewed",
+                package.runtime
+            ));
+        };
+        if shown.package != package.package
+            || shown.version != package.version
+            || shown.digest != package.digest
+            || shown.reasons != package.reasons
+        {
+            return Err(format!(
+                "runtime {} changed its package, version, digest or reasons after the install",
+                package.runtime
+            ));
+        }
+        let allowed = match shown.status {
+            PackageStatus::Present => package.status == PackageStatus::Present,
+            PackageStatus::Install => matches!(
+                package.status,
+                PackageStatus::Install | PackageStatus::Present
+            ),
+            _ => false,
+        };
+        if !allowed {
+            return Err(format!(
+                "runtime {} is {} after the install; the preview showed {}",
+                package.runtime,
+                wire_name(&package.status),
+                wire_name(&shown.status)
+            ));
+        }
+    }
+    for shown in &previewed.packages {
+        if !after
+            .packages
+            .iter()
+            .any(|package| package.runtime == shown.runtime)
+        {
+            return Err(format!(
+                "runtime {} is no longer planned after the install",
+                shown.runtime
+            ));
+        }
+    }
+    for profile in &after.profiles {
+        let Some(shown) = previewed
+            .profiles
+            .iter()
+            .find(|shown| shown.name == profile.name)
+        else {
+            return Err(format!(
+                "profile {} is planned after the install but was not previewed",
+                profile.name
+            ));
+        };
+        if shown.base != profile.base || shown.digest != profile.digest {
+            return Err(format!(
+                "profile {} changed its base or digest after the install",
+                profile.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Applies the packages and profile pins the plan still lists, over the
 /// daemon's RPCs, recording one line per outcome.
 ///
 /// # Errors
 ///
 /// Returns the errors of the daemon calls, and [`CliError::SetupIncomplete`]
-/// for a previewed digest or path the request cannot carry.
-async fn apply_packages_and_profiles(
+/// for a planned digest or path the request cannot carry.
+async fn apply_remaining(
     client: &mut Client,
     dir: &Path,
-    previewed: &EnsureReport,
+    remaining: &EnsureReport,
     applied: &mut Vec<String>,
 ) -> Result<(), CliError> {
     let release_dir = dir.join(RELEASE_RUNTIME_DIR);
-    for package in previewed
+    for package in remaining
         .packages
         .iter()
         .filter(|package| package.status == PackageStatus::Install)
@@ -507,17 +704,15 @@ async fn apply_packages_and_profiles(
             wire_name(&result.status)
         ));
     }
-    for profile in previewed
+    for profile in remaining
         .profiles
         .iter()
         .filter(|profile| profile.status == ProfileStatus::Bind)
     {
         let digest = PackageDigest::parse(&profile.digest).map_err(|_malformed| {
             CliError::SetupIncomplete {
-                detail: format!(
-                    "profile {}: its previewed digest is not valid",
-                    profile.name
-                ),
+                detail: format!("profile {}: its planned digest is not valid", profile.name),
+                applied: Vec::new(),
             }
         })?;
         let bound = client
@@ -538,21 +733,51 @@ async fn apply_packages_and_profiles(
 
 /// Runs the final checks and fails when any is not met.
 ///
-/// Hook gaps are reported and do not fail the verdict.
+/// Every runtime the preview planned must be present in the plan read after
+/// the apply, that plan must carry no refusal, and a runtime it lists but the
+/// preview did not is reported. Hook gaps are reported and do not fail.
 ///
 /// # Errors
 ///
 /// Returns [`CliError::SetupIncomplete`] naming every check that is not met.
 async fn verdict(
     paths: &Paths,
+    previewed: &EnsureReport,
     after: &EnsureReport,
     hooks: &[IntegrationReinstall],
 ) -> Result<Verdict, CliError> {
-    let packages_missing: Vec<String> = after
+    let packages_missing: Vec<String> = previewed
         .packages
         .iter()
-        .filter(|package| package.status != PackageStatus::Present)
+        .filter(|shown| {
+            !after.packages.iter().any(|package| {
+                package.runtime == shown.runtime && package.status == PackageStatus::Present
+            })
+        })
+        .map(|shown| shown.runtime.clone())
+        .collect();
+    let packages_unexpected: Vec<String> = after
+        .packages
+        .iter()
+        .filter(|package| {
+            !previewed
+                .packages
+                .iter()
+                .any(|shown| shown.runtime == package.runtime)
+        })
         .map(|package| package.runtime.clone())
+        .collect();
+    let profiles_pending: Vec<String> = previewed
+        .profiles
+        .iter()
+        .filter(|shown| {
+            shown.status == ProfileStatus::Bind
+                && after
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.name == shown.name)
+        })
+        .map(|shown| shown.name.clone())
         .collect();
     let hooks_failed = hook_lines(hooks, HOOK_FAILED);
     let hook_gaps = hook_lines(hooks, HOOK_GAP);
@@ -561,10 +786,18 @@ async fn verdict(
             .await
             .map_err(|error| CliError::SetupIncomplete {
                 detail: format!("the daemon does not answer its health check: {error}"),
+                applied: Vec::new(),
             })?;
     let diagnosis = doctor::diagnose(paths).await?;
     let verdict = Verdict {
         packages_missing,
+        packages_unexpected,
+        profiles_pending,
+        refusals: after
+            .refusals
+            .iter()
+            .map(|refusal| format!("{}: {}", refusal.subject, refusal.detail))
+            .collect(),
         hooks_failed,
         hook_gaps,
         health: health.status,
@@ -573,8 +806,26 @@ async fn verdict(
     let mut problems = Vec::new();
     if !verdict.packages_missing.is_empty() {
         problems.push(format!(
-            "packages not present: {}",
+            "runtimes not present after the apply: {}",
             verdict.packages_missing.join(", ")
+        ));
+    }
+    if !verdict.packages_unexpected.is_empty() {
+        problems.push(format!(
+            "runtimes planned after the apply but not previewed: {}",
+            verdict.packages_unexpected.join(", ")
+        ));
+    }
+    if !verdict.profiles_pending.is_empty() {
+        problems.push(format!(
+            "profiles still to pin: {}",
+            verdict.profiles_pending.join(", ")
+        ));
+    }
+    if !verdict.refusals.is_empty() {
+        problems.push(format!(
+            "the plan after the apply refuses: {}",
+            verdict.refusals.join("; ")
         ));
     }
     if !verdict.hooks_failed.is_empty() {
@@ -588,6 +839,7 @@ async fn verdict(
     } else {
         Err(CliError::SetupIncomplete {
             detail: problems.join("; "),
+            applied: Vec::new(),
         })
     }
 }
@@ -654,6 +906,7 @@ fn path_text(path: &Path) -> Result<String, CliError> {
                 "{} is not valid UTF-8, which the daemon request cannot carry",
                 path.display()
             ),
+            applied: Vec::new(),
         })
 }
 
@@ -677,9 +930,10 @@ fn refusal_text(refusals: &[Refusal]) -> String {
 
 /// Renders the preview: every effect and gap, before anything is written.
 fn render_plan(plan: &HostPlan) -> String {
+    let preview = &plan.preview;
     let mut out = String::new();
     let _ = writeln!(out, "pohunek setup, version {VERSION}");
-    match &plan.service {
+    match &preview.service {
         ServiceStep::Install { from } => {
             let _ = writeln!(out, "service: install this release from {from}");
         }
@@ -688,7 +942,7 @@ fn render_plan(plan: &HostPlan) -> String {
         }
     }
     let _ = writeln!(out, "packages:");
-    for package in &plan.report.packages {
+    for package in &preview.packages {
         let _ = writeln!(
             out,
             "  {}  {} {}  {}  reasons {}",
@@ -705,7 +959,7 @@ fn render_plan(plan: &HostPlan) -> String {
         );
     }
     let _ = writeln!(out, "profiles:");
-    for profile in &plan.report.profiles {
+    for profile in &preview.profiles {
         let _ = writeln!(
             out,
             "  {} (base {}): {}",
@@ -715,7 +969,7 @@ fn render_plan(plan: &HostPlan) -> String {
         );
     }
     let _ = writeln!(out, "hooks:");
-    for integration in &plan.report.integrations {
+    for integration in &preview.integrations {
         match &integration.profile {
             Some(profile) => {
                 let _ = writeln!(out, "  {} profile {profile}", integration.runtime);
@@ -725,22 +979,29 @@ fn render_plan(plan: &HostPlan) -> String {
             }
         }
     }
-    let _ = writeln!(out, "hook gaps:");
-    for gap in &plan.hook_gaps {
-        let _ = writeln!(
-            out,
-            "  {}: {}",
-            gap.integration,
-            gap.detail.as_deref().unwrap_or_default()
-        );
+    let _ = writeln!(out, "hermes homes:");
+    for home in &preview.hermes_homes {
+        let state = match home.status {
+            "update" => "updated (marked by pohunek)".to_owned(),
+            "gap" => format!("left alone: {}", home.detail.as_deref().unwrap_or_default()),
+            _ => format!(
+                "cannot be planned: {}",
+                home.detail.as_deref().unwrap_or_default()
+            ),
+        };
+        let _ = writeln!(out, "  {}: {state}", home.integration);
     }
     let _ = writeln!(out, "config:");
-    for (path, exists) in &plan.config_files {
-        let state = if *exists { "keep (exists)" } else { "create" };
-        let _ = writeln!(out, "  {state}: {}", path.display());
+    for file in &preview.config {
+        let state = if file.exists {
+            "keep (exists)"
+        } else {
+            "create"
+        };
+        let _ = writeln!(out, "  {state}: {}", file.path);
     }
     let _ = writeln!(out, "gaps:");
-    for gap in &plan.report.gaps {
+    for gap in &preview.gaps {
         let _ = writeln!(out, "  {}: {} ({})", gap.runtime, gap.detail, gap.code);
     }
     out

@@ -563,9 +563,9 @@ impl<'a> Engine<'a> {
             }
             Err(error) => return Err(error),
         };
-        let mut unused = LateGate::default();
+        let mut late = LateGate::default();
         let result = self
-            .run_steps(&mut record, &layout, staged, &config, &mut unused)
+            .run_steps(&mut record, &layout, staged, &config, &mut late)
             .await;
         self.settle(&record, result).await?;
         Ok(InstallReport {
@@ -577,6 +577,7 @@ impl<'a> Engine<'a> {
             resumed,
             rolled_back,
             search_path: search_path_report,
+            runtimes: late.runtimes,
         })
     }
 

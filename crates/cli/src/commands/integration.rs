@@ -853,19 +853,26 @@ fn reinstall_hermes_homes(env: &IntegrationEnv) -> Vec<IntegrationReinstall> {
         .collect()
 }
 
-/// The Hermes homes [`reinstall_after_upgrade`] would leave as gaps, read
-/// without writing anything: a home without the pohunek marker.
-pub(crate) fn hermes_home_gaps(env: &IntegrationEnv) -> Vec<IntegrationReinstall> {
+/// Every Hermes home the apply acts on, planned without writing anything.
+///
+/// A home with the pohunek marker is `update`, the same home the apply
+/// updates. A home without it is a `gap` with the command that installs it.
+/// A home that cannot be planned is `failed`.
+pub(crate) fn hermes_home_plan(env: &IntegrationEnv) -> Vec<IntegrationReinstall> {
     let (home, selections) = match hermes_selections(env) {
         Ok(found) => found,
         Err(failure) => return vec![failure],
     };
     selections
         .into_iter()
-        .filter_map(|(integration, selector, selection)| {
+        .map(|(integration, selector, selection)| {
             match plan_hermes_home(integration, &selector, selection, &home, &env.state_dir) {
-                HermesPlan::Done(result) if result.status == "gap" => Some(result),
-                HermesPlan::Done(_) | HermesPlan::Update(_) => None,
+                HermesPlan::Done(result) => result,
+                HermesPlan::Update(update) => IntegrationReinstall {
+                    integration: update.integration,
+                    status: "update",
+                    detail: None,
+                },
             }
         })
         .collect()

@@ -184,26 +184,31 @@ pub(crate) enum CliError {
 
     /// Bare `pohunek setup` stopped after it started changing the host. The
     /// changes made so far are kept; re-running setup completes them.
-    #[error("setup did not complete: {detail}")]
+    #[error("setup did not complete: {detail}{}", changes_text(.applied))]
     SetupIncomplete {
         /// What was left undone, with the next step.
         detail: String,
+        /// The changes made before the stop, in order.
+        applied: Vec<String>,
     },
 
-    /// Bare `pohunek setup` installed the service, then found that the release
-    /// plan read from the installed version differs from the preview. The
-    /// installed service is kept and nothing else was changed; a re-run plans
-    /// from the installed service.
+    /// Bare `pohunek setup` installed the service, and the plan read from the
+    /// installed version does not match the preview. The installed service
+    /// and the changes the install engine made are kept; a re-run plans from
+    /// the installed service.
     #[error(
-        "setup installed pohunek {version} at {}, then stopped: {detail}; nothing else was changed",
-        prefix.display()
+        "setup stopped after installing pohunek {version} at {}: {detail}{}. Nothing else was changed.",
+        prefix.display(),
+        changes_text(.applied)
     )]
     SetupInstalledOnly {
         /// The version that was installed.
         version: String,
         /// The prefix it was installed under.
         prefix: PathBuf,
-        /// What differs.
+        /// The changes made, in order: the service and the install engine's.
+        applied: Vec<String>,
+        /// What differs from the preview.
         detail: String,
     },
 
@@ -387,13 +392,15 @@ impl CliError {
             CliError::SetupInstalledOnly {
                 version,
                 prefix,
+                applied,
                 detail,
             } => ProtocolError::new(
                 ErrorClass::Configuration,
                 "setup_plan_changed_after_install",
                 format!(
-                    "setup installed pohunek {version} at {}, then stopped: {detail}; nothing else was changed",
-                    prefix.display()
+                    "setup stopped after installing pohunek {version} at {}: {detail}{}. Nothing else was changed.",
+                    prefix.display(),
+                    changes_text(applied)
                 ),
                 Some(
                     "fix the cause named above, then re-run `pohunek setup`; it plans from the installed service and does not reinstall it"
@@ -412,10 +419,10 @@ impl CliError {
                 format!("setup stopped before any change: {detail}"),
                 Some("resolve the reported refusal or gap, then re-run `pohunek setup`".to_owned()),
             ),
-            CliError::SetupIncomplete { detail } => ProtocolError::new(
+            CliError::SetupIncomplete { detail, applied } => ProtocolError::new(
                 ErrorClass::Configuration,
                 "setup_incomplete",
-                format!("setup did not complete: {detail}"),
+                format!("setup did not complete: {detail}{}", changes_text(applied)),
                 Some("resolve the reported item, then re-run `pohunek setup`; finished steps are kept".to_owned()),
             ),
             CliError::RemoteConfirmationDeclined { host } => ProtocolError::new(
@@ -485,6 +492,16 @@ impl CliError {
     /// The recovery hint to surface beneath this error, when one applies.
     pub(crate) fn recover_hint(&self) -> Option<String> {
         self.to_protocol_error().recover
+    }
+}
+
+/// The changes a setup stop reports, as a suffix of its message: empty when
+/// nothing was changed yet.
+pub(crate) fn changes_text(applied: &[String]) -> String {
+    if applied.is_empty() {
+        String::new()
+    } else {
+        format!(". Changes made: {}", applied.join("; "))
     }
 }
 

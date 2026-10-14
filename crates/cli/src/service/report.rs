@@ -33,6 +33,12 @@ pub struct InstallReport {
     pub rolled_back: Option<PendingReport>,
     /// How the daemon job's executable search path was obtained.
     pub search_path: SearchPathReport,
+    /// The official runtime step the install ran: the plan, or the apply when
+    /// the install installed packages or pinned profiles. The install applies
+    /// the runtimes its profiles, sessions and integrations use, and nothing
+    /// else.
+    #[serde(default)]
+    pub runtimes: Option<EnsureReport>,
 }
 
 /// How the daemon job's executable search path was obtained.
