@@ -665,9 +665,9 @@ changes (enable, disable, install, uninstall), and is removed when none
 remains. It needs the `pohunek service` installation, like jobs and services.
 Only an installation of this pohunek version gets a new or restarted
 dispatcher. Under another version, `disable` and `uninstall` stop and remove
-an installed dispatcher, also while another enabled plugin reacts, and warn
-that no reaction runs until `pohunek workflow enable` of a plugin with
-reactions installs it again from this version.
+an installed dispatcher, also while another enabled plugin reacts; when one
+still does, they warn that no reaction runs until `pohunek workflow enable` of
+a plugin with reactions installs the dispatcher again from this version.
 It is not part of the daemon: it connects to the local daemon's public
 `subscribe` stream only, never starts the daemon, and has no unit dependency
 on it.
