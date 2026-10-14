@@ -27,7 +27,8 @@ pub const DRY_RUN_FLAG: &str = "--dry-run";
 /// and the official package archives.
 pub const RELEASE_RUNTIME_DIR: &str = "runtime";
 
-/// The release has no usable `runtime/` catalog for this host.
+/// The release has no usable `runtime/` catalog for this host, and a runtime
+/// the host uses has no installed package that serves it.
 pub const CODE_RELEASE_CATALOG_UNAVAILABLE: &str = "release_runtime_catalog_unavailable";
 /// The release catalog lists no package of a runtime the host uses for this
 /// platform.
@@ -53,6 +54,9 @@ pub struct EnsureReport {
     pub dry_run: bool,
     /// One entry per official runtime the host uses.
     pub packages: Vec<PackageAction>,
+    /// Whether the package catalog trust state records the release
+    /// catalog's sequence and revoked keys.
+    pub catalog: CatalogStatus,
     /// One entry per host profile over an official runtime that pins no
     /// package.
     pub profiles: Vec<ProfileAction>,
@@ -86,6 +90,25 @@ pub enum PackageStatus {
     Install,
     /// The step installed, enabled and selected the release's package.
     Installed,
+    /// The release has no usable catalog, and an installed package that
+    /// loads serves the runtime; it keeps serving it. The action names that
+    /// package.
+    Kept,
+}
+
+/// The package catalog trust state against the release catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogStatus {
+    /// The release has no usable catalog, so the trust state is not read.
+    Unavailable,
+    /// The recorded trust state is at or past the release catalog's sequence
+    /// and holds its revoked keys; nothing to do.
+    Current,
+    /// The plan records the release catalog's trust state.
+    Record,
+    /// The step recorded the release catalog's trust state.
+    Recorded,
 }
 
 /// One official runtime the host uses and the release package for it.
@@ -129,10 +152,16 @@ pub struct ProfileAction {
 }
 
 /// Integration hooks the installer reinstalls through the new daemon.
+///
+/// One entry per config home that holds the hooks: the runtime's default home
+/// or the home a host profile selects.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntegrationAction {
     /// Runtime id whose daemon-installed hooks are present.
     pub runtime: String,
+    /// The host profile whose config home holds the hooks; `None` for the
+    /// runtime's default home.
+    pub profile: Option<String>,
 }
 
 /// A reason the plan cannot be applied.

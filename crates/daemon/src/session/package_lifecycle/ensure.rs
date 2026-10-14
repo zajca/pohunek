@@ -18,19 +18,22 @@ use std::sync::{Arc, Mutex};
 
 use package::catalog_state::CatalogState;
 use package::registry::{RegistryState, RetainedDigests};
+use package::verify::VerifyError;
 use package::{PackageDigest, VerifiedCatalog, MAX_CATALOG_BYTES};
 use pohunek_service_config::runtimes::{
-    EnsureReport, IntegrationAction, PackageAction, PackageStatus, ProfileAction, ProfileStatus,
-    Refusal, UseReason, CODE_PACKAGE_ARCHIVE_INVALID, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
-    CODE_PROFILE_NOT_MIGRATABLE, CODE_RELEASE_CATALOG_UNAVAILABLE, ENSURE_REPORT_VERSION,
+    CatalogStatus, EnsureReport, IntegrationAction, PackageAction, PackageStatus, ProfileAction,
+    ProfileStatus, Refusal, UseReason, CODE_PACKAGE_ARCHIVE_INVALID,
+    CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, CODE_PROFILE_NOT_MIGRATABLE,
+    CODE_RELEASE_CATALOG_UNAVAILABLE, ENSURE_REPORT_VERSION,
 };
 use protocol::{
     IntegrationInstallState, IntegrationStatusParams, PackageBindProfileParams, PackageBindStatus,
-    PackageErrorKind, PackageInstallStatus, ProtocolError, RuntimeId, RuntimeRef,
+    PackageErrorKind, PackageIdentity, PackageInstallStatus, ProtocolError, RuntimeId, RuntimeRef,
 };
 use tracing::warn;
 
 use super::bind::bind_profile;
+use super::error::rejection_kind;
 use super::selection::{conflict, declared_by};
 use super::source::read_regular_file;
 use super::trust;
@@ -38,7 +41,9 @@ use super::{
     commit_install, ensure_selectable, prepare_official, prove_loadable, read_state, unix_now,
     Context, HostTrustAnchor, InstallPlan, Prepared,
 };
-use crate::agent::host::{is_reserved, PackageStore, RuntimeHost};
+use crate::agent::host::{
+    is_reserved, PackageRejection, PackageStore, RuntimeDefinition, RuntimeHost,
+};
 use crate::agent::{apply_pin, parse_head, Pin, ProfileRegistry};
 use crate::catalog_anchor::CatalogTrust;
 use crate::session::runtime_host_over;
@@ -53,9 +58,6 @@ const PACKAGES_DIR: &str = "packages";
 /// Suffix of a release package archive. The archive of a runtime is named
 /// after the runtime id, as `xtask` writes it.
 const ARCHIVE_SUFFIX: &str = ".tar.zst";
-
-/// Refusal subject of a problem with the release catalog as a whole.
-const CATALOG_SUBJECT: &str = "runtime-catalog";
 
 /// The inputs of one run, resolved by the daemon binary.
 #[derive(Debug, Clone)]
@@ -103,12 +105,38 @@ pub enum EnsureError {
     },
 }
 
-/// One official runtime the plan installs or keeps.
+/// What the plan does with one official runtime's package.
+enum Action {
+    /// The installed package serves the runtime and verifies; nothing to do.
+    Present,
+    /// The release archive is installed, enabled and selected, or its missing
+    /// or altered root is restored.
+    Install(Box<Prepared>),
+    /// No usable release catalog: the installed package that serves the
+    /// runtime keeps serving it.
+    Kept,
+}
+
+/// The state of an installed release package the plan found.
+enum Health {
+    /// Enabled, selected, and its root verifies and loads.
+    Present,
+    /// Not installed, or not serving, or its root is missing: the archive
+    /// installs, enables and selects it again.
+    Install,
+    /// The root is present and fails verification or loading; the reason
+    /// names the stable error kind.
+    Damaged(PackageErrorKind),
+}
+
+/// One official runtime the plan keeps or installs.
 struct Planned {
     runtime: RuntimeId,
     reasons: Vec<UseReason>,
-    prepared: Prepared,
-    present: bool,
+    identity: PackageIdentity,
+    digest: PackageDigest,
+    definition: RuntimeDefinition,
+    action: Action,
 }
 
 /// One host profile over an official runtime that pins no package.
@@ -153,11 +181,11 @@ struct Gathered {
 
 /// What the plan reads from the registries and the store.
 struct PlanInputs<'a> {
-    inputs: &'a EnsureInputs,
     /// The registry as it is; `None` without a package store, where nothing
     /// is installed.
     state: Option<&'a RegistryState>,
-    /// The context a conflict check reads installed packages through.
+    /// The context a conflict check and a health check read installed packages
+    /// through.
     planning: Option<&'a Context>,
     /// The digests a session or a profile still pins.
     retained: &'a RetainedDigests,
@@ -172,11 +200,19 @@ struct Release<'a> {
     archive_dir: PathBuf,
 }
 
+/// The catalog trust state the plan reports, and the catalog a non-empty plan
+/// records.
+struct CatalogPlan {
+    status: CatalogStatus,
+    record: Option<VerifiedCatalog>,
+}
+
 /// Accumulates the report while the plan is computed.
 struct Report {
     version: u32,
     daemon: String,
     dry_run: bool,
+    catalog: CatalogStatus,
     packages: Vec<PackageAction>,
     profiles: Vec<ProfileAction>,
     integrations: Vec<IntegrationAction>,
@@ -189,6 +225,7 @@ impl Report {
             version: ENSURE_REPORT_VERSION,
             daemon: inputs.daemon_version.clone(),
             dry_run: inputs.dry_run,
+            catalog: CatalogStatus::Unavailable,
             packages: Vec::new(),
             profiles: Vec::new(),
             integrations: Vec::new(),
@@ -211,6 +248,7 @@ impl Report {
             report_version: self.version,
             daemon_version: self.daemon,
             dry_run: self.dry_run,
+            catalog: self.catalog,
             packages: self.packages,
             profiles: self.profiles,
             integrations: self.integrations,
@@ -219,7 +257,8 @@ impl Report {
     }
 }
 
-/// Computes the plan and, unless it is a dry run or has refusals, applies it.
+/// Computes the plan and, unless it is a dry run, has refusals or has nothing
+/// to change, applies it.
 ///
 /// # Errors
 ///
@@ -264,22 +303,24 @@ pub fn ensure_official_runtimes(inputs: &EnsureInputs) -> Result<EnsureReport, E
     let gathered = gather(inputs, &profiles, &mut report)?;
     let retained = retained_pins(&inputs.store_path, &profiles, None)?;
     let plan = PlanInputs {
-        inputs,
         state: state.as_ref(),
         planning: planning.as_ref(),
         retained: &retained,
     };
-    let Some(planned) = plan_packages(&gathered.uses, &catalog_state, &plan, &mut report)? else {
-        return Ok(report.finish());
-    };
+    let release = load_release(inputs, &catalog_state);
+    let catalog = catalog_plan(release.as_ref(), &catalog_state);
+    report.catalog = catalog.status;
+    let planned = plan_packages(&gathered.uses, release.as_ref(), &plan, &mut report)?;
     let binds = plan_binds(&profiles, &gathered.unpinned, &planned, &mut report);
-    let changes = planned.iter().any(|plan| !plan.present) || !binds.is_empty();
+    let changes = planned
+        .iter()
+        .any(|plan| matches!(plan.action, Action::Install(_)))
+        || !binds.is_empty()
+        || catalog.record.is_some();
     if inputs.dry_run || !report.refusals.is_empty() || !changes {
-        // Without changes every planned package is present, so the status
-        // reported for an absent one is only seen on a plan.
         report.packages = planned
             .iter()
-            .map(|plan| package_action(plan, PackageStatus::Present, PackageStatus::Install))
+            .map(|plan| package_action(plan, false))
             .collect();
         report.profiles = binds
             .iter()
@@ -288,28 +329,28 @@ pub fn ensure_official_runtimes(inputs: &EnsureInputs) -> Result<EnsureReport, E
         return Ok(report.finish());
     }
     drop(planning);
-    apply(inputs, existing, planned, binds, &mut report)?;
+    apply(
+        inputs,
+        existing,
+        planned,
+        binds,
+        catalog.record,
+        &mut report,
+    )?;
     Ok(report.finish())
 }
 
-/// Reads the integrations, the host profiles and the sessions, and collects
-/// the official runtimes they use.
+/// Reads the profiles, the integrations and the sessions, and collects the
+/// official runtimes they use.
 fn gather(
     inputs: &EnsureInputs,
     profiles: &ProfileRegistry,
     report: &mut Report,
 ) -> Result<Gathered, EnsureError> {
     let mut uses = Uses::default();
-    let homes = integration_homes(profiles)?;
-    for runtime in crate::integration::hook_runtime_ids() {
-        if integration_present(&homes, &runtime) {
-            report.integrations.push(IntegrationAction {
-                runtime: runtime.as_str().to_owned(),
-            });
-            uses.add(&runtime, UseReason::Integration);
-        }
-    }
     let mut unpinned = Vec::new();
+    // Every profile over an official base, pinned or not, with its base.
+    let mut official_profiles: Vec<(String, RuntimeId)> = Vec::new();
     for (name, text) in profiles.scanned_texts().map_err(EnsureError::Profiles)? {
         // A profile that cannot be read or parsed may be over an official
         // runtime, so it refuses with its reason instead of being skipped. Its
@@ -349,6 +390,7 @@ fn gather(
         // A pinned profile still uses its runtime: the release package must be
         // present for it, and a second run then reports it as present.
         uses.add(&head.base, UseReason::Profile);
+        official_profiles.push((name.clone(), head.base.clone()));
         if head.pin().is_none() {
             unpinned.push(Unpinned {
                 name,
@@ -357,13 +399,123 @@ fn gather(
             });
         }
     }
+    let homes = integration_homes(profiles)?;
+    for runtime in crate::integration::hook_runtime_ids() {
+        for profile in integration_homes_of(&homes, &runtime, &official_profiles) {
+            report.integrations.push(IntegrationAction {
+                runtime: runtime.as_str().to_owned(),
+                profile: profile.clone(),
+            });
+            uses.add(&runtime, UseReason::Integration);
+        }
+    }
     for runtime in read_store(&inputs.store_path)?.runtimes {
         uses.add(&runtime, UseReason::Session);
     }
     Ok(Gathered { uses, unpinned })
 }
 
-/// Installs, enables and selects the planned packages, then pins the profiles.
+/// The config homes of `runtime` that hold its daemon-installed hooks, as the
+/// profile each one is selected by (`None` for the runtime's default home).
+///
+/// A profile home that resolves to the default home's directory is the same
+/// home and is reported once, under the default entry.
+fn integration_homes_of(
+    homes: &crate::integration::ConfigHomes,
+    runtime: &RuntimeId,
+    official_profiles: &[(String, RuntimeId)],
+) -> Vec<Option<String>> {
+    let default = inspect_home(homes, runtime, None);
+    let mut found = Vec::new();
+    if default.holds_hooks() {
+        found.push(None);
+    }
+    for (name, base) in official_profiles {
+        if base != runtime {
+            continue;
+        }
+        let home = inspect_home(homes, runtime, Some(name));
+        if !home.holds_hooks() {
+            continue;
+        }
+        if default.same_home_as(&home) {
+            continue;
+        }
+        found.push(Some(name.clone()));
+    }
+    found
+}
+
+/// What the managed hooks of one config home look like.
+enum Inspection {
+    /// Managed assets or registrations are present (even if outdated).
+    Installed(Vec<String>),
+    /// No managed asset is present; the expected paths name where they go.
+    NotInstalled(Vec<String>),
+    /// The home could not be inspected.
+    Unreadable,
+}
+
+impl Inspection {
+    /// A home that cannot be inspected counts as holding hooks: the post-ready
+    /// reinstall then runs and reports its own failure, where an absent answer
+    /// would hide the hooks from the operator.
+    fn holds_hooks(&self) -> bool {
+        !matches!(self, Self::NotInstalled(_))
+    }
+
+    /// Whether both inspections name the same managed asset paths, which means
+    /// both selections resolve to one home directory.
+    fn same_home_as(&self, other: &Self) -> bool {
+        match (self.expected_paths(), other.expected_paths()) {
+            (Some(mine), Some(theirs)) => !mine.is_empty() && mine == theirs,
+            _ => false,
+        }
+    }
+
+    fn expected_paths(&self) -> Option<&[String]> {
+        match self {
+            Self::Installed(paths) | Self::NotInstalled(paths) => Some(paths),
+            Self::Unreadable => None,
+        }
+    }
+}
+
+/// Inspects the managed hooks of `runtime` in the config home its `profile`
+/// selects, or in its default home when `profile` is `None`.
+fn inspect_home(
+    homes: &crate::integration::ConfigHomes,
+    runtime: &RuntimeId,
+    profile: Option<&str>,
+) -> Inspection {
+    let params = IntegrationStatusParams {
+        agent: Some(RuntimeRef::from(runtime.clone())),
+        profile: profile.map(str::to_owned),
+        all_profiles: false,
+    };
+    match crate::integration::status_in(homes, params) {
+        Ok(result) => match result.agents.into_iter().next() {
+            Some(agent) if agent.state != IntegrationInstallState::NotInstalled => {
+                Inspection::Installed(agent.expected_asset_paths)
+            }
+            Some(agent) => Inspection::NotInstalled(agent.expected_asset_paths),
+            None => Inspection::NotInstalled(Vec::new()),
+        },
+        Err(error) => {
+            warn!(
+                runtime = %runtime,
+                profile = ?profile,
+                code = %error.code,
+                detail = %error.msg,
+                "the integration hooks cannot be inspected; they are listed for reinstall"
+            );
+            Inspection::Unreadable
+        }
+    }
+}
+
+/// Installs, enables and selects the planned package, records the release
+/// catalog, and pins the profiles.
 ///
 /// The package store is created here, once the plan has no refusal and has a
 /// change to make.
@@ -372,6 +524,7 @@ fn apply(
     existing: Option<PackageStore>,
     planned: Vec<Planned>,
     binds: Vec<Bind>,
+    record: Option<VerifiedCatalog>,
     report: &mut Report,
 ) -> Result<(), EnsureError> {
     let store = match existing {
@@ -387,12 +540,22 @@ fn apply(
         trust: inputs.catalog_trust.clone(),
         integrations: Mutex::default(),
     };
+    // The catalog trust state is recorded before any package, as an install
+    // does: a later failure leaves nothing installed under a stale watermark.
+    if let Some(catalog) = record {
+        context
+            .store
+            .registry()
+            .record_catalog(&catalog)
+            .map_err(|error| EnsureError::Registry(error.to_string()))?;
+        report.catalog = CatalogStatus::Recorded;
+    }
     for plan in planned {
-        let action = package_action(&plan, PackageStatus::Present, PackageStatus::Installed);
-        if !plan.present {
-            install(&context, plan.prepared, &inputs.store_path, &profiles)?;
+        let entry = package_action(&plan, true);
+        if let Action::Install(prepared) = plan.action {
+            install(&context, *prepared, &inputs.store_path, &profiles)?;
         }
-        report.packages.push(action);
+        report.packages.push(entry);
     }
     for bind in binds {
         let mut retained = profiles
@@ -428,13 +591,12 @@ fn is_official(runtime: &RuntimeId) -> bool {
     is_reserved(runtime) && runtime.as_str() != RuntimeId::SHELL
 }
 
-/// The official runtime a session record was launched from, if any.
+/// The official runtime a session record was launched from, if any. A session
+/// launched from an installed package counts too: its frozen digest stays
+/// retained and is never rebound.
 fn session_runtime(binding: &crate::store::ResumeBinding) -> Option<RuntimeId> {
     let runtime = match binding.launch_binding.binding() {
-        Some(launch) => match &launch.provenance {
-            protocol::BindingProvenance::Builtin { .. } => launch.runtime_id.clone(),
-            protocol::BindingProvenance::Package { .. } => return None,
-        },
+        Some(launch) => launch.runtime_id.clone(),
         None => match &binding.agent_base {
             RuntimeRef::Id(runtime) => runtime.clone(),
             RuntimeRef::Historical(_) => return None,
@@ -500,79 +662,142 @@ fn retained_pins(
 
 /// Verifies the release catalog for the plan.
 ///
-/// Returns `None` after the refusal is recorded when the catalog cannot be
-/// trusted or read.
+/// `None` when there is no trust anchor, or the catalog is missing, unreadable
+/// or refused by the verifier (including a catalog older than the recorded
+/// watermark). The reason is logged; the plan then keeps the installed packages
+/// and refuses only the runtimes that have none.
 fn load_release<'a>(
-    inputs: &EnsureInputs,
-    anchor: &'a HostTrustAnchor,
+    inputs: &'a EnsureInputs,
     catalog_state: &'a CatalogState,
-    report: &mut Report,
-) -> Result<Option<Release<'a>>, EnsureError> {
+) -> Option<Release<'a>> {
+    let CatalogTrust::Loaded(anchor) = &inputs.catalog_trust else {
+        return None;
+    };
     let catalog_path = inputs.release_dir.join(CATALOG_FILE);
     let catalog_text = catalog_path.to_string_lossy().into_owned();
-    let now = unix_now().map_err(kind_error)?;
+    let now = match unix_now() {
+        Ok(now) => now,
+        Err(kind) => {
+            warn!(code = %ProtocolError::from(kind).code, "the release catalog is not usable");
+            return None;
+        }
+    };
     let verified = read_regular_file(&catalog_text, catalog_bytes_limit())
-        .map_err(|_failure| "the release catalog cannot be read".to_owned())
-        .and_then(|bytes| {
-            trust::verify_catalog_document(&bytes, anchor, catalog_state, now)
-                .map_err(kind_refusal_detail)
-        });
+        .map_err(|_failure| PackageErrorKind::SourceUnreadable)
+        .and_then(|bytes| trust::verify_catalog_document(&bytes, anchor, catalog_state, now));
     match verified {
-        Ok(catalog) => Ok(Some(Release {
+        Ok(catalog) => Some(Release {
             anchor,
             catalog_state,
             catalog,
             catalog_path: catalog_text,
             archive_dir: inputs.release_dir.join(PACKAGES_DIR),
-        })),
-        Err(detail) => {
-            report.refuse(CATALOG_SUBJECT, CODE_RELEASE_CATALOG_UNAVAILABLE, &detail);
-            Ok(None)
+        }),
+        Err(kind) => {
+            warn!(
+                code = %ProtocolError::from(kind).code,
+                "the release catalog is not usable"
+            );
+            None
+        }
+    }
+}
+
+/// The catalog trust state of a usable release catalog against the recorded
+/// one: `current` when the recorded watermark is the catalog's sequence and the
+/// catalog's revoked keys are already recorded, otherwise `record`.
+fn catalog_plan(release: Option<&Release<'_>>, state: &CatalogState) -> CatalogPlan {
+    let Some(release) = release else {
+        return CatalogPlan {
+            status: CatalogStatus::Unavailable,
+            record: None,
+        };
+    };
+    let current = state.high_water() == Some(release.catalog.sequence())
+        && release
+            .catalog
+            .revoked_key_ids()
+            .is_subset(state.revoked_key_ids());
+    if current {
+        CatalogPlan {
+            status: CatalogStatus::Current,
+            record: None,
+        }
+    } else {
+        CatalogPlan {
+            status: CatalogStatus::Record,
+            record: Some(release.catalog.clone()),
         }
     }
 }
 
 /// Plans the package of every used runtime.
-///
-/// Returns `None` when the plan cannot be made at all, after the refusals have
-/// been recorded.
 fn plan_packages(
     uses: &Uses,
-    catalog_state: &CatalogState,
+    release: Option<&Release<'_>>,
     plan: &PlanInputs<'_>,
     report: &mut Report,
-) -> Result<Option<Vec<Planned>>, EnsureError> {
-    let runtimes = uses.list();
-    if runtimes.is_empty() {
-        return Ok(Some(Vec::new()));
-    }
-    let anchor = match &plan.inputs.catalog_trust {
-        CatalogTrust::Loaded(anchor) => anchor,
-        CatalogTrust::Absent | CatalogTrust::Invalid(_) => {
-            for (runtime, _) in &runtimes {
-                report.refuse(
-                    runtime.as_str(),
-                    CODE_RELEASE_CATALOG_UNAVAILABLE,
-                    "this build has no usable trust anchor beside the daemon executable",
-                );
-            }
-            return Ok(None);
-        }
-    };
-    let Some(release) = load_release(plan.inputs, anchor, catalog_state, report)? else {
-        return Ok(None);
-    };
+) -> Result<Vec<Planned>, EnsureError> {
     let mut planned = Vec::new();
-    for (runtime, reasons) in runtimes {
-        if let Some(entry) = plan_runtime(plan, &release, runtime, reasons, report)? {
+    for (runtime, reasons) in uses.list() {
+        let entry = match release {
+            Some(release) => plan_runtime(plan, release, runtime, reasons, report)?,
+            None => plan_installed(plan, runtime, reasons, report),
+        };
+        if let Some(entry) = entry {
             planned.push(entry);
         }
     }
-    Ok(Some(planned))
+    Ok(planned)
 }
 
-/// Plans one official runtime: its one release package for this platform,
-/// verified, and whether the host already has it selected.
+/// Plans a runtime without a usable release catalog: the installed package
+/// that serves it keeps serving it. A runtime nothing serves is refused.
+fn plan_installed(
+    plan: &PlanInputs<'_>,
+    runtime: RuntimeId,
+    reasons: Vec<UseReason>,
+    report: &mut Report,
+) -> Option<Planned> {
+    let served = plan
+        .planning
+        .and_then(|context| context.runtimes.resolve_id(&runtime).ok());
+    let Some(definition) = served else {
+        report.refuse(
+            runtime.as_str(),
+            CODE_RELEASE_CATALOG_UNAVAILABLE,
+            "this release has no usable runtime catalog, and no installed package serves this \
+             runtime; install the official package from a release that carries its catalog",
+        );
+        return None;
+    };
+    match definition.binding().provenance.clone() {
+        protocol::BindingProvenance::Package {
+            package,
+            package_digest,
+        } => Some(Planned {
+            runtime,
+            reasons,
+            identity: package,
+            digest: package_digest,
+            definition: (*definition).clone(),
+            action: Action::Kept,
+        }),
+        protocol::BindingProvenance::Builtin { .. } => {
+            report.refuse(
+                runtime.as_str(),
+                CODE_RELEASE_CATALOG_UNAVAILABLE,
+                "this release has no usable runtime catalog, and only a built-in serves this \
+                 runtime; install the official package from a release that carries its catalog",
+            );
+            None
+        }
+    }
+}
+
+/// Plans one official runtime with a usable release catalog: its one release
+/// package for this platform, verified, and whether the host already has it
+/// selected and healthy.
 fn plan_runtime(
     plan: &PlanInputs<'_>,
     release: &Release<'_>,
@@ -629,42 +854,96 @@ fn plan_runtime(
         );
         return Ok(None);
     }
-    let present = plan.state.is_some_and(|state| {
-        state.package(&prepared.digest).is_some_and(|record| {
-            record.enabled() && state.selected(&record.identity().id) == Some(&prepared.digest)
-        })
-    });
-    // The bind of a profile refuses a package the coexistence rules reject
-    // (`ensure_coexists`); the same test runs here, for present packages too,
-    // so a dry run refuses what an apply would.
-    if let (Some(context), Some(state)) = (plan.planning, plan.state) {
-        let integration = declared_by(&prepared.definition);
-        let blocking = conflict(
-            context,
-            state,
-            plan.retained,
-            (&prepared.digest, &prepared.identity.id),
-            &integration,
+    if coexistence_blocked(plan, &prepared) {
+        report.refuse(
+            &subject,
+            &ProtocolError::from(PackageErrorKind::IntegrationIncompatible).code,
+            "a retained version of this package has an incompatible integration",
         );
-        if blocking.is_some() {
-            warn!(
-                runtime = %runtime,
-                "the release package cannot be selected next to a retained version"
-            );
-            report.refuse(
-                &subject,
-                &ProtocolError::from(PackageErrorKind::IntegrationIncompatible).code,
-                "a retained version of this package has an incompatible integration",
-            );
-            return Ok(None);
-        }
+        return Ok(None);
     }
+    let health = health_of(plan, &prepared.digest);
+    if let Health::Damaged(kind) = health {
+        report.refuse(
+            &subject,
+            &ProtocolError::from(kind).code,
+            &format!(
+                "the installed package root of this runtime is altered or damaged; remove it with \
+                 `pohunek plugin uninstall --digest {} --remove-modified --yes`, then run the \
+                 upgrade again",
+                prepared.digest.as_str()
+            ),
+        );
+        return Ok(None);
+    }
+    let identity = prepared.identity.clone();
+    let digest = prepared.digest.clone();
+    let definition = prepared.definition.clone();
+    let action = if matches!(health, Health::Present) {
+        Action::Present
+    } else {
+        Action::Install(Box::new(prepared))
+    };
     Ok(Some(Planned {
         runtime,
         reasons,
-        prepared,
-        present,
+        identity,
+        digest,
+        definition,
+        action,
     }))
+}
+
+/// Whether a retained version of the package `prepared` would make a profile
+/// bind refuse it (`ensure_coexists`). The same test runs in the plan, for
+/// installed packages too, so a dry run refuses what an apply would.
+fn coexistence_blocked(plan: &PlanInputs<'_>, prepared: &Prepared) -> bool {
+    let (Some(context), Some(state)) = (plan.planning, plan.state) else {
+        return false;
+    };
+    let integration = declared_by(&prepared.definition);
+    let blocking = conflict(
+        context,
+        state,
+        plan.retained,
+        (&prepared.digest, &prepared.identity.id),
+        &integration,
+    );
+    if blocking.is_some() {
+        warn!(
+            runtime = %prepared.definition.runtime_id(),
+            "the release package cannot be selected next to a retained version"
+        );
+    }
+    blocking.is_some()
+}
+
+/// Classifies the installed release package `digest` against the registry.
+///
+/// A recorded package whose root is missing is restored from the archive. A
+/// root that is present but altered is not: the install refuses it, so the
+/// plan reports it as damaged before anything changes.
+fn health_of(plan: &PlanInputs<'_>, digest: &PackageDigest) -> Health {
+    match (plan.planning, plan.state) {
+        (Some(context), Some(state)) => match state.package(digest) {
+            None => Health::Install,
+            Some(record) => match context.store.read_definition(digest, record.identity()) {
+                Ok(_definition) => {
+                    let serving = record.enabled()
+                        && state.selected(&record.identity().id) == Some(digest)
+                        && prove_loadable(context, digest).is_ok();
+                    if serving {
+                        Health::Present
+                    } else {
+                        Health::Install
+                    }
+                }
+                Err(PackageRejection::Root(VerifyError::RootMissing)) => Health::Install,
+                Err(rejection) => Health::Damaged(rejection_kind(&rejection)),
+            },
+        },
+        _ => Health::Install,
+    }
 }
 
 /// Plans the pins of the unpinned profiles, validating each rewritten profile
@@ -681,8 +960,8 @@ fn plan_binds(
             continue;
         };
         let pin = Pin {
-            package: plan.prepared.identity.id.clone(),
-            digest: plan.prepared.digest.clone(),
+            package: plan.identity.id.clone(),
+            digest: plan.digest.clone(),
         };
         let rewritten = match apply_pin(&profile.text, &pin) {
             Ok(rewritten) => rewritten,
@@ -698,7 +977,7 @@ fn plan_binds(
         if let Err(error) = profiles.validate_candidate(
             &profile.name,
             &rewritten,
-            &Arc::new(plan.prepared.definition.clone()),
+            &Arc::new(plan.definition.clone()),
         ) {
             report.refuse(
                 &profile.name,
@@ -710,7 +989,7 @@ fn plan_binds(
         binds.push(Bind {
             name: profile.name.clone(),
             base: profile.base.clone(),
-            digest: plan.prepared.digest.clone(),
+            digest: plan.digest.clone(),
         });
     }
     binds
@@ -720,8 +999,8 @@ fn plan_binds(
 /// lock for each change.
 ///
 /// An absent record is installed with both flags set. A record that is kept
-/// has only what is not yet so changed: a disabled or unselected package is
-/// enabled or selected, never reinstalled.
+/// keeps its recorded flags; its root is restored from the archive when it is
+/// missing or altered, and only what is not yet so is enabled or selected.
 fn install(
     context: &Context,
     prepared: Prepared,
@@ -731,6 +1010,7 @@ fn install(
     let retained = retained_pins(store_path, profiles, None)?;
     let state = read_state(context).map_err(kind_error)?;
     let digest = prepared.digest.clone();
+    let definition = prepared.definition.clone();
     let Some(record) = state.package(&digest) else {
         let result = commit_install(
             context,
@@ -750,6 +1030,25 @@ fn install(
         }
         return Ok(());
     };
+    if prove_loadable(context, &digest).is_err() {
+        // The record keeps its flags: the install restores only the root.
+        let result = commit_install(
+            context,
+            prepared,
+            InstallPlan {
+                enable: false,
+                select: false,
+                dry_run: false,
+            },
+            &retained,
+        )
+        .map_err(kind_error)?;
+        if result.status != PackageInstallStatus::RootRestored {
+            return Err(EnsureError::Registry(
+                "the release package root was not restored".to_owned(),
+            ));
+        }
+    }
     if !record.enabled() {
         prove_loadable(context, &digest).map_err(kind_error)?;
         context
@@ -759,7 +1058,7 @@ fn install(
             .map_err(|error| EnsureError::Registry(error.to_string()))?;
     }
     if state.selected(&record.identity().id) != Some(&digest) {
-        ensure_selectable(context, &retained, &digest, &prepared.definition).map_err(kind_error)?;
+        ensure_selectable(context, &retained, &digest, &definition).map_err(kind_error)?;
         context
             .store
             .registry()
@@ -783,14 +1082,20 @@ fn profile_action(bind: &Bind, status: ProfileStatus) -> ProfileAction {
     }
 }
 
-/// The package status of one planned runtime.
-fn package_action(plan: &Planned, present: PackageStatus, changed: PackageStatus) -> PackageAction {
+/// The package status of one planned runtime, after the apply when `applied`.
+fn package_action(plan: &Planned, applied: bool) -> PackageAction {
+    let status = match &plan.action {
+        Action::Present => PackageStatus::Present,
+        Action::Kept => PackageStatus::Kept,
+        Action::Install(_) if applied => PackageStatus::Installed,
+        Action::Install(_) => PackageStatus::Install,
+    };
     PackageAction {
         runtime: plan.runtime.as_str().to_owned(),
-        package: plan.prepared.identity.id.as_str().to_owned(),
-        version: plan.prepared.identity.version.as_str().to_owned(),
-        digest: plan.prepared.digest.as_str().to_owned(),
-        status: if plan.present { present } else { changed },
+        package: plan.identity.id.as_str().to_owned(),
+        version: plan.identity.version.as_str().to_owned(),
+        digest: plan.digest.as_str().to_owned(),
+        status,
         reasons: plan.reasons.clone(),
     }
 }
@@ -810,34 +1115,6 @@ fn integration_homes(
     )
     .map_err(|error| EnsureError::Registry(error.to_string()))?;
     Ok(crate::integration::ConfigHomes::new(profiles.clone(), base))
-}
-
-/// Whether the daemon-installed hooks of `runtime` are present in its home.
-///
-/// A home that cannot be inspected counts as present: the post-ready reinstall
-/// then runs and reports its own failure, where an absent answer would hide the
-/// hooks from the operator. The inspection error is logged.
-fn integration_present(homes: &crate::integration::ConfigHomes, runtime: &RuntimeId) -> bool {
-    let params = IntegrationStatusParams {
-        agent: Some(RuntimeRef::from(runtime.clone())),
-        profile: None,
-        all_profiles: false,
-    };
-    match crate::integration::status_in(homes, params) {
-        Ok(result) => result
-            .agents
-            .iter()
-            .any(|agent| agent.state != IntegrationInstallState::NotInstalled),
-        Err(error) => {
-            warn!(
-                runtime = %runtime,
-                code = %error.code,
-                detail = %error.msg,
-                "the integration hooks cannot be inspected; they are listed for reinstall"
-            );
-            true
-        }
-    }
 }
 
 /// The largest catalog the step reads, as the install path bounds it.

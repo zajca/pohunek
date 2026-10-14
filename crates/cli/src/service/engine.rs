@@ -304,7 +304,7 @@ impl<'a> Engine<'a> {
             ready_timeout: settings::DAEMON_READY_TIMEOUT,
             stop_timeout: settings::SESSION_STOP_TIMEOUT,
             preflight: Box::new(DaemonPreflight),
-            runtimes: Box::new(DaemonRuntimes),
+            runtimes: Box::new(DaemonRuntimes::default()),
             integrations: Box::new(CliIntegrations),
             accept_runtime_loss: false,
             #[cfg(target_os = "linux")]
@@ -1285,6 +1285,23 @@ impl<'a> Engine<'a> {
         let applied = self.runtimes.run(self.context, &dir, false).await?;
         runtimes::check_applied(&dir, &applied)?;
         late.runtimes = Some(applied);
+        if record.operation == Operation::Upgrade {
+            // The verdict taken before the apply judged the packages that were
+            // installed then. The apply may select another package, so the new
+            // release judges the live sessions again, with the same decision as
+            // the late gate. A refusal or a preflight that cannot run fails this
+            // step, which rolls the apply back.
+            late.gated = Some(
+                preflight::gate(
+                    &*self.preflight,
+                    self.context,
+                    &dir,
+                    self.reported(&record.version),
+                    self.accept_runtime_loss,
+                )
+                .await?,
+            );
+        }
         self.advance(record, Step::Runtimes)
     }
 
@@ -1305,17 +1322,12 @@ impl<'a> Engine<'a> {
         };
         match plan {
             Ok(plan) => {
-                let runtimes: Vec<String> = plan
-                    .integrations
-                    .iter()
-                    .map(|integration| integration.runtime.clone())
-                    .collect();
                 let env = IntegrationEnv {
                     paths: Paths::from_base(self.context.paths()),
                     home: self.context.home().map(Path::to_path_buf),
                     state_dir: self.context.paths().state_dir.clone(),
                 };
-                let results = self.integrations.reinstall(&env, &runtimes).await;
+                let results = self.integrations.reinstall(&env, &plan.integrations).await;
                 (Some(plan), results)
             }
             Err(error) => (
@@ -1338,6 +1350,11 @@ impl<'a> Engine<'a> {
         if matches!(error, Error::Interrupted(_)) {
             return Err(error);
         }
+        // The runtime step's daemon may still run, so the transaction is kept
+        // as it is: rolling back would restore state under a live writer.
+        if matches!(error, Error::UpgradeRuntimesUnconfirmed { .. }) {
+            return Err(error);
+        }
         if record.operation == Operation::Install && record.step >= Step::Registering {
             // An ambiguous registration may have left a running daemon, and
             // only the session-checked uninstall may stop one.
@@ -1356,6 +1373,9 @@ impl<'a> Engine<'a> {
                 self.store.clear()?;
                 Err(error)
             }
+            // The restore is kept, not failed over: the typed error reaches the
+            // operator, and the next command resumes the rollback.
+            Err(rollback @ Error::UpgradeRuntimesUnconfirmed { .. }) => Err(rollback),
             Err(rollback) => Err(Error::RollbackFailed {
                 original: Box::new(error),
                 rollback: Box::new(rollback),
@@ -1408,7 +1428,7 @@ impl<'a> Engine<'a> {
                     });
                 }
                 self.mark_rolling_back(record)?;
-                self.restore_runtime_state(record)?;
+                self.restore_runtime_state(record, &layout)?;
                 // Install refuses to start while service.toml exists, so any
                 // file present now was written by this transaction.
                 remove_config(&config_path)?;
@@ -1456,7 +1476,7 @@ impl<'a> Engine<'a> {
                 if let Some(hook) = &self.after_rollback_stop {
                     (hook.0)();
                 }
-                self.restore_runtime_state(record)?;
+                self.restore_runtime_state(record, &layout)?;
                 if restarts_previous {
                     // The new daemon may have written the store while it was
                     // stopping. Judge the previous reader again, on the restored
@@ -1504,10 +1524,20 @@ impl<'a> Engine<'a> {
     /// Puts back the state files the runtime step backed up, if it backed any up.
     ///
     /// Runs after the daemon that may have written them is stopped and before
-    /// the previous daemon starts.
-    fn restore_runtime_state(&self, record: &Record) -> Result<(), Error> {
+    /// the previous daemon starts. The restore holds the data authority lock, so
+    /// a running daemon that still owns the data keeps the transaction instead.
+    fn restore_runtime_state(&self, record: &Record, layout: &InstallLayout) -> Result<(), Error> {
         match &record.runtime_backup {
-            Some(backup) => runtimes::restore(self.context, &self.store, backup),
+            Some(backup) => {
+                let daemon =
+                    layout
+                        .daemon_executable(&record.version)
+                        .ok_or_else(|| Error::Record {
+                            path: self.store.path(),
+                            detail: format!("version {} has no daemon executable", record.version),
+                        })?;
+                runtimes::restore(self.context, &daemon, &self.store, backup)
+            }
             None => Ok(()),
         }
     }

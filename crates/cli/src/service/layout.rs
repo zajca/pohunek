@@ -56,6 +56,16 @@ use super::settings::{
 /// File name of the CLI in a staging directory, a version directory, and `<prefix>/bin`.
 pub const CLI_NAME: &str = "pohunek";
 
+/// The manifest a sealed release archive carries at its root.
+const ARCHIVE_MANIFEST_NAME: &str = "MANIFEST";
+
+/// Largest manifest read before a release is judged sealed.
+///
+/// A manifest holds one line of about 100 bytes per file of the archive, so
+/// the bound allows tens of thousands of files and keeps a hostile archive from
+/// filling memory.
+const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+
 /// The release's catalog file inside `runtime/`, as `xtask` assembles it.
 const RUNTIME_CATALOG_FILE: &str = "runtime-catalog.json";
 
@@ -314,6 +324,7 @@ impl Staged {
 /// [`Error::VersionProbe`] or [`Error::VersionMismatch`] for a failed probe,
 /// and filesystem errors for unsafe directories.
 pub async fn stage(layout: &InstallLayout, from: &Path, reported: &str) -> Result<Staged, Error> {
+    check_sealed_runtime(from)?;
     let versions = open_owner_dir(&layout.versions_dir(), PUBLIC_MODE)?;
     sweep(&versions)?;
     let name = format!(
@@ -617,6 +628,49 @@ fn sweep(versions: &TrustedDir) -> Result<(), Error> {
         };
         if name.starts_with(STAGING_PREFIX) || name.starts_with(REMOVAL_PREFIX) {
             remove_tree(versions, name)?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a sealed release whose manifest lists a `runtime/` file the release
+/// does not carry.
+///
+/// A sealed archive carries `MANIFEST` at its root, written after the archive's
+/// files were assembled, with one `sha256 <digest> <path>` line per file. A
+/// listed `runtime/` path that is absent means the archive is incomplete, so
+/// nothing is staged from it. A release without a manifest is a development
+/// build and is not checked.
+fn check_sealed_runtime(from: &Path) -> Result<(), Error> {
+    let manifest = from.join(ARCHIVE_MANIFEST_NAME);
+    let metadata = match std::fs::symlink_metadata(&manifest) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_error("inspect", &manifest)(error)),
+    };
+    if !metadata.is_file() {
+        return Err(staged_runtime(&manifest, "it is not a regular file"));
+    }
+    if metadata.len() > MAX_MANIFEST_BYTES {
+        return Err(staged_runtime(
+            &manifest,
+            "it is too large to be a manifest",
+        ));
+    }
+    let text = std::fs::read_to_string(&manifest).map_err(io_error("read", &manifest))?;
+    for line in text.lines() {
+        let Some(path) = line
+            .strip_prefix("sha256 ")
+            .and_then(|rest| rest.split_once(' '))
+            .map(|(_digest, path)| Path::new(path))
+        else {
+            continue;
+        };
+        if path.starts_with(RUNTIME_DIR) && std::fs::symlink_metadata(from.join(path)).is_err() {
+            return Err(staged_runtime(
+                &from.join(path),
+                "the sealed archive lists it, but the archive does not carry it",
+            ));
         }
     }
     Ok(())
@@ -1426,6 +1480,51 @@ pub(crate) mod tests {
             installed_versions(&layout).expect("versions").is_empty(),
             "nothing was installed"
         );
+    }
+
+    #[tokio::test]
+    async fn a_sealed_release_that_lists_a_runtime_file_it_lacks_is_refused_before_staging() {
+        let (_root, root) = temp_root();
+        let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
+        let from = stage_dir(root.as_path(), "1.0.0");
+        std::fs::write(
+            from.join(ARCHIVE_MANIFEST_NAME),
+            format!(
+                "pohunek-archive-manifest 1\nsha256 {} {RUNTIME_DIR}/{RUNTIME_CATALOG_FILE}\n",
+                "0".repeat(64)
+            ),
+        )
+        .expect("manifest");
+
+        assert!(
+            matches!(
+                stage(&layout, &from, "1.0.0").await,
+                Err(Error::StagedRuntime { .. })
+            ),
+            "a listed runtime file that is absent refuses the release"
+        );
+        assert!(
+            installed_versions(&layout).expect("versions").is_empty(),
+            "nothing was staged or installed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sealed_release_whose_listed_runtime_files_exist_is_staged() {
+        let (_root, root) = temp_root();
+        let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
+        let from = stage_dir(root.as_path(), "1.0.0");
+        write_runtime(&from, b"package");
+        std::fs::write(
+            from.join(ARCHIVE_MANIFEST_NAME),
+            format!(
+                "pohunek-archive-manifest 1\nsha256 {} {RUNTIME_DIR}/{RUNTIME_CATALOG_FILE}\n",
+                "0".repeat(64)
+            ),
+        )
+        .expect("manifest");
+
+        stage(&layout, &from, "1.0.0").await.expect("staged");
     }
 
     /// Publishes `1.0.0` from a source holding `anchor`, if any, and returns

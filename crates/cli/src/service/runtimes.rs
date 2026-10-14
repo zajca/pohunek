@@ -15,12 +15,13 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
 use std::pin::Pin;
 use std::process::Stdio;
+use std::time::Duration;
 
 use pohunek_paths::DAEMON_EXECUTABLE_NAME;
-use pohunek_platform::filesystem::{EntryKind, TrustedDir};
+use pohunek_platform::filesystem::{AdvisoryLock, EntryKind, FsError, TrustedDir};
 use pohunek_service_config::runtimes::{
-    EnsureReport, PackageStatus, ProfileStatus, DRY_RUN_FLAG, ENSURE_REPORT_VERSION,
-    ENSURE_RUNTIMES_ARG,
+    CatalogStatus, EnsureReport, IntegrationAction, PackageStatus, ProfileStatus, DRY_RUN_FLAG,
+    ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG,
 };
 use tokio::io::AsyncReadExt as _;
 
@@ -64,12 +65,12 @@ const STATE_DIR_MODE: u32 = 0o700;
 
 /// Reinstalls the integration hooks a release lists, once its daemon serves.
 pub trait IntegrationStep: Debug + Send + Sync {
-    /// Returns one outcome per integration of `runtimes`, and the Hermes
-    /// plugin outcomes, all resolved in `env`.
+    /// Returns one outcome per listed hook home, and the Hermes plugin
+    /// outcomes, all resolved in `env`.
     fn reinstall<'a>(
         &'a self,
         env: &'a IntegrationEnv,
-        runtimes: &'a [String],
+        actions: &'a [IntegrationAction],
     ) -> Pin<Box<dyn Future<Output = Vec<IntegrationReinstall>> + Send + 'a>>;
 }
 
@@ -81,10 +82,10 @@ impl IntegrationStep for CliIntegrations {
     fn reinstall<'a>(
         &'a self,
         env: &'a IntegrationEnv,
-        runtimes: &'a [String],
+        actions: &'a [IntegrationAction],
     ) -> Pin<Box<dyn Future<Output = Vec<IntegrationReinstall>> + Send + 'a>> {
         Box::pin(crate::commands::integration::reinstall_after_upgrade(
-            env, runtimes, true,
+            env, actions, true,
         ))
     }
 }
@@ -99,17 +100,45 @@ pub trait RuntimeStep: Debug + Send + Sync {
 }
 
 /// Runs the daemon executable of the release as a child process.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct DaemonRuntimes;
+#[derive(Debug, Clone, Copy)]
+pub struct DaemonRuntimes {
+    /// How long a plan may run before it is ended.
+    pub plan_timeout: Duration,
+    /// How long an apply may run before it is ended.
+    pub apply_timeout: Duration,
+    /// How long an ended child may take to be reaped before the step gives up
+    /// on confirming its exit.
+    pub exit_timeout: Duration,
+}
+
+impl Default for DaemonRuntimes {
+    fn default() -> Self {
+        Self {
+            plan_timeout: settings::RUNTIMES_PLAN_TIMEOUT,
+            apply_timeout: settings::RUNTIMES_APPLY_TIMEOUT,
+            exit_timeout: settings::DAEMON_EXIT_TIMEOUT,
+        }
+    }
+}
 
 impl RuntimeStep for DaemonRuntimes {
     fn run<'a>(&'a self, context: &'a Context, dir: &'a Path, dry_run: bool) -> Running<'a> {
-        Box::pin(run_daemon(context, dir, dry_run))
+        Box::pin(run_daemon(*self, context, dir, dry_run))
     }
 }
 
 /// Runs the step's daemon with the environment the installed daemon gets.
-async fn run_daemon(context: &Context, dir: &Path, dry_run: bool) -> Result<EnsureReport, Error> {
+///
+/// A run that outlives its timeout is ended and reaped before this returns, so
+/// a caller that restores state after the error never races the process. When
+/// the exit cannot be confirmed, the error is [`Error::UpgradeRuntimesUnconfirmed`],
+/// which keeps the transaction instead of rolling it back.
+async fn run_daemon(
+    runtimes: DaemonRuntimes,
+    context: &Context,
+    dir: &Path,
+    dry_run: bool,
+) -> Result<EnsureReport, Error> {
     let daemon = dir.join(DAEMON_EXECUTABLE_NAME);
     let failure = |detail: String| Error::UpgradeRuntimesFailed {
         binary: daemon.clone(),
@@ -142,21 +171,42 @@ async fn run_daemon(context: &Context, dir: &Path, dry_run: bool) -> Result<Ensu
         .take()
         .expect("stderr was configured as a pipe");
     let timeout = if dry_run {
-        settings::RUNTIMES_PLAN_TIMEOUT
+        runtimes.plan_timeout
     } else {
-        settings::RUNTIMES_APPLY_TIMEOUT
+        runtimes.apply_timeout
     };
     let run = async {
-        let (report, diagnostics) = tokio::join!(
-            read_bounded(stdout, settings::RUNTIMES_OUTPUT),
-            read_bounded(stderr, settings::PREFLIGHT_DIAGNOSTICS),
-        );
-        let status = child.wait().await;
+        let read = async {
+            tokio::join!(
+                read_bounded(stdout, settings::RUNTIMES_OUTPUT),
+                read_bounded(stderr, settings::PREFLIGHT_DIAGNOSTICS),
+            )
+        };
+        let ((report, diagnostics), status) = tokio::join!(read, child.wait());
         (report, diagnostics, status)
     };
-    let (report, diagnostics, status) = tokio::time::timeout(timeout, run)
-        .await
-        .map_err(|_elapsed| failure(format!("it did not finish within {} s", timeout.as_secs())))?;
+    let (report, diagnostics, status) = match tokio::time::timeout(timeout, run).await {
+        Ok(finished) => finished,
+        Err(_elapsed) => {
+            // End the daemon and reap it before reporting, so no caller acts
+            // on its state while it still runs.
+            let _ = child.start_kill();
+            return match tokio::time::timeout(runtimes.exit_timeout, child.wait()).await {
+                Ok(Ok(_)) => Err(failure(format!(
+                    "it did not finish within {} s and was ended",
+                    timeout.as_secs()
+                ))),
+                _ => Err(Error::UpgradeRuntimesUnconfirmed {
+                    binary: daemon.clone(),
+                    detail: format!(
+                        "it did not finish within {} s and its exit was not confirmed within {} s",
+                        timeout.as_secs(),
+                        runtimes.exit_timeout.as_secs()
+                    ),
+                }),
+            };
+        }
+    };
     let status = status.map_err(|error| failure(format!("cannot wait for it: {error}")))?;
     if !status.success() {
         let diagnostics = String::from_utf8_lossy(&diagnostics.unwrap_or_default())
@@ -194,8 +244,9 @@ async fn read_bounded(
     Ok(bytes)
 }
 
-/// Whether applying `plan` changes anything: a package to install or a
-/// profile to pin. An empty plan lets the step skip the daemon stop.
+/// Whether applying `plan` changes anything: a package to install, a profile
+/// to pin, or the release catalog's trust state to record. An empty plan lets
+/// the step skip the daemon stop.
 #[must_use]
 pub fn needs_apply(plan: &EnsureReport) -> bool {
     plan.packages
@@ -205,6 +256,7 @@ pub fn needs_apply(plan: &EnsureReport) -> bool {
             .profiles
             .iter()
             .any(|profile| profile.status == ProfileStatus::Bind)
+        || plan.catalog == CatalogStatus::Record
 }
 
 /// Checks that a plan carries no refusal, the precondition of any change.
@@ -227,22 +279,26 @@ pub fn check_plan(plan: &EnsureReport) -> Result<(), Error> {
 /// # Errors
 ///
 /// Returns [`Error::UpgradeRuntimesRefused`] for a refusal and
-/// [`Error::UpgradeRuntimesFailed`] for a package or profile still to do.
+/// [`Error::UpgradeRuntimesFailed`] for a package, profile, or catalog record
+/// still to do.
 pub fn check_applied(dir: &Path, report: &EnsureReport) -> Result<(), Error> {
     check_plan(report)?;
-    let undone = report
+    let mut undone = report
         .packages
         .iter()
         .filter(|package| package.status == PackageStatus::Install)
-        .map(|package| package.runtime.as_str())
+        .map(|package| package.runtime.clone())
         .chain(
             report
                 .profiles
                 .iter()
                 .filter(|profile| profile.status == ProfileStatus::Bind)
-                .map(|profile| profile.name.as_str()),
+                .map(|profile| profile.name.clone()),
         )
         .collect::<Vec<_>>();
+    if report.catalog == CatalogStatus::Record {
+        undone.push("the release catalog".to_owned());
+    }
     if undone.is_empty() {
         return Ok(());
     }
@@ -430,16 +486,60 @@ pub fn verify_backup(backup: &RuntimeBackup, store: &Store) -> Result<(), Error>
     Ok(())
 }
 
-/// Puts every journaled state file back as it was before the step.
+/// Takes the daemon data authority lock without waiting for it.
 ///
-/// A file that did not exist is removed; any other is rewritten from its
-/// verified backup. The directory is created when it is missing.
+/// The daemon holds this lock for its whole run and for the official runtime
+/// step, so a held lock means a daemon may still write the state a restore is
+/// about to replace. A data directory that does not exist holds no lock, and
+/// the guard is released when it is dropped.
 ///
 /// # Errors
 ///
-/// Returns [`Error::RuntimeBackup`] for a backup that does not verify, before
+/// Returns [`Error::UpgradeRuntimesUnconfirmed`] when the lock is held, and a
+/// filesystem error when the data directory cannot be opened or locked.
+fn acquire_data_authority(context: &Context, daemon: &Path) -> Result<Option<AdvisoryLock>, Error> {
+    let path = context.paths().data_authority_lock_path();
+    let unconfirmed = || Error::UpgradeRuntimesUnconfirmed {
+        binary: daemon.to_path_buf(),
+        detail: format!(
+            "the data authority lock {} is held by a running daemon",
+            path.display()
+        ),
+    };
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(unconfirmed());
+    };
+    let directory = match TrustedDir::open_absolute(parent, STATE_DIR_MODE) {
+        Ok(directory) => directory,
+        Err(error) if error.io_kind() == Some(std::io::ErrorKind::NotFound) => return Ok(None),
+        Err(source) => return Err(super::error::fs_error("open the data directory", source)),
+    };
+    match directory.acquire_lock(name, FILE_MODE_OWNER) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(FsError::LockContended { .. }) => Err(unconfirmed()),
+        Err(source) => Err(super::error::fs_error("lock the data authority", source)),
+    }
+}
+
+/// Puts every journaled state file back as it was before the step.
+///
+/// The data authority lock is taken first and held for the whole restore; it
+/// is released when this returns, before the previous daemon starts. A file
+/// that did not exist is removed; any other is rewritten from its verified
+/// backup. The directory is created when it is missing.
+///
+/// # Errors
+///
+/// Returns [`Error::UpgradeRuntimesUnconfirmed`] while the data authority lock
+/// is held, [`Error::RuntimeBackup`] for a backup that does not verify, before
 /// anything is written, and filesystem errors for the state directories.
-pub fn restore(context: &Context, store: &Store, backup: &RuntimeBackup) -> Result<(), Error> {
+pub fn restore(
+    context: &Context,
+    daemon: &Path,
+    store: &Store,
+    backup: &RuntimeBackup,
+) -> Result<(), Error> {
+    let _authority = acquire_data_authority(context, daemon)?;
     verify_backup(backup, store)?;
     let plugins = context.paths().plugins_dir();
     let agents = context.paths().config_dir.join(AGENTS_DIR);
@@ -482,7 +582,7 @@ mod tests {
             "#!/bin/sh\n\
              [ \"$1\" = {ENSURE_RUNTIMES_ARG} ] || exit 9\n\
              if [ \"$2\" = {DRY_RUN_FLAG} ]; then dry=true; else dry=false; fi\n\
-             printf '{{\"report_version\":{report_version},\"daemon_version\":\"2.0.0\",\"dry_run\":%s,\"packages\":[],\"profiles\":[],\"integrations\":[],\"refusals\":[]}}\\n' \"{dry_value}\"\n\
+             printf '{{\"report_version\":{report_version},\"daemon_version\":\"2.0.0\",\"dry_run\":%s,\"packages\":[],\"catalog\":\"current\",\"profiles\":[],\"integrations\":[],\"refusals\":[]}}\\n' \"{dry_value}\"\n\
              echo 'diagnostic line' >&2\n\
              exit {exit_code}\n"
         );
@@ -504,11 +604,11 @@ mod tests {
         let context = context(root.as_path());
         fake_daemon(root.as_path(), ENSURE_REPORT_VERSION, None, 0);
 
-        let plan = run_daemon(&context, root.as_path(), true)
+        let plan = run_daemon(DaemonRuntimes::default(), &context, root.as_path(), true)
             .await
             .expect("plan");
         assert!(plan.dry_run && !needs_apply(&plan));
-        let applied = run_daemon(&context, root.as_path(), false)
+        let applied = run_daemon(DaemonRuntimes::default(), &context, root.as_path(), false)
             .await
             .expect("apply");
         assert!(!applied.dry_run);
@@ -521,7 +621,7 @@ mod tests {
         fake_daemon(root.as_path(), ENSURE_REPORT_VERSION + 1, Some(true), 0);
 
         let detail = failure_detail(
-            run_daemon(&context, root.as_path(), true)
+            run_daemon(DaemonRuntimes::default(), &context, root.as_path(), true)
                 .await
                 .expect_err("the version is refused"),
         );
@@ -536,7 +636,7 @@ mod tests {
         fake_daemon(root.as_path(), ENSURE_REPORT_VERSION, Some(true), 0);
 
         let detail = failure_detail(
-            run_daemon(&context, root.as_path(), false)
+            run_daemon(DaemonRuntimes::default(), &context, root.as_path(), false)
                 .await
                 .expect_err("the dry-run flag is refused"),
         );
@@ -550,10 +650,55 @@ mod tests {
         fake_daemon(root.as_path(), ENSURE_REPORT_VERSION, None, 3);
 
         let detail = failure_detail(
-            run_daemon(&context, root.as_path(), false)
+            run_daemon(DaemonRuntimes::default(), &context, root.as_path(), false)
                 .await
                 .expect_err("the exit is refused"),
         );
         assert!(detail.contains("diagnostic line"), "{detail}");
+    }
+
+    /// Writes a `pohunekd` that records its pid in `pid_file` and then runs
+    /// `sleep`, so an apply never finishes on its own.
+    fn hanging_daemon(dir: &Path, pid_file: &Path) {
+        let script = format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec sleep 600\n",
+            pid_file.display()
+        );
+        let path = dir.join(DAEMON_EXECUTABLE_NAME);
+        std::fs::write(&path, script).expect("write hanging daemon");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    }
+
+    fn short_timeouts(exit_timeout: Duration) -> DaemonRuntimes {
+        DaemonRuntimes {
+            plan_timeout: Duration::from_secs(10),
+            apply_timeout: Duration::from_millis(300),
+            exit_timeout,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_apply_that_outlives_its_timeout_is_reaped_before_the_error_returns() {
+        let (_root, root) = temp_root();
+        let context = context(root.as_path());
+        let pid_file = root.as_path().join("pid");
+        hanging_daemon(root.as_path(), &pid_file);
+
+        let error = short_timeouts(Duration::from_secs(10))
+            .run(&context, root.as_path(), false)
+            .await
+            .expect_err("the apply does not finish");
+        let detail = failure_detail(error);
+        assert!(detail.contains("was ended"), "{detail}");
+
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("pid file")
+            .trim()
+            .parse()
+            .expect("pid");
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err(),
+            "the daemon is gone and reaped when the error is returned"
+        );
     }
 }

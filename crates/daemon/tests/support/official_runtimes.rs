@@ -135,6 +135,12 @@ impl OfficialCatalog {
     /// their archives under `packages/` and the catalog listing them, signed by
     /// this key. The archives are the bytes `runtime-packages` builds.
     pub(crate) fn write_release(&self, release: &Path, runtimes: &[&str]) {
+        self.write_release_at(release, runtimes, CATALOG_SEQUENCE);
+    }
+
+    /// [`Self::write_release`] with the catalog's `sequence`, so a test can
+    /// publish a newer or an older release catalog.
+    pub(crate) fn write_release_at(&self, release: &Path, runtimes: &[&str], sequence: u64) {
         let packages = release.join("packages");
         std::fs::create_dir_all(&packages).expect("create the release packages directory");
         let entries = runtimes
@@ -148,7 +154,7 @@ impl OfficialCatalog {
             .collect();
         std::fs::write(
             release.join("runtime-catalog.json"),
-            signed(&self.key, catalog_of(CATALOG_SEQUENCE, WINDOW_END, entries)),
+            signed(&self.key, catalog_of(sequence, WINDOW_END, entries)),
         )
         .expect("write the release catalog");
     }

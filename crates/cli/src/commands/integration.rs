@@ -39,6 +39,7 @@ use crate::hermes_integration::target::{ProfileName, TargetContext, TargetSelect
 use crate::paths::Paths;
 use crate::service::report::IntegrationReinstall;
 use crate::target::LOCAL_HOST;
+use pohunek_service_config::runtimes::IntegrationAction;
 
 /// The maximum number of absolute PATH entries examined for the Hermes binary.
 ///
@@ -716,12 +717,12 @@ pub struct IntegrationEnv {
 /// Failures are reported per integration; the caller never rolls back for them.
 pub(crate) async fn reinstall_after_upgrade(
     env: &IntegrationEnv,
-    runtimes: &[String],
+    actions: &[IntegrationAction],
     hermes: bool,
 ) -> Vec<IntegrationReinstall> {
     let mut results = Vec::new();
-    for runtime in runtimes {
-        results.push(reinstall_runtime(&env.paths, runtime).await);
+    for action in actions {
+        results.push(reinstall_runtime(&env.paths, action).await);
     }
     if hermes {
         results.extend(reinstall_hermes_homes(env));
@@ -729,10 +730,16 @@ pub(crate) async fn reinstall_after_upgrade(
     results
 }
 
-/// Installs one runtime's daemon-backed hook and reports its outcome.
-async fn reinstall_runtime(paths: &Paths, runtime: &str) -> IntegrationReinstall {
-    let integration = runtime.to_owned();
-    let agent = match runtime.parse::<HookAgentArg>() {
+/// Installs one listed hook home's daemon-backed hook and reports its outcome.
+///
+/// A home the release lists for a host profile is reinstalled in that profile's
+/// config home; the default home is the one the runtime uses without a profile.
+async fn reinstall_runtime(paths: &Paths, action: &IntegrationAction) -> IntegrationReinstall {
+    let integration = match &action.profile {
+        Some(profile) => format!("{} profile {profile}", action.runtime),
+        None => action.runtime.clone(),
+    };
+    let agent = match action.runtime.parse::<HookAgentArg>() {
         Ok(agent) => agent,
         Err(error) => {
             return IntegrationReinstall {
@@ -743,7 +750,7 @@ async fn reinstall_runtime(paths: &Paths, runtime: &str) -> IntegrationReinstall
         }
     };
     let selection = HomeSelectionArgs {
-        profile: None,
+        profile: action.profile.clone(),
         all_profiles: false,
     };
     match install_hooks(paths, Some(agent), &selection).await {

@@ -66,7 +66,7 @@ use pohunek_daemon::session::{
 use pohunek_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
 use pohunek_platform::supervisor::{self, Namespace};
 use pohunek_service_config::runtimes::{
-    EnsureReport, Refusal, CODE_DAEMON_RUNNING, DRY_RUN_FLAG, ENSURE_REPORT_VERSION,
+    CatalogStatus, EnsureReport, Refusal, CODE_DAEMON_RUNNING, DRY_RUN_FLAG, ENSURE_REPORT_VERSION,
     ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
 };
 use pohunek_service_config::{InputTiming, ServiceConfig, WaitTiming};
@@ -282,6 +282,7 @@ fn ensure_runtimes(dry_run: bool) -> Result<EnsureReport, String> {
                     report_version: ENSURE_REPORT_VERSION,
                     daemon_version: DAEMON_VERSION.to_owned(),
                     dry_run,
+                    catalog: CatalogStatus::Unavailable,
                     packages: Vec::new(),
                     profiles: Vec::new(),
                     integrations: Vec::new(),

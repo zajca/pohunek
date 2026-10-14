@@ -653,6 +653,19 @@ is reported and does not roll the upgrade back. A Hermes home without the pohune
 marker is reported as a gap with the command that installs it; nothing is written
 into it.
 
+The apply is judged once more. After it, the new release's preflight judges the
+live sessions again, with the same decision as before the apply, because the
+apply may select a package with another native contract. A session at risk, or
+a preflight that cannot run, rolls the apply back.
+
+When the release carries no usable runtime catalog, an installed package that
+loads keeps serving its runtime: the step reports `catalog: unavailable` and the
+package as `kept`, with nothing installed and nothing refused. A runtime with no
+installed package that serves it still fails with
+`release_runtime_catalog_unavailable`. A plan whose only change is the release
+catalog's trust state (`catalog: record`) stops and backs up the daemon like any
+other apply.
+
 ## Move Claude and Codex sessions to the official package before upgrading
 
 A session records the runtime source it was launched from: a built-in runtime

@@ -20,13 +20,14 @@ use package::ANCHOR_FILE_NAME;
 use pohunek_daemon::lock::InstanceLock;
 use pohunek_paths::{METADATA_STORE_NAME as STORE_NAME, PLUGINS_SUBDIR};
 use pohunek_service_config::runtimes::{
-    EnsureReport, PackageStatus, ProfileStatus, UseReason, CODE_DAEMON_RUNNING,
+    CatalogStatus, EnsureReport, PackageStatus, ProfileStatus, UseReason, CODE_DAEMON_RUNNING,
     CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, CODE_PROFILE_NOT_MIGRATABLE,
     CODE_RELEASE_CATALOG_UNAVAILABLE, DRY_RUN_FLAG, ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG,
     RELEASE_RUNTIME_DIR,
 };
 use pohunek_test_support::bin_exe;
 use pohunek_test_support::env::TestEnv;
+use protocol::{PackageErrorKind, ProtocolError};
 
 /// Name of the host agent profiles directory under the config directory.
 const PROFILES_SUBDIR: &str = "agents";
@@ -73,14 +74,75 @@ impl Host {
         self.binary_dir().join(RELEASE_RUNTIME_DIR)
     }
 
-    /// Trusts the release key and publishes `runtimes` as the release.
-    fn publish(&self, runtimes: &[&str]) {
+    /// Trusts the release key and publishes `runtimes` as the release, with
+    /// the catalog at `sequence`.
+    fn publish_at(&self, runtimes: &[&str], sequence: u64) {
         fs::write(
             self.binary_dir().join(ANCHOR_FILE_NAME),
             self.catalog.anchor_bytes(),
         )
         .expect("write the trust anchor");
-        self.catalog.write_release(&self.release_dir(), runtimes);
+        self.catalog
+            .write_release_at(&self.release_dir(), runtimes, sequence);
+    }
+
+    /// Publishes `runtimes` as the release, with the first catalog sequence.
+    fn publish(&self, runtimes: &[&str]) {
+        self.publish_at(runtimes, FIRST_SEQUENCE);
+    }
+
+    /// Removes the release catalog and its trust anchor, as a release without
+    /// a `runtime/` directory does.
+    fn remove_release(&self) {
+        fs::remove_file(self.binary_dir().join(ANCHOR_FILE_NAME)).expect("remove the anchor");
+        fs::remove_dir_all(self.release_dir()).expect("remove the release directory");
+    }
+
+    /// Appends a line to the first file under the installed package root, so
+    /// the root is present but does not match its recorded manifest.
+    fn alter_installed_root(&self) {
+        let packages = self.plugins_dir().join("packages");
+        let mut pending = vec![fs::read_dir(&packages)
+            .expect("the packages directory")
+            .next()
+            .expect("one installed package root")
+            .expect("a package root entry")
+            .path()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(&directory).expect("a package directory") {
+                let path = entry.expect("a directory entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    let mut content = fs::read(&path).expect("a package file");
+                    content.extend_from_slice(b"altered\n");
+                    fs::write(&path, content).expect("alter the package file");
+                    return;
+                }
+            }
+        }
+        panic!("the installed package root holds no file");
+    }
+
+    fn registry_path(&self) -> PathBuf {
+        self.plugins_dir().join("registry.json")
+    }
+
+    fn catalog_state_path(&self) -> PathBuf {
+        self.plugins_dir().join("catalog-state.json")
+    }
+
+    /// Removes the root of the one installed package, as a damaged install
+    /// would lack it.
+    fn remove_installed_root(&self) {
+        let packages = self.plugins_dir().join("packages");
+        let root = fs::read_dir(&packages)
+            .expect("the packages directory")
+            .next()
+            .expect("one installed package root")
+            .expect("a package root entry")
+            .path();
+        fs::remove_dir_all(root).expect("remove the package root");
     }
 
     fn plugins_dir(&self) -> PathBuf {
@@ -262,10 +324,21 @@ fn a_release_catalog_without_the_runtime_for_this_platform_refuses_and_changes_n
 /// session is a Claude conversation the daemon recorded.
 const CLAUDE_SESSION_STORE: &str = include_str!("../src/store/fixtures/schema-7/metadata.jsonl");
 
+/// Catalog sequence of the first release a test publishes.
+const FIRST_SEQUENCE: u64 = 1;
+
+/// A metadata store with one session of the Claude runtime pinned to an
+/// installed package, as a release that ran the package recorded it.
+const PACKAGE_SESSION_STORE: &str = include_str!("fixtures/ensure/claude-package-session.jsonl");
+
 /// File name of the managed Claude state hook under `<config>/hooks`.
 const CLAUDE_STATE_HOOK: &str = "pohunek-agent-state.sh";
 
 impl Host {
+    fn store_path(&self) -> PathBuf {
+        self.env.data_home().join(APP_DIR).join(STORE_NAME)
+    }
+
     /// The metadata store the daemon keeps sessions in.
     fn write_store(&self, content: &str) {
         let dir = self.env.data_home().join(APP_DIR);
@@ -391,4 +464,233 @@ fn a_profile_that_fails_the_load_checks_refuses_the_step_and_is_not_skipped() {
     assert_eq!(refusal_codes(&plan), [CODE_PROFILE_NOT_MIGRATABLE]);
     assert_eq!(plan.refusals[0].subject, "unsafe");
     assert!(!host.plugins_dir().exists());
+}
+
+/// Publishes a newer release catalog, applies it, and checks that the
+/// recorded trust state moves with it: a repeat finds it current.
+#[test]
+fn a_newer_release_catalog_is_recorded_and_a_repeat_finds_it_current() {
+    let host = Host::new();
+    host.publish_at(&["claude"], 1);
+    host.write_claude_profile();
+    let first = host.step(false);
+    assert_eq!(first.catalog, CatalogStatus::Recorded);
+
+    host.publish_at(&["claude"], 2);
+    let plan = host.step(true);
+    assert_eq!(plan.catalog, CatalogStatus::Record);
+    assert_eq!(plan.packages[0].status, PackageStatus::Present);
+
+    let applied = host.step(false);
+    assert_eq!(applied.catalog, CatalogStatus::Recorded);
+    assert!(applied.refusals.is_empty(), "{:?}", applied.refusals);
+    assert_eq!(applied.packages[0].status, PackageStatus::Present);
+
+    let repeat = host.step(false);
+    assert_eq!(repeat.catalog, CatalogStatus::Current);
+    assert_eq!(repeat.packages[0].status, PackageStatus::Present);
+    assert!(repeat.profiles.is_empty());
+}
+
+/// A release catalog older than the recorded watermark is refused by the
+/// verifier, so the step keeps the installed package and records nothing.
+#[test]
+fn a_release_catalog_older_than_the_recorded_one_keeps_the_installed_package() {
+    let host = Host::new();
+    host.publish_at(&["claude"], 2);
+    host.write_claude_profile();
+    host.step(false);
+    let recorded = fs::read(host.catalog_state_path()).expect("the recorded catalog state");
+
+    host.publish_at(&["claude"], 1);
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        assert_eq!(report.catalog, CatalogStatus::Unavailable);
+        assert_eq!(report.packages.len(), 1);
+        assert_eq!(report.packages[0].status, PackageStatus::Kept);
+        assert!(report.profiles.is_empty());
+    }
+    assert_eq!(
+        fs::read(host.catalog_state_path()).expect("the catalog state"),
+        recorded,
+        "an older catalog never rewrites the recorded trust state"
+    );
+}
+
+/// A session launched from an installed official package keeps its runtime
+/// planned, and its frozen digest is never rebound.
+#[test]
+fn a_session_launched_from_an_installed_package_plans_its_runtime() {
+    let host = Host::new();
+    host.publish(&["claude"]);
+    host.write_store(PACKAGE_SESSION_STORE);
+    let store_before = fs::read(host.store_path()).expect("the metadata store");
+
+    let plan = host.step(true);
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(plan.packages.len(), 1);
+    assert_eq!(plan.packages[0].runtime, "claude");
+    assert_eq!(plan.packages[0].status, PackageStatus::Install);
+    assert!(plan.packages[0].reasons.contains(&UseReason::Session));
+
+    let applied = host.step(false);
+    assert_eq!(applied.packages[0].status, PackageStatus::Installed);
+    let repeat = host.step(false);
+    assert_eq!(repeat.packages[0].status, PackageStatus::Present);
+    assert_eq!(
+        fs::read(host.store_path()).expect("the metadata store"),
+        store_before,
+        "the step never writes the metadata store"
+    );
+}
+
+/// A selected release package whose root is gone is planned for install, the
+/// archive restores the root, and a repeat finds it present.
+#[test]
+fn a_release_package_with_a_missing_root_is_restored_by_the_step() {
+    let host = Host::new();
+    host.publish(&["claude"]);
+    host.write_claude_profile();
+    host.step(false);
+    host.remove_installed_root();
+
+    let plan = host.step(true);
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(plan.packages[0].status, PackageStatus::Install);
+
+    let applied = host.step(false);
+    assert!(applied.refusals.is_empty(), "{:?}", applied.refusals);
+    assert_eq!(applied.packages[0].status, PackageStatus::Installed);
+
+    let repeat = host.step(false);
+    assert_eq!(repeat.packages[0].status, PackageStatus::Present);
+}
+
+/// Hooks that exist only in a host profile's config home are listed under
+/// that profile, and the default home is not listed.
+#[test]
+fn hooks_only_in_a_profile_home_are_listed_under_that_profile() {
+    let host = Host::new();
+    host.publish(&["claude"]);
+    let work_home = host.env.root().join("work-claude");
+    let hooks = work_home.join("hooks");
+    fs::create_dir_all(&hooks).expect("the profile hooks directory");
+    fs::write(
+        hooks.join(CLAUDE_STATE_HOOK),
+        "#!/bin/sh\n# an earlier hook\n",
+    )
+    .expect("write the profile hook");
+    let profiles = host.profiles_dir();
+    let work = profiles.join("work.toml");
+    fs::write(
+        &work,
+        format!(
+            "base = \"claude\"\n\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+            work_home.display()
+        ),
+    )
+    .expect("write the work profile");
+    fs::set_permissions(&work, fs::Permissions::from_mode(0o600)).expect("secure the profile");
+
+    let plan = host.step(true);
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    let integrations: Vec<(&str, Option<&str>)> = plan
+        .integrations
+        .iter()
+        .map(|action| (action.runtime.as_str(), action.profile.as_deref()))
+        .collect();
+    assert_eq!(integrations, [("claude", Some("work"))]);
+}
+
+/// Without a usable release catalog an installed package keeps serving its
+/// runtime for the pinned profile: the plan is a no-op and the registry is
+/// unchanged.
+#[test]
+fn without_a_release_catalog_an_installed_package_keeps_serving_its_runtime() {
+    let host = Host::new();
+    host.publish(&["claude"]);
+    host.write_claude_profile();
+    let applied = host.step(false);
+    let digest = applied.packages[0].digest.clone();
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    host.remove_release();
+
+    let plan = host.step(true);
+    let repeat = host.step(false);
+
+    for report in [&plan, &repeat] {
+        assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+        assert_eq!(report.catalog, CatalogStatus::Unavailable);
+        assert_eq!(report.packages.len(), 1);
+        assert_eq!(report.packages[0].status, PackageStatus::Kept);
+        assert_eq!(report.packages[0].digest, digest);
+        assert!(report.profiles.is_empty());
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry,
+        "a kept package changes nothing"
+    );
+}
+
+/// Without a release catalog an unpinned profile over a kept runtime binds to
+/// the installed package, and the apply pins it.
+#[test]
+fn without_a_release_catalog_an_unpinned_profile_binds_to_the_installed_package() {
+    let host = Host::new();
+    host.publish(&["claude"]);
+    host.write_claude_profile();
+    let applied = host.step(false);
+    let digest = applied.packages[0].digest.clone();
+    host.write_claude_profile();
+    host.remove_release();
+
+    let plan = host.step(true);
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(plan.packages[0].status, PackageStatus::Kept);
+    assert_eq!(plan.profiles.len(), 1);
+    assert_eq!(plan.profiles[0].status, ProfileStatus::Bind);
+    assert_eq!(plan.profiles[0].digest, digest);
+
+    let bound = host.step(false);
+    assert!(bound.refusals.is_empty(), "{:?}", bound.refusals);
+    assert_eq!(bound.profiles.len(), 1);
+    assert_eq!(bound.profiles[0].status, ProfileStatus::Bound);
+    assert!(host
+        .profile_text()
+        .contains(&format!("digest = \"{digest}\"")));
+}
+
+/// A release package whose root is present but altered is refused by the plan,
+/// before any change; the apply refuses it the same way and exits successfully.
+#[test]
+fn a_release_package_with_an_altered_root_is_refused_by_the_plan_and_changes_nothing() {
+    let host = Host::new();
+    host.publish(&["claude"]);
+    host.write_claude_profile();
+    host.step(false);
+    host.alter_installed_root();
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    let profile = host.profile_text();
+    let root_refusal = ProtocolError::from(PackageErrorKind::RootInvalid).code;
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert_eq!(refusal_codes(report), [root_refusal.as_str()]);
+        assert_eq!(report.refusals[0].subject, "claude");
+        assert!(report.packages.is_empty());
+        assert!(report.profiles.is_empty());
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
+    assert_eq!(host.profile_text(), profile);
 }

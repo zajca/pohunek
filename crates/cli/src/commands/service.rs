@@ -14,7 +14,7 @@ use std::process::ExitCode;
 
 use clap::{Subcommand, ValueHint};
 use pohunek_service_config::preflight::{PreflightReport, StoreState};
-use pohunek_service_config::runtimes::EnsureReport;
+use pohunek_service_config::runtimes::{CatalogStatus, EnsureReport, PackageStatus};
 
 use crate::commands::render_json;
 use crate::error::CliError;
@@ -374,8 +374,34 @@ fn render_upgrade(report: &report::UpgradeReport) -> String {
     text
 }
 
-/// Lists the official runtime packages and profile pins of the runtime step.
+/// Lists the official runtime packages, the catalog trust state and profile
+/// pins of the runtime step.
 fn render_runtimes(text: &mut String, runtimes: &EnsureReport) {
+    match runtimes.catalog {
+        CatalogStatus::Unavailable => {
+            let kept: Vec<&str> = runtimes
+                .packages
+                .iter()
+                .filter(|package| package.status == PackageStatus::Kept)
+                .map(|package| package.runtime.as_str())
+                .collect();
+            if kept.is_empty() {
+                let _ = writeln!(
+                    text,
+                    "catalog  unavailable: the release has no usable runtime catalog (absent, not verifiable, or older than the recorded one)"
+                );
+            } else {
+                let _ = writeln!(
+                    text,
+                    "catalog  unavailable: the release has no usable runtime catalog (absent, not verifiable, or older than the recorded one); the installed package keeps serving {}",
+                    kept.join(", ")
+                );
+            }
+        }
+        other => {
+            let _ = writeln!(text, "catalog  {}", format!("{other:?}").to_lowercase());
+        }
+    }
     for package in &runtimes.packages {
         let _ = writeln!(
             text,
@@ -842,6 +868,39 @@ mod tests {
         });
         assert!(text.contains("pending    install 1.0.0 stopped after step config"));
         assert!(text.contains("not installed (/c/pohunek/service.toml is missing)"));
+    }
+
+    #[test]
+    fn a_kept_package_and_an_unavailable_catalog_are_rendered_with_their_reason() {
+        let runtimes = EnsureReport {
+            report_version: pohunek_service_config::runtimes::ENSURE_REPORT_VERSION,
+            daemon_version: "2.0.0".to_owned(),
+            dry_run: true,
+            packages: vec![pohunek_service_config::runtimes::PackageAction {
+                runtime: "claude".to_owned(),
+                package: "pohunek.runtime.claude".to_owned(),
+                version: "1.0.0".to_owned(),
+                digest: "de".repeat(32),
+                status: PackageStatus::Kept,
+                reasons: vec![pohunek_service_config::runtimes::UseReason::Profile],
+            }],
+            catalog: CatalogStatus::Unavailable,
+            profiles: Vec::new(),
+            integrations: Vec::new(),
+            refusals: Vec::new(),
+        };
+        let mut text = String::new();
+        render_runtimes(&mut text, &runtimes);
+        assert!(
+            text.contains(
+                "catalog  unavailable: the release has no usable runtime catalog (absent, not verifiable, or older than the recorded one); the installed package keeps serving claude"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("runtime claude  pohunek.runtime.claude 1.0.0  kept"),
+            "{text}"
+        );
     }
 
     #[test]

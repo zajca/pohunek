@@ -60,6 +60,11 @@ pub const HOST_APPROVAL_KEY_NAME: &str = "approval.key";
 pub const HOST_GOVERNANCE_NAME: &str = "governance.json";
 /// Cross-process host-state lock filename.
 pub const HOST_STATE_LOCK_NAME: &str = "state.lock";
+/// Cross-process lock filename protecting the daemon-owned data directory.
+///
+/// The daemon holds it for its whole run and for the official runtime step;
+/// the upgrade takes it, without waiting, before it restores a runtime backup.
+pub const DATA_AUTHORITY_LOCK_NAME: &str = "data.lock";
 /// Owner-private runtime package store subdirectory under
 /// [`BasePaths::state_dir`].
 ///
@@ -515,6 +520,12 @@ impl BasePaths {
     #[must_use]
     pub fn host_state_lock_path(&self) -> PathBuf {
         self.host_state_dir().join(HOST_STATE_LOCK_NAME)
+    }
+
+    /// Returns the cross-process data-authority lock path.
+    #[must_use]
+    pub fn data_authority_lock_path(&self) -> PathBuf {
+        self.data_dir.join(DATA_AUTHORITY_LOCK_NAME)
     }
 }
 

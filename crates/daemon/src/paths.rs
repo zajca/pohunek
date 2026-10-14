@@ -19,9 +19,6 @@ use std::path::PathBuf;
 
 use crate::error::DaemonError;
 
-/// Cross-process lock filename protecting the daemon-owned data directory.
-const DATA_AUTHORITY_LOCK_NAME: &str = "data.lock";
-
 /// Resolved set of daemon paths.
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -143,7 +140,7 @@ impl Paths {
     /// Returns the cross-process data-authority lock path.
     #[must_use]
     pub fn data_authority_lock_path(&self) -> PathBuf {
-        self.data_dir.join(DATA_AUTHORITY_LOCK_NAME)
+        self.data_dir.join(pohunek_paths::DATA_AUTHORITY_LOCK_NAME)
     }
 }
 

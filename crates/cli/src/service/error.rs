@@ -470,6 +470,16 @@ pub enum Error {
         refusals: Vec<Refusal>,
     },
 
+    /// The official runtime step did not end its daemon run, or its exit could
+    /// not be confirmed, so state may still be changing and nothing is restored.
+    #[error("the official runtime step of {} did not end: {detail}", binary.display())]
+    UpgradeRuntimesUnconfirmed {
+        /// The daemon executable that was asked.
+        binary: PathBuf,
+        /// Why the exit is not confirmed.
+        detail: String,
+    },
+
     /// The official runtime step did not produce a usable report, or its
     /// apply left work undone.
     #[error("the official runtime step of {} failed: {detail}", binary.display())]
@@ -671,6 +681,7 @@ impl Error {
             Self::UpgradePreflightFailed { .. } => "service_upgrade_preflight_failed",
             Self::UpgradeRuntimesRefused { .. } => "service_upgrade_runtimes_refused",
             Self::UpgradeRuntimesFailed { .. } => "service_upgrade_runtimes_failed",
+            Self::UpgradeRuntimesUnconfirmed { .. } => "service_upgrade_runtimes_unconfirmed",
             Self::RuntimeBackup { .. } => "service_runtime_backup_invalid",
             Self::RollbackStoreUnusable { .. } => "service_rollback_store_unusable",
             Self::RollbackAtRisk { .. } => "service_rollback_sessions_at_risk",
@@ -729,6 +740,9 @@ impl Error {
             ),
             Self::UpgradeRuntimesRefused { .. } => Some(
                 "the release's official runtime packages cannot be installed or bound as planned; the listed subjects name what to fix, and nothing was changed",
+            ),
+            Self::UpgradeRuntimesUnconfirmed { .. } => Some(
+                "the upgrade is kept, not rolled back: confirm that no `pohunekd ensure-official-runtimes` process of that release is running (`pgrep -fl ensure-official-runtimes`), then rerun `pohunek service upgrade`",
             ),
             Self::UpgradeRuntimesFailed { .. } => Some(
                 "run `<staged>/pohunekd ensure-official-runtimes --dry-run` by hand with the same XDG environment to see its output, then retry",
