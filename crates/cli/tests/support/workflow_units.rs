@@ -950,7 +950,13 @@ pub(crate) mod native {
             .map(|key| namespace.plugin_label(key))
             .filter(|label| {
                 let target = format!("gui/{}/{label}", uid());
-                launchctl(&["print", &target]).code() != Some(LAUNCHCTL_ABSENT)
+                // Only a successful print proves the label loaded and only the
+                // absent code proves it gone; any other answer is no evidence.
+                match launchctl(&["print", &target]).code() {
+                    Some(0) => true,
+                    Some(LAUNCHCTL_ABSENT) => false,
+                    other => panic!("launchctl print {target} answered {other:?}"),
+                }
             })
             .collect()
     }
