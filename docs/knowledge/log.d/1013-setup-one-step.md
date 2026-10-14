@@ -7,16 +7,25 @@
   packages, pins the profiles, installs the hooks of the homes that exist and
   writes the missing config files. A second plan and the daemon's health and
   `doctor` form the verdict.
-- `--yes` applies unattended. Without a terminal, or with `--json`, setup
-  needs `--yes` and otherwise refuses with `setup_consent_required`; the
+- `--yes` applies unattended. Without a terminal and without `--yes`, setup
+  refuses with `setup_consent_required`; `--json` needs `--yes` as well. The
   refusal changes nothing.
 - An installed service of another version is a gap: `pohunek service upgrade`
   runs first. Setup never upgrades.
 - A Hermes home without the pohunek marker is a gap with its install command;
   setup never picks its access policy. Gaps do not fail the verdict.
 - A plan that changes after the service install stops with the service
-  installed and nothing else changed; a re-run converges.
+  installed. The stop names the changes the install engine made, and setup
+  changes nothing else; a re-run converges. The install engine's own changes
+  (installed packages, pinned profiles, a recorded catalog) are accepted only
+  as reported by its runtime step.
+- A pending interrupted install stops setup before any change.
+- A package the install left disabled or unselected is enabled and selected.
+- The Hermes homes applied are the homes previewed; the apply does not
+  rediscover them.
 - `pohunek setup config` and `pohunek setup completions` are unchanged; an
   existing config file is never overwritten.
-- The `--json` result carries the full preview. A failure after the first
-  change lists the changes made in its message.
+- `--json --yes` prints one result document that carries the full preview.
+  A failure after the first change lists the changes made in its message.
+- `pohunek service install` renders the runtime step it ran (catalog, packages,
+  profiles).

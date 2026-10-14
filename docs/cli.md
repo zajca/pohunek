@@ -117,19 +117,28 @@ upgrade of the release files. It runs in this order:
    remain (the agent is not on the `PATH`, its config home is missing, or the
    platform has no package). The plan only reads.
 3. Preview and consent: every effect and gap is printed before anything is
-   written. The owner confirms once. A plan the planner refuses stops the run
-   before its first change.
+   written, including the catalog trust state (`record` means the install or
+   the apply records it) and every Hermes home the apply acts on. The owner
+   confirms once. A plan the planner refuses stops the run before its first
+   change. An interrupted `pohunek service install` or `upgrade` that is still
+   pending stops the run before any change too; the stop names the command that
+   resumes it, or `pohunek service uninstall` to roll it back.
 4. Apply: after a fresh install, setup reads the plan again and checks that it
-   matches the preview, allowing only the transitions the install performed
-   (a previewed package now present, a previewed profile now pinned). Setup then
-   installs and enables the remaining packages, pins the remaining profiles, and
-   installs the hooks in the homes that exist. A runtime
-   already served by another package is left untouched. Every Hermes home the
-   run acts on is listed in the preview: a home with the pohunek marker is
-   updated, and a home without it is a gap. Setup does not choose a Hermes
-   access policy for you, so it names the `pohunek integration hermes install`
-   command for such a home and writes nothing into it. A gap does not fail the
-   run.
+   matches the preview. It allows only the transitions the install engine
+   reports: a previewed package the engine installed is now present, and a
+   previewed profile the engine pinned has left the plan. Setup then installs
+   the remaining packages, enables and selects a package that the install left
+   disabled or unselected, pins the remaining profiles, and installs the hooks in
+   the homes that exist. A runtime already served by another package is left
+   untouched.
+
+   The Hermes homes applied are exactly the homes the preview listed. A home
+   with the pohunek marker is updated, and a home without it is a gap: setup
+   does not choose a Hermes access policy for you, so it names the
+   `pohunek integration hermes install` command for such a home and writes
+   nothing into it. A home that appears after the preview is not touched; a
+   listed home that has gone is reported. A profiles directory that cannot be
+   read is reported as a failure. A gap does not fail the run.
 5. Config: the missing config files are written and existing files are kept.
 6. Verdict: the plan is read again. Every runtime the preview planned must be
    present in it, it must carry no refusal, and it must not list a runtime the
@@ -137,25 +146,28 @@ upgrade of the release files. It runs in this order:
    hook may have failed. Then the daemon's health and `doctor` run. Hook gaps
    are listed, not failed.
 
-If the plan read after the service install differs from the preview, setup
-stops there. The output names the installed version, the prefix and the changes the
-install made; setup itself changed nothing else. Fix the cause the output names and run `pohunek setup` again: it
-plans from the installed service and converges without reinstalling it.
+If the plan read after the service install differs from the preview in any way
+the install engine does not account for, setup stops there. The output names the
+installed version, the prefix and the changes the install made; setup itself
+changed nothing else. Fix the cause the output names and run `pohunek setup`
+again: it plans from the installed service and converges without reinstalling
+it.
 
 The run is refused with the hint `--yes` when it cannot ask: without a terminal
 and without `--yes`, or with `--json` and no `--yes`. The refusal changes
 nothing.
 
-`--json` does not print a preview before the run, because it cannot ask. Its
-one result document carries the full preview in `preview` (service, packages,
-profiles, integrations, gaps, every Hermes home and the config files), then the
-`applied` lines, the hook outcomes, the config result and the verdict. Read the
-preview from that document, and pass `--yes` to apply it.
+`--json --yes` applies the plan without asking and prints one result document.
+It carries the full preview in `preview` (service, packages, profiles,
+integrations, gaps, catalog, every Hermes home and the config files), then the
+`applied` lines, the hook outcomes, the config result and the verdict. It
+prints no separate preview, because it cannot ask: to read the plan first, run
+`pohunek setup` in a terminal.
 
 A failure after the first change prints an error instead of a result, and its
 message lists the changes made (`Changes made: ...`); `--json` carries the same
-text in `msg`. The finished steps are kept. Run `pohunek setup` again to
-complete them. `--host` is ignored.
+text in `msg`. The finished steps are kept, including the config files created
+so far. Run `pohunek setup` again to complete them. `--host` is ignored.
 
 ### Shell completion
 
