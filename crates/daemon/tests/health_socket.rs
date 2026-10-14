@@ -3425,10 +3425,12 @@ async fn waited_input_with_host_submit_delay(
 import tty
 
 tty.setraw(0)
-with open({ready:?}, "wb") as marker:
-    marker.write(b"ready")
 body = bytearray()
+# The capture exists before the ready marker, so a test that reads it as soon
+# as the input was refused finds it empty rather than missing.
 with open({received:?}, "wb") as capture:
+    with open({ready:?}, "wb") as marker:
+        marker.write(b"ready")
     while len(body) < len(b"hello\r"):
         chunk = os.read(0, len(b"hello\r") - len(body))
         body.extend(chunk)
