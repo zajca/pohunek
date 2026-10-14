@@ -24,10 +24,10 @@ use pohunek_daemon::lock::InstanceLock;
 use pohunek_paths::{METADATA_STORE_NAME as STORE_NAME, PLUGINS_SUBDIR};
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, PackageStatus, ProfileStatus, UseReason, CODE_DAEMON_RUNNING,
-    CODE_GAP_AGENT_NOT_ON_PATH, CODE_GAP_CONFIG_HOME_MISSING, CODE_GAP_SERVED_BY_OTHER_PACKAGE,
-    CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, CODE_PROFILE_NOT_MIGRATABLE,
-    CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE, DETECT_FLAG, DRY_RUN_FLAG,
-    ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
+    CODE_GAP_AGENT_NOT_ON_PATH, CODE_GAP_CONFIG_HOME_MISSING, CODE_GAP_CONFIG_HOME_SYMLINK,
+    CODE_GAP_SERVED_BY_OTHER_PACKAGE, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
+    CODE_PROFILE_NOT_MIGRATABLE, CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE,
+    DETECT_FLAG, DRY_RUN_FLAG, ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
 };
 use pohunek_test_support::bin_exe;
 use pohunek_test_support::env::TestEnv;
@@ -1330,6 +1330,52 @@ fn a_profile_home_that_does_not_exist_is_a_gap_and_its_hooks_are_not_listed() {
         .collect();
     assert_eq!(integrations, [("claude", None)]);
     assert!(!work_home.exists(), "the step never creates a profile home");
+}
+
+#[test]
+fn a_symlinked_default_home_is_a_gap_and_a_profile_home_it_points_at_is_still_planned() {
+    let host = Host::new();
+    host.publish(&["claude"]);
+    host.put_program("claude");
+    let real = host.env.root().join("real-claude");
+    fs::create_dir_all(&real).expect("the real config home");
+    let default_home = host.env.home().join(".claude");
+    fs::create_dir_all(host.env.home()).expect("the user's home");
+    std::os::unix::fs::symlink(&real, &default_home).expect("symlink the default home");
+    let work = host.profiles_dir().join("work.toml");
+    fs::write(
+        &work,
+        format!(
+            "base = \"claude\"\n\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+            real.display()
+        ),
+    )
+    .expect("write the work profile");
+    fs::set_permissions(&work, fs::Permissions::from_mode(0o600)).expect("secure the profile");
+
+    let plan = host.detect_step();
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(gap_codes(&plan), [("claude", CODE_GAP_CONFIG_HOME_SYMLINK)]);
+    let integrations: Vec<(&str, Option<&str>)> = plan
+        .integrations
+        .iter()
+        .map(|action| (action.runtime.as_str(), action.profile.as_deref()))
+        .collect();
+    assert_eq!(integrations, [("claude", Some("work"))]);
+    assert!(
+        default_home
+            .symlink_metadata()
+            .expect("the default home")
+            .file_type()
+            .is_symlink(),
+        "the step leaves the symlink as it is"
+    );
+    assert!(
+        fs::read_dir(&real).expect("the real home").next().is_none(),
+        "the step writes nothing into the real home"
+    );
+    assert!(!host.plugins_dir().exists());
 }
 
 #[tokio::test]

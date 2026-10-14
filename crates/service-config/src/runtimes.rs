@@ -58,6 +58,9 @@ pub const CODE_GAP_AGENT_NOT_ON_PATH: &str = "agent_not_on_search_path";
 /// A runtime's declared config home does not exist. The package is still
 /// planned; the home is never created by the step.
 pub const CODE_GAP_CONFIG_HOME_MISSING: &str = "config_home_missing";
+/// A runtime's declared config home is a symlink. The installer writes hooks
+/// only into a real directory, so no integration is planned for it.
+pub const CODE_GAP_CONFIG_HOME_SYMLINK: &str = "config_home_is_symlink";
 /// Another package already serves the runtime id. It is left untouched.
 pub const CODE_GAP_SERVED_BY_OTHER_PACKAGE: &str = "runtime_served_by_other_package";
 

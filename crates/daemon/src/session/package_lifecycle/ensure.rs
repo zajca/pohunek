@@ -23,9 +23,10 @@ use package::{PackageDigest, VerifiedCatalog, MAX_CATALOG_BYTES};
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, Gap, IntegrationAction, PackageAction, PackageStatus,
     ProfileAction, ProfileStatus, Refusal, UseReason, CODE_GAP_AGENT_NOT_ON_PATH,
-    CODE_GAP_CONFIG_HOME_MISSING, CODE_GAP_SERVED_BY_OTHER_PACKAGE, CODE_PACKAGE_ARCHIVE_INVALID,
-    CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, CODE_PROFILE_NOT_MIGRATABLE,
-    CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE, ENSURE_REPORT_VERSION,
+    CODE_GAP_CONFIG_HOME_MISSING, CODE_GAP_CONFIG_HOME_SYMLINK, CODE_GAP_SERVED_BY_OTHER_PACKAGE,
+    CODE_PACKAGE_ARCHIVE_INVALID, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
+    CODE_PROFILE_NOT_MIGRATABLE, CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE,
+    ENSURE_REPORT_VERSION,
 };
 use pohunek_worker_protocol::BaseEnv;
 use protocol::{
@@ -49,7 +50,7 @@ use crate::agent::host::{
 };
 use crate::agent::{apply_pin, parse_head, Pin, ProfileRegistry, ValidatedLaunchProgram};
 use crate::catalog_anchor::CatalogTrust;
-use crate::integration::Home;
+use crate::integration::{config_path_kind, ConfigPath, Home};
 use crate::session::runtime_host_over;
 use crate::store::Store;
 
@@ -1233,6 +1234,15 @@ fn config_home_gap(plan: &PlanInputs<'_>, definition: &RuntimeDefinition, report
     let runtime = definition.runtime_id();
     let program = definition.program().as_str();
     match Home::resolve(declared, plan.base, &[]) {
+        Ok(home) if config_path_kind(&home.dir) == ConfigPath::Symlink => report.gap(
+            runtime.as_str(),
+            CODE_GAP_CONFIG_HOME_SYMLINK,
+            &format!(
+                "its config home {} is a symlink; hooks are installed only into a real directory, \
+                 so make it a real directory, then run setup again",
+                home.dir.display()
+            ),
+        ),
         Ok(home) if home.dir.is_dir() => {}
         Ok(home) => report.gap(
             runtime.as_str(),
@@ -1316,6 +1326,24 @@ fn detected_integrations(
                     continue;
                 }
             };
+            // A symlinked home is never planned and never takes the identity of
+            // the directory it points at, so it cannot shadow a real home. The
+            // default home's gap is reported by `config_home_gap`.
+            if config_path_kind(&home.dir) == ConfigPath::Symlink {
+                if let Some(name) = &profile {
+                    report.gap(
+                        runtime,
+                        CODE_GAP_CONFIG_HOME_SYMLINK,
+                        &format!(
+                            "the config home {} of profile `{name}` is a symlink; hooks are installed \
+                             only into a real directory, so point the profile at a real directory, \
+                             then run setup again",
+                            home.dir.display()
+                        ),
+                    );
+                }
+                continue;
+            }
             let key = (runtime.to_owned(), home.identity());
             if seen.contains(&key) {
                 continue;

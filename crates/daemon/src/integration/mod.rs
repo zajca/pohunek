@@ -610,7 +610,7 @@ struct ConfigDirIssue {
 
 /// What exists at an agent config path, without following a symlink.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConfigPath {
+pub(crate) enum ConfigPath {
     Absent,
     Directory,
     /// A symlink, live or dangling; the installer never follows one.
@@ -626,7 +626,7 @@ enum ConfigPath {
 /// A symlink anywhere on the path, live or dangling, is [`ConfigPath::Symlink`]
 /// because the installer's trusted walk refuses it; a missing component is
 /// [`ConfigPath::Absent`].
-fn config_path_kind(path: &Path) -> ConfigPath {
+pub(crate) fn config_path_kind(path: &Path) -> ConfigPath {
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component);
