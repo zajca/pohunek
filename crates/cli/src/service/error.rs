@@ -561,6 +561,31 @@ pub enum Error {
     #[cfg(test)]
     #[error("interrupted after step {0:?}")]
     Interrupted(super::record::Step),
+
+    /// A workflow plugin refuses the service uninstall, with the code,
+    /// message, recovery and class its `pohunek workflow` error carries.
+    #[error("{message}")]
+    Workflow {
+        /// The stable code of the workflow error.
+        code: &'static str,
+        /// The message of the workflow error.
+        message: String,
+        /// The recovery hint of the workflow error.
+        hint: &'static str,
+        /// The error class of the workflow error.
+        class: protocol::ErrorClass,
+    },
+}
+
+impl From<crate::workflow::Error> for Error {
+    fn from(error: crate::workflow::Error) -> Self {
+        Self::Workflow {
+            code: error.code(),
+            message: error.to_string(),
+            hint: error.hint(),
+            class: error.class(),
+        }
+    }
 }
 
 impl Error {
@@ -615,6 +640,7 @@ impl Error {
             Self::RollbackFailed { .. } => "service_rollback_failed",
             #[cfg(test)]
             Self::Interrupted(_) => "service_interrupted",
+            Self::Workflow { code, .. } => code,
         }
     }
 
@@ -672,6 +698,7 @@ impl Error {
             Self::NonUtf8Env { .. } => {
                 Some("point the named variable at a UTF-8 path, then retry")
             }
+            Self::Workflow { hint, .. } => Some(hint),
             Self::MissingEnv { var } if var == pohunek_paths::HOME => Some(
                 "set HOME to your existing home directory, the session workers' working directory, then retry",
             ),

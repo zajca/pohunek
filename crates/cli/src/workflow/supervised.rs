@@ -43,7 +43,8 @@
 
 // Rust guideline compliant 2026-10-13
 
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -81,6 +82,16 @@ const BACKOFF_DIR: &str = "backoff";
 
 /// Largest state file read back; the files hold one small JSON object.
 const MAX_STATE_FILE_BYTES: usize = 4096;
+
+/// The stored count of a service's short runs when its backoff file cannot be
+/// parsed. The restart delay of that count is the longest one, so a damaged
+/// file never speeds up restarts.
+pub(crate) const DAMAGED_BACKOFF: u32 = u32::MAX;
+
+/// The stored count after a stable run, which starts the count over. It is
+/// one, not zero, so the next start waits the initial restart delay; a
+/// service's consecutive short runs are the stored count minus this.
+pub(crate) const STABLE_BACKOFF_FAILURES: u32 = 1;
 
 /// How much earlier than `every_s` a job check still counts as due.
 ///
@@ -351,7 +362,7 @@ fn save_backoff(
     ran: Duration,
 ) {
     let failures = if ran >= Duration::from_millis(knobs.services.stable_after_ms) {
-        1
+        STABLE_BACKOFF_FAILURES
     } else {
         failures.saturating_add(1)
     };
@@ -513,13 +524,40 @@ fn due(store: &Store, state: &TrustedDir, request: &Request) -> Result<bool, Err
 }
 
 /// The service's count of short runs; a file that cannot be parsed counts
-/// as the longest backoff, so damage never speeds up restarts.
+/// as [`DAMAGED_BACKOFF`].
 fn read_backoff(state: &TrustedDir, request: &Request) -> Result<u32, Error> {
     Ok(match read_state::<Backoff>(state, BACKOFF_DIR, request)? {
         Stored::Absent => 0,
         Stored::Valid(backoff) => backoff.failures,
-        Stored::Damaged => u32::MAX,
+        Stored::Damaged => DAMAGED_BACKOFF,
     })
+}
+
+/// The service's stored count of short runs, read without creating anything:
+/// a missing state directory or file counts as zero, as a fresh unit does.
+///
+/// # Errors
+///
+/// Returns [`Error::Store`] when the state directory is unusable.
+pub(crate) fn backoff_of(state_dir: &Path, request: &Request) -> Result<u32, Error> {
+    let not_found = |error: &FsError| error.io_kind() == Some(io::ErrorKind::NotFound);
+    let state = match TrustedDir::open_absolute(state_dir, PRIVATE_DIR_MODE) {
+        Ok(state) => state,
+        Err(error) if not_found(&error) => return Ok(0),
+        Err(error) => return Err(state_error(&error)),
+    };
+    let dir = match state.open_child(BACKOFF_DIR, PRIVATE_DIR_MODE) {
+        Ok(dir) => dir,
+        Err(error) if not_found(&error) => return Ok(0),
+        Err(error) => return Err(state_error(&error)),
+    };
+    let bytes = match dir.read_file(state_file(request), PRIVATE_FILE_MODE, MAX_STATE_FILE_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) if not_found(&error) => return Ok(0),
+        Err(error) => return Err(state_error(&error)),
+    };
+    Ok(serde_json::from_slice::<Backoff>(&bytes)
+        .map_or(DAMAGED_BACKOFF, |backoff| backoff.failures))
 }
 
 /// What a unit state file holds.

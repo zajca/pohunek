@@ -10,10 +10,12 @@
 
 use std::path::Path;
 
+use std::io::ErrorKind;
+
 use pohunek_logging::{Files, Legacy, Policy, Writer};
 use pohunek_platform::filesystem::TrustedDir;
 use protocol::{PackageDigest, PackageVersion};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::config::Logs;
 use super::Error;
@@ -27,8 +29,11 @@ const LOGS_DIR: &str = "logs";
 /// Mode of the plugin state directory and its `logs` subdirectory.
 const PRIVATE_DIR_MODE: u32 = 0o700;
 
+/// Mode of the run log files.
+const PRIVATE_FILE_MODE: u32 = 0o600;
+
 /// How a run ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Outcome {
     /// The child exited with status zero.
@@ -58,6 +63,14 @@ pub(crate) enum Outcome {
     /// A supervised run did not start because an earlier run of the same
     /// job or service still holds its lock.
     OverlapSkipped,
+}
+
+impl Outcome {
+    /// Whether the outcome counts toward a job's consecutive failures: any
+    /// outcome except a success, and an overlap skip, which started no run.
+    pub(crate) fn is_failure(self) -> bool {
+        !matches!(self, Self::Ok | Self::OverlapSkipped)
+    }
 }
 
 /// One run record.
@@ -149,5 +162,93 @@ impl RunLog {
         std::io::Write::write_all(&mut self.writer, &line).map_err(|error| Error::RunLog {
             detail: error.to_string(),
         })
+    }
+}
+
+/// One run record read back from the run log.
+///
+/// Only the fields status needs are read; a record's other fields, which
+/// hold no value a run was given, are ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ReadRecord {
+    /// RFC 3339 UTC time the run started.
+    pub(crate) ts: String,
+    /// Invocation kind as the record names it.
+    pub(crate) kind: String,
+    /// The declared name, when the record has one.
+    #[serde(default)]
+    pub(crate) name: Option<String>,
+    /// Archive digest the run used.
+    pub(crate) digest: PackageDigest,
+    /// How the run ended.
+    pub(crate) outcome: Outcome,
+    /// The child's exit code, when it exited.
+    #[serde(default)]
+    pub(crate) exit_code: Option<i32>,
+    /// The signal that ended the child, when one did.
+    #[serde(default)]
+    pub(crate) signal: Option<i32>,
+    /// The stable code of the error the run ended with, when it ended with one.
+    #[serde(default)]
+    pub(crate) error_code: Option<String>,
+}
+
+/// Reads the retained run records below `state_dir`, newest first.
+///
+/// The active file and its rotations are read, at most `logs.run_log_files`
+/// of them and each at most `logs.run_log_file_bytes`: the bounds the writer
+/// keeps the family within, so a status read never grows past them. A line
+/// that does not parse is skipped, which includes a line still being
+/// appended. A missing log directory holds no records.
+///
+/// # Errors
+///
+/// Returns [`Error::RunLog`] when a directory is unsafe, a file is larger than
+/// its bound, or a file cannot be read.
+pub(crate) fn recent(state_dir: &Path, logs: Logs) -> Result<Vec<ReadRecord>, Error> {
+    let failed = |detail: String| Error::RunLog { detail };
+    let Some(dir) = open_logs_dir(state_dir)? else {
+        return Ok(Vec::new());
+    };
+    let max_bytes = usize::try_from(logs.run_log_file_bytes)
+        .map_err(|_too_large| failed("the run log file size is too large".to_owned()))?;
+    let files = usize::try_from(logs.run_log_files)
+        .map_err(|_too_many| failed("the run log file count is too large".to_owned()))?;
+    let mut records = Vec::new();
+    for index in 0..files {
+        // The writer keeps the newest records in the active file and moves
+        // older ones to `.1`, `.2`, and so on.
+        let name = if index == 0 {
+            FILE_NAME.to_owned()
+        } else {
+            format!("{FILE_NAME}.{index}")
+        };
+        let bytes = match dir.read_file(&name, PRIVATE_FILE_MODE, max_bytes) {
+            Ok(bytes) => bytes,
+            Err(error) if error.io_kind() == Some(ErrorKind::NotFound) => continue,
+            Err(error) => return Err(failed(error.to_string())),
+        };
+        records.extend(
+            bytes
+                .split(|byte| *byte == b'\n')
+                .rev()
+                .filter_map(|line| serde_json::from_slice::<ReadRecord>(line).ok()),
+        );
+    }
+    Ok(records)
+}
+
+/// Opens the `logs` directory below `state_dir`; `None` when either is missing.
+fn open_logs_dir(state_dir: &Path) -> Result<Option<TrustedDir>, Error> {
+    let failed = |detail: String| Error::RunLog { detail };
+    let state = match TrustedDir::open_absolute(state_dir, PRIVATE_DIR_MODE) {
+        Ok(state) => state,
+        Err(error) if error.io_kind() == Some(ErrorKind::NotFound) => return Ok(None),
+        Err(error) => return Err(failed(error.to_string())),
+    };
+    match state.open_child(LOGS_DIR, PRIVATE_DIR_MODE) {
+        Ok(dir) => Ok(Some(dir)),
+        Err(error) if error.io_kind() == Some(ErrorKind::NotFound) => Ok(None),
+        Err(error) => Err(failed(error.to_string())),
     }
 }

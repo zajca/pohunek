@@ -42,6 +42,7 @@ use crate::service::Context;
 use crate::target::is_local_host;
 use crate::workflow::manifest::{resolve_argv, Action as Declared, ArgsMode, Manifest};
 use crate::workflow::runner::{run_action, Completed, Invocation, Output};
+use crate::workflow::status;
 use crate::workflow::store::{read_candidate, Candidate, Purged, Recorded, Store};
 use crate::workflow::supervised::{self, Request};
 use crate::workflow::units::{self, Host};
@@ -109,6 +110,22 @@ pub(crate) enum Action {
         /// Plugin id.
         #[arg(value_name = "PLUGIN")]
         plugin: PackageId,
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show the jobs and services of installed workflow plugins: each one's
+    /// native state, last run, consecutive failures, and for a service the
+    /// restart delay its next start waits.
+    ///
+    /// Local only. The service manager is asked for each unit's state and the
+    /// plugin's run log is read; the daemon is not contacted.
+    Status {
+        /// Plugin id. Without it, every installed plugin with jobs or services
+        /// is shown.
+        #[arg(value_name = "PLUGIN")]
+        plugin: Option<PackageId>,
         /// Emit machine-readable JSON instead of text.
         #[arg(long)]
         json: bool,
@@ -208,6 +225,7 @@ impl Action {
             | Self::Inspect { json, .. }
             | Self::Enable { json, .. }
             | Self::Disable { json, .. }
+            | Self::Status { json, .. }
             | Self::Uninstall { json, .. }
             | Self::Run { json, .. } => *json,
             Self::Install(args) => args.json,
@@ -428,6 +446,11 @@ pub(crate) async fn run(action: Action, host: &str) -> Result<ExitCode, CliError
             let (record, warnings) =
                 units::disable(&store, &mut Host::resolve_lazily(), &plugin).await?;
             print_toggled(json, &record, warnings, "Disabled")?;
+        }
+        Action::Status { plugin, json } => {
+            let report =
+                status::report(&store, &mut Host::resolve_lazily(), plugin.as_ref()).await?;
+            print_output(json, &report, || status::render(&report))?;
         }
         Action::Exec { .. } => unreachable!("the trampoline returned above"),
         Action::Uninstall {

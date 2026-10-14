@@ -118,6 +118,10 @@ pub async fn upgrade(
 pub async fn uninstall(options: UninstallOptions) -> Result<report::UninstallReport, Error> {
     let context = Context::resolve()?;
     let inherited = inherited_lock(&context)?;
+    // Checked before the service manager is contacted: the refusal must not
+    // depend on the manager answering. The unit lifecycle lock stays held until
+    // the uninstall ends, so no workflow enable records units meanwhile.
+    let _units = crate::workflow::units::check_no_units(&context)?;
     let backend = connect_installed(&context).await?;
     engine(&context, &backend, inherited)
         .uninstall(options)

@@ -19,6 +19,7 @@ pub(crate) mod config;
 pub(crate) mod manifest;
 pub(crate) mod runlog;
 pub(crate) mod runner;
+pub(crate) mod status;
 pub(crate) mod store;
 pub(crate) mod supervised;
 pub(crate) mod units;
@@ -345,6 +346,20 @@ pub(crate) enum Error {
         /// The received signal number.
         signal: i32,
     },
+
+    /// `pohunek service uninstall` was given while workflow plugins still have
+    /// recorded jobs or services: their units run the installed CLI, so the
+    /// uninstall would strand them. Nothing was changed.
+    #[error(
+        "service uninstall refused: workflow plugins still have jobs or services installed: {}; \
+         run {} first",
+        plugins.join(", "),
+        disable_commands(plugins)
+    )]
+    UnitsInstalled {
+        /// The ids of the plugins with recorded units, sorted.
+        plugins: Vec<String>,
+    },
 }
 
 impl Error {
@@ -386,6 +401,7 @@ impl Error {
             Self::ActionFailed { .. } => "workflow_action_failed",
             Self::OutputIncomplete { .. } => "workflow_output_incomplete",
             Self::OutputInvalid { .. } => "workflow_output_invalid",
+            Self::UnitsInstalled { .. } => "workflow_units_installed",
         }
     }
 
@@ -533,6 +549,9 @@ impl Error {
                 "with --json the action must print exactly one JSON document on stdout; run it \
                  without --json to see what it prints"
             }
+            Self::UnitsInstalled { .. } => {
+                "disable each plugin named above, then run the service uninstall again"
+            }
         }
     }
 
@@ -582,6 +601,16 @@ impl Error {
             _ => ErrorClass::Configuration,
         }
     }
+}
+
+/// The `pohunek workflow disable` command of each plugin, as a list a message
+/// can name.
+fn disable_commands(plugins: &[String]) -> String {
+    plugins
+        .iter()
+        .map(|id| format!("`pohunek workflow disable {id}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// What to fix before enabling a plugin again after `cause` stopped its

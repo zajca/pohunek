@@ -43,6 +43,7 @@ launchd_scenario!(installing_again_leaves_running_units_alone);
 launchd_scenario!(re_enabling_with_a_damaged_unit_record_changes_nothing);
 launchd_scenario!(disable_stops_the_units_of_a_modified_plugin);
 launchd_scenario!(uninstall_stops_the_units_of_a_modified_plugin);
+launchd_scenario!(status_shows_running_units_and_failing_runs);
 
 /// A launchd user-session variable, removed again when the guard drops, also
 /// when the scenario fails.

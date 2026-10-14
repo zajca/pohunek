@@ -658,6 +658,50 @@ impl Store {
         Ok(units)
     }
 
+    /// The ids of the plugins whose unit record names at least one unit,
+    /// sorted. Callers hold the unit lifecycle lock.
+    ///
+    /// A leftover temporary of an interrupted record write is ignored, since
+    /// the record it replaces is what counts. Any other entry of the unit
+    /// record directory is unexplained and refused, so no plugin can hide
+    /// units behind it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Store`] when the directory cannot be listed, holds an
+    /// unexplained entry, or a record cannot be read.
+    pub(crate) fn plugins_with_units(&self) -> Result<Vec<PackageId>, Error> {
+        let Some(root) = self.open_records_root(false)? else {
+            return Ok(Vec::new());
+        };
+        let Some(dir) = open_child_if_present(&root, UNIT_RECORDS_DIR)? else {
+            return Ok(Vec::new());
+        };
+        let names = dir.entry_names().map_err(|error| fs(&error))?;
+        let mut plugins = Vec::new();
+        for name in names {
+            let name = name.to_string_lossy();
+            if name.ends_with(UNIT_RECORD_TEMPORARY_SUFFIX) {
+                continue;
+            }
+            let Some(id) = name.strip_suffix(UNIT_RECORD_SUFFIX) else {
+                return Err(Error::Store(
+                    "the unit record directory holds an entry that is not a unit record, so \
+                     the units it may name cannot be told apart"
+                        .to_owned(),
+                ));
+            };
+            let id = PackageId::parse(id).map_err(|_invalid| {
+                Error::Store("the unit record directory holds a record of an invalid id".to_owned())
+            })?;
+            if !self.recorded_units(&id)?.is_empty() {
+                plugins.push(id);
+            }
+        }
+        plugins.sort();
+        Ok(plugins)
+    }
+
     /// Adds `added` to the units recorded for plugin `id` and writes the
     /// record. Callers hold the unit lifecycle lock.
     ///
@@ -987,9 +1031,16 @@ fn remove_child(parent: &TrustedDir, name: &str, prefix: &str) -> Result<Purged,
     }
 }
 
+/// Extension of a unit record file, which is named after its plugin id.
+const UNIT_RECORD_SUFFIX: &str = ".json";
+
+/// Extension of the temporary file a unit record write stages before it
+/// replaces the record.
+const UNIT_RECORD_TEMPORARY_SUFFIX: &str = ".json.tmp";
+
 /// The file name of the unit record of plugin `id`.
 fn unit_record_name(id: &PackageId) -> String {
-    format!("{id}.json")
+    format!("{id}{UNIT_RECORD_SUFFIX}")
 }
 
 /// The error for a unit record that cannot be used. It names the plugin and

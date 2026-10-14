@@ -18,7 +18,9 @@ use std::process::Stdio;
 
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use pohunek_cli::workflow_units::{disable_plugin, enable_plugin, uninstall_plugin};
+use pohunek_cli::workflow_units::{
+    disable_plugin, enable_plugin, status_plugins, uninstall_plugin,
+};
 use pohunek_platform::supervisor::{PluginUnitKey, PluginUnitKind, ServiceState};
 use pohunek_test_support::wait::{poll_until, wait_until};
 use serde_json::Value;
@@ -626,6 +628,74 @@ pub(crate) async fn uninstall_stops_the_units_of_a_modified_plugin() {
 }
 
 /// The value of a variable planted in the service manager's environment.
+/// The status of plugin `id`, or of every plugin with units when `id` is
+/// `None`, from the same code `pohunek workflow status --json` runs.
+async fn status_of(managed: &Managed, id: Option<&str>) -> Value {
+    status_plugins(&managed.units.context, id)
+        .await
+        .expect("workflow status")
+}
+
+/// The status of the unit `kind` `name` in a status report of one plugin.
+fn unit_of<'a>(report: &'a Value, kind: &str, name: &str) -> &'a Value {
+    report["plugins"][0]["units"]
+        .as_array()
+        .and_then(|units| {
+            units
+                .iter()
+                .find(|unit| unit["kind"] == kind && unit["name"] == name)
+        })
+        .unwrap_or_else(|| panic!("no {kind} {name} in {report}"))
+}
+
+/// Status reports a running service, and a failing job's last run and its
+/// consecutive failures; after disable it lists no units.
+pub(crate) async fn status_shows_running_units_and_failing_runs() {
+    let mut managed = Managed::new(KNOBS);
+    let plugin = Plugin::new("acme.status")
+        .service("serve", "hang")
+        .job("crash", "crash", 1);
+    let id = plugin.id.clone();
+    managed.enable(&plugin).await;
+
+    let report = wait_until("the service to run and the job to fail twice", || async {
+        let report = status_of(&managed, Some(&id)).await;
+        let serving = unit_of(&report, "service", "serve")["state"] == "running";
+        let failing = unit_of(&report, "job", "crash")["consecutive_failures"]
+            .as_u64()
+            .is_some_and(|count| count >= 2);
+        (serving && failing).then_some(report)
+    })
+    .await;
+    assert_eq!(report["plugins"][0]["enabled"], true, "{report}");
+    // A service that never exited has no backoff, so its next start waits none.
+    let serve = unit_of(&report, "service", "serve");
+    assert_eq!(serve["backoff_ms"], 0, "{serve}");
+    let crash = unit_of(&report, "job", "crash");
+    assert_eq!(crash["last_run"]["outcome"], "exit_nonzero", "{crash}");
+    assert_eq!(crash["last_run"]["exit_code"], 3, "{crash}");
+    assert!(crash["last_run"]["ts"].is_string(), "{crash}");
+    assert!(
+        crash.get("backoff_ms").is_none(),
+        "a job reports no backoff: {crash}"
+    );
+
+    managed.disable(&id).await;
+    let report = status_of(&managed, Some(&id)).await;
+    assert_eq!(report["plugins"][0]["enabled"], false, "{report}");
+    assert!(
+        report["plugins"][0]["units"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "{report}"
+    );
+    let all = status_of(&managed, None).await;
+    assert!(
+        all["plugins"].as_array().is_some_and(Vec::is_empty),
+        "a plugin without units is not listed: {all}"
+    );
+}
+
 const PLANTED_VALUE: &str = "planted-in-the-manager";
 
 /// A variable planted in the service manager's environment for one scenario.

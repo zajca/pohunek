@@ -53,6 +53,7 @@ use std::time::Duration;
 
 use package::registry::PackageRecord;
 use pohunek_paths::BasePaths;
+use pohunek_platform::filesystem::FileLock;
 use pohunek_platform::supervisor::{
     self, Activation, JobDefinition, JobSpec, Namespace, PluginUnitDefinition, PluginUnitKey,
     PluginUnitKind, PluginUnits, RestartPolicy, MAX_JOB_TIMEOUT, MIN_JOB_INTERVAL,
@@ -63,6 +64,7 @@ use protocol::{PackageDigest, PackageId};
 use super::config::{self, Knobs, MAX_KILL_GRACE_MS, SUPERVISED_MARGIN_MS};
 use super::manifest::{Job, Manifest};
 use super::runner::kind_name;
+use super::status;
 use super::store::{Removal, Store, UnitKind, UnitName};
 use super::Error;
 use crate::paths::WorkflowDirs;
@@ -196,7 +198,8 @@ impl Host {
         }
     }
 
-    fn context(&mut self) -> Result<&Context, Error> {
+    /// The resolved context, resolving it on first use.
+    pub(crate) fn context(&mut self) -> Result<&Context, Error> {
         if self.context.is_none() {
             let context = Context::resolve().map_err(|error| Error::ServiceNotInstalled {
                 reason: error.to_string(),
@@ -347,7 +350,7 @@ fn definitions(
 }
 
 /// Connects the service manager backend of `installation`.
-fn connect<'a>(
+pub(crate) fn connect<'a>(
     context: &'a Context,
     installation: &Installation,
     id: &'a PackageId,
@@ -854,6 +857,30 @@ impl From<Error> for LifecycleError {
     }
 }
 
+/// Refuses while any workflow plugin has recorded units, so a service
+/// uninstall never strands units that run the installation it would remove.
+///
+/// Returns the unit lifecycle lock, held from before the records are read; the
+/// caller keeps it until the uninstall is done, so no enable can record units
+/// in between. `None` when there is no workflow store, which holds no units.
+///
+/// # Errors
+///
+/// Returns [`Error::Busy`] while another unit lifecycle command holds the lock,
+/// [`Error::Store`] when a unit record cannot be read, and
+/// [`Error::UnitsInstalled`] naming the plugins with recorded units.
+pub(crate) fn check_no_units(context: &Context) -> Result<Option<FileLock>, Error> {
+    let store = store_of(context)?;
+    let lock = store.lock_units()?;
+    let plugins = store.plugins_with_units()?;
+    if plugins.is_empty() {
+        return Ok(lock);
+    }
+    Err(Error::UnitsInstalled {
+        plugins: plugins.iter().map(ToString::to_string).collect(),
+    })
+}
+
 /// The workflow plugin store of `context`'s paths.
 fn store_of(context: &Context) -> Result<Store, Error> {
     let paths = context.paths();
@@ -916,6 +943,26 @@ pub async fn uninstall_plugin(
     )
     .await?;
     Ok(removal.warnings)
+}
+
+/// Reports the status of workflow plugin `plugin` of `context`'s installation,
+/// or of every installed plugin with recorded units when `plugin` is `None`,
+/// exactly as `pohunek workflow status --json` does for the context it resolves.
+///
+/// # Errors
+///
+/// Returns the code and message `pohunek workflow status` reports for the
+/// plugin id, the store or the knobs; a unit that cannot be inspected is
+/// reported inside the result instead.
+pub async fn status_plugins(
+    context: &Context,
+    plugin: Option<&str>,
+) -> Result<serde_json::Value, LifecycleError> {
+    let id = plugin.map(parse_id).transpose()?;
+    let store = store_of(context)?;
+    let report = status::report(&store, &mut Host::given(context.clone()), id.as_ref()).await?;
+    serde_json::to_value(&report)
+        .map_err(|error| LifecycleError::from(Error::Store(error.to_string())))
 }
 
 fn parse_id(plugin: &str) -> Result<PackageId, LifecycleError> {

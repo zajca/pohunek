@@ -521,7 +521,7 @@ fn workflow_plugin_ids_complete_from_the_installed_store() {
     install_workflow(&env, "other.tool", &["build"], &[]);
     let store = tree(&workflow_store(&env));
 
-    for subcommand in ["inspect", "enable", "disable", "uninstall"] {
+    for subcommand in ["inspect", "enable", "disable", "status", "uninstall"] {
         assert_eq!(
             candidates(&env, &["pohunek", "workflow", subcommand, "acme."]),
             ["acme.lint", "acme.paused", "acme.work"],
