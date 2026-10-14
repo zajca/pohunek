@@ -3265,6 +3265,75 @@ with open({received:?}, "wb") as capture:
     let _ = handle.await;
 }
 
+/// A Claude-based profile whose override manifest declares no idle rule on a
+/// screen region is refused at creation: the Claude base waits for screen
+/// readiness, which such a manifest can never report.
+#[tokio::test]
+async fn claude_profile_without_a_screen_idle_rule_is_refused_before_any_session() {
+    let socket = temp_socket("claude-profile-no-idle");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let manifests_dir = agents_dir.join("manifests");
+    std::fs::create_dir(&manifests_dir).expect("create manifests directory");
+    let script = socket.dir.join("claude-never-used.py");
+    claude_stub_without_prompt_box(&script, &socket.dir.join("received.bin"));
+    let variants = [
+        (
+            "blockedonly",
+            "[[rules]]\n\
+             id = \"custom-blocked\"\n\
+             state = \"blocked\"\n\
+             priority = 1\n\
+             region = \"whole_recent\"\n\
+             contains = \"custom blocker\"\n",
+        ),
+        ("emptyrules", "rules = []\n"),
+    ];
+    for (name, manifest) in variants {
+        std::fs::write(manifests_dir.join(format!("{name}.toml")), manifest)
+            .expect("write override manifest");
+        write_claude_profile(&agents_dir, name, &script);
+        let profile = agents_dir.join(format!("{name}.toml"));
+        let body = std::fs::read_to_string(&profile).expect("read profile");
+        std::fs::write(&profile, format!("{body}manifest = \"{name}\"\n"))
+            .expect("declare override manifest");
+    }
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+
+    for (name, _) in variants {
+        let mut params = session_params(&socket);
+        name.clone_into(&mut params.agent);
+        params.input = Some("hello Claude".to_owned());
+        let error = err_payload(create_session_with_params(&mut control, params).await);
+        assert_eq!(error.code, "invalid_profile", "profile {name}");
+        assert!(
+            error.msg.contains("input.ready = screen_idle"),
+            "profile {name} names the readiness rule: {}",
+            error.msg
+        );
+    }
+
+    let list = Request::make(
+        "claude-profile-no-idle-list",
+        method::SESSION_LIST,
+        Value::Null,
+    );
+    let sessions: Vec<SessionInfo> =
+        serde_json::from_value(ok_payload(exchange(&mut control, &list).await))
+            .expect("list sessions");
+    assert!(sessions.is_empty(), "no session was created");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
 /// The public waited-input result reveals whether the selected runtime's
 /// framing needs a delayed submit: a nonzero delay refuses the wait before
 /// writing, while zero can deliver and observe the fake agent's blocked OSC.

@@ -27,8 +27,8 @@ use serde::Deserialize;
 use tracing::warn;
 
 use super::host::{
-    is_reserved, LaunchProgram, ProfileInputs, RevisionKeys, RuntimeDefinition, RuntimeHost,
-    ServedBy, Spawn,
+    is_reserved, InputReadiness, LaunchProgram, ProfileInputs, RevisionKeys, RuntimeDefinition,
+    RuntimeHost, ServedBy, Spawn,
 };
 use super::{InputRules, LaunchEnv, NativeArgs, NativeSessionLaunch, SessionRefKind};
 use crate::detect::{Manifest, MAX_MANIFEST_SOURCE_BYTES};
@@ -1092,6 +1092,21 @@ fn resolve_profile_text(
     });
     let native = resolve_native(name, &definition, raw.resume.as_ref())?;
     let manifest_source = resolve_manifest(name, dir, raw.manifest.as_deref())?;
+    // The override replaces the base's detection, so a base that waits for a
+    // screen idle state needs the override to declare one.
+    if let Some(source) = &manifest_source {
+        if definition.input_readiness() == InputReadiness::ScreenIdle
+            && !source.manifest.has_screen_idle_rule()
+        {
+            return Err(invalid_profile(
+                name,
+                &format!(
+                    "the override manifest '{}' declares no idle rule on a screen region, but the base runtime waits for screen readiness (input.ready = screen_idle)",
+                    raw.manifest.as_deref().unwrap_or_default()
+                ),
+            ));
+        }
+    }
     let binding_json = serde_json::to_vec(definition.binding())
         .map_err(|err| invalid_profile(name, &format!("launch binding: {err}")))?;
     let inputs = ProfileInputs::of(

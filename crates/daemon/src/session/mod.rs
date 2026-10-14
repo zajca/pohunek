@@ -643,6 +643,11 @@ struct SessionRegistryInner {
     /// Holds the next committed create before its initial input.
     #[cfg(test)]
     initial_input_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Holds the next create once its readiness wait has ended, before the
+    /// wait's outcome decides the create.
+    #[cfg(test)]
+    initial_input_outcome_hold:
+        std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
     /// Holds the next committed exit before it is announced.
     #[cfg(test)]
     exit_announce_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
@@ -1780,6 +1785,8 @@ impl SessionRegistry {
                 #[cfg(test)]
                 initial_input_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
+                initial_input_outcome_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
                 exit_announce_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 exit_commit_hold: std::sync::Mutex::new(None),
@@ -2532,6 +2539,21 @@ impl SessionRegistry {
         }
     }
 
+    /// Parks a create once its readiness wait ended when a test armed the hold.
+    #[cfg(test)]
+    async fn hold_initial_input_outcome(&self) {
+        let gate = self
+            .inner
+            .initial_input_outcome_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
     /// Parks a create before its initial input when a test armed the hold.
     #[cfg(test)]
     async fn hold_initial_input(&self, id: &SessionId) {
@@ -2933,19 +2955,19 @@ impl SessionRegistry {
     /// readiness is not an error: the prompt is written once the wait ends,
     /// because a silent agent may still read it. For a [`InputReadiness::ScreenIdle`]
     /// session the wait gets the full configured grace, since its readiness
-    /// has no silent-reader fallback, and an unobserved readiness fails with
-    /// `session_input_not_ready` so nothing is written to an unready prompt.
+    /// has no silent-reader fallback, and only observed readiness releases the
+    /// prompt.
     ///
     /// # Errors
     ///
-    /// Returns `session_input_not_ready` for a `ScreenIdle` session whose
-    /// readiness was not observed before the deadline or the daemon shut down.
+    /// Returns `session_input_not_ready` for a `ScreenIdle` session whose wait
+    /// ended by the deadline or by daemon shutdown rather than by readiness.
     async fn await_initial_input_readiness(
         &self,
         session_id: &SessionId,
         extended_input_ready_wait: bool,
     ) -> Result<(), ProtocolError> {
-        let (mut input_ready, readiness) = {
+        let (input_ready, readiness) = {
             let sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get(session_id) else {
                 return Ok(());
@@ -2965,12 +2987,46 @@ impl SessionRegistry {
         if grace.is_zero() && !strict {
             return Ok(());
         }
+        let outcome = self.wait_for_input_readiness(input_ready, grace).await;
+        #[cfg(test)]
+        self.hold_initial_input_outcome().await;
+        match (strict, outcome) {
+            (_, InitialInputWait::Ready) | (false, _) => Ok(()),
+            (true, InitialInputWait::TimedOut) => {
+                let activity = self.current_activity_label(session_id).await;
+                Err(runtime_error(
+                    "session_input_not_ready",
+                    format!(
+                        "agent did not show an editable prompt within {} ms (last activity: {activity}); nothing was sent, raise input.initial_startup_grace_ms if the agent starts slowly",
+                        grace.as_millis()
+                    ),
+                ))
+            }
+            (true, InitialInputWait::ShutDown) => Err(runtime_error(
+                "session_input_not_ready",
+                "the daemon shut down before the agent showed an editable prompt; nothing was sent",
+            )),
+        }
+    }
+
+    /// Waits until `input_ready` turns true, the daemon shuts down, or `grace`
+    /// elapses, whichever comes first. The returned outcome is the one that
+    /// ended the wait; the watch is not read again afterwards, so an update
+    /// that lands after the wait ended cannot change it.
+    async fn wait_for_input_readiness(
+        &self,
+        mut input_ready: watch::Receiver<bool>,
+        grace: Duration,
+    ) -> InitialInputWait {
         let shutdown = self.inner.daemon_shutdown.clone();
-        let _ = tokio::time::timeout(grace, async {
+        let wait = async {
             let mut detector_open = true;
-            while !*input_ready.borrow() {
+            loop {
+                if *input_ready.borrow_and_update() {
+                    return InitialInputWait::Ready;
+                }
                 tokio::select! {
-                    () = shutdown.cancelled() => break,
+                    () = shutdown.cancelled() => return InitialInputWait::ShutDown,
                     changed = input_ready.changed(), if detector_open => {
                         // A stopped detector has no readiness evidence; the
                         // outer deadline still bounds the fallback.
@@ -2978,22 +3034,19 @@ impl SessionRegistry {
                     }
                 }
             }
-        })
-        .await;
-        if !strict || *input_ready.borrow() {
-            return Ok(());
-        }
-        let activity = self.current_activity(session_id).await.map_or_else(
+        };
+        tokio::time::timeout(grace, wait)
+            .await
+            .unwrap_or(InitialInputWait::TimedOut)
+    }
+
+    /// The last reported activity of session `id` as a lowercase word, for
+    /// the readiness error message.
+    async fn current_activity_label(&self, id: &SessionId) -> String {
+        self.current_activity(id).await.map_or_else(
             || "none".to_owned(),
             |activity| format!("{activity:?}").to_lowercase(),
-        );
-        Err(runtime_error(
-            "session_input_not_ready",
-            format!(
-                "agent did not show an editable prompt within {} ms (last activity: {activity}); nothing was sent, raise input.initial_startup_grace_ms if the agent starts slowly",
-                grace.as_millis()
-            ),
-        ))
+        )
     }
 
     /// Roll back a session whose initial `--input` could not be delivered or
@@ -6726,6 +6779,17 @@ fn runtime_state_label(state: RuntimeState) -> &'static str {
         RuntimeState::Conflict => "conflict",
         RuntimeState::Incompatible => "incompatible",
     }
+}
+
+/// What ended the wait for a freshly spawned agent's input readiness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitialInputWait {
+    /// The detector reported the agent's input reader as ready.
+    Ready,
+    /// The readiness grace elapsed first.
+    TimedOut,
+    /// The daemon began shutting down first.
+    ShutDown,
 }
 
 fn runtime_error(code: impl Into<String>, msg: impl Into<String>) -> ProtocolError {
