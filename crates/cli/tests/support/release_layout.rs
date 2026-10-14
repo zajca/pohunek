@@ -492,9 +492,15 @@ impl Layout {
                 continue;
             }
             let command = fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
-            let Ok(executable) = fs::read_link(entry.path().join("exe")) else {
-                // Exited between the scan and the read.
-                continue;
+            let executable = match fs::read_link(entry.path().join("exe")) {
+                Ok(executable) => executable,
+                Err(_) if process_ended(&entry.path()) => continue,
+                Err(source) => {
+                    return Err(LayoutError::Io {
+                        what: format!("read the executable of live process {pid}"),
+                        source,
+                    });
+                }
             };
             // The running image is hashed through /proc/<pid>/exe, the inode
             // that was executed, whatever its path now holds. It stays readable
@@ -709,11 +715,12 @@ impl Layout {
 
 /// Whether the process of `directory` (a `/proc/<pid>` entry) has ended: its
 /// entry is gone, or it is a zombie or dead task whose image can no longer be
-/// read although the entry remains until its parent reaps it.
+/// read although the entry remains until its parent reaps it. A `stat` that
+/// cannot be read while the entry exists proves no exit.
 #[cfg(target_os = "linux")]
 fn process_ended(directory: &Path) -> bool {
     let Ok(stat) = fs::read_to_string(directory.join("stat")) else {
-        return true;
+        return !directory.exists();
     };
     // The state follows the parenthesised command name, which may itself hold
     // spaces or parentheses.
