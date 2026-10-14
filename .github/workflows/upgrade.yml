@@ -3,16 +3,15 @@ name: Upgrade test
 # A session started on the previous release's published binaries must survive
 # `pohunek service upgrade` to this build (issue #525). The job installs the
 # previous release from its GitHub Release assets (checksum verified, never
-# rebuilt), installs the official Claude runtime package from that release's
-# archive under its signed catalog and pins the host profiles to it, starts a
-# session from the package with a fake agent that runs the managed hooks,
-# upgrades through the operator path, and asserts the preflight judges the
-# session adoptable, the session stays live, its screen, input, hooks and
-# notifications work, stop/resume relaunch from the same package digest with
-# the native reference, and the previous release's own CLI still talks to the
-# new daemon. The previous release must ship runtime/packages/claude.tar.zst
-# (v0.34.2 or later). scripts/upgrade-test does the work;
-# crates/cli/tests/release_upgrade.rs holds the assertions.
+# rebuilt), starts a session on that release's built-in Claude and Codex
+# runtimes with a fake agent that runs the managed hooks, upgrades through the
+# operator path, and asserts the preflight judges the session adoptable, the
+# session stays live, its screen, input, hooks and notifications work,
+# stop/resume relaunch from the same package digest with the native reference,
+# and the previous release's own CLI still talks to the new daemon. The upgrade
+# installs the official runtime packages from the head build's `runtime/` tree
+# (written by `cargo xtask release test-runtime`). scripts/upgrade-test does the
+# work; crates/cli/tests/release_upgrade.rs holds the assertions.
 #
 # Callers:
 # - ci.yml runs it on pull requests that touch the daemon, worker, protocol or

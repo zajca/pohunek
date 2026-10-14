@@ -552,6 +552,13 @@ than downloading it, and fails if install, status, doctor, or uninstall fails
 or an installed-state result does not report the package and its digest as the
 plugin's provenance.
 
+`cargo xtask release test-runtime --output <dir> --runtime <id>` (repeat
+`--runtime`) is TEST-ONLY. It builds the official runtime packages from
+`runtime-packages/<id>` into the release layout (`runtime-catalog-anchor.json`
+and `runtime/`) with a random signing key that is never stored, so its catalog
+is not a release. `scripts/upgrade-test` runs it for the head binaries. Never
+publish its output or feed it to `release assemble`.
+
 ### Release rehearsal
 
 `ci.yml` runs the same two reusable workflows with `mode: rehearsal`

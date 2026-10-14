@@ -26,6 +26,8 @@ mod release_tree;
 mod runtime_package;
 mod site;
 pub mod test_code;
+mod test_runtime;
+mod throwaway_trust;
 mod ts;
 mod upstream_stage;
 #[cfg(test)]

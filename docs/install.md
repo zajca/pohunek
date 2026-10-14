@@ -126,10 +126,14 @@ not be adopted by the new daemon (`service_upgrade_sessions_at_risk`, listing
 each session with a reason code). The same preflight carries the release's
 official runtime plan: the packages the upgrade installs and the profiles it
 pins. The upgrade installs and pins them in the same run, so a host on an older
-release needs no manual package migration. `--accept-runtime-loss` proceeds
-after you have reviewed the session list, and it never overrides a plan the
-release cannot apply (`service_upgrade_runtimes_refused`, before anything is
-stopped) or a store the new daemon would refuse to start with. See the
+release needs no manual package migration: one `pohunek service upgrade` moves
+its built-in Claude Code and Codex profiles to the packages, adopts its live
+sessions, leaves its stopped sessions resumable (a resume relaunches them from
+the package digest), and reinstalls the hooks. `--accept-runtime-loss` is only
+for a session the new daemon cannot adopt, after you have reviewed the session
+list; it never overrides a plan the release cannot apply
+(`service_upgrade_runtimes_refused`, before anything is stopped) or a store the
+new daemon would refuse to start with. See the
 [update runbook](knowledge/runbooks/update-after-release.md).
 
 The first upgrade from a legacy daemon-owned PTY release refuses live sessions
@@ -315,20 +319,22 @@ package cannot honor (its native reference kind, a hook-reported reference, or
 fork support for a fork), and a session record of v0.33.0 that names no package,
 answer `runtime_served_by_package`, and its work continues in a new session. A
 fork of a Hermes session answers `agent_fork_unsupported`, because Hermes has no
-native fork. Install the Claude Code and
-Codex packages on the earlier release before upgrading so that live sessions
-stay usable (the upgrade from a release with the official runtime step installs
-and pins them itself, see the [update runbook](knowledge/runbooks/update-after-release.md)). No earlier release archive carries the Hermes package, so finish or
+native fork. A host on an
+earlier release that runs the built-in Claude Code or Codex needs no package
+install before upgrading: the upgrade from a release with the official runtime
+step installs and pins the packages itself, see the
+[update runbook](knowledge/runbooks/update-after-release.md). No earlier release archive carries the Hermes package, so finish or
 stop built-in Hermes sessions before upgrading; the upgrade preflight reports a
 live one at risk, and after an upgrade with `--accept-runtime-loss` installing
 the Hermes package from this release's archive lets you finish its work. On
-the earlier release the first installed version of a package is enabled,
-selected and takes the id over from that release's built-in runtime at once,
-and a host agent profile on that base must be pinned to the package with
-`pohunek plugin profile migrate <name> --yes` (without `--yes` it only previews
-the change); until then its launches fail with `invalid_profile`. The same
-migration pins a profile over `claude`, `codex` or `hermes` on this release once
-its package is installed.
+a release without the upgrade's runtime step, the first installed version of a
+package is enabled, selected and takes the id over from that release's built-in
+runtime at once, and a host agent profile on that base must be pinned to the
+package with `pohunek plugin profile migrate <name> --yes` (without `--yes` it
+only previews the change); until then its launches fail with `invalid_profile`.
+This manual migration is the fallback: the upgrade pins those profiles itself.
+The same migration pins a profile over `claude`, `codex` or `hermes` on this
+release once its package is installed.
 
 The Hermes operator plugin comes only from the Hermes package as well: the CLI
 carries no copy of its payload, so install the package before the plugin:

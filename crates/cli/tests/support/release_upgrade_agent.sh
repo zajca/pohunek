@@ -3,7 +3,7 @@
 #
 # The test writes this file with its first line replaced by an interpreter
 # line naming a copy of the shell called `fake-claude-sh`, and with a
-# `FAKE_CLAUDE_VERSION_LINE` assignment after it. The process image is then
+# `FAKE_AGENT_VERSION_LINE` assignment after it. The process image is then
 # that copy, whose name the worker accepts as a claude launch, and the profile
 # launches this script directly, so the package's version probe runs it too.
 #
@@ -27,7 +27,7 @@
 #   quit             exits
 
 if [ "${1:-}" = --version ]; then
-    printf '%s\n' "$FAKE_CLAUDE_VERSION_LINE"
+    printf '%s\n' "$FAKE_AGENT_VERSION_LINE"
     exit 0
 fi
 

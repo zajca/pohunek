@@ -64,6 +64,9 @@ Claude hooks afterwards with `pohunek integration install --agent codex` or
 `--agent claude`, and the Hermes operator plugin as the
 [Hermes operator](hermes-operator.md) guide describes.
 `--no-enable` stages a package until `plugin enable`. `docs/install.md` has the complete procedure.
+A `pohunek service upgrade` runs this install for the release's packages it needs
+and pins the host profiles to them, so the manual install is the fallback for a
+host that upgrades without that step.
 
 ## Config home
 

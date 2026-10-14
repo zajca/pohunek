@@ -257,6 +257,25 @@ pub(crate) enum ReleaseAction {
     /// attestation recomputes from the bytes, and the signed catalog verifies
     /// against `--anchor`. Nothing is written to `--output` on a refusal.
     Assemble(AssembleArgs),
+    /// TEST ONLY: write a runtime tree for the one-step upgrade test. The
+    /// catalog is signed with a random key that is discarded after signing,
+    /// so no release can use the tree. `release assemble` never accepts it:
+    /// the release signs with the CI root against the committed anchor
+    /// (`scripts/release-workflow/assemble`), and `unpack_daemon` refuses a
+    /// daemon archive that carries `runtime/` or an anchor other than that one.
+    ///
+    /// Writes `runtime-catalog-anchor.json` and `runtime/` (the catalog and the
+    /// package of each `--runtime`) into the existing directory `--output`. The
+    /// output must lie outside the checkout and outside any release tree.
+    TestRuntime {
+        /// Existing directory that receives the tree; it must not hold one yet,
+        /// and must not lie inside the checkout or a release tree.
+        #[arg(long, value_name = "DIR")]
+        output: PathBuf,
+        /// Official runtime id whose package goes into the tree; repeat per runtime.
+        #[arg(long = "runtime", value_name = "ID", required = true)]
+        runtime: Vec<String>,
+    },
     /// Verify a release bundle directory against its inventory.
     ///
     /// Recomputes `release-inventory.sha256` against the directory, requires
@@ -319,6 +338,14 @@ pub(crate) fn run(action: ReleaseAction, root: &Path) -> Result<(), XtaskError> 
             println!(
                 "release assemble ok: {} files, sequence {}",
                 summary.files, summary.sequence
+            );
+        }
+        ReleaseAction::TestRuntime { output, runtime } => {
+            let summary = crate::test_runtime::write(root, &output, &runtime)?;
+            println!(
+                "release test-runtime ok: {} runtimes written to {}",
+                summary.runtimes.len(),
+                summary.output.display()
             );
         }
         ReleaseAction::VerifyInventory { dir, anchor, now } => {

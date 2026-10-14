@@ -1,9 +1,9 @@
 #!/bin/sh
 # Silent `claude` reader for the release upgrade test. The test writes it with
-# the same interpreter line and `FAKE_CLAUDE_VERSION_LINE` assignment as the
+# the same interpreter line and `FAKE_AGENT_VERSION_LINE` assignment as the
 # fake agent, and `--version` answers the package's version probe.
 if [ "${1:-}" = --version ]; then
-    printf '%s\n' "$FAKE_CLAUDE_VERSION_LINE"
+    printf '%s\n' "$FAKE_AGENT_VERSION_LINE"
     exit 0
 fi
 # Do not emit readiness output before accepting the first prompt. The previous
