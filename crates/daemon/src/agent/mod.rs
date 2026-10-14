@@ -530,33 +530,44 @@ mod tests {
         crate::test_support::scoped_dir(&format!("pohunek-agent-test-{tag}-"))
     }
 
-    /// Set in a child process that runs one scenario in a fixture working
-    /// directory.
-    const FIXTURE_CWD_CHILD_VAR: &str = "POHUNEK_AGENT_TEST_FIXTURE_CWD_CHILD";
+    /// Set in the child process that [`in_own_process`] runs a test in.
+    const OWN_PROCESS_CHILD_VAR: &str = "POHUNEK_AGENT_TEST_OWN_PROCESS_CHILD";
 
-    /// Runs the test `name` of this module in a child process whose working
-    /// directory is `cwd`.
+    /// Runs the calling test's `body` in a child process of this test binary
+    /// that runs only that test.
     ///
-    /// The working directory is process-wide, so changing it here would reach
-    /// every concurrently running test of this binary and the children they
-    /// spawn; the child owns it instead.
-    fn run_in_fixture_cwd(cwd: &Path, name: &str) {
+    /// The working directory and the environment are process-wide: a test that
+    /// changed either here would reach every concurrently running test of this
+    /// binary and the children they spawn, including the `PATH` that registry
+    /// fixtures snapshot for their agents. The child owns them instead.
+    fn in_own_process(body: impl FnOnce()) {
+        if std::env::var_os(OWN_PROCESS_CHILD_VAR).is_some() {
+            body();
+            return;
+        }
+        let name = std::thread::current()
+            .name()
+            .expect("the test harness names each test's thread after the test")
+            .to_owned();
         let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
-            .args([
-                "--exact",
-                &format!("agent::tests::{name}"),
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .current_dir(cwd)
-            .env(FIXTURE_CWD_CHILD_VAR, "1")
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env(OWN_PROCESS_CHILD_VAR, "1")
             .output()
-            .expect("run the scenario in the fixture working directory");
+            .expect("run the test in its own process");
         assert!(
             output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
-            "{name} failed in the fixture working directory: {}{}",
+            "{name} failed in its own process: {}{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Panics unless the calling test runs [`in_own_process`], the only place
+    /// a test may change the process environment or working directory.
+    fn assert_own_process() {
+        assert!(
+            std::env::var_os(OWN_PROCESS_CHILD_VAR).is_some(),
+            "a test changes the process environment or working directory only in_own_process"
         );
     }
 
@@ -577,12 +588,14 @@ mod tests {
     }
 
     fn with_path<T>(path: &Path, run: impl FnOnce() -> T) -> T {
+        assert_own_process();
         let mut env = ProcessEnv::lock();
         env.set("PATH", path);
         run()
     }
 
     fn with_path_and_shell<T>(path: &Path, shell: &str, run: impl FnOnce() -> T) -> T {
+        assert_own_process();
         let mut env = ProcessEnv::lock();
         env.set("PATH", path).set("SHELL", shell);
         run()
@@ -605,68 +618,64 @@ mod tests {
 
     #[test]
     fn served_launches_resolve_their_binary_with_exact_argv_and_preserve_opts() {
-        for (name, expected_args) in [
-            ("codex", &[][..]),
-            ("claude", &[][..]),
-            ("hermes", &["chat"][..]),
-            ("shell", &[][..]),
-        ] {
-            let bin_dir = temp_dir(&format!("{name}-bin"));
-            let program = write_executable(&bin_dir, name);
-            let cwd = temp_dir(&format!("{name}-cwd"));
+        in_own_process(|| {
+            for (name, expected_args) in [
+                ("codex", &[][..]),
+                ("claude", &[][..]),
+                ("hermes", &["chat"][..]),
+                ("shell", &[][..]),
+            ] {
+                let bin_dir = temp_dir(&format!("{name}-bin"));
+                let program = write_executable(&bin_dir, name);
+                let cwd = temp_dir(&format!("{name}-cwd"));
 
-            // The shell runtime launches `$SHELL`, here a bare name on `PATH`.
-            let command = with_path_and_shell(&bin_dir, "shell", || {
-                launch_served(name, &launch_opts(cwd.clone())).expect("launch command")
-            });
+                // The shell runtime launches `$SHELL`, here a bare name on `PATH`.
+                let command = with_path_and_shell(&bin_dir, "shell", || {
+                    launch_served(name, &launch_opts(cwd.clone())).expect("launch command")
+                });
 
-            assert_eq!(command.program, program.display().to_string(), "{name}");
-            assert_eq!(command.args, expected_args, "{name}");
-            assert_eq!(command.cwd, *cwd, "{name}");
-            assert_eq!((command.cols, command.rows), (120, 40), "{name}");
-            assert_eq!(
-                command.env,
-                vec![("POHUNEK_SESSION_ID".to_owned(), "s-42".to_owned())],
-                "{name}"
-            );
-        }
+                assert_eq!(command.program, program.display().to_string(), "{name}");
+                assert_eq!(command.args, expected_args, "{name}");
+                assert_eq!(command.cwd, *cwd, "{name}");
+                assert_eq!((command.cols, command.rows), (120, 40), "{name}");
+                assert_eq!(
+                    command.env,
+                    vec![("POHUNEK_SESSION_ID".to_owned(), "s-42".to_owned())],
+                    "{name}"
+                );
+            }
+        });
     }
 
     #[test]
     fn validated_program_refuses_relative_and_empty_path_entries() {
-        let cwd = temp_dir("validated-relative-path");
-        let relative_dir = cwd.join("relative-bin");
-        fs::create_dir(&relative_dir).expect("create relative bin");
-        write_executable(&relative_dir, "hermes");
-        write_executable(&cwd, "hermes");
-        run_in_fixture_cwd(
-            &cwd,
-            "relative_path_entries_are_not_searched_from_the_fixture_cwd",
-        );
-    }
-
-    /// Child half of [`validated_program_refuses_relative_and_empty_path_entries`],
-    /// run with the fixture as its working directory.
-    #[test]
-    fn relative_path_entries_are_not_searched_from_the_fixture_cwd() {
-        if std::env::var_os(FIXTURE_CWD_CHILD_VAR).is_none() {
-            return;
-        }
-        let results = [
-            // A relative entry, an empty entry (the working directory), and `.`
-            // are never searched; neither is a relative program path.
-            ValidatedLaunchProgram::resolve_with_path("hermes", Some(OsStr::new("relative-bin"))),
-            ValidatedLaunchProgram::resolve_with_path("hermes", Some(OsStr::new(""))),
-            ValidatedLaunchProgram::resolve_with_path("hermes", Some(OsStr::new("."))),
-            ValidatedLaunchProgram::resolve_with_path("./hermes", Some(OsStr::new("/usr/bin"))),
-            ValidatedLaunchProgram::resolve_with_path(
-                "relative-bin/hermes",
-                Some(OsStr::new("/usr/bin")),
-            ),
-        ];
-        for (index, result) in results.iter().enumerate() {
-            assert!(result.is_none(), "case {index}: {result:?}");
-        }
+        in_own_process(|| {
+            let cwd = temp_dir("validated-relative-path");
+            let relative_dir = cwd.join("relative-bin");
+            fs::create_dir(&relative_dir).expect("create relative bin");
+            write_executable(&relative_dir, "hermes");
+            write_executable(&cwd, "hermes");
+            assert_own_process();
+            std::env::set_current_dir(&cwd).expect("enter the fixture directory");
+            let results = [
+                // A relative entry, an empty entry (the working directory), and `.`
+                // are never searched; neither is a relative program path.
+                ValidatedLaunchProgram::resolve_with_path(
+                    "hermes",
+                    Some(OsStr::new("relative-bin")),
+                ),
+                ValidatedLaunchProgram::resolve_with_path("hermes", Some(OsStr::new(""))),
+                ValidatedLaunchProgram::resolve_with_path("hermes", Some(OsStr::new("."))),
+                ValidatedLaunchProgram::resolve_with_path("./hermes", Some(OsStr::new("/usr/bin"))),
+                ValidatedLaunchProgram::resolve_with_path(
+                    "relative-bin/hermes",
+                    Some(OsStr::new("/usr/bin")),
+                ),
+            ];
+            for (index, result) in results.iter().enumerate() {
+                assert!(result.is_none(), "case {index}: {result:?}");
+            }
+        });
     }
 
     #[test]
@@ -693,73 +702,79 @@ mod tests {
 
     #[test]
     fn an_unusable_first_candidate_does_not_shadow_a_later_one() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let first = temp_dir("shadow-first");
-        let second = temp_dir("shadow-second");
-        // No execute bit at all: refused for every user, root included.
-        let unusable = first.join("agent");
-        fs::write(&unusable, "#!/bin/sh\nexit 0\n").expect("write");
-        fs::set_permissions(&unusable, fs::Permissions::from_mode(0o644)).expect("chmod");
-        let usable = write_executable(&second, "agent");
-        let path = std::env::join_paths([&first, &second]).expect("join");
-        let resolved = with_path(Path::new(&path), || {
-            (
-                which_executable("agent"),
-                resolve_binary("agent").expect("launch path resolves"),
-                ValidatedLaunchProgram::resolve("agent"),
-            )
+        in_own_process(|| {
+            use std::os::unix::fs::PermissionsExt as _;
+            let first = temp_dir("shadow-first");
+            let second = temp_dir("shadow-second");
+            // No execute bit at all: refused for every user, root included.
+            let unusable = first.join("agent");
+            fs::write(&unusable, "#!/bin/sh\nexit 0\n").expect("write");
+            fs::set_permissions(&unusable, fs::Permissions::from_mode(0o644)).expect("chmod");
+            let usable = write_executable(&second, "agent");
+            let path = std::env::join_paths([&first, &second]).expect("join");
+            let resolved = with_path(Path::new(&path), || {
+                (
+                    which_executable("agent"),
+                    resolve_binary("agent").expect("launch path resolves"),
+                    ValidatedLaunchProgram::resolve("agent"),
+                )
+            });
+            assert_eq!(resolved.0.as_deref(), Some(usable.as_path()));
+            assert_eq!(resolved.1, usable.display().to_string());
+            assert_eq!(
+                resolved.2.expect("validated").as_path(),
+                usable.canonicalize().expect("canonical")
+            );
         });
-        assert_eq!(resolved.0.as_deref(), Some(usable.as_path()));
-        assert_eq!(resolved.1, usable.display().to_string());
-        assert_eq!(
-            resolved.2.expect("validated").as_path(),
-            usable.canonicalize().expect("canonical")
-        );
     }
 
     #[test]
     fn empty_and_relative_path_entries_are_skipped_not_fatal() {
-        let bin = temp_dir("skip-entries");
-        let agent = write_executable(&bin, "agent");
-        let absolute = bin.display().to_string();
-        let filler = format!("/{}", "x".repeat(200));
-        let long = format!("{}:{absolute}", vec![filler; 40].join(":"));
-        for path in [
-            format!("{absolute}:"),
-            format!(":{absolute}"),
-            format!("./node_modules/.bin:{absolute}"),
-            long,
-        ] {
-            let resolved = with_path(Path::new(&path), || {
-                (resolve_binary("agent"), which_executable("agent"))
-            });
-            assert_eq!(
-                resolved.0.expect("launch path resolves"),
-                agent.display().to_string(),
-                "{path}"
-            );
-            assert_eq!(resolved.1.as_deref(), Some(agent.as_path()), "{path}");
-        }
+        in_own_process(|| {
+            let bin = temp_dir("skip-entries");
+            let agent = write_executable(&bin, "agent");
+            let absolute = bin.display().to_string();
+            let filler = format!("/{}", "x".repeat(200));
+            let long = format!("{}:{absolute}", vec![filler; 40].join(":"));
+            for path in [
+                format!("{absolute}:"),
+                format!(":{absolute}"),
+                format!("./node_modules/.bin:{absolute}"),
+                long,
+            ] {
+                let resolved = with_path(Path::new(&path), || {
+                    (resolve_binary("agent"), which_executable("agent"))
+                });
+                assert_eq!(
+                    resolved.0.expect("launch path resolves"),
+                    agent.display().to_string(),
+                    "{path}"
+                );
+                assert_eq!(resolved.1.as_deref(), Some(agent.as_path()), "{path}");
+            }
+        });
     }
 
     #[test]
     fn a_writable_candidate_is_never_launched_and_does_not_shadow_a_trusted_one() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let first = temp_dir("writable-first");
-        let second = temp_dir("writable-second");
-        // Mode 0777 lets any account replace the file the daemon would run.
-        let loose = write_executable(&first, "agent");
-        fs::set_permissions(&loose, fs::Permissions::from_mode(0o777)).expect("chmod");
-        let trusted = write_executable(&second, "agent");
-        let path = std::env::join_paths([&first, &second]).expect("join");
-        let resolved = with_path(Path::new(&path), || {
-            (which_executable("agent"), resolve_binary("agent"))
+        in_own_process(|| {
+            use std::os::unix::fs::PermissionsExt as _;
+            let first = temp_dir("writable-first");
+            let second = temp_dir("writable-second");
+            // Mode 0777 lets any account replace the file the daemon would run.
+            let loose = write_executable(&first, "agent");
+            fs::set_permissions(&loose, fs::Permissions::from_mode(0o777)).expect("chmod");
+            let trusted = write_executable(&second, "agent");
+            let path = std::env::join_paths([&first, &second]).expect("join");
+            let resolved = with_path(Path::new(&path), || {
+                (which_executable("agent"), resolve_binary("agent"))
+            });
+            assert_eq!(resolved.0.as_deref(), Some(trusted.as_path()));
+            assert_eq!(resolved.1.expect("resolves"), trusted.display().to_string());
+            // Alone, the writable candidate does not resolve at all.
+            let alone = with_path(first.as_path(), || resolve_binary("agent"));
+            alone.expect_err("a writable candidate alone does not resolve");
         });
-        assert_eq!(resolved.0.as_deref(), Some(trusted.as_path()));
-        assert_eq!(resolved.1.expect("resolves"), trusted.display().to_string());
-        // Alone, the writable candidate does not resolve at all.
-        let alone = with_path(first.as_path(), || resolve_binary("agent"));
-        alone.expect_err("a writable candidate alone does not resolve");
     }
 
     /// Writes an executable `git` that prints `label` into `dir`.
@@ -773,98 +788,96 @@ mod tests {
 
     #[test]
     fn helper_programs_run_the_trusted_candidate_never_an_unsafe_one_earlier_on_path() {
-        let first = temp_dir("git-unsafe");
-        let second = temp_dir("git-safe");
-        // Mode 0777 lets any account replace the program the daemon would run.
-        fake_git(&first, "unsafe", 0o777);
-        let safe = fake_git(&second, "safe", 0o755);
-        let path = std::env::join_paths([&first, &second]).expect("join");
-        let repo = temp_dir("git-repo");
-        let (detected, output, resolved) = with_path(Path::new(&path), || {
-            let detected = crate::project::detect::git(&repo, &[]);
-            let output = crate::worktree::git_command(&repo)
-                .expect("a trusted git exists")
-                .output()
-                .expect("spawn git");
-            (detected, output, trusted_program("git"))
+        in_own_process(|| {
+            let first = temp_dir("git-unsafe");
+            let second = temp_dir("git-safe");
+            // Mode 0777 lets any account replace the program the daemon would run.
+            fake_git(&first, "unsafe", 0o777);
+            let safe = fake_git(&second, "safe", 0o755);
+            let path = std::env::join_paths([&first, &second]).expect("join");
+            let repo = temp_dir("git-repo");
+            let (detected, output, resolved) = with_path(Path::new(&path), || {
+                let detected = crate::project::detect::git(&repo, &[]);
+                let output = crate::worktree::git_command(&repo)
+                    .expect("a trusted git exists")
+                    .output()
+                    .expect("spawn git");
+                (detected, output, trusted_program("git"))
+            });
+            let none = with_path(first.as_path(), || trusted_program("git"));
+            assert_eq!(detected.as_deref(), Some("safe"));
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "safe");
+            assert_eq!(resolved, Ok(safe));
+            // With only the unsafe candidate there is no git to run at all.
+            assert!(none.expect_err("untrusted").contains("not trusted"));
         });
-        let none = with_path(first.as_path(), || trusted_program("git"));
-        assert_eq!(detected.as_deref(), Some("safe"));
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "safe");
-        assert_eq!(resolved, Ok(safe));
-        // With only the unsafe candidate there is no git to run at all.
-        assert!(none.expect_err("untrusted").contains("not trusted"));
     }
 
     #[test]
     fn doctor_capabilities_and_spawn_agree_on_an_unsafe_git() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let loose_file = temp_dir("agree-file");
-        let loose_dir = temp_dir("agree-dir");
-        let safe_dir = temp_dir("agree-safe");
-        fake_git(&loose_file, "unsafe", 0o777);
-        fs::set_permissions(&loose_dir, fs::Permissions::from_mode(0o777)).expect("chmod");
-        fake_git(&loose_dir, "unsafe", 0o755);
-        let safe = fake_git(&safe_dir, "safe", 0o755);
-        // What each of the three consults, for one `PATH`.
-        let verdict = |path: &std::ffi::OsStr| {
-            let doctor = hostcheck::binary_with_path("git", true, Some(path), "");
-            let capability = hostcheck::resolve_executable("git", Some(path));
-            let spawn = with_path(Path::new(path), || trusted_program("git").ok());
-            (
-                doctor.status == protocol::DoctorStatus::Ok,
-                capability,
-                spawn,
-            )
-        };
-        for unsafe_only in [&loose_file, &loose_dir] {
-            let (doctor_ok, capability, spawn) = verdict(unsafe_only.as_os_str());
-            assert!(!doctor_ok, "doctor must not accept an unsafe git");
-            assert_eq!(capability, None);
-            assert_eq!(spawn, None);
-        }
-        let both = std::env::join_paths([&loose_file, &loose_dir, &safe_dir]).expect("join");
-        let (doctor_ok, capability, spawn) = verdict(&both);
-        assert!(doctor_ok);
-        assert_eq!(capability, Some(safe.clone()));
-        assert_eq!(spawn, Some(safe));
+        in_own_process(|| {
+            use std::os::unix::fs::PermissionsExt as _;
+            let loose_file = temp_dir("agree-file");
+            let loose_dir = temp_dir("agree-dir");
+            let safe_dir = temp_dir("agree-safe");
+            fake_git(&loose_file, "unsafe", 0o777);
+            fs::set_permissions(&loose_dir, fs::Permissions::from_mode(0o777)).expect("chmod");
+            fake_git(&loose_dir, "unsafe", 0o755);
+            let safe = fake_git(&safe_dir, "safe", 0o755);
+            // What each of the three consults, for one `PATH`.
+            let verdict = |path: &std::ffi::OsStr| {
+                let doctor = hostcheck::binary_with_path("git", true, Some(path), "");
+                let capability = hostcheck::resolve_executable("git", Some(path));
+                let spawn = with_path(Path::new(path), || trusted_program("git").ok());
+                (
+                    doctor.status == protocol::DoctorStatus::Ok,
+                    capability,
+                    spawn,
+                )
+            };
+            for unsafe_only in [&loose_file, &loose_dir] {
+                let (doctor_ok, capability, spawn) = verdict(unsafe_only.as_os_str());
+                assert!(!doctor_ok, "doctor must not accept an unsafe git");
+                assert_eq!(capability, None);
+                assert_eq!(spawn, None);
+            }
+            let both = std::env::join_paths([&loose_file, &loose_dir, &safe_dir]).expect("join");
+            let (doctor_ok, capability, spawn) = verdict(&both);
+            assert!(doctor_ok);
+            assert_eq!(capability, Some(safe.clone()));
+            assert_eq!(spawn, Some(safe));
+        });
     }
 
     #[test]
     fn the_launch_path_refuses_relative_programs_and_path_entries() {
-        let cwd = temp_dir("launch-relative");
-        let relative_dir = cwd.join("bin");
-        fs::create_dir(&relative_dir).expect("create bin");
-        write_executable(&relative_dir, "agent");
-        write_executable(&cwd, "agent");
-        run_in_fixture_cwd(&cwd, "relative_programs_are_refused_from_the_fixture_cwd");
-    }
-
-    /// Child half of [`the_launch_path_refuses_relative_programs_and_path_entries`],
-    /// run with the fixture as its working directory.
-    #[test]
-    fn relative_programs_are_refused_from_the_fixture_cwd() {
-        if std::env::var_os(FIXTURE_CWD_CHILD_VAR).is_none() {
-            return;
-        }
-        let mut env = ProcessEnv::lock();
-        let refused = [
-            ("bin", "agent"),
-            ("", "agent"),
-            (".", "agent"),
-            ("/usr/bin", "./agent"),
-            ("/usr/bin", "bin/agent"),
-        ]
-        .map(|(path, program)| {
-            env.set("PATH", path);
-            (
-                resolve_binary(program).is_err(),
-                which_executable(program).is_none(),
-            )
+        in_own_process(|| {
+            let cwd = temp_dir("launch-relative");
+            let relative_dir = cwd.join("bin");
+            fs::create_dir(&relative_dir).expect("create bin");
+            write_executable(&relative_dir, "agent");
+            write_executable(&cwd, "agent");
+            assert_own_process();
+            std::env::set_current_dir(&cwd).expect("enter the fixture directory");
+            let refused = [
+                ("bin", "agent"),
+                ("", "agent"),
+                (".", "agent"),
+                ("/usr/bin", "./agent"),
+                ("/usr/bin", "bin/agent"),
+            ]
+            .map(|(path, program)| {
+                with_path(Path::new(path), || {
+                    (
+                        resolve_binary(program).is_err(),
+                        which_executable(program).is_none(),
+                    )
+                })
+            });
+            for (index, (launch, probe)) in refused.iter().enumerate() {
+                assert!(*launch && *probe, "case {index}");
+            }
         });
-        for (index, (launch, probe)) in refused.iter().enumerate() {
-            assert!(*launch && *probe, "case {index}");
-        }
     }
 
     #[test]
@@ -952,165 +965,178 @@ mod tests {
 
     #[test]
     fn fork_pty_command_preserves_claude_argv_with_frozen_args() {
-        let bin_dir = temp_dir("template-fork-bin");
-        write_executable(&bin_dir, "claude-sonnet");
-        let cwd = temp_dir("template-fork-cwd");
-        let session = SessionRef::id("native-123").expect("id ref");
-        let launch = served_native_launch(&protocol::RuntimeId::claude()).expect("claude recovers");
+        in_own_process(|| {
+            let bin_dir = temp_dir("template-fork-bin");
+            write_executable(&bin_dir, "claude-sonnet");
+            let cwd = temp_dir("template-fork-cwd");
+            let session = SessionRef::id("native-123").expect("id ref");
+            let launch =
+                served_native_launch(&protocol::RuntimeId::claude()).expect("claude recovers");
 
-        let command = with_path(&bin_dir, || {
-            fork_pty_command_from_launch(
-                "claude-sonnet",
-                vec!["--model".to_owned(), "sonnet".to_owned()],
-                &launch,
-                &session,
-                &launch_opts(&cwd),
-            )
-            .expect("fork command")
-            .0
+            let command = with_path(&bin_dir, || {
+                fork_pty_command_from_launch(
+                    "claude-sonnet",
+                    vec!["--model".to_owned(), "sonnet".to_owned()],
+                    &launch,
+                    &session,
+                    &launch_opts(&cwd),
+                )
+                .expect("fork command")
+                .0
+            });
+
+            assert_eq!(
+                command.args,
+                vec![
+                    "--model",
+                    "sonnet",
+                    "--resume",
+                    "native-123",
+                    "--fork-session",
+                ]
+            );
         });
-
-        assert_eq!(
-            command.args,
-            vec![
-                "--model",
-                "sonnet",
-                "--resume",
-                "native-123",
-                "--fork-session",
-            ]
-        );
     }
 
     #[test]
     fn hermes_resume_keeps_reference_as_one_argument_after_chat() {
-        let bin_dir = temp_dir("hermes-resume-bin");
-        write_executable(&bin_dir, "hermes");
-        let session = SessionRef::id("native id with spaces + symbols")
-            .expect("spaces and non-control symbols are valid in opaque ids");
+        in_own_process(|| {
+            let bin_dir = temp_dir("hermes-resume-bin");
+            write_executable(&bin_dir, "hermes");
+            let session = SessionRef::id("native id with spaces + symbols")
+                .expect("spaces and non-control symbols are valid in opaque ids");
 
-        let command = with_path(&bin_dir, || {
-            resume_pty_command_from_launch(
-                "hermes",
-                vec!["chat".to_owned()],
-                &served_native_launch(&protocol::RuntimeId::hermes()).expect("Hermes resumes"),
-                &session,
-                &launch_opts(temp_dir("hermes-resume-cwd")),
-            )
-            .expect("Hermes resume command")
+            let command = with_path(&bin_dir, || {
+                resume_pty_command_from_launch(
+                    "hermes",
+                    vec!["chat".to_owned()],
+                    &served_native_launch(&protocol::RuntimeId::hermes()).expect("Hermes resumes"),
+                    &session,
+                    &launch_opts(temp_dir("hermes-resume-cwd")),
+                )
+                .expect("Hermes resume command")
+            });
+
+            assert_eq!(
+                command.args,
+                vec!["chat", "--resume", "native id with spaces + symbols"]
+            );
+            assert!(!command
+                .args
+                .iter()
+                .any(|arg| { matches!(arg.as_str(), "--continue" | "--pass-session-id") }));
         });
-
-        assert_eq!(
-            command.args,
-            vec!["chat", "--resume", "native id with spaces + symbols"]
-        );
-        assert!(!command
-            .args
-            .iter()
-            .any(|arg| { matches!(arg.as_str(), "--continue" | "--pass-session-id") }));
     }
 
     #[test]
     fn resume_keeps_shell_metacharacter_references_as_one_argv_element() {
-        let bin_dir = temp_dir("template-meta-bin");
-        write_executable(&bin_dir, "myagent");
-        let cwd = temp_dir("template-meta-cwd");
-        let launch = served_native_launch(&protocol::RuntimeId::claude()).expect("claude recovers");
-        let hostile_id = "a b;$(touch pwned)|`x` 'q' \"z\" *";
-        let hostile_path = "/work/a b/$(touch pwned);|.jsonl";
+        in_own_process(|| {
+            let bin_dir = temp_dir("template-meta-bin");
+            write_executable(&bin_dir, "myagent");
+            let cwd = temp_dir("template-meta-cwd");
+            let launch =
+                served_native_launch(&protocol::RuntimeId::claude()).expect("claude recovers");
+            let hostile_id = "a b;$(touch pwned)|`x` 'q' \"z\" *";
+            let hostile_path = "/work/a b/$(touch pwned);|.jsonl";
 
-        let by_id = with_path(&bin_dir, || {
-            resume_pty_command_from_launch(
-                "myagent",
-                Vec::new(),
-                &launch,
-                &SessionRef::id(hostile_id).expect("id"),
-                &launch_opts(&cwd),
-            )
-            .expect("id resume")
-        });
-        assert_eq!(
-            by_id.args,
-            vec!["--resume".to_owned(), hostile_id.to_owned()]
-        );
-
-        let path_launch = NativeSessionLaunch::new(
-            SessionRefKind::Path,
-            NativeArgs::from_template(&["--session", "{reference}"]).expect("resume"),
-            Some(NativeArgs::from_template(&["--fork", "{reference}"]).expect("fork")),
-        );
-        let path = SessionRef::path(hostile_path).expect("path");
-        let (resume, fork) = with_path(&bin_dir, || {
-            (
+            let by_id = with_path(&bin_dir, || {
                 resume_pty_command_from_launch(
                     "myagent",
                     Vec::new(),
-                    &path_launch,
-                    &path,
+                    &launch,
+                    &SessionRef::id(hostile_id).expect("id"),
                     &launch_opts(&cwd),
                 )
-                .expect("path resume"),
-                fork_pty_command_from_launch(
-                    "myagent",
-                    Vec::new(),
-                    &path_launch,
-                    &path,
-                    &launch_opts(&cwd),
+                .expect("id resume")
+            });
+            assert_eq!(
+                by_id.args,
+                vec!["--resume".to_owned(), hostile_id.to_owned()]
+            );
+
+            let path_launch = NativeSessionLaunch::new(
+                SessionRefKind::Path,
+                NativeArgs::from_template(&["--session", "{reference}"]).expect("resume"),
+                Some(NativeArgs::from_template(&["--fork", "{reference}"]).expect("fork")),
+            );
+            let path = SessionRef::path(hostile_path).expect("path");
+            let (resume, fork) = with_path(&bin_dir, || {
+                (
+                    resume_pty_command_from_launch(
+                        "myagent",
+                        Vec::new(),
+                        &path_launch,
+                        &path,
+                        &launch_opts(&cwd),
+                    )
+                    .expect("path resume"),
+                    fork_pty_command_from_launch(
+                        "myagent",
+                        Vec::new(),
+                        &path_launch,
+                        &path,
+                        &launch_opts(&cwd),
+                    )
+                    .expect("path fork")
+                    .0,
                 )
-                .expect("path fork")
-                .0,
-            )
+            });
+            assert_eq!(
+                resume.args,
+                vec!["--session".to_owned(), hostile_path.to_owned()]
+            );
+            assert_eq!(
+                fork.args,
+                vec!["--fork".to_owned(), hostile_path.to_owned()]
+            );
         });
-        assert_eq!(
-            resume.args,
-            vec!["--session".to_owned(), hostile_path.to_owned()]
-        );
-        assert_eq!(
-            fork.args,
-            vec!["--fork".to_owned(), hostile_path.to_owned()]
-        );
     }
 
     #[test]
     fn resume_pty_command_from_launch_preserves_frozen_profile_args() {
-        let bin_dir = temp_dir("template-args-bin");
-        write_executable(&bin_dir, "myagent");
-        let cwd = temp_dir("template-args-cwd");
-        let session = SessionRef::id("native-123").expect("id ref");
-        let launch = served_native_launch(&protocol::RuntimeId::claude()).expect("claude recovers");
+        in_own_process(|| {
+            let bin_dir = temp_dir("template-args-bin");
+            write_executable(&bin_dir, "myagent");
+            let cwd = temp_dir("template-args-cwd");
+            let session = SessionRef::id("native-123").expect("id ref");
+            let launch =
+                served_native_launch(&protocol::RuntimeId::claude()).expect("claude recovers");
 
-        let command = with_path(&bin_dir, || {
-            resume_pty_command_from_launch(
-                "myagent",
-                vec!["--model".to_owned(), "sonnet".to_owned()],
-                &launch,
-                &session,
-                &launch_opts(&cwd),
-            )
-            .expect("resume command")
+            let command = with_path(&bin_dir, || {
+                resume_pty_command_from_launch(
+                    "myagent",
+                    vec!["--model".to_owned(), "sonnet".to_owned()],
+                    &launch,
+                    &session,
+                    &launch_opts(&cwd),
+                )
+                .expect("resume command")
+            });
+
+            // The program is the snapshot's, not the base runtime's `claude`.
+            assert!(command.program.ends_with("/myagent"), "{}", command.program);
+            assert_eq!(
+                command.args,
+                vec!["--model", "sonnet", "--resume", "native-123"],
+                "resume relaunch must preserve frozen profile args before resume argv"
+            );
         });
-
-        // The program is the snapshot's, not the base runtime's `claude`.
-        assert!(command.program.ends_with("/myagent"), "{}", command.program);
-        assert_eq!(
-            command.args,
-            vec!["--model", "sonnet", "--resume", "native-123"],
-            "resume relaunch must preserve frozen profile args before resume argv"
-        );
     }
 
     #[test]
     fn missing_agent_binary_returns_typed_error() {
-        let empty_path = temp_dir("empty-path");
-        let cwd = temp_dir("missing-cwd");
+        in_own_process(|| {
+            let empty_path = temp_dir("empty-path");
+            let cwd = temp_dir("missing-cwd");
 
-        let err = with_path(&empty_path, || {
-            launch_served("codex", &launch_opts(&cwd)).expect_err("missing codex binary")
+            let err = with_path(&empty_path, || {
+                launch_served("codex", &launch_opts(&cwd)).expect_err("missing codex binary")
+            });
+
+            assert_eq!(err.class, ErrorClass::Runtime);
+            assert_eq!(err.code, "agent_binary_missing");
+            assert!(err.msg.contains("codex"));
+            assert!(err.recover.is_some());
         });
-
-        assert_eq!(err.class, ErrorClass::Runtime);
-        assert_eq!(err.code, "agent_binary_missing");
-        assert!(err.msg.contains("codex"));
-        assert!(err.recover.is_some());
     }
 }
