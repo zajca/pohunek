@@ -1611,14 +1611,10 @@ impl Upgrade {
             .json(&["service", "upgrade", "--from", &from, "--json"]);
         eprintln!("service upgrade: {report}");
         assert_upgrade_report(&report, &self.previous_version, &self.head_version);
+        // After an apply the upgrade's preflight is the judgement against the
+        // installed packages, which carries no plan; `service check` above
+        // carries the plan and `runtimes` below the applied step.
         assert_preflight_adoptable(&report, live, stopped, head_version, "service upgrade");
-        assert_runtime_step(
-            &report["preflight"]["runtimes"],
-            &planned,
-            "bind",
-            &plan_profiles,
-            "service upgrade plan",
-        );
         let applied: Vec<(&str, &str, &str)> = planned
             .iter()
             .map(|(runtime, digest, status)| {
