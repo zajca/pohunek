@@ -78,7 +78,7 @@ instead of competing with them.
 ### Runtime plugin packages — [#139](https://github.com/zajca/pohunek/issues/139) (milestone C, project 5)
 
 Runtimes become signed, content-addressed packages installed per host; only
-`shell` stays built in. **37/46.** Landed: the accepted RFC (#152), the
+`shell` stays built in. **37/46** on 2026-10-14. Landed: the accepted RFC (#152), the
 `RuntimeId` protocol and generic runtime host (#140), the authenticated package
 registry (#141), the CLI lifecycle and profile migration (#143), generic hook
 schemas and integration activation (#144), digest-bound package releases with
@@ -98,7 +98,7 @@ Guide: [`knowledge/guides/runtime-packages.md`](knowledge/guides/runtime-package
 
 ### Workflow plugins — [#148](https://github.com/zajca/pohunek/issues/148) (child of #139; milestone C, project 5)
 
-Bounded out-of-process plugins with declared actions and jobs. **4/4.** Landed:
+Bounded out-of-process plugins with declared actions and jobs. **4/4** on 2026-10-14. Landed:
 `session.list` metadata filter (#327) and the display decision (#328: core adds
 no UI data contract; `zajca/pohunek-work` renders plugin data from public
 contracts). Also landed under #148: the CLI-owned workflow plugin store,
