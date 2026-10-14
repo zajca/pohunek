@@ -191,7 +191,7 @@ filter = '''
 (package(=pohunek-platform) and binary(=launchd))
 or (package(=pohunek-daemon) and binary(=supervised_lifecycle))
 or (package(=pohunek-cli) and (
-  binary(=service_launchd) or binary(=service_upgrade)
+  binary(=service_launchd) or binary(=service_upgrade) or binary(=setup_host_native)
   or binary(=workflow_launchd) or binary(=workflow_store)))
 '''
 test-group = 'launchd-gui'

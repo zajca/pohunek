@@ -55,7 +55,7 @@ use crate::commands::integration::{
 use crate::commands::setup::{config_files, install_config_into, ConfigResult};
 use crate::error::CliError;
 use crate::paths::Paths;
-use crate::service::engine::{install_layout, installed_search_path};
+use crate::service::engine::{install_layout, installed_job_path};
 use crate::service::report::{IntegrationReinstall, StatusReport};
 use crate::service::runtimes::DaemonRuntimes;
 use crate::service::{self, Context, VERSION};
@@ -386,7 +386,7 @@ async fn plan_in(
         match status.active_version.as_deref() {
             Some(VERSION) => {
                 let dir = installed_version_dir(&status)?;
-                let search = installed_search_path(context).await?;
+                let search = installed_job_path(context).await?.value;
                 (ServiceStep::Present, dir, search)
             }
             other => {
@@ -586,7 +586,7 @@ async fn install_service(
             detail: "the installed daemon has no version directory".to_owned(),
             applied: Vec::new(),
         })?;
-    let installed_search = installed_search_path(context).await?;
+    let installed_search = installed_job_path(context).await?.value;
     let after = planner
         .plan(context, &version_dir, &installed_search)
         .await?;
