@@ -686,7 +686,16 @@ Foreground reconciliation selects the recognized process-group leader first;
 when the leader is an unidentified wrapper, it selects a recognized member of
 the same foreground PGID. It never selects a nested agent by kind from another
 process group. Replacing an active agent clears stale native identity metadata
-and switches the detector configuration with the new agent.
+and switches the detector configuration with the new agent. An active agent
+that a managed hook reports through the session's worker switches it the same
+way once the daemon projects the worker's journal, and its release restores the
+session's default configuration.
+
+The durable session record keeps the active agent the worker journaled, with
+whether it was reported or observed, so a daemon restart restores it even after
+the worker's claim expired. An agent reported only to the daemon socket (the
+hooks' fallback when the worker cannot be reached) or observed by procwatch is
+kept in memory; procwatch observes a running agent again after a restart.
 
 A known shell foreground group suppresses descendant fallback after clearing a
 process-bound nested claim, which prevents claim/clear flapping while the agent

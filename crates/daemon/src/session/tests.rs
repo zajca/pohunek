@@ -820,7 +820,7 @@ async fn composite_wait_short_circuits_ended_lost_and_disappeared_runtimes() {
 /// start identity of a process, and one request and response round trip with
 /// the worker socket.
 #[cfg(unix)]
-const WORKER_IDENTITY_HELPERS: &str = r#"import json
+pub(super) const WORKER_IDENTITY_HELPERS: &str = r#"import json
 import os
 import socket
 import sys

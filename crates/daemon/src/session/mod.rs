@@ -6657,9 +6657,10 @@ impl SessionAgentResolution {
     }
 }
 
-/// Re-resolutions an active-agent report attempts when package changes keep
-/// replacing the session's pin between its resolution and its commit; each
-/// one needs a package transaction to finish inside that window.
+/// Re-resolutions an active-agent report or a worker identity projection
+/// attempts when package changes keep replacing the session's pin between its
+/// resolution and its commit; each one needs a package transaction to finish
+/// inside that window.
 const MAX_STALE_REPORT_RESOLUTIONS: u32 = 3;
 
 /// Whether `current` is still the pinned definition `resolved` captured.

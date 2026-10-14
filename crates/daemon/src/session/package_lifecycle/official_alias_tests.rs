@@ -13,11 +13,13 @@
 
 use pohunek_service_config::preflight::PROBE_BUDGET;
 use std::fs;
+use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use package::PackageDigest;
 use pohunek_service_config::preflight::{Verdict, CODE_RUNTIME_SOURCE_NOT_SERVED};
+use pohunek_test_support::wait::wait_until;
 use protocol::{
     PackageBindProfileParams, PackageBindStatus, PackageErrorKind, PackageInstallStatus,
     PackageOrigin, PackageSetEnabledParams, PackageUninstallParams, RuntimeId,
@@ -30,8 +32,8 @@ use crate::agent::host::ServedBy;
 use crate::procwatch::HostInspector;
 use crate::session::procwatch::OwnRuntime;
 use crate::session::tests::{
-    durable_recovery, hermetic_shell, native_report_params, params, temp_dir, temp_store_path,
-    write_supported_hermes_executable,
+    durable_recovery, hermetic_shell, hook_gate, native_report_params, params, temp_dir,
+    temp_store_path, write_supported_hermes_executable, WORKER_IDENTITY_HELPERS,
 };
 use crate::session::upgrade_preflight::{self, PreflightInputs};
 use crate::session::{SessionRegistry, SessionRegistryConfig};
@@ -2861,8 +2863,14 @@ async fn observe_own_runtime_process(registry: &SessionRegistry, id: &protocol::
 /// A live session of the built-in Claude runtime, adopted by the installed
 /// package, with a host profile named like the runtime that carries its own
 /// manifest override and is pinned to the package.
+/// Launch keys of a session agent that sleeps until the test stops it.
+const SLEEPING_LAUNCH: &str = "program = \"/bin/sh\"\nargs = [\"-c\", \"sleep 600\"]\n";
+
+/// Adopts a session of profile [`PROFILE`], launched with `launch`, beside a
+/// host profile named like its runtime that carries its own manifest.
 async fn adopt_session_beside_a_profile_named_like_its_runtime(
     tag: &str,
+    launch: &str,
 ) -> (Fixture, protocol::SessionId) {
     let key = signing_key("root");
     let dir = temp_dir(tag);
@@ -2883,10 +2891,7 @@ async fn adopt_session_beside_a_profile_named_like_its_runtime(
         RuntimeId::CLAUDE,
         "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 600\"]\nmanifest = \"tuned\"\n",
     );
-    fixture.write_profile(
-        PROFILE,
-        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 600\"]\n",
-    );
+    fixture.write_profile(PROFILE, &format!("base = \"claude\"\n{launch}"));
     let previous = compiled_in_daemon(&fixture, &store_path);
     let created = previous
         .create(protocol::SessionNewParams {
@@ -2959,60 +2964,251 @@ async fn running_detector(registry: &SessionRegistry, id: &protocol::SessionId) 
     detector_debug(&config)
 }
 
-#[tokio::test]
-async fn an_explicit_report_of_a_profile_named_like_its_runtime_keeps_its_override_through_a_restart(
-) {
-    let (adopted, created_id) =
-        adopt_session_beside_a_profile_named_like_its_runtime("claude-reported-shadow").await;
-    assert!(
-        adopted
-            .registry
-            .report_agent(claude_identity_report(&created_id))
-            .await
-            .recorded,
-        "the explicit report of the profile named like the runtime is recorded"
-    );
-    let override_config = running_detector(&adopted.registry, &created_id).await;
-    assert_ne!(
-        override_config,
-        detector_debug(&crate::detect::DetectorConfig::for_definition(
-            &adopted
+/// Python agent that reports itself to its worker as the Claude agent once the
+/// test releases its gate, releases that identity on the next release, and
+/// then holds until the session stops. It is the session's root process, as a
+/// directly launched agent is, so procwatch leaves its claim to the root's
+/// exit.
+const WORKER_REPORTED_CLAUDE: &str = r#"
+import datetime
+import time
+
+gate = open(sys.argv[1], encoding="ascii")
+failure_path = sys.argv[1] + ".failure"
+
+def record_failure(kind, value, trace):
+    # The test reads this file, so the reporter never dies without a reason.
+    import traceback
+    with open(failure_path, "w", encoding="utf-8") as handle:
+        handle.write("".join(traceback.format_exception(kind, value, trace)))
+
+sys.excepthook = record_failure
+pid = os.getpid()
+start_identity = process_start_identity(pid)
+
+def claim(kind, sequence):
+    return {
+        "type": kind,
+        "runtime_id": os.environ["POHUNEK_WORKER_INSTANCE_ID"],
+        "provider": "claude",
+        "pid": pid,
+        "start_identity": start_identity,
+        "sequence": sequence,
+    }
+
+gate.readline()
+# Worker claim sequences are the host CLOCK_MONOTONIC in nanoseconds.
+sequence = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+report = claim("identity_report", sequence)
+report["expires_at"] = (
+    datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=int(sys.argv[2]))
+).isoformat().replace("+00:00", "Z")
+assert send(report) is True
+gate.readline()
+assert send(claim("identity_release", sequence + 1)) is True
+gate.readline()
+"#;
+
+/// Lifetime of a claim that outlives every step of its scenario, inside the
+/// worker's bound.
+const LASTING_CLAIM_TTL_SECS: u32 = 55;
+
+/// Lifetime of a claim the scenario lets expire in the worker. The scenario
+/// waits for the daemon to project the claim first, which takes milliseconds.
+const EXPIRING_CLAIM_TTL_SECS: u32 = 5;
+
+/// A session of [`PROFILE`] running [`WORKER_REPORTED_CLAUDE`], beside a host
+/// profile named like its runtime, with the reporter's gate and its claim
+/// lifetime of `ttl_secs`.
+struct WorkerReportedClaude {
+    adopted: Fixture,
+    id: protocol::SessionId,
+    gate: fs::File,
+    failure_path: PathBuf,
+    /// The running configuration of an explicit report of the profile named
+    /// like the runtime: its manifest override.
+    override_config: String,
+    /// The session's own default configuration.
+    default_config: String,
+}
+
+impl WorkerReportedClaude {
+    async fn adopt(tag: &str, ttl_secs: u32) -> Self {
+        let root = temp_dir(&format!("{tag}-agent"));
+        let reporter = root.join("reporter.py");
+        fs::write(
+            &reporter,
+            [WORKER_IDENTITY_HELPERS, WORKER_REPORTED_CLAUDE].concat(),
+        )
+        .expect("write the identity reporter");
+        let gate_path = root.join("reporter.gate");
+        let gate = hook_gate(&gate_path);
+        let (adopted, id) = adopt_session_beside_a_profile_named_like_its_runtime(
+            tag,
+            &format!(
+                "program = \"python3\"\nargs = [\"{}\", \"{}\", \"{ttl_secs}\"]\n",
+                reporter.display(),
+                gate_path.display()
+            ),
+        )
+        .await;
+        let (override_config, default_config) = {
+            let sessions = adopted.registry.inner.sessions.lock().await;
+            let entry = sessions.get(&id).expect("the live session");
+            let pinned = entry.pinned.clone().expect("the session's pin is served");
+            let shadow = adopted
                 .registry
                 .inner
                 .profiles
-                .runtimes()
-                .resolve_id(&RuntimeId::parse(RuntimeId::CLAUDE).expect("runtime id"))
-                .expect("the package serves claude")
-        )),
-        "the report runs the profile's manifest override"
-    );
-    persist_session(&adopted.registry, &created_id).await;
-    let adopted = adopted.reopen_with_workers_of(&adopted.registry).await;
+                .resolve_agent_pinned(RuntimeId::CLAUDE, &pinned)
+                .expect("the profile resolves through the pinned definition");
+            (
+                detector_debug(&crate::session::detector_config_for_resolved_agent(&shadow)),
+                detector_debug(&entry.default_detector_config),
+            )
+        };
+        assert_ne!(
+            override_config, default_config,
+            "the profile's manifest override is not the session's default detector"
+        );
+        Self {
+            adopted,
+            id,
+            gate,
+            failure_path: PathBuf::from(format!("{}.failure", gate_path.display())),
+            override_config,
+            default_config,
+        }
+    }
+
+    /// Lets the reporter take its next step.
+    fn release(&mut self) {
+        self.gate
+            .write_all(b"next\n")
+            .expect("release the reporter's next step");
+    }
+
+    /// Waits until the session's active agent is `agent` and its detector runs
+    /// `config`.
+    async fn wait_for(&self, what: &str, agent: Option<&str>, config: &str) {
+        let registry = &self.adopted.registry;
+        wait_until(what, || async {
+            if let Ok(failure) = fs::read_to_string(&self.failure_path) {
+                panic!("the identity reporter failed: {failure}");
+            }
+            let info = registry.inspect(&self.id).await.expect("inspect");
+            (info.active_agent.as_deref() == agent
+                && running_detector(registry, &self.id).await == config)
+                .then_some(())
+        })
+        .await;
+    }
+
+    async fn stop(self) {
+        self.adopted
+            .registry
+            .stop(&self.id)
+            .await
+            .expect("stop the adopted session");
+        self.adopted
+            .registry
+            .remove(&self.id)
+            .await
+            .expect("remove the adopted session");
+    }
+}
+
+#[tokio::test]
+async fn a_worker_reported_agent_runs_its_detector_until_its_release() {
+    let mut session =
+        WorkerReportedClaude::adopt("claude-worker-reported-live", LASTING_CLAIM_TTL_SECS).await;
+    session.release();
+    let override_config = session.override_config.clone();
+    session
+        .wait_for(
+            "the worker report to run the reported profile's override",
+            Some(RuntimeId::CLAUDE),
+            &override_config,
+        )
+        .await;
+    session.release();
+    let default_config = session.default_config.clone();
+    session
+        .wait_for(
+            "the worker release to restore the session's default detector",
+            None,
+            &default_config,
+        )
+        .await;
+    session.stop().await;
+}
+
+#[tokio::test]
+async fn a_worker_reported_profile_named_like_its_runtime_keeps_its_override_through_a_restart() {
+    let mut session =
+        WorkerReportedClaude::adopt("claude-worker-reported-restart", EXPIRING_CLAIM_TTL_SECS)
+            .await;
+    session.release();
+    let override_config = session.override_config.clone();
+    session
+        .wait_for(
+            "the worker report to run the reported profile's override",
+            Some(RuntimeId::CLAUDE),
+            &override_config,
+        )
+        .await;
+    // Once the claim expired, the worker no longer reports it, and a restart
+    // restores the active agent from the session's durable record alone.
+    let worker = {
+        let sessions = session.adopted.registry.inner.sessions.lock().await;
+        let entry = sessions.get(&session.id).expect("the live session");
+        let crate::session::RuntimeHandle::Worker(worker) = &entry.runtime else {
+            panic!("the session runs on a worker");
+        };
+        worker.clone()
+    };
+    wait_until("the worker to drop the expired claim", || async {
+        worker
+            .inspect()
+            .await
+            .expect("inspect the worker")
+            .active_identity
+            .is_none()
+            .then_some(())
+    })
+    .await;
+
+    let adopted = session
+        .adopted
+        .reopen_with_workers_of(&session.adopted.registry)
+        .await;
     Box::pin(adopted.registry.reconcile_workers())
         .await
         .expect("startup reconciliation");
     assert_eq!(
-        running_detector(&adopted.registry, &created_id).await,
+        adopted
+            .registry
+            .inspect(&session.id)
+            .await
+            .expect("inspect")
+            .active_agent
+            .as_deref(),
+        Some(RuntimeId::CLAUDE),
+        "the durable record restores the reported agent"
+    );
+    assert_eq!(
+        running_detector(&adopted.registry, &session.id).await,
         override_config,
         "the reconciled session starts with the restored report's override"
     );
-
     install_unselected_next_claude(&adopted).await;
     assert_eq!(
-        running_detector(&adopted.registry, &created_id).await,
+        running_detector(&adopted.registry, &session.id).await,
         override_config,
         "a restored report keeps the profile's override through a package refresh"
     );
-    adopted
-        .registry
-        .stop(&created_id)
-        .await
-        .expect("stop the adopted session");
-    adopted
-        .registry
-        .remove(&created_id)
-        .await
-        .expect("remove the adopted session");
+    session.adopted = adopted;
+    session.stop().await;
 }
 
 /// Records a nested Codex agent as procwatch observes it in session `id`.
@@ -3159,8 +3355,11 @@ async fn an_observed_nested_agent_in_a_record_without_an_origin_is_restored_as_o
 
 #[tokio::test]
 async fn a_procwatch_observed_own_agent_is_not_shadowed_by_a_profile_named_like_its_runtime() {
-    let (adopted, created_id) =
-        adopt_session_beside_a_profile_named_like_its_runtime("claude-observed-shadow").await;
+    let (adopted, created_id) = adopt_session_beside_a_profile_named_like_its_runtime(
+        "claude-observed-shadow",
+        SLEEPING_LAUNCH,
+    )
+    .await;
     observe_own_runtime_process(&adopted.registry, &created_id).await;
     // The daemon restarts from its persisted record.
     persist_session(&adopted.registry, &created_id).await;
