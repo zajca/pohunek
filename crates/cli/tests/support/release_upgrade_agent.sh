@@ -78,7 +78,9 @@ done
 
 if [ -n "$resume_ref" ]; then
     native_id="$resume_ref"
-    launch_event="evt-after-resume"
+    # The daemon merges notifications that carry one hook event id, whichever
+    # session sends it, so each resumed launch sends its own.
+    launch_event="evt-after-resume-$$"
 else
     native_id="$FAKE_AGENT_NATIVE_ID"
     launch_event="evt-before-upgrade"

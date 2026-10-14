@@ -215,7 +215,10 @@ const NATIVE_AFTER: &str = "native-after-upgrade";
 /// release's own notification hook is not accepted by its own daemon, so that
 /// one is not observable and not asserted.
 const EVENT_AFTER_UPGRADE: &str = "evt-after-upgrade";
-const EVENT_AFTER_RESUME: &str = "evt-after-resume";
+/// Prefix of the hook event id a resumed launch sends; the fake agent appends
+/// its process id, because the daemon merges notifications by event id across
+/// sessions.
+const EVENT_AFTER_RESUME: &str = "evt-after-resume-";
 
 /// Environment a child CLI receives; nothing else is inherited, so no
 /// `POHUNEK_*` input of this test reaches the daemon or the CLIs.
@@ -542,6 +545,38 @@ fn wait_native_id(cli: &Cli, id: &str, expected: &str) {
     poll_until(
         &format!("native id {expected} of {id} via {}", cli.label),
         || (native_id(cli, id).as_deref() == Some(expected)).then_some(()),
+    );
+}
+
+/// The number of notifications of session `id` that mention `event`.
+fn notification_count(cli: &Cli, id: &str, event: &str) -> usize {
+    let list = cli.json(&["notifications", "list", "--session", id, "--json"]);
+    list["notifications"].as_array().map_or(0, |records| {
+        records
+            .iter()
+            .filter(|record| record.to_string().contains(event))
+            .count()
+    })
+}
+
+/// Waits until session `id` has more than `known` notifications that mention
+/// `event`.
+fn wait_new_notification(cli: &Cli, id: &str, event: &str, known: usize) {
+    poll_until(
+        &format!("a new notification {event} of {id} via {}", cli.label),
+        || {
+            let list = cli
+                .try_json(&["notifications", "list", "--session", id, "--json"])
+                .ok()?;
+            (list
+                .get("notifications")?
+                .as_array()?
+                .iter()
+                .filter(|record| record.to_string().contains(event))
+                .count()
+                > known)
+                .then_some(())
+        },
     );
 }
 
@@ -1765,19 +1800,22 @@ impl Upgrade {
     /// package its profile names.
     fn resume(&self, id: &str, native: &str, stopped: &Runtime) -> Runtime {
         let launched = self.run.launches().len();
+        let notified = notification_count(&self.head, id, EVENT_AFTER_RESUME);
         self.head.json(&["session", "resume", id, "--json"]);
-        self.assert_relaunched(id, native, stopped, launched)
+        self.assert_relaunched(id, native, stopped, launched, notified)
     }
 
-    /// Checks a relaunch of session `id` after `launched` launches: a new
-    /// generation of this build's worker, launched with `--resume <native>`,
-    /// whose store pin is the package its profile names.
+    /// Checks a relaunch of session `id` after `launched` launches and
+    /// `notified` resume notifications: a new generation of this build's
+    /// worker, launched with `--resume <native>`, whose hooks deliver a new
+    /// resume notification and whose store pin is the package its profile names.
     fn assert_relaunched(
         &self,
         id: &str,
         native: &str,
         stopped: &Runtime,
         launched: usize,
+        notified: usize,
     ) -> Runtime {
         let head = &self.head;
         let resumed = wait_live(head, id);
@@ -1804,7 +1842,7 @@ impl Upgrade {
         });
         assert_eq!(status["active_version"], self.head_version.as_str());
         wait_native_id(head, id, native);
-        wait_notification(head, id, EVENT_AFTER_RESUME);
+        wait_new_notification(head, id, EVENT_AFTER_RESUME, notified);
         assert_store_pin(
             &self.run,
             id,
@@ -1890,9 +1928,10 @@ impl Upgrade {
     }
 }
 
-/// Checks the hooks the upgrade reinstalled: the Claude integration is
-/// installed and no integration failed. A Hermes home without the pohunek
-/// marker is a `gap`, because the upgrade installs that integration only by hand.
+/// Checks the hooks the upgrade reinstalled: the Claude integration is listed
+/// and every integration is installed, except a Hermes home without the
+/// pohunek marker, which is a `gap` because that integration is installed only
+/// by hand.
 fn assert_claude_hooks_reinstalled(report: &Value) {
     let integrations = report["integrations"]
         .as_array()
@@ -1900,15 +1939,20 @@ fn assert_claude_hooks_reinstalled(report: &Value) {
     assert!(
         integrations
             .iter()
-            .any(|item| item["integration"] == "claude" && item["status"] == "installed"),
+            .any(|item| item["integration"] == "claude"),
         "the upgrade did not reinstall the Claude hooks: {report}"
     );
-    assert!(
-        integrations
-            .iter()
-            .all(|item| item["status"] == "installed" || item["status"] == "gap"),
-        "an integration failed to reinstall: {report}"
-    );
+    for item in integrations {
+        let unmarked_hermes_home = item["integration"] == "hermes"
+            && item["status"] == "gap"
+            && item["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.starts_with("no pohunek marker in this home;"));
+        assert!(
+            item["status"] == "installed" || unmarked_hermes_home,
+            "an integration was not reinstalled: {item} in {report}"
+        );
+    }
 }
 
 #[test]
