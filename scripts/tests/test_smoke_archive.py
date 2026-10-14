@@ -26,7 +26,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 PACKAGING = ROOT / "packaging"
 SCRIPT = PACKAGING / "smoke-archive"
-TARGET = "x86_64-unknown-linux-gnu"
+# On macOS, use aarch64-apple-darwin for arm64; on Linux, use x86_64-unknown-linux-gnu
+TARGET = "aarch64-apple-darwin" if sys.platform.startswith("darwin") else "x86_64-unknown-linux-gnu"
 VERSION = "1.2.3"
 NAME = f"pohunek-daemon-{VERSION}-{TARGET}"
 EPOCH = "1700000000"
@@ -36,8 +37,13 @@ MARKER_SLEEP = "2987"
 
 STUB_PREAMBLE = """#!/bin/sh
 set -eu
-pkg="sha256:$(sha256sum "$POHUNEK_CONSUMER_PACKAGE" | cut -d' ' -f1)"
-h() { sha256sum "$POHUNEK_CONSUMER_BIN_DIR/$1" | cut -d' ' -f1; }
+if command -v sha256sum >/dev/null 2>&1; then
+  sum_cmd="sha256sum"
+else
+  sum_cmd="shasum -a 256"
+fi
+pkg="sha256:$($sum_cmd "$POHUNEK_CONSUMER_PACKAGE" | cut -d' ' -f1)"
+h() { $sum_cmd "$POHUNEK_CONSUMER_BIN_DIR/$1" | cut -d' ' -f1; }
 """
 
 STUB_REPORT = """
@@ -68,17 +74,50 @@ def sudo_available():
     return probe.returncode == 0
 
 
+def can_run_smoke_archive_tests():
+    """Check if the platform can run smoke-archive tests."""
+    if sys.platform.startswith("linux"):
+        return bool(shutil.which("unshare") and shutil.which("jq") and userns_available())
+    elif sys.platform.startswith("darwin"):
+        # On macOS, check for sandbox-exec, jq, and codesign
+        import platform
+        if platform.machine() != "arm64":
+            return False
+        has_sandbox = bool(shutil.which("sandbox-exec") or Path("/usr/bin/sandbox-exec").exists())
+        has_jq = bool(shutil.which("jq"))
+        has_codesign = bool(shutil.which("codesign") or Path("/usr/bin/codesign").exists())
+        return has_sandbox and has_jq and has_codesign
+    return False
+
+
 def processes_with_marker():
     found = []
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
+    if sys.platform.startswith("darwin"):
+        # On macOS, use ps to find processes with the marker sleep duration
         try:
-            cmdline = (entry / "cmdline").read_bytes().split(b"\0")
-        except OSError:
-            continue
-        if cmdline[:2] == [b"sleep", MARKER_SLEEP.encode()]:
-            found.append(entry.name)
+            result = subprocess.run(
+                ["ps", "aux"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            for line in result.stdout.splitlines()[1:]:  # Skip header
+                parts = line.split()
+                if len(parts) >= 11 and parts[10] == f"sleep" and len(parts) > 11 and parts[11] == MARKER_SLEEP:
+                    found.append(parts[1])  # PID is second column
+        except Exception:
+            pass
+    else:
+        # On Linux, use /proc
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                cmdline = (entry / "cmdline").read_bytes().split(b"\0")
+            except OSError:
+                continue
+            if cmdline[:2] == [b"sleep", MARKER_SLEEP.encode()]:
+                found.append(entry.name)
     return found
 
 
@@ -121,7 +160,7 @@ def process_snapshot(pids):
 
 class _SmokeArchiveFixture:
     def setUp(self):
-        self.base = Path(tempfile.mkdtemp(prefix="pohunek-smoke-test-"))
+        self.base = Path(tempfile.mkdtemp(prefix="pohunek-smoke-test-")).resolve()
         self.addCleanup(shutil.rmtree, self.base, ignore_errors=True)
         self.tmpdir = self.base / "tmp"
         self.tmpdir.mkdir()
@@ -153,7 +192,18 @@ class _SmokeArchiveFixture:
             digest = catalog_digest_override or f"sha256:{sha256_hex(package)}"
             entries.append({"runtime_id": runtime, "package_id": f"pohunek.runtime.{runtime}", "digest": digest})
         (tree / "runtime" / "runtime-catalog.json").write_text(json.dumps({"catalog": {"entries": entries}}))
-        run_checked([PACKAGING / "write-manifest", tree, "daemon", VERSION, TARGET, "none"])
+
+        # On Darwin, add one real ad-hoc-signed Mach-O for verify-signed to check
+        if sys.platform.startswith("darwin"):
+            mach_o = tree / "test-mach-o"
+            shutil.copy("/usr/bin/true", mach_o)
+            subprocess.run(["codesign", "-s", "-", "-f", str(mach_o)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # write-manifest requires a minimum-macos version for apple-darwin targets
+            manifest_args = [PACKAGING / "write-manifest", tree, "daemon", VERSION, TARGET, "none", "11.0"]
+        else:
+            manifest_args = [PACKAGING / "write-manifest", tree, "daemon", VERSION, TARGET, "none"]
+
+        run_checked(manifest_args)
         out = self.base / "dist"
         shutil.rmtree(out, ignore_errors=True)
         run_checked([PACKAGING / "archive", self.base / "tree", NAME, out], env={"SOURCE_DATE_EPOCH": EPOCH})
@@ -324,8 +374,8 @@ class _SmokeArchiveFixture:
                 process.wait(timeout=10)
 
 @unittest.skipUnless(
-    sys.platform.startswith("linux") and shutil.which("unshare") and shutil.which("jq") and userns_available(),
-    "needs Linux with unprivileged user namespaces, unshare and jq",
+    can_run_smoke_archive_tests(),
+    "needs (Linux with unshare, jq and unprivileged userns) or (Darwin arm64 with sandbox-exec, jq and codesign)",
 )
 class SmokeArchiveTest(_SmokeArchiveFixture, unittest.TestCase):
     # -- scenarios ----------------------------------------------------------
@@ -645,7 +695,12 @@ for host in ("192.0.2.1", "8.8.8.8"):
     try:
         socket.create_connection((host, 53), timeout=3).close()
     except OSError as error:
-        if error.errno != errno.ENETUNREACH:
+        # On Linux, denied connections fail with ENETUNREACH.
+        # On macOS under sandbox, they fail with EPERM or EACCES.
+        allowed_errors = (errno.ENETUNREACH,)
+        if sys.platform.startswith('darwin'):
+            allowed_errors = (errno.EPERM, errno.EACCES)
+        if error.errno not in allowed_errors:
             print("OUTBOUND-WRONG-ERROR", host, error); sys.exit(1)
         print("OUTBOUND-REFUSED", host, error.errno)
     else:
@@ -655,7 +710,11 @@ PY
         self.write_consumer(STUB_PREAMBLE + probe + STUB_REPORT)
         result = self.smoke("--runtime", "pi")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("OUTBOUND-REFUSED 192.0.2.1 101", result.stdout)
+        # On Linux errno is 101 (ENETUNREACH), on macOS it's 1 (EPERM)
+        if sys.platform.startswith("linux"):
+            self.assertIn("OUTBOUND-REFUSED 192.0.2.1 101", result.stdout)
+        else:
+            self.assertIn("OUTBOUND-REFUSED 192.0.2.1 1", result.stdout)
         self.assertIn("OUTBOUND-REFUSED 8.8.8.8", result.stdout)
         self.assertNotIn("OUTBOUND-REACHED", result.stdout)
 
@@ -673,14 +732,47 @@ PY
         self.assertIn("outlived the consumer run", result.stderr)
         self.assert_cleaned_up()
 
+    def test_a_helper_in_its_own_session_is_killed_and_fails_the_run(self):
+        # Start a helper in its OWN session that names the work temp root in its argv,
+        # so stray_check's snapshot-based identity-kill branch (not pgrep -g) catches it.
+        # Write the pid to a file OUTSIDE work so we can verify it's dead afterward.
+        pidfile = self.base / "helper.pid"
+        self.write_consumer(
+            STUB_PREAMBLE
+            + f'/usr/bin/perl -MPOSIX -e \'POSIX::setsid(); open(my $f, ">", $ARGV[0]) or die; print $f "$$\\n"; close $f; sleep 60\' {pidfile} "$TMPDIR/marker" </dev/null >/dev/null 2>&1 &\n'
+            + f'while [ ! -s {pidfile} ]; do sleep 0.1; done\n'
+            + STUB_REPORT
+        )
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("outlived the consumer run", result.stderr)
+        # Verify pidfile was written before consumer exited
+        self.assertTrue(pidfile.exists())
+
+        # On Darwin, verify it was the snapshot-based identity-kill branch (not pgrep -g)
+        # and verify the helper is actually dead (killed by stray_check)
+        if sys.platform.startswith("darwin"):
+            pid = int(pidfile.read_text().strip())
+            self.assertNotIn("process group", result.stderr)
+            # Verify the helper is actually dead (killed by stray_check)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+        # On Linux the written pid is namespace-local; the namespace teardown that
+        # kills the helper is covered by the termination scenarios.
+
+        self.assert_cleaned_up()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "userns isolation is Linux-only")
     def test_termination_kills_the_userns_namespace_and_its_workload(self):
         self.assert_termination_kills_namespace("userns")
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "userns isolation is Linux-only")
     def test_the_userns_strategy_can_be_forced(self):
         result = self.smoke("--isolation=userns", "--runtime", "pi")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("isolation userns", result.stdout)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "userns isolation is Linux-only")
     def test_userns_strategy_does_not_run_shadow_tools_from_caller_path(self):
         shadow = self.base / "shadow"
         shadow.mkdir()
@@ -697,8 +789,8 @@ PY
         self.assert_cleaned_up()
 
     @unittest.skipUnless(
-        shutil.which("sudo") and shutil.which("setpriv") and sudo_available(),
-        "skipped: `sudo -n unshare` is unavailable here, so the sudo strategy is not exercised locally",
+        sys.platform.startswith("linux") and shutil.which("sudo") and shutil.which("setpriv") and sudo_available(),
+        "sudo isolation is Linux-only, or `sudo -n unshare` is unavailable",
     )
     def test_the_sudo_strategy_isolates_and_drops_to_the_invoking_user(self):
         self.write_consumer(STUB_PREAMBLE + 'echo "UID=$(id -u)"\n' + STUB_REPORT)

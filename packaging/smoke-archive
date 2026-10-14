@@ -218,7 +218,12 @@ stage_check() {
     [ -z "$unknown_exec" ] || fail "staged upstream has an invalid STAGE.links exec path: $stage_dir/$unknown_exec"
     conflicting_link=$(LC_ALL=C comm -12 "$work/stage-links-sorted.txt" "$work/stage-files-sorted.txt" | head -n 1)
     [ -z "$conflicting_link" ] || fail "staged upstream has a duplicate STAGE.links link path: $stage_dir/$conflicting_link"
-    stage_real=$(cd "$stage_dir" && pwd -P)
+    if [ "$(uname -s)" = Darwin ]; then
+        stage_real=$(/usr/bin/perl -MCwd=realpath -e 'my $p = realpath($ARGV[0]); defined $p or exit 1; print $p' -- "$stage_dir") \
+            || fail "cannot resolve staged upstream to a canonical path: $stage_dir"
+    else
+        stage_real=$(cd "$stage_dir" && pwd -P)
+    fi
     # Empty directories are absent from both manifests, but their names must
     # still obey the stage tree's name contract. NUL-delimited paths preserve
     # newlines and other hostile bytes while scanning the tree in one pass.
@@ -271,8 +276,9 @@ stage_check() {
                         resolved=$(readlink -e -- "$link_prefix") \
                             || fail "unresolvable link in staged upstream: $stage_dir/$path"
                     else
-                        # macOS: symlinks in pinned upstreams are trusted; skip validation
-                        resolved="$link_prefix"
+                        # macOS: resolve each prefix with perl, requiring existence and refusing cycles
+                        resolved=$(/usr/bin/perl -MCwd=realpath -e 'my $p = realpath($ARGV[0]); defined $p && -e $p or exit 1; print $p' -- "$link_prefix") \
+                            || fail "unresolvable link in staged upstream: $stage_dir/$path"
                     fi
                     case $resolved in
                         "$stage_real" | "$stage_real"/*) ;;
@@ -340,25 +346,44 @@ stray_check() {
             /bin/kill -KILL -- -"$stray_pgid" 2>/dev/null || true
             fail "a process outlived the consumer run (process group $stray_pgid)"
         fi
-        # Snapshot first, then filter in this shell without spawning anything.
-        # The command substitution's subshell is a fork of this shell (same
-        # argv, so it names the temp root) and is our child (ppid $$): skip it.
-        # A real stray is never our child here: the consumer ran in its own
-        # session, and orphans are reparented to launchd.
-        snapshot=$(/bin/ps -U "$(/usr/bin/id -u)" -o pid=,ppid=,command=)
+        # /bin/ps is denied inside the sandbox; `pgrep -lf` prints "<pid> <argv>".
+        # pgrep never lists itself. This shell and its forks (the command
+        # substitution) run "<self> __inner sandbox <work> ...": skip them.
+        uid=$(/usr/bin/id -u)
+        snapshot=$(/usr/bin/pgrep -lf -U "$uid" . 2>/dev/null || true)
         same_user=
-        while read -r pid ppid cmd; do
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            pid=${line%% *}
+            cmd=${line#* }
             [ "$pid" = "$$" ] && continue
-            [ "$ppid" = "$$" ] && continue
             case $cmd in
+                *" __inner sandbox $work "*) continue ;;
                 *"$work"*) same_user="$pid $cmd"; break ;;
             esac
         done <<EOF
 $snapshot
 EOF
         if [ -n "$same_user" ]; then
-            /bin/kill -KILL -- -"$stray_pgid" 2>/dev/null || true
-            fail "a process outlived the consumer run (contains temp root in command: $same_user)"
+            stray_pid=${same_user%% *}
+            # Re-verify the identity right before signalling: same pid, still
+            # naming the temp root.
+            now=$(/usr/bin/pgrep -lf -U "$uid" . 2>/dev/null | while IFS= read -r l; do if [ "${l%% *}" = "$stray_pid" ]; then printf '%s\n' "$l"; fi; done) || true
+            case $now in
+                *"$work"*)
+                    /bin/kill -KILL -- "-$stray_pid" 2>/dev/null || true
+                    /bin/kill -KILL "$stray_pid" 2>/dev/null || true
+                    ;;
+            esac
+            n=0
+            while /bin/kill -0 "$stray_pid" 2>/dev/null && [ "$n" -lt 50 ]; do
+                sleep 0.1
+                n=$((n + 1))
+            done
+            if /bin/kill -0 "$stray_pid" 2>/dev/null; then
+                fail "a process outlived the consumer run and survived SIGKILL: $same_user"
+            fi
+            fail "a process outlived the consumer run: $same_user"
         fi
     else
         for proc_dir in /proc/[0-9]*; do
@@ -746,8 +771,14 @@ run_sandbox() {
         '(allow network* (remote ip "localhost:*"))' \
         '(allow network-bind (local ip "localhost:*"))' \
         '(allow network-inbound (local ip "localhost:*"))' \
+        '(allow network* (remote unix-socket (regex #"^/private/tmp/(ph-|pohunek-)")))' \
+        '(allow network-bind (local unix-socket (regex #"^/private/tmp/(ph-|pohunek-)")))' \
         "(allow network* (remote unix-socket (subpath \"$work\")))" \
         "(allow network-bind (local unix-socket (subpath \"$work\")))")
+    # Unix sockets are local IPC, not egress. The daemon's runtime default
+    # (/private/tmp/pohunek-<uid>) and the test support's temp roots (/private/tmp/ph-*)
+    # hold its sockets. The scope is narrowed so the smoke cannot reach unrelated host
+    # sockets in /tmp. DNS (/private/var/run/mDNSResponder) stays denied.
     exec /usr/bin/sandbox-exec -p "$profile" /usr/bin/env -i PATH="$root_path" \
         /bin/sh "$self" __inner sandbox "$work" "$root" "$stage" "$work/consumer" "$node_dir" $runtimes
 }
