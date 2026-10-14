@@ -302,16 +302,19 @@ impl Layout {
     /// A process qualifies when its command name or its executable's file name
     /// starts with `pohunek`, or when its executable is byte-identical to a
     /// binary of this layout under any name. `image` hashes the executable
-    /// only when the names do not already decide. `None` means its bytes could
-    /// not be read: on Linux the process exited, since `/proc/<pid>/exe` stays
-    /// readable after an unlink; on macOS its executable path no longer holds a
-    /// file. Such a process is not judged a pohunek binary by its bytes.
+    /// only when the names do not already decide; it yields `None` only for a
+    /// process that has exited, and fails for a live one whose bytes cannot be
+    /// read, so an unreadable copy never passes as a foreign binary.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of `image`.
     fn runs_a_pohunek_binary(
         &self,
         command: &str,
         executable: &Path,
-        image: impl FnOnce() -> Option<String>,
-    ) -> bool {
+        image: impl FnOnce() -> Result<Option<String>, LayoutError>,
+    ) -> Result<bool, LayoutError> {
         let named = |name: &str| name.starts_with(POHUNEK_NAME_PREFIX);
         if named(command)
             || executable
@@ -319,9 +322,10 @@ impl Layout {
                 .and_then(|name| name.to_str())
                 .is_some_and(named)
         {
-            return true;
+            return Ok(true);
         }
-        image().is_some_and(|digest| BINARIES.iter().any(|name| self.file(name).digest == digest))
+        Ok(image()?
+            .is_some_and(|digest| BINARIES.iter().any(|name| self.file(name).digest == digest)))
     }
 
     /// Re-hashes every installed file and its source.
@@ -493,9 +497,18 @@ impl Layout {
                 continue;
             };
             // The running image is hashed through /proc/<pid>/exe, the inode
-            // that was executed, whatever its path now holds.
-            let image = || sha256_file(&entry.path().join("exe")).ok();
-            if !self.runs_a_pohunek_binary(command.trim(), &executable, image) {
+            // that was executed, whatever its path now holds. It stays readable
+            // after an unlink, so a failure is an exit only once the process
+            // is gone.
+            let image = || match sha256_file(&entry.path().join("exe")) {
+                Ok(digest) => Ok(Some(digest)),
+                Err(_) if !entry.path().exists() => Ok(None),
+                Err(source) => Err(LayoutError::Io {
+                    what: format!("hash the image of live process {pid}"),
+                    source,
+                }),
+            };
+            if !self.runs_a_pohunek_binary(command.trim(), &executable, image)? {
                 continue;
             }
             let Some(name) = BINARIES.iter().find(|name| self.path(name) == executable) else {
@@ -574,14 +587,23 @@ impl Layout {
                 continue;
             }
 
-            // Read the executable; Ok(None) means process exited.
-            let Some(executable) = inspect(
-                format!("read executable of process {}", fact.pid),
-                inspector.executable(fact.pid),
-            )?
-            else {
-                // Process exited during the scan.
-                continue;
+            // Ok(None) means the process exited during the scan.
+            let executable = match inspector.executable(fact.pid) {
+                Ok(Some(executable)) => executable,
+                Ok(None) => continue,
+                // An unreadable executable fails the scan only for a process
+                // that may belong to the scope or reports a pohunek name; any
+                // other process is unrelated whatever it executes.
+                Err(error)
+                    if fact.comm.starts_with(POHUNEK_NAME_PREFIX)
+                        || inspector.cwd(fact.pid).is_ok_and(|cwd| below_root(&cwd)) =>
+                {
+                    return Err(LayoutError::Io {
+                        what: format!("read executable of process {}", fact.pid),
+                        source: std::io::Error::other(error),
+                    });
+                }
+                Err(_) => continue,
             };
 
             // Check membership BEFORE processing the executable so unrelated processes
@@ -594,9 +616,25 @@ impl Layout {
                 continue;
             }
             // Darwin offers no handle to the executed image, so the bytes are
-            // those the executable path holds at observation time.
-            let image = || sha256_file(&executable).ok();
-            if !self.runs_a_pohunek_binary(&fact.comm, &executable, image) {
+            // those the executable path holds at observation time. A path that
+            // cannot be hashed is an exit only once the process is gone.
+            let image = || match sha256_file(&executable) {
+                Ok(digest) => Ok(Some(digest)),
+                Err(source) => {
+                    if inspect(
+                        format!("check if process {} is running", fact.pid),
+                        inspector.is_running(fact.identity()),
+                    )? {
+                        Err(LayoutError::Io {
+                            what: format!("hash the executable of live process {}", fact.pid),
+                            source,
+                        })
+                    } else {
+                        Ok(None)
+                    }
+                }
+            };
+            if !self.runs_a_pohunek_binary(&fact.comm, &executable, image)? {
                 continue;
             }
 
