@@ -1004,10 +1004,13 @@ Hooks have two separate roles:
   cannot supply. That is the shape the shipped hooks already have, and it stops
   an unrelated command in the same terminal from rewriting another process's
   identity. If the private endpoint cannot be reached, the hook uses the local
-  public daemon as a hardened fallback; that path has no kernel peer binding,
-  is not covered by the worker's launch-process rule (tracked in
-  [#868](https://github.com/zajca/pohunek/issues/868)), and
-  relies on its runtime, ordering, expiry, and provider rules alone. That
+  public daemon as a hardened fallback. That path admits a report only from the
+  kernel peer of its local connection when that peer is the session's PTY root
+  itself, refuses every report for an `identity-v1` session
+  (`native_report_unattested`), and then applies its runtime, ordering, expiry,
+  and provider rules. The shipped Claude and Codex hooks are descendants of the
+  agent, so their fallback is refused and their native reference arrives only
+  through the worker. That
   report carries the exact runtime id, PID plus kernel start identity, a
   monotonic sequence, and a short RFC 3339 expiry. The daemon rejects stale
   runtime/session/provider identity, PID reuse, expired claims, and duplicate or
@@ -1223,9 +1226,10 @@ Trust boundary:
   `NamedForProvider` the worker accepts a descendant's report naming the launch
   process as that process's report, because the Codex and Claude Code hooks are
   such descendants and cannot be told apart from another one; the rule orders
-  and attributes reports, it does not authenticate them. Only
-  `FrozenRootEntrypoint` (`identity-v1`) binds the root's report to the root's
-  own kernel peer. Under every schema the worker refuses a report from a
+  and attributes reports, it does not authenticate them. On the worker path
+  only `FrozenRootEntrypoint` (`identity-v1`) binds the root's report to the
+  root's own kernel peer; the public `session.report_native_id` fallback admits
+  only the PTY root's own process and refuses `identity-v1` sessions. Under every schema the worker refuses a report from a
   process that is neither the process it names nor a descendant of it
   (`peer_outside_subject`). Authenticated agent
   identity is tracked in [#52](https://github.com/zajca/pohunek/issues/52) and

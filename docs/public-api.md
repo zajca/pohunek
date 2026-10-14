@@ -405,8 +405,10 @@ native-id report is the necessary local fallback when the owner-private worker
 claim cannot be delivered. The owner-private worker claim is additionally bound
 to kernel peer identity — the worker accepts a report only from the process it
 names or from a descendant of that process, and never from a request field —
-while this public fallback has no peer binding and rests on its runtime,
-ordering, expiry, and provider rules alone. This is a narrow server-side confused-deputy guard
+while this public fallback admits only the session's PTY root itself, attested
+by the kernel peer of its local connection, refuses every report for an
+`identity-v1` session with `native_report_unattested`, and then applies its
+runtime, ordering, expiry, and provider rules. This is a narrow server-side confused-deputy guard
 inside the existing single-operator trust boundary, not per-session
 authentication or a broader mutation policy.
 
@@ -1012,8 +1014,9 @@ report naming an ancestor is that ancestor's report and is ordered with it;
 under `FrozenRootEntrypoint` only the root itself may name the root. This
 binding is not an authentication boundary: every process in the agent's PTY
 subtree runs as the owner, so under `NamedForProvider` any process the launch
-process starts can file the launch process's report, and only `FrozenRootEntrypoint` (`identity-v1`) binds
-the root's report to the root's own kernel peer (see the trust boundary in the
+process starts can file the launch process's report, and on the worker path
+only `FrozenRootEntrypoint` (`identity-v1`) binds the root's report to the
+root's own kernel peer (see the trust boundary in the
 [architecture](architecture.md)). Across
 processes the latest accepted claim, in arrival order at the worker, is the
 active identity, and the worker's imported active claim carries that process's
