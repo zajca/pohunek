@@ -415,6 +415,8 @@ impl PtyOwner {
                 rows: command.rows,
             });
         }
+        // macOS `openpty` fails (an unknown -6 error) when several threads of
+        // one process allocate a PTY at once; a worker allocates one per runtime.
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -485,7 +487,6 @@ impl PtyOwner {
             process_group,
             start_identity,
         };
-        drop(pair.slave);
 
         let reader_output = output.clone();
         let reader_output_order = Arc::clone(&output_order);
@@ -587,6 +588,11 @@ impl PtyOwner {
             }
         };
         startup.commit();
+        // The worker's slave descriptor closes only after the reader is released.
+        // A root that already exited leaves this as the slave's last close, and
+        // Darwin then waits at most 60 ticks for the master to drain the output
+        // queue before it discards the rest, so the reader must be free to read.
+        drop(pair.slave);
 
         Ok(Self {
             identity,
