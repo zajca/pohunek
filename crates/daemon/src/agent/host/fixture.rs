@@ -301,6 +301,43 @@ fn official_entries(official: &OfficialPackage) -> [package::ArchiveEntry; 2] {
     ]
 }
 
+/// The archive entries of the official package of `runtime` as
+/// [`OfficialFixtureSource`] serves it: the package's own descriptor and
+/// detection manifest, with the version probe dropped for Codex and Claude.
+///
+/// # Panics
+///
+/// Panics when `runtime` is not `codex`, `claude` or `hermes`.
+pub(crate) fn official_package_entries(runtime: &str) -> [package::ArchiveEntry; 2] {
+    let official = OFFICIAL_PACKAGES
+        .iter()
+        .find(|official| official.runtime == runtime)
+        .unwrap_or_else(|| panic!("{runtime} is not an official fixture runtime"));
+    official_entries(official)
+}
+
+/// The package id and version the official descriptor of `runtime` declares,
+/// read from the descriptor itself so tests follow package version bumps.
+///
+/// # Panics
+///
+/// Panics when `runtime` is not an official fixture runtime or its descriptor
+/// does not declare a string `id` and `version`.
+pub(crate) fn official_package_identity(runtime: &str) -> (String, String) {
+    let official = OFFICIAL_PACKAGES
+        .iter()
+        .find(|official| official.runtime == runtime)
+        .unwrap_or_else(|| panic!("{runtime} is not an official fixture runtime"));
+    let table: toml::Table = toml::from_str(official.descriptor).expect("the descriptor parses");
+    let field = |key: &str| {
+        table[key]
+            .as_str()
+            .unwrap_or_else(|| panic!("{runtime} declares a string `{key}`"))
+            .to_owned()
+    };
+    (field("id"), field("version"))
+}
+
 /// Parses `official` with its version probe dropped unless the fixture keeps
 /// it.
 ///

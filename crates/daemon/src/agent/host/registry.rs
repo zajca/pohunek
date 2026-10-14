@@ -93,9 +93,10 @@ impl RuntimeRegistry {
     ///
     /// An [`SourceTrust::Official`] definition of an official agent id
     /// replaces the built-in definition of that id, whichever source comes
-    /// first. The replaced built-in is not served: a session launched from it
-    /// is refused by the launch-pin check rather than observed or resumed
-    /// through another definition.
+    /// first. The replaced built-in is not served. A session launched from it
+    /// is observed and resumed through that package only when the package
+    /// adopts it (see `launch::adopts`); any other session is refused by the
+    /// launch-pin check rather than run through another definition.
     ///
     /// # Errors
     ///

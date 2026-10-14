@@ -204,16 +204,19 @@ while the root is modified.
   catalog authorized it; after a daemon upgrade, release the lost digest and
   install the current release's package as section 1 step 4 describes.
 - `runtime_served_by_package`: the session was launched from a built-in
-  runtime, and an official package serves that id now. There is no built-in
-  to return to: start a new session on the package.
+  runtime, and an official package serves that id, but the package does not
+  honor the session's recovery binding (or the record names no package, as in a
+  v0.33.0 record). Resume and fork are refused; start a new session on the
+  package.
 - `runtime_builtin_removed`: the session was launched from the built-in Codex,
   Claude Code or Hermes runtime of an earlier release, which this daemon does
   not compile in, and no package serves its runtime id. Resume, fork and every
   interaction (input, attach, resize, rename, metadata) are refused; only stop
   and remove work. Install the official package from the release archive (the
-  hint names the command): a live session can then be used again to finish its
-  work, but it is never resumed or forked (a Hermes fork answers
-  `agent_fork_unsupported`), so continue in a new session with
+  hint names the command): the package then adopts the session, a live session
+  accepts input again, and resume and fork run through the package when it
+  honors the recovery contract. A Hermes fork answers `agent_fork_unsupported`.
+  If the package does not honor the contract, continue in a new session with
   `pohunek session new --agent <runtime>` (`codex`, `claude` or `hermes`).
   Install the Codex or Claude Code package on the earlier release before
   upgrading to keep live sessions usable; no earlier release archive carries

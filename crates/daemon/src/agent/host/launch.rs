@@ -7,6 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use super::claim::is_reserved;
 use super::definition::RuntimeDefinition;
 use super::handle::RuntimeHost;
+use crate::agent::NativeSessionLaunch;
 use crate::agent::{build_pty_command, LaunchCommand, LaunchOpts, ValidatedLaunchProgram};
 
 /// The runtime identity a persisted launch snapshot was frozen with.
@@ -91,13 +92,16 @@ pub(crate) fn launch_command(
 /// An unpinned snapshot may only be served by a built-in definition. A pinned
 /// one needs the same runtime from the same origin: a built-in pin accepts any
 /// built-in descriptor revision of the same package (the snapshot itself is
-/// frozen), a package pin needs the identical package and archive digest.
+/// frozen), a package pin needs the identical package and archive digest. A
+/// built-in pin of an official package is also served by that package
+/// ([`adopts`]).
 ///
 /// # Errors
 ///
 /// Returns `runtime_served_by_package` when a built-in or unpinned snapshot
-/// meets a package-served runtime, and `runtime_not_installed` for every other
-/// definition that cannot serve the pin.
+/// meets a package-served runtime it is not adopted by, and
+/// `runtime_not_installed` for every other definition that cannot serve the
+/// pin.
 pub(crate) fn check_pin(
     pin: &LaunchPin,
     definition: &RuntimeDefinition,
@@ -109,7 +113,7 @@ pub(crate) fn check_pin(
             frozen.runtime_id == current.runtime_id
                 && same_origin(&frozen.provenance, &current.provenance)
         }
-    };
+    } || adopts(pin, definition);
     if allowed {
         return Ok(());
     }
@@ -129,6 +133,104 @@ pub(crate) fn check_pin(
         ))
     } else {
         Err(ProtocolError::runtime_not_installed(&current.runtime_id))
+    }
+}
+
+/// Whether the official package `definition` adopts a session frozen with
+/// `pin`: a built-in pin of a reserved runtime id that the package of the same
+/// package id now serves under that id.
+///
+/// Only official packages may serve a reserved id (`decide_claim`), so the
+/// package identity is the whole trust question here; the version may differ
+/// from the built-in's.
+pub(crate) fn adopts(pin: &LaunchPin, definition: &RuntimeDefinition) -> bool {
+    let LaunchPin::Pinned(frozen) = pin else {
+        return false;
+    };
+    let BindingProvenance::Builtin {
+        package: Some(built_in),
+        ..
+    } = &frozen.provenance
+    else {
+        return false;
+    };
+    let current = definition.binding();
+    let BindingProvenance::Package { package, .. } = &current.provenance else {
+        return false;
+    };
+    frozen.runtime_id == current.runtime_id
+        && is_reserved(&current.runtime_id)
+        && package.id == built_in.id
+}
+
+/// Checks that the package an adopted session resumes or forks from honors the
+/// launch the session froze.
+///
+/// The argv is always the frozen one, so only what the frozen spec relies on is
+/// compared: the reference kind, a hook-reported reference (the built-in's
+/// reference is reported, which an assigned package strategy cannot honor)
+/// and, for a fork, fork support on both sides. A session that is not adopted
+/// is not checked here.
+///
+/// # Errors
+///
+/// Returns `runtime_served_by_package` when the package does not honor the
+/// frozen launch.
+pub(crate) fn honors_frozen_launch(
+    pin: &LaunchPin,
+    definition: &RuntimeDefinition,
+    frozen: Option<&NativeSessionLaunch>,
+    fork: bool,
+) -> Result<(), ProtocolError> {
+    if !adopts(pin, definition) {
+        return Ok(());
+    }
+    let honored = match (frozen, definition.native()) {
+        (Some(frozen), Some(served)) => {
+            frozen.reference_kind() == served.reference_kind()
+                && frozen.assigned().is_none()
+                && served.assigned().is_none()
+                && (!fork || (frozen.supports_fork() && served.supports_fork()))
+        }
+        _ => false,
+    };
+    if honored {
+        Ok(())
+    } else {
+        Err(ProtocolError::runtime_served_by_package(
+            definition.runtime_id(),
+        ))
+    }
+}
+
+/// The launch spec a relaunch of a session frozen with `frozen` runs under.
+///
+/// An adopting package that does not support fork has its fork arguments
+/// removed, so the relaunched session cannot fork through a spec the package
+/// does not honor.
+pub(crate) fn relaunch_launch(
+    frozen: &LaunchPin,
+    definition: &RuntimeDefinition,
+    launch: NativeSessionLaunch,
+) -> NativeSessionLaunch {
+    let package_forks = definition
+        .native()
+        .is_some_and(NativeSessionLaunch::supports_fork);
+    if adopts(frozen, definition) && !package_forks {
+        launch.without_fork()
+    } else {
+        launch
+    }
+}
+
+/// The pin a relaunch of a session frozen with `frozen` records: an adopted
+/// session records the package it now launches from, so later resumes resolve
+/// that exact digest; every other session keeps its pin.
+pub(crate) fn relaunch_pin(frozen: &LaunchPin, definition: &RuntimeDefinition) -> LaunchPin {
+    if adopts(frozen, definition) {
+        LaunchPin::of(definition)
+    } else {
+        frozen.clone()
     }
 }
 

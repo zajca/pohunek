@@ -35,7 +35,8 @@ pub use handle::{PackageReport, ReloadError, RuntimeHost};
 pub(crate) use launch::check_pin;
 pub use launch::LaunchPin;
 pub(crate) use launch::{
-    launch_command, validate_launch_runtime, validate_launch_runtime_with_timeout_detailed, Spawn,
+    honors_frozen_launch, launch_command, relaunch_launch, relaunch_pin, validate_launch_runtime,
+    validate_launch_runtime_with_timeout_detailed, Spawn,
 };
 pub(crate) use package::may_serve_reserved;
 pub use package::{

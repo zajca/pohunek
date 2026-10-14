@@ -584,15 +584,19 @@ code. A session whose stored runtime is already lost or terminal is not listed:
 the upgrade is not what ends it.
 
 - `adoptable`: the new daemon adopts the worker and keeps its native recovery.
+  A session launched from the built-in Codex, Claude Code or Hermes of an earlier
+  release is adoptable when the official package that serves its runtime id is
+  installed and adopts it, live or stopped (its pin names that package id; the
+  package version may differ). Resume and fork then run through the package.
 - `would lose recovery`: the worker is adopted but the session cannot resume
   natively (`native_recovery_unmappable`, `resume_record_unreadable`,
   `native_recovery_unverified`, `runtime_source_not_served`). A binding that
   needs the runtime registry to complete its launch spec is
   `native_recovery_unverified`, because the store migration cannot consult the
   registry. `runtime_source_not_served` means the session's launch pin names a
-  runtime source the new binary does not serve: a built-in runtime it does not
-  ship or an official package serves in place of, or a package digest that is
-  not installed. Resume and fork resolve exactly the pinned source, so nothing
+  runtime source the new binary does not serve and no installed package adopts:
+  a built-in runtime it does not ship, or a package digest that is not
+  installed. Resume and fork resolve exactly the pinned source, so nothing
   else stands in and no command rebinds the session. Finish the work in the
   live session, then continue in a new one with `pohunek session new --agent
   <runtime>` (the `detail` names the runtime), or accept the loss. When the
@@ -639,12 +643,13 @@ failing `pohunekd`, an unparsable report) fails with
 
 A session records the runtime source it was launched from: a built-in runtime
 compiled into the daemon, or the digest of an installed runtime package.
-Resume and fork relaunch exactly that source, so a release that does not serve
-it adopts the live worker but reports the session as `would lose recovery`
-with `runtime_source_not_served`. To keep native recovery across an upgrade to
-a release that does not serve the built-in Claude or Codex runtime, move the
-work onto the official package with the release that is running now, before
-upgrading:
+Resume and fork relaunch exactly that source. A release that does not serve it
+and has no installed package adopting it adopts the live worker but reports the
+session as `would lose recovery` with `runtime_source_not_served`. To keep native
+recovery across an upgrade to a release that does not serve the built-in Claude
+or Codex runtime, install the official package with the release that is running,
+before upgrading. The installed package adopts the built-in sessions, and
+the preflight reports them as `adoptable`:
 
 1. Install the official package from the running release's daemon archive
    (v0.34.2 or later ships it under `runtime/`), authorized by the archive's
@@ -660,17 +665,20 @@ upgrading:
    the ones in `needs_migration`, and `pohunek plugin profile migrate <name>
    --yes` pins each to the selected package digest.
 3. Start new sessions for the work. They are pinned to the package digest.
-   Sessions launched from the built-in keep running; finish their work before
-   the upgrade, or accept losing their native recovery.
+   Sessions launched from the built-in are adopted by the installed package,
+   live or stopped, and keep resume and fork through it when the package honors
+   their recovery contract. Finish the work in a session the package cannot
+   honor before the upgrade, or accept losing its native recovery.
 
    A release that compiles none of Codex, Claude Code and Hermes in (every
    release after 0.34.x) serves `codex`, `claude` and `hermes` only from their
    packages. A live Codex, Claude or Hermes session launched from the built-in
-   is adopted, but resume and fork are refused, and without the installed
-   package every interaction with it (input, attach, resize, rename, metadata)
-   is refused too, whether or not it could resume (`runtime_builtin_removed`;
-   the preflight reports it at risk and its detail says so). Installing the
-   package in step 1 keeps such a session usable after the upgrade. No release
+   without the installed package is refused every interaction with it (input,
+   attach, resize, rename, metadata), whether or not it could resume
+   (`runtime_builtin_removed`; the preflight reports it at risk and its detail
+   says so). Installing the package in step 1 keeps such a session usable after
+   the upgrade, and resume and fork run through the package when it honors the
+   recovery contract. No release
    up to 0.34.x ships the Hermes package, so step 1 has no Hermes package to
    install: finish or stop built-in Hermes sessions before the upgrade, or
    accept the loss (`--accept-runtime-loss`) and install the Hermes package

@@ -1318,10 +1318,11 @@ is loaded. The migration never launches anything: a restored session stays
 `lost` until an explicit `session.resume`. A record of the built-in Codex,
 Claude Code or Hermes, or of a host profile over one of them, is restored and
 listed, but this daemon compiles none of them in: its resume and fork answer
-`runtime_builtin_removed` while no package serves the alias, and
-`runtime_served_by_package` once the official package serves it (see
-[official aliases](../guides/runtime-packages.md#official-aliases)); the
-migration is a new session. A record that
+`runtime_builtin_removed` while no package serves the alias. Once the official
+package serves it, the package adopts the record (see
+[official aliases](../guides/runtime-packages.md#official-aliases)) and resume
+and fork run through it when the recovery contract is honored; otherwise they
+answer `runtime_served_by_package`, and the migration is a new session. A record that
 cannot be completed (the profile was deleted, no longer runs on the same
 runtime, or declares no native resume) still loads and keeps its place in
 `session list`. The daemon logs `reconcile.native_recovery.unrepairable` at

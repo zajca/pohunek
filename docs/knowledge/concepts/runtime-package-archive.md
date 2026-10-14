@@ -444,14 +444,16 @@ and is reported by the host (package-pinned sessions are then incompatible).
   cannot be trusted. Loading a recorded package re-checks that its record is
   `official` before it may serve a reserved id.
 - A session is observed and resumed only through the runtime source its launch
-  pin names (`RuntimeHost::resolve_pinned`). A built-in pin is served only by a
-  built-in of the same package identity the registry serves now, so a built-in
-  session of an alias an official package serves is refused with
+  pin names (`RuntimeHost::resolve_pinned`). A built-in pin is served by the
+  official package of the same package identity that serves the alias, when the
+  session's pin names that package id (the version may differ). That package
+  adopts the session, live or stopped: its callbacks, detector and input rules
+  apply, and resume and fork run through it when the session's recovery contract
+  is honored. A session whose contract is not honored is refused with
   `runtime_served_by_package` (hint: a new session with `pohunek session new
-  --agent <alias>`; no rebind) and, once adopted at startup, is observed with the
-  generic shell manifest, its persisted input framing and its journaled hook
-  schema only. The upgrade preflight reports any pin the new binary does not
-  serve as `runtime_source_not_served`.
+  --agent <alias>`; no rebind). The upgrade preflight reports a session the package
+  adopts as `adoptable` and any other pin the new binary does not serve as
+  `runtime_source_not_served`.
 - `package.uninstall` is refused with `package_referenced` while a live, lost or
   resumable session or a host profile pins the digest. `remove_modified` removes
   only a root that fails verification; a verified root answers

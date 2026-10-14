@@ -248,9 +248,10 @@ launch binding (runtime id plus where its definition came from). A profile whose
 store, refuses resume and fork with `runtime_not_installed`, and works again once
 the runtime is installed. The exception is a session launched from the built-in
 runtime of an official alias this daemon does not compile in (the built-in Codex,
-Claude Code or Hermes of an earlier release): it is refused with `runtime_builtin_removed`, and
-installing the official package restores interaction with a live session only,
-never resume or fork (`runtime_served_by_package`). `session stop` and `session rm` still work on such
+Claude Code or Hermes of an earlier release): it is refused with `runtime_builtin_removed` while no
+package serves the alias. Once the official package serves it, the package adopts the session, live or
+stopped, and resume and fork run through it when the session's recovery contract is honored;
+otherwise they answer `runtime_served_by_package`. `session stop` and `session rm` still work on such
 a session (or one whose recorded kind is a historical label): they release the
 worker and the session's worktrees and never launch, resume, fork or write
 input, so they need no runtime definition. Removal keeps its fail-closed

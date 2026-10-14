@@ -430,25 +430,25 @@ are not observed as that agent. A session launched from the built-in Codex,
 Claude or Hermes of an earlier release is refused with
 `runtime_builtin_removed` on resume, fork and every interaction (input,
 attach, resize, rename, metadata) while nothing serves its runtime id; once the
-package is installed, the live session can be used again and resume and fork
-answer `runtime_served_by_package` as below (a Hermes fork answers
-`agent_fork_unsupported`, because Hermes declares no native fork).
-A session launched from the built-in runtime keeps its binding but cannot be
-resumed or forked while the package serves the alias: the request fails with
-`runtime_served_by_package`. The migration is a new session:
-`pohunek session new --agent <alias>`, which the package serves; no command
-rebinds a session to another runtime source. Stop and remove still work. After
-a daemon restart such a live session is adopted but observed only through its
-launch-time facts (generic shell manifest or the host profile's manifest
-override, persisted input framing, the hook schema its worker journaled); hook
-reports and processes naming its runtime are never attributed through the
-package, and stay unattributed until the next restart even when the package is
-uninstalled in between. `pohunekd upgrade-preflight` reports it as
+package is installed, the official package adopts the session, live or stopped,
+when the session's launch pin names the package id; the package version may
+differ. The live session accepts input again, and its hook reports and processes
+are attributed through the package. Resume and fork run through the package when
+it honors the session's recovery contract: the same native reference kind, a
+hook-reported (not core-assigned) reference, and for fork, fork support in both
+the frozen spec and the package. The relaunched run is pinned to the package
+digest. A Hermes fork answers `agent_fork_unsupported`, because Hermes declares
+no native fork. A session whose contract the package cannot honor, and a
+session record that names no package (v0.33.0), answer `runtime_served_by_package`;
+the migration is a new session: `pohunek session new --agent <alias>`, which the
+package serves. No command rebinds a session to another runtime source. Stop and
+remove still work. `pohunekd upgrade-preflight` reports an adoptable built-in
+session as `adoptable`. A session that no package adopts is reported as
 `would_lose_recovery` with code `runtime_source_not_served`, so `pohunek service
 upgrade` refuses until `--accept-runtime-loss` is given. A session whose worker
 runs a release before 0.34.0 journals no hook schema; if that worker journaled
 an active identity, the identity cannot be verified, so the session is not
-adopted: the preflight reports `would_not_be_adopted` with
+reattached: the preflight reports `would_not_be_adopted` with
 `worker_identity_unverified`, and startup reports the runtime as a `conflict`
 (`active_identity_provider_invalid`). Stop such a session with the running
 release before the upgrade, or accept losing its runtime. A host profile on

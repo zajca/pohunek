@@ -718,10 +718,13 @@ created); only an unreadable runtime definition leaves it unavailable
 (`worker_identity_unverified`). The remaining blind spots are the supervisor
 job's identity and socket failures at connect time. A binding that needs the
 runtime registry to complete its launch spec is reported as
-`native_recovery_unverified`. A session whose launch pin names a runtime source
-the new binary does not serve, resolved as resume resolves it against that
-binary's built-in runtimes and the installed packages, is `would_lose_recovery`
-with `runtime_source_not_served`, and so is any live session, resumable or not,
+`native_recovery_unverified`. A session whose launch pin names a built-in
+runtime source of an earlier release is `adoptable` when the official package
+that serves its runtime id is installed and adopts it, live or stopped. A session
+whose launch pin names a runtime source the new binary does not serve, resolved
+as resume resolves it against that binary's built-in runtimes and the installed
+packages, and that no package adopts, is `would_lose_recovery` with
+`runtime_source_not_served`, and so is any live session, resumable or not,
 whose runtime resolves nowhere on the new binary, because every interaction
 with it would be refused. A live worker journal without a store record is
 listed as an unmanaged worker and does not refuse the upgrade, unless a store
@@ -834,12 +837,21 @@ a host profile over it that pins no package is `runtime_not_installed`, and
 both hints name the catalog install (and, for the profile, `pohunek plugin
 profile migrate`). A session launched from the built-in Codex, Claude Code or
 Hermes of an earlier release is refused with `runtime_builtin_removed` while
-nothing serves its runtime id and with `runtime_served_by_package` once the
-package does (a Hermes fork then answers `agent_fork_unsupported`): it is never
-rebound, and its recovery is a new session. A foreground or unmanaged `codex`,
-`claude` or `hermes` process is attributed only through the installed package's
-detection manifest (and, for Codex and Claude Code, its `[transcripts]` table),
-so without the package it is not observed as that agent.
+nothing serves its runtime id. Once the official package serves that id, the
+package adopts the session, live or stopped, when the session's launch pin
+names that package id; the package version may differ. Resume and fork then run
+through the package, and the relaunched run is pinned to the package digest. Resume
+and fork additionally require that the package honors the session's frozen
+recovery contract: the same native reference kind, a hook-reported (not
+core-assigned) reference, and for fork, fork support in both the frozen spec and
+the package. A Hermes fork still answers `agent_fork_unsupported`. A session
+whose recovery contract the package cannot honor is refused with
+`runtime_served_by_package`, and its recovery is a new session. So is a session
+whose pin names no package (an unpinned record of an earlier release). A
+foreground or unmanaged `codex`, `claude` or `hermes` process is attributed only
+through the installed package's detection manifest (and, for Codex and Claude
+Code, its `[transcripts]` table), so without the package it is not observed as
+that agent.
 
 Runtime responsibilities:
 
