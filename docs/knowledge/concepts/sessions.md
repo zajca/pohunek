@@ -967,10 +967,13 @@ never share a directory. The directory is private
 profile that sets `TMPDIR` in its `[env]` keeps that value instead. Stopping a
 session keeps the directory and resuming it reuses it; removing the session,
 explicitly or through retention, deletes it with its content. When the daemon
-starts, it deletes the directories that nothing it knows at startup names (no
-record, resume binding, worker, service-manager job or worker journal), which a crash or a failed
-delete can leave behind. When it cannot tell, for example because a store line
-is unreadable, it deletes nothing. A launch whose directory is not a private directory of the daemon's user fails
+starts, it deletes the directories of its own store that nothing it knows at
+startup names, which a crash or a failed delete can leave behind. A directory
+is kept when a session record, a resume binding, a store line the daemon
+rejected that names the session, a worker or its claimed session, a
+service-manager job or a worker journal names it. When it cannot tell, because
+worker discovery, the job listing or the journal scan failed, or a rejected
+store line names no session, it deletes nothing. A launch whose directory is not a private directory of the daemon's user fails
 with `session_tmpdir_unsafe` before the agent starts.
 
 ## Retention

@@ -5134,6 +5134,45 @@ async fn a_tmpdir_root_that_is_not_utf8_refuses_the_launch() {
     let _ = handle.await;
 }
 
+/// The directory holding the stores' `TMPDIR` roots must be private like the
+/// roots themselves: a group-readable one refuses the launch before any worker
+/// starts.
+#[tokio::test]
+async fn a_group_readable_directory_of_tmpdir_roots_refuses_the_launch() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let socket = temp_socket("session-tmpdir-roots-mode");
+    let store_roots = socket.dir.join("session-tmp");
+    std::fs::create_dir(&store_roots).expect("create the directory of store roots");
+    std::fs::set_permissions(&store_roots, std::fs::Permissions::from_mode(0o750))
+        .expect("make it group-readable");
+    let started = socket.dir.join("agent-started");
+    let script = format!("touch '{}'; exec sleep 30", started.display());
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", script.as_str()]),
+        session_tmp_root: Some(store_roots.join("0123456789abcdef")),
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+
+    let error =
+        err_payload(create_session_with_params(&mut control, session_params(&socket)).await);
+    assert_eq!(error.code, "session_tmpdir_unsafe", "{error}");
+    assert_eq!(error.class, ErrorClass::Runtime);
+    assert!(!started.exists(), "the agent never starts");
+    assert_eq!(
+        std::fs::read_dir(&store_roots)
+            .expect("list the directory of store roots")
+            .count(),
+        0,
+        "no store root is created below it"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
 /// A `TMPDIR` root reached through a symlink is refused before any worker
 /// starts, and no session is left behind.
 #[tokio::test]
