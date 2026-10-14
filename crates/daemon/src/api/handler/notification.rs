@@ -223,6 +223,10 @@ async fn enrich_notification_session_context(
 }
 
 /// `notification.list`: list durable notification records.
+///
+/// A result that does not fit one control line answers
+/// `notification_list_too_large`, so the caller pages with `limit` instead of
+/// receiving a frame its reader refuses.
 pub(super) async fn handle_notification_list(
     request: &Request,
     notifications: Option<&NotificationService>,
@@ -235,11 +239,17 @@ pub(super) async fn handle_notification_list(
         Ok(notifications) => notifications,
         Err(resp) => return resp,
     };
-    run_notification_blocking(request, move || {
-        notifications
-            .list(params)
-            .map_err(|err| err.to_protocol_error())
-    })
+    super::util::run_blocking_bounded(
+        request,
+        move || {
+            notifications
+                .list(params)
+                .map_err(|err| err.to_protocol_error())
+        },
+        "notification_task_panicked",
+        "notification operation task panicked",
+        ProtocolError::notification_list_too_large(),
+    )
     .await
 }
 

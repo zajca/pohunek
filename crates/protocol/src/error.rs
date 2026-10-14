@@ -391,6 +391,21 @@ impl ProtocolError {
         )
     }
 
+    /// Stable code of [`Self::notification_list_too_large`].
+    pub const NOTIFICATION_LIST_TOO_LARGE: &'static str = "notification_list_too_large";
+
+    /// The canonical error for a `notification.list` result whose records do
+    /// not fit one control line.
+    #[must_use]
+    pub fn notification_list_too_large() -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            Self::NOTIFICATION_LIST_TOO_LARGE,
+            "the matching notification records exceed the public response budget",
+            Some("request fewer records with `limit` and follow `next_cursor`".to_owned()),
+        )
+    }
+
     /// The canonical `runtime/session_has_no_managed_terminal` error.
     #[must_use]
     pub fn session_has_no_managed_terminal() -> Self {

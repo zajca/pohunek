@@ -28,6 +28,10 @@ use pohunek_test_support::env::TestEnv;
 use protocol::{Request, Response, CLIENT_PROTOCOL_VERSIONS, PROTOCOL_VERSION};
 use serde_json::{json, Value};
 
+#[cfg(target_os = "linux")]
+#[path = "support/connect_redirect.rs"]
+mod connect_redirect;
+
 const SESSION_ID: &str = "s-fixture-1";
 const SESSION_NAME: &str = "fixture-session";
 const SLOW_RESPONSE_DELAY: Duration = Duration::from_millis(300);
@@ -1809,7 +1813,7 @@ fn fake_netbird_resolution_reaches_tcp_fixture_with_origin_pair() {
     let netbird_ip = "100.64.0.42";
     let tcp_fixture = TcpFixtureDaemon::start(Ipv4Addr::LOCALHOST, Scenario::Success);
     let remote_port = tcp_fixture.address.port();
-    let (connect_redirect, connect_capture) = build_connect_redirect(&home);
+    let (connect_redirect, connect_capture) = connect_redirect::build(&home.root);
     let bin = home.root.join("bin");
     fs::create_dir_all(&bin).expect("create fixture bin");
     let netbird = bin.join("netbird");
@@ -1907,7 +1911,7 @@ fn stable_netbird_peer_identity_follows_its_new_address_but_not_a_reassigned_one
     let home = TestHome::new();
     let tcp_fixture = TcpFixtureDaemon::start(Ipv4Addr::LOCALHOST, Scenario::Success);
     let remote_port = tcp_fixture.address.port();
-    let (connect_redirect, connect_capture) = build_connect_redirect(&home);
+    let (connect_redirect, connect_capture) = connect_redirect::build(&home.root);
     let bin = home.root.join("identity-netbird-bin");
     fs::create_dir_all(&bin).expect("create NetBird fixture bin");
     let netbird = bin.join("netbird");
@@ -1961,79 +1965,6 @@ fn stable_netbird_peer_identity_follows_its_new_address_but_not_a_reassigned_one
     assert!(!tcp_fixture.finish().is_empty());
 }
 
-#[cfg(target_os = "linux")]
-fn build_connect_redirect(home: &TestHome) -> (PathBuf, PathBuf) {
-    // The production resolver must reject loopback as a NetBird peer. This
-    // process-local interposer preserves that validation: the CLI resolves and
-    // attempts the fixed CGNAT target, the shim records that original target,
-    // and only then redirects the syscall to the loopback fixture. Nothing is
-    // linked into or enabled by the production binary.
-    let source = home.root.join("connect-redirect.c");
-    let library = home.root.join("connect-redirect.so");
-    let capture = home.root.join("connect-targets.log");
-    fs::write(
-        &source,
-        r#"#define _GNU_SOURCE
-#include <arpa/inet.h>
-#include <dlfcn.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
-typedef int (*connect_fn)(int, const struct sockaddr *, socklen_t);
-
-int connect(int fd, const struct sockaddr *address, socklen_t length) {
-    static connect_fn real_connect = NULL;
-    if (real_connect == NULL) {
-        real_connect = (connect_fn)dlsym(RTLD_NEXT, "connect");
-    }
-    if (address != NULL && address->sa_family == AF_INET &&
-        length >= sizeof(struct sockaddr_in)) {
-        const struct sockaddr_in *original = (const struct sockaddr_in *)address;
-        unsigned int host = ntohl(original->sin_addr.s_addr);
-        if ((host & 0xffc00000U) == 0x64400000U) {
-            const char *capture = getenv("POHUNEK_TEST_CONNECT_CAPTURE");
-            if (capture != NULL) {
-                char ip[INET_ADDRSTRLEN];
-                char line[96];
-                inet_ntop(AF_INET, &original->sin_addr, ip, sizeof(ip));
-                int count = snprintf(line, sizeof(line), "%s:%u\n", ip, ntohs(original->sin_port));
-                int output = open(capture, O_WRONLY | O_CREAT | O_APPEND, 0600);
-                if (output >= 0) {
-                    (void)write(output, line, (size_t)count);
-                    (void)close(output);
-                }
-            }
-            struct sockaddr_in redirected = *original;
-            redirected.sin_addr.s_addr = htonl(0x7f000001U);
-            return real_connect(fd, (const struct sockaddr *)&redirected, sizeof(redirected));
-        }
-    }
-    return real_connect(fd, address, length);
-}
-"#,
-    )
-    .expect("write connect redirect source");
-    let compiled = Command::new("cc")
-        .args(["-shared", "-fPIC", "-O2"])
-        .arg(&source)
-        .args(["-o"])
-        .arg(&library)
-        .arg("-ldl")
-        .output()
-        .expect("compile connect redirect");
-    assert!(
-        compiled.status.success(),
-        "compile connect redirect: {}",
-        utf8(&compiled.stderr)
-    );
-    (library, capture)
-}
-
 /// Installs a scripted `netbird` binary whose real `status` probe reports a
 /// single connected peer named `fixture-remote.netbird.test` at `netbird_ip`.
 /// The script records each invocation in `calls`, so a test can prove at the
@@ -2084,7 +2015,7 @@ fn remote_screen_args(json: bool) -> Vec<&'static str> {
 fn remote_port_override_reaches_the_connect_target() {
     let home = TestHome::new();
     let local_fixture = FixtureDaemon::start(&home.socket(), Scenario::Success);
-    let (connect_redirect, connect_capture) = build_connect_redirect(&home);
+    let (connect_redirect, connect_capture) = connect_redirect::build(&home.root);
     let calls = home.root.join("netbird-calls-valid.log");
     // One real CLI process per configured value; the capture log records the
     // raw `connect()` target after provider resolution and before redirect,
@@ -2117,7 +2048,7 @@ fn remote_port_override_reaches_the_connect_target() {
 fn remote_port_default_is_used_when_the_override_is_unset() {
     let home = TestHome::new();
     let local_fixture = FixtureDaemon::start(&home.socket(), Scenario::Success);
-    let (connect_redirect, connect_capture) = build_connect_redirect(&home);
+    let (connect_redirect, connect_capture) = connect_redirect::build(&home.root);
     let calls = home.root.join("netbird-calls-default.log");
     let mut command = home.command();
     install_fake_netbird(&mut command, &home, "100.64.0.42", &calls);

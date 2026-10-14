@@ -2384,6 +2384,17 @@ Important fields:
 deleted records by default. `NotificationListParams` can filter by status, kind,
 severity, provider, session id, and creation time range, plus `limit` and
 `cursor`.
+A result whose records do not fit one control line answers
+`runtime/notification_list_too_large` instead, with a recovery hint to request
+fewer records with `limit` and follow `next_cursor`; `next_cursor` is set only
+when `limit` cut the result. A caller that omits `limit` gets the whole
+matching set only while it fits one response, so a client that must list a
+growing history pages. `pohunek notifications list` without `--limit` does so:
+it follows `next_cursor` with pages of 200 records and halves the page size
+when the daemon answers `notification_list_too_large`. A daemon of an earlier
+release sends a line longer than the control-line limit instead, which ends
+the connection; the listing then starts again from the first page at half the
+size on a new connection, so no cursor crosses connections.
 
 ### `NotificationPolicy`
 

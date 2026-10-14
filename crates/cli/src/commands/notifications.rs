@@ -626,15 +626,12 @@ async fn list_on_target(
     params: NotificationListParams,
     agent: Option<protocol::RuntimeRef>,
 ) -> Result<NotificationListResult, protocol::ProtocolError> {
-    let client = connect_target(paths, &target)
-        .await
-        .map_err(error_details)?;
-    let mut sdk = client.into_sdk();
-    let mut result = sdk
-        .list_notifications(params)
-        .await
-        .map_err(CliError::from)
-        .map_err(error_details)?;
+    let listed = if params.limit.is_some() {
+        list_one_page(paths, &target, params).await
+    } else {
+        list_every_page(paths, &target, params).await
+    };
+    let mut result = listed.map_err(error_details)?;
     result.notifications.retain(|record| {
         agent
             .as_ref()
@@ -642,6 +639,97 @@ async fn list_on_target(
     });
     sort_notifications(&mut result.notifications);
     Ok(result)
+}
+
+/// Lists the one page `params` asks for.
+async fn list_one_page(
+    paths: &Paths,
+    target: &HostTarget,
+    params: NotificationListParams,
+) -> Result<NotificationListResult, CliError> {
+    let mut sdk = connect_target(paths, target).await?.into_sdk();
+    Ok(sdk.list_notifications(params).await?)
+}
+
+/// Records one `notification.list` page asks for when the command has no
+/// `--limit`. A page of typical records fits one control line with room to
+/// spare; a page that does not fit is asked again at half the size, down to a
+/// single record.
+const LIST_PAGE_SIZE: u32 = 200;
+
+/// Lists every matching record by following `next_cursor` from `params.cursor`,
+/// so the whole history never has to fit one response.
+///
+/// A daemon reports a page too large for one control line with
+/// `notification_list_too_large`. A daemon of an earlier release sends the
+/// oversized line instead, which leaves the connection unusable: the client
+/// refuses it as a framing error from the local daemon and as an unavailable
+/// daemon from a remote host. The listing then starts again from the first
+/// page at half the size on a new connection. A cursor never crosses
+/// connections, because a remote host name resolved again may select another
+/// daemon, so every record listed comes from one connection.
+async fn list_every_page(
+    paths: &Paths,
+    target: &HostTarget,
+    params: NotificationListParams,
+) -> Result<NotificationListResult, CliError> {
+    let mut sdk = connect_target(paths, target).await?.into_sdk();
+    let mut page_params = params.clone();
+    let mut notifications = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut page_size = LIST_PAGE_SIZE;
+    loop {
+        page_params.limit = Some(page_size);
+        let page = match sdk.list_notifications(page_params.clone()).await {
+            Ok(page) => page,
+            Err(error) if page_size > 1 && is_list_too_large(&error) => {
+                page_size /= 2;
+                continue;
+            }
+            Err(
+                pohunek_client::ClientError::Framing(_)
+                | pohunek_client::ClientError::RemoteDaemonUnavailable { .. },
+            ) if page_size > 1 => {
+                sdk = connect_target(paths, target).await?.into_sdk();
+                page_params = params.clone();
+                notifications.clear();
+                visited.clear();
+                page_size /= 2;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        notifications.extend(page.notifications);
+        let Some(next) = page.next_cursor else {
+            break;
+        };
+        // A cursor the walk already followed would never end it.
+        if !visited.insert(next.clone()) {
+            return Err(CliError::Protocol(protocol::ProtocolError::new(
+                protocol::ErrorClass::Daemon,
+                "notification_list_cursor_repeated",
+                "the daemon repeated a notification.list pagination cursor",
+                Some("upgrade the daemon and client together".to_owned()),
+            )));
+        }
+        page_params.cursor = Some(next);
+    }
+    Ok(NotificationListResult {
+        notifications,
+        next_cursor: None,
+    })
+}
+
+/// Whether `error` is the daemon's answer to a page that did not fit one
+/// control line.
+fn is_list_too_large(error: &pohunek_client::ClientError) -> bool {
+    match error {
+        pohunek_client::ClientError::Protocol(source)
+        | pohunek_client::ClientError::RemoteProtocol { source, .. } => {
+            source.code == protocol::ProtocolError::NOTIFICATION_LIST_TOO_LARGE
+        }
+        _ => false,
+    }
 }
 
 async fn policy_get_on_target(
