@@ -593,31 +593,8 @@ impl Layout {
                 continue;
             }
 
-            // Ok(None) means the process exited during the scan.
-            let executable = match inspector.executable(fact.pid) {
-                Ok(Some(executable)) => executable,
-                Ok(None) => continue,
-                // An unreadable executable fails the scan only for a process
-                // that may belong to the scope or reports a pohunek name; any
-                // other process is unrelated whatever it executes.
-                Err(error)
-                    if fact.comm.starts_with(POHUNEK_NAME_PREFIX)
-                        || inspector.cwd(fact.pid).is_ok_and(|cwd| below_root(&cwd)) =>
-                {
-                    // A process that ended after the failed read is skipped
-                    // like any other exit.
-                    if !inspect(
-                        format!("check if process {} is running", fact.pid),
-                        inspector.is_running(fact.identity()),
-                    )? {
-                        continue;
-                    }
-                    return Err(LayoutError::Io {
-                        what: format!("read executable of process {}", fact.pid),
-                        source: std::io::Error::other(error),
-                    });
-                }
-                Err(_) => continue,
+            let Some(executable) = darwin_executable(inspector, &fact, below_root)? else {
+                continue;
             };
 
             // Check membership BEFORE processing the executable so unrelated processes
@@ -635,10 +612,7 @@ impl Layout {
             let image = || match sha256_file(&executable) {
                 Ok(digest) => Ok(Some(digest)),
                 Err(source) => {
-                    if inspect(
-                        format!("check if process {} is running", fact.pid),
-                        inspector.is_running(fact.identity()),
-                    )? {
+                    if still_running(inspector, &fact)? {
                         Err(LayoutError::Io {
                             what: format!("hash the executable of live process {}", fact.pid),
                             source,
@@ -656,27 +630,18 @@ impl Layout {
             let canonical_exe = match fs::canonicalize(&executable) {
                 Ok(path) => path,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // Process executable is no longer available. Check if the process is still running.
-                    match inspect(
-                        format!("check if process {pid} is running", pid = fact.pid),
-                        inspector.is_running(fact.identity()),
-                    ) {
-                        Ok(false) => {
-                            // Process has exited; skip it.
-                            continue;
-                        }
-                        Ok(true) => {
-                            // Process is alive but its executable path no longer resolves.
-                            return Err(LayoutError::Io {
-                                what: format!(
-                                    "the executable of live process {} no longer resolves",
-                                    fact.pid
-                                ),
-                                source: e,
-                            });
-                        }
-                        Err(err) => return Err(err),
+                    // A process that exited is skipped; a live one whose
+                    // executable path no longer resolves fails the scan.
+                    if !still_running(inspector, &fact)? {
+                        continue;
                     }
+                    return Err(LayoutError::Io {
+                        what: format!(
+                            "the executable of live process {} no longer resolves",
+                            fact.pid
+                        ),
+                        source: e,
+                    });
                 }
                 Err(source) => {
                     return Err(LayoutError::Io {
@@ -710,6 +675,58 @@ impl Layout {
         }
 
         Ok(found)
+    }
+}
+
+/// Whether the process of `fact` still runs.
+#[cfg(target_os = "macos")]
+fn still_running(
+    inspector: pohunek_platform::process::HostInspector,
+    fact: &pohunek_platform::process::ProcessFact,
+) -> Result<bool, LayoutError> {
+    use pohunek_platform::process::ProcessInspector as _;
+
+    inspect(
+        format!("check if process {} is running", fact.pid),
+        inspector.is_running(fact.identity()),
+    )
+}
+
+/// The executable of `fact`, or `None` for a process the scan skips: one that
+/// exited, or one whose executable cannot be read and that neither reports a
+/// pohunek name nor works in a directory `in_scope` accepts.
+///
+/// # Errors
+///
+/// Fails for a live process with a pohunek name or an in-scope working
+/// directory whose executable cannot be read.
+#[cfg(target_os = "macos")]
+fn darwin_executable(
+    inspector: pohunek_platform::process::HostInspector,
+    fact: &pohunek_platform::process::ProcessFact,
+    in_scope: impl Fn(&Path) -> bool,
+) -> Result<Option<PathBuf>, LayoutError> {
+    use pohunek_platform::process::ProcessInspector as _;
+
+    match inspector.executable(fact.pid) {
+        Ok(Some(executable)) => Ok(Some(executable)),
+        Err(error)
+            if fact.comm.starts_with(POHUNEK_NAME_PREFIX)
+                || inspector.cwd(fact.pid).is_ok_and(|cwd| in_scope(&cwd)) =>
+        {
+            // A process that ended after the failed read is skipped like any
+            // other exit.
+            if !still_running(inspector, fact)? {
+                return Ok(None);
+            }
+            Err(LayoutError::Io {
+                what: format!("read executable of process {}", fact.pid),
+                source: std::io::Error::other(error),
+            })
+        }
+        // `Ok(None)` is an exit during the scan; any other process whose
+        // executable cannot be read is unrelated whatever it executes.
+        Ok(None) | Err(_) => Ok(None),
     }
 }
 
