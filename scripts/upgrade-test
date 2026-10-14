@@ -76,6 +76,8 @@ readonly BINARIES=(pohunek pohunekd pohunek-sessiond)
 readonly ACCOUNT_PREFIX="phkupg"
 # Lines of each journal kept in the failure diagnostics.
 readonly JOURNAL_LINES=400
+# Byte cap of each daemon or session log tail in the failure diagnostics.
+readonly LOG_TAIL_BYTES=262144
 # Files of the previous daemon archive's `runtime/` the test installs the
 # official Claude package from.
 readonly PREVIOUS_RUNTIME_FILES=(packages/claude.tar.zst runtime-catalog.json)
@@ -241,8 +243,9 @@ create_account_user() {
 
 # Writes what is needed to diagnose a failure to $collect_dir/diagnostics, a
 # directory this invoking account created: unit status and journals,
-# service.toml, the transaction journal and state listing, and the account
-# manager's state. Every command is best effort.
+# service.toml, the transaction journal and state listing, the tails of the
+# daemon and session logs, and the account manager's state. Every command is
+# best effort.
 collect_diagnostics() {
   local out="$collect_dir/diagnostics"
   mkdir -p -m 700 "$out"
@@ -259,6 +262,14 @@ collect_diagnostics() {
   # small file there that names a transaction, never the host key directory.
   as_user sh -c 'for f in $(find "$1" -maxdepth 4 -type f \( -name "*transaction*" -o -name "*.record" \) -not -path "*/host/*" 2>/dev/null); do echo "== $f"; cat "$f"; done' sh \
     "$layout_home/.local/state/pohunek" >"$out/transaction.txt" 2>&1
+  # The daemon log and the session logs record the hook reports and session
+  # events the daemon handled; the journals above carry neither. Only those
+  # two log families are read, each tail capped in lines and then in bytes,
+  # keeping the newest bytes.
+  as_user sh -c 'find "$1" -maxdepth 1 -type f \( -name pohunekd.jsonl -o -name "pohunek-session-*.jsonl" \) -exec sh -c "$4" sh "$2" "$3" {} +' sh \
+    "$layout_home/.local/state/pohunek/logs" "$JOURNAL_LINES" "$LOG_TAIL_BYTES" \
+    'lines=$1; bytes=$2; shift 2; for f do echo "== $f"; tail -n "$lines" "$f" | tail -c "$bytes"; echo; done' \
+    >"$out/logs.txt" 2>&1
   if [ "$current_user" = false ] && [ "$created_account" = 1 ]; then
     priv systemctl status "user@$uid.service" --no-pager >"$out/user-manager-status.txt" 2>&1
     priv journalctl -u "user@$uid.service" --no-pager --lines "$JOURNAL_LINES" >"$out/user-manager-journal.txt" 2>&1

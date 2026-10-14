@@ -87,7 +87,10 @@ fi
 printf 'launch args=[%s] native=%s\n' "$launch_args" "$native_id" >>"$FAKE_AGENT_LOG"
 printf 'fake-agent started args=[%s]\n' "$launch_args"
 report_native "$native_id"
-notify notification permission_prompt "$launch_event"
+# An error notification, not a permission prompt: the daemon debounces an
+# attention notification and drops it once the session starts working, which
+# this agent's own output can trigger at launch.
+notify stop_failure "" "$launch_event"
 printf 'fake-agent ready native=%s\n' "$native_id"
 
 while IFS= read -r line; do

@@ -154,6 +154,30 @@ echo "modified=$manifest_modified backup=[$manifest_backup]"
                 self.assertTrue((backup / "Cargo.toml").exists())
                 self.assertTrue((backup / "Cargo.lock").exists())
 
+    def test_failure_diagnostics_keep_the_newest_daemon_log_entries(self) -> None:
+        logs = self.home / ".local/state/pohunek/logs"
+        logs.mkdir(parents=True)
+        # More bytes than the cap within the line limit, so the byte cap decides
+        # which entries survive.
+        entry = "x" * 1023
+        lines = [f"{index:04}{entry}" for index in range(399)] + ["FINAL-ENTRY"]
+        (logs / "pohunekd.jsonl").write_text("\n".join(lines) + "\n")
+        (logs / "pohunek-session-s1.jsonl").write_text("session-entry\n")
+        (logs / "other.log").write_text("unrelated-entry\n")
+        body = f"""
+home="{self.home}"
+created_account=1
+as_user() {{ case "$1" in sh) "$@" ;; *) : ;; esac; }}
+collect_diagnostics
+cat "$collect_dir/diagnostics/logs.txt"
+"""
+        result = run_sourced(body, self.log, self.home)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("FINAL-ENTRY", result.stdout)
+        self.assertNotIn("0000" + entry, result.stdout)
+        self.assertIn("session-entry", result.stdout)
+        self.assertNotIn("unrelated-entry", result.stdout)
+
     def select(self, target: str, tags: list[str]) -> str:
         listing = "\n".join(tags)
         body = f'printf "%s\\n" "$(printf "{listing}\\n" | greatest_below {target})"'
