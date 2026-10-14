@@ -377,6 +377,10 @@ cargo clippy -p pohunek-daemon --all-targets  # lint one crate
 python3 scripts/test-partitions run cli       # exact CI shard: core/daemon/relay/cli/relay-db/heavy
 python3 scripts/test-partitions check         # exhaustive, disjoint nextest inventory check
 python3 scripts/test-partitions --archive-file nextest-archive.tar.zst run heavy  # CI mode: no compile
+python3 scripts/test-partitions --archive-file A check-macos   # 13-package macOS set: exact lane/tier/bucket partition
+python3 scripts/test-partitions --archive-file A check-macos --scope lane  # PR lane archive: its 9 packages only
+python3 scripts/test-partitions --archive-file A run-macos     # PR macOS lane: 9 packages, profile macos
+python3 scripts/test-partitions --archive-file A run-macos-tier  # main/nightly macOS tier: client, netbird, package, xtask
 ```
 
 `cargo ta` (`cargo xtask affected [--base REF] [--print] [-- NEXTEST_ARGS]`)

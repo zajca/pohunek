@@ -25,6 +25,10 @@ flaky-result = "fail"
 # of either kind joins this group and takes that lock.
 [test-groups]
 unreadable-holders = { max-threads = 1 }
+# Tests that drive the real launchd `gui/<uid>` domain (bootstrap, bootout,
+# kickstart) share one domain per login session, so they run one at a time.
+# Used by profile.macos only; see its overrides below.
+launchd-gui = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = '''
@@ -137,3 +141,53 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 
 [profile.package.junit]
 path = "junit.xml"
+
+# The macOS lane: one `cargo nextest archive --profile macos` and one run from
+# that archive per job (scripts/test-partitions run-macos and check-macos).
+# Settings below live here, not under profile.default, so Linux runs are
+# unchanged.
+[profile.macos]
+inherits = "ci"
+junit.path = "junit.xml"
+# Many lane tests wait on timeouts rather than use CPU, so 5 slots on the
+# 3-vCPU hosted runner fill those waits. Measured on macos-15, 5 threads match
+# 6 in wall time (~450 s).
+test-threads = 5
+# A FLAKY result is classified and still fails the run (flaky-result =
+# "fail", inherited from profile.default). The retries only tell a failure
+# that happens every time from one that happens sometimes, for diagnosis.
+retries = { backoff = "fixed", count = 2, delay = "1s" }
+
+# The deadline tests of this binary (worker connect 2 s, worker initialize
+# 8 s, stale-job initialize 5 s) expect the host to answer within their
+# bound, so no other test may share the CPU while one runs.
+[[profile.macos.overrides]]
+filter = 'package(=pohunek-daemon) and binary(=supervised_lifecycle)'
+threads-required = "num-test-threads"
+
+# The session worker's resource test prints its measurements on success.
+# They are shown in the log without --nocapture and kept in the JUnit report,
+# which stores no success output unless asked to.
+[[profile.macos.overrides]]
+filter = 'package(=pohunek-session-worker) and binary(=resources)'
+success-output = "immediate"
+junit.store-success-output = true
+
+# A host probe test waits on child processes such as `launchctl print
+# gui/<uid>`. A wedged one is killed after 15 minutes, so it fails with a
+# TIMEOUT instead of holding the runner until the job timeout.
+[[profile.macos.overrides]]
+filter = 'package(=pohunek-hostcheck)'
+slow-timeout = { period = "60s", terminate-after = 15 }
+
+# Tests that bootstrap, bootout or kickstart jobs in the shared `gui/<uid>`
+# domain. workflow_store boots out labels on macOS in one of its tests.
+[[profile.macos.overrides]]
+filter = '''
+(package(=pohunek-platform) and binary(=launchd))
+or (package(=pohunek-daemon) and binary(=supervised_lifecycle))
+or (package(=pohunek-cli) and (
+  binary(=service_launchd) or binary(=service_upgrade)
+  or binary(=workflow_launchd) or binary(=workflow_store)))
+'''
+test-group = 'launchd-gui'
