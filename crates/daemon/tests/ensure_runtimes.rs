@@ -1114,16 +1114,23 @@ impl Host {
     }
 
     fn raw_detect(&self) -> Output {
+        self.raw_detect_with(&[])
+    }
+
+    /// Runs the detection plan with `extra` set on the child's environment only.
+    fn raw_detect_with(&self, extra: &[(&str, &str)]) -> Output {
         let dir = programs_dir(self);
         fs::create_dir_all(&dir).expect("the programs directory");
-        self.env
-            .command(&self.binary)
+        let mut command = self.env.command(&self.binary);
+        command
             .arg(ENSURE_RUNTIMES_ARG)
             .arg(DRY_RUN_FLAG)
             .arg(DETECT_FLAG)
-            .env("PATH", &dir)
-            .output()
-            .expect("run the daemon binary")
+            .env("PATH", &dir);
+        for (name, value) in extra {
+            command.env(name, value);
+        }
+        command.output().expect("run the daemon binary")
     }
 }
 
@@ -1376,6 +1383,169 @@ fn a_symlinked_default_home_is_a_gap_and_a_profile_home_it_points_at_is_still_pl
         "the step writes nothing into the real home"
     );
     assert!(!host.plugins_dir().exists());
+}
+
+#[test]
+fn a_profile_pinned_to_an_unavailable_package_is_a_gap_and_does_not_shadow_a_valid_profile_home() {
+    let host = Host::new();
+    host.publish(&["claude"]);
+    host.put_program("claude");
+    host.make_home(".claude");
+    let shared = host.env.root().join("shared-claude");
+    fs::create_dir_all(&shared).expect("the shared config home");
+    // Sorts before the valid profile, so a dedup that ran first would keep it.
+    let broken = host.profiles_dir().join("a-broken.toml");
+    fs::write(
+        &broken,
+        format!(
+            "base = \"claude\"\npackage = \"pohunek.runtime.claude\"\ndigest = \"sha256:{}\"\n\n\
+             [env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+            "0".repeat(64),
+            shared.display()
+        ),
+    )
+    .expect("write the pinned profile");
+    fs::set_permissions(&broken, fs::Permissions::from_mode(0o600)).expect("secure the profile");
+    let valid = host.profiles_dir().join("b-valid.toml");
+    fs::write(
+        &valid,
+        format!(
+            "base = \"claude\"\n\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+            shared.display()
+        ),
+    )
+    .expect("write the valid profile");
+    fs::set_permissions(&valid, fs::Permissions::from_mode(0o600)).expect("secure the profile");
+
+    let plan = host.detect_step();
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(plan.gaps.len(), 1, "{:?}", plan.gaps);
+    assert_eq!(plan.gaps[0].runtime, "claude");
+    assert!(
+        plan.gaps[0].detail.contains("`a-broken`"),
+        "{}",
+        plan.gaps[0].detail
+    );
+    let integrations: Vec<(&str, Option<&str>)> = plan
+        .integrations
+        .iter()
+        .map(|action| (action.runtime.as_str(), action.profile.as_deref()))
+        .collect();
+    assert_eq!(
+        integrations,
+        [("claude", None), ("claude", Some("b-valid"))]
+    );
+}
+
+#[test]
+fn a_default_home_spelled_with_dot_dot_is_a_gap_and_does_not_shadow_a_profile_home() {
+    let host = Host::new();
+    host.publish(&["claude"]);
+    host.put_program("claude");
+    // The daemon reads the relocation variable from its launch environment,
+    // which the service file's allowlist names.
+    let mut allowlist = default_allowlist();
+    allowlist.push("CLAUDE_CONFIG_DIR".to_owned());
+    host.write_service(&allowlist);
+    let real = host.env.root().join("real-claude");
+    fs::create_dir_all(&real).expect("the real config home");
+    let spelled = real.join("..").join("real-claude");
+    let work = host.profiles_dir().join("work.toml");
+    fs::write(
+        &work,
+        format!(
+            "base = \"claude\"\n\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+            real.display()
+        ),
+    )
+    .expect("write the work profile");
+    fs::set_permissions(&work, fs::Permissions::from_mode(0o600)).expect("secure the profile");
+
+    let output = host.raw_detect_with(&[("CLAUDE_CONFIG_DIR", spelled.to_str().expect("utf-8"))]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: EnsureReport =
+        serde_json::from_slice(&output.stdout).expect("the step prints its report as JSON");
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(gap_codes(&plan), [("claude", "integration_path_untrusted")]);
+    let integrations: Vec<(&str, Option<&str>)> = plan
+        .integrations
+        .iter()
+        .map(|action| (action.runtime.as_str(), action.profile.as_deref()))
+        .collect();
+    assert_eq!(integrations, [("claude", Some("work"))]);
+    assert!(
+        fs::read_dir(&real).expect("the real home").next().is_none(),
+        "the step writes nothing into the real home"
+    );
+    assert!(!host.plugins_dir().exists());
+}
+
+/// A default home spelled `<real home><suffix>`, which the installer refuses,
+/// with a profile whose home is the real directory: the refused default is a
+/// gap, and the profile's real home is still planned.
+fn assert_refused_default_spelling_does_not_shadow_profile(suffix: &str) {
+    let host = Host::new();
+    host.publish(&["claude"]);
+    host.put_program("claude");
+    let mut allowlist = default_allowlist();
+    allowlist.push("CLAUDE_CONFIG_DIR".to_owned());
+    host.write_service(&allowlist);
+    let real = host.env.root().join("real-claude");
+    fs::create_dir_all(&real).expect("the real config home");
+    let work = host.profiles_dir().join("work.toml");
+    fs::write(
+        &work,
+        format!(
+            "base = \"claude\"\n\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+            real.display()
+        ),
+    )
+    .expect("write the work profile");
+    fs::set_permissions(&work, fs::Permissions::from_mode(0o600)).expect("secure the profile");
+    let spelled = format!("{}{suffix}", real.display());
+
+    let output = host.raw_detect_with(&[("CLAUDE_CONFIG_DIR", &spelled)]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: EnsureReport =
+        serde_json::from_slice(&output.stdout).expect("the step prints its report as JSON");
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(gap_codes(&plan), [("claude", "integration_path_untrusted")]);
+    let integrations: Vec<(&str, Option<&str>)> = plan
+        .integrations
+        .iter()
+        .map(|action| (action.runtime.as_str(), action.profile.as_deref()))
+        .collect();
+    assert_eq!(
+        integrations,
+        [("claude", Some("work"))],
+        "spelling {suffix:?}"
+    );
+    assert!(
+        fs::read_dir(&real).expect("the real home").next().is_none(),
+        "the step writes nothing into the real home"
+    );
+    assert!(!host.plugins_dir().exists());
+}
+
+#[test]
+fn a_default_home_with_a_trailing_slash_is_a_gap_and_does_not_shadow_a_profile_home() {
+    assert_refused_default_spelling_does_not_shadow_profile("/");
+}
+
+#[test]
+fn a_default_home_with_a_double_slash_is_a_gap_and_does_not_shadow_a_profile_home() {
+    assert_refused_default_spelling_does_not_shadow_profile("//");
 }
 
 #[tokio::test]

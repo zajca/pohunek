@@ -2196,7 +2196,10 @@ the runtime is planned only when the host uses it), `config_home_missing` (the
 declared config home does not exist; the package is still planned and the step
 never creates the home), `config_home_is_symlink` (the config home is a symlink; hooks
 are installed only into a real directory, so no integration is planned into it and
-the step follows no symlink), `runtime_served_by_other_package` (another package serves
+the step follows no symlink), `integration_path_untrusted` (the installer refuses the
+path: it is not a normalized absolute path to a real directory), a profile's own
+resolution error such as `runtime_not_installed` (a profile pinned to a package the host
+cannot serve, which `integration.install` would reject), `runtime_served_by_other_package` (another package serves
 the runtime id; it is left untouched), and `official_package_unavailable_for_platform`
 (the release catalog lists no package for this platform; a refusal without
 `--detect`). A gap never blocks an apply, and `gaps` is always empty without

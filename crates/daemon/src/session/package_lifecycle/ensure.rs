@@ -196,13 +196,19 @@ impl Uses {
     }
 }
 
+/// A host profile over an official runtime, with the package digest it pins.
+struct OfficialProfile {
+    name: String,
+    base: RuntimeId,
+    digest: Option<PackageDigest>,
+}
+
 /// What [`gather`] found.
 struct Gathered {
     uses: Uses,
     unpinned: Vec<Unpinned>,
-    /// Every host profile over an official runtime, pinned or not, with its
-    /// base.
-    official: Vec<(String, RuntimeId)>,
+    /// Every host profile over an official runtime, pinned or not.
+    official: Vec<OfficialProfile>,
 }
 
 /// What the plan reads from the registries and the store.
@@ -511,11 +517,6 @@ fn compute(inputs: &EnsureInputs, detect: bool) -> Result<Computed, EnsureError>
         detect_targets(release.as_ref(), &mut uses, &mut report)?;
     }
     let planned = plan_packages(&uses, release.as_ref(), &plan, &mut report)?;
-    if detect {
-        let integrations =
-            detected_integrations(&profiles, &base, &planned, &official, &mut report);
-        report.integrations = integrations;
-    }
     let binds = plan_binds(
         &profiles,
         &plan,
@@ -524,6 +525,11 @@ fn compute(inputs: &EnsureInputs, detect: bool) -> Result<Computed, EnsureError>
         &planned,
         &mut report,
     )?;
+    if detect {
+        let integrations =
+            detected_integrations(&profiles, &base, &planned, &binds, &official, &mut report);
+        report.integrations = integrations;
+    }
     Ok(Computed {
         report,
         planned,
@@ -544,7 +550,7 @@ fn gather(
     let mut uses = Uses::default();
     let mut unpinned = Vec::new();
     // Every profile over an official base, pinned or not, with its base.
-    let mut official_profiles: Vec<(String, RuntimeId)> = Vec::new();
+    let mut official_profiles: Vec<OfficialProfile> = Vec::new();
     for (name, text) in profiles.scanned_texts().map_err(EnsureError::Profiles)? {
         // A profile that cannot be read or parsed may be over an official
         // runtime, so it refuses with its reason instead of being skipped. Its
@@ -584,7 +590,11 @@ fn gather(
         // A pinned profile still uses its runtime: the release package must be
         // present for it, and a second run then reports it as present.
         uses.add(&head.base, UseReason::Profile);
-        official_profiles.push((name.clone(), head.base.clone()));
+        official_profiles.push(OfficialProfile {
+            name: name.clone(),
+            base: head.base.clone(),
+            digest: head.pin().map(|pin| pin.digest),
+        });
         if head.pin().is_none() {
             unpinned.push(Unpinned {
                 name,
@@ -625,15 +635,16 @@ fn gather(
 fn integration_homes_of(
     homes: &crate::integration::ConfigHomes,
     runtime: &RuntimeId,
-    official_profiles: &[(String, RuntimeId)],
+    official_profiles: &[OfficialProfile],
 ) -> Vec<Option<String>> {
     let default = inspect_home(homes, runtime, None);
     let mut found = Vec::new();
     if default.holds_hooks() {
         found.push(None);
     }
-    for (name, base) in official_profiles {
-        if base != runtime {
+    for profile in official_profiles {
+        let name = &profile.name;
+        if &profile.base != runtime {
             continue;
         }
         let home = inspect_home(homes, runtime, Some(name));
@@ -1224,37 +1235,103 @@ fn detect_targets(
     Ok(())
 }
 
-/// Gaps a runtime whose declared config home does not exist. The package is
-/// still planned and the home is never created: the step only reads the home,
-/// and the agent creates it on its first start.
+/// The installer's code for a config path it refuses, as `integration.install`
+/// reports it. Only a normalized absolute path to a real directory is accepted.
+const CODE_HOME_PATH_REFUSED: &str = "integration_path_untrusted";
+
+/// How the installer's own path walk classifies a planned config home.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeAdmission {
+    /// A real directory the installer walks; hooks can be installed into it.
+    Admitted,
+    /// Not there yet; the agent creates it on its first start.
+    Missing,
+    /// A symlink, which the installer never follows.
+    Symlink,
+    /// Not a directory, or not inspectable; the installer refuses the path.
+    Refused,
+}
+
+/// Classifies `home` with the classifier the installer uses. Only a
+/// [`ConfigPath::Directory`] spelled the way the trusted walk accepts is
+/// admitted into planning and identity deduplication, so a path the installer
+/// refuses never shadows another home. The spelling is checked first because
+/// [`config_path_kind`] collapses `//`, `/./` and a trailing `/`.
+fn admit_home(home: &Home) -> HomeAdmission {
+    if !pohunek_platform::filesystem::is_normalized_absolute_path(&home.dir) {
+        return HomeAdmission::Refused;
+    }
+    match config_path_kind(&home.dir) {
+        ConfigPath::Directory => HomeAdmission::Admitted,
+        ConfigPath::Absent => HomeAdmission::Missing,
+        ConfigPath::Symlink => HomeAdmission::Symlink,
+        ConfigPath::Other | ConfigPath::Unreadable => HomeAdmission::Refused,
+    }
+}
+
+/// Reports a planned config home that is not admitted, with its one next step.
+/// An admitted home reports nothing.
+fn report_home_gap(
+    report: &mut Report,
+    runtime: &str,
+    profile: Option<&str>,
+    program: &str,
+    home: &Home,
+    admission: HomeAdmission,
+) {
+    let owner = match profile {
+        Some(name) => format!("the config home of profile `{name}`"),
+        None => "its config home".to_owned(),
+    };
+    let dir = home.dir.display();
+    let (code, detail) = match admission {
+        HomeAdmission::Admitted => return,
+        HomeAdmission::Missing => (
+            CODE_GAP_CONFIG_HOME_MISSING,
+            format!(
+                "{owner} {dir} does not exist; start `{program}` once so it creates the home, \
+                 then run setup again"
+            ),
+        ),
+        HomeAdmission::Symlink => (
+            CODE_GAP_CONFIG_HOME_SYMLINK,
+            format!(
+                "{owner} {dir} is a symlink; hooks are installed only into a real directory, so \
+                 replace it with one, then run setup again"
+            ),
+        ),
+        HomeAdmission::Refused => (
+            CODE_HOME_PATH_REFUSED,
+            format!(
+                "{owner} {dir} is refused by the installer, which takes only a normalized absolute \
+                 path to a real directory; fix it, then run setup again"
+            ),
+        ),
+    };
+    report.gap(runtime, code, &detail);
+}
+
+/// Gaps a runtime whose declared config home is not admitted. The package is
+/// still planned and the home is never created: the step only reads the home.
 fn config_home_gap(plan: &PlanInputs<'_>, definition: &RuntimeDefinition, report: &mut Report) {
     let Some(declared) = definition.config_home() else {
         return;
     };
-    let runtime = definition.runtime_id();
-    let program = definition.program().as_str();
+    let runtime = definition.runtime_id().as_str();
     match Home::resolve(declared, plan.base, &[]) {
-        Ok(home) if config_path_kind(&home.dir) == ConfigPath::Symlink => report.gap(
-            runtime.as_str(),
-            CODE_GAP_CONFIG_HOME_SYMLINK,
-            &format!(
-                "its config home {} is a symlink; hooks are installed only into a real directory, \
-                 so make it a real directory, then run setup again",
-                home.dir.display()
-            ),
-        ),
-        Ok(home) if home.dir.is_dir() => {}
-        Ok(home) => report.gap(
-            runtime.as_str(),
-            CODE_GAP_CONFIG_HOME_MISSING,
-            &format!(
-                "its config home {} does not exist; start `{program}` once so it creates the \
-                 home, then run setup again",
-                home.dir.display()
-            ),
-        ),
+        Ok(home) => {
+            let admission = admit_home(&home);
+            report_home_gap(
+                report,
+                runtime,
+                None,
+                definition.program().as_str(),
+                &home,
+                admission,
+            );
+        }
         Err(error) => report.gap(
-            runtime.as_str(),
+            runtime,
             CODE_GAP_CONFIG_HOME_MISSING,
             &format!(
                 "its config home cannot be resolved ({}); set {} or HOME, then run setup again",
@@ -1266,19 +1343,21 @@ fn config_home_gap(plan: &PlanInputs<'_>, definition: &RuntimeDefinition, report
 }
 
 /// The config homes `--detect` lists: for each planned runtime whose hooks the
-/// setup installs, its default home and each host profile's home, when the
-/// directory exists. Each distinct directory appears once. Pi declares no
+/// setup installs, its default home and each host profile's home, when admitted
+/// (see [`admit_home`]). Each distinct directory appears once. Pi declares no
 /// hooks, so it has none.
 ///
-/// The profiles are built on the planned definitions, because a planned
-/// package is not installed yet when the plan is made. A profile home that does
-/// not resolve or does not exist is a gap, since its hooks cannot be installed.
-/// The default home's gap is reported by [`config_home_gap`].
+/// A profile is resolved the way `integration.install` will see it after the
+/// plan applies: a profile the plan binds, or whose pin is the planned package,
+/// is built on the planned definition; any other profile is resolved through the
+/// installed package it names. A profile that does not resolve is a gap and
+/// never enters the identity deduplication.
 fn detected_integrations(
     profiles: &ProfileRegistry,
     base: &BaseEnv,
     planned: &[Planned],
-    official: &[(String, RuntimeId)],
+    binds: &[Bind],
+    official: &[OfficialProfile],
     report: &mut Report,
 ) -> Vec<IntegrationAction> {
     let hook_runtimes = crate::integration::hook_runtime_ids();
@@ -1289,59 +1368,65 @@ fn detected_integrations(
             continue;
         }
         let runtime = entry.runtime.as_str();
+        let program = entry.definition.program().as_str();
         let Some(declared) = entry.definition.config_home() else {
             continue;
         };
-        let definition = Arc::new(entry.definition.clone());
-        let mut homes: Vec<(Option<String>, Result<Home, ProtocolError>)> =
-            vec![(None, Home::resolve(declared, base, &[]))];
-        for (name, profile_base) in official {
-            if profile_base != &entry.runtime {
-                continue;
+        if let Ok(home) = Home::resolve(declared, base, &[]) {
+            if matches!(admit_home(&home), HomeAdmission::Admitted) {
+                seen.push((runtime.to_owned(), home.identity()));
+                actions.push(IntegrationAction {
+                    runtime: runtime.to_owned(),
+                    profile: None,
+                });
             }
-            let resolved = match profiles.resolve_agent_pinned(name, &definition) {
-                Ok(agent) => match agent.profile {
-                    Some(profile) => Home::resolve(declared, base, &profile.env),
-                    None => continue,
-                },
-                Err(error) => Err(error),
-            };
-            homes.push((Some(name.clone()), resolved));
         }
-        for (profile, resolved) in homes {
-            let home = match resolved {
-                Ok(home) => home,
+        let definition = Arc::new(entry.definition.clone());
+        for official_profile in official.iter().filter(|p| p.base == entry.runtime) {
+            let name = official_profile.name.as_str();
+            let planned_package = binds.iter().any(|bind| bind.name == name)
+                || official_profile.digest.as_ref() == Some(&entry.digest);
+            let resolved = if planned_package {
+                profiles.resolve_agent_pinned(name, &definition)
+            } else {
+                profiles.resolve_agent(name)
+            };
+            let agent = match resolved {
+                Ok(agent) => agent,
                 Err(error) => {
-                    if let Some(name) = &profile {
-                        report.gap(
-                            runtime,
-                            CODE_GAP_CONFIG_HOME_MISSING,
-                            &format!(
-                                "profile `{name}` cannot be resolved against the release package \
-                                 ({}); fix or remove the profile, then run setup again",
-                                error.code
-                            ),
-                        );
-                    }
+                    report.gap(
+                        runtime,
+                        &error.code,
+                        &format!(
+                            "profile `{name}` cannot be served by the package it names ({}); \
+                             repair or re-pin the profile, then run setup again",
+                            error.code
+                        ),
+                    );
                     continue;
                 }
             };
-            // A symlinked home is never planned and never takes the identity of
-            // the directory it points at, so it cannot shadow a real home. The
-            // default home's gap is reported by `config_home_gap`.
-            if config_path_kind(&home.dir) == ConfigPath::Symlink {
-                if let Some(name) = &profile {
+            let Some(resolved_profile) = agent.profile.as_ref() else {
+                continue;
+            };
+            let home = match Home::resolve(declared, base, &resolved_profile.env) {
+                Ok(home) => home,
+                Err(error) => {
                     report.gap(
                         runtime,
-                        CODE_GAP_CONFIG_HOME_SYMLINK,
+                        CODE_GAP_CONFIG_HOME_MISSING,
                         &format!(
-                            "the config home {} of profile `{name}` is a symlink; hooks are installed \
-                             only into a real directory, so point the profile at a real directory, \
-                             then run setup again",
-                            home.dir.display()
+                            "the config home of profile `{name}` cannot be resolved ({}); fix \
+                             the profile's environment, then run setup again",
+                            error.code
                         ),
                     );
+                    continue;
                 }
+            };
+            let admission = admit_home(&home);
+            if !matches!(admission, HomeAdmission::Admitted) {
+                report_home_gap(report, runtime, Some(name), program, &home, admission);
                 continue;
             }
             let key = (runtime.to_owned(), home.identity());
@@ -1349,23 +1434,9 @@ fn detected_integrations(
                 continue;
             }
             seen.push(key);
-            if !home.dir.is_dir() {
-                if let Some(name) = &profile {
-                    report.gap(
-                        runtime,
-                        CODE_GAP_CONFIG_HOME_MISSING,
-                        &format!(
-                            "the config home {} of profile `{name}` does not exist; start the \
-                             profile's agent once so it creates the home, then run setup again",
-                            home.dir.display()
-                        ),
-                    );
-                }
-                continue;
-            }
             actions.push(IntegrationAction {
                 runtime: runtime.to_owned(),
-                profile,
+                profile: Some(name.to_owned()),
             });
         }
     }
