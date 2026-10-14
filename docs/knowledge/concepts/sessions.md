@@ -212,10 +212,15 @@ input. An older client that does not send that option keeps a 500 ms silent
 startup bound so its five-second response deadline remains usable.
 
 A runtime whose descriptor declares `[input] ready = "screen_idle"` (Claude
-Code) is ready only when its rendered prompt box shows. Claude enables bracketed
-paste before that box accepts input and drops earlier pastes, so the enable
-signal does not start the write. Such a runtime gets the full configured grace
-even from an older client. When the box does not render in time, `session.new`
+Code, Pi and Hermes) is ready only when its rendered prompt shows. This applies
+to initial input written into the terminal; a launch without a host profile of
+a runtime that takes its first prompt as an argument (Claude, Pi) passes it on
+the command line and does not wait. Claude
+enables bracketed paste before its prompt box accepts input and drops earlier
+pastes, Pi enables it before it draws any screen, and Hermes discards input
+queued during its start, so neither the enable signal nor the end of the grace
+starts the write. Such a runtime gets the full configured grace even from an
+older client. When the box does not render in time, `session.new`
 fails with `session_input_not_ready`, the initial input is not written, and the
 session is removed through the same rollback as any failed initial-input create.
 

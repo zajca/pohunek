@@ -310,12 +310,24 @@ after the host's startup grace ends for a silent agent
   evidence from the detection manifest.
 - `ready = "screen_idle"`: only the screen-sourced idle evidence of the
   detection manifest counts. Declare it when the agent enables bracketed paste
-  before its input accepts a paste, so the enable signal arrives too early. The
-  Claude package declares it; its `live_prompt_box` rule is the evidence.
+  before its input accepts a paste, or discards input queued during its start,
+  so the enable signal or the grace would release the input too early.
+
+The official packages declare:
+
+| Runtime | `ready` | Evidence |
+|---|---|---|
+| Claude | `screen_idle` | `live_prompt_box`: Claude drops pastes sent before its prompt box renders |
+| Pi | `screen_idle` | `idle_editor_rule`: Pi enables bracketed paste before it draws any screen |
+| Hermes | `screen_idle` | `idle_prompt` or `tui_idle_status`: Hermes discards queued terminal input during its start |
+| Codex | absent (`bracketed_paste`) | Codex reports idle only in its terminal title, which `screen_idle` does not count (#1114) |
 
 A `screen_idle` session whose screen shows no readiness by the end of the grace
 fails `session.new` with `session_input_not_ready`, nothing is written, and the
-session is rolled back. The `[input]` table is parsed strictly: a daemon of
+session is rolled back. That grace is the host's
+`input.initial_startup_grace_ms` in `service.toml`, 5000 ms on a fresh install,
+and a `screen_idle` runtime gets all of it even from a client without
+`extended_input_ready_wait`; raise it on a host where the agent starts slower. The `[input]` table is parsed strictly: a daemon of
 release 0.34.x rejects a descriptor that carries `ready`, so a package with this
 key needs a daemon that knows it.
 

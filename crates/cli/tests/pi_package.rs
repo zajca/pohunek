@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 
 use package::directory::build_directory_archive;
 use package::{read_archive, Limits, PackageDigest};
-use pohunek_daemon::agent::host::{definition_from_archive, LaunchProgram, RuntimeDefinition};
+use pohunek_daemon::agent::host::{
+    definition_from_archive, InputReadiness, LaunchProgram, RuntimeDefinition,
+};
 use pohunek_daemon::agent::{
     LaunchView, NativeReferenceStrategy, ReferenceCheckFailure, ReferenceExistence, RefusalPhase,
     SessionRef,
@@ -121,6 +123,11 @@ fn the_descriptor_declares_the_verified_pi_launch_contract() {
     let rules = definition.input_rules();
     assert!(rules.bracketed_paste, "Pi enables bracketed paste");
     assert_eq!(rules.submit_delay, Duration::from_millis(150));
+    assert_eq!(
+        definition.input_readiness(),
+        InputReadiness::ScreenIdle,
+        "the idle editor frame, not the bracketed-paste enable, shows readiness"
+    );
 
     assert_eq!(
         definition.native_reference_strategy(),
@@ -1866,6 +1873,58 @@ async fn a_real_pi_session_launches_is_detected_resumes_and_forks() {
         "{refused}"
     );
 
+    fixture.harness.stop().await;
+}
+
+/// Pi's idle editor frame is its input readiness, so a launch with initial
+/// input waits for the real editor and the prompt reaches the model once.
+///
+/// Needs a `pi` on `PATH` and `POHUNEK_PI_E2E=1`; the model is a loopback
+/// stub.
+#[tokio::test]
+#[ignore = "needs a real `pi` on PATH; run with POHUNEK_PI_E2E=1 and --ignored"]
+async fn a_real_pi_launch_submits_its_initial_input_once_the_editor_shows() {
+    require_real_pi();
+    let fixture = Fixture::start().await;
+    fixture.install().await;
+    fixture.write_profile();
+    fixture.stub.open_gate();
+
+    let cwd = fixture.harness.env.cwd().to_path_buf();
+    let (code, launched) = fixture
+        .harness
+        .json(&[
+            "session",
+            "new",
+            "--agent",
+            PROFILE,
+            "--cwd",
+            path_str(&cwd),
+            "--name",
+            "initial-input",
+            "--input",
+            PROMPT,
+        ])
+        .await;
+    assert_eq!(code, 0, "{launched}");
+    let id = launched["ok"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    fixture
+        .wait_screen_line(
+            &id,
+            &format!("{}{}", model_stub::FIRST_CHUNK, model_stub::SECOND_CHUNK),
+        )
+        .await;
+    assert_eq!(fixture.stub.started(), 1, "one model request");
+    assert_eq!(
+        fixture.stub.bodies_containing(PROMPT).len(),
+        1,
+        "the model request carries the initial input"
+    );
+
+    fixture.stop(&id).await;
     fixture.harness.stop().await;
 }
 

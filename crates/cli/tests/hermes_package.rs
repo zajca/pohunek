@@ -1165,10 +1165,20 @@ async fn the_signed_hermes_package_is_selected_and_failed_installs_preserve_it()
     let golden_descriptor: toml::Table = golden_body(GOLDEN_DESCRIPTOR, BUILTIN_DESCRIPTOR)
         .parse()
         .expect("the golden descriptor is TOML");
+    let mut package =
+        strip_package_specific_fields(read_toml(&format!("{PACKAGE_DIR}/runtime.toml")));
+    // `ready` is the one key the package declares that the v0.34 built-in
+    // descriptor does not: the built-in relied on the bracketed-paste enable signal.
+    let input = package
+        .get_mut("input")
+        .and_then(toml::Value::as_table_mut)
+        .expect("an [input] table");
     assert_eq!(
-        strip_package_specific_fields(read_toml(&format!("{PACKAGE_DIR}/runtime.toml"))),
-        strip_package_specific_fields(golden_descriptor)
+        input.remove("ready").as_ref().and_then(toml::Value::as_str),
+        Some("screen_idle"),
+        "the rendered Hermes prompt is its only input readiness signal"
     );
+    assert_eq!(package, strip_package_specific_fields(golden_descriptor));
 
     let package_manifest =
         fs::read_to_string(package_dir().join("detect.toml")).expect("package manifest");
@@ -1724,6 +1734,88 @@ if os.environ.get('HERMES_TEST_CHILD_PROBE') == '1' and not any(arg in ('--versi
     assert_eq!(code, 0, "remove Hermes session and worker: {removed}");
     let (code, missing) = harness.json(&["session", "inspect", &session_id]).await;
     assert_eq!(code, 1, "removed Hermes session is absent: {missing}");
+    harness.stop().await;
+}
+
+/// The rendered Hermes prompt is its input readiness, so a launch with initial
+/// input waits through the real Hermes start, which flushes the terminal's
+/// queued input, and the prompt reaches the model as the one turn.
+#[tokio::test]
+#[ignore = "needs a real `hermes` from a provisioned stage; set POHUNEK_HERMES_E2E=1 and POHUNEK_HERMES_BIN, then use --ignored"]
+async fn a_real_hermes_launch_submits_its_initial_input_once_the_prompt_shows() {
+    let _process_env = ProcessEnv::lock();
+    let hermes_bin = require_real_hermes();
+    let key = test_key();
+    let harness = trusted_harness(&key).await;
+    let (_, digest, _, _) = install_official(&harness, &key).await;
+    selected_package(&harness, &digest).await;
+
+    let hermes_home = harness.env.root().join("hermes-home");
+    let provider = HermesProvider::start(REAL_TURN_RESPONSE);
+    write_home(&hermes_home, &provider);
+    let path = format!(
+        "{}:/usr/bin:/bin",
+        hermes_bin.parent().expect("Hermes bin directory").display()
+    );
+    let mut proxy_env = String::new();
+    for (name, value) in provider.proxy_env() {
+        writeln!(proxy_env, "{name} = \"{value}\"").expect("write to a string");
+    }
+    harness.profile(
+        PROFILE,
+        &format!(
+            "base = \"hermes\"\npackage = \"{PACKAGE_ID}\"\ndigest = \"{}\"\nprogram = \"{}\"\n[env]\nHERMES_HOME = \"{}\"\nPATH = \"{}\"\nDBUS_SESSION_BUS_ADDRESS = \"unix:path={}/unreachable-dbus\"\n{}",
+            digest.as_str(),
+            path_str(&hermes_bin),
+            path_str(&hermes_home),
+            path,
+            path_str(harness.env.root()),
+            proxy_env,
+        ),
+    );
+
+    let cwd = harness.env.cwd().to_path_buf();
+    let (code, launched) = harness
+        .json(&[
+            "session",
+            "new",
+            "--agent",
+            PROFILE,
+            "--cwd",
+            path_str(&cwd),
+            "--name",
+            "hermes-initial-input",
+            "--input",
+            REAL_TURN_PROMPT,
+        ])
+        .await;
+    assert_eq!(
+        code,
+        0,
+        "launch Hermes with initial input: {launched}; provider: {}",
+        provider.diagnostics()
+    );
+    let session_id = launched["ok"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    wait_until("the model response to the initial input", || async {
+        provider.assert_healthy();
+        let (code, screen) = harness.json(&["session", "screen", &session_id]).await;
+        assert_eq!(code, 0, "read Hermes response screen: {screen}");
+        screen["ok"]["visible_lines"]
+            .as_array()
+            .expect("visible Hermes lines")
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|line| line.contains(REAL_TURN_RESPONSE))
+            .then_some(())
+    })
+    .await;
+    provider.assert_turn(REAL_TURN_PROMPT);
+
+    let (code, removed) = harness.json(&["session", "rm", &session_id]).await;
+    assert_eq!(code, 0, "remove Hermes session and worker: {removed}");
     harness.stop().await;
 }
 

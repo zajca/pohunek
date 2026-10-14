@@ -635,7 +635,7 @@ async fn host_inspect_over_tcp_returns_capabilities() {
     assert_eq!(caps.protocol_version, PROTOCOL_VERSION);
     assert_eq!(
         caps.supported_agents,
-        vec!["shell", "codex", "claude", "hermes"]
+        vec!["shell", "codex", "claude", "hermes", "pi"]
     );
     assert_eq!(caps.worktree_supported, caps.git_available);
 
@@ -1733,9 +1733,9 @@ async fn daemon_doctor_reports_embedded_and_override_manifest_health_redacted() 
             .unwrap_or_else(|| panic!("doctor reports {name}: {payload}"))
     };
     assert_eq!(find("agent_manifest_embedded_shell")["status"], "ok");
-    // Codex, Claude and Hermes are served only by their official packages, so
-    // the daemon embeds no manifest of theirs to check.
-    for runtime in ["codex", "claude", "hermes"] {
+    // Codex, Claude, Hermes and Pi are served only by their official packages,
+    // so the daemon embeds no manifest of theirs to check.
+    for runtime in ["codex", "claude", "hermes", "pi"] {
         let name = format!("agent_manifest_embedded_{runtime}");
         assert!(
             checks.iter().all(|check| check["name"] != name.as_str()),

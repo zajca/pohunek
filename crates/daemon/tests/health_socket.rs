@@ -3087,12 +3087,12 @@ async fn claude_stub_session_publishes_screen_blocked_and_receives_plain_input()
     let _ = handle.await;
 }
 
-/// How long a `session.new --input` for a Claude stub waits for a prompt box
-/// that the stub never renders. The stub enables bracketed paste at once, so
-/// the grace covers the window in which bracketed paste alone would have
-/// released the input under the old readiness rule, and it stays short so the
-/// refusal path finishes quickly.
-const CLAUDE_PROMPT_BOX_GRACE: Duration = Duration::from_millis(1_500);
+/// How long a `session.new --input` for a stub of a `screen_idle` runtime waits
+/// for a prompt that the stub never renders. The stub enables bracketed paste
+/// at once, so the grace covers the window in which bracketed paste alone would
+/// release the input of a runtime without that declaration, and it stays short
+/// so the refusal path finishes quickly.
+const UNRENDERED_PROMPT_GRACE: Duration = Duration::from_millis(1_500);
 
 /// Prompt box the Claude stub renders, shaped like the idle screen in
 /// `compat/claude/screens/idle.txt`: a rule, the `❯` line, and a rule. The
@@ -3105,20 +3105,7 @@ const CLAUDE_PROMPT_BOX_SCREEN: &str = "\x1b[2J\x1b[H\u{2500}\u{2500}\u{2500}\u{
 /// initial input once readiness is observed; an unprofiled `claude` launch
 /// passes the prompt as an argument (`prompt_arg`) and never waits.
 fn write_claude_profile(agents_dir: &Path, name: &str, script: &Path) {
-    let stub = agents_dir.join(format!("{name}-agent"));
-    write_executable(
-        &stub,
-        &official_runtimes::python_agent_launcher("claude", script),
-    );
-    std::fs::write(
-        agents_dir.join(format!("{name}.toml")),
-        format!(
-            "base = \"claude\"\n{}program = {}\n",
-            official_runtimes::profile_pin("claude"),
-            toml::Value::String(stub.display().to_string())
-        ),
-    )
-    .expect("write Claude stub profile");
+    write_official_profile(agents_dir, "claude", name, script);
 }
 
 /// A Claude stub that enables bracketed paste and never renders the prompt
@@ -3158,7 +3145,7 @@ async fn claude_initial_input_is_not_sent_before_the_prompt_box_renders() {
     let config = SessionRegistryConfig {
         agents_dir: Some(agents_dir),
         host_state_dir: Some(socket.dir.join("host-state")),
-        initial_input_startup_grace: CLAUDE_PROMPT_BOX_GRACE,
+        initial_input_startup_grace: UNRENDERED_PROMPT_GRACE,
         ..support::hermetic_registry_config()
     };
     let (shutdown, handle, _) =
@@ -3371,7 +3358,7 @@ async fn claude_profile_with_a_screen_idle_rule_waits_for_screen_readiness() {
     let config = SessionRegistryConfig {
         agents_dir: Some(agents_dir),
         host_state_dir: Some(socket.dir.join("host-state")),
-        initial_input_startup_grace: CLAUDE_PROMPT_BOX_GRACE,
+        initial_input_startup_grace: UNRENDERED_PROMPT_GRACE,
         ..support::hermetic_registry_config()
     };
     let (shutdown, handle, _) =
@@ -3386,6 +3373,199 @@ async fn claude_profile_with_a_screen_idle_rule_waits_for_screen_readiness() {
     assert!(
         captured.is_empty(),
         "the stub received input before its prompt box rendered"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Writes a host profile `name` over the pinned official `runtime` package
+/// whose program is a launcher for `script`.
+fn write_official_profile(agents_dir: &Path, runtime: &str, name: &str, script: &Path) {
+    let stub = agents_dir.join(format!("{name}-agent"));
+    write_executable(
+        &stub,
+        &official_runtimes::python_agent_launcher(runtime, script),
+    );
+    std::fs::write(
+        agents_dir.join(format!("{name}.toml")),
+        format!(
+            "base = \"{runtime}\"\n{}program = {}\n",
+            official_runtimes::profile_pin(runtime),
+            toml::Value::String(stub.display().to_string())
+        ),
+    )
+    .expect("write official runtime stub profile");
+}
+
+/// The idle classic prompt of Hermes, which its manifest's `idle_prompt` rule
+/// matches on the bottom screen lines.
+const HERMES_IDLE_PROMPT_SCREEN: &str = "\x1b[2J\x1b[HWelcome to Hermes Agent!\r\n\r\n\u{276f} ";
+
+/// The longest the Hermes stub waits for queued input before it flushes: past
+/// the bound in which an older client's initial input is written to an agent
+/// that shows no readiness, like a Hermes whose start outlasts that bound.
+fn hermes_stub_flush_delay() -> Duration {
+    pohunek_service_config::COMPAT_INITIAL_INPUT_STARTUP_GRACE * 2
+}
+
+/// A Hermes stub that, like Hermes's startup terminal query, enters cbreak
+/// mode, waits until input is queued or [`hermes_stub_flush_delay`] passes, and
+/// restores its terminal mode with `TCSAFLUSH`, which discards every byte
+/// queued so far; only then does it render its idle prompt, enable bracketed
+/// paste and record every byte it reads into `received`.
+fn hermes_stub_flushing_at_startup(script: &Path, received: &Path) {
+    let screen_hex = HERMES_IDLE_PROMPT_SCREEN
+        .bytes()
+        .map(|byte| format!("\\x{byte:02x}"))
+        .collect::<Vec<_>>()
+        .concat();
+    std::fs::write(
+        script,
+        format!(
+            r#"import os
+import select
+import termios
+import tty
+
+attributes = termios.tcgetattr(0)
+tty.setcbreak(0, termios.TCSANOW)
+select.select([0], [], [], {delay})
+termios.tcsetattr(0, termios.TCSAFLUSH, attributes)
+os.write(1, b"{screen_hex}")
+os.write(1, b"\x1b[?2004h")
+tty.setraw(0, termios.TCSANOW)
+with open({received:?}, "wb") as capture:
+    while True:
+        chunk = os.read(0, 4096)
+        if not chunk:
+            break
+        capture.write(chunk)
+        capture.flush()
+"#,
+            delay = hermes_stub_flush_delay().as_secs_f64(),
+            received = received.display().to_string(),
+        ),
+    )
+    .expect("write Hermes stub flushing at startup");
+}
+
+/// Hermes declares that only its rendered prompt shows readiness, so its
+/// initial input waits past the startup flush for both an older client and one
+/// that opts into the extended wait, and arrives once.
+#[tokio::test]
+async fn hermes_initial_input_waits_past_its_startup_input_flush() {
+    let socket = temp_socket("hermes-flush");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let clients = [("older", None), ("extended", Some(true))];
+    for (client, _) in clients {
+        let script = socket.dir.join(format!("hermes-flush-{client}.py"));
+        hermes_stub_flushing_at_startup(&script, &socket.dir.join(format!("{client}.bin")));
+        write_official_profile(
+            &agents_dir,
+            "hermes",
+            &format!("hermesflush{client}"),
+            &script,
+        );
+    }
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+    for (client, extended_input_ready_wait) in clients {
+        let mut params = session_params(&socket);
+        params.agent = format!("hermesflush{client}");
+        params.input = Some("hello Hermes".to_owned());
+        params.extended_input_ready_wait = extended_input_ready_wait;
+        let created: SessionInfo = serde_json::from_value(ok_payload(
+            create_session_with_params(&mut control, params).await,
+        ))
+        .expect("hermes session info");
+        let bytes =
+            read_file_until(&socket.dir.join(format!("{client}.bin")), b"hello Hermes").await;
+        assert_eq!(
+            bytes
+                .windows(b"hello Hermes".len())
+                .filter(|window| *window == b"hello Hermes")
+                .count(),
+            1,
+            "the {client} client's initial input is delivered exactly once"
+        );
+        let stop_req = Request::make(
+            &format!("hermes-flush-stop-{client}"),
+            method::SESSION_STOP,
+            serde_json::to_value(&created.id).expect("serialize id"),
+        );
+        let _: SessionStopResult =
+            serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+                .expect("stop result");
+    }
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Pi declares that only its idle editor frame shows readiness, so a Pi that
+/// enables bracketed paste and never draws that frame gets no initial input:
+/// an older client's launch is refused and rolled back as for Claude.
+#[tokio::test]
+async fn pi_initial_input_is_not_sent_before_its_editor_frame_renders() {
+    let socket = temp_socket("pi-no-frame");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let received = socket.dir.join("received.bin");
+    let script = socket.dir.join("pi-no-frame.py");
+    std::fs::write(
+        &script,
+        format!(
+            r#"import os
+import termios
+import tty
+
+os.write(1, b"\x1b[?2004h")
+tty.setraw(0, termios.TCSANOW)
+with open({received:?}, "wb") as capture:
+    while True:
+        chunk = os.read(0, 4096)
+        if not chunk:
+            break
+        capture.write(chunk)
+        capture.flush()
+"#,
+            received = received.display().to_string(),
+        ),
+    )
+    .expect("write Pi stub without editor frame");
+    write_official_profile(&agents_dir, "pi", "pinoframe", &script);
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        initial_input_startup_grace: UNRENDERED_PROMPT_GRACE,
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+    let mut params = session_params(&socket);
+    "pinoframe".clone_into(&mut params.agent);
+    params.input = Some("hello Pi".to_owned());
+    let error = err_payload(create_session_with_params(&mut control, params).await);
+    assert_eq!(error.code, "session_input_not_ready");
+
+    let list = Request::make("pi-no-frame-list", method::SESSION_LIST, Value::Null);
+    let sessions: Vec<SessionInfo> =
+        serde_json::from_value(ok_payload(exchange(&mut control, &list).await))
+            .expect("list sessions");
+    assert!(sessions.is_empty(), "the refused session was rolled back");
+    let captured = std::fs::read(&received).unwrap_or_default();
+    assert!(
+        captured.is_empty(),
+        "the stub received input before its editor frame rendered"
     );
 
     let _ = shutdown.send(());
