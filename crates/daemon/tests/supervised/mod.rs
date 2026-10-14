@@ -641,12 +641,24 @@ impl Installation {
         self.identity(pid).expect("descendant is running")
     }
 
-    /// Last counter value the session's agent command recorded.
+    /// Last counter value the session's agent command recorded; 0 before it
+    /// recorded any.
+    ///
+    /// The agent replaces the file whole, so any content other than a number
+    /// is a fixture defect and fails the test rather than reading as 0.
     pub(crate) fn counter(&self, session_id: &str) -> u64 {
-        std::fs::read_to_string(self.probe.join(format!("{session_id}.counter")))
-            .ok()
-            .and_then(|text| text.trim().parse().ok())
-            .unwrap_or(0)
+        let path = self.probe.join(format!("{session_id}.counter"));
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+            Err(error) => panic!("counter {} is unreadable: {error}", path.display()),
+        };
+        text.trim().parse().unwrap_or_else(|error| {
+            panic!(
+                "counter {} holds {text:?}, not a number: {error}",
+                path.display()
+            )
+        })
     }
 
     /// Worker jobs of this namespace.
@@ -1197,8 +1209,9 @@ fn write_agent_profile(paths: &BasePaths, probe: &Path) {
 ///
 /// It starts a descendant that ignores `SIGHUP` and `SIGTERM` (so neither the
 /// PTY hangup nor the sweep's `SIGTERM` ends it) and records its PID, prints
-/// and records a counter every [`COUNTER_INTERVAL`], and echoes each input
-/// line. `POHUNEK_SESSION_ID` is part of the worker-provided child identity.
+/// and records a counter every [`COUNTER_INTERVAL`] (written to a temporary
+/// file and renamed over the counter, so a reader never sees it half written),
+/// and echoes each input line. `POHUNEK_SESSION_ID` is part of the worker-provided child identity.
 ///
 /// The descendant is the test binary run as the holding image, not a platform
 /// binary: it outlives its parent shell, and the sweep can attribute such an
@@ -1211,7 +1224,8 @@ pub(crate) fn agent_script(probe: &Path) -> String {
         "p='{probe}'; s=\"$POHUNEK_SESSION_ID\"; \
          (trap '' HUP TERM; exec {hold}) & echo $! > \"$p/$s.descendant\"; \
          (n=0; while :; do n=$((n+1)); printf 'counter:%04d\\n' \"$n\"; \
-         echo \"$n\" > \"$p/$s.counter\"; sleep {COUNTER_INTERVAL}; done) & \
+         echo \"$n\" > \"$p/$s.counter.tmp\" && mv -f \"$p/$s.counter.tmp\" \"$p/$s.counter\"; \
+         sleep {COUNTER_INTERVAL}; done) & \
          while IFS= read -r line; do printf 'input:%s\\n' \"$line\"; done"
     )
 }
