@@ -13,7 +13,7 @@ use std::path::Path;
 use std::io::ErrorKind;
 
 use pohunek_logging::{Files, Legacy, Policy, Writer};
-use pohunek_platform::filesystem::{FileLock, FsError, LockKind, TrustedDir};
+use pohunek_platform::filesystem::{EntryKind, FileLock, FsError, LockKind, TrustedDir};
 use protocol::{PackageDigest, PackageVersion};
 use serde::{Deserialize, Serialize};
 
@@ -225,7 +225,22 @@ pub(crate) fn recent(state_dir: &Path, logs: Logs) -> Result<Vec<ReadRecord>, Er
         .map_err(|_too_large| failed("the run log file size is too large".to_owned()))?;
     let files = usize::try_from(logs.run_log_files)
         .map_err(|_too_many| failed("the run log file count is too large".to_owned()))?;
-    let _family = lock_family(&dir)?;
+    loop {
+        let family = lock_family(&dir)?;
+        let records = read_family(&dir, files, max_bytes)?;
+        // Without the lock file no writer has run yet. One that starts while
+        // the files are read creates it before it writes, so its appearance
+        // means the read may have raced the first write and is repeated under
+        // the lock.
+        if family.is_some() || !lock_family_exists(&dir)? {
+            return Ok(records);
+        }
+    }
+}
+
+/// Reads the retained run log files of `dir`, newest record first.
+fn read_family(dir: &TrustedDir, files: usize, max_bytes: usize) -> Result<Vec<ReadRecord>, Error> {
+    let failed = |detail: String| Error::RunLog { detail };
     let mut records = Vec::new();
     for index in 0..files {
         // The writer keeps the newest records in the active file and moves
@@ -248,6 +263,15 @@ pub(crate) fn recent(state_dir: &Path, logs: Logs) -> Result<Vec<ReadRecord>, Er
         );
     }
     Ok(records)
+}
+
+/// Whether the run log family lock file of `dir` exists.
+fn lock_family_exists(dir: &TrustedDir) -> Result<bool, Error> {
+    dir.entry_identity(format!("{FILE_NAME}.lock"), EntryKind::RegularFile)
+        .map(|identity| identity.is_some())
+        .map_err(|error| Error::RunLog {
+            detail: error.to_string(),
+        })
 }
 
 /// Takes a shared hold of the run log family lock the writer serializes on,

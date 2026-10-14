@@ -1988,15 +1988,12 @@ fn an_unreadable_unit_record_refuses_the_service_uninstall() {
     assert!(record.exists(), "the refusal removed the unit record");
 }
 
-/// Without a reachable service manager, status reports each recorded unit as
-/// `unknown` with the reason, never fails for it, and its text names the
-/// unit; a plugin with no recorded unit is not listed.
-#[cfg(target_os = "linux")]
 /// A run refused before its manifest verified (here: the plugin is disabled)
 /// is recorded with the requested unit name, so status counts it for that
 /// unit. Status reads the run log under the writer's lock without creating
 /// the lock file: with the lock file removed, it still reads the records and
 /// leaves no lock file behind.
+#[cfg(target_os = "linux")]
 #[test]
 fn status_counts_refused_runs_and_creates_no_run_log_lock() {
     let units = workflow_units::UnitEnv::new(|env| env.root().join("units"));
@@ -2036,6 +2033,10 @@ fn status_counts_refused_runs_and_creates_no_run_log_lock() {
     assert!(!lock.exists(), "status created the run log lock file");
 }
 
+/// Without a reachable service manager, status reports each recorded unit as
+/// `unknown` with the reason, never fails for it, and its text names the
+/// unit; a plugin with no recorded unit is not listed.
+#[cfg(target_os = "linux")]
 #[test]
 fn status_reports_units_it_cannot_inspect_as_unknown() {
     let units = workflow_units::UnitEnv::new(|env| env.root().join("units"));
