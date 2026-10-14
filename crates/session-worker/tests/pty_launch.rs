@@ -11,9 +11,7 @@ use std::fs::File;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use std::time::Duration;
-#[cfg(target_os = "linux")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use pohunek_session_worker::{Command, EnvBase, OutputEvent, PtyError, PtyOwner, WorkerConfig};
 use pohunek_test_support::tempdir;
@@ -23,10 +21,10 @@ use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
 /// Upper bound for any single wait on child output or exit.
 const OUTPUT_WAIT: Duration = Duration::from_secs(10);
 /// Descriptor limit the large-limit scenario raises the soft limit to.
-#[cfg(target_os = "linux")]
 const LARGE_DESCRIPTOR_LIMIT: u64 = 1_048_576;
+/// Smallest soft limit the budget scenario falls back to before giving up.
+const MINIMUM_SOFT_LIMIT: u64 = 1024;
 /// Longest acceptable launch under the large descriptor limit.
-#[cfg(target_os = "linux")]
 const LAUNCH_BUDGET: Duration = Duration::from_millis(100);
 /// Descriptor number the lowered-limit regression holds open above the soft limit.
 const HIGH_DESCRIPTOR: libc::c_int = 1024;
@@ -356,12 +354,38 @@ fn a_non_cloexec_descriptor_above_a_lowered_soft_limit_is_not_inherited() {
     );
 }
 
-/// Launching under a 2^20 descriptor limit stays inside the launch budget.
+/// Raises the soft descriptor limit as far as the kernel accepts, and returns
+/// the accepted value (`None` for `RLIM_INFINITY`).
 ///
-/// Linux only: the budget measures the `close_range` path. The macOS sweep
-/// costs one `fcntl` per descriptor below the limit, so its launch time is
-/// linear in the limit by design.
-#[cfg(target_os = "linux")]
+/// The first attempt is `RLIM_INFINITY`, the value a runtime such as Bun can
+/// set. Refused attempts fall back to [`LARGE_DESCRIPTOR_LIMIT`], then halve.
+/// Darwin refuses soft limits above `kern.maxfilesperproc`, so the halving lands
+/// on the largest value it allows.
+fn raise_soft_limit_as_far_as_allowed() -> Option<u64> {
+    let maximum = getrlimit(Resource::Nofile).maximum;
+    let mut candidates = vec![None];
+    let mut target = maximum.map_or(LARGE_DESCRIPTOR_LIMIT, |hard| {
+        hard.min(LARGE_DESCRIPTOR_LIMIT)
+    });
+    while target >= MINIMUM_SOFT_LIMIT {
+        candidates.push(Some(target));
+        target /= 2;
+    }
+    for current in candidates {
+        if setrlimit(Resource::Nofile, Rlimit { current, maximum }).is_ok() {
+            return current;
+        }
+    }
+    panic!("no soft descriptor limit could be set");
+}
+
+/// Launching under a large descriptor limit stays inside the launch budget.
+///
+/// The soft limit is raised as far as the platform allows, toward 2^20. Linux
+/// marks descriptors with `close_range`, whose cost does not depend on the
+/// limit. macOS sweeps, so the sweep bound must follow the open descriptors
+/// rather than the limit; a bound taken from a large soft limit would make the
+/// child loop over every number below it before exec.
 #[test]
 fn a_launch_under_a_large_descriptor_limit_meets_the_budget() {
     run_in_child(
@@ -373,17 +397,9 @@ fn a_launch_under_a_large_descriptor_limit_meets_the_budget() {
                 .build()
                 .expect("runtime");
             runtime.block_on(async {
-                let limit = getrlimit(Resource::Nofile);
-                let hard = limit.maximum.unwrap_or(LARGE_DESCRIPTOR_LIMIT);
-                let soft = LARGE_DESCRIPTOR_LIMIT.min(hard);
-                setrlimit(
-                    Resource::Nofile,
-                    Rlimit {
-                        current: Some(soft),
-                        maximum: limit.maximum,
-                    },
-                )
-                .expect("raise the soft descriptor limit");
+                let soft = raise_soft_limit_as_far_as_allowed();
+                let soft_label =
+                    soft.map_or_else(|| "infinity".to_owned(), |value| value.to_string());
 
                 let home = tempdir().expect("home directory");
                 let cwd = tempdir().expect("working directory");
@@ -392,9 +408,10 @@ fn a_launch_under_a_large_descriptor_limit_meets_the_budget() {
                     .expect("spawn under a large descriptor limit");
                 let elapsed = started.elapsed();
                 output_until(&pty, "ran").await;
+                println!("launch-elapsed {elapsed:?} soft-limit {soft_label}");
                 assert!(
                     elapsed < LAUNCH_BUDGET,
-                    "launch took {elapsed:?} under a soft limit of {soft}"
+                    "launch took {elapsed:?} under a soft limit of {soft_label}"
                 );
             });
         },

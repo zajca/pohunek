@@ -151,34 +151,123 @@ fn is_runnable(path: &Path) -> bool {
     !path.is_dir() && access(path, AccessFlags::X_OK).is_ok()
 }
 
-/// Directory listing the process's open descriptors.
-#[cfg(target_os = "linux")]
-const OPEN_DESCRIPTOR_DIRECTORY: &str = "/proc/self/fd";
-/// Directory listing the process's open descriptors.
-#[cfg(not(target_os = "linux"))]
-const OPEN_DESCRIPTOR_DIRECTORY: &str = "/dev/fd";
-
-/// Computes the exclusive upper bound of the child's fallback sweep.
+/// Extra descriptor numbers the sweep covers above the highest listed one.
 ///
+/// Descriptors opened by other threads between the listing and the fork take
+/// the lowest free numbers, so they land just above the highest listed one.
+/// The worker opens its descriptors close-on-exec, so this only guards against
+/// non-close-on-exec opens that race the fork.
+const SWEEP_SLACK: libc::c_int = 256;
+
+/// Computes the exclusive upper bound of the child's fallback sweep, before fork.
+///
+/// The bound follows the descriptors this process holds open, not its soft
+/// `RLIMIT_NOFILE`. A runtime that raises the soft limit to `RLIM_INFINITY`
+/// would otherwise make the child loop over billions of numbers before exec.
 /// Lowering the soft limit does not close descriptors already open above it,
-/// so the bound also covers the highest open descriptor. A descriptor opened
-/// after this scan is below the soft limit, because the kernel allocates the
-/// lowest free number and refuses numbers at or above the limit.
+/// and those are part of the listing.
 ///
 /// # Errors
 ///
-/// Returns an error when the limit or the descriptor listing cannot be read.
-/// The spawn then fails rather than guessing a bound.
+/// Returns an error when the descriptor table cannot be listed completely. The
+/// spawn then fails rather than guessing a bound.
 fn descriptor_sweep_bound() -> io::Result<libc::c_int> {
-    let soft_limit = descriptor_limit()?;
-    Ok(soft_limit.max(highest_open_descriptor()?.saturating_add(1)))
+    Ok(highest_open_descriptor()?
+        .saturating_add(1)
+        .saturating_add(SWEEP_SLACK))
 }
 
-/// Returns the highest descriptor number the process has open, or the last
-/// inherited-range number when none is open above it.
+/// Returns the highest open descriptor number, or one below the inherited
+/// range when none is open there. The listing is complete or an error.
+#[cfg(target_os = "linux")]
 fn highest_open_descriptor() -> io::Result<libc::c_int> {
+    highest_listed_descriptor("/proc/self/fd")
+}
+
+/// Returns the highest open descriptor number, or one below the inherited
+/// range when none is open there. The listing is complete or an error.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn highest_open_descriptor() -> io::Result<libc::c_int> {
+    highest_listed_descriptor("/dev/fd")
+}
+
+/// Extra entries requested beyond the size probe when listing Darwin descriptors.
+///
+/// Another thread may open descriptors between the size probe and the listing.
+/// A completely filled buffer is retried with double the room.
+#[cfg(target_os = "macos")]
+const DESCRIPTOR_LIST_SLACK: usize = 16;
+
+/// Returns the highest open descriptor number, or one below the inherited
+/// range when none is open there. The listing is complete or an error.
+///
+/// Uses `proc_pidinfo(PROC_PIDLISTFDS)`, the same descriptor-table query the
+/// CLI uses for its bounded children.
+#[cfg(target_os = "macos")]
+#[expect(
+    unsafe_code,
+    reason = "proc_pidinfo(PROC_PIDLISTFDS) is the libc boundary for the descriptor table"
+)]
+fn highest_open_descriptor() -> io::Result<libc::c_int> {
+    let pid = libc::c_int::try_from(std::process::id())
+        .map_err(|source| io::Error::new(io::ErrorKind::InvalidInput, source))?;
+    let entry_size = std::mem::size_of::<libc::proc_fdinfo>();
+    // SAFETY: a null buffer with zero size only asks for the required byte count.
+    let required =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    let required = usize::try_from(required).map_err(|_source| io::Error::last_os_error())?;
+    let mut capacity = required / entry_size + DESCRIPTOR_LIST_SLACK;
+    loop {
+        let mut entries = vec![
+            libc::proc_fdinfo {
+                proc_fd: 0,
+                proc_fdtype: 0,
+            };
+            capacity
+        ];
+        let buffer_size = capacity
+            .checked_mul(entry_size)
+            .ok_or_else(listing_overflow)?;
+        let buffer_bytes =
+            libc::c_int::try_from(buffer_size).map_err(|_source| listing_overflow())?;
+        // SAFETY: `entries` provides `buffer_bytes` writable bytes of properly
+        // aligned `proc_fdinfo` storage that outlives the call.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDLISTFDS,
+                0,
+                entries.as_mut_ptr().cast(),
+                buffer_bytes,
+            )
+        };
+        let written = usize::try_from(written).map_err(|_source| io::Error::last_os_error())?;
+        if written < buffer_size {
+            return Ok(entries[..written / entry_size]
+                .iter()
+                .map(|entry| entry.proc_fd)
+                .max()
+                .unwrap_or(FIRST_INHERITED_DESCRIPTOR - 1));
+        }
+        // A completely filled buffer may be truncated; retry with more room.
+        capacity = capacity.checked_mul(2).ok_or_else(listing_overflow)?;
+    }
+}
+
+/// Error for a descriptor listing whose buffer size overflows.
+#[cfg(target_os = "macos")]
+fn listing_overflow() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "open descriptor listing overflowed",
+    )
+}
+
+/// Returns the highest number named in a directory of open descriptors.
+#[cfg(not(target_os = "macos"))]
+fn highest_listed_descriptor(directory: &str) -> io::Result<libc::c_int> {
     let mut highest = FIRST_INHERITED_DESCRIPTOR - 1;
-    for entry in std::fs::read_dir(OPEN_DESCRIPTOR_DIRECTORY)? {
+    for entry in std::fs::read_dir(directory)? {
         let number = entry?
             .file_name()
             .to_str()
@@ -192,26 +281,6 @@ fn highest_open_descriptor() -> io::Result<libc::c_int> {
         highest = highest.max(number);
     }
     Ok(highest)
-}
-
-/// Reads the soft `RLIMIT_NOFILE`.
-///
-/// A limit above `c_int::MAX` is clamped to it; the kernel's descriptor table
-/// is bounded well below that value.
-#[expect(
-    unsafe_code,
-    reason = "getrlimit has no safe wrapper in the nix feature set this crate enables"
-)]
-fn descriptor_limit() -> io::Result<libc::c_int> {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `limit` is a valid, writable `rlimit` for the duration of the call.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(libc::c_int::try_from(limit.rlim_cur).unwrap_or(libc::c_int::MAX))
 }
 
 /// Registers the child-side session setup that runs between fork and exec.
