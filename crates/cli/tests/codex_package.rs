@@ -374,14 +374,25 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
     assert_eq!(package, strip(golden, GOLDEN_PACKAGE_VERSION));
 }
 
-/// The manifest file is the golden built-in manifest of release v0.34.2: same
-/// process matchers, same rules in the same order with the same fields.
+/// Rule the package adds to the golden built-in manifest: the folder trust
+/// dialog of Codex 0.160, which the built-in never matched.
+const FOLDER_TRUST_RULE: &str = "folder_trust_prompt";
+
+/// The manifest file is the golden built-in manifest of release v0.34.2 plus
+/// [`FOLDER_TRUST_RULE`]: same process matchers, and every built-in rule in
+/// the same order with the same fields.
 #[test]
-fn the_package_manifest_file_equals_the_builtin_manifest_file() {
+fn the_package_manifest_file_is_the_builtin_manifest_file_plus_the_folder_trust_rule() {
     let package = read_toml(&format!("{PACKAGE_DIR}/detect.toml"));
     let golden_text = golden_body(GOLDEN_MANIFEST, BUILTIN_MANIFEST);
     let golden: toml::Table = golden_text.parse().expect("the golden is TOML");
-    assert_eq!(package, golden);
+    let mut builtin_rules = package.clone();
+    builtin_rules
+        .get_mut("rules")
+        .and_then(toml::Value::as_array_mut)
+        .expect("rules")
+        .retain(|rule| rule["id"].as_str() != Some(FOLDER_TRUST_RULE));
+    assert_eq!(builtin_rules, golden);
     let ids: Vec<&str> = package["rules"]
         .as_array()
         .expect("rules")
@@ -394,6 +405,7 @@ fn the_package_manifest_file_equals_the_builtin_manifest_file() {
             "osc_title_blocked",
             "osc_title_working",
             "workspace_trust_prompt",
+            FOLDER_TRUST_RULE,
             "live_strong_blocker",
             "weak_blocker",
             "osc_title_idle",
@@ -553,9 +565,16 @@ enum Meaning {
     Idle,
     Working,
     Blocked,
+    /// A dialog without a title that the screen reads as blocked once the
+    /// terminal is at least [`FOLDER_TRUST_MIN_COLUMNS`] wide.
+    ScreenBlocked,
     /// A screen no rule speaks for: only the byte-activity fallback applies.
     Silent,
 }
+
+/// Narrowest captured width at which the folder trust question is still on
+/// one row; below it the question wraps and the screen rule cannot match.
+const FOLDER_TRUST_MIN_COLUMNS: u16 = 30;
 
 impl Meaning {
     fn of(state: &str) -> Self {
@@ -563,9 +582,8 @@ impl Meaning {
             "idle" | "idle_after_turn" => Self::Idle,
             "working_early" | "working_stream" => Self::Working,
             "approval" | "askuser" => Self::Blocked,
-            // Codex 0.160.0 asks "Trust this folder?"; `workspace_trust_prompt`
-            // matches only the older wording, so the dialog stays unclassified.
-            "trust" | "login" => Self::Silent,
+            "trust" => Self::ScreenBlocked,
+            "login" => Self::Silent,
             other => panic!("unknown fixture state {other}"),
         }
     }
@@ -574,7 +592,7 @@ impl Meaning {
         match self {
             Self::Idle => Some(AgentActivity::Idle),
             Self::Working => Some(AgentActivity::Working),
-            Self::Blocked => Some(AgentActivity::Blocked),
+            Self::Blocked | Self::ScreenBlocked => Some(AgentActivity::Blocked),
             Self::Silent => None,
         }
     }
@@ -696,6 +714,9 @@ fn every_captured_screen_is_classified_by_its_title() {
     let definition = installed_definition();
     for frame in top_level_frames().into_iter().chain(width_frames()) {
         let expected = frame.meaning();
+        if expected == Meaning::ScreenBlocked {
+            continue;
+        }
         match expected.activity() {
             Some(activity) => assert_eq!(
                 frame.evidence(&definition),
@@ -737,10 +758,28 @@ fn the_captured_screens_span_the_supported_terminal_widths() {
     assert!(
         frames
             .iter()
-            .filter(|frame| frame.meaning() == Meaning::Silent)
+            .filter(|frame| matches!(frame.meaning(), Meaning::ScreenBlocked | Meaning::Silent))
             .all(|frame| frame.title.is_none()),
         "no title was emitted for the trust and login dialogs"
     );
+}
+
+/// The folder trust dialog sets no title, so its screen alone reads it as
+/// blocked, down to the narrowest width at which its question is on one row.
+#[test]
+fn the_folder_trust_dialog_is_blocked_from_the_screen_alone() {
+    let definition = installed_definition();
+    let mut checked = 0_usize;
+    for frame in top_level_frames().into_iter().chain(width_frames()) {
+        if frame.meaning() != Meaning::ScreenBlocked {
+            continue;
+        }
+        let expected = (frame.columns >= FOLDER_TRUST_MIN_COLUMNS)
+            .then_some((AgentActivity::Blocked, StateSource::Screen));
+        assert_eq!(frame.evidence(&definition), expected, "{}", frame.name);
+        checked += 1;
+    }
+    assert_eq!(checked, 10, "the top-level and the nine width captures");
 }
 
 /// The title alone decides idle, working and blocked: the rows carry no
@@ -846,6 +885,37 @@ fn the_workspace_trust_rule_matches_its_dialog_at_the_top_of_the_screen_only() {
     assert_eq!(screen_activity(&definition, &dialog(&prose), 80), None);
     let mut buried = vec![String::from("line"); 9];
     buried.extend(dialog(&trust));
+    assert_eq!(screen_activity(&definition, &buried, 80), None);
+}
+
+#[test]
+fn the_folder_trust_rule_needs_the_dialog_heading_at_the_top_of_the_screen() {
+    let definition = installed_definition();
+    let folder_trust = [
+        "  Folder access",
+        "  /work/project",
+        "  Trust this folder? Codex can read, edit, and run files here.",
+        "\u{203a} 1. Trust and continue",
+        "  2. Back to Agent Command Center",
+        "  enter continue \u{b7} esc back",
+    ];
+    assert_eq!(
+        screen_activity(&definition, &dialog(&folder_trust), 80),
+        Some(AgentActivity::Blocked)
+    );
+
+    // A reply that quotes the question and both choices is not the dialog
+    // without its heading line, nor is the dialog below the first sixteen lines.
+    let quoted = [
+        "\u{2022} The dialog reads:",
+        "  Trust this folder? Codex can read, edit, and run files here.",
+        "  1. Trust and continue",
+        "  2. Back to Agent Command Center",
+        "\u{203a} ",
+    ];
+    assert_eq!(screen_activity(&definition, &dialog(&quoted), 80), None);
+    let mut buried = vec![String::from("line"); 17];
+    buried.extend(dialog(&folder_trust));
     assert_eq!(screen_activity(&definition, &buried, 80), None);
 }
 
@@ -1011,13 +1081,18 @@ fn the_process_matchers_accept_the_observed_codex_process_forms() {
 
 /// Everything the golden built-in manifest of release v0.34.2 classifies, the
 /// package manifest classifies the same way: the captured frames with and
-/// without their titles, and the synthetic dialogs of the rule tests.
+/// without their titles, and the synthetic dialogs of the rule tests. The
+/// folder trust dialog, which only [`FOLDER_TRUST_RULE`] reads, is checked by
+/// `the_folder_trust_dialog_is_blocked_from_the_screen_alone`.
 #[test]
 fn the_package_manifest_behaves_like_the_builtin_manifest_on_every_frame() {
     let package = installed_definition();
     let golden = golden_definition();
     let mut compared = 0_usize;
     for frame in top_level_frames().into_iter().chain(width_frames()) {
+        if frame.meaning() == Meaning::ScreenBlocked {
+            continue;
+        }
         for title in [frame.title.as_deref(), None] {
             assert_eq!(
                 transitions(&package, title, &frame.rows, frame.columns),
