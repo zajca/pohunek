@@ -4479,6 +4479,52 @@ for claim in plan:
             run.finish().await;
         }
 
+        /// A far-future subagent start leaves a record mark no later than its
+        /// arrival, so the subagent's genuine stop, taken from the host's
+        /// monotonic clock afterwards, is still newer and completes it instead
+        /// of being stale until the runtime ends.
+        #[tokio::test]
+        async fn a_far_future_subagent_start_does_not_freeze_its_record() {
+            let log = EventLog::default();
+            let _subscriber = log.install();
+            let root = crate::test_support::scoped_dir("ph-far-future-subagent-");
+            let client = Client::new(&root);
+            let steps = vec![turn(vec![
+                session_hook(None),
+                client.send(
+                    CLAUDE,
+                    &json!([
+                        {"type": START, "sequence": FAR_FUTURE_SEQUENCE, "id": "far-sub"},
+                        {"type": STOP, "sequence": "now", "id": "far-sub"},
+                    ]),
+                ),
+            ])];
+            let run = replay_checking(&root, steps, None).await;
+            let outcomes: Vec<(String, bool)> = client
+                .answers()
+                .into_iter()
+                .map(|answer| (answer.action, answer.ok))
+                .collect();
+            assert_eq!(
+                outcomes,
+                [(START.to_owned(), true), (STOP.to_owned(), true)],
+                "{}",
+                log.rendered()
+            );
+            let last = run.snapshots.last().expect("the final snapshot");
+            assert_eq!(
+                row(last, "far-sub").phase,
+                SubagentPhase::Completed,
+                "the genuine stop completes the subagent: {last:?}"
+            );
+            assert!(
+                log.named(IGNORED_EVENT).is_empty(),
+                "no claim was stale: {}",
+                log.rendered()
+            );
+            run.finish().await;
+        }
+
         /// A snapshot that began before a release and arrives after it is stale:
         /// the release's clear raised the sequence mark past it. Without that,
         /// the late snapshot would restore the background the release ended.
