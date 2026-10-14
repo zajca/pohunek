@@ -3370,6 +3370,8 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 
@@ -3899,6 +3901,50 @@ mod tests {
         protocol::PROTOCOL_VERSION.get().to_string()
     }
 
+    /// Captures the first notification request on `listener`, answering it,
+    /// until one arrives, the hook exits, or the capture deadline passes.
+    fn capture_notification_request(
+        listener: &UnixListener,
+        hook_exited: &AtomicBool,
+    ) -> Vec<Value> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(HOOK_CAPTURE_TIMEOUT_SECS);
+        let mut requests = Vec::new();
+        loop {
+            // Read the flag before accepting: a WouldBlock that follows an
+            // observed exit means the backlog is fully drained.
+            let exited = hook_exited.load(Ordering::Acquire);
+            match listener.accept() {
+                Ok((mut stream, _addr)) => {
+                    // BSD-derived accept inherits the listener's nonblocking flag.
+                    stream
+                        .set_nonblocking(false)
+                        .expect("make daemon hook stream blocking");
+                    let mut raw = Vec::new();
+                    let mut byte = [0_u8; 1];
+                    while stream.read(&mut byte).expect("read hook request") == 1 {
+                        raw.push(byte[0]);
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                    }
+                    let request =
+                        serde_json::from_slice::<Value>(&raw).expect("hook request is JSON");
+                    requests.push(request);
+                    write_hook_response(&mut stream);
+                    break;
+                }
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    if exited || std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(HOOK_CAPTURE_POLL_MS));
+                }
+                Err(err) => panic!("accept hook request: {err}"),
+            }
+        }
+        requests
+    }
+
     fn run_notification_asset_custom(
         agent: &str,
         args: &[&str],
@@ -3923,44 +3969,16 @@ mod tests {
         let temp = scoped_dir(&format!("{agent}-notify-run"));
         let socket_path = temp.join("daemon.sock");
         let tmpdir = tmpdir_override.unwrap_or(&temp);
+        // Set once the hook process has exited. The hook is synchronous, so
+        // every request it sent is already queued on the listener by then.
+        let hook_exited = Arc::new(AtomicBool::new(false));
         let handle = socket_available.then(|| {
             let listener = UnixListener::bind(&socket_path).expect("bind hook socket");
             listener
                 .set_nonblocking(true)
                 .expect("make hook socket nonblocking");
-            thread::spawn(move || {
-                let deadline =
-                    std::time::Instant::now() + Duration::from_secs(HOOK_CAPTURE_TIMEOUT_SECS);
-                let mut requests = Vec::new();
-                while std::time::Instant::now() < deadline {
-                    match listener.accept() {
-                        Ok((mut stream, _addr)) => {
-                            // BSD-derived accept inherits the listener's nonblocking flag.
-                            stream
-                                .set_nonblocking(false)
-                                .expect("make daemon hook stream blocking");
-                            let mut raw = Vec::new();
-                            let mut byte = [0_u8; 1];
-                            while stream.read(&mut byte).expect("read hook request") == 1 {
-                                raw.push(byte[0]);
-                                if byte[0] == b'\n' {
-                                    break;
-                                }
-                            }
-                            let request = serde_json::from_slice::<Value>(&raw)
-                                .expect("hook request is JSON");
-                            requests.push(request);
-                            write_hook_response(&mut stream);
-                            break;
-                        }
-                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(HOOK_CAPTURE_POLL_MS));
-                        }
-                        Err(err) => panic!("accept hook request: {err}"),
-                    }
-                }
-                requests
-            })
+            let hook_exited = Arc::clone(&hook_exited);
+            thread::spawn(move || capture_notification_request(&listener, &hook_exited))
         });
 
         let mut command = Command::new("/bin/sh");
@@ -3998,6 +4016,7 @@ mod tests {
         let output = child
             .wait_with_output()
             .expect("wait for notification hook");
+        hook_exited.store(true, Ordering::Release);
         let requests = handle
             .map(|handle| handle.join().expect("hook socket thread"))
             .unwrap_or_default();

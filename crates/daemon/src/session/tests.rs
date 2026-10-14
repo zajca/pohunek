@@ -11119,15 +11119,26 @@ const UNANSWERED_CONNECT_DEADLINE: Duration = Duration::from_millis(300);
 /// Bound on the whole unanswered-socket reconnect. It only fails a hung loop:
 /// a correct loop returns after about one connect deadline.
 const UNANSWERED_RECONNECT_BOUND: Duration = Duration::from_secs(20);
+/// Worker exit wait of the final stop in the unanswered-socket test. The
+/// worker is in-process and journals this test's own pid, so no exit proof can
+/// arrive; the stop only waits out this deadline before it retires the job.
+const UNANSWERED_WORKER_EXIT_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[tokio::test]
 async fn reconnect_classifies_a_worker_socket_that_accepts_and_never_answers() {
-    let registry = SessionRegistry::new(SessionRegistryConfig {
+    let mut config = SessionRegistryConfig {
         shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(temp_store_path("reconnect-unanswered")),
         ..SessionRegistryConfig::default()
-    });
+    };
+    let (runtime_root, state_root) = test_worker_roots(&config);
+    config.worker_runtime_root = Some(runtime_root.clone());
+    config.worker_state_root = Some(state_root.clone());
+    let mut supervision = super::test_supervision(&runtime_root, &state_root);
+    supervision.worker_exit_timeout = UNANSWERED_WORKER_EXIT_TIMEOUT;
+    config.supervision = Some(supervision);
+    let registry = SessionRegistry::new(config);
     let created = registry.create(params()).await.expect("create session");
     let (_worker, expected) = live_worker_and_identity(&registry, &created.id).await;
     let socket = temp_dir("unanswered").join("w.sock");
@@ -16634,7 +16645,11 @@ async fn launch_build_failure_with_a_failing_binding_store_is_compensated_by_the
 #[tokio::test]
 async fn failed_worktree_removal_is_retried_until_the_checkout_is_removable() {
     let daemon = RestartableDaemon::new("wt-remove-fail");
-    let registry = SessionRegistry::new(daemon.without_shell());
+    // The retry loop is parked at its pass barrier between the explicit
+    // assertions, so a short delay cannot run a pass out of order.
+    let mut config = daemon.without_shell();
+    config.supervision_retry_initial = super::TEST_SUPERVISION_RETRY_INITIAL;
+    let registry = SessionRegistry::new(config);
     let mut passes = retry_passes(&registry);
     let gate = hold_bound_create(&registry);
     let creating = tokio::spawn({
