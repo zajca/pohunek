@@ -48,8 +48,9 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    scripts/release <patch|minor|major|X.Y.Z> [--notes FILE] --dry-run
    ```
 
-   This prints the current and next version, the tag, and whether the release
-   notes cover any changed compatibility constants. It also describes the
+   This prints the current and next version, the tag, the knowledge-log
+   fragments the release would file, and whether the release notes cover any
+   changed compatibility constants. It also describes the
    commit, evidence checks, and pushes it would perform. Confirm that matches
    intent.
 
@@ -59,8 +60,10 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    scripts/release <patch|minor|major|X.Y.Z> [--notes FILE]
    ```
 
-   The script bumps `version` in `[workspace.package]` in `Cargo.toml`, refreshes
-   `Cargo.lock`, commits `Release vX.Y.Z`, and requires successful main and
+   The script files the `docs/knowledge/log.d/` fragments under `## X.Y.Z` in
+   `docs/knowledge/log.md` and removes them (`cargo xtask docs log fold`), bumps
+   `version` in `[workspace.package]` in `Cargo.toml`, refreshes `Cargo.lock`,
+   commits all of it as `Release vX.Y.Z`, and requires successful main and
    nightly CI evidence for that exact commit before creating an annotated tag
    `vX.Y.Z`. By default it pushes the release branch before waiting for evidence
    and pushes the tag after verification. With `--no-push`, it checks only

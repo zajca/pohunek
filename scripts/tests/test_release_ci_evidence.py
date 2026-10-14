@@ -50,6 +50,28 @@ os.execv(real, [real, *args])
 
 FAKE_CARGO = "#!/bin/sh\nexit 0\n"
 
+# Stands in for `cargo xtask docs log fold`: records the call, and outside a dry
+# run files the fragments the way the real fold does (log written, log.d gone).
+FOLDING_CARGO = r'''#!/bin/sh
+case "$*" in
+  "xtask docs log fold "*)
+    printf '%s\n' "cargo $*" >> "$EVENTS"
+    case "$*" in
+      *--dry-run*) ;;
+      *)
+        version=$(printf '%s\n' "$*" | sed 's/.*--version \([^ ]*\).*/\1/')
+        printf '\n## %s\n\n- Folded.\n' "$version" >> docs/knowledge/log.md
+        rm -rf docs/knowledge/log.d
+        ;;
+    esac
+    ;;
+esac
+exit 0
+'''
+
+LOG = "# Knowledge Bundle Log\n\n## 0.1.0\n\n- First release.\n"
+FRAGMENT = "## Unreleased (2026-10-14, a change, #1)\n\n- A change.\n"
+
 FAKE_GH = r'''#!/usr/bin/env python3
 import json
 import os
@@ -212,6 +234,52 @@ class ReleaseEvidenceTests(unittest.TestCase):
                 "tier": tier,
             })
         self.state.write_text(json.dumps({"sha": sha, "runs": runs}))
+
+    def add_knowledge_log(self):
+        self.write_copy("docs/knowledge/log.md", LOG)
+        self.write_copy("docs/knowledge/log.d/1-a-change.md", FRAGMENT)
+        self.write_copy("bin/cargo", FOLDING_CARGO, executable=True)
+        self.git("add", "docs", "bin")
+        self.git("commit", "-m", "Record a knowledge-log fragment")
+
+    def tracked(self, revision):
+        return subprocess.check_output(
+            [shutil.which("git"), "-C", str(self.repo), "ls-tree", "-r", "--name-only", revision],
+            text=True,
+        ).split()
+
+    def test_release_commit_files_the_knowledge_log_fragments(self):
+        self.add_knowledge_log()
+        result = self.run_release()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("cargo xtask docs log fold --version 0.1.1", self.read_events())
+        candidate = json.loads(self.state.read_text())["sha"]
+        self.assertNotIn("docs/knowledge/log.d/1-a-change.md", self.tracked(candidate))
+        log = subprocess.check_output(
+            [shutil.which("git"), "-C", str(self.repo), "show", f"{candidate}:docs/knowledge/log.md"],
+            text=True,
+        )
+        self.assertIn("## 0.1.1", log)
+        status = subprocess.check_output(
+            [shutil.which("git"), "-C", str(self.repo), "status", "--porcelain"], text=True
+        )
+        self.assertEqual(status, "", "the release commit holds the whole fold")
+
+    def test_dry_run_plans_the_fold_and_changes_nothing(self):
+        self.add_knowledge_log()
+        result = self.run_release("--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("cargo xtask docs log fold --version 0.1.1 --dry-run", self.read_events())
+        self.assertIn("docs/knowledge/log.d/1-a-change.md", self.tracked("HEAD"))
+        self.assertTrue((self.repo / "docs/knowledge/log.d/1-a-change.md").exists())
+
+    def test_already_versioned_candidate_with_unfolded_fragments_is_refused(self):
+        self.add_knowledge_log()
+        self.prepare_existing_candidate()
+        result = self.run_release("0.1.1", "--no-push")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("still has knowledge-log fragments", result.stderr)
+        self.assertFalse((self.repo / ".git/refs/tags/v0.1.1").exists())
 
     def test_push_checks_both_tiers_before_tag_and_tag_push(self):
         result = self.run_release()

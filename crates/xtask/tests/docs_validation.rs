@@ -38,6 +38,7 @@ fn issue_kind(issue: &BundleValidationIssue) -> &'static str {
         BundleValidationIssue::MissingSince { .. } => "missing_since",
         BundleValidationIssue::BrokenLink { .. } => "broken_link",
         BundleValidationIssue::ReservedFrontmatter { .. } => "reserved_frontmatter",
+        BundleValidationIssue::LogFragment { .. } => "log_fragment",
         BundleValidationIssue::UnsupportedFileType { .. } => "unsupported_file_type",
     }
 }

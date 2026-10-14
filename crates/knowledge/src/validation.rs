@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::log::{self, FRAGMENT_DIR};
 use crate::{Concept, ConceptType, CONCEPT_SCHEMA_VERSION};
 
 /// Summary returned after a bundle passes validation.
@@ -14,8 +15,11 @@ use crate::{Concept, ConceptType, CONCEPT_SCHEMA_VERSION};
 pub struct BundleValidationReport {
     /// Concept frontmatter schema version this bundle was checked against.
     pub schema_version: u32,
-    /// Number of markdown files inspected during validation.
+    /// Number of markdown files inspected during validation, not counting the
+    /// log fragments.
     pub files_checked: usize,
+    /// Number of unreleased log fragments under `log.d/` inspected.
+    pub fragments_checked: usize,
     /// All concepts parsed from the bundle, in sorted file order.
     pub concepts: Vec<Concept>,
 }
@@ -117,6 +121,13 @@ pub enum BundleValidationIssue {
         /// Reserved file carrying disallowed frontmatter.
         path: PathBuf,
     },
+    #[error("invalid log fragment `{}`: {reason}", path.display())]
+    LogFragment {
+        /// Fragment file, or entry of the fragment directory, that was refused.
+        path: PathBuf,
+        /// The fragment rule it breaks.
+        reason: String,
+    },
     #[error("unsupported file type in knowledge bundle: `{}`", path.display())]
     UnsupportedFileType {
         /// Path of the unsupported (non-file) entry.
@@ -131,7 +142,8 @@ pub enum BundleValidationIssue {
 /// Returns a [`BundleValidationError`] collecting every issue found: unreadable
 /// directories or files, missing or invalid frontmatter, duplicate concept ids,
 /// concepts missing a required `since`, broken internal links, reserved files
-/// carrying frontmatter, or unsupported file types.
+/// carrying frontmatter, log fragments that break the rules of
+/// [`crate::log`], or unsupported file types.
 pub fn validate_bundle(
     dir: impl AsRef<Path>,
 ) -> Result<BundleValidationReport, BundleValidationError> {
@@ -141,6 +153,11 @@ pub fn validate_bundle(
     let mut markdown_files = Vec::new();
     collect_markdown_files(root, &mut markdown_files, &mut issues);
     markdown_files.sort();
+    let fragment_dir = root.join(FRAGMENT_DIR);
+    let (fragments, markdown_files): (Vec<PathBuf>, Vec<PathBuf>) = markdown_files
+        .into_iter()
+        .partition(|path| path.starts_with(&fragment_dir));
+    validate_fragments(&normalized_root, &fragment_dir, &fragments, &mut issues);
 
     let mut concepts = Vec::new();
     let mut ids: HashMap<String, PathBuf> = HashMap::new();
@@ -208,10 +225,62 @@ pub fn validate_bundle(
         Ok(BundleValidationReport {
             schema_version: CONCEPT_SCHEMA_VERSION,
             files_checked: markdown_files.len(),
+            fragments_checked: fragments.len(),
             concepts,
         })
     } else {
         Err(BundleValidationError::new(issues))
+    }
+}
+
+/// Checks every unreleased log fragment and every entry of the fragment
+/// directory. Links in a fragment resolve from the bundle root, where the
+/// assembled log carries them.
+fn validate_fragments(
+    root: &Path,
+    fragment_dir: &Path,
+    fragments: &[PathBuf],
+    issues: &mut Vec<BundleValidationIssue>,
+) {
+    if let Ok(entries) = fs::read_dir(fragment_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_markdown_file = entry.file_type().is_ok_and(|kind| kind.is_file())
+                && path.extension().is_some_and(|extension| extension == "md");
+            if !is_markdown_file {
+                issues.push(BundleValidationIssue::LogFragment {
+                    path,
+                    reason: "only `.md` fragment files belong in log.d".to_owned(),
+                });
+            }
+        }
+    }
+    let log_path = root.join(log::LOG_FILE);
+    for path in fragments {
+        if path.parent() != Some(fragment_dir) {
+            continue;
+        }
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) => {
+                issues.push(BundleValidationIssue::ReadFile {
+                    path: path.clone(),
+                    message: error.to_string(),
+                });
+                continue;
+            }
+        };
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if let Err(error) = log::parse_fragment(name, &content) {
+            issues.push(BundleValidationIssue::LogFragment {
+                path: path.clone(),
+                reason: error.reason().to_owned(),
+            });
+        }
+        validate_links_from(root, &log_path, path, &content, issues);
     }
 }
 
@@ -271,6 +340,18 @@ fn validate_links(
     content: &str,
     issues: &mut Vec<BundleValidationIssue>,
 ) {
+    validate_links_from(root, path, path, content, issues);
+}
+
+/// Checks the internal links of `content`, resolved as if it were the file
+/// `base`, and reports a broken one against `path`.
+fn validate_links_from(
+    root: &Path,
+    base: &Path,
+    path: &Path,
+    content: &str,
+    issues: &mut Vec<BundleValidationIssue>,
+) {
     let mut remaining = content;
     while let Some(start) = remaining.find("](") {
         remaining = &remaining[start + 2..];
@@ -293,7 +374,7 @@ fn validate_links(
         }
 
         let resolved = normalize_path(
-            &path
+            &base
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
                 .join(target_path),

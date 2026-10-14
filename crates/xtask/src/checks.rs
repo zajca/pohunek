@@ -49,6 +49,7 @@ pub(crate) fn check_docs(
 
     let mut all_pass = true;
     all_pass &= check_schema_validation(source_dir);
+    all_pass &= check_knowledge_log(source_dir);
     all_pass &= check_deterministic_build(source_dir, output_root)?;
     all_pass &= check_source_map_paths(source_dir, &repo);
     all_pass &= check_upstream_verifier_docs(source_dir);
@@ -74,6 +75,23 @@ fn check_schema_validation(source_dir: &Path) -> bool {
         }
         Err(err) => {
             println!("[FAIL] schema-validation: {err}");
+            false
+        }
+    }
+}
+
+/// The committed `log.md` carries no unreleased section: those belong in
+/// fragments under `log.d/`, which must follow the fragment rules.
+fn check_knowledge_log(source_dir: &Path) -> bool {
+    match crate::knowledge_log::check(source_dir) {
+        Ok(fragments) => {
+            println!(
+                "[PASS] knowledge-log: log.md has no unreleased section, {fragments} fragment(s) valid"
+            );
+            true
+        }
+        Err(reason) => {
+            println!("[FAIL] knowledge-log: {reason}");
             false
         }
     }

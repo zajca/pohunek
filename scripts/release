@@ -1,7 +1,8 @@
 #!/bin/sh
 
-# Cut a new release: bump the workspace version, refresh the lockfile, commit,
-# push the candidate to main, require exact-commit CI evidence, then tag it.
+# Cut a new release: bump the workspace version, refresh the lockfile, file the
+# knowledge-log fragments under the release heading, commit, push the candidate
+# to main, require exact-commit CI evidence, then tag it.
 # Pushing the tag triggers .github/workflows/release.yml,
 # which builds the binaries, runs the compatibility rows, signs the runtime
 # catalog and publishes the GitHub Release as a draft that becomes visible only
@@ -211,8 +212,18 @@ pohunek_info "next version:    $next  (tag $tag)"
 
 pohunek_check_compat_notes
 
+# The unreleased knowledge-log fragments (docs/knowledge/log.d) are filed under
+# the release heading of docs/knowledge/log.md and removed in the release commit.
+knowledge_dir="$repo_root/docs/knowledge"
+fragment_dir="$knowledge_dir/log.d"
+
+pohunek_fold_knowledge_log() {
+  ( cd "$repo_root" && cargo xtask docs log fold --version "$next" "$@" )
+}
+
 if [ "$dry_run" = true ]; then
-  pohunek_info "dry run: would bump $manifest to $next, refresh Cargo.lock, commit, push the candidate, verify exact-commit main and nightly CI evidence, then tag $tag$( [ "$push" = true ] && printf ' and push the tag' )"
+  pohunek_fold_knowledge_log --dry-run
+  pohunek_info "dry run: would bump $manifest to $next, refresh Cargo.lock, fold the knowledge-log fragments, commit, push the candidate, verify exact-commit main and nightly CI evidence, then tag $tag$( [ "$push" = true ] && printf ' and push the tag' )"
   exit 0
 fi
 
@@ -229,8 +240,15 @@ if git -C "$repo_root" rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
 fi
 
 if [ "$version_already_bumped" = true ]; then
+  if [ -d "$fragment_dir" ] && [ -n "$(ls -A "$fragment_dir")" ]; then
+    pohunek_fail "the candidate still has knowledge-log fragments in docs/knowledge/log.d; fold them with 'cargo xtask docs log fold --version $next' and commit"
+  fi
   pohunek_info "workspace is already at $next; checking this commit as the release candidate"
 else
+  # Fold first: it validates every fragment before it writes, so a refused
+  # fragment stops the release with the tree unchanged.
+  pohunek_fold_knowledge_log
+
   # Bump the version in [workspace.package] (only that table's `version` line).
   tmp="$manifest.tmp"
   awk -v nextver="$next" '
@@ -249,6 +267,9 @@ else
   ( cd "$repo_root" && cargo update --workspace --offline >/dev/null 2>&1 || cargo update --workspace >/dev/null )
 
   git -C "$repo_root" add Cargo.toml Cargo.lock
+  if [ -d "$knowledge_dir" ]; then
+    git -C "$repo_root" add -A -- docs/knowledge
+  fi
   git -C "$repo_root" commit -m "Release $tag"
 fi
 candidate_sha="$(git -C "$repo_root" rev-parse HEAD)"
