@@ -118,7 +118,10 @@ upgrade of the release files. It runs in this order:
    platform has no package). The plan only reads.
 3. Preview and consent: every effect and gap is printed before anything is
    written, including the catalog trust state (`record` means the install or
-   the apply records it) and every Hermes home the apply acts on. The owner
+   the apply records it; on an installed service with no official package to
+   install, nothing records it and the preview says so, to be recorded with the
+   next official package install or `pohunek service upgrade`) and every Hermes
+   home the apply acts on. The owner
    confirms once. A plan the planner refuses stops the run before its first
    change. An interrupted `pohunek service install` or `upgrade` that is still
    pending stops the run before any change too; the stop names the command that

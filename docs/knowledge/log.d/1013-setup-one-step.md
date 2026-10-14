@@ -29,3 +29,7 @@
   A failure after the first change lists the changes made in its message.
 - `pohunek service install` renders the runtime step it ran (catalog, packages,
   profiles).
+- A Hermes home previewed as an update that cannot be updated at apply time
+  fails the verdict. A config write that fails part way names the files it
+  created. A catalog to be recorded on an installed host with no official
+  package to install is a note, not an effect.
