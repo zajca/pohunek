@@ -499,10 +499,10 @@ impl Layout {
             // The running image is hashed through /proc/<pid>/exe, the inode
             // that was executed, whatever its path now holds. It stays readable
             // after an unlink, so a failure is an exit only once the process
-            // is gone.
+            // has ended.
             let image = || match sha256_file(&entry.path().join("exe")) {
                 Ok(digest) => Ok(Some(digest)),
-                Err(_) if !entry.path().exists() => Ok(None),
+                Err(_) if process_ended(&entry.path()) => Ok(None),
                 Err(source) => Err(LayoutError::Io {
                     what: format!("hash the image of live process {pid}"),
                     source,
@@ -598,6 +598,14 @@ impl Layout {
                     if fact.comm.starts_with(POHUNEK_NAME_PREFIX)
                         || inspector.cwd(fact.pid).is_ok_and(|cwd| below_root(&cwd)) =>
                 {
+                    // A process that ended after the failed read is skipped
+                    // like any other exit.
+                    if !inspect(
+                        format!("check if process {} is running", fact.pid),
+                        inspector.is_running(fact.identity()),
+                    )? {
+                        continue;
+                    }
                     return Err(LayoutError::Io {
                         what: format!("read executable of process {}", fact.pid),
                         source: std::io::Error::other(error),
@@ -697,6 +705,21 @@ impl Layout {
 
         Ok(found)
     }
+}
+
+/// Whether the process of `directory` (a `/proc/<pid>` entry) has ended: its
+/// entry is gone, or it is a zombie or dead task whose image can no longer be
+/// read although the entry remains until its parent reaps it.
+#[cfg(target_os = "linux")]
+fn process_ended(directory: &Path) -> bool {
+    let Ok(stat) = fs::read_to_string(directory.join("stat")) else {
+        return true;
+    };
+    // The state follows the parenthesised command name, which may itself hold
+    // spaces or parentheses.
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .is_some_and(|state| matches!(state, "Z" | "X" | "x"))
 }
 
 /// Whether a value of the process environment of `directory` (a `/proc/<pid>`
