@@ -349,16 +349,17 @@ pub(crate) enum Error {
     },
 
     /// `pohunek service uninstall` was given while workflow plugins still have
-    /// recorded jobs or services: their units run the installed CLI, so the
-    /// uninstall would strand them. Nothing was changed.
+    /// recorded jobs or services, or the reaction dispatcher unit is
+    /// recorded: those units run the installed CLI, so the uninstall would
+    /// strand them. Nothing was changed.
     #[error(
-        "service uninstall refused: workflow plugins still have jobs or services installed: {}; \
-         run {} first",
+        "service uninstall refused: workflow plugins still have jobs, services or reactions \
+         installed: {}; run {} first",
         plugins.join(", "),
         disable_commands(plugins)
     )]
     UnitsInstalled {
-        /// The ids of the plugins with recorded units, sorted.
+        /// The ids of the plugins whose disable removes those units, sorted.
         plugins: Vec<String>,
     },
 }

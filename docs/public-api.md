@@ -3281,9 +3281,10 @@ Every `--json` result is one standard CLI process envelope. The `ok` payloads:
   behind refuses every run.
 - `inspect`: `{plugin, description, files_dir, state_dir, config_dir,
   actions: [{name, argv, args, timeout_ms?, max_output_bytes?}],
-  jobs?: [{name, argv, every_s, timeout_ms?}], services?: [{name, argv}]}`.
-  `argv[0]` is resolved to an absolute path; `args` is `none` or
-  `passthrough`; `jobs` and `services` are present when declared.
+  jobs?: [{name, argv, every_s, timeout_ms?}], services?: [{name, argv}],
+  reactions?: [{name, events, argv, timeout_ms?}]}`. `argv[0]` is resolved to
+  an absolute path; `args` is `none` or `passthrough`; `jobs`, `services` and
+  `reactions` are present when declared.
 - `run`: the action's stdout, which must be exactly one JSON document (JSON
   whitespace around it is allowed and dropped), placed as `ok` byte for byte:
   key order, number spelling and inner whitespace are the action's own. It is
@@ -3346,7 +3347,7 @@ CLI envelope, not to the protocol's error type:
 | `workflow_installed_disabled` | `runtime` | `install --yes` only: the new plugin was recorded, but a step after that failed: reaching the service manager (`cause` `workflow_units_failed`), marking the plugin enabled (`workflow_store_busy` while another workflow command holds the store lock, `workflow_root_invalid`, or `workflow_store_failed`; for a failure that may have written the flag, the plugin is disabled again first), or installing a unit (`workflow_units_failed`). `cause` is that failure's code. When every step was undone the plugin stays installed disabled with no units and the message says so: fix the cause, then run `pohunek workflow enable <id>`. When undoing the failed step failed too (a unit install, or clearing a flag that may have been written), the message says the plugin may remain enabled or keep units: run `pohunek workflow disable <id>` until it succeeds, then `pohunek workflow enable <id>`. Every check that can refuse an enabling install, and the unit lifecycle lock, come before the record is written. |
 | `workflow_unit_stale` | `runtime` | A unit names another archive than the installed one; it was refused and recorded. |
 | `workflow_unit_unknown` | `configuration` | The installed manifest declares no job or service of the unit's name; nothing was run. |
-| `workflow_units_installed` | `configuration` | Only `pohunek service uninstall`: a workflow plugin still has jobs or services recorded, or the reaction dispatcher unit is recorded. The message names each plugin and the `pohunek workflow disable <id>` that stops it; nothing was changed. |
+| `workflow_units_installed` | `configuration` | Only `pohunek service uninstall`: a workflow plugin still has jobs or services recorded, or the reaction dispatcher unit is recorded. The message names each plugin to disable and its `pohunek workflow disable <id>`: the plugins with recorded units, and for the dispatcher each enabled plugin that declares a reaction or fails verification, or every installed plugin when none does; nothing was changed. |
 
 `workflow run` streams the action's stdout and stderr, each up to its cap.
 With `--json` it captures stdout up to the same cap instead, still streams

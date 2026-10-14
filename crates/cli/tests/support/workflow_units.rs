@@ -908,6 +908,28 @@ pub(crate) mod native {
         nix::unistd::Uid::effective().as_raw()
     }
 
+    /// Most bytes of `launchctl` stderr a failed check quotes: enough for its
+    /// one-line reason.
+    const LAUNCHCTL_REASON_BYTES: usize = 512;
+
+    /// `launchctl print <target>`: its exit code and the start of its stderr.
+    fn launchctl_print(target: &str) -> (Option<i32>, String) {
+        let output = Command::new("/bin/launchctl")
+            .env_clear()
+            .current_dir("/")
+            .args(["print", target])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("launchctl runs");
+        let reason = &output.stderr[..output.stderr.len().min(LAUNCHCTL_REASON_BYTES)];
+        (
+            output.status.code(),
+            String::from_utf8_lossy(reason).trim().to_owned(),
+        )
+    }
+
     fn launchctl(arguments: &[&str]) -> std::process::ExitStatus {
         // launchctl addresses launchd through the mach bootstrap port, not
         // through any variable.
@@ -950,7 +972,15 @@ pub(crate) mod native {
             .map(|key| namespace.plugin_label(key))
             .filter(|label| {
                 let target = format!("gui/{}/{label}", uid());
-                launchctl(&["print", &target]).code() != Some(LAUNCHCTL_ABSENT)
+                // Only a successful print proves the label loaded and only the
+                // absent code proves it gone; any other answer is no evidence.
+                match launchctl_print(&target) {
+                    (Some(0), _reason) => true,
+                    (Some(LAUNCHCTL_ABSENT), _reason) => false,
+                    (other, reason) => {
+                        panic!("launchctl print {target} answered {other:?}: {reason}")
+                    }
+                }
             })
             .collect()
     }
