@@ -37,7 +37,7 @@ use tokio_util::codec::{Framed, LinesCodec};
 use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo, RemoteServer};
 use pohunek_daemon::error::DaemonError;
 use pohunek_daemon::governance::HostGovernanceService;
-use pohunek_daemon::procwatch::HostInspector;
+use pohunek_daemon::procwatch::{HostInspector, ProcessInspector};
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 use pohunek_test_support::worker_binary;
@@ -1456,6 +1456,133 @@ async fn daemon_doctor_bounds_aggregate_version_probes_across_slow_profiles() {
         2,
         "aggregate budget permits only two full probes"
     );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Opens the write end of the FIFO at `path` without waiting for a reader.
+///
+/// While the returned file is open, a reader's open completes at once and its
+/// read blocks; dropping it, also while a failure unwinds or when this process
+/// exits, hands every reader end of file.
+fn open_fifo_writer(path: &Path) -> std::fs::File {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    // A non-blocking read end lets the write end open without blocking; only
+    // the write end is kept.
+    let reader = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .expect("open the FIFO for reading");
+    let writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open the FIFO for writing");
+    drop(reader);
+    writer
+}
+
+#[tokio::test]
+async fn daemon_doctor_version_probe_leaves_no_descendant_behind() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = pohunek_test_support::tempdir().expect("create probe fixture root");
+    let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
+    process_env.set("PATH", root.path());
+    let agents = root.path().join("agents");
+    std::fs::create_dir(&agents).expect("create agents directory");
+    let descendants = root.path().join("descendants");
+    std::fs::create_dir(&descendants).expect("create descendant pid directory");
+    let hold = root.path().join("hold");
+    nix::unistd::mkfifo(&hold, nix::sys::stat::Mode::S_IRWXU).expect("create the hold FIFO");
+    let _hold_writer = open_fifo_writer(&hold);
+    // Each probe starts a descendant in its process group. The descendant opens
+    // the FIFO read-write, so the read-only open after it cannot block, drops
+    // that write end, records its pid, and blocks reading: a shell builtin step
+    // that ends only once this test's write end closes, also when it unwinds or
+    // exits. The probe prints its version and exits only after that pid is
+    // recorded, so its group still holds a live descendant when it exits.
+    let runtime = root.path().join("forking-runtime");
+    std::fs::write(
+        &runtime,
+        format!(
+            "#!/bin/sh\n\
+             sh -c 'exec 3<> \"{hold}\" 4< \"{hold}\" 3>&-; echo $$ > \"{descendants}/$$\"; read held <&4' &\n\
+             until [ -s \"{descendants}/$!\" ]; do :; done\n\
+             printf '%s\\n' '{banner}'\n",
+            descendants = descendants.display(),
+            hold = hold.display(),
+            banner = official_runtimes::supported_banner("hermes"),
+        ),
+    )
+    .expect("write forking version-probe executable");
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755))
+        .expect("make forking runtime executable");
+    std::fs::write(
+        agents.join("forking.toml"),
+        format!(
+            "base = \"hermes\"\n{}program = \"{}\"\n[env]\nPATH = \"/bin\"\n",
+            official_runtimes::profile_pin("hermes"),
+            runtime.display()
+        ),
+    )
+    .expect("write forking profile");
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents),
+        ..shell_config()
+    };
+    let (_addr, socket, shutdown, handle) =
+        spawn_dual_servers_serving_official_runtimes("doctor-probe-group", "0.0.0", config).await;
+    let mut client = connect_unix(&socket).await;
+    let payload = ok_payload(
+        exchange(
+            &mut client,
+            &Request::make("doctor-probe-group", method::DAEMON_DOCTOR, Value::Null),
+        )
+        .await,
+    );
+    // A ready profile proves the probe exited and printed its version rather
+    // than running into the probe timeout, whose cleanup ends the group anyway.
+    let profile = payload["report"]["checks"]
+        .as_array()
+        .expect("doctor checks array")
+        .iter()
+        .find(|check| check["name"] == "agent_profile_forking")
+        .unwrap_or_else(|| panic!("doctor reports the forking profile: {payload}"));
+    assert_eq!(profile["status"], "ok", "{payload}");
+
+    let pids: Vec<u32> = std::fs::read_dir(&descendants)
+        .expect("read descendant pids")
+        .map(|entry| {
+            entry
+                .expect("read descendant pid entry")
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse().ok())
+                .expect("a numeric descendant pid")
+        })
+        .collect();
+    assert!(
+        !pids.is_empty(),
+        "the doctor must run the profile's version probe: {payload}"
+    );
+    let inspector = HostInspector::new();
+    pohunek_test_support::wait::wait_until("the probe's descendants to be terminated", || {
+        let ended = pids.iter().all(|pid| {
+            inspector
+                .identity(*pid)
+                .expect("inspect a probe descendant")
+                .is_none_or(|identity| {
+                    !inspector
+                        .is_running(identity)
+                        .expect("inspect a probe descendant")
+                })
+        });
+        async move { ended.then_some(()) }
+    })
+    .await;
 
     let _ = shutdown.send(());
     let _ = handle.await;

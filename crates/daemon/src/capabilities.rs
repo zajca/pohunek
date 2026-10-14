@@ -558,22 +558,38 @@ fn spawn_and_collect_probe(
     let mut child = command.spawn().ok()?;
     let deadline = now() + timeout;
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if now() < deadline => {
+        match probe_exited(&mut child) {
+            Ok(true) => {
+                // The exited child is not reaped yet, so its pid still holds
+                // the process group id and the signal reaches only the probe's
+                // own group.
+                terminate_probe_process_group(child.id());
+                match child.wait() {
+                    Ok(status) => break status,
+                    Err(_) => return Some(ProbeOutcome::Unavailable),
+                }
+            }
+            Ok(false) if now() < deadline => {
                 std::thread::sleep(VERSION_PROBE_POLL_INTERVAL);
             }
-            Ok(None) => {
+            Ok(false) => {
                 terminate_probe_process(&mut child);
                 return Some(ProbeOutcome::TimedOut);
             }
-            Err(_) => {
+            Err(error) if probe_child_gone(&error) => {
+                // The child is no longer waitable, so its pid and group id may
+                // already belong to an unrelated process and must not be
+                // signalled.
+                debug!(%error, "version probe child is no longer waitable");
+                return Some(ProbeOutcome::Unavailable);
+            }
+            Err(error) => {
+                debug!(%error, "version probe exit check failed");
                 terminate_probe_process(&mut child);
                 return Some(ProbeOutcome::Unavailable);
             }
         }
     };
-    terminate_probe_process_group(child.id());
     let mut output = Vec::with_capacity(VERSION_OUTPUT_LIMIT);
     File::open(&sandbox.output_path)
         .ok()?
@@ -711,6 +727,49 @@ fn configure_probe_process_group(command: &mut Command) {
 
 #[cfg(not(unix))]
 fn configure_probe_process_group(_command: &mut Command) {}
+
+/// Whether the probe child has exited, observed without reaping it, so its pid
+/// and process group id stay reserved until `child` is waited.
+///
+/// An interrupted check reports the child as still running, so the caller's
+/// deadline decides when to check again.
+#[cfg(unix)]
+fn probe_exited(child: &mut std::process::Child) -> std::io::Result<bool> {
+    use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
+
+    let pid = i32::try_from(child.id())
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid probe PID")
+        })?;
+    match waitid(
+        WaitId::Pid(pid),
+        WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+    ) {
+        Ok(status) => Ok(status.is_some()),
+        Err(rustix::io::Errno::INTR) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Whether the probe child has exited.
+#[cfg(not(unix))]
+fn probe_exited(child: &mut std::process::Child) -> std::io::Result<bool> {
+    child.try_wait().map(|status| status.is_some())
+}
+
+/// Whether a failed exit check means the probe child is no longer waitable.
+#[cfg(unix)]
+fn probe_child_gone(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ECHILD)
+}
+
+/// Whether a failed exit check means the probe child is no longer waitable.
+#[cfg(not(unix))]
+fn probe_child_gone(_error: &std::io::Error) -> bool {
+    false
+}
 
 fn terminate_probe_process(child: &mut std::process::Child) {
     terminate_probe_process_group(child.id());
