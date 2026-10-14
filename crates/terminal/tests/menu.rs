@@ -127,9 +127,10 @@ fn assert_rename_cursor(screen: &vt100::Screen, buffer: &str) -> u16 {
     let (cursor_row, cursor_col) = screen.cursor_position();
     assert!(!screen.hide_cursor(), "rename input must show the cursor");
     assert_eq!(cursor_row, input_row, "cursor must sit on the input row");
-    assert!(
-        (input_col..=input_col + input_len).contains(&cursor_col),
-        "cursor column {cursor_col} must stay within {input:?} starting at {input_col}"
+    assert_eq!(
+        cursor_col,
+        input_col + input_len,
+        "the cursor must sit right after {input:?}, which starts at column {input_col}"
     );
     let text = row_text(screen, input_row);
     let left_border = text

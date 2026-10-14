@@ -634,11 +634,11 @@ fn wide_header_characters_take_two_cells_and_are_never_split() {
 fn the_physical_cursor_follows_the_overlay_input_cell_or_the_agent() {
     /// Agent cursor after "agent prompt" on the first row.
     const AGENT_CURSOR: (u16, u16) = (0, 12);
-    /// Overlay cursor cell two columns into the first body line.
+    /// Overlay cursor cell two columns into the text of the first body line.
     const INPUT_CELL: (u16, u16) = (0, 2);
-    /// That cell on the physical terminal: the "Kill" row, two columns after
-    /// the first interior column.
-    const INPUT_CURSOR: (u16, u16) = (MENU_FIRST_BODY_ROW, MENU_LEFT_COL + 1 + 2);
+    /// That cell on the physical terminal: the "Kill" row, after the left
+    /// border, the interior's padding cell, and two text columns.
+    const INPUT_CURSOR: (u16, u16) = (MENU_FIRST_BODY_ROW, MENU_LEFT_COL + 1 + 1 + 2);
     let mut terminal = AttachedTerminal::new(MENU_COLS, MENU_ROWS);
     terminal.agent_output(b"agent prompt");
     terminal.compositor.set_overlay(Some(menu()));
