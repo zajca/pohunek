@@ -99,6 +99,16 @@ impl Host {
             .write_release_archives(&self.release_dir(), sequence, archives);
     }
 
+    /// Disables the installed package `digest` through the registry, as the
+    /// operator's `plugin disable` does.
+    fn disable_package(&self, digest: &PackageDigest) {
+        pohunek_daemon::agent::host::PackageStore::open(&self.plugins_dir())
+            .expect("the package store")
+            .registry()
+            .set_enabled(digest, false)
+            .expect("disable the package");
+    }
+
     /// Removes the root of the installed package `digest`.
     fn remove_package_root(&self, digest: &str) {
         let hex = digest.strip_prefix("sha256:").expect("a sha256 digest");
@@ -758,4 +768,251 @@ fn an_unpinned_profile_is_refused_when_a_retained_older_version_is_damaged() {
         registry
     );
     assert_eq!(fs::read(&second).expect("the unpinned profile"), profile);
+}
+
+/// The state a digest-only profile repair starts from: the older version is
+/// installed, then replaced by a newer selected one, and nothing but the
+/// digest-only profile `second` refers to the older version. Returns the older
+/// digest, the newer digest, and the path of `second`.
+fn digest_only_repair_state(host: &Host) -> (String, PackageDigest, PathBuf) {
+    host.publish_at(&["claude"], 1);
+    host.write_claude_profile();
+    let older = host.step(false).packages[0].digest.clone();
+    // Nothing references the older version once the profile is unpinned.
+    host.write_profile("official", "base = \"claude\"\n");
+    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.0.2");
+    host.publish_archives(2, &[("claude", &bytes, &digest)]);
+    let newer = host.step(false);
+    assert_eq!(newer.packages[0].status, PackageStatus::Installed);
+    host.remove_package_root(&older);
+    let second = host.write_profile(
+        "second",
+        &format!("base = \"claude\"\ndigest = \"{older}\"\n"),
+    );
+    (older, digest, second)
+}
+
+/// A profile that carries only an older `digest` (no `package` key) does not
+/// reference that version for the bind that replaces it. With the older root
+/// gone and no release catalog, the newer selected version is bound to it, and
+/// the plan and the apply agree.
+#[test]
+fn a_digest_only_profile_is_rebound_when_its_replaced_older_version_is_damaged() {
+    let host = Host::new();
+    let (_older, digest, second) = digest_only_repair_state(&host);
+    host.remove_release();
+
+    let plan = host.step(true);
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(plan.profiles.len(), 1);
+    assert_eq!(plan.profiles[0].name, "second");
+    assert_eq!(plan.profiles[0].status, ProfileStatus::Bind);
+    assert_eq!(plan.profiles[0].digest, digest.as_str());
+
+    let applied = host.step(false);
+
+    assert!(applied.refusals.is_empty(), "{:?}", applied.refusals);
+    assert_eq!(applied.profiles.len(), 1);
+    assert_eq!(applied.profiles[0].status, ProfileStatus::Bound);
+    let text = fs::read_to_string(&second).expect("the rebound profile");
+    assert!(
+        text.contains(&format!("digest = \"{}\"", digest.as_str())),
+        "{text}"
+    );
+}
+
+/// With the catalog still published, the newer release package is already
+/// installed and selected. Its plan judges the profile's bind only: the
+/// digest-only profile does not block the package it is bound to.
+#[test]
+fn a_digest_only_profile_does_not_block_an_installed_release_package() {
+    let host = Host::new();
+    let (_older, digest, _second) = digest_only_repair_state(&host);
+
+    let plan = host.step(true);
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    let claude = plan
+        .packages
+        .iter()
+        .find(|package| package.runtime == "claude")
+        .expect("the claude package");
+    assert_eq!(claude.status, PackageStatus::Present);
+    assert_eq!(claude.digest, digest.as_str());
+    assert_eq!(plan.profiles.len(), 1);
+    assert_eq!(plan.profiles[0].status, ProfileStatus::Bind);
+}
+
+/// A release package that is selected but disabled is only enabled: the apply
+/// makes no selecting call, so the retained set is not judged for it. A
+/// digest-only profile that retains a damaged older version is then bound to
+/// the enabled package, and the plan and the apply agree.
+#[test]
+fn a_selected_but_disabled_release_package_is_enabled_and_its_profile_bound() {
+    let host = Host::new();
+    let (_older, digest, second) = digest_only_repair_state(&host);
+    host.disable_package(&digest);
+
+    let plan = host.step(true);
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    let claude = plan
+        .packages
+        .iter()
+        .find(|package| package.runtime == "claude")
+        .expect("the claude package");
+    assert_eq!(claude.status, PackageStatus::Install);
+    assert_eq!(plan.profiles.len(), 1);
+    assert_eq!(plan.profiles[0].status, ProfileStatus::Bind);
+
+    let applied = host.step(false);
+
+    assert!(applied.refusals.is_empty(), "{:?}", applied.refusals);
+    let claude = applied
+        .packages
+        .iter()
+        .find(|package| package.runtime == "claude")
+        .expect("the claude package");
+    assert_eq!(claude.status, PackageStatus::Installed);
+    assert_eq!(applied.profiles.len(), 1);
+    assert_eq!(applied.profiles[0].status, ProfileStatus::Bound);
+    assert!(fs::read_to_string(&second)
+        .expect("the bound profile")
+        .contains(&format!("digest = \"{}\"", digest.as_str())));
+
+    let repeat = host.step(false);
+    let claude = repeat
+        .packages
+        .iter()
+        .find(|package| package.runtime == "claude")
+        .expect("the claude package");
+    assert_eq!(claude.status, PackageStatus::Present);
+}
+
+/// A selected but disabled release package is only enabled, and the apply then
+/// runs the coexistence check of the profile bind it carries. Another profile
+/// retains a damaged older version, so the plan refuses the bind before the
+/// enable is applied, and nothing changes.
+#[test]
+fn a_selected_but_disabled_release_package_is_not_enabled_when_its_bind_would_refuse() {
+    let host = Host::new();
+    host.publish_at(&["claude"], 1);
+    host.write_profile("other", "base = \"claude\"\n");
+    let older = host.step(false).packages[0].digest.clone();
+    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.0.2");
+    host.publish_archives(2, &[("claude", &bytes, &digest)]);
+    let newer = host.step(false);
+    assert_eq!(newer.packages[0].status, PackageStatus::Installed);
+    host.disable_package(&digest);
+    host.remove_package_root(&older);
+    let target = host.write_profile("target", "base = \"claude\"\n");
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    let profile = fs::read(&target).expect("the unpinned profile");
+    let incompatible = ProtocolError::from(PackageErrorKind::IntegrationIncompatible).code;
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert_eq!(refusal_codes(report), [incompatible.as_str()]);
+        assert_eq!(report.refusals[0].subject, "target");
+        assert!(report.profiles.is_empty());
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry,
+        "the enable is not applied"
+    );
+    assert_eq!(fs::read(&target).expect("the unpinned profile"), profile);
+}
+
+/// The state both missing-root scenarios start from: a healthy older version is
+/// retained by the pinned profile `other`, and the newer selected version is
+/// published again from its archive. Returns the older and the newer digest.
+fn selected_root_missing_state(host: &Host) -> (String, PackageDigest) {
+    host.publish_at(&["claude"], 1);
+    host.write_profile("other", "base = \"claude\"\n");
+    let older = host.step(false).packages[0].digest.clone();
+    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.0.2");
+    host.publish_archives(2, &[("claude", &bytes, &digest)]);
+    let newer = host.step(false);
+    assert_eq!(newer.packages[0].status, PackageStatus::Installed);
+    host.remove_package_root(digest.as_str());
+    (older, digest)
+}
+
+/// The selected version's root is missing, and the older retained version is
+/// healthy and compatible. The apply restores the root from the archive and then
+/// binds the unpinned profile, so the plan plans that bind.
+#[test]
+fn an_unpinned_profile_binds_when_the_selected_root_is_missing_and_the_older_version_is_compatible()
+{
+    let host = Host::new();
+    let (_older, digest) = selected_root_missing_state(&host);
+    host.write_profile("target", "base = \"claude\"\n");
+
+    let plan = host.step(true);
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    let claude = plan
+        .packages
+        .iter()
+        .find(|package| package.runtime == "claude")
+        .expect("the claude package");
+    assert_eq!(claude.status, PackageStatus::Install);
+    assert_eq!(plan.profiles.len(), 1);
+    assert_eq!(plan.profiles[0].status, ProfileStatus::Bind);
+
+    let applied = host.step(false);
+
+    assert!(applied.refusals.is_empty(), "{:?}", applied.refusals);
+    let claude = applied
+        .packages
+        .iter()
+        .find(|package| package.runtime == "claude")
+        .expect("the claude package");
+    assert_eq!(claude.status, PackageStatus::Installed);
+    assert_eq!(applied.profiles[0].status, ProfileStatus::Bound);
+    let repeat = host.step(false);
+    assert_eq!(repeat.packages[0].status, PackageStatus::Present);
+    assert!(repeat.profiles.is_empty());
+    assert_eq!(digest.as_str(), applied.packages[0].digest);
+}
+
+/// The selected version's root and the older retained version's root are both
+/// missing. The older version stays unresolvable, so the bind refuses after the
+/// restore; the plan refuses first, and nothing changes: the selected root stays
+/// missing.
+#[test]
+fn an_unpinned_profile_is_refused_before_restore_when_both_roots_are_missing() {
+    let host = Host::new();
+    let (older, digest) = selected_root_missing_state(&host);
+    host.remove_package_root(&older);
+    let target = host.write_profile("target", "base = \"claude\"\n");
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    let profile = fs::read(&target).expect("the unpinned profile");
+    let incompatible = ProtocolError::from(PackageErrorKind::IntegrationIncompatible).code;
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert_eq!(refusal_codes(report), [incompatible.as_str()]);
+        assert_eq!(report.refusals[0].subject, "target");
+        assert!(report.profiles.is_empty());
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
+    assert_eq!(fs::read(&target).expect("the unpinned profile"), profile);
+    assert!(
+        !host
+            .plugins_dir()
+            .join("packages")
+            .join(digest.as_str().strip_prefix("sha256:").expect("sha256"))
+            .exists(),
+        "the selected root is not restored"
+    );
 }

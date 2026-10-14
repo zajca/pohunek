@@ -28,11 +28,12 @@ use pohunek_service_config::runtimes::{
 };
 use protocol::{
     IntegrationInstallState, IntegrationStatusParams, PackageBindProfileParams, PackageBindStatus,
-    PackageErrorKind, PackageIdentity, PackageInstallStatus, ProtocolError, RuntimeId, RuntimeRef,
+    PackageErrorKind, PackageId, PackageIdentity, PackageInstallStatus, ProtocolError, RuntimeId,
+    RuntimeRef,
 };
 use tracing::warn;
 
-use super::bind::{bind_profile, ensure_coexists};
+use super::bind::bind_profile;
 use super::error::rejection_kind;
 use super::selection::{conflict, declared_by};
 use super::source::read_regular_file;
@@ -311,7 +312,14 @@ pub fn ensure_official_runtimes(inputs: &EnsureInputs) -> Result<EnsureReport, E
     let catalog = catalog_plan(release.as_ref(), &catalog_state);
     report.catalog = catalog.status;
     let planned = plan_packages(&gathered.uses, release.as_ref(), &plan, &mut report)?;
-    let binds = plan_binds(&profiles, &plan, &gathered.unpinned, &planned, &mut report);
+    let binds = plan_binds(
+        &profiles,
+        &plan,
+        &inputs.store_path,
+        &gathered.unpinned,
+        &planned,
+        &mut report,
+    )?;
     let changes = planned
         .iter()
         .any(|plan| matches!(plan.action, Action::Install(_)))
@@ -558,10 +566,7 @@ fn apply(
         report.packages.push(entry);
     }
     for bind in binds {
-        let mut retained = profiles
-            .pinned_digests_excluding(Some(&bind.name))
-            .map_err(EnsureError::Profiles)?;
-        retained.extend(read_store(&inputs.store_path)?.pins);
+        let retained = retained_pins(&inputs.store_path, &profiles, Some(&bind.name))?;
         let params = PackageBindProfileParams {
             profile: bind.name.clone(),
             digest: Some(bind.digest.clone()),
@@ -762,15 +767,31 @@ fn plan_installed(
 ) -> Option<Planned> {
     let served = plan
         .planning
-        .and_then(|context| context.runtimes.resolve_id(&runtime).ok());
-    let Some(definition) = served else {
-        report.refuse(
-            runtime.as_str(),
-            CODE_RELEASE_CATALOG_UNAVAILABLE,
-            "this release has no usable runtime catalog, and no installed package serves this \
-             runtime; install the official package from a release that carries its catalog",
-        );
-        return None;
+        .map(|context| context.runtimes.resolve_id(&runtime));
+    let definition = match served {
+        Some(Ok(definition)) => definition,
+        Some(Err(error)) => {
+            report.refuse(
+                runtime.as_str(),
+                CODE_RELEASE_CATALOG_UNAVAILABLE,
+                &format!(
+                    "this release has no usable runtime catalog, and no installed package serves \
+                     this runtime ({}); install the official package from a release that carries \
+                     its catalog",
+                    error.code
+                ),
+            );
+            return None;
+        }
+        None => {
+            report.refuse(
+                runtime.as_str(),
+                CODE_RELEASE_CATALOG_UNAVAILABLE,
+                "this release has no usable runtime catalog, and no installed package serves this \
+                 runtime; install the official package from a release that carries its catalog",
+            );
+            return None;
+        }
     };
     let (identity, digest) = match definition.binding().provenance.clone() {
         protocol::BindingProvenance::Package {
@@ -872,14 +893,6 @@ fn plan_runtime(
         );
         return Ok(None);
     }
-    if coexistence_blocked(plan, &prepared) {
-        report.refuse(
-            &subject,
-            &ProtocolError::from(PackageErrorKind::IntegrationIncompatible).code,
-            "a retained version of this package has an incompatible integration",
-        );
-        return Ok(None);
-    }
     let health = health_of(plan, &prepared.digest);
     if let Health::Damaged(kind) = health {
         refuse_damaged(report, &subject, kind, &prepared.digest);
@@ -891,6 +904,19 @@ fn plan_runtime(
                 &subject,
                 &ProtocolError::from(kind).code,
                 "the release package cannot take this runtime id alongside the installed runtimes",
+            );
+            return Ok(None);
+        }
+        // The apply judges the retained set only where it selects the package:
+        // a package that is already the selected version is only enabled, and
+        // a new or unselected one is selected over every retained digest.
+        if selection_pending(plan, &prepared.identity.id, &prepared.digest)
+            && coexistence_blocked(plan, &prepared)
+        {
+            report.refuse(
+                &subject,
+                &ProtocolError::from(PackageErrorKind::IntegrationIncompatible).code,
+                "a retained version of this package has an incompatible integration",
             );
             return Ok(None);
         }
@@ -911,6 +937,12 @@ fn plan_runtime(
         definition,
         action,
     }))
+}
+
+/// Whether the apply selects `prepared`: it is not the selected version of its
+/// package yet, so the selecting call judges the retained set.
+fn selection_pending(plan: &PlanInputs<'_>, id: &PackageId, digest: &PackageDigest) -> bool {
+    plan.state.and_then(|state| state.selected(id)) != Some(digest)
 }
 
 /// Whether a retained version of the package `prepared` would make a profile
@@ -971,10 +1003,11 @@ fn health_of(plan: &PlanInputs<'_>, digest: &PackageDigest) -> Health {
 fn plan_binds(
     profiles: &ProfileRegistry,
     plan: &PlanInputs<'_>,
+    store_path: &Path,
     unpinned: &[Unpinned],
     planned: &[Planned],
     report: &mut Report,
-) -> Vec<Bind> {
+) -> Result<Vec<Bind>, EnsureError> {
     let targets: Vec<&Unpinned> = unpinned
         .iter()
         .filter(|profile| planned.iter().any(|entry| entry.runtime == profile.base))
@@ -990,14 +1023,17 @@ fn plan_binds(
                  permissions, then run the upgrade again",
             );
         }
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut binds = Vec::new();
     for profile in unpinned {
         let Some(entry) = planned.iter().find(|entry| entry.runtime == profile.base) else {
             continue;
         };
-        if let Some(kind) = bind_coexistence(plan, entry) {
+        // The reference this profile replaces is not a reference to compare
+        // with, so the set is the one the apply's bind uses.
+        let retained = retained_pins(store_path, profiles, Some(&profile.name))?;
+        if let Some(kind) = bind_coexistence(plan, entry, &retained) {
             report.refuse(
                 &profile.name,
                 &ProtocolError::from(kind).code,
@@ -1038,20 +1074,38 @@ fn plan_binds(
             digest: entry.digest.clone(),
         });
     }
-    binds
+    Ok(binds)
 }
 
 /// The coexistence refusal a bind of `entry` meets, as `ensure_coexists` judges
 /// it. An installed, selected package is judged here; a package the apply still
 /// installs is judged by [`coexistence_blocked`] before the bind is planned.
-fn bind_coexistence(plan: &PlanInputs<'_>, entry: &Planned) -> Option<PackageErrorKind> {
-    if matches!(entry.action, Action::Install(_)) {
+fn bind_coexistence(
+    plan: &PlanInputs<'_>,
+    entry: &Planned,
+    retained: &RetainedDigests,
+) -> Option<PackageErrorKind> {
+    // A pending selection is judged over the global set by the install-time
+    // check, which covers this set: the global set is a superset of it.
+    if selection_pending(plan, &entry.identity.id, &entry.digest) {
         return None;
     }
     let (Some(context), Some(state)) = (plan.planning, plan.state) else {
         return None;
     };
-    ensure_coexists(context, state, plan.retained, &entry.digest).err()
+    // The apply restores a missing root of the selected candidate before it
+    // binds, so the candidate's integration is the one its archive declares,
+    // which is the one its restored root reads. The retained versions are read
+    // as they are, a missing root stays unresolvable.
+    let integration = declared_by(&entry.definition);
+    conflict(
+        context,
+        state,
+        retained,
+        (&entry.digest, &entry.identity.id),
+        &integration,
+    )
+    .map(|_| PackageErrorKind::IntegrationIncompatible)
 }
 
 /// The claim refusal an install of `prepared` meets against the installed
