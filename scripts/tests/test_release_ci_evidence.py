@@ -331,7 +331,7 @@ class ReleaseEvidenceTests(unittest.TestCase):
         (self.repo / "Cargo.toml.tmp").mkdir()
         result = self.run_release()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Cargo.toml.tmp", result.stderr)
+        self.assertIn("could not be restored or removed: Cargo.toml.tmp", result.stderr)
         self.assertTrue((self.repo / "docs/knowledge/log.d/1-a-change.md").exists())
         self.assertEqual(self.show("HEAD", "docs/knowledge/log.md"), LOG)
         self.assertEqual((self.repo / "docs/knowledge/log.md").read_text(), LOG)

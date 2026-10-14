@@ -497,3 +497,23 @@ fn a_resumed_fold_ends_its_release_section_at_an_indented_heading() {
     assert!(error.to_string().contains("is not filed in it"), "{error}");
     assert!(root.join("log.d").join(NEWER.0).exists());
 }
+
+#[test]
+fn a_fold_never_overwrites_an_existing_temporary_file() {
+    let dir = temp_dir("fold-temporary");
+    let root = dir.path();
+    write_bundle(root, COMMITTED_LOG, &[NEWER]);
+    // The fold runs in this process, so this is the exact name it would use.
+    let taken = root.join(format!(".log.md.{}.tmp", std::process::id()));
+    fs::write(&taken, "not the fold's").expect("write the colliding file");
+    let before = snapshot(root);
+
+    fold_log(root, RELEASE, false).expect_err("the temporary name is taken");
+
+    assert_eq!(read(&taken), "not the fold's");
+    assert_eq!(
+        snapshot(root),
+        before,
+        "the log and the fragment are untouched"
+    );
+}
