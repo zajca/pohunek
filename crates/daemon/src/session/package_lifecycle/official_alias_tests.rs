@@ -3174,8 +3174,12 @@ async fn a_profile_changed_only_by_the_migration_pin_is_judged_adoptable_as_resu
 
 /// A stopped session of the built-in Claude runtime, whose package declares no
 /// version probe, relaunched as the base kind with no profile from `program`.
-async fn stopped_probeless_claude(tag: &str, program: &str) -> StoppedClaude {
+async fn stopped_probeless_claude(
+    tag: &str,
+    program: impl FnOnce(&Fixture) -> String,
+) -> StoppedClaude {
     let session = stopped_built_in_claude(tag).await;
+    let program = program(&session.fixture);
     let package = real_official(RuntimeId::CLAUDE);
     install_real_official(
         &session.fixture,
@@ -3201,7 +3205,7 @@ async fn stopped_probeless_claude(tag: &str, program: &str) -> StoppedClaude {
     recovery.agent = RuntimeId::CLAUDE.to_owned();
     recovery.agent_base = protocol::RuntimeRef::claude();
     recovery.profile_revision = None;
-    recovery.program = program.to_owned();
+    recovery.program = program.clone();
     store
         .record_session(&record)
         .expect("write the session record");
@@ -3214,7 +3218,7 @@ async fn stopped_probeless_claude(tag: &str, program: &str) -> StoppedClaude {
         projection.agent = RuntimeId::CLAUDE.to_owned();
         projection.agent_base = protocol::RuntimeRef::claude();
         projection.profile_revision = None;
-        projection.program = program.to_owned();
+        projection.program = program;
         store
             .record_resume(&projection)
             .expect("write the resume projection");
@@ -3225,10 +3229,14 @@ async fn stopped_probeless_claude(tag: &str, program: &str) -> StoppedClaude {
 #[tokio::test]
 async fn a_stopped_session_of_a_runtime_without_a_probe_whose_executable_is_gone_is_judged_as_resume_refuses_it(
 ) {
-    let root = pohunek_test_support::tempdir().expect("an isolated directory");
-    let missing = root.path().join("no-such-agent-executable");
-    let session =
-        stopped_probeless_claude("preflight-missing-executable", &missing.to_string_lossy()).await;
+    let session = stopped_probeless_claude("preflight-missing-executable", |fixture| {
+        fixture
+            .dir
+            .join("no-such-agent-executable")
+            .to_string_lossy()
+            .into_owned()
+    })
+    .await;
     let (verdict, code) =
         stopped_preflight_verdict(&session.fixture, &session.store_path, &session.id);
     let restarted = restart(&session.fixture).await;
@@ -3256,14 +3264,16 @@ fn agent_directory(fixture: &Fixture, name: &str, mode: u32, agent: &str) -> Pat
 }
 
 #[tokio::test]
-async fn an_agent_only_in_an_untrusted_path_directory_is_refused_by_resume_and_the_preflight_alike()
-{
-    const AGENT: &str = "agent-untrusted-path";
-    let session = stopped_probeless_claude("preflight-untrusted-path", AGENT).await;
-    // The only copy sits in a directory another user can write.
-    let untrusted = agent_directory(&session.fixture, "untrusted-path", 0o777, AGENT);
-    let mut environment = pohunek_test_support::process_env::ProcessEnv::lock();
-    environment.set("PATH", &untrusted);
+async fn an_agent_in_an_untrusted_directory_is_refused_by_resume_and_the_preflight_alike() {
+    const AGENT: &str = "agent-untrusted-directory";
+    let session = stopped_probeless_claude("preflight-untrusted-directory", |fixture| {
+        // The only copy sits in a directory another user can write.
+        agent_directory(fixture, "untrusted-directory", 0o777, AGENT)
+            .join(AGENT)
+            .to_string_lossy()
+            .into_owned()
+    })
+    .await;
 
     let (verdict, code) =
         stopped_preflight_verdict(&session.fixture, &session.store_path, &session.id);
@@ -3278,24 +3288,15 @@ async fn an_agent_only_in_an_untrusted_path_directory_is_refused_by_resume_and_t
 }
 
 #[tokio::test]
-async fn a_trusted_copy_later_on_the_path_is_found_by_the_resolver_and_by_the_preflight_alike() {
-    const AGENT: &str = "agent-trusted-later";
-    let session = stopped_probeless_claude("preflight-trusted-later", AGENT).await;
-    let untrusted = agent_directory(&session.fixture, "untrusted-first", 0o777, AGENT);
-    let trusted = agent_directory(&session.fixture, "trusted-later", 0o755, AGENT);
-    // The conversation the base-kind launch reads lives under the default Claude
-    // home of `HOME`, which the test owns.
-    let home = session.fixture.dir.join("home");
-    let conversations = home.join(".claude").join("projects").join("work");
-    fs::create_dir_all(&conversations).expect("the conversation directory");
-    fs::write(conversations.join(format!("{CONVERSATION}.jsonl")), b"{}\n")
-        .expect("the conversation");
-    let mut environment = pohunek_test_support::process_env::ProcessEnv::lock();
-    environment.set(
-        "PATH",
-        std::env::join_paths([&untrusted, &trusted]).expect("the PATH"),
-    );
-    environment.set("HOME", &home);
+async fn a_trusted_copy_of_the_agent_is_found_by_the_resolver_and_by_the_preflight_alike() {
+    const AGENT: &str = "agent-trusted-directory";
+    let session = stopped_probeless_claude("preflight-trusted-directory", |fixture| {
+        agent_directory(fixture, "trusted-directory", 0o755, AGENT)
+            .join(AGENT)
+            .to_string_lossy()
+            .into_owned()
+    })
+    .await;
 
     let (verdict, code) =
         stopped_preflight_verdict(&session.fixture, &session.store_path, &session.id);
@@ -3333,10 +3334,13 @@ async fn a_spent_probe_budget_still_adopts_a_runtime_without_a_probe_whose_execu
     // The package declares no version probe, so resolving the executable is the
     // whole check, and it spends none of the budget.
     const AGENT: &str = "agent-probeless-resolves";
-    let session = stopped_probeless_claude("preflight-spent-budget-resolves", AGENT).await;
-    let directory = agent_directory(&session.fixture, "probeless-path", 0o755, AGENT);
-    let mut environment = pohunek_test_support::process_env::ProcessEnv::lock();
-    environment.set("PATH", &directory);
+    let session = stopped_probeless_claude("preflight-spent-budget-resolves", |fixture| {
+        agent_directory(fixture, "probeless-directory", 0o755, AGENT)
+            .join(AGENT)
+            .to_string_lossy()
+            .into_owned()
+    })
+    .await;
 
     let (verdict, code) = stopped_preflight_verdict_entered(
         &session.fixture,
@@ -3361,12 +3365,14 @@ async fn a_spent_probe_budget_still_adopts_a_runtime_without_a_probe_whose_execu
 
 #[tokio::test]
 async fn a_spent_probe_budget_reports_a_missing_runtime_without_a_probe_as_missing() {
-    const AGENT: &str = "agent-probeless-absent";
-    let session = stopped_probeless_claude("preflight-spent-budget-missing", AGENT).await;
-    let empty = session.fixture.dir.join("empty-path");
-    fs::create_dir(&empty).expect("create an empty PATH directory");
-    let mut environment = pohunek_test_support::process_env::ProcessEnv::lock();
-    environment.set("PATH", &empty);
+    let session = stopped_probeless_claude("preflight-spent-budget-missing", |fixture| {
+        fixture
+            .dir
+            .join("agent-probeless-absent")
+            .to_string_lossy()
+            .into_owned()
+    })
+    .await;
 
     let (verdict, code) = stopped_preflight_verdict_entered(
         &session.fixture,

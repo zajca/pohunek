@@ -865,9 +865,18 @@ fn parent_slice(namespace: &Namespace) -> String {
 /// [`Error::Timeout`] when a call does not finish within `call_timeout`, and
 /// [`Error::Operation`] when the manager rejects the property read.
 pub async fn user_manager_environment(call_timeout: Duration) -> Result<Vec<String>, Error> {
+    read_user_manager_environment(None, call_timeout).await
+}
+
+/// [`user_manager_environment`] over the bus at `address`, or over the session
+/// bus the environment names when `address` is `None`.
+async fn read_user_manager_environment(
+    address: Option<&str>,
+    call_timeout: Duration,
+) -> Result<Vec<String>, Error> {
     const OPERATION: &str = "read_user_manager_environment";
 
-    let bus = Bus::connect(call_timeout).await?;
+    let bus = Bus::connect_to(address, call_timeout).await?;
     let manager = bus.manager(OPERATION).await?;
     manager
         .get_property::<Vec<String>>(MANAGER_ENVIRONMENT_PROPERTY)
@@ -883,10 +892,20 @@ struct Bus {
 
 impl Bus {
     async fn connect(call_timeout: Duration) -> Result<Self, Error> {
+        Self::connect_to(None, call_timeout).await
+    }
+
+    /// Connects to the bus at `address`, or to the session bus the environment
+    /// names when `address` is `None`.
+    async fn connect_to(address: Option<&str>, call_timeout: Duration) -> Result<Self, Error> {
         const OPERATION: &str = "connect";
 
-        let connection = zbus::connection::Builder::session()
-            .map_err(|source| unavailable(OPERATION, source))?
+        let builder = match address {
+            Some(address) => zbus::connection::Builder::address(address),
+            None => zbus::connection::Builder::session(),
+        }
+        .map_err(|source| unavailable(OPERATION, source))?;
+        let connection = builder
             .method_timeout(call_timeout)
             .build()
             .await
@@ -2241,15 +2260,12 @@ mod tests {
         const CALL_BOUND: Duration = Duration::from_secs(5);
         let root = pohunek_test_support::tempdir().expect("scratch directory");
         let missing_bus = root.path().join("no-such-bus");
-        let mut env = pohunek_test_support::process_env::ProcessEnv::lock();
-        env.set(
-            "DBUS_SESSION_BUS_ADDRESS",
-            format!("unix:path={}", missing_bus.display()),
-        );
-        let outcome =
-            std::thread::spawn(|| async_io::block_on(user_manager_environment(CALL_BOUND)))
-                .join()
-                .expect("reading outside a Tokio runtime must not panic");
+        let address = format!("unix:path={}", missing_bus.display());
+        let outcome = std::thread::spawn(move || {
+            async_io::block_on(read_user_manager_environment(Some(&address), CALL_BOUND))
+        })
+        .join()
+        .expect("reading outside a Tokio runtime must not panic");
         assert!(
             matches!(outcome, Err(Error::Unavailable { .. })),
             "{outcome:?}"
