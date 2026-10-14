@@ -21,7 +21,7 @@ use super::builtin::BuiltinSource;
 use super::claim::{is_reserved, ServedBy};
 use super::definition::{DefinitionError, LaunchProgram, RuntimeDefinition};
 use super::launch::{check_pin, LaunchPin};
-use super::package::{PackageSource, PackageStore, RejectedPackage};
+use super::package::{PackageRejection, PackageSource, PackageStore, RejectedPackage};
 use super::registry::{RegistryError, RuntimeRegistry, RuntimeSource, SourceTrust};
 
 /// Cheap-to-clone handle over the daemon's runtime registry.
@@ -55,6 +55,24 @@ pub struct PackageReport {
     /// then holds the built-in runtimes only, and package-pinned sessions
     /// resolve as incompatible.
     pub fault: Option<PackageRegistryError>,
+}
+
+impl PackageReport {
+    /// Whether the official package of `runtime` was left out of the registry
+    /// without loading, so it may serve that official runtime id.
+    ///
+    /// The package is matched by its official package id. A runtime id
+    /// conflict leaves out a package whose root loaded, so it does not count:
+    /// its content is not what failed.
+    #[must_use]
+    pub fn official_unavailable(&self, runtime: &RuntimeId) -> bool {
+        let id = protocol::official_package_id(runtime);
+        self.rejected.iter().any(|rejected| {
+            rejected.official
+                && rejected.identity.id.as_str() == id
+                && !matches!(rejected.reason, PackageRejection::RuntimeIdConflict)
+        })
+    }
 }
 
 /// The sources a reload rebuilds the registry from, and the store pinned

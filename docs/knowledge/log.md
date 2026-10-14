@@ -22,6 +22,24 @@
 - The 3000 ms default is below the client's 5 s request deadline, so a
   fire-and-forget caller receives the typed error instead of `request_timeout`.
 
+## Unreleased (2026-10-13, doctor hints for unloadable packages, #991)
+
+- `pohunek plugin profile list` reports a pinned profile whose pinned digest is
+  installed but cannot be loaded as `package_unavailable`, when the pin names
+  that digest's package. The detail names `pohunek plugin doctor` only; the
+  migration is not offered because the pin already names the digest. A
+  loadable package that serves another runtime, or a pin naming another
+  package than the digest's, is still `needs_migration`.
+- An unpinned profile over an official alias (`codex`, `claude`, `hermes`)
+  whose official package (`pohunek.runtime.<alias>`, matched by package id) is
+  installed but was left out of the runtime registry after a rebuild is refused with `runtime_incompatible` (it was
+  `runtime_not_installed`). Its recovery names `pohunek plugin doctor` and the
+  migration after the repair, not the install, which the package's root or
+  identity check refuses. The refusal is decided from the package report the
+  registry rebuild records; no protocol code was added.
+- The runtime packages guide, the runtime package recovery runbook and
+  `docs/public-api.md` list the new states and refusal.
+
 ## Unreleased (2026-10-13, package version bump gate, #894)
 
 - `cargo xtask package bump` fails a runtime package whose archive differs
@@ -109,8 +127,8 @@
   an official alias, a package that serves the base otherwise, then
   `pohunek plugin profile migrate <name>`.
 - When an installed package that may serve such a base cannot be loaded (its
-  root or descriptor fails verification; for an official alias only an
-  official package counts), the profile is `package_unavailable` and the
+  root or descriptor fails verification; for an official alias only that
+  alias's official package, `pohunek.runtime.<alias>`, counts), the profile is `package_unavailable` and the
   detail names `pohunek plugin doctor`, which reports the fault and its
   repair.
 - The `runtime-packages` guide, the `runtime-package-recovery` runbook and

@@ -7,7 +7,7 @@
 //! server; this file covers what the daemon does with them. Registry state is
 //! also read straight from the plugin root through `package::registry`.
 
-// Rust guideline compliant 2026-10-04
+// Rust guideline compliant 2026-10-13
 
 #![cfg(unix)]
 
@@ -748,6 +748,103 @@ async fn an_unpinned_profile_whose_package_cannot_load_points_at_doctor() {
             "{refused}"
         );
     }
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn a_pinned_profile_whose_package_cannot_load_points_at_doctor() {
+    let harness = Harness::start().await;
+    let built = harness.archive("1.0.0");
+    install_enabled(&harness, &built).await;
+    harness.profile("work", &format!("base = \"{RUNTIME}\"\n"));
+    let (code, migrated) = harness
+        .json(&["plugin", "profile", "migrate", "work", "--yes"])
+        .await;
+    assert_eq!(code, 0, "{migrated}");
+    assert_eq!(migrated["ok"]["status"], "bound");
+    tamper(&harness, &built.digest);
+    // A pin whose package id is not the digest's package needs its pin
+    // corrected: repairing the package would not make it usable.
+    harness.profile(
+        "wrong-id",
+        &format!(
+            "base = \"{RUNTIME}\"\npackage = \"acme.runtime.other\"\ndigest = \"{}\"\n",
+            built.digest
+        ),
+    );
+
+    let (code, listed) = harness.json(&["plugin", "profile", "list"]).await;
+    assert_eq!(code, 0, "{listed}");
+    let profiles = listed["ok"]["profiles"].as_array().expect("profiles");
+    let named = |name: &str| {
+        profiles
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is listed: {listed}"))
+    };
+    assert_eq!(named("wrong-id")["state"], "needs_migration", "{listed}");
+    let entry = named("work");
+    assert_eq!(entry["state"], "package_unavailable", "{listed}");
+    let detail = entry["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains("pohunek plugin doctor"), "{listed}");
+    // The profile is already pinned to the digest, so migrating cannot help.
+    assert!(!detail.contains("plugin profile migrate"), "{listed}");
+    assert!(!detail.contains("plugin install"), "{listed}");
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn an_official_profile_refused_after_a_registry_rebuild_points_at_doctor() {
+    let key = test_key();
+    let anchor = HostTrustAnchor::new(vec![root_of(&key, WINDOW_START, WINDOW_END)], Vec::new())
+        .expect("the test trust anchor");
+    let harness = Harness::start_with_trust(CatalogTrust::Loaded(anchor)).await;
+    harness.profile("codex-work", "base = \"codex\"\n");
+    // Nothing serves or may serve `claude`: the damaged package is Codex's.
+    harness.profile("claude-work", "base = \"claude\"\n");
+    let official = harness.archive_of(OFFICIAL_CODEX_ID, "codex", "1.0.0");
+    let (code, installed) =
+        install_official(&harness, &key, &official, OFFICIAL_CODEX_ID, "codex").await;
+    assert_eq!(code, 0, "{installed}");
+    tamper(&harness, &official.digest);
+    // Installing another package rebuilds the runtime registry, which leaves
+    // the tampered official package out of it.
+    let other = harness.archive("1.0.0");
+    install_enabled(&harness, &other).await;
+
+    let (code, listed) = harness.json(&["plugin", "profile", "list"]).await;
+    assert_eq!(code, 0, "{listed}");
+    let entry = listed["ok"]["profiles"]
+        .as_array()
+        .expect("profiles")
+        .iter()
+        .find(|entry| entry["name"] == "codex-work")
+        .expect("codex-work is listed")
+        .clone();
+    assert_eq!(entry["state"], "package_unavailable", "{entry}");
+
+    let (code, refused) = launch(&harness, "codex-work").await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(refused["err"]["code"], "runtime_incompatible", "{refused}");
+    let recover = refused["err"]["recover"].as_str().unwrap_or_default();
+    assert!(recover.contains("pohunek plugin doctor"), "{refused}");
+    assert!(!recover.contains("plugin install"), "{refused}");
+
+    let claude = listed["ok"]["profiles"]
+        .as_array()
+        .expect("profiles")
+        .iter()
+        .find(|entry| entry["name"] == "claude-work")
+        .expect("claude-work is listed")
+        .clone();
+    assert_eq!(claude["state"], "package_not_installed", "{claude}");
+    let (code, refused) = launch(&harness, "claude-work").await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(refused["err"]["code"], "runtime_not_installed", "{refused}");
+    let recover = refused["err"]["recover"].as_str().unwrap_or_default();
+    assert!(recover.contains("plugin install"), "{refused}");
 
     harness.stop().await;
 }

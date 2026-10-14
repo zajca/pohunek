@@ -182,7 +182,14 @@ Codex, Claude Code and Hermes in, so while no official package serves `codex`,
 `agent_profile_not_found`, an unpinned `base = "codex"`, `base = "claude"` or
 `base = "hermes"` profile with `runtime_not_installed`, and both hints name
 `pohunek plugin install runtime/packages/<runtime>.tar.zst --catalog runtime/runtime-catalog.json`
-(`codex`, `claude` or `hermes`) from the current release's archive.
+(`codex`, `claude` or `hermes`) from the current release's archive. When the
+installed official package of that runtime (`pohunek.runtime.<runtime>`) cannot
+be loaded (its root or descriptor fails
+verification, typically after a registry rebuild), the same unpinned profile
+fails with `runtime_incompatible` instead, and its recovery names
+`pohunek plugin doctor`: run doctor, repair the package it reports as section 1
+describes, then migrate the profile. Reinstalling the archive does not help
+while the root is modified.
 
 - A fresh launch of a disabled package, or of a package that is no longer
   installed, fails with `runtime_not_installed`. Run `pohunek plugin list`;
@@ -228,13 +235,15 @@ Run `pohunek plugin profile list` (implemented in
   `runtime_not_installed`. Install the package the detail names (for `codex`,
   `claude` or `hermes` the official package from the release archive), then
   pin the profile with `pohunek plugin profile migrate <name> --yes`.
-- `package_unavailable`: no installed package serves the base, but an
-  installed one that may serve it cannot be loaded. The migration refuses a
-  faulted package (`package_profile_target_invalid`), and the repair depends
-  on the fault: a missing root is restored by reinstalling the same archive,
-  a modified one refuses that reinstall (`package_root_invalid`). Run
-  `pohunek plugin doctor` and repair the package it names as section 1
-  describes, then migrate the profile.
+- `package_unavailable`: either the pinned digest is installed but cannot be
+  loaded, or no installed package serves the base but an installed one that may
+  serve it cannot be loaded. A pinned profile needs only the repair: the pin
+  already names the digest, and the migration would pin it again. Otherwise
+  the migration refuses a faulted package (`package_profile_target_invalid`),
+  and the repair depends on the fault: a missing root is restored by
+  reinstalling the same archive, a modified one refuses that reinstall
+  (`package_root_invalid`). Run `pohunek plugin doctor` and repair the package
+  it names as section 1 describes; an unpinned profile is then migrated.
 - `pin_not_installed`: the pinned digest is not installed. Reinstall that
   exact archive, or pin the profile to an installed version with
   `pohunek plugin profile migrate <name> --digest <digest> --yes`.
