@@ -4,7 +4,7 @@
 //! connection. Unknown additive object fields are ignored by serde, while
 //! unknown operations fail deserialization and affect only that connection.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-14
 
 use std::fmt::{Debug, Formatter};
 use std::path::PathBuf;
@@ -1227,6 +1227,12 @@ pub enum ControlCode {
     /// Part of the plan may already have reached the child. Sent only on
     /// connections that negotiated at least [`INPUT_STALL_VERSION`].
     InputStalled,
+    /// The launch working directory is not an existing directory, so no child
+    /// process was spawned.
+    ///
+    /// Sent only on connections that negotiated at least
+    /// [`LAUNCH_CWD_CHECK_VERSION`](crate::LAUNCH_CWD_CHECK_VERSION).
+    LaunchCwdMissing,
 }
 
 /// Describes output evicted before a requested cursor.

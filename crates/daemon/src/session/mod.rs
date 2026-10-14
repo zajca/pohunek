@@ -6694,6 +6694,18 @@ fn worker_error_to_protocol(err: WorkerError) -> ProtocolError {
                     .to_owned(),
             ),
         ),
+        WorkerError::Rejected {
+            code: pohunek_worker_protocol::ControlCode::LaunchCwdMissing,
+            message,
+            ..
+        } => ProtocolError::new(
+            ErrorClass::Runtime,
+            "session_cwd_missing",
+            message,
+            Some(
+                "the session's working directory no longer exists; nothing was started".to_owned(),
+            ),
+        ),
         other => runtime_error("worker_operation_failed", other.to_string()),
     }
 }

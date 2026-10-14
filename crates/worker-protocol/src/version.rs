@@ -4,7 +4,7 @@
 //! ranges. Every worker-aware release supports the current protocol and the
 //! immediately preceding protocol.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-10-14
 
 use std::fmt::{Display, Formatter};
 
@@ -45,6 +45,13 @@ pub const BASE_ENVIRONMENT_VERSION: Version = Version(6);
 /// version-six peer neither sends the bound nor receives that code, and its
 /// input writes stay unbounded.
 pub const INPUT_STALL_VERSION: Version = Version(7);
+
+/// First version that reports a missing launch working directory as
+/// [`ControlCode::LaunchCwdMissing`](crate::ControlCode::LaunchCwdMissing).
+///
+/// A version-six peer cannot decode that code, so it receives the same refusal
+/// as a runtime fault with the identical sanitized message.
+pub const LAUNCH_CWD_CHECK_VERSION: Version = Version(7);
 
 /// Versions supported by this crate release.
 pub const SUPPORTED_RANGE: VersionRange = VersionRange {

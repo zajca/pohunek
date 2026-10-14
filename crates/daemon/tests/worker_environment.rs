@@ -497,6 +497,63 @@ async fn version_six_controller_of_a_version_seven_worker_sees_a_stall_as_runtim
         .expect("stop the silent child after the stall");
 }
 
+/// Initializes the fixture's worker with a working directory that does not
+/// exist under the fixture root.
+async fn initialize_into_missing_cwd(fixture: &Fixture, worker: &Worker) -> WorkerError {
+    let mut initialize = fixture.initialize(worker.worker_id().await);
+    initialize.cwd = fixture.root.join("missing-worktree");
+    worker
+        .initialize(initialize)
+        .await
+        .expect_err("a missing working directory must refuse the launch")
+}
+
+#[tokio::test]
+async fn version_seven_initialize_into_a_missing_cwd_reports_launch_cwd_missing() {
+    let mut fixture = Fixture::start();
+    let worker = fixture.connect(CURRENT_VERSION).await;
+    assert_eq!(worker.selected_version().await, CURRENT_VERSION);
+
+    let error = initialize_into_missing_cwd(&fixture, &worker).await;
+    assert!(
+        matches!(
+            error,
+            WorkerError::Rejected {
+                code: ControlCode::LaunchCwdMissing,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    // The fixture does not expose the spawned child, so the inspect snapshot
+    // stands in: a refused launch leaves no child process and no running phase.
+    let snapshot = worker.inspect().await.expect("inspect refused worker");
+    assert_eq!(snapshot.child_process, None, "no child may be started");
+    assert_ne!(snapshot.phase, RuntimePhase::Running);
+}
+
+#[tokio::test]
+async fn version_six_initialize_into_a_missing_cwd_reports_runtime_fault() {
+    let mut fixture = Fixture::start();
+    let worker = fixture.connect(PREVIOUS_VERSION).await;
+    assert_eq!(worker.selected_version().await, PREVIOUS_VERSION);
+
+    let error = initialize_into_missing_cwd(&fixture, &worker).await;
+    assert!(
+        matches!(
+            error,
+            WorkerError::Rejected {
+                code: ControlCode::RuntimeFault,
+                ..
+            }
+        ),
+        "a version-six peer cannot decode LaunchCwdMissing, so it must see RuntimeFault: {error:?}"
+    );
+    let snapshot = worker.inspect().await.expect("inspect refused worker");
+    assert_eq!(snapshot.child_process, None, "no child may be started");
+    assert_ne!(snapshot.phase, RuntimePhase::Running);
+}
+
 /// Child script that leaves its terminal unread until the gate file named by
 /// `$1` exists, then drains stdin for good.
 const GATED_DRAIN_SCRIPT: &str = "while [ ! -e \"$1\" ]; do sleep 0.05; done; exec cat >/dev/null";

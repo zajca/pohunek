@@ -1,6 +1,6 @@
 //! Owns one PTY master and its managed process identity.
 
-// Rust guideline compliant 2026-10-13
+// Rust guideline compliant 2026-10-14
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -14,8 +14,7 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
 use pohunek_platform::process::{HostInspector, ProcessInspector};
-use pohunek_worker_protocol::is_denylisted;
-use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child as PtyChild, MasterPty, PtySize};
 use rustix::event::{poll, PollFd, PollFlags};
 use rustix::fd::{BorrowedFd, OwnedFd};
 use rustix::fs::{open, Mode, OFlags};
@@ -24,6 +23,7 @@ use rustix::termios::{tcflow, Action};
 use tokio::sync::{watch, Mutex as AsyncMutex};
 use tracing::{event, Level};
 
+use crate::child_spawn;
 use crate::input::InputWriter;
 use crate::output::OutputCompletion;
 use crate::{OutputEvent, OutputHub, OutputSubscriber, RingError, WriteCoordinator};
@@ -159,6 +159,12 @@ pub enum PtyError {
     /// Opening the PTY failed.
     #[error("failed to allocate PTY: {0}")]
     Allocate(String),
+    /// The launch working directory is not an existing directory.
+    ///
+    /// Checked before spawning because the PTY layer would otherwise start the
+    /// child in `$HOME` without reporting an error.
+    #[error("launch working directory is not an existing directory")]
+    CwdMissing,
     /// Spawning the child failed.
     #[error("failed to spawn PTY command: {message}")]
     Spawn {
@@ -419,33 +425,6 @@ impl PtyOwner {
             })
             .map_err(|source| PtyError::Allocate(source.to_string()))?;
 
-        let mut builder = CommandBuilder::new(&command.program);
-        builder.args(&command.args);
-        // `CommandBuilder::new` captures this worker process's own environment,
-        // which under a service manager describes the worker's supervision.
-        match command.base {
-            EnvBase::Empty => builder.env_clear(),
-            // Strip every ambient `POHUNEK_*` marker so the child carries only
-            // the worker-authoritative identity from `command.env` (RFC §11.5
-            // environment sanitization; §17.5 removes daemon id from ownership).
-            // Otherwise a daemon running inside another pohunek session leaks
-            // that ancestor's `POHUNEK_DAEMON_ID`, and procwatch mis-attributes
-            // the agent as foreign-owned. `vars_os` tolerates non-UTF-8 names.
-            EnvBase::Inherited => {
-                for name in std::env::vars_os() {
-                    if let Some(name) = name.0.to_str() {
-                        if name.starts_with("POHUNEK_") || is_denylisted(name) {
-                            builder.env_remove(name);
-                        }
-                    }
-                }
-            }
-        }
-        for (key, value) in &command.env {
-            builder.env(key, value);
-        }
-        builder.cwd(&command.cwd);
-
         let tty_name = Arc::new(pair.master.tty_name().ok_or(PtyError::MissingTtyName)?);
         // Every master descriptor below shares this file description, so the
         // output reader and the input writer both observe non-blocking mode.
@@ -472,14 +451,19 @@ impl PtyOwner {
         let output = OutputHub::new(history_bytes, subscriber_bytes, command.rows, command.cols)?;
         let output_order = Arc::new(Mutex::new(()));
 
-        let child = pair.slave.spawn_command(builder).map_err(|_source| {
+        // A spawn failure is reported as a missing directory only when the
+        // directory is gone, because `ENOENT` also means a missing program.
+        let child = child_spawn::spawn_pty_child(&command, &tty_name).map_err(|_source| {
+            if !command.cwd.is_dir() {
+                return PtyError::CwdMissing;
+            }
             let program = Path::new(&command.program);
             PtyError::Spawn {
                 message: "process launch failed".to_owned(),
                 not_found: program.is_absolute() && !program.exists(),
             }
         })?;
-        let mut child = SpawnGuard::new(child);
+        let mut child = SpawnGuard::new(Box::new(child));
         let pid = child
             .child
             .as_ref()
