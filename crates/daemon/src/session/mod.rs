@@ -56,8 +56,8 @@ use crate::project::{detect_at, ProjectManager};
 use crate::runtime::lifecycle::{Generation, LifecycleGuard, SessionLocks};
 use crate::runtime::{DimensionUpdate, SupervisionConfig, Worker, WorkerError, WorkerLauncher};
 use crate::store::{
-    DesiredState, ProjectRecord, ReportTransport, ResumeBinding, RuntimeRecord, SessionRecord,
-    SessionTransaction, SessionWriteOutcome, Store, TransactionKind, WorktreeStatus,
+    ActiveAgentOrigin, DesiredState, ProjectRecord, ReportTransport, ResumeBinding, RuntimeRecord,
+    SessionRecord, SessionTransaction, SessionWriteOutcome, Store, TransactionKind, WorktreeStatus,
 };
 use crate::time::now_rfc3339;
 use crate::worktree::{
@@ -1539,6 +1539,7 @@ impl SessionRegistry {
             recovery: Some(Self::resume_binding_from_entry(id, entry)),
             native_identity_ordering: entry.last_native_report.clone(),
             runtime,
+            active_agent_origin: active_agent_origin(entry),
         }
     }
 
@@ -6290,6 +6291,7 @@ fn create_intent_record(
         }),
         info,
         native_identity_ordering: None,
+        active_agent_origin: None,
         recovery: None,
         runtime: RuntimeRecord {
             state: RuntimeState::Starting,
@@ -6682,6 +6684,19 @@ fn clear_active_agent(entry: &mut SessionEntry, tombstone: ActiveAgentReport) ->
     send_detector_config(entry, default_detector_config);
     entry.info.updated_at = timestamp_now();
     entry.info.clone()
+}
+
+/// How the active agent `entry.info` names became known, when the report
+/// behind it is still the entry's.
+fn active_agent_origin(entry: &SessionEntry) -> Option<ActiveAgentOrigin> {
+    let report = entry.active_agent.as_ref()?;
+    (entry.info.active_agent.as_deref() == Some(report.agent.as_str())).then_some(
+        if report.observed {
+            ActiveAgentOrigin::Observed
+        } else {
+            ActiveAgentOrigin::Reported
+        },
+    )
 }
 
 fn send_detector_config(entry: &SessionEntry, config: DetectorConfig) {
@@ -7087,6 +7102,7 @@ fn preserve_durable_worker_metadata(existing: &SessionRecord, replacement: &mut 
         .info
         .active_agent_session_path
         .clone_from(&existing.info.active_agent_session_path);
+    replacement.active_agent_origin = existing.active_agent_origin;
     let preserved_launch = preserve_durable_launch_identity(
         existing,
         &mut replacement.info,

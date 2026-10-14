@@ -5688,6 +5688,7 @@ fn seed_live_session_at(paths: &BasePaths, executable: &Path, session_id: &str, 
         transaction: None,
         info,
         recovery: None,
+        active_agent_origin: None,
         native_identity_ordering: None,
         runtime: RuntimeRecord {
             state: RuntimeState::Live,

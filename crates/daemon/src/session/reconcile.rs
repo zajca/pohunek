@@ -45,7 +45,7 @@ use crate::runtime::lifecycle::{
     UnsupportedJournalSchema, IDENTITY_MISMATCH, SUPERVISION_AMBIGUOUS, SUPERVISION_UNAVAILABLE,
 };
 use crate::session::target::open_detector_output;
-use crate::store::{ResumeBinding, SessionWriteOutcome};
+use crate::store::{ActiveAgentOrigin, ResumeBinding, SessionWriteOutcome};
 
 // Rust guideline compliant 2026-10-12
 
@@ -1628,11 +1628,7 @@ impl SessionRegistry {
         record.info.state = SessionState::Stopped;
         record.info.state_source = StateSource::Process;
         record.info.activity = None;
-        record.info.active_agent = None;
-        record.info.active_agent_base = None;
-        record.info.active_agent_pid = None;
-        record.info.active_agent_session_id = None;
-        record.info.active_agent_session_path = None;
+        clear_active_identity(&mut record);
         if !self
             .insert_unavailable_record(record, RuntimeState::Terminal, "")
             .await
@@ -3531,7 +3527,7 @@ impl SessionRegistry {
         }
         import_native_reference(&mut record, &snapshot);
         let identity_projection = if root_missing_during_drain || retry_identity {
-            clear_active_identity(&mut record.info);
+            clear_active_identity(&mut record);
             WorkerIdentityProjection::unreported()
         } else {
             match import_worker_identities(&mut record, &snapshot) {
@@ -3564,7 +3560,7 @@ impl SessionRegistry {
         }
         let active_agent = identity_projection
             .active
-            .or_else(|| active_report_from_info(&record.info));
+            .or_else(|| active_report_from_record(&record));
         let detector_output = match open_detector_output(&worker, &id).await {
             Ok(output) => output,
             Err(error) => {
@@ -4565,7 +4561,8 @@ fn apply_identity_projection(
         || entry.info.native_session_id != candidate.info.native_session_id
         || entry.info.native_session_path != candidate.info.native_session_path;
     let active_changed = projection.privately_reported
-        && (entry.info.active_agent != candidate.info.active_agent
+        && (super::active_agent_origin(entry) != candidate.active_agent_origin
+            || entry.info.active_agent != candidate.info.active_agent
             || entry.info.active_agent_base != candidate.info.active_agent_base
             || entry.info.active_agent_pid != candidate.info.active_agent_pid
             || entry.info.active_agent_session_id != candidate.info.active_agent_session_id
@@ -4788,14 +4785,21 @@ fn claim_process_facts(
     Ok(())
 }
 
-fn active_report_from_info(info: &protocol::SessionInfo) -> Option<ActiveAgentReport> {
+fn active_report_from_record(record: &SessionRecord) -> Option<ActiveAgentReport> {
+    let info = &record.info;
     let agent = info.active_agent.clone()?;
-    // procwatch records an observed agent under its runtime id, while a reported
-    // agent carries its profile's name. The record keeps no origin, so a restored
-    // agent named like its runtime is treated as observed. The only ambiguous
-    // case is an explicit report of exactly that name while a same-named profile
-    // exists: it runs the pinned definition until the client reports again.
-    let observed = agent == super::agent_kind_label(&info.agent_base);
+    // A record before schema 10 keeps no origin. procwatch records an observed
+    // agent under its own runtime id, while a reported agent carries its
+    // profile's name, so such an agent named like its runtime is treated as
+    // observed.
+    let observed = match record.active_agent_origin {
+        Some(ActiveAgentOrigin::Observed) => true,
+        Some(ActiveAgentOrigin::Reported) => false,
+        None => {
+            let base = info.active_agent_base.as_ref().unwrap_or(&info.agent_base);
+            agent == super::agent_kind_label(base)
+        }
+    };
     Some(ActiveAgentReport {
         source: "persisted".to_owned(),
         agent,
@@ -4808,7 +4812,9 @@ fn active_report_from_info(info: &protocol::SessionInfo) -> Option<ActiveAgentRe
     })
 }
 
-fn clear_active_identity(info: &mut protocol::SessionInfo) {
+fn clear_active_identity(record: &mut SessionRecord) {
+    record.active_agent_origin = None;
+    let info = &mut record.info;
     info.active_agent = None;
     info.active_agent_base = None;
     info.active_agent_pid = None;
@@ -4884,7 +4890,7 @@ fn apply_worker_identities_with(
         let release_matches = record.info.active_agent.as_deref() == Some(&release.provider)
             && record.info.active_agent_pid == Some(release.process.pid);
         if release_matches {
-            clear_active_identity(&mut record.info);
+            clear_active_identity(record);
         }
         return Ok(WorkerIdentityProjection {
             active: None,
@@ -4906,6 +4912,7 @@ fn apply_worker_identities_with(
         }
         None => (None, None),
     };
+    record.active_agent_origin = Some(ActiveAgentOrigin::Reported);
     record.info.active_agent = Some(identity.provider.clone());
     record.info.active_agent_base = Some(agent_base);
     record.info.active_agent_pid = Some(identity.process.pid);
@@ -5800,6 +5807,7 @@ fn import_legacy_manifest(store: &crate::store::Store) -> Result<LegacyManifest,
                 transaction: None,
                 info,
                 recovery,
+                active_agent_origin: None,
                 native_identity_ordering: None,
                 runtime: crate::store::RuntimeRecord {
                     state: runtime_state,
@@ -6626,6 +6634,7 @@ while os.getppid() == parent:
     #[test]
     fn reconciliation_imports_immutable_launch_and_nested_active_identity() {
         let mut record = identity_record();
+        record.active_agent_origin = Some(crate::store::ActiveAgentOrigin::Observed);
         let snapshot = identity_snapshot("native-launch");
 
         let active =
@@ -6649,6 +6658,11 @@ while os.getppid() == parent:
             Some("nested-native")
         );
         assert_eq!(active.active.expect("active report").pid, Some(60));
+        assert_eq!(
+            record.active_agent_origin,
+            Some(crate::store::ActiveAgentOrigin::Reported),
+            "a worker-reported identity is reported, whatever the record held"
+        );
 
         let conflict =
             import_worker_identities(&mut record, &identity_snapshot("different-launch"))
@@ -8154,6 +8168,7 @@ while os.getppid() == parent:
                     previous_worker_instance_id: None,
                     daemon_instance_id: None,
                 }),
+                active_agent_origin: None,
                 native_identity_ordering: Some(NativeIdentityOrdering {
                     worker_instance_id: worker_instance_id.to_string(),
                     pid: child.pid,
@@ -9599,6 +9614,7 @@ while os.getppid() == parent:
             session_id: "s-identity".to_owned(),
             desired_state: DesiredState::Running,
             transaction: None,
+            active_agent_origin: None,
             native_identity_ordering: None,
             info: SessionInfo {
                 id: SessionId("s-identity".to_owned()),

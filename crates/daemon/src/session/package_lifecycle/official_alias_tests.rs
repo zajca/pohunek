@@ -2730,22 +2730,10 @@ async fn persist_session(registry: &SessionRegistry, id: &protocol::SessionId) {
         .expect("persist the session record");
 }
 
-#[tokio::test]
-async fn a_procwatch_observed_own_agent_is_not_shadowed_by_a_profile_named_like_its_runtime() {
-    let (adopted, created_id) =
-        adopt_session_beside_a_profile_named_like_its_runtime("claude-observed-shadow").await;
-    observe_own_runtime_process(&adopted.registry, &created_id).await;
-    // The daemon restarts from its persisted record, which keeps the agent's
-    // name but no origin.
-    persist_session(&adopted.registry, &created_id).await;
-    let adopted = adopted.reopen_with_workers_of(&adopted.registry).await;
-    Box::pin(adopted.registry.reconcile_workers())
-        .await
-        .expect("startup reconciliation");
-
-    // The next version is installed without being selected: a package change
-    // that the refresh sees while the session keeps its pin, to which the
-    // profile of the runtime's name is bound.
+/// Installs the next Claude version without selecting it: a package change
+/// that the refresh sees while the session keeps its pin, to which the
+/// profile of the runtime's name is bound.
+async fn install_unselected_next_claude(fixture: &Fixture) {
     let next = claude_next_version_without_fork();
     let (package_id, _) = crate::agent::host::fixture::official_package_identity(RuntimeId::CLAUDE);
     let key = signing_key("root");
@@ -2756,13 +2744,87 @@ async fn a_procwatch_observed_own_agent_is_not_shadowed_by_a_profile_named_like_
             vec![entry(&next, &package_id, RuntimeId::CLAUDE, "1.0.2")],
         ),
     );
-    let mut install = catalog_install(&adopted, &next, &document, false);
+    let mut install = catalog_install(fixture, &next, &document, false);
     install.select = false;
-    adopted
+    fixture
         .registry
         .package_install(install)
         .await
         .expect("install the unselected version");
+}
+
+/// The running detector configuration of session `id`.
+async fn running_detector(registry: &SessionRegistry, id: &protocol::SessionId) -> String {
+    let sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get(id).expect("the live session");
+    let config = entry.detector_config.borrow().config.clone();
+    detector_debug(&config)
+}
+
+#[tokio::test]
+async fn an_explicit_report_of_a_profile_named_like_its_runtime_keeps_its_override_through_a_restart(
+) {
+    let (adopted, created_id) =
+        adopt_session_beside_a_profile_named_like_its_runtime("claude-reported-shadow").await;
+    assert!(
+        adopted
+            .registry
+            .report_agent(claude_identity_report(&created_id))
+            .await
+            .recorded,
+        "the explicit report of the profile named like the runtime is recorded"
+    );
+    let override_config = running_detector(&adopted.registry, &created_id).await;
+    assert_ne!(
+        override_config,
+        detector_debug(&crate::detect::DetectorConfig::for_definition(
+            &adopted
+                .registry
+                .inner
+                .profiles
+                .runtimes()
+                .resolve_id(&RuntimeId::parse(RuntimeId::CLAUDE).expect("runtime id"))
+                .expect("the package serves claude")
+        )),
+        "the report runs the profile's manifest override"
+    );
+    persist_session(&adopted.registry, &created_id).await;
+    let adopted = adopted.reopen_with_workers_of(&adopted.registry).await;
+    Box::pin(adopted.registry.reconcile_workers())
+        .await
+        .expect("startup reconciliation");
+
+    install_unselected_next_claude(&adopted).await;
+    assert_eq!(
+        running_detector(&adopted.registry, &created_id).await,
+        override_config,
+        "a restored report keeps the profile's override through a package refresh"
+    );
+    adopted
+        .registry
+        .stop(&created_id)
+        .await
+        .expect("stop the adopted session");
+    adopted
+        .registry
+        .remove(&created_id)
+        .await
+        .expect("remove the adopted session");
+}
+
+#[tokio::test]
+async fn a_procwatch_observed_own_agent_is_not_shadowed_by_a_profile_named_like_its_runtime() {
+    let (adopted, created_id) =
+        adopt_session_beside_a_profile_named_like_its_runtime("claude-observed-shadow").await;
+    observe_own_runtime_process(&adopted.registry, &created_id).await;
+    // The daemon restarts from its persisted record.
+    persist_session(&adopted.registry, &created_id).await;
+    let adopted = adopted.reopen_with_workers_of(&adopted.registry).await;
+    Box::pin(adopted.registry.reconcile_workers())
+        .await
+        .expect("startup reconciliation");
+
+    install_unselected_next_claude(&adopted).await;
     let served = adopted
         .registry
         .inner

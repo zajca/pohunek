@@ -42,6 +42,7 @@ const SHAPE_SNAPSHOTS: &[(u32, &str)] = &[
     (7, include_str!("fixtures/shape/schema-7.txt")),
     (8, include_str!("fixtures/shape/schema-8.txt")),
     (9, include_str!("fixtures/shape/schema-9.txt")),
+    (10, include_str!("fixtures/shape/schema-10.txt")),
 ];
 
 /// A profile revision: 64 lowercase hex digits.
@@ -246,7 +247,8 @@ fn session_json() -> Value {
             "generation": "g1",
             "executable": "/opt/pohunek/pohunek-sessiond",
             "reason": "none"
-        }
+        },
+        "active_agent_origin": "reported"
     });
     record["info"]["background"] = background_json();
     record["info"]["output_force_closed"] = json!(true);
@@ -327,6 +329,7 @@ fn assert_every_field_is_reviewed(
         recovery: _,
         native_identity_ordering,
         runtime,
+        active_agent_origin: _,
     } = session;
     if let Some(SessionTransaction {
         id: _,

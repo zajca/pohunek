@@ -774,6 +774,7 @@ impl SessionRegistry {
                 daemon_instance_id: None,
             }),
             info: preparing_info,
+            active_agent_origin: None,
             native_identity_ordering: carried_native_report.as_deref().cloned(),
             recovery: Some(ResumeBinding {
                 session_id: id.0.clone(),

@@ -829,6 +829,7 @@ impl Installation {
                 transaction: None,
                 info,
                 recovery: Some(self.seeded_binding(session_id)),
+                active_agent_origin: None,
                 native_identity_ordering: None,
                 runtime,
             })
