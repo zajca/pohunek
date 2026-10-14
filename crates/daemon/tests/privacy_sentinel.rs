@@ -21,6 +21,8 @@
 
 #[path = "support/official_runtimes.rs"]
 mod official_runtimes;
+#[path = "support/root_reporter.rs"]
+mod root_reporter;
 mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -81,16 +83,6 @@ async fn governance_service(socket: &Path) -> Arc<HostGovernanceService> {
             .await
             .expect("open real isolated host-governance service"),
     )
-}
-
-/// Write `body` to `path` and mark it executable, for the stub sentinel agent.
-fn write_executable(path: &Path, body: &str) {
-    std::fs::write(path, body).expect("write executable test script");
-    let mut permissions = std::fs::metadata(path)
-        .expect("test script metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(path, permissions).expect("chmod test script");
 }
 
 /// Connect a line-framed client to the daemon's control socket.
@@ -781,27 +773,29 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
         .expect("make data directory private");
     std::fs::create_dir_all(&agents_dir).expect("create agents dir");
 
-    // Stub sentinel agent: answers the official package's version probe,
-    // enables bracketed paste and renders a Claude prompt box so the initial
-    // prompt is written once the agent is ready, prints a terminal-output
-    // sentinel unrelated to any input, then echoes back whatever the daemon
-    // injects as the initial prompt, exactly as a real agent's terminal echo
-    // would. The managed child's environment carries only the profile's `env`
-    // plus the reserved `POHUNEK_*` handshake keys (RFC §22) — no `PATH` — so
-    // `cat` is invoked by absolute path rather than relying on `execvp` path
-    // resolution.
+    // Stub sentinel agent: a reporting Python image, so its own process is the
+    // PTY root that reports the native id. It answers the official package's
+    // version probe, enables bracketed paste and renders a Claude prompt box so
+    // the initial prompt is written once the agent is ready, then execs `sh`
+    // (printing a terminal-output sentinel unrelated to any input) and `cat`,
+    // which echoes the injected prompt as a real agent's terminal echo would.
+    // The managed child's environment carries only the profile's `env` plus the
+    // reserved `POHUNEK_*` handshake keys (RFC §22) — no `PATH` — so `cat` is
+    // invoked by absolute path.
     //
-    // The prompt box is the `❯` line between two `─` rules (UTF-8 as octal
-    // escapes), the shape the Claude manifest's `live_prompt_box` matches.
-    let rule = "\\342\\224\\200".repeat(20);
-    let script = agents_dir.join("stub-agent.sh");
-    write_executable(
-        &script,
-        &format!(
-            "#!/bin/sh\n{}set -eu\nprintf '\\033[?2004h{rule}\\r\\n\\342\\235\\257 \\r\\n{rule}\\r\\n'\nprintf '{OUTPUT}\\n'\nexec /bin/cat\n",
-            official_runtimes::sh_version_answer("claude")
-        ),
+    // The prompt box is the `❯` line between two `─` rules, the shape the
+    // Claude manifest's `live_prompt_box` matches.
+    let rule = "\u{2500}".repeat(20);
+    let reporter_dir = root.join("reporter");
+    std::fs::create_dir(&reporter_dir).expect("create the reporting agent directory");
+    let mut root_agent = root_reporter::RootReporter::install_with_banner(
+        &reporter_dir,
+        "sentinel-agent",
+        "claude",
+        &reporter_dir,
+        &format!("\x1b[?2004h{rule}\r\n\u{276f} \r\n{rule}\r\n"),
     );
+    let script = reporter_dir.join("sentinel-agent");
     // A host agent profile (Part C): `base = "claude"`, pinned to the installed
     // official package, makes the session resumable (required for
     // `session.report_native_id` below) while `program`/`args` override the
@@ -870,6 +864,49 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
     // before driving the rest of the scenario.
     let _ = wait_for_dir_containing(&worker_state_root, created.id.0.as_bytes()).await;
 
+    // Report a native id — the "hook value" channel — from the agent's own
+    // process over the public `session.report_native_id` RPC. The daemon admits
+    // a report only from the PTY root, so the report is sent by the stub, and
+    // the stub then execs the output-printing shell and `cat`.
+    let worker_instance_id = created
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.worker_instance_id.as_deref())
+        .expect("created managed session exposes its runtime id");
+    let report_req = Request::make(
+        "privacy-sentinel-report-native-id",
+        method::SESSION_REPORT_NATIVE_ID,
+        serde_json::to_value(
+            SessionReportNativeIdParams::new(
+                created.id.clone(),
+                worker_instance_id,
+                "claude",
+                created.pid,
+                process_start_identity(created.pid),
+                ReportSequence::new(1),
+                (OffsetDateTime::now_utc() + time::Duration::seconds(30))
+                    .format(&Rfc3339)
+                    .expect("format native identity expiry"),
+                HOOK,
+                None,
+            )
+            .expect("valid native identity claim"),
+        )
+        .expect("serialize report-native-id params"),
+    );
+    let reported: SessionReportNativeIdResult = serde_json::from_value(ok_payload(
+        root_agent
+            .send("report", root_reporter::Via::Root, &socket, &report_req)
+            .await,
+    ))
+    .expect("report-native-id result");
+    assert!(reported.recorded, "the sentinel native id must be recorded");
+    root_agent.exec(&[
+        "/bin/sh",
+        "-c",
+        &format!("printf '%s\\n' '{OUTPUT}'; exec /bin/cat"),
+    ]);
+
     // Attach and read the child's real terminal output: proof the output and
     // prompt sentinels actually flowed through the PTY, before asserting they
     // never land anywhere durable below.
@@ -903,43 +940,6 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
         "the injected prompt sentinel must reach the attach stream via the agent's echo"
     );
     drop(raw);
-
-    // Report a native id — the "hook value" channel — over the public
-    // `session.report_native_id` RPC, exactly as
-    // `report_native_id_records_binding_and_updates_info` in
-    // `session/tests.rs` does; this is the same call the shipped
-    // `pohunek-agent-state.sh` hook falls back to when it cannot reach the
-    // worker's private hook socket.
-    let worker_instance_id = created
-        .runtime
-        .as_ref()
-        .and_then(|runtime| runtime.worker_instance_id.as_deref())
-        .expect("created managed session exposes its runtime id");
-    let report_req = Request::make(
-        "privacy-sentinel-report-native-id",
-        method::SESSION_REPORT_NATIVE_ID,
-        serde_json::to_value(
-            SessionReportNativeIdParams::new(
-                created.id.clone(),
-                worker_instance_id,
-                "claude",
-                created.pid,
-                process_start_identity(created.pid),
-                ReportSequence::new(1),
-                (OffsetDateTime::now_utc() + time::Duration::seconds(30))
-                    .format(&Rfc3339)
-                    .expect("format native identity expiry"),
-                HOOK,
-                None,
-            )
-            .expect("valid native identity claim"),
-        )
-        .expect("serialize report-native-id params"),
-    );
-    let reported: SessionReportNativeIdResult =
-        serde_json::from_value(ok_payload(exchange(&mut control, &report_req).await))
-            .expect("report-native-id result");
-    assert!(reported.recorded, "the sentinel native id must be recorded");
 
     // A rejected private identity report must not leak either. This test
     // process is neither the reported runtime process nor a descendant of it,

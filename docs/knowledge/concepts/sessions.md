@@ -1128,7 +1128,10 @@ native reference with an empty worker field.
 If the owner-private worker identity claim cannot be delivered, the shipped
 hook falls back to the local public daemon with the exact runtime id, PID and
 kernel start identity, a monotonic sequence, and a short expiry. That public
-path carries no kernel peer binding, so it rests on those rules alone. Stale runtime,
+path admits only the session's PTY root itself, attested by the kernel peer of
+its local connection, and refuses every report for an `identity-v1` session
+(`native_report_unattested`); a hook, a descendant of the agent, is therefore
+refused there. Stale runtime,
 PID reuse, wrong provider/session, expiry, and duplicate or reordered reports
 are rejected. The public path is fallback; the private worker claim remains
 preferred because it survives daemon outage.
@@ -1260,8 +1263,8 @@ a report naming the root from any other process, a descendant included, is
 refused, and it accepts the root's report only while the root still runs the
 exact entrypoint and shebang interpreter the worker froze before spawning it.
 Every later conversation id of the root is verified the same way before it is
-journaled. Only this rule binds the root's report to the root's own kernel
-peer. Under `NamedForProvider` a hook reports as a descendant of the launch
+journaled. On the worker path only this rule binds the root's report to the
+root's own kernel peer. Under `NamedForProvider` a hook reports as a descendant of the launch
 process, and a descendant's report naming the launch process counts as that
 process's report; every process in the agent's PTY subtree runs as the owner,
 so this rule attributes reports and does not authenticate them. Under every
@@ -1284,10 +1287,13 @@ when the launch agent reports a newer verified conversation. Only the
 `SessionStart` identity report carries a conversation
 id; a subagent's `SubagentStart` and `SubagentStop` reports and Claude's
 main-`Stop` subagent snapshot are separate claim types that never touch the
-reference. The worker's launch-process rule
-does not cover the daemon's public `session.report_native_id` fallback, which
-keeps its own runtime, process-identity, ordering and expiry checks; that gap is
-tracked separately.
+reference. The daemon's public `session.report_native_id` fallback is attested
+against the kernel peer of its local connection: only the session's PTY root
+itself is admitted, so a descendant of the root reporting the root's pid and
+start identity is refused with `native_report_unattested` and records nothing.
+A session on the `identity-v1` schema refuses that method for every report, the
+root included, so its native reference comes only from the worker. Its runtime,
+process-identity, ordering and expiry checks still apply to an admitted report.
 The official Pi package is the worked example: see the [Pi runtime package](../guides/pi-package.md).
 
 `session.fork` creates a new pohunek session id and PTY from the source session's

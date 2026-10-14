@@ -98,9 +98,10 @@ The assistant must:
   owner-private socket is still not a sandbox against arbitrary commands run
   under the same Unix account, and in a shell session most of what the operator
   runs is inside the managed process tree by construction. The public
-  `session.report_native_id` fallback has no peer binding at all, is not
-  covered by the worker's launch-process rule, and relies on its runtime,
-  ordering, expiry, and provider rules.
+  `session.report_native_id` fallback is bound to the kernel peer of its local
+  connection: only the session's PTY root itself is admitted, and a session on
+  the `identity-v1` schema refuses it altogether. Its runtime, ordering, expiry,
+  and provider rules still apply. Remote TCP callers carry no peer and are refused.
 - Never copy worker journal or structured-log diagnostics into shared reports
   without review. Journals intentionally omit prompt, input, terminal, and
   environment bytes; preserve that boundary when adding diagnostics.
@@ -114,9 +115,9 @@ The assistant must:
   authentication or a general mutation policy. The lifecycle reports
   `session.report_agent`, `session.release_agent`, and
   `session.report_native_id` are deliberately allowed to target their own
-  session; hooks require that path, and the public native-id report is the
-  necessary local fallback when the owner-private worker claim cannot be
-  delivered.
+  session; hooks require that path. The owner-private worker claim is the route
+  for a hook's native reference: the public native-id report accepts only the
+  PTY root itself, so a hook's fallback to it is refused.
 - The Rust SDK inherits that origin from the calling process by default
   (`OriginSource::Environment`, which reads `POHUNEK_SESSION_ID` and
   `POHUNEK_DAEMON_ID`). `OriginSource::Omitted` makes a connection attach no

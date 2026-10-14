@@ -140,8 +140,10 @@ identity comes from the earliest process named for the provider). Under
 `identity-subagent-v1` a hook, which runs as a descendant of the launch
 process, files that process's report, so any process the launch process
 starts can file it: the agent's process tree runs as the owner and is not an
-identity boundary. Only `identity-v1` binds the root's report to the root's own
-kernel peer. A package only
+identity boundary. On the worker path only `identity-v1` binds the root's
+report to the root's own kernel peer; the public `session.report_native_id`
+fallback admits only the PTY root's own process and refuses `identity-v1`
+sessions. A package only
 names one; it cannot carry schema contents, add actions, or relax validation.
 The `identity-v1` launch rule requires the entrypoint's shebang interpreter to
 run the script itself. An interpreter that re-executes another image, such as a macOS

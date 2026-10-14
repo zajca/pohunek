@@ -9,12 +9,16 @@
 
 // The daemon's unit tests share this view; it keeps `session.remove`
 // independent of the test host's processes whose markers cannot be read.
+#[path = "health_socket/native_attestation.rs"]
+mod native_attestation;
 #[path = "health_socket/native_recovery.rs"]
 mod native_recovery;
 #[path = "support/official_runtimes.rs"]
 mod official_runtimes;
 #[path = "../src/procwatch/readable_host.rs"]
 mod readable_host;
+#[path = "support/root_reporter.rs"]
+mod root_reporter;
 mod support;
 
 use std::collections::BTreeMap;
@@ -1329,17 +1333,6 @@ async fn wait_for_notification_event(
 /// Build a stub agent script that logs its argv and then idles.
 /// A fake `runtime` agent that answers the official package's version probe,
 /// logs its arguments to `argv_log` and idles.
-fn stub_agent_script(runtime: &str, argv_log: &Path) -> String {
-    format!(
-        "#!/bin/sh\n\
-{version}\
-printf '%s\\n' \"$*\" >> '{argv}'\n\
-/bin/sleep 30\n",
-        version = official_runtimes::sh_version_answer(runtime),
-        argv = argv_log.display(),
-    )
-}
-
 fn process_start_identity(pid: u32) -> ProcessStartIdentity {
     let identity = HostInspector::new()
         .identity(pid)
@@ -5328,12 +5321,9 @@ async fn worktree_session_persists_recovery_and_worktree_metadata() {
     let data_dir = temp_dir("wt-resume-state");
     let store_path = data_dir.join("metadata.jsonl");
     let worktree_root = data_dir.join("worktrees");
-    let argv_log_dir = temp_dir("wt-resume-argv");
-    let argv_log = argv_log_dir.join("argv.log");
-    write_executable(
-        &bin_dir.join(bin_name),
-        &stub_agent_script(bin_name, &argv_log),
-    );
+    // The agent's own process is the PTY root, so it is the process that reports the native id.
+    let mut root_agent =
+        root_reporter::RootReporter::install(&bin_dir, bin_name, bin_name, &data_dir);
 
     let socket = temp_socket("wt-resume");
     let config = SessionRegistryConfig {
@@ -5383,9 +5373,17 @@ async fn worktree_session_persists_recovery_and_worktree_metadata() {
         )
         .expect("serialize worktree report-native-id params"),
     );
-    let reported: SessionReportNativeIdResult =
-        serde_json::from_value(ok_payload(exchange(&mut control, &report_req).await))
-            .expect("worktree report-native-id result");
+    let reported: SessionReportNativeIdResult = serde_json::from_value(ok_payload(
+        root_agent
+            .send(
+                "worktree-report",
+                root_reporter::Via::Root,
+                &socket,
+                &report_req,
+            )
+            .await,
+    ))
+    .expect("worktree report-native-id result");
     assert!(reported.recorded, "worktree native id must be recorded");
 
     let captured = inspect_session(&mut control, &created.id).await;

@@ -18,7 +18,7 @@ use protocol::{
 use super::util::{error_value, ok_value, ok_value_bounded, parse_optional_params, parse_params};
 use super::{ControlTransport, DaemonState};
 use crate::session::{
-    validate_session_list_filters, ProfileChange, SessionRegistry, UnconfirmedCleanup,
+    validate_session_list_filters, ControlPeer, ProfileChange, SessionRegistry, UnconfirmedCleanup,
 };
 
 pub(super) async fn handle_session_new(request: &Request, sessions: &SessionRegistry) -> Response {
@@ -419,13 +419,16 @@ pub(super) async fn handle_session_wait_turn(
 pub(super) async fn handle_session_report_native_id(
     request: &Request,
     sessions: &SessionRegistry,
+    peer: Option<&ControlPeer>,
 ) -> Response {
     let params = match parse_params::<SessionReportNativeIdParams>(request) {
         Ok(params) => params,
         Err(err) => return error_value(request, err),
     };
-    let result = sessions.report_native_id(params).await;
-    ok_value(request, &result)
+    match sessions.report_native_id(params, peer).await {
+        Ok(result) => ok_value(request, &result),
+        Err(err) => error_value(request, err),
+    }
 }
 
 pub(super) async fn handle_session_report_agent(

@@ -41,7 +41,7 @@ use pohunek_client::OverlayRegistry;
 use crate::discovery::DiscoveryCache;
 use crate::governance::HostGovernanceService;
 use crate::notifications::{AttentionCoordinator, NotificationService};
-use crate::session::SessionRegistry;
+use crate::session::{ControlPeer, SessionRegistry};
 
 /// Static facts the daemon reports from `daemon.health`.
 ///
@@ -82,6 +82,11 @@ pub struct DaemonState {
     pub discovery: DiscoveryCache,
     /// The transport the connections served with this state arrive on.
     pub transport: ControlTransport,
+    /// The kernel-attested peer of the one local connection this state serves.
+    ///
+    /// Set per accepted Unix connection. `None` on every other state, so a
+    /// caller without an attested peer is refused where one is required.
+    pub control_peer: Option<Arc<ControlPeer>>,
 }
 
 impl DaemonState {
@@ -112,13 +117,25 @@ impl DaemonState {
             attention: None,
             discovery,
             transport: ControlTransport::default(),
+            control_peer: None,
         }
     }
 
     /// Mark the connections served with this state as arriving on `transport`.
+    ///
+    /// A listener's state carries no connection peer; the local accept loop
+    /// attaches one to each accepted connection.
     #[must_use]
     pub fn with_transport(mut self, transport: ControlTransport) -> Self {
         self.transport = transport;
+        self.control_peer = None;
+        self
+    }
+
+    /// Attach the kernel-attested peer of one accepted connection.
+    #[must_use]
+    pub fn with_control_peer(mut self, peer: Option<Arc<ControlPeer>>) -> Self {
+        self.control_peer = peer;
         self
     }
 
@@ -385,7 +402,12 @@ async fn handle_negotiated(
             session::handle_session_wait_turn(request, &state.sessions).await
         }
         method::SESSION_REPORT_NATIVE_ID => {
-            session::handle_session_report_native_id(request, &state.sessions).await
+            session::handle_session_report_native_id(
+                request,
+                &state.sessions,
+                state.control_peer.as_deref(),
+            )
+            .await
         }
         method::SESSION_REPORT_AGENT => {
             session::handle_session_report_agent(request, &state.sessions).await

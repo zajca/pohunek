@@ -1005,10 +1005,13 @@ Hooks have two separate roles:
   cannot supply. That is the shape the shipped hooks already have, and it stops
   an unrelated command in the same terminal from rewriting another process's
   identity. If the private endpoint cannot be reached, the hook uses the local
-  public daemon as a hardened fallback; that path has no kernel peer binding,
-  is not covered by the worker's launch-process rule (tracked in
-  [#868](https://github.com/zajca/pohunek/issues/868)), and
-  relies on its runtime, ordering, expiry, and provider rules alone. That
+  public daemon as a hardened fallback. That path admits a report only from the
+  kernel peer of its local connection when that peer is the session's PTY root
+  itself, refuses every report for an `identity-v1` session
+  (`native_report_unattested`), and then applies its runtime, ordering, expiry,
+  and provider rules. The shipped Claude and Codex hooks are descendants of the
+  agent, so their fallback is refused and their native reference arrives only
+  through the worker. That
   report carries the exact runtime id, PID plus kernel start identity, a
   monotonic sequence, and a short RFC 3339 expiry. The daemon rejects stale
   runtime/session/provider identity, PID reuse, expired claims, and duplicate or
@@ -1184,7 +1187,10 @@ only origin-session exceptions are the lifecycle reports
 
 Hooks run only in a Pohunek-managed Hermes process. They use a short bounded
 local Unix-socket attempt, prefer worker-private identity reporting, and fall
-back to the hardened local public native-ID method. They never start a
+back to the local public native-ID method, which accepts a report only from the
+session's PTY root (see the attestation rule in the public API); the Hermes
+reporter runs in the agent process, but its `identity-v1` session refuses that
+method for every report, so the worker socket records the reference. They never start a
 subprocess, access the network or Hermes `state.db`, emit terminal output, or
 copy prompt/tool/output payloads. A failed hook is counted and swallowed, so
 process and screen detection remain the daemon's fallback. `on_session_end` is
@@ -1221,9 +1227,10 @@ Trust boundary:
   `NamedForProvider` the worker accepts a descendant's report naming the launch
   process as that process's report, because the Codex and Claude Code hooks are
   such descendants and cannot be told apart from another one; the rule orders
-  and attributes reports, it does not authenticate them. Only
-  `FrozenRootEntrypoint` (`identity-v1`) binds the root's report to the root's
-  own kernel peer. Under every schema the worker refuses a report from a
+  and attributes reports, it does not authenticate them. On the worker path
+  only `FrozenRootEntrypoint` (`identity-v1`) binds the root's report to the
+  root's own kernel peer; the public `session.report_native_id` fallback admits
+  only the PTY root's own process and refuses `identity-v1` sessions. Under every schema the worker refuses a report from a
   process that is neither the process it names nor a descendant of it
   (`peer_outside_subject`). Authenticated agent
   identity is tracked in [#52](https://github.com/zajca/pohunek/issues/52) and
@@ -1546,8 +1553,11 @@ that remain are cheap, free-by-default, or inherited:
   and `session.input` with `plugin_self_target_denied`. Read-only observation is allowed. The lifecycle
   reports `session.report_agent`, `session.release_agent`, and
   `session.report_native_id` are also deliberately allowed: managed hooks must
-  report their own session, and the public native-id method is the necessary
-  local fallback when the owner-private worker claim cannot be delivered. The
+  report their own session. The public `session.report_native_id` method
+  attests its caller with the kernel peer of the local connection: it admits
+  only the session's PTY root itself, and refuses every report of an
+  `identity-v1` session, so a hook's fallback to it is refused and the
+  owner-private worker claim is the route for a native reference. The
   pair is atomic and is copied to dedicated wait connections. This narrowly
   prevents an in-session automation client from invoking those nine mutations
   against the PTY that hosts it, but it is not authentication: any same-user
