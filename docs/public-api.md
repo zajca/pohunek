@@ -2095,12 +2095,16 @@ allowlist` of `service.toml`, by default `PATH`, `HOME`, `USER`, `LOGNAME`,
 `SHELL`, `LANG`, `LC_*`, `TMPDIR`, `SSH_AUTH_SOCK`, `DISPLAY`,
 `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, and `XDG_*`), `TERM`, the agent
 profile's environment, and the reserved values above. `TMPDIR` names the
-session's private temporary directory, `<cache_dir>/session-tmp/<session id>`
-below the daemon's cache directory (`$XDG_CACHE_HOME/pohunek` or the platform
-cache path), on Linux and macOS alike. It replaces a `TMPDIR` the allowlist
+session's private temporary directory,
+`<cache_dir>/session-tmp/<store key>/<session id>` below the daemon's cache
+directory (`$XDG_CACHE_HOME/pohunek` or the platform cache path), on Linux and
+macOS alike. The store key is the first 16 hex digits of the SHA-256 of the
+metadata store's canonical path (its directory resolved through
+`realpath`, then `metadata.jsonl`), so daemons with different stores that share
+a cache directory never share a root. It replaces a `TMPDIR` the allowlist
 forwards, so concurrent sessions never share temporary names; a profile that
 sets `TMPDIR` in its `[env]` keeps its own value and gets no private directory.
-The directory and the `session-tmp` directory above it have mode 0700 and must
+The directory and the directories above it up to `session-tmp` have mode 0700 and must
 be directories of the daemon's user reached without a symlink; a launch whose
 directory fails that check fails with runtime-class `session_tmpdir_unsafe`,
 one whose directory cannot be created, or whose path is not valid UTF-8 and so
@@ -2109,7 +2113,17 @@ any worker starts. A stop keeps the directory and a resume of the same session
 reuses it (recreating it when it is gone); a fork gets its own. Every removal
 (`session.remove`, retention, a rolled-back create) deletes it with everything
 an agent left in it; a delete that fails is logged with its path and leaves
-the removal itself successful. Ambient `POHUNEK_*`
+the removal itself successful. Daemon startup deletes every entry of its own
+store's root that no startup evidence names: a session record, a resume
+binding, a store line the daemon rejected that names a session, a worker
+runtime slot or a worker's claimed session (also of an orphaned worker that
+keeps running), a service-manager job of the session, or a worker journal.
+That is what a crash, a failed delete, or a reset store leaves behind. It
+deletes nothing, and logs why, when worker discovery, the service manager's
+job listing (which must list every job it holds), or the journal scan fails
+(WARN), or when a rejected store line names no session (INFO). An entry it cannot delete, such as a symlink, is logged and
+kept, and startup continues. Other stores' roots are never entered. Ambient
+`POHUNEK_*`
 markers coming from the daemon or the profile are stripped first, so only the
 worker's authoritative reserved values reach the child. Service-manager
 variables (`NOTIFY_SOCKET`, `WATCHDOG_*`, `INVOCATION_ID`, `JOURNAL_STREAM`,

@@ -958,15 +958,20 @@ retried. A lost worker cannot be reconstructed by retrying attach; inspect
 ## Temporary directory
 
 Each session's agent runs with `TMPDIR` set to the session's own directory,
-`<cache_dir>/session-tmp/<session id>` below Pohunek's cache directory
-(`$XDG_CACHE_HOME/pohunek` or the platform cache path), so agents running side
-by side never overwrite each other's temporary files. The directory is private
+`<cache_dir>/session-tmp/<store key>/<session id>` below Pohunek's cache
+directory (`$XDG_CACHE_HOME/pohunek` or the platform cache path), so agents
+running side by side never overwrite each other's temporary files. The store
+key comes from the metadata store's path, so two daemons with different stores
+never share a directory. The directory is private
 (mode 0700) and replaces a `TMPDIR` forwarded from the daemon's environment. A
 profile that sets `TMPDIR` in its `[env]` keeps that value instead. Stopping a
 session keeps the directory and resuming it reuses it; removing the session,
-explicitly or through retention, deletes it with its content. A launch whose
-directory is not a private directory of the daemon's user fails with
-`session_tmpdir_unsafe` before the agent starts.
+explicitly or through retention, deletes it with its content. When the daemon
+starts, it deletes the directories that nothing it knows at startup names (no
+record, resume binding, worker, service-manager job or worker journal), which a crash or a failed
+delete can leave behind. When it cannot tell, for example because a store line
+is unreadable, it deletes nothing. A launch whose directory is not a private directory of the daemon's user fails
+with `session_tmpdir_unsafe` before the agent starts.
 
 ## Retention
 

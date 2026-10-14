@@ -76,7 +76,8 @@ const STORE_NAME: &str = pohunek_paths::METADATA_STORE_NAME;
 
 /// Subdirectory under the data dir holding per-session git worktrees.
 const WORKTREES_SUBDIR: &str = "worktrees";
-/// Directory under the cache dir that holds each session's private `TMPDIR`.
+/// Directory under the cache dir that holds, per store, each session's private
+/// `TMPDIR`.
 const SESSION_TMP_SUBDIR: &str = "session-tmp";
 
 /// Subdirectory under the data dir holding the append-only event log.
@@ -365,11 +366,15 @@ async fn run() -> Result<(), DaemonError> {
     // The schema migration runs before the registry exists so reconciliation and
     // adoption only ever see a store at the current schema.
     pohunek_daemon::store::migrate_at_startup(&store_path)?;
+    let session_tmp_root = pohunek_daemon::session::store_session_tmp_root(
+        &paths.cache_dir.join(SESSION_TMP_SUBDIR),
+        &store_path,
+    )?;
     let config = SessionRegistryConfig {
         socket_path: Some(paths.socket.clone()),
         store_path: Some(store_path),
         worktree_root: Some(paths.data_dir.join(WORKTREES_SUBDIR)),
-        session_tmp_root: Some(paths.cache_dir.join(SESSION_TMP_SUBDIR)),
+        session_tmp_root: Some(session_tmp_root),
         event_log_dir: Some(paths.data_dir.join(EVENTS_SUBDIR)),
         retention_policy_path: Some(paths.data_dir.join(RETENTION_POLICY_NAME)),
         log_dir: Some(paths.log_dir.clone()),

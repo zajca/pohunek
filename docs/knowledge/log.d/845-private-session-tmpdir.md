@@ -1,6 +1,7 @@
 ## Unreleased (2026-10-14, private TMPDIR per session, #845)
 
-- Every launched session gets `TMPDIR=<cache_dir>/session-tmp/<session id>`,
+- Every launched session gets
+  `TMPDIR=<cache_dir>/session-tmp/<store key>/<session id>`,
   a private (0700) directory below the daemon's cache directory, on Linux and
   macOS. It replaces a `TMPDIR` forwarded through the environment allowlist, so
   concurrent agents no longer overwrite each other's temporary files; a profile

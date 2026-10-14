@@ -1,15 +1,19 @@
 //! The private temporary directory of each session.
 //!
 //! Every launched session gets `TMPDIR=<root>/<session id>`, where `root` is
-//! `<cache_dir>/session-tmp` below the daemon's private cache directory, so
-//! concurrent agents never share temporary file names. A profile that sets
-//! `TMPDIR` in its `[env]` keeps its own value. The directory survives a stop
-//! and a resume of the same session and is deleted when the session is
-//! removed.
+//! `<cache_dir>/session-tmp/<store key>` below the daemon's private cache
+//! directory ([`store_session_tmp_root`]), so concurrent agents never share
+//! temporary file names. A profile that sets `TMPDIR` in its `[env]` keeps its
+//! own value. The directory survives a stop and a resume of the same session
+//! and is deleted when the session is removed. Daemon startup deletes the
+//! directories that no startup evidence names, which a crash or a failed
+//! deletion can leave behind, and keeps them all when it cannot tell.
 
 // Rust guideline compliant 2026-10-14
 
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
+use std::fmt::Write as _;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -17,7 +21,7 @@ use std::path::{Path, PathBuf};
 use pohunek_platform::filesystem::{EntryIdentity, EntryKind, FsError, StageOutcome, TrustedDir};
 use protocol::{ErrorClass, ProtocolError, RuntimeRef, SessionId};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::SessionRegistry;
 use crate::agent::LaunchEnv;
@@ -128,7 +132,111 @@ impl SessionRegistry {
             );
         }
     }
+
+    /// Deletes every entry of the temporary directory root that is not the
+    /// directory of a session `owners` names; each deletion and failure is
+    /// logged. When `owners` cannot name them all, nothing is deleted and the
+    /// reason is logged.
+    pub(super) async fn delete_orphaned_session_tmpdirs(&self, owners: TmpdirOwners) {
+        let Some(root) = self.inner.config.session_tmp_root.clone() else {
+            return;
+        };
+        let known = match owners {
+            TmpdirOwners::Known(known) => known,
+            TmpdirOwners::Unknown { reason, failure } => {
+                if failure {
+                    warn!(
+                        path = %root.display(),
+                        reason = %reason,
+                        "orphaned session temporary directories are kept: their sessions cannot be established"
+                    );
+                } else {
+                    info!(
+                        path = %root.display(),
+                        reason = %reason,
+                        "orphaned session temporary directories are kept: their sessions cannot be established"
+                    );
+                }
+                return;
+            }
+        };
+        if let Err(error) = tokio::task::spawn_blocking(move || remove_orphans(&root, &known)).await
+        {
+            warn!(
+                error = %error,
+                "deleting orphaned session temporary directories panicked"
+            );
+        }
+    }
 }
+
+/// The sessions whose private temporary directory startup keeps.
+pub(super) enum TmpdirOwners {
+    /// Every session that may own a directory; any other entry is orphaned.
+    Known(HashSet<String>),
+    /// The owning sessions cannot be established, so no entry is deleted.
+    Unknown {
+        /// Why ownership is unknown.
+        reason: String,
+        /// Whether a scan failed, as opposed to an expected store condition.
+        failure: bool,
+    },
+}
+
+impl TmpdirOwners {
+    /// Ownership is unknown because of an expected store condition.
+    pub(super) fn unknown(reason: String) -> Self {
+        Self::Unknown {
+            reason,
+            failure: false,
+        }
+    }
+
+    /// Ownership is unknown because a scan failed.
+    pub(super) fn unknown_after_failure(reason: String) -> Self {
+        Self::Unknown {
+            reason,
+            failure: true,
+        }
+    }
+}
+
+/// The private temporary directory root of the store at `store_path` below
+/// `cache_root`: `<cache_root>/<store key>`, where the key is the first 16 hex
+/// digits of the SHA-256 of the store's canonical path. Daemons with different
+/// stores that share a cache directory therefore never share a root, and each
+/// startup sweep stays inside its own.
+///
+/// # Errors
+///
+/// Returns the I/O error when the store's directory cannot be canonicalized.
+pub fn store_session_tmp_root(cache_root: &Path, store_path: &Path) -> std::io::Result<PathBuf> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
+
+    let directory = store_path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} has no parent directory", store_path.display()),
+        )
+    })?;
+    let file_name = store_path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} has no file name", store_path.display()),
+        )
+    })?;
+    let canonical = std::fs::canonicalize(directory)?.join(file_name);
+    let digest = Sha256::digest(canonical.as_os_str().as_bytes());
+    let mut key = String::with_capacity(STORE_KEY_BYTES * 2);
+    for byte in digest.iter().take(STORE_KEY_BYTES) {
+        let _ = write!(key, "{byte:02x}");
+    }
+    Ok(cache_root.join(key))
+}
+
+/// Bytes of the store path digest that name a store's temporary root.
+const STORE_KEY_BYTES: usize = 8;
 
 /// Returns the temporary directory of `id` below `root`.
 pub(super) fn session_tmpdir(root: &Path, id: &SessionId) -> PathBuf {
@@ -171,19 +279,73 @@ pub(super) fn remove(root: &Path, id: &SessionId) {
 }
 
 fn try_remove(root: &Path, id: &SessionId) -> Result<(), String> {
-    let root_dir = match TrustedDir::open_absolute(root, PRIVATE_DIR_MODE) {
-        Ok(root_dir) => root_dir,
-        Err(error) if error.io_kind() == Some(std::io::ErrorKind::NotFound) => return Ok(()),
-        Err(error) => return Err(error.to_string()),
+    match open_root(root).map_err(|error| error.to_string())? {
+        Some(root_dir) => remove_entry(&root_dir, OsStr::new(&id.0)),
+        None => Ok(()),
+    }
+}
+
+/// Deletes every entry of `root` except the directories named in `known`:
+/// the directories of sessions whose record is gone and the quarantined
+/// leftovers of an interrupted deletion.
+///
+/// An entry that is not a directory, such as a symlink, is never followed;
+/// it fails the deletion and stays.
+fn remove_orphans(root: &Path, known: &HashSet<String>) {
+    let listed = open_root(root).and_then(|root_dir| match root_dir {
+        Some(root_dir) => root_dir.entry_names().map(|names| Some((root_dir, names))),
+        None => Ok(None),
+    });
+    let (root_dir, names) = match listed {
+        Ok(Some(listed)) => listed,
+        Ok(None) => return,
+        Err(error) => {
+            warn!(
+                path = %root.display(),
+                error = %error,
+                "failed to list the session temporary directories"
+            );
+            return;
+        }
     };
+    for name in names {
+        if name.to_str().is_some_and(|name| known.contains(name)) {
+            continue;
+        }
+        let path = root.join(&name);
+        match remove_entry(&root_dir, &name) {
+            Ok(()) => info!(
+                path = %path.display(),
+                "deleted an orphaned session temporary directory"
+            ),
+            Err(error) => warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to delete an orphaned session temporary directory"
+            ),
+        }
+    }
+}
+
+/// Opens the temporary directory root; a missing root is `None`.
+fn open_root(root: &Path) -> Result<Option<TrustedDir>, FsError> {
+    match TrustedDir::open_absolute(root, PRIVATE_DIR_MODE) {
+        Ok(root_dir) => Ok(Some(root_dir)),
+        Err(error) if error.io_kind() == Some(std::io::ErrorKind::NotFound) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Deletes the directory `name` below `root_dir`, if it exists.
+fn remove_entry(root_dir: &TrustedDir, name: &OsStr) -> Result<(), String> {
     let Some(identity) = root_dir
-        .entry_identity(&id.0, EntryKind::Directory)
+        .entry_identity(name, EntryKind::Directory)
         .map_err(|error| error.to_string())?
     else {
         return Ok(());
     };
     let staged = match root_dir
-        .stage_random(&id.0, REMOVAL_PREFIX, identity)
+        .stage_random(name, REMOVAL_PREFIX, identity)
         .map_err(|error| error.to_string())?
     {
         StageOutcome::Staged(staged) => staged,

@@ -911,7 +911,9 @@ impl SessionRegistry {
     /// journaled worker still runs, each is re-checked
     /// once the worker initialization deadline has passed since this first
     /// sight (see [`Self::settle_unproven_stale_job`]). Discovery failure only skips this
-    /// cleanup; every record's own generation is inspected individually.
+    /// cleanup and is returned with the inventory, since the jobs that failure
+    /// hides are unknown; every record's own generation is inspected
+    /// individually.
     ///
     /// `journal_of` returns the journaled worker of a stale generation from
     /// the startup scan, or why it cannot be decided.
@@ -920,15 +922,15 @@ impl SessionRegistry {
         lifecycle: Option<&Lifecycle<'_>>,
         records: &[SessionRecord],
         journal_of: impl Fn(&WorkerKey) -> Result<Option<JournalWorker<'j>>, String>,
-    ) -> Vec<RuntimeInventoryEntry> {
+    ) -> (Vec<RuntimeInventoryEntry>, Option<String>) {
         let Some(lifecycle) = lifecycle else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
         let observations = match lifecycle.supervisor.discover().await {
             Ok(observations) => observations,
             Err(error) => {
                 tracing::warn!(error = %error, "worker job discovery failed; stale jobs are kept");
-                return Vec::new();
+                return (Vec::new(), Some(error.to_string()));
             }
         };
         let mut orphans = Vec::new();
@@ -983,7 +985,7 @@ impl SessionRegistry {
                 }
             }
         }
-        orphans
+        (orphans, None)
     }
 
     /// Re-reconciles `id` in the background until its evidence settles.

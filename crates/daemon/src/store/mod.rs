@@ -914,6 +914,16 @@ impl Store {
         Ok(self.read_all()?.3)
     }
 
+    /// The lines the loaders skip because no record kind accepts them. A
+    /// missing file yields an empty list.
+    pub(crate) fn load_rejected(&self) -> io::Result<Vec<RejectedLine>> {
+        let Some(content) = self.read_content()? else {
+            return Ok(Vec::new());
+        };
+        let lines = self.checked_lines(&content)?;
+        Ok(partition_lines(lines).1)
+    }
+
     /// Upserts one logical session and preserves every other record kind.
     ///
     /// A terminal record drops the session's resume binding in the same

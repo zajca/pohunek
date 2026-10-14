@@ -4931,6 +4931,84 @@ async fn every_session_gets_a_private_tmpdir_that_its_removal_deletes() {
     let _ = handle.await;
 }
 
+/// Daemon startup deletes the private `TMPDIR` of every session without a
+/// record and the quarantined leftovers of an interrupted deletion, keeps the
+/// directory of a stopped session, and leaves an entry it cannot delete, such
+/// as a symlink, in place without following it or failing the startup.
+#[tokio::test]
+async fn startup_deletes_the_tmpdirs_of_sessions_without_a_record() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const SCRIPT: &str = concat!(
+        ": > \"$TMPDIR/data\" && ",
+        "printf '%s|' \"$TMPDIR\" > tmpdir.partial && mv tmpdir.partial tmpdir.txt; ",
+        "exec sleep 30",
+    );
+    let socket = temp_socket("session-tmpdir-orphans");
+    let tmp_root = socket.dir.join("cache").join("session-tmp");
+    let store_path = socket.dir.join("metadata.jsonl");
+    let outside = temp_dir("orphan-link-target");
+    std::fs::write(outside.join("kept"), b"").expect("write the symlink target's file");
+    let config = || SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", SCRIPT]),
+        session_tmp_root: Some(tmp_root.clone()),
+        store_path: Some(store_path.clone()),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        ..support::hermetic_registry_config()
+    };
+
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config()).await;
+    let mut control = connect(&socket).await;
+    let cwd = socket.dir.join("stopped");
+    std::fs::create_dir(&cwd).expect("create the session's working directory");
+    let (stopped, stopped_tmp) = session_with_reported_tmpdir(&mut control, "shell", &cwd).await;
+    stop_session(&mut control, &stopped.id).await;
+    wait_for_state(&mut control, &stopped.id, SessionState::Stopped).await;
+    drop(control);
+    let _ = shutdown.send(());
+    let _ = handle.await;
+
+    let orphan = tmp_root.join("orphaned-session");
+    std::fs::create_dir_all(orphan.join("ro").join("inner")).expect("create the orphan's tree");
+    std::fs::write(orphan.join("ro").join("inner").join("file"), b"").expect("orphan file");
+    std::fs::set_permissions(orphan.join("ro"), std::fs::Permissions::from_mode(0o555))
+        .expect("make the orphan's directory read-only");
+    let leftover = tmp_root.join(".pohunek-session-tmp-leftover");
+    std::fs::create_dir(&leftover).expect("create the quarantined leftover");
+    std::fs::write(leftover.join("file"), b"").expect("leftover file");
+    let link = tmp_root.join("linked");
+    std::os::unix::fs::symlink(&*outside, &link).expect("link out of the TMPDIR root");
+
+    let (restarted, _worker_home) = worker_backed_registry(&socket, config());
+    restarted
+        .reconcile_workers()
+        .await
+        .expect("startup reconciles despite an entry it cannot delete");
+
+    assert!(!orphan.exists(), "the orphan's TMPDIR is deleted");
+    assert!(!leftover.exists(), "the quarantined leftover is deleted");
+    assert!(
+        stopped_tmp.join("data").exists(),
+        "a stopped session keeps its TMPDIR"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link).is_ok_and(|metadata| metadata.is_symlink()),
+        "an entry that is not a directory stays"
+    );
+    assert!(
+        outside.join("kept").exists(),
+        "the symlink's target is never followed"
+    );
+    assert_eq!(
+        restarted
+            .inspect(&stopped.id)
+            .await
+            .expect("the stopped session is still listed")
+            .state,
+        SessionState::Stopped
+    );
+}
+
 /// Environment flag that marks the re-executed child of the wide-tree scenario.
 const WIDE_TMPDIR_CHILD: &str = "POHUNEK_HEALTH_SOCKET_WIDE_TMPDIR_CHILD";
 /// Descriptor limit the wide-tree scenario runs its daemon under.
