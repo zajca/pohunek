@@ -47,7 +47,8 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> XtaskError + '_ {
 /// and removes them.
 ///
 /// The log is written before any fragment is removed, so an interrupted fold
-/// leaves fragments that are also in the log, never an entry in neither.
+/// leaves fragments that are also in the log, never an entry in neither; a
+/// repeated fold then only removes them (see [`log::fold`]).
 ///
 /// # Errors
 ///
@@ -116,16 +117,33 @@ pub fn migrate(source_dir: &Path, dry_run: bool) -> Result<MigrateSummary, Xtask
         return Ok(summary);
     }
     fs::create_dir_all(&fragment_dir).map_err(io(&fragment_dir))?;
-    for fragment in &extracted {
-        let path = fragment_dir.join(&fragment.file_name);
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .and_then(|mut file| std::io::Write::write_all(&mut file, fragment.content.as_bytes()))
-            .map_err(io(&path))?;
+    let mut written: Vec<PathBuf> = Vec::new();
+    let outcome = extracted
+        .iter()
+        .try_for_each(|fragment| {
+            let path = fragment_dir.join(&fragment.file_name);
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(io(&path))?;
+            written.push(path.clone());
+            std::io::Write::write_all(&mut file, fragment.content.as_bytes()).map_err(io(&path))
+        })
+        .and_then(|()| fs::write(&log_path, kept).map_err(io(&log_path)));
+    if let Err(error) = outcome {
+        // The log still holds every section, so the fragments written so far
+        // are removed; a repeated migration then names them the same way.
+        for path in &written {
+            if let Err(cleanup) = fs::remove_file(path) {
+                return Err(XtaskError::Usage(format!(
+                    "{error}; removing the partial fragment `{}` failed too: {cleanup}",
+                    path.display()
+                )));
+            }
+        }
+        return Err(error);
     }
-    fs::write(&log_path, kept).map_err(io(&log_path))?;
     Ok(summary)
 }
 

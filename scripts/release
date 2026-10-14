@@ -221,6 +221,19 @@ pohunek_fold_knowledge_log() {
   ( cd "$repo_root" && cargo xtask docs log fold --version "$next" "$@" )
 }
 
+# Between the fold and the release commit the script edits tracked files of a
+# tree it verified clean. A failing step restores them, so the release can be
+# repeated from the same commit.
+release_edits_pending=false
+pohunek_restore_release_edits() {
+  [ "$release_edits_pending" = true ] || return 0
+  for path in Cargo.toml Cargo.lock docs/knowledge; do
+    git -C "$repo_root" restore --source=HEAD --staged --worktree -- "$path" 2>/dev/null || true
+  done
+  printf 'pohunek: a release step failed; the version bump and the knowledge-log fold were undone\n' >&2
+}
+trap pohunek_restore_release_edits EXIT
+
 if [ "$dry_run" = true ]; then
   pohunek_fold_knowledge_log --dry-run
   pohunek_info "dry run: would bump $manifest to $next, refresh Cargo.lock, fold the knowledge-log fragments, commit, push the candidate, verify exact-commit main and nightly CI evidence, then tag $tag$( [ "$push" = true ] && printf ' and push the tag' )"
@@ -247,6 +260,7 @@ if [ "$version_already_bumped" = true ]; then
 else
   # Fold first: it validates every fragment before it writes, so a refused
   # fragment stops the release with the tree unchanged.
+  release_edits_pending=true
   pohunek_fold_knowledge_log
 
   # Bump the version in [workspace.package] (only that table's `version` line).
@@ -271,6 +285,7 @@ else
     git -C "$repo_root" add -A -- docs/knowledge
   fi
   git -C "$repo_root" commit -m "Release $tag"
+  release_edits_pending=false
 fi
 candidate_sha="$(git -C "$repo_root" rev-parse HEAD)"
 

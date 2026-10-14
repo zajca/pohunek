@@ -297,3 +297,124 @@ fn copy_tree(source: &Path, destination: &Path) {
         }
     }
 }
+
+#[test]
+fn a_repeated_fold_after_an_interrupted_removal_only_removes_the_rest() {
+    let dir = temp_dir("fold-resume");
+    let root = dir.path();
+    write_bundle(root, COMMITTED_LOG, &[OLDER, NEWER]);
+    fold_log(root, RELEASE, false).expect("first fold succeeds");
+    let folded = read(root.join("log.md"));
+    // The first fold wrote the log, then stopped before removing this fragment.
+    fs::create_dir_all(root.join("log.d")).expect("recreate log.d");
+    fs::write(root.join("log.d").join(OLDER.0), OLDER.1).expect("restore fragment");
+
+    let summary = fold_log(root, RELEASE, false).expect("the repeated fold completes");
+
+    assert_eq!(summary.folded, [OLDER.0]);
+    assert_eq!(read(root.join("log.md")), folded, "nothing is filed twice");
+    assert!(!root.join("log.d").exists());
+}
+
+#[test]
+fn a_fold_into_an_existing_release_section_missing_the_entry_is_refused() {
+    let dir = temp_dir("fold-existing");
+    let root = dir.path();
+    let log = "# Knowledge Bundle Log\n\n## 0.35.0\n\n### 2026-10-01, other, #1\n\n- Other.\n";
+    write_bundle(root, log, &[NEWER]);
+    let before = snapshot(root);
+
+    let error = fold_log(root, RELEASE, false).expect_err("the entry is not in the section");
+
+    assert!(
+        error.to_string().contains("already has `## 0.35.0`"),
+        "{error}"
+    );
+    assert_eq!(snapshot(root), before);
+}
+
+#[test]
+fn a_migration_that_fails_part_way_removes_the_fragments_it_wrote() {
+    let dir = temp_dir("migrate-partial");
+    let root = dir.path();
+    let log = concat!(
+        "# Knowledge Bundle Log\n\n",
+        "## Unreleased (2026-10-14, first, #1)\n\n- First.\n\n",
+        "## Unreleased (2026-10-14, second, #2)\n\n- Second.\n",
+    );
+    write_bundle(root, log, &[]);
+    // A read-only log makes the last step fail after both fragments exist.
+    let log_path = root.join("log.md");
+    let mut permissions = fs::metadata(&log_path).expect("log metadata").permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&log_path, permissions.clone()).expect("make the log read-only");
+
+    let outcome = migrate_log(root, false);
+
+    #[expect(
+        clippy::permissions_set_readonly_false,
+        reason = "the test owns the file and restores write access for its cleanup"
+    )]
+    permissions.set_readonly(false);
+    fs::set_permissions(&log_path, permissions).expect("restore write access");
+    outcome.expect_err("the read-only log fails the migration");
+    assert!(
+        !root.join("log.d/1-first.md").exists(),
+        "the first fragment is removed again"
+    );
+    assert!(
+        !root.join("log.d/2-second.md").exists(),
+        "the second fragment is removed again"
+    );
+    assert_eq!(
+        read(root.join("log.md")),
+        log,
+        "the log keeps every section"
+    );
+}
+
+#[test]
+fn crlf_fragments_and_logs_parse_like_lf_ones() {
+    let dir = temp_dir("crlf");
+    let root = dir.path();
+    let crlf = |text: &str| text.replace('\n', "\r\n");
+    let log =
+        crlf("# Knowledge Bundle Log\n\n## Unreleased (2026-10-14, crlf entry, #5)\n\n- Body.\n");
+    write_bundle(root, &log, &[(NEWER.0, &crlf(NEWER.1))]);
+    validate_docs(root).expect("a CRLF fragment validates");
+
+    let summary = migrate_log(root, false).expect("a CRLF log migrates");
+
+    assert_eq!(summary.written, ["5-crlf-entry.md"]);
+    validate_docs(root).expect("the migrated bundle validates");
+}
+
+#[test]
+fn an_impossible_date_and_an_indented_unreleased_heading_are_refused() {
+    let dir = temp_dir("date");
+    let root = dir.path();
+    let impossible = (
+        "7-impossible-date.md",
+        "## Unreleased (2026-02-29, impossible date, #7)\n\n- Body.\n",
+    );
+    write_bundle(root, COMMITTED_LOG, &[impossible]);
+    let error = validate_docs(root).expect_err("2026 has no 29 February");
+    assert!(error.to_string().contains("date"), "{error}");
+
+    let leap = (
+        "8-leap-day.md",
+        "## Unreleased (2028-02-29, leap day, #8)\n\n- Body.\n",
+    );
+    fs::remove_file(root.join("log.d").join(impossible.0)).expect("remove fragment");
+    fs::write(root.join("log.d").join(leap.0), leap.1).expect("write leap fragment");
+    validate_docs(root).expect("2028 has a 29 February");
+
+    let indented =
+        format!("{COMMITTED_LOG}\n   ## Unreleased (2026-10-14, indented, #9)\n\n- Body.\n");
+    fs::write(root.join("log.md"), indented).expect("write log");
+    let error = fold_log(root, RELEASE, true).expect_err("an indented heading is still a section");
+    assert!(
+        error.to_string().contains("belongs in a fragment"),
+        "{error}"
+    );
+}

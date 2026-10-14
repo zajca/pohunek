@@ -27,6 +27,7 @@
 
 // Rust guideline compliant 2026-10-14
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt;
 use std::fs;
@@ -52,6 +53,9 @@ const RELEASE_ENTRY_OPEN: &str = "### ";
 
 /// Length of an ISO 8601 calendar date, `YYYY-MM-DD`.
 const DATE_LEN: usize = 10;
+
+/// Indentation up to which a Markdown line is still a heading.
+const MAX_HEADING_INDENT: usize = 3;
 
 /// Extension of a fragment file.
 const FRAGMENT_EXTENSION: &str = ".md";
@@ -135,6 +139,8 @@ impl std::error::Error for LogError {}
 /// Returns a [`LogError`] naming the first rule of the module documentation
 /// the fragment breaks.
 pub fn parse_fragment(file_name: &str, content: &str) -> Result<Fragment, LogError> {
+    let content = unix_lines(content);
+    let content = content.as_ref();
     let refuse = |reason: &str| LogError::new(file_name, reason);
     let issue = file_issue(file_name).ok_or_else(|| {
         refuse("the file name must be `<issue>-<slug>.md`, the slug in lower-case letters, digits and dashes")
@@ -155,10 +161,7 @@ pub fn parse_fragment(file_name: &str, content: &str) -> Result<Fragment, LogErr
             format!("the heading must cite #{issue}, the issue of the file name"),
         ));
     }
-    if rest
-        .lines()
-        .any(|line| line.starts_with(TITLE_OPEN) || line.starts_with(SECTION_OPEN))
-    {
+    if rest.lines().any(opens_title_or_section) {
         return Err(refuse(
             "the body must not hold a `#` or `##` heading; use `###` or deeper",
         ));
@@ -174,6 +177,37 @@ pub fn parse_fragment(file_name: &str, content: &str) -> Result<Fragment, LogErr
         issue,
         body: body.to_owned(),
     })
+}
+
+/// `text` with CRLF line ends turned into LF, so a file saved with either
+/// parses the same.
+fn unix_lines(text: &str) -> Cow<'_, str> {
+    if text.contains('\r') {
+        Cow::Owned(text.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+/// `line` without the indentation a Markdown heading may carry.
+fn unindented(line: &str) -> &str {
+    let indent = line.bytes().take_while(|&byte| byte == b' ').count();
+    if indent <= MAX_HEADING_INDENT {
+        &line[indent..]
+    } else {
+        line
+    }
+}
+
+/// Whether `line` is a first- or second-level ATX heading.
+fn opens_title_or_section(line: &str) -> bool {
+    let line = unindented(line);
+    let hashes = line.bytes().take_while(|&byte| byte == b'#').count();
+    (1..=2).contains(&hashes)
+        && line[hashes..]
+            .chars()
+            .next()
+            .is_none_or(char::is_whitespace)
 }
 
 /// The issue number of a `<issue>-<slug>.md` file name.
@@ -200,16 +234,28 @@ fn label_date(label: &str) -> Option<&str> {
     let digits = [0, 1, 2, 3, 5, 6, 8, 9]
         .iter()
         .all(|&index| bytes[index].is_ascii_digit());
+    let year = date.get(..4)?.parse::<u32>().ok()?;
     let month = date.get(5..7)?.parse::<u8>().ok()?;
     let day = date.get(8..10)?.parse::<u8>().ok()?;
     let valid = digits
         && bytes[4] == b'-'
         && bytes[7] == b'-'
-        && (1..=12).contains(&month)
-        && (1..=31).contains(&day)
+        && (1..=days_in_month(year, month)).contains(&day)
         && !topic.trim().is_empty()
         && !topic.trim_start().starts_with('#');
     valid.then_some(date)
+}
+
+/// Days of `month` in `year` of the Gregorian calendar; 0 for no such month.
+fn days_in_month(year: u32, month: u8) -> u8 {
+    let leap = (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 /// The `#<number>` issues `label` cites.
@@ -279,7 +325,10 @@ fn log_order(left: &Fragment, right: &Fragment) -> Ordering {
 ///
 /// Returns a [`LogError`] naming the first `## Unreleased` heading.
 pub fn check_log(path: &Path, log: &str) -> Result<(), LogError> {
-    match log.lines().find(|line| line.starts_with("## Unreleased")) {
+    match log
+        .lines()
+        .find(|line| unindented(line).starts_with("## Unreleased"))
+    {
         Some(heading) => Err(LogError::new(
             path,
             format!("`{heading}` belongs in a fragment under {FRAGMENT_DIR}/"),
@@ -303,23 +352,47 @@ pub fn assemble(log: &str, fragments: &[Fragment]) -> Result<String, LogError> {
 /// its first section, in the order given. Without fragments the log is
 /// returned unchanged.
 ///
+/// A log that already has the `## <version>` section is a fold that wrote the
+/// log but did not remove every fragment: when that section already holds
+/// each fragment's entry, the log is returned unchanged, so removing the
+/// fragments completes the fold instead of filing them twice.
+///
 /// # Errors
 ///
-/// Returns a [`LogError`] when `log` does not open with a `# ` title line.
+/// Returns a [`LogError`] when `log` does not open with a `# ` title line, or
+/// when it already has the `## <version>` section without every fragment's
+/// entry.
 pub fn fold(log: &str, fragments: &[Fragment], version: &str) -> Result<String, LogError> {
     if fragments.is_empty() {
         return Ok(log.to_owned());
     }
+    let log = unix_lines(log);
+    let heading = format!("{SECTION_OPEN}{version}");
     let entries: Vec<String> = fragments.iter().map(Fragment::release_entry).collect();
-    insert_sections(
-        log,
-        &format!("{SECTION_OPEN}{version}\n\n{}", entries.join("\n")),
-    )
+    if log.lines().any(|line| line == heading) {
+        return match fragments
+            .iter()
+            .zip(&entries)
+            .find(|(_, entry)| !log.contains(entry.as_str()))
+        {
+            None => Ok(log.into_owned()),
+            Some((fragment, _)) => Err(LogError::new(
+                LOG_FILE,
+                format!(
+                    "the log already has `{heading}`, and `{}` is not filed in it",
+                    fragment.file_name
+                ),
+            )),
+        };
+    }
+    insert_sections(&log, &format!("{heading}\n\n{}", entries.join("\n")))
 }
 
 /// Inserts `sections` before the first section of `log`, after its title and
 /// any introduction.
 fn insert_sections(log: &str, sections: &str) -> Result<String, LogError> {
+    let log = unix_lines(log);
+    let log = log.as_ref();
     if !log.starts_with(TITLE_OPEN) {
         return Err(LogError::new(
             LOG_FILE,
@@ -371,6 +444,7 @@ pub struct Extracted {
 /// not open with a date, since its fragment could not be named, or whose
 /// fragment would fail [`parse_fragment`].
 pub fn split_unreleased(log: &str, taken: &[String]) -> Result<(String, Vec<Extracted>), LogError> {
+    let log = unix_lines(log);
     let mut kept = String::new();
     let mut extracted: Vec<Extracted> = Vec::new();
     let mut current: Option<(String, String)> = None;

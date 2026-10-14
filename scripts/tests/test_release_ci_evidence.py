@@ -273,6 +273,23 @@ class ReleaseEvidenceTests(unittest.TestCase):
         self.assertIn("docs/knowledge/log.d/1-a-change.md", self.tracked("HEAD"))
         self.assertTrue((self.repo / "docs/knowledge/log.d/1-a-change.md").exists())
 
+    def test_failed_step_after_the_fold_restores_the_tree(self):
+        self.add_knowledge_log()
+        failing = FOLDING_CARGO.replace(
+            "exit 0\n", 'case "$*" in update*) exit 3 ;; esac\nexit 0\n'
+        )
+        self.write_copy("bin/cargo", failing, executable=True)
+        self.git("add", "bin")
+        self.git("commit", "-m", "Make cargo update fail")
+        result = self.run_release()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("were undone", result.stderr)
+        status = subprocess.check_output(
+            [shutil.which("git"), "-C", str(self.repo), "status", "--porcelain"], text=True
+        )
+        self.assertEqual(status, "", "the failed release leaves the tree as it found it")
+        self.assertTrue((self.repo / "docs/knowledge/log.d/1-a-change.md").exists())
+
     def test_already_versioned_candidate_with_unfolded_fragments_is_refused(self):
         self.add_knowledge_log()
         self.prepare_existing_candidate()
