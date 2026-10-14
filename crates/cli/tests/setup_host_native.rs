@@ -636,13 +636,11 @@ async fn a_config_write_that_fails_part_way_names_the_files_already_created() {
     let planner = ScriptedPlanner::new(vec![report(&json!([]))]);
     let prompts = config_dir(&installation).join("prompts");
     fs::create_dir_all(&prompts).expect("prompts directory");
-    // A dangling link: the file does not exist, and its directory does not
-    // either, so the write fails after the earlier files were created.
-    std::os::unix::fs::symlink(
-        installation.root.join("missing").join("pr.tmpl"),
-        prompts.join("pr.tmpl"),
-    )
-    .expect("dangling template link");
+    // The write of pr.tmpl goes through a temporary file of this process
+    // beside it. A directory of that name makes the write fail after the
+    // earlier files were created, and leaves no pr.tmpl behind.
+    let blocked = prompts.join(format!(".pr.tmpl.{}.tmp", std::process::id()));
+    fs::create_dir_all(&blocked).expect("blocking temporary directory");
 
     let host_plan = plan(&installation.context, &release, &planner)
         .await
@@ -657,6 +655,7 @@ async fn a_config_write_that_fails_part_way_names_the_files_already_created() {
         "the created file is named: {message}"
     );
     assert!(message.contains("issue.tmpl"), "{message}");
+    assert!(!prompts.join("pr.tmpl").exists(), "no partial file is left");
     assert!(
         installed_at_this_version(&installation).await,
         "the service is kept"

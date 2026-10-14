@@ -16,7 +16,8 @@
 
 use std::fmt::Write as _;
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -129,10 +130,34 @@ pub(crate) fn install_config_into(
             result.skipped.push(path.display().to_string());
             continue;
         }
-        fs::write(&path, body)?;
+        write_atomically(&path, body)?;
         result.created.push(path.display().to_string());
     }
     Ok(())
+}
+
+/// Writes `body` to `path` through a temporary file beside it, then renames
+/// it into place. A failed write leaves no partial file where a later run
+/// would find the file and skip it.
+fn write_atomically(path: &Path, body: &str) -> std::io::Result<()> {
+    let name = path.file_name().map_or_else(
+        || "config".to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let temp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 /// The config files `setup config` writes, with their default contents.

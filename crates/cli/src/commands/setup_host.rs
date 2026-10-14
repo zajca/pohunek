@@ -1239,8 +1239,8 @@ fn render_report(report: &SetupReport) -> String {
     }
     let _ = writeln!(
         out,
-        "verdict: health {}, doctor {}",
-        report.verdict.health, report.verdict.doctor
+        "verdict: health {}, doctor {}, catalog {}",
+        report.verdict.health, report.verdict.doctor, report.verdict.catalog
     );
     out
 }

@@ -230,6 +230,10 @@ fn render_install(report: &report::InstallReport) -> String {
     render_search_path(&mut text, &report.search_path);
     if let Some(runtimes) = &report.runtimes {
         render_install_runtimes(&mut text, runtimes);
+    } else if report.resumed {
+        // A resume skips the runtime step only when the interrupted run had
+        // completed it, so its outcome is not in this report.
+        let _ = writeln!(text, "runtimes   completed by the interrupted run");
     }
     text
 }
@@ -849,6 +853,17 @@ mod tests {
         );
         assert!(
             text.contains("profile    consumer (base claude, bound)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_resumed_install_says_its_runtime_step_completed_earlier() {
+        let mut install = install_report(search_path_report("login_shell"));
+        install.resumed = true;
+        let text = render_install(&install);
+        assert!(
+            text.contains("runtimes   completed by the interrupted run"),
             "{text}"
         );
     }
