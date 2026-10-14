@@ -2074,7 +2074,8 @@ sets `TMPDIR` in its `[env]` keeps its own value and gets no private directory.
 The directory and the `session-tmp` directory above it have mode 0700 and must
 be directories of the daemon's user reached without a symlink; a launch whose
 directory fails that check fails with runtime-class `session_tmpdir_unsafe`,
-one whose directory cannot be created with `session_tmpdir_failed`, before
+one whose directory cannot be created, or whose path is not valid UTF-8 and so
+cannot be exported, with `session_tmpdir_failed`, before
 any worker starts. A stop keeps the directory and a resume of the same session
 reuses it (recreating it when it is gone); a fork gets its own. Every removal
 (`session.remove`, retention, a rolled-back create) deletes it with everything

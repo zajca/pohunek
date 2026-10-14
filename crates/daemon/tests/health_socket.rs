@@ -4931,6 +4931,131 @@ async fn every_session_gets_a_private_tmpdir_that_its_removal_deletes() {
     let _ = handle.await;
 }
 
+/// Environment flag that marks the re-executed child of the wide-tree scenario.
+const WIDE_TMPDIR_CHILD: &str = "POHUNEK_HEALTH_SOCKET_WIDE_TMPDIR_CHILD";
+/// Descriptor limit the wide-tree scenario runs its daemon under.
+const WIDE_TMPDIR_FD_LIMIT: u64 = 256;
+/// Directories in the read-only directory of the wide-tree scenario, more
+/// than [`WIDE_TMPDIR_FD_LIMIT`].
+const WIDE_TMPDIR_ENTRIES: usize = 600;
+
+/// A read-only directory with more subdirectories than the daemon may hold
+/// descriptors is still deleted with the session, because the cleanup holds
+/// descriptors bounded by the tree's depth.
+///
+/// The scenario re-executes itself so the lowered descriptor limit stays in
+/// that child process.
+#[tokio::test]
+async fn a_wide_read_only_tmpdir_is_deleted_under_a_low_descriptor_limit() {
+    use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+
+    const TEST_NAME: &str = "a_wide_read_only_tmpdir_is_deleted_under_a_low_descriptor_limit";
+    if std::env::var_os(WIDE_TMPDIR_CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(WIDE_TMPDIR_CHILD, "1")
+            .output()
+            .expect("run the re-executed child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("wide-tmpdir-ok"),
+            "child did not run its body:\n{stdout}"
+        );
+        return;
+    }
+
+    let socket = temp_socket("wide-tmpdir");
+    let tmp_root = socket.dir.join("cache").join("session-tmp");
+    let script = format!(
+        concat!(
+            "mkdir \"$TMPDIR/wide\" && i=0 && ",
+            "while [ $i -lt {entries} ]; do mkdir \"$TMPDIR/wide/d$i\" || exit 1; i=$((i+1)); done && ",
+            "chmod 0555 \"$TMPDIR/wide\" && ",
+            "printf '%s|' \"$TMPDIR\" > tmpdir.partial && mv tmpdir.partial tmpdir.txt; ",
+            "exec sleep 30",
+        ),
+        entries = WIDE_TMPDIR_ENTRIES,
+    );
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", script.as_str()]),
+        session_tmp_root: Some(tmp_root.clone()),
+        ..support::hermetic_registry_config()
+    };
+    let hard = getrlimit(Resource::Nofile).maximum;
+    setrlimit(
+        Resource::Nofile,
+        Rlimit {
+            current: Some(WIDE_TMPDIR_FD_LIMIT),
+            maximum: hard,
+        },
+    )
+    .expect("lower the descriptor limit");
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+    let cwd = socket.dir.join("wide-cwd");
+    std::fs::create_dir(&cwd).expect("create the session's working directory");
+    let (session, tmpdir) = session_with_reported_tmpdir(&mut control, "shell", &cwd).await;
+    assert_eq!(tmpdir, tmp_root.join(&session.id.0));
+
+    remove_session(&mut control, &session.id).await;
+    assert!(
+        !tmpdir.exists(),
+        "the removal deletes the wide read-only tree"
+    );
+    let left: Vec<_> = std::fs::read_dir(&tmp_root)
+        .expect("list the TMPDIR root")
+        .map(|entry| entry.expect("TMPDIR root entry").file_name())
+        .collect();
+    assert!(
+        left.is_empty(),
+        "nothing stays below the TMPDIR root: {left:?}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+    println!("wide-tmpdir-ok");
+}
+
+/// A private `TMPDIR` path that is not UTF-8 cannot reach the agent, so the
+/// launch is refused before any worker starts instead of exporting a changed
+/// path.
+#[tokio::test]
+async fn a_tmpdir_root_that_is_not_utf8_refuses_the_launch() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let socket = temp_socket("session-tmpdir-bytes");
+    let tmp_root = socket
+        .dir
+        .join(std::ffi::OsStr::from_bytes(b"session-tmp-\xff"));
+    let started = socket.dir.join("agent-started");
+    let script = format!("touch '{}'; exec sleep 30", started.display());
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", script.as_str()]),
+        session_tmp_root: Some(tmp_root.clone()),
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+
+    let error =
+        err_payload(create_session_with_params(&mut control, session_params(&socket)).await);
+    assert_eq!(error.code, "session_tmpdir_failed", "{error}");
+    assert_eq!(error.class, ErrorClass::Runtime);
+    assert!(!started.exists(), "the agent never starts");
+    assert!(
+        !tmp_root.exists(),
+        "nothing is created below the refused root"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
 /// A `TMPDIR` root reached through a symlink is refused before any worker
 /// starts, and no session is left behind.
 #[tokio::test]

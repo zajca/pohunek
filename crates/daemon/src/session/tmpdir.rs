@@ -48,11 +48,16 @@ impl SessionRegistry {
         id: &SessionId,
     ) -> LaunchEnv {
         let mut env = LaunchEnv::default();
-        if let Some(root) = &self.inner.config.session_tmp_root {
-            env.extend([(
-                TMPDIR.to_owned(),
-                session_tmpdir(root, id).to_string_lossy().into_owned(),
-            )]);
+        // A path that is not UTF-8 cannot travel in the launch environment;
+        // `prepare_session_tmpdir` then refuses the launch.
+        let private = self
+            .inner
+            .config
+            .session_tmp_root
+            .as_ref()
+            .and_then(|root| session_tmpdir(root, id).to_str().map(str::to_owned));
+        if let Some(private) = private {
+            env.extend([(TMPDIR.to_owned(), private)]);
         }
         env.extend(profile_env.iter().cloned());
         env.extend(self.session_pty_env(agent, id));
@@ -62,6 +67,9 @@ impl SessionRegistry {
     /// Creates the private temporary directory of `id` when `env` exports it.
     ///
     /// # Errors
+    ///
+    /// Returns `session_tmpdir_failed` when the private path is not UTF-8 and
+    /// no profile `TMPDIR` replaces it.
     ///
     /// Returns `session_tmpdir_unsafe` or `session_tmpdir_failed` (see
     /// [`ensure`]).
@@ -79,6 +87,17 @@ impl SessionRegistry {
             .rev()
             .find(|(name, _)| name == TMPDIR)
             .map(|(_, value)| Path::new(value));
+        if private.to_str().is_none() && exported.is_none() {
+            return Err(ProtocolError::new(
+                ErrorClass::Runtime,
+                "session_tmpdir_failed",
+                format!(
+                    "the session's private temporary directory {} is not valid UTF-8",
+                    private.display()
+                ),
+                None,
+            ));
+        }
         if exported != Some(private.as_path()) {
             return Ok(());
         }
@@ -204,13 +223,21 @@ fn grant_owner_access(
     expected: EntryIdentity,
 ) -> std::io::Result<()> {
     let uid = rustix::process::geteuid().as_raw();
-    let mut pending = vec![open_accessible(root, name, uid, Some(expected))?];
-    while let Some(dir) = pending.pop() {
-        for name in child_names(&dir)? {
-            let stat = rustix::fs::statat(&dir, name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW)?;
-            if FileType::from_raw_mode(stat.st_mode) == FileType::Directory && stat.st_uid == uid {
-                pending.push(open_accessible(&dir, &name, uid, None)?);
-            }
+    // One frame per level of the current path, so the open descriptors are
+    // bounded by the tree's depth, not by how many directories it holds.
+    let top = open_accessible(root, name, uid, Some(expected))?;
+    let names = child_names(&top)?.into_iter();
+    let mut frames = vec![(top, names)];
+    while let Some((dir, names)) = frames.last_mut() {
+        let Some(name) = names.next() else {
+            frames.pop();
+            continue;
+        };
+        let stat = rustix::fs::statat(&*dir, name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW)?;
+        if FileType::from_raw_mode(stat.st_mode) == FileType::Directory && stat.st_uid == uid {
+            let child = open_accessible(&*dir, &name, uid, None)?;
+            let names = child_names(&child)?.into_iter();
+            frames.push((child, names));
         }
     }
     Ok(())

@@ -10,5 +10,5 @@
   failed delete is logged with the path and does not fail the removal.
 - New runtime-class errors: `session_tmpdir_unsafe` when the directory or the
   `session-tmp` directory is not a private directory of the daemon's user, and
-  `session_tmpdir_failed` when it cannot be created. Both fail the launch
-  before a worker starts.
+  `session_tmpdir_failed` when it cannot be created or its path is not valid
+  UTF-8. Both fail the launch before a worker starts.
