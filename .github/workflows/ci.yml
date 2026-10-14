@@ -1002,6 +1002,12 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p pohunek-cli --test service_systemd -- --ignored --test-threads 1
 
+      # Issue #1013: bare `pohunek setup` against the user manager, including
+      # the fresh-host run from a signed release.
+      - name: pohunek setup on a host
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p pohunek-cli --test setup_host_native -- --ignored --test-threads 1
+
       - name: Supervised worker lifecycle
         if: ${{ !cancelled() }}
         run: cargo test --locked -p pohunek-daemon --test supervised_lifecycle -- --ignored --test-threads 1

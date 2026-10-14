@@ -2,10 +2,14 @@
 //!
 //! The setup runs in-process against an isolated installation, the same way
 //! the `service_*` tests drive the engine. The service, the daemon, the RPCs,
-//! the hooks and the config are real. Only the release planner is scripted:
-//! the built daemon has no `--detect` until 035.3 slice 1 lands, and a
-//! fixture daemon cannot stand in, because the supervisor refuses a main
-//! process whose executable differs from the unit's `ExecStart`.
+//! the hooks and the config are real. Most scenarios script the release
+//! planner with canned reports, because they need a particular plan. The
+//! fresh-host scenario at the end runs the production planner, the release
+//! daemon's `ensure-official-runtimes --detect`, over real package archives.
+//!
+//! A fixture daemon cannot stand in for the release daemon, because the
+//! supervisor refuses a main process whose executable differs from the unit's
+//! `ExecStart`.
 //!
 //! Linux drives the systemd user manager and is ignored unless
 //! `POHUNEK_SYSTEMD_E2E=1` opts in; macOS drives `gui/<uid>` in the ordinary
@@ -19,6 +23,7 @@
 mod native;
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::future::Future;
 use std::os::unix::fs::PermissionsExt as _;
@@ -26,10 +31,24 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use ed25519_dalek::SigningKey;
 use native::Installation;
-use pohunek_cli::host_setup::{apply, plan, ReleasePlanner, ServiceStep};
+use package::directory::build_directory_archive;
+use package::{read_archive, CatalogEntry, Limits, PackageDigest, ANCHOR_FILE_NAME};
+
+use pohunek_cli::host_setup::{apply, plan, ReleasePlanner, ServiceStep, SetupReport};
+use pohunek_cli::service::context::PathDiscovery;
+use pohunek_cli::service::runtimes::DaemonRuntimes;
 use pohunek_cli::service::{self, Context, VERSION};
-use pohunek_service_config::runtimes::EnsureReport;
+use pohunek_daemon::agent::host::definition_from_archive;
+use pohunek_service_config::runtimes::{EnsureReport, PackageStatus};
+use pohunek_test_support::catalog::{
+    anchor_for, attestations_for, catalog_of, host_platform, signed, test_key, ANY_CORE,
+    RUNTIME_API, WINDOW_END,
+};
+use pohunek_test_support::fs::copy_shell_image;
+use pohunek_test_support::workspace_root;
+use protocol::{method, BindingProvenance, RuntimeId, SessionId, SessionNewParams};
 use serde_json::{json, Value};
 
 /// Error code of a setup that stopped after the service install.
@@ -743,4 +762,534 @@ async fn a_recorded_catalog_on_an_installed_host_is_a_note_not_an_effect() {
         .expect("the re-run applies");
     assert_eq!(outcome.verdict.catalog, "record");
     assert!(outcome.preview.catalog_note.is_some());
+}
+
+/// Runtime packages the fresh-host release carries. `pi` is installed only by
+/// the third run, once its agent is on the search path.
+const FRESH_HOST_RUNTIMES: [&str; 3] = ["claude", "codex", "pi"];
+
+/// Program names of the official agents, which the search path of the
+/// scenario offers only as its own fakes.
+const OFFICIAL_AGENTS: [&str; 4] = ["claude", "codex", "hermes", "pi"];
+
+/// System directories whose tools the search path of the scenario offers.
+const SYSTEM_DIRS: [&str; 2] = ["/usr/bin", "/bin"];
+
+/// Native ids the fake agents report when they start.
+const CLAUDE_NATIVE_ID: &str = "d6-claude-native";
+const CODEX_NATIVE_ID: &str = "d6-codex-native";
+
+/// Body of the fake agents, see `support/setup_agent.sh`.
+const FAKE_AGENT_BODY: &str = include_str!("support/setup_agent.sh");
+
+/// Body of the fake `pi`, which only has to be on the search path.
+const FAKE_PRESENCE_BODY: &str = "exit 0\n";
+
+/// Shell whose copy is the fake agents' interpreter. macOS needs bash: its
+/// `/bin/sh` re-execs `/bin/bash`, which would drop the agent's name.
+#[cfg(target_os = "macos")]
+const SHELL: &str = "/bin/bash";
+#[cfg(not(target_os = "macos"))]
+const SHELL: &str = "/bin/sh";
+
+/// Mode of the directories that hold the fake agents and their config homes.
+const PRIVATE_DIR: u32 = 0o700;
+
+/// Mode of the directory that holds the fake agents on the search path.
+const SEARCH_DIR: u32 = 0o755;
+
+/// Mode of a fake agent and of its interpreter copy.
+const EXECUTABLE: u32 = 0o755;
+const PRIVATE_EXECUTABLE: u32 = 0o700;
+
+/// Sequence number of the release catalog the scenario signs.
+const CATALOG_SEQUENCE: u64 = 1;
+
+/// Name of the release's package directory and archive suffix, as the release
+/// daemon reads them.
+const PACKAGES_DIR: &str = "packages";
+const ARCHIVE_SUFFIX: &str = ".tar.zst";
+
+/// The release directory's `runtime/` entry, which the release daemon reads
+/// beside its own executable.
+const RUNTIME_DIR: &str = "runtime";
+
+/// Name of the signed catalog inside `runtime/`.
+const CATALOG_FILE: &str = "runtime-catalog.json";
+
+/// Name of the `SessionStart` hook script the integration installs into each
+/// agent's config home, which the fake agents run.
+const STATE_HOOK: &str = "pohunek-agent-state.sh";
+
+/// The paths whose content differs between two states of the roots.
+fn changed_paths(
+    before: &BTreeMap<PathBuf, Option<Vec<u8>>>,
+    after: &BTreeMap<PathBuf, Option<Vec<u8>>>,
+) -> Vec<PathBuf> {
+    before
+        .keys()
+        .chain(after.keys())
+        .filter(|path| before.get(*path) != after.get(*path))
+        .cloned()
+        .collect()
+}
+
+/// Canonical spelling of an existing path, which the integration installer
+/// requires for a config home (`integration_path_untrusted`,
+/// `config_home_is_symlink`).
+fn canonical(path: &Path) -> PathBuf {
+    fs::canonicalize(path).expect("canonical path")
+}
+
+/// The path as the text the search path and the profiles carry.
+fn path_text(path: &Path) -> String {
+    path.to_str().expect("UTF-8 path").to_owned()
+}
+
+/// Creates a directory with `mode`.
+fn directory(path: &Path, mode: u32) {
+    fs::create_dir_all(path).expect("create directory");
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("set directory mode");
+}
+
+/// The `--version` line the compatibility lock of `runtime` pins. The
+/// installed package's probe accepts that release.
+fn supported_banner(runtime: &str) -> String {
+    let path = workspace_root()
+        .join("compat")
+        .join(runtime)
+        .join("compatibility-lock.json");
+    let lock: Value =
+        serde_json::from_slice(&fs::read(&path).expect("read the compatibility lock"))
+            .expect("the compatibility lock is JSON");
+    let release = lock["upstream"]["release"]
+        .as_str()
+        .expect("the lock pins a release");
+    lock["upstream"]["version_output"]
+        .as_str()
+        .expect("the lock records the version output")
+        .replace("{release}", release)
+}
+
+/// The package archive of `runtime-packages/<runtime>`, built the way
+/// `pohunek plugin install` receives it, and the catalog entry that
+/// authorizes it on this host.
+fn official_archive(runtime: &str) -> (Vec<u8>, CatalogEntry) {
+    let source = workspace_root().join("runtime-packages").join(runtime);
+    let bytes = build_directory_archive(&source, &Limits::DEFAULT)
+        .unwrap_or_else(|error| panic!("the {runtime} package builds: {error:?}"));
+    let archive = read_archive(&bytes, &Limits::DEFAULT).expect("the archive reads");
+    let digest: PackageDigest = archive.digest().clone();
+    let definition = definition_from_archive(archive.entries(), &digest)
+        .unwrap_or_else(|error| panic!("the {runtime} package parses: {error:?}"));
+    let BindingProvenance::Package { package, .. } = definition.binding().provenance.clone() else {
+        panic!("the {runtime} package has package provenance");
+    };
+    let entry = CatalogEntry {
+        package_id: package.id,
+        runtime_id: RuntimeId::parse(runtime).expect("runtime id"),
+        version: package.version,
+        digest,
+        runtime_api: RUNTIME_API,
+        platforms: vec![host_platform()],
+        attestations: attestations_for(&[host_platform()]),
+        core: ANY_CORE.to_owned(),
+    };
+    (bytes, entry)
+}
+
+/// Writes the release's `runtime/` directory: one archive per fresh-host
+/// runtime under `packages/`, and a catalog of them signed by `key`.
+fn write_release_runtime(runtime: &Path, key: &SigningKey) {
+    let packages = runtime.join(PACKAGES_DIR);
+    fs::create_dir_all(&packages).expect("packages directory");
+    let mut entries = Vec::new();
+    for name in FRESH_HOST_RUNTIMES {
+        let (bytes, entry) = official_archive(name);
+        fs::write(packages.join(format!("{name}{ARCHIVE_SUFFIX}")), bytes)
+            .expect("write the package archive");
+        entries.push(entry);
+    }
+    let catalog = catalog_of(CATALOG_SEQUENCE, WINDOW_END, entries);
+    fs::write(runtime.join(CATALOG_FILE), signed(key, catalog)).expect("write the catalog");
+}
+
+/// Stages the release the scenario installs from: this build's binaries, the
+/// throwaway trust anchor beside the daemon, and the signed `runtime/`.
+fn stage_release(installation: &Installation, key: &SigningKey) -> PathBuf {
+    let release = installation.stage();
+    fs::write(release.join(ANCHOR_FILE_NAME), anchor_for(key)).expect("write the trust anchor");
+    write_release_runtime(&release.join(RUNTIME_DIR), key);
+    release
+}
+
+/// Writes the fake `name` agent into `bin`. Its interpreter is a copy of the
+/// shell named `fake-<name>-sh` in `interpreters`, it answers `--version`
+/// with the release its package pins before anything else, and it exports
+/// `env` before `body` runs.
+fn write_fake_agent(
+    bin: &Path,
+    interpreters: &Path,
+    name: &str,
+    env: &[(&str, &str)],
+    body: &str,
+) -> PathBuf {
+    let interpreter = interpreters.join(format!("fake-{name}-sh"));
+    copy_shell_image(SHELL, &interpreter).expect("copy the shell as the agent interpreter");
+    fs::set_permissions(&interpreter, fs::Permissions::from_mode(PRIVATE_EXECUTABLE))
+        .expect("chmod the agent interpreter");
+    let mut exports = String::new();
+    for (key, value) in env {
+        writeln!(exports, "export {key}='{value}'").expect("format into a string");
+    }
+    let script = format!(
+        "#!{}\nif [ \"${{1:-}}\" = --version ]; then printf '%s\\n' '{}'; exit 0; fi\n{exports}{body}",
+        interpreter.display(),
+        supported_banner(name),
+    );
+    let path = bin.join(name);
+    fs::write(&path, script).expect("write the fake agent");
+    fs::set_permissions(&path, fs::Permissions::from_mode(EXECUTABLE)).expect("chmod the agent");
+    path
+}
+
+/// Links every program of the system directories into `tools`, except the
+/// official agents, so the search path the job records offers the system's
+/// tools without any agent installed on the machine running the test.
+fn system_tools(tools: &Path) {
+    directory(tools, SEARCH_DIR);
+    for system in SYSTEM_DIRS {
+        let Ok(listing) = fs::read_dir(system) else {
+            continue;
+        };
+        for entry in listing {
+            let entry = entry.expect("system directory entry");
+            let name = entry.file_name();
+            let excluded = name
+                .to_str()
+                .is_some_and(|name| OFFICIAL_AGENTS.contains(&name));
+            let link = tools.join(&name);
+            if !excluded && !link.exists() && link.symlink_metadata().is_err() {
+                std::os::unix::fs::symlink(entry.path(), &link).expect("link a system tool");
+            }
+        }
+    }
+}
+
+/// Every file and directory under `roots`, keyed by its absolute path.
+fn state_of(roots: &[PathBuf]) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let mut state = BTreeMap::new();
+    for root in roots {
+        for (relative, content) in snapshot(root) {
+            state.insert(root.join(relative), content);
+        }
+    }
+    state
+}
+
+/// Starts a session of host profile `profile` in `cwd` and waits until its
+/// runtime is live.
+async fn start_agent(installation: &Installation, profile: &str, cwd: &Path) -> String {
+    let session = installation
+        .client()
+        .await
+        .call::<method::SessionNew>(SessionNewParams {
+            agent: profile.to_owned(),
+            name: Some(profile.to_owned()),
+            cwd: Some(cwd.to_path_buf()),
+            cols: 80,
+            rows: 24,
+            project: None,
+            repo: None,
+            branch: None,
+            base_branch: None,
+            input: None,
+            extended_input_ready_wait: None,
+            metadata: BTreeMap::new(),
+        })
+        .await
+        .expect("start the agent session")
+        .session
+        .id
+        .0;
+    installation.live(&session).await;
+    session
+}
+
+/// Waits until the session reports `native` as its provider-native id. The
+/// daemon learns it only from the `SessionStart` hook the agent fired.
+async fn wait_native_reference(installation: &Installation, session: &str, native: &str) {
+    native::eventually(&format!("{session} reports {native}"), || async {
+        installation
+            .client()
+            .await
+            .call::<method::SessionInspect>(SessionId(session.to_owned()))
+            .await
+            .ok()
+            .filter(|info| info.native_session_id.as_deref() == Some(native))
+    })
+    .await;
+}
+
+/// Stops a session the scenario started, so no agent writes into the
+/// installation while it is compared.
+async fn stop_agent(installation: &Installation, session: &str) {
+    let stopped = installation
+        .client()
+        .await
+        .call::<method::SessionStop>(SessionId(session.to_owned()))
+        .await
+        .expect("stop the agent session");
+    assert!(stopped.stopped, "{session} was live and stops");
+}
+
+/// A fresh host for the one-command scenario: an XDG home of its own, the
+/// release to install from, and the search path its installed job records.
+struct FreshHost {
+    installation: Installation,
+    home: PathBuf,
+    bin: PathBuf,
+    interpreters: PathBuf,
+    log: PathBuf,
+    release: PathBuf,
+    planner: DaemonRuntimes,
+}
+
+impl FreshHost {
+    /// A host with fake `claude` and `codex` on its search path and their
+    /// config homes present, and no pohunek state at all.
+    fn new() -> Self {
+        let mut installation = Installation::new();
+        let root = canonical(&installation.root);
+        let home = root.join("home");
+        directory(&home, PRIVATE_DIR);
+        let bin = root.join("bin");
+        directory(&bin, SEARCH_DIR);
+        let tools = root.join("tools");
+        system_tools(&tools);
+        let interpreters = root.join("interpreters");
+        directory(&interpreters, PRIVATE_DIR);
+        let release = stage_release(&installation, &test_key());
+        installation.context =
+            installation
+                .context
+                .clone()
+                .with_path_discovery(PathDiscovery::Managed {
+                    login_shell: None,
+                    shell_defaulted: false,
+                    fallback_directories: vec![path_text(&bin), path_text(&tools)],
+                });
+        let host = Self {
+            installation,
+            log: root.join("agent.log"),
+            home,
+            bin,
+            interpreters,
+            release,
+            planner: DaemonRuntimes::default(),
+        };
+        host.add_agent(
+            "claude",
+            &host.home.join(".claude").join("hooks"),
+            CLAUDE_NATIVE_ID,
+        );
+        host.add_agent("codex", &host.home.join(".codex"), CODEX_NATIVE_ID);
+        directory(&host.home.join(".claude"), PRIVATE_DIR);
+        directory(&host.home.join(".codex"), PRIVATE_DIR);
+        host
+    }
+
+    /// Puts the fake `name` on the search path. It fires the hook installed in
+    /// `hooks` with `native` as its native id.
+    fn add_agent(&self, name: &str, hooks: &Path, native: &str) {
+        write_fake_agent(
+            &self.bin,
+            &self.interpreters,
+            name,
+            &[
+                ("FAKE_AGENT_LOG", &path_text(&self.log)),
+                ("FAKE_AGENT_HOOK_DIR", &path_text(hooks)),
+                ("FAKE_AGENT_NATIVE_ID", native),
+            ],
+            FAKE_AGENT_BODY,
+        );
+    }
+
+    /// The trees a run may change: the pohunek config, both agent homes and
+    /// the package store.
+    fn roots(&self) -> [PathBuf; 4] {
+        [
+            config_dir(&self.installation),
+            self.home.join(".claude"),
+            self.home.join(".codex"),
+            self.installation.context.paths().plugins_dir(),
+        ]
+    }
+
+    /// Plans and applies one run of setup with consent; the report carries
+    /// the preview the run was planned with.
+    async fn run(&self) -> SetupReport {
+        let planned = plan(&self.installation.context, &self.release, &self.planner)
+            .await
+            .expect("plan the run");
+        let outcome = apply(&self.installation.context, planned, &self.planner)
+            .await
+            .expect("the run applies");
+        assert_eq!(outcome.verdict.health, "ok", "{:?}", outcome.verdict);
+        assert!(
+            outcome.verdict.hooks_failed.is_empty(),
+            "{:?}",
+            outcome.verdict
+        );
+        assert!(
+            outcome.verdict.hook_gaps.is_empty(),
+            "{:?}",
+            outcome.verdict
+        );
+        outcome
+    }
+}
+
+/// The runtimes a run planned to install.
+fn installs(report: &SetupReport) -> Vec<&str> {
+    report
+        .preview
+        .packages
+        .iter()
+        .filter(|package| package.status == PackageStatus::Install)
+        .map(|package| package.runtime.as_str())
+        .collect()
+}
+
+/// The first run installs the service and the packages of both agents on the
+/// search path, carries the release's trust into the installed version and
+/// installs both hooks, through which both agents then start.
+async fn first_run_sets_up_claude_and_codex(host: &FreshHost) {
+    let outcome = host.run().await;
+    assert!(matches!(
+        outcome.preview.service,
+        ServiceStep::Install { .. }
+    ));
+    assert_eq!(
+        installs(&outcome),
+        ["claude", "codex"],
+        "pi is not on the search path"
+    );
+    for line in [
+        format!("service: installed version {VERSION}"),
+        "package claude: installed".to_owned(),
+        "package codex: installed".to_owned(),
+    ] {
+        assert!(
+            outcome.applied.contains(&line),
+            "{line}: {:?}",
+            outcome.applied
+        );
+    }
+    assert!(
+        !outcome
+            .applied
+            .iter()
+            .any(|line| line.starts_with("package pi")),
+        "{:?}",
+        outcome.applied
+    );
+
+    let status = service::status_in(&host.installation.context)
+        .await
+        .expect("status of the installation");
+    assert!(status.installed && status.active_version.as_deref() == Some(VERSION));
+    let version_dir = status
+        .prefix
+        .expect("the installation prefix")
+        .join("libexec/pohunek")
+        .join(VERSION);
+    assert!(
+        version_dir.join(ANCHOR_FILE_NAME).is_file(),
+        "the anchor is installed"
+    );
+    assert!(
+        version_dir.join(RUNTIME_DIR).join(CATALOG_FILE).is_file(),
+        "the release catalog is installed with the version"
+    );
+    let claude_home = host.home.join(".claude");
+    assert!(
+        fs::read_to_string(claude_home.join("settings.json"))
+            .expect("claude settings")
+            .contains(STATE_HOOK),
+        "claude's settings register the hook"
+    );
+    assert!(host.home.join(".codex").join(STATE_HOOK).is_file());
+
+    let claude = start_agent(&host.installation, "claude", &host.home).await;
+    let codex = start_agent(&host.installation, "codex", &host.home).await;
+    wait_native_reference(&host.installation, &claude, CLAUDE_NATIVE_ID).await;
+    wait_native_reference(&host.installation, &codex, CODEX_NATIVE_ID).await;
+    let launches = fs::read_to_string(&host.log).expect("the agent log");
+    for native in [CLAUDE_NATIVE_ID, CODEX_NATIVE_ID] {
+        assert!(
+            launches.contains(&format!("launch native={native}")),
+            "{launches}"
+        );
+    }
+    stop_agent(&host.installation, &claude).await;
+    stop_agent(&host.installation, &codex).await;
+}
+
+/// A fresh host: one release, one run of the one command, and the agents on
+/// the search path. The first run installs the service and the claude and
+/// codex packages and hooks; both agents then start and fire their hook. A
+/// second run changes nothing. A third run, after a fake `pi` appears on the
+/// same search path, installs only the Pi package.
+///
+/// The host is an XDG home of its own with canonical paths and no pohunek
+/// state. Claude's and codex's config homes exist before the first run, as an
+/// installed agent creates them on its first start. The search path the
+/// installed job records holds the fake agents and links to the system's
+/// tools without any official agent, so no agent of the machine running the
+/// test is detected. The Pi package declares no hook integration and no
+/// config home, so the third run changes only the package store.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn a_fresh_host_is_set_up_by_one_run_and_a_rerun_changes_nothing() {
+    let host = FreshHost::new();
+    first_run_sets_up_claude_and_codex(&host).await;
+
+    let before_rerun = state_of(&host.roots());
+    let rerun = host.run().await;
+    assert_eq!(rerun.preview.service, ServiceStep::Present);
+    assert!(installs(&rerun).is_empty(), "{:?}", rerun.preview.packages);
+    assert!(
+        rerun.applied.is_empty(),
+        "a rerun applies nothing: {:?}",
+        rerun.applied
+    );
+    assert_eq!(
+        state_of(&host.roots()),
+        before_rerun,
+        "a rerun changes no file"
+    );
+
+    write_fake_agent(&host.bin, &host.interpreters, "pi", &[], FAKE_PRESENCE_BODY);
+    let before_pi = state_of(&host.roots());
+    let outcome = host.run().await;
+    assert_eq!(installs(&outcome), ["pi"], "{:?}", outcome.preview.packages);
+    assert!(
+        !outcome.applied.is_empty()
+            && outcome
+                .applied
+                .iter()
+                .all(|line| line.starts_with("package pi")),
+        "only pi is installed: {:?}",
+        outcome.applied
+    );
+    let store = host.installation.context.paths().plugins_dir();
+    let changed = changed_paths(&before_pi, &state_of(&host.roots()));
+    assert!(
+        !changed.is_empty() && changed.iter().all(|path| path.starts_with(&store)),
+        "only the package store changes: {changed:?}"
+    );
 }
