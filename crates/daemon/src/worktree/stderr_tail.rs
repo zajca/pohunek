@@ -416,13 +416,12 @@ fn discard_until(reader: &PipeReader, chunk: &mut [u8], deadline: Instant) -> bo
             Readiness::Idle => continue,
             Readiness::Failed => return false,
         }
-        loop {
-            match rustix::io::read(reader, &mut *chunk) {
-                Ok(0) => return true,
-                Ok(_) | Err(Errno::INTR) => {}
-                Err(Errno::AGAIN) => break,
-                Err(_) => return true,
-            }
+        // One chunk per wake, so a writer that never pauses cannot keep the
+        // loop from reaching the deadline.
+        match rustix::io::read(reader, &mut *chunk) {
+            Ok(0) => return true,
+            Ok(_) | Err(Errno::INTR | Errno::AGAIN) => {}
+            Err(_) => return true,
         }
     }
 }
