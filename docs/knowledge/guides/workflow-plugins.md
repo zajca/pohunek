@@ -33,12 +33,13 @@ pohunek workflow uninstall acme.work [--purge] [--remove-modified]
 pohunek workflow run [--json] acme.work overview [<args>...]
 ```
 
-Event reactions are not yet available; the manifest refuses the reaction
-table until it ships (#148).
+Jobs, services and event reactions need no command of their own: `enable`
+installs their units, and `disable` and `uninstall` remove them (see
+[Jobs and services](#jobs-and-services) and [Event reactions](#event-reactions)).
 
 With dynamic shell completion (`pohunek setup completions <shell> --dynamic`),
 Tab completes installed plugin ids for `inspect`, `enable`, `disable`,
-`uninstall` and `run` (`run` offers only enabled plugins), and after
+`status`, `uninstall` and `run` (`run` offers only enabled plugins), and after
 `workflow run <id>` the actions of that plugin. A plugin whose installed files
 fail verification offers no actions. Completion only reads the store, within
 its short deadline, and stays silent when the store is missing or unusable.
@@ -78,8 +79,8 @@ argv = ["bin/work", "notify"]
 Rules, each checked at install time:
 
 - The manifest is at most 64 KiB, checked before it is parsed. Every table
-  refuses unknown keys, so `[reactions]` is refused today. At least one
-  action, job or service is required. The description is 1 to 1024 bytes.
+  refuses unknown keys. At least one action, job, service or reaction is
+  required. The description is 1 to 1024 bytes.
 - `argv` has 1 to 64 entries of at most 4096 bytes each, with no NUL byte. No
   shell ever interprets it.
 - `argv[0]` is either a package path to an executable file of the archive
@@ -113,8 +114,9 @@ and every action's, job's and service's argv with `argv[0]` resolved to its
 absolute path, with each job's interval and requested timeout. Nothing
 is created until you repeat the command with `--yes`; until then it fails with
 `consent_required`. `--no-enable` installs the plugin disabled. A plugin with
-jobs or services is enabled as `pohunek workflow enable` enables it (see
-[Jobs and services](#jobs-and-services)); without a `pohunek service`
+jobs, services or reactions is enabled as `pohunek workflow enable` enables it
+(see [Jobs and services](#jobs-and-services) and
+[Event reactions](#event-reactions)); without a `pohunek service`
 installation of this pohunek version an enabling install is refused before
 anything is created (`workflow_service_not_installed`), and `--no-enable` still
 installs it. An
@@ -431,8 +433,8 @@ longest kill grace and 30 s for its own checks below it, so the run is always
 recorded as `timeout` before the service manager would kill it. Every knob is
 read again at each run except `jobs.check_period_s`, which is written into a
 job's timer when the plugin is enabled: run `pohunek workflow enable` again
-after changing it. The reactions table arrives with that feature and is
-refused until then.
+after changing it. The `[reactions]` knobs are described under
+[Event reactions](#event-reactions).
 
 ## Jobs and services
 
@@ -697,8 +699,9 @@ next dispatcher restart. Reactions take their deadline and output caps from
 
 ## Local only
 
-Every `pohunek workflow` command works on this user's files and never contacts
-a daemon; `enable`, `disable` and `uninstall` of a plugin with jobs or
+Every `pohunek workflow` command you type works on this user's files and never
+contacts a daemon; only the dispatcher unit's hidden `__dispatch` connects to
+the local daemon's `subscribe` stream, and it never starts the daemon. `enable`, `disable` and `uninstall` of a plugin with jobs or
 services also use this user's service manager, and `status` only reads the
 state of those units from it. A remote `--host` fails with
 `workflow_local_only` before any file is read or written.

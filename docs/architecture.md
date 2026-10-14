@@ -375,9 +375,10 @@ run record is the only failure record; `ExitTimeOut` bounds a stop, after
 which the backend kills the rest of the job's process group captured before
 the stop. Stopping a unit boots it out but keeps its definition,
 so it runs again at the next login until it is removed. Worker discovery
-never matches these names or labels, so it neither adopts nor sweeps them. No
-command installs plugin units yet; the CLI that drives both backends is
-ordered work in #326.
+never matches these names or labels, so it neither adopts nor sweeps them.
+`pohunek workflow enable` installs a plugin's job and service units through
+this contract, and `disable` and `uninstall` remove them
+(`crates/cli/src/workflow/units.rs`).
 
 The shared contract crate compiles and tests natively on Apple Silicon Darwin
 with a macOS 14 deployment target. Intel Macs are outside the current release
@@ -1238,9 +1239,10 @@ Trust boundary:
   socket only (`crates/daemon/src/api/handler/package.rs`, error
   `local_only_method`), and the CLI refuses a remote `--host`
   (`plugin_local_only`). A remote owner connection over the overlay can launch
-  only what is already installed and enabled on that host. `pohunek workflow`
-  never contacts a daemon and refuses a remote `--host` before any I/O
-  (`workflow_local_only`).
+  only what is already installed and enabled on that host. The `pohunek workflow`
+  commands never contact a daemon and refuse a remote `--host` before any I/O
+  (`workflow_local_only`); only the reaction dispatcher unit reads the local
+  daemon's `subscribe` stream, as a client that never starts it.
 - **Workflow plugins are owner code outside core.** The CLI keeps them in its
   own registry root and per-plugin state and config directories, all `0700`,
   and serializes every change under one store lock.
