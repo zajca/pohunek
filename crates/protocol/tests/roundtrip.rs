@@ -132,6 +132,7 @@ fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
         branch: None,
         worktree_path: None,
         warnings: Vec::new(),
+        capability_refusals: None,
         output_force_closed: false,
         metadata: BTreeMap::new(),
         created_at: "2026-06-17T10:00:00Z".to_owned(),

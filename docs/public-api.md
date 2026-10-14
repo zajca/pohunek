@@ -261,7 +261,8 @@ kinds and events v3 never defined (a v3 connection never receives a
 `native_recovery` session warning; v4 connections do). The `background_state`
 event is withheld from v3 connections, and `SessionInfo.background` is removed
 from the session objects a v3 connection receives, so a v3 client sees no
-background snapshot. A client whose range does not overlap the window
+background snapshot. `SessionInfo.capability_refusals` is removed from them as
+well. A client whose range does not overlap the window
 receives `daemon/version_mismatch` before any method runs; a client of this build
 negotiates v3 and translates as described above. The window covers
 the public daemon protocol and the Hermes CLI tool path: the CLI's `--json`
@@ -713,8 +714,9 @@ migration (start a new session with `pohunek session new --agent <runtime>`,
 which the official package serves; no command rebinds the session to another
 runtime source), and the stored binding is kept unchanged. A fork of a Hermes
 session answers `agent_fork_unsupported`, because Hermes declares no native fork.
-`session list` reports resume and fork as false for any session that resume or
-fork would refuse. A session pinned to a runtime
+`session list` and `session inspect` report each of resume and fork as false,
+with its refusal code in `capability_refusals`, when the session's recovery
+resolution refuses that operation. A session pinned to a runtime
 source the daemon does not serve otherwise (a built-in of a runtime id that is
 not an official alias, a package digest that is not installed) is refused with
 `runtime/runtime_not_installed`. Stop and remove still work. A session the
@@ -1333,12 +1335,33 @@ Important fields:
   native-session launch spec (reference kind, resume argv, optional fork argv),
   so `fork` is `true` only when `resume` is `true`. Clients must use these flags
   instead of inferring provider behavior from `agent` or `agent_base`. Records
-  that predate the field load both flags as `false`. `session list` reports a flag
-  as `false` when resume or fork would refuse that session at the time of the
-  list, even though the frozen value is `true`. Host profiles declare the
+  that predate the field load both flags as `false`. `session list` and
+  `session inspect` report a flag as `false`, even though the frozen value is
+  `true`, when the session's recovery resolution refuses it at the time of the
+  request: the runtime it was launched from is not served, its package fails
+  verification, or the serving runtime cannot honor the frozen launch spec.
+  Refusals that depend on the session's current state (a live runtime) or on
+  checks of one request (a changed profile, the native reference) come only
+  from the operation itself. Host profiles declare the
   spec in `[resume]` (`reference_kind`, `args`, optional `fork_args`, accepted only on
   bases whose runtime declares a native fork, such as `claude`); see the
-  agent-profiles concept page.
+  agent-profiles concept page. The capability object itself is unchanged in
+  this release: it stays strict, and the refusal reasons ride in
+  `capability_refusals`.
+- `capability_refusals`: optional `{resume?: string, fork?: string}` object on
+  `session list` and `session inspect` responses, present only when the daemon
+  cleared a frozen `true` capability. Each value is the error code
+  `session.resume` or `session.fork` returns for that recovery resolution (for example
+  `runtime_served_by_package`, `runtime_builtin_removed`,
+  `runtime_not_installed`, `runtime_incompatible`, `agent_not_resumable` or
+  `agent_fork_unsupported`), derived from the same recovery resolution that
+  clears the flag, so for a refusal of that resolution the listing and the
+  operation name the same reason. A frozen
+  `false` capability carries no reason. Stored records, events and other
+  results never carry the field. The object is open: clients ignore operations
+  they do not know. Protocol 3 connections never receive it. Human
+  `session list` output adds a `refused <id>: resume=<code> fork=<code>` line,
+  and `session inspect` a `capability_refusals` row.
 - `name`: optional owner-set display name; absent means the session is shown by
   its id. Set at `session.new` and changed via `session.rename`.
 - `agent`: profile name.
@@ -1454,7 +1477,13 @@ Important fields:
   context. When a session leaves every known active worktree, `worktree_path` is
   cleared; `repo` and `branch` remain populated when git detection still finds a
   repository at the new cwd.
-- `warnings`: non-fatal warnings, each `{kind, message, detail?}`. `kind` is
+- `warnings`: non-fatal warnings, each `{kind, message, detail?}`. The Rust
+  client of this build drops a warning whose `kind` it does not know, so a
+  newer daemon can add kinds without breaking its decode; earlier Rust clients
+  reject an unknown kind. A daemon of this build that loads a store record
+  written by a newer daemon drops such a warning too and keeps the session;
+  when it later rewrites that session's record, the dropped warning is not
+  kept, so a later upgrade does not show it again. `kind` is
   `fetch`, `base_branch_fallback`, `setup_script` or `hook` for worktree setup,
   and `native_recovery` for a session whose stored native recovery record could
   not be completed after an upgrade: it cannot resume or fork, `message` says to

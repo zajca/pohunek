@@ -2392,6 +2392,12 @@ pub enum SessionWarningKind {
     /// stays listed; start a new session and resume the native conversation
     /// from the reference in the warning's `detail`.
     NativeRecovery,
+    /// A kind this build does not know, sent by a newer daemon. Decoding a
+    /// [`SessionInfo`] drops warnings of this kind, and serializing it fails,
+    /// so it never reaches a display or a re-emitted document.
+    #[serde(other, skip_serializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
 
 /// A non-fatal warning surfaced for a session.
@@ -2413,6 +2419,17 @@ pub struct SessionWarning {
     pub detail: Option<String>,
 }
 
+/// Decodes [`SessionInfo::warnings`], dropping the warnings of a kind this
+/// build does not know.
+fn known_warnings<'de, D>(deserializer: D) -> Result<Vec<SessionWarning>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let mut warnings = Vec::<SessionWarning>::deserialize(deserializer)?;
+    warnings.retain(|warning| warning.kind != SessionWarningKind::Unknown);
+    Ok(warnings)
+}
+
 /// Mutation capabilities frozen for one logical session.
 ///
 /// Clients use these flags to render resume and fork actions without inferring
@@ -2428,6 +2445,38 @@ pub struct SessionCapabilities {
     pub resume: bool,
     /// Whether the session has a frozen native fork operation.
     pub fork: bool,
+}
+
+/// Typed reasons the session's recovery resolution refuses an operation its
+/// frozen [`SessionCapabilities`] allow.
+///
+/// Each code is the error code `session.resume` or `session.fork` returns for
+/// that resolution, derived from the same check that clears the matching
+/// capability in a list or inspect response. Refusals that depend on the
+/// session's current state or on one request are not listed. Unlike the capability
+/// object, this object is open: a newer daemon may add operations.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionCapabilityRefusals.ts"))]
+pub struct SessionCapabilityRefusals {
+    /// Error code `session.resume` refuses with when the recovery resolution
+    /// refuses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub resume: Option<String>,
+    /// Error code `session.fork` refuses with when the recovery resolution
+    /// refuses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub fork: Option<String>,
+}
+
+impl SessionCapabilityRefusals {
+    /// Whether no operation is refused.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.resume.is_none() && self.fork.is_none()
+    }
 }
 
 /// Summary returned by session lifecycle methods and published by events.
@@ -2449,6 +2498,12 @@ pub struct SessionInfo {
     /// Session-specific mutation capabilities frozen when the session started.
     #[serde(default)]
     pub capabilities: SessionCapabilities,
+    /// Why the daemon refuses a capability the frozen [`Self::capabilities`]
+    /// allow, set only on list and inspect responses whose capability it
+    /// cleared. Stored records and events never carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub capability_refusals: Option<SessionCapabilityRefusals>,
     /// Owner-set display name, or `None` when the session is shown by its id.
     /// Set at `session.new` and changed via `session.rename`; cosmetic only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2583,7 +2638,11 @@ pub struct SessionInfo {
     /// Non-fatal warnings raised while setting up the worktree. Empty when the
     /// session has no worktree or setup was clean; omitted from the wire form
     /// when empty.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "known_warnings"
+    )]
     pub warnings: Vec<SessionWarning>,
     /// Whether the session's PTY output was force-closed when its runtime
     /// ended: a process outside the session's process group kept the terminal
@@ -3254,6 +3313,7 @@ mod tests {
             branch: None,
             worktree_path: None,
             warnings: Vec::new(),
+            capability_refusals: None,
             output_force_closed: false,
             metadata: BTreeMap::new(),
             created_at: "2026-01-01T00:00:00Z".to_owned(),

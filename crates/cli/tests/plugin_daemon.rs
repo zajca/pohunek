@@ -944,3 +944,72 @@ async fn update_to_a_recorded_version_enables_and_selects_it() {
 
     harness.stop().await;
 }
+
+#[tokio::test]
+async fn session_list_names_the_code_resume_and_fork_refuse_a_damaged_package_session_with() {
+    let harness = Harness::start().await;
+    let built = harness.archive("1.0.0");
+    install_enabled(&harness, &built).await;
+    let (code, created) = launch(&harness, RUNTIME).await;
+    assert_eq!(code, 0, "{created}");
+    let id = created["ok"]["id"]
+        .as_str()
+        .expect("created session id")
+        .to_owned();
+    assert_eq!(
+        created["ok"]["capabilities"],
+        serde_json::json!({"resume": true, "fork": true}),
+        "{created}"
+    );
+    assert!(
+        created["ok"].get("capability_refusals").is_none(),
+        "{created}"
+    );
+    tamper(&harness, &built.digest);
+    // Installing another package rebuilds the runtime registry, which leaves
+    // the tampered package out of it.
+    let other = harness.archive_of("acme.runtime.other", "other", "1.0.0");
+    install_enabled(&harness, &other).await;
+
+    let (code, resumed) = harness.json(&["session", "resume", &id]).await;
+    assert_eq!(code, 1, "{resumed}");
+    let resume_code = resumed["err"]["code"]
+        .as_str()
+        .expect("resume refusal code");
+    let (code, forked) = harness.json(&["session", "fork", &id]).await;
+    assert_eq!(code, 1, "{forked}");
+    let fork_code = forked["err"]["code"].as_str().expect("fork refusal code");
+
+    let (code, listed) = harness.json(&["session", "list"]).await;
+    assert_eq!(code, 0, "{listed}");
+    let session = listed["ok"]
+        .as_array()
+        .expect("session list array")
+        .iter()
+        .find(|session| session["id"] == id.as_str())
+        .expect("the session is listed")
+        .clone();
+    assert_eq!(
+        session["capabilities"],
+        serde_json::json!({"resume": false, "fork": false}),
+        "{session}"
+    );
+    assert_eq!(
+        session["capability_refusals"],
+        serde_json::json!({"resume": resume_code, "fork": fork_code}),
+        "{session}"
+    );
+
+    let human = harness.run(&["session", "list"]).await;
+    assert_eq!(human.status.code(), Some(0), "{}", stderr_text(&human));
+    let line = format!("refused {id}: resume={resume_code} fork={fork_code}");
+    assert!(
+        stdout_text(&human)
+            .lines()
+            .any(|candidate| candidate == line),
+        "{line} in {}",
+        stdout_text(&human)
+    );
+
+    harness.stop().await;
+}

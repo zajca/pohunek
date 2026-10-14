@@ -716,6 +716,7 @@ mod tests {
             branch: None,
             worktree_path: None,
             warnings: Vec::new(),
+            capability_refusals: None,
             output_force_closed: false,
             metadata: BTreeMap::new(),
             created_at: "2026-07-03T10:00:00Z".to_owned(),

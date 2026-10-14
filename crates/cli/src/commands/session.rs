@@ -1915,6 +1915,14 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
             session.cwd.display(),
         );
     }
+    render_list_footer(&mut output, sessions);
+    output
+}
+
+/// Appends the per-session lines that the table's columns only count: the
+/// native recovery target, the refused capabilities and native recovery
+/// warnings.
+fn render_list_footer(output: &mut String, sessions: &[SessionInfo]) {
     // The WARN column only counts; a lost native recovery record needs its
     // recovery hint where the operator looks for the session.
     for session in sessions {
@@ -1934,6 +1942,14 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
                     .unwrap_or("<unknown>")
             );
         }
+        if let Some(refusals) = &session.capability_refusals {
+            let _ = writeln!(
+                output,
+                "refused {}: {}",
+                session.id.0,
+                capability_refusals_label(refusals)
+            );
+        }
         for warning in session
             .warnings
             .iter()
@@ -1948,7 +1964,6 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
             );
         }
     }
-    output
 }
 
 fn render_list_quiet(sessions: &[SessionInfo]) -> String {
@@ -2172,6 +2187,12 @@ fn render_inspect_human(info: &SessionInfo) -> String {
                 .map_or_else(none, |p| p.display().to_string()),
         ),
         ("warnings", warn_count_label(info)),
+        (
+            "capability_refusals",
+            info.capability_refusals
+                .as_ref()
+                .map_or_else(none, capability_refusals_label),
+        ),
         (
             "subagents_running",
             running_subagent_count(info).to_string(),
@@ -2508,6 +2529,16 @@ fn state_source_label(source: StateSource) -> &'static str {
     }
 }
 
+/// The operations a session's recovery resolution refuses, with the error code
+/// each returns for it, as `resume=<code> fork=<code>`.
+fn capability_refusals_label(refusals: &protocol::SessionCapabilityRefusals) -> String {
+    [("resume", &refusals.resume), ("fork", &refusals.fork)]
+        .into_iter()
+        .filter_map(|(operation, code)| code.as_ref().map(|code| format!("{operation}={code}")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn warning_kind_label(kind: SessionWarningKind) -> &'static str {
     match kind {
         SessionWarningKind::Fetch => "fetch",
@@ -2515,6 +2546,7 @@ fn warning_kind_label(kind: SessionWarningKind) -> &'static str {
         SessionWarningKind::SetupScript => "setup_script",
         SessionWarningKind::Hook => "hook",
         SessionWarningKind::NativeRecovery => "native_recovery",
+        SessionWarningKind::Unknown => "unknown",
     }
 }
 
@@ -2560,6 +2592,7 @@ mod tests {
             branch: None,
             worktree_path: None,
             warnings: Vec::new(),
+            capability_refusals: None,
             output_force_closed: false,
             created_at: "2026-06-17T10:00:00Z".to_owned(),
             updated_at: "2026-06-17T10:01:00Z".to_owned(),

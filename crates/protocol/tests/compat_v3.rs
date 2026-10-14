@@ -458,6 +458,38 @@ fn protocol_3_session_results_omit_native_file_activity() {
 }
 
 #[test]
+fn protocol_3_session_results_omit_capability_refusals() {
+    let previous = fixtures(RESULTS, "results.json")
+        .entries
+        .into_iter()
+        .find(|entry| entry["method"] == method::SESSION_INSPECT)
+        .expect("recorded session.inspect result")["result"]
+        .clone();
+    let mut current =
+        upgrade_result(v3(), method::SESSION_INSPECT, previous).expect("upgrade recorded result");
+    current["capabilities"] = json!({"resume": false, "fork": false});
+    current["capability_refusals"] =
+        json!({"resume": "runtime_served_by_package", "fork": "runtime_served_by_package"});
+    let decoded: protocol::SessionInfo =
+        serde_json::from_value(current.clone()).expect("current type decodes the refusals");
+    assert_eq!(
+        decoded
+            .capability_refusals
+            .and_then(|refusals| refusals.resume)
+            .as_deref(),
+        Some("runtime_served_by_package")
+    );
+
+    let legacy = result(v3(), method::SESSION_INSPECT, current).expect("downgrade result");
+    assert!(legacy.get("capability_refusals").is_none());
+    let upgraded = upgrade_result(v3(), method::SESSION_INSPECT, legacy)
+        .expect("upgrade previous-release result");
+    let session: protocol::SessionInfo =
+        serde_json::from_value(upgraded).expect("current type accepts old result");
+    assert_eq!(session.capability_refusals, None);
+}
+
+#[test]
 fn current_events_downgrade_to_the_protocol_3_golden() {
     let table = event_table();
     let mut renamed = 0;

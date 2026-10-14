@@ -319,6 +319,7 @@ fn session_info(
         object.remove("native_last_activity_at");
         object.remove("background");
         object.remove("output_force_closed");
+        object.remove("capability_refusals");
         if let Some(Value::Array(warnings)) = object.get_mut("warnings") {
             warnings.retain(|warning| {
                 warning

@@ -5,6 +5,7 @@ import type { CwdSource } from "./CwdSource";
 import type { RuntimeRef } from "./RuntimeRef";
 import type { SessionBackground } from "./SessionBackground";
 import type { SessionCapabilities } from "./SessionCapabilities";
+import type { SessionCapabilityRefusals } from "./SessionCapabilityRefusals";
 import type { SessionId } from "./SessionId";
 import type { SessionRuntime } from "./SessionRuntime";
 import type { SessionState } from "./SessionState";
@@ -33,6 +34,12 @@ export type SessionInfo = {
    * Session-specific mutation capabilities frozen when the session started.
    */
   capabilities: SessionCapabilities;
+  /**
+   * Why the daemon refuses a capability the frozen [`Self::capabilities`]
+   * allow, set only on list and inspect responses whose capability it
+   * cleared. Stored records and events never carry it.
+   */
+  capability_refusals?: SessionCapabilityRefusals;
   /**
    * Owner-set display name, or `None` when the session is shown by its id.
    * Set at `session.new` and changed via `session.rename`; cosmetic only.
