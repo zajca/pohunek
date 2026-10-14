@@ -72,7 +72,7 @@ Please address the outstanding work on this PR, then summarize what you did.
 ";
 
 /// Result of `setup config`: which files were created vs left untouched.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct ConfigResult {
     /// Files written by this run.
     pub created: Vec<String>,
@@ -102,22 +102,37 @@ pub(crate) fn run_config(paths: &Paths, force: bool, json: bool) -> Result<(), C
 /// exists unless `force` is set. Tracks created vs skipped so a re-run is
 /// transparent about what it touched.
 pub(crate) fn install_config(paths: &Paths, force: bool) -> Result<ConfigResult, CliError> {
+    let mut result = ConfigResult::default();
+    install_config_into(paths, force, &mut result)?;
+    Ok(result)
+}
+
+/// Writes the config files like [`install_config`], recording each file in
+/// `result` as soon as it is created or kept. A failure part way through
+/// leaves in `result` the files written before it.
+///
+/// # Errors
+///
+/// Returns the error of the first file that cannot be inspected or written.
+pub(crate) fn install_config_into(
+    paths: &Paths,
+    force: bool,
+    result: &mut ConfigResult,
+) -> Result<(), CliError> {
     fs::create_dir_all(paths.config_dir.join("prompts"))?;
 
-    let mut created = Vec::new();
-    let mut skipped = Vec::new();
     for (path, body) in config_files(paths) {
         // Preserve user edits: only write when the file is absent or `force` is
         // set. `try_exists` distinguishes "absent" from "cannot tell", surfacing
         // the latter as an error rather than silently overwriting.
         if !force && path.try_exists()? {
-            skipped.push(path.display().to_string());
+            result.skipped.push(path.display().to_string());
             continue;
         }
         fs::write(&path, body)?;
-        created.push(path.display().to_string());
+        result.created.push(path.display().to_string());
     }
-    Ok(ConfigResult { created, skipped })
+    Ok(())
 }
 
 /// The config files `setup config` writes, with their default contents.

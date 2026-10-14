@@ -556,3 +556,150 @@ async fn an_unreadable_profiles_directory_is_reported_in_the_preview() {
         .expect("the listing failure is previewed");
     assert_eq!(failure.status, "failed");
 }
+
+/// The Hermes plugin marker pohunek writes into a home it owns.
+fn hermes_marker(home: &Path) -> PathBuf {
+    home.join(HERMES_HOME)
+        .join("plugins")
+        .join("operators")
+        .join("pohunek")
+        .join(".pohunek-owned.json")
+}
+
+/// A planner report that lists `catalog` as its trust state and no packages.
+fn catalog_report(catalog: &str) -> EnsureReport {
+    serde_json::from_value(json!({
+        "report_version": 1,
+        "daemon_version": VERSION,
+        "dry_run": true,
+        "packages": [],
+        "catalog": catalog,
+        "profiles": [],
+        "integrations": [],
+        "refusals": [],
+    }))
+    .expect("a planner report of this layout")
+}
+
+/// A Hermes home previewed as an update whose marker is gone at apply time
+/// fails the verdict and is named; it is not reported as an ordinary gap.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn a_marked_hermes_home_unmarked_after_the_preview_fails_the_verdict() {
+    let installation = Installation::new();
+    let release = release(&installation);
+    let planner = ScriptedPlanner::new(vec![report(&hermes())]);
+    unmarked_hermes_home(&installation);
+    let home = installation.root.join("home");
+    fs::create_dir_all(hermes_marker(&home).parent().expect("plugin root")).expect("plugin root");
+    fs::write(hermes_marker(&home), "{}").expect("marker");
+
+    let host_plan = plan(&installation.context, &release, &planner)
+        .await
+        .expect("plan the host");
+    let shown = host_plan
+        .preview
+        .hermes_homes
+        .iter()
+        .find(|shown| shown.integration == "hermes")
+        .expect("the default home is previewed");
+    assert_eq!(
+        shown.status, "update",
+        "the marked home is previewed as an update"
+    );
+
+    fs::remove_file(hermes_marker(&home)).expect("the marker goes");
+    let error = apply(&installation.context, host_plan, &planner)
+        .await
+        .expect_err("the home that cannot be updated fails the verdict");
+    assert_eq!(error.code(), "setup_incomplete");
+    let message = error.to_string();
+    assert!(
+        message.contains("hermes: this home was marked in the preview"),
+        "the failed update is named: {message}"
+    );
+}
+
+/// A config file that cannot be written after an earlier one was created
+/// stops setup, and the stop names the files already created.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn a_config_write_that_fails_part_way_names_the_files_already_created() {
+    let installation = Installation::new();
+    let release = release(&installation);
+    let planner = ScriptedPlanner::new(vec![report(&json!([]))]);
+    let prompts = config_dir(&installation).join("prompts");
+    fs::create_dir_all(&prompts).expect("prompts directory");
+    // A dangling link: the file does not exist, and its directory does not
+    // either, so the write fails after the earlier files were created.
+    std::os::unix::fs::symlink(
+        installation.root.join("missing").join("pr.tmpl"),
+        prompts.join("pr.tmpl"),
+    )
+    .expect("dangling template link");
+
+    let host_plan = plan(&installation.context, &release, &planner)
+        .await
+        .expect("plan the host");
+    let error = apply(&installation.context, host_plan, &planner)
+        .await
+        .expect_err("the failed config write stops setup");
+    assert_eq!(error.code(), "setup_incomplete");
+    let message = error.to_string();
+    assert!(
+        message.contains("config created:") && message.contains("attach.conf"),
+        "the created file is named: {message}"
+    );
+    assert!(message.contains("issue.tmpl"), "{message}");
+    assert!(
+        installed_at_this_version(&installation).await,
+        "the service is kept"
+    );
+}
+
+/// On an installed host whose catalog is to be recorded and that installs no
+/// official package, the catalog is a note, not an effect: nothing records it,
+/// and the verdict does not claim it.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn a_recorded_catalog_on_an_installed_host_is_a_note_not_an_effect() {
+    let installation = Installation::new();
+    let release = release(&installation);
+    let planner = ScriptedPlanner::new(vec![
+        catalog_report("unavailable"),
+        catalog_report("unavailable"),
+        catalog_report("record"),
+        catalog_report("record"),
+    ]);
+    let first = plan(&installation.context, &release, &planner)
+        .await
+        .expect("plan the install");
+    apply(&installation.context, first, &planner)
+        .await
+        .expect("install");
+
+    let rerun = plan(&installation.context, &release, &planner)
+        .await
+        .expect("plan the re-run");
+    assert_eq!(rerun.preview.service, ServiceStep::Present);
+    let note = rerun
+        .preview
+        .catalog_note
+        .clone()
+        .expect("the note is previewed");
+    assert!(note.contains("next official package install"), "{note}");
+    let outcome = apply(&installation.context, rerun, &planner)
+        .await
+        .expect("the re-run applies");
+    assert_eq!(outcome.verdict.catalog, "record");
+    assert!(outcome.preview.catalog_note.is_some());
+}

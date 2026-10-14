@@ -929,6 +929,18 @@ pub(crate) fn reinstall_previewed_hermes_homes(
         let (integration, selector, selection) = selections.swap_remove(index);
         results.push(
             match plan_hermes_home(integration, &selector, selection, &home, &env.state_dir) {
+                // A home marked in the preview that is unmarked now is a failure:
+                // the owner was shown an update, and nothing was written.
+                HermesPlan::Done(result) if shown.status == "update" && result.status == "gap" => {
+                    IntegrationReinstall {
+                        integration: result.integration,
+                        status: "failed",
+                        detail: Some(
+                            "this home was marked in the preview and is not marked now; nothing was written"
+                                .to_owned(),
+                        ),
+                    }
+                }
                 HermesPlan::Done(result) => result,
                 HermesPlan::Update(update) if shown.status == "update" => {
                     execute_hermes_update(&update, &plugins)

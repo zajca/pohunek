@@ -51,7 +51,7 @@ use crate::commands::health;
 use crate::commands::integration::{
     hermes_home_plan, reinstall_after_upgrade, reinstall_previewed_hermes_homes, IntegrationEnv,
 };
-use crate::commands::setup::{config_files, install_config, ConfigResult};
+use crate::commands::setup::{config_files, install_config_into, ConfigResult};
 use crate::error::CliError;
 use crate::paths::Paths;
 use crate::service::engine::{install_layout, installed_search_path};
@@ -163,6 +163,8 @@ pub struct Preview {
     /// The release catalog's trust state: `record` means the install or the
     /// apply records it.
     pub catalog: CatalogStatus,
+    /// What the catalog state means for this run when no step records it.
+    pub catalog_note: Option<String>,
     /// Every Hermes home the apply acts on, with its planned state.
     pub hermes_homes: Vec<IntegrationReinstall>,
     /// The config files, each with whether it exists.
@@ -184,6 +186,8 @@ pub struct Verdict {
     pub hooks_failed: Vec<String>,
     /// Hook homes left as gaps, each with the command that installs it.
     pub hook_gaps: Vec<String>,
+    /// The release catalog's trust state in the plan read after the apply.
+    pub catalog: String,
     /// The daemon's health status.
     pub health: String,
     /// The overall status of `doctor`.
@@ -323,6 +327,21 @@ fn integration_env(context: &Context) -> IntegrationEnv {
     }
 }
 
+/// The note for a catalog that is to be recorded but that no step of this
+/// run records: an installed service, and no official package to install.
+/// A fresh install records the catalog itself, through its runtime step.
+fn catalog_note(service: &ServiceStep, previewed: &EnsureReport) -> Option<String> {
+    let installs = previewed
+        .packages
+        .iter()
+        .any(|package| package.status == PackageStatus::Install);
+    (*service == ServiceStep::Present && previewed.catalog == CatalogStatus::Record && !installs)
+        .then(|| {
+            "the release catalog's trust state is recorded with the next official package install or `pohunek service upgrade`"
+                .to_owned()
+        })
+}
+
 /// Reads the service state and the release plan without changing anything.
 ///
 /// # Errors
@@ -405,6 +424,7 @@ async fn plan_in(
         integrations: previewed.integrations.clone(),
         gaps: previewed.gaps.clone(),
         catalog: previewed.catalog,
+        catalog_note: catalog_note(&service, &previewed),
         hermes_homes,
         config,
     };
@@ -483,6 +503,10 @@ async fn apply_steps(
 
     let paths = paths_of(context);
     let mut client = Client::connect(LOCAL_HOST, &paths).await?;
+    let installs_packages = remaining
+        .packages
+        .iter()
+        .any(|package| package.status == PackageStatus::Install);
     apply_remaining(&mut client, &dir, &remaining, applied).await?;
 
     let env = integration_env(context);
@@ -500,13 +524,16 @@ async fn apply_steps(
         applied.push(format!("hook {}: {}", hook.integration, hook.status));
     }
 
-    let config = install_config(&paths, false)?;
+    let mut config = ConfigResult::default();
+    let written = install_config_into(&paths, false, &mut config);
     for path in &config.created {
         applied.push(format!("config created: {path}"));
     }
+    written?;
 
     let after = planner.plan(context, &dir, &search_path).await?;
-    let verdict = verdict(&paths, previewed, &after, &hooks).await?;
+    let catalog_recorded = installs_packages && previewed.catalog == CatalogStatus::Record;
+    let verdict = verdict(&paths, previewed, &after, &hooks, catalog_recorded).await?;
     Ok((hooks, config, verdict))
 }
 
@@ -623,13 +650,17 @@ fn engine_installed(engine: Option<&EnsureReport>, runtime: &str) -> bool {
     })
 }
 
-/// Whether the install engine reports profile `name` pinned.
-fn engine_bound(engine: Option<&EnsureReport>, name: &str) -> bool {
+/// Whether two profile entries name the same pin: name, base and digest.
+fn same_profile(left: &ProfileAction, right: &ProfileAction) -> bool {
+    left.name == right.name && left.base == right.base && left.digest == right.digest
+}
+
+/// Whether the install engine reports the profile `shown` pinned.
+fn engine_bound(engine: Option<&EnsureReport>, shown: &ProfileAction) -> bool {
     engine.is_some_and(|report| {
-        report
-            .profiles
-            .iter()
-            .any(|profile| profile.name == name && wire_name(&profile.status) == ENGINE_BOUND)
+        report.profiles.iter().any(|profile| {
+            same_profile(profile, shown) && wire_name(&profile.status) == ENGINE_BOUND
+        })
     })
 }
 
@@ -656,7 +687,7 @@ fn check_engine_changes_shown(
         let shown = previewed
             .profiles
             .iter()
-            .any(|shown| shown.name == profile.name && shown.status == ProfileStatus::Bind);
+            .any(|shown| same_profile(shown, profile) && shown.status == ProfileStatus::Bind);
         if wire_name(&profile.status) == ENGINE_BOUND && !shown {
             return Err(format!(
                 "the install engine pinned profile {}, which the preview did not show",
@@ -761,7 +792,7 @@ fn check_profile_transitions(
             .profiles
             .iter()
             .any(|profile| profile.name == shown.name);
-        if !pending && shown.status == ProfileStatus::Bind && !engine_bound(engine, &shown.name) {
+        if !pending && shown.status == ProfileStatus::Bind && !engine_bound(engine, shown) {
             return Err(format!(
                 "profile {} left the plan after the install, but the install engine did not pin it",
                 shown.name
@@ -777,6 +808,13 @@ fn check_catalog_transition(
     after: &EnsureReport,
     engine: Option<&EnsureReport>,
 ) -> Result<(), String> {
+    let engine_recorded = engine.is_some_and(|report| report.catalog == CatalogStatus::Recorded);
+    if engine_recorded && after.catalog != CatalogStatus::Current {
+        return Err(format!(
+            "the install engine recorded the catalog trust state, but the plan after the install shows {}",
+            wire_name(&after.catalog)
+        ));
+    }
     if previewed.catalog == after.catalog {
         return Ok(());
     }
@@ -893,6 +931,7 @@ async fn verdict(
     previewed: &EnsureReport,
     after: &EnsureReport,
     hooks: &[IntegrationReinstall],
+    catalog_recorded_by_install: bool,
 ) -> Result<Verdict, CliError> {
     let packages_missing: Vec<String> = previewed
         .packages
@@ -948,6 +987,7 @@ async fn verdict(
             .collect(),
         hooks_failed,
         hook_gaps,
+        catalog: wire_name(&after.catalog),
         health: health.status,
         doctor: diagnosis.overall.as_str().to_owned(),
     };
@@ -975,6 +1015,12 @@ async fn verdict(
             "the plan after the apply refuses: {}",
             verdict.refusals.join("; ")
         ));
+    }
+    if catalog_recorded_by_install && after.catalog == CatalogStatus::Record {
+        problems.push(
+            "the official package install did not record the release catalog's trust state"
+                .to_owned(),
+        );
     }
     if !verdict.hooks_failed.is_empty() {
         problems.push(format!("hooks failed: {}", verdict.hooks_failed.join("; ")));
@@ -1090,6 +1136,9 @@ fn render_plan(plan: &HostPlan) -> String {
         }
     }
     let _ = writeln!(out, "catalog: {}", wire_name(&preview.catalog));
+    if let Some(note) = &preview.catalog_note {
+        let _ = writeln!(out, "  note: {note}");
+    }
     let _ = writeln!(out, "packages:");
     for package in &preview.packages {
         let _ = writeln!(
@@ -1161,6 +1210,9 @@ fn render_report(report: &SetupReport) -> String {
     let mut out = String::new();
     for line in &report.applied {
         let _ = writeln!(out, "{line}");
+    }
+    if let Some(note) = &report.preview.catalog_note {
+        let _ = writeln!(out, "note: {note}");
     }
     for line in &report.verdict.hook_gaps {
         let _ = writeln!(out, "hook gap: {line}");

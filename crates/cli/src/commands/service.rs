@@ -237,9 +237,7 @@ fn render_install(report: &report::InstallReport) -> String {
 /// Appends the official runtime step the install ran: the catalog trust
 /// state, and each package and profile pin with its status.
 fn render_install_runtimes(text: &mut String, runtimes: &EnsureReport) {
-    if runtimes.catalog == CatalogStatus::Record || runtimes.catalog == CatalogStatus::Recorded {
-        let _ = writeln!(text, "catalog    trust state recorded");
-    }
+    let _ = writeln!(text, "catalog    {}", wire_name(&runtimes.catalog));
     for package in &runtimes.packages {
         let _ = writeln!(
             text,
@@ -844,7 +842,7 @@ mod tests {
             .expect("a runtime report"),
         );
         let text = render_install(&install);
-        assert!(text.contains("catalog    trust state recorded"), "{text}");
+        assert!(text.contains("catalog    recorded"), "{text}");
         assert!(
             text.contains("package    claude claude-code 1.0.0 (installed)"),
             "{text}"
