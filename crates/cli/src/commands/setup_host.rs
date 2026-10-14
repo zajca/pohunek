@@ -991,6 +991,27 @@ async fn verdict(
         health: health.status,
         doctor: diagnosis.overall.as_str().to_owned(),
     };
+    let problems = verdict_problems(
+        &verdict,
+        catalog_recorded_by_install && after.catalog == CatalogStatus::Record,
+        diagnosis.overall == DoctorStatus::Fail,
+    );
+    if problems.is_empty() {
+        Ok(verdict)
+    } else {
+        Err(CliError::SetupIncomplete {
+            detail: problems.join("; "),
+            applied: Vec::new(),
+        })
+    }
+}
+
+/// The reasons a verdict is not met, one per failed check.
+fn verdict_problems(
+    verdict: &Verdict,
+    catalog_unrecorded: bool,
+    doctor_failed: bool,
+) -> Vec<String> {
     let mut problems = Vec::new();
     if !verdict.packages_missing.is_empty() {
         problems.push(format!(
@@ -1016,7 +1037,7 @@ async fn verdict(
             verdict.refusals.join("; ")
         ));
     }
-    if catalog_recorded_by_install && after.catalog == CatalogStatus::Record {
+    if catalog_unrecorded {
         problems.push(
             "the official package install did not record the release catalog's trust state"
                 .to_owned(),
@@ -1025,17 +1046,10 @@ async fn verdict(
     if !verdict.hooks_failed.is_empty() {
         problems.push(format!("hooks failed: {}", verdict.hooks_failed.join("; ")));
     }
-    if diagnosis.overall == DoctorStatus::Fail {
+    if doctor_failed {
         problems.push("doctor reports a failed check; run `pohunek doctor`".to_owned());
     }
-    if problems.is_empty() {
-        Ok(verdict)
-    } else {
-        Err(CliError::SetupIncomplete {
-            detail: problems.join("; "),
-            applied: Vec::new(),
-        })
-    }
+    problems
 }
 
 /// The hook lines of `hooks` with `status`, as `integration: detail`.
