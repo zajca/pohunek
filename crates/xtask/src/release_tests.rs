@@ -501,7 +501,7 @@ fn a_complete_set_assembles_a_verifiable_reproducible_bundle() {
     }
     for runtime in runtimes() {
         expected.push(format!("pohunek-runtime-{runtime}-{VERSION}.tar.zst"));
-        for target in [GNU, MUSL, MAC] {
+        for target in [MAC, GNU, MUSL] {
             expected.push(format!("attestation-{runtime}-{target}.json"));
         }
     }
@@ -645,7 +645,9 @@ fn a_missing_attestation_row_is_refused() {
 #[test]
 fn an_attestation_row_outside_the_matrix_is_refused() {
     let fixture = Fixture::new();
-    let name = format!("attestation-{}-{MAC}.json", runtimes()[0]);
+    // Use a target that is not in the declared set, so it yields Unexpected.
+    let undeclared_target = "riscv64gc-unknown-linux-gnu";
+    let name = format!("attestation-{}-{}.json", runtimes()[0], undeclared_target);
     fs::write(fixture.input(&name), "{}").expect("extra row");
     fixture.expect_refused(
         fixture.assemble(&fixture.out("bundle")),

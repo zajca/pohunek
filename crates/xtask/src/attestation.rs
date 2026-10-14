@@ -912,7 +912,7 @@ mod tests {
             fs::write(fixture.path("lock.json"), lock_json("0.160.0", "0.161.0")).expect("write");
             fs::write(
                 fixture.path("matrix.json"),
-                matrix_json(&[("codex", GNU), ("codex", MUSL), ("codex", MAC)]),
+                matrix_json(&[("codex", MAC), ("codex", GNU), ("codex", MUSL)]),
             )
             .expect("write");
             fixture.write_report(&fixture.report("0.160.0"));
@@ -1199,7 +1199,7 @@ mod tests {
         fixture.attest(COMMIT, GNU).expect("attest");
         fs::write(
             fixture.path("matrix.json"),
-            matrix_json(&[("codex", GNU), ("codex", MUSL)])
+            matrix_json(&[("codex", MAC), ("codex", GNU), ("codex", MUSL)])
                 .replace("\"suite_version\": 3", "\"suite_version\": 4"),
         )
         .expect("write");
@@ -1344,14 +1344,24 @@ mod tests {
     fn matrix_check_accepts_exactly_packages_times_targets() {
         let root = matrix_root(
             &["codex", "pi"],
-            &[("codex", GNU), ("codex", MUSL), ("pi", GNU), ("pi", MUSL)],
+            &[
+                ("codex", MAC),
+                ("codex", GNU),
+                ("codex", MUSL),
+                ("pi", MAC),
+                ("pi", GNU),
+                ("pi", MUSL),
+            ],
         );
         run_matrix_check(root.path()).expect("consistent matrix");
     }
 
     #[test]
     fn matrix_check_refuses_a_package_without_rows_and_a_row_without_a_package() {
-        let root = matrix_root(&["codex", "pi"], &[("codex", GNU), ("codex", MUSL)]);
+        let root = matrix_root(
+            &["codex", "pi"],
+            &[("codex", MAC), ("codex", GNU), ("codex", MUSL)],
+        );
         expect_refusal(
             run_matrix_check(root.path()),
             &format!("rows.pi/{GNU}"),
@@ -1360,7 +1370,12 @@ mod tests {
 
         let root = matrix_root(
             &["codex"],
-            &[("codex", GNU), ("codex", MUSL), ("ghost", GNU)],
+            &[
+                ("codex", MAC),
+                ("codex", GNU),
+                ("codex", MUSL),
+                ("ghost", GNU),
+            ],
         );
         expect_refusal(
             run_matrix_check(root.path()),
@@ -1370,7 +1385,12 @@ mod tests {
 
         let root = matrix_root(
             &["codex"],
-            &[("codex", GNU), ("codex", MUSL), ("codex", "z-target")],
+            &[
+                ("codex", MAC),
+                ("codex", GNU),
+                ("codex", MUSL),
+                ("codex", "z-target"),
+            ],
         );
         expect_refusal(
             run_matrix_check(root.path()),

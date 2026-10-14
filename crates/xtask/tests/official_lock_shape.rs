@@ -26,7 +26,11 @@ use sha2::{Digest as _, Sha256};
 const LOCKED_RUNTIMES: [&str; 4] = ["claude", "codex", "hermes", "pi"];
 
 /// Targets every official package is attested on.
-const TARGETS: [&str; 2] = ["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"];
+const TARGETS: [&str; 3] = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+];
 
 /// Executables of one release, whose bytes an attestation's binary set covers.
 const BINARIES: [&str; 3] = ["pohunek", "pohunekd", "pohunek-sessiond"];
