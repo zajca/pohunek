@@ -4327,9 +4327,18 @@ async fn session_start_hook_is_terminated_after_hook_timeout() {
 
 #[tokio::test]
 async fn session_stop_hook_reports_stopped_done_and_failed_reasons_once() {
-    async fn run_case(tag: &str, command: &str, stop: bool, expected_reason: &str) {
+    /// Runs one case. With `exit_code`, the root exits with it once the test
+    /// creates its release file, after the precondition is checked; without
+    /// one, the root runs until the test stops it.
+    async fn run_case(tag: &str, exit_code: Option<i32>, expected_reason: &str) {
         let config_dir = temp_dir(&format!("session-stop-config-{tag}"));
         let cwd = temp_dir(&format!("session-stop-cwd-{tag}"));
+        // The root starts in `cwd`, so the relative name needs no quoting.
+        let release = cwd.join("release");
+        let command = match exit_code {
+            Some(code) => format!("while [ ! -e release ]; do sleep 0.05; done; exit {code}"),
+            None => "sleep 30".to_owned(),
+        };
         let store_path = temp_store_path(&format!("session-stop-store-{tag}"));
         let agents_dir = temp_agents_dir_with(
             &format!("session-stop-agent-{tag}"),
@@ -4356,7 +4365,7 @@ async fn session_stop_hook_reports_stopped_done_and_failed_reasons_once() {
 
         let created = registry
             .create(SessionNewParams {
-                cwd: Some(cwd),
+                cwd: Some(cwd.clone()),
                 ..resumable_params()
             })
             .await
@@ -4379,9 +4388,10 @@ async fn session_stop_hook_reports_stopped_done_and_failed_reasons_once() {
             "terminal transition precondition: one resume binding for {tag}"
         );
 
-        if stop {
+        if exit_code.is_none() {
             registry.stop(&created.id).await.expect("stop session");
         } else {
+            std::fs::write(&release, b"").expect("release the root");
             registry
                 .wait_for_exit(&created.id, HANG_GUARD)
                 .await
@@ -4404,9 +4414,9 @@ async fn session_stop_hook_reports_stopped_done_and_failed_reasons_once() {
         );
     }
 
-    run_case("stopped", "sleep 30", true, "stopped").await;
-    run_case("done", "sleep 0.2; exit 0", false, "done").await;
-    run_case("failed", "sleep 0.2; exit 7", false, "failed").await;
+    run_case("stopped", None, "stopped").await;
+    run_case("done", Some(0), "done").await;
+    run_case("failed", Some(7), "failed").await;
 }
 
 #[tokio::test]
