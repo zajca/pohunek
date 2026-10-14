@@ -6282,6 +6282,7 @@ mod tests {
         DesiredState, NativeIdentityOrdering, ResumeBinding, RuntimeRecord, SessionRecord,
         SessionWriteOutcome, Store, StoredInputRules,
     };
+    use pohunek_service_config::preflight::PROBE_BUDGET;
 
     /// Interactive shell for registries whose sessions run the default shell.
     ///
@@ -19282,6 +19283,8 @@ handler = "codex-hook-v1"
                 Some(trust) => run_with(
                     &inputs,
                     &PreflightOptions {
+                        probe_budget: PROBE_BUDGET,
+                        entry: std::time::Instant::now(),
                         release: Some(ReleaseInputs {
                             release_dir: release.clone(),
                             catalog_trust: trust.clone(),

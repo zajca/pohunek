@@ -14,7 +14,10 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use package::registry::RegistryError as PackageRegistryError;
 use package::PackageDigest;
-use protocol::{BindingProvenance, LaunchBinding, PackageId, ProtocolError, RuntimeId, RuntimeRef};
+use protocol::{
+    BindingProvenance, LaunchBinding, PackageId, PackageIdentity, ProtocolError, RuntimeId,
+    RuntimeRef,
+};
 use tracing::warn;
 
 use super::builtin::BuiltinSource;
@@ -421,10 +424,39 @@ impl RuntimeHost {
         if pinned_id != runtime_id {
             return Err(ProtocolError::runtime_not_installed(runtime_id));
         }
+        // The release step installs exactly the planned archive, and the plan
+        // verified it when it was made, so the planned definition of this digest
+        // is what the pin resolves to once the step ran.
+        if let Some(planned) = self.planned_definition(runtime_id, package_digest, package) {
+            return Ok(Arc::new(planned));
+        }
         store
             .load_pinned(runtime_id, package_digest, package)
             .map(Arc::new)
             .map_err(|reason| refuse(runtime_id, &reason))
+    }
+
+    /// The planned definition of exactly `digest` under `identity` for
+    /// `runtime_id`, when the planned overlay holds it.
+    fn planned_definition(
+        &self,
+        runtime_id: &RuntimeId,
+        digest: &PackageDigest,
+        identity: &PackageIdentity,
+    ) -> Option<RuntimeDefinition> {
+        self.packages
+            .as_ref()?
+            .planned
+            .iter()
+            .find_map(|definition| {
+                let matches = definition.runtime_id() == runtime_id
+                    && matches!(
+                        &definition.binding().provenance,
+                        BindingProvenance::Package { package, package_digest }
+                            if package == identity && package_digest == digest
+                    );
+                matches.then(|| definition.clone())
+            })
     }
 
     /// Verifies the package root of a definition that adopts a built-in `pin`.

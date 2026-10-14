@@ -68,6 +68,7 @@ use pohunek_daemon::session::{
 };
 use pohunek_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
 use pohunek_platform::supervisor::{self, Namespace};
+use pohunek_service_config::preflight::{PROBE_BUDGET, RELEASE_PLAN_FLAG};
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, Refusal, CODE_DAEMON_RUNNING, DRY_RUN_FLAG, ENSURE_REPORT_VERSION,
     ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
@@ -167,6 +168,8 @@ const PROFILES_SUBDIR: &str = "agents";
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // The probe deadline of `upgrade-preflight` counts from here.
+    let entry = std::time::Instant::now();
     if std::env::args_os()
         .skip(1)
         .eq([OsString::from(VERSION_FLAG)])
@@ -177,7 +180,13 @@ async fn main() -> ExitCode {
         .skip(1)
         .eq([OsString::from(UPGRADE_PREFLIGHT_ARG)])
     {
-        return print_upgrade_preflight();
+        return print_upgrade_preflight(false, entry);
+    }
+    if std::env::args_os().skip(1).eq([
+        OsString::from(UPGRADE_PREFLIGHT_ARG),
+        OsString::from(RELEASE_PLAN_FLAG),
+    ]) {
+        return print_upgrade_preflight(true, entry);
     }
     if std::env::args_os()
         .skip(1)
@@ -206,7 +215,11 @@ async fn main() -> ExitCode {
 }
 
 /// Prints the preflight report of the installed state as JSON.
-fn print_upgrade_preflight() -> ExitCode {
+///
+/// With `release_plan` the judgement also serves the runtimes the release step
+/// would leave behind; without it the judgement serves the installed packages
+/// only, as a rollback's preflight must.
+fn print_upgrade_preflight(release_plan: bool, entry: std::time::Instant) -> ExitCode {
     let report = Paths::resolve()
         .map_err(|error| error.to_string())
         .and_then(|paths| {
@@ -217,12 +230,14 @@ fn print_upgrade_preflight() -> ExitCode {
             };
             let release_dir = release_runtime_dir()?;
             let options = PreflightOptions {
-                release: release_dir.is_dir().then(move || ReleaseInputs {
+                release: (release_plan && release_dir.is_dir()).then(move || ReleaseInputs {
                     release_dir,
                     catalog_trust: CatalogTrust::load_beside_executable(),
                 }),
                 profiles_dir: Some(paths.config_dir.join(PROFILES_SUBDIR)),
                 host_state_dir: Some(paths.state_dir.clone()),
+                probe_budget: PROBE_BUDGET,
+                entry,
                 launch: launch_environment(&paths),
             };
             let inspector = pohunek_daemon::procwatch::HostInspector::new();

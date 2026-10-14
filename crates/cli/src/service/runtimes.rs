@@ -19,7 +19,6 @@ use std::time::Duration;
 
 use pohunek_paths::DAEMON_EXECUTABLE_NAME;
 use pohunek_platform::filesystem::{AdvisoryLock, EntryKind, FsError, TrustedDir};
-use pohunek_platform::shell_env::SearchPath;
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, IntegrationAction, PackageStatus, ProfileStatus, DRY_RUN_FLAG,
     ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG,
@@ -104,7 +103,7 @@ pub trait RuntimeStep: Debug + Send + Sync {
         context: &'a Context,
         dir: &'a Path,
         dry_run: bool,
-        search_path: &'a SearchPath,
+        search_path: &'a str,
     ) -> Running<'a>;
 }
 
@@ -136,7 +135,7 @@ impl RuntimeStep for DaemonRuntimes {
         context: &'a Context,
         dir: &'a Path,
         dry_run: bool,
-        search_path: &'a SearchPath,
+        search_path: &'a str,
     ) -> Running<'a> {
         Box::pin(run_daemon(*self, context, dir, dry_run, search_path))
     }
@@ -153,7 +152,7 @@ async fn run_daemon(
     context: &Context,
     dir: &Path,
     dry_run: bool,
-    search_path: &SearchPath,
+    search_path: &str,
 ) -> Result<EnsureReport, Error> {
     let daemon = dir.join(DAEMON_EXECUTABLE_NAME);
     let failure = |detail: String| Error::UpgradeRuntimesFailed {
@@ -626,7 +625,7 @@ mod tests {
             &context,
             root.as_path(),
             true,
-            &SearchPath::empty(),
+            "/usr/bin:/bin",
         )
         .await
         .expect("plan");
@@ -636,7 +635,7 @@ mod tests {
             &context,
             root.as_path(),
             false,
-            &SearchPath::empty(),
+            "/usr/bin:/bin",
         )
         .await
         .expect("apply");
@@ -650,7 +649,7 @@ mod tests {
         let tools = root.join("tools");
         std::fs::create_dir_all(&tools).expect("tools dir");
         std::fs::set_permissions(&tools, std::fs::Permissions::from_mode(0o755)).expect("mode");
-        let search_path = SearchPath::new(vec![tools]).expect("search path");
+        let search_path = tools.display().to_string();
         fake_daemon(root.as_path(), ENSURE_REPORT_VERSION, None, 0);
         // The daemon refuses to answer unless it has the job's PATH.
         let path = root.join(DAEMON_EXECUTABLE_NAME);
@@ -660,8 +659,9 @@ mod tests {
             body.replacen(
                 "#!/bin/sh\n",
                 &format!(
-                    "#!/bin/sh\n[ \"$PATH\" = '{}' ] || exit 7\n",
-                    search_path.to_env_value()
+                    "#!/bin/sh
+[ \"$PATH\" = '{search_path}' ] || exit 7
+"
                 ),
                 1,
             ),
@@ -692,7 +692,7 @@ mod tests {
                 &context,
                 root.as_path(),
                 true,
-                &SearchPath::empty(),
+                "/usr/bin:/bin",
             )
             .await
             .expect_err("without the job PATH the daemon refuses"),
@@ -712,7 +712,7 @@ mod tests {
                 &context,
                 root.as_path(),
                 true,
-                &SearchPath::empty(),
+                "/usr/bin:/bin",
             )
             .await
             .expect_err("the version is refused"),
@@ -733,7 +733,7 @@ mod tests {
                 &context,
                 root.as_path(),
                 false,
-                &SearchPath::empty(),
+                "/usr/bin:/bin",
             )
             .await
             .expect_err("the dry-run flag is refused"),
@@ -753,7 +753,7 @@ mod tests {
                 &context,
                 root.as_path(),
                 false,
-                &SearchPath::empty(),
+                "/usr/bin:/bin",
             )
             .await
             .expect_err("the exit is refused"),
@@ -789,7 +789,7 @@ mod tests {
         hanging_daemon(root.as_path(), &pid_file);
 
         let error = short_timeouts(Duration::from_secs(10))
-            .run(&context, root.as_path(), false, &SearchPath::empty())
+            .run(&context, root.as_path(), false, "/usr/bin:/bin")
             .await
             .expect_err("the apply does not finish");
         let detail = failure_detail(error);

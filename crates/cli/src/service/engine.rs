@@ -161,7 +161,6 @@ use std::time::{Duration, Instant};
 
 use pohunek_paths::InstallLayout;
 use pohunek_platform::process::{HostInspector, Pid, ProcessInspector};
-use pohunek_platform::shell_env::SearchPath;
 use pohunek_platform::supervisor::{
     self, JobDefinition, Namespace, ServiceObservation, ServiceState, WorkerKey,
 };
@@ -176,6 +175,8 @@ use super::definition::{
 };
 use super::error::{supervisor_error, Error, LiveSession, OutdatedWorker};
 use super::layout::{self, Staged};
+use pohunek_platform::shell_env::SearchPath;
+
 use super::manager_env;
 use super::preflight::{self, AdoptionPreflight, DaemonPreflight, Gated};
 use super::record::{self, ConfigBackup, Operation, Record, Step, Store, TransactionLock};
@@ -778,6 +779,7 @@ impl<'a> Engine<'a> {
             from,
             self.reported(version),
             &search_path,
+            preflight::ReleasePlan::Included,
             self.accept_runtime_loss,
         )
         .await
@@ -1077,6 +1079,7 @@ impl<'a> Engine<'a> {
                     dir,
                     self.reported(&version),
                     &search_path,
+                    preflight::ReleasePlan::Included,
                     self.accept_runtime_loss,
                 )
                 .await
@@ -1218,6 +1221,7 @@ impl<'a> Engine<'a> {
                 dir,
                 self.reported(&record.version),
                 &search_path,
+                preflight::ReleasePlan::Included,
                 self.accept_runtime_loss,
             )
             .await
@@ -1260,7 +1264,7 @@ impl<'a> Engine<'a> {
         record: &mut Record,
         layout: &InstallLayout,
         late: &mut LateGate,
-        search_path: &SearchPath,
+        search_path: &str,
     ) -> Result<(), Error> {
         if record.step >= Step::Runtimes {
             return Ok(());
@@ -1315,6 +1319,8 @@ impl<'a> Engine<'a> {
                     &dir,
                     self.reported(&record.version),
                     search_path,
+                    // The apply has run, so the installed packages are the plan's result.
+                    preflight::ReleasePlan::Omitted,
                     self.accept_runtime_loss,
                 )
                 .await?,
@@ -2622,15 +2628,15 @@ fn load_config_for_upgrade(path: &Path) -> Result<Option<UpgradeSource>, Error> 
 /// # Errors
 ///
 /// See [`job_search_path`].
-pub(crate) async fn installed_search_path(context: &Context) -> Result<SearchPath, Error> {
-    match load_config_for_upgrade(&context.config_path())? {
-        Some(source) => job_search_path(context, &source.config).await,
-        None => Ok(SearchPath::empty()),
-    }
+pub(crate) async fn installed_search_path(context: &Context) -> Result<String, Error> {
+    let source = load_config_for_upgrade(&context.config_path())?.ok_or(Error::NotInstalled {
+        path: context.config_path(),
+    })?;
+    job_search_path(context, &source.config).await
 }
 
-/// The `PATH` the daemon job of `config` runs with, which every preflight and
-/// runtime spawn of the CLI gets.
+/// The `PATH` the daemon job of `config` runs with, byte for byte, which every
+/// preflight and runtime spawn of the CLI gets.
 ///
 /// The recorded `PATH` of `config` is the job's `PATH`, as
 /// [`super::definition::daemon_definition`] writes it into the systemd unit or
@@ -2641,14 +2647,14 @@ pub(crate) async fn installed_search_path(context: &Context) -> Result<SearchPat
 /// # Errors
 ///
 /// Returns [`Error::ManagerEnvironment`] when the service manager's `PATH`
-/// cannot be read or is not a usable search path.
+/// cannot be read or cannot be carried by a process environment.
 pub(crate) async fn job_search_path(
     context: &Context,
     config: &ServiceConfig,
-) -> Result<SearchPath, Error> {
+) -> Result<String, Error> {
     let recorded = config.search_path();
     if !recorded.is_empty() {
-        return Ok(recorded.clone());
+        return Ok(recorded.to_env_value());
     }
     if cfg!(target_os = "linux") {
         return manager_env::user_manager_search_path(context.user_manager()).await;
@@ -2658,23 +2664,19 @@ pub(crate) async fn job_search_path(
 
 /// The launchd user domain's `PATH` as the search path of a job without one.
 #[cfg(target_os = "macos")]
-fn launchd_domain_search_path(context: &Context) -> Result<SearchPath, Error> {
+fn launchd_domain_search_path(context: &Context) -> Result<String, Error> {
     let value = pohunek_platform::supervisor::launchd::read_user_domain_path(
         context.launchd_domain_config(),
     )
     .map_err(|error| Error::ManagerEnvironment {
         detail: format!("the launchd user domain's PATH cannot be read: {error}"),
     })?;
-    SearchPath::new(value.split(':').map(std::path::PathBuf::from).collect()).map_err(|error| {
-        Error::ManagerEnvironment {
-            detail: format!("the launchd user domain's PATH is not a usable search path: {error}"),
-        }
-    })
+    manager_env::carry(&value).map_err(|detail| Error::ManagerEnvironment { detail })
 }
 
 /// Only macOS has a launchd user domain.
 #[cfg(not(target_os = "macos"))]
-fn launchd_domain_search_path(_context: &Context) -> Result<SearchPath, Error> {
+fn launchd_domain_search_path(_context: &Context) -> Result<String, Error> {
     Err(Error::ManagerEnvironment {
         detail: "a launchd job exists only on macOS".to_owned(),
     })

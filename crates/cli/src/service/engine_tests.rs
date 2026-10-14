@@ -43,7 +43,7 @@ use crate::service::inherited::Token;
 use crate::service::layout::tests::{anchor_bytes, stage_dir, write_anchor};
 use crate::service::layout::CLI_NAME;
 use crate::service::manager_env::UserManager;
-use crate::service::preflight::Judging;
+use crate::service::preflight::{Judging, ReleasePlan};
 use crate::service::runtimes::Running;
 use crate::service::usage::tests::{
     own_identity, spawn_when_exec_free, write_journal, write_live_journal, write_outdated_journal,
@@ -187,7 +187,8 @@ impl AdoptionPreflight for InProcessPreflight {
         &'a self,
         context: &'a Context,
         _daemon: &'a Path,
-        _search_path: &'a SearchPath,
+        _search_path: &'a str,
+        _plan: ReleasePlan,
     ) -> Judging<'a> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -214,6 +215,8 @@ struct ScriptedPreflight {
     stopped: Vec<SessionVerdict>,
     /// The `PATH` of every judgment, in call order.
     search_paths: Arc<Mutex<Vec<String>>>,
+    /// The release-plan choice of every judgment, in call order.
+    plans: Arc<Mutex<Vec<ReleasePlan>>>,
 }
 
 impl AdoptionPreflight for ScriptedPreflight {
@@ -221,15 +224,17 @@ impl AdoptionPreflight for ScriptedPreflight {
         &'a self,
         context: &'a Context,
         daemon: &'a Path,
-        search_path: &'a SearchPath,
+        search_path: &'a str,
+        plan: ReleasePlan,
     ) -> Judging<'a> {
         Box::pin(async move {
             self.search_paths
                 .lock()
                 .expect("search path lock")
-                .push(search_path.to_env_value());
+                .push(search_path.to_owned());
+            self.plans.lock().expect("plan lock").push(plan);
             let mut report: PreflightReport =
-                self.inner.judge(context, daemon, search_path).await?;
+                self.inner.judge(context, daemon, search_path, plan).await?;
             report.runtimes = self.runtimes.clone();
             report.stopped_sessions = self.stopped.clone();
             Ok(report)
@@ -352,10 +357,10 @@ impl RuntimeStep for RuntimeFake {
         context: &'a Context,
         dir: &'a Path,
         dry_run: bool,
-        search_path: &'a SearchPath,
+        search_path: &'a str,
     ) -> Running<'a> {
         Box::pin(async move {
-            self.script().search_paths.push(search_path.to_env_value());
+            self.script().search_paths.push(search_path.to_owned());
             if dry_run {
                 let removals = self.1.world().uninstalls;
                 let mut script = self.script();
@@ -2367,6 +2372,36 @@ async fn the_runtime_judgment_and_plan_run_with_the_path_of_the_installed_job() 
 }
 
 #[tokio::test]
+async fn only_the_upgrades_own_gates_judge_the_release_plan() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    harness.runtimes.script().calls.clear();
+    seed_runtime_state(&harness);
+    harness.runtimes.plan(installing_plan());
+    let preflight = ScriptedPreflight::default();
+    let plans = Arc::clone(&preflight.plans);
+
+    harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect("upgrade");
+
+    // The early gate and the late gate before the swap judge the plan; the
+    // post-apply judgement runs after the apply, when the plan is already the
+    // installed state, so it judges the installed packages only.
+    assert_eq!(
+        plans.lock().expect("plan lock").clone(),
+        [
+            ReleasePlan::Included,
+            ReleasePlan::Included,
+            ReleasePlan::Omitted,
+        ]
+    );
+}
+
+#[tokio::test]
 async fn an_upgrade_stops_the_daemon_and_backs_up_before_it_applies_the_runtime_plan() {
     let harness = Harness::new();
     harness.install(V1).await.expect("install");
@@ -2568,7 +2603,8 @@ impl AdoptionPreflight for PostApplyPreflight {
         &'a self,
         context: &'a Context,
         daemon: &'a Path,
-        search_path: &'a SearchPath,
+        search_path: &'a str,
+        plan: ReleasePlan,
     ) -> Judging<'a> {
         Box::pin(async move {
             // Only the new release's judgment after the apply is scripted; the
@@ -2576,7 +2612,7 @@ impl AdoptionPreflight for PostApplyPreflight {
             let new_release = daemon.components().any(|part| part.as_os_str() == V2);
             if !self.runtimes.applied() || !new_release || self.post == PostApply::Clean {
                 return InProcessPreflight::default()
-                    .judge(context, daemon, search_path)
+                    .judge(context, daemon, search_path, plan)
                     .await;
             }
             self.judged_after_apply.fetch_add(1, Ordering::SeqCst);
@@ -2587,7 +2623,7 @@ impl AdoptionPreflight for PostApplyPreflight {
                 });
             }
             let mut report = InProcessPreflight::default()
-                .judge(context, daemon, search_path)
+                .judge(context, daemon, search_path, plan)
                 .await?;
             report.sessions.push(SessionVerdict {
                 session_id: "s-after-apply".to_owned(),
@@ -5761,7 +5797,8 @@ impl AdoptionPreflight for FailingFrom {
         &'a self,
         context: &'a Context,
         daemon: &'a Path,
-        search_path: &'a SearchPath,
+        search_path: &'a str,
+        plan: ReleasePlan,
     ) -> Judging<'a> {
         let call = self.inner.calls.load(Ordering::SeqCst);
         if call >= self.fail_from {
@@ -5772,7 +5809,7 @@ impl AdoptionPreflight for FailingFrom {
                 })
             });
         }
-        self.inner.judge(context, daemon, search_path)
+        self.inner.judge(context, daemon, search_path, plan)
     }
 }
 
@@ -6983,7 +7020,8 @@ impl AdoptionPreflight for CountingFailure {
         &'a self,
         _context: &'a Context,
         daemon: &'a Path,
-        _search_path: &'a SearchPath,
+        _search_path: &'a str,
+        _plan: ReleasePlan,
     ) -> Judging<'a> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {

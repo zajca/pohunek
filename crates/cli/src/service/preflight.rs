@@ -16,9 +16,10 @@ use std::pin::Pin;
 use std::process::Stdio;
 
 use pohunek_paths::DAEMON_EXECUTABLE_NAME;
-use pohunek_platform::shell_env::SearchPath;
 use pohunek_platform::supervisor::SEARCH_PATH_VARIABLE;
-use pohunek_service_config::preflight::{PreflightReport, SessionVerdict, REPORT_VERSION};
+use pohunek_service_config::preflight::{
+    PreflightReport, SessionVerdict, PREFLIGHT_TIMEOUT, RELEASE_PLAN_FLAG, REPORT_VERSION,
+};
 use tokio::io::AsyncReadExt as _;
 
 use super::context::Context;
@@ -29,6 +30,30 @@ use super::settings;
 
 /// Argument that makes the daemon print its preflight report.
 pub const PREFLIGHT_ARGUMENT: &str = "upgrade-preflight";
+
+/// Whether a preflight judgement includes the release's runtime plan.
+///
+/// Only the upgrade's own gates include it: the plan is what the upgrade is
+/// about to apply. The post-apply judgement runs after the apply, so the
+/// installed packages already are the plan's result. A rollback runs the
+/// previous release's binary, which never applies a plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleasePlan {
+    /// The judgement serves the installed packages only.
+    Omitted,
+    /// The judgement adds the release's runtime plan.
+    Included,
+}
+
+impl ReleasePlan {
+    /// The daemon argument this choice passes, if any.
+    fn argument(self) -> Option<&'static str> {
+        match self {
+            Self::Omitted => None,
+            Self::Included => Some(RELEASE_PLAN_FLAG),
+        }
+    }
+}
 
 /// A pending preflight run.
 pub type Judging<'a> = Pin<Box<dyn Future<Output = Result<PreflightReport, Error>> + Send + 'a>>;
@@ -42,7 +67,8 @@ pub trait AdoptionPreflight: Debug + Send + Sync {
         &'a self,
         context: &'a Context,
         daemon: &'a Path,
-        search_path: &'a SearchPath,
+        search_path: &'a str,
+        plan: ReleasePlan,
     ) -> Judging<'a>;
 }
 
@@ -55,20 +81,19 @@ impl AdoptionPreflight for DaemonPreflight {
         &'a self,
         context: &'a Context,
         daemon: &'a Path,
-        search_path: &'a SearchPath,
+        search_path: &'a str,
+        plan: ReleasePlan,
     ) -> Judging<'a> {
-        Box::pin(run_daemon(context, daemon, search_path))
+        Box::pin(run_daemon(context, daemon, search_path, plan))
     }
 }
 
-/// Sets the `PATH` of a child that stands in for the daemon job.
+/// Sets the `PATH` of a child that stands in for the daemon job, byte for byte.
 ///
-/// An empty search path sets nothing: the job definition carries no `PATH`
-/// then, and the service manager's own environment applies.
-pub(super) fn set_search_path(command: &mut tokio::process::Command, search_path: &SearchPath) {
-    if !search_path.is_empty() {
-        command.env(SEARCH_PATH_VARIABLE, search_path.to_env_value());
-    }
+/// The job's `PATH` value is the one the child gets, so the child resolves and
+/// probes exactly as the job does.
+pub(super) fn set_search_path(command: &mut tokio::process::Command, search_path: &str) {
+    command.env(SEARCH_PATH_VARIABLE, search_path);
 }
 
 /// The outcome of a preflight the operator may proceed on.
@@ -95,10 +120,18 @@ pub async fn gate(
     context: &Context,
     daemon_dir: &Path,
     version: &str,
-    search_path: &SearchPath,
+    search_path: &str,
     accept_runtime_loss: bool,
 ) -> Result<Gated, Error> {
-    let report = judge_daemon(preflight, context, daemon_dir, version, search_path).await?;
+    let report = judge_daemon(
+        preflight,
+        context,
+        daemon_dir,
+        version,
+        search_path,
+        ReleasePlan::Omitted,
+    )
+    .await?;
     decide(report, accept_runtime_loss)
 }
 
@@ -118,10 +151,11 @@ pub async fn gate_upgrade(
     context: &Context,
     daemon_dir: &Path,
     version: &str,
-    search_path: &SearchPath,
+    search_path: &str,
+    plan: ReleasePlan,
     accept_runtime_loss: bool,
 ) -> Result<Gated, Error> {
-    let report = judge_daemon(preflight, context, daemon_dir, version, search_path).await?;
+    let report = judge_daemon(preflight, context, daemon_dir, version, search_path, plan).await?;
     if let Some(plan) = &report.runtimes {
         runtimes::check_plan(plan)?;
     }
@@ -134,11 +168,12 @@ async fn judge_daemon(
     context: &Context,
     daemon_dir: &Path,
     version: &str,
-    search_path: &SearchPath,
+    search_path: &str,
+    plan: ReleasePlan,
 ) -> Result<PreflightReport, Error> {
     let daemon = daemon_dir.join(DAEMON_EXECUTABLE_NAME);
     probe_daemon(&daemon, version).await?;
-    preflight.judge(context, &daemon, search_path).await
+    preflight.judge(context, &daemon, search_path, plan).await
 }
 
 /// Verifies the daemon binary before using it as compatibility evidence.
@@ -195,15 +230,19 @@ pub fn decide(report: PreflightReport, accept_runtime_loss: bool) -> Result<Gate
 async fn run_daemon(
     context: &Context,
     daemon: &Path,
-    search_path: &SearchPath,
+    search_path: &str,
+    plan: ReleasePlan,
 ) -> Result<PreflightReport, Error> {
     let failure = |detail: String| Error::UpgradePreflightFailed {
         binary: daemon.to_path_buf(),
         detail,
     };
     let mut command = tokio::process::Command::new(daemon);
+    command.arg(PREFLIGHT_ARGUMENT);
+    if let Some(flag) = plan.argument() {
+        command.arg(flag);
+    }
     command
-        .arg(PREFLIGHT_ARGUMENT)
         .env_clear()
         .envs(context.bootstrap_environment()?)
         .stdin(Stdio::null())
@@ -233,12 +272,12 @@ async fn run_daemon(
         let status = child.wait().await;
         (report, diagnostics, status)
     };
-    let (report, diagnostics, status) = tokio::time::timeout(settings::PREFLIGHT_TIMEOUT, run)
+    let (report, diagnostics, status) = tokio::time::timeout(PREFLIGHT_TIMEOUT, run)
         .await
         .map_err(|_elapsed| {
             failure(format!(
                 "it did not finish within {} s",
-                settings::PREFLIGHT_TIMEOUT.as_secs()
+                PREFLIGHT_TIMEOUT.as_secs()
             ))
         })?;
     let status = status.map_err(|error| failure(format!("cannot wait for it: {error}")))?;

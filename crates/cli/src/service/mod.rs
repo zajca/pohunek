@@ -247,6 +247,7 @@ async fn finish_check(
             daemon_dir,
             version,
             &search_path,
+            preflight::ReleasePlan::Included,
             accept_runtime_loss,
         )
         .await?;

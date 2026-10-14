@@ -12,10 +12,49 @@
 
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::runtimes::{EnsureReport, Refusal};
+
+/// Argument that adds the release runtime plan to the judgement of
+/// `pohunekd upgrade-preflight`. Without it the judgement serves the installed
+/// packages only and the report carries no plan.
+///
+/// Only the upgrade's own gates pass it. A rollback runs the previous release's
+/// binary without it, because that binary never applies the plan.
+pub const RELEASE_PLAN_FLAG: &str = "--release-plan";
+
+/// Deadline the installer gives one `pohunekd upgrade-preflight` run.
+///
+/// [`PROBE_BUDGET`] is kept below it, so a probe budget that runs out still
+/// leaves the installer time to read a complete report before the deadline.
+pub const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Time one preflight run may spend on version probes, counted from the entry of
+/// the command.
+///
+/// The probe deadline is the entry of `pohunekd upgrade-preflight` plus this
+/// budget, so the journal scan, the release plan and the registry load count
+/// against it too. A session whose probe would start at or after the deadline
+/// is judged `would_lose_recovery` with [`CODE_PROBE_BUDGET_EXHAUSTED`]: the
+/// judgement stays pessimistic instead of running past [`PREFLIGHT_TIMEOUT`].
+pub const PROBE_BUDGET: Duration = Duration::from_secs(20);
+
+/// Time reserved after the probe deadline for the rest of the judgement and for
+/// the report to be printed. A probe that started before the deadline ends by
+/// its own bounded timeout, so the run ends within this margin of the deadline.
+pub const REPORT_MARGIN: Duration = Duration::from_secs(5);
+
+// The probe deadline and the report margin must end before the installer's
+// deadline.
+const _: () =
+    assert!(PROBE_BUDGET.as_secs() + REPORT_MARGIN.as_secs() < PREFLIGHT_TIMEOUT.as_secs());
+
+/// Machine code of a session whose version probe the probe budget did not
+/// reach.
+pub const CODE_PROBE_BUDGET_EXHAUSTED: &str = "probe_budget_exhausted";
 
 /// Version of the report layout; a reader refuses any other value.
 ///

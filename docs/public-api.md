@@ -2234,7 +2234,17 @@ whose frozen program resume would not find is `would_lose_recovery` with
 `agent_binary_missing`; for a runtime that declares a version probe, the
 preflight runs the same isolated, bounded probe resume runs (the frozen program
 with the probe's arguments, a private `HOME` and working directory), so
-`service check` executes those programs. It writes no pohunek state. See
+`service check` executes those programs. It writes no pohunek state. Identical
+probes (same program, `PATH` and package) run once, and all probes of one run
+share a budget below the installer's preflight deadline; a session whose probe
+the spent budget cuts off is `would_lose_recovery` with `probe_budget_exhausted`.
+The release plan is judged only when the installer passes `--release-plan` (the
+upgrade's own gates and `service check` of an upgrade); without it, as for a
+rollback, which never applies the plan, the preflight judges the installed
+packages only. The preflight runs with the `PATH` the daemon job runs with (the
+one `service.toml` records, else the systemd user manager's or the launchd user
+domain's), and resolves programs with the daemon's own resolver, which skips an
+untrusted candidate the same way at launch. See
 [update after release](knowledge/runbooks/update-after-release.md).
 
 Identity hooks prefer the owner-private worker endpoint so an accepted launch

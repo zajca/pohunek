@@ -20,14 +20,16 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use pohunek_cli::service::manager_env::{user_manager_search_path, UserManager};
-use pohunek_cli::service::preflight::{decide, gate, gate_upgrade, DaemonPreflight};
+use pohunek_cli::service::preflight::{
+    decide, gate, gate_upgrade, AdoptionPreflight as _, DaemonPreflight, ReleasePlan,
+};
 use pohunek_cli::service::{Context, Error, VERSION};
 use pohunek_daemon::store::{DesiredState, RuntimeRecord, SessionRecord, Store};
 use pohunek_paths::{BasePaths, PathEnv, Platform};
 use pohunek_platform::process::{HostInspector, ProcessInspector as _};
-use pohunek_platform::shell_env::SearchPath;
 use pohunek_service_config::preflight::{
-    PreflightReport, SessionVerdict, StoreReport, StoreState, Verdict, REPORT_VERSION,
+    PreflightReport, SessionVerdict, StoreReport, StoreState, Verdict, RELEASE_PLAN_FLAG,
+    REPORT_VERSION,
 };
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, Refusal, ENSURE_REPORT_VERSION,
@@ -288,7 +290,7 @@ async fn the_real_daemon_reports_a_clean_live_session_adoptable() {
         &host.context,
         &archive,
         VERSION,
-        &SearchPath::empty(),
+        "/usr/bin:/bin",
         false,
     )
     .await
@@ -316,7 +318,7 @@ async fn the_real_daemon_names_a_session_it_would_not_adopt_and_the_flag_accepts
         &host.context,
         &archive,
         VERSION,
-        &SearchPath::empty(),
+        "/usr/bin:/bin",
         false,
     )
     .await
@@ -334,7 +336,7 @@ async fn the_real_daemon_names_a_session_it_would_not_adopt_and_the_flag_accepts
         &host.context,
         &archive,
         VERSION,
-        &SearchPath::empty(),
+        "/usr/bin:/bin",
         true,
     )
     .await
@@ -384,7 +386,7 @@ async fn a_preflight_that_fails_or_prints_garbage_fails_closed() {
             &host.context,
             &archive,
             VERSION,
-            &SearchPath::empty(),
+            "/usr/bin:/bin",
             true,
         )
         .await
@@ -454,7 +456,8 @@ async fn the_daemon_report_fields_reach_the_upgrade_gate_through_the_process_bou
         &host.context,
         &daemon,
         VERSION,
-        &SearchPath::empty(),
+        "/usr/bin:/bin",
+        ReleasePlan::Included,
         true,
     )
     .await
@@ -478,7 +481,8 @@ async fn the_daemon_report_fields_reach_the_upgrade_gate_through_the_process_bou
         &host.context,
         &daemon,
         VERSION,
-        &SearchPath::empty(),
+        "/usr/bin:/bin",
+        ReleasePlan::Included,
         false,
     )
     .await
@@ -493,7 +497,8 @@ async fn the_daemon_report_fields_reach_the_upgrade_gate_through_the_process_bou
         &host.context,
         &daemon,
         VERSION,
-        &SearchPath::empty(),
+        "/usr/bin:/bin",
+        ReleasePlan::Included,
         true,
     )
     .await
@@ -509,7 +514,7 @@ async fn the_daemon_judges_with_the_path_its_job_carries() {
     std::fs::create_dir_all(&tools).expect("tools dir");
     std::fs::set_permissions(&tools, std::fs::Permissions::from_mode(0o755))
         .expect("make tools dir readable");
-    let search_path = SearchPath::new(vec![tools]).expect("trusted search path");
+    let search_path = tools.display().to_string();
     // The wrapper refuses to run unless it has the job's PATH, then runs the
     // real daemon, so only the search path decides whether the judgment runs.
     let real = host.archive().join("pohunekd");
@@ -517,7 +522,7 @@ async fn the_daemon_judges_with_the_path_its_job_carries() {
         &host.root.join("wrapper"),
         &format!(
             "[ \"$PATH\" = '{}' ] || exit 7\nexec '{}' \"$@\"",
-            search_path.to_env_value(),
+            search_path,
             real.display()
         ),
     );
@@ -539,7 +544,7 @@ async fn the_daemon_judges_with_the_path_its_job_carries() {
         &host.context,
         &wrapper,
         VERSION,
-        &SearchPath::empty(),
+        "/usr/bin:/bin",
         false,
     )
     .await
@@ -591,7 +596,7 @@ async fn the_daemon_judges_with_the_user_managers_path_and_an_unreadable_one_fai
     let search_path = user_manager_search_path(&manager)
         .await
         .expect("the manager reports its PATH");
-    assert_eq!(search_path.to_env_value(), manager_path);
+    assert_eq!(search_path, manager_path);
     let gated = gate(
         &DaemonPreflight,
         &host.context,
@@ -622,6 +627,148 @@ async fn the_daemon_judges_with_the_user_managers_path_and_an_unreadable_one_fai
 }
 
 #[tokio::test]
+async fn a_user_manager_path_is_judged_as_the_job_gets_it_even_with_an_open_directory() {
+    let host = Host::new();
+    // A directory any user may write to: the daemon job runs with it anyway, so
+    // the judgment must use the same PATH and not refuse it.
+    let open = host.root.join("open-tools");
+    std::fs::create_dir_all(&open).expect("open dir");
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).expect("mode");
+    let value = format!("{}:/usr/bin", open.display());
+    let manager = FakeUserManager(Ok(vec!["HOME=/home/u".to_owned(), format!("PATH={value}")]));
+
+    let search_path = user_manager_search_path(&manager)
+        .await
+        .expect("the job's PATH is used as it is");
+    assert_eq!(search_path, value);
+
+    // A control character is no problem for a process environment: the value
+    // is carried as it is.
+    let control = FakeUserManager(Ok(vec!["PATH=/usr/bin:\u{7}/bin".to_owned()]));
+    assert_eq!(
+        user_manager_search_path(&control).await.expect("carried"),
+        "/usr/bin:\u{7}/bin"
+    );
+}
+
+#[tokio::test]
+async fn a_user_manager_path_reaches_the_spawned_daemon_byte_for_byte() {
+    let host = Host::new();
+    host.seed_live_session(false);
+    let open = host.root.join("resolving-tools");
+    std::fs::create_dir_all(&open).expect("open dir");
+    let open_text = open.display().to_string();
+    // A relative entry and a repeated directory: the job runs with this exact
+    // value, so the spawned daemon must receive it unchanged.
+    let value = format!("relative/bin:{open_text}:/usr/bin:{open_text}");
+    let manager = FakeUserManager(Ok(vec![format!("PATH={value}")]));
+    let received = host.root.join("received-path");
+    let real = host.archive().join("pohunekd");
+    // The stand-in records the PATH it was started with, then runs the real daemon.
+    let recording = scripted_daemon(
+        &host.root.join("recording"),
+        &format!(
+            "printf '%s' \"$PATH\" > '{}'\nexec '{}' \"$@\"",
+            received.display(),
+            real.display()
+        ),
+    );
+
+    let search_path = user_manager_search_path(&manager)
+        .await
+        .expect("a value a process environment carries is used");
+    assert_eq!(search_path, value);
+    let gated = gate(
+        &DaemonPreflight,
+        &host.context,
+        &recording,
+        VERSION,
+        &search_path,
+        false,
+    )
+    .await
+    .expect("the daemon judges");
+    assert_eq!(gated.report.sessions.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(&received).expect("the daemon's record"),
+        value,
+        "the spawned daemon received the job's PATH unchanged"
+    );
+
+    // Only a NUL byte cannot be carried by a process environment.
+    let nul = FakeUserManager(Ok(vec!["PATH=/usr/bin\u{0}/bin".to_owned()]));
+    assert_eq!(
+        user_manager_search_path(&nul)
+            .await
+            .expect_err("a NUL byte is refused")
+            .code(),
+        "service_manager_environment_unavailable"
+    );
+}
+
+#[tokio::test]
+async fn the_release_plan_flag_reaches_the_daemon_only_for_the_upgrade_judgement() {
+    let host = Host::new();
+    host.seed_live_session(false);
+    let real = host.archive().join("pohunekd");
+    // Each stand-in runs the real daemon only with the argument its caller must
+    // pass: the upgrade's judgement with the release-plan flag, a rollback's
+    // judgement with none.
+    let with_plan = scripted_daemon(
+        &host.root.join("with-plan"),
+        &format!(
+            "[ \"$2\" = '{RELEASE_PLAN_FLAG}' ] || exit 7\nexec '{}' \"$@\"",
+            real.display()
+        ),
+    );
+    let without_plan = scripted_daemon(
+        &host.root.join("without-plan"),
+        &format!("[ -z \"$2\" ] || exit 8\nexec '{}' \"$@\"", real.display()),
+    );
+
+    // The report carries the release plan only when the flag reached the
+    // daemon; this host has no installed configuration, so the plan itself is
+    // reported as unreadable, which is the daemon's own answer.
+    let report = DaemonPreflight
+        .judge(
+            &host.context,
+            &with_plan.join("pohunekd"),
+            "/usr/bin:/bin",
+            ReleasePlan::Included,
+        )
+        .await
+        .expect("the upgrade's judgement passes the release-plan flag");
+    assert!(report.runtimes.is_some(), "the plan was judged");
+
+    gate(
+        &DaemonPreflight,
+        &host.context,
+        &without_plan,
+        VERSION,
+        "/usr/bin:/bin",
+        false,
+    )
+    .await
+    .expect("a rollback's judgement passes no flag");
+
+    let error = gate_upgrade(
+        &DaemonPreflight,
+        &host.context,
+        &without_plan,
+        VERSION,
+        "/usr/bin:/bin",
+        ReleasePlan::Included,
+        false,
+    )
+    .await
+    .expect_err("the upgrade's judgement without the flag is not what the daemon answers");
+    assert!(
+        matches!(error, Error::UpgradePreflightFailed { .. }),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_missing_daemon_is_a_staged_binary_error() {
     let host = Host::new();
     let empty = host.root.join("empty");
@@ -632,7 +779,7 @@ async fn a_missing_daemon_is_a_staged_binary_error() {
         &host.context,
         &empty,
         VERSION,
-        &SearchPath::empty(),
+        "/usr/bin:/bin",
         true,
     )
     .await
@@ -653,7 +800,7 @@ async fn a_live_agent_session_that_reported_its_identity_is_adoptable_under_the_
         &host.context,
         &archive,
         VERSION,
-        &SearchPath::empty(),
+        "/usr/bin:/bin",
         false,
     )
     .await

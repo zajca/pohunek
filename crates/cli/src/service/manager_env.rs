@@ -13,7 +13,6 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 
-use pohunek_platform::shell_env::SearchPath;
 use pohunek_platform::supervisor::SEARCH_PATH_VARIABLE;
 
 use super::error::Error;
@@ -57,41 +56,40 @@ impl UserManager for SystemdUserManager {
     }
 }
 
-/// Reads the `PATH` of the systemd user manager through `manager`.
+/// Reads the `PATH` of the systemd user manager through `manager`, byte for byte.
 ///
-/// The value is validated like the login-shell `PATH` of an install: every
-/// directory must be trusted, and none may be dropped.
+/// The daemon job runs with exactly this value, and its own resolver and version
+/// probes read it as it is, so it is handed to the preflight and runtime spawns
+/// unchanged. Trust, relative entries, and duplicates are the daemon's to judge.
 ///
 /// # Errors
 ///
 /// Returns [`Error::ManagerEnvironment`] when the environment cannot be read,
-/// has no `PATH` entry, or names a `PATH` that is not a usable trusted search
-/// path.
-pub async fn user_manager_search_path(manager: &dyn UserManager) -> Result<SearchPath, Error> {
+/// has no `PATH` entry, or holds a `PATH` that a process environment cannot carry.
+pub async fn user_manager_search_path(manager: &dyn UserManager) -> Result<String, Error> {
     let failure = |detail: String| Error::ManagerEnvironment { detail };
     let environment = manager.environment().await.map_err(failure)?;
-    search_path_of(&environment).map_err(failure)
-}
-
-/// Parses the `PATH` entry of a manager environment.
-fn search_path_of(environment: &[String]) -> Result<SearchPath, String> {
     let prefix = format!("{SEARCH_PATH_VARIABLE}=");
     let value = environment
         .iter()
         .find_map(|entry| entry.strip_prefix(prefix.as_str()))
-        .ok_or_else(|| "it sets no PATH entry".to_owned())?;
-    let sanitized = SearchPath::sanitize(value, true)
-        .map_err(|error| format!("its PATH is not a usable search path: {error}"))?;
-    if !sanitized.untrusted.is_empty() {
-        return Err(format!(
-            "its PATH names {} untrusted director{}",
-            sanitized.untrusted.len(),
-            if sanitized.untrusted.len() == 1 {
-                "y"
-            } else {
-                "ies"
-            }
-        ));
+        .ok_or_else(|| failure("it sets no PATH entry".to_owned()))?;
+    carry(value).map_err(failure)
+}
+
+/// The `PATH` value of a job, if a process environment can carry it.
+///
+/// A value with a NUL byte cannot be placed in a process environment. Every
+/// other byte sequence is passed as it is.
+///
+/// # Errors
+///
+/// Returns a message for a value with an interior NUL byte.
+pub(crate) fn carry(value: &str) -> Result<String, String> {
+    if value.contains('\0') {
+        return Err(
+            "its PATH contains a NUL byte, which a process environment cannot carry".to_owned(),
+        );
     }
-    Ok(sanitized.path)
+    Ok(value.to_owned())
 }

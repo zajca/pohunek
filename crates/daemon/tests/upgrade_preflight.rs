@@ -16,6 +16,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use pohunek_daemon::agent::host::PackageStore;
 use pohunek_daemon::procwatch::{HostInspector, ProcessInspector};
@@ -31,9 +32,12 @@ use pohunek_service_config::preflight::{
     CODE_RESUME_RECORD_UNREADABLE, CODE_RUNTIME_IDENTITY_MISMATCH, CODE_RUNTIME_SOURCE_NOT_SERVED,
     CODE_STORE_UNUSABLE, CODE_WORKER_ENDED, CODE_WORKER_NOT_RUNNING, REPORT_VERSION,
 };
+use pohunek_service_config::preflight::{
+    CODE_PROBE_BUDGET_EXHAUSTED, PREFLIGHT_TIMEOUT, PROBE_BUDGET, RELEASE_PLAN_FLAG,
+};
 use pohunek_service_config::runtimes::{
     PackageStatus, ProfileStatus, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
-    CODE_RUNTIME_PLAN_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE,
+    CODE_RUNTIME_PLAN_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE, RELEASE_RUNTIME_DIR,
 };
 #[path = "support/service_file.rs"]
 mod service_file;
@@ -259,6 +263,8 @@ impl Host {
             release: None,
             profiles_dir: None,
             host_state_dir: None,
+            probe_budget: PROBE_BUDGET,
+            entry: std::time::Instant::now(),
             launch: Ok(self.launch()),
         }
     }
@@ -1494,6 +1500,8 @@ fn release_options(
         }),
         profiles_dir: Some(profiles.to_path_buf()),
         host_state_dir: None,
+        probe_budget: PROBE_BUDGET,
+        entry: std::time::Instant::now(),
         launch: Ok(host.launch()),
     }
 }
@@ -1654,6 +1662,8 @@ fn a_release_plan_that_cannot_be_computed_is_a_refusal_not_an_empty_plan() {
         // Without the profile directory the plan cannot see what it pins.
         profiles_dir: None,
         host_state_dir: None,
+        probe_budget: PROBE_BUDGET,
+        entry: std::time::Instant::now(),
         launch: Ok(host.launch()),
     };
 
@@ -1805,6 +1815,8 @@ async fn the_service_file_allowlist_decides_the_path_the_version_probe_runs_unde
                 release: None,
                 profiles_dir: None,
                 host_state_dir: None,
+                probe_budget: PROBE_BUDGET,
+                entry: std::time::Instant::now(),
                 launch: Ok(launch),
             },
             &HostInspector::new(),
@@ -1849,6 +1861,8 @@ fn an_unreadable_service_file_refuses_the_plan() {
             release: None,
             profiles_dir: None,
             host_state_dir: None,
+            probe_budget: PROBE_BUDGET,
+            entry: std::time::Instant::now(),
             launch: launch.map_err(|_detail| "the service file is unreadable".to_owned()),
         },
         &HostInspector::new(),
@@ -2131,4 +2145,295 @@ fn a_malformed_resume_line_with_a_removal_field_is_not_a_removal_intent() {
     assert_eq!(skipped.verdict, Verdict::WouldLoseRecovery, "{skipped:?}");
     assert_eq!(skipped.code, CODE_RECORD_UNREADABLE, "{skipped:?}");
     assert!(report.at_risk().any(|session| session.session_id == "s-2"));
+}
+
+/// A stopped session of the served runtime, pinned to its official package,
+/// whose recovery launches `program`.
+fn stopped_served_line(session: &str, worker: &str, program: &Path) -> Value {
+    let mut line = served_session_line(session, worker);
+    line["runtime"]["state"] = json!("lost");
+    line["recovery"]["program"] = json!(program.to_string_lossy());
+    line
+}
+
+/// The verdict of the stopped session `session` in `report`.
+fn stopped_verdict_of<'a>(report: &'a PreflightReport, session: &str) -> (&'a Verdict, &'a str) {
+    let found = report
+        .stopped_sessions
+        .iter()
+        .find(|candidate| candidate.session_id == session)
+        .unwrap_or_else(|| {
+            panic!(
+                "no stopped verdict for {session}: {:?}",
+                report.stopped_sessions
+            )
+        });
+    (&found.verdict, found.code.as_str())
+}
+
+/// An agent that never answers its version probe, written as `bin/<name>`.
+fn hanging_agent(host: &Host, name: &str) -> PathBuf {
+    let agent = host.agent_path().join(name);
+    fs::write(&agent, "#!/bin/sh\n/bin/sleep 30\n").expect("write the hanging agent");
+    fs::set_permissions(&agent, fs::Permissions::from_mode(0o700)).expect("make it executable");
+    agent
+}
+
+#[tokio::test]
+async fn a_package_pinned_session_whose_root_is_missing_is_judged_through_the_restored_archive() {
+    let host = Host::serving().await;
+    let digest = official_digest(SERVED_RUNTIME);
+    fs::remove_dir_all(
+        installed_root(&host, &digest)
+            .parent()
+            .expect("the package directory"),
+    )
+    .expect("remove the root");
+    let release = host.env.root().join("release").join("runtime");
+    let catalog = official_runtimes::OfficialCatalog::new();
+    catalog.write_release(&release, &[SERVED_RUNTIME]);
+    let profiles = private_dir(host.env.config_home().join("pohunek").join("agents"));
+    let agent = host.agent_path().join(SERVED_RUNTIME);
+    host.write_store(&[stopped_served_line("s-1", "w-one", &agent)]);
+
+    let report = run_with(
+        &host.inputs(),
+        &release_options(&host, &release, &catalog, &profiles),
+        &HostInspector::new(),
+    );
+
+    let plan = report.runtimes.as_ref().expect("the release plan");
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(
+        stopped_verdict_of(&report, "s-1"),
+        (&Verdict::Adoptable, CODE_ADOPTABLE),
+        "{:?}",
+        report.stopped_sessions
+    );
+}
+
+#[tokio::test]
+async fn the_release_plan_judges_the_upgrade_only_when_the_binary_is_given_its_flag() {
+    let host = Host::serving().await;
+    // The claude root is gone: only the release plan restores it.
+    let digest = official_digest("claude");
+    fs::remove_dir_all(
+        installed_root(&host, &digest)
+            .parent()
+            .expect("the package directory"),
+    )
+    .expect("remove the root");
+    let mut line = built_in_line("claude", "s-1", "w-one");
+    line["runtime"]["state"] = json!("lost");
+    host.write_store(&[line]);
+    host.write_service(&default_allowlist());
+    // A daemon beside a release `runtime/` directory that ships claude.
+    let beside = host.env.root().join("release-bin");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&beside)
+        .expect("the release directory");
+    let daemon = beside.join("pohunekd");
+    fs::copy(bin_exe("pohunekd"), &daemon).expect("copy the daemon beside its release");
+    let catalog = official_runtimes::OfficialCatalog::new();
+    fs::write(
+        beside.join(package::ANCHOR_FILE_NAME),
+        catalog.anchor_bytes(),
+    )
+    .expect("write the trust anchor");
+    catalog.write_release(&beside.join(RELEASE_RUNTIME_DIR), &["claude"]);
+    let run = |flag: Option<&str>| -> PreflightReport {
+        let mut command = host.env.command(&daemon);
+        command.arg("upgrade-preflight");
+        command.args(flag);
+        let output = command.output().expect("run the daemon");
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice(&output.stdout).expect("the report")
+    };
+
+    // Without the flag (what a rollback runs) the installed packages decide.
+    let installed = run(None);
+    assert!(installed.runtimes.is_none(), "{:?}", installed.runtimes);
+    assert_ne!(stopped_verdict_of(&installed, "s-1").0, &Verdict::Adoptable);
+
+    let planned = run(Some(RELEASE_PLAN_FLAG));
+    assert!(planned.runtimes.is_some());
+    assert_eq!(
+        stopped_verdict_of(&planned, "s-1"),
+        (&Verdict::Adoptable, CODE_ADOPTABLE),
+        "{:?}",
+        planned.stopped_sessions
+    );
+}
+
+/// Several sessions whose probes all launch `agents`, one executable each.
+fn stopped_sessions_launching(host: &Host, agents: &[PathBuf]) {
+    let lines: Vec<Value> = agents
+        .iter()
+        .enumerate()
+        .map(|(index, agent)| {
+            stopped_served_line(&format!("s-{index:02}"), &format!("w-{index:02}"), agent)
+        })
+        .collect();
+    host.write_store(&lines);
+}
+
+#[tokio::test]
+async fn sessions_sharing_a_hanging_executable_are_probed_once_and_share_its_verdict() {
+    let host = Host::serving().await;
+    let agent = hanging_agent(&host, "hanging-shared");
+    stopped_sessions_launching(&host, &[agent.clone(), agent.clone(), agent.clone(), agent]);
+
+    let report = run_with(
+        &host.inputs(),
+        &PreflightOptions {
+            release: None,
+            profiles_dir: None,
+            host_state_dir: None,
+            probe_budget: Duration::from_secs(3),
+            entry: std::time::Instant::now(),
+            launch: Ok(host.launch()),
+        },
+        &HostInspector::new(),
+    );
+
+    let verdicts: Vec<&str> = report
+        .stopped_sessions
+        .iter()
+        .map(|session| session.code.as_str())
+        .collect();
+    assert_eq!(
+        verdicts, ["agent_runtime_unsupported"; 4],
+        "{:?}",
+        report.stopped_sessions
+    );
+    assert_eq!(report.at_risk().count(), 4);
+}
+
+#[tokio::test]
+async fn a_spent_probe_budget_judges_the_remaining_sessions_pessimistically() {
+    let host = Host::serving().await;
+    let mut agents: Vec<PathBuf> = (0..4)
+        .map(|index| hanging_agent(&host, &format!("hanging-{index}")))
+        .collect();
+    // Resolution runs no probe: a removed program is reported as resume
+    // refuses it, even after the budget is spent.
+    agents.push(host.agent_path().join("removed-agent"));
+    stopped_sessions_launching(&host, &agents);
+
+    let report = run_with(
+        &host.inputs(),
+        &PreflightOptions {
+            release: None,
+            profiles_dir: None,
+            host_state_dir: None,
+            probe_budget: Duration::from_secs(3),
+            entry: std::time::Instant::now(),
+            launch: Ok(host.launch()),
+        },
+        &HostInspector::new(),
+    );
+
+    // The first probe runs its full deadline; the budget left cuts the next one
+    // short, and nothing starts after it.
+    let verdicts: Vec<&str> = report
+        .stopped_sessions
+        .iter()
+        .map(|session| session.code.as_str())
+        .collect();
+    assert_eq!(
+        verdicts,
+        [
+            "agent_runtime_unsupported",
+            CODE_PROBE_BUDGET_EXHAUSTED,
+            CODE_PROBE_BUDGET_EXHAUSTED,
+            CODE_PROBE_BUDGET_EXHAUSTED,
+            "agent_binary_missing"
+        ],
+        "{:?}",
+        report.stopped_sessions
+    );
+    assert!(report
+        .stopped_sessions
+        .iter()
+        .all(|session| session.verdict == Verdict::WouldLoseRecovery));
+}
+
+#[tokio::test]
+async fn many_sessions_sharing_a_hanging_executable_complete_within_the_preflight_deadline() {
+    let host = Host::serving().await;
+    let agent = hanging_agent(&host, "hanging-process");
+    stopped_sessions_launching(&host, &vec![agent; 12]);
+    host.write_service(&default_allowlist());
+
+    let started = std::time::Instant::now();
+    let output = host
+        .env
+        .command(bin_exe("pohunekd"))
+        .arg("upgrade-preflight")
+        .output()
+        .expect("run pohunekd");
+    let elapsed = started.elapsed();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(elapsed < PREFLIGHT_TIMEOUT, "the run took {elapsed:?}");
+    let report: PreflightReport =
+        serde_json::from_slice(&output.stdout).expect("stdout is the report");
+    assert_eq!(report.stopped_sessions.len(), 12);
+    assert!(report
+        .stopped_sessions
+        .iter()
+        .all(|session| session.code == "agent_runtime_unsupported"));
+}
+
+#[tokio::test]
+async fn the_probe_deadline_counts_the_work_before_the_probes_from_the_entry_of_the_command() {
+    let host = Host::serving().await;
+    let agents: Vec<PathBuf> = (0..10)
+        .map(|index| hanging_agent(&host, &format!("slow-{index}")))
+        .collect();
+    stopped_sessions_launching(&host, &agents);
+    // Twelve seconds of the journal scan, the plan and the registry load passed
+    // before the first probe, as on a slow host.
+    let entry = std::time::Instant::now()
+        .checked_sub(Duration::from_secs(12))
+        .expect("the monotonic clock is older than the simulated entry");
+
+    let report = run_with(
+        &host.inputs(),
+        &PreflightOptions {
+            release: None,
+            profiles_dir: None,
+            host_state_dir: None,
+            entry,
+            probe_budget: PROBE_BUDGET,
+            launch: Ok(host.launch()),
+        },
+        &HostInspector::new(),
+    );
+
+    // The judgement ends inside the installer's deadline, and the probes that
+    // were left are judged pessimistically rather than run past the budget.
+    let elapsed = entry.elapsed();
+    assert!(
+        elapsed < PREFLIGHT_TIMEOUT,
+        "the judgement took {elapsed:?}"
+    );
+    let codes: Vec<&str> = report
+        .stopped_sessions
+        .iter()
+        .map(|session| session.code.as_str())
+        .collect();
+    assert_eq!(
+        report.at_risk().count(),
+        10,
+        "{:?}",
+        report.stopped_sessions
+    );
+    assert_eq!(
+        codes.last(),
+        Some(&CODE_PROBE_BUDGET_EXHAUSTED),
+        "{codes:?}"
+    );
+    assert!(codes.contains(&CODE_PROBE_BUDGET_EXHAUSTED), "{codes:?}");
 }

@@ -26,9 +26,12 @@
 
 // Rust guideline compliant 2026-10-12
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use pohunek_service_config::preflight::{
     PreflightReport, SessionVerdict, StoreReport, StoreState, Verdict, CODE_ADOPTABLE,
@@ -43,11 +46,13 @@ use pohunek_service_config::preflight::{
 };
 use tracing::warn;
 
+use pohunek_service_config::preflight::{CODE_PROBE_BUDGET_EXHAUSTED, PROBE_BUDGET};
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, Refusal, CODE_RUNTIME_PLAN_UNAVAILABLE,
     CODE_SERVICE_CONFIG_UNREADABLE, ENSURE_REPORT_VERSION,
 };
 use pohunek_worker_protocol::{negotiate, BaseEnv, Version, VersionRange, SUPPORTED_RANGE};
+use protocol::{BindingProvenance, ProtocolError};
 
 use super::{
     import_worker_identities, import_worker_subagents, initial_input_orphaned,
@@ -56,10 +61,11 @@ use super::{
     JournalReject, WorkerJournalScan,
 };
 use crate::agent::host::{
-    validate_launch_runtime, BuiltinSource, PackageSource, PackageStore, RuntimeDefinition,
-    RuntimeHost, Spawn,
+    validate_launch_runtime_with_timeout_detailed, BuiltinSource, PackageSource, PackageStore,
+    RuntimeDefinition, RuntimeHost, Spawn,
 };
-use crate::agent::ProfileRegistry;
+use crate::agent::{ProfileRegistry, ValidatedLaunchProgram};
+use crate::capabilities::LaunchValidationFailure;
 use crate::catalog_anchor::CatalogTrust;
 use crate::procwatch::ProcessInspector;
 use crate::runtime::environment::effective_variable;
@@ -109,6 +115,13 @@ pub struct PreflightOptions {
     /// The host-state directory the profile revision key is kept in. It is
     /// read, never created: a judgement compares revisions the daemon froze.
     pub host_state_dir: Option<PathBuf>,
+    /// The entry of the command. The probe deadline is `entry` plus
+    /// `probe_budget`, so the work before the probes counts against it.
+    pub entry: Instant,
+    /// The time the version probes of one judgement may spend, counted from
+    /// `entry`. A probe that would start at or after the deadline is judged
+    /// [`CODE_PROBE_BUDGET_EXHAUSTED`].
+    pub probe_budget: Duration,
     /// The launch environment of the installed daemon, or the reason the
     /// installed `service.toml` cannot be read. The integration homes are read
     /// with it and the version probe runs under it. An unreadable file refuses
@@ -122,6 +135,8 @@ impl Default for PreflightOptions {
             release: None,
             profiles_dir: None,
             host_state_dir: None,
+            entry: Instant::now(),
+            probe_budget: PROBE_BUDGET,
             launch: Ok(LaunchEnvironment::subprocess_default()),
         }
     }
@@ -197,10 +212,16 @@ pub fn run_with(
         Ok(launch) => launch.base().map_err(|error| error.to_string()),
         Err(detail) => Err(detail.clone()),
     };
+    let deadline = options
+        .entry
+        .checked_add(options.probe_budget)
+        .unwrap_or(options.entry);
+    let probes = ProbeLedger::new(deadline);
     let judging = Judging {
         runtimes: &runtimes,
         profiles: &profiles,
         base_env: &base_env,
+        probes: &probes,
     };
     let dry = Store::new(inputs.store_path.clone()).dry_run_migration();
     let (store, sessions, unmanaged_workers, stopped_sessions) = match dry {
@@ -782,6 +803,135 @@ struct Judging<'a> {
     profiles: &'a ProfileRegistry,
     /// The base environment, or the reason it cannot be built.
     base_env: &'a Result<BaseEnv, String>,
+    /// The version probes this judgement has run or may still run.
+    probes: &'a ProbeLedger,
+}
+
+/// The version probes of one judgement: the budget they share, and the outcome
+/// of each distinct probe, so an executable that stalls costs one probe however
+/// many sessions launch it.
+struct ProbeLedger {
+    deadline: Instant,
+    outcomes: RefCell<HashMap<ProbeKey, ProbeOutcome>>,
+}
+
+/// The outcome of a probe that finished: `Ok` when the executable passes, or
+/// the refusal's code and detail.
+type ProbeOutcome = Result<(), (String, String)>;
+
+/// What one probe ran against: the program as the launch names it, the `PATH`
+/// it runs under, and the executable of the package whose probe it is.
+#[derive(PartialEq, Eq, Hash)]
+struct ProbeKey {
+    program: String,
+    launch_path: Option<OsString>,
+    probed: String,
+}
+
+impl ProbeLedger {
+    fn new(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            outcomes: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// The time left before the probe deadline, as of now.
+    fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+}
+
+/// The outcome of the version probe one session needs.
+enum Probe {
+    /// The executable passes the probe of its runtime.
+    Supported,
+    /// The executable does not pass: resume refuses it with `code`.
+    Refused { code: String, detail: String },
+    /// The probe budget is spent before this probe could finish.
+    BudgetExhausted,
+}
+
+/// Runs the version probe of `program` under `launch_path` for `definition`,
+/// as resume validates the program it relaunches, unless the same probe
+/// already has an outcome in `ledger` or the budget is spent.
+fn run_probe(
+    definition: &RuntimeDefinition,
+    program: &str,
+    launch_path: Option<&OsStr>,
+    ledger: &ProbeLedger,
+) -> Probe {
+    let key = ProbeKey {
+        program: program.to_owned(),
+        launch_path: launch_path.map(OsStr::to_os_string),
+        probed: probed_identity(definition),
+    };
+    if let Some(outcome) = ledger.outcomes.borrow().get(&key) {
+        return match outcome {
+            Ok(()) => Probe::Supported,
+            Err((code, detail)) => Probe::Refused {
+                code: code.clone(),
+                detail: detail.clone(),
+            },
+        };
+    }
+    // Resolution alone runs no probe, so only a declared probe waits on the
+    // budget; a program that does not resolve is refused as resume refuses it.
+    let remaining = ledger.remaining();
+    if definition.version_probe_parser().is_some() && remaining.is_zero() {
+        if ValidatedLaunchProgram::resolve(program).is_none() {
+            let error = ProtocolError::agent_binary_missing(&reported_program(definition, program));
+            return Probe::Refused {
+                code: error.code,
+                detail: error.msg,
+            };
+        }
+        return Probe::BudgetExhausted;
+    }
+    let result = validate_launch_runtime_with_timeout_detailed(
+        definition,
+        Spawn::Program(program),
+        launch_path,
+        remaining,
+    );
+    let outcome = match result {
+        Ok(_) => Ok(()),
+        // Only a probe the shortened budget cut short is budget exhaustion; a
+        // probe that ran its full deadline is an executable that does not pass.
+        Err(LaunchValidationFailure::ProbeTimedOut) => return Probe::BudgetExhausted,
+        Err(LaunchValidationFailure::Missing) => {
+            let error = ProtocolError::agent_binary_missing(&reported_program(definition, program));
+            Err((error.code, error.msg))
+        }
+        Err(LaunchValidationFailure::Unsupported) => {
+            let error = ProtocolError::agent_runtime_unsupported();
+            Err((error.code, error.msg))
+        }
+    };
+    ledger.outcomes.borrow_mut().insert(key, outcome.clone());
+    match outcome {
+        Ok(()) => Probe::Supported,
+        Err((code, detail)) => Probe::Refused { code, detail },
+    }
+}
+
+/// What a probe of `definition` is keyed by beyond its program: the executable
+/// of the package that declares it.
+fn probed_identity(definition: &RuntimeDefinition) -> String {
+    match &definition.binding().provenance {
+        BindingProvenance::Package { package_digest, .. } => package_digest.as_str().to_owned(),
+        BindingProvenance::Builtin { .. } => format!("builtin:{}", definition.runtime_id()),
+    }
+}
+
+/// The name a missing-executable refusal reports for `program`: its file name,
+/// as the launch validation names it.
+fn reported_program(definition: &RuntimeDefinition, program: &str) -> String {
+    Path::new(program)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or_else(|| definition.runtime_id().as_str())
+        .to_owned()
 }
 
 /// Judges one live session record against the journals of its session.
@@ -1222,22 +1372,34 @@ fn judge_launch(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<Judg
         .then(|| effective_variable(base, profile_env.as_slice(), "PATH"))
         .flatten();
     let program = binding_program(binding, &definition);
-    let error = validate_launch_runtime(
+    match run_probe(
         &definition,
-        Spawn::Program(&program),
+        &program,
         launch_path.as_deref(),
-    )
-    .err()?;
-    Some((
-        Verdict::WouldLoseRecovery,
-        error.code.clone(),
-        format!(
-            "the agent the session launches from does not pass the version probe of its \
-             runtime ({}: {}), so resume and fork refuse it; install a supported release of the \
-             agent, or upgrade with --accept-runtime-loss",
-            error.code, error.msg
-        ),
-    ))
+        judging.probes,
+    ) {
+        Probe::Supported => None,
+        Probe::Refused { code, detail } => Some((
+            Verdict::WouldLoseRecovery,
+            code.clone(),
+            format!(
+                "the agent the session launches from does not pass the version probe of its \
+                 runtime ({code}: {detail}), so resume and fork refuse it; install a supported \
+                 release of the agent, or upgrade with --accept-runtime-loss"
+            ),
+        )),
+        Probe::BudgetExhausted => Some((
+            Verdict::WouldLoseRecovery,
+            CODE_PROBE_BUDGET_EXHAUSTED.to_owned(),
+            format!(
+                "the version probes of this upgrade's judgement used their total budget of {} \
+                 seconds before this session's agent was probed, so its recovery cannot be \
+                 verified; stop the agent that hangs its version probe, or upgrade with \
+                 --accept-runtime-loss",
+                PROBE_BUDGET.as_secs()
+            ),
+        )),
+    }
 }
 
 /// Every interaction with an adopted session needs its runtime source served.
