@@ -2189,7 +2189,11 @@ session gets a new worker generation.
 `--dry-run` computes its plan without changing anything. `--dry-run --detect` also
 plans every runtime of the release catalog for this platform whose program is on
 the daemon's search path, each with the reason `detected` (a runtime the host uses
-keeps its other reasons). `--detect` without `--dry-run` is a usage error. Its
+keeps its other reasons). `--detect` without `--dry-run` is a usage error. A host
+without an installed `service.toml` is planned with the launch environment `service
+install` gives its daemon: the default allowlist over the process environment. An
+existing service file that is unreadable or malformed still refuses, and a plain
+dry run still refuses a missing file. Its
 `gaps` list, one per runtime with `runtime`, `code` and a `detail` that names the
 one next step: `agent_not_on_search_path` (the program is not on the search path;
 the runtime is planned only when the host uses it), `config_home_missing` (the

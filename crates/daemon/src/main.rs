@@ -259,7 +259,7 @@ fn print_upgrade_preflight(release_plan: bool, entry: std::time::Instant) -> Exi
                 host_state_dir: Some(paths.state_dir.clone()),
                 probe_budget: PROBE_BUDGET,
                 entry,
-                launch: launch_environment(&paths),
+                launch: launch_environment(&paths, false),
             };
             let inspector = pohunek_daemon::procwatch::HostInspector::new();
             let report = upgrade_preflight::run_with(&inputs, &options, &inspector);
@@ -279,11 +279,19 @@ fn print_upgrade_preflight(release_plan: bool, entry: std::time::Instant) -> Exi
 
 /// The launch environment the installed daemon's `service.toml` configures,
 /// read as daemon startup reads it, or the reason it cannot be read.
-fn launch_environment(paths: &Paths) -> Result<LaunchEnvironment, String> {
-    LaunchEnvironment::from_service_file(
-        &paths.config_dir.join(pohunek_service_config::FILE_NAME),
-        EnvironmentSource::Process,
-    )
+///
+/// With `detect`, a host without an installed service file is planned with the
+/// environment `service install` gives its daemon: the default allowlist over
+/// the process environment. Setup previews before it installs the service, so
+/// that host is the normal case for the detection plan. Any other failure stays
+/// a refusal.
+fn launch_environment(paths: &Paths, detect: bool) -> Result<LaunchEnvironment, String> {
+    let path = paths.config_dir.join(pohunek_service_config::FILE_NAME);
+    if detect {
+        return LaunchEnvironment::from_service_file_if_present(&path, EnvironmentSource::Process)
+            .map(|environment| environment.unwrap_or_else(LaunchEnvironment::subprocess_default));
+    }
+    LaunchEnvironment::from_service_file(&path, EnvironmentSource::Process)
 }
 
 /// The release `runtime/` directory beside the running daemon executable.
@@ -339,7 +347,7 @@ fn ensure_runtimes(dry_run: bool, detect: bool) -> Result<EnsureReport, String> 
         catalog_trust: CatalogTrust::load_beside_executable(),
         dry_run,
         daemon_version: DAEMON_VERSION.to_owned(),
-        environment: launch_environment(&paths),
+        environment: launch_environment(&paths, detect),
     };
     if detect {
         return detect_official_runtimes(&inputs)

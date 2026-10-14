@@ -63,6 +63,13 @@ struct Host {
 
 impl Host {
     fn new() -> Self {
+        let host = Self::without_service();
+        host.write_service(&default_allowlist());
+        host
+    }
+
+    /// A host whose `service.toml` does not exist yet, as before `service install`.
+    fn without_service() -> Self {
         let env = TestEnv::new().expect("hermetic environment");
         let binary_dir = env.root().join("bin");
         fs::DirBuilder::new()
@@ -71,13 +78,11 @@ impl Host {
             .expect("the binary directory");
         let binary = binary_dir.join("pohunekd");
         fs::copy(bin_exe("pohunekd"), &binary).expect("copy the daemon beside its anchor");
-        let host = Self {
+        Self {
             env,
             catalog: OfficialCatalog::new(),
             binary,
-        };
-        host.write_service(&default_allowlist());
-        host
+        }
     }
 
     /// The installed service file the step reads its launch environment from.
@@ -1546,6 +1551,56 @@ fn a_default_home_with_a_trailing_slash_is_a_gap_and_does_not_shadow_a_profile_h
 #[test]
 fn a_default_home_with_a_double_slash_is_a_gap_and_does_not_shadow_a_profile_home() {
     assert_refused_default_spelling_does_not_shadow_profile("//");
+}
+
+#[test]
+fn a_fresh_host_without_a_service_file_is_planned_under_detect_and_creates_nothing() {
+    let host = Host::without_service();
+    host.publish(&["claude"]);
+    host.put_program("claude");
+    host.make_home(".claude");
+
+    let plan = host.detect_step();
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert!(plan.gaps.is_empty(), "{:?}", plan.gaps);
+    assert_eq!(plan.packages.len(), 1);
+    assert_eq!(plan.packages[0].runtime, "claude");
+    assert_eq!(plan.packages[0].reasons, [UseReason::Detected]);
+    assert!(
+        !host.service_path().exists(),
+        "the step installs no service file"
+    );
+    assert!(!host.plugins_dir().exists());
+    assert!(!host.store_path().exists());
+}
+
+#[test]
+fn a_fresh_host_without_a_service_file_still_refuses_a_plain_dry_run() {
+    let host = Host::without_service();
+    host.publish(&["claude"]);
+    host.put_program("claude");
+
+    let report = host.step(true);
+
+    assert_eq!(refusal_codes(&report), [CODE_SERVICE_CONFIG_UNREADABLE]);
+    assert!(report.packages.is_empty());
+    assert!(!host.plugins_dir().exists());
+}
+
+#[test]
+fn a_malformed_service_file_still_refuses_under_detect() {
+    let host = Host::new();
+    host.publish(&["claude"]);
+    host.put_program("claude");
+    fs::write(host.service_path(), "this is not a service file = [\n")
+        .expect("corrupt the service file");
+
+    let plan = host.detect_step();
+
+    assert_eq!(refusal_codes(&plan), [CODE_SERVICE_CONFIG_UNREADABLE]);
+    assert!(plan.packages.is_empty());
+    assert!(!host.plugins_dir().exists());
 }
 
 #[tokio::test]
