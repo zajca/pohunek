@@ -12,5 +12,9 @@
   refusal changes nothing.
 - An installed service of another version is a gap: `pohunek service upgrade`
   runs first. Setup never upgrades.
+- A Hermes home without the pohunek marker is a gap with its install command;
+  setup never picks its access policy. Gaps do not fail the verdict.
+- A plan that changes after the service install stops with the service
+  installed and nothing else changed; a re-run converges.
 - `pohunek setup config` and `pohunek setup completions` are unchanged; an
   existing config file is never overwritten.

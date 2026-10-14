@@ -119,10 +119,19 @@ upgrade of the release files. It runs in this order:
    before its first change.
 4. Apply: the packages are installed, enabled and selected, the profiles are
    pinned, and the hooks are installed in the homes that exist. A runtime
-   already served by another package is left untouched.
+   already served by another package is left untouched. A Hermes home without
+   the pohunek marker is a gap: setup does not choose a Hermes access policy
+   for you, so it names the `pohunek integration hermes install` command and
+   writes nothing into that home. A gap does not fail the run.
 5. Config: the missing config files are written and existing files are kept.
 6. Verdict: the plan is read again, every planned package must be present and
-   no hook may be pending, then the daemon's health and `doctor` run.
+   no hook may have failed, then the daemon's health and `doctor` run. Hook
+   gaps are listed, not failed.
+
+If the plan read after the service install differs from the preview, setup
+stops there. The output names the installed version and prefix; nothing else
+was changed. Fix the cause the output names and run `pohunek setup` again: it
+plans from the installed service and converges without reinstalling it.
 
 The run is refused with the hint `--yes` when it cannot ask: without a terminal
 and without `--yes`, or with `--json` and no `--yes`. The refusal changes

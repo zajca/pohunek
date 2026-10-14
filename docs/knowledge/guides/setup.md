@@ -161,6 +161,11 @@ terminal or with `--json` it needs `--yes`), and then installs the service and
 the packages, pins the profiles, installs the hooks of the homes that exist, and
 writes the missing config files. It never upgrades an installed service: a
 different installed version is a gap, and `pohunek service upgrade` runs first.
+A Hermes home without the pohunek marker is a gap that names the
+`pohunek integration hermes install` command; setup never chooses its access
+policy and never writes into it. If the plan read after the service install
+differs from the preview, setup stops with the service installed and nothing
+else changed, and a re-run converges.
 The subcommands are:
 
 - `pohunek setup config` writes a default `attach.conf` (the `pohunek attach`
