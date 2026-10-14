@@ -447,6 +447,9 @@ fn render_worktree_line(wt: &ProjectWorktree) -> String {
     if wt.locked {
         flags.push("locked".to_owned());
     }
+    if let Some(owner) = &wt.owner_session_id {
+        flags.push(format!("owner={owner}"));
+    }
     if let Some(session) = &wt.session_id {
         flags.push(format!("session={session}"));
     }
@@ -565,6 +568,7 @@ mod tests {
                     locked: false,
                     owned: false,
                     session_id: None,
+                    owner_session_id: None,
                 },
                 ProjectWorktree {
                     path: PathBuf::from("/data/worktrees/s-1-ui-feature"),
@@ -574,6 +578,7 @@ mod tests {
                     locked: false,
                     owned: true,
                     session_id: Some("s-1".to_owned()),
+                    owner_session_id: Some("s-1".to_owned()),
                 },
             ],
         };
@@ -583,7 +588,9 @@ mod tests {
         assert!(output.contains("worktrees (2):"));
         assert!(output.contains("/code/ui  main"));
         assert!(
-            output.contains("owned") && output.contains("session=s-1"),
+            output.contains("owned")
+                && output.contains("owner=s-1")
+                && output.contains("session=s-1"),
             "owned worktree with a live session must be flagged: {output}"
         );
     }

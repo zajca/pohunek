@@ -271,7 +271,7 @@ impl ProjectManager {
         // binding path / session path is the un-canonicalized join. Compare both
         // sides through `canonical_or_original` so a symlinked worktree-root (e.g.
         // a symlinked data dir) does not silently mis-mark ownership or sessions.
-        let owned: Vec<PathBuf> = self
+        let owned: Vec<(PathBuf, String)> = self
             .store
             .load_worktrees()
             .map_err(store_error)?
@@ -280,7 +280,7 @@ impl ProjectManager {
                 binding.status == WorktreeStatus::Active
                     && binding.project_id.as_deref() == Some(info.id.as_str())
             })
-            .map(|binding| canonical_or_original(&binding.path))
+            .map(|binding| (canonical_or_original(&binding.path), binding.session_id))
             .collect();
         // Each live session matches a worktree at its bound worktree path (worktree
         // session) or its cwd (in-place), canonicalized once here.
@@ -298,7 +298,10 @@ impl ProjectManager {
             .into_iter()
             .map(|raw| {
                 let canonical = canonical_or_original(&raw.path);
-                let owned = owned.contains(&canonical);
+                let owner_session_id = owned
+                    .iter()
+                    .find(|(path, _)| *path == canonical)
+                    .map(|(_, session_id)| session_id.clone());
                 let session_id = session_paths
                     .iter()
                     .find(|(_, paths)| paths.contains(&canonical))
@@ -309,8 +312,9 @@ impl ProjectManager {
                     head: raw.head,
                     bare: raw.bare,
                     locked: raw.locked,
-                    owned,
+                    owned: owner_session_id.is_some(),
                     session_id,
+                    owner_session_id,
                 }
             })
             .collect();
@@ -595,6 +599,7 @@ mod tests {
         assert_eq!(main.branch.as_deref(), Some("main"));
         assert!(!main.owned, "the main checkout is not a pohunek worktree");
         assert_eq!(main.session_id, None);
+        assert_eq!(main.owner_session_id, None);
 
         // rm → forgets the record; resolving it again is NotFound.
         assert!(pm.remove(&added.id).expect("remove"), "removed");
@@ -660,6 +665,7 @@ mod tests {
             .expect("feature worktree present");
         assert!(feature.owned, "pohunek owns the feature worktree");
         assert_eq!(feature.session_id.as_deref(), Some("s-1"));
+        assert_eq!(feature.owner_session_id.as_deref(), Some("s-1"));
     }
 
     #[test]

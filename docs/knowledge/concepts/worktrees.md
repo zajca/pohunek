@@ -21,6 +21,12 @@ touching the main checkout. They also make remote project sessions practical:
 the daemon resolves the project on the target host and creates the worktree in
 that host's filesystem.
 
+`pohunek project show <project> --json` lists the project's worktrees. A
+worktree Pohunek created carries `owned: true` and `owner_session_id`, the
+session it was created for, which stays after that session stops; `session_id`
+appears only while a live session runs in the worktree. The human output flags
+them as `owner=<id>` and `session=<id>`.
+
 Removing a project record never deletes the main repository. The project remove
 command has a separate `--prune-worktrees` option for worktrees Pohunek created;
 it does not remove unrelated worktrees.

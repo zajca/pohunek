@@ -2,8 +2,8 @@
 
 /**
  * One worktree of a project as seen live via `git worktree list --porcelain`,
- * enriched with pohunek's own view (whether it created the worktree, and whether
- * a live session runs in it).
+ * enriched with pohunek's own view (whether it created the worktree, for which
+ * session, and whether a live session runs in it).
  */
 export type ProjectWorktree = {
   /**
@@ -34,4 +34,9 @@ export type ProjectWorktree = {
    * The id of a live pohunek session running in this worktree, if any.
    */
   session_id?: string;
+  /**
+   * The id of the session pohunek created this worktree for, whether or not
+   * that session still runs. Absent when pohunek does not own the worktree.
+   */
+  owner_session_id?: string;
 };

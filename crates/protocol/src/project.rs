@@ -161,8 +161,8 @@ pub struct ProjectRemoveParams {
 }
 
 /// One worktree of a project as seen live via `git worktree list --porcelain`,
-/// enriched with pohunek's own view (whether it created the worktree, and whether
-/// a live session runs in it).
+/// enriched with pohunek's own view (whether it created the worktree, for which
+/// session, and whether a live session runs in it).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "ProjectWorktree.ts"))]
@@ -187,6 +187,11 @@ pub struct ProjectWorktree {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub session_id: Option<String>,
+    /// The id of the session pohunek created this worktree for, whether or not
+    /// that session still runs. Absent when pohunek does not own the worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub owner_session_id: Option<String>,
 }
 
 /// Result of `project.show`: the project plus its live worktrees.

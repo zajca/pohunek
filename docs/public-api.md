@@ -503,7 +503,7 @@ All params and result type names below refer to structs exported by
 | `notification.retention.prune` | `NotificationRetentionParams` or `null` | `NotificationRetentionResult` | Explicitly deletes records selected by retention filters, or reports matches when `dry_run` is true. Applied pruning may also compact the action log at the policy threshold. |
 | `project.list` | `ProjectListParams` or `null` | `Vec<ProjectInfo>` | Lists known projects on the target host. |
 | `project.add` | `ProjectAddParams` | `ProjectInfo` | Registers a host-local git project path. |
-| `project.show` | `ProjectShowParams` | `ProjectShowResult` | Shows a project plus live worktree state. |
+| `project.show` | `ProjectShowParams` | `ProjectShowResult` | Shows a project plus live worktree state. Each `ProjectWorktree` reports `owned` when pohunek created it; `owner_session_id` names the session it was created for and stays after that session stops; `session_id` names a live (non-terminal) session running in it. Each of the two ids is omitted, never `null`, when it does not apply: `owner_session_id` on a worktree pohunek does not own, `session_id` when no live session runs there. Clients older than `owner_session_id` ignore it. |
 | `project.rename` | `ProjectRenameParams` | `ProjectInfo` | Sets a custom display label. |
 | `project.remove` | `ProjectRemoveParams` | `ProjectRemoveResult` | Removes a project record and optionally owned worktrees. |
 | `project.prompt` | `ProjectPromptParams` | `ProjectPromptResult` | Resolves a prompt template without rendering it. |
