@@ -11642,11 +11642,51 @@ handler = "codex-hook-v1"
             fixture_over(inspector, worker_initialize, ScriptedSupervisor::scripted())
         }
 
+        /// A [`fixture`] whose supervision retries run on the short test
+        /// delay, for scenarios that wait for a background retry pass.
+        fn fixture_retrying(inspector: Arc<dyn ProcessInspector>) -> Fixture {
+            fixture_over_retrying(
+                inspector,
+                None,
+                ScriptedSupervisor::scripted(),
+                crate::session::TEST_SUPERVISION_RETRY_INITIAL,
+            )
+        }
+
+        /// A [`fixture_with`] whose retries run on the short test delay.
+        fn fixture_with_retrying(
+            inspector: Arc<dyn ProcessInspector>,
+            worker_initialize: Option<Duration>,
+        ) -> Fixture {
+            fixture_over_retrying(
+                inspector,
+                worker_initialize,
+                ScriptedSupervisor::scripted(),
+                crate::session::TEST_SUPERVISION_RETRY_INITIAL,
+            )
+        }
+
         /// A [`fixture_with`] whose jobs are managed by `supervisor`.
         fn fixture_over(
             inspector: Arc<dyn ProcessInspector>,
             worker_initialize: Option<Duration>,
             supervisor: ScriptedSupervisor,
+        ) -> Fixture {
+            fixture_over_retrying(
+                inspector,
+                worker_initialize,
+                supervisor,
+                crate::session::supervision::SUPERVISION_RETRY_INITIAL,
+            )
+        }
+
+        /// A [`fixture_over`] whose supervision retries start after
+        /// `supervision_retry_initial`.
+        fn fixture_over_retrying(
+            inspector: Arc<dyn ProcessInspector>,
+            worker_initialize: Option<Duration>,
+            supervisor: ScriptedSupervisor,
+            supervision_retry_initial: Duration,
         ) -> Fixture {
             let root = temp_root();
             let runtime_root = root.join("runtime/workers");
@@ -11676,6 +11716,7 @@ handler = "codex-hook-v1"
                     worker_state_root: Some(state_root),
                     worker_connect_deadline: Duration::from_millis(300),
                     supervision: Some(supervision),
+                    supervision_retry_initial,
                     log_dir: Some(root.join("logs")),
                     ..SessionRegistryConfig::default()
                 },
@@ -12651,7 +12692,7 @@ handler = "codex-hook-v1"
 
         #[tokio::test]
         async fn unavailable_supervisor_keeps_the_session_reconnecting_and_retries() {
-            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let fixture = fixture_retrying(Arc::new(RetryInspector::default()));
             let marked = Marked::spawn("runtime-s-309");
             persist_record(&fixture.root, "s-309", Some("runtime-s-309"));
             write_live_journal(
@@ -12893,7 +12934,7 @@ handler = "codex-hook-v1"
 
         #[tokio::test]
         async fn abandoned_create_settled_by_a_retry_leaves_the_registry() {
-            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let fixture = fixture_retrying(Arc::new(RetryInspector::default()));
             let mut record = persist_record(&fixture.root, "s-316", None);
             record.runtime.worker_id = None;
             record.transaction = Some(crate::store::SessionTransaction {
@@ -13075,7 +13116,8 @@ handler = "codex-hook-v1"
         async fn abandoned_create_waits_for_an_unavailable_supervisor() {
             const INITIALIZE: Duration = Duration::from_secs(1);
 
-            let fixture = fixture_with(Arc::new(RetryInspector::default()), Some(INITIALIZE));
+            let fixture =
+                fixture_with_retrying(Arc::new(RetryInspector::default()), Some(INITIALIZE));
             persist_preparing_record(&fixture.root, "s-318");
             let id = service_id("s-318", TEST_GENERATION);
             fixture
@@ -13104,7 +13146,7 @@ handler = "codex-hook-v1"
 
         #[tokio::test]
         async fn ambiguous_generation_is_adopted_once_its_worker_is_reachable_again() {
-            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let fixture = fixture_retrying(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
             let (controller, worker_instance_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-319", "worker-s-319")
@@ -13172,7 +13214,7 @@ handler = "codex-hook-v1"
 
         #[tokio::test]
         async fn readopted_worker_is_watched_only_by_its_new_watchers() {
-            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let fixture = fixture_retrying(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
             let (controller, worker_instance_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-350", "worker-s-350")
@@ -13774,8 +13816,9 @@ handler = "codex-hook-v1"
         #[tokio::test]
         async fn replayed_removal_keeps_its_intent_until_the_sweep_is_confirmed() {
             let inspector = Arc::new(RetryInspector::default());
-            let fixture =
-                fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
+            let fixture = fixture_retrying(
+                Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>
+            );
             let runtime_root = fixture.root.join("runtime/workers");
             let (controller, worker_instance_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-382", "worker-s-382")
@@ -14097,11 +14140,14 @@ handler = "codex-hook-v1"
 
         /// A fixture whose marker reads fail until the returned inspector
         /// is told otherwise; the process table is the readable host view.
+        /// A fixture whose unreadable markers stay unreadable until the test
+        /// clears them, with retries on the short test delay.
         fn unreadable_marker_fixture() -> (Fixture, Arc<RetryInspector>) {
             let inspector = Arc::new(RetryInspector::default());
             inspector.fail_markers(true);
-            let fixture =
-                fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
+            let fixture = fixture_retrying(
+                Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>
+            );
             (fixture, inspector)
         }
 
@@ -14362,7 +14408,7 @@ handler = "codex-hook-v1"
 
         #[tokio::test]
         async fn ambiguous_generation_whose_job_ends_becomes_a_proven_crash() {
-            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let fixture = fixture_retrying(Arc::new(RetryInspector::default()));
             let marked = Marked::spawn("runtime-s-320");
             persist_record(&fixture.root, "s-320", Some("runtime-s-320"));
             write_live_journal(
@@ -14420,7 +14466,7 @@ handler = "codex-hook-v1"
 
         #[tokio::test]
         async fn panicking_retry_pass_keeps_its_session_pending_and_the_loop_serving() {
-            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let fixture = fixture_retrying(Arc::new(RetryInspector::default()));
             for session_id in ["s-321", "s-322"] {
                 persist_record(&fixture.root, session_id, None);
                 write_live_journal(&fixture.root, session_id, dead_worker(), None);
@@ -14476,7 +14522,8 @@ handler = "codex-hook-v1"
         async fn panicking_abandoned_create_settlement_is_handed_to_the_retry() {
             const INITIALIZE: Duration = Duration::from_secs(30);
 
-            let fixture = fixture_with(Arc::new(RetryInspector::default()), Some(INITIALIZE));
+            let fixture =
+                fixture_with_retrying(Arc::new(RetryInspector::default()), Some(INITIALIZE));
             persist_preparing_record(&fixture.root, "s-323");
             let id = service_id("s-323", TEST_GENERATION);
             fixture
@@ -14524,7 +14571,7 @@ handler = "codex-hook-v1"
 
         #[tokio::test]
         async fn failed_journal_scan_is_ambiguous_until_a_scan_succeeds() {
-            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let fixture = fixture_retrying(Arc::new(RetryInspector::default()));
             let marked = Marked::spawn("runtime-s-330");
             persist_record(&fixture.root, "s-330", Some("runtime-s-330"));
             write_live_journal(
@@ -14562,7 +14609,7 @@ handler = "codex-hook-v1"
 
         #[tokio::test]
         async fn failed_runtime_root_enumeration_is_ambiguous_until_it_succeeds() {
-            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let fixture = fixture_retrying(Arc::new(RetryInspector::default()));
             let marked = Marked::spawn("runtime-s-331");
             persist_record(&fixture.root, "s-331", Some("runtime-s-331"));
             write_live_journal(
@@ -14602,7 +14649,8 @@ handler = "codex-hook-v1"
         async fn abandoned_create_is_not_settled_while_its_journals_cannot_be_scanned() {
             const INITIALIZE: Duration = Duration::from_millis(500);
 
-            let fixture = fixture_with(Arc::new(RetryInspector::default()), Some(INITIALIZE));
+            let fixture =
+                fixture_with_retrying(Arc::new(RetryInspector::default()), Some(INITIALIZE));
             persist_preparing_record(&fixture.root, "s-332");
             let id = service_id("s-332", TEST_GENERATION);
             fixture
@@ -16283,7 +16331,13 @@ handler = "codex-hook-v1"
         /// initial delay, however far the backoff of the others has grown.
         #[tokio::test(start_paused = true)]
         async fn a_session_scheduled_later_is_rechecked_after_the_initial_delay() {
-            let fixture = fixture(Arc::new(RetryInspector::default()));
+            // Pins the production delay: this scenario checks the schedule itself.
+            let fixture = fixture_over_retrying(
+                Arc::new(RetryInspector::default()),
+                None,
+                ScriptedSupervisor::scripted(),
+                crate::session::supervision::SUPERVISION_RETRY_INITIAL,
+            );
             let record = persist_record(&fixture.root, "s-5280", None);
             assert!(
                 fixture
@@ -16721,6 +16775,16 @@ handler = "codex-hook-v1"
             })
         }
 
+        /// A [`fixture`] whose supervision retries run on the short test delay.
+        fn fixture_retrying(connect: Duration) -> Fixture {
+            fixture_over_retrying(
+                connect,
+                Workload::Held,
+                |_root| Arc::new(ReadableHost::new()),
+                crate::session::TEST_SUPERVISION_RETRY_INITIAL,
+            )
+        }
+
         /// What the PTY of a fixture runs: a hangup-ignoring descendant that
         /// records its PID, and the main process that stays alive beside it.
         #[derive(Clone, Copy)]
@@ -16764,6 +16828,22 @@ handler = "codex-hook-v1"
             workload: Workload,
             host: impl FnOnce(&std::path::Path) -> Arc<dyn ProcessInspector>,
         ) -> Fixture {
+            fixture_over_retrying(
+                connect,
+                workload,
+                host,
+                crate::session::supervision::SUPERVISION_RETRY_INITIAL,
+            )
+        }
+
+        /// A [`fixture_over`] whose supervision retries start after
+        /// `supervision_retry_initial`.
+        fn fixture_over_retrying(
+            connect: Duration,
+            workload: Workload,
+            host: impl FnOnce(&std::path::Path) -> Arc<dyn ProcessInspector>,
+            supervision_retry_initial: Duration,
+        ) -> Fixture {
             let root = temp_root();
             let inspector = host(&root);
             let environment = SubprocessWorkerEnvironment {
@@ -16791,6 +16871,7 @@ handler = "codex-hook-v1"
                     worker_state_root: Some(root.join("s/pohunek/workers")),
                     worker_connect_deadline: connect,
                     supervision: Some(supervision),
+                    supervision_retry_initial,
                     ..SessionRegistryConfig::default()
                 },
                 Arc::clone(&supervisor) as Arc<dyn crate::runtime::WorkerLauncher>,
@@ -17034,7 +17115,7 @@ handler = "codex-hook-v1"
 
         #[tokio::test]
         async fn unavailable_manager_keeps_the_crashed_session_reconnecting_until_it_answers() {
-            let fixture = fixture(SHORT_CONNECT);
+            let fixture = fixture_retrying(SHORT_CONNECT);
             let (created, job, descendant) = fixture.create().await;
             fixture
                 .supervisor

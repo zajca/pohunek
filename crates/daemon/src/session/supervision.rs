@@ -997,7 +997,7 @@ impl SessionRegistry {
     /// create's worktree, binding, or record could not be removed. One task
     /// serves every pending session with a doubling delay bounded by
     /// [`SUPERVISION_RETRY_MAX`], which restarts from
-    /// [`SUPERVISION_RETRY_INITIAL`] whenever a session newly joins, so a new
+    /// `supervision_retry_initial` whenever a session newly joins, so a new
     /// session's first re-check is never delayed by the backoff of the ones
     /// already waiting; each pass classifies from fresh evidence and
     /// never kills while it stays ambiguous. The task stops when no session is
@@ -1020,8 +1020,9 @@ impl SessionRegistry {
         if start {
             let inner = Arc::downgrade(&self.inner);
             let shutdown = self.inner.daemon_shutdown.clone();
+            let initial = self.inner.config.supervision_retry_initial;
             tokio::spawn(async move {
-                run_supervision_retries(inner, shutdown).await;
+                run_supervision_retries(inner, shutdown, initial).await;
             });
         }
     }
@@ -1348,6 +1349,7 @@ impl SessionRegistry {
 async fn run_supervision_retries(
     inner: Weak<SessionRegistryInner>,
     shutdown: tokio_util::sync::CancellationToken,
+    initial: Duration,
 ) {
     let mut running = RunningGuard {
         inner: Weak::clone(&inner),
@@ -1368,13 +1370,13 @@ async fn run_supervision_retries(
             })
             .unwrap_or_default(),
     );
-    let mut delay = SUPERVISION_RETRY_INITIAL;
+    let mut delay = initial;
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return,
             () = tokio::time::sleep(delay) => {}
             () = wake.notified() => {
-                delay = SUPERVISION_RETRY_INITIAL;
+                delay = initial;
                 continue;
             }
         }

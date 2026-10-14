@@ -16645,7 +16645,11 @@ async fn launch_build_failure_with_a_failing_binding_store_is_compensated_by_the
 #[tokio::test]
 async fn failed_worktree_removal_is_retried_until_the_checkout_is_removable() {
     let daemon = RestartableDaemon::new("wt-remove-fail");
-    let registry = SessionRegistry::new(daemon.without_shell());
+    // The retry loop is parked at its pass barrier between the explicit
+    // assertions, so a short delay cannot run a pass out of order.
+    let mut config = daemon.without_shell();
+    config.supervision_retry_initial = super::TEST_SUPERVISION_RETRY_INITIAL;
+    let registry = SessionRegistry::new(config);
     let mut passes = retry_passes(&registry);
     let gate = hold_bound_create(&registry);
     let creating = tokio::spawn({

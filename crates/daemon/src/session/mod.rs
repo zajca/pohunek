@@ -484,6 +484,10 @@ pub struct SessionRegistryConfig {
     /// `None` disables session launch with `worker_backend_required`; there is
     /// no daemon-owned PTY fallback.
     pub supervision: Option<SupervisionConfig>,
+    /// First delay before re-reconciling sessions whose native supervisor was
+    /// unavailable. The delay doubles per pass up to the retry bound, and
+    /// restarts from this value whenever a session newly joins the retry.
+    pub supervision_retry_initial: Duration,
     /// Bound on how long [`SessionRegistry::drain_creates`] waits for the
     /// create transactions still running when daemon shutdown starts.
     /// Defaults to [`DEFAULT_CREATE_DRAIN_TIMEOUT`].
@@ -543,6 +547,7 @@ impl Default for SessionRegistryConfig {
             worker_state_root: None,
             worker_connect_deadline: DEFAULT_WORKER_CONNECT_DEADLINE,
             supervision: None,
+            supervision_retry_initial: supervision::SUPERVISION_RETRY_INITIAL,
             create_drain_timeout: DEFAULT_CREATE_DRAIN_TIMEOUT,
         }
     }
@@ -7244,6 +7249,12 @@ fn owned_test_worker_roots(
         .unwrap_or_else(|| state_base.join("state"));
     (runtime_root, state_root, owned)
 }
+
+/// Supervision retry delay of the scenarios that wait for a background retry
+/// pass. Other scenarios keep `SUPERVISION_RETRY_INITIAL`, so a retry cannot
+/// run inside their explicit steps.
+#[cfg(test)]
+const TEST_SUPERVISION_RETRY_INITIAL: Duration = Duration::from_millis(25);
 
 /// Supervision inputs for the in-process test launcher.
 ///
