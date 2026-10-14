@@ -720,7 +720,11 @@ impl SessionRegistry {
                 let config = reported_detector_config
                     .clone()
                     .unwrap_or_else(|| entry.default_detector_config.clone());
-                super::send_detector_config(entry, config);
+                // Reconfiguring restarts detection, so an agent whose
+                // configuration already runs keeps its detector state.
+                if entry.detector_config.borrow().config != config {
+                    super::send_detector_config(entry, config);
+                }
             }
             let mut changed = projected.any;
             if entry.info.subagents != subagents {
