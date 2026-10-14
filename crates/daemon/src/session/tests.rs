@@ -1550,14 +1550,6 @@ fn write_resume_agent_script(path: &std::path::Path, marker: &std::path::Path) {
     );
 }
 
-#[cfg(unix)]
-fn terminate_pid(pid: u32) {
-    let _ = pohunek_test_support::process_env::command("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .status();
-}
-
 pub(super) async fn wait_for_file_contains(path: &std::path::Path, needle: &str) -> String {
     wait_until(
         &format!("{} to contain {needle:?}", path.display()),
@@ -12662,6 +12654,12 @@ async fn legacy_harness_exit_during_daemon_shutdown_keeps_recovery_binding() {
         .create(resumable_params())
         .await
         .expect("create session");
+    // Captured while the child runs, so the cleanup below cannot signal a
+    // process that reused its PID after it exited.
+    let child = crate::procwatch::HostInspector::new()
+        .identity(created.pid)
+        .expect("inspect the session child")
+        .expect("the session child runs");
     let recorded = registry
         .report_as_root(native_report!(&registry;
             session_id: created.id.clone(),
@@ -12698,7 +12696,7 @@ async fn legacy_harness_exit_during_daemon_shutdown_keeps_recovery_binding() {
         .load_resume()
         .expect("load after shutdown exit");
     let _ = registry.stop(&created.id).await;
-    terminate_pid(created.pid);
+    crate::procwatch::scoped_host::kill_if_current(&crate::procwatch::HostInspector::new(), child);
 
     assert_eq!(
         persisted.len(),

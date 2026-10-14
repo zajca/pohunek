@@ -530,6 +530,36 @@ mod tests {
         crate::test_support::scoped_dir(&format!("pohunek-agent-test-{tag}-"))
     }
 
+    /// Set in a child process that runs one scenario in a fixture working
+    /// directory.
+    const FIXTURE_CWD_CHILD_VAR: &str = "POHUNEK_AGENT_TEST_FIXTURE_CWD_CHILD";
+
+    /// Runs the test `name` of this module in a child process whose working
+    /// directory is `cwd`.
+    ///
+    /// The working directory is process-wide, so changing it here would reach
+    /// every concurrently running test of this binary and the children they
+    /// spawn; the child owns it instead.
+    fn run_in_fixture_cwd(cwd: &Path, name: &str) {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                &format!("agent::tests::{name}"),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .current_dir(cwd)
+            .env(FIXTURE_CWD_CHILD_VAR, "1")
+            .output()
+            .expect("run the scenario in the fixture working directory");
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{name} failed in the fixture working directory: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn write_executable(dir: &Path, name: &str) -> PathBuf {
         let path = dir.join(name);
         fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write executable fixture");
@@ -609,9 +639,19 @@ mod tests {
         fs::create_dir(&relative_dir).expect("create relative bin");
         write_executable(&relative_dir, "hermes");
         write_executable(&cwd, "hermes");
-        let _cwd_guard = ProcessEnv::lock();
-        let old_cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&cwd).expect("enter fixture cwd");
+        run_in_fixture_cwd(
+            &cwd,
+            "relative_path_entries_are_not_searched_from_the_fixture_cwd",
+        );
+    }
+
+    /// Child half of [`validated_program_refuses_relative_and_empty_path_entries`],
+    /// run with the fixture as its working directory.
+    #[test]
+    fn relative_path_entries_are_not_searched_from_the_fixture_cwd() {
+        if std::env::var_os(FIXTURE_CWD_CHILD_VAR).is_none() {
+            return;
+        }
         let results = [
             // A relative entry, an empty entry (the working directory), and `.`
             // are never searched; neither is a relative program path.
@@ -624,7 +664,6 @@ mod tests {
                 Some(OsStr::new("/usr/bin")),
             ),
         ];
-        std::env::set_current_dir(old_cwd).expect("restore cwd");
         for (index, result) in results.iter().enumerate() {
             assert!(result.is_none(), "case {index}: {result:?}");
         }
@@ -798,9 +837,17 @@ mod tests {
         fs::create_dir(&relative_dir).expect("create bin");
         write_executable(&relative_dir, "agent");
         write_executable(&cwd, "agent");
+        run_in_fixture_cwd(&cwd, "relative_programs_are_refused_from_the_fixture_cwd");
+    }
+
+    /// Child half of [`the_launch_path_refuses_relative_programs_and_path_entries`],
+    /// run with the fixture as its working directory.
+    #[test]
+    fn relative_programs_are_refused_from_the_fixture_cwd() {
+        if std::env::var_os(FIXTURE_CWD_CHILD_VAR).is_none() {
+            return;
+        }
         let mut env = ProcessEnv::lock();
-        let old_cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&cwd).expect("enter fixture cwd");
         let refused = [
             ("bin", "agent"),
             ("", "agent"),
@@ -815,7 +862,6 @@ mod tests {
                 which_executable(program).is_none(),
             )
         });
-        std::env::set_current_dir(old_cwd).expect("restore cwd");
         for (index, (launch, probe)) in refused.iter().enumerate() {
             assert!(*launch && *probe, "case {index}");
         }
