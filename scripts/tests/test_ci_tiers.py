@@ -2,6 +2,8 @@
 
 from pathlib import Path
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -42,9 +44,14 @@ MACOS_PATH_OWNERSHIP = {
             "crates/netbird/**",
             "crates/overlay/**",
             "crates/prompt/**",
+            "crates/assistant/**",
+            "crates/package/**",
             "scripts/acceptance/**",
             "scripts/dev-bootstrap",
             "scripts/tests/test_dev_bootstrap.py",
+            "scripts/test-partitions",
+            ".config/nextest.toml",
+            ".github/actions/hermes-test-python/**",
             "crates/relay-client/**",
             "crates/relay-protocol/**",
             "docs/knowledge/**",
@@ -174,6 +181,31 @@ MACOS_PATH_OWNERSHIP = {
         },
     },
 }
+# macOS jobs that never run on a pull request, whatever their paths filter
+# matches: the main and nightly tiers run them unconditionally.
+MACOS_TIER_JOBS = {"macos-tier"}
+# The guard that keeps fork and Dependabot pull requests out of the release
+# rehearsal: their token cannot hold the scopes the called workflow declares.
+SAME_REPOSITORY_PR = (
+    "(github.event_name != 'pull_request' || "
+    "(github.event.pull_request.head.repo.full_name == github.repository && "
+    "github.actor != 'dependabot[bot]'))"
+)
+# macOS jobs of the reusable workflows `ci.yml` calls, by calling job. They
+# take macOS slots in a CI run like the jobs of `ci.yml` itself, so a pull
+# request starts them only through the caller's paths filter.
+MACOS_CALLED_JOBS = {
+    "release-rehearsal-build": {
+        "workflow": "release-build.yml",
+        "jobs": {"rehearsal-macos"},
+        "filter": "release_rehearsal",
+    },
+    "release-rehearsal": {
+        "workflow": "release-evidence.yml",
+        "jobs": {"consumer", "rows"},
+        "filter": "release_rehearsal",
+    },
+}
 
 
 def block(text: str, name: str, indent: int = 2) -> str:
@@ -189,8 +221,8 @@ def block(text: str, name: str, indent: int = 2) -> str:
     return match.group(1)
 
 
-def workflow_jobs() -> dict[str, str]:
-    jobs_text = CI.split("jobs:\n", 1)[1]
+def workflow_jobs(workflow: str = CI) -> dict[str, str]:
+    jobs_text = workflow.split("jobs:\n", 1)[1]
     matches = list(re.finditer(r"(?m)^  ([a-z][a-z0-9-]*):\n", jobs_text))
     return {
         match.group(1): jobs_text[
@@ -200,6 +232,24 @@ def workflow_jobs() -> dict[str, str]:
         ]
         for index, match in enumerate(matches)
     }
+
+
+def runner_matrix_may_use_macos(job: str) -> bool:
+    """Whether a job that runs on `matrix.runner` may place a leg on macOS.
+
+    Only the job's `strategy` block is read: a static runner value there that
+    names macOS counts, and so does any part of the matrix computed at run
+    time (`fromJSON`), whose legs cannot be known from the file.
+    """
+    if not re.search(r"(?m)^    runs-on: \$\{\{ matrix\.runner \}\}$", job):
+        return False
+    if not re.search(r"(?m)^    strategy:\n", job):
+        return False
+    strategy = block(job, "strategy", indent=4)
+    return bool(
+        re.search(r"(?m)^\s+(?:- )?runner: \[?[^\n]*macos", strategy)
+        or "fromJSON(" in strategy
+    )
 
 
 def filter_paths(name: str) -> set[str]:
@@ -384,7 +434,7 @@ class CiTierWorkflowTests(unittest.TestCase):
             if re.search(r"(?m)^    runs-on:.*macos", definition)
             or re.search(r"(?m)^    runs-on: \$\{\{ matrix\.runner \}\}", definition)
         }
-        self.assertEqual(discovered_macos_jobs, set(MACOS_PATH_OWNERSHIP))
+        self.assertEqual(discovered_macos_jobs, set(MACOS_PATH_OWNERSHIP) | MACOS_TIER_JOBS)
 
         for name, ownership in MACOS_PATH_OWNERSHIP.items():
             with self.subTest(job=name):
@@ -422,6 +472,81 @@ class CiTierWorkflowTests(unittest.TestCase):
                         "main-tier-only inputs must stay out of the PR filter inventory",
                     )
 
+    def test_called_workflows_start_macos_jobs_on_a_pull_request_only_through_their_filter(self):
+        jobs = workflow_jobs()
+        callers = {
+            name: re.search(r"(?m)^    uses: \./\.github/workflows/([a-z0-9-]+\.yml)$", definition)
+            for name, definition in jobs.items()
+        }
+        called = {name: match.group(1) for name, match in callers.items() if match is not None}
+        discovered = {}
+        for caller, workflow in called.items():
+            text = (ROOT / ".github" / "workflows" / workflow).read_text()
+            called_jobs = workflow_jobs(text)
+            macos = {
+                name
+                for name, definition in called_jobs.items()
+                if re.search(r"(?m)^    runs-on:.*macos", definition)
+                or re.search(r"(?m)^        os: \[.*macos.*\]$", definition)
+                or runner_matrix_may_use_macos(definition)
+            }
+            if macos:
+                discovered[caller] = {"workflow": workflow, "jobs": macos}
+        self.assertEqual(
+            discovered,
+            {
+                caller: {"workflow": entry["workflow"], "jobs": entry["jobs"]}
+                for caller, entry in MACOS_CALLED_JOBS.items()
+            },
+        )
+
+        for caller, entry in MACOS_CALLED_JOBS.items():
+            with self.subTest(caller=caller):
+                condition = re.search(r"(?m)^    if: \$\{\{ (.+) \}\}$", jobs[caller])
+                self.assertIsNotNone(condition, f"{caller} has no explicit tier condition")
+                assert condition is not None
+                # A fork or Dependabot pull request never starts the release
+                # rehearsal; the scenarios below are a same-repository PR.
+                self.assertIn(SAME_REPOSITORY_PR, condition.group(1))
+                expression = condition.group(1).replace(SAME_REPOSITORY_PR, "'same' == 'same'")
+                for filter_value, expected in (("true", True), ("false", False)):
+                    self.assertEqual(
+                        evaluate_condition(
+                            expression,
+                            event="pull_request",
+                            changes={entry["filter"]: filter_value},
+                        ),
+                        expected,
+                        f"{caller} on a pull request with {entry['filter']}={filter_value}",
+                    )
+                for event, tier in (("push", ""), ("schedule", ""), ("workflow_dispatch", "main")):
+                    self.assertTrue(
+                        evaluate_condition(
+                            expression,
+                            event=event,
+                            tier=tier,
+                            changes={entry["filter"]: "false"},
+                        ),
+                        f"{caller} on {event} {tier}",
+                    )
+
+    def test_main_and_nightly_only_macos_job_has_no_pull_request_branch(self):
+        jobs = workflow_jobs()
+        for name in MACOS_TIER_JOBS:
+            with self.subTest(job=name):
+                expression = re.search(r"(?m)^    if: \$\{\{ (.+) \}\}$", jobs[name])
+                self.assertIsNotNone(expression, f"{name} has no explicit tier condition")
+                assert expression is not None
+                self.assertNotIn("pull_request", expression.group(1))
+                self.assertNotIn("needs.", expression.group(1))
+                for required in ("github.event_name == 'schedule'", "github.event_name == 'push'"):
+                    self.assertIn(required, expression.group(1))
+                for tier in ("main", "nightly"):
+                    self.assertRegex(
+                        expression.group(1),
+                        rf"github.event_name == 'workflow_dispatch' && \(.*inputs\.tier == '{tier}'",
+                    )
+
     def test_a_pull_request_starts_a_macos_job_only_for_its_own_filter(self):
         # Every macOS job holds one of the five concurrent hosted macOS slots,
         # so on a pull request nothing but its own paths filter may start it
@@ -455,6 +580,122 @@ class CiTierWorkflowTests(unittest.TestCase):
                     self.assertTrue(evaluate_condition(
                         expression.group(1), event=event, tier=tier, result="skipped",
                     ))
+        # A job without a pull-request branch never starts on a pull request,
+        # whichever filters match and whatever the package selection produced.
+        for name in MACOS_TIER_JOBS:
+            expression = re.search(r"(?m)^    if: \$\{\{ (.+) \}\}$", jobs[name])
+            assert expression is not None
+            for result, outputs in selections:
+                for value in ("true", "false"):
+                    changes = {filter_name: value for filter_name in filter_names()}
+                    with self.subTest(job=name, selection=result, outputs=outputs, filters=value):
+                        self.assertFalse(evaluate_condition(
+                            expression.group(1), event="pull_request",
+                            changes=changes, result=result, outputs=outputs,
+                        ))
+            for event, tier in (("push", ""), ("schedule", ""), ("workflow_dispatch", "main"), ("workflow_dispatch", "nightly")):
+                with self.subTest(job=name, event=event, tier=tier):
+                    self.assertTrue(evaluate_condition(
+                        expression.group(1), event=event, tier=tier, result="skipped",
+                    ))
+
+
+def load_test_partitions():
+    """The `scripts/test-partitions` module, which has no `.py` suffix."""
+    path = str(ROOT / "scripts" / "test-partitions")
+    loader = importlib.machinery.SourceFileLoader("test_partitions_script", path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+class MacosLanePackageSetTests(unittest.TestCase):
+    """The macOS jobs build, lint and run exactly the package sets the runner checks."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.partitions = load_test_partitions()
+
+    @staticmethod
+    def packages(command: str) -> list[str]:
+        return re.findall(r"(?<= -p )[a-z][a-z0-9-]*", command)
+
+    def test_lane_lints_and_archives_exactly_the_lane_packages(self):
+        lane = workflow_jobs()["platform-contracts"]
+        clippy = [line for line in lane.splitlines() if "cargo clippy --locked -p" in line]
+        self.assertEqual(len(clippy), 1, "the lane lints in one clippy step")
+        archive = [line for line in lane.splitlines() if "cargo nextest archive --locked --profile macos" in line]
+        self.assertEqual(len(archive), 1)
+        # nextest runs no doctests; the lane runs them natively for the same set.
+        doctests = [line for line in lane.splitlines() if "cargo test --locked --doc -p" in line]
+        self.assertEqual(len(doctests), 1, "the lane runs its doctests in one step")
+        for command in (clippy[0], archive[0], doctests[0]):
+            with self.subTest(command=command):
+                packages = self.packages(command)
+                self.assertEqual(sorted(packages), sorted(self.partitions.LANE_PACKAGES))
+                self.assertEqual(len(set(packages)), len(packages))
+        self.assertNotIn("cargo check", lane)
+        self.assertEqual(
+            [line for line in lane.splitlines() if "cargo test" in line], doctests,
+            "doctests are the only cargo test of the lane",
+        )
+        self.assertIn("check-macos --scope lane", lane)
+        self.assertRegex(lane, r"scripts/test-partitions .* run-macos\n")
+
+    def test_tier_archive_holds_every_macos_package_and_runs_only_the_tier(self):
+        tier = workflow_jobs()["macos-tier"]
+        archive = [line for line in tier.splitlines() if "cargo nextest archive --locked --profile macos" in line]
+        self.assertEqual(len(archive), 1)
+        packages = self.packages(archive[0])
+        self.assertEqual(sorted(packages), sorted(self.partitions.MACOS_PACKAGES))
+        self.assertEqual(len(packages), 13)
+        self.assertIn("check-macos --scope all", tier)
+        self.assertIn("run-macos-tier", tier)
+        self.assertNotIn("cargo test", tier)
+
+    def test_macos_lane_archive_and_tier_archive_use_the_checked_selections(self):
+        self.assertEqual(
+            self.partitions.MACOS_SCOPES["lane"][1],
+            self.partitions.LANE_SET,
+        )
+        self.assertEqual(
+            self.partitions.MACOS_SCOPES["all"][1],
+            self.partitions.MACOS_SET,
+        )
+
+
+class HermesTestInterpreterActionTests(unittest.TestCase):
+    """Both native jobs get the Hermes test interpreter from one pinned composite."""
+
+    ACTION = ROOT / ".github" / "actions" / "hermes-test-python" / "action.yml"
+
+    def test_both_macos_jobs_use_the_composite_and_no_inline_copy(self):
+        for job in ("platform-contracts", "macos-tier"):
+            with self.subTest(job=job):
+                steps = job_steps(workflow_jobs()[job])
+                step = steps["Require the Hermes test interpreter"]
+                self.assertIn("        uses: ./.github/actions/hermes-test-python\n", step)
+                others = "".join(body for name, body in steps.items() if name != "Require the Hermes test interpreter")
+                self.assertNotIn("POHUNEK_PYTHON_BIN", others)
+                self.assertNotIn("uv python install", others)
+
+    def test_the_composite_installs_the_pinned_uv_and_exports_the_interpreter(self):
+        action = self.ACTION.read_text()
+        self.assertIn(
+            "uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0",
+            action,
+        )
+        self.assertIn('version: "0.9.28"', action)
+        self.assertIn("enable-cache: true", action)
+        self.assertIn("printf 'POHUNEK_PYTHON_BIN=%s\\n' \"$python_bin\" >> \"$GITHUB_ENV\"", action)
+
+    def test_the_composite_uses_only_commit_pinned_actions_and_is_in_the_lane_filter(self):
+        for use in re.findall(r"uses: (\S+)", self.ACTION.read_text()):
+            self.assertRegex(use, r"@[0-9a-f]{40}", use)
+        self.assertIn(".github/actions/hermes-test-python/**", filter_paths("macos"))
+        self.assertIn(".github/actions/hermes-test-python/**", MACOS_PATH_OWNERSHIP["platform-contracts"]["pr"])
 
 
 class RuntimePackageSelectionTests(unittest.TestCase):

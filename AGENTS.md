@@ -46,6 +46,9 @@ unrelated runbooks.
   with `11_universal_guidelines.md`.
 - **Gate execution:** use the [gates skill](.agents/skills/gates/SKILL.md),
   which follows the verification guide above.
+- **macOS native tests:** the `platform contracts (arm64)` lane runs from one
+  nextest archive, and `macOS tier packages (arm64)` runs on main and nightly
+  only; both are described in the verification guide's CI tiers section.
 
 For workspace layout and routine development commands, see
 [docs/development.md](docs/development.md). The canonical skills live under

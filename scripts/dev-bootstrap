@@ -290,8 +290,8 @@ SYSTEMD_SUITE_SELECTORS = word_list(
     f"`-p {package} --test {Path(file).stem}`" for package, file in SYSTEMD_SUITE_FILES
 )
 # The packages whose tests drive the real launchd `gui/<uid>` domain, with
-# those test files, in the order the CI job `platform contracts (arm64)` runs
-# them, each as `cargo test --locked -p <package>`.
+# those test files. The CI job `platform contracts (arm64)` runs them from its
+# nextest archive; a local run of each suite is `cargo test --locked -p <package>`.
 LAUNCHD_SUITE_FILES = (
     ("pohunek-platform", ("crates/platform/tests/launchd.rs",)),
     ("pohunek-daemon", ("crates/daemon/tests/supervised_lifecycle.rs",)),

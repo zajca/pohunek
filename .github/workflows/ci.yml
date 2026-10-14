@@ -115,6 +115,9 @@ jobs:
     if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && needs.changes.outputs.macos == 'true') }}
     needs: changes
     runs-on: macos-15
+    # The lane's test phase takes about 450 s on macos-15; the rest of the
+    # budget covers the toolchain, cache restore and a cold build.
+    timeout-minutes: 45
     env:
       # Compile against the oldest supported macOS SDK contract. Runtime
       # acceptance on macOS 14 remains an explicit release milestone.
@@ -148,90 +151,8 @@ jobs:
               sys.exit(f"dev-bootstrap --path native: os {doc['os']!r}, launchd-gui-domain {status!r}; expected Darwin and 'ok'")
           PY
 
-      # The Hermes integration tests in pohunek-cli stand in for the pinned
-      # runtime with a canonical Python >= 3.10 that imports `yaml` and passes
-      # the production runtime policy (crates/cli/src/hermes_integration/
-      # test_python.rs): owned by root or the runner user, no group/other write
-      # bit on the file or any ancestor. The hosted interpreters (setup-python
-      # framework builds, Homebrew) live in shared, group-writable trees and
-      # are not relocatable, so the step installs a relocatable standalone
-      # CPython with uv into a private directory this job owns and applies the
-      # same checks before exporting the path. PyYAML goes into that
-      # interpreter itself because a venv interpreter canonicalizes to the base
-      # binary and would lose its site-packages.
-      - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
-        with:
-          version: "0.9.28"
-          enable-cache: true
-
       - name: Require the Hermes test interpreter
-        shell: /bin/bash {0}
-        run: |
-          set -euo pipefail
-          uid="$(id -u)"
-          if stat -f '%u %Lp' / >/dev/null 2>&1; then
-            stat_fields() { stat -f '%u %Lp' "$1"; }
-          else
-            stat_fields() { stat -c '%u %a' "$1"; }
-          fi
-
-          # Mirrors validate_runtime/validate_safe_ancestors: owner is root or
-          # this user, and no group/other write bit unless a root-owned sticky
-          # directory. Prints every path so a rejection is self-diagnosing.
-          policy_violations=0
-          check_path() {
-            local path="$1" owner mode
-            read -r owner mode < <(stat_fields "$path")
-            printf '  %s uid=%s mode=%s\n' "$path" "$owner" "$mode"
-            if [[ "$owner" != "$uid" && "$owner" != 0 ]]; then
-              echo "  REJECT: owner uid $owner is neither $uid nor root: $path" >&2
-              policy_violations=1
-            fi
-            if (( (8#$mode & 8#022) != 0 )); then
-              if [[ -d "$path" && "$owner" == 0 && -k "$path" ]]; then
-                :
-              else
-                echo "  REJECT: group/other write bit (mode $mode): $path" >&2
-                policy_violations=1
-              fi
-            fi
-          }
-
-          private_root="$RUNNER_TEMP/hermes-test-python"
-          rm -rf "$private_root"
-          install -d -m 700 "$private_root"
-          private_root="$(cd "$private_root" && pwd -P)"
-          export UV_PYTHON_INSTALL_DIR="$private_root/install"
-          export UV_PYTHON_BIN_DIR="$private_root/bin-links"
-          install -d -m 700 "$UV_PYTHON_INSTALL_DIR" "$UV_PYTHON_BIN_DIR"
-          uv python install 3.12 --no-config
-          found="$(uv python find 3.12 --no-config --no-project --managed-python)"
-          python_bin="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$found")"
-          [[ "$python_bin" == "$private_root"/install/* ]] \
-            || { echo "resolved interpreter escapes the private install: $found -> $python_bin" >&2; exit 1; }
-          uv pip install --no-config --link-mode copy --python "$python_bin" --break-system-packages pyyaml==6.0.2
-          # Symlinks keep their targets' modes; only real entries are changed.
-          find "$private_root" -not -type l -exec chmod go-w {} +
-
-          echo "Hermes test interpreter candidate: $python_bin" >&2
-          resolved="$("$python_bin" -I -c 'import os, sys; print(os.path.realpath(sys.executable))')"
-          [[ "$resolved" == "$python_bin" ]] \
-            || { echo "interpreter is not canonical: $resolved != $python_bin" >&2; exit 1; }
-          prefix="$("$python_bin" -I -c 'import os, sys; print(os.path.realpath(sys.prefix))')"
-          [[ "$prefix" == "$private_root"/install/* ]] \
-            || { echo "interpreter prefix is outside the private install: $prefix" >&2; exit 1; }
-          path="$python_bin"
-          while :; do
-            check_path "$path"
-            [[ "$path" == / ]] && break
-            path="$(dirname "$path")"
-          done
-          (( policy_violations == 0 )) \
-            || { echo "Hermes test interpreter violates the runtime policy: $python_bin" >&2; exit 1; }
-          "$python_bin" -I -c 'import sys, yaml; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
-            || { echo "Hermes test interpreter lacks Python >= 3.10 with PyYAML: $python_bin" >&2; exit 1; }
-          printf 'POHUNEK_PYTHON_BIN=%s\n' "$python_bin" >> "$GITHUB_ENV"
+        uses: ./.github/actions/hermes-test-python
 
       - name: Install Rust toolchain
         uses: ./.github/actions/setup-rust
@@ -244,114 +165,173 @@ jobs:
           shared-key: platform-contracts
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Check shared platform contracts
-        run: cargo check --locked -p pohunek-platform --all-targets
-
-      # The launchd backend and its integration tests compile only on macOS,
-      # so the Linux clippy gate never sees them.
-      - name: Lint shared platform contracts
-        run: cargo clippy --locked -p pohunek-platform --all-targets -- -D warnings
-
-      # Covers the Darwin process backend: same-user facts, descendants, cwd,
-      # executable identity, controlling-terminal foreground groups, ownership
-      # markers, and the kqueue `NOTE_EXIT` watch. It also covers the Darwin
-      # peer backend: `LOCAL_PEERCRED` for the owner, `LOCAL_PEERPID` for the
-      # process id, and the `last_pid` drift that `Binding::revalidate` must
-      # reject. It also runs `tests/launchd.rs` against the runner's real
-      # `gui/<uid>` domain. Those paths exist only on a native runner, so this
-      # step is the only gate that executes them.
-      - name: Test shared platform contracts
-        run: cargo test --locked -p pohunek-platform
-
-      - name: Test APFS foreign-owner rejection
-        run: sudo env PATH="$PATH" RUSTUP_HOME="$HOME/.rustup" CARGO_HOME="$HOME/.cargo" CARGO_TARGET_DIR=/tmp/pohunek-platform-root-target TMPDIR=/tmp MACOSX_DEPLOYMENT_TARGET=14.0 RUSTFLAGS='-D warnings' cargo test --locked -p pohunek-platform filesystem::tests::apfs_foreign_owned_private_directory_is_rejected -- --ignored --exact
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-nextest
 
       - name: Verify native APFS test volume
         run: diskutil info / | grep -q 'Type (Bundle):.*apfs'
-
-      - name: Check shared path contracts
-        run: cargo check --locked -p pohunek-paths --all-targets
-
-      - name: Test shared path contracts
-        run: cargo test --locked -p pohunek-paths
-
-      # The private daemon-to-worker protocol carries no target-specific code,
-      # and the peer identity work in issue #98 must keep it that way: a check
-      # here fails the moment a platform assumption leaks into the wire crate.
-      - name: Check private worker protocol
-        run: cargo check --locked -p pohunek-worker-protocol --all-targets
-
-      # The durable session worker: its PTY readiness, attach ordering, output
-      # drain, and stop escalation. The whole crate runs here rather than a
-      # named subset, because there is no telling in advance which test catches
-      # a Darwin difference. launchd supervision stays with issue #100.
-      - name: Check session worker
-        run: cargo check --locked -p pohunek-session-worker --all-targets
-
-      - name: Test session worker
-        run: cargo test --locked -p pohunek-session-worker
-
-      # Prints the idle CPU and descriptor counts the resource test asserts on,
-      # so the native measurements are readable from the job log.
-      - name: Measure session worker resources
-        run: cargo test --locked -p pohunek-session-worker --test resources -- --nocapture
 
       # Issue #100: every launchd suite needs the logged-in GUI session's
       # `gui/<uid>` domain. Its absence is a hard failure, never a skip.
       - name: Require the launchd gui domain
         run: /bin/launchctl print "gui/$(id -u)" >/dev/null
 
-      - name: Check daemon, CLI, and service configuration
-        run: cargo check --locked -p pohunek-daemon -p pohunek-cli -p pohunek-service-config --all-targets
+      # Linux clippy never compiles the launchd backend or other
+      # `cfg(target_os = "macos")` code, so the lane lints it natively. The
+      # lint is not replaced by scripts/darwin-check, which runs --all-features.
+      # pohunek-worker-protocol must stay free of platform code (issue #98).
+      - name: Lint macOS lane packages
+        run: cargo clippy --locked -p pohunek-platform -p pohunek-paths -p pohunek-worker-protocol -p pohunek-session-worker -p pohunek-service-config -p pohunek-test-support -p pohunek-daemon -p pohunek-cli -p pohunek-hostcheck --all-targets -- -D warnings
 
-      - name: Lint daemon, CLI, worker, and service configuration
-        run: cargo clippy --locked -p pohunek-daemon -p pohunek-cli -p pohunek-session-worker -p pohunek-service-config -p pohunek-worker-protocol -p pohunek-paths --all-targets -- -D warnings
-
-      # Daemon and CLI integration tests spawn the real binaries by path, so
-      # build them even when an earlier suite failed.
-      - name: Build daemon, worker, and CLI binaries
+      # One archive holds the test binaries of the nine lane packages, and the
+      # binaries the tests spawn by path. The macos profile in
+      # .config/nextest.toml sets the thread count, retries and the launchd
+      # test group for the run below.
+      - name: Build macOS lane archive
         if: ${{ !cancelled() }}
-        run: cargo build --locked -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli --bins
+        run: cargo nextest archive --locked --profile macos -p pohunek-platform -p pohunek-paths -p pohunek-worker-protocol -p pohunek-session-worker -p pohunek-service-config -p pohunek-test-support -p pohunek-daemon -p pohunek-cli -p pohunek-hostcheck --archive-file "$RUNNER_TEMP/macos-lane.tar.zst"
 
-      - name: Test service configuration
-        # Independent suites: report each even when an earlier one failed.
+      # Fails when a lane test is absent from the archive or selected twice.
+      - name: Check macOS lane partition
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p pohunek-service-config
+        run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/macos-lane.tar.zst" check-macos --scope lane
 
-      # Daemon tests build their trusted roots and sockets under
-      # these fixture roots, so their Darwin contract is checked first.
-      - name: Test fixture roots
+      # Covers the Darwin process backend (same-user facts, descendants, cwd,
+      # controlling-terminal groups, the kqueue NOTE_EXIT watch), the Darwin peer
+      # backend (LOCAL_PEERCRED, LOCAL_PEERPID, and the last_pid drift that
+      # Binding::revalidate must reject), and the real gui/<uid> launchd suites.
+      # Those paths run only on a native runner.
+      # Independent of the check: the tests still run when the partition check fails.
+      - name: Run macOS lane tests
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p pohunek-test-support
+        run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/macos-lane.tar.zst" run-macos
 
-      - name: Test daemon
-        # Independent suites: report each even when an earlier one failed.
+      # nextest runs no doctests, so the lane packages' doc examples run here,
+      # natively, where their Darwin code paths are compiled.
+      - name: Run macOS lane doctests
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p pohunek-daemon
+        run: cargo test --locked --doc -p pohunek-platform -p pohunek-paths -p pohunek-worker-protocol -p pohunek-session-worker -p pohunek-service-config -p pohunek-test-support -p pohunek-daemon -p pohunek-cli -p pohunek-hostcheck
 
-      # The whole CLI suite runs natively, including the Hermes operator
-      # filesystem lifecycle of issue #96: its transaction tests in the library
-      # and the package-backed lifecycle scenarios of tests/hermes_package.rs,
-      # which install the Hermes package through a throwaway signed catalog.
-      # It also runs tests/workflow_launchd.rs, the workflow plugin units of
-      # issue #326 against the runner's real `gui/<uid>` domain.
-      - name: Test CLI
-        # Independent suites: report each even when an earlier one failed.
+      - name: Test APFS foreign-owner rejection
         if: ${{ !cancelled() }}
-        run: cargo test --locked -p pohunek-cli
-
-      - name: Check and lint host probes
-        if: ${{ !cancelled() }}
+        # The foreign-owned directory needs root. The lane's lib test binary is
+        # run from the archive extracted by the steps above, so no root-owned
+        # file is written under target/, which rust-cache saves.
+        shell: bash
         run: |
-          cargo check --locked -p pohunek-hostcheck --all-targets
-          cargo clippy --locked -p pohunek-hostcheck --all-targets -- -D warnings
+          set -euo pipefail
+          metadata="$PWD/target/nextest/binaries-metadata.json"
+          test -f "$metadata" || { echo "archive metadata missing: $metadata" >&2; exit 1; }
+          bin="$(python3 -I -c "
+          import json, os, sys
+          metadata, root = sys.argv[1], sys.argv[2]
+          summary = json.load(open(metadata))
+          target_dir = summary['rust-build-meta']['target-directory'].rstrip('/')
+          entry = summary['rust-binaries'].get('pohunek-platform')
+          if entry is None:
+              sys.exit('no pohunek-platform lib test binary in the archive metadata')
+          path = entry['binary-path']
+          # The archive records the build-time target directory; extraction
+          # places the binaries under <root>/target. Only that extracted copy
+          # is the binary this run built, so no other path is accepted.
+          if os.path.isabs(path):
+              if not path.startswith(target_dir + '/'):
+                  sys.exit(f'binary path {path} is outside the recorded target directory {target_dir}')
+              path = os.path.relpath(path, target_dir)
+          extracted = os.path.join(root, 'target', path)
+          if not os.path.isfile(extracted):
+              sys.exit(f'pohunek-platform lib test binary not extracted at {extracted}')
+          print(extracted)
+          " "$metadata" "$PWD")"
+          output="$RUNNER_TEMP/apfs-root-test.txt"
+          (cd "$PWD/crates/platform" && sudo env TMPDIR=/tmp "$bin" filesystem::tests::apfs_foreign_owned_private_directory_is_rejected --ignored --exact) | tee "$output"
+          # libtest exits 0 when the filter matches nothing, so require that
+          # exactly this one test ran and passed.
+          grep -qx 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]* filtered out; finished in .*' "$output" \
+            || { echo "the APFS root test did not run exactly once" >&2; exit 1; }
 
-      - name: Test host probes
+      - name: Summarize flaky tests
+        if: always()
+        run: python3 scripts/junit-flaky-summary --label "macos lane" target/nextest/macos/junit.xml
+
+      - name: Upload macOS lane test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-lane-junit
+          path: target/nextest/macos/junit.xml
+          if-no-files-found: warn
+
+  # The macOS packages the PR lane does not test (issue #361): their macOS-only
+  # test code runs here on main and nightly, never on a pull request.
+  macos-tier:
+    name: macOS tier packages (arm64)
+    # No pull_request branch: this job never starts on a pull request.
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) }}
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+      # mold is Linux-only: keep the default linker on macOS runners.
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify native runner architecture
+        shell: bash
+        run: test "$(uname -m)" = "arm64"
+
+      - name: Require the Hermes test interpreter
+        uses: ./.github/actions/hermes-test-python
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: macos-tier
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-nextest
+
+      # xtask's dependency_policy test reads the registry sources of the locked
+      # dependency graph, which an archive build does not fetch.
+      - name: Fetch locked crate sources
+        run: cargo fetch --locked
+
+      # Same contract as the lane: a launchd-backed test in these packages fails
+      # when the `gui/<uid>` domain is absent, and never skips.
+      - name: Require the launchd gui domain
+        run: /bin/launchctl print "gui/$(id -u)" >/dev/null
+
+      - name: Build macOS tier archive
+        run: cargo nextest archive --locked --profile macos -p pohunek-platform -p pohunek-paths -p pohunek-worker-protocol -p pohunek-session-worker -p pohunek-service-config -p pohunek-test-support -p pohunek-daemon -p pohunek-cli -p pohunek-hostcheck -p pohunek-client -p pohunek-netbird -p pohunek-package -p xtask --archive-file "$RUNNER_TEMP/macos-all.tar.zst"
+
+      # Covers all 13 macOS packages: the lane's nine and the tier's four.
+      - name: Check macOS partition
+        run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/macos-all.tar.zst" check-macos --scope all
+
+      - name: Run macOS tier tests
         if: ${{ !cancelled() }}
-        # A test waiting on a child process must fail with evidence, never hold
-        # the runner for hours.
-        timeout-minutes: 15
-        run: cargo test --locked -p pohunek-hostcheck
+        run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/macos-all.tar.zst" run-macos-tier
+
+      - name: Summarize flaky tests
+        if: always()
+        run: python3 scripts/junit-flaky-summary --label "macos tier" target/nextest/macos/junit.xml
+
+      - name: Upload macOS tier test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-tier-junit
+          path: target/nextest/macos/junit.xml
+          if-no-files-found: warn
 
   # Native Apple Silicon packaging (issue #104): the daemon archive is built
   # twice from the same commit and must come out byte-identical, its Mach-O
@@ -722,7 +702,8 @@ jobs:
             # manifest is included because these crates inherit workspace
             # package, dependency, and lint settings from it. The job also runs
             # the macOS contributor path (scripts/dev-bootstrap and its
-            # scenarios, issue #801).
+            # scenarios, issue #801), and the lane's nextest profile and runner
+            # (.config/nextest.toml, scripts/test-partitions, issue #361).
             macos:
               - 'Cargo.toml'
               - 'crates/platform/**'
@@ -742,9 +723,14 @@ jobs:
               - 'crates/netbird/**'
               - 'crates/overlay/**'
               - 'crates/prompt/**'
+              - 'crates/assistant/**'
+              - 'crates/package/**'
               - 'scripts/acceptance/**'
               - 'scripts/dev-bootstrap'
               - 'scripts/tests/test_dev_bootstrap.py'
+              - 'scripts/test-partitions'
+              - '.config/nextest.toml'
+              - '.github/actions/hermes-test-python/**'
               - 'crates/relay-client/**'
               - 'crates/relay-protocol/**'
               - 'docs/knowledge/**'

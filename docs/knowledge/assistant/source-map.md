@@ -189,7 +189,9 @@ Release packaging and contributor verification:
 - `crates/xtask/src/knowledge_log.rs` — `cargo xtask docs log fold|migrate` and
   the `knowledge-log` docs check.
 - `scripts/test-partitions` — disjoint unit/daemon/relay/cli/relay-db/heavy CI
-  shards and exhaustive inventory check. Heavy is the exact complement of the
+  shards and exhaustive inventory check, and the macOS lane selections
+  (`check-macos`, `run-macos`, `run-macos-tier`) that the `platform contracts
+  (arm64)` and `macOS tier packages (arm64)` jobs run from one archive. Heavy is the exact complement of the
   fast filter; relay heavy tests (`relay-db`, the only PostgreSQL fixture
   consumers) run in a CI job gated by a paths filter on relay-relevant files,
   so non-relay changes never start the Postgres service. The shards run from
