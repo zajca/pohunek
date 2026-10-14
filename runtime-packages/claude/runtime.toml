@@ -27,6 +27,10 @@ bracketed_paste = false
 submit_delay_ms = 150
 submit_delay_configurable = true
 text_policy = "unrestricted"
+# Claude enables bracketed paste before its prompt box accepts a paste and drops
+# pastes sent until the box renders, so the enable signal is not readiness: only
+# the rendered prompt box (detect rule `live_prompt_box`) shows that it reads input.
+ready = "screen_idle"
 
 [resume]
 supported = true

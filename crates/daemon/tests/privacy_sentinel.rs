@@ -781,18 +781,24 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
         .expect("make data directory private");
     std::fs::create_dir_all(&agents_dir).expect("create agents dir");
 
-    // Stub sentinel agent: answers the official package's version probe, or
-    // prints a terminal-output sentinel unrelated to any input, then echoes
-    // back whatever the daemon injects as the initial prompt, exactly as a
-    // real agent's terminal echo would. The managed
-    // child's environment carries only the profile's `env` plus the reserved
-    // `POHUNEK_*` handshake keys (RFC §22) — no `PATH` — so `cat` is invoked
-    // by absolute path rather than relying on `execvp` path resolution.
+    // Stub sentinel agent: answers the official package's version probe,
+    // enables bracketed paste and renders a Claude prompt box so the initial
+    // prompt is written once the agent is ready, prints a terminal-output
+    // sentinel unrelated to any input, then echoes back whatever the daemon
+    // injects as the initial prompt, exactly as a real agent's terminal echo
+    // would. The managed child's environment carries only the profile's `env`
+    // plus the reserved `POHUNEK_*` handshake keys (RFC §22) — no `PATH` — so
+    // `cat` is invoked by absolute path rather than relying on `execvp` path
+    // resolution.
+    //
+    // The prompt box is the `❯` line between two `─` rules (UTF-8 as octal
+    // escapes), the shape the Claude manifest's `live_prompt_box` matches.
+    let rule = "\\342\\224\\200".repeat(20);
     let script = agents_dir.join("stub-agent.sh");
     write_executable(
         &script,
         &format!(
-            "#!/bin/sh\n{}set -eu\nprintf '{OUTPUT}\\n'\nexec /bin/cat\n",
+            "#!/bin/sh\n{}set -eu\nprintf '\\033[?2004h{rule}\\r\\n\\342\\235\\257 \\r\\n{rule}\\r\\n'\nprintf '{OUTPUT}\\n'\nexec /bin/cat\n",
             official_runtimes::sh_version_answer("claude")
         ),
     );

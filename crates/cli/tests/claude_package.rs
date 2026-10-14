@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 use package::directory::build_directory_archive;
 use package::{read_archive, CatalogEntry, Limits, PackageDigest};
 use pohunek_daemon::agent::host::{
-    definition_from_archive, DefinitionError, DefinitionOrigin, HandlerId, LaunchProgram,
-    ProbeVersion, RuntimeDefinition, TranscriptParser,
+    definition_from_archive, DefinitionError, DefinitionOrigin, HandlerId, InputReadiness,
+    LaunchProgram, ProbeVersion, RuntimeDefinition, TranscriptParser,
 };
 use pohunek_daemon::agent::{NativeReferenceStrategy, SessionRef};
 use pohunek_daemon::catalog_anchor::CatalogTrust;
@@ -197,7 +197,7 @@ fn frame_bytes(title: Option<&str>, rows: &[String]) -> Vec<u8> {
     bytes
 }
 
-fn detector_for(manifest: &Manifest, now: Instant, columns: u16) -> Detector {
+fn detector_for(definition: &RuntimeDefinition, now: Instant, columns: u16) -> Detector {
     Detector::new(
         24,
         columns,
@@ -210,7 +210,8 @@ fn detector_for(manifest: &Manifest, now: Instant, columns: u16) -> Detector {
                 stable_visible_refresh: Duration::from_millis(800),
                 startup_grace: Duration::ZERO,
             },
-            manifest: Some(manifest.clone()),
+            manifest: Some(definition.manifest().as_ref().clone()),
+            input_readiness: definition.input_readiness(),
         },
     )
 }
@@ -224,7 +225,7 @@ fn transitions(
     columns: u16,
 ) -> Vec<ActivityTransition> {
     let started = Instant::now();
-    let mut detector = detector_for(definition.manifest(), started, columns);
+    let mut detector = detector_for(definition, started, columns);
     detector.feed(started, &frame_bytes(title, rows))
 }
 
@@ -244,7 +245,7 @@ fn screen_activity(
 /// The activity the manifest reads from the terminal title alone.
 fn title_activity(definition: &RuntimeDefinition, title: &str) -> Option<AgentActivity> {
     let started = Instant::now();
-    let mut detector = detector_for(definition.manifest(), started, 80);
+    let mut detector = detector_for(definition, started, 80);
     detector
         .feed(started, format!("\x1b]2;{title}\x07").as_bytes())
         .iter()
@@ -455,6 +456,11 @@ fn the_descriptor_declares_the_verified_claude_launch_contract() {
         definition.submit_delay_configurable(),
         "a daemon-configured submit delay replaces the descriptor's"
     );
+    assert_eq!(
+        definition.input_readiness(),
+        InputReadiness::ScreenIdle,
+        "the prompt box, not the bracketed-paste enable, shows readiness"
+    );
 
     assert_eq!(
         definition.native_reference_strategy(),
@@ -497,8 +503,8 @@ fn the_descriptor_declares_the_verified_claude_launch_contract() {
 }
 
 /// The package keeps every fact the built-in Claude descriptor of release
-/// v0.34.2 carries; only the manifest source, the version probe and the
-/// transcript tree, which that descriptor does not declare, differ.
+/// v0.34.2 carries; only the manifest source, the version probe, the transcript
+/// tree and the input readiness, which that descriptor does not declare, differ.
 #[test]
 fn the_package_descriptor_preserves_every_builtin_claude_fact() {
     let package = installed_definition();
@@ -537,9 +543,9 @@ fn the_package_descriptor_preserves_every_builtin_claude_fact() {
 
 /// The same facts as data: the package descriptor and the golden built-in
 /// descriptor are equal tables once the package version, the manifest
-/// reference, the version probe and the transcript tree, the fields that differ
-/// by design, are removed. The package version is above the golden's because
-/// the package manifest carries the #613 rules (see
+/// reference, the version probe, the transcript tree and the input readiness,
+/// the fields that differ by design, are removed. The package version is above
+/// the golden's because the package manifest carries the #613 rules (see
 /// [`the_package_manifest_file_is_the_golden_manifest_with_the_613_rules`]).
 #[test]
 fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
@@ -575,11 +581,29 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
         assert!(package.contains_key(section), "[{section}] is declared");
     }
     package.remove("transcripts");
+    // `ready` is the one key the package declares that v0.34.2 does not: the
+    // built-in Claude descriptor relied on the bracketed-paste enable signal.
+    let input = package
+        .get_mut("input")
+        .and_then(toml::Value::as_table_mut)
+        .expect("an [input] table");
+    assert_eq!(
+        input.remove("ready").as_ref().and_then(toml::Value::as_str),
+        Some("screen_idle"),
+        "Claude's prompt box is its only input readiness signal"
+    );
     let golden_text = golden_body(GOLDEN_DESCRIPTOR, BUILTIN_DESCRIPTOR);
     let golden: toml::Table = golden_text.parse().expect("the golden is TOML");
     assert!(
         !golden.contains_key("transcripts"),
         "v0.34.2 declares no transcript tree"
+    );
+    assert!(
+        golden
+            .get("input")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|input| !input.contains_key("ready")),
+        "v0.34.2 declares no input readiness"
     );
     assert_eq!(package, strip(golden, GOLDEN_PACKAGE_VERSION));
 }
@@ -954,7 +978,7 @@ fn a_streaming_reply_reads_working_from_its_title_and_turn_footer() {
             .unwrap_or_else(|| panic!("{} shows the reply", frame.name));
         reply.push('.');
         let started = Instant::now();
-        let mut detector = detector_for(definition.manifest(), started, frame.columns);
+        let mut detector = detector_for(&definition, started, frame.columns);
         let mut seen = detector.feed(started, &frame_bytes(Some(title), &frame.rows));
         seen.extend(detector.feed(started, &frame_bytes(None, &rerendered)));
         let published = seen.last().map(|transition| transition.activity);
@@ -1190,7 +1214,7 @@ fn the_permission_rules_read_the_options_of_a_visible_dialog() {
 /// without a title, built from the regions the detector renders for it.
 fn screen_rule(definition: &RuntimeDefinition, rows: &[String], columns: u16) -> Option<String> {
     let started = Instant::now();
-    let mut detector = detector_for(definition.manifest(), started, columns);
+    let mut detector = detector_for(definition, started, columns);
     detector.feed(started, &frame_bytes(None, rows));
     let context = detector
         .region_previews()

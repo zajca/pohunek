@@ -280,6 +280,32 @@ repeated `{version}`) fails package validation. A pre-release banner such as
 `codex-cli 0.161.0-rc.1` never matches, so the runtime reports unsupported.
 Verify the real banner of the runtime before declaring the template.
 
+## Declaring input readiness
+
+The `[input]` table may declare `ready`, the signal that shows the agent reads
+initial input. `session.new` writes its initial input only after that signal, or
+after the host's startup grace ends for a silent agent
+(`input.initial_startup_grace_ms` in `service.toml`).
+
+- `ready = "bracketed_paste"`, the default when the key is absent: the agent
+  enabled bracketed paste, or its screen shows an editable prompt or idle
+  evidence from the detection manifest.
+- `ready = "screen_idle"`: only the screen-sourced idle evidence of the
+  detection manifest counts. Declare it when the agent enables bracketed paste
+  before its input accepts a paste, so the enable signal arrives too early. The
+  Claude package declares it; its `live_prompt_box` rule is the evidence.
+
+A `screen_idle` session whose screen shows no readiness by the end of the grace
+fails `session.new` with `session_input_not_ready`, nothing is written, and the
+session is rolled back. The `[input]` table is parsed strictly: a daemon of
+release 0.34.x rejects a descriptor that carries `ready`, so a package with this
+key needs a daemon that knows it.
+
+A host profile over a `screen_idle` base may name a detection manifest override only if that
+override declares an idle rule on a screen region (for example `live_prompt_box`). An override with no
+such rule, such as `rules = []` or only working and blocked rules, is an `invalid_profile` error at
+profile load, so `doctor` reports it and no session is created from it.
+
 ## Versioning official packages
 
 The `version` of an official package's `runtime.toml` names its archive. Two

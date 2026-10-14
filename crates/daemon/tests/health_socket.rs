@@ -2586,6 +2586,17 @@ async fn session_input_to_an_agent_that_never_reads_fails_with_a_typed_stall() {
         .expect("server task joins");
 }
 
+/// Launcher for a fake agent that runs `script` under Python without a version
+/// probe. The profiles using it are based on `shell`, whose readiness is the
+/// bracketed-paste rule these tests exercise; a Claude base would require the
+/// prompt box, which the fake does not render.
+fn python_launcher(script: &Path) -> String {
+    format!(
+        "#!/bin/sh\nexec /usr/bin/python3 '{}' \"$@\"\n",
+        script.display()
+    )
+}
+
 /// Covers delayed reader startup while remaining below the configured
 /// five-second fallback.
 const INITIAL_READER_OBSERVATION_WINDOW: Duration = Duration::from_secs(3);
@@ -2658,20 +2669,16 @@ while True:
         warning_first = if warning_first { "True" } else { "False" },
         stale_mode_first = if stale_mode_first { "True" } else { "False" },
     );
-    std::fs::write(&script, fake_source).expect("write Claude reader script");
-    write_executable(
-        &fake,
-        &official_runtimes::python_agent_launcher("claude", &script),
-    );
+    std::fs::write(&script, fake_source).expect("write reader script");
+    write_executable(&fake, &python_launcher(&script));
     std::fs::write(
-        agents_dir.join("readerclaude.toml"),
+        agents_dir.join("readershell.toml"),
         format!(
-            "base = \"claude\"\n{}program = {}\n",
-            official_runtimes::profile_pin("claude"),
+            "base = \"shell\"\nprogram = {}\n",
             toml::Value::String(fake.display().to_string())
         ),
     )
-    .expect("write Claude reader profile");
+    .expect("write reader profile");
     let config_dir = socket.dir.join("config");
     std::fs::create_dir_all(config_dir.join("hooks")).expect("create session hook directory");
     let hook_started = socket.dir.join("hook-started");
@@ -2690,7 +2697,7 @@ while True:
 
     let mut client = connect(&socket).await;
     let mut params = session_params(&socket);
-    "readerclaude".clone_into(&mut params.agent);
+    "readershell".clone_into(&mut params.agent);
     params.input = Some("hello reader".to_owned());
     params.extended_input_ready_wait = Some(true);
     let mut create =
@@ -2716,7 +2723,7 @@ while True:
                     .expect("list running reader sessions");
             if let Some(session) = sessions
                 .iter()
-                .find(|session| session.agent == "readerclaude")
+                .find(|session| session.agent == "readershell")
             {
                 break session.id.clone();
             }
@@ -2878,15 +2885,11 @@ while True:
         ),
     )
     .expect("write silent reader script");
-    write_executable(
-        &fake,
-        &official_runtimes::python_agent_launcher("claude", &script),
-    );
+    write_executable(&fake, &python_launcher(&script));
     std::fs::write(
         agents_dir.join("silentreader.toml"),
         format!(
-            "base = \"claude\"\n{}program = {}\n",
-            official_runtimes::profile_pin("claude"),
+            "base = \"shell\"\nprogram = {}\n",
             toml::Value::String(fake.display().to_string())
         ),
     )
@@ -3085,6 +3088,247 @@ async fn claude_stub_session_publishes_screen_blocked_and_receives_plain_input()
     let _: SessionStopResult =
         serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
             .expect("stop result");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// How long a `session.new --input` for a Claude stub waits for a prompt box
+/// that the stub never renders. The stub enables bracketed paste at once, so
+/// the grace covers the window in which bracketed paste alone would have
+/// released the input under the old readiness rule, and it stays short so the
+/// refusal path finishes quickly.
+const CLAUDE_PROMPT_BOX_GRACE: Duration = Duration::from_millis(1_500);
+
+/// Prompt box the Claude stub renders, shaped like the idle screen in
+/// `compat/claude/screens/idle.txt`: a rule, the `❯` line, and a rule. The
+/// Claude manifest's `live_prompt_box` rule matches the `❯` line between the
+/// rules.
+const CLAUDE_PROMPT_BOX_SCREEN: &str = "\x1b[2J\x1b[H\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\r\n\u{276f} \r\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\r\n? for shortcuts\r\n";
+
+/// Writes a host profile `name` over the pinned official Claude package whose
+/// program is a launcher for `script`. A profile-backed launch writes the
+/// initial input once readiness is observed; an unprofiled `claude` launch
+/// passes the prompt as an argument (`prompt_arg`) and never waits.
+fn write_claude_profile(agents_dir: &Path, name: &str, script: &Path) {
+    let stub = agents_dir.join(format!("{name}-agent"));
+    write_executable(
+        &stub,
+        &official_runtimes::python_agent_launcher("claude", script),
+    );
+    std::fs::write(
+        agents_dir.join(format!("{name}.toml")),
+        format!(
+            "base = \"claude\"\n{}program = {}\n",
+            official_runtimes::profile_pin("claude"),
+            toml::Value::String(stub.display().to_string())
+        ),
+    )
+    .expect("write Claude stub profile");
+}
+
+/// A Claude stub that enables bracketed paste and never renders the prompt
+/// box records every byte it reads into `received`.
+fn claude_stub_without_prompt_box(script: &Path, received: &Path) {
+    std::fs::write(
+        script,
+        format!(
+            r#"import os
+import tty
+
+os.write(1, b"\x1b[?2004h")
+tty.setraw(0)
+with open({received:?}, "wb") as capture:
+    while True:
+        chunk = os.read(0, 4096)
+        if not chunk:
+            break
+        capture.write(chunk)
+        capture.flush()
+"#,
+            received = received.display().to_string(),
+        ),
+    )
+    .expect("write Claude stub without prompt box");
+}
+
+#[tokio::test]
+async fn claude_initial_input_is_not_sent_before_the_prompt_box_renders() {
+    let socket = temp_socket("claude-no-prompt");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let received = socket.dir.join("received.bin");
+    let script = socket.dir.join("claude-no-prompt.py");
+    claude_stub_without_prompt_box(&script, &received);
+    write_claude_profile(&agents_dir, "claudenoprompt", &script);
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        initial_input_startup_grace: CLAUDE_PROMPT_BOX_GRACE,
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+    let mut params = session_params(&socket);
+    "claudenoprompt".clone_into(&mut params.agent);
+    params.input = Some("hello Claude".to_owned());
+    let response = create_session_with_params(&mut control, params).await;
+    let error = err_payload(response);
+    assert_eq!(error.code, "session_input_not_ready");
+
+    let list = Request::make("claude-no-prompt-list", method::SESSION_LIST, Value::Null);
+    let sessions: Vec<SessionInfo> =
+        serde_json::from_value(ok_payload(exchange(&mut control, &list).await))
+            .expect("list sessions");
+    assert!(sessions.is_empty(), "the refused session was rolled back");
+    let captured = std::fs::read(&received).unwrap_or_default();
+    assert!(
+        captured.is_empty(),
+        "the stub received input before its prompt box rendered"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn claude_initial_input_is_delivered_once_the_prompt_box_renders() {
+    let socket = temp_socket("claude-prompt");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let received = socket.dir.join("received.bin");
+    let script = socket.dir.join("claude-prompt.py");
+    // Hex escapes keep the screen's bytes exact inside the Python literal.
+    let screen_hex = CLAUDE_PROMPT_BOX_SCREEN
+        .bytes()
+        .map(|byte| format!("\\x{byte:02x}"))
+        .collect::<Vec<_>>()
+        .concat();
+    std::fs::write(
+        &script,
+        format!(
+            r#"import os
+import tty
+
+os.write(1, b"\x1b[?2004h")
+os.write(1, b"{screen_hex}")
+tty.setraw(0)
+with open({received:?}, "wb") as capture:
+    while True:
+        chunk = os.read(0, 4096)
+        if not chunk:
+            break
+        capture.write(chunk)
+        capture.flush()
+"#,
+            received = received.display().to_string(),
+        ),
+    )
+    .expect("write Claude stub with prompt box");
+    write_claude_profile(&agents_dir, "claudeprompt", &script);
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+    let mut params = session_params(&socket);
+    "claudeprompt".clone_into(&mut params.agent);
+    params.input = Some("hello Claude".to_owned());
+    let created: SessionInfo = serde_json::from_value(ok_payload(
+        create_session_with_params(&mut control, params).await,
+    ))
+    .expect("claude session info");
+    let bytes = read_file_until(&received, b"hello Claude").await;
+    assert_eq!(
+        bytes
+            .windows(b"hello Claude".len())
+            .filter(|window| *window == b"hello Claude")
+            .count(),
+        1,
+        "the initial input is delivered exactly once"
+    );
+
+    let stop_req = Request::make(
+        "claude-prompt-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+            .expect("stop result");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// A Claude-based profile whose override manifest declares no idle rule on a
+/// screen region is refused at creation: the Claude base waits for screen
+/// readiness, which such a manifest can never report.
+#[tokio::test]
+async fn claude_profile_without_a_screen_idle_rule_is_refused_before_any_session() {
+    let socket = temp_socket("claude-profile-no-idle");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let manifests_dir = agents_dir.join("manifests");
+    std::fs::create_dir(&manifests_dir).expect("create manifests directory");
+    let script = socket.dir.join("claude-never-used.py");
+    claude_stub_without_prompt_box(&script, &socket.dir.join("received.bin"));
+    let variants = [
+        (
+            "blockedonly",
+            "[[rules]]\n\
+             id = \"custom-blocked\"\n\
+             state = \"blocked\"\n\
+             priority = 1\n\
+             region = \"whole_recent\"\n\
+             contains = \"custom blocker\"\n",
+        ),
+        ("emptyrules", "rules = []\n"),
+    ];
+    for (name, manifest) in variants {
+        std::fs::write(manifests_dir.join(format!("{name}.toml")), manifest)
+            .expect("write override manifest");
+        write_claude_profile(&agents_dir, name, &script);
+        let profile = agents_dir.join(format!("{name}.toml"));
+        let body = std::fs::read_to_string(&profile).expect("read profile");
+        std::fs::write(&profile, format!("{body}manifest = \"{name}\"\n"))
+            .expect("declare override manifest");
+    }
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+
+    for (name, _) in variants {
+        let mut params = session_params(&socket);
+        name.clone_into(&mut params.agent);
+        params.input = Some("hello Claude".to_owned());
+        let error = err_payload(create_session_with_params(&mut control, params).await);
+        assert_eq!(error.code, "invalid_profile", "profile {name}");
+        assert!(
+            error.msg.contains("input.ready = screen_idle"),
+            "profile {name} names the readiness rule: {}",
+            error.msg
+        );
+    }
+
+    let list = Request::make(
+        "claude-profile-no-idle-list",
+        method::SESSION_LIST,
+        Value::Null,
+    );
+    let sessions: Vec<SessionInfo> =
+        serde_json::from_value(ok_payload(exchange(&mut control, &list).await))
+            .expect("list sessions");
+    assert!(sessions.is_empty(), "no session was created");
 
     let _ = shutdown.send(());
     let _ = handle.await;

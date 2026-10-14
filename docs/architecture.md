@@ -1080,12 +1080,14 @@ Kandev's hard-won handling:
 A runtime package declares its input framing in the `[input]` table of its
 descriptor `runtime.toml`, next to its launch command, detection manifest and
 resume command: `bracketed_paste`, `submit_delay_ms`, `text_policy`
-(`unrestricted` or `hermes_safe_text`) and the optional
+(`unrestricted` or `hermes_safe_text`), the optional
 `submit_delay_configurable`, which lets a submit delay configured on the daemon
-for that runtime replace the declared one (for example
-`runtime-packages/claude/runtime.toml`). The daemon parses the table into the
-runtime definition (`crates/daemon/src/agent/host/definition.rs`), and the
-worker input plan below applies it.
+for that runtime replace the declared one, and the optional `ready`
+(`bracketed_paste` or `screen_idle`) that says which signal shows the agent
+reads initial input (for example `runtime-packages/claude/runtime.toml`). The
+daemon parses the table into the runtime definition
+(`crates/daemon/src/agent/host/definition.rs`), and the worker input plan below
+applies it.
 
 Every worker input plan preserves provider framing as two fragments: the body
 fragment owns the provider submit delay and a separate fragment carries the

@@ -119,6 +119,7 @@ fn package_definition(runtime: &str) -> RuntimeDefinition {
         program: LaunchProgram::Fixed("acme".to_owned()),
         default_args: Vec::new(),
         input_rules: InputRules::unrestricted(false, Duration::ZERO),
+        input_readiness: crate::agent::host::InputReadiness::BracketedPaste,
         submit_delay_configurable: false,
         manifest: shell_manifest(),
         native: None,
@@ -666,6 +667,7 @@ fn definitions_reject_unsafe_launch_text() {
             program: LaunchProgram::Fixed("demo".to_owned()),
             default_args: args,
             input_rules: InputRules::unrestricted(false, Duration::ZERO),
+            input_readiness: crate::agent::host::InputReadiness::BracketedPaste,
             submit_delay_configurable: false,
             manifest: shell_manifest(),
             native: None,
@@ -716,6 +718,7 @@ fn builtin_parts() -> DefinitionParts {
         program: LaunchProgram::Fixed("demo".to_owned()),
         default_args: Vec::new(),
         input_rules: InputRules::unrestricted(false, Duration::ZERO),
+        input_readiness: crate::agent::host::InputReadiness::BracketedPaste,
         submit_delay_configurable: false,
         manifest: shell_manifest(),
         native: None,
@@ -784,6 +787,7 @@ fn submit_delay_must_be_exactly_representable() {
     let with_delay = |delay: Duration| {
         RuntimeDefinition::new(DefinitionParts {
             input_rules: InputRules::unrestricted(false, delay),
+            input_readiness: crate::agent::host::InputReadiness::BracketedPaste,
             ..builtin_parts()
         })
     };
@@ -1080,6 +1084,7 @@ fn a_pin_needs_the_same_runtime_from_the_same_origin() {
         program: LaunchProgram::Fixed("acme".to_owned()),
         default_args: Vec::new(),
         input_rules: InputRules::unrestricted(false, Duration::ZERO),
+        input_readiness: crate::agent::host::InputReadiness::BracketedPaste,
         submit_delay_configurable: false,
         manifest: shell_manifest(),
         native: None,
@@ -1123,6 +1128,7 @@ mod launch_validation {
             program: LaunchProgram::Fixed("acme".to_owned()),
             default_args: Vec::new(),
             input_rules: InputRules::unrestricted(false, Duration::ZERO),
+            input_readiness: crate::agent::host::InputReadiness::BracketedPaste,
             submit_delay_configurable: false,
             manifest: shell_manifest(),
             native: None,
@@ -1500,6 +1506,7 @@ fn only_the_builtin_shell_may_name_a_schema_without_a_handler() {
         program: LaunchProgram::Fixed("acme".to_owned()),
         default_args: Vec::new(),
         input_rules: InputRules::unrestricted(false, Duration::ZERO),
+        input_readiness: crate::agent::host::InputReadiness::BracketedPaste,
         submit_delay_configurable: false,
         manifest: shell_manifest(),
         native: None,

@@ -13796,6 +13796,7 @@ fn acme_definition(submit_delay_configurable: bool, prompt_arg: bool) -> Runtime
         program: LaunchProgram::Fixed("acme".to_owned()),
         default_args: Vec::new(),
         input_rules: InputRules::unrestricted(true, Duration::from_millis(150)),
+        input_readiness: crate::agent::host::InputReadiness::BracketedPaste,
         submit_delay_configurable,
         manifest: Arc::new(crate::detect::generic_shell_manifest().clone()),
         native: None,
@@ -16703,6 +16704,23 @@ async fn reconciled_create_whose_worker_ended_is_retired_then_compensated() {
         .await;
 }
 
+/// Arms `registry` to park the next create once its readiness wait has ended.
+fn hold_initial_input_outcome(
+    registry: &SessionRegistry,
+) -> crate::runtime::lifecycle::tests::StartGate {
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: None,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    *registry
+        .inner
+        .initial_input_outcome_hold
+        .lock()
+        .expect("initial input outcome hold is never poisoned") = Some(gate.clone());
+    gate
+}
+
 /// Arms `registry` to park its next committed create before its initial
 /// input.
 fn hold_initial_input(registry: &SessionRegistry) -> crate::runtime::lifecycle::tests::StartGate {
@@ -16738,6 +16756,59 @@ fn undelivered_create(daemon: &RestartableDaemon) -> crate::store::SessionRecord
         "its runtime was launched"
     );
     record.clone()
+}
+
+/// A `ScreenIdle` create whose wait ends by daemon shutdown is refused even
+/// when its readiness turns true after that outcome was decided.
+#[tokio::test]
+async fn screen_idle_create_ended_by_shutdown_stays_refused_after_readiness_arrives() {
+    let daemon = RestartableDaemon::new("wt-strict-shutdown");
+    let (registry, _supervisor) = scripted_registry(daemon.config.clone());
+    let create_gate = hold_initial_input(&registry);
+    let outcome_gate = hold_initial_input_outcome(&registry);
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        let params = SessionNewParams {
+            input: Some("echo strict".to_owned()),
+            ..daemon.params("feat/strict-shutdown")
+        };
+        async move { registry.create(params).await }
+    });
+    create_gate.entered.notified().await;
+    // The test owns the readiness channel of the committed session, so the
+    // only readiness it can report is the one it sends.
+    let (readiness_tx, readiness_rx) = tokio::sync::watch::channel(false);
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions
+        .values_mut()
+        .next()
+        .expect("the committed session entry");
+    entry.input_ready = readiness_rx;
+    entry.default_detector_config.input_readiness = crate::agent::host::InputReadiness::ScreenIdle;
+    drop(sessions);
+    create_gate.release.notify_one();
+
+    registry.begin_daemon_shutdown();
+    outcome_gate.entered.notified().await;
+    readiness_tx
+        .send(true)
+        .expect("the registry still holds the readiness receiver");
+    outcome_gate.release.notify_one();
+
+    let error = creating
+        .await
+        .expect("create task joins")
+        .expect_err("a shutdown-ended wait never releases the input");
+    assert_eq!(error.code, "session_input_not_ready");
+    assert!(
+        error.msg.contains("shut down"),
+        "the message names the shutdown: {}",
+        error.msg
+    );
+    assert!(
+        registry.inner.sessions.lock().await.is_empty(),
+        "the refused create is rolled back"
+    );
 }
 
 #[tokio::test]

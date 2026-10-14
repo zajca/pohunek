@@ -32,7 +32,7 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 use ulid::Ulid;
 
-use crate::agent::host::{self, RuntimeDefinition, RuntimeHost};
+use crate::agent::host::{self, InputReadiness, RuntimeDefinition, RuntimeHost};
 use crate::agent::{
     agent_fork_unsupported, agent_not_resumable, build_pty_command, fork_pty_command_from_launch,
     resume_pty_command_from_launch, InputRules, LaunchCommand, LaunchOpts,
@@ -643,6 +643,11 @@ struct SessionRegistryInner {
     /// Holds the next committed create before its initial input.
     #[cfg(test)]
     initial_input_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Holds the next create once its readiness wait has ended, before the
+    /// wait's outcome decides the create.
+    #[cfg(test)]
+    initial_input_outcome_hold:
+        std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
     /// Holds the next committed exit before it is announced.
     #[cfg(test)]
     exit_announce_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
@@ -1780,6 +1785,8 @@ impl SessionRegistry {
                 #[cfg(test)]
                 initial_input_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
+                initial_input_outcome_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
                 exit_announce_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 exit_commit_hold: std::sync::Mutex::new(None),
@@ -2289,7 +2296,9 @@ impl SessionRegistry {
     ///
     /// # Errors
     ///
-    /// Returns the delivery or persistence error after the rollback.
+    /// Returns the readiness error when the agent declared readiness did not
+    /// show before the deadline, or the delivery or persistence error, after
+    /// the rollback.
     async fn complete_create(
         &self,
         info: SessionInfo,
@@ -2318,8 +2327,13 @@ impl SessionRegistry {
         // the bytes are not delivered to a stdin reader that has not yet
         // entered raw/bracketed-paste mode (and would drop or mis-frame
         // them). Bounded, so a silent agent can never wedge `session.new`.
-        self.await_initial_input_readiness(&info.id, extended_input_ready_wait)
-            .await;
+        if let Err(error) = self
+            .await_initial_input_readiness(&info.id, extended_input_ready_wait)
+            .await
+        {
+            self.rollback_failed_initial_input(&info.id).await;
+            return Err(error);
+        }
         let delivered = match self.write_input_to_session(&info.id, &input).await {
             Ok(()) => self.commit_initial_input(&info.id).await,
             Err(error) => Err(error),
@@ -2520,6 +2534,21 @@ impl SessionRegistry {
                 *point == at && gate.session_id.as_deref().is_none_or(|held| held == id.0)
             });
         if let Some((_, gate)) = held {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    /// Parks a create once its readiness wait ended when a test armed the hold.
+    #[cfg(test)]
+    async fn hold_initial_input_outcome(&self) {
+        let gate = self
+            .inner
+            .initial_input_outcome_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(gate) = gate {
             gate.entered.notify_one();
             gate.release.notified().await;
         }
@@ -2921,35 +2950,83 @@ impl SessionRegistry {
     /// Wait for a freshly spawned agent to expose its input reader before a
     /// `session.new --input` prompt is injected, capped at
     /// [`SessionRegistryConfig::initial_input_startup_grace`].
+    ///
+    /// For a [`InputReadiness::BracketedPaste`] session an unobserved
+    /// readiness is not an error: the prompt is written once the wait ends,
+    /// because a silent agent may still read it. For a [`InputReadiness::ScreenIdle`]
+    /// session the wait gets the full configured grace, since its readiness
+    /// has no silent-reader fallback, and only observed readiness releases the
+    /// prompt.
+    ///
+    /// # Errors
+    ///
+    /// Returns `session_input_not_ready` for a `ScreenIdle` session whose wait
+    /// ended by the deadline or by daemon shutdown rather than by readiness.
     async fn await_initial_input_readiness(
         &self,
         session_id: &SessionId,
         extended_input_ready_wait: bool,
-    ) {
-        let grace = if extended_input_ready_wait {
-            self.inner.config.initial_input_startup_grace
-        } else {
-            self.inner
-                .config
-                .initial_input_startup_grace
-                .min(pohunek_service_config::COMPAT_INITIAL_INPUT_STARTUP_GRACE)
-        };
-        if grace.is_zero() {
-            return;
-        }
-        let mut input_ready = {
+    ) -> Result<(), ProtocolError> {
+        let (input_ready, readiness) = {
             let sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get(session_id) else {
-                return;
+                return Ok(());
             };
-            entry.input_ready.clone()
+            (
+                entry.input_ready.clone(),
+                entry.default_detector_config.input_readiness,
+            )
         };
+        let strict = readiness == InputReadiness::ScreenIdle;
+        let configured = self.inner.config.initial_input_startup_grace;
+        let grace = if extended_input_ready_wait || strict {
+            configured
+        } else {
+            configured.min(pohunek_service_config::COMPAT_INITIAL_INPUT_STARTUP_GRACE)
+        };
+        if grace.is_zero() && !strict {
+            return Ok(());
+        }
+        let outcome = self.wait_for_input_readiness(input_ready, grace).await;
+        #[cfg(test)]
+        self.hold_initial_input_outcome().await;
+        match (strict, outcome) {
+            (_, InitialInputWait::Ready) | (false, _) => Ok(()),
+            (true, InitialInputWait::TimedOut) => {
+                let activity = self.current_activity_label(session_id).await;
+                Err(runtime_error(
+                    "session_input_not_ready",
+                    format!(
+                        "agent did not show an editable prompt within {} ms (last activity: {activity}); nothing was sent, raise input.initial_startup_grace_ms if the agent starts slowly",
+                        grace.as_millis()
+                    ),
+                ))
+            }
+            (true, InitialInputWait::ShutDown) => Err(runtime_error(
+                "session_input_not_ready",
+                "the daemon shut down before the agent showed an editable prompt; nothing was sent",
+            )),
+        }
+    }
+
+    /// Waits until `input_ready` turns true, the daemon shuts down, or `grace`
+    /// elapses, whichever comes first. The returned outcome is the one that
+    /// ended the wait; the watch is not read again afterwards, so an update
+    /// that lands after the wait ended cannot change it.
+    async fn wait_for_input_readiness(
+        &self,
+        mut input_ready: watch::Receiver<bool>,
+        grace: Duration,
+    ) -> InitialInputWait {
         let shutdown = self.inner.daemon_shutdown.clone();
-        let _ = tokio::time::timeout(grace, async {
+        let wait = async {
             let mut detector_open = true;
-            while !*input_ready.borrow() {
+            loop {
+                if *input_ready.borrow_and_update() {
+                    return InitialInputWait::Ready;
+                }
                 tokio::select! {
-                    () = shutdown.cancelled() => break,
+                    () = shutdown.cancelled() => return InitialInputWait::ShutDown,
                     changed = input_ready.changed(), if detector_open => {
                         // A stopped detector has no readiness evidence; the
                         // outer deadline still bounds the fallback.
@@ -2957,8 +3034,19 @@ impl SessionRegistry {
                     }
                 }
             }
-        })
-        .await;
+        };
+        tokio::time::timeout(grace, wait)
+            .await
+            .unwrap_or(InitialInputWait::TimedOut)
+    }
+
+    /// The last reported activity of session `id` as a lowercase word, for
+    /// the readiness error message.
+    async fn current_activity_label(&self, id: &SessionId) -> String {
+        self.current_activity(id).await.map_or_else(
+            || "none".to_owned(),
+            |activity| format!("{activity:?}").to_lowercase(),
+        )
     }
 
     /// Roll back a session whose initial `--input` could not be delivered or
@@ -6366,6 +6454,7 @@ fn detector_config_for_resolved_agent(resolved: &ResolvedAgent) -> DetectorConfi
     {
         Some(manifest) => DetectorConfig {
             manifest: Some(manifest),
+            input_readiness: resolved.definition.input_readiness(),
             ..DetectorConfig::default()
         },
         None => DetectorConfig::for_definition(&resolved.definition),
@@ -6690,6 +6779,17 @@ fn runtime_state_label(state: RuntimeState) -> &'static str {
         RuntimeState::Conflict => "conflict",
         RuntimeState::Incompatible => "incompatible",
     }
+}
+
+/// What ended the wait for a freshly spawned agent's input readiness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitialInputWait {
+    /// The detector reported the agent's input reader as ready.
+    Ready,
+    /// The readiness grace elapsed first.
+    TimedOut,
+    /// The daemon began shutting down first.
+    ShutDown,
 }
 
 fn runtime_error(code: impl Into<String>, msg: impl Into<String>) -> ProtocolError {

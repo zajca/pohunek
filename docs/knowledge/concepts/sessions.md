@@ -211,6 +211,14 @@ The current SDK and CLI opt into the host's full configured grace for initial
 input. An older client that does not send that option keeps a 500 ms silent
 startup bound so its five-second response deadline remains usable.
 
+A runtime whose descriptor declares `[input] ready = "screen_idle"` (Claude
+Code) is ready only when its rendered prompt box shows. Claude enables bracketed
+paste before that box accepts input and drops earlier pastes, so the enable
+signal does not start the write. Such a runtime gets the full configured grace
+even from an older client. When the box does not render in time, `session.new`
+fails with `session_input_not_ready`, the initial input is not written, and the
+session is removed through the same rollback as any failed initial-input create.
+
 A session can also carry owner metadata, set atomically at creation with
 repeatable `pohunek session new --meta key=value` flags (split on the first
 `=`, so a value may itself contain `=`; a missing `=`, an empty key, or a key
