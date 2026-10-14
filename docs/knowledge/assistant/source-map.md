@@ -44,6 +44,7 @@ Current CLI and command surface:
 - `crates/cli/src/commands/host_fanout.rs`
 - `crates/cli/src/commands/discovery_cache.rs`
 - `crates/cli/src/commands/setup.rs`
+- `crates/cli/src/commands/setup_host.rs`
 - `crates/cli/src/commands/host.rs`
 - `crates/cli/src/commands/integration.rs`
 - `crates/cli/src/commands/prompt.rs`

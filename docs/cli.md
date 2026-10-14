@@ -70,7 +70,8 @@ port is retained.
 | `pohunek integration status` | Inspect daemon-managed Codex/Claude hooks on the effective `--host` (`--profile` and `--all-profiles` select profile config homes and are local-only), or one explicitly selected local Hermes target. |
 | `pohunek integration doctor / uninstall` | Diagnose or remove daemon-managed Codex/Claude hooks (`doctor` follows `--host`; `uninstall` targets the local daemon; both accept `--profile NAME` and `--all-profiles`, local-only), or, with `--agent hermes`, one explicitly selected local Hermes plugin target. |
 | `pohunek integration update --agent hermes` | Atomically refresh one explicitly selected local Hermes plugin target. |
-| `pohunek setup [config]` | Install the default `attach.conf` and prompt templates (a bare `setup` is `setup config`). |
+| `pohunek setup [--yes] [--json]` | The one host setup: installs the service from this release, applies the official runtime packages, profile pins and hooks for the runtimes this host has, and writes the missing config files. It previews every change and asks once; `--yes` applies without asking, and without a terminal or with `--json` it needs `--yes`. It never upgrades an installed service. |
+| `pohunek setup config [--force] [--json]` | Install the default `attach.conf` and prompt templates; existing files are kept unless `--force`. |
 | `pohunek setup completions <bash\|zsh\|fish>` | Install completion in the shell's conventional user directory; add `--dynamic` to opt in to runtime candidates. |
 | `pohunek assistant [intent] [request…]` | Launch the self-help assistant with knowledge bundle + live snapshot. |
 | `pohunek agent-skill` | Print the complete bundled agent skill; `--json` wraps the skill text and its `content_sha256` in the process envelope. Fully local — `--host` is accepted and ignored. |
@@ -99,6 +100,35 @@ The human `host inspect` table adds `config_home_id=...` to every runtime that
 declares a config home. Entries that show the same value launch against the same
 config directory (one account); the value is an opaque keyed digest and never a
 path.
+
+### Host setup
+
+Bare `pohunek setup` is the command to run on a host once, and again after an
+upgrade of the release files. It runs in this order:
+
+1. Service: without an installed service it installs the release binaries next
+   to the running `pohunek`. An installed service of the same version is kept.
+   An installed service of another version is a gap: run
+   `pohunek service upgrade` first, because setup never upgrades.
+2. Plan: the release's planner reads the runtime catalog and reports every
+   runtime whose package program is on the service `PATH`, with the gaps that
+   remain (the agent is not on the `PATH`, its config home is missing, or the
+   platform has no package). The plan only reads.
+3. Preview and consent: every effect and gap is printed before anything is
+   written. The owner confirms once. A plan the planner refuses stops the run
+   before its first change.
+4. Apply: the packages are installed, enabled and selected, the profiles are
+   pinned, and the hooks are installed in the homes that exist. A runtime
+   already served by another package is left untouched.
+5. Config: the missing config files are written and existing files are kept.
+6. Verdict: the plan is read again, every planned package must be present and
+   no hook may be pending, then the daemon's health and `doctor` run.
+
+The run is refused with the hint `--yes` when it cannot ask: without a terminal
+and without `--yes`, or with `--json` and no `--yes`. The refusal changes
+nothing. `--json` prints one document with the preview, the applied lines and
+the verdict. A failure after the first change keeps the finished steps; run
+`pohunek setup` again to complete them. `--host` is ignored.
 
 ### Shell completion
 

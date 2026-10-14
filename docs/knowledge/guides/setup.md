@@ -154,7 +154,14 @@ The installer refuses a unit or `LaunchAgents` directory that is group- or
 world-writable and names the fix (`chmod go-w <path>`); it never changes
 permissions itself.
 
-Local configuration is installed through `pohunek setup`. The subcommands are:
+`pohunek setup` is the host setup. Without a subcommand it previews the service
+install or the kept service, the official runtime packages, profile pins, hooks
+and gaps of this host, asks once (`--yes` applies unattended; without a
+terminal or with `--json` it needs `--yes`), and then installs the service and
+the packages, pins the profiles, installs the hooks of the homes that exist, and
+writes the missing config files. It never upgrades an installed service: a
+different installed version is a gap, and `pohunek service upgrade` runs first.
+The subcommands are:
 
 - `pohunek setup config` writes a default `attach.conf` (the `pohunek attach`
   reconnect settings, every key commented at its default) and the
@@ -163,9 +170,9 @@ Local configuration is installed through `pohunek setup`. The subcommands are:
   given.
 - `pohunek setup completions <bash|zsh|fish>` installs shell completion.
 
-A bare `pohunek setup` is `pohunek setup config` without `--force`; `--json`
-returns the `created` and `skipped` file lists. Desktop launchers (rofi, sway)
-and the issue/PR pickers are not part of core; they live in `zajca/pohunek-work`
+`pohunek setup config` returns the `created` and `skipped` file lists with
+`--json`; the bare `pohunek setup` reports them among its results. Desktop
+launchers (rofi, sway) and the issue/PR pickers are not part of core; they live in `zajca/pohunek-work`
 and call the public `pohunek` CLI. Upgrading from a release that installed
 launchers: remove `<data_dir>/bin/{lib.sh,pohunek-rofi,pohunek-rofi-issue,pohunek-launch-issue,pohunek-launch-pr}`
 and `<config_home>/sway/config.d/pohunek.conf` as described in the

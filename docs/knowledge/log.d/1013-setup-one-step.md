@@ -1,0 +1,16 @@
+## Unreleased (2026-10-14, one host setup command, #1013)
+
+- Bare `pohunek setup` is the one host setup. It installs the service from
+  this release when none is installed, plans the official runtime packages
+  for the runtimes this host has (`pohunekd ensure-official-runtimes --dry-run
+  --detect`), previews every effect and gap, asks once, then installs the
+  packages, pins the profiles, installs the hooks of the homes that exist and
+  writes the missing config files. A second plan and the daemon's health and
+  `doctor` form the verdict.
+- `--yes` applies unattended. Without a terminal, or with `--json`, setup
+  needs `--yes` and otherwise refuses with `setup_consent_required`; the
+  refusal changes nothing.
+- An installed service of another version is a gap: `pohunek service upgrade`
+  runs first. Setup never upgrades.
+- `pohunek setup config` and `pohunek setup completions` are unchanged; an
+  existing config file is never overwritten.
