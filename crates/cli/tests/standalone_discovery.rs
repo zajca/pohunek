@@ -405,3 +405,42 @@ fn discover_and_list_json_need_cache_and_netbird_but_not_runtime_socket() {
         assert!(document["protocol"]["maximum"].is_number());
     }
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn discovery_creates_the_pohunek_cache_directory_owner_private() {
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    let bin = env.root().join("bin");
+    fs::create_dir_all(&bin).expect("create bin");
+    fake_netbird(&bin);
+    let pohunek_cache = env.cache_home().join("pohunek");
+    assert!(!pohunek_cache.exists(), "the scenario starts without it");
+    let inherited_path = std::env::var("PATH").expect("PATH");
+
+    // The CLI runs under the umask of a default login session, under which a
+    // plain `mkdir` is 0755; `sh` sets it so this test binary keeps its own.
+    let output = env
+        .command("/bin/sh")
+        .args(["-c", "umask 022; exec \"$0\" \"$@\""])
+        .arg(pohunek_test_support::bin_exe("pohunek"))
+        .args(["host", "discover", "--refresh", "--json"])
+        .env("PATH", format!("{}:{inherited_path}", bin.display()))
+        .output()
+        .expect("run CLI discovery");
+
+    assert!(
+        output.status.success(),
+        "discovery failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The daemon refuses a non-private `XDG_CACHE_HOME/pohunek` as a worker
+    // directory parent, so the client must not create it wider.
+    for directory in [pohunek_cache.clone(), pohunek_cache.join("host-discovery")] {
+        let mode = fs::metadata(&directory)
+            .expect("the discovery cache directory exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "{}", directory.display());
+    }
+}

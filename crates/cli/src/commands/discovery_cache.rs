@@ -8,7 +8,9 @@ use std::fs;
 use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::io::Write as _;
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{
+    DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -161,7 +163,12 @@ fn ensure_private_dir(dir: &Path) -> Result<(), CliError> {
             .into());
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(dir)?;
+            // Every missing ancestor is created owner-private too: the daemon
+            // refuses a non-private `XDG_CACHE_HOME/pohunek`.
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(PRIVATE_DIR_MODE)
+                .create(dir)?;
             true
         }
         Err(error) => return Err(error.into()),

@@ -40,11 +40,32 @@ fn extract_into_knowledge_dir(knowledge_dir: &Path, version_hash: &str) -> io::R
         return Ok(target);
     }
 
-    fs::create_dir_all(knowledge_dir)?;
+    create_private_dir_all(knowledge_dir)?;
     let temp = temporary_dir(knowledge_dir, version_hash);
     publish_through(&temp, &target)?;
     Ok(target)
 }
+
+/// Creates `dir` and every missing ancestor owner-private. The cache root is
+/// `XDG_CACHE_HOME/pohunek`, which the daemon refuses unless it is 0700.
+fn create_private_dir_all(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(PRIVATE_DIR_MODE)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(dir)
+    }
+}
+
+/// Mode of every directory the materializer creates above a bundle.
+#[cfg(unix)]
+const PRIVATE_DIR_MODE: u32 = 0o700;
 
 /// Build the bundle in `temp` and rename it onto `target`.
 ///
