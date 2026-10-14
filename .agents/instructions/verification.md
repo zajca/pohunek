@@ -146,6 +146,13 @@ manual dispatch, and must pass for nightly CI evidence. Manual
 dispatch requires the `main` or `nightly` choice; nightly adds the nightly-only
 checks to main. Schedule and manual runs do not cancel PR or main runs.
 
+Before the final head of a pull request merges, dispatch `ci.yml` once with
+`tier=main` on the branch (`gh workflow run ci.yml --ref <branch> -f tier=main`)
+only when the diff touches a release workflow or release xtask code, the runtime
+packages or packaging, the TypeScript SDK, Cargo dependencies, or the protocol
+version window. Ordinary worker, PTY, hook, daemon, and CLI changes need no
+dispatch: pull-request CI already runs the macOS lanes.
+
 The automatic red-main issue reporter remains pending under #477 S3. The S4
 release evidence gate is implemented: `scripts/release` requires successful
 main and nightly CI evidence for the exact release commit before tagging. The
