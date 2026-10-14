@@ -10,9 +10,10 @@
 //! 2. Plan: the release's `pohunekd ensure-official-runtimes --dry-run --detect`
 //!    reads the catalog and reports the packages, profiles, integrations and
 //!    gaps. It only reads, so it runs before the preview and before any write.
-//! 3. Preview and consent: every effect and gap is shown first, and the
-//!    `--json` result carries the same preview. `--yes` runs unattended;
-//!    without a terminal or with `--json` the run is refused.
+//! 3. Preview and consent: every effect and gap is shown first. Without a
+//!    terminal and without `--yes` the run is refused. `--json --yes` applies
+//!    and prints one result document that carries the same preview; `--json`
+//!    alone is refused, because it cannot ask.
 //! 4. Apply: after a fresh install the plan is read again and must match the
 //!    preview, modulo exactly the transitions the install engine performs.
 //!    Setup then applies what remains over the daemon's RPCs, installs the
@@ -35,19 +36,21 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use pohunek_service_config::runtimes::{
-    EnsureReport, Gap, IntegrationAction, PackageAction, PackageStatus, ProfileAction,
-    ProfileStatus, Refusal, RELEASE_RUNTIME_DIR,
+    CatalogStatus, EnsureReport, Gap, IntegrationAction, PackageAction, PackageStatus,
+    ProfileAction, ProfileStatus, Refusal, RELEASE_RUNTIME_DIR,
 };
 use protocol::{
     method, DoctorStatus, PackageBindProfileParams, PackageDigest, PackageInstallParams,
-    PackageTrust,
+    PackageSelectParams, PackageSetEnabledParams, PackageTrust,
 };
 use serde::Serialize;
 
 use crate::client::Client;
 use crate::commands::doctor;
 use crate::commands::health;
-use crate::commands::integration::{hermes_home_plan, reinstall_after_upgrade, IntegrationEnv};
+use crate::commands::integration::{
+    hermes_home_plan, reinstall_after_upgrade, reinstall_previewed_hermes_homes, IntegrationEnv,
+};
 use crate::commands::setup::{config_files, install_config, ConfigResult};
 use crate::error::CliError;
 use crate::paths::Paths;
@@ -157,6 +160,9 @@ pub struct Preview {
     pub integrations: Vec<IntegrationAction>,
     /// The daemon's gaps.
     pub gaps: Vec<Gap>,
+    /// The release catalog's trust state: `record` means the install or the
+    /// apply records it.
+    pub catalog: CatalogStatus,
     /// Every Hermes home the apply acts on, with its planned state.
     pub hermes_homes: Vec<IntegrationReinstall>,
     /// The config files, each with whether it exists.
@@ -329,6 +335,15 @@ async fn plan_in(
     planner: &dyn ReleasePlanner,
 ) -> Result<HostPlan, CliError> {
     let status = service::status_in(context).await?;
+    if let Some(pending) = &status.pending_transaction {
+        return Err(CliError::SetupBlocked {
+            detail: format!(
+                "an interrupted {} of version {} stopped after step {}; resume it by rerunning \
+                 the interrupted `pohunek service {}`, or roll it back with `pohunek service uninstall`",
+                pending.operation, pending.version, pending.step, pending.operation
+            ),
+        });
+    }
     let (service, dir, search_path) = if status.installed {
         match status.active_version.as_deref() {
             Some(VERSION) => {
@@ -389,6 +404,7 @@ async fn plan_in(
         profiles: previewed.profiles.clone(),
         integrations: previewed.integrations.clone(),
         gaps: previewed.gaps.clone(),
+        catalog: previewed.catalog,
         hermes_homes,
         config,
     };
@@ -413,27 +429,11 @@ async fn apply_in(
     plan: HostPlan,
     planner: &dyn ReleasePlanner,
 ) -> Result<SetupReport, CliError> {
-    let HostPlan {
-        service,
-        dir,
-        search_path,
-        previewed,
-        preview,
-    } = plan;
     let mut applied = Vec::new();
-    let steps = apply_steps(
-        context,
-        service,
-        dir,
-        search_path,
-        &previewed,
-        &mut applied,
-        planner,
-    )
-    .await;
+    let steps = apply_steps(context, &plan, &mut applied, planner).await;
     match steps {
         Ok((hooks, config, verdict)) => Ok(SetupReport {
-            preview,
+            preview: plan.preview,
             applied,
             hooks,
             config,
@@ -464,18 +464,21 @@ fn with_changes(error: CliError, applied: Vec<String>) -> CliError {
 /// Returns the error of the first step that fails.
 async fn apply_steps(
     context: &Context,
-    service: ServiceStep,
-    dir: PathBuf,
-    search_path: String,
-    previewed: &EnsureReport,
+    plan: &HostPlan,
     applied: &mut Vec<String>,
     planner: &dyn ReleasePlanner,
 ) -> Result<(Vec<IntegrationReinstall>, ConfigResult, Verdict), CliError> {
-    let (dir, search_path, remaining) = match service {
+    let previewed = &plan.previewed;
+    let hermes_homes = &plan.preview.hermes_homes;
+    let (dir, search_path, remaining) = match &plan.service {
         ServiceStep::Install { from } => {
-            install_service(context, Path::new(&from), previewed, applied, planner).await?
+            install_service(context, Path::new(from), previewed, applied, planner).await?
         }
-        ServiceStep::Present => (dir, search_path, previewed.clone()),
+        ServiceStep::Present => (
+            plan.dir.clone(),
+            plan.search_path.clone(),
+            previewed.clone(),
+        ),
     };
 
     let paths = paths_of(context);
@@ -483,22 +486,24 @@ async fn apply_steps(
     apply_remaining(&mut client, &dir, &remaining, applied).await?;
 
     let env = integration_env(context);
-    let hermes = remaining
-        .integrations
-        .iter()
-        .any(|integration| integration.runtime == HERMES_RUNTIME);
     let others: Vec<IntegrationAction> = remaining
         .integrations
         .iter()
         .filter(|integration| integration.runtime != HERMES_RUNTIME)
         .cloned()
         .collect();
-    let hooks = reinstall_after_upgrade(&env, &others, hermes).await;
+    let mut hooks = reinstall_after_upgrade(&env, &others, false).await;
+    if !hermes_homes.is_empty() {
+        hooks.extend(reinstall_previewed_hermes_homes(&env, hermes_homes));
+    }
     for hook in &hooks {
         applied.push(format!("hook {}: {}", hook.integration, hook.status));
     }
 
     let config = install_config(&paths, false)?;
+    for path in &config.created {
+        applied.push(format!("config created: {path}"));
+    }
 
     let after = planner.plan(context, &dir, &search_path).await?;
     let verdict = verdict(&paths, previewed, &after, &hooks).await?;
@@ -539,7 +544,7 @@ async fn install_service(
     let after = planner
         .plan(context, &version_dir, &installed_search)
         .await?;
-    if let Err(detail) = check_transitions(previewed, &after) {
+    if let Err(detail) = check_transitions(previewed, &after, installed.runtimes.as_ref()) {
         return Err(CliError::SetupInstalledOnly {
             version: installed.version,
             prefix: installed.prefix,
@@ -567,21 +572,30 @@ fn engine_changes(runtimes: Option<&EnsureReport>) -> Vec<String> {
             changes.push(format!("profile {}: bound", profile.name));
         }
     }
+    if report.catalog == CatalogStatus::Recorded {
+        changes.push("catalog trust state: recorded".to_owned());
+    }
     changes
 }
 
-/// Checks that the plan read after a fresh install matches the preview.
+/// Checks that the plan read after a fresh install matches the preview, and
+/// that every difference is a transition the install engine reports.
 ///
-/// The install engine may have installed a previewed package (`install` ->
-/// `present`) and pinned a previewed profile (which then leaves the plan).
-/// Everything else must match: the same runtimes, packages, versions, digests
-/// and reasons, the same integrations and gaps, and no refusal. A package or
-/// profile still to do is kept, and setup applies it.
+/// The engine may change only what the preview showed. A previewed package may
+/// be `present` after the install only when the engine reports it installed,
+/// and a previewed package the engine installed must be present. A previewed
+/// profile pin may leave the plan only when the engine reports it bound. A
+/// recorded catalog is accepted only when the engine reports it recorded.
+/// Integrations, gaps and refusals must match.
 ///
 /// # Errors
 ///
 /// Returns the first difference, as the message the stop reports.
-fn check_transitions(previewed: &EnsureReport, after: &EnsureReport) -> Result<(), String> {
+fn check_transitions(
+    previewed: &EnsureReport,
+    after: &EnsureReport,
+    engine: Option<&EnsureReport>,
+) -> Result<(), String> {
     if !after.refusals.is_empty() {
         return Err(format!(
             "the plan read after the install refuses: {}",
@@ -594,6 +608,72 @@ fn check_transitions(previewed: &EnsureReport, after: &EnsureReport) -> Result<(
     if previewed.gaps != after.gaps {
         return Err("the gaps differ from the preview".to_owned());
     }
+    check_engine_changes_shown(previewed, engine)?;
+    check_package_transitions(previewed, after, engine)?;
+    check_profile_transitions(previewed, after, engine)?;
+    check_catalog_transition(previewed, after, engine)
+}
+
+/// Whether the install engine reports `runtime`'s package installed.
+fn engine_installed(engine: Option<&EnsureReport>, runtime: &str) -> bool {
+    engine.is_some_and(|report| {
+        report.packages.iter().any(|package| {
+            package.runtime == runtime && wire_name(&package.status) == ENGINE_INSTALLED
+        })
+    })
+}
+
+/// Whether the install engine reports profile `name` pinned.
+fn engine_bound(engine: Option<&EnsureReport>, name: &str) -> bool {
+    engine.is_some_and(|report| {
+        report
+            .profiles
+            .iter()
+            .any(|profile| profile.name == name && wire_name(&profile.status) == ENGINE_BOUND)
+    })
+}
+
+/// Every package and profile the install engine changed was in the preview.
+fn check_engine_changes_shown(
+    previewed: &EnsureReport,
+    engine: Option<&EnsureReport>,
+) -> Result<(), String> {
+    let Some(report) = engine else {
+        return Ok(());
+    };
+    for package in &report.packages {
+        let shown = previewed.packages.iter().any(|shown| {
+            shown.runtime == package.runtime && shown.status == PackageStatus::Install
+        });
+        if wire_name(&package.status) == ENGINE_INSTALLED && !shown {
+            return Err(format!(
+                "the install engine installed runtime {}, which the preview did not show",
+                package.runtime
+            ));
+        }
+    }
+    for profile in &report.profiles {
+        let shown = previewed
+            .profiles
+            .iter()
+            .any(|shown| shown.name == profile.name && shown.status == ProfileStatus::Bind);
+        if wire_name(&profile.status) == ENGINE_BOUND && !shown {
+            return Err(format!(
+                "the install engine pinned profile {}, which the preview did not show",
+                profile.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Each planned package matches its preview, and changes status only as the
+/// install engine reports.
+fn check_package_transitions(
+    previewed: &EnsureReport,
+    after: &EnsureReport,
+    engine: Option<&EnsureReport>,
+) -> Result<(), String> {
     for package in &after.packages {
         let Some(shown) = previewed
             .packages
@@ -615,20 +695,24 @@ fn check_transitions(previewed: &EnsureReport, after: &EnsureReport) -> Result<(
                 package.runtime
             ));
         }
-        let allowed = match shown.status {
-            PackageStatus::Present => package.status == PackageStatus::Present,
-            PackageStatus::Install => matches!(
-                package.status,
-                PackageStatus::Install | PackageStatus::Present
-            ),
+        let installed = engine_installed(engine, &package.runtime);
+        let allowed = match (shown.status, package.status) {
+            (PackageStatus::Present, PackageStatus::Present) => true,
+            (PackageStatus::Install, PackageStatus::Install) => !installed,
+            (PackageStatus::Install, PackageStatus::Present) => installed,
             _ => false,
         };
         if !allowed {
             return Err(format!(
-                "runtime {} is {} after the install; the preview showed {}",
+                "runtime {} is {} after the install; the preview showed {}, and the install engine {}",
                 package.runtime,
                 wire_name(&package.status),
-                wire_name(&shown.status)
+                wire_name(&shown.status),
+                if installed {
+                    "reports it installed"
+                } else {
+                    "reports no install"
+                }
             ));
         }
     }
@@ -644,6 +728,16 @@ fn check_transitions(previewed: &EnsureReport, after: &EnsureReport) -> Result<(
             ));
         }
     }
+    Ok(())
+}
+
+/// Each profile pin matches its preview; a pin that leaves the plan must be
+/// one the install engine reports bound.
+fn check_profile_transitions(
+    previewed: &EnsureReport,
+    after: &EnsureReport,
+    engine: Option<&EnsureReport>,
+) -> Result<(), String> {
     for profile in &after.profiles {
         let Some(shown) = previewed
             .profiles
@@ -662,7 +756,42 @@ fn check_transitions(previewed: &EnsureReport, after: &EnsureReport) -> Result<(
             ));
         }
     }
+    for shown in &previewed.profiles {
+        let pending = after
+            .profiles
+            .iter()
+            .any(|profile| profile.name == shown.name);
+        if !pending && shown.status == ProfileStatus::Bind && !engine_bound(engine, &shown.name) {
+            return Err(format!(
+                "profile {} left the plan after the install, but the install engine did not pin it",
+                shown.name
+            ));
+        }
+    }
     Ok(())
+}
+
+/// The catalog trust state changes only as the install engine records it.
+fn check_catalog_transition(
+    previewed: &EnsureReport,
+    after: &EnsureReport,
+    engine: Option<&EnsureReport>,
+) -> Result<(), String> {
+    if previewed.catalog == after.catalog {
+        return Ok(());
+    }
+    let recorded = previewed.catalog == CatalogStatus::Record
+        && after.catalog == CatalogStatus::Current
+        && engine.is_some_and(|report| report.catalog == CatalogStatus::Recorded);
+    if recorded {
+        Ok(())
+    } else {
+        Err(format!(
+            "the catalog trust state is {} after the install, the preview showed {}",
+            wire_name(&after.catalog),
+            wire_name(&previewed.catalog)
+        ))
+    }
 }
 
 /// Applies the packages and profile pins the plan still lists, over the
@@ -703,6 +832,25 @@ async fn apply_remaining(
             package.runtime,
             wire_name(&result.status)
         ));
+        // An already registered package keeps its recorded flags, so the
+        // flags the plan needs are set here, as the release apply sets them.
+        if !result.package.enabled {
+            client
+                .call::<method::PackageSetEnabled>(PackageSetEnabledParams {
+                    digest: result.package.digest.clone(),
+                    enabled: true,
+                })
+                .await?;
+            applied.push(format!("package {}: enabled", package.runtime));
+        }
+        if !result.package.selected {
+            client
+                .call::<method::PackageSelect>(PackageSelectParams {
+                    digest: result.package.digest.clone(),
+                })
+                .await?;
+            applied.push(format!("package {}: selected", package.runtime));
+        }
     }
     for profile in remaining
         .profiles
@@ -941,6 +1089,7 @@ fn render_plan(plan: &HostPlan) -> String {
             let _ = writeln!(out, "service: runs version {VERSION}; kept");
         }
     }
+    let _ = writeln!(out, "catalog: {}", wire_name(&preview.catalog));
     let _ = writeln!(out, "packages:");
     for package in &preview.packages {
         let _ = writeln!(

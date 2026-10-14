@@ -238,3 +238,55 @@ fn setup_config_still_writes_only_config_files() {
         "an existing file is kept"
     );
 }
+
+/// An interrupted install that is still pending stops setup before any change,
+/// and the stop names the command that resumes it.
+#[test]
+fn a_pending_install_stops_setup_before_any_change() {
+    let env = TestEnv::new().expect("private environment");
+    let binary = pohunek_test_support::bin_exe("pohunek");
+    let state = env.state_home().join("pohunek");
+    fs::create_dir_all(&state).expect("state directory");
+    // The state directory must be owner-only, as the service records require.
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("owner-only state");
+    let record = pohunek_cli::service::record::Record {
+        schema_version: pohunek_cli::service::record::SCHEMA_VERSION,
+        operation: pohunek_cli::service::record::Operation::Install,
+        version: "9.9.9-pending".to_owned(),
+        prefix: env.home().join(".local"),
+        previous_version: None,
+        version_dir_preexisted: false,
+        config_backup: None,
+        step: pohunek_cli::service::record::Step::Started,
+        rolling_back: false,
+        runtime_stop: false,
+        runtime_backup: None,
+    };
+    pohunek_cli::service::record::Store::new(state)
+        .save(&record)
+        .expect("record the pending install");
+    let before = tree(env.root());
+
+    let output = run_setup(&env, &binary, &["setup", "--yes"]);
+
+    assert!(!output.status.success(), "a pending install stops setup");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("interrupted install of version 9.9.9-pending")
+            && stderr.contains("pohunek service install")
+            && stderr.contains("pohunek service uninstall"),
+        "the stop names the pending install and its next step: {stderr}"
+    );
+    // Reading the transaction store creates its lock files. They coordinate
+    // service commands and hold no configuration, so they are not a change.
+    let without_locks = |tree: BTreeMap<PathBuf, Option<u64>>| {
+        tree.into_iter()
+            .filter(|(path, _)| !path.to_string_lossy().contains("service-install.lock"))
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(
+        without_locks(tree(env.root())),
+        without_locks(before),
+        "a pending install writes no configuration, package or hook"
+    );
+}

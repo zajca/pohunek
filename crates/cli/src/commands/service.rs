@@ -228,7 +228,45 @@ fn render_install(report: &report::InstallReport) -> String {
     let _ = writeln!(text, "config     {}", report.config_path.display());
     let _ = writeln!(text, "daemon     {}", report.daemon_executable.display());
     render_search_path(&mut text, &report.search_path);
+    if let Some(runtimes) = &report.runtimes {
+        render_install_runtimes(&mut text, runtimes);
+    }
     text
+}
+
+/// Appends the official runtime step the install ran: the catalog trust
+/// state, and each package and profile pin with its status.
+fn render_install_runtimes(text: &mut String, runtimes: &EnsureReport) {
+    if runtimes.catalog == CatalogStatus::Record || runtimes.catalog == CatalogStatus::Recorded {
+        let _ = writeln!(text, "catalog    trust state recorded");
+    }
+    for package in &runtimes.packages {
+        let _ = writeln!(
+            text,
+            "package    {} {} {} ({})",
+            package.runtime,
+            package.package,
+            package.version,
+            wire_name(&package.status)
+        );
+    }
+    for profile in &runtimes.profiles {
+        let _ = writeln!(
+            text,
+            "profile    {} (base {}, {})",
+            profile.name,
+            profile.base,
+            wire_name(&profile.status)
+        );
+    }
+}
+
+/// The wire name of a value, as the `--json` output spells it.
+fn wire_name<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default()
 }
 
 /// Appends the `PATH` source line and a warning for every fallback or refusal.
@@ -775,6 +813,46 @@ mod tests {
             login_shell_failure: None,
             dropped: Vec::new(),
         }
+    }
+
+    #[test]
+    fn an_install_that_ran_the_runtime_step_prints_its_packages_and_profiles() {
+        let mut install = install_report(search_path_report("login_shell"));
+        install.runtimes = Some(
+            serde_json::from_value(serde_json::json!({
+                "report_version": 1,
+                "daemon_version": "1.2.3",
+                "dry_run": false,
+                "packages": [{
+                    "runtime": "claude",
+                    "package": "claude-code",
+                    "version": "1.0.0",
+                    "digest": format!("sha256:{}", "a".repeat(64)),
+                    "status": "installed",
+                    "reasons": ["profile"]
+                }],
+                "catalog": "recorded",
+                "profiles": [{
+                    "name": "consumer",
+                    "base": "claude",
+                    "digest": format!("sha256:{}", "a".repeat(64)),
+                    "status": "bound"
+                }],
+                "integrations": [],
+                "refusals": []
+            }))
+            .expect("a runtime report"),
+        );
+        let text = render_install(&install);
+        assert!(text.contains("catalog    trust state recorded"), "{text}");
+        assert!(
+            text.contains("package    claude claude-code 1.0.0 (installed)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("profile    consumer (base claude, bound)"),
+            "{text}"
+        );
     }
 
     #[test]

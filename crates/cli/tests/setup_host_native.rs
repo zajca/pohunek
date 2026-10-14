@@ -21,6 +21,7 @@ mod native;
 use std::collections::BTreeMap;
 use std::fs;
 use std::future::Future;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -211,6 +212,14 @@ async fn unmarked_hermes_home_is_a_gap_and_existing_config_is_kept() {
         .skipped
         .iter()
         .any(|path| path.ends_with("attach.conf")));
+    assert!(
+        outcome
+            .applied
+            .iter()
+            .any(|line| line.starts_with("config created: ") && line.ends_with("issue.tmpl")),
+        "the config files created are among the applied steps: {:?}",
+        outcome.applied
+    );
     assert!(outcome
         .config
         .created
@@ -384,53 +393,54 @@ fn unpinned_profile() -> Value {
     }])
 }
 
-/// A host with no service and an unpinned profile over an official runtime.
+/// A profile the preview pins that leaves the plan after the install is a
+/// mismatch unless the install engine reports it bound. Here the engine
+/// reports nothing bound (this release has no catalog for the package, so the
+/// engine's own runtime step does nothing), so the stop names the profile and
+/// the service is the only change.
 ///
-/// The install engine runs the release's runtime step for that profile, which
-/// installs the package and pins the profile, so the plan read after the
-/// install no longer lists them. The scripted planner reproduces that
-/// transition: the preview shows the package to install and the profile to
-/// pin, and the plan after the install shows the package present and the
-/// profile gone. The install engine itself is not scripted: this release has
-/// no catalog for the package, so the engine's own runtime step does nothing
-/// here. Setup must accept the transition and must not install or pin again,
-/// which an attempt would show, because it would need an archive this release
-/// does not carry.
+/// The accepted transition, where the engine reports the package installed and
+/// the profile bound, cannot be produced here: the engine's runtime step needs a
+/// signed release catalog with real archives, which this branch's harness does
+/// not build. That path is covered only by the release harness.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(
     target_os = "linux",
     ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
 )]
-async fn an_install_engine_transition_is_accepted_without_reapplying() {
+async fn a_profile_that_vanishes_without_an_engine_pin_stops_setup() {
     let installation = Installation::new();
     let release = release(&installation);
-    let preview = planned(&claude("install"), &unpinned_profile());
+    let preview = planned(&claude("present"), &unpinned_profile());
     let after = planned(&claude("present"), &json!([]));
-    let planner = ScriptedPlanner::new(vec![preview, after.clone(), after]);
+    let planner = ScriptedPlanner::new(vec![preview, after]);
 
     let host_plan = plan(&installation.context, &release, &planner)
         .await
         .expect("plan the host");
-    let outcome = apply(&installation.context, host_plan, &planner)
+    let error = apply(&installation.context, host_plan, &planner)
         .await
-        .expect("setup accepts the install engine's transition");
-    assert!(outcome
-        .applied
-        .iter()
-        .any(|line| *line == format!("service: installed version {VERSION}")));
+        .expect_err("a pin the engine did not make stops setup");
+    assert_eq!(error.code(), PLAN_CHANGED_CODE);
+    let message = error.to_string();
     assert!(
-        outcome
-            .applied
-            .iter()
-            .all(|line| !line.starts_with("package claude:")
-                && !line.starts_with("profile consumer:")),
-        "setup does not install or pin again: {:?}",
-        outcome.applied
+        message.contains(
+            "profile consumer left the plan after the install, but the install engine did not pin it"
+        ),
+        "the stop names the profile: {message}"
     );
-    assert!(outcome.verdict.packages_missing.is_empty());
-    assert!(outcome.verdict.packages_unexpected.is_empty());
-    assert!(outcome.verdict.profiles_pending.is_empty());
-    assert_eq!(outcome.verdict.health, "ok");
+    assert!(
+        message.contains("Changes made: service: installed version"),
+        "{message}"
+    );
+    assert!(
+        !config_dir(&installation).join("attach.conf").exists(),
+        "no config file was written"
+    );
+    assert!(
+        installed_at_this_version(&installation).await,
+        "the service is kept"
+    );
 }
 
 /// A runtime the preview planned that the plan after the apply omits fails
@@ -466,4 +476,83 @@ async fn a_verdict_plan_that_drops_a_previewed_runtime_fails_and_names_it() {
         installed_at_this_version(&installation).await,
         "the service is kept"
     );
+}
+
+/// A Hermes home the preview listed that is gone when the apply runs fails the
+/// verdict and is named. A home that appeared after the preview is not touched.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn a_hermes_home_that_vanishes_after_the_preview_fails_and_a_new_one_is_untouched() {
+    let installation = Installation::new();
+    let release = release(&installation);
+    let planner = ScriptedPlanner::new(vec![report(&hermes())]);
+    let home = unmarked_hermes_home(&installation);
+    let profiles = home.join("profiles");
+    fs::create_dir_all(profiles.join("work")).expect("previewed profile home");
+
+    let host_plan = plan(&installation.context, &release, &planner)
+        .await
+        .expect("plan the host");
+    assert!(host_plan
+        .preview
+        .hermes_homes
+        .iter()
+        .any(|shown| shown.integration == "hermes profile work"));
+
+    // Between consent and apply: the previewed home goes, and a new one appears.
+    fs::remove_dir_all(profiles.join("work")).expect("remove previewed home");
+    fs::create_dir_all(profiles.join("late")).expect("new profile home");
+    fs::write(profiles.join("late").join("owner.yaml"), "owner: value\n").expect("new file");
+    let late_before = snapshot(&profiles.join("late"));
+
+    let error = apply(&installation.context, host_plan, &planner)
+        .await
+        .expect_err("the vanished home fails the verdict");
+    assert_eq!(error.code(), "setup_incomplete");
+    let message = error.to_string();
+    assert!(
+        message.contains("hermes profile work"),
+        "the vanished home is named: {message}"
+    );
+    assert!(
+        !message.contains("hermes profile late"),
+        "the new home is not reported as applied: {message}"
+    );
+    assert_eq!(
+        snapshot(&profiles.join("late")),
+        late_before,
+        "the home that appeared after the preview is untouched"
+    );
+}
+
+/// A profiles directory that cannot be read is a failure in the preview, not
+/// an empty list of profile homes.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn an_unreadable_profiles_directory_is_reported_in_the_preview() {
+    let installation = Installation::new();
+    let release = release(&installation);
+    let planner = ScriptedPlanner::new(vec![report(&hermes())]);
+    let home = unmarked_hermes_home(&installation);
+    let profiles = home.join("profiles");
+    fs::create_dir_all(profiles.join("work")).expect("profile home");
+    fs::set_permissions(&profiles, fs::Permissions::from_mode(0o000)).expect("unreadable");
+
+    let outcome = plan(&installation.context, &release, &planner).await;
+    // Restore before any assertion, so the temporary root can be removed.
+    fs::set_permissions(&profiles, fs::Permissions::from_mode(0o700)).expect("restore");
+    let host_plan = outcome.expect("plan the host");
+    let failure = host_plan
+        .preview
+        .hermes_homes
+        .iter()
+        .find(|shown| shown.integration == "hermes profiles")
+        .expect("the listing failure is previewed");
+    assert_eq!(failure.status, "failed");
 }
