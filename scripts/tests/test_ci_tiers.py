@@ -184,6 +184,28 @@ MACOS_PATH_OWNERSHIP = {
 # macOS jobs that never run on a pull request, whatever their paths filter
 # matches: the main and nightly tiers run them unconditionally.
 MACOS_TIER_JOBS = {"macos-tier"}
+# The guard that keeps fork and Dependabot pull requests out of the release
+# rehearsal: their token cannot hold the scopes the called workflow declares.
+SAME_REPOSITORY_PR = (
+    "(github.event_name != 'pull_request' || "
+    "(github.event.pull_request.head.repo.full_name == github.repository && "
+    "github.actor != 'dependabot[bot]'))"
+)
+# macOS jobs of the reusable workflows `ci.yml` calls, by calling job. They
+# take macOS slots in a CI run like the jobs of `ci.yml` itself, so a pull
+# request starts them only through the caller's paths filter.
+MACOS_CALLED_JOBS = {
+    "release-rehearsal-build": {
+        "workflow": "release-build.yml",
+        "jobs": {"rehearsal-macos"},
+        "filter": "release_rehearsal",
+    },
+    "release-rehearsal": {
+        "workflow": "release-evidence.yml",
+        "jobs": {"consumer"},
+        "filter": "release_rehearsal",
+    },
+}
 
 
 def block(text: str, name: str, indent: int = 2) -> str:
@@ -199,8 +221,8 @@ def block(text: str, name: str, indent: int = 2) -> str:
     return match.group(1)
 
 
-def workflow_jobs() -> dict[str, str]:
-    jobs_text = CI.split("jobs:\n", 1)[1]
+def workflow_jobs(workflow: str = CI) -> dict[str, str]:
+    jobs_text = workflow.split("jobs:\n", 1)[1]
     matches = list(re.finditer(r"(?m)^  ([a-z][a-z0-9-]*):\n", jobs_text))
     return {
         match.group(1): jobs_text[
@@ -430,6 +452,63 @@ class CiTierWorkflowTests(unittest.TestCase):
                     self.assertTrue(
                         all(path not in pr_paths for path in main_paths),
                         "main-tier-only inputs must stay out of the PR filter inventory",
+                    )
+
+    def test_called_workflows_start_macos_jobs_on_a_pull_request_only_through_their_filter(self):
+        jobs = workflow_jobs()
+        callers = {
+            name: re.search(r"(?m)^    uses: \./\.github/workflows/([a-z0-9-]+\.yml)$", definition)
+            for name, definition in jobs.items()
+        }
+        called = {name: match.group(1) for name, match in callers.items() if match is not None}
+        discovered = {}
+        for caller, workflow in called.items():
+            text = (ROOT / ".github" / "workflows" / workflow).read_text()
+            called_jobs = workflow_jobs(text)
+            macos = {
+                name
+                for name, definition in called_jobs.items()
+                if re.search(r"(?m)^    runs-on:.*macos", definition)
+                or re.search(r"(?m)^        os: \[.*macos.*\]$", definition)
+            }
+            if macos:
+                discovered[caller] = {"workflow": workflow, "jobs": macos}
+        self.assertEqual(
+            discovered,
+            {
+                caller: {"workflow": entry["workflow"], "jobs": entry["jobs"]}
+                for caller, entry in MACOS_CALLED_JOBS.items()
+            },
+        )
+
+        for caller, entry in MACOS_CALLED_JOBS.items():
+            with self.subTest(caller=caller):
+                condition = re.search(r"(?m)^    if: \$\{\{ (.+) \}\}$", jobs[caller])
+                self.assertIsNotNone(condition, f"{caller} has no explicit tier condition")
+                assert condition is not None
+                # A fork or Dependabot pull request never starts the release
+                # rehearsal; the scenarios below are a same-repository PR.
+                self.assertIn(SAME_REPOSITORY_PR, condition.group(1))
+                expression = condition.group(1).replace(SAME_REPOSITORY_PR, "'same' == 'same'")
+                for filter_value, expected in (("true", True), ("false", False)):
+                    self.assertEqual(
+                        evaluate_condition(
+                            expression,
+                            event="pull_request",
+                            changes={entry["filter"]: filter_value},
+                        ),
+                        expected,
+                        f"{caller} on a pull request with {entry['filter']}={filter_value}",
+                    )
+                for event, tier in (("push", ""), ("schedule", ""), ("workflow_dispatch", "main")):
+                    self.assertTrue(
+                        evaluate_condition(
+                            expression,
+                            event=event,
+                            tier=tier,
+                            changes={entry["filter"]: "false"},
+                        ),
+                        f"{caller} on {event} {tier}",
                     )
 
     def test_main_and_nightly_only_macos_job_has_no_pull_request_branch(self):

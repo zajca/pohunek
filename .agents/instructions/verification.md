@@ -131,7 +131,11 @@ macOS job runs only for its narrow input filter, never because the runtime
 package selection picked Hermes; and the SDK macOS job runs for its own narrow
 input filter. The Linux `hermes-package` job follows the package selection like
 the other runtime package jobs. A change to
-`.github/workflows/ci.yml` selects all four pull-request macOS jobs. A push to
+`.github/workflows/ci.yml` selects all four pull-request macOS jobs. The
+release rehearsal, which a pull request starts through its `release_rehearsal`
+filter, adds macOS jobs from the workflows it calls: the signed
+`aarch64-apple-darwin` CLI and daemon builds (`rehearsal-macos`) and the macOS
+leg of the release consumer build. A push to
 `main` runs the main tier: platform contracts, the macOS tier packages, the
 `macos-15` package job, Hermes macOS, and SDK macOS, alongside the Linux jobs
 selected on main. PR and main runs cancel superseded runs on the same ref. A
