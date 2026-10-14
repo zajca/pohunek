@@ -32,6 +32,8 @@ use crate::workflow_units::{
     assert_alternating, describe, variable_names, wait_gone, Managed, Plugin, UnitEnv,
     DIRECT_KNOBS, KNOBS, SUPERVISED_ENVIRONMENT, TICK_OUTPUT,
 };
+use pohunek_cli::service::definition::identity_config;
+use pohunek_cli::service::VERSION;
 
 /// Runs a scenario waits for before it counts a schedule as repeating.
 const REPEATED_RUNS: usize = 3;
@@ -44,6 +46,9 @@ const BACKOFF_RUNS: usize = 5;
 /// that always exits at once: none for the first start, then
 /// `restart_initial_ms` (500) doubling up to `restart_max_ms` (2000).
 const BACKOFF_DELAYS_MS: [u64; BACKOFF_RUNS] = [0, 500, 1000, 2000, 2000];
+
+/// Another version than this CLI, recorded for the installation.
+const OTHER_VERSION: &str = "0.0.1";
 
 /// A digest no installed archive has.
 const STALE_DIGEST: &str =
@@ -745,4 +750,87 @@ pub(crate) async fn the_dispatcher_unit_follows_the_reacting_plugins() {
         "no enabled plugin declares a reaction, so the dispatcher unit {} is removed",
         unit[0]
     );
+}
+
+/// Path of the record that marks the dispatcher unit of `managed` installed.
+fn dispatcher_record(managed: &Managed) -> PathBuf {
+    managed
+        .units
+        .env
+        .state_home()
+        .join("pohunek/workflow-plugins/units/REACTIONS.json")
+}
+
+/// While an enabled plugin's reactions keep the dispatcher unit installed,
+/// `service uninstall` is refused with that plugin's disable command, the
+/// step that removes the dispatcher.
+pub(crate) async fn service_uninstall_names_the_enabled_plugin_that_reacts() {
+    let mut managed = Managed::new(KNOBS);
+    let plugin = Plugin::new("acme.react").reaction("on_created", &["session_created"], "react");
+    managed.enable(&plugin).await;
+
+    // The refusal comes before the service manager is contacted, so the CLI
+    // child needs no access to it.
+    let output = managed
+        .units
+        .command(&["service", "uninstall", "--json"])
+        .output()
+        .expect("run pohunek service uninstall");
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    let document: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|_| panic!("a JSON envelope: {}", describe(&output)));
+    assert_eq!(
+        document["err"]["code"], "workflow_units_installed",
+        "{document}"
+    );
+    let message = document["err"]["msg"].as_str().expect("a message");
+    assert!(
+        message.contains("run `pohunek workflow disable acme.react` first"),
+        "{document}"
+    );
+    assert!(!message.contains("dispatcher"), "{document}");
+}
+
+/// Under a service installation of another pohunek version, disabling a
+/// plugin with reactions succeeds and stops and removes the dispatcher unit,
+/// also while other enabled plugins react, and later disables succeed with no
+/// dispatcher left to remove: removing a unit runs no trampoline, as for a
+/// plugin's own units, and only this version may write the unit again.
+pub(crate) async fn the_dispatcher_is_removed_under_an_installation_of_another_version() {
+    assert_ne!(VERSION, OTHER_VERSION);
+    let mut managed = Managed::new(KNOBS);
+    let ids = ["acme.react", "acme.watch", "acme.audit"];
+    for id in ids {
+        let plugin = Plugin::new(id).reaction("on_created", &["session_created"], "react");
+        managed.enable(&plugin).await;
+    }
+    let namespace = managed.units.context.namespace().expect("the namespace");
+    let unit = native::names(&namespace, &[dispatcher_key()]);
+    let record = dispatcher_record(&managed);
+    assert!(record.exists(), "enabling recorded the dispatcher unit");
+    assert!(managed.unit_files().contains(&unit[0]), "{unit:?}");
+    assert!(!native::loaded(&namespace, &[dispatcher_key()]).is_empty());
+    identity_config(
+        &managed.units.context,
+        &managed.units.env.root().join("prefix"),
+        OTHER_VERSION,
+    )
+    .expect("the installation configuration")
+    .write(&managed.units.context.config_path())
+    .expect("record the other version");
+
+    disable_plugin(&managed.units.context, ids[0])
+        .await
+        .expect("disable the first plugin");
+    assert!(!record.exists(), "the dispatcher unit is still recorded");
+    assert!(!managed.unit_files().contains(&unit[0]), "{unit:?}");
+    assert!(native::loaded(&namespace, &[dispatcher_key()]).is_empty());
+    // A plugin still reacts, and no dispatcher is left to remove.
+    for id in [ids[2], ids[1]] {
+        disable_plugin(&managed.units.context, id)
+            .await
+            .expect("disable a later plugin");
+    }
+    assert!(!record.exists(), "the dispatcher unit was recorded again");
+    assert!(native::loaded(&namespace, &[dispatcher_key()]).is_empty());
 }
