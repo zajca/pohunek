@@ -103,6 +103,8 @@ pub struct Gated {
     pub report: PreflightReport,
     /// Whether at-risk sessions exist and `--accept-runtime-loss` accepted them.
     pub accepted: bool,
+    /// Conditions of the judgement's inputs that the operator must be told.
+    pub warnings: Vec<String>,
 }
 
 /// Runs the preflight of the staged `daemon` and applies the operator's choice.
@@ -214,12 +216,14 @@ pub fn decide(report: PreflightReport, accept_runtime_loss: bool) -> Result<Gate
         return Ok(Gated {
             report,
             accepted: false,
+            warnings: Vec::new(),
         });
     }
     if accept_runtime_loss {
         Ok(Gated {
             report,
             accepted: true,
+            warnings: Vec::new(),
         })
     } else {
         Err(Error::UpgradeAtRisk { sessions: at_risk })

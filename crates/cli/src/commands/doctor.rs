@@ -471,6 +471,7 @@ mod tests {
             step: "bootstrap",
             preflight: None,
             accepted_runtime_loss: false,
+            warnings: Vec::new(),
         });
         assert_eq!(
             launchd_job_check(Ok(pending), false, Supervision::Native).status,
@@ -539,6 +540,7 @@ mod tests {
             step: "bootstrap",
             preflight: None,
             accepted_runtime_loss: false,
+            warnings: Vec::new(),
         };
         let mut failed = status(true, Some(job("failed")));
         failed.pending_transaction = Some(pending());

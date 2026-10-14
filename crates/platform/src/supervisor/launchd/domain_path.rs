@@ -1,11 +1,10 @@
-//! The `PATH` launchd gives a job of the user domain that sets none.
+//! The persisted launchd user-domain `PATH`, read from `user.plist`.
 //!
 //! `launchctl config user path <value>` stores the value in a property list
-//! of the launchd configuration directory, and every service of that domain
-//! that sets no `PATH` runs with it. Without such a value launchd uses its
-//! standard `PATH`. The reader keeps the same answer for every caller, so the
-//! preflight and runtime spawns of the CLI judge with the value the job runs
-//! with.
+//! of the launchd configuration directory. launchd applies it only after a
+//! reboot, so this file is not the `PATH` of a running job: the active state is
+//! in [`super::job_path`]. The CLI reads this file only for a job that is not
+//! loaded, as the best evidence it has then.
 
 use std::fs::File;
 use std::io::{BufReader, ErrorKind};

@@ -287,6 +287,15 @@ pub struct Record {
     /// only copy of the state before it.
     #[serde(default)]
     pub runtime_backup: Option<RuntimeBackup>,
+    /// The launchd default `PATH` of the previous job, read from its loaded
+    /// `default environment` at the upgrade's early gate.
+    ///
+    /// Written on macOS only, and only when that gate read it from the loaded
+    /// job. A rollback, and the migration's steps after the job is unloaded,
+    /// use it when launchd reports the job as not loaded. On Linux the field is
+    /// never written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launchd_default_path: Option<String>,
 }
 
 /// Exclusive ownership of the install transaction, released on drop.
@@ -975,6 +984,7 @@ mod tests {
             rolling_back: false,
             runtime_stop: false,
             runtime_backup: None,
+            launchd_default_path: None,
         }
     }
 
@@ -1054,6 +1064,7 @@ mod tests {
         let saved = Record {
             runtime_stop: true,
             runtime_backup: Some(journal.clone()),
+            launchd_default_path: None,
             step: Step::Runtimes,
             ..record(Step::Runtimes)
         };

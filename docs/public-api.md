@@ -2241,9 +2241,18 @@ the spent budget cuts off is `would_lose_recovery` with `probe_budget_exhausted`
 The release plan is judged only when the installer passes `--release-plan` (the
 upgrade's own gates and `service check` of an upgrade); without it, as for a
 rollback, which never applies the plan, the preflight judges the installed
-packages only. The preflight runs with the `PATH` the daemon job runs with (the
-one `service.toml` records, else the systemd user manager's or the launchd user
-domain's), and resolves programs with the daemon's own resolver, which skips an
+packages only. The preflight runs with the `PATH` the daemon job runs with, byte
+for byte: the one `service.toml` records; else, on Linux, the systemd user
+manager's `Environment` `PATH`; else, on macOS, launchd's active `PATH` of the job:
+the domain's `environment` `PATH` (`launchctl print gui/<uid>`, set by `launchctl
+setenv`), else the `default environment` of the loaded job (`launchctl print
+gui/<uid>/<label>`), else, for a job that is not loaded, the launchd default an
+upgrade journaled while the job was loaded, else the persisted launchd
+configuration, the best evidence available. A rollback judges with the same order,
+so the `PATH` it uses is the one the restored job gets where launchd can still
+report it; a `warning:` line names a journal that gave no default. An
+unrecognized `launchctl print` output refuses the upgrade with `service_manager_environment_unavailable`. The
+preflight resolves programs with the daemon's own resolver, which skips an
 untrusted candidate the same way at launch. See
 [update after release](knowledge/runbooks/update-after-release.md).
 

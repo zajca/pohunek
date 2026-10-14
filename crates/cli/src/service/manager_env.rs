@@ -93,3 +93,62 @@ pub(crate) fn carry(value: &str) -> Result<String, String> {
     }
     Ok(value.to_owned())
 }
+
+/// What launchd reports for the daemon job's `PATH`, from both of its sources.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ActiveJob {
+    /// The domain's `PATH`, set with `launchctl setenv`, when the domain has one.
+    pub domain: Option<String>,
+    /// The `default environment` `PATH` of the loaded job, when it is loaded.
+    pub loaded_default: Option<String>,
+}
+
+/// Reads launchd's active state of the daemon job.
+pub trait LaunchdJob: Debug + Send + Sync {
+    /// Returns the active `PATH` of job `label` of `gui/<uid>`, or the reason it
+    /// cannot be read.
+    fn active_path<'a>(
+        &'a self,
+        uid: u32,
+        label: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<ActiveJob, String>> + Send + 'a>>;
+}
+
+/// Reads the active state through `launchctl`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemLaunchd;
+
+impl LaunchdJob for SystemLaunchd {
+    #[cfg(target_os = "macos")]
+    fn active_path<'a>(
+        &'a self,
+        uid: u32,
+        label: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<ActiveJob, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let sources = pohunek_platform::supervisor::launchd::job_path_sources(
+                uid,
+                label,
+                super::settings::LAUNCHCTL_COMMAND,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            Ok(ActiveJob {
+                domain: sources.domain,
+                loaded_default: sources.loaded_default,
+            })
+        })
+    }
+
+    /// launchd exists only on macOS.
+    #[cfg(not(target_os = "macos"))]
+    fn active_path<'a>(
+        &'a self,
+        _uid: u32,
+        _label: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<ActiveJob, String>> + Send + 'a>> {
+        Box::pin(std::future::ready(Err(
+            "launchd exists only on macOS".to_owned()
+        )))
+    }
+}

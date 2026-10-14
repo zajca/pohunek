@@ -231,6 +231,8 @@ struct LateGate {
     refused: bool,
     /// The runtime plan, or the apply, this run carried out.
     runtimes: Option<EnsureReport>,
+    /// Conditions of this run's inputs that the operator must be told.
+    warnings: Vec<String>,
 }
 
 /// A test action run just before the adoption preflight of the daemon swap.
@@ -538,6 +540,7 @@ impl<'a> Engine<'a> {
                     rolling_back: false,
                     runtime_stop: false,
                     runtime_backup: None,
+                    launchd_default_path: None,
                 };
                 self.store.save(&record)?;
                 record
@@ -599,6 +602,7 @@ impl<'a> Engine<'a> {
                 let mut report = pending_report(&record);
                 if let Some(gated) = self.rollback_pending(&record).await? {
                     report.accepted_runtime_loss = gated.accepted;
+                    report.warnings.clone_from(&gated.warnings);
                     report.preflight = Some(gated.report);
                 }
                 Ok((None, Some(report)))
@@ -630,7 +634,7 @@ impl<'a> Engine<'a> {
         upgrade_preflight(self.context)?;
         let config_path = self.context.config_path();
         let plan = upgrade_plan(self.store.load()?, version)?;
-        let gated = self.adoption_gate(&plan, from, version).await?;
+        let (gated, job_path) = self.adoption_gate(&plan, from, version).await?;
         let (resume, rolled_back) = self.resolve_plan(plan).await?;
         // The file is read as an upgrade source, so a previous release's
         // schema-2, schema-3, schema-4 or schema-5 installation upgrades into this one
@@ -660,6 +664,7 @@ impl<'a> Engine<'a> {
                 .refresh_active_version(staged, &layout, version)
                 .await?;
             return Ok(UpgradeReport {
+                warnings: Vec::new(),
                 from_version,
                 to_version: version.to_owned(),
                 unchanged: true,
@@ -684,6 +689,11 @@ impl<'a> Engine<'a> {
         let mut record = if let Some(record) = &resume {
             record.clone()
         } else {
+            // A fresh upgrade swaps the daemon, so its early gate has read the
+            // job `PATH` while the previous daemon is still loaded. Only the
+            // launchd default of a loaded job is journaled: the other sources
+            // can be read again later.
+            let launchd_default_path = job_path.and_then(|job| job.loaded_default);
             let record = Record {
                 schema_version: record::SCHEMA_VERSION,
                 operation: Operation::Upgrade,
@@ -696,6 +706,7 @@ impl<'a> Engine<'a> {
                 rolling_back: false,
                 runtime_stop: false,
                 runtime_backup: None,
+                launchd_default_path,
             };
             self.store.save(&record)?;
             record
@@ -713,12 +724,20 @@ impl<'a> Engine<'a> {
             other => other,
         };
         self.settle(&record, result).await?;
-        let (post, integrations) = self.reinstall_integrations(&layout, version, config).await;
+        let (post, integrations) = self
+            .reinstall_integrations(
+                &layout,
+                version,
+                config,
+                record.launchd_default_path.as_deref(),
+            )
+            .await;
         // The preflight right before the swap is the one that counts.
         let gated = late.gated.or(gated);
         let (removed_versions, kept_versions, gc_error) =
             self.collect_garbage_reported(&layout, version).await;
         Ok(UpgradeReport {
+            warnings: late.warnings,
             from_version,
             to_version: version.to_owned(),
             unchanged: false,
@@ -756,7 +775,7 @@ impl<'a> Engine<'a> {
         plan: &Plan,
         from: &Path,
         version: &str,
-    ) -> Result<Option<Gated>, Error> {
+    ) -> Result<(Option<Gated>, Option<JobPath>), Error> {
         // Only a fresh plan needs the installed version, which a rollback
         // would otherwise replace.
         let installed = match plan {
@@ -770,20 +789,20 @@ impl<'a> Engine<'a> {
             installed.as_ref().map(ServiceConfig::active_version),
             version,
         ) {
-            return Ok(None);
+            return Ok((None, None));
         }
-        let search_path = installed_search_path(self.context).await?;
-        preflight::gate_upgrade(
+        let job = installed_job_path(self.context).await?;
+        let gated = preflight::gate_upgrade(
             &*self.preflight,
             self.context,
             from,
             self.reported(version),
-            &search_path,
+            &job.value,
             preflight::ReleasePlan::Included,
             self.accept_runtime_loss,
         )
-        .await
-        .map(Some)
+        .await?;
+        Ok((Some(gated), Some(job)))
     }
 
     /// Uninstalls the service following `options`.
@@ -935,6 +954,7 @@ impl<'a> Engine<'a> {
         };
         if let Some(gated) = gated {
             rolled_back.accepted_runtime_loss = gated.accepted;
+            rolled_back.warnings.clone_from(&gated.warnings);
             rolled_back.preflight = Some(gated.report);
         }
         report.rolled_back = Some(rolled_back);
@@ -1063,22 +1083,27 @@ impl<'a> Engine<'a> {
         // past registration has replaced it, and the new daemon's own adoption
         // decides. A migration already gated and stopped the daemon above;
         // nothing else can start between its stop and this point.
-        let search_path = job_search_path(self.context, config).await?;
-        if record.operation == Operation::Upgrade
+        let swap = record.operation == Operation::Upgrade
             && record.config_backup.is_none()
-            && replaces_daemon(record.step)
-        {
-            #[cfg(test)]
+            && replaces_daemon(record.step);
+        #[cfg(test)]
+        if swap {
             if let Some(hook) = &self.before_swap {
                 (hook.0)();
             }
+        }
+        // The job is resolved here, after the hook and after a migration's stop,
+        // so the value the runtime step gets is the one the new daemon gets.
+        let job = job_path(self.context, config, record.launchd_default_path.as_deref()).await?;
+        late.warnings.extend(job_warnings(self.context, &job));
+        if swap {
             if let Some(dir) = config.daemon_executable().parent() {
                 match preflight::gate_upgrade(
                     &*self.preflight,
                     self.context,
                     dir,
                     self.reported(&version),
-                    &search_path,
+                    &job.value,
                     preflight::ReleasePlan::Included,
                     self.accept_runtime_loss,
                 )
@@ -1092,8 +1117,7 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        self.run_runtimes(record, layout, late, &search_path)
-            .await?;
+        self.run_runtimes(record, layout, late, &job.value).await?;
         self.checkpoint(Step::Runtimes)?;
         if replaces_daemon(record.step) {
             let resuming = record.step == Step::Registering;
@@ -1213,14 +1237,15 @@ impl<'a> Engine<'a> {
         if let Some(hook) = &self.before_swap {
             (hook.0)();
         }
-        let search_path = job_search_path(self.context, config).await?;
+        let job = job_path(self.context, config, record.launchd_default_path.as_deref()).await?;
+        late.warnings.extend(job_warnings(self.context, &job));
         if let Some(dir) = config.daemon_executable().parent() {
             match preflight::gate_upgrade(
                 &*self.preflight,
                 self.context,
                 dir,
                 self.reported(&record.version),
-                &search_path,
+                &job.value,
                 preflight::ReleasePlan::Included,
                 self.accept_runtime_loss,
             )
@@ -1337,12 +1362,13 @@ impl<'a> Engine<'a> {
         layout: &InstallLayout,
         version: &str,
         config: &ServiceConfig,
+        journal_default: Option<&str>,
     ) -> (Option<EnsureReport>, Vec<IntegrationReinstall>) {
         let plan = match layout.version_dir(version) {
-            Some(dir) => match job_search_path(self.context, config).await {
-                Ok(search_path) => {
+            Some(dir) => match job_path(self.context, config, journal_default).await {
+                Ok(job) => {
                     self.runtimes
-                        .run(self.context, &dir, true, &search_path)
+                        .run(self.context, &dir, true, &job.value)
                         .await
                 }
                 Err(error) => Err(error),
@@ -1486,7 +1512,7 @@ impl<'a> Engine<'a> {
                 let new_daemon_may_run = record.step >= Step::Registering
                     || (record.config_backup.is_some() && record.step >= Step::StopDaemon);
                 if restarts_previous && new_daemon_may_run && record.runtime_backup.is_none() {
-                    gated = Some(self.rollback_gate(&layout, previous).await?);
+                    gated = Some(self.rollback_gate(&layout, previous, record).await?);
                 }
                 self.mark_rolling_back(record)?;
                 if record.step >= Step::Registering
@@ -1513,7 +1539,7 @@ impl<'a> Engine<'a> {
                     // The new daemon may have written the store while it was
                     // stopping. Judge the previous reader again, on the restored
                     // state, before the config restore and daemon start.
-                    gated = Some(self.rollback_gate(&layout, previous).await?);
+                    gated = Some(self.rollback_gate(&layout, previous, record).await?);
                 }
                 let restored = self.restore_rollback_config(record, previous, &config_path)?;
                 if restarts_previous {
@@ -1575,7 +1601,12 @@ impl<'a> Engine<'a> {
     }
 
     /// Judges a rollback using the previous version's daemon reader.
-    async fn rollback_gate(&self, layout: &InstallLayout, previous: &str) -> Result<Gated, Error> {
+    async fn rollback_gate(
+        &self,
+        layout: &InstallLayout,
+        previous: &str,
+        record: &Record,
+    ) -> Result<Gated, Error> {
         let daemon_dir =
             layout
                 .version_dir(previous)
@@ -1583,8 +1614,8 @@ impl<'a> Engine<'a> {
                     version: previous.to_owned(),
                     detail: "previous version has no valid installation directory".to_owned(),
                 })?;
-        let search_path = installed_search_path(self.context).await?;
-        rollback::gate(
+        let job = journal_job_path(self.context, record).await?;
+        let mut gated = rollback::gate(
             rollback::Inputs {
                 preflight: &*self.preflight,
                 context: self.context,
@@ -1595,10 +1626,12 @@ impl<'a> Engine<'a> {
             &daemon_dir,
             previous,
             self.reported(previous),
-            &search_path,
+            &job.value,
             self.accept_runtime_loss,
         )
-        .await
+        .await?;
+        gated.warnings = job_warnings(self.context, &job);
+        Ok(gated)
     }
 
     /// Restores the `service.toml` an upgrade record rolls back to.
@@ -2319,6 +2352,8 @@ pub(super) fn job_alive(observation: &ServiceObservation) -> bool {
         )
 }
 
+/// The report of a pending transaction. Its warnings come from the rollback
+/// that judges it, which knows what it resolved.
 pub(crate) fn pending_report(record: &Record) -> PendingReport {
     PendingReport {
         operation: record.operation.as_str(),
@@ -2326,7 +2361,46 @@ pub(crate) fn pending_report(record: &Record) -> PendingReport {
         step: record.step.as_str(),
         preflight: None,
         accepted_runtime_loss: false,
+        warnings: Vec::new(),
     }
+}
+
+/// The warnings a job `PATH` owes the operator: the persisted launchd
+/// configuration was used because the job is not loaded and the transaction
+/// journal holds no launchd default. Only a transaction can have one.
+#[cfg(target_os = "macos")]
+pub(crate) fn job_warnings(context: &Context, job: &JobPath) -> Vec<String> {
+    if job.source != PathSource::Persisted {
+        return Vec::new();
+    }
+    let journal = context.paths().state_dir.join(record::FILE_NAME);
+    let warning = format!(
+        "the launchd job is not loaded and the transaction journal {} holds no launchd default PATH, so the persisted launchd configuration was used",
+        journal.display()
+    );
+    tracing::warn!(journal = %journal.display(), "{warning}");
+    vec![warning]
+}
+
+/// No launchd job runs on other hosts, so no `PATH` is persisted there.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn job_warnings(_context: &Context, _job: &JobPath) -> Vec<String> {
+    Vec::new()
+}
+
+/// The `PATH` a rollback of `record` judges with: the one the installed
+/// configuration gives the job, with the launchd default the upgrade journaled
+/// while the previous job was loaded standing in when the job is not loaded.
+pub(crate) async fn journal_job_path(context: &Context, record: &Record) -> Result<JobPath, Error> {
+    let source = load_config_for_upgrade(&context.config_path())?.ok_or(Error::NotInstalled {
+        path: context.config_path(),
+    })?;
+    job_path(
+        context,
+        &source.config,
+        record.launchd_default_path.as_deref(),
+    )
+    .await
 }
 
 /// What an install or upgrade does with the pending transaction record.
@@ -2627,59 +2701,150 @@ fn load_config_for_upgrade(path: &Path) -> Result<Option<UpgradeSource>, Error> 
 ///
 /// # Errors
 ///
-/// See [`job_search_path`].
-pub(crate) async fn installed_search_path(context: &Context) -> Result<String, Error> {
+/// See [`job_path`].
+pub(crate) async fn installed_job_path(context: &Context) -> Result<JobPath, Error> {
     let source = load_config_for_upgrade(&context.config_path())?.ok_or(Error::NotInstalled {
         path: context.config_path(),
     })?;
-    job_search_path(context, &source.config).await
+    job_path(context, &source.config, None).await
 }
 
-/// The `PATH` the daemon job of `config` runs with, byte for byte, which every
-/// preflight and runtime spawn of the CLI gets.
+/// Where the `PATH` of a job without its own came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathSource {
+    /// The `PATH` `service.toml` records for the job.
+    Recorded,
+    /// The systemd user manager's `Environment`, read now (Linux).
+    UserManager,
+    /// The launchd domain's `environment`, set by `launchctl setenv`.
+    #[cfg(target_os = "macos")]
+    Domain,
+    /// The `default environment` of the loaded job (launchd).
+    #[cfg(target_os = "macos")]
+    LoadedDefault,
+    /// The launchd default the upgrade journaled while the job was loaded.
+    #[cfg(target_os = "macos")]
+    Journal,
+    /// The persisted launchd configuration, or launchd's standard `PATH`.
+    #[cfg(target_os = "macos")]
+    Persisted,
+}
+
+/// The `PATH` a daemon job runs with, byte for byte, and where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JobPath {
+    /// The value the job's processes get.
+    pub(crate) value: String,
+    /// Where the value came from.
+    pub(crate) source: PathSource,
+    /// The launchd `default environment` `PATH` of the loaded job, whatever
+    /// `value` is. An upgrade journals it; `None` when the job is not loaded and
+    /// always on Linux.
+    pub(crate) loaded_default: Option<String>,
+}
+
+/// The `PATH` of the daemon job of `config`, which every preflight and runtime
+/// spawn of the CLI gets.
 ///
 /// The recorded `PATH` of `config` is the job's `PATH`, as
 /// [`super::definition::daemon_definition`] writes it into the systemd unit or
 /// the launchd plist. A job that records none inherits its service manager's
-/// `PATH`: the systemd user manager's on Linux, read by [`manager_env`], and the
-/// launchd user domain's on macOS, read by the platform's launchd reader.
+/// `PATH`:
+///
+/// - Linux: the systemd user manager's `Environment`, read now. The restored or
+///   new job gets exactly that, so no journal value applies.
+/// - macOS, in launchd's order: the domain's `environment` `PATH` (readable
+///   whether or not the job is loaded); the loaded job's `default environment`;
+///   for a job that is not loaded, `journal_default` (the launchd default the
+///   upgrade journaled while the job was loaded); and only without that, the
+///   persisted launchd configuration, then launchd's standard `PATH`. The last
+///   two are the best evidence available and are reported as
+///   [`PathSource::Persisted`].
+///
+/// `journal_default` is the journal's `launchd_default_path` of the transaction
+/// the call belongs to, or `None` outside a transaction.
 ///
 /// # Errors
 ///
-/// Returns [`Error::ManagerEnvironment`] when the service manager's `PATH`
-/// cannot be read or cannot be carried by a process environment.
-pub(crate) async fn job_search_path(
+/// Returns [`Error::ManagerEnvironment`] when the service manager's `PATH` cannot
+/// be read or cannot be carried by a process environment.
+pub(crate) async fn job_path(
     context: &Context,
     config: &ServiceConfig,
-) -> Result<String, Error> {
+    journal_default: Option<&str>,
+) -> Result<JobPath, Error> {
     let recorded = config.search_path();
     if !recorded.is_empty() {
-        return Ok(recorded.to_env_value());
+        return Ok(JobPath {
+            value: recorded.to_env_value(),
+            source: PathSource::Recorded,
+            loaded_default: None,
+        });
     }
     if cfg!(target_os = "linux") {
-        return manager_env::user_manager_search_path(context.user_manager()).await;
+        let value = manager_env::user_manager_search_path(context.user_manager()).await?;
+        return Ok(JobPath {
+            value,
+            source: PathSource::UserManager,
+            loaded_default: None,
+        });
     }
-    launchd_domain_search_path(context)
+    launchd_job_path(context, journal_default).await
 }
 
-/// The launchd user domain's `PATH` as the search path of a job without one.
+/// The launchd `PATH` of a job without its own (macOS), in launchd's order: the
+/// domain's `PATH`; the loaded job's default; for a job that is not loaded, the
+/// default the transaction journaled; and only without that, the persisted
+/// configuration, then launchd's standard `PATH`.
 #[cfg(target_os = "macos")]
-fn launchd_domain_search_path(context: &Context) -> Result<String, Error> {
-    let value = pohunek_platform::supervisor::launchd::read_user_domain_path(
-        context.launchd_domain_config(),
-    )
-    .map_err(|error| Error::ManagerEnvironment {
-        detail: format!("the launchd user domain's PATH cannot be read: {error}"),
-    })?;
-    manager_env::carry(&value).map_err(|detail| Error::ManagerEnvironment { detail })
+async fn launchd_job_path(
+    context: &Context,
+    journal_default: Option<&str>,
+) -> Result<JobPath, Error> {
+    use super::manager_env::ActiveJob;
+
+    let label = context.namespace()?.daemon_label();
+    let ActiveJob {
+        domain,
+        loaded_default,
+    } = context
+        .launchd_job()
+        .active_path(context.uid(), &label)
+        .await
+        .map_err(|detail| Error::ManagerEnvironment { detail })?;
+    let (value, source) = if let Some(value) = domain {
+        (value, PathSource::Domain)
+    } else if let Some(value) = loaded_default.clone() {
+        (value, PathSource::LoadedDefault)
+    } else if let Some(value) = journal_default {
+        (value.to_owned(), PathSource::Journal)
+    } else {
+        let value = pohunek_platform::supervisor::launchd::read_user_domain_path(
+            context.launchd_domain_config(),
+        )
+        .map_err(|error| Error::ManagerEnvironment {
+            detail: format!("the launchd user domain's PATH cannot be read: {error}"),
+        })?;
+        (value, PathSource::Persisted)
+    };
+    let value =
+        manager_env::carry(&value).map_err(|detail| Error::ManagerEnvironment { detail })?;
+    Ok(JobPath {
+        value,
+        source,
+        loaded_default,
+    })
 }
 
-/// Only macOS has a launchd user domain.
+/// Only macOS has launchd.
 #[cfg(not(target_os = "macos"))]
-fn launchd_domain_search_path(_context: &Context) -> Result<String, Error> {
-    Err(Error::ManagerEnvironment {
+fn launchd_job_path<'a>(
+    _context: &'a Context,
+    _journal_default: Option<&'a str>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<JobPath, Error>> + Send + 'a>> {
+    Box::pin(std::future::ready(Err(Error::ManagerEnvironment {
         detail: "a launchd job exists only on macOS".to_owned(),
-    })
+    })))
 }
 
 /// Checks a pending configuration migration without changing the file or job.

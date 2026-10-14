@@ -698,6 +698,30 @@ installed package that serves it still fails with
 catalog's trust state (`catalog: record`) stops and backs up the daemon like any
 other apply.
 
+### The journal of an interrupted upgrade
+
+An interrupted upgrade leaves its transaction journal, `service-install.json` in
+the CLI's state directory. On macOS it holds the launchd default `PATH` of the
+previous daemon job, in the optional `launchd_default_path` field, read from the
+loaded job when the upgrade started. Linux never writes the field, and a
+journal written without it has none.
+
+A job without a recorded `PATH` gets, in launchd's order: the domain's `PATH` (set
+with `launchctl setenv`, readable whether or not the job is loaded); the loaded
+job's default; for a job that is not loaded, the journaled default of the
+transaction; and only when none of these is available, the persisted launchd
+configuration. A rollback therefore judges with the `PATH` the restored job gets
+where launchd can still say so. The persisted-configuration case is reported as a
+`warning:` line that names the journal, because it is the best evidence available
+and not launchd's answer. On Linux a job gets the systemd user manager's current
+`Environment` `PATH`; the journal does not change that.
+
+A journal written by an older CLI, or one whose job was not loaded when the upgrade
+started, has no journaled default; its rollback of a job that is not loaded reads
+the persisted configuration with that warning. A journal with the field is read by
+older CLIs as an unknown field, so an older CLI refuses it; roll it back with the
+CLI that wrote it or with this release.
+
 ## Move Claude and Codex sessions to the official package before upgrading
 
 The upgrade installs and pins the official packages itself (see above), so the

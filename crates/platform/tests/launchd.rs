@@ -26,7 +26,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use pohunek_platform::process::{HostInspector, ProcessIdentity, ProcessInspector as _};
-use pohunek_platform::supervisor::launchd::{LaunchdDaemon, LaunchdPluginUnits, LaunchdSupervisor};
+use pohunek_platform::supervisor::launchd::{
+    job_path_sources, LaunchdDaemon, LaunchdPluginUnits, LaunchdSupervisor,
+};
 use pohunek_platform::supervisor::{
     Activation, DaemonSupervisor as _, Error, JobDefinition, JobLogs, JobSpec, Namespace,
     PluginUnitDefinition, PluginUnitKey, PluginUnitKind, PluginUnits as _, RestartPolicy,
@@ -749,6 +751,64 @@ async fn daemon_agent_installs_replaces_and_uninstalls() {
     assert!(!path.exists(), "agent definition removed");
     wait_gone(&[second_process], Instant::now() + ABSENCE_MARGIN).await;
     daemon.uninstall().await.expect("absent daemon uninstalls");
+}
+
+/// A loaded job without a `PATH` of its own runs with the `PATH` launchd gives
+/// it, and the reader returns exactly the value that job received.
+#[tokio::test]
+async fn a_loaded_job_without_a_path_reports_the_path_it_received() {
+    let fixture = Fixture::new();
+    let agents = fixture.root.join("LaunchAgents");
+    let daemon = LaunchdDaemon::new(&fixture.namespace, uid(), agents, COMMAND_DEADLINE)
+        .expect("valid daemon manager");
+    let label = fixture.namespace.daemon_label();
+    let _cleanup = Bootout(label.clone());
+    let received = fixture.root.join("received-path");
+    // The job records the `PATH` it was started with, and sets none itself.
+    let script = format!("printf '%s' \"$PATH\" > '{}'", received.display());
+    let definition = JobDefinition::new(JobSpec {
+        executable: PathBuf::from("/bin/sh"),
+        arguments: vec![
+            "-c".to_owned(),
+            script,
+            "pohunek-test-daemon".to_owned(),
+            fixture.namespace.as_str().to_owned(),
+        ],
+        environment: BTreeMap::new(),
+        working_directory: fixture.root.clone(),
+        logs: Some(JobLogs {
+            stdout: fixture.root.join("path.out.log"),
+            stderr: fixture.root.join("path.err.log"),
+        }),
+        start_timeout: Duration::from_secs(10),
+        exit_timeout: Duration::from_secs(5),
+        restart: RestartPolicy::OnFailure {
+            throttle: Duration::from_secs(1),
+        },
+        open_files: 1_024,
+    })
+    .expect("valid daemon definition");
+    daemon.install(&definition).await.expect("daemon installs");
+
+    let received_value = wait::wait_until("the job's PATH record", || async {
+        std::fs::read_to_string(&received)
+            .ok()
+            .filter(|text| !text.is_empty())
+    })
+    .await;
+    // The job runs with the domain's `PATH` when one is set, else its own default.
+    let sources = job_path_sources(uid(), &label, COMMAND_DEADLINE)
+        .await
+        .expect("the job's PATH sources are read");
+    let resolved = sources
+        .domain
+        .or(sources.loaded_default)
+        .expect("a loaded job reports a PATH");
+    assert_eq!(
+        resolved, received_value,
+        "the reader returns what the job received"
+    );
+    assert!(!received_value.is_empty(), "the job received a PATH");
 }
 
 #[tokio::test]

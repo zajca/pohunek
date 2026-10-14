@@ -43,6 +43,8 @@ use crate::service::inherited::Token;
 use crate::service::layout::tests::{anchor_bytes, stage_dir, write_anchor};
 use crate::service::layout::CLI_NAME;
 use crate::service::manager_env::UserManager;
+#[cfg(target_os = "macos")]
+use crate::service::manager_env::{ActiveJob, LaunchdJob};
 use crate::service::preflight::{Judging, ReleasePlan};
 use crate::service::runtimes::Running;
 use crate::service::usage::tests::{
@@ -2136,9 +2138,86 @@ fn launchd_domain_xml(value: &str) -> String {
     )
 }
 
+/// Stands in for launchd's active state of the daemon job. The state can change
+/// while a test runs, as a job that is unloaded mid-upgrade does.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct FakeLaunchd(Mutex<Result<ActiveJob, String>>);
+
+#[cfg(target_os = "macos")]
+impl FakeLaunchd {
+    fn new(value: Result<ActiveJob, String>) -> Self {
+        Self(Mutex::new(value))
+    }
+
+    fn set(&self, value: Result<ActiveJob, String>) {
+        *self.0.lock().expect("launchd state") = value;
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl LaunchdJob for FakeLaunchd {
+    fn active_path<'a>(
+        &'a self,
+        _uid: u32,
+        _label: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<ActiveJob, String>> + Send + 'a>> {
+        let value = self.0.lock().expect("launchd state").clone();
+        Box::pin(async move { value })
+    }
+}
+
+/// A loaded job whose `default environment` sets `PATH` to `default`.
+#[cfg(target_os = "macos")]
+fn loaded_job(default: impl Into<String>) -> ActiveJob {
+    ActiveJob {
+        domain: None,
+        loaded_default: Some(default.into()),
+    }
+}
+
+/// A job that is not loaded, in a domain that sets no `PATH`.
+#[cfg(target_os = "macos")]
+fn not_loaded() -> ActiveJob {
+    ActiveJob::default()
+}
+
+/// A domain that sets `domain`, with the job loaded at `default` or not.
+#[cfg(target_os = "macos")]
+fn domain_over(domain: &str, default: Option<&str>) -> ActiveJob {
+    ActiveJob {
+        domain: Some(domain.to_owned()),
+        loaded_default: default.map(str::to_owned),
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn a_launchd_job_without_a_recorded_path_runs_and_judges_with_the_user_domains_path() {
+async fn a_loaded_job_without_a_recorded_path_judges_with_the_path_launchd_reports() {
+    const DEFAULT_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+    let mut harness = Harness::new();
+    harness.context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged)
+        .with_launchd_job(Arc::new(FakeLaunchd::new(Ok(loaded_job(
+            DEFAULT_PATH.to_owned(),
+        )))));
+
+    harness.install(V1).await.expect("install");
+
+    assert!(harness.config().expect("config").search_path().is_empty());
+    let judged = harness.runtimes.script().search_paths.clone();
+    assert!(!judged.is_empty(), "the runtime step ran");
+    assert!(
+        judged.iter().all(|path| path == DEFAULT_PATH),
+        "every spawn gets the PATH launchd reports for the job: {judged:?}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_job_that_is_not_loaded_falls_back_to_the_persisted_domain_configuration() {
     const DOMAIN_PATH: &str = "/opt/pohunek-test/bin:/usr/bin:/bin";
     let mut harness = Harness::new();
     let domain = harness.root.join("user.plist");
@@ -2147,35 +2226,35 @@ async fn a_launchd_job_without_a_recorded_path_runs_and_judges_with_the_user_dom
         .context
         .clone()
         .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged)
-        .with_launchd_domain_config(&domain);
+        .with_launchd_domain_config(&domain)
+        .with_launchd_job(Arc::new(FakeLaunchd::new(Ok(not_loaded()))));
 
     harness.install(V1).await.expect("install");
 
-    assert!(harness.config().expect("config").search_path().is_empty());
     let judged = harness.runtimes.script().search_paths.clone();
     assert!(!judged.is_empty(), "the runtime step ran");
     assert!(
         judged.iter().all(|path| path == DOMAIN_PATH),
-        "every spawn gets the launchd user domain's PATH: {judged:?}"
+        "a job that is down judges with the best evidence available: {judged:?}"
     );
 }
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn an_unreadable_launchd_domain_configuration_refuses_a_job_without_a_recorded_path() {
+async fn an_unrecognized_launchd_report_refuses_a_job_without_a_recorded_path() {
     let mut harness = Harness::new();
-    let domain = harness.root.join("user.plist");
-    std::fs::write(&domain, "not a property list").expect("domain configuration");
     harness.context = harness
         .context
         .clone()
         .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged)
-        .with_launchd_domain_config(&domain);
+        .with_launchd_job(Arc::new(FakeLaunchd::new(Err(
+            "unrecognized launchctl print output: `launchctl changed its output`".to_owned(),
+        ))));
 
     let error = harness
         .install(V1)
         .await
-        .expect_err("the domain's PATH cannot be known");
+        .expect_err("the job's PATH cannot be read");
     assert_eq!(error.code(), "service_manager_environment_unavailable");
     assert!(harness.pending().is_none(), "no transaction was journaled");
     assert!(harness.config().is_none(), "no configuration was kept");
@@ -2331,6 +2410,210 @@ async fn a_stopped_session_at_risk_needs_the_flag_like_a_live_one() {
         .expect("the flag accepts the stopped session's loss");
     assert!(report.accepted_runtime_loss);
     harness.assert_installed(V2);
+}
+
+/// The `PATH` a job without its own gets from its service manager now: the
+/// systemd user manager's on Linux, launchd's active state on macOS.
+fn set_job_path(harness: &mut Harness, path: &str) {
+    harness.context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged);
+    #[cfg(target_os = "linux")]
+    {
+        harness.context = harness
+            .context
+            .clone()
+            .with_user_manager(Arc::new(FakeUserManager(Ok(vec![format!("PATH={path}")]))));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        harness.context = harness
+            .context
+            .clone()
+            .with_launchd_job(Arc::new(FakeLaunchd::new(Ok(loaded_job(path.to_owned())))));
+    }
+}
+
+const JOURNALED_PATH: &str = "/opt/journaled/bin:/usr/bin";
+const CURRENT_PATH: &str = "/opt/current/bin:/usr/bin";
+
+/// Installs V1, starts an upgrade to V2 that stops after registering the new
+/// daemon, and returns the harness with that journal pending.
+async fn interrupted_upgrade_journal(harness: &mut Harness) {
+    set_job_path(harness, JOURNALED_PATH);
+    harness.install(V1).await.expect("install");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registered);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted after the registration");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_rollback_judges_with_the_manager_path_current_at_rollback() {
+    let mut harness = Harness::new();
+    interrupted_upgrade_journal(&mut harness).await;
+    // The manager's environment changes after the upgrade and before the rollback.
+    set_job_path(&mut harness, CURRENT_PATH);
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.search_paths);
+
+    harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V1), V1)
+        .await
+        .expect("the pending upgrade is rolled back");
+
+    let judged = judged.lock().expect("search path lock").clone();
+    assert!(!judged.is_empty(), "the rollback judged");
+    assert!(
+        judged.iter().all(|path| path == CURRENT_PATH),
+        "the rollback judges with the manager's PATH as the restored job gets it: {judged:?}"
+    );
+    // The restored job records no PATH, so it gets the manager's environment.
+    let registered = harness
+        .fake
+        .world()
+        .registered
+        .clone()
+        .expect("the restored daemon is registered");
+    assert_eq!(registered.environment().get("PATH"), None);
+    harness.assert_installed(V1);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_rollback_judges_with_the_domain_path_over_the_journaled_default() {
+    const DOMAIN_PATH: &str = "/opt/domain/bin:/usr/bin";
+    let mut harness = Harness::new();
+    interrupted_upgrade_journal(&mut harness).await;
+    harness.context = harness
+        .context
+        .clone()
+        .with_launchd_job(Arc::new(FakeLaunchd::new(Ok(domain_over(
+            DOMAIN_PATH,
+            Some(CURRENT_PATH),
+        )))));
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.search_paths);
+
+    harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V1), V1)
+        .await
+        .expect("the pending upgrade is rolled back");
+
+    let judged = judged.lock().expect("search path lock").clone();
+    assert!(
+        !judged.is_empty() && judged.iter().all(|path| path == DOMAIN_PATH),
+        "the domain's PATH is what the job gets now: {judged:?}"
+    );
+    harness.assert_installed(V1);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_job_unloaded_before_the_runtime_step_resolves_the_journaled_default_not_the_plist() {
+    const JOURNALED: &str = "/opt/journaled/bin:/usr/bin";
+    const PERSISTED: &str = "/opt/persisted/bin:/usr/bin";
+    let launchd = Arc::new(FakeLaunchd::new(Ok(loaded_job(JOURNALED))));
+    let mut harness = Harness::new();
+    let domain = harness.root.join("user.plist");
+    std::fs::write(&domain, launchd_domain_xml(PERSISTED)).expect("domain configuration");
+    harness.context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged)
+        .with_launchd_job(Arc::clone(&launchd) as Arc<dyn LaunchdJob>)
+        .with_launchd_domain_config(&domain);
+    harness.install(V1).await.expect("install");
+    harness.runtimes.script().search_paths.clear();
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.search_paths);
+    let mut engine = harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight));
+    // The early gate reads the loaded default and journals it; the job is unloaded
+    // before the swap, so the late gate and the runtime step are not given a live
+    // default by launchd.
+    let unloaded = Arc::clone(&launchd);
+    engine.before_swap = Some(SwapHook(Box::new(move || {
+        unloaded.set(Ok(not_loaded()));
+    })));
+
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect("upgrade");
+
+    assert_eq!(
+        judged.lock().expect("search path lock").clone(),
+        [JOURNALED.to_owned(), JOURNALED.to_owned()],
+        "the early and the late gate judge with the journaled default"
+    );
+    let runtime = harness.runtimes.script().search_paths.clone();
+    assert!(!runtime.is_empty(), "the runtime step ran");
+    assert!(
+        runtime.iter().all(|path| path == JOURNALED),
+        "the runtime step does not fall back to the plist: {runtime:?}"
+    );
+    harness.assert_installed(V2);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_journal_without_a_launchd_default_takes_the_persisted_plist_and_warns() {
+    const PERSISTED: &str = "/opt/persisted/bin:/usr/bin";
+    let mut harness = Harness::new();
+    interrupted_upgrade_journal(&mut harness).await;
+    // A journal that does not hold the launchd default.
+    let journal = harness.context.paths().state_dir.join(record::FILE_NAME);
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&journal).expect("journal")).expect("journal JSON");
+    document
+        .as_object_mut()
+        .expect("journal object")
+        .remove("launchd_default_path");
+    std::fs::write(
+        &journal,
+        serde_json::to_vec(&document).expect("journal bytes"),
+    )
+    .expect("rewrite journal");
+    let domain = harness.root.join("user.plist");
+    std::fs::write(&domain, launchd_domain_xml(PERSISTED)).expect("domain configuration");
+    harness.context = harness
+        .context
+        .clone()
+        .with_launchd_job(Arc::new(FakeLaunchd::new(Ok(not_loaded()))))
+        .with_launchd_domain_config(&domain);
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.search_paths);
+
+    let report = harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V1), V1)
+        .await
+        .expect("the pending upgrade is rolled back");
+
+    let judged = judged.lock().expect("search path lock").clone();
+    assert!(
+        !judged.is_empty() && judged.iter().all(|path| path == PERSISTED),
+        "the persisted configuration is the last evidence: {judged:?}"
+    );
+    let rolled_back = report.rolled_back.expect("the rollback is reported");
+    assert_eq!(rolled_back.warnings.len(), 1, "{:?}", rolled_back.warnings);
+    assert!(
+        rolled_back.warnings[0].contains("persisted launchd configuration was used"),
+        "{:?}",
+        rolled_back.warnings
+    );
+    harness.assert_installed(V1);
 }
 
 #[tokio::test]

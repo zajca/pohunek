@@ -389,6 +389,9 @@ fn render_plan(text: &mut String, plan: &EnsureReport) {
 
 fn render_upgrade(report: &report::UpgradeReport) -> String {
     let mut text = String::new();
+    for warning in &report.warnings {
+        let _ = writeln!(text, "warning: {warning}");
+    }
     if let Some(pending) = &report.rolled_back {
         let _ = writeln!(text, "{}", render_rolled_back(pending));
     }
@@ -543,6 +546,7 @@ fn render_check(report: &report::CheckReport) -> String {
                 "rolled back first"
             }
         );
+        render_pending_warnings(&mut text, pending);
     }
     if let Some(preflight) = &report.preflight {
         if let Some(plan) = &preflight.runtimes {
@@ -680,6 +684,13 @@ fn render_status(report: &report::StatusReport) -> String {
     text
 }
 
+/// Appends one `warning:` line for each journal condition of `pending`.
+fn render_pending_warnings(text: &mut String, pending: &report::PendingReport) {
+    for warning in &pending.warnings {
+        let _ = writeln!(text, "warning: {warning}");
+    }
+}
+
 fn render_transaction(text: &mut String, report: &report::StatusReport) {
     match (&report.pending_transaction, report.transaction_in_progress) {
         (Some(pending), true) => {
@@ -688,6 +699,7 @@ fn render_transaction(text: &mut String, report: &report::StatusReport) {
                 "running    {} {} is at step {} in another `pohunek service` command",
                 pending.operation, pending.version, pending.step
             );
+            render_pending_warnings(text, pending);
         }
         (None, true) => {
             let _ = writeln!(
@@ -701,6 +713,7 @@ fn render_transaction(text: &mut String, report: &report::StatusReport) {
                 "pending    {} {} stopped after step {} (rerun it to resume, or uninstall to roll back)",
                 pending.operation, pending.version, pending.step
             );
+            render_pending_warnings(text, pending);
         }
         (None, false) => {}
     }
@@ -711,6 +724,7 @@ fn render_rolled_back(pending: &report::PendingReport) -> String {
         "rolled back an interrupted {} of {} (stopped after step {})",
         pending.operation, pending.version, pending.step
     );
+    render_pending_warnings(&mut text, pending);
     if let Some(preflight) = &pending.preflight {
         text.push('\n');
         render_preflight(&mut text, preflight, pending.accepted_runtime_loss);
@@ -912,6 +926,7 @@ mod tests {
                 step: "config",
                 preflight: None,
                 accepted_runtime_loss: false,
+                warnings: Vec::new(),
             }),
             pending_action: Some("roll_back"),
             locked: true,
@@ -1036,6 +1051,24 @@ mod tests {
     }
 
     #[test]
+    fn a_rolled_back_journal_without_a_job_path_says_so() {
+        let text = render_rolled_back(&report::PendingReport {
+            operation: "upgrade",
+            version: "2.0.0".to_owned(),
+            step: "registered",
+            preflight: None,
+            accepted_runtime_loss: false,
+            warnings: vec![
+                "the journal /state/service-install.json records no job PATH".to_owned(),
+            ],
+        });
+        assert!(
+            text.contains("warning: the journal /state/service-install.json records no job PATH"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn status_renders_not_installed_and_pending_transactions() {
         let text = render_status(&report::StatusReport {
             installed: false,
@@ -1056,6 +1089,7 @@ mod tests {
                 step: "config",
                 preflight: None,
                 accepted_runtime_loss: false,
+                warnings: Vec::new(),
             }),
         });
         assert!(text.contains("pending    install 1.0.0 stopped after step config"));
@@ -1098,6 +1132,7 @@ mod tests {
     #[test]
     fn an_unchanged_upgrade_renders_its_version_cleanup() {
         let text = render_upgrade(&report::UpgradeReport {
+            warnings: Vec::new(),
             from_version: "2.0.0".to_owned(),
             to_version: "2.0.0".to_owned(),
             unchanged: true,
@@ -1164,6 +1199,7 @@ mod tests {
                 step: "ready",
                 preflight: None,
                 accepted_runtime_loss: false,
+                warnings: Vec::new(),
             }),
         };
         let json = render_json(&status).expect("status JSON");
