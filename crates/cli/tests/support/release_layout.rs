@@ -40,6 +40,9 @@ const LIBEXEC: &str = "libexec/pohunek";
 /// version is known.
 const STAGE: &str = ".stage";
 
+/// Prefix of the name of every pohunek binary.
+const POHUNEK_NAME_PREFIX: &str = "pohunek";
+
 /// Size of the read buffer used while hashing.
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -293,6 +296,34 @@ impl Layout {
         &self.file(name).digest
     }
 
+    /// Whether a process runs a pohunek binary, judged by what it executes
+    /// rather than by the name it reports.
+    ///
+    /// A process qualifies when its command name or its executable's file name
+    /// starts with `pohunek`, or when its executable is byte-identical to a
+    /// binary of this layout under any name. `image` hashes the executable
+    /// only when the names do not already decide. `None` means its bytes could
+    /// not be read: on Linux the process exited, since `/proc/<pid>/exe` stays
+    /// readable after an unlink; on macOS its executable path no longer holds a
+    /// file. Such a process is not judged a pohunek binary by its bytes.
+    fn runs_a_pohunek_binary(
+        &self,
+        command: &str,
+        executable: &Path,
+        image: impl FnOnce() -> Option<String>,
+    ) -> bool {
+        let named = |name: &str| name.starts_with(POHUNEK_NAME_PREFIX);
+        if named(command)
+            || executable
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(named)
+        {
+            return true;
+        }
+        image().is_some_and(|digest| BINARIES.iter().any(|name| self.file(name).digest == digest))
+    }
+
     /// Re-hashes every installed file and its source.
     ///
     /// # Errors
@@ -432,8 +463,9 @@ impl Layout {
     ///
     /// # Errors
     ///
-    /// Fails for a process named `pohunek*` that does not execute a
-    /// byte-identical binary of this layout.
+    /// Fails for a process that runs a pohunek binary (see
+    /// [`Self::runs_a_pohunek_binary`]) and does not execute a byte-identical
+    /// binary of this layout at its installed path.
     #[cfg(target_os = "linux")]
     pub(crate) fn pohunek_processes(
         &self,
@@ -456,13 +488,16 @@ impl Layout {
                 continue;
             }
             let command = fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
-            if !command.trim().starts_with("pohunek") {
-                continue;
-            }
             let Ok(executable) = fs::read_link(entry.path().join("exe")) else {
                 // Exited between the scan and the read.
                 continue;
             };
+            // The running image is hashed through /proc/<pid>/exe, the inode
+            // that was executed, whatever its path now holds.
+            let image = || sha256_file(&entry.path().join("exe")).ok();
+            if !self.runs_a_pohunek_binary(command.trim(), &executable, image) {
+                continue;
+            }
             let Some(name) = BINARIES.iter().find(|name| self.path(name) == executable) else {
                 return Err(if executable.starts_with(&self.dir) {
                     LayoutError::ImageMismatch {
@@ -495,8 +530,9 @@ impl Layout {
     ///
     /// # Errors
     ///
-    /// Fails for a process named `pohunek*` that belongs to the scope and does not
-    /// execute a byte-identical binary of this layout. Fails closed on error.
+    /// Fails for a process that belongs to the scope, runs a pohunek binary (see
+    /// [`Self::runs_a_pohunek_binary`]), and does not execute a byte-identical
+    /// binary of this layout. Fails closed on error.
     #[cfg(target_os = "macos")]
     pub(crate) fn pohunek_processes(
         &self,
@@ -534,8 +570,7 @@ impl Layout {
         };
 
         for fact in processes {
-            // Skip own process and non-pohunek processes.
-            if fact.pid == own || !fact.comm.starts_with("pohunek") {
+            if fact.pid == own {
                 continue;
             }
 
@@ -556,6 +591,12 @@ impl Layout {
                 || inspector.cwd(fact.pid).is_ok_and(|cwd| below_root(&cwd));
 
             if !belongs {
+                continue;
+            }
+            // Darwin offers no handle to the executed image, so the bytes are
+            // those the executable path holds at observation time.
+            let image = || sha256_file(&executable).ok();
+            if !self.runs_a_pohunek_binary(&fact.comm, &executable, image) {
                 continue;
             }
 
