@@ -1239,9 +1239,10 @@ Trust boundary:
   socket only (`crates/daemon/src/api/handler/package.rs`, error
   `local_only_method`), and the CLI refuses a remote `--host`
   (`plugin_local_only`). A remote owner connection over the overlay can launch
-  only what is already installed and enabled on that host. `pohunek workflow`
-  never contacts a daemon and refuses a remote `--host` before any I/O
-  (`workflow_local_only`).
+  only what is already installed and enabled on that host. The `pohunek workflow`
+  commands never contact a daemon and refuse a remote `--host` before any I/O
+  (`workflow_local_only`); only the reaction dispatcher unit reads the local
+  daemon's `subscribe` stream, as a client that never starts it.
 - **Workflow plugins are owner code outside core.** The CLI keeps them in its
   own registry root and per-plugin state and config directories, all `0700`,
   and serializes every change under one store lock.

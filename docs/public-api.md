@@ -3193,7 +3193,9 @@ and remote invocations print the same document.
 is no protocol method, event, record or SDK type for workflow plugins: the CLI
 keeps them in its own package registry under `<state>/pohunek/workflow-plugins/`,
 with per-plugin directories `<state>/pohunek/workflow-plugin-state/<id>/` and
-`<config>/pohunek/workflow-plugin-config/<id>/`, and never contacts a daemon.
+`<config>/pohunek/workflow-plugin-config/<id>/`, and its commands never
+contact a daemon; only the reaction dispatcher (below) reads the local daemon's
+`subscribe` stream.
 Every command that changes the store holds the store lock
 `<state>/pohunek/workflow-plugins/store.lock` for its whole run.
 

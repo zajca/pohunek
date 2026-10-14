@@ -79,8 +79,8 @@ argv = ["bin/work", "notify"]
 Rules, each checked at install time:
 
 - The manifest is at most 64 KiB, checked before it is parsed. Every table
-  refuses unknown keys, so `[reactions]` is refused today. At least one
-  action, job or service is required. The description is 1 to 1024 bytes.
+  refuses unknown keys. At least one action, job, service or reaction is
+  required. The description is 1 to 1024 bytes.
 - `argv` has 1 to 64 entries of at most 4096 bytes each, with no NUL byte. No
   shell ever interprets it.
 - `argv[0]` is either a package path to an executable file of the archive
@@ -432,8 +432,8 @@ longest kill grace and 30 s for its own checks below it, so the run is always
 recorded as `timeout` before the service manager would kill it. Every knob is
 read again at each run except `jobs.check_period_s`, which is written into a
 job's timer when the plugin is enabled: run `pohunek workflow enable` again
-after changing it. The reactions table arrives with that feature and is
-refused until then.
+after changing it. The `[reactions]` knobs are described under
+[Event reactions](#event-reactions).
 
 ## Jobs and services
 
@@ -698,8 +698,9 @@ next dispatcher restart. Reactions take their deadline and output caps from
 
 ## Local only
 
-Every `pohunek workflow` command works on this user's files and never contacts
-a daemon; `enable`, `disable` and `uninstall` of a plugin with jobs or
+Every `pohunek workflow` command you type works on this user's files and never
+contacts a daemon; only the dispatcher unit's hidden `__dispatch` connects to
+the local daemon's `subscribe` stream, and it never starts the daemon. `enable`, `disable` and `uninstall` of a plugin with jobs or
 services also use this user's service manager, and `status` only reads the
 state of those units from it. A remote `--host` fails with
 `workflow_local_only` before any file is read or written.
