@@ -114,11 +114,10 @@ CI uses three execution tiers (issue #477). Pull requests always run the
 required Linux checks. On PRs, macOS platform contracts run when their input
 filter matches; the package job runs on `macos-15` only for packaging,
 install-acceptance, launchd-service, or relevant workflow inputs; the Hermes
-macOS job runs for its narrow input filter or whenever the runtime package
-selection did not succeed or selects the Hermes package, which every core
-change does; and the SDK macOS job runs for its own narrow input filter. The
-Linux `hermes-package` job follows the package selection like the other
-runtime package jobs. A change to
+macOS job runs only for its narrow input filter, never because the runtime
+package selection picked Hermes; and the SDK macOS job runs for its own narrow
+input filter. The Linux `hermes-package` job follows the package selection like
+the other runtime package jobs. A change to
 `.github/workflows/ci.yml` selects all four macOS jobs. A push to
 `main` runs the main tier: platform contracts, the
 `macos-15` package job, Hermes macOS, and SDK macOS, alongside the Linux jobs

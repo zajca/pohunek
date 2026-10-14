@@ -236,33 +236,56 @@ PACKAGE_SELECTOR = "package-selection"
 PACKAGE_SELECT_COMMAND = 'cargo xtask package affected --base "$BASE_SHA" --json'
 
 
-def evaluate_package_condition(expression: str, event: str, cancelled: bool, result: str, outputs: dict[str, str]) -> bool:
-    """Evaluate a package job's `if:` in Python for the operators it may use.
+def evaluate_condition(
+    expression: str,
+    *,
+    event: str,
+    cancelled: bool = False,
+    tier: str = "",
+    changes: dict[str, str] | None = None,
+    result: str = "",
+    outputs: dict[str, str] | None = None,
+) -> bool:
+    """Evaluate a job's `if:` in Python for the operators it may use.
 
-    Only `!cancelled()`, `github.event_name`, the selector's `result` and
-    `outputs.<name>`, string literals, `==`, `!=`, `&&`, `||` and parentheses
-    are understood; anything else fails the translation. A missing output reads
-    as the empty string and string comparison ignores case, as in GitHub Actions.
+    Only `!cancelled()`, `github.event_name`, `inputs.tier`, the `changes`
+    job's `outputs.<name>`, the selector's `result` and `outputs.<name>`,
+    string literals, `==`, `!=`, `&&`, `||` and parentheses are understood;
+    anything else fails the translation. A missing output reads as the empty
+    string and string comparison ignores case, as in GitHub Actions.
     """
     python = expression.replace("!cancelled()", "(not cancelled)")
     python = python.replace("github.event_name", "event")
+    python = python.replace("inputs.tier", "tier")
     python = python.replace(f"needs.{PACKAGE_SELECTOR}.result", "result")
     python = re.sub(
         rf"needs\.{re.escape(PACKAGE_SELECTOR)}\.outputs\.([a-z_]+)",
         r"outputs.get('\1', '')",
         python,
     )
+    python = re.sub(r"needs\.changes\.outputs\.([a-z_]+)", r"changes.get('\1', '')", python)
     python = python.replace("&&", " and ").replace("||", " or ")
     python = re.sub(r"'[^']*'", lambda literal: literal.group(0).lower(), python)
-    leftover = re.sub(r"'[^']*'|\b(?:not|and|or|event|result|cancelled|outputs\.get)\b|==|!=|[()\s,]", "", python)
+    leftover = re.sub(
+        r"'[^']*'|\b(?:not|and|or|event|tier|result|cancelled|outputs\.get|changes\.get)\b|==|!=|[()\s,]",
+        "",
+        python,
+    )
     if leftover:
         raise AssertionError(f"untranslated condition syntax {leftover!r} in {expression!r}")
     return bool(eval(python, {"__builtins__": {}}, {
         "event": event.lower(),
         "cancelled": cancelled,
+        "tier": tier.lower(),
+        "changes": {name: value.lower() for name, value in (changes or {}).items()},
         "result": result.lower(),
-        "outputs": {name: value.lower() for name, value in outputs.items()},
+        "outputs": {name: value.lower() for name, value in (outputs or {}).items()},
     }))
+
+
+def evaluate_package_condition(expression: str, event: str, cancelled: bool, result: str, outputs: dict[str, str]) -> bool:
+    """Evaluate a package job's `if:`, which reads only the selector."""
+    return evaluate_condition(expression, event=event, cancelled=cancelled, result=result, outputs=outputs)
 
 
 class CiTierWorkflowTests(unittest.TestCase):
@@ -398,6 +421,40 @@ class CiTierWorkflowTests(unittest.TestCase):
                         all(path not in pr_paths for path in main_paths),
                         "main-tier-only inputs must stay out of the PR filter inventory",
                     )
+
+    def test_a_pull_request_starts_a_macos_job_only_for_its_own_filter(self):
+        # Every macOS job holds one of the five concurrent hosted macOS slots,
+        # so on a pull request nothing but its own paths filter may start it
+        # (issue #1050): a core change selecting every runtime package, or a
+        # failed selection, must not.
+        selections = (
+            ("success", {package: "true" for package in PACKAGE_JOBS.values()}),
+            ("success", {package: "false" for package in PACKAGE_JOBS.values()}),
+            ("failure", {}),
+            ("skipped", {}),
+        )
+        jobs = workflow_jobs()
+        for name, ownership in MACOS_PATH_OWNERSHIP.items():
+            expression = re.search(r"(?m)^    if: \$\{\{ (.+) \}\}$", jobs[name])
+            self.assertIsNotNone(expression, f"{name} has no explicit tier condition")
+            assert expression is not None
+            other_filters = {filter_name: "true" for filter_name in filter_names()}
+            other_filters[ownership["filter"]] = "false"
+            for result, outputs in selections:
+                with self.subTest(job=name, selection=result, outputs=outputs):
+                    self.assertTrue(evaluate_condition(
+                        expression.group(1), event="pull_request",
+                        changes={ownership["filter"]: "true"}, result=result, outputs=outputs,
+                    ))
+                    self.assertFalse(evaluate_condition(
+                        expression.group(1), event="pull_request",
+                        changes=other_filters, result=result, outputs=outputs,
+                    ))
+            for event, tier in (("push", ""), ("schedule", ""), ("workflow_dispatch", "main"), ("workflow_dispatch", "nightly")):
+                with self.subTest(job=name, event=event, tier=tier):
+                    self.assertTrue(evaluate_condition(
+                        expression.group(1), event=event, tier=tier, result="skipped",
+                    ))
 
 
 class RuntimePackageSelectionTests(unittest.TestCase):
