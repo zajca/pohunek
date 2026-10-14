@@ -9,11 +9,12 @@
 
 // Rust guideline compliant 2026-10-14
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use pohunek_platform::filesystem::{EntryKind, FsError, StageOutcome, TrustedDir};
+use pohunek_platform::filesystem::{EntryIdentity, EntryKind, FsError, StageOutcome, TrustedDir};
 use protocol::{ErrorClass, ProtocolError, RuntimeRef, SessionId};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use tracing::warn;
@@ -168,46 +169,112 @@ fn try_remove(root: &Path, id: &SessionId) -> Result<(), String> {
         _ => return Err("the directory changed while it was being removed".to_owned()),
     };
     let staged_path = staged.path();
+    let staged_identity = staged.identity();
     drop(staged);
     if std::fs::remove_dir_all(&staged_path).is_ok() {
         return Ok(());
     }
     // An agent may leave read-only directories (a Go module cache, a Nix
     // build tree); their entries can be unlinked once the owner may write.
-    grant_owner_access(&staged_path).map_err(|error| error.to_string())?;
+    let staged_name = staged_path
+        .file_name()
+        .ok_or_else(|| format!("{}: no staged name", staged_path.display()))?;
+    let root_fd = root_dir
+        .try_clone_descriptor()
+        .map_err(|error| error.to_string())?;
+    grant_owner_access(&root_fd, staged_name, staged_identity)
+        .map_err(|error| format!("{}: {error}", staged_path.display()))?;
     std::fs::remove_dir_all(&staged_path)
         .map_err(|error| format!("{}: {error}", staged_path.display()))
 }
 
 /// Grants the owner `rwx` on every directory of the daemon's user in the tree
-/// at `top`, without following symlinks and without touching any other entry.
+/// `name` below `root`, which must still be the staged inode `expected`.
 ///
-/// Each directory is made accessible through its parent before it is opened,
-/// so a directory its owner cannot even read (mode 0000) is reached as well.
-fn grant_owner_access(top: &Path) -> std::io::Result<()> {
+/// Every directory is opened without following a symlink and changed through
+/// its descriptor, so no entry outside the tree is ever touched.
+fn grant_owner_access(
+    root: &impl AsFd,
+    name: &OsStr,
+    expected: EntryIdentity,
+) -> std::io::Result<()> {
     let uid = rustix::process::geteuid().as_raw();
-    let accessible = |stat: &rustix::fs::Stat| Mode::from_raw_mode(stat.st_mode) | Mode::RWXU;
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let top_stat = rustix::fs::lstat(top)?;
-    if top_stat.st_uid == uid {
-        rustix::fs::chmod(top, accessible(&top_stat))?;
+    let top = std::fs::File::from(open_accessible(root, name, uid)?);
+    let metadata = top.metadata()?;
+    if metadata.dev() != expected.device() || metadata.ino() != expected.inode() {
+        return Err(std::io::Error::other(
+            "the staged directory changed before its permissions were granted",
+        ));
     }
-    let mut pending = vec![rustix::fs::open(top, flags, Mode::empty())?];
+    let mut pending = vec![OwnedFd::from(top)];
     while let Some(dir) = pending.pop() {
         for name in child_names(&dir)? {
             let stat = rustix::fs::statat(&dir, name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW)?;
-            if FileType::from_raw_mode(stat.st_mode) != FileType::Directory || stat.st_uid != uid {
-                continue;
+            if FileType::from_raw_mode(stat.st_mode) == FileType::Directory && stat.st_uid == uid {
+                pending.push(open_accessible(&dir, &name, uid)?);
             }
-            rustix::fs::chmodat(&dir, name.as_os_str(), accessible(&stat), AtFlags::empty())?;
-            pending.push(rustix::fs::openat(
-                &dir,
-                name.as_os_str(),
-                flags,
-                Mode::empty(),
-            )?);
         }
     }
+    Ok(())
+}
+
+/// Opens the directory `name` below `parent` without following a symlink and
+/// grants its owner `rwx` when it belongs to `uid`.
+fn open_accessible(parent: &impl AsFd, name: &OsStr, uid: u32) -> std::io::Result<OwnedFd> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let dir = match rustix::fs::openat(parent, name, flags, Mode::empty()) {
+        Ok(dir) => dir,
+        // A directory its owner may not read (mode 0000) is granted access by
+        // name first, still without following a symlink.
+        Err(rustix::io::Errno::ACCESS) => {
+            grant_unreadable(parent, name, uid)?;
+            rustix::fs::openat(parent, name, flags, Mode::empty())?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let stat = rustix::fs::fstat(&dir)?;
+    if stat.st_uid == uid {
+        rustix::fs::fchmod(&dir, Mode::from_raw_mode(stat.st_mode) | Mode::RWXU)?;
+    }
+    Ok(dir)
+}
+
+/// Grants the owner `rwx` on an unreadable directory of `uid`.
+///
+/// Linux has no no-follow `chmodat`, so the directory is pinned with an
+/// `O_PATH` descriptor and changed through its `/proc/self/fd` link, which
+/// names exactly that inode.
+#[cfg(target_os = "linux")]
+fn grant_unreadable(parent: &impl AsFd, name: &OsStr, uid: u32) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let pinned = rustix::fs::openat(parent, name, flags, Mode::empty())?;
+    let stat = rustix::fs::fstat(&pinned)?;
+    if stat.st_uid != uid {
+        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    }
+    rustix::fs::chmod(
+        format!("/proc/self/fd/{}", pinned.as_raw_fd()).as_str(),
+        Mode::from_raw_mode(stat.st_mode) | Mode::RWXU,
+    )?;
+    Ok(())
+}
+
+/// Grants the owner `rwx` on an unreadable directory of `uid`; the no-follow
+/// `chmodat` changes a symlink swapped in meanwhile, never its target.
+#[cfg(not(target_os = "linux"))]
+fn grant_unreadable(parent: &impl AsFd, name: &OsStr, uid: u32) -> std::io::Result<()> {
+    let stat = rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory || stat.st_uid != uid {
+        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    }
+    rustix::fs::chmodat(
+        parent,
+        name,
+        Mode::from_raw_mode(stat.st_mode) | Mode::RWXU,
+        AtFlags::SYMLINK_NOFOLLOW,
+    )?;
     Ok(())
 }
 
