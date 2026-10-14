@@ -38,6 +38,7 @@ use super::{
     SessionRegistry, SessionRuntime, SessionState, StateSource, UnconfirmedCleanup, Worker,
     WorkerError, WorkerMetadataApplyOutcome, WORKER_CONNECT_RETRY,
 };
+use crate::agent::host::RuntimeDefinition;
 use crate::agent::NativeReferenceProvenance;
 use crate::procwatch::ProcessInspector;
 use crate::runtime::lifecycle::{
@@ -914,6 +915,51 @@ impl SessionRegistry {
             (owners, _) => owners,
         };
         self.delete_orphaned_session_tmpdirs(owners).await;
+    }
+
+    /// The detector configuration a reconciled session starts with: the one
+    /// its restored active agent ran before the restart, chosen as a live
+    /// report or observation chooses it, or `default` without one.
+    fn restored_detector_config(
+        &self,
+        info: &protocol::SessionInfo,
+        pinned: Option<&Arc<RuntimeDefinition>>,
+        active: Option<&ActiveAgentReport>,
+        default: &DetectorConfig,
+    ) -> DetectorConfig {
+        let (Some(active), Some(active_base)) = (active, info.active_agent_base.as_ref()) else {
+            return default.clone();
+        };
+        let own_runtime = *active_base == info.agent_base;
+        if active.observed {
+            let definition = if own_runtime {
+                pinned.cloned()
+            } else {
+                self.inner.profiles.runtimes().resolve_ref(active_base).ok()
+            };
+            return definition.map_or_else(
+                || default.clone(),
+                |definition| DetectorConfig::for_definition(&definition),
+            );
+        }
+        let resolved = match pinned {
+            Some(pinned) => self
+                .inner
+                .profiles
+                .resolve_agent_pinned(&active.agent, pinned),
+            None => self.inner.profiles.resolve_agent(&active.agent),
+        };
+        match resolved {
+            // Without a pin, the session's own runtime is unserved and a
+            // report of it is refused, so the launch default stays.
+            Ok(resolved)
+                if pinned.is_some()
+                    || RuntimeRef::from(resolved.base.clone()) != info.agent_base =>
+            {
+                super::detector_config_for_resolved_agent(&resolved)
+            }
+            _ => default.clone(),
+        }
     }
 
     /// Classifies the socket evidence startup discovery found for a session,
@@ -3658,6 +3704,17 @@ impl SessionRegistry {
             &pin,
             manifest_override,
         );
+        let pinned = self
+            .inner
+            .profiles
+            .runtimes()
+            .pinned_definition(&record.info.agent_base, &pin);
+        let restored_detector_config = self.restored_detector_config(
+            &record.info,
+            pinned.as_ref(),
+            active_agent.as_ref(),
+            &default_detector_config,
+        );
         let detector_cancel = CancellationToken::new();
         let procwatch_cancel = CancellationToken::new();
         let runtime_watch_cancel = CancellationToken::new();
@@ -3666,7 +3723,7 @@ impl SessionRegistry {
             watch::channel((record.info.rows, record.info.cols));
         let (detector_config, detector_config_rx) = watch::channel(DetectorConfigUpdate {
             generation: 0,
-            config: default_detector_config.clone(),
+            config: restored_detector_config,
         });
         let (detector_preview, detector_preview_rx) = mpsc::channel(1);
         let (input_ready_tx, input_ready) = watch::channel(false);
@@ -3685,11 +3742,7 @@ impl SessionRegistry {
             detector_preview,
             input_ready,
             default_detector_config,
-            pinned: self
-                .inner
-                .profiles
-                .runtimes()
-                .pinned_definition(&record.info.agent_base, &pin),
+            pinned,
             procwatch_cancel: procwatch_cancel.clone(),
             runtime_watch_cancel: runtime_watch_cancel.clone(),
             procwatch_rescan: Arc::clone(&procwatch_rescan),

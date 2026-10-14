@@ -2991,6 +2991,11 @@ async fn an_explicit_report_of_a_profile_named_like_its_runtime_keeps_its_overri
     Box::pin(adopted.registry.reconcile_workers())
         .await
         .expect("startup reconciliation");
+    assert_eq!(
+        running_detector(&adopted.registry, &created_id).await,
+        override_config,
+        "the reconciled session starts with the restored report's override"
+    );
 
     install_unselected_next_claude(&adopted).await;
     assert_eq!(
@@ -3006,6 +3011,148 @@ async fn an_explicit_report_of_a_profile_named_like_its_runtime_keeps_its_overri
     adopted
         .registry
         .remove(&created_id)
+        .await
+        .expect("remove the adopted session");
+}
+
+/// Records a nested Codex agent as procwatch observes it in session `id`.
+async fn observe_nested_codex(registry: &SessionRegistry, id: &protocol::SessionId) {
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(id).expect("the live session");
+    entry.active_agent = Some(super::super::ActiveAgentReport {
+        source: "pohunek:procwatch".to_owned(),
+        agent: RuntimeId::CODEX.to_owned(),
+        seq: None,
+        pid: None,
+        start_identity: None,
+        reported_at: std::time::Instant::now(),
+        activity_reported: false,
+        observed: true,
+    });
+    entry.info.active_agent = Some(RuntimeId::CODEX.to_owned());
+    entry.info.active_agent_base = Some(protocol::RuntimeRef::codex());
+}
+
+/// Rewrites session `id`'s durable record without its active agent's origin.
+fn forget_active_agent_origin(store_path: &Path, id: &protocol::SessionId) {
+    let store = crate::store::Store::new(store_path.to_path_buf());
+    let mut record = store
+        .load_sessions()
+        .expect("durable sessions")
+        .into_iter()
+        .find(|record| record.session_id == id.0)
+        .expect("the session record");
+    record.active_agent_origin = None;
+    store
+        .record_session(&record)
+        .expect("write the record without an origin");
+}
+
+#[tokio::test]
+async fn an_observed_nested_agent_in_a_record_without_an_origin_is_restored_as_observed() {
+    let tag = "codex-nested-origin";
+    let key = signing_key("root");
+    let dir = temp_dir(tag);
+    let store_path = temp_store_path(tag);
+    let fixture = Fixture::with_anchor_and_store(
+        &format!("{tag}-plugins"),
+        anchor(&[&key], Vec::new()),
+        store_path.clone(),
+    );
+    fs::create_dir_all(fixture.agents.join("manifests")).expect("the manifests directory");
+    fs::write(
+        fixture.agents.join("manifests").join("tuned.toml"),
+        OVERRIDE_MANIFEST,
+    )
+    .expect("the override manifest");
+    // A host profile named like the nested runtime, with its own manifest.
+    fixture.write_profile(
+        RuntimeId::CODEX,
+        "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 600\"]\nmanifest = \"tuned\"\n",
+    );
+    fixture.write_profile(
+        PROFILE,
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 600\"]\n",
+    );
+    let previous = compiled_in_daemon(&fixture, &store_path);
+    let created = previous
+        .create(protocol::SessionNewParams {
+            agent: PROFILE.to_owned(),
+            cwd: Some(dir),
+            ..params()
+        })
+        .await
+        .expect("a session of the built-in Claude runtime");
+    let adopted = fixture.reopen_with_workers_of(&previous).await;
+    Box::pin(adopted.registry.reconcile_workers())
+        .await
+        .expect("startup reconciliation");
+    install_real_official(
+        &adopted,
+        &adopted.registry,
+        RuntimeId::CLAUDE,
+        &real_official(RuntimeId::CLAUDE),
+        5,
+    )
+    .await;
+    install_real_official(
+        &adopted,
+        &adopted.registry,
+        RuntimeId::CODEX,
+        &real_official(RuntimeId::CODEX),
+        6,
+    )
+    .await;
+    adopted
+        .registry
+        .package_bind_profile(PackageBindProfileParams {
+            profile: RuntimeId::CODEX.to_owned(),
+            digest: None,
+            dry_run: false,
+        })
+        .await
+        .expect("pin the codex profile to the served package");
+    let codex = adopted
+        .registry
+        .inner
+        .profiles
+        .runtimes()
+        .resolve_id(&RuntimeId::parse(RuntimeId::CODEX).expect("runtime id"))
+        .expect("the package serves codex");
+    let observed_config = detector_debug(&crate::detect::DetectorConfig::for_definition(&codex));
+    let profile_config = crate::session::detector_config_for_resolved_agent(
+        &adopted
+            .registry
+            .inner
+            .profiles
+            .resolve_agent(RuntimeId::CODEX)
+            .expect("the codex profile resolves"),
+    );
+    assert_ne!(detector_debug(&profile_config), observed_config);
+
+    // procwatch observed a nested Codex agent; the record keeps no origin, as a
+    // record before schema 10 does.
+    observe_nested_codex(&adopted.registry, &created.id).await;
+    persist_session(&adopted.registry, &created.id).await;
+    forget_active_agent_origin(&store_path, &created.id);
+
+    let adopted = adopted.reopen_with_workers_of(&adopted.registry).await;
+    Box::pin(adopted.registry.reconcile_workers())
+        .await
+        .expect("startup reconciliation");
+    assert_eq!(
+        running_detector(&adopted.registry, &created.id).await,
+        observed_config,
+        "an agent named like its own runtime is restored as observed, not as the profile of its name"
+    );
+    adopted
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the adopted session");
+    adopted
+        .registry
+        .remove(&created.id)
         .await
         .expect("remove the adopted session");
 }
@@ -3122,17 +3269,7 @@ async fn an_explicit_report_of_a_differently_named_profile_keeps_its_override_th
         5,
     )
     .await;
-    let running = |registry: &SessionRegistry| {
-        let registry = registry.clone();
-        let id = created.id.clone();
-        async move {
-            let sessions = registry.inner.sessions.lock().await;
-            let entry = sessions.get(&id).expect("the live session");
-            let config = entry.detector_config.borrow().config.clone();
-            detector_debug(&config)
-        }
-    };
-    let override_config = running(&adopted.registry).await;
+    let override_config = running_detector(&adopted.registry, &created.id).await;
     assert!(
         adopted
             .registry
@@ -3155,6 +3292,11 @@ async fn an_explicit_report_of_a_differently_named_profile_keeps_its_override_th
     Box::pin(adopted.registry.reconcile_workers())
         .await
         .expect("startup reconciliation");
+    assert_eq!(
+        running_detector(&adopted.registry, &created.id).await,
+        override_config,
+        "the reconciled session starts with the restored report's override"
+    );
 
     install_version(
         &adopted,
@@ -3166,7 +3308,7 @@ async fn an_explicit_report_of_a_differently_named_profile_keeps_its_override_th
     )
     .await;
     assert_eq!(
-        running(&adopted.registry).await,
+        running_detector(&adopted.registry, &created.id).await,
         override_config,
         "the explicit report of a differently named profile keeps its manifest override"
     );
