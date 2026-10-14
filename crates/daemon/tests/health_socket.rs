@@ -33,14 +33,14 @@ use protocol::{
     NotificationPolicyParams, NotificationPolicyResult, NotificationRetentionParams,
     NotificationRetentionResult, NotificationSeverity, NotificationSource, NotificationStatus,
     NotificationUpdateParams, NotificationUpdateResult, ProcessStartIdentity, ProjectInfo,
-    ProjectShowResult, ReportSequence, Request as ProtocolRequest, Response, RuntimeId, RuntimeRef,
-    SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
-    SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter,
-    SessionListParams, SessionNewParams, SessionRemoveResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult, SessionWarningKind,
-    StateSource, TerminalDimensions, WorktreeRemoveParams, WorktreeRemoveResult, ENV_DAEMON_ID,
-    ENV_SESSION_ID, PROTOCOL_VERSION,
+    ProjectShowResult, ProjectWorktree, ReportSequence, Request as ProtocolRequest, Response,
+    RuntimeId, RuntimeRef, SessionAttachParams, SessionAttachResult, SessionDetachParams,
+    SessionDetachResult, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
+    SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams, SessionRemoveResult,
+    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionState,
+    SessionStopResult, SessionWarningKind, StateSource, TerminalDimensions, WorktreeRemoveParams,
+    WorktreeRemoveResult, ENV_DAEMON_ID, ENV_SESSION_ID, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
@@ -4673,6 +4673,114 @@ async fn two_sessions_on_one_repo_get_distinct_worktrees() {
     assert!(
         !cleaned_store.contains("\"kind\":\"worktree\""),
         "session.remove drops exact worktree ownership bindings: {cleaned_store}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Registers `repo` as a project and returns its raw `project.show` result.
+async fn show_project_of(framed: &mut Framed<UnixStream, LinesCodec>, repo: &Path) -> Value {
+    let add = Request::make(
+        "owner-project-add",
+        method::PROJECT_ADD,
+        serde_json::json!({ "path": repo }),
+    );
+    let project: ProjectInfo =
+        serde_json::from_value(ok_payload(exchange(framed, &add).await)).expect("project info");
+    let show = Request::make(
+        "owner-project-show",
+        method::PROJECT_SHOW,
+        serde_json::json!({ "reference": project.id }),
+    );
+    ok_payload(exchange(framed, &show).await)
+}
+
+/// Returns the typed worktree entry at `path` and its raw JSON object.
+fn worktree_entry(shown: &Value, path: &Path) -> (ProjectWorktree, Value) {
+    let canonical = path.canonicalize().expect("canonical worktree path");
+    let typed: ProjectShowResult =
+        serde_json::from_value(shown.clone()).expect("project show result");
+    let index = typed
+        .worktrees
+        .iter()
+        .position(|worktree| worktree.path == canonical || worktree.path == path)
+        .unwrap_or_else(|| {
+            panic!(
+                "project.show lists the worktree {}: {shown}",
+                path.display()
+            )
+        });
+    (
+        typed.worktrees[index].clone(),
+        shown["worktrees"][index].clone(),
+    )
+}
+
+/// `project.show` names the session a worktree was created for after that
+/// session stops, while `session_id` names only a live session in it.
+#[tokio::test]
+async fn a_stopped_session_still_owns_its_worktree_in_project_show() {
+    let repo = init_git_repo();
+    let worktree_root = temp_dir("owner-wt-root");
+    let store_path = temp_dir("owner-wt-store").join("metadata.jsonl");
+    let socket = temp_socket("owner-worktree");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "exec sleep 30"]),
+        worktree_root: Some(worktree_root.to_path_buf()),
+        store_path: Some(store_path),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut control = connect(&socket).await;
+    let session: SessionInfo = serde_json::from_value(ok_payload(
+        create_worktree_session(
+            &mut control,
+            RuntimeRef::shell(),
+            repo.cwd().to_path_buf(),
+            "feature/owner",
+        )
+        .await,
+    ))
+    .expect("session info");
+    let path = session.worktree_path.clone().expect("worktree path");
+
+    let (live, _) = worktree_entry(&show_project_of(&mut control, repo.cwd()).await, &path);
+    assert!(live.owned, "pohunek owns the session's worktree: {live:?}");
+    assert_eq!(
+        live.owner_session_id.as_deref(),
+        Some(session.id.0.as_str())
+    );
+    assert_eq!(live.session_id.as_deref(), Some(session.id.0.as_str()));
+
+    stop_session(&mut control, &session.id).await;
+    wait_for_state(&mut control, &session.id, SessionState::Stopped).await;
+
+    let shown = show_project_of(&mut control, repo.cwd()).await;
+    let (stopped, raw) = worktree_entry(&shown, &path);
+    assert!(
+        stopped.owned,
+        "the stopped session still owns its worktree: {raw}"
+    );
+    assert_eq!(
+        stopped.owner_session_id.as_deref(),
+        Some(session.id.0.as_str()),
+        "the owner survives the stop: {raw}"
+    );
+    assert!(
+        raw.get("session_id").is_none(),
+        "a worktree without a live session omits session_id: {raw}"
+    );
+    let unowned = shown["worktrees"]
+        .as_array()
+        .expect("worktrees array")
+        .iter()
+        .find(|entry| entry["owned"] == false)
+        .unwrap_or_else(|| panic!("the repository's own checkout is listed: {shown}"));
+    assert!(
+        unowned.get("owner_session_id").is_none(),
+        "an unowned worktree omits owner_session_id: {unowned}"
     );
 
     let _ = shutdown.send(());
