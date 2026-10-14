@@ -1195,9 +1195,12 @@ check = "none"
         let outside = scope.join("elsewhere");
         fs::create_dir_all(&outside).expect("outside dir");
         let renamed = outside.join("watcher");
-        // A plain copy keeps the mode and, on macOS, the binary's embedded
-        // ad-hoc signature, so it runs as it is.
-        fs::copy(host.layout.path("pohunek"), &renamed)
+        // The bytes carry the binary's embedded ad-hoc signature on macOS, so
+        // the copy runs as it is. They are written through a child process,
+        // so no sibling test thread's fork inherits a writable descriptor of
+        // the copy and makes its exec fail with ETXTBSY.
+        let image = fs::read(host.layout.path("pohunek")).expect("read the layout CLI");
+        pohunek_test_support::fs::write_executable(&renamed, image)
             .expect("copy the layout CLI under another name");
         assert_eq!(
             sha256_file(&renamed).expect("hash the copy"),
