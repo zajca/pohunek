@@ -555,7 +555,8 @@ fn a_complete_set_assembles_a_verifiable_reproducible_bundle() {
     assert_eq!(verified.entries.len(), runtimes().len());
     for entry in &verified.entries {
         assert!(
-            entry.contains(&format!("[{GNU}, {MUSL}]")) && entry.ends_with(&format!(" ={VERSION}")),
+            entry.contains(&format!("[{MAC}, {GNU}, {MUSL}]"))
+                && entry.ends_with(&format!(" ={VERSION}")),
             "unexpected entry {entry}"
         );
     }
