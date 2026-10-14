@@ -368,7 +368,10 @@ rotated, owner-private family (`runs.jsonl`, `runs.jsonl.1`, …):
 ```
 
 `kind` is `action` for `workflow run`, and `job` or `service` for a run of a
-unit (see [Jobs and services](#jobs-and-services)). `outcome` is `ok`,
+unit (see [Jobs and services](#jobs-and-services)). A unit's record names the
+unit even when its run was refused before the manifest verified (`refused`,
+`overlap_skipped`), since the unit name it was started with fits the unit name
+grammar. `outcome` is `ok`,
 `exit_nonzero`, `timeout`, `output_limit`, `interrupted`, `spawn_failed`,
 `failed`, `refused`, `overlap_skipped` (a unit run skipped because the
 previous run of the same unit was still active), or, with `--json` after a
@@ -474,8 +477,19 @@ actions never touch the service manager.
   (or `workflow_service_not_installed` when the recorded installation is
   unusable) and the plugin stays installed, disabled; repeat it once the
   cause is fixed.
-- Nothing yet stops `pohunek service uninstall` while plugin units exist.
-  Without a `pohunek service` installation, `disable` and `uninstall` still
+- `pohunek service uninstall` refuses with `workflow_units_installed` while
+  any plugin's unit record names a unit. The check runs before the service
+  manager is contacted and changes nothing. It takes `units.lock` (a unit
+  command running at the same time makes it fail with `workflow_store_busy`)
+  and keeps it until the uninstall ends (creating the workflow store's lock
+  file when no store exists yet), so a `workflow enable` or enabling install
+  meanwhile fails with `workflow_store_busy` instead of recording units. Its
+  message names each such plugin with the `pohunek workflow disable <id>` that
+  stops it. A unit record that cannot be read refuses it with
+  `workflow_store_failed`. The operator order is: `pohunek workflow disable <id>`
+  for each named plugin (or `pohunek workflow uninstall <id>`), then
+  `pohunek service uninstall`.
+- Without a `pohunek service` installation, `disable` and `uninstall` still
   look for the plugin's units, in the namespace and unit directory a
   `pohunek service install` would record for this user and these roots, and
   remove them. They accept an installation of any version: removing a unit
@@ -496,6 +510,43 @@ remain. A record that cannot be read or is invalid fails the command with
 systemd and `io.github.zajca.pohunek.<ns>.wf.<h12>.<j|s>.<name>` on launchd,
 where `<h12>` is the first 12 hex characters of SHA-256 over the plugin id,
 so a job and a service may share a name.
+
+### Status
+
+`pohunek workflow status [<id>] [--json]` shows the recorded jobs and services
+of the installed plugins: every plugin that has units when no id is given, or
+the named plugin, with an empty `units` list when it has none. It is local and
+read-only: it asks the service manager for each unit's state and reads the
+plugin's run log, and it never contacts the daemon.
+
+Each unit reports:
+
+- `state`: `running`, `stopped`, `failed` or `unknown`, from the service
+  manager. A job is `running` while its schedule is armed and `failed` while
+  its last run failed; launchd never reports `failed`. The state is `unknown`,
+  with a `state_reason`, when no `pohunek service` installation is recorded,
+  the manager cannot be reached, the manager has no unit of that name, or it
+  reports a transitional state.
+- `last_run`: the newest run record of the unit of the installed archive, with
+  `ts`, `outcome`, and `exit_code`, `signal` or `error_code` where recorded;
+  `null` when there is none. The run log is read under a shared hold of its
+  writer's lock, opened read-only and never created, so status writes nothing.
+- `consecutive_failures`: for a job, the number of newest run records of the
+  unit whose outcome is not `ok`, counted up to the first `ok`. An
+  `overlap_skipped` record started no run, so it neither counts nor ends the
+  count. For a service, it is the stored count of short runs in its backoff
+  file minus one, the value a stable run leaves there. After a fresh start the
+  first short run stores one and so reads zero; `last_run` and the run log are
+  the exact history. `null` when the count cannot be determined.
+- `backoff_ms` (services only): the delay the unit's next start waits, computed
+  by the same function the trampoline waits with. `backoff_error` is present
+  when the backoff file cannot be read or parsed; the delay then is the longest
+  one, as the trampoline's own start.
+
+The counts cover the retained run log only: the active file and its rotations,
+at most `logs.run_log_files` files of `logs.run_log_file_bytes` bytes each. A
+run log that cannot be read is reported as `run_log_error`; its units then have
+no `last_run`, and a job has a `null` `consecutive_failures`.
 
 ### Each run
 
@@ -573,7 +624,8 @@ the unit's final `SIGKILL` reaches every process of the unit.
 
 Every `pohunek workflow` command works on this user's files and never contacts
 a daemon; `enable`, `disable` and `uninstall` of a plugin with jobs or
-services also use this user's service manager. A remote `--host` fails with
+services also use this user's service manager, and `status` only reads the
+state of those units from it. A remote `--host` fails with
 `workflow_local_only` before any file is read or written.
 
 ## Trust boundary

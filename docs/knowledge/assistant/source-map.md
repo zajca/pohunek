@@ -614,6 +614,7 @@ Runtime package archive format:
 - `crates/cli/src/workflow/runner.rs` — `workflow run`: refusals, the child's argv, cwd and exact environment, the context JSON, deadline, output caps, signal handling, outcome precedence, and the `--json` stdout capture and its single-document check.
 - `crates/cli/src/workflow/config.rs` — the owner knobs `<config>/pohunek/workflow.toml`: tables, defaults, ranges and the file safety rule.
 - `crates/cli/src/workflow/runlog.rs` — the per-plugin `logs/runs.jsonl` record and its outcomes.
+- `crates/cli/src/workflow/status.rs` — `workflow status`: native state, last run, consecutive failures and service backoff of each recorded unit.
 - `crates/cli/src/workflow/units.rs` — job and service units: the service installation they need, their definitions, and enable, disable and uninstall against the user service manager.
 - `crates/cli/src/workflow/supervised.rs` — the `__exec` trampoline every unit runs: refusals, the run lock, the wall-clock job schedule, the service backoff and stop handling.
 - `crates/paths/src/lib.rs` — `WORKFLOW_PLUGINS_SUBDIR`, `WORKFLOW_PLUGIN_STATE_SUBDIR` and `WORKFLOW_PLUGIN_CONFIG_SUBDIR`.

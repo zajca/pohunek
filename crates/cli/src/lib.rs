@@ -26,7 +26,7 @@ mod workflow;
 pub mod workflow_units {
     #[doc(inline)]
     pub use crate::workflow::units::{
-        disable_plugin, enable_plugin, uninstall_plugin, LifecycleError,
+        disable_plugin, enable_plugin, status_plugins, uninstall_plugin, LifecycleError,
     };
 }
 

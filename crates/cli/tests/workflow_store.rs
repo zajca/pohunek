@@ -1869,3 +1869,224 @@ async fn the_daemon_refuses_a_workflow_archive_as_a_runtime_package() {
 
     harness.stop().await;
 }
+
+/// Writes the unit record of [`PLUGIN_ID`] with `contents`, where the store
+/// keeps it, and returns its path.
+#[cfg(target_os = "linux")]
+fn write_unit_record(units: &workflow_units::UnitEnv, contents: &[u8]) -> PathBuf {
+    let units_dir = units
+        .env
+        .state_home()
+        .join("pohunek/workflow-plugins/units");
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&units_dir)
+        .expect("create the unit record directory");
+    let record_path = units_dir.join(format!("{PLUGIN_ID}.json"));
+    fs::write(&record_path, contents).expect("write the unit record");
+    fs::set_permissions(&record_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod the unit record");
+    record_path
+}
+
+/// Everything a refused `service uninstall` must leave as it found it: the
+/// installation record, the plugin list and the unit files.
+#[cfg(target_os = "linux")]
+fn installation_snapshot(units: &workflow_units::UnitEnv) -> (Vec<u8>, Vec<Value>, Vec<String>) {
+    let config = fs::read(units.context.config_path()).expect("read service.toml");
+    let mut files: Vec<String> = fs::read_dir(units.context.supervisor_dir())
+        .map(|entries| {
+            entries
+                .map(|entry| {
+                    entry
+                        .expect("a unit directory entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    (config, units.listed(), files)
+}
+
+/// Runs `pohunek service uninstall --json` in `units`' hermetic environment.
+#[cfg(target_os = "linux")]
+fn service_uninstall(units: &workflow_units::UnitEnv) -> (Option<i32>, Value) {
+    let output = units
+        .command(&["service", "uninstall", "--json"])
+        .output()
+        .expect("run pohunek service uninstall");
+    let document: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|_| panic!("a JSON envelope: {}", workflow_units::describe(&output)));
+    (output.status.code(), document)
+}
+
+/// `service uninstall` refuses before any effect while a plugin still has
+/// recorded units, names the plugin with its recovery, and proceeds past
+/// the refusal once the unit record is gone.
+#[cfg(target_os = "linux")]
+#[test]
+fn service_uninstall_is_refused_while_plugin_units_are_recorded() {
+    let units = workflow_units::UnitEnv::new(|env| env.root().join("units"));
+    let plugin = workflow_units::Plugin::new(PLUGIN_ID).job("tick", "tick", 3600);
+    units.install(&plugin);
+    let record = write_unit_record(&units, br#"{"units":[{"kind":"job","name":"tick"}]}"#);
+    let before = installation_snapshot(&units);
+
+    let (code, document) = service_uninstall(&units);
+    assert_eq!(code, Some(1), "{document}");
+    assert_eq!(
+        document["err"]["code"], "workflow_units_installed",
+        "{document}"
+    );
+    let message = document["err"]["msg"].as_str().expect("a message");
+    assert!(
+        message.contains(PLUGIN_ID)
+            && message.contains(&format!("pohunek workflow disable {PLUGIN_ID}")),
+        "{document}"
+    );
+    assert_eq!(
+        installation_snapshot(&units),
+        before,
+        "the refusal changed something"
+    );
+    assert!(record.exists(), "the refusal removed the unit record");
+
+    fs::remove_file(&record).expect("remove the unit record");
+    let (_code, document) = service_uninstall(&units);
+    assert_ne!(
+        document["err"]["code"], "workflow_units_installed",
+        "{document}"
+    );
+}
+
+/// A unit record that cannot be read refuses `service uninstall` as well:
+/// its units cannot be named, so nothing may be removed.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unreadable_unit_record_refuses_the_service_uninstall() {
+    let units = workflow_units::UnitEnv::new(|env| env.root().join("units"));
+    let plugin = workflow_units::Plugin::new(PLUGIN_ID).job("tick", "tick", 3600);
+    units.install(&plugin);
+    let record = write_unit_record(&units, b"{not a unit record");
+    let before = installation_snapshot(&units);
+
+    let (code, document) = service_uninstall(&units);
+    assert_eq!(code, Some(1), "{document}");
+    assert_eq!(
+        document["err"]["code"], "workflow_store_failed",
+        "{document}"
+    );
+    assert_eq!(
+        installation_snapshot(&units),
+        before,
+        "the refusal changed something"
+    );
+    assert!(record.exists(), "the refusal removed the unit record");
+}
+
+/// A run refused before its manifest verified (here: the plugin is disabled)
+/// is recorded with the requested unit name, so status counts it for that
+/// unit. Status reads the run log under the writer's lock without creating
+/// the lock file: with the lock file removed, it still reads the records and
+/// leaves no lock file behind.
+#[cfg(target_os = "linux")]
+#[test]
+fn status_counts_refused_runs_and_creates_no_run_log_lock() {
+    let units = workflow_units::UnitEnv::new(|env| env.root().join("units"));
+    let plugin = workflow_units::Plugin::new(PLUGIN_ID).job("tick", "tick", 3600);
+    let digest = units.install(&plugin);
+    write_unit_record(&units, br#"{"units":[{"kind":"job","name":"tick"}]}"#);
+    // Installed disabled, so each trampoline run is refused and recorded.
+    for _ in 0..2 {
+        let output = units
+            .exec(PLUGIN_ID, digest.as_str(), "job", "tick")
+            .output()
+            .expect("run the trampoline");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}",
+            workflow_units::describe(&output)
+        );
+    }
+    let lock = units.state_dir(PLUGIN_ID).join("logs/runs.jsonl.lock");
+    fs::remove_file(&lock).expect("remove the run log lock file");
+
+    let output = units
+        .command(&["workflow", "status", "--json"])
+        .output()
+        .expect("run pohunek workflow status");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        workflow_units::describe(&output)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("a JSON envelope");
+    let unit = &document["ok"]["plugins"][0]["units"][0];
+    assert_eq!(unit["last_run"]["outcome"], "refused", "{document}");
+    assert_eq!(unit["consecutive_failures"], 2, "{document}");
+    assert!(!lock.exists(), "status created the run log lock file");
+}
+
+/// Without a reachable service manager, status reports each recorded unit as
+/// `unknown` with the reason, never fails for it, and its text names the
+/// unit; a plugin with no recorded unit is not listed.
+#[cfg(target_os = "linux")]
+#[test]
+fn status_reports_units_it_cannot_inspect_as_unknown() {
+    let units = workflow_units::UnitEnv::new(|env| env.root().join("units"));
+    let plugin = workflow_units::Plugin::new(PLUGIN_ID).job("tick", "tick", 3600);
+    units.install(&plugin);
+    write_unit_record(&units, br#"{"units":[{"kind":"job","name":"tick"}]}"#);
+
+    let output = units
+        .command(&["workflow", "status", "--json"])
+        .output()
+        .expect("run pohunek workflow status");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        workflow_units::describe(&output)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("a JSON envelope");
+    let plugins = document["ok"]["plugins"].as_array().expect("plugins");
+    assert_eq!(plugins.len(), 1, "{document}");
+    let unit = &plugins[0]["units"][0];
+    assert_eq!(unit["kind"], "job", "{document}");
+    assert_eq!(unit["name"], "tick", "{document}");
+    assert_eq!(unit["state"], "unknown", "{document}");
+    assert!(
+        unit["state_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("service manager")),
+        "{document}"
+    );
+    // No run was ever recorded, so there is no last run and no failed run.
+    assert!(unit["last_run"].is_null(), "{document}");
+    assert_eq!(unit["consecutive_failures"], 0, "{document}");
+    assert!(unit.get("backoff_ms").is_none(), "{document}");
+
+    let output = units
+        .command(&["workflow", "status"])
+        .output()
+        .expect("run pohunek workflow status");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        workflow_units::describe(&output)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    // `install` records the plugin disabled, and status shows that state.
+    assert!(
+        text.contains(&format!("{PLUGIN_ID} 1.0.0 (disabled)")),
+        "{text}"
+    );
+    assert!(text.contains("job tick: unknown ("), "{text}");
+}

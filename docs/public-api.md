@@ -3173,6 +3173,7 @@ Every command that changes the store holds the store lock
 pohunek workflow install work.tar.zst --sha256 <digest> --yes --json
 pohunek workflow list --json
 pohunek workflow inspect acme.work --json
+pohunek workflow status acme.work --json
 pohunek workflow enable acme.work --json
 pohunek workflow disable acme.work --json
 pohunek workflow uninstall acme.work --purge --json
@@ -3191,6 +3192,16 @@ Every `--json` result is one standard CLI process envelope. The `ok` payloads:
   `already_installed` or `root_restored`. `warnings` is present when the
   plugin was recorded but the store could not confirm the change is durable.
 - `list`: `{plugins: [plugin...]}`.
+- `status`: `{plugins: [{id, version, digest, enabled, units: [unit...],
+  units_error?, run_log_error?}]}`, where a unit is `{kind, name, state,
+  state_reason?, last_run, consecutive_failures, backoff_ms?, backoff_error?}`.
+  `kind` is `job` or `service`; `state` is `running`, `stopped`, `failed` or
+  `unknown`; `last_run` is `{ts, outcome, exit_code?, signal?, error_code?}` or
+  `null`; `consecutive_failures` is `null` when it cannot be determined;
+  `backoff_ms` and `backoff_error` are present for services only. `units_error`
+  and `run_log_error` are present when the unit record or the run log cannot be
+  read. The guide's [Status](knowledge/guides/workflow-plugins.md#status)
+  section defines each field.
 - `enable` and `disable`: the updated `plugin`, plus `warnings` from
   `disable` when it could not list the units of a plugin whose files fail
   verification and no unit record names any unit, or when no `pohunek service`
@@ -3264,6 +3275,7 @@ CLI envelope, not to the protocol's error type:
 | `workflow_installed_disabled` | `runtime` | `install --yes` only: the new plugin was recorded, but a step after that failed: reaching the service manager (`cause` `workflow_units_failed`), marking the plugin enabled (`workflow_store_busy` while another workflow command holds the store lock, `workflow_root_invalid`, or `workflow_store_failed`; for a failure that may have written the flag, the plugin is disabled again first), or installing a unit (`workflow_units_failed`). `cause` is that failure's code. When every step was undone the plugin stays installed disabled with no units and the message says so: fix the cause, then run `pohunek workflow enable <id>`. When undoing the failed step failed too (a unit install, or clearing a flag that may have been written), the message says the plugin may remain enabled or keep units: run `pohunek workflow disable <id>` until it succeeds, then `pohunek workflow enable <id>`. Every check that can refuse an enabling install, and the unit lifecycle lock, come before the record is written. |
 | `workflow_unit_stale` | `runtime` | A unit names another archive than the installed one; it was refused and recorded. |
 | `workflow_unit_unknown` | `configuration` | The installed manifest declares no job or service of the unit's name; nothing was run. |
+| `workflow_units_installed` | `configuration` | Only `pohunek service uninstall`: a workflow plugin still has jobs or services recorded. The message names each plugin and the `pohunek workflow disable <id>` that stops it; nothing was changed. |
 
 `workflow run` streams the action's stdout and stderr, each up to its cap.
 With `--json` it captures stdout up to the same cap instead, still streams

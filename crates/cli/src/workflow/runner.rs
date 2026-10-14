@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 
 use futures::FutureExt as _;
 use package::registry::PackageRecord;
-use pohunek_platform::supervisor::{PluginUnitKind, BOOTSTRAP_ENV_ALLOWLIST};
+use pohunek_platform::supervisor::{PluginUnitKey, PluginUnitKind, BOOTSTRAP_ENV_ALLOWLIST};
 use protocol::{
     PackageDigest, PackageId, PackageVersion, ProtocolVersionRange, ENV_DAEMON_ID, ENV_SESSION_ID,
 };
@@ -547,9 +547,14 @@ pub(crate) fn run_supervised(
             execute(run, store, knobs, &invocation, &prepared, interrupts)
         }
         Err((error, name)) => {
+            // A refusal before the manifest verified still names the unit
+            // when the requested name fits the unit name grammar.
+            let requested = PluginUnitKey::new(plugin.as_str(), unit.kind, unit.name)
+                .is_ok()
+                .then_some(unit.name);
             run.append(
                 &installed,
-                name.as_deref(),
+                name.as_deref().or(requested),
                 Outcome::Refused,
                 None,
                 Some(&error),
