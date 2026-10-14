@@ -411,7 +411,7 @@ fn installed_cli() -> Result<(PathBuf, bool), Error> {
 /// flag is set so the variable is not forwarded to the run's child either.
 /// Any other case resolves as the environment says, and a mismatch is refused
 /// by `installation_at`.
-fn trampoline_paths(uid: u32) -> Result<(BasePaths, bool), Error> {
+pub(crate) fn trampoline_paths(uid: u32) -> Result<(BasePaths, bool), Error> {
     let not_installed = |reason: String| Error::ServiceNotInstalled { reason };
     let platform = Platform::current().map_err(|error| not_installed(error.to_string()))?;
     let env = PathEnv::capture();

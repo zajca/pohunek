@@ -624,9 +624,11 @@ Runtime package archive format:
 - `crates/cli/src/workflow/status.rs` — `workflow status`: native state, last run, consecutive failures and service backoff of each recorded unit.
 - `crates/cli/src/workflow/units.rs` — job and service units: the service installation they need, their definitions, and enable, disable and uninstall against the user service manager.
 - `crates/cli/src/workflow/supervised.rs` — the `__exec` trampoline every unit runs: refusals, the run lock, the wall-clock job schedule, the service backoff and stop handling.
+- `crates/cli/src/workflow/dispatch.rs` — the event reaction dispatcher (`__dispatch`): the daemon `subscribe` stream with backoff reconnects, per-plugin bounded queues with `dropped` accounting, one worker per plugin and the stop handling.
 - `crates/paths/src/lib.rs` — `WORKFLOW_PLUGINS_SUBDIR`, `WORKFLOW_PLUGIN_STATE_SUBDIR` and `WORKFLOW_PLUGIN_CONFIG_SUBDIR`.
 - `crates/cli/tests/workflow_store.rs` — consent, digest, hostile-manifest, tampered-root, local-only and lifecycle scenarios through the real binary.
 - `crates/cli/tests/workflow_run.rs` — `workflow run` scenarios through the real binary: exact environment and origin pair (with a real `pohunekd` session), refusals, deadline, output cap, interruption, slow output consumer, redaction, context and owner knobs.
+- `crates/cli/tests/workflow_reactions.rs` — event reactions against the real systemd user manager and a real `pohunekd`: the context and origin-free environment, queue drops with delivery after overflow, an oversized event's omission, a wedged reaction that delays neither session commands nor a daemon restart, and the dispatcher unit following the reacting plugins.
 - `crates/cli/tests/workflow_run_json.rs` — `workflow run --json` and verbatim-argument scenarios through the real binary: byte-exact `ok`, invalid, failed, cut and capped output as single error envelopes, refusals as envelopes, and every argument after the action reaching it unchanged.
 - `crates/cli/tests/support/workflow_scenarios.rs` — job and service scenarios against the real service manager (`workflow_systemd.rs`, `workflow_launchd.rs`): enable and disable, overlap, timeout, service backoff, failure isolation, stale units, the supervised environment and clean stops.
 - `docs/knowledge/guides/workflow-plugins.md`

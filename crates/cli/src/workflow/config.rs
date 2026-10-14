@@ -6,15 +6,15 @@
 //! account could otherwise plant the file. When the file exists it must be a
 //! regular file owned by the user with mode `0600`, and
 //! parsing is strict: unknown tables or keys, wrong types and out-of-range
-//! values fail with [`Error::ConfigInvalid`] before anything runs. Tables of
-//! later workflow slices are unknown keys here.
+//! values fail with [`Error::ConfigInvalid`] before anything runs.
 //!
 //! `[jobs]` and `[services]` apply to the supervised runs of the plugin units
 //! (see [`super::supervised`]). Every knob is read again at each run, and a
 //! job outside `jobs.min_interval_s` or `jobs.timeout_max_ms` is refused then
 //! as when it was enabled, except `jobs.check_period_s`, which is written
 //! into the job's timer unit when the plugin is enabled and so needs a new
-//! `pohunek workflow enable` to change.
+//! `pohunek workflow enable` to change. `[reactions]` applies to the
+//! dispatcher, which reads it when it starts.
 
 // Rust guideline compliant 2026-10-13
 
@@ -108,6 +108,30 @@ const DEFAULT_ACTION_TIMEOUT_MS: u64 = 60 * 1000;
 /// Default ceiling a manifest `timeout_ms` may request: ten minutes, the
 /// platform's longest supervised job deadline (`MAX_JOB_TIMEOUT`).
 const DEFAULT_ACTION_TIMEOUT_MAX_MS: u64 = 10 * 60 * 1000;
+
+/// Default number of events a plugin may hold waiting for its reactions: 16.
+///
+/// A reaction is an action of the plugin, so a burst of events that outruns
+/// one reaction at a time is shed rather than buffered without bound. The
+/// dispatcher reads the socket independently of the queues, so a full queue
+/// never delays the daemon's own stream.
+const DEFAULT_REACTION_QUEUE_DEPTH: u64 = 16;
+
+/// Ceiling of `reactions.queue_depth`: 1024 entries per plugin. Each queued
+/// event is held in memory as its serialized form, so the bound is what keeps
+/// a stalled plugin from growing the dispatcher.
+const MAX_REACTION_QUEUE_DEPTH: u64 = 1024;
+
+/// Default first reconnect delay of the dispatcher: one second.
+const DEFAULT_RECONNECT_INITIAL_MS: u64 = 1000;
+
+/// Default longest reconnect delay: one minute. A daemon that is down for
+/// longer is restarted by the user, and the dispatcher picks it up within a
+/// minute of that.
+const DEFAULT_RECONNECT_MAX_MS: u64 = 60 * 1000;
+
+/// Ceiling of `reactions.reconnect_max_ms`: one hour.
+const MAX_RECONNECT_MS: u64 = 60 * 60 * 1000;
 
 /// Default time between `SIGTERM` and `SIGKILL`: five seconds.
 const DEFAULT_KILL_GRACE_MS: u64 = 5 * 1000;
@@ -279,6 +303,30 @@ impl Services {
     }
 }
 
+/// Event reaction dispatch, the `[reactions]` table.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub(crate) struct Reactions {
+    /// Events one plugin may hold waiting for its reactions. A further event
+    /// is dropped and counted in a `dropped` run record.
+    pub(crate) queue_depth: u64,
+    /// Delay before the first reconnect after the daemon stream ends; it
+    /// doubles with each failed attempt.
+    pub(crate) reconnect_initial_ms: u64,
+    /// Longest delay between two reconnect attempts.
+    pub(crate) reconnect_max_ms: u64,
+}
+
+impl Default for Reactions {
+    fn default() -> Self {
+        Self {
+            queue_depth: DEFAULT_REACTION_QUEUE_DEPTH,
+            reconnect_initial_ms: DEFAULT_RECONNECT_INITIAL_MS,
+            reconnect_max_ms: DEFAULT_RECONNECT_MAX_MS,
+        }
+    }
+}
+
 /// Every owner knob of workflow runs.
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -291,6 +339,8 @@ pub(crate) struct Knobs {
     pub(crate) jobs: Jobs,
     /// The `[services]` table.
     pub(crate) services: Services,
+    /// The `[reactions]` table.
+    pub(crate) reactions: Reactions,
 }
 
 /// Reads the knobs file at `path`; an absent file or directory yields the
@@ -344,6 +394,7 @@ fn check_ranges(knobs: &Knobs) -> Result<(), String> {
     let logs = &knobs.logs;
     let jobs = &knobs.jobs;
     let services = &knobs.services;
+    let reactions = &knobs.reactions;
     let ranges = [
         (
             "limits.action_timeout_max_ms",
@@ -434,6 +485,24 @@ fn check_ranges(knobs: &Knobs) -> Result<(), String> {
             services.stable_after_ms,
             1,
             MAX_SERVICE_DELAY_MS,
+        ),
+        (
+            "reactions.queue_depth",
+            reactions.queue_depth,
+            1,
+            MAX_REACTION_QUEUE_DEPTH,
+        ),
+        (
+            "reactions.reconnect_max_ms",
+            reactions.reconnect_max_ms,
+            1,
+            MAX_RECONNECT_MS,
+        ),
+        (
+            "reactions.reconnect_initial_ms",
+            reactions.reconnect_initial_ms,
+            1,
+            reactions.reconnect_max_ms,
         ),
     ];
     for (key, value, minimum, maximum) in ranges {

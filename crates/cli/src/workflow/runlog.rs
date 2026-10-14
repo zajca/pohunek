@@ -72,6 +72,8 @@ pub(crate) enum Outcome {
     /// A supervised run did not start because an earlier run of the same
     /// job or service still holds its lock.
     OverlapSkipped,
+    /// Events a plugin's reaction queue refused, counted in one record.
+    Dropped,
 }
 
 impl Outcome {
@@ -123,6 +125,9 @@ pub(crate) struct Record<'a> {
     /// The restart delay a service run waited before it started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) backoff_ms: Option<u64>,
+    /// Events refused by a full reaction queue during one overflow episode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) dropped: Option<u64>,
 }
 
 /// An open run log of one plugin.

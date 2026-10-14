@@ -144,6 +144,10 @@ impl UnitKind {
     }
 }
 
+/// The unit name of the reaction dispatcher in its record. It is not a plugin
+/// unit name: the platform key is built from a reserved owner.
+pub(crate) const DISPATCHER_UNIT_NAME: &str = "dispatch";
+
 /// One job or service of a plugin, as its unit record lists it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -681,7 +685,7 @@ impl Store {
         let mut plugins = Vec::new();
         for name in names {
             let name = name.to_string_lossy();
-            if name.ends_with(UNIT_RECORD_TEMPORARY_SUFFIX) {
+            if name.ends_with(UNIT_RECORD_TEMPORARY_SUFFIX) || name == DISPATCHER_RECORD {
                 continue;
             }
             let Some(id) = name.strip_suffix(UNIT_RECORD_SUFFIX) else {
@@ -700,6 +704,67 @@ impl Store {
         }
         plugins.sort();
         Ok(plugins)
+    }
+
+    /// Whether the reaction dispatcher unit is recorded as installed.
+    /// Callers hold the unit lifecycle lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Store`] when the record cannot be inspected.
+    pub(crate) fn dispatcher_recorded(&self) -> Result<bool, Error> {
+        let Some(root) = self.open_records_root(false)? else {
+            return Ok(false);
+        };
+        let Some(dir) = open_child_if_present(&root, UNIT_RECORDS_DIR)? else {
+            return Ok(false);
+        };
+        dir.entry_identity(DISPATCHER_RECORD, EntryKind::RegularFile)
+            .map(|identity| identity.is_some())
+            .map_err(|error| fs(&error))
+    }
+
+    /// Records the reaction dispatcher unit as installed, or removes the
+    /// record. Callers hold the unit lifecycle lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Store`] when the record cannot be written or removed.
+    pub(crate) fn set_dispatcher_recorded(&self, recorded: bool) -> Result<(), Error> {
+        if !recorded {
+            let Some(root) = self.open_records_root(false)? else {
+                return Ok(());
+            };
+            let Some(dir) = open_child_if_present(&root, UNIT_RECORDS_DIR)? else {
+                return Ok(());
+            };
+            return remove_record_file(&dir, DISPATCHER_RECORD);
+        }
+        let bytes = serde_json::to_vec(&UnitRecord {
+            units: vec![UnitName {
+                kind: UnitKind::Service,
+                name: DISPATCHER_UNIT_NAME.to_owned(),
+            }],
+        })
+        .map_err(|_cause| Error::Store("the dispatcher record cannot be encoded".to_owned()))?;
+        let root = self
+            .open_records_root(true)?
+            .ok_or_else(|| Error::Store("the store root is missing".to_owned()))?;
+        let dir = root
+            .open_or_create_child(UNIT_RECORDS_DIR, PRIVATE_DIR_MODE)
+            .map_err(|error| fs(&error))?;
+        let temporary = format!("{DISPATCHER_RECORD}.tmp");
+        remove_record_file(&dir, &temporary)?;
+        dir.replace_file(DISPATCHER_RECORD, &temporary, &bytes, UNIT_RECORD_FILE_MODE)
+            .map_err(|error| match error {
+                AtomicReplaceError::BeforeCommit(cause) => fs(&cause),
+                AtomicReplaceError::CommittedDurabilityUncertain(_cause) => Error::Store(
+                    "the dispatcher record was written, but the store could not confirm the \
+                     change is durable"
+                        .to_owned(),
+                ),
+                _ => Error::Store("the dispatcher record was not written".to_owned()),
+            })
     }
 
     /// Adds `added` to the units recorded for plugin `id` and writes the
@@ -1037,6 +1102,12 @@ const UNIT_RECORD_SUFFIX: &str = ".json";
 /// Extension of the temporary file a unit record write stages before it
 /// replaces the record.
 const UNIT_RECORD_TEMPORARY_SUFFIX: &str = ".json.tmp";
+
+/// Name of the record that marks the reaction dispatcher unit as installed.
+///
+/// Upper case, so it can never be the record of a plugin: a package id is
+/// lower case.
+const DISPATCHER_RECORD: &str = "REACTIONS.json";
 
 /// The file name of the unit record of plugin `id`.
 fn unit_record_name(id: &PackageId) -> String {

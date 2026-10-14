@@ -42,3 +42,4 @@ systemd_scenario!(re_enabling_with_a_damaged_unit_record_changes_nothing);
 systemd_scenario!(disable_stops_the_units_of_a_modified_plugin);
 systemd_scenario!(uninstall_stops_the_units_of_a_modified_plugin);
 systemd_scenario!(status_shows_running_units_and_failing_runs);
+systemd_scenario!(the_dispatcher_unit_follows_the_reacting_plugins);

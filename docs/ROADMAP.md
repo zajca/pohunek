@@ -106,7 +106,8 @@ the strict `workflow.toml` manifest and the consent install (`pohunek
 workflow`), and CLI action invocation with `--json` results and shell
 completion ([#325](https://github.com/zajca/pohunek/issues/325)). Open:
 periodic jobs/services in manifests
-[#326](https://github.com/zajca/pohunek/issues/326) and event reactions.
+[#326](https://github.com/zajca/pohunek/issues/326) and event reactions, which
+the reaction dispatcher delivers (#148).
 Core consumes no plugin data for launch-profile policy in v1
 ([#480](https://github.com/zajca/pohunek/issues/480), closed).
 

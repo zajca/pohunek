@@ -811,7 +811,10 @@ fn knobs_are_strict_and_their_defaults_apply_without_a_file() {
     let recorded = fixture.records().len();
     for (text, needle) in [
         ("[limits]\nkill_grace = 1\n", "unknown key"),
-        ("[reactions]\nqueue_depth = 1\n", "unknown key"),
+        (
+            "[reactions]\nqueue_depth = 0\n",
+            "reactions.queue_depth must be in 1..=1024",
+        ),
         (
             "[jobs]\ntimeout_max_ms = 510001\n",
             "jobs.timeout_max_ms must be in 1..=510000",

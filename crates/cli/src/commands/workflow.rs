@@ -40,6 +40,7 @@ use crate::error::CliError;
 use crate::paths::Paths;
 use crate::service::Context;
 use crate::target::is_local_host;
+use crate::workflow::dispatch;
 use crate::workflow::manifest::{resolve_argv, Action as Declared, ArgsMode, Manifest};
 use crate::workflow::runner::{run_action, Completed, Invocation, Output};
 use crate::workflow::status;
@@ -206,6 +207,11 @@ pub(crate) enum Action {
         #[arg(value_name = "NAME")]
         name: String,
     },
+
+    /// Run the event reaction dispatcher; the entry point of its service
+    /// manager unit, never typed by hand.
+    #[command(name = "__dispatch", hide = true)]
+    Dispatch,
 }
 
 /// The kind of a unit, as `__exec` names it.
@@ -229,7 +235,7 @@ impl Action {
             | Self::Uninstall { json, .. }
             | Self::Run { json, .. } => *json,
             Self::Install(args) => args.json,
-            Self::Exec { .. } => false,
+            Self::Exec { .. } | Self::Dispatch => false,
         }
     }
 }
@@ -405,6 +411,9 @@ pub(crate) async fn run(action: Action, host: &str) -> Result<ExitCode, CliError
             supervised::execute(&request)
         }));
     }
+    if matches!(action, Action::Dispatch) {
+        return Ok(dispatch::execute().await);
+    }
     let dirs = Paths::workflow_dirs()?;
     let knobs_path = dirs.knobs.clone();
     let store = Store::new(dirs);
@@ -452,7 +461,7 @@ pub(crate) async fn run(action: Action, host: &str) -> Result<ExitCode, CliError
                 status::report(&store, &mut Host::resolve_lazily(), plugin.as_ref()).await?;
             print_output(json, &report, || status::render(&report))?;
         }
-        Action::Exec { .. } => unreachable!("the trampoline returned above"),
+        Action::Exec { .. } | Action::Dispatch => unreachable!("handled before the store opens"),
         Action::Uninstall {
             plugin,
             purge,

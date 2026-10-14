@@ -12,8 +12,9 @@ intents: [setup, update, debug, help]
 A workflow plugin is a bundle of owner tooling, such as a work-overview tool
 that joins an issue tracker, a code host and pohunek sessions into one table.
 It declares named **actions** as argv arrays, and optionally periodic
-**jobs** and long-running **services** that your user service manager runs
-while the plugin is enabled. It acts on pohunek only through the public CLI or
+**jobs**, long-running **services** and event **reactions** that your user
+service manager or the daemon's event stream drives while the plugin is
+enabled. It acts on pohunek only through the public CLI or
 SDK, like any script the owner runs. It is not a runtime
 package: the daemon never loads, lists or runs it, and it cannot extend the
 daemon, the session worker, protocol methods, overlay transports or any user
@@ -619,6 +620,80 @@ trampoline's own group, so the run's process group can survive the unit. A
 later start of the unit can then run alongside it, and `disable` and
 `uninstall` do not find that process. Stop such a process yourself. On systemd
 the unit's final `SIGKILL` reaches every process of the unit.
+
+## Event reactions
+
+A plugin may declare reactions: argv arrays that run when the daemon publishes
+a public event. Each reaction names the events it wants and runs once for
+every matching event.
+
+```toml
+[reactions.on_stop]
+events = ["session_stopped", "session_runtime_lost"]
+argv = ["bin/work", "react"]
+timeout_ms = 30000   # optional; must be <= limits.action_timeout_max_ms
+```
+
+- `events` is a non-empty list of distinct names from the daemon's public
+  event table (`docs/public-api.md`, "Events"). `attach_opened` and
+  `attach_closed` are refused. A name outside the table, or a repeated one,
+  refuses the manifest.
+- `argv` follows the rules of actions: no shell, a package path or absolute
+  `argv[0]`, and no user arguments.
+- A reaction runs without the session origin pair, whatever the dispatcher's
+  environment holds, with its output discarded and only its byte counts
+  recorded. Its context carries `invocation.kind = "reaction"` and the event
+  as `event = {"event": "<name>", "payload": {...}}`. When the whole context
+  would exceed `limits.max_context_bytes`, the event is omitted and the
+  context says `event_omitted = "too_large"`, with `session_id` when the
+  payload names a session.
+
+**The dispatcher.** The reactions of every enabled plugin run in one
+dispatcher unit of your user service manager, which runs the hidden
+`pohunek workflow __dispatch`. It is installed while at least one enabled
+plugin declares reactions, is restarted whenever the set of such plugins
+changes (enable, disable, install, uninstall), and is removed when none
+remains. It needs the `pohunek service` installation, like jobs and services.
+It is not part of the daemon: it connects to the local daemon's public
+`subscribe` stream only, never starts the daemon, and has no unit dependency
+on it.
+
+**Queues and drops.** Each plugin has a queue of `reactions.queue_depth`
+events. The dispatcher reads the stream without waiting for reactions, so a
+slow reaction never delays the daemon's stream or other plugins. An event that
+finds its plugin's queue full is dropped. When the plugin's worker next takes
+an event, it writes one `dropped` run record counting the events refused since
+its previous record. Reactions of one plugin run one at a time, in the order
+their events were queued.
+
+**Reconnects.** When the daemon stream ends or the daemon is down, the
+dispatcher retries with a delay that starts at `reactions.reconnect_initial_ms`
+and doubles up to `reactions.reconnect_max_ms`. The delay goes back to the
+initial value only after a subscription has delivered an event, so a daemon
+that accepts a subscription and closes it at once is retried ever more slowly. Events published while it is
+disconnected are not replayed. A reaction that needs the current state reads it
+through the CLI.
+
+**Stopping.** A dispatcher stop (`SIGTERM`, `SIGINT`, `SIGHUP`, or the unit
+stopping) starts no further reaction and stops the running reaction's process
+group within `limits.kill_grace_ms`.
+
+**Run records.** A reaction run writes a record with `kind = "reaction"` and
+the outcomes of any run (`ok`, `exit_nonzero`, `timeout`, `interrupted`,
+`refused`, and so on). A drop record has `outcome = "dropped"`, no `name`, and
+a `dropped` count.
+
+**Knobs.** `[reactions]` in `workflow.toml`:
+
+| Knob | Default | Range |
+|---|---|---|
+| `queue_depth` | 16 | 1..=1024 |
+| `reconnect_initial_ms` | 1000 | 1..=`reconnect_max_ms` |
+| `reconnect_max_ms` | 60000 | 1..=3600000 |
+
+The dispatcher reads its knobs when it starts, so a change takes effect at the
+next dispatcher restart. Reactions take their deadline and output caps from
+`[limits]`.
 
 ## Local only
 
