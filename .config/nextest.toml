@@ -29,6 +29,10 @@ unreadable-holders = { max-threads = 1 }
 # kickstart) share one domain per login session, so they run one at a time.
 # Used by profile.macos only; see its overrides below.
 launchd-gui = { max-threads = 1 }
+# The PTY scenarios of xtask's `hermes::tests` take turns on the module's
+# in-process `PTY_SCENARIOS` mutex, which a process per test cannot share.
+# Used by profile.macos only; see its overrides below.
+hermes-pty = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = '''
@@ -191,3 +195,9 @@ or (package(=pohunek-cli) and (
   or binary(=workflow_launchd) or binary(=workflow_store)))
 '''
 test-group = 'launchd-gui'
+
+# Every test of the module joins the group, since any of them may take the
+# module's private mutex; its non-PTY tests run in milliseconds.
+[[profile.macos.overrides]]
+filter = 'package(=xtask) and test(/^hermes::tests::/)'
+test-group = 'hermes-pty'

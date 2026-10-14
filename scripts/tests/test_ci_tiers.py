@@ -129,6 +129,7 @@ MACOS_PATH_OWNERSHIP = {
             "sdk/ts/sdk/test/e2e.test.ts",
             "sdk/ts/sdk/test/hermes-plugin.e2e.test.ts",
             ".github/workflows/ci.yml",
+            ".config/nextest.toml",
             "rust-toolchain.toml",
             ".github/actions/setup-rust/**",
         },
@@ -654,6 +655,51 @@ class MacosLanePackageSetTests(unittest.TestCase):
         self.assertIn("check-macos --scope all", tier)
         self.assertIn("run-macos-tier", tier)
         self.assertNotIn("cargo test", tier)
+
+    def test_hermes_macos_job_runs_its_tests_through_nextest(self):
+        hermes = workflow_jobs()["hermes-compatibility-macos"]
+        self.assertNotIn("cargo test", hermes)
+        steps = job_steps(hermes)
+        self.assertIn("tool: cargo-nextest", steps["Install cargo-nextest"])
+        harness = steps["Test Hermes harness natively"]
+        self.assertIn(
+            "cargo nextest run --locked --profile macos -p xtask --lib -E 'test(hermes)'\n",
+            harness,
+        )
+        package = steps["Drive a real pinned Hermes session through the package"]
+        self.assertIn(
+            "cargo nextest run --locked --profile macos -p pohunek-cli --test hermes_package"
+            " --run-ignored all --test-threads 1\n",
+            package,
+        )
+        # Both runs write the macos profile's one report path, so each copies
+        # it under its own name, which the summary and the upload read.
+        for step, report in ((harness, "harness"), (package, "package")):
+            with self.subTest(report=report):
+                self.assertIn(
+                    f'cp target/nextest/macos/junit.xml "$RUNNER_TEMP/hermes-junit/{report}.xml" || status=1\n',
+                    step,
+                )
+                self.assertIn('exit "$status"\n', step)
+                self.assertIn(f"$RUNNER_TEMP/hermes-junit/{report}.xml", steps["Summarize flaky tests"])
+        self.assertIn("if: always()", steps["Summarize flaky tests"])
+        self.assertIn("if: always()", steps["Upload Hermes macOS test reports"])
+        self.assertIn("path: ${{ runner.temp }}/hermes-junit/", steps["Upload Hermes macOS test reports"])
+
+    def test_hermes_pty_scenarios_run_one_at_a_time_under_the_macos_profile(self):
+        # The scenarios serialize on an in-process mutex, which nextest's
+        # process per test cannot share, so a test group stands in for it.
+        self.assertIn(
+            "static PTY_SCENARIOS: std::sync::Mutex<()>",
+            (ROOT / "crates" / "xtask" / "src" / "hermes.rs").read_text(),
+        )
+        with (ROOT / ".config" / "nextest.toml").open("rb") as config:
+            nextest = tomllib.load(config)
+        self.assertEqual(nextest["test-groups"]["hermes-pty"], {"max-threads": 1})
+        self.assertIn(
+            {"filter": "package(=xtask) and test(/^hermes::tests::/)", "test-group": "hermes-pty"},
+            nextest["profile"]["macos"]["overrides"],
+        )
 
     def test_macos_lane_archive_and_tier_archive_use_the_checked_selections(self):
         self.assertEqual(

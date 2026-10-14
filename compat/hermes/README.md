@@ -130,7 +130,7 @@ The same gate runs natively on Apple Silicon in the
 with the stock macOS `/bin/bash` 3.2 and BSD userland (the provisioner uses
 `curl`, `tar`, `sha256sum` or `shasum -a 256`, whichever exists, and no GNU
 `realpath`),
-runs both shell tests, the xtask Hermes unit tests, the compatibility gate, and
+runs both shell tests, the xtask Hermes unit tests (through nextest), the compatibility gate, and
 `scripts/smoke-hermes-plugin-release` against a packaged development daemon
 archive extracted outside the checkout. The smoke takes the extracted daemon
 archive, the Hermes package archive, a signed catalog that authorizes it, and
