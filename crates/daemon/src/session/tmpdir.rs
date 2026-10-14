@@ -245,16 +245,30 @@ pub(super) fn session_tmpdir(root: &Path, id: &SessionId) -> PathBuf {
 
 /// Opens or creates the private temporary directory of `id`.
 ///
-/// The root and the session directory are created with mode 0700 and must be
-/// directories of the daemon's user with exactly that mode, reached without
-/// following a symlink.
+/// The directory holding the store roots, the store's root and the session
+/// directory are created with mode 0700 and must be directories of the
+/// daemon's user with exactly that mode, reached without following a symlink.
 ///
 /// # Errors
 ///
 /// Returns `session_tmpdir_unsafe` when an existing entry fails those checks,
 /// and `session_tmpdir_failed` when the directory cannot be created.
 pub(super) fn ensure(root: &Path, id: &SessionId) -> Result<PathBuf, ProtocolError> {
-    let root_dir = TrustedDir::open_or_create_absolute(root, PRIVATE_DIR_MODE)
+    let (Some(store_roots), Some(key)) = (root.parent(), root.file_name()) else {
+        return Err(ProtocolError::new(
+            ErrorClass::Runtime,
+            "session_tmpdir_failed",
+            format!(
+                "the session's private temporary root {} has no parent directory",
+                root.display()
+            ),
+            None,
+        ));
+    };
+    let store_roots_dir = TrustedDir::open_or_create_absolute(store_roots, PRIVATE_DIR_MODE)
+        .map_err(|error| tmpdir_error(&error))?;
+    let root_dir = store_roots_dir
+        .open_or_create_child(key, PRIVATE_DIR_MODE)
         .map_err(|error| tmpdir_error(&error))?;
     let session_dir = root_dir
         .open_or_create_child(&id.0, PRIVATE_DIR_MODE)
