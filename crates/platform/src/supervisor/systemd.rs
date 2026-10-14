@@ -2240,6 +2240,9 @@ mod tests {
         /// Upper bound for the refused connect; a missing socket fails at
         /// once, so the bound only matters if the connect path hangs.
         const CONNECT_BOUND: Duration = Duration::from_secs(5);
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let root = pohunek_test_support::tempdir().expect("scratch directory");
         let missing_bus = root.path().join("no-such-bus");
         let mut env = pohunek_test_support::process_env::ProcessEnv::lock();
