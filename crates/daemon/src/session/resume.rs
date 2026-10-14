@@ -824,8 +824,7 @@ impl SessionRegistry {
                 },
             ..
         } = relaunch;
-        let mut env_extra = env;
-        env_extra.extend(self.session_pty_env(binding.agent_base.clone(), &id));
+        let env_extra = self.launch_env(&env, binding.agent_base.clone(), &id);
         let opts = LaunchOpts {
             cwd: binding.cwd.clone(),
             cols: params.cols,
@@ -1276,9 +1275,7 @@ impl SessionRegistry {
                 },
             ..
         } = relaunch;
-        // Profile env first, daemon handshake env appended last (POHUNEK_* wins).
-        let mut env_extra = env;
-        env_extra.extend(self.session_pty_env(binding.agent_base.clone(), &id));
+        let env_extra = self.launch_env(&env, binding.agent_base.clone(), &id);
         let opts = LaunchOpts {
             cwd: binding.cwd.clone(),
             cols: binding.cols,

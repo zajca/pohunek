@@ -92,6 +92,7 @@ mod resume;
 mod retention;
 mod supervision;
 mod target;
+mod tmpdir;
 mod turn_events;
 mod turn_wait;
 
@@ -414,6 +415,11 @@ pub struct SessionRegistryConfig {
     /// to enable worktree binding; when unset, a `session.new` carrying a
     /// repo+branch fails (no silent default).
     pub worktree_root: Option<PathBuf>,
+    /// Root of the sessions' private temporary directories
+    /// (`<cache_dir>/session-tmp`); each launch exports its session's
+    /// directory below it as `TMPDIR`. `None` launches sessions with the
+    /// `TMPDIR` of their profile or of the forwarded daemon environment.
+    pub session_tmp_root: Option<PathBuf>,
     /// Wall-clock bound on each worktree/session lifecycle hook. A hook that
     /// exceeds it is terminated and recorded/logged as a non-fatal hook warning,
     /// so a hanging hook can never wedge a session operation. Defaults to
@@ -519,6 +525,7 @@ impl Default for SessionRegistryConfig {
             socket_path: None,
             store_path: None,
             worktree_root: None,
+            session_tmp_root: None,
             hook_timeout: DEFAULT_HOOK_TIMEOUT,
             hook_stderr_tail_bytes: DEFAULT_HOOK_STDERR_TAIL_BYTES,
             hook_stderr_release_grace: DEFAULT_HOOK_STDERR_RELEASE_GRACE,
@@ -2960,15 +2967,14 @@ impl SessionRegistry {
             .profile
             .as_ref()
             .and_then(|profile| profile.manifest.clone());
-        // Profile env first, then the daemon handshake env appended last, so
-        // every reserved POHUNEK_* key takes the daemon's value (last-write-wins;
-        // the loader also strips POHUNEK_* from the profile env up front).
-        let mut env_extra = resolved
-            .profile
-            .as_ref()
-            .map(|profile| profile.env.clone())
-            .unwrap_or_default();
-        env_extra.extend(self.session_pty_env(base.clone(), id));
+        let env_extra = self.launch_env(
+            resolved
+                .profile
+                .as_ref()
+                .map_or(&[][..], |profile| profile.env.as_slice()),
+            base.clone(),
+            id,
+        );
         let opts = LaunchOpts {
             cwd: launch_cwd.clone(),
             cols: params.cols,
@@ -4624,6 +4630,7 @@ impl SessionRegistry {
         // retained terminal worker may still emit a final control diagnostic,
         // but the shared writer keeps any such file within the same hard cap.
         self.delete_session_logs(id).await?;
+        self.delete_session_tmpdir(id).await;
 
         // A concurrent eviction (another removal path) leaves no entry here.
         let evicted = self.remove_session_entry(id).await;

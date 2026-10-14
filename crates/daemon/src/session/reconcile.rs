@@ -2050,6 +2050,7 @@ impl SessionRegistry {
     /// Returns whether the create is fully compensated; `false` keeps the
     /// record and any entry untouched.
     pub(super) async fn try_compensate_create(&self, id: &SessionId) -> bool {
+        self.delete_session_tmpdir(id).await;
         if !self.cleanup_bound_worktree(id).await {
             tracing::warn!(
                 session_id = %id.0,

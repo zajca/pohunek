@@ -76,6 +76,8 @@ const STORE_NAME: &str = pohunek_paths::METADATA_STORE_NAME;
 
 /// Subdirectory under the data dir holding per-session git worktrees.
 const WORKTREES_SUBDIR: &str = "worktrees";
+/// Directory under the cache dir that holds each session's private `TMPDIR`.
+const SESSION_TMP_SUBDIR: &str = "session-tmp";
 
 /// Subdirectory under the data dir holding the append-only event log.
 const EVENTS_SUBDIR: &str = "events";
@@ -367,6 +369,7 @@ async fn run() -> Result<(), DaemonError> {
         socket_path: Some(paths.socket.clone()),
         store_path: Some(store_path),
         worktree_root: Some(paths.data_dir.join(WORKTREES_SUBDIR)),
+        session_tmp_root: Some(paths.cache_dir.join(SESSION_TMP_SUBDIR)),
         event_log_dir: Some(paths.data_dir.join(EVENTS_SUBDIR)),
         retention_policy_path: Some(paths.data_dir.join(RETENTION_POLICY_NAME)),
         log_dir: Some(paths.log_dir.clone()),
