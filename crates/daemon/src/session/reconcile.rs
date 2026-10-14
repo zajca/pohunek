@@ -4734,15 +4734,22 @@ fn claim_process_facts(
 }
 
 fn active_report_from_info(info: &protocol::SessionInfo) -> Option<ActiveAgentReport> {
+    let agent = info.active_agent.clone()?;
+    // procwatch records an observed agent under its runtime id, while a reported
+    // agent carries its profile's name. The record keeps no origin, so a restored
+    // agent named like its runtime is treated as observed. The only ambiguous
+    // case is an explicit report of exactly that name while a same-named profile
+    // exists: it runs the pinned definition until the client reports again.
+    let observed = agent == super::agent_kind_label(&info.agent_base);
     Some(ActiveAgentReport {
         source: "persisted".to_owned(),
-        agent: info.active_agent.clone()?,
+        agent,
         seq: None,
         pid: info.active_agent_pid,
         start_identity: None,
         reported_at: crate::time::now(),
         activity_reported: false,
-        observed: false,
+        observed,
     })
 }
 

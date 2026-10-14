@@ -2617,11 +2617,31 @@ async fn adopt_session_beside_a_profile_named_like_its_runtime(
     (adopted, created.id)
 }
 
+/// Writes session `id`'s durable record as the daemon does after a change.
+async fn persist_session(registry: &SessionRegistry, id: &protocol::SessionId) {
+    let record = {
+        let sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get(id).expect("the live session");
+        SessionRegistry::session_record(id, entry, entry.desired_state, None)
+    };
+    registry
+        .write_session_record(record)
+        .await
+        .expect("persist the session record");
+}
+
 #[tokio::test]
 async fn a_procwatch_observed_own_agent_is_not_shadowed_by_a_profile_named_like_its_runtime() {
     let (adopted, created_id) =
         adopt_session_beside_a_profile_named_like_its_runtime("claude-observed-shadow").await;
     observe_own_runtime_process(&adopted.registry, &created_id).await;
+    // The daemon restarts from its persisted record, which keeps the agent's
+    // name but no origin.
+    persist_session(&adopted.registry, &created_id).await;
+    let adopted = adopted.reopen_with_workers_of(&adopted.registry).await;
+    Box::pin(adopted.registry.reconcile_workers())
+        .await
+        .expect("startup reconciliation");
 
     // The next version is installed without being selected: a package change
     // that the refresh sees while the session keeps its pin, to which the
@@ -2696,6 +2716,108 @@ async fn a_procwatch_observed_own_agent_is_not_shadowed_by_a_profile_named_like_
     adopted
         .registry
         .remove(&created_id)
+        .await
+        .expect("remove the adopted session");
+}
+
+#[tokio::test]
+async fn an_explicit_report_of_a_differently_named_profile_keeps_its_override_through_a_restart() {
+    let tag = "claude-tuned-restart";
+    let key = signing_key("root");
+    let dir = temp_dir(tag);
+    let store_path = temp_store_path(tag);
+    let fixture = Fixture::with_anchor_and_store(
+        &format!("{tag}-plugins"),
+        anchor(&[&key], Vec::new()),
+        store_path.clone(),
+    );
+    fs::create_dir_all(fixture.agents.join("manifests")).expect("the manifests directory");
+    fs::write(
+        fixture.agents.join("manifests").join("tuned.toml"),
+        OFFICIAL_MANIFEST,
+    )
+    .expect("the override manifest");
+    fixture.write_profile(
+        TUNED_PROFILE,
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 600\"]\nmanifest = \"tuned\"\n",
+    );
+    let previous = compiled_in_daemon(&fixture, &store_path);
+    let created = previous
+        .create(protocol::SessionNewParams {
+            agent: TUNED_PROFILE.to_owned(),
+            cwd: Some(dir),
+            ..params()
+        })
+        .await
+        .expect("a session of the tuned profile");
+    let adopted = fixture.reopen_with_workers_of(&previous).await;
+    Box::pin(adopted.registry.reconcile_workers())
+        .await
+        .expect("startup reconciliation");
+    install_real_official(
+        &adopted,
+        &adopted.registry,
+        RuntimeId::CLAUDE,
+        &real_official(RuntimeId::CLAUDE),
+        5,
+    )
+    .await;
+    let running = |registry: &SessionRegistry| {
+        let registry = registry.clone();
+        let id = created.id.clone();
+        async move {
+            let sessions = registry.inner.sessions.lock().await;
+            let entry = sessions.get(&id).expect("the live session");
+            let config = entry.detector_config.borrow().config.clone();
+            detector_debug(&config)
+        }
+    };
+    let override_config = running(&adopted.registry).await;
+    assert!(
+        adopted
+            .registry
+            .report_agent(protocol::SessionReportAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:tuned".to_owned(),
+                agent: TUNED_PROFILE.to_owned(),
+                activity: None,
+                seq: None,
+                pid: None,
+                agent_session_id: None,
+                agent_session_path: None,
+            })
+            .await
+            .recorded,
+        "the explicit report of the tuned profile is recorded"
+    );
+    persist_session(&adopted.registry, &created.id).await;
+    let adopted = adopted.reopen_with_workers_of(&adopted.registry).await;
+    Box::pin(adopted.registry.reconcile_workers())
+        .await
+        .expect("startup reconciliation");
+
+    install_version(
+        &adopted,
+        &adopted.registry,
+        RuntimeId::CLAUDE,
+        &claude_next_version_without_fork(),
+        "1.0.2",
+        6,
+    )
+    .await;
+    assert_eq!(
+        running(&adopted.registry).await,
+        override_config,
+        "the explicit report of a differently named profile keeps its manifest override"
+    );
+    adopted
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the adopted session");
+    adopted
+        .registry
+        .remove(&created.id)
         .await
         .expect("remove the adopted session");
 }
