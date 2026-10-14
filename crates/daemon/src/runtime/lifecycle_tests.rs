@@ -1826,22 +1826,17 @@ const FAKE_WORKER_EXIT_CODE: i32 = 3;
 
 /// Writes an executable that prints [`FAKE_WORKER_FATAL`] to stderr and
 /// exits with [`FAKE_WORKER_EXIT_CODE`] before binding any socket.
+///
+/// A child process writes it, so no write descriptor on it exists in this
+/// process for a concurrently forked sibling to inherit, which would make its
+/// exec fail with `ETXTBSY`.
 pub(crate) fn write_exiting_worker(directory: &Path) -> PathBuf {
     let path = directory.join("exiting-sessiond");
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o700)
-        .open(&path)
-        .expect("create fake worker");
-    std::io::Write::write_all(
-        &mut file,
-        format!("#!/bin/sh\necho '{FAKE_WORKER_FATAL}' >&2\nexit {FAKE_WORKER_EXIT_CODE}\n")
-            .as_bytes(),
+    pohunek_test_support::fs::write_executable(
+        &path,
+        format!("#!/bin/sh\necho '{FAKE_WORKER_FATAL}' >&2\nexit {FAKE_WORKER_EXIT_CODE}\n"),
     )
     .expect("write fake worker");
-    file.sync_all().expect("flush fake worker");
-    drop(file);
     path
 }
 
