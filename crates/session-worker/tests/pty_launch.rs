@@ -1,29 +1,49 @@
 //! Launch contract of a PTY child: working directory, session, descriptors,
 //! and descriptor-limit behaviour, observed through real PTY spawns.
+//!
+//! Probes use only what Linux and macOS both provide: `ps` for process ids,
+//! the shell's `[ -e /dev/fd/N ]` for descriptor numbers, and the process's own
+//! `fcntl` for descriptor flags.
 
 // Rust guideline compliant 2026-10-14
 
-use std::os::fd::AsRawFd;
+use std::fs::File;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 use pohunek_session_worker::{Command, EnvBase, OutputEvent, PtyError, PtyOwner, WorkerConfig};
 use pohunek_test_support::tempdir;
+use rustix::io::FdFlags;
 use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
 
 /// Upper bound for any single wait on child output or exit.
 const OUTPUT_WAIT: Duration = Duration::from_secs(10);
 /// Descriptor limit the large-limit scenario raises the soft limit to.
+#[cfg(target_os = "linux")]
 const LARGE_DESCRIPTOR_LIMIT: u64 = 1_048_576;
 /// Longest acceptable launch under the large descriptor limit.
+#[cfg(target_os = "linux")]
 const LAUNCH_BUDGET: Duration = Duration::from_millis(100);
+/// Descriptor number the lowered-limit regression holds open above the soft limit.
+const HIGH_DESCRIPTOR: libc::c_int = 1024;
+/// Soft limit the lowered-limit regression lowers below [`HIGH_DESCRIPTOR`].
+const LOWERED_DESCRIPTOR_LIMIT: u64 = 256;
+/// Soft limit the lowered-limit regression raises to so that [`HIGH_DESCRIPTOR`] is allocable.
+const RAISED_DESCRIPTOR_LIMIT: u64 = 4096;
+/// Lowest number the probe descriptors are allocated from.
+const PROBE_MINIMUM: libc::c_int = 200;
+/// Number of probe descriptors the inheritance scenario opens.
+const PROBE_COUNT: usize = 3;
 /// Environment flag that marks the re-executed child of a descriptor-limit test.
 const LIMIT_CHILD_FLAG: &str = "POHUNEK_SESSION_WORKER_LIMIT_CHILD";
-/// Descriptor number the parent uses for its non-close-on-exec probe.
-const PROBE_DESCRIPTOR: libc::c_int = 200;
 /// Environment passed to every scenario shell: a fixed search path, no inheritance.
 const SHELL_PATH: &str = "/usr/bin:/bin";
+/// Standard descriptors every child keeps: stdin, stdout, and stderr.
+const STANDARD_DESCRIPTORS: [&str; 3] = ["0", "1", "2"];
 
 fn shell_command(script: &str, cwd: &Path, home: &Path) -> Command {
     Command {
@@ -51,6 +71,23 @@ fn spawn(command: Command) -> Result<PtyOwner, PtyError> {
     )
 }
 
+/// Opens a descriptor at or above `minimum` that the child would inherit.
+fn inheritable_descriptor(minimum: libc::c_int) -> OwnedFd {
+    let fd = rustix::io::fcntl_dupfd_cloexec(
+        File::open("/dev/null").expect("open probe source"),
+        minimum,
+    )
+    .expect("duplicate probe descriptor");
+    rustix::io::fcntl_setfd(&fd, FdFlags::empty()).expect("clear close-on-exec on the probe");
+    assert!(
+        rustix::io::fcntl_getfd(&fd)
+            .expect("read descriptor flags")
+            .is_empty(),
+        "the probe must lack close-on-exec to test inheritance"
+    );
+    fd
+}
+
 /// Collects retained and live output until `needle` appears, and returns it.
 async fn output_until(pty: &PtyOwner, needle: &str) -> String {
     let mut subscriber = pty.subscribe_output(None).expect("subscribe to output");
@@ -69,6 +106,28 @@ async fn output_until(pty: &PtyOwner, needle: &str) -> String {
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for {needle:?}"));
     String::from_utf8_lossy(&collected).into_owned()
+}
+
+/// Runs `body` as a re-executed child of this test, so that process-wide
+/// state such as the descriptor limit stays inside that child.
+fn run_in_child(test_name: &str, marker: &str, body: impl FnOnce()) {
+    if std::env::var_os(LIMIT_CHILD_FLAG).is_none() {
+        let output = ProcessCommand::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", test_name, "--nocapture"])
+            .env(LIMIT_CHILD_FLAG, "1")
+            .output()
+            .expect("run the re-executed child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "re-executed child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains(marker), "child did not finish:\n{stdout}");
+        return;
+    }
+    body();
+    println!("{marker}");
 }
 
 /// A missing working directory fails the spawn and starts no process.
@@ -112,15 +171,19 @@ async fn the_child_starts_in_the_requested_directory() {
     assert_eq!(Path::new(printed), canonical.as_path());
 }
 
-/// The child leads its own session and owns the PTY as its controlling
-/// terminal, and a resize delivers SIGWINCH to it.
+/// The child is its process group's leader and the foreground group of its
+/// controlling terminal, and a resize delivers SIGWINCH to it.
+///
+/// `ps -o tpgid` reports the terminal's foreground group. It equals the child's
+/// pid only when the child is the controlling terminal's foreground group,
+/// which requires the child to have acquired the PTY as its controlling tty.
 #[tokio::test]
 async fn the_child_leads_the_session_and_receives_resize_signals() {
     let home = tempdir().expect("home directory");
     let cwd = tempdir().expect("working directory");
     let script = concat!(
         "trap 'printf \"winch-seen\\n\"' WINCH; ",
-        "printf 'ids %s %s\\n' \"$$\" \"$(cut -d' ' -f5-7 /proc/$$/stat)\"; ",
+        "printf 'ids %s\\n' \"$(ps -o pid= -o pgid= -o tpgid= -p $$)\"; ",
         "printf 'ready\\n'; ",
         "while :; do sleep 0.1; done"
     );
@@ -133,19 +196,16 @@ async fn the_child_leads_the_session_and_receives_resize_signals() {
         .find_map(|line| line.strip_prefix("ids "))
         .expect("the shell reported its ids");
     let fields: Vec<&str> = ids.split_whitespace().collect();
-    assert_eq!(fields.len(), 4, "{ids:?}");
+    assert_eq!(fields.len(), 3, "{ids:?}");
     let shell_pid: u32 = fields[0].parse().expect("shell pid");
-    let process_group: i64 = fields[1].parse().expect("process group");
-    let session: i64 = fields[2].parse().expect("session");
-    let tty_number: i64 = fields[3].parse().expect("controlling terminal");
+    let process_group: u32 = fields[1].parse().expect("process group");
+    let foreground_group: u32 = fields[2].parse().expect("foreground process group");
     assert_eq!(shell_pid, pid, "the shell is the managed child");
+    assert_eq!(process_group, pid, "the child leads its process group");
     assert_eq!(
-        process_group,
-        i64::from(pid),
-        "the child leads its process group"
+        foreground_group, pid,
+        "the child's group is the foreground group of its terminal"
     );
-    assert_eq!(session, i64::from(pid), "the child leads its session");
-    assert_ne!(tty_number, 0, "the PTY is the controlling terminal");
 
     pty.resize("launch-test", 1, 100, 30)
         .await
@@ -157,52 +217,50 @@ async fn the_child_leads_the_session_and_receives_resize_signals() {
         .expect("stop the shell");
 }
 
-/// The child inherits only the three PTY descriptors, not a worker descriptor
-/// that lacks close-on-exec, and a missing absolute program fails the spawn.
+/// The child inherits only the three PTY descriptors, not worker descriptors
+/// that lack close-on-exec, and a missing absolute program fails the spawn.
 #[tokio::test]
 async fn the_child_sees_only_the_pty_descriptors() {
     let home = tempdir().expect("home directory");
     let cwd = tempdir().expect("working directory");
 
-    // A duplicate above the range the child's shell uses for its own
-    // descriptors, with close-on-exec cleared so that it would be inherited.
-    let probe = rustix::io::fcntl_dupfd_cloexec(
-        std::fs::File::open("/dev/null").expect("open probe"),
-        PROBE_DESCRIPTOR,
-    )
-    .expect("duplicate probe descriptor");
-    rustix::io::fcntl_setfd(&probe, rustix::io::FdFlags::empty())
-        .expect("clear close-on-exec on the probe");
-    assert!(
-        rustix::io::fcntl_getfd(&probe)
-            .expect("read descriptor flags")
-            .is_empty(),
-        "the probe must lack close-on-exec to test inheritance"
-    );
-    let probe_number = probe.as_raw_fd();
-
-    let pty = spawn(shell_command(
-        "for f in /proc/$$/fd/*; do printf 'fd %s\\n' \"${f##*/}\"; done; printf 'listed\\n'",
-        cwd.path(),
-        home.path(),
-    ))
-    .expect("spawn descriptor listing");
-    let output = output_until(&pty, "listed").await;
-    drop(probe);
-
-    let listed: Vec<&str> = output
-        .lines()
-        .filter_map(|line| line.strip_prefix("fd "))
+    let probes: Vec<OwnedFd> = (0..PROBE_COUNT)
+        .map(|_| inheritable_descriptor(PROBE_MINIMUM))
         .collect();
-    for standard in ["0", "1", "2"] {
+    let probe_numbers: Vec<libc::c_int> = probes.iter().map(AsRawFd::as_raw_fd).collect();
+
+    let mut commands: Vec<String> = STANDARD_DESCRIPTORS
+        .iter()
+        .map(|number| format!("[ -e /dev/fd/{number} ] && printf 'open {number}\\n'"))
+        .collect();
+    commands.extend(
+        probe_numbers
+            .iter()
+            .map(|number| format!("[ -e /dev/fd/{number} ] && printf 'leak {number}\\n'")),
+    );
+    commands.push("printf 'listed\\n'".to_owned());
+    let script = commands.join("; ");
+
+    let pty =
+        spawn(shell_command(&script, cwd.path(), home.path())).expect("spawn descriptor listing");
+    let output = output_until(&pty, "listed").await;
+    drop(probes);
+
+    for standard in STANDARD_DESCRIPTORS {
         assert!(
-            listed.contains(&standard),
-            "descriptor {standard} missing: {listed:?}"
+            output
+                .lines()
+                .any(|line| line == format!("open {standard}")),
+            "descriptor {standard} missing:\n{output}"
         );
     }
+    let leaked: Vec<&str> = output
+        .lines()
+        .filter(|line| line.starts_with("leak "))
+        .collect();
     assert!(
-        !listed.contains(&probe_number.to_string().as_str()),
-        "inherited descriptor {probe_number} leaked into the child: {listed:?}"
+        leaked.is_empty(),
+        "inherited probe descriptors leaked into the child: {leaked:?}"
     );
 
     let missing = spawn(Command {
@@ -231,59 +289,114 @@ async fn the_child_sees_only_the_pty_descriptors() {
     );
 }
 
+/// A non-close-on-exec descriptor above a lowered soft limit is not inherited.
+///
+/// On Linux this exercises `close_range`, which marks every descriptor from 3
+/// upward regardless of the soft limit. macOS has no range call, so the
+/// `platform contracts (arm64)` CI job covers the bounded per-descriptor sweep
+/// there natively: the sweep must reach descriptors above the soft limit,
+/// which only its precomputed bound from the open-descriptor listing allows.
+#[test]
+fn a_non_cloexec_descriptor_above_a_lowered_soft_limit_is_not_inherited() {
+    run_in_child(
+        "a_non_cloexec_descriptor_above_a_lowered_soft_limit_is_not_inherited",
+        "lowered-limit-regression-clean",
+        || {
+            let limit = getrlimit(Resource::Nofile);
+            let hard = limit.maximum.unwrap_or(u64::MAX);
+            assert!(
+                hard > u64::try_from(HIGH_DESCRIPTOR).expect("positive descriptor"),
+                "the hard descriptor limit must exceed the probe number"
+            );
+            let raised = RAISED_DESCRIPTOR_LIMIT.min(hard);
+            setrlimit(
+                Resource::Nofile,
+                Rlimit {
+                    current: Some(raised),
+                    maximum: limit.maximum,
+                },
+            )
+            .expect("raise the soft descriptor limit");
+            let probe = inheritable_descriptor(HIGH_DESCRIPTOR);
+            let probe_number = probe.as_raw_fd();
+            assert!(
+                probe_number >= HIGH_DESCRIPTOR,
+                "probe landed at {probe_number}"
+            );
+            setrlimit(
+                Resource::Nofile,
+                Rlimit {
+                    current: Some(LOWERED_DESCRIPTOR_LIMIT),
+                    maximum: limit.maximum,
+                },
+            )
+            .expect("lower the soft descriptor limit below the probe");
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async {
+                let home = tempdir().expect("home directory");
+                let cwd = tempdir().expect("working directory");
+                let script = format!(
+                    "if [ -e /dev/fd/{probe_number} ]; then printf 'leaked\\n'; \
+                     else printf 'clean\\n'; fi; printf 'done\\n'"
+                );
+                let pty = spawn(shell_command(&script, cwd.path(), home.path()))
+                    .expect("spawn above the lowered soft limit");
+                let output = output_until(&pty, "done").await;
+                assert!(
+                    output.lines().any(|line| line == "clean"),
+                    "descriptor {probe_number} was inherited:\n{output}"
+                );
+            });
+            drop(probe);
+        },
+    );
+}
+
 /// Launching under a 2^20 descriptor limit stays inside the launch budget.
+///
+/// Linux only: the budget measures the `close_range` path. The macOS sweep
+/// costs one `fcntl` per descriptor below the limit, so its launch time is
+/// linear in the limit by design.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_launch_under_a_large_descriptor_limit_meets_the_budget() {
-    if std::env::var_os(LIMIT_CHILD_FLAG).is_none() {
-        // Re-execute this test in its own process so the raised limit cannot
-        // leak into other tests of this binary.
-        let output = ProcessCommand::new(std::env::current_exe().expect("test binary"))
-            .args([
-                "--exact",
-                "a_launch_under_a_large_descriptor_limit_meets_the_budget",
-                "--nocapture",
-            ])
-            .env(LIMIT_CHILD_FLAG, "1")
-            .output()
-            .expect("run the limit child");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success(),
-            "limit child failed:\n{stdout}\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(stdout.contains("launch-within-budget"), "{stdout}");
-        return;
-    }
+    run_in_child(
+        "a_launch_under_a_large_descriptor_limit_meets_the_budget",
+        "launch-within-budget",
+        || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async {
+                let limit = getrlimit(Resource::Nofile);
+                let hard = limit.maximum.unwrap_or(LARGE_DESCRIPTOR_LIMIT);
+                let soft = LARGE_DESCRIPTOR_LIMIT.min(hard);
+                setrlimit(
+                    Resource::Nofile,
+                    Rlimit {
+                        current: Some(soft),
+                        maximum: limit.maximum,
+                    },
+                )
+                .expect("raise the soft descriptor limit");
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    runtime.block_on(async {
-        let limit = getrlimit(Resource::Nofile);
-        let hard = limit.maximum.unwrap_or(LARGE_DESCRIPTOR_LIMIT);
-        let soft = LARGE_DESCRIPTOR_LIMIT.min(hard);
-        setrlimit(
-            Resource::Nofile,
-            Rlimit {
-                current: Some(soft),
-                maximum: limit.maximum,
-            },
-        )
-        .expect("raise the soft descriptor limit");
-
-        let home = tempdir().expect("home directory");
-        let cwd = tempdir().expect("working directory");
-        let started = Instant::now();
-        let pty = spawn(shell_command("printf 'ran\\n'", cwd.path(), home.path()))
-            .expect("spawn under a large descriptor limit");
-        let elapsed = started.elapsed();
-        output_until(&pty, "ran").await;
-        assert!(
-            elapsed < LAUNCH_BUDGET,
-            "launch took {elapsed:?} under a soft limit of {soft}"
-        );
-        println!("launch-within-budget {elapsed:?}");
-    });
+                let home = tempdir().expect("home directory");
+                let cwd = tempdir().expect("working directory");
+                let started = Instant::now();
+                let pty = spawn(shell_command("printf 'ran\\n'", cwd.path(), home.path()))
+                    .expect("spawn under a large descriptor limit");
+                let elapsed = started.elapsed();
+                output_until(&pty, "ran").await;
+                assert!(
+                    elapsed < LAUNCH_BUDGET,
+                    "launch took {elapsed:?} under a soft limit of {soft}"
+                );
+            });
+        },
+    );
 }

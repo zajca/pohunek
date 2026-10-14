@@ -57,9 +57,9 @@ pub(crate) fn spawn_pty_child(command: &Command, slave_device: &Path) -> io::Res
         environment.get(OsStr::new("PATH")).map(OsString::as_os_str),
     )
     .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "program is not executable"))?;
-    // Read in the parent because the child may not call getrlimit or allocate
-    // after fork.
-    let descriptor_limit = descriptor_limit()?;
+    // Computed in the parent because the child may not read the descriptor
+    // table or call getrlimit after fork.
+    let sweep_bound = descriptor_sweep_bound()?;
 
     // The slave is opened by name so that it never becomes the worker's
     // controlling terminal; `O_CLOEXEC` keeps it out of any other child.
@@ -77,7 +77,7 @@ pub(crate) fn spawn_pty_child(command: &Command, slave_device: &Path) -> io::Res
     process.stdin(Stdio::from(rustix::io::dup(&slave)?));
     process.stdout(Stdio::from(rustix::io::dup(&slave)?));
     process.stderr(Stdio::from(slave));
-    install_session_setup(&mut process, descriptor_limit);
+    install_session_setup(&mut process, sweep_bound);
     // The parent's slave descriptors close when `process` drops at the end of
     // this function, after the child has been created.
     process.spawn()
@@ -151,7 +151,50 @@ fn is_runnable(path: &Path) -> bool {
     !path.is_dir() && access(path, AccessFlags::X_OK).is_ok()
 }
 
-/// Reads the descriptor limit the child uses for its fallback marking loop.
+/// Directory listing the process's open descriptors.
+#[cfg(target_os = "linux")]
+const OPEN_DESCRIPTOR_DIRECTORY: &str = "/proc/self/fd";
+/// Directory listing the process's open descriptors.
+#[cfg(not(target_os = "linux"))]
+const OPEN_DESCRIPTOR_DIRECTORY: &str = "/dev/fd";
+
+/// Computes the exclusive upper bound of the child's fallback sweep.
+///
+/// Lowering the soft limit does not close descriptors already open above it,
+/// so the bound also covers the highest open descriptor. A descriptor opened
+/// after this scan is below the soft limit, because the kernel allocates the
+/// lowest free number and refuses numbers at or above the limit.
+///
+/// # Errors
+///
+/// Returns an error when the limit or the descriptor listing cannot be read.
+/// The spawn then fails rather than guessing a bound.
+fn descriptor_sweep_bound() -> io::Result<libc::c_int> {
+    let soft_limit = descriptor_limit()?;
+    Ok(soft_limit.max(highest_open_descriptor()?.saturating_add(1)))
+}
+
+/// Returns the highest descriptor number the process has open, or the last
+/// inherited-range number when none is open above it.
+fn highest_open_descriptor() -> io::Result<libc::c_int> {
+    let mut highest = FIRST_INHERITED_DESCRIPTOR - 1;
+    for entry in std::fs::read_dir(OPEN_DESCRIPTOR_DIRECTORY)? {
+        let number = entry?
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<libc::c_int>().ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "open descriptor listing is not numeric",
+                )
+            })?;
+        highest = highest.max(number);
+    }
+    Ok(highest)
+}
+
+/// Reads the soft `RLIMIT_NOFILE`.
 ///
 /// A limit above `c_int::MAX` is clamped to it; the kernel's descriptor table
 /// is bounded well below that value.
@@ -176,13 +219,13 @@ fn descriptor_limit() -> io::Result<libc::c_int> {
     unsafe_code,
     reason = "pre_exec is an unsafe API; the registered closure only calls async-signal-safe libc functions"
 )]
-fn install_session_setup(process: &mut std::process::Command, descriptor_limit: libc::c_int) {
+fn install_session_setup(process: &mut std::process::Command, sweep_bound: libc::c_int) {
     // SAFETY: the closure captures one `c_int`, and calls only
     // `enter_pty_session`, which allocates nothing and calls only
     // async-signal-safe functions. That is the requirement after fork in a
     // multithreaded process.
     unsafe {
-        process.pre_exec(move || enter_pty_session(descriptor_limit));
+        process.pre_exec(move || enter_pty_session(sweep_bound));
     }
 }
 
@@ -195,7 +238,7 @@ fn install_session_setup(process: &mut std::process::Command, descriptor_limit: 
     unsafe_code,
     reason = "session setup and descriptor marking are libc calls with no safe wrapper"
 )]
-fn enter_pty_session(descriptor_limit: libc::c_int) -> io::Result<()> {
+fn enter_pty_session(sweep_bound: libc::c_int) -> io::Result<()> {
     for signal in RESET_SIGNALS {
         // SAFETY: `signal` with `SIG_DFL` is async-signal-safe; the previous
         // disposition is intentionally discarded.
@@ -229,11 +272,12 @@ fn enter_pty_session(descriptor_limit: libc::c_int) -> io::Result<()> {
     if unsafe { libc::ioctl(libc::STDIN_FILENO, request, 0) } == -1 {
         return Err(io::Error::last_os_error());
     }
-    mark_inherited_descriptors_cloexec(descriptor_limit);
+    mark_inherited_descriptors_cloexec(sweep_bound);
     Ok(())
 }
 
-/// Marks every descriptor from `FIRST_INHERITED_DESCRIPTOR` upward close-on-exec.
+/// Marks every descriptor from `FIRST_INHERITED_DESCRIPTOR` below `sweep_bound`
+/// close-on-exec.
 ///
 /// Marking instead of closing is required: std's exec-status pipe is a
 /// close-on-exec descriptor above 2 that the child writes an exec failure
@@ -243,12 +287,12 @@ fn enter_pty_session(descriptor_limit: libc::c_int) -> io::Result<()> {
     unsafe_code,
     reason = "close_range and fcntl are libc calls with no safe wrapper"
 )]
-fn mark_inherited_descriptors_cloexec(descriptor_limit: libc::c_int) {
+fn mark_inherited_descriptors_cloexec(sweep_bound: libc::c_int) {
     #[cfg(target_os = "linux")]
     {
         // SAFETY: `syscall` with `SYS_close_range` takes integer arguments and
         // only updates the descriptor table. `CLOSE_RANGE_CLOEXEC` marks rather
-        // than closes. The call fails before kernel 5.11, and the loop below
+        // than closes. The call fails before kernel 5.11, and the sweep below
         // then covers the range.
         let marked = unsafe {
             libc::syscall(
@@ -262,7 +306,7 @@ fn mark_inherited_descriptors_cloexec(descriptor_limit: libc::c_int) {
             return;
         }
     }
-    for descriptor in FIRST_INHERITED_DESCRIPTOR..descriptor_limit {
+    for descriptor in FIRST_INHERITED_DESCRIPTOR..sweep_bound {
         // SAFETY: `fcntl` with `F_SETFD` is async-signal-safe. Descriptors that
         // are not open return EBADF, which is expected and ignored.
         unsafe {
