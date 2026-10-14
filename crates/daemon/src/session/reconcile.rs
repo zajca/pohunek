@@ -6465,12 +6465,15 @@ while os.getppid() == parent:
             .unwrap_or(false)
     }
 
+    /// Waits until the pid file holds a pid. Writers publish it by rename, and
+    /// an empty or unparsable file is treated as not published yet.
     async fn wait_for_pid_file(path: &Path) -> u32 {
-        let contents = wait_until("the nested pid file", || async {
-            std::fs::read_to_string(path).ok()
+        wait_until("the nested pid file", || async {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|contents| contents.trim().parse().ok())
         })
-        .await;
-        contents.trim().parse().expect("nested pid")
+        .await
     }
 
     fn process_start_identity(pid: u32) -> u64 {
@@ -12196,9 +12199,9 @@ handler = "codex-hook-v1"
             std::fs::write(
                 config_dir.join("hooks/session-start"),
                 format!(
-                    "echo $$ > '{}'\nexec sleep {}\n",
-                    pid_file.display(),
-                    HOOK_RUN_BOUND.as_secs()
+                    "echo $$ > '{pid}.tmp'\nmv '{pid}.tmp' '{pid}'\nexec sleep {hold}\n",
+                    pid = pid_file.display(),
+                    hold = HOOK_RUN_BOUND.as_secs()
                 ),
             )
             .expect("write session-start hook");
