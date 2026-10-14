@@ -153,6 +153,17 @@ fn soft_descriptor_limit() -> Option<libc::rlim_t> {
     (result == 0).then_some(limit.rlim_cur)
 }
 
+/// Converts a `proc_pidinfo` result into a byte count, or `None` on failure.
+///
+/// `proc_pidinfo` reports failure as zero (or a negative value) with `errno`
+/// set. The Rust runtime keeps descriptors 0 through 2 open, so a zero-byte
+/// listing is never a complete table; `None` makes the caller scan the whole
+/// bounded range.
+#[cfg(target_os = "macos")]
+fn listed_bytes(result: libc::c_int) -> Option<usize> {
+    usize::try_from(result).ok().filter(|bytes| *bytes > 0)
+}
+
 /// Returns the highest open descriptor number of this process on Darwin.
 ///
 /// Darwin has no `close_range`, so the child closes descriptors one by one up
@@ -170,7 +181,7 @@ fn highest_open_descriptor() -> Option<libc::c_int> {
     // SAFETY: a null buffer with zero size only asks for the required byte count.
     let required =
         unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
-    let mut capacity = usize::try_from(required).ok()? / entry_size + DESCRIPTOR_LIST_SLACK;
+    let mut capacity = listed_bytes(required)? / entry_size + DESCRIPTOR_LIST_SLACK;
     loop {
         let mut entries = vec![
             libc::proc_fdinfo {
@@ -191,7 +202,7 @@ fn highest_open_descriptor() -> Option<libc::c_int> {
                 buffer_bytes,
             )
         };
-        let written = usize::try_from(written).ok()?;
+        let written = listed_bytes(written)?;
         if written < capacity * entry_size {
             return Some(
                 entries[..written / entry_size]

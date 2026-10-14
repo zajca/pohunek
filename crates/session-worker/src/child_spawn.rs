@@ -198,6 +198,20 @@ fn highest_open_descriptor() -> io::Result<libc::c_int> {
 #[cfg(target_os = "macos")]
 const DESCRIPTOR_LIST_SLACK: usize = 16;
 
+/// Converts a `proc_pidinfo` result into a byte count.
+///
+/// `proc_pidinfo` reports failure as zero (or a negative value) with `errno`
+/// set. The Rust runtime keeps descriptors 0 through 2 open (it reopens them
+/// on `/dev/null` at startup when closed), so a zero-byte listing is never a
+/// complete table and is treated as the failure it is.
+#[cfg(target_os = "macos")]
+fn listed_bytes(result: libc::c_int) -> io::Result<usize> {
+    match usize::try_from(result) {
+        Ok(bytes) if bytes > 0 => Ok(bytes),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
 /// Returns the highest open descriptor number, or one below the inherited
 /// range when none is open there. The listing is complete or an error.
 ///
@@ -215,7 +229,7 @@ fn highest_open_descriptor() -> io::Result<libc::c_int> {
     // SAFETY: a null buffer with zero size only asks for the required byte count.
     let required =
         unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
-    let required = usize::try_from(required).map_err(|_source| io::Error::last_os_error())?;
+    let required = listed_bytes(required)?;
     let mut capacity = required / entry_size + DESCRIPTOR_LIST_SLACK;
     loop {
         let mut entries = vec![
@@ -241,7 +255,7 @@ fn highest_open_descriptor() -> io::Result<libc::c_int> {
                 buffer_bytes,
             )
         };
-        let written = usize::try_from(written).map_err(|_source| io::Error::last_os_error())?;
+        let written = listed_bytes(written)?;
         if written < buffer_size {
             return Ok(entries[..written / entry_size]
                 .iter()
