@@ -1433,6 +1433,9 @@ mod tests {
     /// result, so their `None` comes from the daemon, not from setup.
     #[tokio::test(start_paused = true)]
     async fn dynamic_lookups_reach_a_daemon_at_the_resolved_socket() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         for lookup in Lookup::ALL {
             let env = pohunek_test_support::env::TestEnv::new()
                 .expect("create the hermetic test environment");
@@ -1476,6 +1479,9 @@ mod tests {
     /// for exactly the completion deadline, after which it gives up silently.
     #[tokio::test(start_paused = true)]
     async fn dynamic_lookups_give_up_on_an_unanswering_daemon_at_the_completion_deadline() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         for lookup in Lookup::ALL {
             let env = pohunek_test_support::env::TestEnv::new()
                 .expect("create the hermetic test environment");
@@ -1546,6 +1552,9 @@ mod tests {
     /// service could be started: completion never autostarts the daemon.
     #[tokio::test(start_paused = true)]
     async fn dynamic_lookups_against_an_absent_daemon_fail_at_once_and_start_nothing() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         for lookup in Lookup::ALL {
             let env = pohunek_test_support::env::TestEnv::new()
                 .expect("create the hermetic test environment");

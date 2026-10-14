@@ -274,6 +274,9 @@ fn a_profile_without_a_transcript_tree_or_a_resolvable_home_is_skipped() {
 
 #[test]
 fn the_daemon_process_environment_does_not_steer_the_roots() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let steered = scoped_dir("pohunek-roots-steered");
     let mut process = ProcessEnv::lock();
     process.set("CLAUDE_CONFIG_DIR", steered.as_path());
@@ -327,6 +330,9 @@ async fn a_pass_that_cannot_resolve_homes_keeps_the_previous_roots() {
 async fn the_registry_provider_resolves_homes_from_its_own_launch_environment() {
     use crate::session::{SessionRegistry, SessionRegistryConfig};
 
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let steered = scoped_dir("pohunek-roots-registry-steered");
     let rig = Rig::new();
     let work = rig.used_home("work-home", "projects");

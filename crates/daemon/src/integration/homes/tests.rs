@@ -342,6 +342,9 @@ fn status_recovery_commands_name_the_profile_of_the_home() {
 
 #[test]
 fn an_ambient_config_variable_in_the_daemon_environment_steers_nothing() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let ambient = scoped_dir("ambient-provider-home");
     // The daemon process itself carries the variable, and so does the daemon
     // environment the rig forwards the default allowlist from.

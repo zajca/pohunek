@@ -2787,6 +2787,9 @@ const SYSTEM_PATH: &str = "/usr/bin:/bin";
 /// `hermes`.
 #[tokio::test]
 async fn hermes_launches_only_from_the_installed_official_package() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let mut path = ProcessEnv::lock();
     let fakes = pohunek_test_support::tempdir().expect("create the fake hermes directory");
     let lock: Value = serde_json::from_slice(

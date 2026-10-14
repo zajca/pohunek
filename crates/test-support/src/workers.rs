@@ -1026,6 +1026,9 @@ mod tests {
 
     #[test]
     fn the_scan_does_not_depend_on_the_path_of_the_test_process() {
+        if !crate::process_env::in_own_process() {
+            return;
+        }
         let root = tempdir().expect("root");
         let _worker = spawn_orphaned_worker(root.path());
         let mut env = ProcessEnv::lock();

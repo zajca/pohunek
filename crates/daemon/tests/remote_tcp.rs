@@ -792,6 +792,9 @@ fn write_claude_override_profiles(root: &Path, agents: &Path) {
 
 #[tokio::test]
 async fn daemon_doctor_reports_profile_readiness_and_redacts_profile_content() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let agents_root = pohunek_test_support::tempdir().expect("create profile fixture root");
     let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
     process_env.set("PATH", agents_root.path());
@@ -881,6 +884,9 @@ async fn daemon_doctor_reports_profile_readiness_and_redacts_profile_content() {
 async fn daemon_doctor_reports_redacted_provider_integration_readiness() {
     use std::os::unix::fs::PermissionsExt as _;
 
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let root = pohunek_test_support::tempdir().expect("create integration fixture root");
     let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
     process_env.set("PATH", root.path());
@@ -1183,6 +1189,9 @@ async fn daemon_doctor_reports_redacted_provider_integration_readiness() {
 async fn daemon_doctor_bounds_oversized_profile_home_inspection() {
     const PROFILE_SCAN_LIMIT: usize = 4096;
 
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let root = pohunek_test_support::tempdir().expect("create oversized profile fixture root");
     let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
     process_env.set("PATH", root.path());
@@ -1247,6 +1256,9 @@ async fn daemon_doctor_bounds_oversized_profile_home_inspection() {
 async fn daemon_doctor_reports_insecure_profile_directory_without_reading_it() {
     use std::os::unix::fs::PermissionsExt as _;
 
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let root = pohunek_test_support::tempdir().expect("create insecure profile fixture root");
     let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
     process_env.set("PATH", root.path());
@@ -1297,6 +1309,9 @@ async fn daemon_doctor_reports_insecure_profile_directory_without_reading_it() {
 async fn daemon_doctor_uses_daemon_path_for_executable_and_profile_path_for_probe_child() {
     use std::os::unix::fs::PermissionsExt as _;
 
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let root = pohunek_test_support::tempdir().expect("create path fixture root");
     let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
     let daemon_path = root.path().join("daemon-bin");
@@ -1385,6 +1400,9 @@ async fn daemon_doctor_uses_daemon_path_for_executable_and_profile_path_for_prob
 async fn daemon_doctor_bounds_aggregate_version_probes_across_slow_profiles() {
     use std::os::unix::fs::PermissionsExt as _;
 
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let root = pohunek_test_support::tempdir().expect("create slow profile fixture root");
     let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
     process_env.set("PATH", root.path());
@@ -1488,6 +1506,9 @@ fn open_fifo_writer(path: &Path) -> std::fs::File {
 async fn daemon_doctor_version_probe_leaves_no_descendant_behind() {
     use std::os::unix::fs::PermissionsExt as _;
 
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let root = pohunek_test_support::tempdir().expect("create probe fixture root");
     let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
     process_env.set("PATH", root.path());
@@ -1590,6 +1611,9 @@ async fn daemon_doctor_version_probe_leaves_no_descendant_behind() {
 
 #[tokio::test]
 async fn daemon_doctor_truncates_oversized_reports_below_control_line_limit() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let root = pohunek_test_support::tempdir().expect("create large profile fixture root");
     let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
     process_env.set("PATH", root.path());
@@ -1705,6 +1729,9 @@ fn write_manifest_doctor_fixture(root: &Path) -> (PathBuf, PathBuf) {
 
 #[tokio::test]
 async fn daemon_doctor_reports_embedded_and_override_manifest_health_redacted() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let root = pohunek_test_support::tempdir().expect("create manifest fixture root");
     let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
     process_env.set("PATH", root.path());

@@ -433,6 +433,9 @@ fn an_untouched_stage_verifies_with_every_independent_checker() {
 
 #[test]
 fn npm_runs_with_a_scrubbed_environment_and_the_lockfile_registry() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let fixture = Fixture::new();
     let mut env = ProcessEnv::lock();
     env.set("NPM_TOKEN", "must-not-leak")
@@ -1912,6 +1915,9 @@ fn rerecord(stage: &Path, path: &str) {
 
 #[test]
 fn a_provisioned_runtime_is_staged_in_place_and_verifies() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let fixture = Provisioned::new();
     let mut env = ProcessEnv::lock();
     env.set("GITHUB_TOKEN", "must-not-leak")

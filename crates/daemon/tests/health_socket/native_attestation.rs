@@ -135,6 +135,9 @@ fn assert_unattested(response: Response, native: &str) {
 /// identity is refused, and the session keeps the reference it had.
 #[tokio::test]
 async fn descendant_report_naming_the_pty_root_is_refused() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let mut rig = ReportingRig::start("attest-descendant", RuntimeRef::claude(), "claude").await;
     let request = rig.report(FIRST_SEQUENCE, DESCENDANT_REFERENCE);
 
@@ -160,6 +163,9 @@ async fn descendant_report_naming_the_pty_root_is_refused() {
 /// cannot replace what the root recorded.
 #[tokio::test]
 async fn pty_root_report_is_recorded_and_a_later_descendant_cannot_replace_it() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let mut rig = ReportingRig::start("attest-root", RuntimeRef::claude(), "claude").await;
 
     let root = rig.report(FIRST_SEQUENCE, ROOT_REFERENCE);
@@ -199,6 +205,9 @@ async fn pty_root_report_is_recorded_and_a_later_descendant_cannot_replace_it() 
 /// refused.
 #[tokio::test]
 async fn identity_v1_root_report_is_refused_and_records_nothing() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let mut rig = ReportingRig::start("attest-hermes", RuntimeRef::hermes(), "hermes").await;
     let request = rig.report(FIRST_SEQUENCE, ROOT_REFERENCE);
 

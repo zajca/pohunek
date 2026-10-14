@@ -376,6 +376,9 @@ impl Scenario {
 
 #[tokio::test]
 async fn a_forced_output_close_ends_the_session_with_the_root_exit() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let scenario = Scenario::new(Holder::Image, Root::Sleeps);
     let (created, holder, exit_code) = std::thread::scope(|scope| {
         scope
@@ -524,6 +527,9 @@ async fn stop_and_check(
 
 #[tokio::test]
 async fn an_unattributable_holder_keeps_the_forced_close_from_ending_the_session() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let scenario = Scenario::new(Holder::NonDumpable, Root::Sleeps);
     let registry = scenario.registry();
     let (created, holder) = scenario.start(&registry).await;
@@ -642,6 +648,9 @@ fn persist_stop_intent(store: &Path) {
 /// gave up waiting for it: the durable stop intent decides the outcome.
 #[tokio::test]
 async fn a_late_exit_after_the_stop_gave_up_honours_the_stop_intent() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let mut scenario = Scenario::new(Holder::Image, Root::Exits(ROOT_EXIT_STATUS));
     scenario.config.stop_grace = pohunek_session_worker::WorkerConfig::new()
         .terminal_commit_wait_timeout
@@ -704,6 +713,9 @@ async fn a_late_exit_after_the_stop_gave_up_honours_the_stop_intent() {
 /// exit and the forced close, although the worker saw a natural exit.
 #[tokio::test]
 async fn an_exited_worker_still_answering_after_a_restart_honours_the_stop_intent() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let scenario = Scenario::new(Holder::Image, Root::Exits(ROOT_EXIT_STATUS));
     // The worker supervisor outlives the first daemon instance, as a service
     // manager does.
@@ -784,6 +796,9 @@ const LAST_PASS_GENERATIONS: u8 = 2;
 /// of them: the worker verifies that nothing is left before it decides.
 #[tokio::test]
 async fn a_holder_ended_by_the_last_signalling_pass_still_ends_the_session() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let scenario = Scenario::new(Holder::Forking(LAST_PASS_GENERATIONS), Root::Sleeps);
     let registry = scenario.registry();
     let (created, _first) = scenario.start(&registry).await;

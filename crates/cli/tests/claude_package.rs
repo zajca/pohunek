@@ -3726,6 +3726,9 @@ fn recovery_hint(refused: &Value) -> &str {
 /// integration.
 #[tokio::test]
 async fn claude_launches_only_from_the_installed_official_package() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let host = CleanHost::start().await;
 
     let (code, refused) = host.launch("claude").await;
@@ -3808,6 +3811,9 @@ async fn claude_launches_only_from_the_installed_official_package() {
 /// migrated profile launches from the package.
 #[tokio::test]
 async fn an_unpinned_claude_profile_names_the_install_and_the_migration() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let host = CleanHost::start().await;
     host.harness.profile("my-claude", "base = \"claude\"\n");
 
@@ -3854,6 +3860,9 @@ async fn an_unpinned_claude_profile_names_the_install_and_the_migration() {
 /// executable is on `PATH`, and its hint names the package install.
 #[tokio::test]
 async fn the_assistant_finds_no_capable_agent_without_the_official_packages() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let host = CleanHost::start().await;
     let (code, inspected) = host.harness.json(&["host", "inspect", "local"]).await;
     assert_eq!(code, 0, "{inspected}");
@@ -3894,6 +3903,9 @@ async fn the_assistant_finds_no_capable_agent_without_the_official_packages() {
 /// handler, while a new install still needs the package.
 #[tokio::test]
 async fn claude_hooks_stay_removable_without_the_official_package() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let host = CleanHost::start().await;
     let claude_home = host.claude_home();
     fs::create_dir_all(&claude_home).expect("create the Claude home");
@@ -3999,6 +4011,9 @@ fn assert_hooks(homes: &[&Path], present: bool, context: &Value) {
 /// behind.
 #[tokio::test]
 async fn claude_profile_hooks_stay_removable_without_the_official_package() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let host = CleanHost::start().await;
     let root = host.harness.env.root().to_path_buf();
     let own_home = host.claude_home();
@@ -4110,6 +4125,9 @@ async fn claude_profile_hooks_stay_removable_without_the_official_package() {
 /// profile's error instead of leaving it out.
 #[tokio::test]
 async fn an_unresolvable_claude_profile_is_reached_by_all_profiles_while_the_package_serves() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let host = CleanHost::start().await;
     let own_home = host.claude_home();
     let profile_home = host.harness.env.root().join("work-claude");
@@ -4165,6 +4183,9 @@ async fn an_unresolvable_claude_profile_is_reached_by_all_profiles_while_the_pac
 /// accepts, never the one it refuses.
 #[tokio::test]
 async fn a_home_shared_with_an_unresolvable_profile_is_addressed_through_the_resolvable_one() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let host = CleanHost::start().await;
     let shared_home = host.harness.env.root().join("shared-claude");
     fs::create_dir_all(host.claude_home()).expect("create the Claude home");
@@ -4210,6 +4231,9 @@ async fn a_home_shared_with_an_unresolvable_profile_is_addressed_through_the_res
 /// runtime's own home.
 #[tokio::test]
 async fn a_malformed_claude_profile_is_refused_without_the_official_package() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let host = CleanHost::start().await;
     let own_home = host.claude_home();
     let profile_home = host.harness.env.root().join("work-claude");
@@ -4386,6 +4410,9 @@ fn agent_report<'a>(document: &'a Value, runtime: &str) -> &'a Value {
 /// the shared home.
 #[tokio::test]
 async fn a_config_home_two_runtimes_reach_through_the_claude_handler_has_no_owner() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let host = CleanHost::start().await;
     let claude_home = host.claude_home();
     fs::create_dir_all(&claude_home).expect("create the Claude home");

@@ -101,6 +101,9 @@ async fn request_response_connect_local_sends_json_request_line_and_returns_ok_p
 
 #[tokio::test(flavor = "current_thread")]
 async fn omitted_origin_source_ignores_incomplete_process_environment() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let mut process_env = ProcessEnv::lock();
     process_env.set(protocol::ENV_SESSION_ID, "private-session-marker");
     process_env.remove(protocol::ENV_DAEMON_ID);

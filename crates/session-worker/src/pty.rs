@@ -2517,6 +2517,9 @@ mod tests {
     /// child would be attributed to that session's worker instance.
     #[tokio::test]
     async fn inherited_base_child_does_not_carry_the_ambient_worker_instance_marker() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let mut ambient = pohunek_test_support::process_env::ProcessEnv::lock();
         ambient.set("POHUNEK_WORKER_INSTANCE_ID", "ambient-instance");
         let cwd = pohunek_test_support::tempdir().expect("child working directory");

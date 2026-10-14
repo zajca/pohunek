@@ -1230,6 +1230,9 @@ mod tests {
 
     #[tokio::test]
     async fn assistant_materialize_persists_snapshot_and_returns_bundle_metadata() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let _env = EnvGuard::set_all("assistant-materialize-rpc");
         let state = daemon_state(
             HealthInfo::new("test"),
@@ -1303,6 +1306,9 @@ mod tests {
 
     #[tokio::test]
     async fn assistant_materialize_preserves_hook_safety_rules() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let _env = EnvGuard::set_all("assistant-materialize-hook-rules");
         let state = daemon_state(
             HealthInfo::new("test"),
@@ -1331,6 +1337,9 @@ mod tests {
 
     #[tokio::test]
     async fn assistant_materialize_uses_unique_snapshot_paths_per_request() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let _env = EnvGuard::set_all("asst-unique-rpc");
         let state = daemon_state(
             HealthInfo::new("test"),
@@ -1356,6 +1365,9 @@ mod tests {
 
     #[tokio::test]
     async fn assistant_materialize_reuses_complete_cache_without_overwriting() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let _env = EnvGuard::set_all("asst-cache-reuse");
         let state = daemon_state(
             HealthInfo::new("test"),
@@ -1375,6 +1387,9 @@ mod tests {
 
     #[tokio::test]
     async fn assistant_materialize_concurrent_requests_share_a_complete_bundle() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let _env = EnvGuard::set_all("asst-cache-race");
         let state = daemon_state(
             HealthInfo::new("test"),
@@ -1406,6 +1421,9 @@ mod tests {
 
     #[tokio::test]
     async fn assistant_materialize_refuses_incomplete_cache_without_deleting_it() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let _env = EnvGuard::set_all("asst-cache-incomplete");
         let state = daemon_state(
             HealthInfo::new("test"),
@@ -1428,6 +1446,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn assistant_materialize_refuses_symlinked_cache_directory() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let _env = EnvGuard::set_all("asst-cache-symlink");
         let state = daemon_state(
             HealthInfo::new("test"),
@@ -1456,6 +1477,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn assistant_materialize_refuses_symlinked_completion_marker() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let _env = EnvGuard::set_all("asst-marker-symlink");
         let state = daemon_state(
             HealthInfo::new("test"),
@@ -1483,6 +1507,9 @@ mod tests {
 
     #[tokio::test]
     async fn assistant_materialize_prunes_stale_versions_but_preserves_other_paths() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let _env = EnvGuard::set_all("asst-cache-prune");
         let state = daemon_state(
             HealthInfo::new("test"),

@@ -97,6 +97,9 @@ fn removed_names(report: &IntegrationUninstallReport) -> Vec<String> {
 
 #[test]
 fn claude_uninstall_after_install_restores_user_settings_and_is_idempotent() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let dir = scoped_dir("rm-claude");
     write_json(&dir.join("settings.json"), &user_settings());
     install_claude(&dir).expect("install");
@@ -130,6 +133,9 @@ fn claude_uninstall_after_install_restores_user_settings_and_is_idempotent() {
 
 #[test]
 fn codex_uninstall_after_install_keeps_user_hooks_and_drops_only_managed_trust() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let dir = scoped_dir("rm-codex");
     let user_hooks = json!({
         "hooks": {
@@ -353,6 +359,9 @@ fn removal_edits_registration_before_deleting_scripts() {
 
 #[test]
 fn injected_failure_at_every_removal_step_restores_the_installed_tree() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         for fail_at in 0..removal_steps(&agent).len() {
             let dir = scoped_dir("rm-rollback");
@@ -459,6 +468,9 @@ fn uninstall_serializes_with_installers_on_the_same_lock() {
 
 #[test]
 fn explicit_agent_selection_and_unsupported_agents() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let claude = scoped_dir("rm-select-claude");
     let codex = scoped_dir("rm-select-codex");
     install_claude(&claude).expect("install Claude");
@@ -498,6 +510,9 @@ fn assert_no_sentinel(label: &str, text: &str) {
 
 #[test]
 fn removal_and_doctor_outputs_never_carry_provider_secrets() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let claude = scoped_dir("rm-secret-claude");
     let codex = scoped_dir("rm-secret-codex");
     write_json(
@@ -601,6 +616,9 @@ fn state_asset_reading_the_runtime_id_name(asset: &str) -> String {
 /// not its version marker was kept.
 #[test]
 fn doctor_flags_a_stale_hook_that_reads_the_old_environment_name() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let stale_version = format!("VERSION={}", protocol::EXPECTED_INTEGRATION_VERSION - 1);
     let variants = [
         (
@@ -652,6 +670,9 @@ fn state_asset_reporting_runtime_id(asset: &str) -> String {
 /// whether or not its version marker was kept.
 #[test]
 fn doctor_flags_a_stale_hook_that_reports_the_old_wire_key() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let stale_version = format!("VERSION={}", protocol::EXPECTED_INTEGRATION_VERSION - 1);
     let variants = [
         (
@@ -689,6 +710,10 @@ fn doctor_flags_a_stale_hook_that_reports_the_old_wire_key() {
 #[test]
 fn doctor_maps_every_claude_drift_cause_to_its_finding() {
     type Mutation = fn(&Path);
+
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let causes: [(&str, Mutation, Code); 11] = [
         (
             "state missing",
@@ -786,6 +811,10 @@ fn doctor_maps_every_claude_drift_cause_to_its_finding() {
 #[test]
 fn doctor_maps_every_codex_drift_cause_to_its_finding() {
     type Mutation = fn(&Path);
+
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let causes: [(&str, Mutation, Code); 6] = [
         (
             "malformed config",
@@ -842,6 +871,9 @@ fn doctor_maps_every_codex_drift_cause_to_its_finding() {
 
 #[test]
 fn doctor_reports_config_root_failures_and_an_unresolvable_root() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let root = scoped_dir("doctor-root");
     let file = root.join("file");
     fs::write(&file, "").expect("write file");
@@ -863,6 +895,9 @@ fn doctor_reports_config_root_failures_and_an_unresolvable_root() {
 
 #[test]
 fn doctor_distinguishes_an_absent_optional_agent_from_absent_hooks_and_a_healthy_install() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let root = scoped_dir("doctor-optional");
     let absent = diagnose(
         explicit_status(&root.join("missing"), RuntimeRef::claude()),
@@ -1055,6 +1090,9 @@ fn socket_findings_reflect_the_daemon_and_worker_path_limits() {
 
 #[test]
 fn doctor_selects_agents_and_rejects_unsupported_ones() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let claude = fresh_claude();
     let codex = scoped_dir("doctor-select-codex");
     let only_claude = with_config_dirs(&claude, &codex, || {
@@ -1332,6 +1370,9 @@ fn dangling_link(root: &Path, name: &str) -> PathBuf {
 
 #[test]
 fn a_dangling_config_symlink_is_a_failure_for_status_doctor_install_and_uninstall() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let root = scoped_dir("rm-dangling");
     for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         let link = dangling_link(&root, &format!("{}-link", agent.as_wire()));
@@ -1382,6 +1423,9 @@ fn a_dangling_config_symlink_is_a_failure_for_status_doctor_install_and_uninstal
 
 #[test]
 fn a_dangling_symlink_through_env_overrides_and_the_default_dir_is_a_failure() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let root = scoped_dir("rm-dangling-env");
     let claude_link = dangling_link(&root, "claude-override");
     let codex_link = dangling_link(&root, "codex-override");
@@ -1546,6 +1590,9 @@ impl Drop for CleanupFaultGuard {
 fn a_cleanup_that_cannot_delete_an_original_reports_it_and_never_undoes_the_install() {
     use super::commit::CleanupFault;
 
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let dir = scoped_dir("cleanup-unlink");
     write_json(&dir.join("settings.json"), &user_settings());
     install_claude(&dir).expect("seed install");
@@ -1620,6 +1667,9 @@ fn doctor_with_dirs(claude: &Path) -> protocol::IntegrationDoctorResult {
 fn a_cleanup_whose_directory_sync_fails_is_reported_truthfully() {
     use super::commit::CleanupFault;
 
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let dir = scoped_dir("cleanup-sync");
     install_claude(&dir).expect("seed install");
     let _fault = CleanupFaultGuard::install(|_name| Some(CleanupFault::DirectorySync));
@@ -1700,6 +1750,9 @@ fn a_removal_cleanup_failure_is_reported_and_the_registration_edit_stays_committ
 
 #[test]
 fn a_real_unlink_failure_during_cleanup_is_reported_not_raised() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     if nix::unistd::Uid::effective().is_root() {
         // Root ignores directory permissions, so the failure cannot be provoked.
         return;
@@ -1771,6 +1824,9 @@ fn refused_homes(base: &Path) -> Vec<(&'static str, PathBuf)> {
 
 #[test]
 fn status_and_doctor_refuse_exactly_the_paths_install_and_uninstall_refuse() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let base = scoped_dir("rm-walk");
     let homes = refused_homes(&base);
     for (name, home) in &homes {
@@ -2012,6 +2068,9 @@ const QUARANTINE_NAME: &str = ".pohunek-integration-displaced-fixture";
 
 #[test]
 fn the_quarantine_scan_never_follows_a_symlinked_root_or_hooks_directory() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let base = scoped_dir("doctor-scan-symlink");
     let outside = base.join("outside");
     fs::create_dir(&outside).expect("create outside dir");
@@ -2121,6 +2180,9 @@ fn an_incomplete_quarantine_scan_is_always_an_error_finding() {
 
 #[test]
 fn doctor_is_not_ok_when_the_real_scan_bound_is_exceeded() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let codex = scoped_dir("doctor-scan-real-bound");
     install_codex(&codex).expect("install");
     for index in 0..4200 {
@@ -2332,6 +2394,9 @@ fn append_user_hook_with_trust(dir: &Path, command: &str) -> usize {
 
 #[test]
 fn a_user_hook_after_the_managed_group_keeps_its_own_trust_through_reinstall_and_uninstall() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let dir = scoped_dir("trust-after");
     install_codex(&dir).expect("install");
     let user_hash = trust_hash(USER_AFTER_COMMAND);
@@ -2397,6 +2462,9 @@ fn a_user_hook_after_the_managed_group_keeps_its_own_trust_through_reinstall_and
 
 #[test]
 fn a_user_hook_before_the_managed_group_keeps_its_trust_through_every_operation() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let dir = scoped_dir("trust-before");
     let hooks_path = dir.join("hooks.json");
     write_json(
@@ -2887,6 +2955,9 @@ fn an_uninstall_rollback_keeps_a_file_edited_in_place_after_it_was_written() {
 
 #[test]
 fn doctor_does_not_conclude_anything_while_an_operation_holds_the_lock() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let claude = scoped_dir("doctor-busy");
     install_claude(&claude).expect("install");
     fs::write(
@@ -2931,6 +3002,9 @@ fn doctor_does_not_conclude_anything_while_an_operation_holds_the_lock() {
 
 #[test]
 fn the_doctor_lock_probe_never_creates_the_lock_file() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let dir = scoped_dir("doctor-no-lock-file");
     assert!(!dir.join(INSTALL_LOCK_NAME).exists());
     let other = scoped_dir("doctor-no-lock-file-codex");
@@ -2996,6 +3070,10 @@ fn a_symlink_or_hard_link_alias_of_the_macos_stub_is_still_the_stub() {
 #[test]
 fn an_unsafe_installer_lock_is_an_error_finding() {
     type Break = fn(&Path);
+
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let breaks: [(&str, Break); 3] = [
         ("symlink", |lock| {
             let target = lock.with_extension("target");
@@ -3040,6 +3118,9 @@ fn an_unsafe_installer_lock_is_an_error_finding() {
 
 #[test]
 fn the_doctor_holds_the_lock_for_its_whole_inspection() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let claude = scoped_dir("doctor-holds-lock");
     install_claude(&claude).expect("install");
     let codex = scoped_dir("doctor-holds-lock-codex");
@@ -3081,6 +3162,9 @@ fn the_doctor_holds_the_lock_for_its_whole_inspection() {
 
 #[test]
 fn an_operation_that_creates_the_lock_during_the_inspection_drops_the_conclusions() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let claude = scoped_dir("doctor-lock-appears");
     let codex = scoped_dir("doctor-lock-appears-codex");
     assert!(!claude.join(INSTALL_LOCK_NAME).exists());
@@ -3269,6 +3353,10 @@ fn a_staging_failure_that_names_a_location_is_reported_and_one_that_does_not_is_
 #[test]
 fn unsafe_paths_in_a_not_installed_config_still_fail_the_doctor_and_the_install() {
     type Prepare = fn(&Path);
+
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let claude_cases: [(&str, Prepare); 3] = [
         ("symlinked hooks directory", |dir| {
             // Outside the config directory, removed when the test thread ends.
@@ -3345,6 +3433,9 @@ fn unsafe_paths_in_a_not_installed_config_still_fail_the_doctor_and_the_install(
 
 #[test]
 fn an_empty_safe_config_is_still_only_informational() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         let dir = scoped_dir("not-installed-safe");
         let other = scoped_dir("not-installed-safe-other");
