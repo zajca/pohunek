@@ -447,6 +447,7 @@ async fn the_daemon_report_fields_reach_the_upgrade_gate_through_the_process_bou
                 code: "package_unavailable_for_platform".to_owned(),
                 detail: "no package for this platform".to_owned(),
             }],
+            gaps: Vec::new(),
         }),
         Vec::new(),
     );

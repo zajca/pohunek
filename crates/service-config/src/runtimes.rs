@@ -23,6 +23,12 @@ pub const ENSURE_RUNTIMES_ARG: &str = "ensure-official-runtimes";
 /// previous release's daemon still runs.
 pub const DRY_RUN_FLAG: &str = "--dry-run";
 
+/// Flag after [`DRY_RUN_FLAG`] that also plans every runtime of the release
+/// catalog whose program is on the search path, and reports what cannot be
+/// planned as a [`Gap`]. It is a plan only: without [`DRY_RUN_FLAG`] it is a
+/// usage error.
+pub const DETECT_FLAG: &str = "--detect";
+
 /// The release directory below the version directory that holds the catalog
 /// and the official package archives.
 pub const RELEASE_RUNTIME_DIR: &str = "runtime";
@@ -46,6 +52,18 @@ pub const CODE_RUNTIME_PLAN_UNAVAILABLE: &str = "runtime_plan_unavailable";
 /// inherits, and therefore the plan and the version probes, are unknown.
 pub const CODE_SERVICE_CONFIG_UNREADABLE: &str = "service_config_unreadable";
 
+/// A runtime's program is not on the search path, so its agent is not
+/// installed for this host.
+pub const CODE_GAP_AGENT_NOT_ON_PATH: &str = "agent_not_on_search_path";
+/// A runtime's declared config home does not exist. The package is still
+/// planned; the home is never created by the step.
+pub const CODE_GAP_CONFIG_HOME_MISSING: &str = "config_home_missing";
+/// A runtime's declared config home is a symlink. The installer writes hooks
+/// only into a real directory, so no integration is planned for it.
+pub const CODE_GAP_CONFIG_HOME_SYMLINK: &str = "config_home_is_symlink";
+/// Another package already serves the runtime id. It is left untouched.
+pub const CODE_GAP_SERVED_BY_OTHER_PACKAGE: &str = "runtime_served_by_other_package";
+
 /// What the step found, planned and (unless a dry run) did.
 ///
 /// A report with any [`EnsureReport::refusals`] changed nothing: the step
@@ -66,11 +84,21 @@ pub struct EnsureReport {
     /// One entry per host profile over an official runtime that pins no
     /// package.
     pub profiles: Vec<ProfileAction>,
-    /// The daemon-installed integration hooks the installer reinstalls once
-    /// the new daemon is ready.
+    /// The config homes whose daemon-installed integration hooks the
+    /// installer reinstalls once the new daemon is ready.
+    ///
+    /// Without `--detect`, one entry per home that already holds hooks. With
+    /// `--detect`, one entry per existing home of a planned runtime whose
+    /// hooks the setup installs, whether or not hooks are present yet. Each
+    /// distinct home appears once.
     pub integrations: Vec<IntegrationAction>,
     /// Why the plan cannot be applied; empty when it can.
     pub refusals: Vec<Refusal>,
+    /// What `--detect` found that the setup must resolve or accept, one next
+    /// step each. Always empty without `--detect`, and a gap never blocks an
+    /// apply that has no refusal.
+    #[serde(default)]
+    pub gaps: Vec<Gap>,
 }
 
 /// Why the host uses an official runtime.
@@ -83,6 +111,20 @@ pub enum UseReason {
     Session,
     /// Its integration hooks are installed.
     Integration,
+    /// Its program is on the search path, found by `--detect`.
+    Detected,
+}
+
+/// A condition `--detect` reports without refusing the plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gap {
+    /// The runtime id the gap is about.
+    pub runtime: String,
+    /// One of the `CODE_*` or `CODE_GAP_*` constants of this module, or a
+    /// package error code of the daemon.
+    pub code: String,
+    /// Operator-facing detail with the one next step.
+    pub detail: String,
 }
 
 /// The state of one official runtime's package.

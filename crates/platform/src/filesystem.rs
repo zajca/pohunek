@@ -2809,6 +2809,17 @@ pub fn sync_file(file: &File) -> FsResult<()> {
     })
 }
 
+/// Whether `path` has the spelling the trusted walk accepts: absolute, with no
+/// `//`, `/./`, trailing `/` or `/.`, and no `..` component.
+///
+/// This is the trusted walk's own spelling check, not a second copy of it, so a
+/// caller that tests a path with it before [`TrustedDir::open_absolute_owner_safe`]
+/// agrees with the walk on every path.
+#[must_use]
+pub fn is_normalized_absolute_path(path: &Path) -> bool {
+    absolute_components(path).is_ok()
+}
+
 fn absolute_components(path: &Path) -> FsResult<Vec<&OsStr>> {
     let raw = path.as_os_str().as_bytes();
     if raw == b"/"

@@ -63,15 +63,15 @@ use pohunek_daemon::session::upgrade_preflight::{
     self, PreflightInputs, PreflightOptions, ReleaseInputs,
 };
 use pohunek_daemon::session::{
-    ensure_official_runtimes, EnsureInputs, SessionRegistry, SessionRegistryConfig,
-    SessionRetentionTask, RETENTION_POLICY_NAME,
+    detect_official_runtimes, ensure_official_runtimes, EnsureInputs, SessionRegistry,
+    SessionRegistryConfig, SessionRetentionTask, RETENTION_POLICY_NAME,
 };
 use pohunek_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
 use pohunek_platform::supervisor::{self, Namespace};
 use pohunek_service_config::preflight::{PROBE_BUDGET, RELEASE_PLAN_FLAG};
 use pohunek_service_config::runtimes::{
-    CatalogStatus, EnsureReport, Refusal, CODE_DAEMON_RUNNING, DRY_RUN_FLAG, ENSURE_REPORT_VERSION,
-    ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
+    CatalogStatus, EnsureReport, Refusal, CODE_DAEMON_RUNNING, DETECT_FLAG, DRY_RUN_FLAG,
+    ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
 };
 use pohunek_service_config::{InputTiming, ServiceConfig, WaitTiming};
 
@@ -200,6 +200,27 @@ async fn main() -> ExitCode {
     ]) {
         return print_ensure_runtimes(true);
     }
+    if std::env::args_os().skip(1).eq([
+        OsString::from(ENSURE_RUNTIMES_ARG),
+        OsString::from(DRY_RUN_FLAG),
+        OsString::from(DETECT_FLAG),
+    ]) || std::env::args_os().skip(1).eq([
+        OsString::from(ENSURE_RUNTIMES_ARG),
+        OsString::from(DETECT_FLAG),
+        OsString::from(DRY_RUN_FLAG),
+    ]) {
+        return print_ensure_runtimes_detect();
+    }
+    let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if arguments.first() == Some(&OsString::from(ENSURE_RUNTIMES_ARG))
+        && arguments[1..].contains(&OsString::from(DETECT_FLAG))
+    {
+        eprintln!(
+            "pohunekd: {DETECT_FLAG} needs {DRY_RUN_FLAG} and plans only; setup applies the plan \
+             through the running daemon"
+        );
+        return ExitCode::FAILURE;
+    }
     // The startup future is large (reconciliation, listeners, event logs); box
     // it so it lives on the heap instead of inflating the `main` task frame.
     match Box::pin(run()).await {
@@ -238,7 +259,7 @@ fn print_upgrade_preflight(release_plan: bool, entry: std::time::Instant) -> Exi
                 host_state_dir: Some(paths.state_dir.clone()),
                 probe_budget: PROBE_BUDGET,
                 entry,
-                launch: launch_environment(&paths),
+                launch: launch_environment(&paths, false),
             };
             let inspector = pohunek_daemon::procwatch::HostInspector::new();
             let report = upgrade_preflight::run_with(&inputs, &options, &inspector);
@@ -258,11 +279,19 @@ fn print_upgrade_preflight(release_plan: bool, entry: std::time::Instant) -> Exi
 
 /// The launch environment the installed daemon's `service.toml` configures,
 /// read as daemon startup reads it, or the reason it cannot be read.
-fn launch_environment(paths: &Paths) -> Result<LaunchEnvironment, String> {
-    LaunchEnvironment::from_service_file(
-        &paths.config_dir.join(pohunek_service_config::FILE_NAME),
-        EnvironmentSource::Process,
-    )
+///
+/// With `detect`, a host without an installed service file is planned with the
+/// environment `service install` gives its daemon: the default allowlist over
+/// the process environment. Setup previews before it installs the service, so
+/// that host is the normal case for the detection plan. Any other failure stays
+/// a refusal.
+fn launch_environment(paths: &Paths, detect: bool) -> Result<LaunchEnvironment, String> {
+    let path = paths.config_dir.join(pohunek_service_config::FILE_NAME);
+    if detect {
+        return LaunchEnvironment::from_service_file_if_present(&path, EnvironmentSource::Process)
+            .map(|environment| environment.unwrap_or_else(LaunchEnvironment::subprocess_default));
+    }
+    LaunchEnvironment::from_service_file(&path, EnvironmentSource::Process)
 }
 
 /// The release `runtime/` directory beside the running daemon executable.
@@ -276,7 +305,17 @@ fn release_runtime_dir() -> Result<PathBuf, String> {
 
 /// Prints the offline runtime step's report as JSON, or its failure on stderr.
 fn print_ensure_runtimes(dry_run: bool) -> ExitCode {
-    let report = ensure_runtimes(dry_run).and_then(|report| {
+    print_ensure_report(ensure_runtimes(dry_run, false))
+}
+
+/// Prints the detection plan of the runtime step as JSON, or its failure on
+/// stderr. The plan changes nothing.
+fn print_ensure_runtimes_detect() -> ExitCode {
+    print_ensure_report(ensure_runtimes(true, true))
+}
+
+fn print_ensure_report(report: Result<EnsureReport, String>) -> ExitCode {
+    let report = report.and_then(|report| {
         serde_json::to_string_pretty(&report).map_err(|error| error.to_string())
     });
     match report {
@@ -297,7 +336,7 @@ fn print_ensure_runtimes(dry_run: bool) -> ExitCode {
 /// authority and the instance locks until it ends, so a daemon cannot start
 /// underneath it; a held lock is a refusal, because the running daemon owns
 /// the state and nothing may change.
-fn ensure_runtimes(dry_run: bool) -> Result<EnsureReport, String> {
+fn ensure_runtimes(dry_run: bool, detect: bool) -> Result<EnsureReport, String> {
     let paths = Paths::resolve().map_err(|error| error.to_string())?;
     let release_dir = release_runtime_dir()?;
     let inputs = EnsureInputs {
@@ -308,8 +347,13 @@ fn ensure_runtimes(dry_run: bool) -> Result<EnsureReport, String> {
         catalog_trust: CatalogTrust::load_beside_executable(),
         dry_run,
         daemon_version: DAEMON_VERSION.to_owned(),
-        environment: launch_environment(&paths),
+        environment: launch_environment(&paths, detect),
     };
+    if detect {
+        return detect_official_runtimes(&inputs)
+            .map(|plan| plan.report)
+            .map_err(|error| error.to_string());
+    }
     if dry_run {
         return ensure_official_runtimes(&inputs).map_err(|error| error.to_string());
     }
@@ -338,6 +382,7 @@ fn ensure_runtimes(dry_run: bool) -> Result<EnsureReport, String> {
                         detail: "a daemon holds the instance lock; stop it before the runtime step"
                             .to_owned(),
                     }],
+                    gaps: Vec::new(),
                 });
             }
             Err(error) => return Err(error.to_string()),

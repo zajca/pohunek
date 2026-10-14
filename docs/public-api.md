@@ -2185,6 +2185,35 @@ running across an upgrade from the previous private protocol version keeps
 starting its session's children from its own sanitized environment until that
 session gets a new worker generation.
 
+`pohunekd ensure-official-runtimes` is the offline runtime step of the release;
+`--dry-run` computes its plan without changing anything. `--dry-run --detect` also
+plans every runtime of the release catalog for this platform whose program is on
+the daemon's search path, each with the reason `detected` (a runtime the host uses
+keeps its other reasons). `--detect` without `--dry-run` is a usage error. A host
+without an installed `service.toml` is planned with the launch environment `service
+install` gives its daemon: the default allowlist over the process environment. An
+existing service file that is unreadable or malformed still refuses, and a plain
+dry run still refuses a missing file. Its
+`gaps` list, one per runtime with `runtime`, `code` and a `detail` that names the
+one next step: `agent_not_on_search_path` (the program is not on the search path;
+the runtime is planned only when the host uses it), `config_home_missing` (the
+declared config home does not exist; the package is still planned and the step
+never creates the home), `config_home_is_symlink` (the config home is a symlink; hooks
+are installed only into a real directory, so no integration is planned into it and
+the step follows no symlink), `integration_path_untrusted` (the installer refuses the
+path: it is not a normalized absolute path to a real directory), a profile's own
+resolution error such as `runtime_not_installed` (a profile pinned to a package the host
+cannot serve, which `integration.install` would reject), `runtime_served_by_other_package` (another package serves
+the runtime id; it is left untouched), and `official_package_unavailable_for_platform`
+(the release catalog lists no package for this platform; a refusal without
+`--detect`). A gap never blocks an apply, and `gaps` is always empty without
+`--detect`. `integrations` lists the config homes the installer reinstalls hooks
+into: without `--detect`, the homes that already hold hooks; with `--detect`, each
+existing home of a planned runtime whose hooks the setup installs, whether or not
+hooks are present yet (Pi declares none). Each distinct home appears once. `reason`
+values are `profile`, `session`, `integration` and `detected`. The report layout
+stays at `report_version` 1.
+
 `pohunek service upgrade` and `pohunek service check` of an existing service run
 a read-only preflight before any effect by invoking `pohunekd upgrade-preflight`
 of the staged archive. That mode takes no other argument, is an internal contract

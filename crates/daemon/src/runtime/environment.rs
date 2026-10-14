@@ -80,8 +80,37 @@ impl LaunchEnvironment {
         path: &std::path::Path,
         source: EnvironmentSource,
     ) -> Result<Self, String> {
-        let config = pohunek_service_config::ServiceConfig::load_upgrade_source(path)
-            .map_err(|error| error.to_string())?;
+        Self::read_service_file(path, source).map_err(|error| error.to_string())
+    }
+
+    /// [`Self::from_service_file`] for a host that may have no installed service
+    /// file yet: a file, or the directory it lives in, that does not exist gives
+    /// `Ok(None)`. Every other failure is an error, including a file that exists
+    /// but is untrusted or unparsable.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason an existing file cannot be read or parsed.
+    pub fn from_service_file_if_present(
+        path: &std::path::Path,
+        source: EnvironmentSource,
+    ) -> Result<Option<Self>, String> {
+        match Self::read_service_file(path, source) {
+            Ok(environment) => Ok(Some(environment)),
+            Err(pohunek_service_config::ConfigError::Io { source, .. })
+                if source.io_kind() == Some(std::io::ErrorKind::NotFound) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn read_service_file(
+        path: &std::path::Path,
+        source: EnvironmentSource,
+    ) -> Result<Self, pohunek_service_config::ConfigError> {
+        let config = pohunek_service_config::ServiceConfig::load_upgrade_source(path)?;
         Ok(Self::new(
             config.config.environment_allowlist().to_vec(),
             source,

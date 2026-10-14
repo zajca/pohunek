@@ -328,6 +328,7 @@ fn refused_plan(code: &str, detail: &str) -> EnsureReport {
             code: code.to_owned(),
             detail: detail.to_owned(),
         }],
+        gaps: Vec::new(),
     }
 }
 
