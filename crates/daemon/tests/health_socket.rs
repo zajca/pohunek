@@ -3402,10 +3402,15 @@ async fn claude_profile_with_a_screen_idle_rule_waits_for_screen_readiness() {
 /// The public waited-input result reveals whether the selected runtime's
 /// framing needs a delayed submit: a nonzero delay refuses the wait before
 /// writing, while zero can deliver and observe the fake agent's blocked OSC.
+///
+/// With `delivered`, the capture is read once the fake agent has read the whole
+/// input, which it may still be doing when the wait times out; a refused input
+/// is never written, so its capture is read at once.
 async fn waited_input_with_host_submit_delay(
     runtime: RuntimeRef,
     host_delay: Duration,
     override_delay: Option<Duration>,
+    delivered: bool,
 ) -> (Response, Option<Vec<u8>>) {
     let socket = temp_socket("host-submit-delay");
     let bin_dir = socket.dir.join("bin");
@@ -3485,6 +3490,13 @@ while True:
         .expect("waited input params"),
     );
     let response = exchange(&mut control, &request).await;
+    if delivered {
+        wait_until("fake waited-input agent read the whole input", || async {
+            let captured = tokio::fs::read(&received).await.ok()?;
+            (captured.len() >= b"hello\r".len()).then_some(())
+        })
+        .await;
+    }
     let captured = tokio::fs::read(received).await.ok();
     let stop = Request::make(
         "stop-host-input",
@@ -3502,7 +3514,7 @@ while True:
 #[tokio::test]
 async fn host_zero_submit_delay_passes_wait_framing_for_opted_in_claude() {
     let (response, captured) =
-        waited_input_with_host_submit_delay(RuntimeRef::claude(), Duration::ZERO, None).await;
+        waited_input_with_host_submit_delay(RuntimeRef::claude(), Duration::ZERO, None, true).await;
     let error = response
         .into_result()
         .expect_err("the fake agent leaves the activity wait incomplete");
@@ -3513,7 +3525,7 @@ async fn host_zero_submit_delay_passes_wait_framing_for_opted_in_claude() {
 #[tokio::test]
 async fn host_zero_submit_delay_does_not_override_non_opted_in_codex() {
     let (response, captured) =
-        waited_input_with_host_submit_delay(RuntimeRef::codex(), Duration::ZERO, None).await;
+        waited_input_with_host_submit_delay(RuntimeRef::codex(), Duration::ZERO, None, false).await;
     let error = response
         .into_result()
         .expect_err("Codex keeps its descriptor delay");
@@ -3527,6 +3539,7 @@ async fn per_runtime_submit_delay_override_wins_over_host_zero() {
         RuntimeRef::claude(),
         Duration::ZERO,
         Some(Duration::from_millis(40)),
+        false,
     )
     .await;
     let error = response
