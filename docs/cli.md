@@ -107,7 +107,9 @@ Bare `pohunek setup` is the command to run on a host once, and again after an
 upgrade of the release files. It runs in this order:
 
 1. Service: without an installed service it installs the release binaries next
-   to the running `pohunek`. An installed service of the same version is kept.
+   to the running `pohunek`. The install itself applies the runtime packages
+   and profile pins that the host's profiles, sessions and integrations need;
+   it reports them. An installed service of the same version is kept.
    An installed service of another version is a gap: run
    `pohunek service upgrade` first, because setup never upgrades.
 2. Plan: the release's planner reads the runtime catalog and reports every
@@ -117,27 +119,43 @@ upgrade of the release files. It runs in this order:
 3. Preview and consent: every effect and gap is printed before anything is
    written. The owner confirms once. A plan the planner refuses stops the run
    before its first change.
-4. Apply: the packages are installed, enabled and selected, the profiles are
-   pinned, and the hooks are installed in the homes that exist. A runtime
-   already served by another package is left untouched. A Hermes home without
-   the pohunek marker is a gap: setup does not choose a Hermes access policy
-   for you, so it names the `pohunek integration hermes install` command and
-   writes nothing into that home. A gap does not fail the run.
+4. Apply: after a fresh install, setup reads the plan again and checks that it
+   matches the preview, allowing only the transitions the install performed
+   (a previewed package now present, a previewed profile now pinned). Setup then
+   installs and enables the remaining packages, pins the remaining profiles, and
+   installs the hooks in the homes that exist. A runtime
+   already served by another package is left untouched. Every Hermes home the
+   run acts on is listed in the preview: a home with the pohunek marker is
+   updated, and a home without it is a gap. Setup does not choose a Hermes
+   access policy for you, so it names the `pohunek integration hermes install`
+   command for such a home and writes nothing into it. A gap does not fail the
+   run.
 5. Config: the missing config files are written and existing files are kept.
-6. Verdict: the plan is read again, every planned package must be present and
-   no hook may have failed, then the daemon's health and `doctor` run. Hook
-   gaps are listed, not failed.
+6. Verdict: the plan is read again. Every runtime the preview planned must be
+   present in it, it must carry no refusal, and it must not list a runtime the
+   preview did not show. Every profile pin the preview showed must be done. No
+   hook may have failed. Then the daemon's health and `doctor` run. Hook gaps
+   are listed, not failed.
 
 If the plan read after the service install differs from the preview, setup
-stops there. The output names the installed version and prefix; nothing else
-was changed. Fix the cause the output names and run `pohunek setup` again: it
+stops there. The output names the installed version, the prefix and the changes the
+install made; setup itself changed nothing else. Fix the cause the output names and run `pohunek setup` again: it
 plans from the installed service and converges without reinstalling it.
 
 The run is refused with the hint `--yes` when it cannot ask: without a terminal
 and without `--yes`, or with `--json` and no `--yes`. The refusal changes
-nothing. `--json` prints one document with the preview, the applied lines and
-the verdict. A failure after the first change keeps the finished steps; run
-`pohunek setup` again to complete them. `--host` is ignored.
+nothing.
+
+`--json` does not print a preview before the run, because it cannot ask. Its
+one result document carries the full preview in `preview` (service, packages,
+profiles, integrations, gaps, every Hermes home and the config files), then the
+`applied` lines, the hook outcomes, the config result and the verdict. Read the
+preview from that document, and pass `--yes` to apply it.
+
+A failure after the first change prints an error instead of a result, and its
+message lists the changes made (`Changes made: ...`); `--json` carries the same
+text in `msg`. The finished steps are kept. Run `pohunek setup` again to
+complete them. `--host` is ignored.
 
 ### Shell completion
 

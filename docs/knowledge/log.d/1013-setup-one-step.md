@@ -18,3 +18,5 @@
   installed and nothing else changed; a re-run converges.
 - `pohunek setup config` and `pohunek setup completions` are unchanged; an
   existing config file is never overwritten.
+- The `--json` result carries the full preview. A failure after the first
+  change lists the changes made in its message.
