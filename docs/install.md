@@ -55,7 +55,7 @@ Install on macOS with Homebrew:
 
 ```bash
 brew install zajca/pohunek/pohunek    # tap zajca/homebrew-pohunek, formula pohunek
-pohunek service install
+pohunek setup
 ```
 
 Run `pohunek service upgrade` after every `brew upgrade pohunek`, and
@@ -162,37 +162,32 @@ cargo build --release --locked \
 ## Quick start
 
 ```bash
-# 1. Check the environment (binaries, socket paths, writable state dirs)
-pohunek doctor
+# 1. Download the daemon archive for your platform from Releases, check it
+#    with its .sha256 and `gh attestation verify` (see "Release archives"),
+#    and extract it.
+cd pohunek-daemon-<version>-<target>
 
-# 2. Install the host daemon as a login service. Run the pohunek that sits next
-#    to pohunekd and pohunek-sessiond (unpacked daemon archive or target/release);
-#    --from defaults to its directory.
-./target/release/pohunek service install
-pohunek service status
-pohunek health
-pohunek host governance inspect local --json
+# 2. Set up the host. Run the pohunek of the extracted archive: it installs the
+#    login service from this directory, the official runtime packages and
+#    hooks for the agents on the service PATH, and the missing config files.
+#    It previews every change and asks once; --yes applies unattended.
+./pohunek setup
 
-# 3. Install the official Claude Code package from the extracted daemon
-#    archive, then its hooks (native session-id capture + notifications); see
-#    "Install official runtime packages from the release archive" below.
-pohunek plugin install runtime/packages/claude.tar.zst --catalog runtime/runtime-catalog.json --yes
-pohunek integration install --agent claude
-
-# 4. Start an agent session and attach to it
+# 3. Start an agent session and attach to it
 pohunek session new --agent claude --name "fix-login-bug"
-pohunek session list
 pohunek attach <session-id>        # Ctrl-] detaches, the agent keeps running
 ```
 
-Claude Code, Codex and Hermes are served only by their official packages, so
-step 3 installs the Claude Code package before its hooks: a bare `integration install`
-covers only the runtimes the daemon serves. The packages capture the native
-session id through those hooks, so without them a session cannot be resumed.
-`--agent claude` needs Claude Code's config home (`CLAUDE_CONFIG_DIR`, else
-`~/.claude`) to exist, which Claude Code creates on its first run. The Apple
-Silicon archive carries no runtime package yet (#929), so on macOS steps 3 and 4
-need a package runtime you install yourself.
+`pohunek setup` reports every requirement it cannot meet with one next step:
+an agent that is not on the service `PATH`, a config home that does not exist
+yet (Claude Code creates `~/.claude`, Codex `~/.codex`, on their first run), or
+a platform whose release carries no package for a runtime. The Apple Silicon
+archive carries no runtime package yet (#929), so on macOS the official
+runtimes are such gaps. Run `pohunek setup` again after you install an agent:
+it installs only what is missing, and on a ready host it changes nothing. The
+[CLI reference](cli.md#host-setup) describes each step, and the sections below
+cover the same steps one at a time (`pohunek service install`, `pohunek plugin
+install`, `pohunek integration install`).
 
 For an isolated feature branch, let the daemon create a dedicated worktree. To
 run Codex there, install its package and then its hooks the same way;

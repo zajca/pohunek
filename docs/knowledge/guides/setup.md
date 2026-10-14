@@ -9,14 +9,21 @@ intents: [setup, help]
 
 # Local Setup
 
-Start with structured inspection:
+On a new host, run `pohunek setup` from the extracted daemon archive (or after
+`brew install`). It installs the login service, the official runtime packages
+and hooks for the agents on the service `PATH`, and the missing config files,
+and reports each gap with its next step; `docs/cli.md`, "Host setup", lists
+every step.
+Run it again after you install an agent; on a ready host it changes nothing.
+
+To inspect a host, start with structured inspection:
 
 1. Run `pohunek doctor --json` to check local binaries, socket paths, and
    writable state directories. The check list depends on the platform; see
    [Doctor checks by platform](#doctor-checks-by-platform).
 2. Run `pohunek service status --json` to see whether the daemon is installed
-   as a login service. If `installed` is false, install it with
-   `pohunek service install` (see below). For development only,
+   as a login service. If `installed` is false, run `pohunek setup`, or install
+   only the service with `pohunek service install` (see below). For development only,
    `pohunek daemon start --dev-subprocess --detach` runs a daemon with plain
    subprocess workers and no service configuration.
 3. Run `pohunek health --json` or `pohunek status --json` to confirm the daemon

@@ -33,3 +33,9 @@
   fails the verdict. A config write that fails part way names the files it
   created. A catalog to be recorded on an installed host with no official
   package to install is a note, not an effect.
+- Setup installs only the hooks the daemon does not report as current, so a
+  run on a ready host applies nothing and a modified hook is still repaired.
+- The install quick start, the setup guide and the Homebrew path in the macOS
+  runbook use `pohunek setup`.
+- The CI job `real systemd supervision` also runs the native setup suite,
+  including a fresh host set up from a signed release by one run.

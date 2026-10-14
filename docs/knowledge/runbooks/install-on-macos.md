@@ -37,13 +37,14 @@ named `...-unsigned-development`, and not a release.
 
 ```bash
 brew install zajca/pohunek/pohunek
-pohunek service install
+pohunek setup
 ```
 
 The tap is `zajca/homebrew-pohunek` and the formula is `pohunek`. It is a
 formula, not a cask, so Homebrew sets no quarantine attribute. It places
 `pohunek`, `pohunekd`, and `pohunek-sessiond` side by side and does no launchd
-work; `pohunek service install` registers the login agent.
+work; `pohunek setup` registers the login agent (through `pohunek service
+install`) and reports the runtime packages and hooks this host can use.
 
 - After every `brew upgrade pohunek`, run `pohunek service upgrade`.
 - Before `brew uninstall pohunek`, run `pohunek service uninstall`.

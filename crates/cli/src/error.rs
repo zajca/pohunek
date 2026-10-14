@@ -387,7 +387,10 @@ impl CliError {
                 ErrorClass::Configuration,
                 "setup_consent_required",
                 "setup changes this host and needs your consent; nothing was changed".to_owned(),
-                Some("review the plan, then re-run `pohunek setup --yes` to apply it".to_owned()),
+                Some(
+                    "run `pohunek setup` in a terminal to review the plan and confirm it, or `pohunek setup --yes` to apply it without a review"
+                        .to_owned(),
+                ),
             ),
             CliError::SetupInstalledOnly {
                 version,

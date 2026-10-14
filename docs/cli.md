@@ -132,7 +132,7 @@ upgrade of the release files. It runs in this order:
    previewed profile the engine pinned has left the plan. Setup then installs
    the remaining packages, enables and selects a package that the install left
    disabled or unselected, pins the remaining profiles, and installs the hooks in
-   the homes that exist. A runtime already served by another package is left
+   the homes that exist, except a hook the daemon already reports as current. A runtime already served by another package is left
    untouched.
 
    The Hermes homes applied are exactly the homes the preview listed. A home
