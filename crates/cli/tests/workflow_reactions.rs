@@ -261,9 +261,10 @@ async fn service_uninstall_names_the_enabled_plugin_that_reacts() {
 }
 
 /// Under a service installation of another pohunek version, disabling a
-/// plugin with reactions keeps the dispatcher unit unchanged while another
-/// enabled plugin reacts, and disabling the last one removes it: removing a
-/// unit runs no trampoline, as for a plugin's own units.
+/// plugin with reactions succeeds and stops and removes the dispatcher unit,
+/// also while another enabled plugin reacts: removing a unit runs no
+/// trampoline, as for a plugin's own units, and only this version may write
+/// the unit again.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
 async fn disabling_removes_the_dispatcher_under_an_installation_of_another_version() {
@@ -291,12 +292,9 @@ async fn disabling_removes_the_dispatcher_under_an_installation_of_another_versi
     // In process, like `enable`: the CLI's own child has no bus to the real
     // user manager in the hermetic environment.
     managed.disable(PLUGIN).await;
-    assert!(
-        record.exists(),
-        "the dispatcher unit of {OTHER_PLUGIN} was removed"
-    );
-    managed.disable(OTHER_PLUGIN).await;
     assert!(!record.exists(), "the dispatcher unit is still recorded");
+    managed.disable(OTHER_PLUGIN).await;
+    assert!(!record.exists(), "the dispatcher unit was recorded again");
 }
 
 #[tokio::test(flavor = "multi_thread")]

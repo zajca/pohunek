@@ -11,8 +11,7 @@
   `pohunek workflow disable the reaction dispatcher` command that does not
   exist.
 - Under a service installation of another pohunek version, disabling or
-  uninstalling a plugin with reactions succeeds: the last one removes the
-  dispatcher unit, as for a plugin's own units, and while another enabled
-  plugin reacts the installed dispatcher is kept unchanged (it refuses the
-  runs of a disabled plugin). Only installing the dispatcher needs this
-  version.
+  uninstalling a plugin with reactions succeeds and stops and removes the
+  dispatcher unit, as for a plugin's own units. While another enabled plugin
+  still reacts, the command warns that no reaction runs until
+  `pohunek workflow enable` installs the dispatcher again from this version.
