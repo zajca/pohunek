@@ -1477,7 +1477,13 @@ Important fields:
   context. When a session leaves every known active worktree, `worktree_path` is
   cleared; `repo` and `branch` remain populated when git detection still finds a
   repository at the new cwd.
-- `warnings`: non-fatal warnings, each `{kind, message, detail?}`. `kind` is
+- `warnings`: non-fatal warnings, each `{kind, message, detail?}`. The Rust
+  client of this build drops a warning whose `kind` it does not know, so a
+  newer daemon can add kinds without breaking its decode; earlier Rust clients
+  reject an unknown kind. A daemon of this build that loads a store record
+  written by a newer daemon drops such a warning too and keeps the session;
+  when it later rewrites that session's record, the dropped warning is not
+  kept, so a later upgrade does not show it again. `kind` is
   `fetch`, `base_branch_fallback`, `setup_script` or `hook` for worktree setup,
   and `native_recovery` for a session whose stored native recovery record could
   not be completed after an upgrade: it cannot resume or fork, `message` says to

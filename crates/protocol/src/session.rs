@@ -2392,6 +2392,12 @@ pub enum SessionWarningKind {
     /// stays listed; start a new session and resume the native conversation
     /// from the reference in the warning's `detail`.
     NativeRecovery,
+    /// A kind this build does not know, sent by a newer daemon. Decoding a
+    /// [`SessionInfo`] drops warnings of this kind, and serializing it fails,
+    /// so it never reaches a display or a re-emitted document.
+    #[serde(other, skip_serializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
 
 /// A non-fatal warning surfaced for a session.
@@ -2411,6 +2417,17 @@ pub struct SessionWarning {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub detail: Option<String>,
+}
+
+/// Decodes [`SessionInfo::warnings`], dropping the warnings of a kind this
+/// build does not know.
+fn known_warnings<'de, D>(deserializer: D) -> Result<Vec<SessionWarning>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let mut warnings = Vec::<SessionWarning>::deserialize(deserializer)?;
+    warnings.retain(|warning| warning.kind != SessionWarningKind::Unknown);
+    Ok(warnings)
 }
 
 /// Mutation capabilities frozen for one logical session.
@@ -2621,7 +2638,11 @@ pub struct SessionInfo {
     /// Non-fatal warnings raised while setting up the worktree. Empty when the
     /// session has no worktree or setup was clean; omitted from the wire form
     /// when empty.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "known_warnings"
+    )]
     pub warnings: Vec<SessionWarning>,
     /// Whether the session's PTY output was force-closed when its runtime
     /// ended: a process outside the session's process group kept the terminal
