@@ -7,6 +7,11 @@
 //! Trust is the archive digest the owner supplies at install time.
 //! [`runner`] runs one declared action under the owner limits of [`config`]
 //! and appends a record to the plugin's run log ([`runlog`]).
+//!
+//! Declared jobs and services run as units of the user's service manager:
+//! [`units`] installs and removes them when a plugin is enabled, disabled or
+//! uninstalled, and every unit runs the hidden `pohunek workflow __exec`
+//! trampoline ([`supervised`]), which owns every run decision.
 
 // Rust guideline compliant 2026-10-13
 
@@ -15,6 +20,8 @@ pub(crate) mod manifest;
 pub(crate) mod runlog;
 pub(crate) mod runner;
 pub(crate) mod store;
+pub(crate) mod supervised;
+pub(crate) mod units;
 
 use std::io::ErrorKind;
 use std::process::ExitStatus;
@@ -269,6 +276,65 @@ pub(crate) enum Error {
         reason: &'static str,
     },
 
+    /// The plugin declares jobs or services, but no `pohunek service`
+    /// installation provides the executable their units run.
+    #[error("workflow plugin jobs and services need the pohunek service installation: {reason}")]
+    ServiceNotInstalled {
+        /// What is missing or does not match, by path or key only.
+        reason: String,
+    },
+
+    /// A declared job or service is outside the owner's `[jobs]` bounds.
+    #[error("{unit} of workflow plugin {id} {reason}; nothing was changed")]
+    UnitRefused {
+        /// The plugin id.
+        id: String,
+        /// `job <name>` or `service <name>`.
+        unit: String,
+        /// The bound it breaks, naming the knob.
+        reason: String,
+    },
+
+    /// The service manager did not complete a unit operation.
+    #[error("the service manager units of workflow plugin {id} failed: {detail}")]
+    Units {
+        /// The plugin id.
+        id: String,
+        /// What was attempted, what failed, and what was rolled back.
+        detail: String,
+    },
+
+    /// A fresh install recorded the plugin, but enabling it failed after
+    /// that; the plugin stays installed disabled with no units, unless
+    /// undoing the failed enable failed too.
+    #[error("workflow plugin {id} was installed, but enabling it failed{}: {source}", if *.undone { ", so it stays installed disabled with no units" } else { ", and undoing that failed too, so it may remain enabled or keep units" })]
+    InstalledDisabled {
+        /// The plugin id.
+        id: String,
+        /// Why enabling failed; its code is the `cause` of the `--json`
+        /// error.
+        source: Box<Error>,
+        /// Whether the plugin is disabled with no units.
+        undone: bool,
+    },
+
+    /// A unit runs another archive than the installed one: residue of an
+    /// earlier installation.
+    #[error("a unit of workflow plugin {id} names another archive than the installed one; nothing was run")]
+    UnitStale {
+        /// The plugin id.
+        id: String,
+    },
+
+    /// The installed manifest declares no job or service of the unit's name.
+    #[error("workflow plugin {id} declares no {unit}; nothing was run")]
+    UnitUnknown {
+        /// The plugin id.
+        id: String,
+        /// `job <name>` or `service <name>`, the name escaped.
+        unit: String,
+    },
+
     /// The CLI received a terminating signal while the action ran.
     #[error("action {action} of workflow plugin {id} was stopped because pohunek received signal {signal}")]
     Interrupted {
@@ -311,6 +377,12 @@ impl Error {
             Self::ActionTimeout { .. } => "workflow_action_timeout",
             Self::OutputLimit { .. } => "workflow_output_limit",
             Self::Interrupted { .. } => "workflow_action_interrupted",
+            Self::ServiceNotInstalled { .. } => "workflow_service_not_installed",
+            Self::UnitRefused { .. } => "workflow_unit_refused",
+            Self::Units { .. } => "workflow_units_failed",
+            Self::UnitStale { .. } => "workflow_unit_stale",
+            Self::UnitUnknown { .. } => "workflow_unit_unknown",
+            Self::InstalledDisabled { .. } => "workflow_installed_disabled",
             Self::ActionFailed { .. } => "workflow_action_failed",
             Self::OutputIncomplete { .. } => "workflow_output_incomplete",
             Self::OutputInvalid { .. } => "workflow_output_invalid",
@@ -421,6 +493,34 @@ impl Error {
                  one that applied"
             }
             Self::Interrupted { .. } => "run the action again when it may finish",
+            Self::ServiceNotInstalled { .. } => {
+                "install the service with `pohunek service install`, or install the plugin \
+                 with --no-enable"
+            }
+            Self::UnitRefused { .. } => {
+                "raise the named knob in workflow.toml, or ask the plugin author for a value \
+                 within it"
+            }
+            Self::Units { .. } => {
+                "check the user service manager (`systemctl --user` or `launchctl`), then repeat \
+                 the command; it is safe to repeat"
+            }
+            Self::UnitStale { .. } => {
+                "the unit is left over from another install; remove it with \
+                 `pohunek workflow disable <id>`, or `pohunek workflow enable <id>` to replace it"
+            }
+            Self::UnitUnknown { .. } => {
+                "the unit is left over from another install; remove it with \
+                 `pohunek workflow disable <id>`"
+            }
+            Self::InstalledDisabled { undone: true, .. } => {
+                "then run `pohunek workflow enable <id>`; installing the plugin again does not \
+                 enable it"
+            }
+            Self::InstalledDisabled { undone: false, .. } => {
+                "then run `pohunek workflow disable <id>` until it succeeds, which removes any \
+                 unit and disables the plugin, and then `pohunek workflow enable <id>`"
+            }
             Self::ActionFailed { .. } => {
                 "the action reported a failure; its stderr above says why, and its stdout was \
                  not printed"
@@ -433,6 +533,27 @@ impl Error {
                 "with --json the action must print exactly one JSON document on stdout; run it \
                  without --json to see what it prints"
             }
+        }
+    }
+
+    /// The recovery shown beneath the error: [`Error::hint`]. For an
+    /// installed-disabled plugin it is prefixed by the fix clause of the
+    /// failure that left it disabled ([`enable_fix`] of its `source`), then a
+    /// comma.
+    pub(crate) fn recovery(&self) -> String {
+        match self {
+            Self::InstalledDisabled { source, .. } => {
+                format!("{}, {}", enable_fix(source), self.hint())
+            }
+            _ => self.hint().to_owned(),
+        }
+    }
+
+    /// The code of the failure that left an installed plugin disabled.
+    pub(crate) fn cause_code(&self) -> Option<&'static str> {
+        match self {
+            Self::InstalledDisabled { source, .. } => Some(source.code()),
+            _ => None,
         }
     }
 
@@ -454,9 +575,30 @@ impl Error {
             | Self::Interrupted { .. }
             | Self::ActionFailed { .. }
             | Self::OutputIncomplete { .. }
-            | Self::OutputInvalid { .. } => ErrorClass::Runtime,
+            | Self::OutputInvalid { .. }
+            | Self::Units { .. }
+            | Self::UnitStale { .. }
+            | Self::InstalledDisabled { .. } => ErrorClass::Runtime,
             _ => ErrorClass::Configuration,
         }
+    }
+}
+
+/// What to fix before enabling a plugin again after `cause` stopped its
+/// enable: a clause without a step of its own, since the step to repeat is
+/// the enable.
+fn enable_fix(cause: &Error) -> &'static str {
+    match cause {
+        Error::Busy => "wait for the other workflow command to finish",
+        Error::Units { .. } => "check the user service manager (`systemctl --user` or `launchctl`)",
+        Error::RootInvalid { .. } => {
+            "check the plugin's installed files with `pohunek workflow inspect <id>`"
+        }
+        Error::ServiceNotInstalled { .. } => "check the `pohunek service` installation",
+        Error::Store(_) => {
+            "check that the pohunek state and config directories are owned by you and private"
+        }
+        _ => "fix the cause above",
     }
 }
 

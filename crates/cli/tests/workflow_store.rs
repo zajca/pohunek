@@ -12,17 +12,26 @@
 
 use std::fmt::Write as _;
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Output, Stdio};
 
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
 use package::{build_archive, read_archive, ArchiveEntry, Limits, PackageDigest};
+use pohunek_cli::service::definition::identity_config;
+use pohunek_cli::service::VERSION;
 use pohunek_test_support::env::TestEnv;
+use pohunek_test_support::wait::poll_until;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 #[path = "support/plugin_harness.rs"]
 mod plugin_harness;
+#[path = "support/workflow_units.rs"]
+mod workflow_units;
 
 use plugin_harness::{path_str, Harness};
 
@@ -427,17 +436,567 @@ fn an_archive_that_also_carries_runtime_toml_is_refused() {
 }
 
 #[test]
-fn a_jobs_table_is_refused_until_jobs_ship() {
+fn a_reactions_table_is_refused_until_reactions_ship() {
     let fixture = Fixture::new();
     let document = format!(
-        "{}\n[jobs.poll]\nevery_s = 300\nargv = [\"bin/work\", \"{SENTINEL}\"]\n",
+        "{}\n[reactions.on_stop]\nevents = [\"session_stopped\"]\nargv = [\"bin/work\", \"{SENTINEL}\"]\n",
         manifest("1.0.0", "bin/work")
     );
-    let message = fixture.refused_manifest("jobs", &plugin_files(&document));
+    let message = fixture.refused_manifest("reactions", &plugin_files(&document));
     assert!(
         message.contains("does not match the manifest schema"),
-        "[jobs] table: {message}"
+        "[reactions] table: {message}"
     );
+}
+
+/// A manifest with one job and one service besides the action.
+fn unit_manifest() -> String {
+    format!(
+        "{}\n[jobs.poll]\nevery_s = 300\ntimeout_ms = 120000\nargv = [\"bin/work\", \"poll\"]\n\n\
+         [services.notify]\nargv = [\"bin/work\", \"notify\"]\n",
+        manifest("1.0.0", "bin/work")
+    )
+}
+
+#[test]
+fn hostile_jobs_and_services_are_refused() {
+    let fixture = Fixture::new();
+    let base = manifest("1.0.0", "bin/work");
+    for (case, table, needle) in [
+        (
+            "job without every_s",
+            format!("[jobs.poll]\nargv = [\"bin/work\", \"{SENTINEL}\"]\n"),
+            "does not match the manifest schema",
+        ),
+        (
+            "job with an unknown key",
+            format!(
+                "[jobs.poll]\nevery_s = 60\nshell = true\nargv = [\"bin/work\", \"{SENTINEL}\"]\n"
+            ),
+            "does not match the manifest schema",
+        ),
+        (
+            "job interval above a week",
+            format!("[jobs.poll]\nevery_s = 604801\nargv = [\"bin/work\", \"{SENTINEL}\"]\n"),
+            "job poll: every_s must be at most 604800 seconds",
+        ),
+        (
+            "job with a zero interval",
+            format!("[jobs.poll]\nevery_s = 0\nargv = [\"bin/work\", \"{SENTINEL}\"]\n"),
+            "does not match the manifest schema",
+        ),
+        (
+            "service with a bare argv[0]",
+            format!("[services.notify]\nargv = [\"work\", \"{SENTINEL}\"]\n"),
+            "service notify: argv[0] is a bare command name",
+        ),
+        (
+            "service with a job key",
+            format!("[services.notify]\nevery_s = 60\nargv = [\"bin/work\", \"{SENTINEL}\"]\n"),
+            "does not match the manifest schema",
+        ),
+        (
+            "service name outside the grammar",
+            format!("[services.Notify]\nargv = [\"bin/work\", \"{SENTINEL}\"]\n"),
+            "an action, job or service name is not",
+        ),
+    ] {
+        let document = format!("{base}\n{table}");
+        let message = fixture.refused_manifest(case, &plugin_files(&document));
+        assert!(message.contains(needle), "{case}: {message}");
+    }
+}
+
+#[test]
+fn jobs_and_services_are_reviewed_installed_and_inspected() {
+    let fixture = Fixture::new();
+    let (archive, digest) = fixture.archive("units", &plugin_files(&unit_manifest()));
+    let review = fixture.run(&[
+        "workflow",
+        "install",
+        path_str(&archive),
+        "--sha256",
+        digest.as_str(),
+    ]);
+    assert_eq!(review.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&review.stdout);
+    let files = fixture.package_root(&digest).join("files");
+    let program = path_str(&files.join("bin/work")).to_owned();
+    for needle in [
+        "Jobs (each runs periodically as you".to_owned(),
+        "  poll  (every 300 s)".to_owned(),
+        format!("argv: [\"{program}\", \"poll\"]"),
+        "requested timeout: 120000 ms".to_owned(),
+        "Services (each runs continuously as you".to_owned(),
+        format!("argv: [\"{program}\", \"notify\"]"),
+    ] {
+        assert!(text.contains(&needle), "{needle:?} in the review:\n{text}");
+    }
+    assert!(
+        !fixture.store_root().exists(),
+        "the review installed nothing"
+    );
+
+    let (code, document) = fixture.install(&archive, &digest, &["--yes", "--no-enable"]);
+    assert_eq!(code, 0, "{document}");
+    assert_eq!(document["ok"]["plugin"]["enabled"], false, "{document}");
+    let (code, document) = fixture.json(&["workflow", "inspect", PLUGIN_ID]);
+    assert_eq!(code, 0, "{document}");
+    let inspected = &document["ok"];
+    assert_eq!(inspected["jobs"][0]["name"], "poll", "{document}");
+    assert_eq!(inspected["jobs"][0]["every_s"], 300, "{document}");
+    assert_eq!(inspected["jobs"][0]["timeout_ms"], 120_000, "{document}");
+    assert_eq!(
+        inspected["jobs"][0]["argv"][0],
+        program.as_str(),
+        "{document}"
+    );
+    assert_eq!(inspected["services"][0]["name"], "notify", "{document}");
+    assert_eq!(inspected["services"][0]["argv"][1], "notify", "{document}");
+}
+
+#[test]
+fn jobs_and_services_need_the_service_installation() {
+    let fixture = Fixture::new();
+    let (archive, digest) = fixture.archive("units", &plugin_files(&unit_manifest()));
+
+    // An enabling install is refused before any effect.
+    let (code, document) = fixture.install(&archive, &digest, &["--yes"]);
+    assert_eq!(code, 1, "{document}");
+    assert_eq!(
+        document["err"]["code"], "workflow_service_not_installed",
+        "{document}"
+    );
+    assert!(
+        !fixture.store_root().exists(),
+        "the refusal created the store"
+    );
+
+    let (code, document) = fixture.install(&archive, &digest, &["--yes", "--no-enable"]);
+    assert_eq!(code, 0, "{document}");
+    let (code, document) = fixture.json(&["workflow", "enable", PLUGIN_ID]);
+    assert_eq!(code, 1, "{document}");
+    assert_eq!(
+        document["err"]["code"], "workflow_service_not_installed",
+        "{document}"
+    );
+    assert_eq!(
+        fixture.listed()[0]["enabled"],
+        false,
+        "enable changed nothing"
+    );
+
+    // Without a service installation, leftover units are looked up in the
+    // derived namespace; a service manager that cannot be reached is a
+    // warning, never a silent skip. On Linux the hermetic environment has no
+    // session bus, so the warning is certain. On macOS a logged-in runner's
+    // `gui/<uid>` domain answers, and the lookup boots out labels of the
+    // namespace of this test's private roots, which no job ever had, so
+    // nothing of the host changes; a host without that domain (SSH,
+    // headless) gets the warning instead. Both outcomes are accepted, and
+    // any warning must be the unreachable one.
+    for verb in ["disable", "uninstall"] {
+        let (code, document) = fixture.json(&["workflow", verb, PLUGIN_ID]);
+        assert_eq!(code, 0, "{verb}: {document}");
+        if let Some(warnings) = document["ok"]["warnings"].as_array() {
+            for warning in warnings {
+                let warning = warning.as_str().expect("a warning");
+                assert!(
+                    warning.contains("could not be reached"),
+                    "{verb}: {warning}"
+                );
+            }
+        }
+    }
+    assert!(fixture.listed().is_empty());
+}
+
+/// An enabling install refuses with `workflow_store_busy` before it records
+/// anything while another unit lifecycle command holds `units.lock`.
+#[test]
+fn an_enabling_install_waits_for_no_unit_lifecycle_lock() {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let units = workflow_units::UnitEnv::new(|env| env.root().join("units"));
+    // Any installed plugin creates the store and its lock files' directory.
+    units.install(&workflow_units::Plugin::new("acme.other"));
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(
+            units
+                .env
+                .state_home()
+                .join("pohunek/workflow-plugins/units.lock"),
+        )
+        .expect("open the unit lifecycle lock");
+    lock.lock().expect("hold the unit lifecycle lock");
+
+    let plugin = workflow_units::Plugin::new(PLUGIN_ID).service("serve", "hang");
+    let digest = units.archive(&plugin);
+    let output = units.install_with(&plugin, &digest, &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        workflow_units::describe(&output)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("a JSON envelope");
+    assert_eq!(document["err"]["code"], "workflow_store_busy", "{document}");
+    let listed: Vec<Value> = units.listed();
+    assert_eq!(
+        listed.len(),
+        1,
+        "only the other plugin is recorded: {listed:?}"
+    );
+    assert_eq!(listed[0]["id"], "acme.other", "{listed:?}");
+
+    // An enabling install of a recorded plugin with units decides under the
+    // same lock whether the plugin is still recorded, so an uninstall can
+    // never slip in between; while another command holds the lock it is
+    // refused too.
+    let recorded = workflow_units::Plugin::new("acme.recorded").service("serve", "hang");
+    drop(lock);
+    let recorded_digest = units.install(&recorded);
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(
+            units
+                .env
+                .state_home()
+                .join("pohunek/workflow-plugins/units.lock"),
+        )
+        .expect("open the unit lifecycle lock");
+    lock.lock().expect("hold the unit lifecycle lock");
+    let output = units.install_with(&recorded, &recorded_digest, &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        workflow_units::describe(&output)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("a JSON envelope");
+    assert_eq!(document["err"]["code"], "workflow_store_busy", "{document}");
+}
+
+/// An enabling install whose units cannot be installed keeps the plugin
+/// installed disabled and says how to enable it; installing again changes
+/// nothing. The hermetic environment has no session bus, so the systemd user
+/// manager cannot be reached.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_install_whose_enable_fails_stays_installed_disabled() {
+    let units = workflow_units::UnitEnv::new(|env| env.root().join("units"));
+    let plugin = workflow_units::Plugin::new(PLUGIN_ID).service("serve", "hang");
+    let digest = units.archive(&plugin);
+
+    let output = units.install_with(&plugin, &digest, &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        workflow_units::describe(&output)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("a JSON envelope");
+    assert_eq!(
+        document["err"]["code"], "workflow_installed_disabled",
+        "{document}"
+    );
+    assert_eq!(
+        document["err"]["cause"], "workflow_units_failed",
+        "{document}"
+    );
+    let message = document["err"]["msg"].as_str().expect("a message");
+    assert!(message.contains("stays installed disabled"), "{message}");
+    let recover = document["err"]["recover"]
+        .as_str()
+        .expect("a recovery hint");
+    // What to fix for the cause, then the one step to repeat; never a hint
+    // to repeat the install, which would not enable the plugin.
+    assert!(
+        recover.starts_with("check the user service manager"),
+        "{recover}"
+    );
+    assert!(
+        recover.contains("then run `pohunek workflow enable"),
+        "{recover}"
+    );
+    assert!(
+        !recover.contains("repeat") && !recover.contains("retry"),
+        "{recover}"
+    );
+    assert_eq!(units.listed()[0]["enabled"], false);
+
+    let output = units.install_with(&plugin, &digest, &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        workflow_units::describe(&output)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("a JSON envelope");
+    assert_eq!(document["ok"]["status"], "already_installed", "{document}");
+    assert_eq!(document["ok"]["plugin"]["enabled"], false, "{document}");
+}
+
+/// Services in the record-size scenario. Three-letter names give a record
+/// entry of 32 bytes (name, fixed fields and comma) for a manifest entry of
+/// 24 bytes, so 2100 services put the record past 64 KiB while the manifest
+/// stays well under its own 64 KiB limit.
+#[cfg(target_os = "linux")]
+const RECORD_SIZE_SERVICES: usize = 2100;
+
+/// The `index`-th service name of [`RECORD_SIZE_SERVICES`]: three lowercase
+/// letters, unique for every index below 26^3.
+#[cfg(target_os = "linux")]
+fn record_size_service(index: usize) -> String {
+    let letter = |digit: usize| char::from(b'a' + u8::try_from(digit % 26).expect("below 26"));
+    format!(
+        "{}{}{}",
+        letter(index / (26 * 26)),
+        letter(index / 26),
+        letter(index)
+    )
+}
+
+/// A unit record that lists as many units as a large manifest declares is
+/// read, and recorded units whose removal cannot be confirmed fail the
+/// disable: no service manager is reachable, so the units may still run, and
+/// the record is kept. The hermetic environment has no session bus, and the
+/// installation's `service.toml` is removed so the namespace this process
+/// derives is the one looked up. Linux only: there the hermetic environment
+/// reaches no user manager, while a macOS runner's launchd domain answers.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_unit_record_of_a_large_manifest_is_read() {
+    let names: Vec<String> = (0..RECORD_SIZE_SERVICES).map(record_size_service).collect();
+    let units = workflow_units::UnitEnv::new(|env| env.root().join("units"));
+    let plugin = workflow_units::Plugin::new(PLUGIN_ID).compact_services(&names);
+    units.install(&plugin);
+    fs::remove_file(units.context.config_path()).expect("remove the installation record");
+
+    let units_dir = units
+        .env
+        .state_home()
+        .join("pohunek/workflow-plugins/units");
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&units_dir)
+        .expect("create the unit record directory");
+    let entries: Vec<Value> = names
+        .iter()
+        .map(|name| serde_json::json!({ "kind": "service", "name": name }))
+        .collect();
+    let record = serde_json::to_vec(&serde_json::json!({ "units": entries }))
+        .expect("serialize the unit record");
+    assert!(
+        record.len() > 64 * 1024,
+        "the record is {} bytes",
+        record.len()
+    );
+    let record_path = units_dir.join(format!("{PLUGIN_ID}.json"));
+    fs::write(&record_path, &record).expect("write the unit record");
+    fs::set_permissions(&record_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod the unit record");
+
+    let output = units
+        .command(&["workflow", "disable", PLUGIN_ID, "--json"])
+        .output()
+        .expect("run pohunek workflow disable");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        workflow_units::describe(&output)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("a JSON envelope");
+    assert_eq!(
+        document["err"]["code"], "workflow_units_failed",
+        "{document}"
+    );
+    let message = document["err"]["msg"].as_str().expect("a message");
+    assert!(
+        message.contains("the recorded units were not removed and stay recorded"),
+        "{document}"
+    );
+    assert_eq!(
+        units.listed()[0]["enabled"],
+        false,
+        "the plugin is disabled"
+    );
+    assert!(
+        record_path.exists(),
+        "the unit record is kept while its units cannot be reached"
+    );
+}
+
+/// Another version than this CLI, recorded for the installation.
+const OTHER_VERSION: &str = "0.0.1";
+
+/// Restart delay a refused service is paced with: longer than the scenario
+/// runs, so the stop request always arrives during the pacing. The owner
+/// knob only sets the wait, so a larger value changes nothing else.
+const REFUSAL_PACING_MS: u64 = 60_000;
+
+/// Enabling a plugin with units refuses an installation recorded for another
+/// version of pohunek, before any unit is written: that version's trampoline
+/// may not exist, so the units would never run.
+#[test]
+fn enabling_refuses_an_installation_of_another_version() {
+    assert_ne!(VERSION, OTHER_VERSION);
+    let units = workflow_units::UnitEnv::new(|env| env.root().join("units"));
+    let plugin = workflow_units::Plugin::new(PLUGIN_ID).service("serve", "hang");
+    units.install(&plugin);
+    let prefix = units.env.root().join("prefix");
+    identity_config(&units.context, &prefix, OTHER_VERSION)
+        .expect("the installation configuration")
+        .write(&units.context.config_path())
+        .expect("record the other version");
+
+    let output = units
+        .command(&["workflow", "enable", PLUGIN_ID, "--json"])
+        .output()
+        .expect("run pohunek workflow enable");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        workflow_units::describe(&output)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("a JSON envelope");
+    assert_eq!(
+        document["err"]["code"], "workflow_service_not_installed",
+        "{document}"
+    );
+    let message = document["err"]["msg"].as_str().expect("a message");
+    assert!(
+        message.contains(OTHER_VERSION) && message.contains(VERSION),
+        "{message}"
+    );
+    assert_eq!(units.listed()[0]["enabled"], false);
+    assert!(
+        units
+            .context
+            .supervisor_dir()
+            .read_dir()
+            .map_or(true, |mut entries| entries.next().is_none()),
+        "no unit was written"
+    );
+}
+
+/// A stop request that arrives while a refused service is paced before its
+/// next start ends the trampoline as stopped: it exits 0, as for a run the
+/// service manager stops, so the unit is not recorded as failed. The refusal
+/// is recorded first, so the request reaches the pacing.
+#[test]
+fn a_stop_during_a_refused_services_pacing_exits_cleanly() {
+    let units = workflow_units::UnitEnv::new(|env| env.root().join("units"));
+    let paced = format!("restart_max_ms = {REFUSAL_PACING_MS}");
+    let knobs = workflow_units::KNOBS.replace("restart_max_ms = 2000", &paced);
+    assert!(knobs.contains(&paced), "the knob was set");
+    units.knobs(&knobs);
+    // Installed disabled, so the trampoline refuses the service and paces it.
+    let plugin = workflow_units::Plugin::new(PLUGIN_ID).service("serve", "hang");
+    let digest = units.install(&plugin);
+
+    let trampoline = units
+        .exec(PLUGIN_ID, digest.as_str(), "service", "serve")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the trampoline");
+    poll_until("the refusal to be recorded", || {
+        units
+            .records(PLUGIN_ID)
+            .iter()
+            .any(|record| record["outcome"] == "refused")
+            .then_some(())
+    });
+    let pid = Pid::from_raw(i32::try_from(trampoline.id()).expect("a PID"));
+    kill(pid, Signal::SIGTERM).expect("signal the trampoline");
+    let output = trampoline
+        .wait_with_output()
+        .expect("wait for the trampoline");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        workflow_units::describe(&output)
+    );
+}
+
+#[test]
+fn a_job_outside_the_owner_bounds_is_refused_before_any_effect() {
+    // A recorded service installation, so only the job bounds refuse; the
+    // refusal comes before any service manager is contacted.
+    let units = workflow_units::UnitEnv::new(|env| env.root().join("units"));
+    units.knobs("[jobs]\nmin_interval_s = 60\n");
+    // Where `pohunek workflow enable` itself puts units: the systemd user
+    // unit directory of its config home, or its home's `LaunchAgents`.
+    let unit_dirs = [
+        units.env.config_home().join("systemd/user"),
+        units.env.home().join("Library/LaunchAgents"),
+    ];
+    let plugin = workflow_units::Plugin::new(PLUGIN_ID).job("poll", "tick", 30);
+    let digest = units.install(&plugin);
+    let refused = |output: &Output| {
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}",
+            workflow_units::describe(output)
+        );
+        let document: Value = serde_json::from_slice(&output.stdout).expect("a JSON envelope");
+        assert_eq!(
+            document["err"]["code"], "workflow_unit_refused",
+            "{document}"
+        );
+        let message = document["err"]["msg"].as_str().expect("a message");
+        assert!(
+            message.contains("job poll") && message.contains("below jobs.min_interval_s 60"),
+            "{message}"
+        );
+    };
+    refused(
+        &units
+            .command(&["workflow", "enable", PLUGIN_ID, "--json"])
+            .output()
+            .expect("run pohunek workflow enable"),
+    );
+    assert_eq!(
+        units.listed()[0]["enabled"],
+        false,
+        "the refusal changed nothing"
+    );
+    for dir in &unit_dirs {
+        assert!(!dir.exists(), "{} was created", dir.display());
+    }
+
+    // An enabling install of the same archive in a fresh store is refused
+    // before the store exists.
+    let fresh = workflow_units::UnitEnv::new(|env| env.root().join("units"));
+    fresh.knobs("[jobs]\nmin_interval_s = 60\n");
+    let archive = units.env.root().join(format!("{PLUGIN_ID}.tar.zst"));
+    refused(
+        &fresh
+            .command(&[
+                "workflow",
+                "install",
+                path_str(&archive),
+                "--sha256",
+                digest.as_str(),
+                "--yes",
+                "--json",
+            ])
+            .output()
+            .expect("run pohunek workflow install"),
+    );
+    assert!(fresh.listed().is_empty(), "the refusal installed nothing");
 }
 
 #[test]
@@ -1200,10 +1759,24 @@ fn files_that_cannot_be_deleted_leave_a_warning_and_no_record() {
     let (code, document) = fixture.json(&["workflow", "uninstall", PLUGIN_ID, "--remove-modified"]);
     assert_eq!(code, 0, "{document}");
     assert_eq!(document["ok"]["plugin"]["id"], PLUGIN_ID, "{document}");
-    let warning = document["ok"]["warnings"][0].as_str().expect("one warning");
+    let warnings: Vec<&str> = document["ok"]["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .map(|warning| warning.as_str().expect("a warning"))
+        .collect();
     let packages = fixture.store_root().join("packages");
     assert!(
-        warning.contains(".collect-") && warning.contains(path_str(&packages)),
+        warnings
+            .iter()
+            .any(|warning| warning.contains(".collect-") && warning.contains(path_str(&packages))),
+        "{document}"
+    );
+    // Files that fail verification hide which units the plugin had.
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("could not be listed")),
         "{document}"
     );
     assert!(fixture.listed().is_empty(), "the record must be gone");

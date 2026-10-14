@@ -504,10 +504,13 @@ pub trait Supervisor: std::fmt::Debug + Send + Sync {
 
 /// Manages the single long-lived daemon job of one installation.
 ///
-/// The daemon is the only job registered for login: a launchd agent in
-/// `~/Library/LaunchAgents` or an enabled systemd user unit. It restarts on
-/// failure with the definition's throttle. Operations here never touch worker
-/// jobs, so upgrading or removing the daemon leaves live workers running.
+/// The daemon is registered for login as a launchd agent in
+/// `~/Library/LaunchAgents` or an enabled systemd user unit. The only other
+/// login units of an installation are the workflow plugin units the CLI
+/// installs through [`PluginUnits`]. The daemon restarts on failure with the
+/// definition's throttle. Operations here never touch worker jobs or plugin
+/// units, so upgrading or removing the daemon leaves live workers and plugin
+/// units running.
 pub trait DaemonSupervisor: std::fmt::Debug + Send + Sync {
     /// Writes the persistent daemon definition, enables it for login, and
     /// starts it.
@@ -676,6 +679,11 @@ pub trait PluginUnits: std::fmt::Debug + Send + Sync {
 
     /// Stops an installed unit set until it is started again or the user
     /// logs in again, waiting until its processes have exited.
+    ///
+    /// The stop's `SIGTERM` reaches only the unit's main process, which may
+    /// stop its own descendants first. What remains of the unit (systemd: its
+    /// control group; launchd: the job's process group) is then killed, at
+    /// the latest once the definition's exit timeout passed.
     ///
     /// A job's schedule is stopped before its run, so no new run starts in
     /// between. Fails with [`Error::NotFound`] when the set is not installed.

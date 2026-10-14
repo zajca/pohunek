@@ -1,10 +1,11 @@
 //! The `workflow.toml` manifest of a workflow plugin archive.
 //!
-//! The manifest names the plugin and declares its actions as argv arrays that
-//! run without a shell. Parsing is strict: the document is size-capped before
-//! it is parsed, every table refuses unknown keys, and every `argv[0]` names
-//! either an executable file of the same archive by a package path or an
-//! absolute host path. Tables of later workflow slices are unknown keys here.
+//! The manifest names the plugin and declares its actions, periodic jobs and
+//! long-running services as argv arrays that run without a shell. Parsing is
+//! strict: the document is size-capped before it is parsed, every table
+//! refuses unknown keys, and every `argv[0]` names either an executable file
+//! of the same archive by a package path or an absolute host path. Tables of
+//! later workflow slices are unknown keys here.
 
 // Rust guideline compliant 2026-10-13
 
@@ -13,7 +14,7 @@ use std::num::NonZeroU64;
 use std::path::Path;
 
 use package::VerifiedArchive;
-use pohunek_platform::supervisor::{MAX_JOB_ARGUMENTS, MAX_JOB_VALUE_BYTES};
+use pohunek_platform::supervisor::{MAX_JOB_ARGUMENTS, MAX_JOB_INTERVAL, MAX_JOB_VALUE_BYTES};
 use protocol::{PackageId, PackageIdentity, PackageVersion};
 use serde::{Deserialize, Serialize};
 
@@ -34,10 +35,12 @@ pub(crate) const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 /// The manifest schema this build reads.
 const SCHEMA: u32 = 1;
 
-/// Longest action name: a letter followed by at most 31 of `[a-z0-9_]`.
+/// Longest action, job or service name: a letter followed by at most 31 of
+/// `[a-z0-9_]`.
 ///
-/// Names become CLI arguments and, in later slices, part of service unit
-/// names, so they stay short and shell-safe.
+/// Names become CLI arguments and part of service manager unit names and
+/// state file names, so they stay short and shell-safe; the unit name bound
+/// (`MAX_PLUGIN_UNIT_NAME_BYTES`) is larger.
 const MAX_ACTION_NAME_BYTES: usize = 32;
 
 /// Longest plugin description: 1 KiB.
@@ -77,18 +80,46 @@ impl Action {
     /// argv with a package-path `argv[0]` resolved below `files`, the
     /// extracted tree of the package.
     pub(crate) fn resolved_argv(&self, files: &Path) -> Vec<String> {
-        self.argv
-            .iter()
-            .enumerate()
-            .map(|(index, arg)| {
-                if index == 0 && !arg.starts_with('/') {
-                    files.join(arg).display().to_string()
-                } else {
-                    arg.clone()
-                }
-            })
-            .collect()
+        resolve_argv(&self.argv, files)
     }
+}
+
+/// One declared periodic job.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Job {
+    /// Program and fixed arguments, under the rules of [`Action::argv`].
+    pub(crate) argv: Vec<String>,
+    /// Wall-clock seconds from the start of one run to the start of the next;
+    /// enforced against the owner's `jobs.min_interval_s` when units are
+    /// installed.
+    pub(crate) every_s: NonZeroU64,
+    /// Requested run deadline; enforced against the owner's
+    /// `jobs.timeout_max_ms` when units are installed and when a run starts.
+    pub(crate) timeout_ms: Option<NonZeroU64>,
+}
+
+/// One declared long-running service.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Service {
+    /// Program and fixed arguments, under the rules of [`Action::argv`].
+    pub(crate) argv: Vec<String>,
+}
+
+/// argv with a package-path `argv[0]` resolved below `files`, the extracted
+/// tree of the package.
+pub(crate) fn resolve_argv(argv: &[String], files: &Path) -> Vec<String> {
+    argv.iter()
+        .enumerate()
+        .map(|(index, arg)| {
+            if index == 0 && !arg.starts_with('/') {
+                files.join(arg).display().to_string()
+            } else {
+                arg.clone()
+            }
+        })
+        .collect()
 }
 
 /// A validated manifest.
@@ -100,6 +131,18 @@ pub(crate) struct Manifest {
     pub(crate) description: String,
     /// Actions by name.
     pub(crate) actions: BTreeMap<String, Action>,
+    /// Periodic jobs by name.
+    pub(crate) jobs: BTreeMap<String, Job>,
+    /// Long-running services by name.
+    pub(crate) services: BTreeMap<String, Service>,
+}
+
+impl Manifest {
+    /// Whether the manifest declares a job or a service, which run as
+    /// service manager units.
+    pub(crate) fn has_units(&self) -> bool {
+        !self.jobs.is_empty() || !self.services.is_empty()
+    }
 }
 
 #[derive(Deserialize)]
@@ -110,7 +153,12 @@ struct Document {
     #[serde(rename = "schema")]
     _schema: u32,
     plugin: Plugin,
+    #[serde(default)]
     actions: BTreeMap<String, Action>,
+    #[serde(default)]
+    jobs: BTreeMap<String, Job>,
+    #[serde(default)]
+    services: BTreeMap<String, Service>,
 }
 
 #[derive(Deserialize)]
@@ -155,19 +203,29 @@ pub(crate) enum Invalid {
     /// The description is empty or too long.
     #[error("the plugin description must be 1..={MAX_DESCRIPTION_BYTES} bytes")]
     Description,
-    /// The manifest declares no action.
-    #[error("{MANIFEST_PATH} declares no action")]
+    /// The manifest declares no action, job or service.
+    #[error("{MANIFEST_PATH} declares no action, job or service")]
     NoActions,
-    /// An action name breaks the grammar; the name is not echoed.
-    #[error("an action name is not [a-z][a-z0-9_]{{0,31}}")]
+    /// An action, job or service name breaks the grammar; the name is not
+    /// echoed.
+    #[error("an action, job or service name is not [a-z][a-z0-9_]{{0,31}}")]
     ActionName,
-    /// An action's argv breaks a rule.
-    #[error("action {action}: {fault}")]
+    /// An action's, job's or service's argv breaks a rule.
+    #[error("{kind} {action}: {fault}")]
     Argv {
-        /// The action name, valid under the name grammar.
+        /// `action`, `job` or `service`.
+        kind: &'static str,
+        /// The name, valid under the name grammar.
         action: String,
         /// The broken rule.
         fault: ArgvFault,
+    },
+    /// A job's `every_s` is above the longest interval the service managers
+    /// accept.
+    #[error("job {job}: every_s must be at most {} seconds", MAX_JOB_INTERVAL.as_secs())]
+    Interval {
+        /// The job name, valid under the name grammar.
+        job: String,
     },
 }
 
@@ -257,17 +315,41 @@ pub(crate) fn parse(
     if description.is_empty() || description.len() > MAX_DESCRIPTION_BYTES {
         return Err(Invalid::Description);
     }
-    if document.actions.is_empty() {
+    if document.actions.is_empty() && document.jobs.is_empty() && document.services.is_empty() {
         return Err(Invalid::NoActions);
     }
-    for (name, action) in &document.actions {
+    let declared = (document
+        .actions
+        .iter()
+        .map(|(name, action)| ("action", name, &action.argv)))
+    .chain(
+        document
+            .jobs
+            .iter()
+            .map(|(name, job)| ("job", name, &job.argv)),
+    )
+    .chain(
+        document
+            .services
+            .iter()
+            .map(|(name, service)| ("service", name, &service.argv)),
+    );
+    for (kind, name, argv) in declared {
         if !valid_action_name(name) {
             return Err(Invalid::ActionName);
         }
-        check_argv(&action.argv, &executable).map_err(|fault| Invalid::Argv {
+        check_argv(argv, &executable).map_err(|fault| Invalid::Argv {
+            kind,
             action: name.clone(),
             fault,
         })?;
+    }
+    if let Some((name, _job)) = document
+        .jobs
+        .iter()
+        .find(|(_name, job)| job.every_s.get() > MAX_JOB_INTERVAL.as_secs())
+    {
+        return Err(Invalid::Interval { job: name.clone() });
     }
     Ok(Manifest {
         identity: PackageIdentity {
@@ -276,6 +358,8 @@ pub(crate) fn parse(
         },
         description,
         actions: document.actions,
+        jobs: document.jobs,
+        services: document.services,
     })
 }
 

@@ -5,7 +5,7 @@
 //! daemon, a missing required base directory is a fail-fast error: no silent
 //! invented fallbacks (hard project rule).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use pohunek_client::OriginSource;
 use pohunek_paths::{PathEnv, Platform};
@@ -79,30 +79,7 @@ impl Paths {
         let config = pohunek_paths::config_home()
             .map_err(path_error)?
             .join(pohunek_paths::APP_DIR);
-        let dirs = WorkflowDirs {
-            root: state.join(pohunek_paths::WORKFLOW_PLUGINS_SUBDIR),
-            state: state.join(pohunek_paths::WORKFLOW_PLUGIN_STATE_SUBDIR),
-            config: config.join(pohunek_paths::WORKFLOW_PLUGIN_CONFIG_SUBDIR),
-            knobs: config.join(crate::workflow::config::FILE_NAME),
-        };
-        let named = [
-            ("store", &dirs.root),
-            ("state", &dirs.state),
-            ("config", &dirs.config),
-        ];
-        for (index, (name, path)) in named.iter().enumerate() {
-            for (other, other_path) in &named[index + 1..] {
-                if path.starts_with(other_path) || other_path.starts_with(path) {
-                    return Err(crate::workflow::Error::DirsOverlap(format!(
-                        "the {name} directory {} and the {other} directory {}",
-                        path.display(),
-                        other_path.display()
-                    ))
-                    .into());
-                }
-            }
-        }
-        Ok(dirs)
+        Ok(WorkflowDirs::new(&state, &config)?)
     }
 
     /// Resolve only the pohunek cache directory.
@@ -175,6 +152,42 @@ pub(crate) struct WorkflowDirs {
     pub(crate) config: PathBuf,
     /// `<config>/pohunek/workflow.toml`, the owner's run limits.
     pub(crate) knobs: PathBuf,
+}
+
+impl WorkflowDirs {
+    /// The workflow plugin store below pohunek's state directory `state` and
+    /// config directory `config`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workflow `DirsOverlap` error when one of the three locations
+    /// lies inside another: a purge of one plugin's directory must never
+    /// reach the store or another directory.
+    pub(crate) fn new(state: &Path, config: &Path) -> Result<Self, crate::workflow::Error> {
+        let dirs = Self {
+            root: state.join(pohunek_paths::WORKFLOW_PLUGINS_SUBDIR),
+            state: state.join(pohunek_paths::WORKFLOW_PLUGIN_STATE_SUBDIR),
+            config: config.join(pohunek_paths::WORKFLOW_PLUGIN_CONFIG_SUBDIR),
+            knobs: config.join(crate::workflow::config::FILE_NAME),
+        };
+        let named = [
+            ("store", &dirs.root),
+            ("state", &dirs.state),
+            ("config", &dirs.config),
+        ];
+        for (index, (name, path)) in named.iter().enumerate() {
+            for (other, other_path) in &named[index + 1..] {
+                if path.starts_with(other_path) || other_path.starts_with(path) {
+                    return Err(crate::workflow::Error::DirsOverlap(format!(
+                        "the {name} directory {} and the {other} directory {}",
+                        path.display(),
+                        other_path.display()
+                    )));
+                }
+            }
+        }
+        Ok(dirs)
+    }
 }
 
 fn path_error(err: pohunek_paths::PathError) -> CliError {

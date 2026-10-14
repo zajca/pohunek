@@ -55,6 +55,9 @@ pub(crate) enum Outcome {
     /// A JSON-mode child exited zero, but its stdout is not exactly one JSON
     /// document.
     OutputInvalid,
+    /// A supervised run did not start because an earlier run of the same
+    /// job or service still holds its lock.
+    OverlapSkipped,
 }
 
 /// One run record.
@@ -64,7 +67,8 @@ pub(crate) struct Record<'a> {
     pub(crate) ts: String,
     /// ULID of the run, also in the child's context.
     pub(crate) run_id: &'a str,
-    /// Invocation kind; `action` for `workflow run`.
+    /// Invocation kind: `action` for `workflow run`, `job` or `service` for
+    /// a supervised run.
     pub(crate) kind: &'static str,
     /// The declared action name; absent when the name was not verified to be
     /// one the installed manifest declares.
@@ -94,6 +98,9 @@ pub(crate) struct Record<'a> {
     pub(crate) stderr_bytes: u64,
     /// Number of extra command-line arguments given.
     pub(crate) arg_count: usize,
+    /// The restart delay a service run waited before it started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) backoff_ms: Option<u64>,
 }
 
 /// An open run log of one plugin.

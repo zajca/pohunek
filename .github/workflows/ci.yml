@@ -333,6 +333,8 @@ jobs:
       # filesystem lifecycle of issue #96: its transaction tests in the library
       # and the package-backed lifecycle scenarios of tests/hermes_package.rs,
       # which install the Hermes package through a throwaway signed catalog.
+      # It also runs tests/workflow_launchd.rs, the workflow plugin units of
+      # issue #326 against the runner's real `gui/<uid>` domain.
       - name: Test CLI
         # Independent suites: report each even when an earlier one failed.
         if: ${{ !cancelled() }}
@@ -955,8 +957,8 @@ jobs:
           if-no-files-found: warn
 
   # Issue #100: the ignored real-systemd suites drive the runner's own systemd
-  # user manager (transient worker units, the namespaced daemon unit, and the
-  # `pohunek service` transactions). Hosted Ubuntu runners run a user manager
+  # user manager (transient worker units, the namespaced daemon unit, the
+  # `pohunek service` transactions, and the workflow plugin units of #326). Hosted Ubuntu runners run a user manager
   # without lingering; the bus address is exported because the job shell does
   # not carry one.
   systemd-supervision:
@@ -1020,6 +1022,12 @@ jobs:
       - name: pohunek service upgrade with live workers
         if: ${{ !cancelled() }}
         run: cargo test --locked -p pohunek-cli --test service_upgrade -- --ignored --test-threads 1
+
+      # Issue #326: workflow plugin jobs and services as persistent user units
+      # running the `pohunek workflow __exec` trampoline.
+      - name: Workflow plugin units
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p pohunek-cli --test workflow_systemd -- --ignored --test-threads 1
 
   # Issue #525: a session started on the previous release survives
   # `pohunek service upgrade` to this build. The job is the reusable

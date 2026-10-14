@@ -16,6 +16,12 @@
 //! The store keeps one version per plugin id: lookups by id resolve the
 //! selected digest, and an install of another archive of an installed id is
 //! refused under the lock.
+//!
+//! Each plugin with units also has a unit record, one small file in the
+//! `units` directory below the store root, that lists the jobs and services
+//! installed for it. Its names are written before the units are installed,
+//! so the unit lifecycle can stop them even when the installed files no
+//! longer verify. Changes to it are made under the unit lifecycle lock.
 
 // Rust guideline compliant 2026-10-13
 
@@ -31,10 +37,12 @@ use package::registry::{
 use package::verify::{VerifiedRoot, VerifyError};
 use package::{read_archive_with_digest, ArchiveError, Limits, PackageDigest};
 use pohunek_platform::filesystem::{
-    EntryKind, FileLock, FsError, LockKind, RemoveOutcome, StageOutcome, TrustedDir,
+    AtomicReplaceError, EntryKind, FileLock, FsError, LockKind, RemoveOutcome, StageOutcome,
+    TrustedDir,
 };
+use pohunek_platform::supervisor::{PluginUnitKey, PluginUnitKind};
 use protocol::PackageId;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::manifest::{self, Manifest, MANIFEST_PATH, MAX_MANIFEST_BYTES};
 use super::Error;
@@ -62,6 +70,36 @@ const LOCK_NAME: &str = "store.lock";
 /// Mode of the store lock file: owner-only, like the registry's files.
 const LOCK_FILE_MODE: u32 = 0o600;
 
+/// Name of the unit lifecycle lock in the store root.
+///
+/// Enable, disable and uninstall hold it across the registry change and the
+/// service manager operations, which the store lock cannot cover because
+/// each registry change takes and releases that one itself.
+const UNITS_LOCK_NAME: &str = "units.lock";
+
+/// Directory of the unit records, below the store root.
+const UNIT_RECORDS_DIR: &str = "units";
+
+/// Mode of the unit record directory and files: owner-only, like the registry.
+const UNIT_RECORD_FILE_MODE: u32 = 0o600;
+
+/// Largest unit record read or written: three times
+/// [`MAX_MANIFEST_BYTES`](manifest::MAX_MANIFEST_BYTES).
+///
+/// A record entry for a service is `{"kind":"service","name":"<name>"}` plus
+/// its separating comma: 29 bytes beyond the name. Inside a `[services]`
+/// table the shortest manifest line for the same unit is
+/// `<name>.argv=["/x"]` and its newline: 13 bytes beyond the name. The worst
+/// ratio, a one-character name, is 30 to 14 bytes, so a record is at most
+/// about 2.15 times its manifest plus the 12-byte `{"units":[]}` wrapper; a
+/// job entry carries fewer bytes and its manifest line more. Three times
+/// the manifest bound covers every accepted manifest with margin.
+const MAX_UNIT_RECORD_BYTES: usize = 3 * MAX_MANIFEST_BYTES;
+
+/// Staging prefix of a unit record file removed in place; the staged name is
+/// `.unit-record-<name>+<random hex>`.
+const UNIT_RECORD_STAGE_PREFIX: &str = ".unit-record-";
+
 /// Warning when the registry record is gone but the installed files remain.
 ///
 /// The registry leaves undeletable residue under a `.collect-*` name in
@@ -77,6 +115,63 @@ const UNINSTALL_UNCERTAIN: &str = "the plugin record was removed, but the store 
 /// Warning when an install recorded the plugin without confirming durability.
 const INSTALL_UNCERTAIN: &str = "the plugin was recorded, but the store could not confirm the \
     change is durable; check `pohunek workflow list`";
+
+/// Kind of a recorded unit, as its unit record names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum UnitKind {
+    /// A periodic job.
+    Job,
+    /// A long-running service.
+    Service,
+}
+
+impl UnitKind {
+    /// The kind of `kind` as the platform names it.
+    pub(crate) fn of(kind: PluginUnitKind) -> Self {
+        match kind {
+            PluginUnitKind::Job => Self::Job,
+            PluginUnitKind::Service => Self::Service,
+        }
+    }
+
+    /// The platform kind of this unit.
+    pub(crate) fn platform(self) -> PluginUnitKind {
+        match self {
+            Self::Job => PluginUnitKind::Job,
+            Self::Service => PluginUnitKind::Service,
+        }
+    }
+}
+
+/// One job or service of a plugin, as its unit record lists it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UnitName {
+    /// Whether the unit is a job or a service.
+    pub(crate) kind: UnitKind,
+    /// The declared name.
+    pub(crate) name: String,
+}
+
+impl UnitName {
+    /// The platform key of this unit of plugin `id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Store`] when the name is outside the unit name grammar.
+    pub(crate) fn key(&self, id: &PackageId) -> Result<PluginUnitKey, Error> {
+        PluginUnitKey::new(id.as_str(), self.kind.platform(), self.name.as_str())
+            .map_err(|_invalid| Error::Store(format!("a unit name of plugin {id} is invalid")))
+    }
+}
+
+/// The content of one unit record file.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnitRecord {
+    units: Vec<UnitName>,
+}
 
 /// A verified archive and its validated manifest, ready for consent.
 #[derive(Debug)]
@@ -393,6 +488,40 @@ impl Store {
         Ok((record, root, manifest))
     }
 
+    /// Applies the refusals of [`Store::uninstall`] that depend on the
+    /// installed files, without changing anything: with `remove_modified`
+    /// the files must fail verification for a reason other than being
+    /// missing or unreadable, and without it they must verify or be missing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PluginUnknown`], [`Error::RootIntact`],
+    /// [`Error::RootInvalid`] or [`Error::Store`], as [`Store::uninstall`]
+    /// would.
+    pub(crate) fn check_removable(
+        &self,
+        id: &PackageId,
+        remove_modified: bool,
+    ) -> Result<(), Error> {
+        let (registry, record) = self.require(id)?;
+        match (registry.verify(record.digest()), remove_modified) {
+            (Ok(_) | Err(RegistryError::RootInvalid(VerifyError::RootMissing)), true) => {
+                Err(Error::RootIntact { id: id.to_string() })
+            }
+            (Err(RegistryError::RootInvalid(VerifyError::Unreadable { kind })), true)
+                if kind != ErrorKind::PermissionDenied =>
+            {
+                Err(Error::RootInvalid {
+                    id: id.to_string(),
+                    cause: VerifyError::Unreadable { kind },
+                })
+            }
+            (Err(RegistryError::RootInvalid(_)), true)
+            | (Ok(_) | Err(RegistryError::RootInvalid(VerifyError::RootMissing)), false) => Ok(()),
+            (Err(error), _) => Err(by_id(error, id)),
+        }
+    }
+
     /// Uninstalls plugin `id` and, with `purge`, removes its state and
     /// config directories.
     ///
@@ -495,6 +624,127 @@ impl Store {
         })
     }
 
+    /// The units recorded for plugin `id`, sorted; empty when there is no
+    /// record. Callers hold the unit lifecycle lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Store`] when the record cannot be read or is not a
+    /// valid record. A record that cannot be read never reads as empty.
+    pub(crate) fn recorded_units(&self, id: &PackageId) -> Result<Vec<UnitName>, Error> {
+        let Some(root) = self.open_records_root(false)? else {
+            return Ok(Vec::new());
+        };
+        let Some(dir) = open_child_if_present(&root, UNIT_RECORDS_DIR)? else {
+            return Ok(Vec::new());
+        };
+        let name = unit_record_name(id);
+        let bytes = match dir.read_file(&name, UNIT_RECORD_FILE_MODE, MAX_UNIT_RECORD_BYTES) {
+            Ok(bytes) => bytes,
+            Err(error) if error.io_kind() == Some(ErrorKind::NotFound) => return Ok(Vec::new()),
+            Err(FsError::FileTooLarge { .. }) => return Err(unit_record_invalid(id)),
+            Err(error) => return Err(fs(&error)),
+        };
+        let record: UnitRecord =
+            serde_json::from_slice(&bytes).map_err(|_cause| unit_record_invalid(id))?;
+        let mut units = record.units;
+        for unit in &units {
+            unit.key(id).map_err(|_invalid| unit_record_invalid(id))?;
+        }
+        units.sort();
+        if units.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(unit_record_invalid(id));
+        }
+        Ok(units)
+    }
+
+    /// Adds `added` to the units recorded for plugin `id` and writes the
+    /// record. Callers hold the unit lifecycle lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Store`] when the record cannot be read or written.
+    /// A write whose durability is not confirmed is an error as well.
+    pub(crate) fn record_units(&self, id: &PackageId, added: &[UnitName]) -> Result<(), Error> {
+        let mut units = self.recorded_units(id)?;
+        units.extend(added.iter().cloned());
+        units.sort();
+        units.dedup();
+        self.write_unit_record(id, &units)
+    }
+
+    /// Removes `gone` from the units recorded for plugin `id`, deleting the
+    /// record when none remain. Callers hold the unit lifecycle lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Store`] when the record cannot be read or written.
+    pub(crate) fn forget_units(&self, id: &PackageId, gone: &[UnitName]) -> Result<(), Error> {
+        let units: Vec<UnitName> = self
+            .recorded_units(id)?
+            .into_iter()
+            .filter(|unit| !gone.contains(unit))
+            .collect();
+        self.write_unit_record(id, &units)
+    }
+
+    /// Replaces the unit record of plugin `id` with `units`, or deletes it
+    /// when `units` is empty. The replacement is atomic and a stale
+    /// temporary of an earlier write is removed first.
+    fn write_unit_record(&self, id: &PackageId, units: &[UnitName]) -> Result<(), Error> {
+        let name = unit_record_name(id);
+        if units.is_empty() {
+            let Some(root) = self.open_records_root(false)? else {
+                return Ok(());
+            };
+            let Some(dir) = open_child_if_present(&root, UNIT_RECORDS_DIR)? else {
+                return Ok(());
+            };
+            return remove_record_file(&dir, &name);
+        }
+        let bytes = serde_json::to_vec(&UnitRecord {
+            units: units.to_vec(),
+        })
+        .map_err(|_cause| unit_record_invalid(id))?;
+        if bytes.len() > MAX_UNIT_RECORD_BYTES {
+            return Err(Error::Store(format!(
+                "the unit record of plugin {id} is larger than its limit"
+            )));
+        }
+        let root = self
+            .open_records_root(true)?
+            .ok_or_else(|| Error::Store("the store root is missing".to_owned()))?;
+        let dir = root
+            .open_or_create_child(UNIT_RECORDS_DIR, PRIVATE_DIR_MODE)
+            .map_err(|error| fs(&error))?;
+        let temporary = format!("{name}.tmp");
+        remove_record_file(&dir, &temporary)?;
+        dir.replace_file(&name, &temporary, &bytes, UNIT_RECORD_FILE_MODE)
+            .map_err(|error| match error {
+                AtomicReplaceError::BeforeCommit(cause) => fs(&cause),
+                AtomicReplaceError::CommittedDurabilityUncertain(_cause) => Error::Store(format!(
+                    "the unit record of plugin {id} was written, but the store could not \
+                     confirm the change is durable"
+                )),
+                _ => Error::Store(format!("the unit record of plugin {id} was not written")),
+            })
+    }
+
+    /// The store root, opened as a trusted directory; created when `create`
+    /// is set, `None` when it is missing and not created.
+    fn open_records_root(&self, create: bool) -> Result<Option<TrustedDir>, Error> {
+        let opened = if create {
+            TrustedDir::open_or_create_absolute(&self.dirs.root, PRIVATE_DIR_MODE)
+        } else {
+            TrustedDir::open_absolute(&self.dirs.root, PRIVATE_DIR_MODE)
+        };
+        match opened {
+            Ok(root) => Ok(Some(root)),
+            Err(error) if !create && error.io_kind() == Some(ErrorKind::NotFound) => Ok(None),
+            Err(error) => Err(fs(&error)),
+        }
+    }
+
     fn existing(&self) -> Result<Option<Registry>, Error> {
         Registry::open_existing_at(&self.dirs.root, Limits::DEFAULT).map_err(store)
     }
@@ -503,6 +753,50 @@ impl Store {
         let registry = self.existing()?.ok_or_else(|| unknown(id))?;
         let record = self.installed(id)?.ok_or_else(|| unknown(id))?;
         Ok((registry, record))
+    }
+
+    /// Takes the unit lifecycle lock of an existing store; `None` when there
+    /// is no store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Busy`] while another enable, disable or uninstall
+    /// holds it, and [`Error::Store`] when the store is unsafe.
+    pub(crate) fn lock_units(&self) -> Result<Option<FileLock>, Error> {
+        match TrustedDir::open_absolute(&self.dirs.root, PRIVATE_DIR_MODE) {
+            Ok(root) => root
+                .lock_file(UNITS_LOCK_NAME, LOCK_FILE_MODE, LockKind::Exclusive)
+                .map(Some)
+                .map_err(|error| match error {
+                    FsError::LockContended { .. } => Error::Busy,
+                    other => fs(&other),
+                }),
+            Err(error) if error.io_kind() == Some(ErrorKind::NotFound) => Ok(None),
+            Err(error) => Err(fs(&error)),
+        }
+    }
+
+    /// Takes the unit lifecycle lock, creating the store root when it is
+    /// missing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Busy`] while another enable, disable, uninstall or
+    /// enabling install holds it, and [`Error::Store`] when the store is
+    /// unsafe.
+    pub(crate) fn lock_units_creating(&self) -> Result<FileLock, Error> {
+        TrustedDir::open_or_create_absolute(&self.dirs.root, PRIVATE_DIR_MODE)
+            .map_err(|error| fs(&error))?
+            .lock_file(UNITS_LOCK_NAME, LOCK_FILE_MODE, LockKind::Exclusive)
+            .map_err(|error| match error {
+                FsError::LockContended { .. } => Error::Busy,
+                other => fs(&other),
+            })
+    }
+
+    /// The knobs file path.
+    pub(crate) fn knobs_path(&self) -> &Path {
+        &self.dirs.knobs
     }
 
     /// Takes the store lock, creating the store root when it is missing.
@@ -690,6 +984,56 @@ fn remove_child(parent: &TrustedDir, name: &str, prefix: &str) -> Result<Purged,
         Ok(StageOutcome::Missing) => Ok(Purged::Absent),
         Ok(_changed) => Err(left_in_place("it changed while it was purged")),
         Err(error) => Err(left_in_place(&fs_detail(&error))),
+    }
+}
+
+/// The file name of the unit record of plugin `id`.
+fn unit_record_name(id: &PackageId) -> String {
+    format!("{id}.json")
+}
+
+/// The error for a unit record that cannot be used. It names the plugin and
+/// never the file's content.
+fn unit_record_invalid(id: &PackageId) -> Error {
+    Error::Store(format!(
+        "the unit record of plugin {id} is unreadable or invalid, so its units cannot be \
+         identified"
+    ))
+}
+
+/// Opens the child directory `name` of `parent`; `None` when it is missing.
+fn open_child_if_present(parent: &TrustedDir, name: &str) -> Result<Option<TrustedDir>, Error> {
+    match parent.open_child(name, PRIVATE_DIR_MODE) {
+        Ok(dir) => Ok(Some(dir)),
+        Err(error) if error.io_kind() == Some(ErrorKind::NotFound) => Ok(None),
+        Err(error) => Err(fs(&error)),
+    }
+}
+
+/// Removes the regular file `name` of `dir` through a staged name, so the
+/// removal is bound to the inode it inspected. A missing file is not an error.
+fn remove_record_file(dir: &TrustedDir, name: &str) -> Result<(), Error> {
+    let Some(identity) = dir
+        .entry_identity(name, EntryKind::RegularFile)
+        .map_err(|error| fs(&error))?
+    else {
+        return Ok(());
+    };
+    match dir
+        .stage_random(name, UNIT_RECORD_STAGE_PREFIX, identity)
+        .map_err(|error| fs(&error))?
+    {
+        StageOutcome::Staged(entry) => match entry.remove().map_err(|error| fs(&error))? {
+            RemoveOutcome::Removed | RemoveOutcome::Missing => Ok(()),
+            RemoveOutcome::IdentityChanged => Err(Error::Store(format!(
+                "a unit record changed while it was removed; {name} remains in place"
+            ))),
+            _ => Err(Error::Store(format!("{name} could not be removed"))),
+        },
+        StageOutcome::Missing => Ok(()),
+        _ => Err(Error::Store(format!(
+            "{name} changed while it was removed; it remains in place"
+        ))),
     }
 }
 
