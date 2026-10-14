@@ -184,45 +184,67 @@ cat "$collect_dir/diagnostics/logs.txt"
         return run_sourced(body, self.log, self.home).stdout.strip()
 
     def test_a_tagged_target_selects_the_greatest_version_below_it(self) -> None:
-        tags = ["v0.34.0", "v0.33.1", "v0.33.0", "v0.32.3", "v0.9.0", "v0.10.0"]
-        self.assertEqual(self.select("v0.33.1", tags), "v0.33.0")
-        self.assertEqual(self.select("v0.34.0", tags), "v0.33.1")
+        # Versions compare numerically: 0.34.10 is above 0.34.2, and 0.9.0 is
+        # below 0.10.0. Every candidate is at or above the minimum.
+        tags = ["v0.35.0", "v0.34.10", "v0.34.2", "v0.34.1", "v0.9.0", "v0.10.0"]
+        self.assertEqual(self.select("v0.35.0", tags), "v0.34.10")
+        self.assertEqual(self.select("v0.34.10", tags), "v0.34.2")
+        self.assertEqual(self.select("v0.34.3", tags), "v0.34.2")
         self.assertEqual(self.select("v0.10.0", tags), "v0.9.0")
         self.assertEqual(self.select("v0.9.0", tags), "")
-        self.assertEqual(self.select("v0.33.2", tags), "v0.33.1")
+
+    def fake_gh(self, name: str, output: str) -> Path:
+        """A `gh` stub on a private PATH entry that prints `output` and exits 0."""
+        fake = Path(self.tmp.name) / name
+        fake.mkdir()
+        gh = fake / "gh"
+        gh.write_text(f"#!/bin/sh\nprintf '%s\\n' {output}\n")
+        gh.chmod(0o755)
+        return fake
+
+    def resolve(self, fake: Path, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [str(SCRIPT), "--repo", "o/r", "--resolve-only", *args],
+            capture_output=True, text=True, check=False,
+            env={"PATH": f"{fake}:{os.environ['PATH']}"},
+        )
 
     def test_an_untagged_target_keeps_latest_selection(self) -> None:
         # With no --exclude-tag the script asks `gh release view` for the latest.
-        fake = Path(self.tmp.name) / "bin"
-        fake.mkdir()
-        gh = fake / "gh"
-        gh.write_text('#!/bin/sh\necho v0.34.0\n')
-        gh.chmod(0o755)
-        result = subprocess.run(
-            [str(SCRIPT), "--previous", "latest", "--repo", "o/r", "--resolve-only"],
-            capture_output=True, text=True, check=False,
-            env={"PATH": f"{fake}:{os.environ['PATH']}"},
-        )
-        self.assertEqual(result.stdout.strip(), "v0.34.0")
+        fake = self.fake_gh("bin", "v0.34.10")
+        result = self.resolve(fake, "--previous", "latest")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "v0.34.10")
 
     def test_a_tagged_target_resolves_through_the_release_list(self) -> None:
-        fake = Path(self.tmp.name) / "bin2"
-        fake.mkdir()
-        gh = fake / "gh"
-        gh.write_text('#!/bin/sh\nprintf "v0.34.0\\nv0.33.1\\nv0.33.0\\n"\n')
-        gh.chmod(0o755)
-        result = subprocess.run(
-            [str(SCRIPT), "--previous", "latest", "--repo", "o/r",
-             "--exclude-tag", "v0.33.1", "--resolve-only"],
-            capture_output=True, text=True, check=False,
-            env={"PATH": f"{fake}:{os.environ['PATH']}"},
-        )
-        self.assertEqual(result.stdout.strip(), "v0.33.0")
+        fake = self.fake_gh("bin2", "v0.35.0 v0.34.10 v0.34.2")
+        result = self.resolve(fake, "--previous", "latest", "--exclude-tag", "v0.35.0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "v0.34.10")
+
+    def test_a_release_below_the_minimum_is_refused_before_anything_is_fetched(self) -> None:
+        # The scenario starts from the built-in runtimes of 0.34.2, so an older
+        # previous release is refused by explicit tag, by `latest`, and by a
+        # tagged target, each with the minimum named and no download attempted.
+        fake = self.fake_gh("bin3", "v0.33.1")
+        cases = {
+            "explicit": self.resolve(fake, "--previous", "v0.33.1"),
+            "latest": self.resolve(fake, "--previous", "latest"),
+            "tagged target": self.resolve(
+                self.fake_gh("bin4", "v0.34.2 v0.33.1"),
+                "--previous", "latest", "--exclude-tag", "v0.34.2",
+            ),
+        }
+        for name, result in cases.items():
+            with self.subTest(case=name):
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout.strip(), "")
+                self.assertIn("v0.33.1 is older than 0.34.2", result.stderr)
 
     def run_script(self, *args: str, **env: str) -> subprocess.CompletedProcess:
         environment = {"PATH": os.environ["PATH"], **env}
         return subprocess.run(
-            [str(SCRIPT), "--previous", "v0.33.0", "--repo", "o/r", "--head-dir", ".",
+            [str(SCRIPT), "--previous", "v0.34.2", "--repo", "o/r", "--head-dir", ".",
              "--cache-dir", "/nonexistent-cache", "--artifacts-dir", "/nonexistent-out", *args],
             capture_output=True, text=True, check=False, env=environment,
         )

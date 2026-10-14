@@ -50,13 +50,13 @@
 # directories, or systemd manager is read or written. It needs passwordless
 # sudo, systemd, and a Linux x86_64 host.
 #
-# Runtime package: the test installs the official Claude package from the
-# previous release's own daemon archive (`runtime/packages/claude.tar.zst`,
-# authorized by `runtime/runtime-catalog.json`) and starts its session from
-# it, so the previous release must ship both: v0.34.2 or later. An older
-# release, or one whose signed catalog has expired, is refused right after the
-# download, before anything is built and before any account is created.
-#
+# Previous release: the scenario models a previous release with the built-in
+# `claude` and `codex` host profiles (v0.34.2 is the release it is written
+# against). The script needs only that release's three binaries. The official
+# runtime packages come from the head build: its `runtime/` tree is written by
+# `cargo xtask release test-runtime` beside the head binaries, and the upgrade
+# installs them from there.
+
 # Stages: resolve and download the previous release (checksum verified) ->
 # build the test binary from this checkout -> build the target binaries from
 # --head-dir -> run the test in the throwaway account. When the target's
@@ -72,15 +72,17 @@ readonly TARGET_TRIPLE="x86_64-unknown-linux-gnu"
 readonly TEST_NAME="previous_release_session_survives_the_upgrade_to_head"
 # Binaries one daemon archive and one build contain.
 readonly BINARIES=(pohunek pohunekd pohunek-sessiond)
+# Oldest previous release the scenario supports, as X.Y.Z. It is the first
+# release whose built-in `claude` and `codex` host profiles carry the managed
+# hooks the scenario starts its sessions from, so the test cannot model an
+# older one. Compared numerically by `version_at_least`.
+readonly MIN_PREVIOUS_VERSION="0.34.2"
 # Account name prefix; useradd limits names to 32 characters.
 readonly ACCOUNT_PREFIX="phkupg"
 # Lines of each journal kept in the failure diagnostics.
 readonly JOURNAL_LINES=400
 # Byte cap of each daemon or session log tail in the failure diagnostics.
 readonly LOG_TAIL_BYTES=262144
-# Files of the previous daemon archive's `runtime/` the test installs the
-# official Claude package from.
-readonly PREVIOUS_RUNTIME_FILES=(packages/claude.tar.zst runtime-catalog.json)
 # Upper bound, in half-second polls, on the throwaway account's session bus
 # socket appearing after its user manager is started. A hang guard, not a
 # tuned value: a healthy manager creates the socket within a few seconds.
@@ -178,23 +180,18 @@ list_release_tags() {
     --limit 100 --json tagName --jq '.[].tagName'
 }
 
-# Fails unless the extracted previous archive at $1 ships the official Claude
-# package and a signed catalog that has not expired. The daemon refuses an
-# expired catalog on its own; checking `expires_at` here names the cause
-# before anything is built. A catalog without a numeric `expires_at` is left to
-# the daemon to judge.
-require_previous_runtime() {
-  local root=$1 file expires now
-  for file in "${PREVIOUS_RUNTIME_FILES[@]}"; do
-    [ -f "$root/runtime/$file" ] ||
-      fail "$previous ships no runtime/$file; the upgrade test installs the official Claude package from the previous release, which needs v0.34.2 or later"
+# Succeeds when the X.Y.Z version $1 is at least the X.Y.Z version $2. Parts are
+# compared as integers, so 0.34.10 is newer than 0.34.2.
+version_at_least() {
+  local IFS=. left right i
+  read -r -a left <<<"$1"
+  read -r -a right <<<"$2"
+  for i in 0 1 2; do
+    if [ "$((10#${left[i]}))" -ne "$((10#${right[i]}))" ]; then
+      [ "$((10#${left[i]}))" -gt "$((10#${right[i]}))" ]
+      return
+    fi
   done
-  expires=$(jq -r '.catalog.expires_at | numbers' "$root/runtime/runtime-catalog.json") ||
-    fail "$previous ships an unreadable runtime/runtime-catalog.json"
-  now=$(date +%s)
-  if [ -n "$expires" ] && [ "$expires" -le "$now" ]; then
-    fail "the runtime catalog of $previous expired at $(date -u -d "@$expires" '+%Y-%m-%dT%H:%M:%SZ'); its packages cannot be installed, so choose a newer previous release"
-  fi
 }
 
 # Whether the account database already knows $1.
@@ -398,6 +395,8 @@ if [ "$previous" = latest ]; then
 fi
 [[ "$previous" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "previous release tag is not vX.Y.Z: $previous"
 previous_version=${previous#v}
+version_at_least "$previous_version" "$MIN_PREVIOUS_VERSION" ||
+  fail "$previous is older than $MIN_PREVIOUS_VERSION, the oldest previous release the scenario supports"
 info "previous release: $previous"
 if [ "$resolve_only" = true ]; then
   printf '%s\n' "$previous"
@@ -477,12 +476,6 @@ for binary in "${BINARIES[@]}"; do
 done
 [ "$("$staging/previous/pohunek" --version)" = "pohunek $previous_version" ] ||
   fail "the previous pohunek does not report $previous_version"
-# The archive's `runtime/` stays where it was extracted: the staging directory
-# is made readable to the test account below, and the test passes the absolute
-# package and catalog paths to the previous daemon, which reads them as that
-# account.
-require_previous_runtime "$staging/previous"
-
 # ------------------------------------------------------------- test binary
 
 info "building the test binary from $harness_root"
@@ -521,7 +514,7 @@ if [ "$head_version" = "$previous_version" ]; then
 fi
 info "building the target binaries ($head_version) from $head_dir"
 head_executables=$(cd "$head_dir" && cargo build "${build_flags[@]}" \
-  -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli --bins --message-format=json |
+  -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli -p xtask --bins --message-format=json |
   jq -r 'select(.reason == "compiler-artifact" and .executable != null
                 and (.target.kind | index("bin"))) | .executable')
 for binary in "${BINARIES[@]}"; do
@@ -529,6 +522,19 @@ for binary in "${BINARIES[@]}"; do
   [ -x "$source_path" ] || fail "cargo did not build $binary in $head_dir"
   cp "$source_path" "$staging/head/$binary"
 done
+
+# The head's own xtask writes the official runtime packages the head daemon
+# installs from, beside the head binaries in the release layout: the anchor
+# next to the daemon and `runtime/` with the catalog and each package. The
+# catalog is signed with a throwaway key that is discarded, so the tree is
+# test-only. The head tree is the working directory, so the xtask it built
+# reads that checkout's runtime-packages/.
+head_xtask=$(printf '%s\n' "$head_executables" | grep -E '/xtask$' | tail -n 1 || true)
+[ -x "$head_xtask" ] || fail "cargo did not build xtask in $head_dir"
+(cd "$head_dir" && "$head_xtask" release test-runtime --output "$staging/head" \
+  --runtime claude --runtime codex) || fail "cannot write the test runtime tree"
+[ -f "$staging/head/runtime-catalog-anchor.json" ] && [ -f "$staging/head/runtime/runtime-catalog.json" ] ||
+  fail "the test runtime tree is incomplete"
 restore_manifests
 [ "$("$staging/head/pohunek" --version)" = "pohunek $head_version" ] ||
   fail "the head pohunek does not report $head_version"
@@ -582,7 +588,6 @@ status=0
 as_user \
   POHUNEK_SYSTEMD_E2E=1 \
   "POHUNEK_PREVIOUS_BIN_DIR=$staging/previous" \
-  "POHUNEK_PREVIOUS_RUNTIME_DIR=$staging/previous/runtime" \
   "POHUNEK_HEAD_BIN_DIR=$staging/head" \
   "POHUNEK_UPGRADE_ARTIFACTS_DIR=$out_dir" \
   "$staging/release_upgrade" --ignored --exact "$TEST_NAME" --nocapture --test-threads 1 || status=$?

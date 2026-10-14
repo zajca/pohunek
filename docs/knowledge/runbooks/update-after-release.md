@@ -148,23 +148,32 @@ protocol constant that changed (`STORE_SCHEMA_VERSION`, `PROTOCOL_VERSION`,
 `EXPECTED_INTEGRATION_VERSION`); read those lines before updating.
 
 A session launched from a host profile by a previous release that did not
-freeze the profile revision has none recorded, so after the upgrade a plain `pohunek session resume <id>` of it
-fails with `agent_profile_changed` ("no recorded revision"). Resume it with
-`pohunek session resume <id> --accept-profile-change`: the relaunch uses
-the current profile and freezes its revision, and later plain resumes work. The
-local daemon honors the flag; a remote host refuses it.
+freeze the profile revision has none recorded, so a plain `pohunek session resume <id>` of it
+fails with `agent_profile_changed` ("no recorded revision"). Check the profile
+first, then resume it with `pohunek session resume <id> --accept-profile-change`:
+the relaunch uses the current profile and freezes its revision, and later plain
+resumes work. The local daemon honors the flag; a remote host refuses it. The
+upgrade's own profile pins are not such a change: a built-in session whose
+profile differs only by the `package` and `digest` keys the upgrade writes
+resumes with a plain `resume`, and a refusal of that resume is a defect to report.
 
 CI proves the window on every change to the daemon, worker, protocol, or CLI
-crates and on every release tag: the `upgrade` workflow installs the previous
-release's published binaries, starts a session whose fake agent runs that
-release's managed hooks, upgrades the service to the new build with
-`pohunek service check` and `pohunek service upgrade`, and asserts that the
-same worker keeps the session live, `screen`, `input`, hook reports and
-notifications still work, `stop` then `resume --accept-profile-change`
-relaunch with the native reference (a plain `resume` is refused first), and the previous release's own CLI still talks to the new daemon.
-A failure there means a live session would not survive the upgrade; fix it
-before releasing. The run keeps the previous release's store and protocol
-outputs as the `upgrade-goldens-<tag>` artifact.
+crates and on every release tag: the `upgrade` workflow stages the previous
+release's published binaries, whose host profiles run the built-in Claude and
+Codex runtimes with the release's managed hooks. It starts a stopped and a live
+Claude session, then runs `pohunek service check` and one
+`pohunek service upgrade` of the new build without `--accept-runtime-loss`. The
+step installs the release's official packages, pins every host profile to them,
+and reinstalls the hooks. The test asserts that the live session is adopted by
+the same worker and keeps `screen`, `input`, hook reports and notifications
+working, that the stopped session resumes with a plain `resume`, which must
+succeed, onto the package digest its profile names, that `stop` and a plain
+resume of the adopted session relaunch through the package, that new Claude and
+Codex sessions launch through the packages, and that the previous release's own CLI
+still talks to the new daemon. A failure there means a live session would not
+survive the upgrade or a profile would not launch; fix it before releasing. The
+run keeps the previous release's store and protocol outputs as the
+`upgrade-goldens-<tag>` artifact.
 
 On its first start after an update the daemon migrates an older store before
 it serves anything and first copies the original to
@@ -685,6 +694,12 @@ reported as a gap with the command that installs it; nothing is written into it.
 The manual migration below remains the fallback for a host that cannot run the
 upgrade's runtime step, for example to move its sessions before an upgrade.
 
+A host whose previous release installed the packages itself (its own `service
+install` pinned its profiles to them) keeps those pins. The plan then reports the
+head's package as `present` when its digest is the one the host serves, and as
+`install` otherwise; no profile is planned, and the sessions and profiles stay on
+their pinned package until `plugin profile migrate` moves a profile.
+
 The apply is judged once more. After it, the new release's preflight judges the
 live sessions again, with the same decision as before the apply, because the
 apply may select a package with another native contract. A session at risk, or
@@ -724,9 +739,10 @@ CLI that wrote it or with this release.
 
 ## Move Claude and Codex sessions to the official package before upgrading
 
-The upgrade installs and pins the official packages itself (see above), so the
-steps below are optional. They are the manual path to the same state, for a
-host that migrates before it runs the upgrade.
+The upgrade installs and pins the official packages itself (see above), so no
+manual step is needed before `pohunek service upgrade`. The steps below are the
+manual path to the same state, for a host that cannot run the upgrade's runtime
+step or that must move its sessions before the upgrade.
 
 A session records the runtime source it was launched from: a built-in runtime
 compiled into the daemon, or the digest of an installed runtime package.
@@ -785,8 +801,8 @@ serving the sessions and profiles pinned to it. `pohunek plugin update
 <package> <archive> --catalog <catalog> --yes` with the new release's archive
 installs and selects its version for new launches; a profile moves to it only
 through `plugin profile migrate`. The release upgrade test
-(`scripts/upgrade-test`, `crates/cli/tests/release_upgrade.rs`) runs this path
-for Claude from the previous release to the build under test.
+(`scripts/upgrade-test`, `crates/cli/tests/release_upgrade.rs`) runs the one-step
+path for Claude and Codex from the previous release to the build under test.
 
 ## Hook stderr capture from 0.35
 

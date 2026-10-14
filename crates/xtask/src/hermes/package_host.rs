@@ -21,21 +21,18 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ed25519_dalek::SigningKey;
 use package::{
-    catalog_document_bytes, read_archive, sign_catalog, AnchorFile, AnchorFileError, Attestation,
-    BinarySet, Catalog, CatalogEntry, Limits as PackageLimits, PackageDigest, Release, RootKey,
-    Sha256Digest, ANCHOR_FILE_NAME, CATALOG_SCHEMA_VERSION,
+    read_archive, CatalogEntry, Limits as PackageLimits, PackageDigest, ANCHOR_FILE_NAME,
 };
 use serde_json::Value;
-use zeroize::Zeroize as _;
 
 use super::{
     bounded_process_failure, fail, push_path_forms, require_safe_pohunek_binary, run_process,
     sanitize_output, ProcessOutput, DAEMON_SOCKET_RELATIVE_PATH, EXPECTED_PACKAGE_ID,
     EXPECTED_RUNTIME_ID, PROCESS_POLL_INTERVAL,
 };
-use crate::catalog::{archive_identity, read_input, unix_now, verify_bytes};
+use crate::catalog::{archive_identity, read_input};
+use crate::throwaway_trust::{self, write_public, CoreRelease, Trust};
 use crate::XtaskError;
 
 /// The release executables the gate installs, by file name in `--bin-dir`.
@@ -48,9 +45,6 @@ pub(crate) const CATALOG_FILE: &str = "runtime-catalog.json";
 /// installer's public mode. The daemon refuses an anchor whose directory chain
 /// group or others can write.
 const PUBLIC_EXECUTABLE_MODE: u32 = 0o755;
-
-/// Mode of the anchor and catalog files, which hold public data only.
-const PUBLIC_FILE_MODE: u32 = 0o644;
 
 /// Directory below the isolation root that holds the installed executables
 /// and the anchor beside the daemon.
@@ -65,30 +59,6 @@ const ARCHIVE_FILE: &str = "hermes.tar.zst";
 
 /// File the daemon's combined output is written to.
 const DAEMON_LOG_FILE: &str = "pohunekd.log";
-
-/// Seconds a throwaway catalog stays valid. A day covers a gate run and a
-/// release smoke started from the same job, and leaves no long-lived document.
-const CATALOG_LIFETIME_SECONDS: u64 = 24 * 60 * 60;
-
-/// Publication counter of the throwaway catalog; the isolated host has no
-/// catalog high-water mark, so any positive value is accepted.
-const CATALOG_SEQUENCE: u64 = 1;
-
-/// Core range of the throwaway entry. The gate authorizes one archive for the
-/// binaries it was handed; core compatibility is not what it checks.
-const ANY_CORE: &str = ">=0.0.0";
-
-/// Source commit of the throwaway release block. A placeholder: 40 hex digits
-/// are the only property the daemon checks.
-const PLACEHOLDER_COMMIT: &str = "0000000000000000000000000000000000000000";
-
-/// Binary-set and attestation digest of the throwaway catalog. A placeholder:
-/// the daemon checks the shape, and no release attests this archive yet.
-const PLACEHOLDER_DIGEST: &str =
-    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-
-/// Core version recorded in the throwaway release block; shape only.
-const RELEASE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Variable selecting direct-child worker supervision, the documented
 /// dev/test contract for a daemon without a service manager.
@@ -112,8 +82,10 @@ const DAEMON_EXIT_TIMEOUT: Duration = Duration::from_mins(1);
 /// Trailing daemon-log bytes a failure reports, after sanitization.
 const DAEMON_LOG_TAIL_BYTES: u64 = 4 * 1024;
 
-/// Bytes of operating-system randomness an Ed25519 seed takes.
-const SEED_BYTES: usize = 32;
+/// Publication counter of the Hermes gate's throwaway catalog. The gate's
+/// prefix starts with an empty catalog state, so no high-water mark exists
+/// and any positive value is accepted.
+const CATALOG_SEQUENCE: u64 = 1;
 
 /// The release binaries and the Hermes package archive the gate installs.
 #[derive(Debug)]
@@ -181,24 +153,7 @@ pub(super) fn read_package(path: &Path) -> Result<Package, XtaskError> {
         )));
     }
     let digest = verified.digest().clone();
-    let platforms = machine_platforms();
-    let placeholder = placeholder_digest()?;
-    let entry = CatalogEntry {
-        package_id: identity.package_id,
-        runtime_id: identity.runtime_id,
-        version: identity.version,
-        digest: digest.clone(),
-        runtime_api: identity.runtime_api,
-        attestations: platforms
-            .iter()
-            .map(|platform| Attestation {
-                platform: platform.clone(),
-                digest: placeholder.clone(),
-            })
-            .collect(),
-        platforms,
-        core: ANY_CORE.to_owned(),
-    };
+    let entry = throwaway_trust::package_entry(identity, digest.clone())?;
     Ok(Package {
         bytes,
         digest,
@@ -206,58 +161,13 @@ pub(super) fn read_package(path: &Path) -> Result<Package, XtaskError> {
     })
 }
 
-/// A signed catalog authorizing one package and the anchor file that trusts
-/// its signer. The signing key is dropped once the catalog is signed.
-#[derive(Debug)]
-pub(super) struct Trust {
-    pub(super) anchor: Vec<u8>,
-    pub(super) catalog: Vec<u8>,
-}
-
-/// Signs a catalog that authorizes exactly `package` with a fresh random key
-/// and returns it with the anchor trusting that key.
-///
-/// The document is verified against the anchor before it is returned, so a
-/// catalog the daemon would refuse is never used.
-pub(super) fn throwaway_trust(package: &Package) -> Result<Trust, XtaskError> {
-    let now = unix_now()?;
-    let expires_at = now.saturating_add(CATALOG_LIFETIME_SECONDS);
-    let key = random_key()?;
-    let root = RootKey::new(key.verifying_key().to_bytes(), 0, expires_at)
-        .map_err(|error| XtaskError::Anchor(AnchorFileError::Anchor(error)))?;
-    let anchor = AnchorFile::new(vec![root], Vec::new())
-        .map_err(|error| XtaskError::Anchor(AnchorFileError::Anchor(error)))?
-        .to_bytes()
-        .map_err(XtaskError::Anchor)?;
-    let placeholder = placeholder_digest()?;
-    let catalog = Catalog {
-        schema_version: CATALOG_SCHEMA_VERSION,
+/// Signs a catalog that authorizes exactly `package` with a fresh random key.
+fn throwaway_trust(package: &Package) -> Result<Trust, XtaskError> {
+    let release = CoreRelease {
         sequence: CATALOG_SEQUENCE,
-        expires_at,
-        release: Release {
-            version: RELEASE_VERSION.to_owned(),
-            commit: PLACEHOLDER_COMMIT.to_owned(),
-            binary_sets: package
-                .entry
-                .platforms
-                .iter()
-                .map(|target| BinarySet {
-                    target: target.clone(),
-                    digest: placeholder.clone(),
-                })
-                .collect(),
-        },
-        revoked_key_ids: Vec::new(),
-        revoked_digests: Vec::new(),
-        entries: vec![package.entry.clone()],
+        ..throwaway_trust::core_release(env!("CARGO_PKG_VERSION"))?
     };
-    let envelope = sign_catalog(catalog, &key).map_err(XtaskError::Catalog)?;
-    let document = catalog_document_bytes(&envelope).map_err(XtaskError::Catalog)?;
-    verify_bytes(&document, &anchor, None, now)?;
-    Ok(Trust {
-        anchor,
-        catalog: document,
-    })
+    throwaway_trust::sign(std::slice::from_ref(&package.entry), &release)
 }
 
 /// Writes the anchor file and the signed catalog for `package` into
@@ -276,52 +186,6 @@ pub(crate) fn write_throwaway_trust(package: &Path, output_dir: &Path) -> Result
         })?;
     write_public(&output_dir.join(ANCHOR_FILE_NAME), &trust.anchor)?;
     write_public(&output_dir.join(CATALOG_FILE), &trust.catalog)
-}
-
-/// A fresh Ed25519 key from operating-system randomness; the seed buffer is
-/// cleared once the key holds it.
-fn random_key() -> Result<SigningKey, XtaskError> {
-    let mut seed = [0_u8; SEED_BYTES];
-    getrandom::getrandom(&mut seed).map_err(|error| {
-        fail(format!(
-            "operating-system randomness is unavailable: {error}"
-        ))
-    })?;
-    let key = SigningKey::from_bytes(&seed);
-    seed.zeroize();
-    Ok(key)
-}
-
-fn placeholder_digest() -> Result<Sha256Digest, XtaskError> {
-    Sha256Digest::parse(PLACEHOLDER_DIGEST)
-        .map_err(|_error| fail("the placeholder catalog digest is invalid"))
-}
-
-/// The platform names a release daemon of this machine can report. The C
-/// library of a Linux release binary (glibc or musl) is a property of the
-/// binary under test, not of xtask, so both are listed.
-fn machine_platforms() -> Vec<String> {
-    let arch = std::env::consts::ARCH;
-    if cfg!(target_os = "macos") {
-        vec![format!("{arch}-apple-darwin")]
-    } else {
-        vec![
-            format!("{arch}-unknown-linux-gnu"),
-            format!("{arch}-unknown-linux-musl"),
-        ]
-    }
-}
-
-/// Writes public bytes to a new file with [`PUBLIC_FILE_MODE`].
-fn write_public(path: &Path, bytes: &[u8]) -> Result<(), XtaskError> {
-    fs::write(path, bytes)
-        .and_then(|()| fs::set_permissions(path, fs::Permissions::from_mode(PUBLIC_FILE_MODE)))
-        .map_err(|error| {
-            fail(format!(
-                "cannot write the gate file `{}`: {error}",
-                path.display()
-            ))
-        })
 }
 
 /// A running copy of the release daemon in the isolated prefix, and the CLI

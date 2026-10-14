@@ -61,28 +61,33 @@ way (`POHUNEK_DAEMON_BIN`, `POHUNEK_WORKER_BIN`, and `POHUNEK_CLI_BIN` point the
 suites at the built binaries). The `upgrade from the previous release` CI job (`.github/workflows/upgrade.yml`,
 called by `ci.yml` when the daemon, worker, protocol, or CLI crates change, and
 by `release.yml` before any publishable binary is built) installs the previous
-release's published Linux binaries (checksum verified, never rebuilt), installs
-the official Claude package from that release's own archive
-(`plugin install runtime/packages/claude.tar.zst --catalog
-runtime/runtime-catalog.json --yes`), pins the two fake-agent host profiles to it
-with `plugin profile migrate`, starts a session from the package with a fake
-agent running that release's managed hooks, upgrades the service to this build
-with `pohunek service check` and `service upgrade`, and asserts both preflights
-judge the session `adoptable`, the session stays live on the same worker,
-`screen`, `input`, hooks and notifications work, the metadata store keeps the
-session pinned to the same package digest after the adoption and after the
-resume, `stop` then `resume` relaunch from that digest with the native
-reference, the head links a probe package directory (so its daemon installs an
-archive of this build's package format, which can differ from the previous
-release's) next to the pinned package, and the previous release's CLI still
-talks to the new daemon (`crates/cli/tests/release_upgrade.rs`). The previous release must ship
-`runtime/packages/claude.tar.zst` and a signed catalog that has not expired, so
+release's published Linux binaries (checksum verified, never rebuilt), runs
+it on the built-in Claude Code and Codex runtimes, with no package installed and
+no profile pinned. It installs its managed Claude hooks and starts a stopped and
+a live session of Claude profiles, each launched by a fake agent that runs those
+hooks (`crates/cli/tests/release_upgrade.rs`). This build then runs
+`pohunek service check` and one `pohunek service upgrade` without
+`--accept-runtime-loss`, and the test asserts that both preflights judge the live
+and the stopped session `adoptable`, that the plan installs the claude and codex
+packages and binds every profile, and that the applied step pins every host
+profile to the head's package digests and reinstalls the hooks. The live session
+is adopted by the same worker and keeps `screen`, `input`, hooks and
+notifications working, and the store keeps its built-in binding until a
+relaunch. The stopped session resumes with a plain `resume`, which must succeed,
+and its new run is pinned to the package digest; the adopted live session then
+stops and resumes through the package too. The head links a probe package
+directory (so its daemon installs an archive of this build's package format),
+new Claude and Codex sessions launch through the packages, and the previous
+release's CLI still talks to the new daemon. The head's `runtime/` tree and its
+anchor are staged by `cargo xtask release test-runtime` (a test-only catalog
+with a discarded key), so the step runs against the head's own packages. The
+fake agents are scripts whose interpreters are copies of `/bin/sh` named
+`fake-claude-sh` and `fake-codex-sh` (the worker accepts a launch process only by
+an executable name containing its provider), and they answer `--version` with the
+lowest release the head package's descriptor accepts. The previous release must ship a
+built-in Claude and Codex runtime with the daemon archive it installs from, so
 v0.34.2 is the oldest usable previous release; `scripts/upgrade-test` refuses an
-older one, or an expired catalog, before building anything. The fake agents are
-scripts whose interpreter is a copy of `/bin/sh` named `fake-claude-sh` (the
-worker accepts a claude launch process only by an executable name containing
-`claude`), and they answer `--version` with the lowest release the installed
-package's descriptor accepts. It uploads the previous release's store
+older one before downloading or building anything. It uploads the previous release's store
 and protocol outputs as the `upgrade-goldens-<tag>` artifact. Run it on any pair
 with `gh workflow run upgrade.yml -f previous_tag=v0.34.2 -f head_ref=<ref>`
 (the harness comes from the dispatched ref; `head_ref` is only the source built
