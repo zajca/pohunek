@@ -24,8 +24,9 @@ use pohunek_daemon::lock::InstanceLock;
 use pohunek_paths::{METADATA_STORE_NAME as STORE_NAME, PLUGINS_SUBDIR};
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, PackageStatus, ProfileStatus, UseReason, CODE_DAEMON_RUNNING,
+    CODE_GAP_AGENT_NOT_ON_PATH, CODE_GAP_CONFIG_HOME_MISSING, CODE_GAP_SERVED_BY_OTHER_PACKAGE,
     CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, CODE_PROFILE_NOT_MIGRATABLE,
-    CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE, DRY_RUN_FLAG,
+    CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE, DETECT_FLAG, DRY_RUN_FLAG,
     ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
 };
 use pohunek_test_support::bin_exe;
@@ -1071,6 +1072,349 @@ fn a_missing_service_file_refuses_the_plan_and_changes_nothing() {
         assert!(report.packages.is_empty());
         assert!(report.profiles.is_empty());
     }
+    assert_eq!(host.profile_text(), profile);
+    assert!(!host.plugins_dir().exists());
+}
+
+/// The directory the detection step's `PATH` names, which holds the programs a
+/// test makes available to the step.
+fn programs_dir(host: &Host) -> PathBuf {
+    host.env.root().join("programs")
+}
+
+impl Host {
+    /// Makes an executable `name` available to the detection step.
+    fn put_program(&self, name: &str) {
+        let dir = programs_dir(self);
+        fs::create_dir_all(&dir).expect("the programs directory");
+        let path = dir.join(name);
+        fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write the program");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .expect("make the program executable");
+    }
+
+    /// Creates the config home `name` below the user's home, as an agent's
+    /// first start does.
+    fn make_home(&self, name: &str) -> PathBuf {
+        let dir = self.env.home().join(name);
+        fs::create_dir_all(&dir).expect("the config home");
+        dir
+    }
+
+    /// Runs the detection plan with only the programs made available as its
+    /// search path, and parses its report.
+    fn detect_step(&self) -> EnsureReport {
+        let output = self.raw_detect();
+        assert!(
+            output.status.success(),
+            "the detection exits 0, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("the step prints its report as JSON")
+    }
+
+    fn raw_detect(&self) -> Output {
+        let dir = programs_dir(self);
+        fs::create_dir_all(&dir).expect("the programs directory");
+        self.env
+            .command(&self.binary)
+            .arg(ENSURE_RUNTIMES_ARG)
+            .arg(DRY_RUN_FLAG)
+            .arg(DETECT_FLAG)
+            .env("PATH", &dir)
+            .output()
+            .expect("run the daemon binary")
+    }
+}
+
+/// The gaps of `report` as (runtime, code) pairs, in order.
+fn gap_codes(report: &EnsureReport) -> Vec<(&str, &str)> {
+    report
+        .gaps
+        .iter()
+        .map(|gap| (gap.runtime.as_str(), gap.code.as_str()))
+        .collect()
+}
+
+#[test]
+fn a_fresh_host_with_the_programs_on_the_search_path_detects_every_runtime_and_changes_nothing() {
+    let host = Host::new();
+    host.publish(&["claude", "codex", "pi"]);
+    host.put_program("claude");
+    host.put_program("codex");
+    host.put_program("pi");
+    let claude_home = host.make_home(".claude");
+    let codex_home = host.make_home(".codex");
+
+    let without_detect = host.step(true);
+    let plan = host.detect_step();
+
+    assert!(
+        without_detect.packages.is_empty(),
+        "without --detect nothing is planned"
+    );
+    assert!(without_detect.gaps.is_empty());
+    assert_eq!(plan.report_version, ENSURE_REPORT_VERSION);
+    assert!(plan.dry_run);
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert!(plan.gaps.is_empty(), "{:?}", plan.gaps);
+    let planned: Vec<(&str, PackageStatus, &[UseReason])> = plan
+        .packages
+        .iter()
+        .map(|package| {
+            (
+                package.runtime.as_str(),
+                package.status,
+                package.reasons.as_slice(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        planned,
+        [
+            ("claude", PackageStatus::Install, &[UseReason::Detected][..]),
+            ("codex", PackageStatus::Install, &[UseReason::Detected][..]),
+            ("pi", PackageStatus::Install, &[UseReason::Detected][..]),
+        ]
+    );
+    let homes: Vec<(&str, Option<&str>)> = plan
+        .integrations
+        .iter()
+        .map(|action| (action.runtime.as_str(), action.profile.as_deref()))
+        .collect();
+    assert_eq!(
+        homes,
+        [("claude", None), ("codex", None)],
+        "Pi declares no hooks"
+    );
+    assert!(claude_home.is_dir() && codex_home.is_dir());
+    assert!(
+        !host.plugins_dir().exists(),
+        "a detection creates no package store"
+    );
+}
+
+#[test]
+fn a_runtime_already_used_keeps_its_reasons_and_gains_detected() {
+    let host = Host::new();
+    host.publish(&["claude", "codex"]);
+    host.put_program("claude");
+    host.make_home(".claude");
+    let profile = host.write_claude_profile();
+
+    let plan = host.detect_step();
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    let claude = plan
+        .packages
+        .iter()
+        .find(|package| package.runtime == "claude")
+        .expect("the profile's runtime is planned");
+    assert_eq!(claude.reasons, [UseReason::Profile, UseReason::Detected]);
+    assert_eq!(
+        plan.profiles.len(),
+        1,
+        "the profile is planned to be pinned"
+    );
+    assert_eq!(
+        host.profile_text(),
+        profile,
+        "a detection leaves the profile"
+    );
+}
+
+#[test]
+fn a_program_missing_from_the_search_path_is_a_gap_and_its_runtime_is_not_planned() {
+    let host = Host::new();
+    host.publish(&["claude", "codex", "pi"]);
+    host.put_program("claude");
+    host.put_program("pi");
+    host.make_home(".claude");
+
+    let plan = host.detect_step();
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(gap_codes(&plan), [("codex", CODE_GAP_AGENT_NOT_ON_PATH)]);
+    let planned: Vec<&str> = plan
+        .packages
+        .iter()
+        .map(|package| package.runtime.as_str())
+        .collect();
+    assert_eq!(planned, ["claude", "pi"]);
+    assert!(!host.plugins_dir().exists());
+}
+
+#[test]
+fn a_missing_config_home_is_a_gap_and_the_package_is_still_planned_without_creating_the_home() {
+    let host = Host::new();
+    host.publish(&["claude"]);
+    host.put_program("claude");
+
+    let plan = host.detect_step();
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(gap_codes(&plan), [("claude", CODE_GAP_CONFIG_HOME_MISSING)]);
+    assert_eq!(plan.packages.len(), 1);
+    assert_eq!(plan.packages[0].status, PackageStatus::Install);
+    assert!(
+        plan.integrations.is_empty(),
+        "no hooks are planned into a missing home"
+    );
+    assert!(
+        !host.env.home().join(".claude").exists(),
+        "the step never creates a config home"
+    );
+    assert!(!host.plugins_dir().exists());
+}
+
+#[test]
+fn a_profile_home_that_does_not_exist_is_a_gap_and_its_hooks_are_not_listed() {
+    let host = Host::new();
+    host.publish(&["claude"]);
+    host.put_program("claude");
+    host.make_home(".claude");
+    let work_home = host.env.root().join("work-claude");
+    let work = host.profiles_dir().join("work.toml");
+    fs::write(
+        &work,
+        format!(
+            "base = \"claude\"\n\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+            work_home.display()
+        ),
+    )
+    .expect("write the work profile");
+    fs::set_permissions(&work, fs::Permissions::from_mode(0o600)).expect("secure the profile");
+    // A relative config directory is not one the agent can be launched with.
+    let relative = host.profiles_dir().join("relative.toml");
+    fs::write(
+        &relative,
+        "base = \"claude\"\n\n[env]\nCLAUDE_CONFIG_DIR = \"relative-claude\"\n",
+    )
+    .expect("write the relative profile");
+    fs::set_permissions(&relative, fs::Permissions::from_mode(0o600)).expect("secure the profile");
+
+    let plan = host.detect_step();
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(
+        gap_codes(&plan),
+        [
+            ("claude", CODE_GAP_CONFIG_HOME_MISSING),
+            ("claude", CODE_GAP_CONFIG_HOME_MISSING),
+        ]
+    );
+    let relative_gap = plan
+        .gaps
+        .iter()
+        .find(|gap| gap.detail.contains("`relative`"))
+        .expect("the relative profile is a gap");
+    assert!(
+        relative_gap.detail.contains("cannot be resolved"),
+        "{}",
+        relative_gap.detail
+    );
+    let work_gap = plan
+        .gaps
+        .iter()
+        .find(|gap| gap.detail.contains("`work`"))
+        .expect("the work profile is a gap");
+    assert!(
+        work_gap.detail.contains("does not exist"),
+        "{}",
+        work_gap.detail
+    );
+    let integrations: Vec<(&str, Option<&str>)> = plan
+        .integrations
+        .iter()
+        .map(|action| (action.runtime.as_str(), action.profile.as_deref()))
+        .collect();
+    assert_eq!(integrations, [("claude", None)]);
+    assert!(!work_home.exists(), "the step never creates a profile home");
+}
+
+#[tokio::test]
+async fn a_runtime_served_by_another_package_is_reported_and_its_installed_state_is_untouched() {
+    let host = Host::new();
+    host.publish(&["pi"]);
+    host.put_program("pi");
+    let foreign = official_runtimes::preinstall_third_party(
+        &host.plugins_dir(),
+        host.env.root(),
+        "pi",
+        "acme.runtime.pi",
+    )
+    .await;
+    let registry_before =
+        fs::read(host.registry_path()).expect("the registry before the detection");
+
+    let plan = host.detect_step();
+
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(gap_codes(&plan), [("pi", CODE_GAP_SERVED_BY_OTHER_PACKAGE)]);
+    assert!(
+        plan.packages.is_empty(),
+        "the other package is not replaced"
+    );
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry after the detection"),
+        registry_before,
+        "a detection writes nothing"
+    );
+    assert!(
+        host.plugins_dir()
+            .join("packages")
+            .join(foreign.as_str().trim_start_matches("sha256:"))
+            .is_dir(),
+        "the other package keeps its root"
+    );
+}
+
+#[test]
+fn a_platform_without_a_package_is_a_gap_with_detect_and_a_refusal_without() {
+    let host = Host::new();
+    host.publish(&["codex"]);
+    host.write_claude_profile();
+
+    let refused = host.step(true);
+    let plan = host.detect_step();
+
+    assert_eq!(
+        refusal_codes(&refused),
+        [CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM]
+    );
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(
+        gap_codes(&plan),
+        [
+            ("claude", CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM),
+            ("codex", CODE_GAP_AGENT_NOT_ON_PATH),
+        ]
+    );
+    assert!(plan.packages.is_empty());
+    assert!(!host.plugins_dir().exists());
+}
+
+#[test]
+fn detect_without_dry_run_is_a_usage_error_and_changes_nothing() {
+    let host = Host::new();
+    host.publish(&["claude"]);
+    let profile = host.write_claude_profile();
+
+    let output = host
+        .env
+        .command(&host.binary)
+        .arg(ENSURE_RUNTIMES_ARG)
+        .arg(DETECT_FLAG)
+        .output()
+        .expect("run the daemon binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(DETECT_FLAG) && stderr.contains(DRY_RUN_FLAG),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty());
     assert_eq!(host.profile_text(), profile);
     assert!(!host.plugins_dir().exists());
 }

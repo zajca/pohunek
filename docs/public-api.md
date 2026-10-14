@@ -2185,6 +2185,26 @@ running across an upgrade from the previous private protocol version keeps
 starting its session's children from its own sanitized environment until that
 session gets a new worker generation.
 
+`pohunekd ensure-official-runtimes` is the offline runtime step of the release;
+`--dry-run` computes its plan without changing anything. `--dry-run --detect` also
+plans every runtime of the release catalog for this platform whose program is on
+the daemon's search path, each with the reason `detected` (a runtime the host uses
+keeps its other reasons). `--detect` without `--dry-run` is a usage error. Its
+`gaps` list, one per runtime with `runtime`, `code` and a `detail` that names the
+one next step: `agent_not_on_search_path` (the program is not on the search path;
+the runtime is planned only when the host uses it), `config_home_missing` (the
+declared config home does not exist; the package is still planned and the step
+never creates the home), `runtime_served_by_other_package` (another package serves
+the runtime id; it is left untouched), and `official_package_unavailable_for_platform`
+(the release catalog lists no package for this platform; a refusal without
+`--detect`). A gap never blocks an apply, and `gaps` is always empty without
+`--detect`. `integrations` lists the config homes the installer reinstalls hooks
+into: without `--detect`, the homes that already hold hooks; with `--detect`, each
+existing home of a planned runtime whose hooks the setup installs, whether or not
+hooks are present yet (Pi declares none). Each distinct home appears once. `reason`
+values are `profile`, `session`, `integration` and `detected`. The report layout
+stays at `report_version` 1.
+
 `pohunek service upgrade` and `pohunek service check` of an existing service run
 a read-only preflight before any effect by invoking `pohunekd upgrade-preflight`
 of the staged archive. That mode takes no other argument, is an internal contract

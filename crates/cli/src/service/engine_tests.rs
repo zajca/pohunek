@@ -320,6 +320,7 @@ fn runtime_report(
             profile: None,
         }],
         refusals,
+        gaps: Vec::new(),
     }
 }
 

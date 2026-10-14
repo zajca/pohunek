@@ -195,30 +195,78 @@ impl OfficialCatalog {
     /// the plugin root later serves the packages from their recorded official
     /// provenance, with or without this key in its trust anchor.
     pub(crate) async fn preinstall(&self, plugins_dir: &Path, scratch: &Path) {
-        let worker_home = scratch.join("installer");
-        let environment = SubprocessWorkerEnvironment {
-            runtime_home: worker_home.join("runtime"),
-            state_home: worker_home.join("state"),
-            data_home: worker_home.join("data"),
-            config_home: worker_home.join("config"),
-            cache_home: worker_home.join("cache"),
-            home: worker_home.clone(),
-            daemon_socket: worker_home.join("daemon.sock"),
-        };
-        let config = SessionRegistryConfig {
-            worker_runtime_root: Some(environment.runtime_home.join("pohunek/workers")),
-            worker_state_root: Some(environment.state_home.join("pohunek/workers")),
-            supervision: Some(environment.supervision(worker_binary())),
-            ..SessionRegistryConfig::default()
-        };
-        let registry = SessionRegistry::new_production_with_inspector(
-            self.configure(config, plugins_dir.to_path_buf()),
-            Arc::new(SubprocessWorkerLauncher::new()),
-            Arc::new(HostInspector::new()),
-        )
-        .expect("the installer registry opens the plugin root");
+        let registry = installer_registry(
+            self.configure(installer_config(scratch), plugins_dir.to_path_buf()),
+        );
         self.install(&registry, scratch).await;
     }
+}
+
+/// The registry configuration of an installer run whose workers live below
+/// `scratch`.
+fn installer_config(scratch: &Path) -> SessionRegistryConfig {
+    let worker_home = scratch.join("installer");
+    let environment = SubprocessWorkerEnvironment {
+        runtime_home: worker_home.join("runtime"),
+        state_home: worker_home.join("state"),
+        data_home: worker_home.join("data"),
+        config_home: worker_home.join("config"),
+        cache_home: worker_home.join("cache"),
+        home: worker_home.clone(),
+        daemon_socket: worker_home.join("daemon.sock"),
+    };
+    SessionRegistryConfig {
+        worker_runtime_root: Some(environment.runtime_home.join("pohunek/workers")),
+        worker_state_root: Some(environment.state_home.join("pohunek/workers")),
+        supervision: Some(environment.supervision(worker_binary())),
+        ..SessionRegistryConfig::default()
+    }
+}
+
+/// A production registry over `config`, for an installer run.
+fn installer_registry(config: SessionRegistryConfig) -> SessionRegistry {
+    SessionRegistry::new_production_with_inspector(
+        config,
+        Arc::new(SubprocessWorkerLauncher::new()),
+        Arc::new(HostInspector::new()),
+    )
+    .expect("the installer registry opens the plugin root")
+}
+
+/// Installs a copy of `runtime-packages/<runtime>` whose descriptor declares
+/// `package_id` instead of the official id, as a local third-party package
+/// with an explicit digest, enabled and selected. Returns its digest.
+///
+/// The package serves `runtime`'s id without catalog authority, so a daemon
+/// over `plugins_dir` judges every official package of that id as a conflict.
+pub(crate) async fn preinstall_third_party(
+    plugins_dir: &Path,
+    scratch: &Path,
+    runtime: &str,
+    package_id: &str,
+) -> PackageDigest {
+    let (bytes, digest) = third_party_archive(runtime, package_id);
+    let archive = scratch.join(format!("third-party-{runtime}.tar.zst"));
+    std::fs::write(&archive, bytes).expect("write the third-party package archive");
+    let config = SessionRegistryConfig {
+        plugins_dir: Some(plugins_dir.to_path_buf()),
+        ..installer_config(scratch)
+    };
+    let registry = installer_registry(config);
+    let result = registry
+        .package_install(PackageInstallParams {
+            archive_path: path_string(&archive),
+            trust: PackageTrust::ExplicitDigest {
+                digest: digest.clone(),
+            },
+            enable: true,
+            select: true,
+            dry_run: false,
+        })
+        .await
+        .unwrap_or_else(|error| panic!("the third-party {runtime} package installs: {error:?}"));
+    assert_eq!(result.status, PackageInstallStatus::Installed, "{runtime}");
+    digest
 }
 
 /// The `--version` banner of the release `compat/<runtime>/compatibility-lock.json`
@@ -300,30 +348,53 @@ fn built_archive(runtime: &str) -> (Vec<u8>, PackageDigest) {
 /// directory whose descriptor declares `version`: the bytes and digest a later
 /// release of the same package carries.
 pub(crate) fn variant_archive(runtime: &str, version: &str) -> (Vec<u8>, PackageDigest) {
+    edited_archive(runtime, &|name, text| {
+        if name != "runtime.toml" {
+            return text;
+        }
+        let mut replaced = false;
+        text.lines()
+            .map(|line| {
+                if !replaced && line.starts_with("version = ") {
+                    replaced = true;
+                    format!("version = \"{version}\"")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    })
+}
+
+/// The archive of `runtime-packages/<runtime>` whose descriptor declares
+/// `package_id` instead of the official package id.
+fn third_party_archive(runtime: &str, package_id: &str) -> (Vec<u8>, PackageDigest) {
+    let official = format!("id = \"pohunek.runtime.{runtime}\"");
+    edited_archive(runtime, &|name, text| {
+        if name == "runtime.toml" {
+            text.replacen(&official, &format!("id = \"{package_id}\""), 1)
+        } else {
+            text
+        }
+    })
+}
+
+/// The archive of a copy of `runtime-packages/<runtime>` whose every file
+/// passes through `edit` with its name.
+fn edited_archive(
+    runtime: &str,
+    edit: &dyn Fn(&str, String) -> String,
+) -> (Vec<u8>, PackageDigest) {
     let source = workspace_root().join("runtime-packages").join(runtime);
     let scratch = pohunek_test_support::tempdir().expect("a scratch directory");
     for entry in std::fs::read_dir(&source).expect("the runtime package directory") {
         let path = entry.expect("a package file entry").path();
         let name = path.file_name().expect("a file name").to_owned();
         let text = std::fs::read_to_string(&path).expect("a package file");
-        let text = if name == "runtime.toml" {
-            let mut replaced = false;
-            text.lines()
-                .map(|line| {
-                    if !replaced && line.starts_with("version = ") {
-                        replaced = true;
-                        format!("version = \"{version}\"")
-                    } else {
-                        line.to_owned()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-                + "\n"
-        } else {
-            text
-        };
-        std::fs::write(scratch.path().join(name), text).expect("copy a package file");
+        let edited = edit(&name.to_string_lossy(), text);
+        std::fs::write(scratch.path().join(name), edited).expect("copy a package file");
     }
     archive_of(scratch.path(), runtime)
 }

@@ -1003,6 +1003,7 @@ mod tests {
                     profile: None,
                 }],
                 refusals: Vec::new(),
+                gaps: Vec::new(),
             }),
         }
     }
@@ -1114,6 +1115,7 @@ mod tests {
             profiles: Vec::new(),
             integrations: Vec::new(),
             refusals: Vec::new(),
+            gaps: Vec::new(),
         };
         let mut text = String::new();
         render_runtimes(&mut text, &runtimes);

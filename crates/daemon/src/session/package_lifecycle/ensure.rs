@@ -21,11 +21,13 @@ use package::registry::{RegistryState, RetainedDigests};
 use package::verify::VerifyError;
 use package::{PackageDigest, VerifiedCatalog, MAX_CATALOG_BYTES};
 use pohunek_service_config::runtimes::{
-    CatalogStatus, EnsureReport, IntegrationAction, PackageAction, PackageStatus, ProfileAction,
-    ProfileStatus, Refusal, UseReason, CODE_PACKAGE_ARCHIVE_INVALID,
+    CatalogStatus, EnsureReport, Gap, IntegrationAction, PackageAction, PackageStatus,
+    ProfileAction, ProfileStatus, Refusal, UseReason, CODE_GAP_AGENT_NOT_ON_PATH,
+    CODE_GAP_CONFIG_HOME_MISSING, CODE_GAP_SERVED_BY_OTHER_PACKAGE, CODE_PACKAGE_ARCHIVE_INVALID,
     CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, CODE_PROFILE_NOT_MIGRATABLE,
     CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE, ENSURE_REPORT_VERSION,
 };
+use pohunek_worker_protocol::BaseEnv;
 use protocol::{
     IntegrationInstallState, IntegrationStatusParams, PackageBindProfileParams, PackageBindStatus,
     PackageErrorKind, PackageId, PackageIdentity, PackageInstallStatus, ProtocolError, RuntimeId,
@@ -45,8 +47,9 @@ use super::{
 use crate::agent::host::{
     is_reserved, PackageRejection, PackageStore, RuntimeDefinition, RuntimeHost,
 };
-use crate::agent::{apply_pin, parse_head, Pin, ProfileRegistry};
+use crate::agent::{apply_pin, parse_head, Pin, ProfileRegistry, ValidatedLaunchProgram};
 use crate::catalog_anchor::CatalogTrust;
+use crate::integration::Home;
 use crate::session::runtime_host_over;
 use crate::store::Store;
 
@@ -62,6 +65,10 @@ const ARCHIVE_SUFFIX: &str = ".tar.zst";
 
 /// Refusal subject of an installed `service.toml` that cannot be read.
 const SERVICE_CONFIG_SUBJECT: &str = "service-config";
+
+/// Refusal subject of a release catalog that cannot be used by `--detect`,
+/// which plans from the catalog and not from the installed runtimes alone.
+const RELEASE_CATALOG_SUBJECT: &str = "release-catalog";
 
 /// The inputs of one run, resolved by the daemon binary.
 #[derive(Debug, Clone)]
@@ -176,6 +183,13 @@ impl Uses {
         }
     }
 
+    /// Makes `runtime` one the plan judges, without a reason of its own.
+    fn touch(&mut self, runtime: &RuntimeId) {
+        self.0
+            .entry(runtime.as_str().to_owned())
+            .or_insert_with(|| (runtime.clone(), Vec::new()));
+    }
+
     fn list(&self) -> Vec<(RuntimeId, Vec<UseReason>)> {
         self.0.values().cloned().collect()
     }
@@ -185,6 +199,9 @@ impl Uses {
 struct Gathered {
     uses: Uses,
     unpinned: Vec<Unpinned>,
+    /// Every host profile over an official runtime, pinned or not, with its
+    /// base.
+    official: Vec<(String, RuntimeId)>,
 }
 
 /// What the plan reads from the registries and the store.
@@ -197,6 +214,9 @@ struct PlanInputs<'a> {
     planning: Option<&'a Context>,
     /// The digests a session or a profile still pins.
     retained: &'a RetainedDigests,
+    /// The launch base environment the config homes of the planned definitions
+    /// are resolved with, as a launch resolves them.
+    base: &'a BaseEnv,
 }
 
 /// The release catalog, verified, and where its archives are.
@@ -220,24 +240,30 @@ struct Report {
     version: u32,
     daemon: String,
     dry_run: bool,
+    /// Whether the plan detects the runtimes on the search path; a condition
+    /// that is a refusal otherwise is then a gap.
+    detect: bool,
     catalog: CatalogStatus,
     packages: Vec<PackageAction>,
     profiles: Vec<ProfileAction>,
     integrations: Vec<IntegrationAction>,
     refusals: Vec<Refusal>,
+    gaps: Vec<Gap>,
 }
 
 impl Report {
-    fn new(inputs: &EnsureInputs) -> Self {
+    fn new(inputs: &EnsureInputs, detect: bool) -> Self {
         Self {
             version: ENSURE_REPORT_VERSION,
             daemon: inputs.daemon_version.clone(),
             dry_run: inputs.dry_run,
+            detect,
             catalog: CatalogStatus::Unavailable,
             packages: Vec::new(),
             profiles: Vec::new(),
             integrations: Vec::new(),
             refusals: Vec::new(),
+            gaps: Vec::new(),
         }
     }
 
@@ -247,6 +273,24 @@ impl Report {
             code: code.to_owned(),
             detail: detail.to_owned(),
         });
+    }
+
+    fn gap(&mut self, runtime: &str, code: &str, detail: &str) {
+        self.gaps.push(Gap {
+            runtime: runtime.to_owned(),
+            code: code.to_owned(),
+            detail: detail.to_owned(),
+        });
+    }
+
+    /// Records a condition as a gap under `--detect`, and as a refusal
+    /// otherwise, so the upgrade's plan does not change.
+    fn gap_or_refuse(&mut self, subject: &str, gap_code: &str, refusal_code: &str, detail: &str) {
+        if self.detect {
+            self.gap(subject, gap_code, detail);
+        } else {
+            self.refuse(subject, refusal_code, detail);
+        }
     }
 
     /// Ends the report. With a refusal the planned entries stay as the plan
@@ -261,6 +305,7 @@ impl Report {
             profiles: self.profiles,
             integrations: self.integrations,
             refusals: self.refusals,
+            gaps: self.gaps,
         }
     }
 }
@@ -283,7 +328,25 @@ pub struct OfficialPlan {
 ///
 /// Returns [`EnsureError`] when a store cannot be read. A refusal is a report.
 pub fn plan_official_runtimes(inputs: &EnsureInputs) -> Result<OfficialPlan, EnsureError> {
-    let computed = compute(inputs)?;
+    plan_with(inputs, false)
+}
+
+/// Computes the plan of [`plan_official_runtimes`] and also plans every runtime
+/// of the release catalog whose program is on the search path, as the
+/// `--detect` setup plan does. Nothing is changed.
+///
+/// Runtimes that cannot be planned are reported as gaps, not refusals, except
+/// where the archive or the catalog fails its checks.
+///
+/// # Errors
+///
+/// Returns [`EnsureError`] when a store cannot be read. A refusal is a report.
+pub fn detect_official_runtimes(inputs: &EnsureInputs) -> Result<OfficialPlan, EnsureError> {
+    plan_with(inputs, true)
+}
+
+fn plan_with(inputs: &EnsureInputs, detect: bool) -> Result<OfficialPlan, EnsureError> {
+    let computed = compute(inputs, detect)?;
     let definitions = computed
         .planned
         .iter()
@@ -303,7 +366,7 @@ pub fn plan_official_runtimes(inputs: &EnsureInputs) -> Result<OfficialPlan, Ens
 /// Returns [`EnsureError`] when a store cannot be read or a change fails
 /// midway. A refusal is a report, not an error: it means nothing changed.
 pub fn ensure_official_runtimes(inputs: &EnsureInputs) -> Result<EnsureReport, EnsureError> {
-    let computed = compute(inputs)?;
+    let computed = compute(inputs, false)?;
     if inputs.dry_run || !computed.report.refusals.is_empty() || !computed.has_changes() {
         return Ok(computed.dry_report(inputs.dry_run));
     }
@@ -371,11 +434,11 @@ impl Computed {
 }
 
 /// Reads the sources and plans every change, without writing.
-fn compute(inputs: &EnsureInputs) -> Result<Computed, EnsureError> {
+fn compute(inputs: &EnsureInputs, detect: bool) -> Result<Computed, EnsureError> {
     let launch = match &inputs.environment {
         Ok(launch) => launch,
         Err(detail) => {
-            let mut report = Report::new(inputs);
+            let mut report = Report::new(inputs, detect);
             report.refuse(
                 SERVICE_CONFIG_SUBJECT,
                 CODE_SERVICE_CONFIG_UNREADABLE,
@@ -424,23 +487,39 @@ fn compute(inputs: &EnsureInputs) -> Result<Computed, EnsureError> {
         integrations: Mutex::default(),
     });
 
-    let mut report = Report::new(inputs);
-    let gathered = gather(inputs, launch, &profiles, &mut report)?;
+    let mut report = Report::new(inputs, detect);
+    let Gathered {
+        mut uses,
+        unpinned,
+        official,
+    } = gather(inputs, launch, &profiles, &mut report)?;
+    let base = launch
+        .base()
+        .map_err(|error| EnsureError::Registry(error.to_string()))?;
     let retained = retained_pins(&inputs.store_path, &profiles, None)?;
     let plan = PlanInputs {
         state: state.as_ref(),
         planning: planning.as_ref(),
         retained: &retained,
+        base: &base,
     };
     let release = load_release(inputs, &catalog_state);
     let catalog = catalog_plan(release.as_ref(), &catalog_state);
     report.catalog = catalog.status;
-    let planned = plan_packages(&gathered.uses, release.as_ref(), &plan, &mut report)?;
+    if detect {
+        detect_targets(release.as_ref(), &mut uses, &mut report)?;
+    }
+    let planned = plan_packages(&uses, release.as_ref(), &plan, &mut report)?;
+    if detect {
+        let integrations =
+            detected_integrations(&profiles, &base, &planned, &official, &mut report);
+        report.integrations = integrations;
+    }
     let binds = plan_binds(
         &profiles,
         &plan,
         &inputs.store_path,
-        &gathered.unpinned,
+        &unpinned,
         &planned,
         &mut report,
     )?;
@@ -516,17 +595,25 @@ fn gather(
     let homes = integration_homes(profiles, launch)?;
     for runtime in crate::integration::hook_runtime_ids() {
         for profile in integration_homes_of(&homes, &runtime, &official_profiles) {
-            report.integrations.push(IntegrationAction {
-                runtime: runtime.as_str().to_owned(),
-                profile: profile.clone(),
-            });
+            // A detecting plan lists the homes its hooks would reach instead,
+            // see `detected_integrations`.
+            if !report.detect {
+                report.integrations.push(IntegrationAction {
+                    runtime: runtime.as_str().to_owned(),
+                    profile: profile.clone(),
+                });
+            }
             uses.add(&runtime, UseReason::Integration);
         }
     }
     for runtime in read_store(&inputs.store_path)?.runtimes {
         uses.add(&runtime, UseReason::Session);
     }
-    Ok(Gathered { uses, unpinned })
+    Ok(Gathered {
+        uses,
+        unpinned,
+        official: official_profiles,
+    })
 }
 
 /// The config homes of `runtime` that hold its daemon-installed hooks, as the
@@ -947,7 +1034,7 @@ fn plan_runtime(
     plan: &PlanInputs<'_>,
     release: &Release<'_>,
     runtime: RuntimeId,
-    reasons: Vec<UseReason>,
+    mut reasons: Vec<UseReason>,
     report: &mut Report,
 ) -> Result<Option<Planned>, EnsureError> {
     let subject = runtime.as_str().to_owned();
@@ -964,32 +1051,16 @@ fn plan_runtime(
         })
         .count();
     if listed != 1 {
-        report.refuse(
+        report.gap_or_refuse(
             &subject,
+            CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
             CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM,
             "the release catalog lists no single package of this runtime for this platform",
         );
         return Ok(None);
     }
-    let archive = release
-        .archive_dir
-        .join(format!("{}{ARCHIVE_SUFFIX}", runtime.as_str()));
-    let archive_text = archive.to_string_lossy().into_owned();
-    let prepared = match prepare_official(
-        release.anchor,
-        release.catalog_state,
-        &archive_text,
-        &release.catalog_path,
-    ) {
-        Ok(prepared) => prepared,
-        Err(kind) => {
-            report.refuse(
-                &subject,
-                CODE_PACKAGE_ARCHIVE_INVALID,
-                &kind_refusal_detail(kind),
-            );
-            return Ok(None);
-        }
+    let Some(prepared) = prepare_release_archive(release, &runtime, report) else {
+        return Ok(None);
     };
     if prepared.definition.runtime_id() != &runtime {
         report.refuse(
@@ -999,6 +1070,16 @@ fn plan_runtime(
         );
         return Ok(None);
     }
+    if report.detect
+        && !detect_on_search_path(
+            report,
+            &subject,
+            prepared.definition.program().as_str(),
+            &mut reasons,
+        )
+    {
+        return Ok(None);
+    }
     let health = health_of(plan, &prepared.digest);
     if let Health::Damaged(kind) = health {
         refuse_damaged(report, &subject, kind, &prepared.digest);
@@ -1006,11 +1087,7 @@ fn plan_runtime(
     }
     if !matches!(health, Health::Present) {
         if let Some(kind) = claim_refusal(plan, &prepared) {
-            report.refuse(
-                &subject,
-                &ProtocolError::from(kind).code,
-                "the release package cannot take this runtime id alongside the installed runtimes",
-            );
+            report_claim_refusal(report, &subject, kind);
             return Ok(None);
         }
         // The apply judges the retained set only where it selects the package:
@@ -1026,6 +1103,9 @@ fn plan_runtime(
             );
             return Ok(None);
         }
+    }
+    if report.detect {
+        config_home_gap(plan, &prepared.definition, report);
     }
     let identity = prepared.identity.clone();
     let digest = prepared.digest.clone();
@@ -1043,6 +1123,225 @@ fn plan_runtime(
         definition,
         action,
     }))
+}
+
+/// Prepares the release archive of `runtime` that the catalog authorizes. A
+/// failed check is a refusal of the plan.
+fn prepare_release_archive(
+    release: &Release<'_>,
+    runtime: &RuntimeId,
+    report: &mut Report,
+) -> Option<Prepared> {
+    let archive = release
+        .archive_dir
+        .join(format!("{}{ARCHIVE_SUFFIX}", runtime.as_str()));
+    let archive_text = archive.to_string_lossy().into_owned();
+    match prepare_official(
+        release.anchor,
+        release.catalog_state,
+        &archive_text,
+        &release.catalog_path,
+    ) {
+        Ok(prepared) => Some(prepared),
+        Err(kind) => {
+            report.refuse(
+                runtime.as_str(),
+                CODE_PACKAGE_ARCHIVE_INVALID,
+                &kind_refusal_detail(kind),
+            );
+            None
+        }
+    }
+}
+
+/// Under `--detect`, marks the runtime detected when its `program` is on the
+/// search path, and gaps it otherwise. Returns whether the runtime is still
+/// planned: a runtime the host uses keeps its planned package, while one it
+/// does not use is not installed for an agent that is not there.
+fn detect_on_search_path(
+    report: &mut Report,
+    subject: &str,
+    program: &str,
+    reasons: &mut Vec<UseReason>,
+) -> bool {
+    if ValidatedLaunchProgram::resolve(program).is_some() {
+        reasons.push(UseReason::Detected);
+        return true;
+    }
+    report.gap(
+        subject,
+        CODE_GAP_AGENT_NOT_ON_PATH,
+        &format!(
+            "`{program}` is not on the search path; put the agent on it, then run setup again"
+        ),
+    );
+    !reasons.is_empty()
+}
+
+/// Reports a release package the claim rules refuse: a conflict with another
+/// package that serves the runtime id is a gap under `--detect`, every other
+/// refusal stays a refusal.
+fn report_claim_refusal(report: &mut Report, subject: &str, kind: PackageErrorKind) {
+    let refusal_code = ProtocolError::from(kind).code;
+    let detail = "the release package cannot take this runtime id alongside the installed runtimes";
+    if kind == PackageErrorKind::RuntimeConflict {
+        report.gap_or_refuse(
+            subject,
+            CODE_GAP_SERVED_BY_OTHER_PACKAGE,
+            &refusal_code,
+            detail,
+        );
+    } else {
+        report.refuse(subject, &refusal_code, detail);
+    }
+}
+
+/// Adds every runtime of the release catalog for this platform and core to
+/// `uses`, so `--detect` judges each one. Without a usable catalog nothing can
+/// be detected, which is a refusal.
+fn detect_targets(
+    release: Option<&Release<'_>>,
+    uses: &mut Uses,
+    report: &mut Report,
+) -> Result<(), EnsureError> {
+    let Some(release) = release else {
+        report.refuse(
+            RELEASE_CATALOG_SUBJECT,
+            CODE_RELEASE_CATALOG_UNAVAILABLE,
+            "this release has no usable runtime catalog, so the runtimes cannot be detected; \
+             install the release again from a build that carries its runtime catalog",
+        );
+        return Ok(());
+    };
+    let platform = trust::host_platform().map_err(kind_error)?;
+    let core = trust::core_version().map_err(kind_error)?;
+    for entry in release.catalog.entries() {
+        if entry.supports_platform(&platform) && entry.supports_core(&core) {
+            uses.touch(entry.runtime_id());
+        }
+    }
+    Ok(())
+}
+
+/// Gaps a runtime whose declared config home does not exist. The package is
+/// still planned and the home is never created: the step only reads the home,
+/// and the agent creates it on its first start.
+fn config_home_gap(plan: &PlanInputs<'_>, definition: &RuntimeDefinition, report: &mut Report) {
+    let Some(declared) = definition.config_home() else {
+        return;
+    };
+    let runtime = definition.runtime_id();
+    let program = definition.program().as_str();
+    match Home::resolve(declared, plan.base, &[]) {
+        Ok(home) if home.dir.is_dir() => {}
+        Ok(home) => report.gap(
+            runtime.as_str(),
+            CODE_GAP_CONFIG_HOME_MISSING,
+            &format!(
+                "its config home {} does not exist; start `{program}` once so it creates the \
+                 home, then run setup again",
+                home.dir.display()
+            ),
+        ),
+        Err(error) => report.gap(
+            runtime.as_str(),
+            CODE_GAP_CONFIG_HOME_MISSING,
+            &format!(
+                "its config home cannot be resolved ({}); set {} or HOME, then run setup again",
+                error.code,
+                declared.env()
+            ),
+        ),
+    }
+}
+
+/// The config homes `--detect` lists: for each planned runtime whose hooks the
+/// setup installs, its default home and each host profile's home, when the
+/// directory exists. Each distinct directory appears once. Pi declares no
+/// hooks, so it has none.
+///
+/// The profiles are built on the planned definitions, because a planned
+/// package is not installed yet when the plan is made. A profile home that does
+/// not resolve or does not exist is a gap, since its hooks cannot be installed.
+/// The default home's gap is reported by [`config_home_gap`].
+fn detected_integrations(
+    profiles: &ProfileRegistry,
+    base: &BaseEnv,
+    planned: &[Planned],
+    official: &[(String, RuntimeId)],
+    report: &mut Report,
+) -> Vec<IntegrationAction> {
+    let hook_runtimes = crate::integration::hook_runtime_ids();
+    let mut seen: Vec<(String, PathBuf)> = Vec::new();
+    let mut actions = Vec::new();
+    for entry in planned {
+        if !hook_runtimes.contains(&entry.runtime) {
+            continue;
+        }
+        let runtime = entry.runtime.as_str();
+        let Some(declared) = entry.definition.config_home() else {
+            continue;
+        };
+        let definition = Arc::new(entry.definition.clone());
+        let mut homes: Vec<(Option<String>, Result<Home, ProtocolError>)> =
+            vec![(None, Home::resolve(declared, base, &[]))];
+        for (name, profile_base) in official {
+            if profile_base != &entry.runtime {
+                continue;
+            }
+            let resolved = match profiles.resolve_agent_pinned(name, &definition) {
+                Ok(agent) => match agent.profile {
+                    Some(profile) => Home::resolve(declared, base, &profile.env),
+                    None => continue,
+                },
+                Err(error) => Err(error),
+            };
+            homes.push((Some(name.clone()), resolved));
+        }
+        for (profile, resolved) in homes {
+            let home = match resolved {
+                Ok(home) => home,
+                Err(error) => {
+                    if let Some(name) = &profile {
+                        report.gap(
+                            runtime,
+                            CODE_GAP_CONFIG_HOME_MISSING,
+                            &format!(
+                                "profile `{name}` cannot be resolved against the release package \
+                                 ({}); fix or remove the profile, then run setup again",
+                                error.code
+                            ),
+                        );
+                    }
+                    continue;
+                }
+            };
+            let key = (runtime.to_owned(), home.identity());
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            if !home.dir.is_dir() {
+                if let Some(name) = &profile {
+                    report.gap(
+                        runtime,
+                        CODE_GAP_CONFIG_HOME_MISSING,
+                        &format!(
+                            "the config home {} of profile `{name}` does not exist; start the \
+                             profile's agent once so it creates the home, then run setup again",
+                            home.dir.display()
+                        ),
+                    );
+                }
+                continue;
+            }
+            actions.push(IntegrationAction {
+                runtime: runtime.to_owned(),
+                profile,
+            });
+        }
+    }
+    actions
 }
 
 /// Whether the apply selects `prepared`: it is not the selected version of its
