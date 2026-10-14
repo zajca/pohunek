@@ -938,19 +938,30 @@ fn write_fake_agent(
     copy_shell_image(SHELL, &interpreter).expect("copy the shell as the agent interpreter");
     fs::set_permissions(&interpreter, fs::Permissions::from_mode(PRIVATE_EXECUTABLE))
         .expect("chmod the agent interpreter");
+    // A shebang line ends at the first blank, so the interpreter path must
+    // hold none.
+    let interpreter_text = path_text(&interpreter);
+    assert!(
+        !interpreter_text.contains(char::is_whitespace),
+        "the interpreter path {interpreter_text:?} fits a shebang line"
+    );
     let mut exports = String::new();
     for (key, value) in env {
-        writeln!(exports, "export {key}='{value}'").expect("format into a string");
+        writeln!(exports, "export {key}={}", shell_quoted(value)).expect("format into a string");
     }
     let script = format!(
-        "#!{}\nif [ \"${{1:-}}\" = --version ]; then printf '%s\\n' '{}'; exit 0; fi\n{exports}{body}",
-        interpreter.display(),
-        supported_banner(name),
+        "#!{interpreter_text}\nif [ \"${{1:-}}\" = --version ]; then printf '%s\\n' {}; exit 0; fi\n{exports}{body}",
+        shell_quoted(&supported_banner(name)),
     );
     let path = bin.join(name);
     fs::write(&path, script).expect("write the fake agent");
     fs::set_permissions(&path, fs::Permissions::from_mode(EXECUTABLE)).expect("chmod the agent");
     path
+}
+
+/// `value` as one single-quoted shell word.
+fn shell_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
 }
 
 /// Links every program of the system directories into `tools`, except the
