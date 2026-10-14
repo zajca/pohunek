@@ -90,7 +90,11 @@ The assistant must:
   not enough. In a session whose hook schema declares the frozen-root launch
   rule (`identity-v1`), a report or release naming the PTY root is accepted
   only from the root's own peer (its PID and kernel start time), because every
-  descendant inherits the worker socket path and instance id. This binds a report to its reporter, not to the account: an
+  descendant inherits the worker socket path and instance id. Under the
+  subagent-capable rule (`identity-subagent-v1`) the hooks report as
+  descendants of the launch process, so any process the launch process starts
+  can file its report. This binds a report to its reporter's subtree, not to
+  the account: an
   owner-private socket is still not a sandbox against arbitrary commands run
   under the same Unix account, and in a shell session most of what the operator
   runs is inside the managed process tree by construction. The public

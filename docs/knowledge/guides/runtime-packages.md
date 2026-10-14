@@ -136,7 +136,12 @@ Core owns the schemas: `identity-v1` (identity, release, notification; only the
 PTY root itself, reporting in process while it runs the frozen launch
 entrypoint, may set or update the launch identity) and
 `identity-subagent-v1` (the same plus subagent start and stop; the launch
-identity comes from the earliest process named for the provider). A package only
+identity comes from the earliest process named for the provider). Under
+`identity-subagent-v1` a hook, which runs as a descendant of the launch
+process, files that process's report, so any process the launch process
+starts can file it: the agent's process tree runs as the owner and is not an
+identity boundary. Only `identity-v1` binds the root's report to the root's own
+kernel peer. A package only
 names one; it cannot carry schema contents, add actions, or relax validation.
 The `identity-v1` launch rule requires the entrypoint's shebang interpreter to
 run the script itself. An interpreter that re-executes another image, such as a macOS
