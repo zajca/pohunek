@@ -677,6 +677,10 @@ impl SessionRegistry {
             let reported_detector_config = projection.active.as_ref().and_then(|active| {
                 self.active_agent_detector_config(&candidate.info, pinned.as_ref(), Some(active))
             });
+            #[cfg(test)]
+            if projection.privately_reported {
+                self.hold_metadata_apply().await;
+            }
             let mut sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get_mut(id) else {
                 return WorkerMetadataApplyOutcome::Discarded;

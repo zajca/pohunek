@@ -2301,8 +2301,8 @@ async fn a_live_built_in_claude_session_follows_its_package_detector_through_ins
         .expect("remove the adopted session");
 }
 
-/// Arms `registry` to park its next active-agent report between resolving its
-/// agent and committing it.
+/// Arms `registry` to park every active-agent report resolution between
+/// resolving its agent and committing it, until [`disarm_report_hold`].
 fn arm_report_hold(registry: &SessionRegistry) -> crate::runtime::lifecycle::tests::StartGate {
     let gate = crate::runtime::lifecycle::tests::StartGate {
         session_id: None,
@@ -2315,6 +2315,15 @@ fn arm_report_hold(registry: &SessionRegistry) -> crate::runtime::lifecycle::tes
         .lock()
         .expect("report hold is never poisoned") = Some(gate.clone());
     gate
+}
+
+/// Lets every later report resolution of `registry` commit without parking.
+fn disarm_report_hold(registry: &SessionRegistry) {
+    *registry
+        .inner
+        .report_hold
+        .lock()
+        .expect("report hold is never poisoned") = None;
 }
 
 #[tokio::test]
@@ -2376,6 +2385,7 @@ async fn an_agent_report_held_across_an_uninstall_follows_the_current_pin() {
         running_detector(&adopted.registry, &created.id).await,
         generic
     );
+    disarm_report_hold(&adopted.registry);
     gate.release.notify_one();
     let held = reporting.await.expect("the held report finishes");
 
@@ -2411,6 +2421,187 @@ async fn an_agent_report_held_across_an_uninstall_follows_the_current_pin() {
     adopted
         .registry
         .remove(&created.id)
+        .await
+        .expect("remove the adopted session");
+}
+
+/// A session of the built-in Claude runtime adopted by a daemon that then
+/// installed the official Claude package, with the package's detector
+/// configuration.
+async fn adopted_claude_beside_its_package(tag: &str) -> (Fixture, protocol::SessionId, String) {
+    let key = signing_key("root");
+    let dir = temp_dir(tag);
+    let store_path = temp_store_path(tag);
+    let fixture = Fixture::with_anchor_and_store(
+        &format!("{tag}-plugins"),
+        anchor(&[&key], Vec::new()),
+        store_path.clone(),
+    );
+    fixture.write_profile(
+        PROFILE,
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 600\"]\n",
+    );
+    let previous = compiled_in_daemon(&fixture, &store_path);
+    let created = previous
+        .create(protocol::SessionNewParams {
+            agent: PROFILE.to_owned(),
+            cwd: Some(dir),
+            ..params()
+        })
+        .await
+        .expect("a session of the built-in Claude runtime");
+    let adopted = fixture.reopen_with_workers_of(&previous).await;
+    Box::pin(adopted.registry.reconcile_workers())
+        .await
+        .expect("startup reconciliation");
+    let package = real_official(RuntimeId::CLAUDE);
+    install_real_official(&adopted, &adopted.registry, RuntimeId::CLAUDE, &package, 5).await;
+    let served = adopted
+        .registry
+        .inner
+        .profiles
+        .runtimes()
+        .resolve_id(&RuntimeId::parse(RuntimeId::CLAUDE).expect("runtime id"))
+        .expect("the package serves claude");
+    let package_config = detector_debug(&crate::detect::DetectorConfig::for_definition(&served));
+    (adopted, created.id, package_config)
+}
+
+#[tokio::test]
+async fn an_agent_report_held_across_a_registry_rebuild_resolves_again_and_commits() {
+    let (adopted, id, package_config) =
+        adopted_claude_beside_its_package("claude-report-rebuild").await;
+
+    // While the report is parked, a host profile named like the runtime gains
+    // its own detection manifest and the registry is rebuilt, so the report
+    // resolves again, to the profile, and then commits.
+    let gate = arm_report_hold(&adopted.registry);
+    let reporting = tokio::spawn({
+        let registry = adopted.registry.clone();
+        let report = claude_identity_report(&id);
+        async move { registry.report_agent(report).await }
+    });
+    gate.entered.notified().await;
+    fs::create_dir_all(adopted.agents.join("manifests")).expect("the manifests directory");
+    fs::write(
+        adopted.agents.join("manifests").join("tuned.toml"),
+        OVERRIDE_MANIFEST,
+    )
+    .expect("the override manifest");
+    adopted.write_profile(
+        RuntimeId::CLAUDE,
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 600\"]\nmanifest = \"tuned\"\n",
+    );
+    adopted
+        .registry
+        .reload_runtimes()
+        .expect("rebuild the runtime registry");
+    disarm_report_hold(&adopted.registry);
+    gate.release.notify_one();
+    let held = reporting.await.expect("the held report finishes");
+
+    assert!(
+        held.recorded,
+        "a report resolved again against a registry that still serves claude is recorded"
+    );
+    assert_eq!(
+        adopted
+            .registry
+            .inspect(&id)
+            .await
+            .expect("inspect")
+            .active_agent
+            .as_deref(),
+        Some(RuntimeId::CLAUDE)
+    );
+    let profile_config = {
+        let sessions = adopted.registry.inner.sessions.lock().await;
+        let pinned = sessions
+            .get(&id)
+            .expect("the live session")
+            .pinned
+            .clone()
+            .expect("the session's pin is served");
+        let resolved = adopted
+            .registry
+            .inner
+            .profiles
+            .resolve_agent_pinned(RuntimeId::CLAUDE, &pinned)
+            .expect("the profile resolves through the pinned definition");
+        detector_debug(&crate::session::detector_config_for_resolved_agent(
+            &resolved,
+        ))
+    };
+    assert_ne!(
+        profile_config, package_config,
+        "the profile's manifest changes what the report resolves to"
+    );
+    assert_eq!(
+        running_detector(&adopted.registry, &id).await,
+        profile_config,
+        "the report commits what it resolved to after the rebuild"
+    );
+    adopted
+        .registry
+        .stop(&id)
+        .await
+        .expect("stop the adopted session");
+    adopted
+        .registry
+        .remove(&id)
+        .await
+        .expect("remove the adopted session");
+}
+
+#[tokio::test]
+async fn an_agent_report_whose_registry_keeps_changing_is_dropped_after_bounded_resolutions() {
+    let (adopted, id, _package_config) =
+        adopted_claude_beside_its_package("claude-report-exhausted").await;
+
+    // Each resolution is parked and the registry rebuilt under it, one time
+    // more than the report resolves again.
+    let gate = arm_report_hold(&adopted.registry);
+    let reporting = tokio::spawn({
+        let registry = adopted.registry.clone();
+        let report = claude_identity_report(&id);
+        async move { registry.report_agent(report).await }
+    });
+    let resolutions = crate::session::MAX_STALE_REPORT_RESOLUTIONS + 1;
+    for resolution in 1..=resolutions {
+        gate.entered.notified().await;
+        adopted
+            .registry
+            .reload_runtimes()
+            .expect("rebuild the runtime registry");
+        if resolution == resolutions {
+            // A report that resolved yet again would now commit unparked.
+            disarm_report_hold(&adopted.registry);
+        }
+        gate.release.notify_one();
+    }
+    let held = reporting.await.expect("the held report finishes");
+
+    assert!(
+        !held.recorded,
+        "a report that never resolves against a stable registry is not recorded"
+    );
+    assert_eq!(
+        adopted
+            .registry
+            .inspect(&id)
+            .await
+            .expect("inspect")
+            .active_agent,
+        None
+    );
+    adopted
+        .registry
+        .stop(&id)
+        .await
+        .expect("stop the adopted session");
+    adopted
+        .registry
+        .remove(&id)
         .await
         .expect("remove the adopted session");
 }
@@ -2467,6 +2658,7 @@ async fn a_nested_agent_report_held_across_an_uninstall_of_its_package_is_never_
         .package_uninstall(uninstall(&package.digest))
         .await
         .expect("uninstall the package");
+    disarm_report_hold(&fixture.registry);
     gate.release.notify_one();
     let held = reporting.await.expect("the held report finishes");
 
@@ -3140,6 +3332,84 @@ async fn a_worker_reported_agent_runs_its_detector_until_its_release() {
             &default_config,
         )
         .await;
+    session.stop().await;
+}
+
+#[tokio::test]
+async fn a_worker_report_projected_across_an_uninstall_runs_the_current_pins_detector() {
+    let mut session =
+        WorkerReportedClaude::adopt("claude-worker-reported-uninstall", LASTING_CLAIM_TTL_SECS)
+            .await;
+    let registry = session.adopted.registry.clone();
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: None,
+        entered: std::sync::Arc::new(tokio::sync::Notify::new()),
+        release: std::sync::Arc::new(tokio::sync::Notify::new()),
+    };
+    *registry
+        .inner
+        .metadata_apply_hold
+        .lock()
+        .expect("metadata apply hold is never poisoned") = Some(gate.clone());
+
+    // The projection resolves the reported profile against the package's
+    // definition, and the package is uninstalled before it commits.
+    session.release();
+    gate.entered.notified().await;
+    // The profile is unbound from the package so the package can go.
+    session.adopted.write_profile(
+        RuntimeId::CLAUDE,
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 600\"]\nmanifest = \"tuned\"\n",
+    );
+    let package = real_official(RuntimeId::CLAUDE);
+    registry
+        .package_uninstall(uninstall(&package.digest))
+        .await
+        .expect("uninstall the package");
+    gate.release.notify_one();
+
+    wait_until("the projected report to reach the session", || async {
+        (registry
+            .inspect(&session.id)
+            .await
+            .expect("inspect")
+            .active_agent
+            .as_deref()
+            == Some(RuntimeId::CLAUDE))
+        .then_some(())
+    })
+    .await;
+    let expected = {
+        let sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get(&session.id).expect("the live session");
+        entry
+            .pinned
+            .clone()
+            .and_then(|pinned| {
+                registry
+                    .inner
+                    .profiles
+                    .resolve_agent_pinned(RuntimeId::CLAUDE, &pinned)
+                    .ok()
+            })
+            .map_or_else(
+                || detector_debug(&entry.default_detector_config),
+                |resolved| {
+                    detector_debug(&crate::session::detector_config_for_resolved_agent(
+                        &resolved,
+                    ))
+                },
+            )
+    };
+    assert_ne!(
+        expected, session.override_config,
+        "the uninstall changes what the reported profile resolves to"
+    );
+    assert_eq!(
+        running_detector(&registry, &session.id).await,
+        expected,
+        "a projection resolved before the uninstall runs the current pin's detector"
+    );
     session.stop().await;
 }
 

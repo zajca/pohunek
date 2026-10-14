@@ -690,10 +690,14 @@ struct SessionRegistryInner {
     /// and applying them.
     #[cfg(test)]
     refresh_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
-    /// Parks the next active-agent report between resolving its agent and
-    /// committing it.
+    /// While armed, parks every active-agent report resolution between
+    /// resolving its agent and committing it.
     #[cfg(test)]
     report_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Parks the next worker metadata projection of a reported agent between
+    /// resolving its detector configuration and committing it.
+    #[cfg(test)]
+    metadata_apply_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
     /// Holds the next committed create before its initial input.
     #[cfg(test)]
     initial_input_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
@@ -1853,6 +1857,8 @@ impl SessionRegistry {
                 #[cfg(test)]
                 report_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
+                metadata_apply_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
                 initial_input_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 initial_input_outcome_hold: std::sync::Mutex::new(None),
@@ -2828,13 +2834,30 @@ impl SessionRegistry {
         }
     }
 
-    /// Parks an active-agent report between resolving its agent and committing
-    /// it, when a test armed the hold.
+    /// Parks an active-agent report resolution between resolving its agent and
+    /// committing it, for as long as a test keeps the hold armed.
     #[cfg(test)]
     async fn hold_report(&self) {
         let gate = self
             .inner
             .report_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    /// Parks a worker metadata projection of a reported agent between
+    /// resolving its detector configuration and committing it, when a test
+    /// armed the hold.
+    #[cfg(test)]
+    pub(super) async fn hold_metadata_apply(&self) {
+        let gate = self
+            .inner
+            .metadata_apply_hold
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();

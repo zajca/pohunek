@@ -695,7 +695,17 @@ The durable session record keeps the active agent the worker journaled, with
 whether it was reported or observed, so a daemon restart restores it even after
 the worker's claim expired. An agent reported only to the daemon socket (the
 hooks' fallback when the worker cannot be reached) or observed by procwatch is
-kept in memory; procwatch observes a running agent again after a restart.
+held in memory and reaches the record only with the session's next record
+write for another reason (a native reference report, a stop, a worker becoming
+unavailable or being adopted again). Whether such an agent restores as reported
+after a restart therefore depends on that timing; without such a write,
+procwatch observes it again, as observed. A worker snapshot projected after
+such a report replaces it with the worker's journaled identity, also when the
+snapshot was read before the report arrived (#1101). A record written before
+schema 10 carries no origin, and its agent counts as observed when its name
+equals the agent's own runtime: a reported agent under a profile named like
+its runtime, nested or not, is then restored as observed until it reports
+again.
 
 A known shell foreground group suppresses descendant fallback after clearing a
 process-bound nested claim, which prevents claim/clear flapping while the agent
