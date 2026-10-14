@@ -31,6 +31,7 @@ filter = '''
 (package(=pohunek-daemon) and binary(=forced_close_stop))
 or (package(=pohunek-session-worker) and test(=server::tests::escaped_pty_holder_ends_with_the_exit_and_the_exact_final_output_offset))
 or (package(=pohunek-cli) and binary(=claude_package) and test(=a_session_removal_ignores_an_unreadable_process_of_the_test_host))
+or (package(=pohunek-cli) and binary(=claude_package) and test(=the_child_guard_terminates_a_non_dumpable_helper_when_the_test_unwinds))
 '''
 test-group = 'unreadable-holders'
 
