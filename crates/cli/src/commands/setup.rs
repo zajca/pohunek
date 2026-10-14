@@ -73,11 +73,11 @@ Please address the outstanding work on this PR, then summarize what you did.
 
 /// Result of `setup config`: which files were created vs left untouched.
 #[derive(Debug, Serialize)]
-pub(crate) struct ConfigResult {
+pub struct ConfigResult {
     /// Files written by this run.
-    pub(crate) created: Vec<String>,
+    pub created: Vec<String>,
     /// Files that already existed and were left untouched.
-    pub(crate) skipped: Vec<String>,
+    pub skipped: Vec<String>,
 }
 
 /// Write a default `attach.conf` and prompt templates.

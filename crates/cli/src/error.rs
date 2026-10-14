@@ -190,6 +190,23 @@ pub(crate) enum CliError {
         detail: String,
     },
 
+    /// Bare `pohunek setup` installed the service, then found that the release
+    /// plan read from the installed version differs from the preview. The
+    /// installed service is kept and nothing else was changed; a re-run plans
+    /// from the installed service.
+    #[error(
+        "setup installed pohunek {version} at {}, then stopped: {detail}; nothing else was changed",
+        prefix.display()
+    )]
+    SetupInstalledOnly {
+        /// The version that was installed.
+        version: String,
+        /// The prefix it was installed under.
+        prefix: PathBuf,
+        /// What differs.
+        detail: String,
+    },
+
     /// Failed to spawn the daemon process.
     #[error("failed to start daemon: {0}")]
     Spawn(String),
@@ -366,6 +383,22 @@ impl CliError {
                 "setup_consent_required",
                 "setup changes this host and needs your consent; nothing was changed".to_owned(),
                 Some("review the plan, then re-run `pohunek setup --yes` to apply it".to_owned()),
+            ),
+            CliError::SetupInstalledOnly {
+                version,
+                prefix,
+                detail,
+            } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "setup_plan_changed_after_install",
+                format!(
+                    "setup installed pohunek {version} at {}, then stopped: {detail}; nothing else was changed",
+                    prefix.display()
+                ),
+                Some(
+                    "fix the cause named above, then re-run `pohunek setup`; it plans from the installed service and does not reinstall it"
+                        .to_owned(),
+                ),
             ),
             CliError::SetupDeclined => ProtocolError::new(
                 ErrorClass::Configuration,

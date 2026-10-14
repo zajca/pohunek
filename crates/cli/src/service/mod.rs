@@ -73,16 +73,29 @@ pub async fn install(
     from: Option<PathBuf>,
     prefix: Option<PathBuf>,
 ) -> Result<report::InstallReport, Error> {
-    let context = Context::resolve()?;
-    let inherited = inherited_lock(&context)?;
-    let from = staged_dir(&context, from)?;
+    install_in(&Context::resolve()?, from, prefix).await
+}
+
+/// Installs this CLI's version as [`install`] does, for the installation
+/// `context` describes instead of the one the process environment selects.
+///
+/// # Errors
+///
+/// Returns the errors of [`install`].
+pub async fn install_in(
+    context: &Context,
+    from: Option<PathBuf>,
+    prefix: Option<PathBuf>,
+) -> Result<report::InstallReport, Error> {
+    let inherited = inherited_lock(context)?;
+    let from = staged_dir(context, from)?;
     let prefix = match prefix {
         Some(prefix) => absolute("--prefix", prefix)?,
         None => context.default_prefix()?,
     };
     let namespace = context.namespace()?;
-    let backend = Backend::connect(&context, &namespace, settings::LAUNCHCTL_COMMAND).await?;
-    engine(&context, &backend, inherited)
+    let backend = Backend::connect(context, &namespace, settings::LAUNCHCTL_COMMAND).await?;
+    engine(context, &backend, inherited)
         .install(&from, &prefix, VERSION)
         .await
 }
@@ -860,6 +873,16 @@ pub(crate) async fn check_with_preflight(
 /// this process (see [`status_of`]).
 pub async fn status() -> Result<report::StatusReport, Error> {
     status_of(&Context::resolve()?).await
+}
+
+/// Reports the installation `context` describes, as [`status`] does for the
+/// process environment.
+///
+/// # Errors
+///
+/// Returns the errors of [`status`].
+pub async fn status_in(context: &Context) -> Result<report::StatusReport, Error> {
+    status_of(context).await
 }
 
 /// Reports the installation `context` locates.

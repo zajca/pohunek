@@ -16,6 +16,13 @@ mod error;
 mod hermes_integration;
 mod paths;
 mod process;
+pub mod host_setup {
+    //! Bare `pohunek setup` as a library: the plan, then the apply, against the
+    //! installation an explicit [`crate::service::Context`] describes.
+    pub use crate::commands::setup_host::{
+        apply, plan, HostPlan, ReleasePlanner, ServiceStep, SetupError, SetupReport, Verdict,
+    };
+}
 pub mod service;
 mod target;
 mod workflow;
@@ -2482,7 +2489,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             // Setup is purely local: it configures this machine. It ignores `--host`.
             let paths = Paths::resolve()?;
             match action {
-                None => commands::setup_host::run(&paths, yes, json).await?,
+                None => commands::setup_host::run(yes, json).await?,
                 Some(SetupAction::Completions {
                     shell,
                     dynamic,
