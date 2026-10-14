@@ -233,22 +233,24 @@ jobs:
           if entry is None:
               sys.exit('no pohunek-platform lib test binary in the archive metadata')
           path = entry['binary-path']
-          candidates = []
+          # The archive records the build-time target directory; extraction
+          # places the binaries under <root>/target. Only that extracted copy
+          # is the binary this run built, so no other path is accepted.
           if os.path.isabs(path):
-              # The archive records the build-time target directory. Extraction
-              # places the binaries under <root>/target, so that copy comes first.
-              if path.startswith(target_dir + '/'):
-                  candidates.append(os.path.join(root, 'target', os.path.relpath(path, target_dir)))
-              candidates.append(path)
-          else:
-              candidates.append(os.path.join(root, path))
-              candidates.append(os.path.join(root, 'target', path))
-          existing = [c for c in candidates if os.path.isfile(c)]
-          if not existing:
-              sys.exit(f'pohunek-platform lib test binary not found under {candidates}')
-          print(existing[0])
+              if not path.startswith(target_dir + '/'):
+                  sys.exit(f'binary path {path} is outside the recorded target directory {target_dir}')
+              path = os.path.relpath(path, target_dir)
+          extracted = os.path.join(root, 'target', path)
+          if not os.path.isfile(extracted):
+              sys.exit(f'pohunek-platform lib test binary not extracted at {extracted}')
+          print(extracted)
           " "$metadata" "$PWD")"
-          (cd "$PWD/crates/platform" && sudo env TMPDIR=/tmp "$bin" filesystem::tests::apfs_foreign_owned_private_directory_is_rejected --ignored --exact)
+          output="$RUNNER_TEMP/apfs-root-test.txt"
+          (cd "$PWD/crates/platform" && sudo env TMPDIR=/tmp "$bin" filesystem::tests::apfs_foreign_owned_private_directory_is_rejected --ignored --exact) | tee "$output"
+          # libtest exits 0 when the filter matches nothing, so require that
+          # exactly this one test ran and passed.
+          grep -qx 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]* filtered out; finished in .*' "$output" \
+            || { echo "the APFS root test did not run exactly once" >&2; exit 1; }
 
       - name: Summarize flaky tests
         if: always()

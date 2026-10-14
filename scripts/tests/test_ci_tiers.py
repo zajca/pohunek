@@ -202,7 +202,7 @@ MACOS_CALLED_JOBS = {
     },
     "release-rehearsal": {
         "workflow": "release-evidence.yml",
-        "jobs": {"consumer"},
+        "jobs": {"consumer", "rows"},
         "filter": "release_rehearsal",
     },
 }
@@ -232,6 +232,24 @@ def workflow_jobs(workflow: str = CI) -> dict[str, str]:
         ]
         for index, match in enumerate(matches)
     }
+
+
+def runner_matrix_may_use_macos(job: str) -> bool:
+    """Whether a job that runs on `matrix.runner` may place a leg on macOS.
+
+    Only the job's `strategy` block is read: a static runner value there that
+    names macOS counts, and so does any part of the matrix computed at run
+    time (`fromJSON`), whose legs cannot be known from the file.
+    """
+    if not re.search(r"(?m)^    runs-on: \$\{\{ matrix\.runner \}\}$", job):
+        return False
+    if not re.search(r"(?m)^    strategy:\n", job):
+        return False
+    strategy = block(job, "strategy", indent=4)
+    return bool(
+        re.search(r"(?m)^\s+(?:- )?runner: \[?[^\n]*macos", strategy)
+        or "fromJSON(" in strategy
+    )
 
 
 def filter_paths(name: str) -> set[str]:
@@ -470,6 +488,7 @@ class CiTierWorkflowTests(unittest.TestCase):
                 for name, definition in called_jobs.items()
                 if re.search(r"(?m)^    runs-on:.*macos", definition)
                 or re.search(r"(?m)^        os: \[.*macos.*\]$", definition)
+                or runner_matrix_may_use_macos(definition)
             }
             if macos:
                 discovered[caller] = {"workflow": workflow, "jobs": macos}

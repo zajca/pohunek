@@ -134,8 +134,9 @@ the other runtime package jobs. A change to
 `.github/workflows/ci.yml` selects all four pull-request macOS jobs. The
 release rehearsal, which a pull request starts through its `release_rehearsal`
 filter, adds macOS jobs from the workflows it calls: the signed
-`aarch64-apple-darwin` CLI and daemon builds (`rehearsal-macos`) and the macOS
-leg of the release consumer build. A push to
+`aarch64-apple-darwin` CLI and daemon builds (`rehearsal-macos`), the macOS
+leg of the release consumer build, and the `aarch64-apple-darwin` release rows
+of the Claude, Codex, Hermes, and Pi packages. A push to
 `main` runs the main tier: platform contracts, the macOS tier packages, the
 `macos-15` package job, Hermes macOS, and SDK macOS, alongside the Linux jobs
 selected on main. PR and main runs cancel superseded runs on the same ref. A
@@ -149,9 +150,11 @@ checks to main. Schedule and manual runs do not cancel PR or main runs.
 Before the final head of a pull request merges, dispatch `ci.yml` once with
 `tier=main` on the branch (`gh workflow run ci.yml --ref <branch> -f tier=main`)
 only when the diff touches a release workflow or release xtask code, the runtime
-packages or packaging, the TypeScript SDK, Cargo dependencies, or the protocol
-version window. Ordinary worker, PTY, hook, daemon, and CLI changes need no
-dispatch: pull-request CI already runs the macOS lanes.
+packages or packaging, the TypeScript SDK, Cargo dependencies, the protocol
+version window, or what the main and nightly tiers run (their jobs in `ci.yml`,
+`scripts/test-partitions`, `.config/nextest.toml`). Ordinary worker, PTY, hook,
+daemon, and CLI changes need no dispatch: pull-request CI already runs the
+macOS lanes.
 
 The automatic red-main issue reporter remains pending under #477 S3. The S4
 release evidence gate is implemented: `scripts/release` requires successful

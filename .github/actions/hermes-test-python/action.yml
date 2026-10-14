@@ -91,4 +91,3 @@ runs:
         "$python_bin" -I -c 'import sys, yaml; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
           || { echo "Hermes test interpreter lacks Python >= 3.10 with PyYAML: $python_bin" >&2; exit 1; }
         printf 'POHUNEK_PYTHON_BIN=%s\n' "$python_bin" >> "$GITHUB_ENV"
-
