@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use official_runtimes::OfficialCatalog;
+use package::PackageDigest;
 use package::ANCHOR_FILE_NAME;
 use pohunek_daemon::lock::InstanceLock;
 use pohunek_paths::{METADATA_STORE_NAME as STORE_NAME, PLUGINS_SUBDIR};
@@ -84,6 +85,33 @@ impl Host {
         .expect("write the trust anchor");
         self.catalog
             .write_release_at(&self.release_dir(), runtimes, sequence);
+    }
+
+    /// Trusts the release key and publishes the given archives as the release,
+    /// under a catalog at `sequence`.
+    fn publish_archives(&self, sequence: u64, archives: &[(&str, &[u8], &PackageDigest)]) {
+        fs::write(
+            self.binary_dir().join(ANCHOR_FILE_NAME),
+            self.catalog.anchor_bytes(),
+        )
+        .expect("write the trust anchor");
+        self.catalog
+            .write_release_archives(&self.release_dir(), sequence, archives);
+    }
+
+    /// Removes the root of the installed package `digest`.
+    fn remove_package_root(&self, digest: &str) {
+        let hex = digest.strip_prefix("sha256:").expect("a sha256 digest");
+        fs::remove_dir_all(self.plugins_dir().join("packages").join(hex))
+            .expect("remove the package root");
+    }
+
+    /// Writes the host profile `name` with `text`.
+    fn write_profile(&self, name: &str, text: &str) -> PathBuf {
+        let path = self.profiles_dir().join(format!("{name}.toml"));
+        fs::write(&path, text).expect("write the profile");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("secure the profile");
+        path
     }
 
     /// Publishes `runtimes` as the release, with the first catalog sequence.
@@ -693,4 +721,41 @@ fn a_release_package_with_an_altered_root_is_refused_by_the_plan_and_changes_not
         registry
     );
     assert_eq!(host.profile_text(), profile);
+}
+
+/// Without a usable release catalog, an unpinned profile whose bind would
+/// conflict with a retained version of its package is refused by the plan: the
+/// installed version that keeps serving has a retained older version whose root
+/// is gone, so the bind's coexistence check fails. Nothing changes.
+#[test]
+fn an_unpinned_profile_is_refused_when_a_retained_older_version_is_damaged() {
+    let host = Host::new();
+    host.publish_at(&["claude"], 1);
+    host.write_claude_profile();
+    let older = host.step(false).packages[0].digest.clone();
+    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.0.2");
+    host.publish_archives(2, &[("claude", &bytes, &digest)]);
+    let newer = host.step(false);
+    assert_eq!(newer.packages[0].status, PackageStatus::Installed);
+    assert_eq!(newer.packages[0].digest, digest.as_str());
+    host.remove_package_root(&older);
+    host.remove_release();
+    let second = host.write_profile("second", "base = \"claude\"\n");
+    let registry = fs::read(host.registry_path()).expect("the registry record");
+    let profile = fs::read(&second).expect("the unpinned profile");
+    let incompatible = ProtocolError::from(PackageErrorKind::IntegrationIncompatible).code;
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert_eq!(refusal_codes(report), [incompatible.as_str()]);
+        assert_eq!(report.refusals[0].subject, "second");
+        assert!(report.profiles.is_empty());
+    }
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry record"),
+        registry
+    );
+    assert_eq!(fs::read(&second).expect("the unpinned profile"), profile);
 }

@@ -138,7 +138,7 @@ fn resolve_target(
 /// whether or not a version is selected. `retained` leaves out the pin this
 /// bind replaces, so rebinding a profile never compares the new pin with the
 /// old one.
-fn ensure_coexists(
+pub(super) fn ensure_coexists(
     context: &Context,
     state: &RegistryState,
     retained: &RetainedDigests,

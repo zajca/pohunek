@@ -32,14 +32,14 @@ use protocol::{
 };
 use tracing::warn;
 
-use super::bind::bind_profile;
+use super::bind::{bind_profile, ensure_coexists};
 use super::error::rejection_kind;
 use super::selection::{conflict, declared_by};
 use super::source::read_regular_file;
 use super::trust;
 use super::{
-    commit_install, ensure_selectable, prepare_official, prove_loadable, read_state, unix_now,
-    Context, HostTrustAnchor, InstallPlan, Prepared,
+    check_claim, commit_install, ensure_selectable, prepare_official, prove_loadable, read_state,
+    unix_now, Context, HostTrustAnchor, InstallPlan, Prepared,
 };
 use crate::agent::host::{
     is_reserved, PackageRejection, PackageStore, RuntimeDefinition, RuntimeHost,
@@ -311,7 +311,7 @@ pub fn ensure_official_runtimes(inputs: &EnsureInputs) -> Result<EnsureReport, E
     let catalog = catalog_plan(release.as_ref(), &catalog_state);
     report.catalog = catalog.status;
     let planned = plan_packages(&gathered.uses, release.as_ref(), &plan, &mut report)?;
-    let binds = plan_binds(&profiles, &gathered.unpinned, &planned, &mut report);
+    let binds = plan_binds(&profiles, &plan, &gathered.unpinned, &planned, &mut report);
     let changes = planned
         .iter()
         .any(|plan| matches!(plan.action, Action::Install(_)))
@@ -752,7 +752,8 @@ fn plan_packages(
 }
 
 /// Plans a runtime without a usable release catalog: the installed package
-/// that serves it keeps serving it. A runtime nothing serves is refused.
+/// that serves it keeps serving it, when its root verifies. A runtime nothing
+/// serves, or whose package does not verify, is refused.
 fn plan_installed(
     plan: &PlanInputs<'_>,
     runtime: RuntimeId,
@@ -771,18 +772,11 @@ fn plan_installed(
         );
         return None;
     };
-    match definition.binding().provenance.clone() {
+    let (identity, digest) = match definition.binding().provenance.clone() {
         protocol::BindingProvenance::Package {
             package,
             package_digest,
-        } => Some(Planned {
-            runtime,
-            reasons,
-            identity: package,
-            digest: package_digest,
-            definition: (*definition).clone(),
-            action: Action::Kept,
-        }),
+        } => (package, package_digest),
         protocol::BindingProvenance::Builtin { .. } => {
             report.refuse(
                 runtime.as_str(),
@@ -790,9 +784,33 @@ fn plan_installed(
                 "this release has no usable runtime catalog, and only a built-in serves this \
                  runtime; install the official package from a release that carries its catalog",
             );
-            None
+            return None;
+        }
+    };
+    match health_of(plan, &digest) {
+        Health::Present => {}
+        Health::Damaged(kind) => {
+            refuse_damaged(report, runtime.as_str(), kind, &digest);
+            return None;
+        }
+        Health::Install => {
+            report.refuse(
+                runtime.as_str(),
+                CODE_RELEASE_CATALOG_UNAVAILABLE,
+                "the installed package serving this runtime does not verify, and no release \
+                 catalog restores it; restore the release catalog, or remove the package",
+            );
+            return None;
         }
     }
+    Some(Planned {
+        runtime,
+        reasons,
+        identity,
+        digest,
+        definition: (*definition).clone(),
+        action: Action::Kept,
+    })
 }
 
 /// Plans one official runtime with a usable release catalog: its one release
@@ -864,17 +882,18 @@ fn plan_runtime(
     }
     let health = health_of(plan, &prepared.digest);
     if let Health::Damaged(kind) = health {
-        report.refuse(
-            &subject,
-            &ProtocolError::from(kind).code,
-            &format!(
-                "the installed package root of this runtime is altered or damaged; remove it with \
-                 `pohunek plugin uninstall --digest {} --remove-modified --yes`, then run the \
-                 upgrade again",
-                prepared.digest.as_str()
-            ),
-        );
+        refuse_damaged(report, &subject, kind, &prepared.digest);
         return Ok(None);
+    }
+    if !matches!(health, Health::Present) {
+        if let Some(kind) = claim_refusal(plan, &prepared) {
+            report.refuse(
+                &subject,
+                &ProtocolError::from(kind).code,
+                "the release package cannot take this runtime id alongside the installed runtimes",
+            );
+            return Ok(None);
+        }
     }
     let identity = prepared.identity.clone();
     let digest = prepared.digest.clone();
@@ -947,21 +966,48 @@ fn health_of(plan: &PlanInputs<'_>, digest: &PackageDigest) -> Health {
 }
 
 /// Plans the pins of the unpinned profiles, validating each rewritten profile
-/// against the planned package definition the way a bind does.
+/// against the planned package definition the way a bind does, and running the
+/// coexistence check a bind runs.
 fn plan_binds(
     profiles: &ProfileRegistry,
+    plan: &PlanInputs<'_>,
     unpinned: &[Unpinned],
     planned: &[Planned],
     report: &mut Report,
 ) -> Vec<Bind> {
+    let targets: Vec<&Unpinned> = unpinned
+        .iter()
+        .filter(|profile| planned.iter().any(|entry| entry.runtime == profile.base))
+        .collect();
+    // The apply rewrites the agents directory through the owner-safety check
+    // this opens it with, so a directory that fails it is refused here.
+    if !targets.is_empty() && profiles.open_for_bind().is_err() {
+        for target in targets {
+            report.refuse(
+                &target.name,
+                CODE_PROFILE_NOT_MIGRATABLE,
+                "the agent profile directory cannot be opened for a rewrite; fix its owner and \
+                 permissions, then run the upgrade again",
+            );
+        }
+        return Vec::new();
+    }
     let mut binds = Vec::new();
     for profile in unpinned {
-        let Some(plan) = planned.iter().find(|plan| plan.runtime == profile.base) else {
+        let Some(entry) = planned.iter().find(|entry| entry.runtime == profile.base) else {
             continue;
         };
+        if let Some(kind) = bind_coexistence(plan, entry) {
+            report.refuse(
+                &profile.name,
+                &ProtocolError::from(kind).code,
+                "an installed version of this package is not compatible with a retained version",
+            );
+            continue;
+        }
         let pin = Pin {
-            package: plan.identity.id.clone(),
-            digest: plan.digest.clone(),
+            package: entry.identity.id.clone(),
+            digest: entry.digest.clone(),
         };
         let rewritten = match apply_pin(&profile.text, &pin) {
             Ok(rewritten) => rewritten,
@@ -977,7 +1023,7 @@ fn plan_binds(
         if let Err(error) = profiles.validate_candidate(
             &profile.name,
             &rewritten,
-            &Arc::new(plan.definition.clone()),
+            &Arc::new(entry.definition.clone()),
         ) {
             report.refuse(
                 &profile.name,
@@ -989,10 +1035,56 @@ fn plan_binds(
         binds.push(Bind {
             name: profile.name.clone(),
             base: profile.base.clone(),
-            digest: plan.digest.clone(),
+            digest: entry.digest.clone(),
         });
     }
     binds
+}
+
+/// The coexistence refusal a bind of `entry` meets, as `ensure_coexists` judges
+/// it. An installed, selected package is judged here; a package the apply still
+/// installs is judged by [`coexistence_blocked`] before the bind is planned.
+fn bind_coexistence(plan: &PlanInputs<'_>, entry: &Planned) -> Option<PackageErrorKind> {
+    if matches!(entry.action, Action::Install(_)) {
+        return None;
+    }
+    let (Some(context), Some(state)) = (plan.planning, plan.state) else {
+        return None;
+    };
+    ensure_coexists(context, state, plan.retained, &entry.digest).err()
+}
+
+/// The claim refusal an install of `prepared` meets against the installed
+/// runtimes, as the install judges it.
+fn claim_refusal(plan: &PlanInputs<'_>, prepared: &Prepared) -> Option<PackageErrorKind> {
+    let context = plan.planning?;
+    check_claim(
+        &context.runtimes,
+        &prepared.definition,
+        &prepared.identity.id,
+        prepared.authority,
+    )
+    .err()
+}
+
+/// Refuses a release package whose installed root is present but damaged, with
+/// the operator's next step.
+fn refuse_damaged(
+    report: &mut Report,
+    subject: &str,
+    kind: PackageErrorKind,
+    digest: &PackageDigest,
+) {
+    report.refuse(
+        subject,
+        &ProtocolError::from(kind).code,
+        &format!(
+            "the installed package root of this runtime is altered or damaged; remove it with \
+             `pohunek plugin uninstall --digest {} --remove-modified --yes`, then run the \
+             upgrade again",
+            digest.as_str()
+        ),
+    );
 }
 
 /// Installs, enables and selects the planned package, under the registry's own
