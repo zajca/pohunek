@@ -112,7 +112,7 @@ pohunek plugin list
 pohunek host inspect local --json
 ```
 
-See the [install guide](../install.md) for details on package verification,
+See `docs/install.md` for details on package verification,
 profiles, and environment setup.
 
 ## Start, status, stop
