@@ -1992,6 +1992,50 @@ fn an_unreadable_unit_record_refuses_the_service_uninstall() {
 /// `unknown` with the reason, never fails for it, and its text names the
 /// unit; a plugin with no recorded unit is not listed.
 #[cfg(target_os = "linux")]
+/// A run refused before its manifest verified (here: the plugin is disabled)
+/// is recorded with the requested unit name, so status counts it for that
+/// unit. Status reads the run log under the writer's lock without creating
+/// the lock file: with the lock file removed, it still reads the records and
+/// leaves no lock file behind.
+#[test]
+fn status_counts_refused_runs_and_creates_no_run_log_lock() {
+    let units = workflow_units::UnitEnv::new(|env| env.root().join("units"));
+    let plugin = workflow_units::Plugin::new(PLUGIN_ID).job("tick", "tick", 3600);
+    let digest = units.install(&plugin);
+    write_unit_record(&units, br#"{"units":[{"kind":"job","name":"tick"}]}"#);
+    // Installed disabled, so each trampoline run is refused and recorded.
+    for _ in 0..2 {
+        let output = units
+            .exec(PLUGIN_ID, digest.as_str(), "job", "tick")
+            .output()
+            .expect("run the trampoline");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}",
+            workflow_units::describe(&output)
+        );
+    }
+    let lock = units.state_dir(PLUGIN_ID).join("logs/runs.jsonl.lock");
+    fs::remove_file(&lock).expect("remove the run log lock file");
+
+    let output = units
+        .command(&["workflow", "status", "--json"])
+        .output()
+        .expect("run pohunek workflow status");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        workflow_units::describe(&output)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("a JSON envelope");
+    let unit = &document["ok"]["plugins"][0]["units"][0];
+    assert_eq!(unit["last_run"]["outcome"], "refused", "{document}");
+    assert_eq!(unit["consecutive_failures"], 2, "{document}");
+    assert!(!lock.exists(), "status created the run log lock file");
+}
+
 #[test]
 fn status_reports_units_it_cannot_inspect_as_unknown() {
     let units = workflow_units::UnitEnv::new(|env| env.root().join("units"));

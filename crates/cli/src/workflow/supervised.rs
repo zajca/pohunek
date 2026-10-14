@@ -130,6 +130,17 @@ pub(crate) struct Request {
     pub(crate) name: String,
 }
 
+impl Request {
+    /// The requested unit name when it fits the unit name grammar, so a run
+    /// record refused before the manifest verified can still name its unit;
+    /// a name outside the grammar is never recorded.
+    pub(crate) fn recordable_name(&self) -> Option<&str> {
+        PluginUnitKey::new(self.plugin.as_str(), self.kind, &self.name)
+            .is_ok()
+            .then_some(self.name.as_str())
+    }
+}
+
 /// The start of a job's last run.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -276,7 +287,7 @@ fn run(request: &Request, store: &Store, knobs: &Knobs, interrupts: &mut Interru
         );
         run.append(
             &installed,
-            None,
+            request.recordable_name(),
             Outcome::Refused,
             None,
             Some(error),
@@ -312,11 +323,12 @@ fn run(request: &Request, store: &Store, knobs: &Knobs, interrupts: &mut Interru
     };
     let _lock = match lock(&state, request) {
         Ok(lock) => lock,
-        // The name is recorded only once the verified manifest declared it.
+        // The requested name is recorded when it fits the unit name grammar,
+        // so status attributes the record to its unit.
         Err(FsError::LockContended { .. }) => {
             run.append(
                 &installed,
-                None,
+                request.recordable_name(),
                 Outcome::OverlapSkipped,
                 None,
                 None,

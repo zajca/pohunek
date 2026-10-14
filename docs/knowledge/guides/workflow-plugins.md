@@ -368,7 +368,10 @@ rotated, owner-private family (`runs.jsonl`, `runs.jsonl.1`, …):
 ```
 
 `kind` is `action` for `workflow run`, and `job` or `service` for a run of a
-unit (see [Jobs and services](#jobs-and-services)). `outcome` is `ok`,
+unit (see [Jobs and services](#jobs-and-services)). A unit's record names the
+unit even when its run was refused before the manifest verified (`refused`,
+`overlap_skipped`), since the unit name it was started with fits the unit name
+grammar. `outcome` is `ok`,
 `exit_nonzero`, `timeout`, `output_limit`, `interrupted`, `spawn_failed`,
 `failed`, `refused`, `overlap_skipped` (a unit run skipped because the
 previous run of the same unit was still active), or, with `--json` after a
@@ -526,7 +529,8 @@ Each unit reports:
   reports a transitional state.
 - `last_run`: the newest run record of the unit of the installed archive, with
   `ts`, `outcome`, and `exit_code`, `signal` or `error_code` where recorded;
-  `null` when there is none.
+  `null` when there is none. The run log is read under a shared hold of its
+  writer's lock, opened read-only and never created, so status writes nothing.
 - `consecutive_failures`: for a job, the number of newest run records of the
   unit whose outcome is not `ok`, counted up to the first `ok`. An
   `overlap_skipped` record started no run, so it neither counts nor ends the

@@ -251,12 +251,14 @@ pub(crate) fn recent(state_dir: &Path, logs: Logs) -> Result<Vec<ReadRecord>, Er
 }
 
 /// Takes a shared hold of the run log family lock the writer serializes on,
-/// retrying while a writer holds it.
-fn lock_family(dir: &TrustedDir) -> Result<FileLock, Error> {
+/// retrying while a writer holds it. The lock file is opened read-only and
+/// never created: without it no writer ever ran, so there is nothing a
+/// rotation could move, and `None` is returned.
+fn lock_family(dir: &TrustedDir) -> Result<Option<FileLock>, Error> {
     let name = format!("{FILE_NAME}.lock");
     let mut attempt = 1;
     loop {
-        match dir.lock_file(&name, PRIVATE_FILE_MODE, LockKind::Shared) {
+        match dir.lock_existing_file(&name, PRIVATE_FILE_MODE, LockKind::Shared) {
             Ok(lock) => return Ok(lock),
             Err(FsError::LockContended { .. }) if attempt < RUN_LOG_LOCK_ATTEMPTS => {
                 attempt += 1;

@@ -35,6 +35,10 @@
   check in `workflow::units::check_no_units`.
 - Completion of `pohunek workflow status` offers the installed plugin ids.
 
+- A supervised run refused before its manifest verified records the unit
+  name it was started with, so `workflow status` counts the refusal for that
+  unit; status reads the run log under the writer's lock read-only and never
+  creates the lock file.
 ## Unreleased (2026-10-13, bounded PTY input stall, #867)
 
 - `service.toml` schema 5 adds the required key `[input]`

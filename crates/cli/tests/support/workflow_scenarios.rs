@@ -136,7 +136,8 @@ pub(crate) async fn an_active_job_run_is_never_overlapped() {
         let records = units.unit_records(&id, "job", "gated");
         (outcome_count(&records, "ok") >= REPEATED_RUNS).then_some(())
     });
-    // The skipped run never verified the manifest, so it names no job.
+    // The skipped run never verified the manifest; it names the job it was
+    // started for, so status attributes it to that job.
     let skipped: Vec<Value> = units
         .records(&id)
         .into_iter()
@@ -144,7 +145,7 @@ pub(crate) async fn an_active_job_run_is_never_overlapped() {
         .collect();
     assert_eq!(skipped.len(), 1, "{skipped:?}");
     assert_eq!(skipped[0]["kind"], "job", "{skipped:?}");
-    assert!(skipped[0].get("name").is_none(), "{skipped:?}");
+    assert_eq!(skipped[0]["name"], "gated", "{skipped:?}");
 }
 
 /// A job run past its deadline is stopped with its whole process group and
