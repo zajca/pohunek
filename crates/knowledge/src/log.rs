@@ -392,10 +392,12 @@ pub fn fold(log: &str, fragments: &[Fragment], version: &str) -> Result<String, 
 /// section, with a trailing blank line so its last entry reads like the
 /// others; `None` when `log` has no such section.
 fn release_section(log: &str, heading: &str) -> Option<String> {
-    let mut lines = log.lines().skip_while(|line| *line != heading);
+    let mut lines = log
+        .lines()
+        .skip_while(|line| unindented(line).trim_end() != heading);
     lines.next()?;
     let mut section = String::new();
-    for line in lines.take_while(|line| !line.starts_with(SECTION_OPEN)) {
+    for line in lines.take_while(|line| !opens_title_or_section(line)) {
         section.push_str(line);
         section.push('\n');
     }

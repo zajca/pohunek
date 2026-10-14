@@ -59,6 +59,9 @@ case "$*" in
     case "$*" in
       *--dry-run*) ;;
       *)
+        if [ -e bin/edit-unrelated ]; then
+          printf -- '- Edited while the release ran.\n' >> docs/knowledge/guide.md
+        fi
         version=$(printf '%s\n' "$*" | sed 's/.*--version \([^ ]*\).*/\1/')
         printf '\n## %s\n\n- Folded.\n' "$version" >> docs/knowledge/log.md
         rm -rf docs/knowledge/log.d
@@ -236,6 +239,7 @@ class ReleaseEvidenceTests(unittest.TestCase):
         self.state.write_text(json.dumps({"sha": sha, "runs": runs}))
 
     def add_knowledge_log(self):
+        self.write_copy("docs/knowledge/guide.md", "# Guide\n")
         self.write_copy("docs/knowledge/log.md", LOG)
         self.write_copy("docs/knowledge/log.d/1-a-change.md", FRAGMENT)
         self.write_copy("bin/cargo", FOLDING_CARGO, executable=True)
@@ -289,6 +293,48 @@ class ReleaseEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(status, "", "the failed release leaves the tree as it found it")
         self.assertTrue((self.repo / "docs/knowledge/log.d/1-a-change.md").exists())
+
+    def show(self, revision, path):
+        return subprocess.check_output(
+            [shutil.which("git"), "-C", str(self.repo), "show", f"{revision}:{path}"], text=True
+        )
+
+    def test_release_commit_and_rollback_leave_other_knowledge_files_alone(self):
+        self.add_knowledge_log()
+        self.write_copy("bin/edit-unrelated", "")
+        self.git("add", "bin")
+        self.git("commit", "-m", "Edit another knowledge file during the fold")
+        result = self.run_release()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        candidate = json.loads(self.state.read_text())["sha"]
+        self.assertEqual(self.show(candidate, "docs/knowledge/guide.md"), "# Guide\n")
+        self.assertIn("Edited while the release ran.", (self.repo / "docs/knowledge/guide.md").read_text())
+
+    def test_rollback_keeps_an_edit_to_another_knowledge_file(self):
+        self.add_knowledge_log()
+        failing = FOLDING_CARGO.replace(
+            "exit 0\n", 'case "$*" in update*) exit 3 ;; esac\nexit 0\n'
+        )
+        self.write_copy("bin/cargo", failing, executable=True)
+        self.write_copy("bin/edit-unrelated", "")
+        self.git("add", "bin")
+        self.git("commit", "-m", "Make cargo update fail and edit another knowledge file")
+        result = self.run_release()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Edited while the release ran.", (self.repo / "docs/knowledge/guide.md").read_text())
+        self.assertTrue((self.repo / "docs/knowledge/log.d/1-a-change.md").exists())
+
+    def test_rollback_still_restores_when_the_bump_file_cannot_be_removed(self):
+        self.add_knowledge_log()
+        # An untracked directory where the bump writes its temporary manifest
+        # fails the bump, and `rm -f` cannot remove it either.
+        (self.repo / "Cargo.toml.tmp").mkdir()
+        result = self.run_release()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Cargo.toml.tmp", result.stderr)
+        self.assertTrue((self.repo / "docs/knowledge/log.d/1-a-change.md").exists())
+        self.assertEqual(self.show("HEAD", "docs/knowledge/log.md"), LOG)
+        self.assertEqual((self.repo / "docs/knowledge/log.md").read_text(), LOG)
 
     def test_already_versioned_candidate_with_unfolded_fragments_is_refused(self):
         self.add_knowledge_log()

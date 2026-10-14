@@ -229,14 +229,14 @@ pohunek_fold_knowledge_log() {
 release_edits_pending=false
 pohunek_restore_release_edits() {
   [ "$release_edits_pending" = true ] || return 0
-  rm -f "$manifest.tmp"
   unrestored=""
+  rm -f "$manifest.tmp" || unrestored=" Cargo.toml.tmp"
   for path in Cargo.toml Cargo.lock docs/knowledge/log.md docs/knowledge/log.d; do
     git -C "$repo_root" cat-file -e "HEAD:$path" 2>/dev/null || continue
     git -C "$repo_root" restore --source=HEAD --staged --worktree -- "$path" || unrestored="$unrestored $path"
   done
   if [ -n "$unrestored" ]; then
-    printf 'pohunek: a release step failed and these paths could not be restored:%s\n' "$unrestored" >&2
+    printf 'pohunek: a release step failed and these paths could not be restored or removed:%s\n' "$unrestored" >&2
   else
     printf 'pohunek: a release step failed; the version bump and the knowledge-log fold were undone\n' >&2
   fi

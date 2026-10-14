@@ -148,18 +148,30 @@ pub fn migrate(source_dir: &Path, dry_run: bool) -> Result<MigrateSummary, Xtask
     Ok(summary)
 }
 
-/// Replaces `path` with `content` through a sibling temporary file, so a
-/// failed write leaves the previous file whole.
+/// Replaces `path` with `content` through a sibling temporary file this run
+/// creates, so a failed write leaves the previous file whole and no existing
+/// file is overwritten on the way.
 fn replace_file(path: &Path, content: &str) -> Result<(), XtaskError> {
     let file_name = path
         .file_name()
         .ok_or_else(|| XtaskError::InvalidPath(path.to_path_buf()))?;
-    let temporary = path.with_file_name(format!(".{}.tmp", file_name.to_string_lossy()));
-    let written = fs::write(&temporary, content)
+    let temporary = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(io(&temporary))?;
+    let written = std::io::Write::write_all(&mut file, content.as_bytes())
+        .and_then(|()| file.sync_all())
         .and_then(|()| fs::rename(&temporary, path))
         .map_err(io(path));
     if written.is_err() {
-        // Best effort: the returned error already reports the failed write.
+        // Best effort: the returned error already reports the failed write,
+        // and the file removed is the one this run created.
         let _ = fs::remove_file(&temporary);
     }
     written

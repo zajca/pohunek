@@ -480,3 +480,20 @@ fn a_fragment_body_with_an_indented_section_heading_is_refused() {
 
     assert!(error.to_string().contains("`##` heading"), "{error}");
 }
+
+#[test]
+fn a_resumed_fold_ends_its_release_section_at_an_indented_heading() {
+    let dir = temp_dir("fold-resume-indented");
+    let root = dir.path();
+    let log = concat!(
+        "# Knowledge Bundle Log\n\n",
+        "## 0.35.0\n\n### 2026-10-01, other, #1\n\n- Other.\n\n",
+        "  ## 0.34.2\n\n### 2026-10-14, newer change, #200\n\n- Newer body.\n",
+    );
+    write_bundle(root, log, &[NEWER]);
+
+    let error = fold_log(root, RELEASE, false).expect_err("the entry belongs to 0.34.2");
+
+    assert!(error.to_string().contains("is not filed in it"), "{error}");
+    assert!(root.join("log.d").join(NEWER.0).exists());
+}
