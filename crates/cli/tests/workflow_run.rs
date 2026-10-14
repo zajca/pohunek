@@ -174,10 +174,15 @@ const STOP_SELF: &str = r#"#!/bin/sh
 "$POHUNEK_CLI" session stop "$1" --json > "$POHUNEK_PLUGIN_STATE_DIR/stop.json" 2> "$POHUNEK_PLUGIN_STATE_DIR/stop.err"
 "#;
 
-/// Lines and line length of [`burst`]'s output: 96 lines of 127 bytes plus a
-/// newline, 12 KiB, which fits the smallest pipe buffer of a supported host
-/// (16 KiB on macOS), so the action can exit while its output still waits.
-const BURST_LINES: usize = 96;
+/// Lines and line length of [`burst`]'s output: 32 lines of 127 bytes plus a
+/// newline, 4 KiB, so the action can exit while its output still waits.
+///
+/// That needs the output to fit the action's stdout pipe. Once an unprivileged
+/// user's pipe buffers pass `/proc/sys/fs/pipe-user-pages-soft`, which a
+/// loaded test host reaches, Linux creates every new pipe of that user with
+/// two pages (one on older kernels), so one page is all the scenario can rely
+/// on.
+const BURST_LINES: usize = 32;
 /// Bytes per [`burst`] line before the newline.
 const BURST_LINE_BYTES: usize = 127;
 
