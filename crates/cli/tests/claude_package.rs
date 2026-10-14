@@ -3621,6 +3621,12 @@ fn spawn_non_dumpable(root: &Path) -> ChildGuard {
 /// the test-host view. The daemon keeps its fail-closed production behaviour.
 #[tokio::test]
 async fn a_session_removal_ignores_an_unreadable_process_of_the_test_host() {
+    // The unreadable helper this test starts would keep another test run's
+    // forced-close sweep unconfirmed.
+    let _host_lock = pohunek_test_support::host_lock::HostLock::acquire(
+        pohunek_test_support::host_lock::UNREADABLE_HOLDERS,
+        "a_session_removal_ignores_an_unreadable_process_of_the_test_host",
+    );
     let fixture = Fixture::start(Seed::Trusted).await;
     let root = fixture.harness.env.root().to_path_buf();
     let program = write_fake_claude(&root, "fake-removal", &banner_of(&locked_release()));
@@ -4508,6 +4514,12 @@ fn spawn_detached_sleeper(env: &pohunek_test_support::env::TestEnv) -> i32 {
 #[cfg(target_os = "linux")]
 #[test]
 fn the_child_guard_terminates_a_non_dumpable_helper_when_the_test_unwinds() {
+    // The non-dumpable helper would keep another test run's forced-close sweep
+    // unconfirmed while it lives.
+    let _host_lock = pohunek_test_support::host_lock::HostLock::acquire(
+        pohunek_test_support::host_lock::UNREADABLE_HOLDERS,
+        "the_child_guard_terminates_a_non_dumpable_helper_when_the_test_unwinds",
+    );
     let env = pohunek_test_support::env::TestEnv::new().expect("create the environment");
     let pid = std::cell::Cell::new(0);
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

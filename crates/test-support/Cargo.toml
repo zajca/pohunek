@@ -15,7 +15,8 @@ catalog = ["dep:pohunek-package", "dep:ed25519-dalek", "dep:getrandom"]
 [dependencies]
 tempfile.workspace = true
 # `workers` signals leaked worker processes through pidfds (`process`).
-rustix = { workspace = true, features = ["process"] }
+# `host_lock` takes a `flock` on a file (`fs`).
+rustix = { workspace = true, features = ["fs", "process"] }
 # The async waits use `tokio::time` and `TestEnv::tokio_command` returns a
 # `tokio::process::Command`; the workspace spec already enables every
 # feature the other crates use, so this adds no build weight to a workspace build.

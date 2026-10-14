@@ -49,6 +49,10 @@
 //! long-lived process whose ownership markers the kernel always exposes, which
 //! a restricted platform binary on macOS 27 is not.
 //!
+//! The [`host_lock`] module holds [`host_lock::HostLock`], an exclusive lock
+//! shared by every test run of the current user on the host, for tests that a
+//! nextest group cannot keep apart because they run in separate runs.
+//!
 //! The [`workers`] module holds [`workers::WorkerGuard`], which terminates the
 //! `pohunek-sessiond` workers a fixture root owns when it drops and fails the
 //! test that left them running; [`env::TestEnv`] carries one for its root.
@@ -71,6 +75,7 @@ pub mod catalog;
 pub mod env;
 pub mod fs;
 pub mod hold;
+pub mod host_lock;
 pub mod process_env;
 pub mod time;
 pub mod wait;
