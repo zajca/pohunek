@@ -146,6 +146,22 @@ impl NotificationStore {
         &self.path
     }
 
+    /// The source ids of `provider`'s records that start with `prefix`, with
+    /// the prefix removed.
+    pub(crate) fn source_id_suffixes(&self, provider: &str, prefix: &str) -> Vec<String> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .records
+            .values()
+            .filter(|record| record.source.provider == provider)
+            .filter_map(|record| record.source_id.as_deref()?.strip_prefix(prefix))
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// Return all reconstructed notification records.
     pub(crate) fn all(&self) -> Vec<NotificationRecord> {
         let state = self

@@ -2,7 +2,7 @@
 
 // Rust guideline compliant 2026-10-12
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use protocol::{
@@ -187,8 +187,11 @@ fn resolve_session_notifications(attention: &AttentionCoordinator, session_id: &
 /// Return a deterministic projector source id.
 ///
 /// Scheme: `projector:<session_id>:<kind>:<transition_epoch>`. The transition
-/// epoch is local to one daemon projector instance and increments only when the
-/// session enters a projected state for that notification kind.
+/// epoch increments only when the session enters a projected state for that
+/// notification kind. It continues from the highest epoch the store holds for
+/// the session and kind, so a restarted daemon never reuses the key of a
+/// record from before the restart, which the store would merge the new
+/// transition into.
 #[must_use]
 fn projector_source_id(
     session_id: &SessionId,
@@ -196,10 +199,46 @@ fn projector_source_id(
     transition_epoch: u64,
 ) -> String {
     format!(
-        "{PROJECTOR_SOURCE_ID_PREFIX}:{}:{}:{transition_epoch}",
-        session_id.0,
-        kind.as_str()
+        "{}{transition_epoch}",
+        projector_source_id_prefix(session_id, kind)
     )
+}
+
+/// The part of a projector source id before its transition epoch.
+fn projector_source_id_prefix(session_id: &SessionId, kind: NotificationKind) -> String {
+    format!("{}{}:", projector_session_prefix(session_id), kind.as_str())
+}
+
+/// The part of a projector source id before its notification kind.
+fn projector_session_prefix(session_id: &SessionId) -> String {
+    format!("{PROJECTOR_SOURCE_ID_PREFIX}:{}:", session_id.0)
+}
+
+/// The notification kind a projector source id names, if the projector
+/// derives that kind.
+fn projected_kind(name: &str) -> Option<NotificationKind> {
+    [
+        NotificationKind::AgentBlocked,
+        NotificationKind::ApprovalRequired,
+        NotificationKind::TurnCompleted,
+        NotificationKind::SessionFinished,
+        NotificationKind::Error,
+    ]
+    .into_iter()
+    .find(|kind| kind.as_str() == name)
+}
+
+/// The session an event the projector derives notifications from names.
+fn event_session_id(event: &Event) -> Option<SessionId> {
+    match event.event() {
+        event::AGENT_STATE => {
+            parse_projector_payload::<AgentStatePayload>(event).map(|payload| payload.session_id)
+        }
+        event::SESSION_UPDATED => {
+            parse_projector_payload::<SessionPayload>(event).map(|payload| payload.session.id)
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -207,6 +246,8 @@ struct ProjectorState {
     activity_by_session: HashMap<SessionId, AgentActivity>,
     lifecycle_by_session: HashMap<SessionId, SessionState>,
     transition_epochs: HashMap<(SessionId, NotificationKind), u64>,
+    /// Sessions whose transition epochs continue from the store's records.
+    seeded_sessions: HashSet<SessionId>,
 }
 
 impl ProjectorState {
@@ -216,6 +257,14 @@ impl ProjectorState {
         attention: &AttentionCoordinator,
         event: &Event,
     ) {
+        if let Some(session_id) = event_session_id(event) {
+            if !self
+                .seed_transition_epochs(notifications, &session_id)
+                .await
+            {
+                return;
+            }
+        }
         for pending in self.pending_event(notifications, attention, event) {
             create_pending_notification_blocking(notifications.clone(), attention, pending).await;
         }
@@ -227,6 +276,12 @@ impl ProjectorState {
         attention: &AttentionCoordinator,
         session: &SessionInfo,
     ) {
+        if !self
+            .seed_transition_epochs(notifications, &session.id)
+            .await
+        {
+            return;
+        }
         for pending in self.pending_session_snapshot(notifications, attention, session) {
             create_pending_notification_blocking(notifications.clone(), attention, pending).await;
         }
@@ -437,7 +492,15 @@ impl ProjectorState {
         {
             return None;
         }
-        let transition_epoch = self.next_transition_epoch(&derived.session_id, derived.kind);
+        let Some(transition_epoch) = self.next_transition_epoch(&derived.session_id, derived.kind)
+        else {
+            warn!(
+                session_id = %derived.session_id.0,
+                kind = derived.kind.as_str(),
+                "projector transition epoch is exhausted; the notification is not created"
+            );
+            return None;
+        };
         let source_id = projector_source_id(&derived.session_id, derived.kind, transition_epoch);
         let params = NotificationCreateParams {
             source: NotificationSource {
@@ -463,13 +526,68 @@ impl ProjectorState {
         })
     }
 
-    fn next_transition_epoch(&mut self, session_id: &SessionId, kind: NotificationKind) -> u64 {
+    /// Continues the transition epochs of `session_id` from the highest ones
+    /// the store holds, once per session and daemon process. The store is read
+    /// off the async runtime.
+    ///
+    /// Returns whether the epochs are seeded. An unseeded session's event is
+    /// not projected, because its transition could reuse a stored key; the
+    /// next event of the session tries again.
+    async fn seed_transition_epochs(
+        &mut self,
+        notifications: &NotificationService,
+        session_id: &SessionId,
+    ) -> bool {
+        if self.seeded_sessions.contains(session_id) {
+            return true;
+        }
+        let service = notifications.clone();
+        let prefix = projector_session_prefix(session_id);
+        let suffixes = match run_projector_blocking(move || {
+            service.source_id_suffixes(PROJECTOR_PROVIDER, &prefix)
+        })
+        .await
+        {
+            Ok(suffixes) => suffixes,
+            Err(error) => {
+                warn!(
+                    session_id = %session_id.0,
+                    %error,
+                    "projector epoch seeding task failed; the session's event is not projected"
+                );
+                return false;
+            }
+        };
+        for suffix in suffixes {
+            let Some((kind, epoch)) = suffix.rsplit_once(':') else {
+                continue;
+            };
+            let (Some(kind), Ok(epoch)) = (projected_kind(kind), epoch.parse::<u64>()) else {
+                continue;
+            };
+            let current = self
+                .transition_epochs
+                .entry((session_id.clone(), kind))
+                .or_insert(0);
+            *current = (*current).max(epoch);
+        }
+        self.seeded_sessions.insert(session_id.clone());
+        true
+    }
+
+    /// The next transition epoch of `session_id` and `kind`, or `None` once
+    /// the counter is exhausted.
+    fn next_transition_epoch(
+        &mut self,
+        session_id: &SessionId,
+        kind: NotificationKind,
+    ) -> Option<u64> {
         let epoch = self
             .transition_epochs
             .entry((session_id.clone(), kind))
             .or_insert(0);
-        *epoch += 1;
-        *epoch
+        *epoch = epoch.checked_add(1)?;
+        Some(*epoch)
     }
 }
 
@@ -1163,6 +1281,114 @@ mod tests {
         assert_eq!(
             projector_source_id(&SessionId("s-2".to_owned()), NotificationKind::Error, 3),
             "projector:s-2:error:3"
+        );
+    }
+
+    /// One blocked transition of session `s-1`, flushed past the debounce.
+    async fn block_and_resume(
+        projector: &mut ProjectorState,
+        service: &NotificationService,
+        attention: &AttentionCoordinator,
+    ) {
+        projector
+            .handle_event_blocking(
+                service,
+                attention,
+                &agent_state_event("s-1", AgentActivity::Blocked),
+            )
+            .await;
+        settle().await;
+        advance_past_debounce().await;
+        settle().await;
+        projector
+            .handle_event_blocking(
+                service,
+                attention,
+                &agent_state_event("s-1", AgentActivity::Working),
+            )
+            .await;
+        settle().await;
+    }
+
+    fn agent_blocked_records(service: &NotificationService) -> usize {
+        list(service)
+            .iter()
+            .filter(|record| record.kind == NotificationKind::AgentBlocked)
+            .count()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_transition_after_a_daemon_restart_surfaces_beside_the_records_before_it() {
+        let dir = temp_data_dir("restart");
+        let before_restart = {
+            let service = NotificationService::open(&dir).expect("open notification service");
+            let (attention, _task) = spawn_coordinator(&service);
+            let mut projector = ProjectorState::default();
+            for _ in 0..2 {
+                block_and_resume(&mut projector, &service, &attention).await;
+            }
+            agent_blocked_records(&service)
+        };
+        assert_eq!(before_restart, 2);
+
+        // A restarted daemon opens the same store with a fresh projector.
+        let service = NotificationService::open(&dir).expect("reopen notification service");
+        let (attention, _task) = spawn_coordinator(&service);
+        let mut projector = ProjectorState::default();
+        block_and_resume(&mut projector, &service, &attention).await;
+        assert_eq!(
+            agent_blocked_records(&service),
+            3,
+            "the first transition after the restart is a new record: {:#?}",
+            list(&service)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_projector_key_at_the_epoch_limit_drops_the_next_transition_without_panicking()
+    {
+        let service = service("epoch-limit");
+        service
+            .create(NotificationCreateParams {
+                source: NotificationSource {
+                    provider: super::PROJECTOR_PROVIDER.to_owned(),
+                    provider_event: event::SESSION_UPDATED.to_owned(),
+                    host_local_source_id: "stored".to_owned(),
+                },
+                kind: NotificationKind::Error,
+                severity: NotificationSeverity::Error,
+                title: "Session failed".to_owned(),
+                body: "Session s-1 failed.".to_owned(),
+                metadata: BTreeMap::new(),
+                session_id: Some(SessionId("s-1".to_owned())),
+                agent_kind: None,
+                source_id: Some(projector_source_id(
+                    &SessionId("s-1".to_owned()),
+                    NotificationKind::Error,
+                    u64::MAX,
+                )),
+                dedupe_key: None,
+                project_id: None,
+            })
+            .expect("store a record at the epoch limit");
+        let attention = AttentionCoordinator::disconnected();
+        let mut projector = ProjectorState::default();
+
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &session_event(
+                    event::SESSION_UPDATED,
+                    &session_info("s-1", SessionState::Failed, Some(1)),
+                ),
+            )
+            .await;
+
+        assert_eq!(
+            list(&service).len(),
+            1,
+            "an exhausted epoch creates nothing rather than reuse a key"
         );
     }
 }

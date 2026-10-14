@@ -481,6 +481,13 @@ impl NotificationService {
         self.inner.store.path()
     }
 
+    /// The source ids of `provider`'s stored records that start with
+    /// `prefix`, with the prefix removed.
+    #[must_use]
+    pub(crate) fn source_id_suffixes(&self, provider: &str, prefix: &str) -> Vec<String> {
+        self.inner.store.source_id_suffixes(provider, prefix)
+    }
+
     /// Subscribe to notification lifecycle events.
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
