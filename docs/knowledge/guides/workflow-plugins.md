@@ -114,8 +114,9 @@ and every action's, job's and service's argv with `argv[0]` resolved to its
 absolute path, with each job's interval and requested timeout. Nothing
 is created until you repeat the command with `--yes`; until then it fails with
 `consent_required`. `--no-enable` installs the plugin disabled. A plugin with
-jobs or services is enabled as `pohunek workflow enable` enables it (see
-[Jobs and services](#jobs-and-services)); without a `pohunek service`
+jobs, services or reactions is enabled as `pohunek workflow enable` enables it
+(see [Jobs and services](#jobs-and-services) and
+[Event reactions](#event-reactions)); without a `pohunek service`
 installation of this pohunek version an enabling install is refused before
 anything is created (`workflow_service_not_installed`), and `--no-enable` still
 installs it. An
