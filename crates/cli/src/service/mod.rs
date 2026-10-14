@@ -906,7 +906,7 @@ async fn status_of(context: &Context) -> Result<report::StatusReport, Error> {
     Engine::new(context, &backend).status(Some(&config)).await
 }
 
-fn staged_dir(context: &Context, from: Option<PathBuf>) -> Result<PathBuf, Error> {
+pub(crate) fn staged_dir(context: &Context, from: Option<PathBuf>) -> Result<PathBuf, Error> {
     match from {
         Some(from) => absolute("--from", from),
         None => Ok(context

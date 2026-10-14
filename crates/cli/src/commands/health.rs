@@ -12,6 +12,20 @@ use crate::commands::render_json;
 use crate::error::CliError;
 use crate::paths::Paths;
 
+/// Fetch the daemon's health from the daemon for `host` without printing it.
+///
+/// # Errors
+///
+/// Returns [`CliError`] if the daemon is unreachable, the host cannot be
+/// resolved, or the daemon returns an error.
+pub(crate) async fn fetch(
+    host: &str,
+    paths: &Paths,
+) -> Result<protocol::DaemonHealthResult, CliError> {
+    let mut client = Client::connect(host, paths).await?;
+    client.call::<method::DaemonHealth>(()).await
+}
+
 /// Run `health`/`status` against the daemon for `host`.
 ///
 /// # Errors
@@ -19,8 +33,7 @@ use crate::paths::Paths;
 /// Returns [`CliError`] if the daemon is unreachable, the host cannot be
 /// resolved, or the daemon returns an error.
 pub(crate) async fn run(host: &str, paths: &Paths, json: bool) -> Result<(), CliError> {
-    let mut client = Client::connect(host, paths).await?;
-    let result = client.call::<method::DaemonHealth>(()).await?;
+    let result = fetch(host, paths).await?;
 
     if json {
         print!("{}", render_json(&result)?);

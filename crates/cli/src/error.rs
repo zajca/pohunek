@@ -164,6 +164,32 @@ pub(crate) enum CliError {
         host: String,
     },
 
+    /// Bare `pohunek setup` needs the owner's consent and the run cannot ask
+    /// for it (`--yes` is missing and stdin is not a terminal, or `--json`).
+    /// Nothing is changed.
+    #[error("setup changes this host and needs your consent; nothing was changed")]
+    SetupConsentRequired,
+
+    /// The owner declined the plan shown by bare `pohunek setup`.
+    #[error("setup was not confirmed; nothing was changed")]
+    SetupDeclined,
+
+    /// Bare `pohunek setup` stopped before its first write: the plan refuses
+    /// it, or the installed service needs another step first.
+    #[error("setup stopped before any change: {detail}")]
+    SetupBlocked {
+        /// The refusals or the gap that blocks the run, with the next step.
+        detail: String,
+    },
+
+    /// Bare `pohunek setup` stopped after it started changing the host. The
+    /// changes made so far are kept; re-running setup completes them.
+    #[error("setup did not complete: {detail}")]
+    SetupIncomplete {
+        /// What was left undone, with the next step.
+        detail: String,
+    },
+
     /// Failed to spawn the daemon process.
     #[error("failed to start daemon: {0}")]
     Spawn(String),
@@ -334,6 +360,30 @@ impl CliError {
                 "confirmation_required",
                 "starting a session on a remote host requires explicit confirmation".to_owned(),
                 Some("re-run with `--yes` to confirm the remote session".to_owned()),
+            ),
+            CliError::SetupConsentRequired => ProtocolError::new(
+                ErrorClass::Configuration,
+                "setup_consent_required",
+                "setup changes this host and needs your consent; nothing was changed".to_owned(),
+                Some("review the plan, then re-run `pohunek setup --yes` to apply it".to_owned()),
+            ),
+            CliError::SetupDeclined => ProtocolError::new(
+                ErrorClass::Configuration,
+                "setup_declined",
+                "setup was not confirmed; nothing was changed".to_owned(),
+                Some("re-run `pohunek setup` and confirm, or pass `--yes`".to_owned()),
+            ),
+            CliError::SetupBlocked { detail } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "setup_blocked",
+                format!("setup stopped before any change: {detail}"),
+                Some("resolve the reported refusal or gap, then re-run `pohunek setup`".to_owned()),
+            ),
+            CliError::SetupIncomplete { detail } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "setup_incomplete",
+                format!("setup did not complete: {detail}"),
+                Some("resolve the reported item, then re-run `pohunek setup`; finished steps are kept".to_owned()),
             ),
             CliError::RemoteConfirmationDeclined { host } => ProtocolError::new(
                 ErrorClass::Configuration,
