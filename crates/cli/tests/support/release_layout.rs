@@ -4,11 +4,12 @@
 //! The three release binaries are copied into
 //! `<prefix>/libexec/pohunek/<version>/`, the directory the service installer
 //! uses. The daemon finds its worker and its trust anchor beside its own
-//! executable there. Every digest is taken from file contents; a running
+//! executable there. Every digest is taken from file contents. On Linux, a running
 //! image is hashed through `/proc/<pid>/exe`, which reads the inode that was
-//! executed even if the path was replaced afterwards.
+//! executed even if the path was replaced afterwards. On macOS, the executable path
+//! is read via the host inspector and verified against the installed bytes.
 
-// Rust guideline compliant 2026-10-08
+// Rust guideline compliant 2026-10-13
 
 use std::fmt;
 use std::fs;
@@ -127,6 +128,18 @@ fn io<T>(what: impl Into<String>, result: std::io::Result<T>) -> Result<T, Layou
     result.map_err(|source| LayoutError::Io {
         what: what.into(),
         source,
+    })
+}
+
+/// Maps a [`pohunek_platform::process::Error`] to [`LayoutError::Io`].
+#[cfg(target_os = "macos")]
+fn inspect<T>(
+    what: impl Into<String>,
+    result: Result<T, pohunek_platform::process::Error>,
+) -> Result<T, LayoutError> {
+    result.map_err(|error| LayoutError::Io {
+        what: what.into(),
+        source: std::io::Error::other(error),
     })
 }
 
@@ -322,6 +335,7 @@ impl Layout {
     ///
     /// Fails when `/proc/<pid>/exe` is not that file, or when the executed
     /// inode hashes differently from the recorded digest.
+    #[cfg(target_os = "linux")]
     pub(crate) fn verify_process(&self, pid: u32, name: &str) -> Result<(), LayoutError> {
         let file = self.file(name);
         let executable = io(
@@ -350,6 +364,69 @@ impl Layout {
         Ok(())
     }
 
+    /// Checks that process `pid` executes the layout file `name` and that the
+    /// file's current bytes match the recorded digest.
+    ///
+    /// On macOS, the executable path is read via the host inspector and canonicalized
+    /// for comparison. Both the path and the bytes are instantaneous snapshots, and
+    /// Darwin offers no handle to the executed image, so the check binds the executable
+    /// path and that file's current bytes at observation time; they may race with a
+    /// concurrent `exec`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the executable path does not match the layout, when the file's
+    /// current bytes differ from the recorded digest, or when the process has exited.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn verify_process(&self, pid: u32, name: &str) -> Result<(), LayoutError> {
+        use pohunek_platform::process::{HostInspector, ProcessInspector as _};
+
+        let file = self.file(name);
+        let inspector = HostInspector::new();
+        let canonical_dir = io(
+            "canonicalize the layout directory",
+            fs::canonicalize(&self.dir),
+        )?;
+        let canonical_layout_path = io("canonicalize layout path", fs::canonicalize(&file.path))?;
+        let Some(executable) = inspect(
+            format!("read executable of process {pid}"),
+            inspector.executable(pid),
+        )?
+        else {
+            return Err(LayoutError::Io {
+                what: format!("process {pid} exited"),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "process no longer exists",
+                ),
+            });
+        };
+        let canonical_executable = io(
+            "canonicalize executable path",
+            fs::canonicalize(&executable),
+        )?;
+        if canonical_executable != canonical_layout_path {
+            return Err(LayoutError::OutsideLayout {
+                pid,
+                executable: canonical_executable,
+                layout: canonical_dir,
+            });
+        }
+        let image = io(
+            format!("hash the executable of process {pid}"),
+            sha256_file(&canonical_executable),
+        )?;
+        if image != file.digest {
+            return Err(LayoutError::Changed {
+                file: format!("the running image of {name} (process {pid})"),
+                expected: file.digest.clone(),
+                actual: image,
+                against: "the installed file",
+            });
+        }
+        Ok(())
+    }
+
     /// Every pohunek process that belongs to the environment rooted at `scope`
     /// (its environment holds a value below `scope`), as `(pid, binary name)`.
     ///
@@ -357,6 +434,7 @@ impl Layout {
     ///
     /// Fails for a process named `pohunek*` that does not execute a
     /// byte-identical binary of this layout.
+    #[cfg(target_os = "linux")]
     pub(crate) fn pohunek_processes(
         &self,
         scope: &Path,
@@ -405,10 +483,146 @@ impl Layout {
         }
         Ok(found)
     }
+
+    /// Every pohunek process that belongs to the environment rooted at `scope`,
+    /// as `(pid, binary name)`.
+    ///
+    /// Only processes inside the scope are checked. A process belongs when its
+    /// executable path or working directory lies below the canonicalized `scope`.
+    /// The platform inspector exposes only the allowlisted ownership markers of
+    /// another process's environment, so membership is decided by executable and
+    /// working directory.
+    ///
+    /// # Errors
+    ///
+    /// Fails for a process named `pohunek*` that belongs to the scope and does not
+    /// execute a byte-identical binary of this layout. Fails closed on error.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn pohunek_processes(
+        &self,
+        scope: &Path,
+    ) -> Result<Vec<(u32, String)>, LayoutError> {
+        use pohunek_platform::process::{HostInspector, ProcessInspector as _};
+
+        let mut found = Vec::new();
+        let inspector = HostInspector::new();
+        let processes = inspect(
+            "inspect same-user processes",
+            inspector.same_user_processes(),
+        )?;
+        let own = std::process::id();
+        let canonical_scope = io("canonicalize scope", fs::canonicalize(scope))?;
+        let canonical_dir = io(
+            "canonicalize the layout directory",
+            fs::canonicalize(&self.dir),
+        )?;
+
+        // Pre-compute canonical paths for the layout binaries.
+        let layout_binaries = BINARIES
+            .iter()
+            .map(|name| {
+                io(
+                    format!("canonicalize layout path {name}"),
+                    fs::canonicalize(self.path(name)),
+                )
+                .map(|path| (*name, path))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let below_root = |path: &Path| -> bool {
+            fs::canonicalize(path).is_ok_and(|canonical| canonical.starts_with(&canonical_scope))
+        };
+
+        for fact in processes {
+            // Skip own process and non-pohunek processes.
+            if fact.pid == own || !fact.comm.starts_with("pohunek") {
+                continue;
+            }
+
+            // Read the executable; Ok(None) means process exited.
+            let Some(executable) = inspect(
+                format!("read executable of process {}", fact.pid),
+                inspector.executable(fact.pid),
+            )?
+            else {
+                // Process exited during the scan.
+                continue;
+            };
+
+            // Check membership BEFORE processing the executable so unrelated processes
+            // outside the scope cannot fail the run.
+            // The RAW executable path (proc_pidpath returns canonical) or cwd below scope.
+            let belongs = executable.starts_with(&canonical_scope)
+                || inspector.cwd(fact.pid).is_ok_and(|cwd| below_root(&cwd));
+
+            if !belongs {
+                continue;
+            }
+
+            // Only for members: canonicalize and check the executable.
+            let canonical_exe = match fs::canonicalize(&executable) {
+                Ok(path) => path,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Process executable is no longer available. Check if the process is still running.
+                    match inspect(
+                        format!("check if process {pid} is running", pid = fact.pid),
+                        inspector.is_running(fact.identity()),
+                    ) {
+                        Ok(false) => {
+                            // Process has exited; skip it.
+                            continue;
+                        }
+                        Ok(true) => {
+                            // Process is alive but its executable path no longer resolves.
+                            return Err(LayoutError::Io {
+                                what: format!(
+                                    "the executable of live process {} no longer resolves",
+                                    fact.pid
+                                ),
+                                source: e,
+                            });
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+                Err(source) => {
+                    return Err(LayoutError::Io {
+                        what: format!("canonicalize executable of process {}", fact.pid),
+                        source,
+                    })
+                }
+            };
+
+            let Some((name, _)) = layout_binaries
+                .iter()
+                .find(|(_, path)| path == &canonical_exe)
+            else {
+                return Err(if canonical_exe.starts_with(&canonical_dir) {
+                    LayoutError::ImageMismatch {
+                        pid: fact.pid,
+                        executable: canonical_exe,
+                        detail: "not one of the three release binaries".to_owned(),
+                    }
+                } else {
+                    LayoutError::OutsideLayout {
+                        pid: fact.pid,
+                        executable: canonical_exe,
+                        layout: canonical_dir.clone(),
+                    }
+                });
+            };
+
+            self.verify_process(fact.pid, name)?;
+            found.push((fact.pid, (*name).to_owned()));
+        }
+
+        Ok(found)
+    }
 }
 
 /// Whether a value of the process environment of `directory` (a `/proc/<pid>`
 /// entry) lies below `scope`.
+#[cfg(target_os = "linux")]
 fn belongs_to(directory: &Path, scope: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt as _;
 
