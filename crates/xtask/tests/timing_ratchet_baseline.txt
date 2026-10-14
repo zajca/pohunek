@@ -40,7 +40,6 @@ crates/relay/src/admission/mod.rs 6
 crates/relay/src/auth/service.rs 3
 crates/relay/src/authorization/admin_tests.rs 1
 crates/relay/src/runtime/tests.rs 3
-crates/relay/src/runtime/tests/ingress.rs 1
 crates/relay/src/server/limits.rs 1
 crates/relay/src/server/transport.rs 1
 crates/session-worker/src/identity.rs 1

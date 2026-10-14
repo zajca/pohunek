@@ -35,7 +35,7 @@ SPEC.loader.exec_module(PLUGIN)
 from pohunek.cli import CliError, CliRunner, Invocation, _minimal_env, _stdout_wire_cap
 from pohunek._pohunek_reporter import Reporter
 from pohunek.hooks import HookReporter
-from pohunek.policy import POLICY_PATH_TOKEN, Policy, PolicyError, load_policy
+from pohunek.policy import MAX_TIMEOUT_MS, POLICY_PATH_TOKEN, Policy, PolicyError, load_policy
 from pohunek.redact import diagnostic
 from pohunek.tools import TOOL_SCHEMAS, Tools, _MAX_INPUT_BYTES, _input
 
@@ -43,10 +43,15 @@ from pohunek.tools import TOOL_SCHEMAS, Tools, _MAX_INPUT_BYTES, _input
 # `true` lives at this path on both Linux and macOS (`/bin/true` is absent on macOS).
 TRUE_BINARY = "/usr/bin/true"
 
-# Tests that spawn a Python child and move bulk output verify byte limits, not
-# scheduler latency on shared runners: an unloaded run takes ~20 ms against the
-# 100 ms default deadline, which a loaded runner can exceed.
-_BULK_COLLECTION_TIMEOUT_MS = 5_000
+# Tests that spawn a Python child and move bulk output verify byte limits and
+# cleanup, not scheduler latency: a loaded runner can delay the child's start,
+# exit, or reaping by seconds. They run under the largest deadline a policy
+# accepts, and the runner's exit grace gets the same bound.
+_BULK_COLLECTION_TIMEOUT_MS = MAX_TIMEOUT_MS
+_BULK_EXIT_GRACE_SECONDS = _BULK_COLLECTION_TIMEOUT_MS / 1000
+# A child that must be killed outlives both exit-grace waits of `_terminate`,
+# so only a delivered signal can end it before the cleanup check.
+_OUTLIVES_TERMINATE_SECONDS = 3 * _BULK_EXIT_GRACE_SECONDS
 
 
 def hook_reporter(environ: dict[str, str] | None = None) -> HookReporter:
@@ -136,6 +141,7 @@ class RunnerTests(unittest.TestCase):
         ) + 16 * 1024
         self.assertEqual(_stdout_wire_cap(bounded), expected)
 
+    @mock.patch("pohunek.cli._EXIT_GRACE_SECONDS", _BULK_EXIT_GRACE_SECONDS)
     def test_collection_accepts_exact_wire_cap_and_rejects_one_byte_over_with_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -157,11 +163,11 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(stdout, b"x" * cap)
                 self.assertEqual(stderr, b"")
                 self.assertGreater(read.call_count, 2)
-                self.assertEqual(process.wait(timeout=1), 0)
+                self.assertEqual(process.wait(timeout=_BULK_EXIT_GRACE_SECONDS), 0)
             finally:
                 runner._terminate(process)
 
-            over_cli, over_pid = self._controlled_cli(root, b"x" * (cap + 1), sleep_seconds=10)
+            over_cli, over_pid = self._controlled_cli(root, b"x" * (cap + 1), sleep_seconds=_OUTLIVES_TERMINATE_SECONDS)
             over_runner = CliRunner(policy(
                 over_cli, max_output_bytes=64, max_screen_bytes=32,
                 tool_timeout_ms=_BULK_COLLECTION_TIMEOUT_MS,
@@ -173,6 +179,7 @@ class RunnerTests(unittest.TestCase):
             with self.assertRaises(ProcessLookupError):
                 os.kill(process_id, 0)
 
+    @mock.patch("pohunek.cli._EXIT_GRACE_SECONDS", _BULK_EXIT_GRACE_SECONDS)
     def test_low_policy_accepts_session_info_with_full_valid_metadata_map(self) -> None:
         metadata = {
             "m0": "x" * 4096,
@@ -214,6 +221,7 @@ class RunnerTests(unittest.TestCase):
             ))
             self.assertEqual(runner.run(Invocation(("session", "inspect", "s-42", "--json"))), session)
 
+    @mock.patch("pohunek.cli._EXIT_GRACE_SECONDS", _BULK_EXIT_GRACE_SECONDS)
     def test_low_policy_accepts_pretty_session_info_collection_near_control_line_limit(self) -> None:
         sessions = [{
             "id": f"s-{index:04d}",
@@ -249,6 +257,7 @@ class RunnerTests(unittest.TestCase):
             ))
             self.assertEqual(runner.run(Invocation(("session", "list", "--json"))), sessions)
 
+    @mock.patch("pohunek.cli._EXIT_GRACE_SECONDS", _BULK_EXIT_GRACE_SECONDS)
     def test_maximum_decoded_base64_response_and_envelope_fit_wire_cap(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bounded = policy(max_output_bytes=1024, max_screen_bytes=1)

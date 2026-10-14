@@ -7,7 +7,27 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 const FIXTURE_SUBJECT: &str = "fixture-subject";
 /// Device code the fixture issuer hands out.
 const FIXTURE_DEVICE_CODE: &str = "fixture-device-code";
+/// Drain budget of a runtime expected to stop cleanly. Its clean stop validates
+/// and releases the lease in a `PostgreSQL` that every relay test shares, which
+/// a loaded runner can delay well past a fraction of a second, before it ends
+/// the witness run; the budget stays below `LEASE_LIFETIME`, as the
+/// configuration requires.
+const CLEAN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// Drain budget of the forced-shutdown scenario. Its stalled handshake never
+/// completes, so the drain always runs out; a short budget only keeps the
+/// scenario quick.
+const FORCED_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(150);
+/// Socket capacity of the forced-shutdown scenario, and its team and principal
+/// shares, which the configuration caps at it. With a single slot, one of two
+/// sockets is refused, which proves the other was accepted and holds it.
+const FORCED_SHUTDOWN_CONNECTIONS: usize = 1;
+/// TLS handshake bound of the forced-shutdown scenario, set through both the
+/// request timeout and the connection lifetime. It exceeds the configured
+/// request timeout cap on purpose: every wait of the scenario is bounded by
+/// `HANG_GUARD`, so within them a socket can only end by being refused.
+const FORCED_SHUTDOWN_HANDSHAKE_TIMEOUT: Duration = HANG_GUARD.saturating_mul(2);
 
+use pohunek_test_support::wait::HANG_GUARD;
 use std::{
     fs,
     net::SocketAddr,
@@ -250,9 +270,11 @@ impl Running {
 
     async fn shutdown(self) -> Result<(), RuntimeError> {
         self.stop.send(()).expect("runtime still running");
-        timeout(Duration::from_secs(2), self.task)
+        // The runtime bounds its own stop; the guard only turns a hang into a
+        // failure.
+        timeout(HANG_GUARD, self.task)
             .await
-            .expect("bounded runtime stop")
+            .expect("runtime stopped within the hang guard")
             .expect("runtime task")
     }
 }
@@ -528,22 +550,48 @@ async fn successful_browser_callback_holds_shared_capacity_until_session_issue_f
 
 #[tokio::test]
 async fn forced_shutdown_cancels_stalled_tls_and_preserves_dirty_evidence() {
-    let ingress = Ingress::new().await;
+    let mut ingress = Ingress::new().await;
+    ingress.config.limits.shutdown_timeout = FORCED_SHUTDOWN_TIMEOUT;
+    ingress.config.limits.connections = FORCED_SHUTDOWN_CONNECTIONS;
+    ingress.config.limits.per_team = FORCED_SHUTDOWN_CONNECTIONS;
+    ingress.config.limits.per_principal = FORCED_SHUTDOWN_CONNECTIONS;
+    ingress.config.limits.request_timeout = FORCED_SHUTDOWN_HANDSHAKE_TIMEOUT;
+    ingress.config.limits.connection_lifetime = FORCED_SHUTDOWN_HANDSHAKE_TIMEOUT;
     let running = ingress.start().await;
-    let mut stalled = tokio::net::TcpStream::connect(running.address)
-        .await
-        .expect("stalled TLS socket");
-    assert!(
-        timeout(Duration::from_millis(30), stalled.read_u8())
+    // A completed `connect` does not order the server's accept queue, so the
+    // listener may accept either socket first; the one it refuses ends, and
+    // the other holds the single slot with its handshake stalled. One hang
+    // guard covers both connects and the refusal, within the handshake bound.
+    let mut stalled = timeout(HANG_GUARD, async {
+        let mut first = tokio::net::TcpStream::connect(running.address)
             .await
-            .is_err(),
-        "handshake is held open"
-    );
+            .expect("first TLS socket");
+        let mut second = tokio::net::TcpStream::connect(running.address)
+            .await
+            .expect("second TLS socket");
+        let second_holds = tokio::select! {
+            refused = first.read_u8() => {
+                refused.expect_err("refused socket closed");
+                true
+            }
+            refused = second.read_u8() => {
+                refused.expect_err("refused socket closed");
+                false
+            }
+        };
+        if second_holds {
+            second
+        } else {
+            first
+        }
+    })
+    .await
+    .expect("one socket refused within the hang guard");
     assert!(matches!(
         running.shutdown().await,
         Err(RuntimeError::Shutdown)
     ));
-    let result = timeout(Duration::from_millis(100), stalled.read_u8())
+    let result = timeout(HANG_GUARD, stalled.read_u8())
         .await
         .expect("pre-TLS socket cancelled");
     result.expect_err("stalled socket cannot survive failure");
@@ -572,23 +620,24 @@ async fn fence_loss_cancels_inflight_request_and_pre_tls_socket() {
     timeout(Duration::from_secs(1), ingress.device_entered.notified())
         .await
         .expect("real handler entered issuer");
-    let changed = std::time::Instant::now();
     sqlx::query("UPDATE relay_lease SET fence_token = $1")
         .bind(Uuid::now_v7())
         .execute(ingress.fixture.store.pool())
         .await
         .expect("replace active fence");
-    let result = timeout(Duration::from_millis(250), running.task)
+    // How soon the watch notices a replaced fence is covered by
+    // `idle_fence_loss_closes_authority_and_preserves_dirty_latch`; this
+    // scenario checks what the stop cancels.
+    let result = timeout(HANG_GUARD, running.task)
         .await
-        .expect("bounded fence-loss stop")
+        .expect("fence-loss stop within the hang guard")
         .expect("runtime task");
     assert!(matches!(result, Err(RuntimeError::Authority(_))));
-    assert!(changed.elapsed() < Duration::from_millis(250));
-    timeout(Duration::from_millis(100), stalled.read_u8())
+    timeout(HANG_GUARD, stalled.read_u8())
         .await
-        .expect("pre-TLS failure bounded")
+        .expect("pre-TLS failure within the hang guard")
         .expect_err("pre-TLS socket closed");
-    timeout(Duration::from_millis(100), request)
+    timeout(HANG_GUARD, request)
         .await
         .expect("inflight request cancelled")
         .expect("request task")
@@ -823,7 +872,7 @@ fn configuration(
     limits.per_principal = 2;
     limits.requests_per_window = 100;
     limits.request_timeout = Duration::from_secs(2);
-    limits.shutdown_timeout = Duration::from_millis(150);
+    limits.shutdown_timeout = CLEAN_SHUTDOWN_TIMEOUT;
     limits.lease_renew = Duration::from_millis(500);
     Config {
         relay_id: fixture.relay_id.clone(),
