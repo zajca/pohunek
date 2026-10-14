@@ -8703,6 +8703,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn escaped_pty_holder_ends_with_the_exit_and_the_exact_final_output_offset() {
+        // Another test run's unreadable holder would keep this sweep unconfirmed.
+        let _host_lock = pohunek_test_support::host_lock::HostLock::acquire(
+            pohunek_test_support::host_lock::UNREADABLE_HOLDERS,
+            "escaped_pty_holder_ends_with_the_exit_and_the_exact_final_output_offset",
+        );
         let directory = BarrierDirectory::new();
         let ready = directory.path().join("escaped-ready");
         // The escaped holder never closes the PTY, so the runtime always ends with

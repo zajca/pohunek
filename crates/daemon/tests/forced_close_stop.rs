@@ -28,6 +28,7 @@ use pohunek_daemon::runtime::{
 };
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 use pohunek_test_support::env::TestEnv;
+use pohunek_test_support::host_lock::{HostLock, UNREADABLE_HOLDERS};
 use pohunek_test_support::process_env::ProcessEnv;
 use pohunek_test_support::wait::{guard, poll_until, wait_until};
 use pohunek_test_support::worker_binary;
@@ -165,6 +166,9 @@ struct Scenario {
     ready: PathBuf,
     config: SessionRegistryConfig,
     release: ReleaseHolder,
+    /// Keeps other test runs' unreadable holders from overlapping this
+    /// scenario's sweeps; declared last, so it is released last.
+    _host_lock: HostLock,
 }
 
 impl Scenario {
@@ -172,6 +176,10 @@ impl Scenario {
     /// until the holder runs. The root then becomes a process that dies on
     /// `SIGTERM`, or, with [`Root::Exits`], exits on its own.
     fn new(holder: Holder, root: Root) -> Self {
+        let host_lock = HostLock::acquire(
+            UNREADABLE_HOLDERS,
+            std::thread::current().name().unwrap_or("forced_close_stop"),
+        );
         let env = TestEnv::new().expect("create the test environment");
         let barrier = env.root().join("holder-barrier");
         std::fs::create_dir(&barrier).expect("holder barrier");
@@ -243,6 +251,7 @@ impl Scenario {
             ready,
             config,
             release: ReleaseHolder(barrier),
+            _host_lock: host_lock,
         }
     }
 

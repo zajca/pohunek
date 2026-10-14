@@ -3621,6 +3621,12 @@ fn spawn_non_dumpable(root: &Path) -> ChildGuard {
 /// the test-host view. The daemon keeps its fail-closed production behaviour.
 #[tokio::test]
 async fn a_session_removal_ignores_an_unreadable_process_of_the_test_host() {
+    // The unreadable helper this test starts would keep another test run's
+    // forced-close sweep unconfirmed.
+    let _host_lock = pohunek_test_support::host_lock::HostLock::acquire(
+        pohunek_test_support::host_lock::UNREADABLE_HOLDERS,
+        "a_session_removal_ignores_an_unreadable_process_of_the_test_host",
+    );
     let fixture = Fixture::start(Seed::Trusted).await;
     let root = fixture.harness.env.root().to_path_buf();
     let program = write_fake_claude(&root, "fake-removal", &banner_of(&locked_release()));

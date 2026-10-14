@@ -19,7 +19,10 @@ flaky-result = "fail"
 # process table, and on Linux it cannot exclude a process whose environment is
 # hidden (non-dumpable) and that started after the worker. The tests below either
 # start such a long-lived process or need that confirmation to succeed, so they
-# never run beside each other; a new test of either kind joins this group.
+# never run beside each other. This group keeps them apart within one run; each
+# of them also holds `pohunek_test_support::host_lock::UNREADABLE_HOLDERS`, which
+# keeps them apart across separate runs of the same user on one host. A new test
+# of either kind joins this group and takes that lock.
 [test-groups]
 unreadable-holders = { max-threads = 1 }
 
