@@ -306,6 +306,23 @@ pub enum InputReadiness {
     ScreenIdle,
 }
 
+impl InputReadiness {
+    /// The readiness a session gets when `manifest` drives its detection.
+    ///
+    /// `ScreenIdle` holds only while the manifest has an idle rule on a screen
+    /// region; without one it could never be observed, so the session gets
+    /// `BracketedPaste`, the readiness of a runtime that declares none. A host
+    /// profile's override manifest is the case this covers: a runtime's own
+    /// manifest is checked by [`RuntimeDefinition::new`].
+    #[must_use]
+    pub fn for_manifest(self, manifest: &Manifest) -> Self {
+        match self {
+            Self::ScreenIdle if !manifest.has_screen_idle_rule() => Self::BracketedPaste,
+            readiness => readiness,
+        }
+    }
+}
+
 /// Unvalidated inputs of a [`RuntimeDefinition`].
 #[derive(Debug, Clone)]
 pub struct DefinitionParts {

@@ -3266,18 +3266,33 @@ with open({received:?}, "wb") as capture:
     let _ = handle.await;
 }
 
+/// Writes `agents_dir/manifests/<name>.toml` with `manifest` and a Claude
+/// profile `name` over `script` that selects it as its override manifest.
+fn write_claude_profile_with_manifest(
+    agents_dir: &Path,
+    name: &str,
+    script: &Path,
+    manifest: &str,
+) {
+    let manifests_dir = agents_dir.join("manifests");
+    std::fs::create_dir_all(&manifests_dir).expect("create manifests directory");
+    std::fs::write(manifests_dir.join(format!("{name}.toml")), manifest)
+        .expect("write override manifest");
+    write_claude_profile(agents_dir, name, script);
+    let profile = agents_dir.join(format!("{name}.toml"));
+    let body = std::fs::read_to_string(&profile).expect("read profile");
+    std::fs::write(&profile, format!("{body}manifest = \"{name}\"\n"))
+        .expect("declare override manifest");
+}
+
 /// A Claude-based profile whose override manifest declares no idle rule on a
-/// screen region is refused at creation: the Claude base waits for screen
-/// readiness, which such a manifest can never report.
+/// screen region loads, and its sessions write the initial input as soon as
+/// bracketed paste is on, because screen readiness could never be observed.
 #[tokio::test]
-async fn claude_profile_without_a_screen_idle_rule_is_refused_before_any_session() {
+async fn claude_profile_without_a_screen_idle_rule_delivers_input_on_bracketed_paste() {
     let socket = temp_socket("claude-profile-no-idle");
     let agents_dir = socket.dir.join("agents");
     std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
-    let manifests_dir = agents_dir.join("manifests");
-    std::fs::create_dir(&manifests_dir).expect("create manifests directory");
-    let script = socket.dir.join("claude-never-used.py");
-    claude_stub_without_prompt_box(&script, &socket.dir.join("received.bin"));
     let variants = [
         (
             "blockedonly",
@@ -3290,14 +3305,13 @@ async fn claude_profile_without_a_screen_idle_rule_is_refused_before_any_session
         ),
         ("emptyrules", "rules = []\n"),
     ];
+    let mut captures = Vec::new();
     for (name, manifest) in variants {
-        std::fs::write(manifests_dir.join(format!("{name}.toml")), manifest)
-            .expect("write override manifest");
-        write_claude_profile(&agents_dir, name, &script);
-        let profile = agents_dir.join(format!("{name}.toml"));
-        let body = std::fs::read_to_string(&profile).expect("read profile");
-        std::fs::write(&profile, format!("{body}manifest = \"{name}\"\n"))
-            .expect("declare override manifest");
+        let received = socket.dir.join(format!("{name}-received.bin"));
+        let script = socket.dir.join(format!("{name}.py"));
+        claude_stub_without_prompt_box(&script, &received);
+        write_claude_profile_with_manifest(&agents_dir, name, &script, manifest);
+        captures.push((name, received));
     }
     let config = SessionRegistryConfig {
         agents_dir: Some(agents_dir),
@@ -3308,28 +3322,78 @@ async fn claude_profile_without_a_screen_idle_rule_is_refused_before_any_session
         spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
     let mut control = connect(&socket).await;
 
-    for (name, _) in variants {
+    for (name, received) in captures {
         let mut params = session_params(&socket);
         name.clone_into(&mut params.agent);
         params.input = Some("hello Claude".to_owned());
-        let error = err_payload(create_session_with_params(&mut control, params).await);
-        assert_eq!(error.code, "invalid_profile", "profile {name}");
-        assert!(
-            error.msg.contains("input.ready = screen_idle"),
-            "profile {name} names the readiness rule: {}",
-            error.msg
+        let created: SessionInfo = serde_json::from_value(ok_payload(
+            create_session_with_params(&mut control, params).await,
+        ))
+        .unwrap_or_else(|err| panic!("profile {name} session info: {err}"));
+        let bytes = read_file_until(&received, b"hello Claude").await;
+        assert_eq!(
+            bytes
+                .windows(b"hello Claude".len())
+                .filter(|window| *window == b"hello Claude")
+                .count(),
+            1,
+            "profile {name} receives the initial input exactly once"
         );
+        let stop_req = Request::make(
+            "claude-profile-no-idle-stop",
+            method::SESSION_STOP,
+            serde_json::to_value(&created.id).expect("serialize id"),
+        );
+        let _: SessionStopResult =
+            serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+                .expect("stop result");
     }
 
-    let list = Request::make(
-        "claude-profile-no-idle-list",
-        method::SESSION_LIST,
-        Value::Null,
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// A Claude-based profile whose override manifest declares an idle rule on a
+/// screen region keeps waiting for that rule to match before it writes the
+/// initial input.
+#[tokio::test]
+async fn claude_profile_with_a_screen_idle_rule_waits_for_screen_readiness() {
+    let socket = temp_socket("claude-profile-idle");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let received = socket.dir.join("received.bin");
+    let script = socket.dir.join("claude-profile-idle.py");
+    claude_stub_without_prompt_box(&script, &received);
+    write_claude_profile_with_manifest(
+        &agents_dir,
+        "idlerule",
+        &script,
+        "[[rules]]\n\
+         id = \"custom_prompt_box\"\n\
+         state = \"idle\"\n\
+         priority = 950\n\
+         region = \"prompt_box_body\"\n\
+         line_regex = ['^\\s*\u{276f}']\n",
     );
-    let sessions: Vec<SessionInfo> =
-        serde_json::from_value(ok_payload(exchange(&mut control, &list).await))
-            .expect("list sessions");
-    assert!(sessions.is_empty(), "no session was created");
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        initial_input_startup_grace: CLAUDE_PROMPT_BOX_GRACE,
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+    let mut params = session_params(&socket);
+    "idlerule".clone_into(&mut params.agent);
+    params.input = Some("hello Claude".to_owned());
+    let error = err_payload(create_session_with_params(&mut control, params).await);
+    assert_eq!(error.code, "session_input_not_ready");
+    let captured = std::fs::read(&received).unwrap_or_default();
+    assert!(
+        captured.is_empty(),
+        "the stub received input before its prompt box rendered"
+    );
 
     let _ = shutdown.send(());
     let _ = handle.await;

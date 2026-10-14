@@ -6540,7 +6540,7 @@ fn detector_config_for_resolved_agent(resolved: &ResolvedAgent) -> DetectorConfi
     {
         Some(manifest) => DetectorConfig {
             manifest: Some(manifest),
-            input_readiness: resolved.definition.input_readiness(),
+            input_readiness: resolved.input_readiness(),
             ..DetectorConfig::default()
         },
         None => DetectorConfig::for_definition(&resolved.definition),

@@ -207,14 +207,22 @@ fn configured_profile_checks(
     configured
         .into_iter()
         .map(|(name, result)| {
-            let result = match result {
-                Ok(agent) => profile_runtime_check(profiles, &agent, base_env, probe_started),
+            let (result, readiness_lost) = match result {
+                Ok(agent) => (
+                    profile_runtime_check(profiles, &agent, base_env, probe_started),
+                    agent.override_lacks_screen_readiness(),
+                ),
                 Err(crate::agent::DoctorProfileError::RuntimeUnavailable) => {
-                    Err(RuntimeFailure::PinnedRuntime)
+                    (Err(RuntimeFailure::PinnedRuntime), false)
                 }
-                Err(crate::agent::DoctorProfileError::Invalid) => Err(RuntimeFailure::Profile),
+                Err(crate::agent::DoctorProfileError::Invalid) => {
+                    (Err(RuntimeFailure::Profile), false)
+                }
             };
-            let (status, detail) = configured_profile_result(result);
+            let (status, detail) = match result {
+                Ok(()) if readiness_lost => (DoctorStatus::Warn, PROFILE_WITHOUT_SCREEN_READINESS),
+                result => configured_profile_result(result),
+            };
             DoctorCheck::new(
                 format!("agent_profile_{}", safe_profile_name(&name)),
                 status,
@@ -223,6 +231,10 @@ fn configured_profile_checks(
         })
         .collect()
 }
+
+/// Doctor detail of a profile whose override manifest cannot report the screen
+/// readiness its base runtime declares (`input.ready = "screen_idle"`).
+const PROFILE_WITHOUT_SCREEN_READINESS: &str = "The profile's override manifest has no idle rule on a screen region, so its sessions write the initial prompt once bracketed paste is on instead of waiting for the prompt to render, and the agent may drop it; add an idle rule on a screen region to the override, such as the package's live_prompt_box rule on prompt_box_body.";
 
 fn configured_profile_result(result: Result<(), RuntimeFailure>) -> (DoctorStatus, &'static str) {
     match result {

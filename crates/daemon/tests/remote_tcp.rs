@@ -744,6 +744,52 @@ async fn daemon_doctor_has_identical_unix_and_tcp_dispatch() {
     let _ = handle.await;
 }
 
+/// Writes two Claude profiles whose override manifests differ in whether they
+/// declare an idle rule on a screen region, over a program that answers the
+/// version probe.
+fn write_claude_override_profiles(root: &Path, agents: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // A Claude profile waits for screen readiness unless its override manifest
+    // lacks an idle rule on a screen region.
+    let manifests = agents.join("manifests");
+    std::fs::create_dir(&manifests).expect("create manifests directory");
+    std::fs::write(manifests.join("norule.toml"), "rules = []\n")
+        .expect("write override manifest without an idle rule");
+    std::fs::write(
+        manifests.join("withrule.toml"),
+        "[[rules]]\n\
+         id = \"custom_prompt_box\"\n\
+         state = \"idle\"\n\
+         priority = 950\n\
+         region = \"prompt_box_body\"\n\
+         line_regex = ['^\\s*\u{276f}']\n",
+    )
+    .expect("write override manifest with an idle rule");
+    let claude_program = root.join("claude-version-stub");
+    std::fs::write(
+        &claude_program,
+        format!(
+            "#!/bin/sh\n{}exit 0\n",
+            official_runtimes::sh_version_answer("claude")
+        ),
+    )
+    .expect("write Claude version stub");
+    std::fs::set_permissions(&claude_program, std::fs::Permissions::from_mode(0o755))
+        .expect("make Claude version stub executable");
+    for (name, manifest) in [("claude-norule", "norule"), ("claude-withrule", "withrule")] {
+        std::fs::write(
+            agents.join(format!("{name}.toml")),
+            format!(
+                "base = \"claude\"\n{}program = {}\nmanifest = \"{manifest}\"\n",
+                official_runtimes::profile_pin("claude"),
+                toml::Value::String(claude_program.display().to_string())
+            ),
+        )
+        .expect("write Claude profile with an override manifest");
+    }
+}
+
 #[tokio::test]
 async fn daemon_doctor_reports_profile_readiness_and_redacts_profile_content() {
     let agents_root = pohunek_test_support::tempdir().expect("create profile fixture root");
@@ -771,6 +817,7 @@ async fn daemon_doctor_reports_profile_readiness_and_redacts_profile_content() {
         "base = \"pi\"\npackage = \"acme.runtime.pi\"\ndigest = \"sha256:0000000000000000000000000000000000000000000000000000000000000000\"\n",
     )
     .expect("write profile with an unavailable pinned runtime");
+    write_claude_override_profiles(agents_root.path(), &agents);
     let config = SessionRegistryConfig {
         agents_dir: Some(agents),
         ..shell_config()
@@ -808,6 +855,12 @@ async fn daemon_doctor_reports_profile_readiness_and_redacts_profile_content() {
         .as_str()
         .expect("pinned runtime detail")
         .contains("pinned runtime is unavailable"));
+    assert_eq!(find("agent_profile_claude-norule")["status"], "warn");
+    assert!(find("agent_profile_claude-norule")["detail"]
+        .as_str()
+        .expect("readiness detail")
+        .contains("prompt_box_body"));
+    assert_eq!(find("agent_profile_claude-withrule")["status"], "ok");
     assert_eq!(find("agent_runtime_codex")["status"], "warn");
     assert!(find("agent_runtime_codex")["detail"]
         .as_str()

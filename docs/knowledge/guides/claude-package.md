@@ -111,6 +111,9 @@ enumerated captured frames may read differently.
   the host's `initial_startup_grace_ms` fails `session.new` with
   `session_input_not_ready` and is rolled back; the initial input is not
   written. Daemons of release 0.34.x reject a descriptor that carries `ready`.
+  A host profile whose override manifest has no idle rule on a screen region
+  (such as `live_prompt_box`) launches with bracketed-paste readiness instead,
+  and `pohunek doctor` warns about it.
 - Version: `version_probe = { parser = "semver-line-v1", args = ["--version"],
   min = "2.1.289", below = "2.2.0", line = "{version} (Claude Code)" }`.
   `claude --version` prints `2.1.289 (Claude Code)` on standard output; any

@@ -721,6 +721,19 @@ Redirect that process's stderr in the hook (`>/dev/null 2>&1` or a log file), or
 set `hooks.stderr_tail_bytes = 0` in `service.toml` to keep every hook's stderr
 on `/dev/null`. Under systemd the daemon restart already ends such processes.
 
+## Claude profiles with a detection manifest override
+
+A Claude package waits for the prompt box before it writes a session's initial
+input (`input.ready = "screen_idle"`, evidence from an idle rule on a screen
+region). A host profile over Claude whose `manifest` override has no such rule,
+such as `rules = []` or only working and blocked rules, keeps loading when
+upgrading from 0.34.2, and its sessions keep the bracketed-paste readiness of
+that release: the initial input is written once bracketed paste is on, and
+Claude may drop it. `pohunek doctor` lists each such profile as a warning
+(`agent_profile_<name>`). To get prompt-box readiness, add an idle rule on the
+`prompt_box_body` region to the override, copying the package's
+`live_prompt_box` rule.
+
 ## Configuration migration from schemas 2, 3, 4 and 5
 
 When the installed `service.toml` was written by release 0.33.x (schema 2, no
