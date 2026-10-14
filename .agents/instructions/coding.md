@@ -55,6 +55,16 @@
   bundle is treated like stale code, not a follow-up. If unsure whether a change
   is assistant-visible, check whether any file under `docs/knowledge/` mentions
   the surface you changed.
+- **Record the knowledge-log entry as a fragment.** A change adds its entry as
+  `docs/knowledge/log.d/<issue>-<slug>.md` and never edits
+  `docs/knowledge/log.md`: one heading line
+  `## Unreleased (<YYYY-MM-DD>, <topic>, #<issue>)` citing the issue of the file
+  name, then the body, with links relative to `docs/knowledge/`. Independent
+  changes then never conflict on the log. The shipped bundle shows the fragments
+  as unreleased sections, `scripts/release` files them under the release
+  heading, and `cargo xtask docs check` refuses an unreleased section in
+  `log.md`. A branch that still edits `log.md` converts its sections with
+  `cargo xtask docs log migrate`.
 - **Keep shell completion synchronized with the CLI.** The clap command tree is
   the source of truth for generated Bash, Zsh, and Fish completion; never
   hand-maintain generated shell scripts. Every command, subcommand, flag, or

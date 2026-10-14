@@ -1,1243 +1,13 @@
 # Knowledge Bundle Log
 
-## Unreleased (2026-10-14, Hermes macOS CI on Hermes inputs only, #1050)
+Each change records its entry as its own fragment under `log.d/`, named
+`<issue>-<slug>.md`. The shipped bundle shows the fragments here as
+`## Unreleased` sections, and `scripts/release` files them under the release
+heading. Entries are newest first.
 
-- On a pull request, the CI job `hermes-compatibility-macos` ("pinned Hermes
-  compatibility (macOS arm64, model-free)") runs only when its `hermes_macos`
-  input filter matches. A runtime package selection that picks Hermes, which
-  every core change does, no longer starts it. Pushes to `main`, the nightly
-  schedule and `main`/`nightly` dispatch still run it, and the Linux
-  `hermes-package` job keeps following the selection.
+## 0.34.0
 
-## Unreleased (2026-10-14, override readiness fallback, #1039)
-
-- A host profile over a `screen_idle` base whose detection-manifest override
-  has no idle rule on a screen region loads instead of failing with
-  `invalid_profile`. Its sessions use `bracketed_paste` readiness, and
-  `pohunek doctor` warns with the fix.
-- The runtime packages guide, the Claude package guide and the update runbook
-  describe the rule.
-
-## Unreleased (2026-10-14, stderr tail of a failing create hook, #669)
-
-- A failing `pre-create` or `post-create` hook's `hook` warning in the
-  `session.new` result ends with `; stderr tail:` and the sanitized last bytes
-  of the hook's stderr, marked when cut. The stored session, `session.list` and
-  the logs keep the warning without the tail; stdout is never kept.
-- The hook's stderr is a pipe the daemon drains. A background process the hook
-  leaves holding it gets `SIGPIPE` after a daemon restart (macOS, unsupervised),
-  so the daemon logs a WARN naming the hook when the pipe is still open two
-  seconds after the hook ended; the runbook explains the fix. #1046 tracks a
-  detached sink.
-- `service.toml` schema 6 adds the required `[hooks] stderr_tail_bytes`
-  (`0..=32768`, `0` disables). Fresh installs and upgrades from schemas 2 to 5
-  write 4096.
-- The RFC security section (B.3.2), `docs/public-api.md`, the setup guide, the
-  worktrees concept and the update runbook describe the capture and its
-  exposure.
-
-## Unreleased (2026-10-14, launch cwd check, #984)
-
-- A session whose working directory no longer exists when the worker launches
-  its agent fails with the new public code `session_cwd_missing` (runtime
-  class) and starts nothing. The create then runs the existing compensation:
-  the worktree binding and the create record are removed once the worker is
-  proven ended, so no agent runs in a directory other than its working
-  directory (the process would otherwise fall back to `$HOME`).
-- The daemon logs worktree binds and removals at INFO, with the removal reason.
-  A hook that exits with a failure status, times out, or cannot be spawned or
-  waited on is logged at WARN with its event and status; hook output is never
-  logged.
-
-## Unreleased (2026-10-14, agent process tree trust boundary, #1007)
-
-- The architecture trust boundary, `docs/public-api.md`, the sessions concept,
-  the runtime packages guide and the trust model state that the agent's PTY
-  subtree runs as the owner and is not an identity boundary: under
-  `NamedForProvider` (`identity-subagent-v1`) any process the launch process
-  starts can file the launch process's report, and only `FrozenRootEntrypoint`
-  (`identity-v1`) binds the root's report to the root's own kernel peer.
-- Authenticated agent identity is tracked in #52 and isolated runtime profiles
-  in #88; an assigned Claude launch id is #1036 and the Codex evaluation #1037.
-
-## Unreleased (2026-10-14, far-future subagent claims, #940)
-
-- A subagent record's journaled sequence, and a remembered orphan stop's, is
-  capped at the worker's `CLOCK_MONOTONIC` reading when the claim arrives, so
-  one far-future start or stop no longer freezes the record until the runtime
-  ends. Claims from the host's monotonic clock keep their sequence, and
-  comparisons use the claim's own sequence.
-- Identity claims are ordered per reporting process since #879, so a
-  far-future identity claim only orders its own process's later claims.
-
-## Unreleased (2026-10-13, declared input readiness for Claude, #844)
-
-- A runtime descriptor's `[input]` table may declare `ready`:
-  `bracketed_paste` (the default when absent) or `screen_idle`. `screen_idle`
-  counts only the screen-sourced idle evidence of the detection manifest, not
-  the bracketed-paste enable signal.
-- The Claude package declares `ready = "screen_idle"` because Claude drops
-  pastes sent between its bracketed-paste enable and the first rendered prompt
-  box. Its version stays `1.0.1`; the version bump gate passes against the
-  released `1.0.0`.
-- A `session.new` with initial input into a `screen_idle` runtime that shows no
-  readiness by the end of `input.initial_startup_grace_ms` fails with
-  `session_input_not_ready` (runtime class), writes nothing, and rolls the
-  session back. It uses the full grace even from clients without
-  `extended_input_ready_wait`.
-- A descriptor carrying `ready` is rejected by daemons of release 0.34.x, which
-  parse `[input]` strictly.
-- The runtime packages guide, the Claude package guide, `docs/public-api.md`,
-  `docs/architecture.md`, the sessions concept and the setup guide describe it.
-
-## Unreleased (2026-10-14, workflow status and service uninstall guard, #326)
-
-- `pohunek workflow status [<id>] [--json]` reports each recorded job and
-  service of the installed plugins: the native state from the service manager
-  (`running`, `stopped`, `failed`, or `unknown` with `state_reason`), the last
-  run record, consecutive failures and, for a service, the restart backoff
-  delay. It is local and read-only. The JSON shape is in `public-api.md`, the
-  fields in the workflow plugins guide's Status section.
-- `pohunek service uninstall` refuses with `workflow_units_installed` while any
-  workflow plugin has a unit record that names units, before the service
-  manager is contacted. An unreadable unit record refuses it with
-  `workflow_store_failed`. The guard lives in `service::uninstall` and the
-  check in `workflow::units::check_no_units`.
-- Completion of `pohunek workflow status` offers the installed plugin ids.
-
-- A supervised run refused before its manifest verified records the unit
-  name it was started with, so `workflow status` counts the refusal for that
-  unit; status reads the run log under the writer's lock read-only and never
-  creates the lock file.
-## Unreleased (2026-10-13, bounded PTY input stall, #867)
-
-- `service.toml` schema 5 adds the required key `[input]`
-  `write_stall_timeout_ms` (3000 on fresh installs). It is a whole millisecond
-  count in `1..=600000`. A missing key makes the daemon refuse startup. Schema
-  4 files, the layout `main` released before this change, are now an upgrade
-  source like schemas 2 and 3: `pohunek service upgrade` migrates them to
-  schema 5 keeping every recorded value and their `[waits]` table, and assigns
-  the 3000 ms stall bound. Schemas 2 and 3 migrate straight to schema 5 with
-  the same default. The value is the longest time one `session.input` or initial input
-  write may wait without the agent reading a byte; it restarts after every
-  accepted byte. Attached terminal input is not bounded.
-- The daemon sends the bound to each worker in `Initialize`. A write that
-  exceeds it fails with the new public code `session_input_stalled` (runtime
-  class). Part of the plan may already have been written. `session.new` with
-  initial input then removes the session it was creating; `session.input`
-  leaves the session running.
-- A worker that negotiated a protocol below 7 receives no bound and keeps
-  unbounded writes.
-- The 3000 ms default is below the client's 5 s request deadline, so a
-  fire-and-forget caller receives the typed error instead of `request_timeout`.
-
-## Unreleased (2026-10-13, doctor hints for unloadable packages, #991)
-
-- `pohunek plugin profile list` reports a pinned profile whose pinned digest is
-  installed but cannot be loaded as `package_unavailable`, when the pin names
-  that digest's package. The detail names `pohunek plugin doctor` only; the
-  migration is not offered because the pin already names the digest. A
-  loadable package that serves another runtime, or a pin naming another
-  package than the digest's, is still `needs_migration`.
-- An unpinned profile over an official alias (`codex`, `claude`, `hermes`)
-  whose official package (`pohunek.runtime.<alias>`, matched by package id) is
-  installed but was left out of the runtime registry after a rebuild is refused with `runtime_incompatible` (it was
-  `runtime_not_installed`). Its recovery names `pohunek plugin doctor` and the
-  migration after the repair, not the install, which the package's root or
-  identity check refuses. The refusal is decided from the package report the
-  registry rebuild records; no protocol code was added.
-- The runtime packages guide, the runtime package recovery runbook and
-  `docs/public-api.md` list the new states and refusal.
-
-## Unreleased (2026-10-13, package version bump gate, #894)
-
-- `cargo xtask package bump` fails a runtime package whose archive differs
-  from every released archive of its runtime while its `runtime.toml` version
-  is not strictly above the released versions (semver). It reuses the verdicts
-  of `package baseline` and adds the decisions `pass`, `undecided` (catalog
-  absent) and `fail` (`version_not_bumped`, or a catalog that does not verify).
-- The `package version bump` pull request job in `ci.yml` compares with the
-  last published release at or below the workspace version.
-- The Codex package is bumped to `1.1.0` for its transcript tree declaration.
-- The rule is in the runtime packages guide; the archive concept describes
-  `version_not_bumped` and the bump decisions.
-
-## Unreleased (2026-10-13, workflow plugin jobs and services, #326)
-
-- `workflow.toml` accepts `[jobs.<name>]` (`argv`, `every_s`, optional
-  `timeout_ms`) and `[services.<name>]` (`argv`); the consent review and
-  `inspect` show them.
-- `pohunek workflow enable` installs and starts one user service manager unit
-  per job and service (systemd user units, launchd agents) of the
-  `pohunek service` installation; `disable` and `uninstall` stop and remove
-  them. New error codes: `workflow_service_not_installed`,
-  `workflow_unit_refused`, `workflow_units_failed`, `workflow_unit_stale`,
-  `workflow_unit_unknown`.
-- Every unit runs the hidden `pohunek workflow __exec`, which refuses residue
-  units, records `overlap_skipped` while a run is active, runs a job once its
-  wall-clock `every_s` has passed, applies a service's restart backoff, never
-  forwards the origin pair or the service manager's environment, and stops
-  the run's process group on `SIGTERM`, then exits 0 so a unit its service
-  manager stopped reads as stopped (the run is recorded `interrupted`).
-  systemd plugin units use `KillMode=mixed`, so a stop signals only the
-  trampoline; the final `SIGKILL` still reaches every remaining process.
-  Uninstall applies its own refusals first, then disables the plugin and
-  removes its units; it fails while a unit cannot be removed. Installing a
-  recorded archive again never touches its units. An enabling install
-  checks everything and takes `units.lock` before it records the plugin; a
-  failure after that leaves it installed disabled
-  (`workflow_installed_disabled`, with the failure's code as `cause`, and
-  a message that says whether undoing the failed enable succeeded). A job outside the `[jobs]` bounds is
-  refused at run time too.
-- Each plugin with units keeps the names of its units in a unit record under
-  the store root. `disable` and `uninstall` stop and remove the recorded units
-  as well as the manifest's, so a plugin whose installed files fail
-  verification no longer leaves running units behind; `uninstall` refuses to
-  remove the plugin record while units are still recorded.
-- `enable` refuses an installation recorded for another pohunek version
-  (`workflow_service_not_installed`, naming both versions), since its units
-  would run that version's trampoline.
-- A stop request that arrives while the trampoline verifies a unit ends the run
-  before its child starts. A stop request during a refused service's restart
-  pacing ends the trampoline as stopped (exit 0), not as a refusal. Run records gain the kinds `job` and
-  `service` and the field `backoff_ms`.
-- New owner knobs `[jobs]` (`timeout_default_ms`, `timeout_max_ms`,
-  `min_interval_s`, `check_period_s`) and `[services]`
-  (`restart_initial_ms`, `restart_max_ms`, `stable_after_ms`).
-- The architecture concept says which login units exist besides the daemon.
-- `uninstall` of an id with no record and no store root is refused as
-  `workflow_plugin_unknown` before any lock is taken, the same answer as an
-  existing store without the record. With `--purge` the unit lock is taken in
-  creating mode, so an enabling install cannot record the plugin between the
-  check and the removal; a recorded plugin is still disabled and its units
-  removed first.
-- A failure while marking a fresh plugin enabled that may have written the flag
-  disables it again before `workflow_installed_disabled` is reported.
-- `enable` records a plugin's unit names before it marks the plugin enabled.
-  When the unit record cannot be written, the command fails with
-  `workflow_store_failed` and changes nothing: an enabled plugin whose units
-  keep running stays enabled instead of being disabled.
-- The unit record is bounded at three times the manifest limit (192 KiB), so the
-  record of a manifest at its size limit with short service names is read.
-- On macOS, `__exec` ignores an inherited `XDG_RUNTIME_DIR` when the
-  installation records the default runtime root
-  (`/private/tmp/pohunek-<uid>`), and leaves it out of the run's environment;
-  before, every run of such an installation was refused after
-  `launchctl setenv XDG_RUNTIME_DIR`.
-- A service's restart backoff counts the child's own lifetime, from its spawn
-  until it ends, so verification and output draining never make an
-  immediately failing service look stable; a run that started no child is
-  short.
-- Without a recorded `pohunek service` installation, `disable` and `uninstall`
-  fail with `workflow_units_failed` and keep the unit record when the service
-  manager cannot be reached while units are recorded.
-- Known limit on macOS: when `__exec` itself is killed with `SIGKILL`, the
-  run's process group can survive the unit; a later start can run alongside it
-  and `disable` and `uninstall` do not find it. The guide documents it; a
-  reconcile mechanism is a follow-up.
-
-## Unreleased (2026-10-13, identity sequences ordered per process, #879)
-
-- The worker orders identity claims and releases per reported process (pid and
-  kernel start identity): a report must be newer than every claim and release
-  accepted for that same process, and reports of different processes are never
-  compared. A descendant's report of its own process, even at
-  `sequence = u64::MAX`, no longer makes the launch root's later reports stale,
-  so the root still establishes the launch identity and updates its native
-  reference. Across processes the latest accepted claim is the active identity.
-- The worker keeps the sequence of every live reporting process and never
-  evicts it, so a released process cannot become active again through its own
-  older claim delivered late. Marks of exited processes are pruned when room is
-  needed; the PTY root and the launch process are always kept. When live
-  reporters besides those two fill the bound (16), a further process's report
-  is refused with the new reason `identity_reporters_exhausted` until one
-  exits; an exited process its parent has not reaped counts as exited. Before
-  the launch identity exists, a launch agent's report with a native reference
-  is verified as a launch claim even at the bound and kept only when it
-  establishes the launch identity, so a full table cannot keep a descendant
-  launch process from being pinned; a deferred verification keeps only its
-  pending launch claim for the retry. A release answered `ok: false` still
-  orders its process's later claims.
-- A report of another process accepted as the active identity clears the
-  background owner's snapshot (`agent_changed`) whatever its sequence, since
-  sequences of different processes are never compared; the clear raises the
-  background mark to the worker's own clock, so an owner snapshot taken before
-  the report and delivered after it stays stale.
-- `docs/public-api.md`, the runtime packages guide and the sessions concept
-  state the per-process order; the sequence contract is a value strictly
-  increasing across every hook event that reports the same process.
-
-## Unreleased (2026-10-13, package archive format on ruzstd 0.9.1, #969)
-
-- Package archives are encoded and read with `ruzstd` 0.9.1, which fixes
-  RUSTSEC-2026-0344; the `.cargo/audit.toml` ignore is gone. The encoder writes
-  other bytes than 0.9.0 for package-sized inputs, so this is a format
-  cut-over: 0.35 refuses archives built before it (including the 0.34.x
-  release archives) and 0.34.x refuses archives built by 0.35. Installed
-  packages keep working across the upgrade, because the registry never
-  re-reads archive bytes. `NonCanonicalCompression` names the rebuild.
-- An encoder-drift guard pins the digests of a large generated sample and of
-  the released v0.34.2 Claude package's content under the current encoder, and
-  a test pins that the v0.34.2 archive is refused.
-- The release upgrade test takes the previous release's archive digest from
-  its raw bytes and its descriptor from a plain decode, and after the upgrade
-  the head links a probe package directory, so its daemon installs an archive
-  of the head's format next to the pinned package.
-- `concepts/runtime-package-archive.md` describes the format generations.
-
-## Unreleased (2026-10-13, workflow run --json and verbatim arguments, #325)
-
-- `pohunek workflow run [--json] <plugin> <action> [<args>...]`: every
-  argument after `<action>` reaches the action verbatim, including `--json`,
-  `--`, `-h`, `--host` and empty strings, so pohunek's own options go before
-  `<plugin>`. A `--` after the action is an argument for the action.
-- `--json` captures the action's stdout up to its cap and prints one CLI
-  envelope whose `ok` is the action's single JSON document byte for byte;
-  stderr still streams. The context's `output` is `json`.
-- New error codes, each an envelope without output bytes:
-  `workflow_action_failed` (non-zero exit or a signal the CLI did not send;
-  carries `exit_code` and `signal?`, and the CLI exits with the action's
-  status), `workflow_output_invalid` (exit 0 but stdout is not exactly one
-  JSON document, including arrays and objects nested deeper than 126 levels;
-  exit 1) and `workflow_output_incomplete` (exit 0 but an
-  escaped process held stdout open; exit 1). The run log gains the outcomes
-  `output_invalid` and `output_incomplete`.
-- The workflow plugins guide, `docs/public-api.md` and `docs/cli.md` describe
-  it.
-
-## Unreleased (2026-10-13, shell completion of workflow plugins, #325)
-
-- Dynamic shell completion completes installed workflow plugin ids for
-  `workflow inspect`, `enable`, `disable`, `uninstall` and `run` (`run` offers
-  only enabled plugins), and the actions of the typed plugin for
-  `workflow run <id>`, read from its installed `workflow.toml` after its files
-  verify. The lookups read the local store only, without the daemon, within the
-  completion deadline; they create, lock and write nothing, and a missing,
-  corrupt or unsafe store completes nothing silently. A line with a remote
-  `--host` completes no workflow plugin, matching `workflow_local_only`. Static
-  scripts never read the store.
-- `docs/cli.md`, `docs/features.md` and the `setup` and `workflow-plugins`
-  guides describe it.
-
-## Unreleased (2026-10-13, verify-inventory checks package digests before decoding, #972)
-
-- `cargo xtask release verify-inventory` takes a required `--anchor <file>`
-  and refuses with a trust-anchor mismatch when any daemon archive ships
-  another anchor, before it verifies the catalog or reads a package. Each
-  top-level package archive is then compared with the digest of the catalog
-  verified under that anchor before it is decompressed, so a tampered package
-  is refused as a package-archive mismatch without reaching the decoder
-  (`concepts/release-bundle.md`).
-
-## Unreleased (2026-10-13, managed hook wording, #151)
-
-- The debug-daemon runbook and the public API call the scripts that
-  `integration install` writes "the managed hooks" and name the compiled Codex
-  and Claude integration handlers as what registers them; neither is called an
-  adapter.
-
-## Unreleased (2026-10-13, Hermes docs match the package-only runtime, #147)
-
-- The Hermes operator guide (and the operator skill generated from it) states
-  what the official package carries, the launch, resume and detection
-  contract in `runtime.toml` and `detect.toml`, instead of a built-in contract
-  it preserves.
-- `docs/features.md`, `docs/README.md` and `docs/ROADMAP.md` describe Codex,
-  Claude Code and Hermes as served only by their official runtime packages:
-  only `shell` is built in, the Linux x86_64 daemon archives ship the
-  packages, macOS daemons ship none until #929, and without its package a bare
-  runtime is `agent_profile_not_found` and a host profile over it
-  `runtime_not_installed`.
-
-## Unreleased (2026-10-13, profile list reports unserved bases, #958)
-
-- `pohunek plugin profile list` reports `builtin` only for a profile over
-  `shell`, the one runtime built into the daemon. An unpinned profile whose
-  base no installed package serves, such as `codex`, `claude`, `hermes` or a
-  third-party runtime, is `package_not_installed`: its launches fail with
-  `runtime_not_installed`. The detail names the official package install for
-  an official alias, a package that serves the base otherwise, then
-  `pohunek plugin profile migrate <name>`.
-- When an installed package that may serve such a base cannot be loaded (its
-  root or descriptor fails verification; for an official alias only that
-  alias's official package, `pohunek.runtime.<alias>`, counts), the profile is `package_unavailable` and the
-  detail names `pohunek plugin doctor`, which reports the fault and its
-  repair.
-- The `runtime-packages` guide, the `runtime-package-recovery` runbook and
-  `docs/cli.md` list the state.
-
-## Unreleased (2026-10-13, package archives decoded only after digest authorization, #967)
-
-- `plugin install --catalog` looks the raw archive digest up in the verified
-  catalog before it decompresses anything. Bytes the catalog does not list,
-  such as a corrupted copy of a listed archive or a file that is not an
-  archive, are refused with `package_untrusted` instead of
-  `package_archive_invalid`; nothing reaches the zstd decoder. A listed archive
-  that does not decode is still `package_archive_invalid`, and the identity,
-  version, core and platform checks after decoding are unchanged.
-- `package::archive_digest` computes the package digest of raw bytes without
-  decoding them.
-- `.cargo/audit.toml` ignores RUSTSEC-2026-0344 (ruzstd 0.9.0 decoder memory
-  blow-up) until the package format migration to ruzstd >= 0.9.1 (#969).
-- The `runtime-package-archive` and `runtime-catalog` concepts, the
-  `runtime-packages` and `hermes-package` guides and the
-  `runtime-package-recovery` runbook describe it.
-
-## Unreleased (2026-10-13, workflow run, owner knobs and run log, #148 #325)
-
-- New `pohunek workflow run <plugin> <action> [-- <args>...]` runs one
-  declared action of an installed, enabled plugin in text mode, after
-  re-verifying its files. It runs without a shell, in the plugin's `files/`
-  directory, with stdin from `/dev/null`, in its own process group, and with
-  an environment of exactly `POHUNEK_PLUGIN_ID`, `POHUNEK_PLUGIN_VERSION`,
-  `POHUNEK_PLUGIN_DIGEST`, `POHUNEK_PLUGIN_CONFIG_DIR`,
-  `POHUNEK_PLUGIN_STATE_DIR`, `POHUNEK_PLUGIN_CONTEXT`, `POHUNEK_CLI`, the set
-  `HOME`/XDG roots, and the
-  `POHUNEK_SESSION_ID`/`POHUNEK_DAEMON_ID` pair when both are set, so
-  `plugin_self_target_denied` still guards the hosting session.
-- `POHUNEK_PLUGIN_CONTEXT` is a compact schema-1 JSON object with the plugin
-  identity, the invocation (`kind`, `name`, ULID `run_id`), the output mode and
-  the CLI version and protocol range.
-- Deadlines, per-stream output caps and the `SIGTERM`-grace-`SIGKILL` stop come
-  from the new owner knobs file `<config>/pohunek/workflow.toml` (`[limits]`,
-  `[logs]`; strict, owner-only, defaults when absent). The CLI also stops the
-  action's group when it receives `SIGINT`, `SIGTERM` or `SIGHUP`. Exit
-  statuses: the action's own, 124 at the deadline, 125 over a cap, 128 plus
-  the signal number when interrupted.
-- Every run of an installed plugin, refused or not, appends a content-free
-  record to `<state>/pohunek/workflow-plugin-state/<id>/logs/runs.jsonl`,
-  except runs that fail before the run log is opened (for example invalid
-  owner knobs, an unknown plugin, or a store or path failure).
-- The action's output is delivered up to its cap whatever the speed of the
-  CLI's own stdout and stderr consumer, unless the CLI is signalled, which
-  ends the run as `interrupted`. An output pipe that an escaped descendant
-  holds open is cut after one second not spent waiting for that consumer,
-  whether the descendant writes or not, with a stderr warning.
-- New error codes `workflow_config_invalid`, `workflow_plugin_disabled`,
-  `workflow_action_unknown`, `workflow_action_args_refused`,
-  `workflow_origin_incomplete`, `workflow_timeout_refused`,
-  `workflow_context_too_large`, `workflow_run_log_failed`,
-  `workflow_spawn_failed`, `workflow_run_failed`, `workflow_action_timeout`,
-  `workflow_output_limit` and `workflow_action_interrupted`. No protocol
-  method, event or SDK type was added; `--json` for `workflow run` is not yet
-  available.
-- Documented in the `workflow-plugins` guide, `safety/trust-model`, the source
-  map, `docs/cli.md` and `docs/public-api.md`.
-
-## Unreleased (2026-10-13, Hermes operator plugin only from the package, #147)
-
-- The CLI installs and updates the Hermes operator plugin only from the
-  installed, enabled and selected official `pohunek.runtime.hermes` package. It
-  carries no copy of the operator payload; the core hook reporter stays
-  compiled in and is installed beside the package payload.
-- Without an installed Hermes package, `pohunek integration install|update
-  --agent hermes` fails with `hermes_package_not_installed` (class
-  `configuration`) and changes nothing; its recovery hint names the official
-  package install. `integration status` and `doctor` report the same code in
-  `package_source_error`, and doctor fails `asset_source` with that hint.
-  `hermes_package_source_missing` is gone: a removed recorded package is now
-  `hermes_package_not_installed` with `package_source_missing=true`.
-- An install an older CLI rendered from its compiled copy (marker version 1 or
-  2, or version 3 with `source=embedded`) is never migrated automatically.
-  Status and doctor report `hermes_package_not_installed` while no package is
-  installed, `integration uninstall` removes it without a package, and
-  `integration update` after the package install rewrites it with
-  `source=package`.
-- A macOS host has no source for the operator plugin until darwin packages are
-  attested (#929).
-- The regenerated operator skill changes the package's operator digest, so a
-  package-backed install reports `outdated=true` once the new package is
-  installed, until `pohunek integration update --agent hermes` rewrites it.
-- The `hermes-operator` guide (regenerated Hermes skill, current bare-status
-  wording), the `hermes-package` guide, the source map, `docs/install.md`,
-  `docs/cli.md`, `docs/runbooks/hermes-operator-plugin.md`,
-  `docs/migrations/hermes-operator-plugin.md`, `docs/architecture.md`,
-  `runtime-packages/README.md` and `compat/hermes/README.md` describe it.
-
-## Unreleased (2026-10-13, built-in Hermes removed from the daemon, #147)
-
-- The daemon compiles no Hermes in: the official `pohunek.runtime.hermes`
-  package, installed from the release catalog, is the only source of
-  `hermes`, as the Codex and Claude Code packages are of `codex` and `claude`.
-  The shell is the only built-in runtime. On a host without the package, a
-  bare `hermes` is `agent_profile_not_found` and an unpinned `base = "hermes"`
-  host profile answers `runtime_not_installed`; each recovery hint names
-  `pohunek plugin install runtime/packages/hermes.tar.zst --catalog
-  runtime/runtime-catalog.json` (the profile hint then names `plugin profile
-  migrate <name>`). While the package serves `hermes`, an unpinned profile
-  over it needs that migration.
-- The release catalog lists the Hermes package for the Linux x86_64 targets
-  only, so a macOS daemon has no source of Hermes (#929).
-- A session launched from the built-in Hermes of an earlier release (pinned,
-  or a v0.33.0 record without a launch binding) answers
-  `runtime_builtin_removed` on resume, fork and every interaction (input,
-  attach, resize, rename, metadata) while no package serves `hermes`; its hint
-  names the install and `pohunek session new --agent hermes`. With the package
-  installed the live session can be used again, resume answers
-  `runtime_served_by_package` and fork `agent_fork_unsupported` (Hermes
-  declares no native fork). `pohunekd upgrade-preflight` reports every live
-  built-in Hermes session as `would_lose_recovery`
-  (`runtime_source_not_served`) whether or not it could resume; with the
-  package installed before the upgrade a non-resumable one is `adoptable`.
-  No earlier release archive carries the package to install before the
-  upgrade.
-- Disabling or uninstalling the Hermes package leaves `hermes` unserved; no
-  official alias has a built-in to fall back to.
-- The compiled `hermes-v1` version-probe parser is removed. The compiled
-  parsers are `semver-v1` and `semver-line-v1`; a descriptor naming any other
-  parser id parses, but its runtime reports `supported: false` and a launch is
-  refused with `agent_runtime_unsupported`. The probe sandbox sets no Hermes
-  home or Python variables and passes the launch `PATH`.
-- `daemon.doctor` checks the embedded manifest only for `shell`
-  (`agent_manifest_embedded_shell`); `agent_manifest_embedded_hermes` is gone.
-- `package.bind_profile` for a `hermes` base no package serves answers
-  `package_profile_target_invalid`; `package_profile_base_builtin` is the
-  shell's only.
-- A `hermes` process outside pohunek or in the foreground of a shell session
-  is recognized only through the installed package's detection manifest.
-- The `no_capable_agent` hint names the official `codex`, `claude` or
-  `hermes` package install from a release archive whose catalog lists the
-  platform, or `--agent` with a capable host profile; a `hermes` on the
-  daemon's `PATH` alone does not make the assistant capable.
-- The v0.34.2 built-in Hermes descriptor and manifest are frozen as goldens in
-  `compat/hermes/builtin-v0.34/`; the package tests compare the package with
-  them, and a new clean-host scenario covers the refused bare launch, the
-  assistant without a capable agent and the launch after the catalog install.
-- `pohunek integration ... --agent hermes` stays the CLI-run Hermes operator
-  plugin lifecycle; `hermes` stays a reserved runtime id. The hint of a bare
-  `integration install` that answers `integration_no_managed_runtime` names
-  only the official packages whose hooks the daemon installs (Codex, Claude
-  Code), never `hermes`.
-- Documented in `guides/hermes-package`, `guides/runtime-packages`,
-  `concepts/agent-profiles`, `concepts/sessions`,
-  `concepts/runtime-package-archive`, the `runtime-package-recovery` and
-  `update-after-release` runbooks, the index, the source map, `README.md`,
-  `runtime-packages/README.md`, `compat/hermes/README.md`, `docs/install.md`,
-  `docs/architecture.md`, `docs/cli.md`, `docs/public-api.md` and
-  `docs/acceptance/README.md`.
-
-## Unreleased (2026-10-13, workflow plugin store and consent install, #148)
-
-- New `pohunek workflow install|list|inspect|enable|disable|uninstall`. A
-  workflow plugin is a package archive with a strict `workflow.toml` manifest
-  (schema 1, `[plugin]` and `[actions.<name>]` with argv arrays), trusted by the
-  digest the owner supplies with `--sha256` and installed only with `--yes`
-  after a review of every action's argv.
-- The CLI keeps workflow plugins in its own registry under
-  `<state>/pohunek/workflow-plugins/` with per-plugin state and config
-  directories; the daemon never reads them, and no protocol method, event or
-  SDK type was added. Every workflow command is local-only.
-- New error codes `workflow_local_only`, `workflow_archive_invalid`,
-  `workflow_digest_mismatch`, `workflow_descriptor_invalid`,
-  `workflow_plugin_unknown`, `workflow_plugin_installed`,
-  `workflow_root_invalid`, `workflow_root_intact`, `workflow_store_busy`,
-  `workflow_purge_incomplete`, `workflow_dirs_overlap` and
-  `workflow_store_failed`; install without consent returns `consent_required`.
-- Changing commands hold `store.lock` in the store root. `uninstall --purge`
-  also purges the kept directories of an id without a record, and
-  `uninstall --remove-modified` removes installed files that fail
-  verification. Config directories live under
-  `<config>/pohunek/workflow-plugin-config/`.
-- A committed uninstall whose files could not all be deleted, an install whose
-  durability is unconfirmed, and a stuck leftover of an earlier purge are
-  reported as `warnings` on success; they never decide the result. A purge
-  leftover of the plugin being purged keeps the purge failing
-  (`workflow_purge_incomplete`). An install whose outcome cannot be read back
-  fails with `workflow_install_uncertain` and keeps the plugin directories.
-- Running actions, reactions, jobs and services are not yet available.
-- Documented in the new `workflow-plugins` guide, the `runtime-packages` guide,
-  `safety/trust-model`, the index and the source map, and in
-  `docs/architecture.md`, `docs/cli.md`, `docs/public-api.md` and `README.md`.
-
-## Unreleased (2026-10-12, Hermes package in runtime-packages, #147)
-
-- `runtime-packages/hermes/` is the official Hermes runtime package:
-  `runtime.toml`, `detect.toml`, the closed operator sidecar `operator.toml`
-  and its payload in `operator/`. `compat/hermes/` holds the compatibility
-  lock, the PTY goldens and the evidence notes. `cargo xtask hermes
-  generate-skill` writes the operator skill and its checksum into the package.
-- Releases build `pohunek-runtime-hermes-<version>.tar.zst` like every other
-  official package. `compat/matrix.json` has Hermes rows for
-  `x86_64-unknown-linux-gnu` and `x86_64-unknown-linux-musl`, so the signed
-  catalog authorizes the reserved `hermes` id on those targets and every Linux
-  daemon archive ships `runtime/packages/hermes.tar.zst`. The macOS daemon
-  archive carries no runtime package (#929). The release-evidence `rows` and
-  `smoke` jobs install Python and uv for a provisioner lock, and the archive
-  smoke restores every staged runtime from an untouched copy and verifies it
-  before each Linux daemon archive.
-- The built-in Hermes runtime and the CLI's compiled operator payload stay as
-  the source for a host without an installed, enabled and selected official
-  package.
-- The regenerated operator skill changes the operator payload digest, so an
-  existing operator install reports `outdated=true` in `integration status`
-  until `pohunek integration update --agent hermes` for its Hermes profile
-  rewrites it.
-- The Linux CI job `hermes-package` follows the runtime package selection,
-  builds its own binaries and the archive with `cargo xtask package build
-  --evidence-dir`, matches a verified release baseline digest, runs the
-  compatibility gate and the real-Hermes package test, and uploads
-  `package-evidence-hermes` and `package-junit-hermes`. The macOS Hermes job
-  also runs when the selection did not succeed or selects Hermes.
-- Documented in the new `hermes-package` guide, the `hermes-operator` guide
-  (regenerated Hermes skill), the `runtime-packages` guide,
-  `concepts/release-bundle`, the index and the source map, and in
-  `runtime-packages/README.md`, `compat/hermes/README.md`, `docs/install.md`,
-  `docs/architecture.md`, `docs/development.md`,
-  `docs/runbooks/hermes-operator-plugin.md` and
-  `.agents/instructions/verification.md`.
-
-## Unreleased (2026-10-12, background work snapshot in the Claude hook, #890)
-
-- `POHUNEK_INTEGRATION_VERSION` is 14. The Claude `stop` hook forwards each
-  background task's sanitized `label` (every type), `program` (`shell` only,
-  the command word's basename) and `agent_type` (`subagent` only) in the
-  `subagent_snapshot` claim. The command and its arguments are never forwarded;
-  the label and program limits come from worker-injected environment variables.
-  The `session` hook forwards `session_source` (`startup`, `resume`, `clear`,
-  `compact`) in its identity report.
-- Documented in the `claude-package` guide. Concept and CLI pages follow with
-  the later slices of #890.
-
-## Unreleased (2026-10-12, built-in Claude removed, #146)
-
-- The daemon compiles no Claude in: the official `pohunek.runtime.claude`
-  package, installed from the release catalog, is the only source of
-  `claude`, as the Codex package is of `codex`. On a host without it, a bare
-  `claude` is `agent_profile_not_found`, an unpinned `base = "claude"` host
-  profile and `integration.install` for `claude` answer
-  `runtime_not_installed`, and each recovery hint names `pohunek plugin
-  install runtime/packages/claude.tar.zst --catalog
-  runtime/runtime-catalog.json` (the profile hint then names `plugin profile
-  migrate <name>`). The built-in runtimes are `shell` and `hermes`.
-- A session launched from the built-in Claude of an earlier release (pinned,
-  or a v0.33.0 record without a launch binding) answers
-  `runtime_builtin_removed` on resume, fork and every interaction (input,
-  attach, resize, rename, metadata) while no package serves `claude`; with the
-  package installed the live session can be used again and resume and fork
-  answer `runtime_served_by_package`. `pohunekd upgrade-preflight` reports
-  such a session as `would_lose_recovery` (`runtime_source_not_served`)
-  whether or not it could resume.
-- The release catalog lists the Claude Code package for the Linux x86_64
-  targets only, so a macOS daemon has no source of Claude Code (#929).
-- `integration.status`, `integration.doctor` and `integration.uninstall` that
-  name `claude` work without the package: the core-owned Claude handler keeps
-  the config home of the 0.34 built-in (`CLAUDE_CONFIG_DIR`, else
-  `~/.claude`), in the runtime's home and, with `profile` or `all_profiles`,
-  in the homes of host profiles over `claude`. Install never resolves through
-  it.
-- New `configuration/integration_home_ambiguous_owner`: an integration request
-  without `agent` that reaches one config home through one handler for
-  several runtimes (a package declaring `claude-hook-v1` and Claude's
-  `[config_home]` under another runtime id) attributes the home to none of
-  them. Each runtime reports the error for it: a bare install fails,
-  `all_profiles` lists it in `failed`, and status and doctor report the home
-  unresolved. A request naming `agent` addresses only that runtime.
-- A foreground `claude` in a shell session and an unmanaged `claude` are
-  recognized only through the installed package's detection manifest and
-  `[transcripts]` table; without the package they are not observed as Claude
-  Code.
-- `daemon.doctor` checks embedded manifests only for `shell` and `hermes`.
-  `pohunek integration --agent` offers only `hermes` as a built-in name;
-  `claude` and `codex` are accepted as runtime ids.
-- New `runtime/integration_no_managed_runtime`: a bare `integration install`
-  on a host where no served runtime has daemon-managed hooks; its hint names
-  the official package install and then `integration install --agent
-  <runtime>`. A bare install resolves every selected home before it writes,
-  so an ambiguous home refuses the request with no home written. The status
-  warning of an unresolved home carries the error's hint; the integration
-  doctor reports an ambiguous home as `config_root_invalid` with a remediation
-  naming `--agent`, and `daemon.doctor` as a warning.
-- `--all-profiles` covers host profiles over a served runtime that do not
-  resolve (unpinned over a package-served alias, or pinned to a version that
-  is not installed): status, doctor and uninstall reach their own `[env]`
-  home, and install lists them in `failed`.
-- A shell session hosting an agent whose runtime is not served (a Claude
-  identity reported by leftover hooks without the package) stays mutable:
-  only the session's own runtime must resolve; a nested agent is checked
-  against the runtime-id grammar.
-- The `no_capable_agent` hint names the official `codex` or `claude` package
-  install from a release archive, a supported `hermes` on the daemon's PATH, or
-  `--agent` with a capable host profile.
-- Documented in `guides/claude-package`, `guides/runtime-packages`,
-  `concepts/agent-profiles`, `concepts/sessions`, the
-  `runtime-package-recovery` and `update-after-release` runbooks, the source
-  map, `README.md`, `docs/install.md`, `docs/architecture.md`, `docs/cli.md`
-  and `docs/public-api.md`.
-
-## Unreleased (2026-10-12, Claude reporter templates, #146)
-
-- The Claude reporter scripts are core-owned templates with the
-  `@POHUNEK_AGENT_ID@` and `@POHUNEK_AGENT_NAME@` placeholders, rendered by
-  the Claude handler from the runtime id `claude` and the name `Claude` like
-  the Codex scripts. The installed bytes are unchanged (recorded in
-  `crates/daemon/src/integration/reporter_golden/claude-*.sh`), so installed
-  integrations stay current. Documented in the runtime packages guide.
-
-## Unreleased (2026-10-12, subagent restart, Claude helper stop, main-turn snapshot and hook failure trace, #883)
-
-- A `SubagentStart` with a newer sequence for a terminal subagent reopens its
-  record: `running` with a new revision, `finished_at_ms` cleared,
-  `started_at_ms` kept; the next `SubagentStop` completes it. This tracks
-  Claude background agents resumed with `SendMessage` or woken by their own
-  background shell. A start for a running subagent is idempotent.
-- A subagent record's phase is the phase implied by the highest-sequence
-  claim the worker admitted for its id, for every provider. A newer start for
-  a running record or a newer stop for a terminal one is ignored but its
-  sequence is persisted in the journal, so a delayed older claim cannot reopen
-  or complete the record; a repeated Codex per-turn stop on a finished child
-  only advances that sequence.
-- `identity-subagent-v1` lists `claude` as a provider whose stop is admitted
-  only after a recorded start. Claude's prompt-suggestion helper stop after
-  every main turn creates no row, changes no count and evicts no history. The
-  worker remembers its sequence in an in-memory set of at most 64 stops, drops
-  an entry once a start for that id applies, and ignores (`stale_sequence`) a
-  delayed start that is not newer than the remembered stop. A Codex stop
-  without a start records a completed subagent (#916).
-- The worker logs every ignored subagent claim as
-  `worker.subagent.claim.ignored` (`duplicate_start`, `stop_without_start`,
-  `stale_sequence`, `not_running`; INFO, hook answer `ok: true`) and every
-  refused one as `worker.subagent.claim.refused` (`capacity`; WARN, hook
-  answer `ok: false`).
-- The Claude state hook runs on the main-agent `Stop` (a second managed `Stop`
-  entry beside the notify hook) and sends the worker a `subagent_snapshot`
-  claim with only the `id`, `type` and `status` of each `background_tasks`
-  entry. It reads at most 1 MiB for this action (64 KiB for the others) and
-  sends nothing for a `Stop` with a non-empty `agent_id` or a missing, invalid
-  or over-256-entry list. `identity-subagent-v1` admits the snapshot.
-- The worker reconciles the rows of the same reporting process with an older
-  sequence and settles only rows whose end the snapshot proves: a running row
-  missing from the snapshot whose newest listing by the reporter falls within
-  its run and is older than the snapshot is `completed`, and any other missing
-  running row is `completed` only when no task that can host an unlisted agent
-  (any type except `shell`, `monitor` and `MCP task`) is listed and the
-  reporter's newest snapshot is older than this one and newer than the row,
-  because Claude builds the listing before the hook reads its clock. Only that
-  newest evidence is kept, so a snapshot older than it, delivered out of
-  order, settles nothing from it. A listed row,
-  running or terminal, is left unchanged, so a fast agent's own stop completes
-  it and a self-woken agent reopens through its own start; a completed row keeps its
-  own sequence, so a resume start ordered before the snapshot still reopens
-  it. It logs `worker.subagent.reconciled` (`snapshot_absent`) and
-  `worker.subagent.snapshot.applied` with the task count `tasks`, the `hosts`
-  flag and the row counts `listed`, `terminalized` and `deferred`. A
-  never-listed row settles at the earliest at the second main-turn end after
-  its start; a row whose reporter never ends another main turn stays
-  `running` until the runtime ends (`lost`). Codex has no snapshot (#916).
-- The sequence contract names the clock the Codex and Claude hooks read:
-  `time.clock_gettime_ns(time.CLOCK_MONOTONIC)`, system-wide, because
-  `time.monotonic_ns()` is defined only within one process.
-- Once a Codex or Claude state hook has seen `POHUNEK_ENV=1` and a session
-  id and started `python3`, it records every reason it fails to deliver a
-  report as one line in the hook failure trace `pohunek-hooks.jsonl` in the
-  pohunek log directory: `input_too_large`, `input_invalid`, `no_snapshot` (with
-  `detail` `subagent_stop`, `tasks_missing`, `tasks_invalid` or
-  `tasks_over_bound`), `worker_socket_missing`,
-  `worker_instance_missing`, `agent_pid_invalid`, `agent_identity_unavailable`,
-  `worker_unreachable`, `worker_timeout`, `worker_closed`, `worker_refused`,
-  and `daemon_socket_missing`, `daemon_unreachable`, `daemon_timeout`,
-  `daemon_closed`, `daemon_refused` and `daemon_protocol_invalid` for the
-  daemon fallback. A line is one JSON object of at most 512 bytes with `ts`,
-  `session`, `provider`, `action`, `reason` and an optional fixed `detail`
-  code, and never carries payload content, input ids, task data, paths or
-  environment values. The worker injects the reserved `POHUNEK_HOOK_TRACE_PATH`
-  and `POHUNEK_HOOK_TRACE_MAX_BYTES` (1 MiB); the hook traces only when both
-  are valid, writes its lines at exit under an exclusive lock that it tries
-  without blocking (at most 5 attempts, 5 ms apart, else the run's lines are
-  dropped), opens the file
-  with `O_NOFOLLOW` and mode `0600`, writes only to an owner-private regular
-  file of the user with one link, and rotates it once into
-  `pohunek-hooks.jsonl.1`, so the trace holds at most 2 MiB. Tracing never
-  changes the hook's exit code or output, a report delivered on its first
-  route writes no line, and a hook without `python3` writes no trace.
-- `POHUNEK_INTEGRATION_VERSION` is 13. `SubagentInfo` and the public wire
-  protocol are unchanged; the private worker hook protocol carries
-  `subagent_snapshot`. Documented in `concepts/sessions`, the `claude-package`
-  and `codex-package` guides, the `debug-session-runtime` and
-  `update-after-release` runbooks, the `runtime-packages` guide,
-  `docs/architecture.md` and
-  `docs/public-api.md` (hook schemas, `SessionInfo.subagents`,
-  `subagent_state`, Provider Notification Hooks, Hook failure trace,
-  Active-Agent Hook Payloads reserved environment, Claude notification hooks,
-  integration version).
-
-## Unreleased (2026-10-12, built-in Codex removed, #145)
-
-- The daemon compiles no Codex in: the official `pohunek.runtime.codex`
-  package, installed from the release catalog, is the only source of `codex`.
-  On a host without it, a bare `codex` stays `agent_profile_not_found`, an
-  unpinned `base = "codex"` host profile and `integration.install` for
-  `codex` answer `runtime_not_installed`, and each recovery hint names
-  `pohunek plugin install runtime/packages/codex.tar.zst --catalog
-  runtime/runtime-catalog.json` (the profile hint then names `plugin profile
-  migrate <name>`). The `agent_profile_not_found` hint of any other name lists
-  `shell` or an installed runtime (`pohunek plugin list`) instead of fixed
-  runtime ids.
-- New `runtime/runtime_builtin_removed`: resume, fork and every mutation
-  (input, attach, resize, rename, metadata) of a session launched from the
-  built-in runtime of an official alias this daemon does not compile in
-  (pinned, or a record without a launch binding) while no package serves the
-  alias. Its hint names the package install and a new session. With the
-  package installed, the live session can be used again and resume and fork
-  answer `runtime_served_by_package`.
-- `pohunekd upgrade-preflight` judges every live session's runtime source with
-  the mutation guard, whatever its resume and fork capabilities: a session
-  whose runtime resolves nowhere is `would_lose_recovery`
-  (`runtime_source_not_served`), and its detail says every interaction is
-  refused until the runtime (for a removed built-in, the official package) is
-  installed.
-- The release catalog lists the Codex package for the Linux x86_64 targets
-  only, so a macOS daemon has no source of Codex (#929).
-- `integration.status`, `integration.doctor` and `integration.uninstall` that
-  name `codex` work without the package: the core-owned Codex handler keeps
-  the config home of the earlier built-in, so leftover pohunek hooks are
-  reported and removed, in the runtime's home and, with `profile` or
-  `all_profiles`, in the homes of host profiles over `codex` (found from each
-  profile's `base` and `[env]`, since such a profile does not resolve). Bare
-  status and doctor cover only served runtimes.
-- A foreground `codex` in a shell session and an unmanaged `codex` are
-  recognized only through the installed package's detection manifest and
-  `[transcripts]` table; without the package they are not observed as Codex.
-- `daemon.doctor` checks embedded manifests only for `shell`, `claude` and
-  `hermes`. `pohunek integration --agent` offers `claude` and `hermes` as
-  built-in names; `codex` is accepted as a runtime id.
-- Documented in `guides/codex-package`, `guides/runtime-packages`,
-  `concepts/agent-profiles`, `concepts/sessions`, the
-  `runtime-package-recovery` and `update-after-release` runbooks, the source
-  map, `docs/install.md`, `docs/architecture.md`, `docs/cli.md` and
-  `docs/public-api.md`.
-
-## Unreleased (2026-10-12, missing program before the version probe, #145)
-
-- `session.new`, `session.resume` and `session.fork` resolve the runtime's
-  program before any version probe, for every runtime but a bare host shell
-  (whose configured shell command its launch resolves), and answer
-  `runtime/agent_binary_missing` when it does not resolve to an executable,
-  before any session, worker, worktree or recovery write. That refusal's
-  message and recover hint name only the program's file name. Only an
-  executable that exists but that the probe rejects (another release,
-  unparseable output, a failing or timed-out probe, an unknown parser) answers
-  `agent_runtime_unsupported`. A missing Hermes executable, and a missing
-  executable of a package runtime that declares a probe (the official Codex
-  and Claude packages), therefore answer `agent_binary_missing`. Documented in
-  `concepts/agent-profiles`, `concepts/sessions`, the
-  `debug-session-runtime` runbook and `docs/public-api.md`.
-
-## Unreleased (2026-10-12, Hermes release consumer driver, #147)
-
-- The release consumer suite has a `hermes` driver. It installs the Hermes
-  package from the catalog, runs `integration install --agent hermes` into a
-  private Hermes home and requires the install and status results to report
-  `provenance` `source=package` with the archive's package id and digest, then
-  drives a real pinned Hermes through one turn against a loopback provider,
-  stops it and resumes it by the conversation id the plugin hook reported. The
-  Linux Hermes package CI job (`hermes-package`) runs it in row mode on the
-  archive built from `runtime-packages/hermes`, after restoring and verifying a
-  pristine stage. Documented
-  in `docs/development.md` ("Release consumer suite") and the source map.
-
-## Unreleased (2026-10-12, release baseline in CI package selection, #149)
-
-- The `package-selection` CI job downloads release `v<workspace version>`'s
-  runtime catalog, attestations and package archives with `gh release
-  download` and runs `cargo xtask package baseline --json`. A pull request
-  skips a package job only when the package and the core are unchanged and the
-  signed release verifies the package; a failed download makes every package
-  missing and runs every job, and only an unreadable checkout fails the
-  selector. Each package job requires its rebuilt archive to hash to a verified
-  baseline digest; a difference fails the job as a non-reproducible build.
-  Release workflows never consult a baseline. Documented in
-  `concepts/runtime-package-archive` ("Release baseline") and
-  `docs/development.md`.
-
-## Unreleased (2026-10-12, Claude package detection rules, #613)
-
-- The official Claude package is version 1.0.1. Its detection manifest adds to
-  the built-in one: the `◐`/`◑` running-turn title and the `esc to interrupt`
-  footer read `working`, so a streaming reply reads working; the question
-  form reads `blocked` when its footer wraps at 30 and 40 columns; the theme
-  picker, the login method list and the folder trust dialog read `blocked`;
-  the completed-turn line with ` · done <time>` is the completed-turn rule; the
-  npm `claude.exe` process matches, and a `node`/`bun` script that merely names
-  `claude` (`claude-companion.mjs`) does not. The built-in manifest is
-  unchanged. The package tests enumerate these differences from the v0.34.2
-  golden. Documented in the `claude-package` guide and the source map.
-
-## Unreleased (2026-10-12, Pi dialogs, selectors and session-dir overrides, #547)
-
-- The Pi package (version 1.0.2) reads Pi's dialogs as `blocked`: an
-  extension's select, confirm, input or editor dialog (also a permission check
-  raised mid-turn), the project trust prompt at startup, the missing session
-  cwd prompt and every login step. A body that holds a selector list (a cursor
-  row and a row indented by two spaces) withholds `idle`,
-  so the model, session, tree, fork and settings selectors match no rule; a
-  quoted draft (`> text`) stays `idle`. Pi's own confirms drawn like an
-  extension dialog (project trust, missing session cwd, "Summarize branch?",
-  "Import session"), the `/trust` selector and the login steps read `blocked`
-  even when the owner opened them. `scripts/tests/test_pi_detect_regex.py`
-  runs the generator in CI and requires `detect.toml` to hold its output. The
-  1.0.1 manifest read 93 of 120 captured dialog screens and 36 of 50 selector
-  screens as `idle`. Screens of a real Pi 1.0.2 at widths 20 to 200 are in
-  `compat/pi/screens/overlays/`.
-- A file existence check may declare `store_env` and `store_max_depth` (a
-  variable that names the store itself, followed by the check),
-  `relocating_args` and `relocating_settings` (store moves the check cannot
-  follow). `session.new`, `session.resume` and `session.fork` refuse a launch
-  that moves the store out of reach with the new code
-  `runtime/agent_native_store_relocated` and a hint naming the variable. Pi
-  declares `PI_CODING_AGENT_SESSION_DIR`, `--session-dir` and the `sessionDir`
-  setting of the agent directory and the project. A settings path that is not
-  a regular file (a FIFO, a directory) is refused without blocking. Recovery
-  runs the same refusal, so a `sessionDir` written after launch, or the loss
-  of the variable the launch had, refuses resume and fork; there the hint says
-  to undo that change (remove the setting, or restore the variable to the path
-  the session was launched with and accept the profile change). A crash of the
-  check (on recovery the whole check, Claude's transcript check included) is
-  `daemon/native_store_check_task_panicked`. The keys are frozen into the
-  session's launch spec (store schema 7, a no-op migration from 6).
-  Documented in the `pi-package` guide, `concepts/sessions`, the
-  `debug-session-runtime` runbook, `docs/public-api.md`, `docs/install.md` and
-  the source map.
-
-## Unreleased (2026-10-12, provisioned upstream staging, #147)
-
-- `cargo xtask compat stage-upstream` stages a lock whose `upstream.kind` is
-  `provisioner`, a Python virtual environment at `venv/`: it runs the script
-  `upstream.provisioner` names (only
-  `scripts/<name>`, a regular executable file, never a link) in place at
-  `<out>/<runtime>` with a cleared environment, links `bin/<binary>` to the
-  entrypoint the script prints, copies the lock and script into `inputs/`,
-  requires the entrypoint's first line to be exactly
-  `#!<stage>/venv/bin/python` or `#!<stage>/venv/bin/python3` (uv writes the
-  latter on macOS),
-  writes `STAGE.sha256` and `STAGE.links`, and requires the banner as the first
-  line of `--version`. A stage path at which uv would write a `#!/bin/sh`
-  trampoline is refused before the script runs. `compat verify-stage` also
-  refuses a provisioned stage whose `inputs/` differ from the committed files,
-  a trampoline entrypoint, another interpreter and a moved stage. Hermes is staged this way; its
-  stage is never moved. Hermes writes into its editable checkout on launch,
-  and a daemon-launched session and the CLI's `-I` plugin probes write
-  bytecode into it, so a stage is verified from a pristine copy before each
-  use. The pinned Hermes CI jobs stage through the command, cache a copy
-  taken before any consumer runs, run `verify-stage` on a cache hit, and
-  restore and verify that copy again before each later consumer. Documented in `concepts/upstream-staging`,
-  `compat/hermes/README.md` and `docs/development.md`.
-
-## Unreleased (2026-10-12, Hermes gate and smoke from the package, #147)
-
-- Every `pohunek integration` result for Hermes reports `provenance`: the
-  source the installed plugin's ownership marker records, as
-  `{"source":"package","package_id":"pohunek.runtime.hermes","package_digest":"sha256:<hex>"}`
-  or `{"source":"embedded"}`, and `null` when no managed plugin is installed
-  (also after `uninstall`). The human form prints a `source:` line. Documented
-  in the `hermes-operator` guide (regenerated Hermes skill).
-- `cargo xtask hermes compatibility` takes `--bin-dir` (the directory of
-  `pohunek`, `pohunekd`, and `pohunek-sessiond`) and `--package` (the Hermes
-  runtime package archive, built by `scripts/build-hermes-package`) in place of
-  `--pohunek-bin`. It copies the binaries into a private prefix with a
-  throwaway trust anchor, signs a catalog for exactly that archive, starts the
-  copied daemon, installs the package with `pohunek plugin install --catalog`,
-  and fails unless install, status, and doctor report the archive digest as
-  the provenance (`source=embedded` fails). `cargo xtask hermes
-  throwaway-catalog` writes such a catalog and its anchor for the release
-  smoke. `packaging/smoke-hermes-plugin-release` ships in the daemon archive
-  and takes the extracted daemon archive, the package archive, the catalog, the
-  anchor, and the Hermes executable. Documented in the source map.
-
-## Unreleased (2026-10-12, CLI session turn waits, #858)
-
-- `pohunek session wait <target>...` waits for turn events through
-  `session.wait_turn` when no legacy flag is given, also with no flags at all:
-  `--until` (comma list or repeated, default all of `turn_completed`,
-  `agent_blocked`, `approval_required`, `exited`), `--after <cursor>`, and
-  `--timeout <duration>` with a unit (`90s`, `5m`; default the daemon default).
-  It takes up to 32 targets on one host; targets on different hosts, several
-  targets in legacy mode, and legacy flags mixed with turn flags are usage
-  errors before any request. `--json` prints the daemon result; the human form
-  prints the event or reason, one `progress:` line per target, and a final
-  `cursor:` line. Every reason exits 0. The legacy predicate wait is selected by
-  any of its flags and is unchanged. Documented in `docs/cli.md`,
-  `concepts/sessions`, the `debug-session-runtime` runbook, a manager-agent loop
-  in the `agent-skill` guide (regenerated skill artifact), and a note in the
-  `hermes-operator` guide that the plugin's wait tool is the short predicate
-  wait (regenerated Hermes skill).
-
-## Unreleased (2026-10-12, built-in parity goldens, #145)
-
-- `compat/codex/builtin-v0.34/` and `compat/claude/builtin-v0.34/` hold golden
-  copies of the built-in Codex and Claude descriptors and detection manifests
-  of release 0.34.2. The package tests compare the official packages with these
-  goldens; the 0.34.2 descriptors declare no transcript tree. While the daemon
-  embeds the built-ins, the tests also require the built-in manifests to equal
-  the goldens byte for byte and the built-in descriptors to be the goldens
-  followed by the package's transcript tree. Documented in the `codex-package`
-  and `claude-package` guides and the source map.
-
-## Unreleased (2026-10-12, upgrade test through the Claude package, #146)
-
-- The release upgrade test installs the official Claude package from the
-  previous release's archive under its signed catalog, pins the fake-agent
-  profiles with `plugin profile migrate`, and starts its session from the
-  package; it asserts the preflight judges that session `adoptable` and that
-  the store keeps the same package pin across adoption and `resume`.
-  `scripts/upgrade-test` refuses a previous release without
-  `runtime/packages/claude.tar.zst` (older than v0.34.2) or with an expired
-  catalog. The `update-after-release` runbook describes moving Claude and Codex
-  work onto the official package before upgrading to a release that does not
-  serve the built-in runtime.
-
-## Unreleased (2026-10-12, Hermes lock shape, #147)
-
-- `compat/hermes/compatibility-lock.json` has the official-package lock shape:
-  `schema`, `package` (`pohunek.runtime.hermes`), `runtime` (`hermes`), an
-  `upstream` object of kind `provisioner` that holds the release and its source
-  provenance, `supported` (`[0.20.0, 0.20.1)`, equal to the package descriptor's
-  version probe range) and `verified_with`; the launch contract is `launch`.
-  `cargo xtask compat attest` and `compat verify` read it like the npm locks
-  (`compat matrix-check` once `runtime-packages/hermes/` exists), and
-  `compat stage-upstream` refuses it for having no `upstream.npm`.
-  Documented in `concepts/upstream-staging` and `compat/hermes/README.md`.
-
-## Unreleased (2026-10-12, TypeScript turn waits, #858)
-
-- The TypeScript SDK adds `client.sessionWaitTurn(params)` for
-  `session.wait_turn`, on a dedicated connection whose deadline follows
-  `timeout_ms` or, when it is omitted, `MAX_SESSION_WAIT_TURN_MS`; generic
-  `call("session.wait_turn", ...)` takes the same path. `@pohunek/protocol`
-  exports `MAX_SESSION_WAIT_TURN_MS`, `MAX_SESSION_WAIT_TURN_TARGETS`, and
-  `MAX_SESSION_TURN_CURSOR_BYTES`. The testkit fixture daemon serves the method
-  and adds `scenario.recordTurnEvent`. Documented in the `ts-sdk` guide,
-  `concepts/sessions`, `sdk/ts/sdk/README.md`, and `docs/public-api.md`.
-
-## Unreleased (2026-10-12, runtime package builder evidence, #149)
-
-- `cargo xtask package build --evidence-dir <D>` writes the builder evidence of
-  an official package next to its archive: `<archive>.sha256`,
-  `<rt>.manifest.json`, `<rt>.provenance-input.json` (source commit and Git
-  tree, builder, archive entries, the lock's whole `upstream` object of any
-  kind) and `<rt>.compat-vector.json` (the package half of a compatibility
-  attestation),
-  as deterministic JSON. A package tree, lock or matrix that differs from
-  `HEAD`, a missing or mismatched lock and an evidence directory inside the
-  package are refused with nothing written. The per-PR package jobs upload it
-  as `package-evidence-<rt>`, the release build as `package-evidence`; it is
-  not a release asset. Documented in `concepts/runtime-package-archive` and
-  `concepts/release-bundle`.
-
-## Unreleased (2026-10-12, service.toml turn-wait timings, #858)
-
-- `service.toml` schema 4 adds `[waits]`: `turn_default_ms` (the timeout of a
-  `session.wait_turn` call that names none, 300000 on fresh installs) and
-  `turn_max_ms` (the ceiling a requested timeout may not exceed, 1800000).
-  Both are whole milliseconds in `5000..=3600000`, and a default above the
-  ceiling makes the daemon refuse startup. `pohunek service upgrade` migrates
-  schema-2 and schema-3 files with the same backup and rollback transaction,
-  assigning the defaults of the missing tables and keeping every recorded
-  value; `config_schema_migration` reports `2` or `3`. Documented in
-  `guides/setup`, the `update-after-release` runbook and `docs/public-api.md`.
-
-## Unreleased (2026-10-12, notification providers by runtime id, #145/#146)
-
-- Notification source ranking follows the hook schemas: a provider ranks as a
-  provider hook exactly when a registered hook schema lists it as an identity
-  provider (today `shell`, `codex`, `claude`, and `hermes`, matched
-  case-sensitively). Hook admission on `notification.create` checks those
-  providers against the session's hook schema and additionally admits a
-  session's own runtime, which does not change its rank. Hermes and shell hook
-  reports therefore rank above user/external reports: inside the debounce
-  window a pending Hermes attention report is kept over a later user report
-  for the same session, and inside the dedupe window it upgrades a projector
-  record and dedupes against an earlier provider-backed record.
-- The default notification policy has no per-provider entries; every provider
-  uses the base `enabled` flags until an override is set. A policy file the
-  daemon already persisted keeps the entries it holds, so on such a host a
-  `--provider default` toggle does not reach `codex`, `claude`, or `hermes`
-  until their own entries are changed too (`policy set --provider <runtime-id>`).
-  The SDK testkit fixture daemon serves the same empty default.
-- `notification.create` judges a session hook claim by the provider name the
-  record is stored and ranked under, and refuses with `hook_not_admitted` a
-  raw provider that only normalizes to a hook provider (for example
-  `"hermes\u0007"` or `" codex"`), so such a spelling cannot bypass the
-  session's hook schema.
-- `pohunek notifications policy set --provider` accepts `default` or any valid
-  runtime id, installed or not (for example `pi`); a new override starts from
-  the base flags. Documented in `concepts/sessions`, the `debug-daemon`
-  runbook, `docs/cli.md`, and
-  `docs/public-api.md`.
-
-## Unreleased (2026-10-12, resumable Pi forks, #546)
-
-- A runtime with `[native_reference] strategy = "assigned"` may declare
-  `assign_fork = true` (only next to `[fork] supported = true`, otherwise
-  `descriptor_invalid`). `session.fork` then generates a fresh reference for the
-  fork and appends the rendered `launch_args` after the `[fork]` args; the fork
-  holds it with provenance `assigned` from creation, so it resumes into its own
-  conversation after a stop or a daemon restart. The official Pi package
-  declares it from package version 1.0.1 (`pi --fork <source> --session-id
-  <fork>`, verified against Pi 1.0.2, which writes the fork's
-  `<time>_<fork>.jsonl` at once); `plugin update` installs 1.0.1 beside 1.0.0. The flag is
-  frozen into the session's native launch spec (store schema 6, a no-op
-  migration from 5), and `PackageRuntimeInfo` gains `fork_launch_args`, shown by
-  `plugin inspect` as the fork's `then adds:` line. Documented in
-  `guides/pi-package`, `concepts/sessions`, `concepts/agent-profiles`,
-  `docs/install.md`, and `docs/public-api.md`.
-
-## Unreleased (2026-10-12, session turn waits, #858)
-
-- New protocol method `session.wait_turn` (Rust SDK `Client::session_wait_turn`)
-  waits for the next `turn_completed`, `agent_blocked`, `approval_required`, or
-  `exited` event of one or more sessions after an opaque cursor, bounded by an
-  agent-chosen timeout (daemon default 5 minutes, ceiling 30 minutes). Results
-  carry the next cursor and per-session progress; reasons are `event`,
-  `timeout`, `cursor_reset`, and `targets_ended`. Turn events come only from
-  admitted provider hook reports for held sessions and from the daemon
-  projector, and are recorded after the attention debounce whether or not the
-  notification policy keeps an inbox record; a `turn_completed` whose window
-  ends while the session works is dropped as a stale stop. `host.inspect` advertises the method with
-  `session_wait_turn_supported`. Documented in `concepts/sessions`, the `debug-session-runtime`
-  runbook, and `docs/public-api.md`.
-
-## Unreleased (2026-10-12, notifications watch filters, #858)
-
-- `pohunek notifications watch` accepts `--session <id>`, `--kind <kind>`, and
-  `--status <status>` (`--unread` is `--status unread`), with the values of the
-  matching `notifications list` flags. The daemon subscription stays global;
-  the filters run client-side on the record each `notification_created` or
-  `notification_updated` event carries, on every host with `--all-hosts`, in
-  human and JSON output. An update that marks an earlier `turn_completed`
-  `acknowledged` therefore does not pass `--unread`. While any filter is set,
-  `notification_deleted` events are dropped, because they carry only the
-  notification id, and `--status deleted` is refused. Without filters every
-  event is printed. Documented in the
-  `debug-daemon` runbook, the `remote-hosts` guide, `docs/cli.md`, and
-  `docs/public-api.md`.
-
-## Unreleased (2026-10-12, sessions pinned to an unserved runtime source, #145/#146)
-
-- A session is observed, resumed and forked only through the runtime source its
-  launch pin names. A built-in pin is served only by a built-in of the same
-  package identity the registry serves now; an official package that serves the
-  alias, a built-in the daemon does not ship, or a package digest that is not
-  installed never stands in. Resume and fork of a built-in session of an alias
-  an official package serves fail with `runtime_served_by_package`, whose hint
-  names `pohunek session new --agent <runtime>` and states that no session is
-  rebound. A live session adopted at startup with such a pin is observed with
-  the generic shell manifest (or its host profile's manifest override), its
-  persisted input framing and its journaled hook schema; hook reports and
-  processes naming its runtime are not attributed through the package, and
-  stay unattributed until the next restart even when the pinned source is
-  served again. A worker of a release before 0.34.0 journals no hook schema, so
-  such a session with a journaled active identity is not adopted
-  (`worker_identity_unverified` in the preflight, a `conflict` with
-  `active_identity_provider_invalid` at startup). A recovery binding whose
-  launch spec the migration left unresolved is completed only from the
-  definition its pin names and otherwise stays unrepaired with a
-  `native_recovery` warning. The upgrade preflight reports such a session
-  `would_lose_recovery` with `runtime_source_not_served`. Documented in
-  `guides/runtime-packages`, `concepts/runtime-package-archive` and
-  `update-after-release`.
-
-## Unreleased (2026-10-12, single worker-instance marker, #493)
-
-- `POHUNEK_WORKER_INSTANCE_ID` is the only worker-instance marker the process
-  inspectors, the runtime sweep, the managed Claude/Codex hooks and the Hermes
-  reporter read. A live worker whose journal names a release before 0.33.1 (or
-  none) marks its children with another name, so the upgrade preflight reports
-  it `would_not_be_adopted` with `worker_marker_legacy`, and startup leaves it
-  running as `incompatible` with the same reason; `session stop`, input,
-  resize and attach on it keep the code `worker_protocol_incompatible` but name
-  `worker_marker_legacy` in `msg` with a `recover` hint. A sweep never
-  signals a worker child (`POHUNEK_WORKER_ID`, set only by a worker) that
-  carries the swept session's `POHUNEK_SESSION_ID` but no worker-instance
-  marker; a lifecycle hook the daemon runs for the session has no worker
-  marker and is ignored. Such a child keeps the cleanup unconfirmed
-  (`runtime_lost_cleanup_unconfirmed`, removal refused) and names such
-  processes by pid in the `session.runtime.sweep_unmarked` WARN. The runtime
-  inventory lists a refused worker as `incompatible` with the same reason. Installed hooks of the previous release differ from the
-  shipped assets and are reported for reinstall. Documented in
-  `update-after-release`, `debug-session-runtime` and `concepts/sessions`.
-
-## Unreleased (2026-10-12, runtime-declared transcripts, #487)
-
-- A runtime descriptor may declare `[transcripts]` (`parser`, a compiled parser
-  id, and `dir`, a plain relative path below `[config_home]`); the external
-  observer takes each transcript root and its parser from it instead of naming
-  Claude and Codex. The built-in and official `codex` and `claude` descriptors
-  declare `jsonl-head-v1` with `sessions` and `projects`, so the observed roots
-  are unchanged; a runtime without the table (Pi) contributes no root, and a
-  tree that equals or nests with another runtime's is attributed to neither
-  (warning `external.transcript_roots.ambiguous`, code
-  `transcripts_ambiguous_owner`). An
-  unknown parser, an unsafe `dir` or a table without `[config_home]` is
-  `descriptor_invalid`. Documented in the `runtime-packages` guide, the
-  `sessions` and `agent-profiles` concepts and the public API.
-
-## Unreleased (2026-10-12, coalition exclusion in the runtime sweep, #821)
-
-- The worker journals its kernel coalitions as the optional `worker_coalitions`
-  (`<resource>:<jetsam>`, decimal; additive, no journal schema bump, so a worker
-  of the previous release lacks it). On macOS the sweep uses them for a hidden
-  process whose fork lineage is open (a launchd creator number, or a creator
-  that exited): when the kernel puts the process in a resource and a jetsam
-  coalition that both differ from the worker's, it cannot have descended from
-  the worker and is ignored, not reported. A launchd job, a system helper such
-  as `mdworker_shared` or `biomesyncd`, or another session's agent started after
-  the worker therefore no longer leaves a removal or a lost-runtime cleanup
-  unconfirmed. Equal, unreadable or missing coalitions prove nothing and keep
-  the process a candidate; a lineage descendant whose coalitions differ is
-  skipped, never selected. Nothing is signalled that was not before.
-
-## Unreleased (2026-10-12, the sweep waits for unreadable candidates, #821)
-
-- The runtime sweep no longer leaves a cleanup unconfirmed because of a hidden
-  process that is only passing: when a pass signals nothing and every remaining
-  candidate is an unreadable-marker process, the daemon re-reads the process
-  table for up to the sweep grace (`sweep.grace_ms`) before it reports those
-  candidates. A process caught between images, or an orphan of a creator that
-  has just exited and is about to follow it, no longer blocks a removal or a
-  lost-runtime cleanup; a candidate that outlives the grace stays listed and the
-  cleanup unconfirmed, exactly as before.
-- The wait is shared by every runtime one operation sweeps: the startup
-  reconciliation, one background re-check of a session, and one removal or stop
-  cleanup each wait at most one sweep grace in total for such candidates, so
-  that wait adds at most one grace to startup readiness however many crashed
-  runtimes a persistent candidate blocks; the runtimes decided after it stay
-  lost with their cleanup unconfirmed.
-
-## Unreleased (2026-10-10, fork lineage decides withheld environments, #795)
-
-- The runtime sweep decides macOS 27 platform binaries by fork lineage instead
-  of listing each as an unreadable candidate. The kernel serves a boot-wide
-  creation number for every same-user process, withheld environment or not, and
-  records the creation number of the creator. That creator number is rewritten
-  to launchd's when the process re-executes after being reparented, so a
-  launchd creator is ambiguous and never excludes a process. The worker journals
-  its own number as the optional `worker_spawn_id` (decimal string, no schema
-  bump), and the daemon gives it to every journal-backed sweep only when the
-  journal's boot identity is the current boot's. A process the worker reached
-  through its creators is reaped like a marked one; a process created before the
-  worker, or under an older non-launchd creator, is ignored and not reported;
-  every other hidden process (created after the worker by launchd, a re-executed
-  orphan, one whose creator exited after the worker started) stays an
-  unreadable candidate and the cleanup unconfirmed. After a lost runtime on
-  macOS 27 the runtime's own processes are reaped without
-  `--accept-unconfirmed-cleanup`; the flag may still be needed for the
-  remaining candidates, which the refusal lists by pid and command name, and
-  for a runtime whose worker journaled no creation number (started by the
-  previous release). Linux keeps its start-time ordering. Documented in the
-  `debug-session-runtime` runbook, `concepts/sessions`, `concepts/architecture`
-  and `docs/cli.md`.
-
-## Unreleased (2026-10-10, macOS 27 withheld environments, #790)
-
-- On macOS 27 the kernel withholds the environment of restricted Apple platform
-  binaries (`/bin/sh`, `/bin/zsh`, `/bin/sleep`). The Darwin inspector now reads
-  such a process as unobservable instead of unmarked, so a lost-runtime sweep
-  lists every one of them as an unreadable candidate and the cleanup stays
-  unconfirmed (`session rm` refuses until they are inspected or
-  `--accept-unconfirmed-cleanup` is given). The runbook `debug-session-runtime`
-  names the case.
-
-## Unreleased (2026-10-08, digest-bound release evidence, #150)
+### 2026-10-08, digest-bound release evidence, #150
 
 - The Release workflow is rewired: producers upload workflow artifacts only,
   the reusable `release-build.yml` and `release-evidence.yml` build the
@@ -1273,7 +43,7 @@
   runtime out of process through the exact release binaries and writes the
   consumer report that `compat attest` consumes.
 
-## Unreleased (2026-10-08, digest-bound release evidence, #150)
+### 2026-10-08, digest-bound release evidence, #150
 
 - Runtime catalog schema 2: a signed `release` block (version, commit, binary
   sets per target) and, per entry, `runtime_api` and per-platform attestation
@@ -1284,14 +54,14 @@
   define the compatibility attestation each release row emits; the new concept
   page `release-attestation` describes the tuple and the trust model.
 
-## Unreleased (2026-10-08, digest-bound release evidence, #150)
+### 2026-10-08, digest-bound release evidence, #150
 
 - Runtime catalog schema 2: a signed `release` block (version, commit, binary
   sets per target) and, per entry, `runtime_api` and per-platform attestation
   digests; the signing domain separator is v2, schema 1 documents are refused.
   The daemon does not enforce the new fields yet.
 
-## Unreleased (2026-10-08, production catalog trust anchor is checked in)
+### 2026-10-08, production catalog trust anchor is checked in
 
 - Decision: the release trust anchor `runtime-catalog-anchor.json` has two
   roots, both valid from 2026-10-08T00:00:00Z: the CI secondary root
@@ -1313,7 +83,7 @@
   staged anchor fails the install before anything is published, and a different
   anchor on republish is a version conflict.
 
-## Unreleased (2026-10-08, catalog anchor writes several roots)
+### 2026-10-08, catalog anchor writes several roots
 
 - `cargo xtask catalog anchor` takes a repeatable `--root
   <public-key-file>:<not-before>:<not-after>` instead of the single-key
@@ -1324,7 +94,7 @@
   output is sorted by key id. The runtime catalog concept page states the form
   and the custody roles (#650).
 
-## Unreleased (2026-10-07, stop and remove need no runtime definition)
+### 2026-10-07, stop and remove need no runtime definition
 
 - `session.stop` and `session.remove` no longer require the session's agent
   runtime to resolve, so the owner can end the worker of and delete a session
@@ -1334,7 +104,7 @@
   read-only. The public API reference and the agent-profiles concept page state
   the rule.
 
-## Unreleased (2026-10-07, outdated integration hook assets are flagged after an upgrade)
+### 2026-10-07, outdated integration hook assets are flagged after an upgrade
 
 - Decision: after a daemon upgrade the managed hook assets are flagged loudly and
   reinstalled by one documented owner command; the daemon and the installer never
@@ -1356,14 +126,14 @@
   install commands after a successful install or upgrade, and the update runbook
   has a "Managed hook assets after an upgrade" section.
 
-## Unreleased (2026-10-07, package test daemons use the test-host process view)
+### 2026-10-07, package test daemons use the test-host process view
 
 - The shared package test harness builds its daemon with
   `SessionRegistry::new_production_with_inspector` and the test-host process
   view, so an unreadable same-user process of a loaded test host no longer makes
   a session removal refuse. Production daemons keep the real host view.
 
-## Unreleased (2026-10-07, Claude hook reporter behind a wrapper shell)
+### 2026-10-07, Claude hook reporter behind a wrapper shell
 
 - The managed Claude hook scripts skip a wrapper shell when they pick the process
   that reports: Claude runs hooks as `/bin/sh -c`, and where that is dash the
@@ -1371,7 +141,7 @@
   SessionStart report and no native reference was recorded. The Claude package
   guide records the finding.
 
-## Unreleased (2026-10-07, Codex conversation id becomes the native reference)
+### 2026-10-07, Codex conversation id becomes the native reference
 
 - The session worker verifies a launch claim from a provider-named direct child
   of the launch process in the provider's hook-helper role (`codex app-server`), so the conversation id Codex reports from its
@@ -1380,7 +150,7 @@
   the Codex package guide replaces its known-gap statement with the verified
   behavior.
 
-## Unreleased (2026-10-07, Claude Code runtime package source)
+### 2026-10-07, Claude Code runtime package source
 
 - Added the Claude Code runtime package guide and the package source
   (`runtime-packages/claude`, `compat/claude/compatibility-lock.json`,
@@ -1398,7 +168,7 @@
 - The source map lists the package source, the lock, the screens, the tests, the
   Messages stub, the shared process guard and the `claude-package` CI job.
 
-## Unreleased (2026-10-06, Codex hook reporter ancestry)
+### 2026-10-06, Codex hook reporter ancestry
 
 - The real-Codex hook test requires the reporting process to descend from the
   launched process instead of being its direct child, because an npm install
@@ -1406,7 +176,7 @@
   the observed process tree of both installs and which processes the package
   matchers accept.
 
-## Unreleased (2026-10-06, Codex package tests install the package)
+### 2026-10-06, Codex package tests install the package
 
 - The Codex package tests install the built archive through a signed catalog
   with a throwaway key and trust anchor, so the real-Codex tests launch through
@@ -1416,7 +186,16 @@
   failure. The guide and the package README state that the package is official
   only through a signed catalog and that no release catalog or key exists.
 
-## Unreleased (2026-10-05, Codex runtime package source)
+### 2026-10-06, trust anchor ACL policy
+
+- The catalog trust anchor and the catalog signing key file are judged on macOS
+  extended ACLs as well as mode bits, through the shared
+  `pohunek_platform::filesystem::acl_grants_change` (anchor: no allow entry that
+  lets another principal change the file) and `acl_grants_access` (signing key:
+  deny-only ACLs only). An unreadable ACL fails closed. Documented in the
+  runtime catalog concept.
+
+### 2026-10-05, Codex runtime package source
 
 - Added the Codex runtime package guide and the package source
   (`runtime-packages/codex`, `compat/codex/compatibility-lock.json`,
@@ -1431,16 +210,7 @@
 - The source map lists the package source, the lock, the screens, the tests, the
   Responses stub and the `codex-package` CI job.
 
-## Unreleased (2026-10-06, trust anchor ACL policy)
-
-- The catalog trust anchor and the catalog signing key file are judged on macOS
-  extended ACLs as well as mode bits, through the shared
-  `pohunek_platform::filesystem::acl_grants_change` (anchor: no allow entry that
-  lets another principal change the file) and `acl_grants_access` (signing key:
-  deny-only ACLs only). An unreadable ACL fails closed. Documented in the
-  runtime catalog concept.
-
-## Unreleased (2026-10-05, reporter templates)
+### 2026-10-05, reporter templates
 
 - The Codex reporter scripts are core-owned templates with `@POHUNEK_AGENT_ID@`
   and `@POHUNEK_AGENT_NAME@` placeholders, rendered from the runtime's id and
@@ -1449,7 +219,7 @@
   installed integrations are unaffected. Documented in the runtime packages
   guide and the source map.
 
-## Unreleased (2026-10-05, catalog trust anchor)
+### 2026-10-05, catalog trust anchor
 
 - The daemon reads its catalog trust anchor from `runtime-catalog-anchor.json`
   beside its executable (public keys, windows, revoked key ids), with an
@@ -1463,7 +233,7 @@
   in the runtime catalog concept, the runtime packages guide, the public API
   reference and the source map.
 
-## Unreleased (2026-10-05, line version probe)
+### 2026-10-05, line version probe
 
 - Runtime descriptors can declare `version_probe = { parser = "semver-line-v1",
   args, min, below, line }`, where `line` is a literal template
@@ -1474,7 +244,7 @@
   is unchanged. Documented in the public API reference, the agent profiles
   concept and the source map.
 
-## Unreleased (2026-10-05, official runtime aliases)
+### 2026-10-05, official runtime aliases
 
 - A catalog-authorized official package may serve `codex`, `claude` or `hermes`
   in place of the built-in runtime; local, linked and explicit-digest packages
@@ -1484,7 +254,7 @@
   package serves its runtime, keeping its binding. The runtime packages guide,
   runtime catalog and archive concepts and the public API describe it.
 
-## Unreleased (2026-10-05, preflight hook schema)
+### 2026-10-05, preflight hook schema
 
 - The upgrade preflight resolves the hook schema of a worker whose journal
   carries none from the runtime definitions (built-in runtimes and the package
@@ -1492,7 +262,7 @@
   is adoptable. `worker_identity_unverified` remains only for a runtime whose
   definition cannot be read.
 
-## Unreleased (2026-10-05, config-home id and observer roots)
+### 2026-10-05, config-home id and observer roots
 
 - `host.inspect` runtime entries may carry `config_home_id`, an opaque keyed
   identifier of the config home a launch of the entry gives its agent (bare
@@ -1502,7 +272,7 @@
   pass, instead of one root per provider taken from the daemon's own environment.
   The agent profiles, sessions and secrets pages and the public API describe it.
 
-## Unreleased (2026-10-05, config homes)
+### 2026-10-05, config homes
 
 - A runtime descriptor may declare its config home in `[config_home]` (a
   variable name and a home-relative default); the built-in `claude` and `codex`
@@ -1518,7 +288,8 @@
   `pohunek integration` gains `--profile` and `--all-profiles`. The agent
   profiles page starts the subscription-switching guide, the public API, CLI,
   runtime packages and secrets pages describe the surface.
-## Unreleased (2026-10-05, upgrade test)
+
+### 2026-10-05, upgrade test
 
 - CI upgrades a session started on the previous release's published binaries
   to the current build through `pohunek service check` and `service upgrade`
@@ -1526,7 +297,7 @@
   workflow, and `release.yml` before any publishable binary is built). The
   update-after-release runbook and the source map describe it.
 
-## Unreleased (2026-10-05, frozen profile revision)
+### 2026-10-05, frozen profile revision
 
 - A session launched from a host profile freezes the profile's keyed revision
   into its resume binding (store schema 3, optional `profile_revision`).
@@ -1541,7 +312,7 @@
   redacting `LaunchEnv` carrier. The public API, CLI, architecture, secrets and
   agent profile docs describe the behavior.
 
-## Unreleased (2026-10-05, hook schema gaps)
+### 2026-10-05, hook schema gaps
 
 - A hook schema now declares the subagent sequence rule next to the subagent
   fields, and a schema without the rule admits no subagent record. The daemon
@@ -1551,7 +322,7 @@
   action tables. The public API and the sessions and runtime packages guides
   describe the rules.
 
-## Unreleased (2026-10-05, compatibility-gated selection)
+### 2026-10-05, compatibility-gated selection
 
 - A package version whose integration (handler id and hook schema id, or none)
   differs from a version of the same package that a live, lost or resumable
@@ -1567,7 +338,7 @@
   integration update path checks the asset set against the schemas of retained
   versions as well.
 
-## Unreleased (2026-10-05, integration handlers)
+### 2026-10-05, integration handlers
 
 - Integration install, status, doctor, and uninstall dispatch through the
   compiled handler a runtime definition names (`integration.handler`) instead of
@@ -1579,7 +350,8 @@
   sources. `pohunek integration --agent` accepts any
   runtime id (built-in names unchanged), and status and doctor recovery commands
   name the runtime that was addressed.
-## Unreleased (2026-10-05, upgrade preflight)
+
+### 2026-10-05, upgrade preflight
 
 - The update runbook describes the read-only upgrade preflight that
   `pohunek service check|upgrade` run with the new binaries: the store dry run,
@@ -1591,7 +363,7 @@
 - The CLI reference, the setup guide, the macOS runbook, the session-runtime
   runbook and the public API cross-reference it.
 
-## Unreleased (2026-10-05, hook schemas)
+### 2026-10-05, hook schemas
 
 - The hook schema is enforced on the public socket (`session.report_agent`,
   `session.release_agent`, `session.report_native_id`, hook-claim
@@ -1605,7 +377,7 @@
   schema reaches the worker, is journaled, and validates daemon imports,
   including the re-projection of a worker that journals no schema.
 
-## Unreleased (2026-10-05, Pi detection and probe PATH)
+### 2026-10-05, Pi detection and probe PATH
 
 - The Pi package guide describes detection as one bottom-anchored editor frame
   (upper border, draft, lower border, footer) read for both states, with busy
@@ -1616,7 +388,7 @@
   also states that the version probe runs under the launch `PATH`, profile
   override included.
 
-## Unreleased (2026-10-05, client-side protocol window)
+### 2026-10-05, client-side protocol window
 
 - The Rust client and the CLI advertise the protocol window `3..=4`
   (`CLIENT_PROTOCOL_VERSIONS` is `SUPPORTED_PROTOCOL_VERSIONS`) and translate
@@ -1632,85 +404,7 @@
   across hosts"; `public-api.md` and the architecture "Protocol window" section
   describe the client side. The source map lists the client fixture test.
 
-## Unreleased (2026-10-04, upgrade window and store schema)
-
-- The update runbook states the upgrade window (release N carries N-1 for live
-  workers, the worker journal and public-protocol clients; persisted state
-  migrates from any older kept schema), the `metadata.jsonl.pre-schema-<old>`
-  backup, and the recovery from a newer-schema refusal. The daemon debug
-  runbook points at it, and the source map lists the schema and shape-guard
-  sources.
-## Unreleased (2026-10-04, conflict watch and stop exit)
-
-- Documented the WARN logged for every `conflict`, `lost`, `reconnecting`, or
-  `incompatible` classification, the background re-check of a `conflict` and
-  what ends it, adoption of a live worker after an upgrade (a binding without a
-  launch spec does not block it), and `session stop` of a `conflict` with its
-  journal and job proof and error codes.
-
-## Unreleased (2026-10-04, public protocol window)
-
-- Documented the public protocol window: a daemon accepts protocol `3..=4`
-  through shape-only edge adapters while clients advertise only their own
-  version, `daemon.health` and `host.inspect` report the negotiated version, and
-  the update runbook now says to upgrade daemons before their clients (a new
-  client against an N-1 daemon remains #527). The source
-  map lists `crates/protocol/src/compat/`.
-
-## Unreleased (2026-10-04, Pi runtime package)
-
-- Added the Pi runtime package guide: package source layout
-  (`runtime-packages/pi`, `compat/pi`), explicit-digest install, the assigned
-  `--session-id`/`--session`/`--fork` contract, the session-file existence check
-  verified against Pi 1.0.2, detection facts, limits, and how CI keeps the
-  descriptor, the supported range and the tests in sync.
-- The source map lists the package sources, the compatibility lock, the real-Pi
-  test and the `pi-package` CI job.
-
-## Unreleased (2026-10-04, data-driven version probe)
-
-- Runtime descriptors can declare `version_probe = { parser = "semver-v1", args,
-  min, below }`: the daemon probes the program with the declared argv in the
-  sandboxed probe environment and accepts a release in `[min, below)`, so a
-  package moves its supported range without a daemon release. Documented in the
-  public API reference and the source map.
-## Unreleased (2026-10-04, legacy resume binding migration)
-
-- Documented that the store migration maps v0.33.0 flat recovery fields and
-  repairs v0.33.1 records that lost their native launch spec, and that an
-  unrepairable record logs a WARN, carries a `native_recovery` session warning
-  and is never resumed automatically. The public API lists the new warning kind.
-
-## Unreleased (2026-10-04, README and reference pages)
-
-- The README is an agent-focused entry point; the human reference lives in
-  `docs/features.md`, `docs/install.md`, `docs/cli.md`, `docs/sdk.md`, and
-  `docs/development.md`, which every release archive carries next to the
-  README. The source map lists those pages, and the macOS install runbook names
-  them among the archive contents.
-
-## Unreleased (2026-10-04, daemon package host)
-
-- Documented the daemon side of runtime packages: the `<state>/plugins` store,
-  `PackageSource` loading, explicit reload, pin resolution by digest,
-  verification before launch and integration changes, the
-  `runtime_incompatible` error and retention-checked uninstall.
-
-## Unreleased (2026-10-04, runtime catalog)
-
-- Added the runtime catalog concept: the signed catalog that authorizes official
-  runtime packages, canonical signed bytes, key rotation and revocation,
-  anti-rollback, reserved runtime ids, and explicit-digest local trust. The
-  source map lists the new `crates/package` files.
-
-## Unreleased (2026-10-04, runtime package archive)
-
-- Added the runtime package archive concept: the canonical deterministic
-  `tar.zst` format, the strict reader's rejection rules, the named size limits,
-  and `cargo xtask package build|verify`. The source map lists the new
-  `crates/package` files.
-
-## Unreleased (2026-10-05, reported references supersede assigned ones)
+### 2026-10-05, reported references supersede assigned ones
 
 - A validated report replaces an assigned native reference: the sessions page,
   the public API reference and the runtime packages guide state that an
@@ -1726,7 +420,87 @@
   lease, every replacement carries an ordering key, and a recovered session
   keeps the key of its record.
 
-## Unreleased (2026-10-04, assigned native references)
+### 2026-10-04, upgrade window and store schema
+
+- The update runbook states the upgrade window (release N carries N-1 for live
+  workers, the worker journal and public-protocol clients; persisted state
+  migrates from any older kept schema), the `metadata.jsonl.pre-schema-<old>`
+  backup, and the recovery from a newer-schema refusal. The daemon debug
+  runbook points at it, and the source map lists the schema and shape-guard
+  sources.
+
+### 2026-10-04, conflict watch and stop exit
+
+- Documented the WARN logged for every `conflict`, `lost`, `reconnecting`, or
+  `incompatible` classification, the background re-check of a `conflict` and
+  what ends it, adoption of a live worker after an upgrade (a binding without a
+  launch spec does not block it), and `session stop` of a `conflict` with its
+  journal and job proof and error codes.
+
+### 2026-10-04, public protocol window
+
+- Documented the public protocol window: a daemon accepts protocol `3..=4`
+  through shape-only edge adapters while clients advertise only their own
+  version, `daemon.health` and `host.inspect` report the negotiated version, and
+  the update runbook now says to upgrade daemons before their clients (a new
+  client against an N-1 daemon remains #527). The source
+  map lists `crates/protocol/src/compat/`.
+
+### 2026-10-04, Pi runtime package
+
+- Added the Pi runtime package guide: package source layout
+  (`runtime-packages/pi`, `compat/pi`), explicit-digest install, the assigned
+  `--session-id`/`--session`/`--fork` contract, the session-file existence check
+  verified against Pi 1.0.2, detection facts, limits, and how CI keeps the
+  descriptor, the supported range and the tests in sync.
+- The source map lists the package sources, the compatibility lock, the real-Pi
+  test and the `pi-package` CI job.
+
+### 2026-10-04, data-driven version probe
+
+- Runtime descriptors can declare `version_probe = { parser = "semver-v1", args,
+  min, below }`: the daemon probes the program with the declared argv in the
+  sandboxed probe environment and accepts a release in `[min, below)`, so a
+  package moves its supported range without a daemon release. Documented in the
+  public API reference and the source map.
+
+### 2026-10-04, legacy resume binding migration
+
+- Documented that the store migration maps v0.33.0 flat recovery fields and
+  repairs v0.33.1 records that lost their native launch spec, and that an
+  unrepairable record logs a WARN, carries a `native_recovery` session warning
+  and is never resumed automatically. The public API lists the new warning kind.
+
+### 2026-10-04, README and reference pages
+
+- The README is an agent-focused entry point; the human reference lives in
+  `docs/features.md`, `docs/install.md`, `docs/cli.md`, `docs/sdk.md`, and
+  `docs/development.md`, which every release archive carries next to the
+  README. The source map lists those pages, and the macOS install runbook names
+  them among the archive contents.
+
+### 2026-10-04, daemon package host
+
+- Documented the daemon side of runtime packages: the `<state>/plugins` store,
+  `PackageSource` loading, explicit reload, pin resolution by digest,
+  verification before launch and integration changes, the
+  `runtime_incompatible` error and retention-checked uninstall.
+
+### 2026-10-04, runtime catalog
+
+- Added the runtime catalog concept: the signed catalog that authorizes official
+  runtime packages, canonical signed bytes, key rotation and revocation,
+  anti-rollback, reserved runtime ids, and explicit-digest local trust. The
+  source map lists the new `crates/package` files.
+
+### 2026-10-04, runtime package archive
+
+- Added the runtime package archive concept: the canonical deterministic
+  `tar.zst` format, the strict reader's rejection rules, the named size limits,
+  and `cargo xtask package build|verify`. The source map lists the new
+  `crates/package` files.
+
+### 2026-10-04, assigned native references
 
 - Runtime definitions declare how core obtains the native session reference in
   a required `[native_reference]` table: `hook`, `assigned` or `none`. The
@@ -1738,7 +512,9 @@
   base's assignment. The rule that a later reported reference supersedes an
   assigned one is not part of this change.
 
-## Unreleased (2026-10-03, native launch spec)
+## 0.33.1
+
+### 2026-10-03, native launch spec
 
 - Replaced the profile `[resume] mode`/`ref_kind` keys and the `[fork]` table
   with a typed native-session launch spec: `[resume] reference_kind`, `args`,
@@ -1750,7 +526,9 @@
   `invalid_profile` rejections; the public API `capabilities` note and the
   sessions fork paragraph follow the frozen spec.
 
-## Unreleased (2026-10-03)
+## 0.33.0
+
+### 2026-10-03
 
 - Documented the macOS release shape: `aarch64-apple-darwin` CLI and daemon
   archives are ad-hoc signed (`signing adhoc` in the `MANIFEST`), not notarized,
@@ -1764,7 +542,9 @@
   the Developer ID keychain and notarization scripts and describes
   `packaging/macos/sign`, `verify-signed --adhoc`, and `package --adhoc-release`.
 
-## Unreleased (2026-09-29)
+## 0.32.0
+
+### 2026-09-29
 
 - Moved the `pohunek attach` reconnect settings from `launcher.conf` to the
   core-owned `<config_dir>/attach.conf` (same keys, same validation, installed
@@ -1879,7 +659,7 @@
   modules in the agent's working directory and `PYTHON*` variables cannot affect
   the hook interpreter's configuration or module resolution.
 
-## Unreleased (2026-09-28)
+### 2026-09-28
 
 - Documented that a `session.remove` refused with `runtime_supervision_ambiguous`
   because same-user processes with unreadable environments may belong to the
@@ -1910,7 +690,7 @@
   final install or upgrade under that lock and runs `service check` before it
   touches the legacy install.
 
-## Unreleased (2026-09-27)
+### 2026-09-27
 
 - Documented that a failed `session new` whose worktree compensation cannot
   finish stays listed as `reconnecting` with `create_compensation_pending`
@@ -1935,7 +715,7 @@
 - Documented the worker session ID grammar: `s-<ULID>` or `s-<digits>` with 1
   to 20 digits.
 
-## Unreleased (2026-09-25)
+### 2026-09-25
 
 - Documented that `migration preflight` takes an explicit `--socket <path>` so
   the archive installer can dial the legacy daemon after renaming its control
@@ -1944,7 +724,9 @@
   abort without removing legacy files when a not-inactive template worker
   survives.
 
-## Unreleased (2026-08-12)
+## 0.31.0
+
+### 2026-08-12
 
 - Documented that a Darwin process between images no longer fails a process
   table read: it is listed without a command line, its markers are

@@ -50,6 +50,31 @@ os.execv(real, [real, *args])
 
 FAKE_CARGO = "#!/bin/sh\nexit 0\n"
 
+# Stands in for `cargo xtask docs log fold`: records the call, and outside a dry
+# run files the fragments the way the real fold does (log written, log.d gone).
+FOLDING_CARGO = r'''#!/bin/sh
+case "$*" in
+  "xtask docs log fold "*)
+    printf '%s\n' "cargo $*" >> "$EVENTS"
+    case "$*" in
+      *--dry-run*) ;;
+      *)
+        if [ -e bin/edit-unrelated ]; then
+          printf -- '- Edited while the release ran.\n' >> docs/knowledge/guide.md
+        fi
+        version=$(printf '%s\n' "$*" | sed 's/.*--version \([^ ]*\).*/\1/')
+        printf '\n## %s\n\n- Folded.\n' "$version" >> docs/knowledge/log.md
+        rm -rf docs/knowledge/log.d
+        ;;
+    esac
+    ;;
+esac
+exit 0
+'''
+
+LOG = "# Knowledge Bundle Log\n\n## 0.1.0\n\n- First release.\n"
+FRAGMENT = "## Unreleased (2026-10-14, a change, #1)\n\n- A change.\n"
+
 FAKE_GH = r'''#!/usr/bin/env python3
 import json
 import os
@@ -212,6 +237,112 @@ class ReleaseEvidenceTests(unittest.TestCase):
                 "tier": tier,
             })
         self.state.write_text(json.dumps({"sha": sha, "runs": runs}))
+
+    def add_knowledge_log(self):
+        self.write_copy("docs/knowledge/guide.md", "# Guide\n")
+        self.write_copy("docs/knowledge/log.md", LOG)
+        self.write_copy("docs/knowledge/log.d/1-a-change.md", FRAGMENT)
+        self.write_copy("bin/cargo", FOLDING_CARGO, executable=True)
+        self.git("add", "docs", "bin")
+        self.git("commit", "-m", "Record a knowledge-log fragment")
+
+    def tracked(self, revision):
+        return subprocess.check_output(
+            [shutil.which("git"), "-C", str(self.repo), "ls-tree", "-r", "--name-only", revision],
+            text=True,
+        ).split()
+
+    def test_release_commit_files_the_knowledge_log_fragments(self):
+        self.add_knowledge_log()
+        result = self.run_release()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("cargo xtask docs log fold --version 0.1.1", self.read_events())
+        candidate = json.loads(self.state.read_text())["sha"]
+        self.assertNotIn("docs/knowledge/log.d/1-a-change.md", self.tracked(candidate))
+        log = subprocess.check_output(
+            [shutil.which("git"), "-C", str(self.repo), "show", f"{candidate}:docs/knowledge/log.md"],
+            text=True,
+        )
+        self.assertIn("## 0.1.1", log)
+        status = subprocess.check_output(
+            [shutil.which("git"), "-C", str(self.repo), "status", "--porcelain"], text=True
+        )
+        self.assertEqual(status, "", "the release commit holds the whole fold")
+
+    def test_dry_run_plans_the_fold_and_changes_nothing(self):
+        self.add_knowledge_log()
+        result = self.run_release("--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("cargo xtask docs log fold --version 0.1.1 --dry-run", self.read_events())
+        self.assertIn("docs/knowledge/log.d/1-a-change.md", self.tracked("HEAD"))
+        self.assertTrue((self.repo / "docs/knowledge/log.d/1-a-change.md").exists())
+
+    def test_failed_step_after_the_fold_restores_the_tree(self):
+        self.add_knowledge_log()
+        failing = FOLDING_CARGO.replace(
+            "exit 0\n", 'case "$*" in update*) exit 3 ;; esac\nexit 0\n'
+        )
+        self.write_copy("bin/cargo", failing, executable=True)
+        self.git("add", "bin")
+        self.git("commit", "-m", "Make cargo update fail")
+        result = self.run_release()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("were undone", result.stderr)
+        status = subprocess.check_output(
+            [shutil.which("git"), "-C", str(self.repo), "status", "--porcelain"], text=True
+        )
+        self.assertEqual(status, "", "the failed release leaves the tree as it found it")
+        self.assertTrue((self.repo / "docs/knowledge/log.d/1-a-change.md").exists())
+
+    def show(self, revision, path):
+        return subprocess.check_output(
+            [shutil.which("git"), "-C", str(self.repo), "show", f"{revision}:{path}"], text=True
+        )
+
+    def test_release_commit_and_rollback_leave_other_knowledge_files_alone(self):
+        self.add_knowledge_log()
+        self.write_copy("bin/edit-unrelated", "")
+        self.git("add", "bin")
+        self.git("commit", "-m", "Edit another knowledge file during the fold")
+        result = self.run_release()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        candidate = json.loads(self.state.read_text())["sha"]
+        self.assertEqual(self.show(candidate, "docs/knowledge/guide.md"), "# Guide\n")
+        self.assertIn("Edited while the release ran.", (self.repo / "docs/knowledge/guide.md").read_text())
+
+    def test_rollback_keeps_an_edit_to_another_knowledge_file(self):
+        self.add_knowledge_log()
+        failing = FOLDING_CARGO.replace(
+            "exit 0\n", 'case "$*" in update*) exit 3 ;; esac\nexit 0\n'
+        )
+        self.write_copy("bin/cargo", failing, executable=True)
+        self.write_copy("bin/edit-unrelated", "")
+        self.git("add", "bin")
+        self.git("commit", "-m", "Make cargo update fail and edit another knowledge file")
+        result = self.run_release()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Edited while the release ran.", (self.repo / "docs/knowledge/guide.md").read_text())
+        self.assertTrue((self.repo / "docs/knowledge/log.d/1-a-change.md").exists())
+
+    def test_rollback_still_restores_when_the_bump_file_cannot_be_removed(self):
+        self.add_knowledge_log()
+        # An untracked directory where the bump writes its temporary manifest
+        # fails the bump, and `rm -f` cannot remove it either.
+        (self.repo / "Cargo.toml.tmp").mkdir()
+        result = self.run_release()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not be restored or removed: Cargo.toml.tmp", result.stderr)
+        self.assertTrue((self.repo / "docs/knowledge/log.d/1-a-change.md").exists())
+        self.assertEqual(self.show("HEAD", "docs/knowledge/log.md"), LOG)
+        self.assertEqual((self.repo / "docs/knowledge/log.md").read_text(), LOG)
+
+    def test_already_versioned_candidate_with_unfolded_fragments_is_refused(self):
+        self.add_knowledge_log()
+        self.prepare_existing_candidate()
+        result = self.run_release("0.1.1", "--no-push")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("still has knowledge-log fragments", result.stderr)
+        self.assertFalse((self.repo / ".git/refs/tags/v0.1.1").exists())
 
     def test_push_checks_both_tiers_before_tag_and_tag_push(self):
         result = self.run_release()

@@ -7,6 +7,14 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+#[expect(
+    dead_code,
+    unreachable_pub,
+    reason = "the build script uses only the assembly half of the library's public log module"
+)]
+#[path = "src/log.rs"]
+mod log;
+
 const REFERENCE_GENERATED: &str = "generated";
 const REFERENCE_MANUAL_ONLY: &str = "manual-only";
 
@@ -25,6 +33,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         fs::remove_dir_all(&out_bundle)?;
     }
     copy_dir_deterministic(&source, &source, &out_bundle)?;
+    assemble_log(&source, &out_bundle)?;
 
     let content_hash = bundle_content_hash(&out_bundle)?;
     println!("cargo:rustc-env=POHUNEK_KNOWLEDGE_CONTENT_HASH={content_hash}");
@@ -32,6 +41,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-env-changed=POHUNEK_KNOWLEDGE_BUNDLE");
     println!("cargo:rerun-if-changed={}", source.display());
 
+    Ok(())
+}
+
+/// Writes the bundle's `log.md` with the unreleased fragments of `source` in
+/// place, so the embedded bundle shows them as the assembled log does.
+fn assemble_log(source: &Path, out_bundle: &Path) -> Result<(), Box<dyn Error>> {
+    let fragments = log::read_fragments(&source.join(log::FRAGMENT_DIR))?;
+    let log_path = source.join(log::LOG_FILE);
+    if fragments.is_empty() || !log_path.is_file() {
+        return Ok(());
+    }
+    let assembled = log::assemble(&fs::read_to_string(&log_path)?, &fragments)?;
+    fs::write(out_bundle.join(log::LOG_FILE), assembled)?;
     Ok(())
 }
 
@@ -64,6 +86,10 @@ fn copy_dir_deterministic(
 
     for path in entries.values() {
         let relative = path.strip_prefix(source_root)?;
+        // The fragments reach the bundle inside the assembled log only.
+        if relative == Path::new(log::FRAGMENT_DIR) {
+            continue;
+        }
         let destination = destination_root.join(relative);
         let file_type = fs::symlink_metadata(path)?.file_type();
         if file_type.is_dir() {

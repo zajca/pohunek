@@ -11,6 +11,8 @@ mod generators;
 mod hermes;
 mod hermes_mock;
 mod hermes_skill;
+mod knowledge_log;
+pub use knowledge_log::{fold as fold_log, migrate as migrate_log, FoldSummary, MigrateSummary};
 mod package_affected;
 mod package_baseline;
 mod package_bump;
@@ -86,6 +88,8 @@ pub struct SiteSummary {
 pub enum XtaskError {
     Usage(String),
     BundleValidation(knowledge::BundleValidationError),
+    /// A knowledge-log fragment or the log itself was refused.
+    KnowledgeLog(knowledge::log::LogError),
     Io {
         path: PathBuf,
         source: io::Error,
@@ -149,6 +153,7 @@ impl fmt::Display for XtaskError {
         match self {
             Self::Usage(message) => write!(f, "{message}"),
             Self::BundleValidation(error) => write!(f, "{error}"),
+            Self::KnowledgeLog(error) => write!(f, "knowledge log: {error}"),
             Self::Io { path, source } => {
                 write!(f, "failed to access `{}`: {source}", path.display())
             }
@@ -188,6 +193,7 @@ impl Error for XtaskError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::BundleValidation(error) => Some(error),
+            Self::KnowledgeLog(error) => Some(error),
             Self::Io { source, .. } => Some(source),
             Self::Json(error) => Some(error),
             Self::Yaml(error) => Some(error),
@@ -252,15 +258,20 @@ pub fn build_docs(options: BuildOptions) -> Result<BuildSummary, XtaskError> {
     generators::config::generate(&bundle_dir, since)?;
     generators::protocol::generate(&bundle_dir, since)?;
 
-    // Phase 2: copy manual docs into the bundle dir.
+    // Phase 2: copy manual docs into the bundle dir. The unreleased log
+    // fragments reach the bundle inside the assembled log only.
     let manual_files = collect_files(&source_dir)?;
     for file in &manual_files {
+        if knowledge_log::is_fragment_path(&file.relative_path) {
+            continue;
+        }
         let destination = bundle_dir.join(&file.relative_path);
         if let Some(parent) = destination.parent() {
             create_dir_all(parent)?;
         }
         copy_file(&file.source_path, &destination)?;
     }
+    knowledge_log::assemble_into(&source_dir, &bundle_dir)?;
 
     // Phase 3: validate the merged bundle.
     validate_docs(&bundle_dir)?;
@@ -295,6 +306,35 @@ pub fn build_docs(options: BuildOptions) -> Result<BuildSummary, XtaskError> {
 /// output directory. No external resources are used — all CSS is inlined.
 pub fn build_site(options: SiteOptions) -> Result<SiteSummary, XtaskError> {
     site::build_site(options)
+}
+
+/// Runs one `docs log` action against the source bundle `source_dir`.
+fn run_log(source_dir: &Path, action: LogAction) -> Result<(), XtaskError> {
+    match action {
+        LogAction::Fold { version, dry_run } => {
+            let summary = fold_log(source_dir, &version, dry_run)?;
+            let verb = if dry_run { "would fold" } else { "folded" };
+            println!(
+                "docs log fold: {verb} {} fragment(s) under {version}",
+                summary.folded.len()
+            );
+            for name in &summary.folded {
+                println!("  {name}");
+            }
+        }
+        LogAction::Migrate { dry_run } => {
+            let summary = migrate_log(source_dir, dry_run)?;
+            let verb = if dry_run { "would write" } else { "wrote" };
+            println!(
+                "docs log migrate: {verb} {} fragment(s)",
+                summary.written.len()
+            );
+            for name in &summary.written {
+                println!("  {name}");
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn check_docs(
@@ -380,6 +420,7 @@ where
                 );
                 Ok(())
             }
+            DocsAction::Log { action } => run_log(&root.join(MANUAL_SOURCE), action),
         },
         TopCommand::Ts { action } => match action {
             TsAction::Generate => {
@@ -683,6 +724,31 @@ enum DocsAction {
     Build,
     Check,
     Site,
+    /// Manage the unreleased knowledge-log fragments under `docs/knowledge/log.d`.
+    Log {
+        #[command(subcommand)]
+        action: LogAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum LogAction {
+    /// Write every fragment into `log.md` under `## <version>` and remove the
+    /// fragments, as the release commit does.
+    Fold {
+        /// Release version the entries are filed under, such as `0.35.0`.
+        #[arg(long, value_name = "X.Y.Z")]
+        version: String,
+        /// Print the fragments that would be folded and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Move every `## Unreleased (...)` section of `log.md` into a fragment.
+    Migrate {
+        /// Print the fragments that would be written and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

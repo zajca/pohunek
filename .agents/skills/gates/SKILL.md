@@ -50,7 +50,8 @@ cannot run in this environment (missing pinned Hermes executable) is a failed/sk
 reason.
 
 `cargo xtask docs check` validates the assistant knowledge bundle (schema,
-drift, source-map, runbooks, secret scan, release extras). Run it for every
+knowledge-log fragments, drift, source-map, runbooks, secret scan, release
+extras). Run it for every
 change; it is mandatory when the change touches anything under `docs/knowledge/`,
 a CLI command/flag, a protocol method/event, or `docs/public-api.md`.
 

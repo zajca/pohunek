@@ -115,11 +115,16 @@ fn collect_markdown_files<'a>(dir: &'a Dir<'a>, files: &mut Vec<&'a File<'a>>) {
     }
 }
 
+/// Whether `file` is not a concept: the reserved `index.md` and `log.md`, or a
+/// log fragment, which a source bundle keeps under `log.d/` and the embedded
+/// bundle carries only inside its assembled log.
 fn is_reserved_markdown(file: &File<'_>) -> bool {
-    file.path()
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| matches!(name, "index.md" | "log.md"))
+    let path = file.path();
+    path.starts_with(crate::log::FRAGMENT_DIR)
+        || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, "index.md" | "log.md"))
 }
 
 fn frontmatter(content: &str) -> Option<&str> {

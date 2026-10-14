@@ -182,6 +182,12 @@ Release packaging and contributor verification:
   gate over the baseline verdicts; fails a changed package whose version is
   not above the released versions, and reports `undecided` for an absent
   catalog.
+- `crates/knowledge/src/log.rs` — knowledge-log fragments under
+  `docs/knowledge/log.d/`: the fragment rules, the entry order, the assembled
+  log the embedded bundle (`crates/knowledge/build.rs`) and `docs build` ship,
+  and the release fold.
+- `crates/xtask/src/knowledge_log.rs` — `cargo xtask docs log fold|migrate` and
+  the `knowledge-log` docs check.
 - `scripts/test-partitions` — disjoint unit/daemon/relay/cli/relay-db/heavy CI
   shards and exhaustive inventory check. Heavy is the exact complement of the
   fast filter; relay heavy tests (`relay-db`, the only PostgreSQL fixture
@@ -426,8 +432,9 @@ Release packaging and contributor verification:
   evaluates its observations (tested by
   `scripts/tests/test_launchd_lifetime_evidence.py`).
 - `docs/acceptance/README.md` — manual acceptance evidence and its schema.
-- `scripts/release` — release versioning, exact-commit main/nightly CI evidence
-  gate, and local-only `--no-push` behavior.
+- `scripts/release` — release versioning, the knowledge-log fold into the
+  release commit, exact-commit main/nightly CI evidence gate, and local-only
+  `--no-push` behavior.
 - `scripts/ci-evidence` — verifies successful Actions jobs and steps for an
   exact commit, with optional dispatch and bounded polling.
 - `scripts/provision-hermes-compat`

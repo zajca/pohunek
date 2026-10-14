@@ -11,7 +11,7 @@ cargo build -p pohunek-session-worker --bin pohunek-sessiond  # daemon tests spa
 cargo nextest run --profile ci --test-threads 4 --workspace --all-features
 cargo test --doc --workspace --all-features              # nextest excludes doctests
 cargo build --workspace --release                        # release profile must build (CI: see below)
-cargo xtask docs check                                   # schema/drift/source-map/verifier/secrets/runbooks
+cargo xtask docs check                                   # schema/log fragments/drift/source-map/verifier/secrets/runbooks
 scripts/build-hermes-package /abs/hermes.tar.zst        # Hermes runtime package for the gate
 cargo xtask hermes compatibility --bin-dir ABS --package /abs/hermes.tar.zst  # pinned, model-free Hermes CLI/golden gate
 ```

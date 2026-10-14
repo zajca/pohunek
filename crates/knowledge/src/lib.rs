@@ -4,6 +4,7 @@
 
 pub mod assistant;
 mod index;
+pub mod log;
 mod materializer;
 #[cfg(feature = "protocol")]
 mod protocol_conversions;
