@@ -4301,7 +4301,9 @@ where
                 }
                 if effect != SubagentOutcome::Applied {
                     if effect.reason() == Some(SubagentReason::StopWithoutStart) {
-                        state.orphan_stops.record(&provider, &subagent_id, sequence);
+                        state
+                            .orphan_stops
+                            .record(&provider, &subagent_id, subagent_mark(sequence));
                     }
                     log_subagent_outcome(&shared, claim, effect);
                 }
@@ -6058,6 +6060,19 @@ fn log_snapshot(shared: &Shared, claim: SnapshotClaim<'_>, result: &Reconciliati
     );
 }
 
+/// The mark a subagent record or a remembered stop keeps for a claim at
+/// `sequence`: the claim's sequence capped at the worker's own
+/// `CLOCK_MONOTONIC` reading, as the background mark is.
+///
+/// A claim taken from the host's monotonic clock is never ahead of the
+/// worker's reading when it arrives, so honest claims keep their sequence. A
+/// claim with a far-future sequence leaves a mark no later than its arrival,
+/// so the next genuine claim, ordered after it, is still newer instead of
+/// stale until the runtime ends. Comparisons always use the unclamped claim.
+fn subagent_mark(sequence: u64) -> u64 {
+    background::clamp_mark(sequence)
+}
+
 /// Applies a subagent start to `journal` under `rule`.
 ///
 /// A start ordered after a running subagent's recorded claim only raises the
@@ -6096,7 +6111,7 @@ fn start_subagent(
     if let Some(index) = index {
         let record = &mut journal.subagents[index];
         if record.phase == JournalSubagentPhase::Running {
-            record.sequence = claim.sequence;
+            record.sequence = subagent_mark(claim.sequence);
             return SubagentOutcome::Ignored {
                 reason: SubagentReason::DuplicateStart,
                 recorded,
@@ -6120,7 +6135,7 @@ fn start_subagent(
     if let Some(index) = index {
         let subagent = &mut journal.subagents[index];
         subagent.phase = JournalSubagentPhase::Running;
-        subagent.sequence = claim.sequence;
+        subagent.sequence = subagent_mark(claim.sequence);
         subagent.revision = journal.subagent_revision;
         subagent.updated_at_ms = occurred_at_ms;
         subagent.finished_at_ms = None;
@@ -6137,7 +6152,7 @@ fn start_subagent(
             provider: claim.provider.to_owned(),
             agent_type: agent_type.map(str::to_owned),
             phase: JournalSubagentPhase::Running,
-            sequence: claim.sequence,
+            sequence: subagent_mark(claim.sequence),
             revision: journal.subagent_revision,
             started_at_ms: occurred_at_ms,
             updated_at_ms: occurred_at_ms,
@@ -6186,7 +6201,7 @@ fn stop_subagent(
     if let Some(index) = index {
         let record = &mut journal.subagents[index];
         if record.phase != JournalSubagentPhase::Running {
-            record.sequence = claim.sequence;
+            record.sequence = subagent_mark(claim.sequence);
             return SubagentOutcome::Ignored {
                 reason: SubagentReason::NotRunning,
                 recorded,
@@ -6198,7 +6213,7 @@ fn stop_subagent(
     if let Some(index) = index {
         let subagent = &mut journal.subagents[index];
         subagent.phase = phase;
-        subagent.sequence = claim.sequence;
+        subagent.sequence = subagent_mark(claim.sequence);
         subagent.revision = journal.subagent_revision;
         subagent.updated_at_ms = occurred_at_ms;
         subagent.finished_at_ms = Some(occurred_at_ms);
@@ -6209,7 +6224,7 @@ fn stop_subagent(
             provider: claim.provider.to_owned(),
             agent_type: None,
             phase,
-            sequence: claim.sequence,
+            sequence: subagent_mark(claim.sequence),
             revision: journal.subagent_revision,
             started_at_ms: occurred_at_ms,
             updated_at_ms: occurred_at_ms,

@@ -980,7 +980,10 @@ highest-sequence claim admitted for its id: a start newer than a terminal
 record reopens it, a stop newer than a running record ends it, a newer start
 for a running record or a newer stop for a terminal one changes no phase but
 advances the record's journaled sequence, and a claim not newer than that
-sequence is ignored), and the subagent providers whose stop is
+sequence is ignored; the journaled sequence is capped at the worker's own
+`CLOCK_MONOTONIC` reading when the claim arrives, so a far-future claim cannot
+make the subagent's later genuine claims stale, while comparisons use the
+claim's own sequence), and the subagent providers whose stop is
 admitted only after a recorded start (`claude` in `identity-subagent-v1`, keyed
 by the reporting provider, so it also covers a Claude in a shell session's
 foreground). A schema that admits subagent

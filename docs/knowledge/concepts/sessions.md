@@ -379,7 +379,13 @@ itself. A newer start for a child that is already running, or a newer stop for
 a terminal child, is ignored: the phase and revision stay, but the worker
 persists the claim's sequence in the journal, so a delayed older claim cannot
 reopen or complete the record. A claim not newer than the recorded sequence is
-ignored and changes nothing.
+ignored and changes nothing. The recorded sequence, and the sequence a
+remembered orphan stop keeps, is capped at the worker's own `CLOCK_MONOTONIC`
+reading when the claim arrives, as the background mark is: a claim taken from
+the host's monotonic clock is never ahead of that reading, so honest claims
+keep their sequence, while a far-future claim leaves a mark no later than its
+arrival and the subagent's next genuine claim is still newer. Comparisons use
+the claim's own sequence.
 
 A Claude `SubagentStop` without a recorded start creates no row and leaves the
 running and recent counts and the retained history unchanged; Claude sends
