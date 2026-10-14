@@ -610,17 +610,16 @@ fn dispatcher_key() -> PluginUnitKey {
 /// the dispatcher verifies every run again, so keeping it is the fail-closed
 /// choice. Only an installation of this version gets the unit written, since
 /// the unit runs that installation's `__dispatch`; under another version an
-/// installed unit is stopped and removed instead of restarted, and the
-/// returned warning says that no reaction runs until this version installs
-/// it again.
+/// installed unit is stopped and removed instead of restarted, and while a
+/// plugin still reacts the returned warning says that no reaction runs until
+/// this version installs the unit again.
 ///
 /// # Errors
 ///
 /// Returns [`Error::ServiceNotInstalled`] when no usable installation exists
-/// for a unit that must be installed or removed, or when a unit that is not
-/// installed must be installed under an installation of another version,
-/// [`Error::Units`] when the service manager refuses, or [`Error::Store`] when
-/// the record cannot be written.
+/// for a unit that must be installed or removed, [`Error::Units`] when the
+/// service manager refuses, or [`Error::Store`] when the record cannot be
+/// written.
 pub(crate) async fn sync_dispatcher(
     store: &Store,
     context: &Context,
@@ -634,25 +633,22 @@ pub(crate) async fn sync_dispatcher(
     let installation = require_installation(context)?;
     // Removing the unit runs no trampoline, so any version may remove it, as
     // `disable` and `uninstall` remove plugin units.
-    let mismatch = match require_same_version(&installation) {
-        Ok(()) => None,
-        Err(error) if reacting && !recorded => return Err(error),
-        Err(error) => Some(error),
-    };
-    let backend = connect(context, &installation, id).await?;
-    if !reacting || mismatch.is_some() {
-        backend.remove(&dispatcher_key()).await.map_err(|error| {
-            units_failed(id, format!("removing the dispatcher unit failed: {error}"))
-        })?;
-        store.set_dispatcher_recorded(false)?;
-        return Ok(mismatch.filter(|_mismatch| reacting).map(|error| {
+    if let Err(mismatch) = require_same_version(&installation) {
+        if recorded {
+            remove_dispatcher(store, context, &installation, id).await?;
+        }
+        return Ok(reacting.then(|| {
             format!(
-                "the reaction dispatcher was stopped and removed, so no reaction runs: {error}; \
-                 after that, `pohunek workflow enable <id>` of a plugin with reactions starts it \
-                 again"
+                "the reaction dispatcher is not running, so no reaction runs: {mismatch}; after \
+                 that, `pohunek workflow enable <id>` of a plugin with reactions starts it again"
             )
         }));
     }
+    if !reacting {
+        remove_dispatcher(store, context, &installation, id).await?;
+        return Ok(None);
+    }
+    let backend = connect(context, &installation, id).await?;
     let environment =
         context
             .service_environment()
@@ -675,6 +671,25 @@ pub(crate) async fn sync_dispatcher(
             )
         })?;
     Ok(None)
+}
+
+/// Stops and removes the reaction dispatcher unit, then forgets its record.
+///
+/// # Errors
+///
+/// Returns [`Error::Units`] when the service manager cannot be reached or
+/// refuses, or [`Error::Store`] when the record cannot be removed.
+async fn remove_dispatcher(
+    store: &Store,
+    context: &Context,
+    installation: &Installation,
+    id: &PackageId,
+) -> Result<(), Error> {
+    let backend = connect(context, installation, id).await?;
+    backend.remove(&dispatcher_key()).await.map_err(|error| {
+        units_failed(id, format!("removing the dispatcher unit failed: {error}"))
+    })?;
+    store.set_dispatcher_recorded(false)
 }
 
 /// The enabled plugins that keep the reaction dispatcher unit installed: those

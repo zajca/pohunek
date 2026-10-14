@@ -52,8 +52,11 @@ const ORIGIN_PREFIX: &str = "origin.";
 /// Another version than this CLI, recorded for the installation.
 const OTHER_VERSION: &str = "0.0.1";
 
-/// A second plugin with reactions, for the scenarios that need two.
+/// A second plugin with reactions, for the scenarios that need several.
 const OTHER_PLUGIN: &str = "acme.watch";
+
+/// A third plugin with reactions, for the scenarios that need several.
+const THIRD_PLUGIN: &str = "acme.audit";
 
 /// Marker file that makes the fixture reaction sleep per run.
 const SLOW_MARKER: &str = "slow";
@@ -262,24 +265,29 @@ async fn service_uninstall_names_the_enabled_plugin_that_reacts() {
 
 /// Under a service installation of another pohunek version, disabling a
 /// plugin with reactions succeeds and stops and removes the dispatcher unit,
-/// also while another enabled plugin reacts: removing a unit runs no
-/// trampoline, as for a plugin's own units, and only this version may write
-/// the unit again.
+/// also while other enabled plugins react, and later disables succeed with no
+/// dispatcher left to remove: removing a unit runs no trampoline, as for a
+/// plugin's own units, and only this version may write the unit again.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
 async fn disabling_removes_the_dispatcher_under_an_installation_of_another_version() {
     assert_ne!(VERSION, OTHER_VERSION);
     let mut managed = Managed::new(KNOBS);
-    let plugin = Plugin::new(PLUGIN).reaction("on_created", &["session_created"], "react");
-    managed.enable(&plugin).await;
-    let other = Plugin::new(OTHER_PLUGIN).reaction("on_created", &["session_created"], "react");
-    managed.enable(&other).await;
+    for id in [PLUGIN, OTHER_PLUGIN, THIRD_PLUGIN] {
+        let plugin = Plugin::new(id).reaction("on_created", &["session_created"], "react");
+        managed.enable(&plugin).await;
+    }
     let record = managed
         .units
         .env
         .state_home()
         .join("pohunek/workflow-plugins/units/REACTIONS.json");
     assert!(record.exists(), "enabling recorded the dispatcher unit");
+    assert_eq!(
+        managed.loaded().len(),
+        1,
+        "only the dispatcher unit is loaded"
+    );
     identity_config(
         &managed.units.context,
         &managed.units.env.root().join("prefix"),
@@ -293,8 +301,12 @@ async fn disabling_removes_the_dispatcher_under_an_installation_of_another_versi
     // user manager in the hermetic environment.
     managed.disable(PLUGIN).await;
     assert!(!record.exists(), "the dispatcher unit is still recorded");
+    assert!(managed.loaded().is_empty(), "{:?}", managed.loaded());
+    // A plugin still reacts, and no dispatcher is left to remove.
+    managed.disable(THIRD_PLUGIN).await;
     managed.disable(OTHER_PLUGIN).await;
     assert!(!record.exists(), "the dispatcher unit was recorded again");
+    assert!(managed.loaded().is_empty(), "{:?}", managed.loaded());
 }
 
 #[tokio::test(flavor = "multi_thread")]
