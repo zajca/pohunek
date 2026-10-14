@@ -24,7 +24,7 @@ use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, IntegrationAction, PackageAction, PackageStatus, ProfileAction,
     ProfileStatus, Refusal, UseReason, CODE_PACKAGE_ARCHIVE_INVALID,
     CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, CODE_PROFILE_NOT_MIGRATABLE,
-    CODE_RELEASE_CATALOG_UNAVAILABLE, ENSURE_REPORT_VERSION,
+    CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE, ENSURE_REPORT_VERSION,
 };
 use protocol::{
     IntegrationInstallState, IntegrationStatusParams, PackageBindProfileParams, PackageBindStatus,
@@ -60,6 +60,9 @@ const PACKAGES_DIR: &str = "packages";
 /// after the runtime id, as `xtask` writes it.
 const ARCHIVE_SUFFIX: &str = ".tar.zst";
 
+/// Refusal subject of an installed `service.toml` that cannot be read.
+const SERVICE_CONFIG_SUBJECT: &str = "service-config";
+
 /// The inputs of one run, resolved by the daemon binary.
 #[derive(Debug, Clone)]
 pub struct EnsureInputs {
@@ -77,6 +80,10 @@ pub struct EnsureInputs {
     pub dry_run: bool,
     /// Version of the daemon binary that runs the step.
     pub daemon_version: String,
+    /// The launch environment of the installed daemon, or the reason the
+    /// installed `service.toml` cannot be read. An unreadable file refuses the
+    /// plan, because the integration homes are read through it.
+    pub environment: Result<crate::runtime::LaunchEnvironment, String>,
 }
 
 /// A failure that stops the step before a report exists.
@@ -258,6 +265,36 @@ impl Report {
     }
 }
 
+/// The plan of one run, as a dry run reports it, and the verified definitions
+/// of the packages it would serve: the release archives it installs and the
+/// installed packages it keeps.
+#[derive(Debug)]
+pub struct OfficialPlan {
+    /// The plan: the packages and profiles it would change, and the refusals.
+    pub report: EnsureReport,
+    /// The definitions the planned packages serve, verified exactly as an apply
+    /// verifies them.
+    pub definitions: Vec<RuntimeDefinition>,
+}
+
+/// Computes the plan without changing anything, whatever `inputs.dry_run` says.
+///
+/// # Errors
+///
+/// Returns [`EnsureError`] when a store cannot be read. A refusal is a report.
+pub fn plan_official_runtimes(inputs: &EnsureInputs) -> Result<OfficialPlan, EnsureError> {
+    let computed = compute(inputs)?;
+    let definitions = computed
+        .planned
+        .iter()
+        .map(|plan| plan.definition.clone())
+        .collect();
+    Ok(OfficialPlan {
+        report: computed.dry_report(true),
+        definitions,
+    })
+}
+
 /// Computes the plan and, unless it is a dry run, has refusals or has nothing
 /// to change, applies it.
 ///
@@ -266,6 +303,93 @@ impl Report {
 /// Returns [`EnsureError`] when a store cannot be read or a change fails
 /// midway. A refusal is a report, not an error: it means nothing changed.
 pub fn ensure_official_runtimes(inputs: &EnsureInputs) -> Result<EnsureReport, EnsureError> {
+    let computed = compute(inputs)?;
+    if inputs.dry_run || !computed.report.refusals.is_empty() || !computed.has_changes() {
+        return Ok(computed.dry_report(inputs.dry_run));
+    }
+    let Computed {
+        mut report,
+        planned,
+        binds,
+        catalog_record,
+        existing,
+    } = computed;
+    apply(
+        inputs,
+        existing,
+        planned,
+        binds,
+        catalog_record,
+        &mut report,
+    )?;
+    Ok(report.finish())
+}
+
+/// What [`compute`] found: the plan, before anything is applied.
+struct Computed {
+    report: Report,
+    /// The planned packages, empty when the plan cannot be made at all.
+    planned: Vec<Planned>,
+    /// The profiles to pin to the planned packages.
+    binds: Vec<Bind>,
+    /// The catalog a non-empty plan records.
+    catalog_record: Option<VerifiedCatalog>,
+    /// The package store when it exists; an apply creates it otherwise.
+    existing: Option<PackageStore>,
+}
+
+impl Computed {
+    fn has_changes(&self) -> bool {
+        self.planned
+            .iter()
+            .any(|plan| matches!(plan.action, Action::Install(_)))
+            || !self.binds.is_empty()
+            || self.catalog_record.is_some()
+    }
+
+    /// The report of the plan. Without changes every planned package is kept
+    /// as it is, so the status reported for an installed one is only seen on a
+    /// plan.
+    fn dry_report(self, dry_run: bool) -> EnsureReport {
+        let Computed {
+            mut report,
+            planned,
+            binds,
+            ..
+        } = self;
+        report.dry_run = dry_run;
+        report.packages = planned
+            .iter()
+            .map(|plan| package_action(plan, false))
+            .collect();
+        report.profiles = binds
+            .iter()
+            .map(|bind| profile_action(bind, ProfileStatus::Bind))
+            .collect();
+        report.finish()
+    }
+}
+
+/// Reads the sources and plans every change, without writing.
+fn compute(inputs: &EnsureInputs) -> Result<Computed, EnsureError> {
+    let launch = match &inputs.environment {
+        Ok(launch) => launch,
+        Err(detail) => {
+            let mut report = Report::new(inputs);
+            report.refuse(
+                SERVICE_CONFIG_SUBJECT,
+                CODE_SERVICE_CONFIG_UNREADABLE,
+                detail,
+            );
+            return Ok(Computed {
+                report,
+                planned: Vec::new(),
+                binds: Vec::new(),
+                catalog_record: None,
+                existing: None,
+            });
+        }
+    };
     // The plan is read over the package store only when it already exists: a
     // store is created by an apply that has something to change, never by a
     // plan or a refusal.
@@ -301,7 +425,7 @@ pub fn ensure_official_runtimes(inputs: &EnsureInputs) -> Result<EnsureReport, E
     });
 
     let mut report = Report::new(inputs);
-    let gathered = gather(inputs, &profiles, &mut report)?;
+    let gathered = gather(inputs, launch, &profiles, &mut report)?;
     let retained = retained_pins(&inputs.store_path, &profiles, None)?;
     let plan = PlanInputs {
         state: state.as_ref(),
@@ -320,38 +444,20 @@ pub fn ensure_official_runtimes(inputs: &EnsureInputs) -> Result<EnsureReport, E
         &planned,
         &mut report,
     )?;
-    let changes = planned
-        .iter()
-        .any(|plan| matches!(plan.action, Action::Install(_)))
-        || !binds.is_empty()
-        || catalog.record.is_some();
-    if inputs.dry_run || !report.refusals.is_empty() || !changes {
-        report.packages = planned
-            .iter()
-            .map(|plan| package_action(plan, false))
-            .collect();
-        report.profiles = binds
-            .iter()
-            .map(|bind| profile_action(bind, ProfileStatus::Bind))
-            .collect();
-        return Ok(report.finish());
-    }
-    drop(planning);
-    apply(
-        inputs,
-        existing,
+    Ok(Computed {
+        report,
         planned,
         binds,
-        catalog.record,
-        &mut report,
-    )?;
-    Ok(report.finish())
+        catalog_record: catalog.record,
+        existing,
+    })
 }
 
 /// Reads the profiles, the integrations and the sessions, and collects the
 /// official runtimes they use.
 fn gather(
     inputs: &EnsureInputs,
+    launch: &crate::runtime::LaunchEnvironment,
     profiles: &ProfileRegistry,
     report: &mut Report,
 ) -> Result<Gathered, EnsureError> {
@@ -407,7 +513,7 @@ fn gather(
             });
         }
     }
-    let homes = integration_homes(profiles)?;
+    let homes = integration_homes(profiles, launch)?;
     for runtime in crate::integration::hook_runtime_ids() {
         for profile in integration_homes_of(&homes, &runtime, &official_profiles) {
             report.integrations.push(IntegrationAction {
@@ -1246,20 +1352,15 @@ fn package_action(plan: &Planned, applied: bool) -> PackageAction {
     }
 }
 
-/// The base environment the integration status reads the config homes with,
-/// as the daemon hands it to agents when it runs without a supervisor.
+/// The base environment the integration status reads the config homes with:
+/// the environment a launch of the installed daemon inherits.
 fn integration_homes(
     profiles: &ProfileRegistry,
+    launch: &crate::runtime::LaunchEnvironment,
 ) -> Result<crate::integration::ConfigHomes, EnsureError> {
-    let allowlist: Vec<String> = pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST
-        .iter()
-        .map(|name| (*name).to_owned())
-        .collect();
-    let base = crate::runtime::environment::base_environment(
-        &allowlist,
-        &crate::runtime::EnvironmentSource::Process,
-    )
-    .map_err(|error| EnsureError::Registry(error.to_string()))?;
+    let base = launch
+        .base()
+        .map_err(|error| EnsureError::Registry(error.to_string()))?;
     Ok(crate::integration::ConfigHomes::new(profiles.clone(), base))
 }
 

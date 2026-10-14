@@ -3029,6 +3029,196 @@ async fn a_profile_pinned_to_another_package_id_is_refused_not_adopted() {
     );
 }
 
+/// The verdict the upgrade preflight gives the stopped session `id` over the
+/// state `fixture` holds, and the refusal code of that verdict.
+fn stopped_preflight_verdict(
+    fixture: &Fixture,
+    store_path: &Path,
+    id: &protocol::SessionId,
+) -> (Verdict, String) {
+    let report = crate::session::upgrade_preflight::run_with(
+        &crate::session::upgrade_preflight::PreflightInputs {
+            store_path: store_path.to_path_buf(),
+            worker_state_root: fixture.dir.join("no-workers"),
+            plugins_dir: fixture.plugins.clone(),
+        },
+        &crate::session::upgrade_preflight::PreflightOptions {
+            release: None,
+            profiles_dir: Some(fixture.agents.clone()),
+            host_state_dir: Some(fixture.dir.join("state")),
+            launch: Ok(crate::runtime::LaunchEnvironment::subprocess_default()),
+        },
+        &crate::procwatch::HostInspector::new(),
+    );
+    let verdict = report
+        .stopped_sessions
+        .iter()
+        .find(|session| session.session_id == id.0)
+        .unwrap_or_else(|| {
+            panic!(
+                "the stopped session is judged: {:?}",
+                report.stopped_sessions
+            )
+        });
+    (verdict.verdict, verdict.code.clone())
+}
+
+#[tokio::test]
+async fn a_stopped_session_whose_profile_was_removed_is_judged_as_resume_refuses_it() {
+    let session = stopped_built_in_claude("preflight-removed-profile").await;
+    let package = real_official(RuntimeId::CLAUDE);
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        &package,
+        5,
+    )
+    .await;
+    bind_claude_profile(&session.fixture).await;
+    fs::remove_file(session.fixture.agents.join(format!("{PROFILE}.toml")))
+        .expect("remove the profile");
+
+    let (verdict, code) =
+        stopped_preflight_verdict(&session.fixture, &session.store_path, &session.id);
+    let restarted = restart(&session.fixture).await;
+
+    assert_eq!(verdict, Verdict::WouldLoseRecovery);
+    assert_eq!(code, "agent_profile_missing");
+    assert_eq!(
+        refused_resume_code(&restarted.registry, &session.id).await,
+        code
+    );
+}
+
+#[tokio::test]
+async fn a_stopped_session_whose_profile_changed_is_judged_as_resume_refuses_it() {
+    let session = stopped_built_in_claude("preflight-edited-profile").await;
+    let package = real_official(RuntimeId::CLAUDE);
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        &package,
+        5,
+    )
+    .await;
+    bind_claude_profile(&session.fixture).await;
+    let config_home = session.fixture.dir.join("claude-home");
+    session.fixture.write_profile(
+        PROFILE,
+        &claude_profile_text(&config_home).replace("sleep 600", "sleep 601"),
+    );
+
+    let (verdict, code) =
+        stopped_preflight_verdict(&session.fixture, &session.store_path, &session.id);
+    let restarted = restart(&session.fixture).await;
+
+    assert_eq!(verdict, Verdict::WouldLoseRecovery);
+    assert_eq!(code, "agent_profile_changed");
+    assert_eq!(
+        refused_resume_code(&restarted.registry, &session.id).await,
+        code
+    );
+}
+
+#[tokio::test]
+async fn a_profile_changed_only_by_the_migration_pin_is_judged_adoptable_as_resume_accepts_it() {
+    let session = stopped_built_in_claude("preflight-migrated-profile").await;
+    let package = real_official(RuntimeId::CLAUDE);
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        &package,
+        5,
+    )
+    .await;
+    bind_claude_profile(&session.fixture).await;
+
+    let (verdict, code) =
+        stopped_preflight_verdict(&session.fixture, &session.store_path, &session.id);
+    let restarted = restart(&session.fixture).await;
+    let resumed = restarted
+        .registry
+        .resume_with(&session.id, crate::session::ProfileChange::Refuse)
+        .await
+        .expect("resume accepts the migrated profile");
+
+    assert_eq!(verdict, Verdict::Adoptable);
+    assert_eq!(code, pohunek_service_config::preflight::CODE_ADOPTABLE);
+    assert_eq!(
+        resumed.runtime.as_ref().map(|runtime| runtime.state),
+        Some(protocol::RuntimeState::Live)
+    );
+    restarted
+        .registry
+        .remove(&session.id)
+        .await
+        .expect("remove the resumed session");
+}
+
+#[tokio::test]
+async fn a_stopped_session_of_a_runtime_without_a_probe_whose_executable_is_gone_is_judged_as_resume_refuses_it(
+) {
+    let session = stopped_built_in_claude("preflight-missing-executable").await;
+    let package = real_official(RuntimeId::CLAUDE);
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        &package,
+        5,
+    )
+    .await;
+    // A base-kind launch with no profile, whose frozen executable is gone. The
+    // session record, its embedded recovery and its resume projection all name
+    // the base kind, so the store stays consistent.
+    let gone = session.fixture.dir.join("gone-agent");
+    let store = crate::store::Store::new(session.store_path.clone());
+    let mut record = store
+        .load_sessions()
+        .expect("durable sessions")
+        .into_iter()
+        .find(|record| record.session_id == session.id.0)
+        .expect("the session record");
+    record.info.agent = RuntimeId::CLAUDE.to_owned();
+    record.info.agent_base = protocol::RuntimeRef::claude();
+    let recovery = record.recovery.as_mut().expect("a recovery binding");
+    recovery.agent = RuntimeId::CLAUDE.to_owned();
+    recovery.agent_base = protocol::RuntimeRef::claude();
+    recovery.profile_revision = None;
+    recovery.program = gone.to_string_lossy().into_owned();
+    store
+        .record_session(&record)
+        .expect("write the session record");
+    if let Some(mut projection) = store
+        .load_resume()
+        .expect("durable resume projections")
+        .into_iter()
+        .find(|binding| binding.session_id == session.id.0)
+    {
+        projection.agent = RuntimeId::CLAUDE.to_owned();
+        projection.agent_base = protocol::RuntimeRef::claude();
+        projection.profile_revision = None;
+        projection.program = gone.to_string_lossy().into_owned();
+        store
+            .record_resume(&projection)
+            .expect("write the resume projection");
+    }
+
+    let (verdict, code) =
+        stopped_preflight_verdict(&session.fixture, &session.store_path, &session.id);
+    let restarted = restart(&session.fixture).await;
+
+    assert_eq!(verdict, Verdict::WouldLoseRecovery);
+    assert_eq!(code, "agent_binary_missing");
+    assert_eq!(
+        refused_resume_code(&restarted.registry, &session.id).await,
+        code
+    );
+}
+
 #[tokio::test]
 async fn a_frozen_revision_keyed_by_another_host_is_not_accepted_for_an_adopted_profile() {
     let session = stopped_built_in_claude("claude-forged-revision").await;

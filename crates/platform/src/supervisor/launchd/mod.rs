@@ -31,6 +31,7 @@ use super::Error;
 // Rust guideline compliant 2026-10-13
 
 mod discovery;
+mod domain_path;
 mod launchctl;
 mod plist;
 mod registration;
@@ -44,6 +45,7 @@ pub use backend::{
     Discovery, LaunchdDaemon, LaunchdPluginUnits, LaunchdSupervisor, MAX_DISCOVERED_DEFINITIONS,
 };
 #[doc(inline)]
+pub use domain_path::{read_user_domain_path, user_domain_path, STANDARD_PATH, USER_DOMAIN_CONFIG};
 pub use registration::{ExternalVolume, StrandedDefinition};
 
 use launchctl::{Completion, RunError, Status};

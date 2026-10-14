@@ -16,6 +16,7 @@
 use pohunek_paths::{InstallLayout, DAEMON_EXECUTABLE_NAME, METADATA_STORE_NAME};
 use pohunek_platform::filesystem::{EntryKind, TrustedDir};
 use pohunek_platform::process::ProcessInspector;
+use pohunek_platform::shell_env::SearchPath;
 use pohunek_platform::supervisor::WorkerKey;
 use pohunek_service_config::preflight::{
     PreflightReport, SessionVerdict, StoreReport, StoreState, Verdict, REPORT_VERSION,
@@ -61,6 +62,7 @@ pub(super) async fn gate(
     daemon_dir: &Path,
     previous: &str,
     reported_version: &str,
+    search_path: &SearchPath,
     accept_runtime_loss: bool,
 ) -> Result<Gated, Error> {
     let judged = if let Some(reader) = LegacyReader::from_version(previous) {
@@ -79,6 +81,7 @@ pub(super) async fn gate(
             inputs.context,
             daemon_dir,
             reported_version,
+            search_path,
             accept_runtime_loss,
         )
         .await
@@ -118,6 +121,8 @@ async fn legacy_report(
         store,
         sessions,
         unmanaged_workers: Vec::new(),
+        stopped_sessions: Vec::new(),
+        runtimes: None,
     })
 }
 

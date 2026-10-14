@@ -11,6 +11,14 @@
 //! launch-pin resolution resume applies. Evidence that cannot be read counts
 //! against the session.
 //!
+//! When the release carries a `runtime/` directory, the judgement serves the
+//! runtimes the release step would leave behind: the planner of that step runs
+//! read-only ([`plan_official_runtimes`]) and its planned packages replace the
+//! installed ones of their runtime ids. A session resumes and forks through the
+//! same version probe resume runs, so a probe the executable fails is judged
+//! as the refusal resume would return. Stopped sessions that keep native
+//! resume or fork are judged by the same recovery rules.
+//!
 //! Evidence only a worker's socket can give (its answering protocol version,
 //! the identity it reports) is judged from what its journal recorded of it.
 //! The store migration does not consult the runtime registry, so a binding
@@ -33,7 +41,13 @@ use pohunek_service_config::preflight::{
     CODE_WORKER_ENDED, CODE_WORKER_MARKER_LEGACY, CODE_WORKER_NOT_ADVANCED,
     CODE_WORKER_NOT_INITIALIZED, CODE_WORKER_NOT_RUNNING, CODE_WORKER_UNVERIFIABLE, REPORT_VERSION,
 };
-use pohunek_worker_protocol::{negotiate, Version, VersionRange, SUPPORTED_RANGE};
+use tracing::warn;
+
+use pohunek_service_config::runtimes::{
+    CatalogStatus, EnsureReport, Refusal, CODE_RUNTIME_PLAN_UNAVAILABLE,
+    CODE_SERVICE_CONFIG_UNREADABLE, ENSURE_REPORT_VERSION,
+};
+use pohunek_worker_protocol::{negotiate, BaseEnv, Version, VersionRange, SUPPORTED_RANGE};
 
 use super::{
     import_worker_identities, import_worker_subagents, initial_input_orphaned,
@@ -41,10 +55,19 @@ use super::{
     scan_worker_journals, validate_identity_claims, IdentityClaims, JournalEvidence, JournalPhase,
     JournalReject, WorkerJournalScan,
 };
-use crate::agent::host::{BuiltinSource, PackageSource, PackageStore, RuntimeHost};
+use crate::agent::host::{
+    validate_launch_runtime, BuiltinSource, PackageSource, PackageStore, RuntimeDefinition,
+    RuntimeHost, Spawn,
+};
+use crate::agent::ProfileRegistry;
+use crate::catalog_anchor::CatalogTrust;
 use crate::procwatch::ProcessInspector;
+use crate::runtime::environment::effective_variable;
 use crate::runtime::lifecycle::IDENTITY_MISMATCH;
-use crate::session::resume::{recovery_contract, recovery_definition};
+use crate::runtime::LaunchEnvironment;
+use crate::session::resume::{binding_program, recovery_contract, recovery_definition};
+use crate::session::resume::{recovery_profile_in, ProfileChange};
+use crate::session::{plan_official_runtimes, EnsureInputs, OfficialPlan};
 use crate::session::{runtime_hook_schema, HookSchemaLookup};
 use crate::session::{DesiredState, Generation, SessionRecord};
 use crate::store::{
@@ -65,6 +88,48 @@ pub struct PreflightInputs {
     pub plugins_dir: PathBuf,
 }
 
+/// The release step inputs of a preflight of a new release.
+#[derive(Debug, Clone)]
+pub struct ReleaseInputs {
+    /// The release's `runtime/` directory, beside the running executable.
+    pub release_dir: PathBuf,
+    /// The trust anchor the release catalog is verified against.
+    pub catalog_trust: CatalogTrust,
+}
+
+/// What the preflight judges against beyond the installed state.
+#[derive(Debug, Clone)]
+pub struct PreflightOptions {
+    /// The release step's inputs. Without them the judgement serves the
+    /// installed packages only, and the report carries no plan.
+    pub release: Option<ReleaseInputs>,
+    /// The host profiles directory. The profile of a session names the
+    /// environment its version probe runs under.
+    pub profiles_dir: Option<PathBuf>,
+    /// The host-state directory the profile revision key is kept in. It is
+    /// read, never created: a judgement compares revisions the daemon froze.
+    pub host_state_dir: Option<PathBuf>,
+    /// The launch environment of the installed daemon, or the reason the
+    /// installed `service.toml` cannot be read. The integration homes are read
+    /// with it and the version probe runs under it. An unreadable file refuses
+    /// the upgrade, so no verdict is computed under a guessed environment.
+    pub launch: Result<LaunchEnvironment, String>,
+}
+
+impl Default for PreflightOptions {
+    fn default() -> Self {
+        Self {
+            release: None,
+            profiles_dir: None,
+            host_state_dir: None,
+            launch: Ok(LaunchEnvironment::subprocess_default()),
+        }
+    }
+}
+
+/// Machine code of a base environment the probe cannot be run under.
+const CODE_WORKER_INITIALIZE_INVALID: &str = "worker_initialize_invalid";
+
 /// Machine code of a store written by a newer daemon.
 const STORE_NEWER: &str = "store_newer_than_binary";
 /// Machine code of a store older than every kept migration.
@@ -79,17 +144,72 @@ const STORE_UNREADABLE: &str = "store_unreadable";
 /// Judges every live session of the installed state against this build.
 ///
 /// Reads only; see the module documentation for what the verdicts rest on.
+/// The judgement serves the installed packages only and reports no release
+/// plan; [`run_with`] judges the runtimes a release step would leave.
 #[must_use]
 pub fn run(inputs: &PreflightInputs, inspector: &dyn ProcessInspector) -> PreflightReport {
+    run_with(inputs, &PreflightOptions::default(), inspector)
+}
+
+/// Judges every live session of the installed state against this build and
+/// the release step described by `options`.
+///
+/// Reads only, and never creates the package store. See [`run`].
+#[must_use]
+pub fn run_with(
+    inputs: &PreflightInputs,
+    options: &PreflightOptions,
+    inspector: &dyn ProcessInspector,
+) -> PreflightReport {
     let journals = scan_worker_journals(&inputs.worker_state_root)
         .map_err(|error| format!("the worker journal root cannot be read: {error}"));
-    let runtimes = read_only_runtimes(&inputs.plugins_dir);
+    let (runtimes_report, planned) = match &options.launch {
+        Ok(_) => release_plan(inputs, options),
+        Err(detail) => (
+            Some(refused_plan(CODE_SERVICE_CONFIG_UNREADABLE, detail)),
+            Vec::new(),
+        ),
+    };
+    let (runtimes, runtimes_report) = match read_only_runtimes(&inputs.plugins_dir, planned) {
+        Ok(runtimes) => (runtimes, runtimes_report),
+        Err(detail) => {
+            warn!(
+                error = %detail,
+                "the installed runtime registry cannot be read; the upgrade is refused"
+            );
+            let detail = format!(
+                "the installed runtime registry cannot be read, so the plan cannot be checked \
+                 against it: {detail}"
+            );
+            (
+                RuntimeHost::from_host_environment(),
+                Some(with_refusal(
+                    runtimes_report,
+                    CODE_RUNTIME_PLAN_UNAVAILABLE,
+                    &detail,
+                )),
+            )
+        }
+    };
+    let profiles = ProfileRegistry::with_runtimes(options.profiles_dir.clone(), runtimes.clone())
+        .with_read_only_revision_state_dir(options.host_state_dir.clone());
+    let base_env = match &options.launch {
+        Ok(launch) => launch.base().map_err(|error| error.to_string()),
+        Err(detail) => Err(detail.clone()),
+    };
+    let judging = Judging {
+        runtimes: &runtimes,
+        profiles: &profiles,
+        base_env: &base_env,
+    };
     let dry = Store::new(inputs.store_path.clone()).dry_run_migration();
-    let (store, sessions, unmanaged_workers) = match dry {
+    let (store, sessions, unmanaged_workers, stopped_sessions) = match dry {
         Ok(dry) => {
             let (sessions, unmanaged) =
-                judge_sessions(&dry, journals.as_ref(), inspector, &runtimes);
-            (store_report(inputs, &dry), sessions, unmanaged)
+                judge_sessions(&dry, journals.as_ref(), inspector, &judging);
+            let mut stopped = judge_stopped_sessions(&dry, &judging);
+            judge_rejected_records(&dry, &sessions, &mut stopped);
+            (store_report(inputs, &dry), sessions, unmanaged, stopped)
         }
         Err(error) => {
             let report = refused_report(inputs, &error);
@@ -110,7 +230,7 @@ pub fn run(inputs: &PreflightInputs, inspector: &dyn ProcessInspector) -> Prefli
                     .collect(),
                 Err(detail) => vec![evidence_unavailable(detail)],
             };
-            (report, sessions, Vec::new())
+            (report, sessions, Vec::new(), Vec::new())
         }
     };
     PreflightReport {
@@ -118,24 +238,113 @@ pub fn run(inputs: &PreflightInputs, inspector: &dyn ProcessInspector) -> Prefli
         daemon_version: crate::DAEMON_VERSION.to_owned(),
         store,
         sessions,
+        stopped_sessions,
         unmanaged_workers,
+        runtimes: runtimes_report,
     }
 }
 
-/// The runtime definitions the preflight reads: the built-in runtimes, plus the
-/// installed packages when the package store exists and can be read. Nothing is
-/// created, and a store that cannot be read leaves only the built-in runtimes,
-/// so a package runtime then resolves to no schema.
-fn read_only_runtimes(plugins_dir: &Path) -> RuntimeHost {
-    if let Ok(Some(store)) = PackageStore::open_existing(plugins_dir) {
-        if let Ok(host) = RuntimeHost::with_packages(
-            BuiltinSource::from_host_environment(),
-            PackageSource::new(store),
-        ) {
-            return host;
-        }
+/// The release step's plan and the definitions of the packages it would
+/// install. Without a release `runtime/` directory there is no plan.
+fn release_plan(
+    inputs: &PreflightInputs,
+    options: &PreflightOptions,
+) -> (Option<EnsureReport>, Vec<RuntimeDefinition>) {
+    let Some(release) = options.release.as_ref() else {
+        return (None, Vec::new());
+    };
+    if !release.release_dir.is_dir() {
+        return (None, Vec::new());
     }
-    RuntimeHost::from_host_environment()
+    // The plan scans the host profiles, so without their directory it cannot
+    // say what the release step would do, and the upgrade must not proceed.
+    let Some(profiles_dir) = options.profiles_dir.clone() else {
+        return (
+            Some(refused_plan(
+                CODE_RUNTIME_PLAN_UNAVAILABLE,
+                "the release runtime plan cannot be computed: the host profiles directory is not known",
+            )),
+            Vec::new(),
+        );
+    };
+    let ensure = EnsureInputs {
+        store_path: inputs.store_path.clone(),
+        plugins_dir: inputs.plugins_dir.clone(),
+        profiles_dir,
+        release_dir: release.release_dir.clone(),
+        catalog_trust: release.catalog_trust.clone(),
+        dry_run: true,
+        daemon_version: crate::DAEMON_VERSION.to_owned(),
+        environment: options.launch.clone(),
+    };
+    match plan_official_runtimes(&ensure) {
+        Ok(OfficialPlan {
+            report,
+            definitions,
+        }) => (Some(report), definitions),
+        Err(error) => (
+            Some(refused_plan(
+                CODE_RUNTIME_PLAN_UNAVAILABLE,
+                &format!("the release runtime plan cannot be computed: {error}"),
+            )),
+            Vec::new(),
+        ),
+    }
+}
+
+/// The report of a release plan that is refused with `code` before any change.
+fn refused_plan(code: &str, detail: &str) -> EnsureReport {
+    EnsureReport {
+        report_version: ENSURE_REPORT_VERSION,
+        daemon_version: crate::DAEMON_VERSION.to_owned(),
+        dry_run: true,
+        catalog: CatalogStatus::Unavailable,
+        packages: Vec::new(),
+        profiles: Vec::new(),
+        integrations: Vec::new(),
+        refusals: vec![Refusal {
+            subject: "runtime-plan".to_owned(),
+            code: code.to_owned(),
+            detail: detail.to_owned(),
+        }],
+    }
+}
+
+/// The runtime definitions the preflight reads: the built-in runtimes, the
+/// installed packages when the package store exists, and the `planned` official
+/// definitions in place of the installed packages of their runtime ids. Nothing
+/// is created.
+///
+/// # Errors
+///
+/// Returns the reason the installed packages or the registry built from them
+/// cannot be read. The caller reports it as a refusal: a judgement over the
+/// built-in runtimes alone is not the state the new daemon starts with.
+fn read_only_runtimes(
+    plugins_dir: &Path,
+    planned: Vec<RuntimeDefinition>,
+) -> Result<RuntimeHost, String> {
+    let store = PackageStore::open_existing(plugins_dir)
+        .map_err(|error| format!("the runtime package store cannot be opened: {error}"))?;
+    RuntimeHost::with_planned_packages(
+        BuiltinSource::from_host_environment(),
+        store.map(PackageSource::new),
+        planned,
+    )
+    .map_err(|error| format!("the runtime registry cannot be built: {error}"))
+}
+
+/// Adds a refusal to the plan report, or starts a report that only refuses.
+fn with_refusal(report: Option<EnsureReport>, code: &str, detail: &str) -> EnsureReport {
+    let mut report = report.unwrap_or_else(|| refused_plan(code, detail));
+    if report.refusals.iter().all(|refusal| refusal.code != code) {
+        report.refusals.push(Refusal {
+            subject: "runtime-plan".to_owned(),
+            code: code.to_owned(),
+            detail: detail.to_owned(),
+        });
+    }
+    report
 }
 
 fn store_report(inputs: &PreflightInputs, dry: &DryRun) -> StoreReport {
@@ -186,7 +395,7 @@ fn judge_sessions(
     dry: &DryRun,
     journals: Result<&HashMap<String, WorkerJournalScan>, &String>,
     inspector: &dyn ProcessInspector,
-    runtimes: &RuntimeHost,
+    judging: &Judging<'_>,
 ) -> (Vec<SessionVerdict>, Vec<String>) {
     let bindings: HashMap<&str, &ResumeBinding> = dry
         .resume
@@ -215,24 +424,15 @@ fn judge_sessions(
             Ok(journals) => Ok(journals.get(&record.session_id)),
             Err(detail) => Err(detail.as_str()),
         };
-        let facts = Facts {
-            binding: bindings.get(record.session_id.as_str()).copied(),
-            recovery: dry
-                .recovery
-                .get(&record.session_id)
-                .copied()
-                .unwrap_or(RecoveryOutcome::Preserved),
-            resume_unreadable: anonymous_resume
-                || unreadable_resume.contains(record.session_id.as_str()),
-        };
-        let (verdict, code, detail) = judge(record, &facts, scan, inspector, runtimes);
+        let facts = facts_of(dry, record, &bindings, &unreadable_resume, anonymous_resume);
+        let (verdict, code, detail) = judge(record, &facts, scan, inspector, judging);
         verdicts.insert(
             record.session_id.clone(),
             SessionVerdict {
                 session_id: record.session_id.clone(),
                 name: record.info.name.clone(),
                 verdict,
-                code: code.to_owned(),
+                code,
                 detail,
             },
         );
@@ -284,6 +484,149 @@ fn judge_sessions(
     }
     journal_gaps(dry, journals, &known, &mut verdicts);
     (verdicts.into_values().collect(), unmanaged)
+}
+
+/// The store-side evidence of one session record.
+fn facts_of<'a>(
+    dry: &DryRun,
+    record: &SessionRecord,
+    bindings: &HashMap<&str, &'a ResumeBinding>,
+    unreadable_resume: &HashSet<&str>,
+    anonymous_resume: bool,
+) -> Facts<'a> {
+    Facts {
+        binding: bindings.get(record.session_id.as_str()).copied(),
+        recovery: dry
+            .recovery
+            .get(&record.session_id)
+            .copied()
+            .unwrap_or(RecoveryOutcome::Preserved),
+        resume_unreadable: anonymous_resume
+            || unreadable_resume.contains(record.session_id.as_str()),
+    }
+}
+
+/// The verdict of every session whose runtime has ended and that keeps native
+/// resume or fork, ordered by session id.
+///
+/// A stopped session has no worker to adopt, so only its recovery is judged:
+/// resume and fork must still resolve through the runtime source the new
+/// daemon serves, under the same rules as a live session's recovery.
+fn judge_stopped_sessions(dry: &DryRun, judging: &Judging<'_>) -> Vec<SessionVerdict> {
+    let bindings: HashMap<&str, &ResumeBinding> = dry
+        .resume
+        .iter()
+        .map(|binding| (binding.session_id.as_str(), binding))
+        .collect();
+    let anonymous_resume = dry.rejected.iter().any(|line| {
+        line.session_id.is_none() && matches!(line.kind.as_deref(), None | Some("resume"))
+    });
+    let unreadable_resume: HashSet<&str> = dry
+        .rejected
+        .iter()
+        .filter(|line| line.kind.as_deref() == Some("resume"))
+        .filter_map(|line| line.session_id.as_deref())
+        .collect();
+    let mut verdicts = Vec::new();
+    for record in &dry.sessions {
+        let stopped = record.info.external != Some(true)
+            && (!record.info.may_own_runtime() || runtime_ended(record));
+        // Reconciliation finishes a removal intent instead of resuming the
+        // session, so its recovery is not one an upgrade must keep.
+        if !stopped || record.desired_state == DesiredState::Removed {
+            continue;
+        }
+        let facts = facts_of(dry, record, &bindings, &unreadable_resume, anonymous_resume);
+        let Some((verdict, code, detail)) = judge_stopped(record, &facts, judging) else {
+            continue;
+        };
+        verdicts.push(SessionVerdict {
+            session_id: record.session_id.clone(),
+            name: record.info.name.clone(),
+            verdict,
+            code,
+            detail,
+        });
+    }
+    verdicts.sort_by(|left: &SessionVerdict, right| left.session_id.cmp(&right.session_id));
+    verdicts
+}
+
+/// Judges one stopped session that keeps native resume or fork, or `None` for
+/// a session without either, which has no recovery to lose.
+fn judge_stopped(
+    record: &SessionRecord,
+    facts: &Facts<'_>,
+    judging: &Judging<'_>,
+) -> Option<Judgement> {
+    let mut candidate = record.clone();
+    if let Some(binding) = facts.binding.cloned() {
+        if let Err(reason) = merge_persisted_recovery(&mut candidate, binding) {
+            return Some((
+                Verdict::WouldLoseRecovery,
+                reason.to_owned(),
+                "the record contradicts its stored resume binding, so native recovery is not \
+                 restored from it"
+                    .to_owned(),
+            ));
+        }
+    }
+    let capabilities = &candidate.info.capabilities;
+    if candidate.recovery.is_none() || (!capabilities.resume && !capabilities.fork) {
+        return None;
+    }
+    Some(match recovery_loss(facts, &candidate, judging) {
+        Some(loss) => loss,
+        None => (
+            Verdict::Adoptable,
+            CODE_ADOPTABLE.to_owned(),
+            "the stored native recovery resumes and forks through the runtime source this \
+             daemon serves"
+                .to_owned(),
+        ),
+    })
+}
+
+/// Judges every record the loader skipped that names a session no other verdict
+/// covers, and that cannot own a live runtime: startup skips it, so the session
+/// loses its recovery. A live skipped record is already judged by
+/// [`judge_sessions`], as not adopted.
+fn judge_rejected_records(
+    dry: &DryRun,
+    sessions: &[SessionVerdict],
+    stopped: &mut Vec<SessionVerdict>,
+) {
+    let mut covered: HashSet<String> = sessions
+        .iter()
+        .chain(stopped.iter())
+        .map(|verdict| verdict.session_id.clone())
+        .collect();
+    for line in &dry.rejected {
+        let Some(session_id) = line.session_id.as_deref() else {
+            continue;
+        };
+        let names_recovery =
+            may_hold_session(line.kind.as_deref()) || line.kind.as_deref() == Some("resume");
+        if line.may_own_runtime
+            || line.removal_intent
+            || !names_recovery
+            || !covered.insert(session_id.to_owned())
+        {
+            continue;
+        }
+        stopped.push(SessionVerdict {
+            session_id: session_id.to_owned(),
+            name: None,
+            verdict: Verdict::WouldLoseRecovery,
+            code: CODE_RECORD_UNREADABLE.to_owned(),
+            detail: format!(
+                "the record cannot be loaded and is skipped at startup, so the session's native \
+                 recovery is lost: {}",
+                line.reason
+            ),
+        });
+    }
+    stopped.sort_by(|left, right| left.session_id.cmp(&right.session_id));
 }
 
 /// Lists what unreadable journal evidence may hide: the whole root failing to
@@ -426,10 +769,19 @@ struct Facts<'a> {
     resume_unreadable: bool,
 }
 
-type Judgement = (Verdict, &'static str, String);
+type Judgement = (Verdict, String, String);
 
-fn not_adopted(code: &'static str, detail: impl Into<String>) -> Judgement {
-    (Verdict::WouldNotBeAdopted, code, detail.into())
+fn not_adopted(code: impl Into<String>, detail: impl Into<String>) -> Judgement {
+    (Verdict::WouldNotBeAdopted, code.into(), detail.into())
+}
+
+/// What the preflight judges against: the runtimes the new daemon serves, the
+/// profiles over them, and the base environment a launch inherits.
+struct Judging<'a> {
+    runtimes: &'a RuntimeHost,
+    profiles: &'a ProfileRegistry,
+    /// The base environment, or the reason it cannot be built.
+    base_env: &'a Result<BaseEnv, String>,
 }
 
 /// Judges one live session record against the journals of its session.
@@ -438,7 +790,7 @@ fn judge(
     facts: &Facts<'_>,
     scan: Result<Option<&WorkerJournalScan>, &str>,
     inspector: &dyn ProcessInspector,
-    runtimes: &RuntimeHost,
+    judging: &Judging<'_>,
 ) -> Judgement {
     // Startup rolls back a create whose initial input a previous daemon never
     // delivered; no new daemon instance can own that marker.
@@ -528,6 +880,19 @@ fn judge(
         }
         _ => {}
     }
+    judge_adoption(facts, journal, &mut candidate, inspector, judging)
+}
+
+/// The live-worker evidence after the record's identity and generation are
+/// bound to the journal: the process, marker, protocol, identity and runtime
+/// source, then the native recovery.
+fn judge_adoption(
+    facts: &Facts<'_>,
+    journal: &JournalEvidence,
+    candidate: &mut SessionRecord,
+    inspector: &dyn ProcessInspector,
+    judging: &Judging<'_>,
+) -> Judgement {
     if let Some(judgement) = judge_process(journal, inspector) {
         return judgement;
     }
@@ -537,13 +902,21 @@ fn judge(
     if let Some(judgement) = judge_protocol(journal) {
         return judgement;
     }
-    if let Some(judgement) = judge_identity(journal, &mut candidate, inspector, runtimes) {
+    if let Some(judgement) = judge_identity(journal, candidate, inspector, judging.runtimes) {
         return judgement;
     }
-    if let Some(judgement) = judge_runtime_source(&candidate, runtimes) {
+    if let Some(judgement) = judge_runtime_source(candidate, judging.runtimes) {
         return judgement;
     }
-    judge_recovery(facts, &candidate, runtimes)
+    match recovery_loss(facts, candidate, judging) {
+        Some(loss) => loss,
+        None => (
+            Verdict::Adoptable,
+            CODE_ADOPTABLE.to_owned(),
+            "the worker journal, process, protocol range and stored recovery are consistent"
+                .to_owned(),
+        ),
+    }
 }
 
 /// Picks the one live journal of the record's generation.
@@ -746,49 +1119,125 @@ fn judge_protocol(journal: &JournalEvidence) -> Option<Judgement> {
     })
 }
 
-/// Whether the session keeps its native recovery.
-fn judge_recovery(
+/// The reason the session loses its native recovery, or `None` when it keeps
+/// it: the stored outcome of the migration, an unreadable resume record, the
+/// registry-dependent launch spec, the launch pin and the version probe.
+fn recovery_loss(
     facts: &Facts<'_>,
     candidate: &SessionRecord,
-    runtimes: &RuntimeHost,
-) -> Judgement {
+    judging: &Judging<'_>,
+) -> Option<Judgement> {
     if facts.recovery == RecoveryOutcome::Lost {
-        return (
+        return Some((
             Verdict::WouldLoseRecovery,
-            CODE_RECOVERY_UNMAPPABLE,
+            CODE_RECOVERY_UNMAPPABLE.to_owned(),
             "the stored native recovery cannot be mapped to the current launch shape, so the \
              session cannot resume natively"
                 .to_owned(),
-        );
+        ));
     }
     // Startup skips an unreadable projection and keeps the record's own
     // recovery, so only a record that depends on the projection loses it.
     if facts.resume_unreadable && candidate.recovery.is_none() {
-        return (
+        return Some((
             Verdict::WouldLoseRecovery,
-            CODE_RESUME_RECORD_UNREADABLE,
+            CODE_RESUME_RECORD_UNREADABLE.to_owned(),
             "the stored resume record of the session cannot be loaded, so native recovery is \
              not restored from it"
                 .to_owned(),
-        );
+        ));
     }
     if facts.recovery == RecoveryOutcome::NeedsRegistry {
-        return (
+        return Some((
             Verdict::WouldLoseRecovery,
-            CODE_RECOVERY_UNVERIFIED,
+            CODE_RECOVERY_UNVERIFIED.to_owned(),
             "the stored native recovery needs the runtime registry to complete its launch spec; \
              that cannot be verified before the upgrade"
                 .to_owned(),
-        );
+        ));
     }
-    if let Some(judgement) = judge_pin(candidate, runtimes) {
-        return judgement;
+    judge_pin(candidate, judging.runtimes).or_else(|| judge_launch(candidate, judging))
+}
+
+/// The launch resume runs before it relaunches a session: the host profile the
+/// session was launched from, resolved and checked against its frozen revision
+/// by the function resume itself runs, then the executable validation resume
+/// runs for the frozen program. A declared version probe runs under the
+/// environment that profile gives the agent; a runtime without one is only
+/// checked for an executable.
+///
+/// Only a session that resumes or forks reaches it. A profile refusal carries
+/// resume's own code, and so does a probe refusal, so the verdict names the
+/// refusal resume would return.
+fn judge_launch(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<Judgement> {
+    let binding = candidate.recovery.as_ref()?;
+    let capabilities = &candidate.info.capabilities;
+    if !capabilities.resume && !capabilities.fork {
+        return None;
     }
-    (
-        Verdict::Adoptable,
-        CODE_ADOPTABLE,
-        "the worker journal, process, protocol range and stored recovery are consistent".to_owned(),
+    let mut profile_env = None;
+    for (fork, required) in [(false, capabilities.resume), (true, capabilities.fork)] {
+        if !required {
+            continue;
+        }
+        match recovery_profile_in(judging.profiles, binding, ProfileChange::Refuse, fork) {
+            Ok(profile) => {
+                profile_env.get_or_insert(profile.env);
+            }
+            Err(error) => {
+                return Some((
+                    Verdict::WouldLoseRecovery,
+                    error.code.clone(),
+                    format!(
+                        "resume refuses the session's host profile ({}: {}), so the session \
+                         cannot resume natively; restore the profile it was launched from, or \
+                         upgrade with --accept-runtime-loss",
+                        error.code, error.msg
+                    ),
+                ));
+            }
+        }
+    }
+    let profile_env = profile_env.unwrap_or_default();
+    let definition = recovery_definition(judging.runtimes, binding).ok()?;
+    // Resume builds the base environment for every relaunch and validates the
+    // frozen executable for every relaunch; only a declared version probe reads
+    // the `PATH` the agent launches under.
+    let base = match judging.base_env {
+        Ok(base) => base,
+        Err(detail) => {
+            return Some((
+                Verdict::WouldLoseRecovery,
+                CODE_WORKER_INITIALIZE_INVALID.to_owned(),
+                format!(
+                    "the launch environment cannot be built ({detail}), so resume cannot probe \
+                     the agent it would run"
+                ),
+            ));
+        }
+    };
+    let launch_path = definition
+        .version_probe_parser()
+        .is_some()
+        .then(|| effective_variable(base, profile_env.as_slice(), "PATH"))
+        .flatten();
+    let program = binding_program(binding, &definition);
+    let error = validate_launch_runtime(
+        &definition,
+        Spawn::Program(&program),
+        launch_path.as_deref(),
     )
+    .err()?;
+    Some((
+        Verdict::WouldLoseRecovery,
+        error.code.clone(),
+        format!(
+            "the agent the session launches from does not pass the version probe of its \
+             runtime ({}: {}), so resume and fork refuse it; install a supported release of the \
+             agent, or upgrade with --accept-runtime-loss",
+            error.code, error.msg
+        ),
+    ))
 }
 
 /// Every interaction with an adopted session needs its runtime source served.
@@ -832,7 +1281,7 @@ fn judge_runtime_source(candidate: &SessionRecord, runtimes: &RuntimeHost) -> Op
     };
     Some((
         Verdict::WouldLoseRecovery,
-        CODE_RUNTIME_SOURCE_NOT_SERVED,
+        CODE_RUNTIME_SOURCE_NOT_SERVED.to_owned(),
         format!(
             "the session was launched from a runtime source this daemon does not serve ({}: \
              {}), so the worker is adopted but {outcome}, or upgrade with \
@@ -868,7 +1317,7 @@ fn judge_pin(candidate: &SessionRecord, runtimes: &RuntimeHost) -> Option<Judgem
     let runtime = binding.agent_base.as_wire();
     Some((
         Verdict::WouldLoseRecovery,
-        CODE_RUNTIME_SOURCE_NOT_SERVED,
+        CODE_RUNTIME_SOURCE_NOT_SERVED.to_owned(),
         format!(
             "the session was launched from a runtime source this daemon does not serve ({}: \
              {}), so the worker is adopted but its recovery is refused; a session cannot \

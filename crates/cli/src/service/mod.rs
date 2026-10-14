@@ -37,6 +37,7 @@ pub mod error;
 pub mod inherited;
 pub mod layout;
 mod legacy_store;
+pub mod manager_env;
 pub mod preflight;
 pub mod record;
 pub mod report;
@@ -215,6 +216,7 @@ async fn finish_check(
                     version: previous.to_owned(),
                     detail: "previous version has no valid installation directory".to_owned(),
                 })?;
+        let search_path = engine::installed_search_path(context).await?;
         let gated = rollback::gate(
             rollback::Inputs {
                 preflight,
@@ -226,6 +228,7 @@ async fn finish_check(
             &daemon_dir,
             previous,
             previous,
+            &search_path,
             accept_runtime_loss,
         )
         .await?;
@@ -237,8 +240,16 @@ async fn finish_check(
         }
     }
     if checked.adoption == Adoption::Required {
-        let gated =
-            preflight::gate(preflight, context, daemon_dir, version, accept_runtime_loss).await?;
+        let search_path = engine::installed_search_path(context).await?;
+        let gated = preflight::gate_upgrade(
+            preflight,
+            context,
+            daemon_dir,
+            version,
+            &search_path,
+            accept_runtime_loss,
+        )
+        .await?;
         checked.report.accepted_runtime_loss |= gated.accepted;
         checked.report.preflight = Some(gated.report);
     }

@@ -105,6 +105,8 @@ use unit_file::{render_plugin_service, render_plugin_timer};
 const DESTINATION: &str = "org.freedesktop.systemd1";
 const MANAGER_PATH: &str = "/org/freedesktop/systemd1";
 const MANAGER_INTERFACE: &str = "org.freedesktop.systemd1.Manager";
+/// Property of the manager interface listing its environment as `KEY=VALUE`.
+const MANAGER_ENVIRONMENT_PROPERTY: &str = "Environment";
 const UNIT_INTERFACE: &str = "org.freedesktop.systemd1.Unit";
 const SERVICE_INTERFACE: &str = "org.freedesktop.systemd1.Service";
 
@@ -848,6 +850,29 @@ fn validate_daemon_restart(definition: &JobDefinition) -> Result<(), Error> {
 /// shared `pohunek.slice` may hold other installations and is never stopped.
 fn parent_slice(namespace: &Namespace) -> String {
     format!("pohunek-{}.slice", namespace.as_str())
+}
+
+/// Reads the `Environment` property of the systemd user manager.
+///
+/// The property is the `KEY=VALUE` list the manager gives its units. A unit
+/// that records no `PATH` runs with that list's `PATH`, so a caller that must
+/// judge with the same `PATH` reads it here. The session bus connection and
+/// the call are both bounded by `call_timeout`.
+///
+/// # Errors
+///
+/// Returns [`Error::Unavailable`] when the session bus cannot be reached,
+/// [`Error::Timeout`] when a call does not finish within `call_timeout`, and
+/// [`Error::Operation`] when the manager rejects the property read.
+pub async fn user_manager_environment(call_timeout: Duration) -> Result<Vec<String>, Error> {
+    const OPERATION: &str = "read_user_manager_environment";
+
+    let bus = Bus::connect(call_timeout).await?;
+    let manager = bus.manager(OPERATION).await?;
+    manager
+        .get_property::<Vec<String>>(MANAGER_ENVIRONMENT_PROPERTY)
+        .await
+        .map_err(|source| bus_error(OPERATION, source))
 }
 
 /// Session-bus connection to the systemd user manager.
@@ -2207,5 +2232,27 @@ mod tests {
             .join()
             .expect("connecting outside a Tokio runtime must not panic");
         assert!(matches!(outcome, Err(Error::Unavailable { .. })));
+    }
+
+    /// Reading the user manager's environment reports an unreachable session
+    /// bus instead of an empty environment.
+    #[test]
+    fn the_user_manager_environment_is_unavailable_without_a_session_bus() {
+        const CALL_BOUND: Duration = Duration::from_secs(5);
+        let root = pohunek_test_support::tempdir().expect("scratch directory");
+        let missing_bus = root.path().join("no-such-bus");
+        let mut env = pohunek_test_support::process_env::ProcessEnv::lock();
+        env.set(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}", missing_bus.display()),
+        );
+        let outcome =
+            std::thread::spawn(|| async_io::block_on(user_manager_environment(CALL_BOUND)))
+                .join()
+                .expect("reading outside a Tokio runtime must not panic");
+        assert!(
+            matches!(outcome, Err(Error::Unavailable { .. })),
+            "{outcome:?}"
+        );
     }
 }

@@ -134,13 +134,18 @@ impl RevisionKey {
 
     /// Reads the key record of the host-state directory under `state_dir`,
     /// creating it with fresh entropy on first use.
-    fn load_or_create(state_dir: &Path) -> Result<Self, ProtocolError> {
+    /// With `create` unset the record must already exist: nothing is created
+    /// or written, so a read-only judgement can compare revisions safely.
+    fn load(state_dir: &Path, create: bool) -> Result<Self, ProtocolError> {
         let unavailable = |stage: &'static str, error: &dyn fmt::Display| {
             warn!(stage, error = %error, "profile revision key unavailable");
             revision_unavailable()
         };
-        let dir =
-            HostStateDir::open_or_create(state_dir).map_err(|error| unavailable("open", &error))?;
+        let dir = if create {
+            HostStateDir::open_or_create(state_dir).map_err(|error| unavailable("open", &error))?
+        } else {
+            HostStateDir::open_existing(state_dir).map_err(|error| unavailable("open", &error))?
+        };
         let existing = dir
             .read_secret_record(REVISION_KEY_RECORD)
             .map_err(|error| unavailable("read", &error))?;
@@ -150,6 +155,9 @@ impl RevisionKey {
                 .try_into()
                 .map_err(|_error| unavailable("decode", &"record has the wrong length"))?;
             return Ok(Self(Zeroizing::new(key)));
+        }
+        if !create {
+            return Err(unavailable("missing", &"the record does not exist"));
         }
         let mut key = Zeroizing::new([0_u8; REVISION_BYTES]);
         getrandom::getrandom(key.as_mut()).map_err(|error| unavailable("entropy", &error))?;
@@ -176,6 +184,9 @@ fn revision_unavailable() -> ProtocolError {
 #[derive(Debug, Default)]
 pub(crate) struct RevisionKeys {
     state_dir: Option<PathBuf>,
+    /// Whether a missing key is created on first use; a read-only judgement
+    /// never creates one.
+    create: bool,
     key: Mutex<Option<Arc<RevisionKey>>>,
 }
 
@@ -184,6 +195,17 @@ impl RevisionKeys {
     pub(crate) fn new(state_dir: Option<PathBuf>) -> Self {
         Self {
             state_dir,
+            create: true,
+            key: Mutex::new(None),
+        }
+    }
+
+    /// Keys stored under `state_dir`, which must already hold the key: a
+    /// missing key is an error, never a new key.
+    pub(crate) fn read_only(state_dir: Option<PathBuf>) -> Self {
+        Self {
+            state_dir,
+            create: false,
             key: Mutex::new(None),
         }
     }
@@ -197,7 +219,7 @@ impl RevisionKeys {
         if let Some(key) = cached.as_ref() {
             return Ok(Arc::clone(key));
         }
-        let key = Arc::new(RevisionKey::load_or_create(state_dir)?);
+        let key = Arc::new(RevisionKey::load(state_dir, self.create)?);
         *cached = Some(Arc::clone(&key));
         Ok(key)
     }

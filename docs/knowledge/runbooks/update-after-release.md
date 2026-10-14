@@ -606,7 +606,12 @@ the upgrade is not what ends it.
   session is reported this way even if it cannot resume, because every
   interaction with it (input, attach, resize, rename, metadata) would be
   refused too: install the runtime first (the `detail` names the official
-  package install), then finish the work.
+  package install), then finish the work. A session whose host profile resume
+  would refuse is reported with resume's code (`agent_profile_missing`,
+  `agent_profile_changed`, `agent_profile_revision_unavailable`): restore the
+  profile, or accept the loss. A stopped session record the new binary cannot
+  load is `record_unreadable` in the stopped list; its recovery is lost at
+  startup.
 - `would not be adopted`: the new daemon would not manage the worker
   (`record_unreadable`, `worker_without_session_record`, `store_unusable`,
   `worker_generation_missing`,
@@ -639,19 +644,46 @@ proceeds, and the `--json` report carries the full `preflight` object and
 failing `pohunekd`, an unparsable report) fails with
 `service_upgrade_preflight_failed`, which the flag does not override.
 
+On Linux the preflight and the runtime step run with the `PATH` of the systemd
+user manager, read from its `Environment` property over the session bus, unless
+the recorded daemon job carries its own `PATH`, because the daemon job inherits
+it. If that `PATH` cannot be read, the command stops with
+`service_manager_environment_unavailable` before any effect; the flag does not
+override it.
+
+Sessions whose runtime has ended but that keep native resume or fork are judged
+by the same rules and listed under stopped sessions (`stopped_sessions` in the
+`--json` report, and a `stopped` section in the text output). A stopped session
+that would lose its resume or fork is at risk and needs `--accept-runtime-loss`
+like a live one.
+
 ### Official runtime packages during an upgrade
 
-After the preflight and before the new daemon starts, the upgrade runs the
-release's `pohunekd ensure-official-runtimes --dry-run`. It plans the official
-runtime packages the host uses and the host profiles pinned to them. A plan
-with refusals fails with `service_upgrade_runtimes_refused` before anything is
-stopped. A plan that changes something stops the old daemon, backs up the
-package registry, the catalog state and the host profiles owner-private, applies
-the plan, and restores the backup when anything fails. Once the new daemon is
-ready, the integration hooks the release lists are reinstalled. A failure there
-is reported and does not roll the upgrade back. A Hermes home without the pohunek
-marker is reported as a gap with the command that installs it; nothing is written
-into it.
+The preflight also carries the release's official runtime plan, from
+`pohunekd ensure-official-runtimes --dry-run` run against the release's
+`runtime/` tree before any effect. The plan lists the packages the host uses
+with the reasons (`profile`, `session`, `integration`), the host profiles it
+pins, the integration hooks it reinstalls, and every refusal. Live and stopped
+sessions are judged against the runtime registry as it will be after the plan
+is applied, so a host on an older release whose sessions the release's packages
+adopt is not refused for them. `service check` and `service upgrade` print the
+plan as `plan` lines and each refusal as a `refused` line.
+
+A plan with refusals (for example, no package for this platform) fails with
+`service_upgrade_runtimes_refused` before anything is stopped, and
+`--accept-runtime-loss` does not override it. The error lists every refusal. On
+a fresh upgrade the early gate refuses it before the binaries are published; a
+resumed upgrade, or a plan that changes between the two gates, is refused at the
+later gate, which keeps the transaction for a rerun or rolls it back. A plan that changes
+something is applied after the old daemon stops: the package registry, the
+catalog state and the host profiles are backed up owner-private first, and the
+backup is restored when anything fails. Once the new daemon is ready, the
+integration hooks the release lists are reinstalled. A failure there is reported
+and does not roll the upgrade back. A Hermes home without the pohunek marker is
+reported as a gap with the command that installs it; nothing is written into it.
+
+The manual migration below remains the fallback for a host that cannot run the
+upgrade's runtime step, for example to move its sessions before an upgrade.
 
 The apply is judged once more. After it, the new release's preflight judges the
 live sessions again, with the same decision as before the apply, because the
@@ -667,6 +699,10 @@ catalog's trust state (`catalog: record`) stops and backs up the daemon like any
 other apply.
 
 ## Move Claude and Codex sessions to the official package before upgrading
+
+The upgrade installs and pins the official packages itself (see above), so the
+steps below are optional. They are the manual path to the same state, for a
+host that migrates before it runs the upgrade.
 
 A session records the runtime source it was launched from: a built-in runtime
 compiled into the daemon, or the digest of an installed runtime package.

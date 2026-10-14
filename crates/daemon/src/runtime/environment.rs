@@ -38,6 +38,68 @@ impl EnvironmentSource {
     }
 }
 
+/// The environment a launch of the daemon hands its agents: the allowlist of the
+/// installed `service.toml`, applied to the daemon's environment source.
+///
+/// A daemon started by the service manager reads the allowlist from its service
+/// file, so a judgement that predicts a launch must read the same file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchEnvironment {
+    allowlist: Vec<String>,
+    source: EnvironmentSource,
+}
+
+impl LaunchEnvironment {
+    /// Pairs `allowlist` with the environment `source` a launch reads.
+    #[must_use]
+    pub fn new(allowlist: Vec<String>, source: EnvironmentSource) -> Self {
+        Self { allowlist, source }
+    }
+
+    /// The environment of a daemon without an installed service file, which
+    /// runs its workers as direct children: the default allowlist over the
+    /// process environment, as that daemon builds it.
+    #[must_use]
+    pub fn subprocess_default() -> Self {
+        Self::new(
+            pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST
+                .iter()
+                .map(|pattern| (*pattern).to_owned())
+                .collect(),
+            EnvironmentSource::Process,
+        )
+    }
+
+    /// Reads the allowlist of the installed service file at `path`, read-only,
+    /// as daemon startup reads it, over the environment `source`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the file cannot be read or parsed.
+    pub fn from_service_file(
+        path: &std::path::Path,
+        source: EnvironmentSource,
+    ) -> Result<Self, String> {
+        let config = pohunek_service_config::ServiceConfig::load_upgrade_source(path)
+            .map_err(|error| error.to_string())?;
+        Ok(Self::new(
+            config.config.environment_allowlist().to_vec(),
+            source,
+        ))
+    }
+
+    /// The allowlist the launch filters the environment with.
+    #[must_use]
+    pub fn allowlist(&self) -> &[String] {
+        &self.allowlist
+    }
+
+    /// The base environment a launch under this configuration inherits.
+    pub(crate) fn base(&self) -> Result<BaseEnv, EnvError> {
+        base_environment(&self.allowlist, &self.source)
+    }
+}
+
 /// Selects the variables of `source` that match `allowlist`.
 ///
 /// `allowlist` is the configured list, or

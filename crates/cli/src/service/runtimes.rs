@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use pohunek_paths::DAEMON_EXECUTABLE_NAME;
 use pohunek_platform::filesystem::{AdvisoryLock, EntryKind, FsError, TrustedDir};
+use pohunek_platform::shell_env::SearchPath;
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, IntegrationAction, PackageStatus, ProfileStatus, DRY_RUN_FLAG,
     ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG,
@@ -29,6 +30,7 @@ use super::context::Context;
 use super::engine::config_digest;
 use super::error::Error;
 use super::layout;
+use super::preflight::set_search_path;
 use super::record::{RuntimeBackup, RuntimeBackupEntry, RuntimeDir, Store};
 use super::report::IntegrationReinstall;
 use super::settings;
@@ -95,8 +97,15 @@ pub type Running<'a> = Pin<Box<dyn Future<Output = Result<EnsureReport, Error>> 
 
 /// Runs `pohunekd ensure-official-runtimes` of the release in `dir`.
 pub trait RuntimeStep: Debug + Send + Sync {
-    /// Returns the report of a plan (`dry_run`) or of an apply in `dir`.
-    fn run<'a>(&'a self, context: &'a Context, dir: &'a Path, dry_run: bool) -> Running<'a>;
+    /// Returns the report of a plan (`dry_run`) or of an apply in `dir`, run
+    /// with the `PATH` `search_path` gives the daemon job.
+    fn run<'a>(
+        &'a self,
+        context: &'a Context,
+        dir: &'a Path,
+        dry_run: bool,
+        search_path: &'a SearchPath,
+    ) -> Running<'a>;
 }
 
 /// Runs the daemon executable of the release as a child process.
@@ -122,8 +131,14 @@ impl Default for DaemonRuntimes {
 }
 
 impl RuntimeStep for DaemonRuntimes {
-    fn run<'a>(&'a self, context: &'a Context, dir: &'a Path, dry_run: bool) -> Running<'a> {
-        Box::pin(run_daemon(*self, context, dir, dry_run))
+    fn run<'a>(
+        &'a self,
+        context: &'a Context,
+        dir: &'a Path,
+        dry_run: bool,
+        search_path: &'a SearchPath,
+    ) -> Running<'a> {
+        Box::pin(run_daemon(*self, context, dir, dry_run, search_path))
     }
 }
 
@@ -138,6 +153,7 @@ async fn run_daemon(
     context: &Context,
     dir: &Path,
     dry_run: bool,
+    search_path: &SearchPath,
 ) -> Result<EnsureReport, Error> {
     let daemon = dir.join(DAEMON_EXECUTABLE_NAME);
     let failure = |detail: String| Error::UpgradeRuntimesFailed {
@@ -156,6 +172,7 @@ async fn run_daemon(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    set_search_path(&mut command, search_path);
     let mut child =
         layout::retry_while_exec_busy(settings::EXEC_BUSY_WAIT, settings::EXEC_BUSY_POLL, || {
             command.spawn()
@@ -604,14 +621,83 @@ mod tests {
         let context = context(root.as_path());
         fake_daemon(root.as_path(), ENSURE_REPORT_VERSION, None, 0);
 
-        let plan = run_daemon(DaemonRuntimes::default(), &context, root.as_path(), true)
-            .await
-            .expect("plan");
+        let plan = run_daemon(
+            DaemonRuntimes::default(),
+            &context,
+            root.as_path(),
+            true,
+            &SearchPath::empty(),
+        )
+        .await
+        .expect("plan");
         assert!(plan.dry_run && !needs_apply(&plan));
-        let applied = run_daemon(DaemonRuntimes::default(), &context, root.as_path(), false)
-            .await
-            .expect("apply");
+        let applied = run_daemon(
+            DaemonRuntimes::default(),
+            &context,
+            root.as_path(),
+            false,
+            &SearchPath::empty(),
+        )
+        .await
+        .expect("apply");
         assert!(!applied.dry_run);
+    }
+
+    #[tokio::test]
+    async fn the_plan_and_the_apply_run_with_the_path_of_the_job() {
+        let (_root, root) = temp_root();
+        let context = context(root.as_path());
+        let tools = root.join("tools");
+        std::fs::create_dir_all(&tools).expect("tools dir");
+        std::fs::set_permissions(&tools, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        let search_path = SearchPath::new(vec![tools]).expect("search path");
+        fake_daemon(root.as_path(), ENSURE_REPORT_VERSION, None, 0);
+        // The daemon refuses to answer unless it has the job's PATH.
+        let path = root.join(DAEMON_EXECUTABLE_NAME);
+        let body = std::fs::read_to_string(&path).expect("read fake daemon");
+        std::fs::write(
+            &path,
+            body.replacen(
+                "#!/bin/sh\n",
+                &format!(
+                    "#!/bin/sh\n[ \"$PATH\" = '{}' ] || exit 7\n",
+                    search_path.to_env_value()
+                ),
+                1,
+            ),
+        )
+        .expect("write fake daemon");
+
+        run_daemon(
+            DaemonRuntimes::default(),
+            &context,
+            root.as_path(),
+            true,
+            &search_path,
+        )
+        .await
+        .expect("the plan runs with the job PATH");
+        run_daemon(
+            DaemonRuntimes::default(),
+            &context,
+            root.as_path(),
+            false,
+            &search_path,
+        )
+        .await
+        .expect("the apply runs with the job PATH");
+        let detail = failure_detail(
+            run_daemon(
+                DaemonRuntimes::default(),
+                &context,
+                root.as_path(),
+                true,
+                &SearchPath::empty(),
+            )
+            .await
+            .expect_err("without the job PATH the daemon refuses"),
+        );
+        assert!(detail.contains("exit status: 7"), "{detail}");
     }
 
     #[tokio::test]
@@ -621,9 +707,15 @@ mod tests {
         fake_daemon(root.as_path(), ENSURE_REPORT_VERSION + 1, Some(true), 0);
 
         let detail = failure_detail(
-            run_daemon(DaemonRuntimes::default(), &context, root.as_path(), true)
-                .await
-                .expect_err("the version is refused"),
+            run_daemon(
+                DaemonRuntimes::default(),
+                &context,
+                root.as_path(),
+                true,
+                &SearchPath::empty(),
+            )
+            .await
+            .expect_err("the version is refused"),
         );
         assert!(detail.contains("expected 1"), "{detail}");
     }
@@ -636,9 +728,15 @@ mod tests {
         fake_daemon(root.as_path(), ENSURE_REPORT_VERSION, Some(true), 0);
 
         let detail = failure_detail(
-            run_daemon(DaemonRuntimes::default(), &context, root.as_path(), false)
-                .await
-                .expect_err("the dry-run flag is refused"),
+            run_daemon(
+                DaemonRuntimes::default(),
+                &context,
+                root.as_path(),
+                false,
+                &SearchPath::empty(),
+            )
+            .await
+            .expect_err("the dry-run flag is refused"),
         );
         assert!(detail.contains("dry_run=true"), "{detail}");
     }
@@ -650,9 +748,15 @@ mod tests {
         fake_daemon(root.as_path(), ENSURE_REPORT_VERSION, None, 3);
 
         let detail = failure_detail(
-            run_daemon(DaemonRuntimes::default(), &context, root.as_path(), false)
-                .await
-                .expect_err("the exit is refused"),
+            run_daemon(
+                DaemonRuntimes::default(),
+                &context,
+                root.as_path(),
+                false,
+                &SearchPath::empty(),
+            )
+            .await
+            .expect_err("the exit is refused"),
         );
         assert!(detail.contains("diagnostic line"), "{detail}");
     }
@@ -685,7 +789,7 @@ mod tests {
         hanging_daemon(root.as_path(), &pid_file);
 
         let error = short_timeouts(Duration::from_secs(10))
-            .run(&context, root.as_path(), false)
+            .run(&context, root.as_path(), false, &SearchPath::empty())
             .await
             .expect_err("the apply does not finish");
         let detail = failure_detail(error);

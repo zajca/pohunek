@@ -21,6 +21,12 @@ pub const WORKER_CONNECT: Duration = Duration::from_secs(10);
 /// systemd template, so both backends expire an uninitialized worker alike.
 pub const WORKER_INITIALIZE: Duration = Duration::from_secs(45);
 
+/// Time the systemd user manager may take to report its environment.
+pub const MANAGER_ENVIRONMENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bytes of the user manager's environment report that are kept.
+pub const MANAGER_ENVIRONMENT_OUTPUT: usize = 1024 * 1024;
+
 /// Deadline of one `/bin/launchctl` command.
 ///
 /// `bootstrap` and `print` finish in milliseconds; ten seconds only guards

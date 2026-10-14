@@ -2194,9 +2194,13 @@ and prints one JSON document (`PreflightReport` in `crates/service-config`,
 `refused`, with `schema_from`, `schema_to`, `records`, `error_code`, `error`) and
 `sessions` (per live session `session_id`, `verdict` `adoptable`,
 `would_lose_recovery` or `would_not_be_adopted`, a stable `code`, and a human
-`detail`, plus the owner-set `name` when there is one) and `unmanaged_workers`
-(ids of live worker journals the store has no record of; the running daemon does
-not manage them either, so they never refuse the upgrade). A session that is not `adoptable` fails the command with the CLI error
+`detail`, plus the owner-set `name` when there is one), `stopped_sessions` (the
+same verdicts for sessions whose runtime has ended but that keep native resume or
+fork; at risk under the same flag), `runtimes` (absent when the release carries no
+`runtime/` tree; otherwise the `EnsureReport` of the release's official runtime
+plan with `packages`, `profiles`, `integrations` and `refusals`), and
+`unmanaged_workers` (ids of live worker journals the store has no record of; the
+running daemon does not manage them either, so they never refuse the upgrade). A session that is not `adoptable` fails the command with the CLI error
 code `service_upgrade_sessions_at_risk` unless `--accept-runtime-loss` is given;
 a `refused` store fails it with `service_upgrade_store_unusable` and a preflight
 that cannot run or be parsed with `service_upgrade_preflight_failed`, neither of
@@ -2220,7 +2224,17 @@ not compile in while no package serves the alias, `runtime_builtin_removed`, or
 a runtime that is not installed) is `would_lose_recovery` with the same code,
 and its `detail` says every interaction (input, attach, resize, rename,
 metadata) is refused until the runtime is installed, naming the official
-package install for a removed built-in. See
+package install for a removed built-in. A live or stopped session whose host
+profile resume would refuse (the profile is missing, or its frozen revision
+changed by more than the migration pin) is `would_lose_recovery` with resume's
+code (`agent_profile_missing`, `agent_profile_changed` or
+`agent_profile_revision_unavailable`), and a stopped session record the new
+binary cannot load is `would_lose_recovery` with `record_unreadable`. A session
+whose frozen program resume would not find is `would_lose_recovery` with
+`agent_binary_missing`; for a runtime that declares a version probe, the
+preflight runs the same isolated, bounded probe resume runs (the frozen program
+with the probe's arguments, a private `HOME` and working directory), so
+`service check` executes those programs. It writes no pohunek state. See
 [update after release](knowledge/runbooks/update-after-release.md).
 
 Identity hooks prefer the owner-private worker endpoint so an accepted launch

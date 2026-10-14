@@ -480,6 +480,14 @@ pub enum Error {
         detail: String,
     },
 
+    /// The `PATH` the daemon job runs with could not be determined, so a
+    /// preflight or runtime step cannot run with the daemon's `PATH`.
+    #[error("cannot determine the PATH the daemon job runs with: {detail}")]
+    ManagerEnvironment {
+        /// Why no usable `PATH` came back.
+        detail: String,
+    },
+
     /// The official runtime step did not produce a usable report, or its
     /// apply left work undone.
     #[error("the official runtime step of {} failed: {detail}", binary.display())]
@@ -682,6 +690,7 @@ impl Error {
             Self::UpgradeRuntimesRefused { .. } => "service_upgrade_runtimes_refused",
             Self::UpgradeRuntimesFailed { .. } => "service_upgrade_runtimes_failed",
             Self::UpgradeRuntimesUnconfirmed { .. } => "service_upgrade_runtimes_unconfirmed",
+            Self::ManagerEnvironment { .. } => "service_manager_environment_unavailable",
             Self::RuntimeBackup { .. } => "service_runtime_backup_invalid",
             Self::RollbackStoreUnusable { .. } => "service_rollback_store_unusable",
             Self::RollbackAtRisk { .. } => "service_rollback_sessions_at_risk",
@@ -743,6 +752,9 @@ impl Error {
             ),
             Self::UpgradeRuntimesUnconfirmed { .. } => Some(
                 "the upgrade is kept, not rolled back: confirm that no `pohunekd ensure-official-runtimes` process of that release is running (`pgrep -fl ensure-official-runtimes`), then rerun `pohunek service upgrade`",
+            ),
+            Self::ManagerEnvironment { .. } => Some(
+                "the daemon job runs with the PATH its definition records, or on Linux the systemd user manager's Environment PATH when it records none; check that source and retry; nothing was changed",
             ),
             Self::UpgradeRuntimesFailed { .. } => Some(
                 "run `<staged>/pohunekd ensure-official-runtimes --dry-run` by hand with the same XDG environment to see its output, then retry",

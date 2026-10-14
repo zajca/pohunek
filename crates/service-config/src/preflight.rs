@@ -15,7 +15,12 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::runtimes::{EnsureReport, Refusal};
+
 /// Version of the report layout; a reader refuses any other value.
+///
+/// Stays at 1 while the layout only gains fields, because the rollback gate
+/// parses reports of older daemons, which ignore fields they do not know.
 pub const REPORT_VERSION: u32 = 1;
 
 /// The session is adopted with its native recovery intact.
@@ -183,19 +188,39 @@ pub struct PreflightReport {
     pub store: StoreReport,
     /// Every live session, ordered by id.
     pub sessions: Vec<SessionVerdict>,
+    /// Sessions whose runtime has ended and that keep native resume or fork,
+    /// ordered by id. Each verdict says whether the session still resumes or
+    /// forks through the runtime source the new daemon serves.
+    #[serde(default)]
+    pub stopped_sessions: Vec<SessionVerdict>,
     /// Sessions whose worker journal is live but which the store has no
     /// record of, ordered by id. The running daemon does not manage them
     /// either, so the upgrade leaves them as they are.
     #[serde(default)]
     pub unmanaged_workers: Vec<String>,
+    /// The release step's plan against this host: the packages and profiles
+    /// it changes, and its refusals. Absent when the release carries no
+    /// `runtime/` directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtimes: Option<EnsureReport>,
 }
 
 impl PreflightReport {
-    /// The sessions whose verdict is not [`Verdict::Adoptable`].
+    /// The live and stopped sessions whose verdict is not
+    /// [`Verdict::Adoptable`].
     pub fn at_risk(&self) -> impl Iterator<Item = &SessionVerdict> {
         self.sessions
             .iter()
+            .chain(&self.stopped_sessions)
             .filter(|session| session.verdict.at_risk())
+    }
+
+    /// The reasons the release step refuses its plan, which the upgrade must
+    /// not override: the plan changes nothing while any remains.
+    pub fn plan_refusals(&self) -> impl Iterator<Item = &Refusal> {
+        self.runtimes
+            .iter()
+            .flat_map(|runtimes| runtimes.refusals.iter())
     }
 
     /// Whether the daemon would refuse to start with the store.
