@@ -1589,6 +1589,15 @@ fn edit_durable_recovery(
         .expect("write the session record");
 }
 
+/// The host profile of the built-in Claude runtime `stopped_built_in_claude`
+/// writes, with its conversations below `config_home`.
+fn claude_profile_text(config_home: &Path) -> String {
+    format!(
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 600\"]\n\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+        config_home.display()
+    )
+}
+
 /// A stopped session of the built-in Claude runtime, launched by a daemon that
 /// compiles it in, whose conversation that daemon recorded.
 struct StoppedClaude {
@@ -1613,13 +1622,7 @@ async fn stopped_built_in_claude(tag: &str) -> StoppedClaude {
     fs::create_dir_all(&conversations).expect("the conversation directory");
     fs::write(conversations.join(format!("{CONVERSATION}.jsonl")), b"{}\n")
         .expect("the conversation");
-    fixture.write_profile(
-        PROFILE,
-        &format!(
-            "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 600\"]\n\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
-            config_home.display()
-        ),
-    );
+    fixture.write_profile(PROFILE, &claude_profile_text(&config_home));
     let previous = compiled_in_daemon(&fixture, &store_path);
     let created = previous
         .create(protocol::SessionNewParams {
@@ -2841,4 +2844,157 @@ async fn an_explicit_report_of_a_differently_named_profile_keeps_its_override_th
         .remove(&created.id)
         .await
         .expect("remove the adopted session");
+}
+
+/// Binds the profile over the built-in Claude runtime to the package that now
+/// serves it, the way `plugin profile migrate` does.
+async fn bind_claude_profile(fixture: &Fixture) {
+    fixture
+        .registry
+        .package_bind_profile(PackageBindProfileParams {
+            profile: PROFILE.to_owned(),
+            digest: None,
+            dry_run: false,
+        })
+        .await
+        .expect("bind the profile to the official package");
+}
+
+/// The error code of a resume of `id` that keeps the profile's change refused.
+async fn refused_resume_code(registry: &SessionRegistry, id: &protocol::SessionId) -> String {
+    registry
+        .resume_with(id, crate::session::ProfileChange::Refuse)
+        .await
+        .expect_err("a changed profile is refused")
+        .code
+}
+
+#[tokio::test]
+async fn a_profile_bound_to_the_adopting_package_resumes_without_accepting_a_change() {
+    let session = stopped_built_in_claude("claude-bound-resume").await;
+    let package = real_official(RuntimeId::CLAUDE);
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        &package,
+        5,
+    )
+    .await;
+    bind_claude_profile(&session.fixture).await;
+    let restarted = restart(&session.fixture).await;
+
+    let resumed = restarted
+        .registry
+        .resume_with(&session.id, crate::session::ProfileChange::Refuse)
+        .await
+        .expect("the bound profile keeps the revision the session froze");
+    assert_eq!(
+        resumed.runtime.as_ref().map(|runtime| runtime.state),
+        Some(protocol::RuntimeState::Live)
+    );
+    restarted
+        .registry
+        .remove(&session.id)
+        .await
+        .expect("remove the resumed session");
+}
+
+#[tokio::test]
+async fn a_real_profile_edit_after_the_adoption_refuses_the_resume() {
+    let session = stopped_built_in_claude("claude-edited-resume").await;
+    let package = real_official(RuntimeId::CLAUDE);
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        &package,
+        5,
+    )
+    .await;
+    bind_claude_profile(&session.fixture).await;
+    let config_home = session.fixture.dir.join("claude-home");
+    session.fixture.write_profile(
+        PROFILE,
+        &claude_profile_text(&config_home).replace("sleep 600", "sleep 601"),
+    );
+    let restarted = restart(&session.fixture).await;
+
+    assert_eq!(
+        refused_resume_code(&restarted.registry, &session.id).await,
+        "agent_profile_changed"
+    );
+}
+
+#[tokio::test]
+async fn a_profile_pinned_to_another_package_id_is_refused_not_adopted() {
+    let session = stopped_built_in_claude("claude-other-pin").await;
+    let package = real_official(RuntimeId::CLAUDE);
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        &package,
+        5,
+    )
+    .await;
+    let config_home = session.fixture.dir.join("claude-home");
+    session.fixture.write_profile(
+        PROFILE,
+        &format!(
+            "package = \"pohunek.runtime.other\"\ndigest = \"{}\"\n{}",
+            package.digest.as_str(),
+            claude_profile_text(&config_home)
+        ),
+    );
+    let restarted = restart(&session.fixture).await;
+
+    assert_eq!(
+        refused_resume_code(&restarted.registry, &session.id).await,
+        "agent_profile_changed"
+    );
+}
+
+#[tokio::test]
+async fn a_frozen_revision_keyed_by_another_host_is_not_accepted_for_an_adopted_profile() {
+    let session = stopped_built_in_claude("claude-forged-revision").await;
+    let package = real_official(RuntimeId::CLAUDE);
+    install_real_official(
+        &session.fixture,
+        &session.fixture.registry,
+        RuntimeId::CLAUDE,
+        &package,
+        5,
+    )
+    .await;
+    bind_claude_profile(&session.fixture).await;
+    let frozen = durable_recovery(&session.store_path, &session.id);
+    let stored = frozen
+        .launch_binding
+        .binding()
+        .expect("the built-in pin")
+        .clone();
+    let config_home = session.fixture.dir.join("claude-home");
+    let inputs = crate::agent::host::ProfileInputs::of(
+        &claude_profile_text(&config_home),
+        None,
+        &serde_json::to_vec(&stored).expect("the stored binding"),
+        &frozen.program,
+        &frozen.args,
+    )
+    .expect("the profile inputs");
+    // A key the host never used; its MAC must not verify under the host key.
+    let other_host = crate::agent::host::RevisionKeys::new(Some(temp_dir("claude-other-host")));
+    let forged = other_host
+        .revision(&inputs)
+        .expect("a revision under another key");
+    edit_durable_recovery(&session.store_path, &session.id, |binding| {
+        binding.profile_revision = Some(forged);
+    });
+    let restarted = restart(&session.fixture).await;
+
+    assert_eq!(
+        refused_resume_code(&restarted.registry, &session.id).await,
+        "agent_profile_changed"
+    );
 }

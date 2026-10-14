@@ -92,6 +92,7 @@ mod turn_events;
 mod turn_wait;
 
 pub use attach::{RedeemedAttach, RedeemedRuntime};
+pub use package_lifecycle::ensure::{ensure_official_runtimes, EnsureError, EnsureInputs};
 pub use package_lifecycle::HostTrustAnchor;
 pub use retention::{SessionRetentionTask, POLICY_FILE_NAME as RETENTION_POLICY_NAME};
 
@@ -6909,6 +6910,12 @@ fn open_runtime_host(plugins_dir: &Path) -> Result<RuntimeHost, ProtocolError> {
             "the runtime package store cannot be opened safely",
         )
     })?;
+    runtime_host_over(store)
+}
+
+/// Builds the runtime host over the built-in runtimes and the already opened
+/// package `store`.
+pub(crate) fn runtime_host_over(store: host::PackageStore) -> Result<RuntimeHost, ProtocolError> {
     RuntimeHost::with_packages(
         host::BuiltinSource::from_host_environment(),
         host::PackageSource::new(store),

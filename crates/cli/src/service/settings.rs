@@ -130,6 +130,32 @@ pub const PREFLIGHT_DIAGNOSTICS: usize = 4 * 1024;
 /// proven readable by the previous release and must not be downgraded.
 pub const ROLLBACK_STORE_BYTES: usize = 16 * 1024 * 1024;
 
+/// Deadline for `pohunekd ensure-official-runtimes --dry-run`.
+///
+/// The plan reads the release catalog, the trust anchor, the store and the
+/// profiles, and never writes; the thirty seconds only guards a wedged disk.
+pub const RUNTIMES_PLAN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Deadline for `pohunekd ensure-official-runtimes`, the apply.
+///
+/// The apply verifies and extracts each official package archive (at most
+/// `MAX_COMPRESSED_BYTES` each) while no daemon runs, so a host with slow
+/// storage needs minutes; a wedged apply still ends and rolls back.
+pub const RUNTIMES_APPLY_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Bytes of the runtime report kept from the daemon.
+///
+/// A report lists one entry per used runtime and profile, so one MiB covers
+/// any realistic host; the cap bounds memory for a binary that floods stdout.
+pub const RUNTIMES_OUTPUT: usize = 1024 * 1024;
+
+/// Largest state file the runtime step backs up or restores.
+///
+/// The package registry grows with the installed packages and each profile is
+/// a small TOML file; the daemon's own readers bound both far below this
+/// ceiling, so a larger file is refused instead of copied.
+pub const RUNTIME_STATE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Deadline for `systemd-analyze verify` on the rendered units.
 ///
 /// Verification loads the unit and its dependencies from disk; thirty seconds

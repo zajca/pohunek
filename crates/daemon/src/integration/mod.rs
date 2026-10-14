@@ -52,6 +52,7 @@ pub use doctor::doctor;
 pub use doctor::doctor_in;
 #[cfg(unix)]
 pub(crate) use doctor::is_ambiguous_owner;
+pub(crate) use handler::hook_runtime_ids;
 pub use handler::{
     install_in, serves_retired, status_in, AssetManifest, DaemonHandler, Handler, RetainedSchemas,
     RetiredBuiltin, StagedUpdate,

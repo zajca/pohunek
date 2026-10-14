@@ -190,6 +190,12 @@ impl Context {
         &self.cli_executable
     }
 
+    /// The user's home directory as the context resolved it.
+    #[must_use]
+    pub fn home(&self) -> Option<&Path> {
+        self.home.as_deref()
+    }
+
     /// Returns the default prefix, `$HOME/.local`.
     ///
     /// # Errors

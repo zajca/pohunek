@@ -639,6 +639,33 @@ proceeds, and the `--json` report carries the full `preflight` object and
 failing `pohunekd`, an unparsable report) fails with
 `service_upgrade_preflight_failed`, which the flag does not override.
 
+### Official runtime packages during an upgrade
+
+After the preflight and before the new daemon starts, the upgrade runs the
+release's `pohunekd ensure-official-runtimes --dry-run`. It plans the official
+runtime packages the host uses and the host profiles pinned to them. A plan
+with refusals fails with `service_upgrade_runtimes_refused` before anything is
+stopped. A plan that changes something stops the old daemon, backs up the
+package registry, the catalog state and the host profiles owner-private, applies
+the plan, and restores the backup when anything fails. Once the new daemon is
+ready, the integration hooks the release lists are reinstalled. A failure there
+is reported and does not roll the upgrade back. A Hermes home without the pohunek
+marker is reported as a gap with the command that installs it; nothing is written
+into it.
+
+The apply is judged once more. After it, the new release's preflight judges the
+live sessions again, with the same decision as before the apply, because the
+apply may select a package with another native contract. A session at risk, or
+a preflight that cannot run, rolls the apply back.
+
+When the release carries no usable runtime catalog, an installed package that
+loads keeps serving its runtime: the step reports `catalog: unavailable` and the
+package as `kept`, with nothing installed and nothing refused. A runtime with no
+installed package that serves it still fails with
+`release_runtime_catalog_unavailable`. A plan whose only change is the release
+catalog's trust state (`catalog: record`) stops and backs up the daemon like any
+other apply.
+
 ## Move Claude and Codex sessions to the official package before upgrading
 
 A session records the runtime source it was launched from: a built-in runtime

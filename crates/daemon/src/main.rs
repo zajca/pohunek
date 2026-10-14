@@ -60,10 +60,15 @@ use pohunek_daemon::runtime::{
 };
 use pohunek_daemon::session::upgrade_preflight::{self, PreflightInputs};
 use pohunek_daemon::session::{
-    SessionRegistry, SessionRegistryConfig, SessionRetentionTask, RETENTION_POLICY_NAME,
+    ensure_official_runtimes, EnsureInputs, SessionRegistry, SessionRegistryConfig,
+    SessionRetentionTask, RETENTION_POLICY_NAME,
 };
 use pohunek_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
 use pohunek_platform::supervisor::{self, Namespace};
+use pohunek_service_config::runtimes::{
+    CatalogStatus, EnsureReport, Refusal, CODE_DAEMON_RUNNING, DRY_RUN_FLAG, ENSURE_REPORT_VERSION,
+    ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
+};
 use pohunek_service_config::{InputTiming, ServiceConfig, WaitTiming};
 
 /// File name of the unified logical-session metadata store under the data dir.
@@ -151,6 +156,9 @@ const VERSION_FLAG: &str = "--version";
 /// them while the preflight runs.
 const UPGRADE_PREFLIGHT_ARG: &str = "upgrade-preflight";
 
+/// Name of the host agent profiles directory under the config directory.
+const PROFILES_SUBDIR: &str = "agents";
+
 #[tokio::main]
 async fn main() -> ExitCode {
     if std::env::args_os()
@@ -164,6 +172,18 @@ async fn main() -> ExitCode {
         .eq([OsString::from(UPGRADE_PREFLIGHT_ARG)])
     {
         return print_upgrade_preflight();
+    }
+    if std::env::args_os()
+        .skip(1)
+        .eq([OsString::from(ENSURE_RUNTIMES_ARG)])
+    {
+        return print_ensure_runtimes(false);
+    }
+    if std::env::args_os().skip(1).eq([
+        OsString::from(ENSURE_RUNTIMES_ARG),
+        OsString::from(DRY_RUN_FLAG),
+    ]) {
+        return print_ensure_runtimes(true);
     }
     // The startup future is large (reconciliation, listeners, event logs); box
     // it so it lives on the heap instead of inflating the `main` task frame.
@@ -203,6 +223,83 @@ fn print_upgrade_preflight() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Prints the offline runtime step's report as JSON, or its failure on stderr.
+fn print_ensure_runtimes(dry_run: bool) -> ExitCode {
+    let report = ensure_runtimes(dry_run).and_then(|report| {
+        serde_json::to_string_pretty(&report).map_err(|error| error.to_string())
+    });
+    match report {
+        Ok(json) => {
+            println!("{json}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("pohunekd: {ENSURE_RUNTIMES_ARG} failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Runs the offline runtime step over the installed state.
+///
+/// A dry run takes no lock and creates nothing. An apply holds the data
+/// authority and the instance locks until it ends, so a daemon cannot start
+/// underneath it; a held lock is a refusal, because the running daemon owns
+/// the state and nothing may change.
+fn ensure_runtimes(dry_run: bool) -> Result<EnsureReport, String> {
+    let paths = Paths::resolve().map_err(|error| error.to_string())?;
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let release_dir = executable
+        .parent()
+        .ok_or_else(|| "the daemon executable has no directory".to_owned())?
+        .join(RELEASE_RUNTIME_DIR);
+    let inputs = EnsureInputs {
+        store_path: paths.data_dir.join(STORE_NAME),
+        plugins_dir: paths.plugins_dir(),
+        profiles_dir: paths.config_dir.join(PROFILES_SUBDIR),
+        release_dir,
+        catalog_trust: CatalogTrust::load_beside_executable(),
+        dry_run,
+        daemon_version: DAEMON_VERSION.to_owned(),
+    };
+    if dry_run {
+        return ensure_official_runtimes(&inputs).map_err(|error| error.to_string());
+    }
+    ensure_private_dir(&paths.data_dir).map_err(|error| error.to_string())?;
+    ensure_private_dir(&paths.runtime_dir).map_err(|error| error.to_string())?;
+    let mut locks = vec![paths.data_authority_lock_path()];
+    if paths.runtime_dir != paths.data_dir {
+        locks.push(paths.lock.clone());
+    }
+    let mut held = Vec::with_capacity(locks.len());
+    for path in &locks {
+        match InstanceLock::acquire(path) {
+            Ok(lock) => held.push(lock),
+            Err(DaemonError::AlreadyRunning { .. }) => {
+                return Ok(EnsureReport {
+                    report_version: ENSURE_REPORT_VERSION,
+                    daemon_version: DAEMON_VERSION.to_owned(),
+                    dry_run,
+                    catalog: CatalogStatus::Unavailable,
+                    packages: Vec::new(),
+                    profiles: Vec::new(),
+                    integrations: Vec::new(),
+                    refusals: vec![Refusal {
+                        subject: "daemon".to_owned(),
+                        code: CODE_DAEMON_RUNNING.to_owned(),
+                        detail: "a daemon holds the instance lock; stop it before the runtime step"
+                            .to_owned(),
+                    }],
+                });
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    let report = ensure_official_runtimes(&inputs).map_err(|error| error.to_string());
+    drop(held);
+    report
 }
 
 #[expect(

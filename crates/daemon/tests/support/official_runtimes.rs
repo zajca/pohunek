@@ -31,8 +31,8 @@ use pohunek_daemon::procwatch::HostInspector;
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{HostTrustAnchor, SessionRegistry, SessionRegistryConfig};
 use pohunek_test_support::catalog::{
-    attestations_for, catalog_of, host_platform, root_of, signed, test_key, ANY_CORE, RUNTIME_API,
-    WINDOW_END, WINDOW_START,
+    anchor_for, attestations_for, catalog_of, host_platform, root_of, signed, test_key, ANY_CORE,
+    RUNTIME_API, WINDOW_END, WINDOW_START,
 };
 use pohunek_test_support::{worker_binary, workspace_root};
 use protocol::{
@@ -129,6 +129,62 @@ impl OfficialCatalog {
             installed.push((runtime, digest));
         }
         installed
+    }
+
+    /// Writes a release `runtime/` directory below `release` for `runtimes`:
+    /// their archives under `packages/` and the catalog listing them, signed by
+    /// this key. The archives are the bytes `runtime-packages` builds.
+    pub(crate) fn write_release(&self, release: &Path, runtimes: &[&str]) {
+        self.write_release_at(release, runtimes, CATALOG_SEQUENCE);
+    }
+
+    /// [`Self::write_release`] with the catalog's `sequence`, so a test can
+    /// publish a newer or an older release catalog.
+    pub(crate) fn write_release_at(&self, release: &Path, runtimes: &[&str], sequence: u64) {
+        let built: Vec<(&str, Vec<u8>, PackageDigest)> = runtimes
+            .iter()
+            .map(|runtime| {
+                let (bytes, digest) = built_archive(runtime);
+                (*runtime, bytes, digest)
+            })
+            .collect();
+        let archives: Vec<(&str, &[u8], &PackageDigest)> = built
+            .iter()
+            .map(|(runtime, bytes, digest)| (*runtime, bytes.as_slice(), digest))
+            .collect();
+        self.write_release_archives(release, sequence, &archives);
+    }
+
+    /// Writes a release `runtime/` directory below `release` holding the given
+    /// `(runtime, archive bytes, archive digest)` entries, under one catalog at
+    /// `sequence`. Each archive is stored as `<runtime>.tar.zst`.
+    pub(crate) fn write_release_archives(
+        &self,
+        release: &Path,
+        sequence: u64,
+        archives: &[(&str, &[u8], &PackageDigest)],
+    ) {
+        let packages = release.join("packages");
+        std::fs::create_dir_all(&packages).expect("create the release packages directory");
+        let entries = archives
+            .iter()
+            .map(|(runtime, bytes, digest)| {
+                std::fs::write(packages.join(format!("{runtime}.tar.zst")), bytes)
+                    .expect("write the release package archive");
+                catalog_entry(runtime, bytes, digest)
+            })
+            .collect();
+        std::fs::write(
+            release.join("runtime-catalog.json"),
+            signed(&self.key, catalog_of(sequence, WINDOW_END, entries)),
+        )
+        .expect("write the release catalog");
+    }
+
+    /// The anchor file bytes that trust this key, for the directory of a daemon
+    /// executable.
+    pub(crate) fn anchor_bytes(&self) -> Vec<u8> {
+        anchor_for(&self.key)
     }
 
     /// Installs the official Codex, Claude and Hermes packages into the plugin root
@@ -234,8 +290,46 @@ pub(crate) fn package_binding(runtime: &str) -> LaunchBinding {
 
 /// The canonical archive of `runtime-packages/<runtime>` and its digest.
 fn built_archive(runtime: &str) -> (Vec<u8>, PackageDigest) {
-    let directory = workspace_root().join("runtime-packages").join(runtime);
-    let bytes = build_directory_archive(&directory, &Limits::DEFAULT)
+    archive_of(
+        &workspace_root().join("runtime-packages").join(runtime),
+        runtime,
+    )
+}
+
+/// The archive of `runtime` built from a copy of its `runtime-packages`
+/// directory whose descriptor declares `version`: the bytes and digest a later
+/// release of the same package carries.
+pub(crate) fn variant_archive(runtime: &str, version: &str) -> (Vec<u8>, PackageDigest) {
+    let source = workspace_root().join("runtime-packages").join(runtime);
+    let scratch = pohunek_test_support::tempdir().expect("a scratch directory");
+    for entry in std::fs::read_dir(&source).expect("the runtime package directory") {
+        let path = entry.expect("a package file entry").path();
+        let name = path.file_name().expect("a file name").to_owned();
+        let text = std::fs::read_to_string(&path).expect("a package file");
+        let text = if name == "runtime.toml" {
+            let mut replaced = false;
+            text.lines()
+                .map(|line| {
+                    if !replaced && line.starts_with("version = ") {
+                        replaced = true;
+                        format!("version = \"{version}\"")
+                    } else {
+                        line.to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
+        } else {
+            text
+        };
+        std::fs::write(scratch.path().join(name), text).expect("copy a package file");
+    }
+    archive_of(scratch.path(), runtime)
+}
+
+fn archive_of(directory: &Path, runtime: &str) -> (Vec<u8>, PackageDigest) {
+    let bytes = build_directory_archive(directory, &Limits::DEFAULT)
         .unwrap_or_else(|error| panic!("the {runtime} package builds: {error:?}"));
     let digest = read_archive(&bytes, &Limits::DEFAULT)
         .expect("the official archive reads")

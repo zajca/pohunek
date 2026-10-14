@@ -692,7 +692,10 @@ states the contract and then the current state.
   A session launched from a host profile by an N-1 that did not freeze the
   profile revision carries none, so after the upgrade it resumes only with `session resume
   --accept-profile-change`; a plain resume fails with `agent_profile_changed`,
-  and the accepted relaunch freezes the current revision.
+  and the accepted relaunch freezes the current revision. A session of a built-in
+  runtime that its official package adopts keeps its frozen revision when the
+  profile differs only by the `package` and `digest` keys the migration writes,
+  so it resumes without the flag.
 
 Everything else stays unshimmed. A record that cannot be migrated or adopted is
 logged at WARN, surfaced to the operator, and carries a recovery hint.
@@ -733,7 +736,7 @@ Sessions at risk refuse the upgrade with
 `service_upgrade_sessions_at_risk` unless `--accept-runtime-loss`, the single
 loss-accepting flag, is given; a store the new daemon would refuse
 (`service_upgrade_store_unusable`) and a preflight that cannot run
-(`service_upgrade_preflight_failed`) are never overridable. The preflight runs before any effect and again right
+(`service_upgrade_preflight_failed`) are never overridable. The official runtime step adds five codes, none overridden by `--accept-runtime-loss`: `service_upgrade_runtimes_refused` (the release's plan cannot be applied; nothing was stopped), `service_upgrade_runtimes_failed` (the release's runtime step did not produce a finished report), `service_runtime_backup_invalid` (a registry, catalog state or host profile cannot be backed up exactly), `service_staged_runtime_invalid` (the release's `runtime/` tree is not the layout the release assembles, or a sealed release lists a `runtime/` file it does not carry), and `service_upgrade_runtimes_unconfirmed` (the step's daemon run could not be ended and its exit confirmed, so the upgrade is kept and not rolled back). The preflight runs before any effect and again right
 before the daemon is replaced (the previous daemon cannot be paused, and its own
 adoption fails closed for what remains); a resumed upgrade whose daemon replacement
 has not completed is judged again. A rerun for the active version and a resume
@@ -888,7 +891,12 @@ binding, so it needs the key; a launch of a bare runtime never does.
 `session.resume` and `session.fork` resolve the profile once, compare its
 current revision with the frozen one and refuse an edited, legacy or missing
 profile with `agent_profile_changed` or `agent_profile_missing` unless the
-local owner accepts the change. Connecting a relay-origin
+local owner accepts the change. The one exception is the migration pin: for an
+adopted built-in session the comparison also accepts a profile whose revision,
+computed without its `package` and `digest` keys, equals the frozen one, with
+the stored built-in binding, the frozen program and arguments, and the profile's
+manifest in the input. A legacy binding without a frozen revision is never
+accepted this way. Connecting a relay-origin
 `session.new` to `RelayProfile` depends on the locally approved `HostShare` of
 [#82](https://github.com/zajca/pohunek/issues/82); until then the relay
 variant is covered at the resolution seam only.

@@ -446,6 +446,23 @@ pub fn serves_retired(host: &RuntimeHost, agent: &RuntimeRef) -> bool {
     retired(host, agent).is_some()
 }
 
+/// The runtime ids whose daemon-installed hooks a daemon-run handler can still
+/// inspect and remove: the runtimes of the handlers that retired a built-in,
+/// in id order. A handler without a retired built-in (the CLI-run hook) is not
+/// listed.
+pub(crate) fn hook_runtime_ids() -> Vec<RuntimeId> {
+    let mut ids: Vec<RuntimeId> = handlers()
+        .iter()
+        .filter_map(|entry| match entry {
+            Handler::Daemon(handler) => handler.retired_builtin(),
+            Handler::CliRun(_) => None,
+        })
+        .filter_map(|retired| RuntimeId::parse(retired.runtime_id).ok())
+        .collect();
+    ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    ids
+}
+
 /// Every runtime of the host that names a daemon-run handler.
 ///
 /// Built-in runtimes are visited before package runtimes, each group in runtime

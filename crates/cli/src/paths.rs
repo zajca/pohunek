@@ -108,6 +108,20 @@ impl Paths {
         Self::resolve_from(&PathEnv::capture())
     }
 
+    /// The CLI paths of an already resolved base layout.
+    pub(crate) fn from_base(base: &pohunek_paths::BasePaths) -> Self {
+        Self {
+            runtime_dir: base.runtime_dir.clone(),
+            socket: base.socket.clone(),
+            data_dir: base.data_dir.clone(),
+            log_dir: base.log_dir.clone(),
+            cache_dir: base.cache_dir.clone(),
+            config_home: base.config_home.clone(),
+            config_dir: base.config_dir.clone(),
+            origin_source: OriginSource::Environment,
+        }
+    }
+
     /// Resolve CLI paths from explicit environment inputs.
     ///
     /// # Errors

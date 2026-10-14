@@ -22,13 +22,13 @@ use std::time::Duration;
 
 use package::registry::RetainedDigests;
 use package::PackageDigest;
-use protocol::{ErrorClass, PackageId, ProtocolError, RuntimeId};
+use protocol::{ErrorClass, LaunchBinding, PackageId, ProtocolError, RuntimeId};
 use serde::Deserialize;
 use tracing::warn;
 
 use super::host::{
-    is_reserved, InputReadiness, LaunchProgram, ProfileInputs, RevisionKeys, RuntimeDefinition,
-    RuntimeHost, ServedBy, Spawn,
+    is_reserved, InputReadiness, LaunchProgram, ProfileInputs, ProfileRevision, RevisionKeys,
+    RuntimeDefinition, RuntimeHost, ServedBy, Spawn,
 };
 use super::{InputRules, LaunchEnv, NativeArgs, NativeSessionLaunch, SessionRefKind};
 use crate::detect::{Manifest, MAX_MANIFEST_SOURCE_BYTES};
@@ -497,6 +497,58 @@ impl ProfileRegistry {
             .transpose()
     }
 
+    /// Whether the profile `name`, read as it is now, has the revision `frozen`
+    /// once its launch inputs are digested as a session frozen with the
+    /// built-in pin `stored` launched them.
+    ///
+    /// The pin keys are removed from the text, the manifest is read as a launch
+    /// reads it, and `stored`, `program` and `args` stand in for the binding and
+    /// launch of the base runtime. A pin the profile carries must name the
+    /// package `served` that now serves the runtime, or the revision does not
+    /// match.
+    ///
+    /// # Errors
+    ///
+    /// Returns the profile read errors, `agent_profile_not_found` without a
+    /// profile directory and `agent_profile_revision_unavailable` when the
+    /// revision key cannot be read.
+    pub(crate) fn frozen_builtin_matches(
+        &self,
+        name: &str,
+        stored: &LaunchBinding,
+        launch: (&str, &[String]),
+        served: (&PackageId, &PackageDigest),
+        frozen: &ProfileRevision,
+    ) -> Result<bool, ProtocolError> {
+        let dir = self
+            .dir
+            .as_deref()
+            .ok_or_else(|| agent_profile_not_found(name))?;
+        let path = dir.join(format!("{name}.toml"));
+        let content = read_profile_text(dir, name, &path)?;
+        let raw: RawProfile = toml::from_str(&content)
+            .map_err(|err| invalid_profile(name, &toml_diagnostic(&content, &err)))?;
+        let pin = parse_package_pin(name, raw.package.as_deref(), raw.digest.as_deref())?;
+        if let Some(pin) = pin {
+            if pin.package != *served.0 || pin.digest != *served.1 {
+                return Ok(false);
+            }
+        }
+        let stripped =
+            bind::without_pin(&content).map_err(|detail| invalid_profile(name, &detail))?;
+        let manifest = resolve_manifest(name, dir, raw.manifest.as_deref())?;
+        let binding_json = serde_json::to_vec(stored)
+            .map_err(|err| invalid_profile(name, &format!("launch binding: {err}")))?;
+        let inputs = ProfileInputs::of(
+            &stripped,
+            manifest.as_ref().map(|source| source.text.as_str()),
+            &binding_json,
+            launch.0,
+            launch.1,
+        )?;
+        self.revision_keys().matches(&inputs, frozen)
+    }
+
     /// Resolve an agent name (4-step chain, fail-closed):
     /// 1. A.2.1 single-segment charset guard (`invalid_name`).
     /// 2. `<dir>/<name>.toml` exists → that profile.
@@ -626,6 +678,28 @@ impl ProfileRegistry {
             .as_deref()
             .ok_or_else(|| invalid_profile(name, "the agents directory is not available"))?;
         resolve_profile_text(name, content, dir, &self.runtimes, Some(definition)).map(|_agent| ())
+    }
+
+    /// Every `*.toml` of the agents directory with its text, read through the
+    /// containment and owner-security checks of a load. A file that fails them
+    /// carries its error instead of text, so one file never hides the others.
+    ///
+    /// # Errors
+    ///
+    /// Returns the listing error of the agents directory.
+    pub(crate) fn scanned_texts(
+        &self,
+    ) -> std::io::Result<Vec<(String, Result<String, ProtocolError>)>> {
+        let Some(dir) = &self.dir else {
+            return Ok(Vec::new());
+        };
+        Ok(scanned_profile_files(dir)?
+            .into_iter()
+            .map(|(stem, path)| {
+                let text = read_profile_text(dir, &stem, &path);
+                (stem, text)
+            })
+            .collect())
     }
 
     /// The package digests that host profiles pin.

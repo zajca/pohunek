@@ -21,6 +21,7 @@
 // Rust guideline compliant 2026-10-13
 
 mod bind;
+pub(super) mod ensure;
 mod error;
 mod fault;
 mod selection;
@@ -824,7 +825,15 @@ fn prepare_archive(
 ) -> Result<Prepared, PackageErrorKind> {
     match trust {
         PackageTrust::ExplicitDigest { digest } => prepare_local(path, digest),
-        PackageTrust::Catalog { catalog_path } => prepare_official(context, path, catalog_path),
+        PackageTrust::Catalog { catalog_path } => {
+            let anchor = context.catalog_anchor()?;
+            let state = context
+                .store
+                .registry()
+                .catalog_state()
+                .map_err(|error| registry_kind(&error))?;
+            prepare_official(anchor, &state, path, catalog_path)
+        }
     }
 }
 
@@ -857,22 +866,17 @@ fn prepare_local(path: &str, pinned: &PackageDigest) -> Result<Prepared, Package
 /// decoded; the identity the decoded descriptor declares must then match a
 /// listed entry that supports this core version and platform.
 fn prepare_official(
-    context: &Context,
+    anchor: &HostTrustAnchor,
+    state: &CatalogState,
     path: &str,
     catalog_path: &str,
 ) -> Result<Prepared, PackageErrorKind> {
     let limits = Limits::DEFAULT;
-    let anchor = context.catalog_anchor()?;
     let bytes = read_archive_file(path, &limits)?;
     let max = u64::try_from(MAX_CATALOG_BYTES).unwrap_or(u64::MAX);
     let document = read_regular_file(catalog_path, max)
         .map_err(|_failure| PackageErrorKind::SourceUnreadable)?;
-    let state: CatalogState = context
-        .store
-        .registry()
-        .catalog_state()
-        .map_err(|error| registry_kind(&error))?;
-    let verified = trust::verify_catalog_document(&document, anchor, &state, unix_now()?)?;
+    let verified = trust::verify_catalog_document(&document, anchor, state, unix_now()?)?;
     let raw = archive_digest(&bytes).map_err(|error| {
         warn!(%error, "a package archive digest cannot be computed");
         PackageErrorKind::ArchiveInvalid
