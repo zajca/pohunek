@@ -31,8 +31,7 @@ template stay compiled into core; the descriptor and detection manifest come
 only from the package.
 
 The release catalog lists the package for the Linux x86_64 glibc and musl
-targets only; the Apple Silicon archive carries no package, so a macOS daemon
-has no source of Codex until darwin packages are attested (#929).
+targets, and for Apple Silicon (aarch64-apple-darwin).
 
 On a host without the package nothing serves `codex`:
 
@@ -43,8 +42,7 @@ On a host without the package nothing serves `codex`:
 - `pohunek integration status|doctor|uninstall --agent codex` still work: the
   core-owned Codex hook handler keeps the config home of the earlier built-in
   (`CODEX_HOME`, else `~/.codex`), so hooks pohunek installed there are reported
-  and removed (only pohunek-owned entries) without the package, also on macOS,
-  where no package exists yet (#929). `--profile <name>` and `--all-profiles`
+  and removed (only pohunek-owned entries) without the package. `--profile <name>` and `--all-profiles`
   reach the homes of host profiles over `codex` too, each through the
   profile's own `[env]` (`CODEX_HOME`), although such a profile does not
   resolve without the package. A bare `integration status` or `doctor`

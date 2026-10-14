@@ -710,6 +710,17 @@ class SigningTests(ReleaseWorkflowFiles):
         self.assertIn('[ "${GITHUB_REF_TYPE:-}" != tag ]', script)
         build = self.build_jobs["binaries"]
         self.assertIn("inputs.mode == 'rehearsal' && matrix.component == 'daemon'", build)
+        rehearsal_macos = self.build_jobs["rehearsal-macos"]
+        self.assertIn("    if: ${{ inputs.mode == 'rehearsal' }}\n", rehearsal_macos)
+        self.assertIn("runs-on: macos-15\n", rehearsal_macos)
+        self.assertIn("permissions:\n      contents: read\n", rehearsal_macos)
+        self.assertIn("matrix:\n        component: [cli, daemon]\n", rehearsal_macos)
+        self.assertIn("test \"$(uname -m)\" = \"arm64\"", rehearsal_macos)
+        self.assertIn("    if: ${{ matrix.component == 'daemon' }}\n", rehearsal_macos)
+        self.assertIn("scripts/release-workflow/rehearsal-trust", rehearsal_macos)
+        self.assertIn("packaging/macos/package --adhoc-release", rehearsal_macos)
+        self.assertIn("name: macos-signed-${{ matrix.component }}", rehearsal_macos)
+        self.assertIn("mkdir -p dist", rehearsal_macos)
         self.assertNotIn("rehearsal-trust", self.release)
 
     def test_provenance_of_every_input_is_verified_before_signing(self):
@@ -769,7 +780,7 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
     def test_rows_are_data_driven_and_run_the_archive_binaries(self):
         rows = self.evidence_jobs["rows"]
         self.assertIn("matrix: ${{ fromJSON(needs.plan.outputs.rows) }}", rows)
-        self.assertIn("build-daemon-${{ matrix.target }}", rows)
+        self.assertIn("name: ${{ matrix.daemon_artifact }}", rows)
         for runtime in ("pi", "codex", "claude"):
             self.assertNotRegex(self.evidence + self.build, rf"\b{runtime}\b(?!-)", runtime)
         script = (SCRIPTS / "run-row").read_text()
@@ -901,7 +912,7 @@ class AssetNameTests(ReleaseWorkflowFiles):
             "sdk-release-assets": self.build,
             "macos-signed-": self.release,
             "attestation-": self.evidence,
-            "release-consumer": self.evidence,
+            "release-consumer-": self.evidence,
             "release-bundle": self.evidence,
         }
         consumed = "\n".join(
@@ -916,6 +927,10 @@ class AssetNameTests(ReleaseWorkflowFiles):
                 self.assertIn(name, consumed)
         # `release-bundle` must stay outside every `release-*` download pattern.
         self.assertNotRegex(self.release + self.evidence + self.build, r"pattern: release-")
+        # Consumer artifacts must include the OS suffix; smoke runs on ubuntu and must
+        # download release-consumer-Linux specifically, not a bare release-consumer.
+        smoke = self.evidence_jobs["smoke"]
+        self.assertIn("name: release-consumer-Linux", smoke)
 
     def test_the_package_evidence_is_uploaded_and_never_consumed(self):
         # Builder evidence is in-house JSON outside the release policy: it is

@@ -18,11 +18,11 @@ fork request returns typed unsupported data instead of creating a child session
 or worktree.
 
 `runtime-packages/hermes/` is the official Hermes runtime package. Releases
-build it, attest it on Linux x86_64 (glibc and musl), and ship it with the
-signed catalog entry that authorizes the reserved `hermes` runtime id in the
-Linux daemon archives; the macOS daemon archive carries no runtime packages.
-The package carries the Hermes launch, resume and detection contract
-(`runtime.toml`, `detect.toml`) and supports only the locked 0.20.0 release.
+build it, attest it on Linux x86_64 (glibc and musl) and Apple Silicon
+(aarch64-apple-darwin), and ship it with the signed catalog entry that
+authorizes the reserved `hermes` runtime id in all daemon archives. The package
+carries the Hermes launch, resume and detection contract (`runtime.toml`,
+`detect.toml`) and supports only the locked 0.20.0 release.
 Its `operator.toml` closes the allowlist for the operator payload in
 `operator/`; the CLI verifies its paths and digests before installation. Pohunek loads the operator plugin and its generated skill
 only from the installed, enabled, and selected official package; the CLI
@@ -33,9 +33,7 @@ the CLI compiles it in and installs it beside the package's operator payload.
 `pohunek.runtime.hermes` package. Install it from an extracted Linux release
 archive with
 `pohunek plugin install runtime/packages/hermes.tar.zst --catalog runtime/runtime-catalog.json`.
-The macOS daemon archive carries no runtime package, so a macOS host has no
-source for the operator plugin until darwin packages are attested
-([#929](https://github.com/zajca/pohunek/issues/929)). Without a usable package, `integration install` and `update` refuse with a
+Without a usable package, `integration install` and `update` refuse with a
 typed source error and change nothing, `integration status` and `doctor`
 report the same code in `package_source_error`, and `doctor` fails its
 `asset_source` check with that code's recovery hint:

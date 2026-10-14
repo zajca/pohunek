@@ -166,10 +166,9 @@ The checks are in `crates/daemon/src/session/package_lifecycle/trust.rs` and
    canonical bytes.
 4. `package_incompatible` means the entry does not support this daemon: every
    official entry pins exactly the core version of its release
-   (`core = "=<version>"`), and current releases list only the Linux x86_64
-   glibc and musl targets. Install the catalog and packages from the daemon archive of
-   the version the daemon runs (`pohunek health` reports it); the Apple Silicon
-   archive currently carries no package.
+   (`core = "=<version>"`), and current releases list the Linux x86_64
+   glibc and musl targets, and Apple Silicon (aarch64-apple-darwin). Install the catalog and packages from the daemon archive of
+   the version the daemon runs (`pohunek health` reports it).
 
 ## 4. The selected package was disabled or removed
 

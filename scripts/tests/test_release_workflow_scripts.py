@@ -93,13 +93,17 @@ class RowMatrixTests(unittest.TestCase):
         rows = [
             {"runtime": "alpha", "target": "x86_64-unknown-linux-gnu"},
             {"runtime": "alpha", "target": "x86_64-unknown-linux-musl"},
+            {"runtime": "alpha", "target": "aarch64-apple-darwin"},
         ]
         result = run("row-matrix", self.matrix(rows))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            json.loads(result.stdout),
-            {"include": [dict(row, runner="ubuntu-latest") for row in rows]},
-        )
+        expected = []
+        for row in rows:
+            if row["target"] == "aarch64-apple-darwin":
+                expected.append(dict(row, runner="macos-15", daemon_artifact="macos-signed-daemon"))
+            else:
+                expected.append(dict(row, runner="ubuntu-latest", daemon_artifact="build-daemon-" + row["target"]))
+        self.assertEqual(json.loads(result.stdout), {"include": expected})
 
     def test_targets_restrict_the_rows_and_an_empty_selection_fails(self):
         rows = [
@@ -108,11 +112,11 @@ class RowMatrixTests(unittest.TestCase):
         ]
         result = run("row-matrix", self.matrix(rows), "x86_64-unknown-linux-musl")
         self.assertEqual([row["target"] for row in json.loads(result.stdout)["include"]], ["x86_64-unknown-linux-musl"])
-        self.assertNotEqual(run("row-matrix", self.matrix(rows), "aarch64-apple-darwin").returncode, 0)
+        self.assertNotEqual(run("row-matrix", self.matrix(rows), "riscv64gc-unknown-linux-gnu").returncode, 0)
 
     def test_a_target_without_a_runner_or_an_unsafe_name_is_refused(self):
         for row in (
-            {"runtime": "alpha", "target": "aarch64-apple-darwin"},
+            {"runtime": "alpha", "target": "riscv64gc-unknown-linux-gnu"},
             {"runtime": "al pha", "target": "x86_64-unknown-linux-gnu"},
             {"runtime": "../x", "target": "x86_64-unknown-linux-gnu"},
             {"runtime": "alpha", "target": "x86_64-unknown-linux-gnu; echo"},

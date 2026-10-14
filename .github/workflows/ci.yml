@@ -1203,7 +1203,7 @@ jobs:
       version: ${{ needs.release-rehearsal-build.outputs.version }}
       commit: ${{ github.sha }}
       mode: rehearsal
-      targets: x86_64-unknown-linux-gnu x86_64-unknown-linux-musl
+      targets: x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-apple-darwin
 
   # TS-binding drift is gated by paths filter (issue #125); it only runs on
   # schedule, push to main, manual dispatch (always a full run), or when the

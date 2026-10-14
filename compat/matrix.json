@@ -4,6 +4,10 @@
   "rows": [
     {
       "runtime": "claude",
+      "target": "aarch64-apple-darwin"
+    },
+    {
+      "runtime": "claude",
       "target": "x86_64-unknown-linux-gnu"
     },
     {
@@ -12,6 +16,10 @@
     },
     {
       "runtime": "codex",
+      "target": "aarch64-apple-darwin"
+    },
+    {
+      "runtime": "codex",
       "target": "x86_64-unknown-linux-gnu"
     },
     {
@@ -20,11 +28,19 @@
     },
     {
       "runtime": "hermes",
+      "target": "aarch64-apple-darwin"
+    },
+    {
+      "runtime": "hermes",
       "target": "x86_64-unknown-linux-gnu"
     },
     {
       "runtime": "hermes",
       "target": "x86_64-unknown-linux-musl"
+    },
+    {
+      "runtime": "pi",
+      "target": "aarch64-apple-darwin"
     },
     {
       "runtime": "pi",

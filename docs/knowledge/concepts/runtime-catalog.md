@@ -284,8 +284,7 @@ from the version (`major << 40 | minor << 20 | patch`, each component below
 `2^20`), `expires_at` is the commit time plus `catalog_validity_days` from
 `packaging/release-policy.json`, every entry's `core` is `=<version>`, an
 entry's platforms are the targets with an attested matrix row, and each
-digest is recomputed from bytes. The macOS arm64 daemon archive carries the
-signed catalog and no package while no macOS row exists. `cargo xtask release
+digest is recomputed from bytes. `cargo xtask release
 verify-inventory` re-verifies a finished bundle. See
 [release bundle](release-bundle.md).
 

@@ -34,14 +34,25 @@ fail() {
     exit 1
 }
 
-# Seconds since the epoch with a fraction (GNU date). The rows run on Linux
-# runners only (row-matrix); another date fails the row before the consumer.
+# Seconds since the epoch with a fraction, read through perl, which both the
+# Linux and the macOS runners carry.
 clock() {
-    now=$(date +%s.%N)
+    now=$(perl -MTime::HiRes=time -e 'printf "%.6f\n", time')
     case $now in
-        '' | *[!0-9.]* | *.*.*) fail "date +%s.%N is not supported here: $now" ;;
+        '' | *[!0-9.]* | *.*.*) fail "the clock is not supported here: $now" ;;
     esac
     printf '%s\n' "$now"
+}
+
+# sha256_check <file>: verify a SHA-256 checksum file. On Linux, use sha256sum.
+# On macOS and other BSD systems, use shasum -a 256. Both print their results
+# to stdout in the format this function checks.
+sha256_check() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -c "$1"
+    else
+        shasum -a 256 -c "$1"
+    fi
 }
 
 # write_junit <seconds> [<failure message>]: the consumer run as a JUnit
@@ -91,8 +102,8 @@ rm -f -- "$junit"
 stem=pohunek-daemon-$VERSION-$TARGET
 archive=$DAEMON_DIR/$stem.tar.gz
 package=$PACKAGES_DIR/pohunek-runtime-$RUNTIME-$VERSION.tar.zst
-(cd "$DAEMON_DIR" && sha256sum -c "$stem.tar.gz.sha256") || fail "daemon archive checksum mismatch"
-(cd "$PACKAGES_DIR" && sha256sum -c "pohunek-runtime-$RUNTIME-$VERSION.tar.zst.sha256") || fail "package archive checksum mismatch"
+(cd "$DAEMON_DIR" && sha256_check "$stem.tar.gz.sha256") || fail "daemon archive checksum mismatch"
+(cd "$PACKAGES_DIR" && sha256_check "pohunek-runtime-$RUNTIME-$VERSION.tar.zst.sha256") || fail "package archive checksum mismatch"
 
 # A short root keeps the suite's socket paths inside the AF_UNIX limit.
 work=$(mktemp -d /tmp/pkrow.XXXXXX)

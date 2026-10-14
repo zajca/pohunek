@@ -69,8 +69,7 @@ this order and naming only the file class and name:
 - `core = "=<version>"` for every entry; `release.binary_sets` covers all daemon
   targets of the policy, each digest computed from the unpacked archive.
 - An entry's `platforms` are exactly the targets with an attested matrix row.
-  Today these are the Linux glibc and musl targets; the macOS arm64 daemon
-  archive carries the signed catalog and no package until a macOS row exists.
+  These are the Linux glibc and musl targets, and Apple Silicon (aarch64-apple-darwin).
 - Each attestation digest is the SHA-256 of the attestation file bytes.
 - The catalog is signed with `--key-file` (never printed) and must verify
   against `--anchor`.

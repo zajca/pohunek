@@ -55,8 +55,8 @@ pohunek plugin install runtime/packages/pi.tar.zst --catalog runtime/runtime-cat
 pohunek plugin install runtime/packages/pi.tar.zst --catalog runtime/runtime-catalog.json --yes
 ```
 
-Current releases list only the Linux x86_64 glibc and musl targets; the Apple Silicon
-archive carries the catalog and no package. `pohunek doctor` must report the
+Current releases list the Linux x86_64 glibc and musl targets, and Apple Silicon
+(aarch64-apple-darwin). `pohunek doctor` must report the
 `catalog_trust_anchor` check as `ok` first. Installing `codex.tar.zst`,
 `claude.tar.zst` or `hermes.tar.zst` makes the package the only source of that
 runtime (see [Official aliases](#official-aliases)); install the Codex or

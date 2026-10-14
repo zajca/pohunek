@@ -30,4 +30,4 @@ sha256 = "f5de9f6249cc96eb94ca12f46d6e032f88ad2bec6465ec55eef82f809ec1e482"
 
 [[payload]]
 path = "skills/pohunek/SKILL.md"
-sha256 = "b0dbd39333bcb64dfc6a176dc40f8621ca2cb02c349b79ae83bc968acff25ff5"
+sha256 = "f2439e3ceab76de42956b47d98645cf8f21546154a2021b882ef9a22edf639b0"
