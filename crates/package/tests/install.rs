@@ -560,18 +560,24 @@ fn errors_never_echo_paths_or_contents() {
 /// body instead of spawning itself.
 const FD_LIMIT_CHILD: &str = "PACKAGE_TEST_FD_LIMIT_CHILD";
 
-/// Descriptor limit of the child: far below the 512 trees x 20 levels an
-/// extraction that kept every directory open would need, and above the
-/// handful the test harness and a 21-deep path hold.
-const FD_LIMIT: u64 = 128;
+/// Descriptor limit of the child. It sits above what the test harness and one
+/// path of [`TREE_DEPTH`] directories hold, and below both [`TREE_COUNT`] (one
+/// descriptor kept per tree) and the [`TREE_COUNT`] x [`TREE_DEPTH`]
+/// directories an extraction that kept every directory open would need.
+const FD_LIMIT: u64 = 32;
 
 /// Directory levels below each tree root.
-const TREE_DEPTH: usize = 20;
+const TREE_DEPTH: usize = 8;
+
+/// Trees of the archive, one file at the bottom of each. More trees than
+/// [`FD_LIMIT`], so a descriptor leaked per tree also exhausts the limit; the
+/// tree stays small because every extracted directory is synced on its own.
+const TREE_COUNT: usize = 48;
 
 fn deep_tree_entries() -> Vec<package::ArchiveEntry> {
-    (0..Limits::DEFAULT.max_files)
+    (0..TREE_COUNT)
         .map(|tree| {
-            let levels = vec!["d"; TREE_DEPTH].join("/");
+            let levels = ["d"; TREE_DEPTH].join("/");
             entry(
                 &format!("t{tree:03}/{levels}/f"),
                 format!("{tree}").as_bytes(),
