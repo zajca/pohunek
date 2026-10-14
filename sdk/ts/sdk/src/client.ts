@@ -110,6 +110,12 @@ export class Client {
     if (method === "session.wait_turn") {
       return this.sessionWaitTurn(params as SessionWaitTurnParams);
     }
+    if (method === "session.wait") {
+      return this.sessionWait(params as SessionWaitParams);
+    }
+    if (method === "session.output") {
+      return this.sessionOutput(params as SessionOutputParams);
+    }
     return this.callDirect(method, params);
   }
 
@@ -138,7 +144,7 @@ export class Client {
     if (params.wait_ms !== undefined) {
       return this.callDedicated("session.output", params, params.wait_ms);
     }
-    return this.call("session.output", params);
+    return this.callDirect("session.output", params);
   }
 
   public async sessionInput(params: SessionInputParams): Promise<SessionInputResult> {
