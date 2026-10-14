@@ -5,6 +5,11 @@ By default nextest builds the workspace test binaries. With `--archive-file`
 every nextest call instead extracts a prebuilt `cargo nextest archive` into
 this checkout's `target/` and lists or runs from it without compiling, which
 is how CI shares one build across the shard jobs.
+
+The macOS lane (`check-macos`, `run-macos`, `run-macos-tier`) takes the same
+archive and checks or runs the macOS package set as nextest selections. Its
+coverage check splits that set into disjoint groups (the PR lane, the tier
+job, and buckets), so a macOS test cannot be dropped without the check failing.
 """
 
 import argparse
@@ -30,6 +35,85 @@ CLI = "package(=pohunek-cli)"
 # form their own shard: CI runs them in a job whose Postgres service is gated
 # by a paths filter on the relay crates.
 SHARDS = ("core", "daemon", "relay", "cli", "relay-db", "heavy")
+# The macOS lane runs on every pull request whose platform inputs change and
+# holds the packages that gate it natively. The tier packages have macOS-only
+# test code too, but a PR does not run them: a separate main and nightly job
+# runs `run-macos-tier`. One archive builds all of them, so a package missing
+# from the archive is a coverage failure.
+LANE_PACKAGES = (
+    "pohunek-platform", "pohunek-paths", "pohunek-worker-protocol",
+    "pohunek-session-worker", "pohunek-service-config", "pohunek-test-support",
+    "pohunek-daemon", "pohunek-cli", "pohunek-hostcheck",
+)
+TIER_PACKAGES = ("pohunek-client", "pohunek-netbird", "pohunek-package", "xtask")
+MACOS_PACKAGES = LANE_PACKAGES + TIER_PACKAGES
+
+
+def package_set(names):
+    """The nextest filter selecting the packages `names`."""
+    return " or ".join(f"package(={name})" for name in names)
+
+
+MACOS_SET = package_set(MACOS_PACKAGES)
+LANE_SET = package_set(LANE_PACKAGES)
+TIER_SET = package_set(TIER_PACKAGES)
+# The run action of each macOS selection, by action name.
+MACOS_RUN_SETS = {"run-macos": LANE_SET, "run-macos-tier": TIER_SET}
+# Ignored tests of the macOS set that neither the lane nor the tier job runs,
+# each with the reason it is run elsewhere. `check-macos` requires every ignored
+# test of the scope to match exactly one bucket. A bucket is required to match
+# at least one test only when one of its `packages` is in the checked scope.
+Bucket = collections.namedtuple("Bucket", "packages expression")
+MACOS_BUCKETS = {
+    # Runs as root in the sudo step of the lane (APFS foreign-owner refusal).
+    "root": Bucket(
+        ("pohunek-platform",),
+        "package(=pohunek-platform) and "
+        "test(=filesystem::tests::apfs_foreign_owned_private_directory_is_rejected)",
+    ),
+    # Child images that only a parent test starts with `--ignored --exact`.
+    "fixture": Bucket(
+        ("pohunek-platform", "pohunek-daemon", "pohunek-test-support",
+         "pohunek-session-worker", "xtask"),
+        " or ".join((
+            "(binary_id(=pohunek-platform) and test(/(^|::)hold$/))",
+            "(package(=pohunek-daemon) and test(/(^|::)hold$/))",
+            "(binary(=launchd) and test(/(^|::)fixture_entry$/))",
+            "(binary(=process_lineage) and test(/(^|::)(hold|orphan)$/))",
+            "(package(=pohunek-test-support) and test(/(^|::)(umask_probe_test_env|umask_probe_tempdir|hold)$/))",
+            "(package(=pohunek-session-worker) and test(/(^|::)environment_listing_child$/))",
+            "(binary_id(=pohunek-daemon) and test(/(^|::)daemon_(git_under_|git_subprocesses_under_|fetch_under_)/))",
+            "(package(=xtask) and test(/(^|::)changed_files_scenario_under_ambient_git_variables$/))",
+        )),
+    ),
+    # Maintenance tools that print or rewrite a checked-in file. A developer runs
+    # them by hand with `--run-ignored only` (the Claude screen captures also
+    # need POHUNEK_CLAUDE_CAPTURE_DIR and egress); no CI job does.
+    "manual": Bucket(
+        ("xtask", "pohunek-cli"),
+        " or ".join((
+            "(package(=xtask) and test(/(^|::)(survey_hermetic_violations|regenerate_allow_list|regenerate_timing_baseline)$/))",
+            "(package(=pohunek-cli) and binary(=claude_package) and test(/^capture_the_real_claude_/))",
+        )),
+    ),
+    # Real-upstream tests of the runtime packages. The Linux package jobs run
+    # them under `--profile package`; the Hermes macOS job also runs
+    # `hermes_package` with `--include-ignored`.
+    "owned-elsewhere": Bucket(
+        ("pohunek-cli",),
+        "package(=pohunek-cli) and (binary(=claude_package) or binary(=codex_package) "
+        "or binary(=pi_package) or binary(=hermes_package)) "
+        "and not test(/^capture_the_real_claude_/)",
+    ),
+}
+# The scope of a check: its packages and the nextest selection of them.
+# `all` is the 13-package macOS set (the tier job); `lane` is the PR lane.
+MACOS_SCOPES = {"all": (MACOS_PACKAGES, MACOS_SET), "lane": (LANE_PACKAGES, LANE_SET)}
+
+
+def bucket_expression(scope_set, name):
+    """The selection of the ignored tests of bucket `name` within `scope_set`."""
+    return f"({scope_set}) and ({MACOS_BUCKETS[name].expression})"
 # Executable name of the session worker a real daemon starts.
 WORKER_EXECUTABLE = "pohunek-sessiond"
 # Argument that carries the worker's control socket path.
@@ -124,6 +208,36 @@ def junit_report(config, profile, root):
     return None
 
 
+def validate_macos_coverage(universe, groups, scope_packages):
+    """Require every test of the scope to be run by exactly one group.
+
+    `universe` holds every test of the scope, ignored ones included. `groups`
+    maps each group name ("lane", "tier" and each in-scope name of
+    MACOS_BUCKETS) to its tests: the non-ignored tests of the lane and tier
+    packages, and the ignored tests of each bucket. Also requires each package
+    of `scope_packages` to contribute a test, so an archive that dropped a
+    package cannot pass. Every group given must be non-empty.
+    """
+    if not universe:
+        raise ValueError("empty macOS test inventory")
+    packages = {binary.split("::")[0] for binary, _name in universe}
+    absent_packages = [name for name in scope_packages if name not in packages]
+    empty = [name for name, tests in groups.items() if not tests]
+    owners = collections.defaultdict(list)
+    for name, tests in groups.items():
+        for test in tests:
+            owners[test].append(name)
+    missing = sorted(universe - owners.keys())
+    extra = sorted(owners.keys() - universe)
+    overlap = {test: names for test, names in sorted(owners.items()) if len(names) > 1}
+    if absent_packages or empty or missing or extra or overlap:
+        raise ValueError(
+            f"macOS partition coverage failed: absent packages={absent_packages}, "
+            f"empty buckets={empty}, missing={missing}, extra={extra}, "
+            f"overlap={overlap}"
+        )
+
+
 class Archive:
     """A nextest archive, extracted into this checkout by its first use.
 
@@ -176,9 +290,9 @@ def nextest_command(subcommand, profile, archive):
     ]
 
 
-def inventory(expression=None, archive=None):
-    command = nextest_command("list", "ci", archive)
-    command.extend(["--run-ignored", "all", "--message-format", "json"])
+def inventory(expression=None, archive=None, run_ignored="all", profile="ci"):
+    command = nextest_command("list", profile, archive)
+    command.extend(["--run-ignored", run_ignored, "--message-format", "json"])
     if expression is not None:
         command.extend(["-E", expression])
     result = subprocess.run(command, cwd=ROOT, check=True, stdout=subprocess.PIPE)
@@ -389,8 +503,15 @@ def require_archive_file(archive):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("run", "check", "filter"))
+    parser.add_argument(
+        "action",
+        choices=("run", "check", "filter", "check-macos", *MACOS_RUN_SETS),
+    )
     parser.add_argument("shard", nargs="?", choices=SHARDS)
+    parser.add_argument(
+        "--scope", choices=tuple(MACOS_SCOPES),
+        help="check-macos only: `all` (default) checks the 13-package set, `lane` the PR lane's 9 packages",
+    )
     parser.add_argument(
         "--archive-file", type=Path,
         help="run and check from this `cargo nextest archive` file instead of building; "
@@ -404,6 +525,17 @@ def main():
         except ValueError as error:
             parser.error(str(error))
         archive = Archive(args.archive_file.resolve())
+    if args.action == "check-macos" or args.action in MACOS_RUN_SETS:
+        if archive is None:
+            parser.error(f"{args.action} needs --archive-file: the macOS lane never builds")
+        if args.shard is not None:
+            parser.error(f"{args.action} takes no shard")
+        if args.action == "check-macos":
+            check_macos(archive, args.scope or "all")
+            return
+        if args.scope is not None:
+            parser.error("--scope applies to check-macos only")
+        run_nextest("macos", MACOS_RUN_SETS[args.action], archive)
     expressions = filters()
     if args.action == "check":
         if args.shard is not None:
@@ -425,15 +557,49 @@ def main():
     profile = {"heavy": "heavy", "relay-db": "relay-db"}.get(args.shard, "ci")
     # CI uploads each job's report under its shard name. Local fast shard runs
     # share the ci report path; copy it before starting the next run if needed.
+    run_nextest(profile, expressions[args.shard], archive)
+
+
+def check_macos(archive, scope):
+    """List the scope's tests from the archive; exit 1 unless their partition is exact.
+
+    Only the groups that intersect the scope are listed: the tier group needs a
+    tier package in scope, and a bucket needs one of its packages in scope.
+    """
+    packages, scope_set = MACOS_SCOPES[scope]
+    universe = inventory(scope_set, archive, "all", "macos")
+    groups = {"lane": inventory(LANE_SET, archive, "default", "macos")}
+    if set(TIER_PACKAGES) & set(packages):
+        groups["tier"] = inventory(TIER_SET, archive, "default", "macos")
+    for name, bucket in MACOS_BUCKETS.items():
+        if set(bucket.packages) & set(packages):
+            groups[name] = inventory(bucket_expression(scope_set, name), archive, "only", "macos")
+    try:
+        validate_macos_coverage(universe, groups, packages)
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        sys.exit(1)
+    for name, tests in groups.items():
+        print(f"{name}: {len(tests)} tests")
+    print(
+        f"macOS coverage OK: {len(universe)} tests selected exactly once "
+        "(including ignored tests)"
+    )
+
+
+def run_nextest(profile, expression, archive):
+    """Run `expression` under `profile` and exit with nextest's status.
+
+    The profile's previous JUnit report is removed first: nextest writes the
+    report only when a run completes, so a report left by an earlier run would
+    pass for this one when the build fails first.
+    """
     with (ROOT / ".config/nextest.toml").open("rb") as config:
         report = junit_report(tomllib.load(config), profile, ROOT)
-    # nextest writes the report only when a run completes, so a report left by
-    # an earlier run (or restored with target/) would pass for this one when
-    # the build fails first; the job summary and upload must see none instead.
     if report is not None:
         report.unlink(missing_ok=True)
     command = nextest_command("run", profile, archive)
-    command.extend(["-E", expressions[args.shard]])
+    command.extend(["-E", expression])
     sys.exit(run_checked(command))
 
 

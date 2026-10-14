@@ -118,6 +118,25 @@ def shard_of(expression, fast):
         "fake nextest: unrecognized filter expression " + repr(expression))
 
 
+def macos_member(kind, scope, test):
+    """Whether a fixture test of the macOS set belongs to the selection `kind`.
+
+    `scope` restricts the selection to the lane packages (`lane`) or to all of
+    them (`all`), as the script's scope set does.
+    """
+    if not test.get("macos", False):
+        return False
+    if scope == "lane" and test.get("set") != "lane" and not test.get("lane_too", False):
+        return False
+    if kind == "universe":
+        return True
+    if kind == "lane":
+        return test.get("set") == "lane" or test.get("lane_too", False)
+    if kind == "tier":
+        return test.get("set") == "tier"
+    return kind in test.get("buckets", [])
+
+
 def main():
     argv = sys.argv[1:]
     if argv[:2] not in (["nextest", "list"], ["nextest", "run"]):
@@ -205,9 +224,28 @@ def main():
             signal.pause()
         return
 
+    fixture = json.loads(Path(os.environ["PARTITIONS_FIXTURE"]).read_text())
+    expression = argv[argv.index("-E") + 1] if "-E" in argv else None
+    macos_expressions = fixture.get("macos_expressions", {})
+    if expression in macos_expressions:
+        mode = argv[argv.index("--run-ignored") + 1] if "--run-ignored" in argv else "default"
+        kind, scope = macos_expressions[expression]
+        suites = {}
+        for entry in fixture["binaries"]:
+            cases = {}
+            for name, test in entry["tests"].items():
+                in_set = macos_member(kind, scope, test)
+                ignored = bool(test.get("ignored", False))
+                wanted = mode == "all" or (mode == "only") == ignored
+                cases[name] = {
+                    "ignored": ignored,
+                    "filter-match": {"status": "matches" if in_set and wanted else "mismatch"},
+                }
+            suites[entry["id"]] = {"testcases": cases}
+        print(json.dumps({"rust-suites": suites}))
+        return
     fast = os.environ["PARTITIONS_FAST"]
     selected = None if "-E" not in argv else shard_of(argv[argv.index("-E") + 1], fast)
-    fixture = json.loads(Path(os.environ["PARTITIONS_FIXTURE"]).read_text())
     suites = {}
     for entry in fixture["binaries"]:
         cases = {}
@@ -299,6 +337,11 @@ class ScriptScenario(unittest.TestCase):
 
     def set_inventory(self, binaries):
         self.inventory.write_text(json.dumps({"binaries": binaries}))
+
+    def set_macos_inventory(self, binaries):
+        self.inventory.write_text(json.dumps({
+            "binaries": binaries, "macos_expressions": MACOS_EXPRESSIONS,
+        }))
 
     def script_environment(self, extra_env=None):
         environment = {**os.environ}
@@ -745,6 +788,293 @@ class WorkerRunActionTests(ScriptScenario):
                     os.killpg(pids["worker"], signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+
+
+def expression_kinds():
+    """The fake's answer for each selection the script builds: kind and scope."""
+    kinds = {
+        partitions.MACOS_SET: ["universe", "all"],
+        partitions.LANE_SET: ["lane", "all"],
+        partitions.TIER_SET: ["tier", "all"],
+    }
+    for packages, scope_set in partitions.MACOS_SCOPES.values():
+        for name in partitions.MACOS_BUCKETS:
+            scope = "lane" if scope_set == partitions.LANE_SET else "all"
+            kinds[partitions.bucket_expression(scope_set, name)] = [name, scope]
+    return kinds
+
+
+MACOS_EXPRESSIONS = expression_kinds()
+
+
+def macos_test(set_name, ignored=False, buckets=(), **extra):
+    """A fixture test of the macOS set in the package group `set_name`."""
+    return {"macos": True, "set": set_name, "ignored": ignored,
+            "buckets": list(buckets), **extra}
+
+
+def macos_inventory():
+    """One binary per macOS package, each with a lane probe, plus one test per bucket.
+
+    The five ignored tests are the real ones the buckets name: the APFS root
+    test, a fixture image, a daemon git child, a maintenance tool and a
+    real-upstream claude test. The tier packages carry one probe each too.
+    """
+    def group_of(name):
+        return "tier" if name in partitions.TIER_PACKAGES else "lane"
+
+    binaries = [
+        {"id": name, "tests": {
+            f"{name.removeprefix('pohunek-')}_tests::lane_probe": macos_test(group_of(name)),
+        }}
+        for name in partitions.MACOS_PACKAGES
+    ]
+    binaries[0]["tests"].update({
+        "filesystem::tests::apfs_foreign_owned_private_directory_is_rejected": {
+            "macos": True, "set": "lane", "ignored": True, "buckets": ["root"]},
+        "process::hold::hold": {"macos": True, "set": "lane", "ignored": True, "buckets": ["fixture"]},
+    })
+    binaries[partitions.MACOS_PACKAGES.index("pohunek-daemon")]["tests"][
+        "worktree::git_env_tests::daemon_git_under_config_entries"] = {
+            "macos": True, "set": "lane", "ignored": True, "buckets": ["fixture"]}
+    binaries[partitions.MACOS_PACKAGES.index("pohunek-cli")]["tests"][
+        "a_real_claude_session_launches"] = {
+            "macos": True, "set": "lane", "ignored": True, "buckets": ["owned-elsewhere"]}
+    binaries[partitions.MACOS_PACKAGES.index("pohunek-cli")]["tests"][
+        "capture_the_real_claude_screens"] = {
+            "macos": True, "set": "lane", "ignored": True, "buckets": ["manual"]}
+    binaries[partitions.MACOS_PACKAGES.index("pohunek-cli")]["id"] = "pohunek-cli::claude_package"
+    binaries[partitions.MACOS_PACKAGES.index("xtask")]["tests"][
+        "regenerate_allow_list"] = {
+            "macos": True, "set": "tier", "ignored": True, "buckets": ["manual"]}
+    return binaries
+
+
+def fixture_test(binaries, binary, name):
+    """The fixture entry of one test, so a scenario can edit it in place."""
+    entry = next(b for b in binaries if b["id"] == binary)
+    return entry["tests"][name]
+
+
+class MacosLaneTests(ScriptScenario):
+    """`check-macos` proves the lane partition; `run-macos` runs it from the archive."""
+
+    def setUp(self):
+        super().setUp()
+        self.archive = self.root / "macos-built-elsewhere.tar.zst"
+        self.archive.write_bytes(b"cargo nextest archive built on macOS")
+        self.binaries = macos_inventory()
+        self.set_macos_inventory(self.binaries)
+
+    def check(self, *extra):
+        return self.run_script("check-macos", "--archive-file", str(self.archive), *extra)
+
+    def test_a_covering_macos_partition_is_reported_bucket_by_bucket(self):
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("lane: 9 tests", result.stdout)
+        self.assertIn("tier: 4 tests", result.stdout)
+        self.assertIn("root: 1 tests", result.stdout)
+        self.assertIn("fixture: 2 tests", result.stdout)
+        self.assertIn("owned-elsewhere: 1 tests", result.stdout)
+        self.assertIn("manual: 2 tests", result.stdout)
+        self.assertIn(
+            "macOS coverage OK: 19 tests selected exactly once (including ignored tests)",
+            result.stdout,
+        )
+
+    def test_check_lists_the_archive_once_per_selection_under_the_macos_profile(self):
+        self.assertEqual(self.check().returncode, 0)
+        calls = self.nextest_calls()
+        self.assertEqual([call["name"] for call in calls], ["cargo-nextest"] * 7)
+        argvs = [call["argv"] for call in calls]
+        self.assertEqual(argvs[0][:4], ["nextest", "list", "--profile", "macos"])
+        self.assertEqual(argvs[0][argvs[0].index("--archive-file") + 1], str(self.archive))
+        self.assertEqual(
+            [argv[argv.index("--run-ignored") + 1] for argv in argvs],
+            ["all", "default", "default", "only", "only", "only", "only"],
+        )
+        self.assertEqual(argvs[0][argvs[0].index("-E") + 1], partitions.MACOS_SET)
+        self.assertNotIn("--workspace", argvs[0])
+        self.assertNotIn("--all-features", argvs[0])
+
+    def test_an_ignored_test_in_no_bucket_fails_the_check(self):
+        self.binaries[0]["tests"]["new_real_probe"] = {
+            "macos": True, "ignored": True, "buckets": []}
+        self.set_macos_inventory(self.binaries)
+        result = self.check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("macOS partition coverage failed", result.stderr)
+        self.assertIn("missing=[('pohunek-platform', 'new_real_probe')]", result.stderr)
+
+    def test_a_test_in_two_buckets_is_reported_as_an_overlap(self):
+        fixture_test(self.binaries, "pohunek-platform",
+                "filesystem::tests::apfs_foreign_owned_private_directory_is_rejected"
+                )["buckets"] = ["root", "fixture"]
+        self.set_macos_inventory(self.binaries)
+        result = self.check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("overlap=", result.stderr)
+        self.assertIn("filesystem::tests::apfs_foreign_owned_private_directory_is_rejected", result.stderr)
+        self.assertIn("'fixture'", result.stderr)
+
+    def test_a_package_absent_from_the_archive_fails_the_check(self):
+        self.binaries = [b for b in self.binaries if b["id"] != "pohunek-paths"]
+        self.set_macos_inventory(self.binaries)
+        result = self.check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("absent packages=['pohunek-paths']", result.stderr)
+
+    def test_a_bucket_matching_no_test_is_reported_empty(self):
+        fixture_test(self.binaries, "pohunek-platform",
+                "filesystem::tests::apfs_foreign_owned_private_directory_is_rejected"
+                )["buckets"] = []
+        self.set_macos_inventory(self.binaries)
+        result = self.check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("empty buckets=['root']", result.stderr)
+
+    def lane_only(self):
+        """The fixture inventory of an archive built for the lane packages only."""
+        return [b for b in self.binaries if b["id"].split("::")[0] in partitions.LANE_PACKAGES]
+
+    def test_lane_scope_passes_with_only_the_lane_packages_in_the_archive(self):
+        self.set_macos_inventory(self.lane_only())
+        result = self.check("--scope", "lane")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("lane: 9 tests", result.stdout)
+        self.assertIn("root: 1 tests", result.stdout)
+        self.assertIn("fixture: 2 tests", result.stdout)
+        self.assertIn("owned-elsewhere: 1 tests", result.stdout)
+        self.assertIn("manual: 1 tests", result.stdout)
+        self.assertNotIn("tier:", result.stdout)
+        self.assertIn("macOS coverage OK: 14 tests", result.stdout)
+
+    def test_lane_scope_lists_only_the_lane_set_and_its_buckets(self):
+        self.set_macos_inventory(self.lane_only())
+        self.assertEqual(self.check("--scope", "lane").returncode, 0)
+        calls = self.nextest_calls()
+        # Universe, lane, then every bucket that has a lane package, each
+        # intersected with the lane set; the tier set is never listed.
+        in_scope = [
+            name for name, bucket in partitions.MACOS_BUCKETS.items()
+            if set(bucket.packages) & set(partitions.LANE_PACKAGES)
+        ]
+        self.assertEqual(len(calls), 2 + len(in_scope))
+        expressions = [call["argv"][call["argv"].index("-E") + 1] for call in calls]
+        self.assertEqual(expressions[0], partitions.LANE_SET)
+        self.assertEqual(expressions[1], partitions.LANE_SET)
+        self.assertNotIn(partitions.TIER_SET, expressions)
+        for expression in expressions[2:]:
+            self.assertTrue(expression.startswith(f"({partitions.LANE_SET}) and ("))
+
+    def test_lane_scope_still_fails_on_an_unbucketed_ignored_lane_test(self):
+        self.binaries[0]["tests"]["new_real_probe"] = macos_test("lane", ignored=True)
+        self.set_macos_inventory(self.lane_only())
+        result = self.check("--scope", "lane")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("missing=[('pohunek-platform', 'new_real_probe')]", result.stderr)
+
+    def test_lane_scope_fails_an_in_scope_bucket_that_matches_nothing(self):
+        fixture_test(self.binaries, "pohunek-platform",
+                     "filesystem::tests::apfs_foreign_owned_private_directory_is_rejected"
+                     )["buckets"] = []
+        self.set_macos_inventory(self.lane_only())
+        result = self.check("--scope", "lane")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("empty buckets=['root']", result.stderr)
+
+    def test_all_scope_requires_every_package_of_the_thirteen(self):
+        self.set_macos_inventory(self.lane_only())
+        result = self.check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "absent packages=['pohunek-client', 'pohunek-netbird', 'pohunek-package', 'xtask']",
+            result.stderr,
+        )
+
+    def test_scope_is_refused_for_the_run_actions(self):
+        result = self.run_script("run-macos", "--archive-file", str(self.archive), "--scope", "lane")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--scope applies to check-macos only", result.stderr)
+        self.assertEqual(self.nextest_calls(), [])
+
+    def test_run_macos_runs_the_lane_from_the_archive_and_removes_a_stale_report(self):
+        stale = self.root / "target" / "nextest" / "macos" / "junit.xml"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("<testsuites/>")
+        result = self.run_script(
+            "run-macos", "--archive-file", str(self.archive),
+            extra_env={"PARTITIONS_STALE_REPORT": str(stale)},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(stale.exists())
+        calls = self.nextest_calls()
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]["argv"]
+        self.assertEqual(argv[1:4], ["run", "--profile", "macos"])
+        self.assertEqual(argv[argv.index("--archive-file") + 1], str(self.archive))
+        self.assertEqual(argv[argv.index("-E") + 1], partitions.LANE_SET)
+        self.assertFalse(calls[0]["stale_report_exists"])
+
+    def test_run_macos_tier_runs_only_the_tier_packages_under_the_macos_profile(self):
+        stale = self.root / "target" / "nextest" / "macos" / "junit.xml"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("<testsuites/>")
+        result = self.run_script(
+            "run-macos-tier", "--archive-file", str(self.archive),
+            extra_env={"PARTITIONS_STALE_REPORT": str(stale)},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(stale.exists())
+        calls = self.nextest_calls()
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]["argv"]
+        self.assertEqual(argv[1:4], ["run", "--profile", "macos"])
+        self.assertEqual(argv[argv.index("--archive-file") + 1], str(self.archive))
+        expression = argv[argv.index("-E") + 1]
+        self.assertEqual(expression, partitions.TIER_SET)
+        for package in partitions.TIER_PACKAGES:
+            self.assertIn(f"package(={package})", expression)
+        for package in partitions.LANE_PACKAGES:
+            self.assertNotIn(f"package(={package})", expression)
+        self.assertFalse(calls[0]["stale_report_exists"])
+
+    def test_a_tier_test_that_the_lane_selects_is_reported_as_an_overlap(self):
+        fixture_test(self.binaries, "pohunek-netbird", "netbird_tests::lane_probe")["lane_too"] = True
+        self.set_macos_inventory(self.binaries)
+        result = self.check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("overlap=", result.stderr)
+        self.assertIn("'lane', 'tier'", result.stderr)
+        self.assertIn("netbird_tests::lane_probe", result.stderr)
+
+    def test_an_ignored_tier_test_in_no_bucket_fails_the_check(self):
+        self.binaries[partitions.MACOS_PACKAGES.index("pohunek-client")]["tests"][
+            "new_real_probe"] = macos_test("tier", ignored=True)
+        self.set_macos_inventory(self.binaries)
+        result = self.check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("macOS partition coverage failed", result.stderr)
+        self.assertIn("missing=[('pohunek-client', 'new_real_probe')]", result.stderr)
+
+    def test_run_macos_status_is_the_runner_status(self):
+        result = self.run_script(
+            "run-macos", "--archive-file", str(self.archive),
+            extra_env={"PARTITIONS_FAKE_RUN_STATUS": "3"},
+        )
+        self.assertEqual(result.returncode, 3, result.stderr)
+
+    def test_the_macos_actions_refuse_a_build_and_a_shard(self):
+        for arguments in (("check-macos",), ("run-macos",), ("run-macos-tier",)):
+            with self.subTest(arguments=arguments):
+                result = self.run_script(*arguments)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("--archive-file", result.stderr)
+        result = self.run_script("run-macos", "core", "--archive-file", str(self.archive))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("takes no shard", result.stderr)
+        self.assertEqual(self.nextest_calls(), [])
 
 
 class LeakedWorkerTests(unittest.TestCase):
