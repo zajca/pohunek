@@ -317,10 +317,13 @@ session is rolled back. The `[input]` table is parsed strictly: a daemon of
 release 0.34.x rejects a descriptor that carries `ready`, so a package with this
 key needs a daemon that knows it.
 
-A host profile over a `screen_idle` base may name a detection manifest override only if that
-override declares an idle rule on a screen region (for example `live_prompt_box`). An override with no
-such rule, such as `rules = []` or only working and blocked rules, is an `invalid_profile` error at
-profile load, so `doctor` reports it and no session is created from it.
+Readiness is `screen_idle` only while the effective detection manifest has an
+idle rule on a screen region (for example `live_prompt_box`). A host profile
+over a `screen_idle` base whose override manifest has no such rule, such as
+`rules = []` or only working and blocked rules, loads, and its sessions use
+`bracketed_paste` readiness. `pohunek doctor` reports that profile as a warning
+(`agent_profile_<name>`); adding an idle rule on a screen region to the
+override restores screen readiness.
 
 ## Versioning official packages
 

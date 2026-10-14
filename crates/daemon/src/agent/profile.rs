@@ -246,6 +246,35 @@ impl ResolvedAgent {
         )
     }
 
+    /// The input readiness a launch of this agent waits for: the base
+    /// runtime's, as far as the profile's override manifest can report it.
+    #[must_use]
+    pub(crate) fn input_readiness(&self) -> InputReadiness {
+        let declared = self.definition.input_readiness();
+        match self.override_manifest() {
+            Some(manifest) => declared.for_manifest(manifest),
+            None => declared,
+        }
+    }
+
+    /// Whether the profile's override manifest keeps this agent from the
+    /// screen readiness its base runtime declares.
+    ///
+    /// Such a profile launches with bracketed-paste readiness, the behaviour
+    /// before runtimes could declare `input.ready`; doctor reports it so the
+    /// owner can add the missing rule.
+    #[must_use]
+    pub(crate) fn override_lacks_screen_readiness(&self) -> bool {
+        self.definition.input_readiness() == InputReadiness::ScreenIdle
+            && self.input_readiness() != InputReadiness::ScreenIdle
+    }
+
+    fn override_manifest(&self) -> Option<&Manifest> {
+        self.profile
+            .as_ref()
+            .and_then(|profile| profile.manifest.as_ref())
+    }
+
     /// The launch arguments frozen into the resume snapshot: the profile's,
     /// else the base descriptor's fixed arguments (never the host shell
     /// command's, which is not part of the runtime).
@@ -1092,21 +1121,6 @@ fn resolve_profile_text(
     });
     let native = resolve_native(name, &definition, raw.resume.as_ref())?;
     let manifest_source = resolve_manifest(name, dir, raw.manifest.as_deref())?;
-    // The override replaces the base's detection, so a base that waits for a
-    // screen idle state needs the override to declare one.
-    if let Some(source) = &manifest_source {
-        if definition.input_readiness() == InputReadiness::ScreenIdle
-            && !source.manifest.has_screen_idle_rule()
-        {
-            return Err(invalid_profile(
-                name,
-                &format!(
-                    "the override manifest '{}' declares no idle rule on a screen region, but the base runtime waits for screen readiness (input.ready = screen_idle)",
-                    raw.manifest.as_deref().unwrap_or_default()
-                ),
-            ));
-        }
-    }
     let binding_json = serde_json::to_vec(definition.binding())
         .map_err(|err| invalid_profile(name, &format!("launch binding: {err}")))?;
     let inputs = ProfileInputs::of(

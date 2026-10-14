@@ -77,7 +77,8 @@ impl DetectorConfig {
     /// Detector config for a session launched with `pin`: the override
     /// manifest when there is one, else the manifest of the definition the pin
     /// resolves to, else the generic shell manifest. An override manifest keeps
-    /// the readiness of the definition the pin resolves to.
+    /// the readiness of the definition the pin resolves to, as far as the
+    /// override can report it ([`InputReadiness::for_manifest`]).
     #[must_use]
     pub fn for_pinned(
         host: &RuntimeHost,
@@ -88,8 +89,9 @@ impl DetectorConfig {
         match override_manifest {
             Some(manifest) => Self {
                 detection: DetectionConfig::default(),
+                input_readiness: readiness_of(host.definition_for_pin(base, pin))
+                    .for_manifest(&manifest),
                 manifest: Some(manifest),
-                input_readiness: readiness_of(host.definition_for_pin(base, pin)),
             },
             None => host.definition_for_pin(base, pin).map_or_else(
                 |_unresolved| Self::generic_shell(),
@@ -144,8 +146,8 @@ impl DetectorConfig {
         match override_manifest {
             Some(manifest) => Self {
                 detection: DetectionConfig::default(),
+                input_readiness: readiness_of(host.resolve_ref(base)).for_manifest(&manifest),
                 manifest: Some(manifest),
-                input_readiness: readiness_of(host.resolve_ref(base)),
             },
             None => Self::for_agent(host, base),
         }
