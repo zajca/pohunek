@@ -435,18 +435,52 @@ fn an_archive_that_also_carries_runtime_toml_is_refused() {
     );
 }
 
+/// Hostile `[reactions]` tables are refused at install, each with its own
+/// reason. The accepted shape is covered by the reaction scenarios.
 #[test]
-fn a_reactions_table_is_refused_until_reactions_ship() {
+fn hostile_reactions_are_refused() {
     let fixture = Fixture::new();
-    let document = format!(
-        "{}\n[reactions.on_stop]\nevents = [\"session_stopped\"]\nargv = [\"bin/work\", \"{SENTINEL}\"]\n",
-        manifest("1.0.0", "bin/work")
-    );
-    let message = fixture.refused_manifest("reactions", &plugin_files(&document));
-    assert!(
-        message.contains("does not match the manifest schema"),
-        "[reactions] table: {message}"
-    );
+    for (case, table, needle) in [
+        (
+            "unknown key",
+            "[reactions.on_stop]\nevents = [\"session_stopped\"]\nargv = [\"bin/work\", \"{SENTINEL}\"]\nevery_s = 60\n".to_owned(),
+            "does not match the manifest schema",
+        ),
+        (
+            "attach stream event",
+            "[reactions.on_attach]\nevents = [\"attach_opened\"]\nargv = [\"bin/work\"]\n".to_owned(),
+            "events must be",
+        ),
+        (
+            "event outside the table",
+            "[reactions.on_guess]\nevents = [\"session_exploded\"]\nargv = [\"bin/work\"]\n".to_owned(),
+            "events must be",
+        ),
+        (
+            "repeated event",
+            "[reactions.on_stop]\nevents = [\"session_stopped\", \"session_stopped\"]\nargv = [\"bin/work\"]\n".to_owned(),
+            "events must be",
+        ),
+        (
+            "no events",
+            "[reactions.on_stop]\nevents = []\nargv = [\"bin/work\"]\n".to_owned(),
+            "events must be",
+        ),
+        (
+            "bare argv[0]",
+            "[reactions.on_stop]\nevents = [\"session_stopped\"]\nargv = [\"work\"]\n".to_owned(),
+            "is a bare command name",
+        ),
+        (
+            "reaction name outside the grammar",
+            "[reactions.OnStop]\nevents = [\"session_stopped\"]\nargv = [\"bin/work\"]\n".to_owned(),
+            "an action, job, service or reaction name is not",
+        ),
+    ] {
+        let document = format!("{}\n{table}", manifest("1.0.0", "bin/work"));
+        let message = fixture.refused_manifest(case, &plugin_files(&document));
+        assert!(message.contains(needle), "{case}: {message}");
+    }
 }
 
 /// A manifest with one job and one service besides the action.
@@ -498,7 +532,7 @@ fn hostile_jobs_and_services_are_refused() {
         (
             "service name outside the grammar",
             format!("[services.Notify]\nargv = [\"bin/work\", \"{SENTINEL}\"]\n"),
-            "an action, job or service name is not",
+            "an action, job, service or reaction name is not",
         ),
     ] {
         let document = format!("{base}\n{table}");

@@ -714,3 +714,35 @@ impl Drop for Planted {
         unset_manager_variable(&self.0);
     }
 }
+
+/// The platform key of the reaction dispatcher unit, as `units.rs` builds it.
+fn dispatcher_key() -> PluginUnitKey {
+    PluginUnitKey::new("pohunek:reactions", PluginUnitKind::Service, "dispatch")
+        .expect("the dispatcher key")
+}
+
+/// The dispatcher unit is installed while an enabled plugin declares a
+/// reaction and removed once none does.
+pub(crate) async fn the_dispatcher_unit_follows_the_reacting_plugins() {
+    let mut managed = Managed::new(KNOBS);
+    let plugin = Plugin::new("acme.react").reaction("on_created", &["session_created"], "react");
+    managed.enable(&plugin).await;
+
+    let namespace = managed.units.context.namespace().expect("the namespace");
+    let unit = native::names(&namespace, &[dispatcher_key()]);
+    assert_eq!(unit.len(), 1, "one dispatcher unit");
+    assert!(
+        managed.unit_files().contains(&unit[0]),
+        "the dispatcher unit {} is installed",
+        unit[0]
+    );
+
+    disable_plugin(&managed.units.context, "acme.react")
+        .await
+        .expect("disable the plugin");
+    assert!(
+        !managed.unit_files().contains(&unit[0]),
+        "no enabled plugin declares a reaction, so the dispatcher unit {} is removed",
+        unit[0]
+    );
+}

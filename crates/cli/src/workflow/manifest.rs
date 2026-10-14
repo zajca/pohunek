@@ -1,11 +1,11 @@
 //! The `workflow.toml` manifest of a workflow plugin archive.
 //!
 //! The manifest names the plugin and declares its actions, periodic jobs and
-//! long-running services as argv arrays that run without a shell. Parsing is
-//! strict: the document is size-capped before it is parsed, every table
-//! refuses unknown keys, and every `argv[0]` names either an executable file
-//! of the same archive by a package path or an absolute host path. Tables of
-//! later workflow slices are unknown keys here.
+//! long-running services, and its event reactions as argv arrays that run
+//! without a shell. Parsing is strict: the document is size-capped before it
+//! is parsed, every table refuses unknown keys, and every `argv[0]` names
+//! either an executable file of the same archive by a package path or an
+//! absolute host path.
 
 // Rust guideline compliant 2026-10-13
 
@@ -42,6 +42,12 @@ const SCHEMA: u32 = 1;
 /// state file names, so they stay short and shell-safe; the unit name bound
 /// (`MAX_PLUGIN_UNIT_NAME_BYTES`) is larger.
 const MAX_ACTION_NAME_BYTES: usize = 32;
+
+/// Longest number of events one reaction subscribes to.
+///
+/// The public event table holds fifteen entries, so the cap only stops a
+/// manifest from listing the same events in a loop of its own making.
+const MAX_REACTION_EVENTS: usize = 32;
 
 /// Longest plugin description: 1 KiB.
 ///
@@ -107,6 +113,37 @@ pub(crate) struct Service {
     pub(crate) argv: Vec<String>,
 }
 
+/// One declared event reaction.
+///
+/// A reaction runs once for every event of its `events` list that the daemon
+/// publishes on the public subscription. The events are the protocol's event
+/// table minus the attach stream events; see [`reactable`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Reaction {
+    /// Public event names, distinct and non-empty.
+    pub(crate) events: Vec<String>,
+    /// Program and fixed arguments, under the rules of [`Action::argv`].
+    pub(crate) argv: Vec<String>,
+    /// Requested run deadline; enforced against the owner's
+    /// `action_timeout_max_ms` when a reaction runs.
+    pub(crate) timeout_ms: Option<NonZeroU64>,
+}
+
+/// Whether a reaction may subscribe to the public event `name`.
+///
+/// Every event of the protocol's event table qualifies except the attach
+/// stream events, whose payloads describe terminal streams rather than
+/// session state a reaction can act on.
+pub(crate) fn reactable(name: &str) -> bool {
+    !matches!(
+        name,
+        protocol::event::ATTACH_OPENED | protocol::event::ATTACH_CLOSED
+    ) && protocol::event::EVENT_SPECS
+        .iter()
+        .any(|spec| spec.name == name)
+}
+
 /// argv with a package-path `argv[0]` resolved below `files`, the extracted
 /// tree of the package.
 pub(crate) fn resolve_argv(argv: &[String], files: &Path) -> Vec<String> {
@@ -135,13 +172,16 @@ pub(crate) struct Manifest {
     pub(crate) jobs: BTreeMap<String, Job>,
     /// Long-running services by name.
     pub(crate) services: BTreeMap<String, Service>,
+    /// Event reactions by name.
+    pub(crate) reactions: BTreeMap<String, Reaction>,
 }
 
 impl Manifest {
-    /// Whether the manifest declares a job or a service, which run as
-    /// service manager units.
+    /// Whether the manifest declares a job, a service or a reaction. Such a
+    /// plugin needs the service manager: jobs and services run as its units,
+    /// and reactions run in the namespace's dispatcher unit.
     pub(crate) fn has_units(&self) -> bool {
-        !self.jobs.is_empty() || !self.services.is_empty()
+        !self.jobs.is_empty() || !self.services.is_empty() || !self.reactions.is_empty()
     }
 }
 
@@ -159,6 +199,8 @@ struct Document {
     jobs: BTreeMap<String, Job>,
     #[serde(default)]
     services: BTreeMap<String, Service>,
+    #[serde(default)]
+    reactions: BTreeMap<String, Reaction>,
 }
 
 #[derive(Deserialize)]
@@ -203,17 +245,17 @@ pub(crate) enum Invalid {
     /// The description is empty or too long.
     #[error("the plugin description must be 1..={MAX_DESCRIPTION_BYTES} bytes")]
     Description,
-    /// The manifest declares no action, job or service.
-    #[error("{MANIFEST_PATH} declares no action, job or service")]
+    /// The manifest declares no action, job, service or reaction.
+    #[error("{MANIFEST_PATH} declares no action, job, service or reaction")]
     NoActions,
-    /// An action, job or service name breaks the grammar; the name is not
-    /// echoed.
-    #[error("an action, job or service name is not [a-z][a-z0-9_]{{0,31}}")]
+    /// An action, job, service or reaction name breaks the grammar; the name
+    /// is not echoed.
+    #[error("an action, job, service or reaction name is not [a-z][a-z0-9_]{{0,31}}")]
     ActionName,
-    /// An action's, job's or service's argv breaks a rule.
+    /// An action's, job's, service's or reaction's argv breaks a rule.
     #[error("{kind} {action}: {fault}")]
     Argv {
-        /// `action`, `job` or `service`.
+        /// `action`, `job`, `service` or `reaction`.
         kind: &'static str,
         /// The name, valid under the name grammar.
         action: String,
@@ -226,6 +268,13 @@ pub(crate) enum Invalid {
     Interval {
         /// The job name, valid under the name grammar.
         job: String,
+    },
+    /// A reaction's `events` is empty, too long, repeats a name or names an
+    /// event that is not reactable.
+    #[error("reaction {reaction}: events must be 1..={MAX_REACTION_EVENTS} distinct public event names, none of them attach_opened or attach_closed")]
+    Events {
+        /// The reaction name, valid under the name grammar.
+        reaction: String,
     },
 }
 
@@ -315,7 +364,11 @@ pub(crate) fn parse(
     if description.is_empty() || description.len() > MAX_DESCRIPTION_BYTES {
         return Err(Invalid::Description);
     }
-    if document.actions.is_empty() && document.jobs.is_empty() && document.services.is_empty() {
+    if document.actions.is_empty()
+        && document.jobs.is_empty()
+        && document.services.is_empty()
+        && document.reactions.is_empty()
+    {
         return Err(Invalid::NoActions);
     }
     let declared = (document
@@ -333,6 +386,12 @@ pub(crate) fn parse(
             .services
             .iter()
             .map(|(name, service)| ("service", name, &service.argv)),
+    )
+    .chain(
+        document
+            .reactions
+            .iter()
+            .map(|(name, reaction)| ("reaction", name, &reaction.argv)),
     );
     for (kind, name, argv) in declared {
         if !valid_action_name(name) {
@@ -351,6 +410,13 @@ pub(crate) fn parse(
     {
         return Err(Invalid::Interval { job: name.clone() });
     }
+    for (name, reaction) in &document.reactions {
+        if !events_valid(&reaction.events) {
+            return Err(Invalid::Events {
+                reaction: name.clone(),
+            });
+        }
+    }
     Ok(Manifest {
         identity: PackageIdentity {
             id: document.plugin.id,
@@ -360,7 +426,19 @@ pub(crate) fn parse(
         actions: document.actions,
         jobs: document.jobs,
         services: document.services,
+        reactions: document.reactions,
     })
+}
+
+/// Whether `events` is non-empty, bounded, distinct and reactable.
+fn events_valid(events: &[String]) -> bool {
+    if events.is_empty() || events.len() > MAX_REACTION_EVENTS {
+        return false;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    events
+        .iter()
+        .all(|event| reactable(event) && seen.insert(event.as_str()))
 }
 
 /// Whether `name` matches `[a-z][a-z0-9_]{0,31}`.

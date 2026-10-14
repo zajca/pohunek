@@ -16,6 +16,7 @@
 // Rust guideline compliant 2026-10-13
 
 pub(crate) mod config;
+pub(crate) mod dispatch;
 pub(crate) mod manifest;
 pub(crate) mod runlog;
 pub(crate) mod runner;

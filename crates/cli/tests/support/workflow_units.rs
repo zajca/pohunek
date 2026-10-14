@@ -78,6 +78,20 @@ wait
 /// Exits with status 3 at once.
 const CRASH: &str = "#!/bin/sh\nexit 3\n";
 
+/// Reaction program: records its context and the origin marker it received,
+/// one file per run, then sleeps three seconds when the plugin state holds a
+/// `slow` marker.
+const REACT: &str = r#"#!/bin/sh
+printf '%s' "$POHUNEK_PLUGIN_CONTEXT" > "$POHUNEK_PLUGIN_STATE_DIR/context.$$.json"
+printf '%s' "${POHUNEK_SESSION_ID:-absent}" > "$POHUNEK_PLUGIN_STATE_DIR/origin.$$.txt"
+if [ -e "$POHUNEK_PLUGIN_STATE_DIR/slow" ]; then /bin/sleep 3; fi
+if [ -e "$POHUNEK_PLUGIN_STATE_DIR/wedge" ]; then
+    : > "$POHUNEK_PLUGIN_STATE_DIR/wedged.$$"
+    trap '' TERM
+    /bin/sleep 60
+fi
+"#;
+
 /// Writes its whole environment to `env-<pid>.txt`, then renames it to
 /// `env.txt` once complete.
 const ENV: &str = r#"#!/bin/sh
@@ -136,6 +150,17 @@ impl Plugin {
         self
     }
 
+    /// Declares reaction `name` for `events`, running `bin/{program}`.
+    pub(crate) fn reaction(mut self, name: &str, events: &[&str], program: &str) -> Self {
+        let events: Vec<String> = events.iter().map(|event| format!("\"{event}\"")).collect();
+        let _ = write!(
+            self.tables,
+            "\n[reactions.{name}]\nevents = [{}]\nargv = [\"bin/{program}\"]\n",
+            events.join(", ")
+        );
+        self
+    }
+
     /// Declares every name in `names` as a service running `bin/hang`, one
     /// line each in a single `[services]` table, so a manifest with many
     /// services stays small enough for its size bound.
@@ -168,6 +193,7 @@ impl Plugin {
             entry("bin/hang", HANG, true),
             entry("bin/crash", CRASH, true),
             entry("bin/env", ENV, true),
+            entry("bin/react", REACT, true),
         ]
     }
 }

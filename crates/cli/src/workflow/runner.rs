@@ -39,6 +39,13 @@
 //! environment is not a session's; `POHUNEK_CLI` is the installed
 //! `<prefix>/bin/pohunek` its unit runs; and both output streams are
 //! discarded without a cap and only counted. A service has no deadline.
+//!
+//! A reaction run ([`run_reaction`]) follows the supervised rules: no origin
+//! pair, output discarded and counted, and the installed `POHUNEK_CLI`. It
+//! differs in its context, which carries the event, and in its deadline,
+//! which is the reaction's `timeout_ms` or `limits.action_timeout_default_ms`.
+//! The dispatcher is its only caller and passes the interrupt source that
+//! carries the dispatcher's shutdown.
 
 // Rust guideline compliant 2026-10-13
 
@@ -57,6 +64,7 @@ use protocol::{
 };
 use serde::Serialize;
 use serde_json::value::RawValue;
+use tokio::sync::watch;
 
 use super::config::Knobs;
 use super::manifest::ArgsMode;
@@ -77,6 +85,9 @@ const KIND_JOB: &str = "job";
 
 /// Invocation kind of a supervised service run.
 const KIND_SERVICE: &str = "service";
+
+/// Invocation kind of an event reaction run.
+const KIND_REACTION: &str = "reaction";
 
 /// How far ahead a service run's deadline lies: a service has none and runs
 /// until it exits or is stopped.
@@ -225,6 +236,36 @@ pub(crate) struct Run {
     pub(crate) child_lifetime: Option<Duration>,
 }
 
+/// Records `count` events that a full reaction queue of `plugin` refused, as
+/// one `dropped` record. Nothing is recorded when the plugin is not
+/// installed, because its run log is then not the plugin's to write to.
+///
+/// # Errors
+///
+/// Returns [`Error::Store`] or [`Error::RunLog`] when the record cannot be
+/// read or written.
+pub(crate) fn record_dropped(
+    store: &Store,
+    knobs: &Knobs,
+    plugin: &PackageId,
+    count: u64,
+) -> Result<(), Error> {
+    let Some(installed) = store.installed(plugin)? else {
+        return Ok(());
+    };
+    let mut run = Run::open(store, knobs, plugin, KIND_REACTION, 0)?;
+    run.append_dropped(&installed, count);
+    Ok(())
+}
+
+/// Appends `entry` to `log`; a failed append is reported on stderr, since the
+/// run itself already happened or was refused.
+fn write_entry(log: &mut RunLog, entry: &Record<'_>) {
+    if let Err(error) = log.append(entry) {
+        eprintln!("warning: {error}");
+    }
+}
+
 impl Run {
     /// Opens the run log of plugin `id` for one run of `kind` and stamps the
     /// run's start.
@@ -300,10 +341,35 @@ impl Run {
             stderr_bytes: bytes[1],
             arg_count: self.arg_count,
             backoff_ms: self.backoff_ms,
+            dropped: None,
         };
-        if let Err(error) = self.log.append(&entry) {
-            eprintln!("warning: {error}");
-        }
+        write_entry(&mut self.log, &entry);
+    }
+
+    /// Appends a `dropped` record counting the events of one overflow episode
+    /// that a plugin's reaction queue refused. The record is written under this
+    /// run's kind and identifiers and names no reaction, since one event may
+    /// have been queued for several.
+    pub(crate) fn append_dropped(&mut self, record: &PackageRecord, count: u64) {
+        let entry = Record {
+            ts: self.ts.clone(),
+            run_id: &self.id,
+            kind: self.kind,
+            name: None,
+            version: &record.identity().version,
+            digest: record.digest(),
+            outcome: Outcome::Dropped,
+            error_code: None,
+            exit_code: None,
+            signal: None,
+            duration_ms: 0,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            arg_count: 0,
+            backoff_ms: None,
+            dropped: Some(count),
+        };
+        write_entry(&mut self.log, &entry);
     }
 }
 
@@ -315,6 +381,15 @@ struct Context<'a> {
     invocation: ContextInvocation<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<&'static str>,
+    /// The event a reaction runs for, as `{"event":…,"payload":…}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event: Option<&'a RawValue>,
+    /// Why the event is absent from the context; only `too_large` today.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event_omitted: Option<&'static str>,
+    /// The session the omitted event concerns, when its payload names one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
     cli: ContextCli,
 }
 
@@ -462,6 +537,9 @@ fn prepare(
             run_id,
         },
         output: invocation.output.name(),
+        event: None,
+        event_omitted: None,
+        session_id: None,
         cli: ContextCli {
             version: env!("CARGO_PKG_VERSION"),
             protocol: protocol::CLIENT_PROTOCOL_VERSIONS,
@@ -565,6 +643,227 @@ pub(crate) fn run_supervised(
     }
 }
 
+/// One event a reaction runs for, as the dispatcher holds it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Delivery<'a> {
+    /// The reaction the manifest declares.
+    pub(crate) reaction: &'a str,
+    /// The serialized `{"event":…,"payload":…}` document.
+    pub(crate) event: &'a RawValue,
+    /// The session the event concerns, when its payload names one.
+    pub(crate) session_id: Option<&'a str>,
+}
+
+/// The dispatcher facts a reaction run shares.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReactionEnv<'a> {
+    /// `POHUNEK_CLI`, the installed `pohunek` the child receives.
+    pub(crate) cli: &'a Path,
+    /// Whether `XDG_RUNTIME_DIR` is left out of the child's environment, as
+    /// for a supervised run of the same dispatcher.
+    pub(crate) runtime_dir_ignored: bool,
+}
+
+/// Runs reaction `delivery.reaction` of the plugin `plugin`, installed with
+/// `digest`, for one event, and returns how the child ended.
+///
+/// `interrupts` carries the dispatcher's shutdown, so a stop request ends the
+/// run.
+///
+/// # Errors
+///
+/// Returns a refusal ([`Error::PluginUnknown`], [`Error::UnitStale`],
+/// [`Error::PluginDisabled`], [`Error::RootInvalid`],
+/// [`Error::UnitUnknown`], [`Error::TimeoutRefused`],
+/// [`Error::ContextTooLarge`]) or a run that ended early
+/// ([`Error::SpawnFailed`], [`Error::Interrupted`], [`Error::ActionTimeout`],
+/// [`Error::RunFailed`]); every one is recorded in the run log.
+pub(crate) fn run_reaction(
+    store: &Store,
+    knobs: &Knobs,
+    plugin: &PackageId,
+    digest: &PackageDigest,
+    delivery: &Delivery<'_>,
+    env: &ReactionEnv<'_>,
+    interrupts: &mut Interrupts,
+) -> Result<Completed, Error> {
+    let installed = store
+        .installed(plugin)?
+        .ok_or_else(|| Error::PluginUnknown {
+            id: plugin.to_string(),
+        })?;
+    let mut run = Run::open(store, knobs, plugin, KIND_REACTION, 0)?;
+    match prepare_reaction(
+        store, knobs, plugin, digest, delivery, env, &installed, &run.id,
+    ) {
+        Ok(prepared) => {
+            // Verification takes time, and a stop request that arrived during it
+            // must end the run before its child is started.
+            if let Some(signal) = interrupts.poll() {
+                let error = Error::Interrupted {
+                    id: plugin.to_string(),
+                    action: prepared.name.clone(),
+                    signal,
+                };
+                run.append(
+                    &installed,
+                    Some(prepared.name.as_str()),
+                    Outcome::Interrupted,
+                    None,
+                    Some(&error),
+                    [0; 2],
+                );
+                return Err(error);
+            }
+            let invocation = Invocation {
+                plugin,
+                action: delivery.reaction,
+                args: &[],
+                output: Output::Discard,
+            };
+            execute(&mut run, store, knobs, &invocation, &prepared, interrupts)
+        }
+        Err((error, name)) => {
+            run.append(
+                &installed,
+                name.as_deref().or(Some(delivery.reaction)),
+                Outcome::Refused,
+                None,
+                Some(&error),
+                [0; 2],
+            );
+            Err(error)
+        }
+    }
+}
+
+/// Applies every refusal rule of a reaction run; on failure returns the error
+/// and the reaction name when the verified manifest declares it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an input the refusal rules read; a wrapper struct would only rename them"
+)]
+fn prepare_reaction(
+    store: &Store,
+    knobs: &Knobs,
+    plugin: &PackageId,
+    digest: &PackageDigest,
+    delivery: &Delivery<'_>,
+    env: &ReactionEnv<'_>,
+    installed: &PackageRecord,
+    run_id: &str,
+) -> Result<Prepared, (Error, Option<String>)> {
+    let id = plugin.to_string();
+    if installed.digest() != digest {
+        return Err((Error::UnitStale { id }, None));
+    }
+    if !installed.enabled() {
+        return Err((Error::PluginDisabled { id }, None));
+    }
+    let (record, root, manifest) = store.inspect(plugin).map_err(|error| (error, None))?;
+    if !record.enabled() || record.digest() != digest {
+        return Err((Error::PluginDisabled { id }, None));
+    }
+    let Some((name, reaction)) = manifest.reactions.get_key_value(delivery.reaction) else {
+        return Err((
+            Error::UnitUnknown {
+                id,
+                unit: format!("reaction {:?}", delivery.reaction),
+            },
+            None,
+        ));
+    };
+    let refuse = |error: Error| (error, Some(name.clone()));
+    let limits = &knobs.limits;
+    let timeout_ms = match reaction.timeout_ms.map(u64::from) {
+        Some(requested) if requested > limits.action_timeout_max_ms => {
+            return Err(refuse(Error::TimeoutRefused {
+                id,
+                action: name.clone(),
+                requested,
+                max: limits.action_timeout_max_ms,
+            }));
+        }
+        Some(requested) => requested,
+        None => limits.action_timeout_default_ms,
+    };
+    let context = reaction_context(&record, &id, name, run_id, delivery, knobs).map_err(refuse)?;
+    let files = root.files_path().to_path_buf();
+    Ok(Prepared {
+        argv: super::manifest::resolve_argv(&reaction.argv, &files),
+        record,
+        name: name.clone(),
+        files,
+        timeout_ms: Some(timeout_ms),
+        // Discarded streams cost nothing to keep reading, as for a supervised run.
+        caps: [u64::MAX; 2],
+        context,
+        // The dispatcher's environment is a service manager's, never a session's.
+        origin: None,
+        cli: Some(env.cli.to_path_buf()),
+        omit_runtime_dir: env.runtime_dir_ignored,
+    })
+}
+
+/// Serializes the context of one reaction run.
+///
+/// The event is included when the whole context fits `limits.max_context_bytes`.
+/// Otherwise the event is omitted with `event_omitted: "too_large"`, and the
+/// session it concerns is named when the payload has one. The size decision
+/// is made on the whole context, so a reduced context is never refused for
+/// a size the omitted event caused.
+fn reaction_context(
+    record: &PackageRecord,
+    id: &str,
+    name: &str,
+    run_id: &str,
+    delivery: &Delivery<'_>,
+    knobs: &Knobs,
+) -> Result<String, Error> {
+    let build = |event: Option<&RawValue>, session_id: Option<&str>| {
+        serde_json::to_string(&Context {
+            schema: CONTEXT_SCHEMA,
+            plugin: ContextPlugin {
+                id: &record.identity().id,
+                version: &record.identity().version,
+                digest: record.digest(),
+            },
+            invocation: ContextInvocation {
+                kind: KIND_REACTION,
+                name,
+                run_id,
+            },
+            output: None,
+            event,
+            event_omitted: event.is_none().then_some(EVENT_TOO_LARGE),
+            session_id,
+            cli: ContextCli {
+                version: env!("CARGO_PKG_VERSION"),
+                protocol: protocol::CLIENT_PROTOCOL_VERSIONS,
+            },
+        })
+        .expect("the context holds only strings, integers and a valid JSON document")
+    };
+    let max = knobs.limits.max_context_bytes;
+    let full = build(Some(delivery.event), None);
+    let context = if u64::try_from(full.len()).unwrap_or(u64::MAX) <= max {
+        full
+    } else {
+        build(None, delivery.session_id)
+    };
+    if u64::try_from(context.len()).unwrap_or(u64::MAX) > max {
+        return Err(Error::ContextTooLarge {
+            id: id.to_owned(),
+            bytes: context.len(),
+            max,
+        });
+    }
+    Ok(context)
+}
+
+/// `event_omitted` value of a context whose event exceeds the context cap.
+const EVENT_TOO_LARGE: &str = "too_large";
+
 /// Applies every refusal rule of a supervised run; on failure returns the
 /// error and the unit name when the verified manifest declares it.
 fn prepare_unit(
@@ -623,6 +922,9 @@ fn prepare_unit(
         },
         invocation: ContextInvocation { kind, name, run_id },
         output: None,
+        event: None,
+        event_omitted: None,
+        session_id: None,
         cli: ContextCli {
             version: env!("CARGO_PKG_VERSION"),
             protocol: protocol::CLIENT_PROTOCOL_VERSIONS,
@@ -1081,6 +1383,8 @@ fn executable_file(program: &str) -> Result<(), io::ErrorKind> {
 #[derive(Debug)]
 pub(crate) struct Interrupts {
     streams: Vec<(i32, tokio::signal::unix::Signal)>,
+    /// Set by the dispatcher when it stops; reported as `SIGTERM` by [`Self::poll`].
+    shutdown: Option<watch::Receiver<bool>>,
 }
 
 impl Interrupts {
@@ -1104,11 +1408,25 @@ impl Interrupts {
         ] {
             streams.push((number, signal(kind)?));
         }
-        Ok(Self { streams })
+        Ok(Self {
+            streams,
+            shutdown: None,
+        })
+    }
+
+    /// Also reports a stop once `shutdown` holds `true`, as a `SIGTERM`. A run
+    /// that is already waiting for its child observes the value on its next
+    /// poll, so a shutdown that does not arrive as a signal still stops it.
+    pub(crate) fn with_shutdown(mut self, shutdown: watch::Receiver<bool>) -> Self {
+        self.shutdown = Some(shutdown);
+        self
     }
 
     /// A signal received since the last poll, without waiting.
     pub(crate) fn poll(&mut self) -> Option<i32> {
+        if self.shutdown.as_ref().is_some_and(|rx| *rx.borrow()) {
+            return Some(libc::SIGTERM);
+        }
         self.streams
             .iter_mut()
             .find_map(|(number, stream)| stream.recv().now_or_never().flatten().map(|()| *number))

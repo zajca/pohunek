@@ -282,6 +282,7 @@ SYSTEMD_SUITE_FILES = (
     ("pohunek-daemon", "crates/daemon/tests/supervised_lifecycle.rs"),
     ("pohunek-cli", "crates/cli/tests/service_upgrade.rs"),
     ("pohunek-cli", "crates/cli/tests/workflow_systemd.rs"),
+    ("pohunek-cli", "crates/cli/tests/workflow_reactions.rs"),
 )
 SYSTEMD_SUITES = word_list(file for _, file in SYSTEMD_SUITE_FILES)
 # The `<suite>` of each real-systemd suite, as the CI job selects it.

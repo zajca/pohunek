@@ -1029,6 +1029,11 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p pohunek-cli --test workflow_systemd -- --ignored --test-threads 1
 
+      # Issue #148: the reaction dispatcher unit and its event delivery.
+      - name: Workflow event reactions
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p pohunek-cli --test workflow_reactions -- --ignored --test-threads 1
+
   # Issue #525: a session started on the previous release survives
   # `pohunek service upgrade` to this build. The job is the reusable
   # upgrade.yml, which downloads the previous release's published binaries and

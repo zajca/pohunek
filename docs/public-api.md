@@ -3214,6 +3214,25 @@ pohunek workflow run --json acme.work overview --since 1d
 after `<action>` to the action verbatim, including `--json`, `--`, `-h`,
 `--host` and empty strings; pohunek's own options go before `<plugin>`.
 
+Event reactions are a CLI process too, not a protocol surface. A plugin's
+`[reactions.<name>]` table names up to 32 distinct public event names from the
+Events table above, except `attach_opened` and `attach_closed`. The hidden
+`pohunek workflow __dispatch` is the entry point of the dispatcher unit. It
+subscribes to the local daemon's `subscribe` stream with no origin pair, and
+never starts the daemon. A reaction's context is the action context, with
+`invocation.kind = "reaction"` and these fields:
+
+- `event`: `{"event": "<name>", "payload": <the event payload>}`, present
+  when the whole context fits `limits.max_context_bytes`.
+- `event_omitted`: `"too_large"` in place of `event` when it does not fit.
+  `session_id` is then present when the payload names a session: `session_id`
+  or, for session events, `session.id`.
+
+Run records of a reaction carry `kind = "reaction"`. A `dropped` record has
+`outcome = "dropped"`, no `name`, and `dropped`, the number of events one
+overflow episode of a plugin's queue refused. No new event kind, daemon method,
+protocol code or SDK type is added for reactions.
+
 Every `--json` result is one standard CLI process envelope. The `ok` payloads:
 
 - `install`: `{status, plugin, warnings?}`, where `status` is `installed`,
