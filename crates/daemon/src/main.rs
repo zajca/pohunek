@@ -554,6 +554,7 @@ async fn build_session_registry(
             config.worker_connect_deadline = deadlines.worker_connect;
             apply_input_timing(&mut config, service.input_timing());
             apply_wait_timing(&mut config, service.wait_timing());
+            config.hook_stderr_tail_bytes = service.hook_stderr_tail_bytes();
             let (supervisor, worker_logs) = native_supervisor(&service, paths).await?;
             info!(
                 service.namespace = %service.namespace(),

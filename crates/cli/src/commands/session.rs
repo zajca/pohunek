@@ -1827,6 +1827,17 @@ fn render_new_human(info: &SessionInfo) -> String {
             warning_kind_label(warning.kind),
             warning.message
         );
+        // A failing create hook's stderr tail is only in this result, so its
+        // multi-line detail is shown here, indented under the warning.
+        if let Some(detail) = &warning.detail {
+            let mut lines = detail.lines();
+            if let Some(first) = lines.next() {
+                let _ = writeln!(output, "    detail: {first}");
+            }
+            for line in lines {
+                let _ = writeln!(output, "      {line}");
+            }
+        }
     }
     output
 }
@@ -3315,11 +3326,24 @@ mod tests {
         session.branch = Some("feature/login".to_owned());
         session.worktree_path = Some(PathBuf::from("/data/worktrees/s-42-project-feature-login"));
         session.cwd = session.worktree_path.clone().expect("worktree path");
-        session.warnings = vec![SessionWarning {
-            kind: SessionWarningKind::SetupScript,
-            message: "Repository setup script failed; the worktree was kept without it.".to_owned(),
-            detail: None,
-        }];
+        session.warnings = vec![
+            SessionWarning {
+                kind: SessionWarningKind::SetupScript,
+                message: "Repository setup script failed; the worktree was kept without it."
+                    .to_owned(),
+                detail: None,
+            },
+            SessionWarning {
+                kind: SessionWarningKind::Hook,
+                message: "The post-create hook failed; the session proceeded without it."
+                    .to_owned(),
+                detail: Some(
+                    "/repo/.pohunek/hooks/post-create exited with status exit status: 7; \
+                     stderr tail:\n[12 earlier bytes omitted]\nnpm ERR! install failed"
+                        .to_owned(),
+                ),
+            },
+        ];
 
         let output = render_new_human(&session);
 
@@ -3336,6 +3360,12 @@ mod tests {
         assert!(
             output.contains("warning [setup_script]:"),
             "new summary must mention warnings: {output}"
+        );
+        assert!(
+            output.contains(
+                "    detail: /repo/.pohunek/hooks/post-create exited with status exit status: 7; stderr tail:\n      [12 earlier bytes omitted]\n      npm ERR! install failed\n"
+            ),
+            "new summary must show the hook's stderr tail: {output}"
         );
     }
 

@@ -16,8 +16,8 @@ use super::{
     worktree_prune,
 };
 use super::{
-    branch_slug, is_valid_worktree, run_output_bounded, WorktreeCleanup, WorktreeManager,
-    WorktreeRequest, WorktreeWork,
+    branch_slug, is_valid_worktree, run_output_bounded, HookStderrCapture, WorktreeCleanup,
+    WorktreeManager, WorktreeRequest, WorktreeWork,
 };
 use crate::store::{Store, WorktreeStatus};
 
@@ -92,7 +92,7 @@ fn manager(tag: &str) -> WorktreeManager {
 fn manager_with_timeout(tag: &str, setup_timeout: Duration) -> WorktreeManager {
     let root = unique_dir(&format!("{tag}-root"));
     let store = unique_dir(&format!("{tag}-store")).join("metadata.jsonl");
-    WorktreeManager::new(root, Arc::new(Store::new(store)), setup_timeout, None)
+    WorktreeManager::new(root, Arc::new(Store::new(store)), setup_timeout, None, None)
 }
 
 /// A manager with a host-global hook layer rooted at `config_dir`.
@@ -103,6 +103,7 @@ fn manager_with_config_dir(tag: &str, config_dir: PathBuf) -> WorktreeManager {
         root,
         Arc::new(Store::new(store)),
         TEST_SETUP_TIMEOUT,
+        None,
         Some(config_dir),
     )
 }
@@ -1283,6 +1284,7 @@ fn binding_persist_failure_rolls_back_the_worktree() {
         Arc::new(Store::new(store_path)),
         TEST_SETUP_TIMEOUT,
         None,
+        None,
     );
     let repo = init_repo("persist-fail-repo");
 
@@ -1757,6 +1759,70 @@ fn host_global_and_in_repo_post_create_run_host_global_first() {
         vec!["host", "repo"],
         "host-global hook runs before the in-repo hook"
     );
+}
+
+/// Release grace of the held-stderr scenario: short, so the warning follows the
+/// hook within moments.
+const HELD_STDERR_RELEASE_GRACE: Duration = Duration::from_millis(200);
+
+#[test]
+fn a_background_process_holding_a_create_hook_stderr_is_reported_by_hook() {
+    // A hook that leaves a process running with its stderr inherited gets a
+    // warning naming the event and script, since that process would get SIGPIPE
+    // after a daemon restart; the warning never carries the hook's output.
+    let logs = crate::runtime::lifecycle::tests::LogCapture::default();
+    let _subscriber = logs.install();
+    let config_dir = unique_dir("hook-held-config");
+    fs::create_dir_all(config_dir.join("hooks")).expect("host hooks dir");
+    let holder_pid = config_dir.join("holder.pid");
+    fs::write(
+        config_dir.join("hooks/post-create"),
+        format!(
+            "#!/bin/sh\necho 'hook output stays private' >&2\nsleep 30 &\necho $! > '{}'\n",
+            holder_pid.display()
+        ),
+    )
+    .expect("write host hook");
+    let mgr = WorktreeManager::new(
+        unique_dir("hook-held-root"),
+        Arc::new(Store::new(
+            unique_dir("hook-held-store").join("metadata.jsonl"),
+        )),
+        TEST_SETUP_TIMEOUT,
+        Some(HookStderrCapture {
+            tail: std::num::NonZeroUsize::new(4096).expect("non-zero tail"),
+            release_grace: HELD_STDERR_RELEASE_GRACE,
+        }),
+        Some(config_dir.clone()),
+    );
+    let repo = init_repo("hook-held-repo");
+
+    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    assert!(
+        bound.warnings.is_empty() && bound.stderr_tails.is_empty(),
+        "a successful hook leaves no warning and no tail: {:?}",
+        bound.warnings
+    );
+    let line = pohunek_test_support::wait::poll_until("the held-stderr warning", || {
+        logs.text()
+            .lines()
+            .find(|line| line.contains("still holds the hook's stderr"))
+            .map(str::to_owned)
+    });
+    assert!(line.contains("post-create"), "{line}");
+    assert!(
+        line.contains(&config_dir.join("hooks/post-create").display().to_string()),
+        "{line}"
+    );
+    assert!(!logs.text().contains("hook output stays private"));
+
+    if let Some(pid) = fs::read_to_string(&holder_pid)
+        .ok()
+        .and_then(|pid| pid.trim().parse::<i32>().ok())
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+    }
 }
 
 // --- retention safety probe -----------------------------------------------

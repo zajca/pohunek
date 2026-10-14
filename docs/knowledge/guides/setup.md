@@ -54,7 +54,7 @@ registers one daemon job: the systemd user unit
 `pohunek-<ns>-daemon.service` plus the slice `pohunek-<ns>-sessions.slice` on
 Linux, or the launchd agent
 `~/Library/LaunchAgents/io.github.zajca.pohunek.<ns>.daemon.plist` on macOS.
-The owner-private `service.toml` (schema 5) records `[input]`
+The owner-private `service.toml` (schema 6) records `[input]`
 `initial_startup_grace_ms = 5000`, `submit_delay_ms = 150` and
 `write_stall_timeout_ms = 3000` on a fresh
 install. These host-wide values control the maximum wait for an input-ready
@@ -88,6 +88,11 @@ milliseconds in `5000..=3600000`, and the default must not exceed the
 ceiling; a violation makes the daemon refuse startup with the named
 configuration error. A daemon started without `service.toml` uses the same
 5 min and 30 min.
+The `[hooks] stderr_tail_bytes = 4096` key is the number of bytes of a failing
+`pre-create` or `post-create` hook's stderr kept for the `session.new` warning.
+It is a whole number in `0..=32768`; `0` disables the capture, and a value
+above the ceiling makes the daemon refuse startup with the named configuration
+error.
 `<ns>` is a 12-hex-digit namespace derived from the user ID and the state and
 runtime roots, so separate installations never touch each other's jobs.
 They never share a prefix either: the first install claims it in
@@ -120,8 +125,8 @@ already gone). Upgrades use
 `pohunek service upgrade`; `pohunek service status` shows the daemon job,
 versions, and workers. When the installed `service.toml` is a previous
 release's schema (schema 2, which predates the `[input]` and `[waits]`
-tables, schema 3, which predates `[waits]`, or schema 4, which predates
-`input.write_stall_timeout_ms`), the upgrade
+tables, schema 3, which predates `[waits]`, schema 4, which predates
+`input.write_stall_timeout_ms`, or schema 5, which predates `[hooks]`), the upgrade
 is a configuration migration: the upgrade first saves the exact pre-upgrade
 bytes owner-private next to its transaction record and journals their
 digest, stops the daemon job before it rewrites `service.toml` (a previous
@@ -139,7 +144,7 @@ written, no daemon restarts, and the record stays for a repaired retry.
 the install or upgrade would make before changing anything, and changes
 nothing (an upgrade also runs a read-only live-session preflight that
 `--accept-runtime-loss` can override, except for an unusable store; on a
-schema-2 or schema-3 installation it names the migration it would perform); `pohunek service lock -- <command>` runs a command that no other
+schema-2, schema-3, schema-4 or schema-5 installation it names the migration it would perform); `pohunek service lock -- <command>` runs a command that no other
 service transaction can interleave with (the archive installer uses both). For
 upgrades, removal, and runtime diagnosis, see
 [update after release](../runbooks/update-after-release.md) and

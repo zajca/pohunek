@@ -109,6 +109,8 @@ impl SessionRegistry {
                 timeout,
                 config_dir.as_deref(),
                 &mut warnings,
+                // These warnings are only logged, so the hook's stderr is never kept.
+                None,
             );
             for warning in warnings {
                 warn!(

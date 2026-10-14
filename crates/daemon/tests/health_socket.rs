@@ -4678,6 +4678,261 @@ async fn a_failing_post_create_hook_keeps_the_session_in_its_worktree() {
     let _ = handle.await;
 }
 
+/// Bytes the chatty failing hook writes to stderr before its last line, far
+/// more than the default tail and more than one pipe buffer, so the capture
+/// must both drain concurrently and cut.
+const CHATTY_HOOK_STDERR_BYTES: usize = 200 * 1024;
+
+/// A failing `post-create` hook's stderr tail reaches the `session.new` warning,
+/// cut to the configured size, marked, and stripped of control characters, while
+/// its stdout never does; the stored session keeps the warning without the tail.
+#[tokio::test]
+async fn a_failing_hook_reports_its_stderr_tail_only_in_the_session_new_result() {
+    let repo = init_git_repo();
+    let worktree_root = temp_dir("hook-tail-wt-root");
+    let socket = temp_socket("hook-tail");
+    let config_dir = host_post_create_hook(
+        &socket,
+        &format!(
+            "#!/bin/sh\n\
+             echo 'stdout is never reported'\n\
+             head -c {CHATTY_HOOK_STDERR_BYTES} /dev/zero | tr '\\0' 'x' >&2\n\
+             printf '\\n\\033[31mFINAL ERROR: npm install failed\\033[0m\\r\\n' >&2\n\
+             exit 7\n"
+        ),
+    );
+    let store_path = temp_dir("hook-tail-store").join("metadata.jsonl");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "exec sleep 30"]),
+        worktree_root: Some(worktree_root.to_path_buf()),
+        store_path: Some(store_path),
+        config_dir: Some(config_dir),
+        ..SessionRegistryConfig::default()
+    };
+    let tail_bytes = usize::try_from(config.hook_stderr_tail_bytes).expect("tail size");
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut control = connect(&socket).await;
+    let created: SessionInfo = serde_json::from_value(ok_payload(
+        create_worktree_session(
+            &mut control,
+            RuntimeRef::shell(),
+            repo.cwd().to_path_buf(),
+            "b",
+        )
+        .await,
+    ))
+    .expect("session info");
+    let [warning] = created.warnings.as_slice() else {
+        panic!("exactly one hook warning expected: {:?}", created.warnings);
+    };
+    assert_eq!(warning.kind, SessionWarningKind::Hook);
+    let detail = warning.detail.as_deref().expect("hook warning detail");
+    let (head, tail) = detail
+        .split_once("; stderr tail:\n")
+        .unwrap_or_else(|| panic!("the detail carries a stderr tail: {detail}"));
+    assert!(head.contains("exited with status"), "{head}");
+    assert!(
+        tail.starts_with('[') && tail.contains("earlier bytes omitted]\n"),
+        "the cut is marked: {}",
+        &tail[..tail.len().min(80)]
+    );
+    assert!(
+        tail.ends_with("FINAL ERROR: npm install failed"),
+        "the tail ends with the hook's last line, without its escape sequences: {}",
+        &tail[tail.len().saturating_sub(80)..]
+    );
+    assert!(
+        !tail
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t'),
+        "control characters other than LF and TAB are stripped"
+    );
+    assert!(!detail.contains("stdout is never reported"));
+    let (_marker, text) = tail.split_once('\n').expect("marker line");
+    assert!(
+        text.len() <= tail_bytes,
+        "the tail is bounded by the configured size: {} > {tail_bytes}",
+        text.len()
+    );
+
+    let list = Request::make("hook-tail-list", method::SESSION_LIST, Value::Null);
+    let sessions: Vec<SessionInfo> =
+        serde_json::from_value(ok_payload(exchange(&mut control, &list).await))
+            .expect("list sessions");
+    let listed = sessions
+        .iter()
+        .find(|session| session.id == created.id)
+        .expect("the session is listed");
+    let [stored] = listed.warnings.as_slice() else {
+        panic!("the listed session keeps its hook warning: {listed:?}");
+    };
+    assert_eq!(
+        stored.detail.as_deref(),
+        Some(head),
+        "the stored warning has no tail"
+    );
+
+    let remove_req = Request::make(
+        "hook-tail-remove",
+        method::SESSION_REMOVE,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let removed: SessionRemoveResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &remove_req).await))
+            .expect("remove result");
+    assert!(removed.removed);
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// How long the descendant a failing hook leaves behind keeps the hook's stderr
+/// open. It is still alive when `session.new` returns unless the create waited
+/// for the pipe's EOF; the test kills it at the end.
+const HOOK_DESCENDANT_HOLD: Duration = Duration::from_secs(600);
+
+/// A failing hook whose background descendants keep its stderr open does not
+/// hold up `session.new`, and a descendant that writes to that stderr after the
+/// hook exited keeps running while the daemon does.
+#[tokio::test]
+async fn a_hook_descendant_holding_stderr_neither_delays_the_create_nor_dies() {
+    let repo = init_git_repo();
+    let worktree_root = temp_dir("hook-hold-wt-root");
+    let socket = temp_socket("hook-hold");
+    let late_writer_done = socket.dir.join("late-writer-done");
+    let holder_pid = socket.dir.join("holder.pid");
+    let config_dir = host_post_create_hook(
+        &socket,
+        &format!(
+            "#!/bin/sh\n\
+             sleep {hold} &\n\
+             echo $! > '{holder}'\n\
+             (sleep 2; echo late >&2; touch '{done}') &\n\
+             echo 'setup failed' >&2\n\
+             exit 3\n",
+            hold = HOOK_DESCENDANT_HOLD.as_secs(),
+            holder = holder_pid.display(),
+            done = late_writer_done.display(),
+        ),
+    );
+    let store_path = temp_dir("hook-hold-store").join("metadata.jsonl");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "exec sleep 30"]),
+        worktree_root: Some(worktree_root.to_path_buf()),
+        store_path: Some(store_path),
+        config_dir: Some(config_dir),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut control = connect(&socket).await;
+    let created: SessionInfo = serde_json::from_value(ok_payload(
+        create_worktree_session(
+            &mut control,
+            RuntimeRef::shell(),
+            repo.cwd().to_path_buf(),
+            "b",
+        )
+        .await,
+    ))
+    .expect("session info");
+    // The holder keeps the hook's stderr open until it exits, so a create that
+    // waited for EOF would return only after it is gone.
+    let holder = std::fs::read_to_string(&holder_pid)
+        .ok()
+        .and_then(|pid| pid.trim().parse::<i32>().ok())
+        .and_then(rustix::process::Pid::from_raw)
+        .expect("the hook recorded its background holder");
+    assert!(
+        rustix::process::test_kill_process(holder).is_ok(),
+        "session.new returned while the hook's descendant still holds its stderr"
+    );
+    let [warning] = created.warnings.as_slice() else {
+        panic!("exactly one hook warning expected: {:?}", created.warnings);
+    };
+    let detail = warning.detail.as_deref().expect("hook warning detail");
+    assert!(
+        detail.ends_with("; stderr tail:\nsetup failed"),
+        "the tail holds what the hook printed before it exited: {detail}"
+    );
+
+    // Without a reader the late write would raise SIGPIPE and the subshell
+    // would die before touching its marker.
+    wait_until("the late stderr writer finishes", || {
+        let done = late_writer_done.exists();
+        async move { done.then_some(()) }
+    })
+    .await;
+
+    let _ = rustix::process::kill_process(holder, rustix::process::Signal::KILL);
+    let remove_req = Request::make(
+        "hook-hold-remove",
+        method::SESSION_REMOVE,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let removed: SessionRemoveResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &remove_req).await))
+            .expect("remove result");
+    assert!(removed.removed);
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// `hooks.stderr_tail_bytes = 0` keeps a failing hook's stderr out of the
+/// warning entirely.
+#[tokio::test]
+async fn a_zero_stderr_tail_size_reports_no_hook_output() {
+    let repo = init_git_repo();
+    let worktree_root = temp_dir("hook-notail-wt-root");
+    let socket = temp_socket("hook-notail");
+    let config_dir = host_post_create_hook(&socket, "#!/bin/sh\necho 'secret-ish' >&2\nexit 1\n");
+    let store_path = temp_dir("hook-notail-store").join("metadata.jsonl");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "exec sleep 30"]),
+        worktree_root: Some(worktree_root.to_path_buf()),
+        store_path: Some(store_path),
+        config_dir: Some(config_dir),
+        hook_stderr_tail_bytes: 0,
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut control = connect(&socket).await;
+    let created: SessionInfo = serde_json::from_value(ok_payload(
+        create_worktree_session(
+            &mut control,
+            RuntimeRef::shell(),
+            repo.cwd().to_path_buf(),
+            "b",
+        )
+        .await,
+    ))
+    .expect("session info");
+    let [warning] = created.warnings.as_slice() else {
+        panic!("exactly one hook warning expected: {:?}", created.warnings);
+    };
+    let detail = warning.detail.as_deref().expect("hook warning detail");
+    assert!(
+        !detail.contains("stderr tail") && !detail.contains("secret-ish"),
+        "{detail}"
+    );
+
+    let remove_req = Request::make(
+        "hook-notail-remove",
+        method::SESSION_REMOVE,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let removed: SessionRemoveResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &remove_req).await))
+            .expect("remove result");
+    assert!(removed.removed);
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
 /// A worktree that disappears between its bind and the agent spawn fails the
 /// create with `session_cwd_missing`: no session is left behind, no worktree
 /// binding is kept, and the agent never starts (in `$HOME` or anywhere else).

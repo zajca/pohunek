@@ -702,22 +702,42 @@ through `plugin profile migrate`. The release upgrade test
 (`scripts/upgrade-test`, `crates/cli/tests/release_upgrade.rs`) runs this path
 for Claude from the previous release to the build under test.
 
-## Configuration migration from schemas 2, 3 and 4
+## Hook stderr capture from 0.35
+
+From 0.35 a failing `pre-create` or `post-create` hook's stderr tail appears in
+the `session.new` warning, so the hook's stderr is a pipe the daemon drains
+instead of `/dev/null` (`hooks.stderr_tail_bytes`, default 4096). A process a
+hook leaves running in the background with its stderr inherited (`npm run dev &`,
+also `nohup cmd &`, since `nohup` redirects only a terminal) keeps running while
+the daemon does, but after a later daemon restart on macOS or without a service
+manager its next stderr write raises `SIGPIPE`. The daemon log names each such
+hook two seconds after it ended:
+
+```text
+WARN ... a background process still holds the hook's stderr; redirect its stderr or set hooks.stderr_tail_bytes = 0, or it gets SIGPIPE after a daemon restart event=post-create script=...
+```
+
+Redirect that process's stderr in the hook (`>/dev/null 2>&1` or a log file), or
+set `hooks.stderr_tail_bytes = 0` in `service.toml` to keep every hook's stderr
+on `/dev/null`. Under systemd the daemon restart already ends such processes.
+
+## Configuration migration from schemas 2, 3, 4 and 5
 
 When the installed `service.toml` was written by release 0.33.x (schema 2, no
 `[input]` or `[waits]` table), by a release with schema 3 (no `[waits]`
-table), or by a release with schema 4 (no `input.write_stall_timeout_ms`) and
-the target version differs, `pohunek service upgrade` turns into a
+table), by a release with schema 4 (no `input.write_stall_timeout_ms`), or by a
+release with schema 5 (no `[hooks]` table) and the target version differs, `pohunek service upgrade` turns into a
 configuration migration and the `--json` reports carry the source schema,
-`config_schema_migration: 2`, `3` or `4`. `service check` verifies a pending migration's
+`config_schema_migration: 2`, `3`, `4` or `5`. `service check` verifies a pending migration's
 backup and reports the migration it would perform without writing anything,
 so an archive updater sees it before any effect. A same-version refresh runs
 no migration and reports `null`. The migration assigns the documented
 defaults of the missing keys and tables explicitly: `[input]` 5000 ms and
 150 ms for schema 2, `input.write_stall_timeout_ms` 3000 ms for schemas 2 to 4,
-`[waits]` 300000 ms and 1800000 ms for schemas 2 and 3. Every value the file
-records, including tuned `[input]` and `[waits]` timings of a schema-3 or
-schema-4 file, is kept.
+`[waits]` 300000 ms and 1800000 ms for schemas 2 and 3, and
+`[hooks] stderr_tail_bytes` 4096 for schemas 2 to 5. Every value the file
+records, including tuned `[input]` and `[waits]` timings of a schema-3,
+schema-4 or schema-5 file, is kept.
 
 The ordering follows the schema boundary. The transaction first saves the
 exact pre-upgrade bytes owner-private next to its record and journals their

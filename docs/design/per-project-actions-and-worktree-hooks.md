@@ -439,8 +439,10 @@ discipline is enforced in **one place** for every event:
   (`terminate_setup_script`, `:928`);
 - **bounded by a timeout** (generalize `setup_script_timeout` to a per-hook
   `hook_timeout` in `SessionRegistryConfig`, `session/mod.rs:126`);
-- **stdout/stderr discarded to `/dev/null`** — no hook *output* ever reaches
-  `SessionWarning` / the append-only event log (`events/mod.rs`);
+- **stdout discarded to `/dev/null`; stderr discarded except a bounded tail of a
+  failing create hook** — see [B.3.2](#b32-stderr-tail-of-a-failing-create-hook).
+  No hook output ever reaches the append-only event log (`events/mod.rs`), a log
+  line, or the metadata store;
 - **environment is `.env_clear()`-ed, then an explicit allowlist is set** — only
   `PATH`, `HOME`, and the documented `POHUNEK_*` context vars. **New and
   load-bearing:** the daemon today spawns the setup script with its **full inherited
@@ -492,6 +494,44 @@ This list is the testable contract (a DoD asserts the exact set per event); new 
 are additive. It is **disjoint from** the launch-time `POHUNEK_*` handshake env
 (`session_pty_env`) — hooks never receive `POHUNEK_SOCKET_PATH`/`_DAEMON_ID`/`_ENV`/
 `_PROTOCOL_VERSION`.
+
+### B.3.2 Stderr tail of a failing create hook
+
+A failing `pre-create` or `post-create` hook tells the session owner *that* setup
+failed; without its output nobody can tell *why*. Its stderr is therefore a pipe,
+and the daemon keeps the last `hooks.stderr_tail_bytes` bytes (`service.toml`,
+default 4096, `0..=32768`, `0` disables the capture) while the hook runs:
+
+- **Only the `session.new` result carries it.** When the hook exits non-zero, times
+  out, or cannot be waited for, the `hook` warning in the `session.new` result gets
+  `; stderr tail:` and the tail appended to its `detail`. The warning stored on the
+  session (`session show`, `session.list`, the metadata store) keeps the detail
+  without the tail, and no log line or event carries it. A successful hook's stderr
+  is discarded. Remove-side and session-level hooks keep `/dev/null`: their warnings
+  are only logged.
+- **Sanitized.** The bytes are decoded as lossy UTF-8; terminal escape
+  sequences and control characters other than line feed and tab are removed, so
+  the text cannot drive a terminal that prints it. A cut is marked `[N earlier bytes omitted]`.
+- **Never waits for the hook's descendants.** One reader thread drains the pipe
+  while the hook runs, so a chatty hook never blocks on a full pipe. When the hook
+  ends, the reader takes only what is buffered at that moment, then keeps reading
+  and discarding until EOF without anyone waiting for it. While the daemon runs,
+  a process the hook left running in the background keeps a stderr that neither
+  fills up nor raises `SIGPIPE`; it holds that reader thread until it closes
+  stderr. The read end lives in the daemon, so after a daemon restart such a
+  process gets `SIGPIPE` on its next stderr write (under systemd the restart
+  already ends it with the daemon's cgroup). **A hook that starts long-lived
+  processes redirects their stderr** (`>/dev/null 2>&1` or a log file);
+  `hooks.stderr_tail_bytes = 0` keeps every hook's stderr on `/dev/null`. When
+  the pipe is still open two seconds after the hook ended, the daemon logs a
+  WARN naming the event and script: "a background process still holds the hook's stderr; redirect its stderr or set hooks.stderr_tail_bytes = 0, or it gets SIGPIPE after a daemon restart". The tracked
+  alternative, a detached sink that outlives the daemon, is #1046.
+- **Exposure.** The tail reaches the client that created the session, which can
+  already read the worktree and the hook script. The hook runs with the cleared
+  environment of B.3.1, so the tail holds only what the hook itself printed, but
+  that can still be secret material the hook read from files (a `.env`, a token
+  file). **Hook authors must not print secrets to stderr.** An operator who cannot
+  rule that out sets `hooks.stderr_tail_bytes = 0`.
 
 ## B.4 Semantics (resolved for v1, open to review)
 
@@ -841,9 +881,11 @@ consistent with the existing invariant that the store and event log hold no secr
   session (no silent fallback).
 - **Remote project:** fully supported — the daemon resolves in-repo `.pohunek/`
   locally on its own host. (The former client-side remote limitation is gone.)
-- **Secret in hook output / env:** the daemon discards hook stdout/stderr to
-  `/dev/null` and clears the hook env to an allowlist (B.3), so neither hook output
-  nor ambient daemon credentials leak through the daemon.
+- **Secret in hook output / env:** the daemon discards hook stdout to `/dev/null`
+  and clears the hook env to an allowlist (B.3), so ambient daemon credentials never
+  reach a hook. Hook stderr is discarded except the bounded tail of a failing create
+  hook, which only the `session.new` caller receives (B.3.2); a hook that prints a
+  secret to stderr exposes it to that caller.
 - **Unknown agent name:** `session.new`/a template naming an agent with no matching
   profile or base kind on the target host → `agent_profile_not_found` (fail-closed, no
   silent default), surfaced to the caller. A bare `shell`/`codex`/`claude` always
@@ -1016,8 +1058,11 @@ then three parallel tracks that don't share files: A1 → A2 → A3 (Part A) ∥
   spawned `.env_clear()`-ed with an explicit allowlist (`PATH`, `HOME`, `POHUNEK_*`).
   A **new requirement** — `run_setup_script` today leaks the full daemon env. The
   `POHUNEK_*` context carries only ids/paths/branch/activity/stop-reason — never tokens.
-- **No secret reaches the event log / wire from hooks.** Hook stdout/stderr →
-  `/dev/null`; the event log and `SessionWarning` carry only structured metadata.
+- **No hook output reaches the event log, the logs, or the store.** Hook stdout →
+  `/dev/null`; stderr → `/dev/null` except the bounded, sanitized tail of a failing
+  `pre-create`/`post-create` hook, which only the `session.new` result carries
+  (B.3.2). The event log, log lines, and the stored `SessionWarning` carry only
+  structured metadata. Hook authors must not print secrets to stderr.
 - **The metadata store keeps its no-secrets invariant under Part C.** The resume
   snapshot persists only the **non-secret structural** profile fields; profile `env`
   (the one field that could carry a token) is **never written to the store** —

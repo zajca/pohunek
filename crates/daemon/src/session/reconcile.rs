@@ -12123,6 +12123,7 @@ handler = "codex-hook-v1"
                     HOOK_RUN_BOUND,
                     Some(&config_dir),
                     &mut warnings,
+                    None,
                 );
                 warnings
             });

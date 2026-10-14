@@ -38,11 +38,12 @@
 //!
 //! # Config migration
 //!
-//! A `service.toml` written by a previous release (`schema_version` 2, 3 or 4,
+//! A `service.toml` written by a previous release (`schema_version` 2, 3, 4 or 5,
 //! in contrast to this crate's [`SCHEMA_VERSION`]) is read only at the
 //! upgrade boundary, through `ServiceConfig::load_upgrade_source`, which
 //! assigns the documented defaults to the keys that schema lacks (input
-//! timings, the write stall bound, and turn-wait timings) explicitly. Its upgrade is a dedicated
+//! timings, the write stall bound, turn-wait timings, and the `[hooks]` stderr
+//! tail size) explicitly. Its upgrade is a dedicated
 //! migration flavor of the transaction, journaled in the record's
 //! `config_backup` (`source_schema_version` and the SHA-256 of the exact
 //! pre-upgrade bytes), with two consequences for ordering:
@@ -153,7 +154,7 @@
 //! cannot stop those workers, so the uninstall names them instead of
 //! waiting on them.
 
-// Rust guideline compliant 2026-09-29
+// Rust guideline compliant 2026-10-14
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -593,7 +594,7 @@ impl<'a> Engine<'a> {
         let gated = self.adoption_gate(&plan, from, version).await?;
         let (resume, rolled_back) = self.resolve_plan(plan).await?;
         // The file is read as an upgrade source, so a previous release's
-        // schema-2, schema-3 or schema-4 installation upgrades into this one
+        // schema-2, schema-3, schema-4 or schema-5 installation upgrades into this one
         // instead of being refused: the migration below carries its exact bytes
         // and schema.
         let source = load_config_for_upgrade(&config_path)?.ok_or(Error::NotInstalled {
@@ -753,8 +754,9 @@ impl<'a> Engine<'a> {
         let registered = self.resolve_uninstall_pending(options, &mut report).await?;
         let config_path = self.context.config_path();
         // The uninstall reads the installed configuration as an upgrade
-        // source, so it removes a previous release's schema-2, schema-3 or
-        // schema-4 installation with this version as well, without a migration.
+        // source, so it removes a previous release's schema-2, schema-3,
+        // schema-4 or schema-5 installation with this version as well, without
+        // a migration.
         let config = match (
             load_config_for_upgrade(&config_path)?.map(|source| source.config),
             &registered,
@@ -2381,7 +2383,7 @@ fn load_config(path: &Path) -> Result<Option<ServiceConfig>, Error> {
 /// Loads `service.toml` as an upgrade source, or `None` when it does not
 /// exist.
 ///
-/// The current schema and the previous schemas 2 and 3 are accepted; a
+/// The current schema and the previous schemas 2, 3, 4 and 5 are accepted; a
 /// schema the binary neither writes nor upgrades from is refused with its
 /// regular error, which names `pohunek service uninstall` and `install`.
 fn load_config_for_upgrade(path: &Path) -> Result<Option<UpgradeSource>, Error> {

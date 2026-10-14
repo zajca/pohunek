@@ -524,6 +524,7 @@ impl Fixture {
             sweep_grace: SWEEP_GRACE,
             input_timing: pohunek_service_config::DEFAULT_INPUT_TIMING,
             wait_timing: pohunek_service_config::DEFAULT_WAIT_TIMING,
+            hook_stderr_tail_bytes: pohunek_service_config::DEFAULT_HOOK_STDERR_TAIL_BYTES,
             open_files: OPEN_FILES,
         })
         .expect("valid fixture service configuration");

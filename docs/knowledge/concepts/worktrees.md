@@ -64,6 +64,21 @@ nothing is started, and the failed create is compensated as above. The daemon
 logs the bind, each removal with its reason, and a failed or timed-out
 post-create or pre-remove hook at WARN, without the hook's output.
 
+A failing `pre-create` or `post-create` hook leaves a `hook` warning on the
+session. In the `session.new` result its `detail` also carries the last
+`hooks.stderr_tail_bytes` bytes of the hook's stderr (`service.toml`, default
+4096, `0` disables), sanitized and marked when cut, so the caller can see why
+setup failed. The stored session and the logs keep the warning without that
+tail. Stdout is never kept, and a successful hook's stderr is discarded.
+`session.new` never waits for processes a hook leaves running in the
+background; their stderr is drained and discarded while the daemon runs, but
+after a daemon restart their next stderr write raises `SIGPIPE`. A hook that
+starts long-lived processes redirects their stderr (`>/dev/null 2>&1` or a log
+file); `hooks.stderr_tail_bytes = 0` keeps hook stderr on `/dev/null`. When such
+a process still holds the stderr two seconds after the hook ended, the daemon
+logs a WARN naming the hook's event and script ("a background process still
+holds the hook's stderr; ...").
+
 Removing a worktree that a live session still uses is refused with the typed
 `worktree_in_use` error; the same code is reserved for `session.remove` when
 other active delegated tasks use the session's worktree. Stop the sessions or

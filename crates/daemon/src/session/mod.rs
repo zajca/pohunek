@@ -4,6 +4,7 @@
 //! daemon retains logical metadata and reconstructible semantic observers.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -59,8 +60,8 @@ use crate::store::{
 };
 use crate::time::now_rfc3339;
 use crate::worktree::{
-    canonical_or_original, run_hook, HookContext, HookEvent, WorktreeCleanup, WorktreeManager,
-    WorktreeRequest,
+    canonical_or_original, run_hook, HookContext, HookEvent, HookStderrCapture, HookStderrTail,
+    WorktreeCleanup, WorktreeManager, WorktreeRequest,
 };
 use reconcile::LossClassification;
 
@@ -176,6 +177,20 @@ const DEFAULT_OUTPUT_HISTORY_LIMIT_BYTES: usize = 10_000_000;
 /// exceeds it is terminated and surfaced as a non-fatal `setup_script` warning.
 /// Overridable via [`SessionRegistryConfig::hook_timeout`].
 const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// Bytes of a failing worktree-create hook's stderr kept for the `session.new`
+/// warning of a daemon without `service.toml`; the installed default of
+/// `hooks.stderr_tail_bytes`.
+const DEFAULT_HOOK_STDERR_TAIL_BYTES: u32 = pohunek_service_config::DEFAULT_HOOK_STDERR_TAIL_BYTES;
+
+/// Default for [`SessionRegistryConfig::hook_stderr_release_grace`].
+///
+/// A hook's short-lived trailing children (a `git` helper, a backgrounded
+/// cleanup) close its stderr within moments of the hook's exit; a process that
+/// still holds it after two seconds is a long-lived background process, which
+/// gets `SIGPIPE` after a daemon restart. Raising it delays that warning;
+/// lowering it may report a child that was about to exit.
+const DEFAULT_HOOK_STDERR_RELEASE_GRACE: Duration = Duration::from_secs(2);
 
 /// Default upper bound for a freshly spawned agent to expose an input-ready
 /// prompt or enable bracketed paste before `session.new --input` is injected.
@@ -399,6 +414,14 @@ pub struct SessionRegistryConfig {
     /// so a hanging hook can never wedge a session operation. Defaults to
     /// [`DEFAULT_HOOK_TIMEOUT`].
     pub hook_timeout: Duration,
+    /// Bytes of a failing `pre-create`/`post-create` hook's stderr kept for the
+    /// `session.new` warning (`hooks.stderr_tail_bytes`); 0 discards it.
+    /// Defaults to [`DEFAULT_HOOK_STDERR_TAIL_BYTES`].
+    pub hook_stderr_tail_bytes: u32,
+    /// How long a background process may keep a captured hook's stderr open
+    /// after the hook ended before the daemon logs a warning naming the hook.
+    /// Defaults to [`DEFAULT_HOOK_STDERR_RELEASE_GRACE`].
+    pub hook_stderr_release_grace: Duration,
     /// Directory for the append-only event log (`<data_dir>/events`). `None`
     /// disables event logging. Started via [`SessionRegistry::spawn_event_log`].
     pub event_log_dir: Option<PathBuf>,
@@ -492,6 +515,8 @@ impl Default for SessionRegistryConfig {
             store_path: None,
             worktree_root: None,
             hook_timeout: DEFAULT_HOOK_TIMEOUT,
+            hook_stderr_tail_bytes: DEFAULT_HOOK_STDERR_TAIL_BYTES,
+            hook_stderr_release_grace: DEFAULT_HOOK_STDERR_RELEASE_GRACE,
             event_log_dir: None,
             retention_policy_path: None,
             log_dir: None,
@@ -1717,6 +1742,13 @@ impl SessionRegistry {
                 root.clone(),
                 Arc::clone(store),
                 config.hook_timeout,
+                usize::try_from(config.hook_stderr_tail_bytes)
+                    .ok()
+                    .and_then(NonZeroUsize::new)
+                    .map(|tail| HookStderrCapture {
+                        tail,
+                        release_grace: config.hook_stderr_release_grace,
+                    }),
                 config.config_dir.clone(),
             ))),
             _ => None,
@@ -2620,8 +2652,10 @@ impl SessionRegistry {
         let guard = self.lock_lifecycle(&id).await;
         let intent = create_intent_record(&id, &params, &resolved, &fallback_cwd)?;
         self.write_session_record(intent).await?;
+        let mut hook_stderr_tails = Vec::new();
         let prepared = match self.resolve_target(&id, &params, fallback_cwd).await {
             Ok(mut target) => {
+                hook_stderr_tails = std::mem::take(&mut target.hook_stderr_tails);
                 #[cfg(test)]
                 self.hold_bound_create(&id).await;
                 if let Err(error) = self
@@ -2660,7 +2694,10 @@ impl SessionRegistry {
             }
         };
         let info = Box::pin(self.clone().run_pty_registration(spec, guard)).await?;
-        Ok((info, pending_initial_input))
+        Ok((
+            with_hook_stderr_tails(info, hook_stderr_tails),
+            pending_initial_input,
+        ))
     }
 
     /// [`Self::outdated_integration_warning`] for the agent `binding` relaunches
@@ -6204,6 +6241,26 @@ fn unfinished_compensation_message(msg: &str, id: &SessionId) -> String {
          and stays listed as create_compensation_pending while the daemon retries the removal",
         id.0
     )
+}
+
+/// Appends each failing create hook's stderr tail to its `hook` warning in the
+/// `session.new` result.
+///
+/// `info` is the caller's copy: the stored session, `session.list`, and the logs
+/// keep the warning without the tail, which bounds what every listing carries.
+fn with_hook_stderr_tails(mut info: SessionInfo, tails: Vec<HookStderrTail>) -> SessionInfo {
+    for tail in tails {
+        let Some(warning) = info.warnings.get_mut(tail.warning) else {
+            continue;
+        };
+        if warning.kind != protocol::SessionWarningKind::Hook {
+            continue;
+        }
+        let detail = warning.detail.get_or_insert_with(String::new);
+        detail.push_str("; stderr tail:\n");
+        detail.push_str(&tail.text);
+    }
+    info
 }
 
 /// Normalize and validate an owner-set session name.
