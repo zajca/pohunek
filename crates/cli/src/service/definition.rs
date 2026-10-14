@@ -7,7 +7,8 @@ use std::path::Path;
 use pohunek_platform::shell_env::SearchPath;
 use pohunek_platform::supervisor::{JobDefinition, JobSpec, RestartPolicy, SEARCH_PATH_VARIABLE};
 use pohunek_service_config::{
-    ConfigSpec, Deadlines, ServiceConfig, DEFAULT_INPUT_TIMING, DEFAULT_WAIT_TIMING,
+    ConfigSpec, Deadlines, ServiceConfig, DEFAULT_HOOK_STDERR_TAIL_BYTES, DEFAULT_INPUT_TIMING,
+    DEFAULT_WAIT_TIMING,
 };
 use pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST;
 
@@ -101,6 +102,7 @@ pub(crate) fn config_with_search_path(
         sweep_grace: settings::SWEEP_GRACE,
         input_timing: DEFAULT_INPUT_TIMING,
         wait_timing: DEFAULT_WAIT_TIMING,
+        hook_stderr_tail_bytes: DEFAULT_HOOK_STDERR_TAIL_BYTES,
         open_files: settings::OPEN_FILES,
     })?)
 }

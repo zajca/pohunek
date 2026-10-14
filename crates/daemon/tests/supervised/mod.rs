@@ -1153,6 +1153,7 @@ fn service_config(
         sweep_grace: settings.sweep_grace,
         input_timing: pohunek_service_config::DEFAULT_INPUT_TIMING,
         wait_timing: pohunek_service_config::DEFAULT_WAIT_TIMING,
+        hook_stderr_tail_bytes: pohunek_service_config::DEFAULT_HOOK_STDERR_TAIL_BYTES,
         open_files: OPEN_FILES,
     })
     .expect("valid service configuration")

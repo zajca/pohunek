@@ -13,7 +13,7 @@
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-10-14
 
 #[path = "support/native.rs"]
 mod native;
@@ -28,7 +28,9 @@ use pohunek_cli::service::record::{ConfigBackup, Operation, Record, Step, Store}
 use pohunek_cli::service::{Backend, Engine, VERSION};
 use pohunek_platform::process::{HostInspector, ProcessIdentity, ProcessInspector as _};
 use pohunek_platform::supervisor::ServiceObservation;
-use pohunek_service_config::{InputTiming, DEFAULT_INPUT_TIMING, DEFAULT_WAIT_TIMING};
+use pohunek_service_config::{
+    InputTiming, DEFAULT_HOOK_STDERR_TAIL_BYTES, DEFAULT_INPUT_TIMING, DEFAULT_WAIT_TIMING,
+};
 
 /// Version directory the upgrade installs this build under.
 const UPGRADE_SUFFIX: &str = "-upgrade";
@@ -475,6 +477,10 @@ async fn upgrade_migrates_the_previous_release_config_over_a_stopped_daemon() {
     assert_eq!(current.active_version(), new);
     assert_eq!(current.input_timing(), DEFAULT_INPUT_TIMING);
     assert_eq!(current.wait_timing(), DEFAULT_WAIT_TIMING);
+    assert_eq!(
+        current.hook_stderr_tail_bytes(),
+        DEFAULT_HOOK_STDERR_TAIL_BYTES
+    );
     assert!(
         !backup_path(&installation).exists(),
         "the backup goes with the record"
@@ -562,6 +568,10 @@ async fn upgrade_migrates_a_schema_three_config_keeping_its_input_timing() {
         }
     );
     assert_eq!(current.wait_timing(), DEFAULT_WAIT_TIMING);
+    assert_eq!(
+        current.hook_stderr_tail_bytes(),
+        DEFAULT_HOOK_STDERR_TAIL_BYTES
+    );
     assert!(
         !backup_path(&installation).exists(),
         "the backup goes with the record"

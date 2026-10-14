@@ -10,7 +10,7 @@
 //! # Schema
 //!
 //! ```toml
-//! schema_version = 5
+//! schema_version = 6
 //! prefix = "/home/u/.local"                       # absolute install prefix
 //! active_version = "0.31.6"                       # <prefix>/libexec/pohunek/<version>
 //!
@@ -43,6 +43,9 @@
 //! turn_default_ms = 300000                         # at most turn_max_ms
 //! turn_max_ms = 1800000
 //!
+//! [hooks]
+//! stderr_tail_bytes = 4096                         # 0..=32768; 0 disables the capture
+//!
 //! [limits]
 //! open_files = 8192                                # 256..=1048576
 //! ```
@@ -54,14 +57,19 @@
 //! caller omits its timeout, and `turn_max_ms` is the ceiling a requested
 //! timeout may not exceed. See [`WaitTiming`] and [`DEFAULT_WAIT_TIMING`].
 //!
+//! `[hooks]` bounds how much of a failing worktree-create hook's stderr the
+//! daemon keeps for the `session.new` warning. See
+//! [`DEFAULT_HOOK_STDERR_TAIL_BYTES`] and [`MAX_HOOK_STDERR_TAIL_BYTES`].
+//!
 //! # Upgrades
 //!
 //! A normal load accepts only [`SCHEMA_VERSION`]. The installer reads the
 //! previous schemas through [`ServiceConfig::load_upgrade_source`], which
 //! assigns the documented defaults to the keys those schemas lack: schema 2
 //! has neither `[input]` nor `[waits]`, schema 3 has no `[waits]` and no
-//! `input.write_stall_timeout_ms`, and schema 4 has no
-//! `input.write_stall_timeout_ms`. Every value a previous file records is kept.
+//! `input.write_stall_timeout_ms`, schema 4 has no
+//! `input.write_stall_timeout_ms`, and none of them nor schema 5 has
+//! `[hooks]`. Every value a previous file records is kept.
 //!
 //! `environment.search_path` is the executable search path the installer
 //! resolved (see `pohunek_platform::shell_env`) and hands to the daemon job as
@@ -105,7 +113,7 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-10-13
+// Rust guideline compliant 2026-10-14
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -136,9 +144,9 @@ pub use error::ConfigError;
 /// so an older binary never half-understands a newer installation and a newer
 /// binary never reads a file that lacks keys it requires. Version 3 holds
 /// `[input]`; version 4 adds `[waits]`; version 5 adds
-/// `input.write_stall_timeout_ms`. Schemas 2, 3 and 4 are read only through
-/// [`ServiceConfig::load_upgrade_source`].
-pub const SCHEMA_VERSION: u32 = 5;
+/// `input.write_stall_timeout_ms`; version 6 adds `[hooks]`. Schemas 2, 3, 4
+/// and 5 are read only through [`ServiceConfig::load_upgrade_source`].
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Input timings written on fresh installs and assigned explicitly when
 /// upgrading a schema-2, schema-3 or schema-4 service file, which lack some
@@ -170,6 +178,24 @@ pub const DEFAULT_WAIT_TIMING: WaitTiming = WaitTiming {
     turn_default: Duration::from_mins(5),
     turn_max: Duration::from_mins(30),
 };
+
+/// Stderr tail size written on fresh installs, assigned when upgrading a
+/// schema-2 to schema-5 file, and used by a daemon without `service.toml`.
+///
+/// 4096 bytes hold the last few dozen lines of a typical tool error (a failed
+/// `npm install`, `git` or compiler run), which is what tells the owner why
+/// project setup failed, while the warning stays a small JSON value.
+pub const DEFAULT_HOOK_STDERR_TAIL_BYTES: u32 = 4096;
+
+/// Largest accepted `hooks.stderr_tail_bytes`.
+///
+/// One `session.new` result can carry four tails (`pre-create` and
+/// `post-create`, each from the host-global and the in-repo layer). Lossy
+/// UTF-8 decoding turns one invalid byte into a three-byte replacement
+/// character, so four 32 KiB tails stay below 384 KiB of text, well within the
+/// 1 MiB control line together with the rest of the session. 32 KiB is also
+/// several hundred lines, more than anyone reads in a warning.
+pub const MAX_HOOK_STDERR_TAIL_BYTES: u32 = 32 * 1024;
 
 /// Shortest accepted `[waits]` value.
 ///
@@ -405,6 +431,9 @@ pub struct ConfigSpec {
     pub input_timing: InputTiming,
     /// Default and ceiling of a turn wait.
     pub wait_timing: WaitTiming,
+    /// Bytes of a failing worktree-create hook's stderr kept for its warning;
+    /// 0 disables the capture.
+    pub hook_stderr_tail_bytes: u32,
     /// Open-file limit applied to supervised jobs.
     pub open_files: u64,
 }
@@ -427,6 +456,7 @@ pub struct ServiceConfig {
     sweep_grace: Duration,
     input_timing: InputTiming,
     wait_timing: WaitTiming,
+    hook_stderr_tail_bytes: u32,
     open_files: u64,
 }
 
@@ -488,6 +518,14 @@ impl ServiceConfig {
             spec.input_timing.write_stall_timeout,
         )?;
         validate_wait_timing(spec.wait_timing)?;
+        if spec.hook_stderr_tail_bytes > MAX_HOOK_STDERR_TAIL_BYTES {
+            return Err(ConfigError::OutOfRange {
+                key: "hooks.stderr_tail_bytes",
+                value: u64::from(spec.hook_stderr_tail_bytes),
+                min: 0,
+                max: u64::from(MAX_HOOK_STDERR_TAIL_BYTES),
+            });
+        }
         if !(MIN_OPEN_FILES..=MAX_OPEN_FILES).contains(&spec.open_files) {
             return Err(ConfigError::OutOfRange {
                 key: "limits.open_files",
@@ -510,6 +548,7 @@ impl ServiceConfig {
             sweep_grace: spec.sweep_grace,
             input_timing: spec.input_timing,
             wait_timing: spec.wait_timing,
+            hook_stderr_tail_bytes: spec.hook_stderr_tail_bytes,
             open_files: spec.open_files,
         })
     }
@@ -534,12 +573,14 @@ impl ServiceConfig {
         parse(path, &read_config_text(path)?)
     }
 
-    /// Reads a current, schema-4, schema-3, or schema-2 service file for an installer upgrade.
+    /// Reads a current, schema-5, schema-4, schema-3, or schema-2 service file for an installer upgrade.
     ///
     /// Schema 2 has no `[input]` or `[waits]` table, schema 3 no `[waits]`
-    /// and no `input.write_stall_timeout_ms`, and schema 4 no
-    /// `input.write_stall_timeout_ms`. This method supplies the documented
-    /// [`DEFAULT_INPUT_TIMING`] and [`DEFAULT_WAIT_TIMING`] explicitly for
+    /// and no `input.write_stall_timeout_ms`, schema 4 no
+    /// `input.write_stall_timeout_ms`, and none of them nor schema 5 a
+    /// `[hooks]` table. This method supplies the documented
+    /// [`DEFAULT_INPUT_TIMING`], [`DEFAULT_WAIT_TIMING`] and
+    /// [`DEFAULT_HOOK_STDERR_TAIL_BYTES`] explicitly for
     /// the missing keys and tables and keeps every recorded value; normal
     /// daemon and worker loads still require every key of the current schema. The caller must preserve the source
     /// schema across the transaction and restore it if the old daemon is
@@ -548,7 +589,7 @@ impl ServiceConfig {
     /// # Errors
     ///
     /// Returns the same trust and validation errors as [`Self::load`], and
-    /// [`ConfigError::UnsupportedSchema`] for schemas other than 2, 3, 4, or
+    /// [`ConfigError::UnsupportedSchema`] for schemas other than 2, 3, 4, 5, or
     /// [`SCHEMA_VERSION`].
     pub fn load_upgrade_source(path: &Path) -> Result<UpgradeSource, ConfigError> {
         Self::load_upgrade_source_bytes(path, read_config_text(path)?.as_bytes())
@@ -566,7 +607,7 @@ impl ServiceConfig {
     ///
     /// Returns [`ConfigError::Parse`] for bytes that are not UTF-8, invalid
     /// TOML, or a missing, unknown, or mistyped key, and
-    /// [`ConfigError::UnsupportedSchema`] for schemas other than 2, 3, 4, or
+    /// [`ConfigError::UnsupportedSchema`] for schemas other than 2, 3, 4, 5, or
     /// [`SCHEMA_VERSION`].
     pub fn load_upgrade_source_bytes(
         path: &Path,
@@ -640,6 +681,9 @@ impl ServiceConfig {
                 write_stall_timeout_ms: millis(self.input_timing.write_stall_timeout),
             },
             waits: RawWaits::from(self.wait_timing),
+            hooks: RawHooks {
+                stderr_tail_bytes: self.hook_stderr_tail_bytes,
+            },
             limits: RawLimits {
                 open_files: self.open_files,
             },
@@ -667,6 +711,7 @@ impl ServiceConfig {
             sweep_grace: self.sweep_grace,
             input_timing: self.input_timing,
             wait_timing: self.wait_timing,
+            hook_stderr_tail_bytes: self.hook_stderr_tail_bytes,
             open_files: self.open_files,
         }
     }
@@ -804,6 +849,13 @@ impl ServiceConfig {
         self.wait_timing
     }
 
+    /// Returns how many bytes of a failing worktree-create hook's stderr the
+    /// daemon keeps for its warning; 0 disables the capture.
+    #[must_use]
+    pub fn hook_stderr_tail_bytes(&self) -> u32 {
+        self.hook_stderr_tail_bytes
+    }
+
     /// Returns the open-file limit for supervised jobs.
     #[must_use]
     pub fn open_files(&self) -> u64 {
@@ -847,6 +899,23 @@ fn write_config_text(path: &Path, text: &str) -> Result<(), ConfigError> {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
+    schema_version: u32,
+    prefix: String,
+    active_version: String,
+    namespace: RawNamespace,
+    deadlines: RawDeadlines,
+    environment: RawEnvironment,
+    sweep: RawSweep,
+    input: RawInput,
+    waits: RawWaits,
+    hooks: RawHooks,
+    limits: RawLimits,
+}
+
+/// Exact on-disk schema-5 shape accepted only for an explicit upgrade.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfigV5 {
     schema_version: u32,
     prefix: String,
     active_version: String,
@@ -982,6 +1051,20 @@ impl From<WaitTiming> for RawWaits {
     }
 }
 
+/// On-disk `[hooks]` table.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHooks {
+    stderr_tail_bytes: u32,
+}
+
+impl RawHooks {
+    /// The documented value assigned to a previous schema, which has no `[hooks]`.
+    const DEFAULT: Self = Self {
+        stderr_tail_bytes: DEFAULT_HOOK_STDERR_TAIL_BYTES,
+    };
+}
+
 /// On-disk `[limits]` table.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1039,6 +1122,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                     write_stall_timeout_ms: millis(DEFAULT_INPUT_TIMING.write_stall_timeout),
                 },
                 waits: RawWaits::from(DEFAULT_WAIT_TIMING),
+                hooks: RawHooks::DEFAULT,
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 2);
@@ -1060,10 +1144,29 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                     write_stall_timeout_ms: millis(DEFAULT_INPUT_TIMING.write_stall_timeout),
                 },
                 waits: previous.waits,
+                hooks: RawHooks::DEFAULT,
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 4);
             Ok((config_from_raw(raw)?, 4))
+        }
+        Some(toml::Value::Integer(5)) => {
+            let previous: RawConfigV5 = toml::from_str(text).map_err(parse_error)?;
+            let raw = RawConfig {
+                schema_version: SCHEMA_VERSION,
+                prefix: previous.prefix,
+                active_version: previous.active_version,
+                namespace: previous.namespace,
+                deadlines: previous.deadlines,
+                environment: previous.environment,
+                sweep: previous.sweep,
+                input: previous.input,
+                waits: previous.waits,
+                hooks: RawHooks::DEFAULT,
+                limits: previous.limits,
+            };
+            debug_assert_eq!(previous.schema_version, 5);
+            Ok((config_from_raw(raw)?, 5))
         }
         Some(toml::Value::Integer(3)) => {
             let previous: RawConfigV3 = toml::from_str(text).map_err(parse_error)?;
@@ -1081,6 +1184,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                     write_stall_timeout_ms: millis(DEFAULT_INPUT_TIMING.write_stall_timeout),
                 },
                 waits: RawWaits::from(DEFAULT_WAIT_TIMING),
+                hooks: RawHooks::DEFAULT,
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 3);
@@ -1130,6 +1234,7 @@ fn config_from_raw(raw: RawConfig) -> Result<ServiceConfig, ConfigError> {
             turn_default: Duration::from_millis(raw.waits.turn_default_ms),
             turn_max: Duration::from_millis(raw.waits.turn_max_ms),
         },
+        hook_stderr_tail_bytes: raw.hooks.stderr_tail_bytes,
         open_files: raw.limits.open_files,
     })
 }

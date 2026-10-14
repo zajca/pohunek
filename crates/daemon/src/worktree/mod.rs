@@ -35,6 +35,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
@@ -48,6 +49,10 @@ use tracing::{debug, info, warn};
 
 use crate::store::{Store, StoreMutation, WorktreeBinding, WorktreeStatus};
 use crate::time::now_rfc3339;
+
+mod stderr_tail;
+
+use stderr_tail::{CaptureSettings, HookOrigin, StderrCapture};
 
 /// Relative path of the optional per-repository setup script, run inside a
 /// freshly created worktree. A non-zero exit (or any spawn failure) is recorded
@@ -135,6 +140,40 @@ pub struct WorktreeBound {
     pub reused: bool,
     /// Non-fatal warnings raised while binding.
     pub warnings: Vec<SessionWarning>,
+    /// Stderr tails of the failing create hooks among [`Self::warnings`].
+    pub stderr_tails: Vec<HookStderrTail>,
+}
+
+/// The rendered stderr tail of one failing hook.
+///
+/// It belongs to the warning at index [`Self::warning`] of the warning list the
+/// same hook run filled. It is kept apart from that warning so only the
+/// `session.new` result carries it, never the stored session or a log line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookStderrTail {
+    /// Index of the hook's warning in its warning list.
+    pub warning: usize,
+    /// Sanitized tail text; see [`stderr_tail`].
+    pub text: String,
+}
+
+/// How much of a failing create hook's stderr is kept, and how long a
+/// background process may hold that stderr after the hook ended before the
+/// daemon warns about it.
+#[derive(Debug, Clone, Copy)]
+pub struct HookStderrCapture {
+    /// Bytes kept per hook.
+    pub tail: NonZeroUsize,
+    /// Grace after the hook ended before a still-open stderr is reported.
+    pub release_grace: Duration,
+}
+
+/// Where a hook run keeps the stderr tails of its failing hooks.
+pub(crate) struct StderrTails<'a> {
+    /// What is captured.
+    pub capture: HookStderrCapture,
+    /// Tails of the hooks that failed, in warning order.
+    pub tails: &'a mut Vec<HookStderrTail>,
 }
 
 #[derive(Debug)]
@@ -240,6 +279,9 @@ pub struct WorktreeManager {
     /// this window is terminated and recorded as a non-fatal `hook` warning, so a
     /// hanging hook can never wedge `session.new` or cleanup.
     hook_timeout: Duration,
+    /// Capture of a failing `pre-create`/`post-create` hook's stderr for the
+    /// `session.new` warning; `None` discards that stderr.
+    hook_stderr: Option<HookStderrCapture>,
     /// Host config dir (`~/.config/pohunek`), source of the host-global hook layer
     /// (`<config_dir>/hooks/<event>`). `None` disables that layer; in-repo hooks
     /// still run.
@@ -248,19 +290,22 @@ pub struct WorktreeManager {
 
 impl WorktreeManager {
     /// Build a manager that creates worktrees under `root`, persists bindings to
-    /// the shared `store`, bounds each hook by `hook_timeout`, and composes the
-    /// host-global hook layer from `config_dir` (when configured).
+    /// the shared `store`, bounds each hook by `hook_timeout`, captures a failing
+    /// create hook's stderr as `hook_stderr` says, and composes
+    /// the host-global hook layer from `config_dir` (when configured).
     #[must_use]
     pub fn new(
         root: PathBuf,
         store: Arc<Store>,
         hook_timeout: Duration,
+        hook_stderr: Option<HookStderrCapture>,
         config_dir: Option<PathBuf>,
     ) -> Self {
         Self {
             root,
             store,
             hook_timeout,
+            hook_stderr,
             config_dir,
         }
     }
@@ -381,6 +426,7 @@ impl WorktreeManager {
                         base_branch: binding.base_branch,
                         reused: true,
                         warnings: Vec::new(),
+                        stderr_tails: Vec::new(),
                     }))
                 }
                 Some(_) => {
@@ -441,6 +487,7 @@ impl WorktreeManager {
         }
 
         let mut warnings = Vec::new();
+        let mut stderr_tails = Vec::new();
         let resolved_base = Self::resolve_base_branch(&repository, req, &mut warnings)?;
         let base_branch = resolved_base.name;
         // Resolve the start-point for a new branch: the commit id pinned by a
@@ -464,6 +511,7 @@ impl WorktreeManager {
             None,
             &base_branch,
             &mut warnings,
+            &mut stderr_tails,
         );
 
         let now = now_rfc3339();
@@ -511,6 +559,7 @@ impl WorktreeManager {
             Some(&path),
             &base_branch,
             &mut warnings,
+            &mut stderr_tails,
         );
 
         Ok(WorktreeBound {
@@ -520,11 +569,13 @@ impl WorktreeManager {
             base_branch,
             reused: false,
             warnings,
+            stderr_tails,
         })
     }
 
     /// Fire a create-side worktree hook (`pre`/`post-create`) from the request
     /// context, bounded by `hook_timeout` and composed with the host-global layer.
+    /// A failing hook's stderr tail goes to `stderr_tails` when capture is on.
     // The create hook needs the event, the hook-lookup dir, the request, the repo,
     // the optional worktree, the base branch, and the warning sink — all distinct
     // inputs with no natural grouping struct beyond the request itself.
@@ -541,6 +592,7 @@ impl WorktreeManager {
         worktree: Option<&Path>,
         base_branch: &str,
         warnings: &mut Vec<SessionWarning>,
+        stderr_tails: &mut Vec<HookStderrTail>,
     ) {
         let ctx = HookContext {
             session_id: req.session_id.clone(),
@@ -560,6 +612,10 @@ impl WorktreeManager {
             self.hook_timeout,
             self.config_dir.as_deref(),
             warnings,
+            self.hook_stderr.map(|capture| StderrTails {
+                capture,
+                tails: stderr_tails,
+            }),
         );
     }
 
@@ -585,6 +641,7 @@ impl WorktreeManager {
             stop_reason: None,
             activity: None,
         };
+        // Remove-hook warnings are only logged, so their stderr is never kept.
         run_hook(
             event,
             in_repo_dir,
@@ -592,6 +649,7 @@ impl WorktreeManager {
             self.hook_timeout,
             self.config_dir.as_deref(),
             warnings,
+            None,
         );
     }
 
@@ -1789,8 +1847,10 @@ fn resolve_in_repo_hook(event: HookEvent, in_repo_dir: &Path) -> Option<PathBuf>
 /// Each hook runs with a **cleared environment** plus only the [`hook_env`]
 /// allowlist (closing the env-inheritance exfil gap: a hostile committed hook can
 /// no longer read the daemon's `GITHUB_TOKEN`/`ANTHROPIC_API_KEY`/socket path), in
-/// its own process group (so a timeout kills the whole subtree), with stdio sent
-/// to `/dev/null` (output never feeds a daemon-side sink).
+/// its own process group (so a timeout kills the whole subtree), with stdin and
+/// stdout on `/dev/null`. Stderr goes to `/dev/null` too unless `stderr_tails` is
+/// given: then a failing hook's bounded, sanitized stderr tail is added to it,
+/// for the caller to show, never to log.
 pub(crate) fn run_hook(
     event: HookEvent,
     in_repo_dir: &Path,
@@ -1798,6 +1858,7 @@ pub(crate) fn run_hook(
     timeout: Duration,
     config_dir: Option<&Path>,
     warnings: &mut Vec<SessionWarning>,
+    mut stderr_tails: Option<StderrTails<'_>>,
 ) {
     let env = hook_env(event, ctx);
     let cwd = &ctx.cwd_or(in_repo_dir);
@@ -1805,11 +1866,27 @@ pub(crate) fn run_hook(
     if let Some(config_dir) = config_dir {
         let host_script = config_dir.join("hooks").join(event.as_env());
         if host_script.is_file() {
-            run_one_hook(event, &host_script, cwd, &env, timeout, warnings);
+            run_one_hook(
+                event,
+                &host_script,
+                cwd,
+                &env,
+                timeout,
+                warnings,
+                stderr_tails.as_mut(),
+            );
         }
     }
     if let Some(in_repo_script) = resolve_in_repo_hook(event, in_repo_dir) {
-        run_one_hook(event, &in_repo_script, cwd, &env, timeout, warnings);
+        run_one_hook(
+            event,
+            &in_repo_script,
+            cwd,
+            &env,
+            timeout,
+            warnings,
+            stderr_tails.as_mut(),
+        );
     }
 }
 
@@ -1823,9 +1900,9 @@ impl HookContext {
 
 /// Spawn one hook script with the full hook discipline (env-clear + allowlist +
 /// process-group + timeout + `/dev/null`), recording any failure as a non-fatal
-/// `Hook` warning. The warning detail carries only the event + a generic reason —
-/// never the hook's output (which can contain secrets; see the security note on
-/// the original setup-script path).
+/// `Hook` warning. The warning detail carries only the script and a generic
+/// reason, never the hook's output, so it is safe to store and log. A failing
+/// hook's stderr tail goes to `stderr_tails` only.
 fn run_one_hook(
     event: HookEvent,
     script: &Path,
@@ -1833,6 +1910,7 @@ fn run_one_hook(
     env: &[(String, String)],
     timeout: Duration,
     warnings: &mut Vec<SessionWarning>,
+    stderr_tails: Option<&mut StderrTails<'_>>,
 ) {
     let interpreter = match crate::agent::trusted_program(SETUP_SCRIPT_INTERPRETER) {
         Ok(interpreter) => interpreter,
@@ -1858,14 +1936,18 @@ fn run_one_hook(
         // allowlist, so a hook can never exfiltrate the daemon's secrets.
         .env_clear()
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::null());
     for (key, value) in env {
         builder.env(key, value);
     }
     configure_process_group(&mut builder);
+    let capture = hook_stderr(&mut builder, event, script, stderr_tails.as_deref());
 
-    let mut child = match builder.spawn() {
+    let spawned = builder.spawn();
+    // The command holds the stderr write end; the capture sees EOF only once
+    // every copy outside the hook's process tree is closed.
+    drop(builder);
+    let mut child = match spawned {
         Ok(child) => child,
         Err(err) => {
             warn!(
@@ -1882,7 +1964,9 @@ fn run_one_hook(
         }
     };
 
-    match wait_with_timeout(&mut child, timeout) {
+    let outcome = wait_with_timeout(&mut child, timeout);
+    let failed = !matches!(&outcome, SetupOutcome::Exited(status) if status.success());
+    match outcome {
         SetupOutcome::Exited(status) if status.success() => {}
         SetupOutcome::Exited(status) => {
             warn!(
@@ -1923,6 +2007,53 @@ fn run_one_hook(
                 event,
                 format!("failed to wait for {}: {err}", script.display()),
             ));
+        }
+    }
+    // A successful hook's stderr is dropped with the capture, without waiting.
+    if let (true, Some(capture), Some(tails)) = (failed, capture, stderr_tails) {
+        if let Some(text) = capture.finish().and_then(|tail| tail.render()) {
+            tails.tails.push(HookStderrTail {
+                warning: warnings.len() - 1,
+                text,
+            });
+        }
+    }
+}
+
+/// Points the hook's stderr at a new capture when `tails` asks for one, else at
+/// `/dev/null`; a capture that cannot start also falls back to `/dev/null`.
+fn hook_stderr(
+    builder: &mut Command,
+    event: HookEvent,
+    script: &Path,
+    tails: Option<&StderrTails<'_>>,
+) -> Option<StderrCapture> {
+    let Some(tails) = tails else {
+        builder.stderr(Stdio::null());
+        return None;
+    };
+    let settings = CaptureSettings {
+        limit: tails.capture.tail,
+        wake_interval: SETUP_SCRIPT_POLL_INTERVAL,
+        release_grace: tails.capture.release_grace,
+    };
+    let origin = HookOrigin {
+        event: event.as_env(),
+        script: script.to_path_buf(),
+    };
+    match StderrCapture::start(settings, origin) {
+        Ok((capture, stderr)) => {
+            builder.stderr(stderr);
+            Some(capture)
+        }
+        Err(err) => {
+            warn!(
+                event = event.as_env(),
+                error = %err,
+                "hook stderr capture is unavailable; the hook's stderr is discarded"
+            );
+            builder.stderr(Stdio::null());
+            None
         }
     }
 }

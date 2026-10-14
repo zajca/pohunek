@@ -1461,7 +1461,14 @@ Important fields:
   `pohunek integration install --agent <agent>` command (with `--profile` for a
   host profile's home) and `detail` carries the status warnings; the session
   still starts, and an agent whose hooks are not installed carries no such
-  warning.
+  warning. For a failing `pre-create` or `post-create` lifecycle hook, the
+  `session.new` result's `detail` ends with `; stderr tail:` and the last
+  `hooks.stderr_tail_bytes` bytes (`service.toml`, default 4096, `0` disables)
+  of the hook's stderr: lossy UTF-8 with terminal escape sequences and control
+  characters other than line feed and tab removed, prefixed by
+  `[N earlier bytes omitted]` when cut. Only that result carries the tail;
+  `session.list`, `session.inspect` and the logs keep the detail without it. Hook
+  authors must not print secrets to stderr.
 - `output_force_closed`: optional boolean, omitted unless `true`. A terminal
   session (`stopped`, `done` or `failed`) whose PTY output was force-closed
   carries `true`: a process outside the session's process group kept the
@@ -2075,15 +2082,19 @@ for #496 raised it to 3, and the `[waits]` table added for #858 (`turn_default_m
 and `turn_max_ms`, the default timeout and the ceiling of `session.wait_turn`,
 each in `5000..=3600000` with the default at most the ceiling; fresh installs
 and migrations write 300000 and 1800000) raised it to 4: the current release
-refuses to serve a schema-2, schema-3 or schema-4 file to the daemon, reads it
+refuses to serve a schema-2, schema-3, schema-4 or schema-5 file to the daemon, reads it
 only at the `pohunek service upgrade` boundary, and upgrades it as a migration
 that assigns the defaults of the missing keys and tables and keeps every
 recorded value. The input write stall bound (`[input] write_stall_timeout_ms`, 3000 ms on fresh
 installs and migrations, `1..=600000`) raised it to 5; a schema-4 file is
-migrated the same way, with only the stall bound assigned.
+migrated the same way, with only the stall bound assigned. The `[hooks]` table
+(`stderr_tail_bytes`, the bytes of a failing worktree-create hook's stderr kept
+for the `session.new` warning, `0..=32768` with 0 disabling the capture, 4096
+on fresh installs and migrations) raised it to 6; a schema-5 file is migrated
+the same way, with only the hooks default assigned.
 `service check` and the success reports of `pohunek service upgrade` name that
 migration in an additive `config_schema_migration` field (the source schema,
-`2`, `3` or `4`, or `null` when no migration runs); the check runs it read-only. The migration stops the daemon before it rewrites
+`2`, `3`, `4` or `5`, or `null` when no migration runs); the check runs it read-only. The migration stops the daemon before it rewrites
 `service.toml`, carries the exact pre-upgrade bytes in an owner-private backup
 digest-verified against its transaction record, and restores those bytes on
 rollback; a resume or rollback that cannot prove the exact pre-upgrade bytes

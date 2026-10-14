@@ -27,6 +27,7 @@ use crate::runtime::lifecycle::{
     SUPERVISION_UNAVAILABLE,
 };
 use crate::store::StoredInputRules;
+use crate::worktree::HookStderrTail;
 
 /// Everything needed to spawn and register one PTY-backed session, shared by
 /// first launch (`create`) and resume (`resume_binding`).
@@ -170,6 +171,9 @@ pub(super) struct TargetResolution {
     pub(super) is_linked_worktree: Option<bool>,
     /// Non-fatal worktree-setup warnings to surface on the session.
     pub(super) warnings: Vec<SessionWarning>,
+    /// Stderr tails of the failing create hooks among [`Self::warnings`], for
+    /// the `session.new` result only.
+    pub(super) hook_stderr_tails: Vec<HookStderrTail>,
 }
 
 impl SessionRegistry {
@@ -319,6 +323,7 @@ impl SessionRegistry {
             project_id,
             is_linked_worktree: Some(true),
             warnings: bound.warnings,
+            hook_stderr_tails: bound.stderr_tails,
         })
     }
 
@@ -356,6 +361,7 @@ impl SessionRegistry {
             project_id,
             is_linked_worktree,
             warnings: Vec::new(),
+            hook_stderr_tails: Vec::new(),
         }
     }
 

@@ -4265,6 +4265,7 @@ async fn session_start_hook_is_terminated_after_hook_timeout() {
             SESSION_HOOK_TIMEOUT_UNDER_TEST,
             Some(&config_dir),
             &mut warnings,
+            None,
         );
         warnings
     });
