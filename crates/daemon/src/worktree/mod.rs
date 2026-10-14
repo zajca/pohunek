@@ -89,11 +89,17 @@ const SETUP_SCRIPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// pathological repo (e.g. a hanging diff/textconv filter) cannot wedge a
 /// blocking-pool thread indefinitely either.
 pub(crate) const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
-/// Poll interval for bounded git subprocesses.
+/// Longest delay between polls of a bounded git subprocess.
 ///
 /// Matches the setup-script poll cadence: prompt enough for tests and short
 /// hangs, with negligible CPU overhead on the blocking worktree thread.
 const GIT_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// First delay between polls of a bounded git subprocess.
+///
+/// Most git commands exit within a few milliseconds, so polling starts short
+/// and doubles up to `GIT_COMMAND_POLL_INTERVAL`, which bounds the wakeups of
+/// a long-running command.
+const GIT_COMMAND_POLL_START: Duration = Duration::from_millis(1);
 
 /// Poll interval while waiting for another worktree operation on the same
 /// repository. Short because the holder is a local `git worktree` command that
@@ -2221,6 +2227,7 @@ enum GitOutcome {
 
 fn wait_child_with_timeout(child: &mut Child, timeout: Duration) -> GitOutcome {
     let deadline = Instant::now() + timeout;
+    let mut poll = GIT_COMMAND_POLL_START;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return GitOutcome::Exited(status),
@@ -2229,7 +2236,8 @@ fn wait_child_with_timeout(child: &mut Child, timeout: Duration) -> GitOutcome {
                     terminate_process_group(child);
                     return GitOutcome::TimedOut;
                 }
-                thread::sleep(GIT_COMMAND_POLL_INTERVAL);
+                thread::sleep(poll);
+                poll = (poll * 2).min(GIT_COMMAND_POLL_INTERVAL);
             }
             Err(err) => return GitOutcome::WaitError(err),
         }
