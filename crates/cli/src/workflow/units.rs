@@ -607,14 +607,16 @@ fn dispatcher_key() -> PluginUnitKey {
 /// at least one enabled plugin declares a reaction, and removed when none
 /// does. A plugin that fails verification is not a reason to remove the unit:
 /// the dispatcher verifies every run again, so keeping it is the fail-closed
-/// choice.
+/// choice. Under an installation of another version an installed unit is
+/// kept unchanged rather than restarted, and the unit can still be removed.
 ///
 /// # Errors
 ///
-/// Returns [`Error::ServiceNotInstalled`] when the unit must be installed or
-/// removed and no usable installation exists, or must be installed and the
-/// installation records another version, [`Error::Units`] when the service
-/// manager refuses, or [`Error::Store`] when the record cannot be written.
+/// Returns [`Error::ServiceNotInstalled`] when no usable installation exists
+/// for a unit that must be installed or removed, or when a unit that is not
+/// installed yet must be installed under an installation of another version,
+/// [`Error::Units`] when the service manager refuses, or [`Error::Store`] when
+/// the record cannot be written.
 pub(crate) async fn sync_dispatcher(
     store: &Store,
     context: &Context,
@@ -625,9 +627,15 @@ pub(crate) async fn sync_dispatcher(
     let installation = if reacting || recorded {
         let installation = require_installation(context)?;
         // Removing the unit runs no trampoline, so any version may remove it,
-        // as `disable` and `uninstall` remove plugin units.
+        // as `disable` and `uninstall` remove plugin units. Only this version
+        // writes the unit, since it runs that version's `__dispatch`.
         if reacting {
-            require_same_version(&installation)?;
+            if let Err(error) = require_same_version(&installation) {
+                // An installed dispatcher keeps its definition: it re-verifies
+                // every run and refuses a plugin that is no longer enabled,
+                // and a plugin is only enabled under this version.
+                return if recorded { Ok(()) } else { Err(error) };
+            }
         }
         Some(installation)
     } else {

@@ -663,6 +663,10 @@ dispatcher unit of your user service manager, which runs the hidden
 plugin declares reactions, is restarted whenever the set of such plugins
 changes (enable, disable, install, uninstall), and is removed when none
 remains. It needs the `pohunek service` installation, like jobs and services.
+Only an installation of this pohunek version gets a new or restarted
+dispatcher; under another version, `disable` and `uninstall` keep an installed
+dispatcher unchanged while another enabled plugin reacts (it refuses the runs
+of a plugin that is no longer enabled) and remove it with the last one.
 It is not part of the daemon: it connects to the local daemon's public
 `subscribe` stream only, never starts the daemon, and has no unit dependency
 on it.
