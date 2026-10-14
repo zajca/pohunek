@@ -690,6 +690,10 @@ struct SessionRegistryInner {
     /// and applying them.
     #[cfg(test)]
     refresh_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Parks the next active-agent report between resolving its agent and
+    /// committing it.
+    #[cfg(test)]
+    report_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
     /// Holds the next committed create before its initial input.
     #[cfg(test)]
     initial_input_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
@@ -1847,6 +1851,8 @@ impl SessionRegistry {
                 #[cfg(test)]
                 refresh_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
+                report_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
                 initial_input_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 initial_input_outcome_hold: std::sync::Mutex::new(None),
@@ -2822,6 +2828,22 @@ impl SessionRegistry {
         }
     }
 
+    /// Parks an active-agent report between resolving its agent and committing
+    /// it, when a test armed the hold.
+    #[cfg(test)]
+    async fn hold_report(&self) {
+        let gate = self
+            .inner
+            .report_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
     /// Parks a resume or fork after its profile resolved when a test armed the
     /// hold.
     #[cfg(test)]
@@ -3427,7 +3449,8 @@ impl SessionRegistry {
     /// The definition comes from [`SessionEntry::pinned`], derived at launch,
     /// at adoption and again after each package change, so callbacks and
     /// process recognition of one session follow the registry's current
-    /// serving source.
+    /// serving source. The resolution carries that definition, so a commit can
+    /// refuse a resolution a package change made stale.
     ///
     /// # Errors
     ///
@@ -3440,7 +3463,8 @@ impl SessionRegistry {
         &self,
         id: &SessionId,
         agent: &str,
-    ) -> Result<ResolvedAgent, CallbackRefusal> {
+    ) -> Result<SessionAgentResolution, CallbackRefusal> {
+        let registry = self.inner.profiles.runtimes().registry();
         let (pinned, agent_base) = {
             let sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get(id) else {
@@ -3448,6 +3472,11 @@ impl SessionRegistry {
                     .inner
                     .profiles
                     .resolve_agent(agent)
+                    .map(|agent| SessionAgentResolution {
+                        agent,
+                        pinned: None,
+                        registry,
+                    })
                     .map_err(CallbackRefusal::Unresolved);
             };
             (entry.pinned.clone(), entry.info.agent_base.clone())
@@ -3457,6 +3486,11 @@ impl SessionRegistry {
                 .inner
                 .profiles
                 .resolve_agent_pinned(agent, &pinned)
+                .map(|agent| SessionAgentResolution {
+                    agent,
+                    pinned: Some(pinned),
+                    registry,
+                })
                 .map_err(CallbackRefusal::Unresolved);
         }
         let resolved = self
@@ -3467,7 +3501,11 @@ impl SessionRegistry {
         if RuntimeRef::from(resolved.base.clone()) == agent_base {
             return Err(CallbackRefusal::UnservedPin(agent_base));
         }
-        Ok(resolved)
+        Ok(SessionAgentResolution {
+            agent: resolved,
+            pinned: None,
+            registry,
+        })
     }
 
     /// Logs why a callback `report` of session `id` naming `agent` is ignored.
@@ -3501,41 +3539,45 @@ impl SessionRegistry {
     pub async fn report_agent(&self, params: SessionReportAgentParams) -> SessionReportAgentResult {
         let not_recorded = SessionReportAgentResult { recorded: false };
         let activity_epoch = self.daemon_instance_id().to_owned();
-        let resolved = match self
-            .resolve_session_agent(&params.session_id, &params.agent)
-            .await
-        {
-            Ok(resolved) => resolved,
-            Err(refusal) => {
-                Self::log_callback_refusal(
-                    &params.session_id,
-                    &params.agent,
-                    "active-agent report",
-                    &refusal,
-                );
-                return not_recorded;
-            }
-        };
-        if !self
-            .hook_report_admitted(
-                &params.session_id,
-                pohunek_worker_protocol::HookAction::IdentityReport,
-                resolved.base.as_str(),
-                "active-agent report",
-            )
-            .await
-        {
-            return not_recorded;
-        }
-
         let valid_session_id =
             validate_agent_session_id(&params.session_id, params.agent_session_id.as_deref());
         let valid_session_path =
             validate_agent_session_path(&params.session_id, params.agent_session_path.as_deref());
         let reported_activity = params.activity;
         let report_sequence = params.seq.map(protocol::ReportSequence::get);
-        let active_detector_config = detector_config_for_resolved_agent(&resolved);
-        let (info, rescan, evidence) = {
+        let mut stale_resolutions = 0;
+        let (info, rescan, evidence) = loop {
+            let resolution = match self
+                .resolve_session_agent(&params.session_id, &params.agent)
+                .await
+            {
+                Ok(resolution) => resolution,
+                Err(refusal) => {
+                    Self::log_callback_refusal(
+                        &params.session_id,
+                        &params.agent,
+                        "active-agent report",
+                        &refusal,
+                    );
+                    return not_recorded;
+                }
+            };
+            let resolved = &resolution.agent;
+            if !self
+                .hook_report_admitted(
+                    &params.session_id,
+                    pohunek_worker_protocol::HookAction::IdentityReport,
+                    resolved.base.as_str(),
+                    "active-agent report",
+                )
+                .await
+            {
+                return not_recorded;
+            }
+            let active_detector_config = detector_config_for_resolved_agent(resolved);
+            #[cfg(test)]
+            self.hold_report().await;
+
             let mut sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get_mut(&params.session_id) else {
                 debug!(
@@ -3550,6 +3592,21 @@ impl SessionRegistry {
                     "active-agent report for a terminal session; ignoring"
                 );
                 return not_recorded;
+            }
+            // A package change replaced a definition the agent resolved
+            // against: committing it would restore the previous detector rules.
+            if resolution.is_stale(entry, &self.inner.profiles.runtimes().registry()) {
+                drop(sessions);
+                stale_resolutions += 1;
+                if stale_resolutions > MAX_STALE_REPORT_RESOLUTIONS {
+                    debug!(
+                        session_id = %params.session_id.0,
+                        agent = %params.agent,
+                        "active-agent report kept resolving against a replaced pin; ignoring"
+                    );
+                    return not_recorded;
+                }
+                continue;
             }
             if !report_is_current(
                 entry.last_agent_report.as_ref(),
@@ -3582,10 +3639,16 @@ impl SessionRegistry {
             entry.active_agent = Some(report.clone());
             entry.last_agent_report = Some(report);
             entry.info.active_agent = Some(resolved.name.clone());
-            entry.info.active_agent_base = Some(RuntimeRef::from(resolved.base));
+            entry.info.active_agent_base = Some(RuntimeRef::from(resolved.base.clone()));
             entry.info.active_agent_pid = pid;
-            entry.info.active_agent_session_id = valid_session_id;
-            entry.info.active_agent_session_path = valid_session_path;
+            entry
+                .info
+                .active_agent_session_id
+                .clone_from(&valid_session_id);
+            entry
+                .info
+                .active_agent_session_path
+                .clone_from(&valid_session_path);
             let evidence = reported_activity.and_then(|activity| {
                 self.inner
                     .turns
@@ -3596,11 +3659,11 @@ impl SessionRegistry {
             });
             send_detector_config(entry, active_detector_config);
             entry.info.updated_at = timestamp_now();
-            (
+            break (
                 entry.info.clone(),
                 Arc::clone(&entry.procwatch_rescan),
                 evidence,
-            )
+            );
         };
 
         self.emit(event::SESSION_UPDATED, &info);
@@ -3626,7 +3689,7 @@ impl SessionRegistry {
             .resolve_session_agent(&params.session_id, &params.agent)
             .await
         {
-            Ok(resolved) => resolved,
+            Ok(resolution) => resolution.agent,
             Err(refusal) => {
                 Self::log_callback_refusal(
                     &params.session_id,
@@ -6573,6 +6636,42 @@ enum CallbackRefusal {
     /// definition of its launch pin because this daemon did not serve that
     /// source when it launched or adopted the session.
     UnservedPin(RuntimeRef),
+}
+
+/// An agent a callback names, resolved for one session.
+struct SessionAgentResolution {
+    agent: ResolvedAgent,
+    /// The session's pinned definition the agent resolved against.
+    pinned: Option<Arc<RuntimeDefinition>>,
+    /// The registry snapshot, taken before the resolution, that every other
+    /// runtime resolved through.
+    registry: Arc<host::RuntimeRegistry>,
+}
+
+impl SessionAgentResolution {
+    /// Whether a package change replaced a definition this resolution used:
+    /// the session's pin, or the registry other runtimes resolve through.
+    fn is_stale(&self, entry: &SessionEntry, registry: &Arc<host::RuntimeRegistry>) -> bool {
+        !same_pin(entry.pinned.as_ref(), self.pinned.as_ref())
+            || !Arc::ptr_eq(&self.registry, registry)
+    }
+}
+
+/// Re-resolutions an active-agent report attempts when package changes keep
+/// replacing the session's pin between its resolution and its commit; each
+/// one needs a package transaction to finish inside that window.
+const MAX_STALE_REPORT_RESOLUTIONS: u32 = 3;
+
+/// Whether `current` is still the pinned definition `resolved` captured.
+fn same_pin(
+    current: Option<&Arc<RuntimeDefinition>>,
+    resolved: Option<&Arc<RuntimeDefinition>>,
+) -> bool {
+    match (current, resolved) {
+        (Some(current), Some(resolved)) => Arc::ptr_eq(current, resolved),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// What the runtime definitions say about a session's hook schema.

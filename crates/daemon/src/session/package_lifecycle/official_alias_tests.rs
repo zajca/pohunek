@@ -1454,7 +1454,8 @@ async fn a_live_session_keeps_its_own_observation_through_a_later_package_versio
         .registry
         .resolve_session_agent(&created.id, RuntimeId::HERMES)
         .await
-        .expect("resolve the callback agent");
+        .expect("resolve the callback agent")
+        .agent;
     assert_eq!(resolved.definition.binding().provenance, first_provenance);
     assert_eq!(
         format!("{:?}", resolved.definition.manifest()),
@@ -2296,6 +2297,203 @@ async fn a_live_built_in_claude_session_follows_its_package_detector_through_ins
         .remove(&created.id)
         .await
         .expect("remove the adopted session");
+}
+
+/// Arms `registry` to park its next active-agent report between resolving its
+/// agent and committing it.
+fn arm_report_hold(registry: &SessionRegistry) -> crate::runtime::lifecycle::tests::StartGate {
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: None,
+        entered: std::sync::Arc::new(tokio::sync::Notify::new()),
+        release: std::sync::Arc::new(tokio::sync::Notify::new()),
+    };
+    *registry
+        .inner
+        .report_hold
+        .lock()
+        .expect("report hold is never poisoned") = Some(gate.clone());
+    gate
+}
+
+#[tokio::test]
+async fn an_agent_report_held_across_an_uninstall_follows_the_current_pin() {
+    let tag = "claude-report-pin-race";
+    let key = signing_key("root");
+    let dir = temp_dir(tag);
+    let store_path = temp_store_path(tag);
+    let fixture = Fixture::with_anchor_and_store(
+        &format!("{tag}-plugins"),
+        anchor(&[&key], Vec::new()),
+        store_path.clone(),
+    );
+    fixture.write_profile(
+        PROFILE,
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 600\"]\n",
+    );
+    let previous = compiled_in_daemon(&fixture, &store_path);
+    let created = previous
+        .create(protocol::SessionNewParams {
+            agent: PROFILE.to_owned(),
+            cwd: Some(dir),
+            ..params()
+        })
+        .await
+        .expect("a session of the built-in Claude runtime");
+    let adopted = fixture.reopen_with_workers_of(&previous).await;
+    Box::pin(adopted.registry.reconcile_workers())
+        .await
+        .expect("startup reconciliation");
+    let package = real_official(RuntimeId::CLAUDE);
+    install_real_official(&adopted, &adopted.registry, RuntimeId::CLAUDE, &package, 5).await;
+    let generic = detector_debug(&crate::detect::DetectorConfig::generic_shell());
+    let served = adopted
+        .registry
+        .inner
+        .profiles
+        .runtimes()
+        .resolve_id(&RuntimeId::parse(RuntimeId::CLAUDE).expect("runtime id"))
+        .expect("the package serves claude");
+    let package_config = detector_debug(&crate::detect::DetectorConfig::for_definition(&served));
+    assert_ne!(package_config, generic);
+
+    // The report resolves its agent against the package's definition, and
+    // the package is uninstalled before the report commits.
+    let gate = arm_report_hold(&adopted.registry);
+    let reporting = tokio::spawn({
+        let registry = adopted.registry.clone();
+        let report = claude_identity_report(&created.id);
+        async move { registry.report_agent(report).await }
+    });
+    gate.entered.notified().await;
+    adopted
+        .registry
+        .package_uninstall(uninstall(&package.digest))
+        .await
+        .expect("uninstall the package");
+    assert_eq!(
+        running_detector(&adopted.registry, &created.id).await,
+        generic
+    );
+    gate.release.notify_one();
+    let held = reporting.await.expect("the held report finishes");
+
+    assert!(
+        !held.recorded,
+        "re-resolved against the current pin, the report names an unserved runtime"
+    );
+    assert_eq!(
+        running_detector(&adopted.registry, &created.id).await,
+        generic,
+        "a report resolved before the uninstall never restores the removed detector"
+    );
+
+    // Served again, the same report runs the package's detector.
+    install_real_official(&adopted, &adopted.registry, RuntimeId::CLAUDE, &package, 6).await;
+    assert!(
+        adopted
+            .registry
+            .report_agent(claude_identity_report(&created.id))
+            .await
+            .recorded,
+        "the report is recorded once the package serves the pin again"
+    );
+    assert_eq!(
+        running_detector(&adopted.registry, &created.id).await,
+        package_config
+    );
+    adopted
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the adopted session");
+    adopted
+        .registry
+        .remove(&created.id)
+        .await
+        .expect("remove the adopted session");
+}
+
+#[tokio::test]
+async fn a_nested_agent_report_held_across_an_uninstall_of_its_package_is_never_committed() {
+    let tag = "codex-nested-report-race";
+    let key = signing_key("root");
+    let dir = temp_dir(tag);
+    let store_path = temp_store_path(tag);
+    let fixture = Fixture::with_anchor_and_store(
+        &format!("{tag}-plugins"),
+        anchor(&[&key], Vec::new()),
+        store_path,
+    );
+    fixture.write_profile(
+        "host",
+        "base = \"shell\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 600\"]\n",
+    );
+    let package = real_official(RuntimeId::CODEX);
+    install_real_official(&fixture, &fixture.registry, RuntimeId::CODEX, &package, 5).await;
+    let created = fixture
+        .registry
+        .create(protocol::SessionNewParams {
+            agent: "host".to_owned(),
+            cwd: Some(dir),
+            ..params()
+        })
+        .await
+        .expect("a shell session");
+    let codex_report = || protocol::SessionReportAgentParams {
+        session_id: created.id.clone(),
+        source: "pohunek:codex".to_owned(),
+        agent: RuntimeId::CODEX.to_owned(),
+        activity: None,
+        seq: None,
+        pid: None,
+        agent_session_id: None,
+        agent_session_path: None,
+    };
+    let before = running_detector(&fixture.registry, &created.id).await;
+
+    // The report resolves the nested agent through the registry that serves
+    // the package, and the package is uninstalled before the report commits.
+    let gate = arm_report_hold(&fixture.registry);
+    let reporting = tokio::spawn({
+        let registry = fixture.registry.clone();
+        let report = codex_report();
+        async move { registry.report_agent(report).await }
+    });
+    gate.entered.notified().await;
+    fixture
+        .registry
+        .package_uninstall(uninstall(&package.digest))
+        .await
+        .expect("uninstall the package");
+    gate.release.notify_one();
+    let held = reporting.await.expect("the held report finishes");
+
+    assert!(
+        !held.recorded,
+        "re-resolved against the current registry, the report names an uninstalled runtime"
+    );
+    assert_eq!(
+        running_detector(&fixture.registry, &created.id).await,
+        before,
+        "the uninstalled package's detector never runs"
+    );
+
+    // Served again, the same report is recorded.
+    install_real_official(&fixture, &fixture.registry, RuntimeId::CODEX, &package, 6).await;
+    assert!(
+        fixture.registry.report_agent(codex_report()).await.recorded,
+        "the nested report is recorded while the package serves codex"
+    );
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+    fixture
+        .registry
+        .remove(&created.id)
+        .await
+        .expect("remove the session");
 }
 
 /// The generation of the running detector configuration of session `id`.
