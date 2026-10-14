@@ -8043,9 +8043,16 @@ while os.getppid() == parent:
                 "native_reference": "nested-after-restart"
             })
         };
+        // The worker orders identity reports per process, so the released
+        // process's sequence never orders another process's report, and the
+        // worker's own order of a process outlives the daemon replacement.
+        assert!(
+            send_identity_hook_from(&reassert, reassert_request(8)).await,
+            "another process's release must not make a report stale after restart"
+        );
         assert!(
             !send_identity_hook_from(&reassert, reassert_request(8)).await,
-            "release sequence must reject a late report after restart"
+            "a report not newer than the process's own must be rejected after restart"
         );
         assert!(
             send_identity_hook_from(&reassert, reassert_request(9)).await,

@@ -637,6 +637,8 @@ struct State {
     /// Unjournaled evidence about journaled subagents that subagent snapshots
     /// reconcile against.
     subagent_evidence: SubagentEvidence,
+    /// Newest identity sequence of each recently reporting process.
+    identity_marks: IdentityMarks,
 }
 
 impl State {
@@ -656,6 +658,7 @@ impl State {
             journal,
             orphan_stops: OrphanStops::default(),
             subagent_evidence: SubagentEvidence::default(),
+            identity_marks: IdentityMarks::default(),
         }
     }
 }
@@ -3784,7 +3787,49 @@ where
                     start_identity,
                     root_identity.pid,
                 ) && root_report_from_root(&shared, peer, pid, &root_identity);
-                let sequence_valid = identity_sequence_is_fresh(&state.journal, sequence);
+                let reporting = Reporter {
+                    pid,
+                    start_identity,
+                };
+                let sequence_valid = identity_sequence_is_fresh(
+                    &state.journal,
+                    &state.identity_marks,
+                    reporting,
+                    sequence,
+                );
+                let pinned = identity_pins(&root_identity, state.journal.launch_identity.as_ref());
+                // Before the launch identity exists only the PTY root is pinned,
+                // and under the named-for-provider rule the launch process can be
+                // one of its descendants, so a report that may establish the
+                // launch identity is not refused for the reporter bound before
+                // its claim is verified.
+                let launch_candidate = state.journal.launch_identity.is_none()
+                    && reference_kind.is_some()
+                    && native_reference.is_some()
+                    && state.launch_agent_base.as_deref() == Some(provider.as_str());
+                let room = process_valid
+                    && sequence_valid
+                    && if launch_candidate {
+                        state.identity_marks.make_room(
+                            reporting,
+                            &pinned,
+                            shared.config.identity_reporters,
+                            reporter_exited,
+                        )
+                    } else {
+                        admit_reporter(
+                            &shared,
+                            "identity_report",
+                            &mut state.identity_marks,
+                            reporting,
+                            &pinned,
+                            peer,
+                        )
+                    };
+                // A launch candidate beyond the bound is kept only when its claim
+                // establishes the launch identity, which pins the reporter, so the
+                // unpinned marks stay within the bound.
+                let beyond_bound = process_valid && sequence_valid && launch_candidate && !room;
                 // The background snapshot follows its reporting process, so an
                 // admitted, process-valid report clears it even when the identity
                 // rules below refuse the report.
@@ -3796,6 +3841,7 @@ where
                             start_identity,
                             sequence,
                             session_source.as_deref(),
+                            false,
                         )
                     })
                     .flatten();
@@ -3807,20 +3853,8 @@ where
                         peer,
                     );
                 }
-                if !process_valid || !sequence_valid {
-                    if background_clear.is_some() {
-                        let mut journal = state.journal.clone();
-                        if background::clear_at(&mut journal, sequence) {
-                            journal.updated_at = timestamp();
-                            persist(shared.journal.clone(), journal.clone()).await?;
-                            state.journal = journal;
-                            if let Some(reason) = background_clear {
-                                log_background_cleared(&shared, reason);
-                            }
-                        }
-                    }
-                    (false, false, current_runtime, None)
-                } else {
+                let mut deferred_claims = None;
+                let admitted = if process_valid && sequence_valid && (room || beyond_bound) {
                     let mut journal = state.journal.clone();
                     let process = ChildIdentity {
                         pid,
@@ -3836,9 +3870,31 @@ where
                         native_reference: native_reference.clone(),
                     });
                     journal.active_identity_release = None;
-                    let background_cleared = background_clear.and_then(|reason| {
-                        background::clear_at(&mut journal, sequence).then_some(reason)
-                    });
+                    // Accepted as the active identity, a report of another process
+                    // clears the owner's snapshot whatever its own clock reads.
+                    // That clock is not ordered against the owner's, so the
+                    // worker's own clock is the barrier: an owner snapshot taken
+                    // before this report arrived is stale. The owner's own session
+                    // start is ordered by its sequence.
+                    let background_cleared = background_clear
+                        .or_else(|| {
+                            report_background_clear(
+                                &journal,
+                                pid,
+                                start_identity,
+                                sequence,
+                                session_source.as_deref(),
+                                true,
+                            )
+                        })
+                        .and_then(|reason| {
+                            let barrier = if reason == AGENT_CHANGED {
+                                background::monotonic_nanos()
+                            } else {
+                                sequence
+                            };
+                            background::clear_at(&mut journal, barrier).then_some(reason)
+                        });
                     if let (Some(reference_kind), Some(native_reference), Some(launch_base)) = (
                         reference_kind,
                         native_reference,
@@ -3875,9 +3931,34 @@ where
                             )?;
                         }
                     }
+                    if beyond_bound && launch_identity_status != LaunchClaimStatus::Accepted {
+                        reject_identity(
+                            &shared,
+                            "identity_report",
+                            RejectReason::IdentityReportersExhausted,
+                            peer,
+                        );
+                        // A launch claim whose verification was deferred keeps its
+                        // bounded pending entry, so the retry can still establish
+                        // the launch identity and pin the process; nothing else of
+                        // the report is kept.
+                        if launch_identity_status == LaunchClaimStatus::Pending {
+                            deferred_claims = Some(journal.pending_launch_claims);
+                        } else {
+                            launch_identity_status = LaunchClaimStatus::NotApplicable;
+                        }
+                        None
+                    } else {
+                        Some((journal, background_cleared))
+                    }
+                } else {
+                    None
+                };
+                if let Some((mut journal, background_cleared)) = admitted {
                     journal.updated_at = timestamp();
                     persist(shared.journal.clone(), journal.clone()).await?;
                     state.journal = journal;
+                    state.identity_marks.record(reporting, sequence);
                     if let Some(reason) = background_cleared {
                         log_background_cleared(&shared, reason);
                     }
@@ -3887,6 +3968,23 @@ where
                         current_runtime,
                         None,
                     )
+                } else {
+                    let mut journal = state.journal.clone();
+                    let deferred = deferred_claims.is_some();
+                    if let Some(claims) = deferred_claims {
+                        journal.pending_launch_claims = claims;
+                    }
+                    let cleared =
+                        background_clear.is_some() && background::clear_at(&mut journal, sequence);
+                    if deferred || cleared {
+                        journal.updated_at = timestamp();
+                        persist(shared.journal.clone(), journal.clone()).await?;
+                        state.journal = journal;
+                        if let (true, Some(reason)) = (cleared, background_clear) {
+                            log_background_cleared(&shared, reason);
+                        }
+                    }
+                    (false, false, current_runtime, None)
                 }
             }
         }
@@ -3919,6 +4017,7 @@ where
                 let pty = state.pty.as_ref().ok_or_else(|| {
                     WorkerError::Protocol("runtime is not initialized".to_owned())
                 })?;
+                let root_identity = pty.identity().clone();
                 let process_valid = hook_claim_valid(
                     &shared,
                     "identity_release",
@@ -3926,8 +4025,8 @@ where
                     ancestry,
                     pid,
                     start_identity,
-                    pty.identity().pid,
-                ) && root_report_from_root(&shared, peer, pid, pty.identity());
+                    root_identity.pid,
+                ) && root_report_from_root(&shared, peer, pid, &root_identity);
                 // A `/clear` ends the session and starts it again in the same
                 // process, so only the other reasons end the snapshot's owner.
                 let owner_released = process_valid
@@ -3940,21 +4039,33 @@ where
                         .is_some_and(|owner| {
                             owner.pid == pid && owner.start_identity == start_identity.to_string()
                         });
-                let released_process = if process_valid {
+                let reporting = Reporter {
+                    pid,
+                    start_identity,
+                };
+                let pinned = identity_pins(&root_identity, state.journal.launch_identity.as_ref());
+                let fresh = process_valid
+                    && identity_sequence_is_fresh(
+                        &state.journal,
+                        &state.identity_marks,
+                        reporting,
+                        sequence,
+                    )
+                    && admit_reporter(
+                        &shared,
+                        "identity_release",
+                        &mut state.identity_marks,
+                        reporting,
+                        &pinned,
+                        peer,
+                    );
+                let released_process = if fresh {
                     state
                         .journal
                         .active_identity
                         .as_ref()
                         .filter(|active| {
-                            active.provider == provider
-                                && active.process.pid == pid
-                                && active.process.start_identity == start_identity.to_string()
-                                && sequence > active.sequence
-                                && state
-                                    .journal
-                                    .active_identity_release
-                                    .as_ref()
-                                    .is_none_or(|release| sequence > release.sequence)
+                            active.provider == provider && is_reporter(&active.process, reporting)
                         })
                         .map(|active| active.process.clone())
                 } else {
@@ -3973,23 +4084,31 @@ where
                     journal.updated_at = timestamp();
                     persist(shared.journal.clone(), journal.clone()).await?;
                     state.journal = journal;
+                    state.identity_marks.record(reporting, sequence);
                     if background_cleared {
                         log_background_cleared(&shared, "release");
                     }
                     (true, false, current_runtime, None)
-                } else if owner_released {
-                    // The identity release was not accepted, for example after a
-                    // `clear` release whose session start never arrived. The owner
-                    // still ends its snapshot.
-                    let mut journal = state.journal.clone();
-                    if background::clear_at(&mut journal, sequence) {
-                        journal.updated_at = timestamp();
-                        persist(shared.journal.clone(), journal.clone()).await?;
-                        state.journal = journal;
-                        log_background_cleared(&shared, "release");
-                    }
-                    (false, false, current_runtime, None)
                 } else {
+                    // A fresh release of a process that is not active ends no
+                    // identity and is answered `ok: false`, but it still makes
+                    // that process's earlier claims stale when they are
+                    // delivered after it.
+                    if fresh {
+                        state.identity_marks.record(reporting, sequence);
+                    }
+                    if owner_released {
+                        // The identity release was not accepted, for example after a
+                        // `clear` release whose session start never arrived. The owner
+                        // still ends its snapshot.
+                        let mut journal = state.journal.clone();
+                        if background::clear_at(&mut journal, sequence) {
+                            journal.updated_at = timestamp();
+                            persist(shared.journal.clone(), journal.clone()).await?;
+                            state.journal = journal;
+                            log_background_cleared(&shared, "release");
+                        }
+                    }
                     (false, false, current_runtime, None)
                 }
             }
@@ -4450,28 +4569,39 @@ fn background_candidates(shared: &Shared, request: &SnapshotRequest) -> Vec<Cand
     candidates
 }
 
+/// The background clear reason of a report from a process other than the
+/// snapshot's owner.
+const AGENT_CHANGED: &str = "agent_changed";
+
 /// Why an admitted, process-valid identity report clears the background
 /// snapshot, if it does.
 ///
-/// Only a snapshot ordered before the report can be cleared. A report from the
-/// snapshot's owner clears it when the owner starts or resumes its session. A
-/// report from any other process clears it, whatever its source, because that
-/// process did not report the snapshot. The owner's `clear` session keeps it,
-/// since the same process starts the session again.
+/// A report from any process other than the snapshot's owner clears it,
+/// whatever its source, because that process did not report the snapshot.
+/// One `accepted` as the active identity clears it whatever its sequence,
+/// because sequences of different processes are never compared; any other
+/// clears only a snapshot ordered before it. A report from the owner clears a
+/// snapshot ordered before it when the owner starts or resumes its session;
+/// the owner's `clear` session keeps it, since the same process starts the
+/// session again.
 fn report_background_clear(
     journal: &JournalRecord,
     pid: u32,
     start_identity: u64,
     sequence: u64,
     session_source: Option<&str>,
+    accepted: bool,
 ) -> Option<&'static str> {
     let owner = journal.background_owner.as_ref()?;
+    let is_owner = owner.pid == pid && owner.start_identity == start_identity.to_string();
+    if !is_owner && accepted {
+        return Some(AGENT_CHANGED);
+    }
     if journal.background_sequence >= sequence {
         return None;
     }
-    let is_owner = owner.pid == pid && owner.start_identity == start_identity.to_string();
     if !is_owner {
-        Some("agent_changed")
+        Some(AGENT_CHANGED)
     } else if matches!(session_source, Some("startup" | "resume")) {
         Some("session_start")
     } else {
@@ -5502,11 +5632,151 @@ impl OrphanStops {
     }
 }
 
-/// The agent process that reported a subagent claim.
+/// The agent process that reported a hook claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Reporter {
     pid: u32,
     start_identity: u64,
+}
+
+/// Newest accepted identity claim or release sequence of each reporting
+/// process that may still report.
+///
+/// A mark is never evicted while its process may still report, because a
+/// forgotten mark would admit that process's own older claim again, for
+/// example after it released. A process that exited, or whose pid now names a
+/// different start identity, can never pass the process checks again, so its
+/// mark is pruned when room is needed. The PTY root and the launch process are
+/// pinned and never count against the bound. When the unpinned marks of live
+/// processes fill the bound, a report from a further process is refused
+/// instead (see [`admit_reporter`]).
+///
+/// The marks are kept in worker memory only: a worker process bootstraps its
+/// own journal and serves one runtime, so they never need to outlive it.
+#[derive(Debug, Default)]
+struct IdentityMarks {
+    /// `(reporter, newest accepted sequence)`.
+    marks: Vec<(Reporter, u64)>,
+}
+
+impl IdentityMarks {
+    /// Newest accepted sequence of `reporter`, if it has a mark.
+    fn get(&self, reporter: Reporter) -> Option<u64> {
+        self.marks
+            .iter()
+            .find(|(process, _)| *process == reporter)
+            .map(|(_, sequence)| *sequence)
+    }
+
+    /// Number of marks of processes `pinned` does not name.
+    fn unpinned(&self, pinned: &[Reporter]) -> usize {
+        self.marks
+            .iter()
+            .filter(|(process, _)| !pinned.contains(process))
+            .count()
+    }
+
+    /// Whether a mark for `reporter` exists or fits within `capacity`
+    /// unpinned marks, pruning the marks of exited processes when the bound
+    /// is reached.
+    fn make_room(
+        &mut self,
+        reporter: Reporter,
+        pinned: &[Reporter],
+        capacity: usize,
+        exited: impl Fn(Reporter) -> bool,
+    ) -> bool {
+        if pinned.contains(&reporter) || self.get(reporter).is_some() {
+            return true;
+        }
+        if self.unpinned(pinned) >= capacity {
+            self.marks
+                .retain(|(process, _)| pinned.contains(process) || !exited(*process));
+        }
+        self.unpinned(pinned) < capacity
+    }
+
+    /// Remembers an accepted claim or release of `reporter` at `sequence`,
+    /// keeping its greatest sequence.
+    ///
+    /// Callers admit `reporter` with [`Self::make_room`] first, so the bound
+    /// holds.
+    fn record(&mut self, reporter: Reporter, sequence: u64) {
+        match self
+            .marks
+            .iter_mut()
+            .find(|(process, _)| *process == reporter)
+        {
+            Some((_, recorded)) => *recorded = (*recorded).max(sequence),
+            None => self.marks.push((reporter, sequence)),
+        }
+    }
+}
+
+/// The processes whose identity marks are pinned: the PTY root and, once
+/// established, the launch process.
+fn identity_pins(root: &ProcessIdentity, launch: Option<&LaunchIdentity>) -> Vec<Reporter> {
+    [
+        Some((root.pid, root.start_identity.as_str())),
+        launch.map(|launch| (launch.process.pid, launch.process.start_identity.as_str())),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|(pid, start_identity)| {
+        start_identity.parse().ok().map(|start_identity| Reporter {
+            pid,
+            start_identity,
+        })
+    })
+    .collect()
+}
+
+/// Whether `reporter` may be given an identity mark, logging a refusal of
+/// `operation`.
+///
+/// A report from a process without a mark is refused with
+/// [`RejectReason::IdentityReportersExhausted`] when the marks of live,
+/// unpinned processes already fill the configured bound. Refusing keeps every
+/// live process's order intact, where evicting a mark would not.
+fn admit_reporter(
+    shared: &Shared,
+    operation: &'static str,
+    marks: &mut IdentityMarks,
+    reporter: Reporter,
+    pinned: &[Reporter],
+    peer: &PeerContext,
+) -> bool {
+    let admitted = marks.make_room(
+        reporter,
+        pinned,
+        shared.config.identity_reporters,
+        reporter_exited,
+    );
+    if !admitted {
+        reject_identity(
+            shared,
+            operation,
+            RejectReason::IdentityReportersExhausted,
+            peer,
+        );
+    }
+    admitted
+}
+
+/// Whether `reporter` has exited, or its pid names a different process.
+///
+/// An exited process its parent has not reaped yet keeps its identity but
+/// can never report again, so it counts as exited. A failed inspection counts
+/// as alive, so an uncertain answer keeps the mark.
+fn reporter_exited(reporter: Reporter) -> bool {
+    let identity = OsProcessIdentity {
+        pid: reporter.pid,
+        start_identity: StartIdentity::new(reporter.start_identity),
+    };
+    match HostInspector::new().is_running(identity) {
+        Ok(running) => !running,
+        Err(_error) => false,
+    }
 }
 
 /// Unjournaled evidence about one journaled subagent.
@@ -6094,16 +6364,51 @@ const fn wire_subagent_phase(phase: JournalSubagentPhase) -> WireSubagentPhase {
     }
 }
 
-fn identity_sequence_is_fresh(journal: &JournalRecord, sequence: u64) -> bool {
-    let active_is_fresh = journal
-        .active_identity
-        .as_ref()
-        .is_none_or(|active| sequence > active.sequence);
-    active_is_fresh
-        && journal
+/// Whether an identity claim or release of `reporter` at `sequence` is newer
+/// than every earlier accepted claim and release of that same process.
+///
+/// Reports of different processes are never ordered against each other, so no
+/// process's sequence can make another process's report stale; the latest
+/// accepted claim is the active identity. The process's mark is its remembered
+/// one, which [`IdentityMarks`] keeps for as long as the process may report,
+/// together with the journaled active identity, release, and launch reference
+/// of that process.
+fn identity_sequence_is_fresh(
+    journal: &JournalRecord,
+    marks: &IdentityMarks,
+    reporter: Reporter,
+    sequence: u64,
+) -> bool {
+    let journaled = [
+        journal
+            .active_identity
+            .as_ref()
+            .map(|active| (&active.process, active.sequence)),
+        journal
             .active_identity_release
             .as_ref()
-            .is_none_or(|release| sequence > release.sequence)
+            .map(|release| (&release.process, release.sequence)),
+        journal
+            .native_reference_claim
+            .as_ref()
+            .map(|reference| (&reference.process, reference.sequence)),
+    ];
+    marks
+        .get(reporter)
+        .into_iter()
+        .chain(
+            journaled
+                .into_iter()
+                .flatten()
+                .filter(|(process, _)| is_reporter(process, reporter))
+                .map(|(_, mark)| mark),
+        )
+        .all(|mark| sequence > mark)
+}
+
+/// Whether the journaled `process` is the process `reporter`.
+fn is_reporter(process: &ChildIdentity, reporter: Reporter) -> bool {
+    process.pid == reporter.pid && process.start_identity == reporter.start_identity.to_string()
 }
 
 fn valid_identity_expiry(value: &str) -> bool {
@@ -7180,8 +7485,8 @@ mod tests {
         validate_observation_request, validate_terminal_snapshot_dimensions,
         validate_terminal_snapshot_response, write_data_error, write_observation_page,
         write_output_chunks, write_runtime_output_event, write_terminal_chunks, Connection,
-        ControlInputId, DataGrant, ObservationGrant, ObservationWaitOutcome, PrefixStream,
-        TokenState, WireTerminalSnapshot, ATTACH_INPUT_PREFIX,
+        ControlInputId, DataGrant, IdentityMarks, ObservationGrant, ObservationWaitOutcome,
+        PrefixStream, Reporter, TokenState, WireTerminalSnapshot, ATTACH_INPUT_PREFIX,
     };
     use pohunek_worker_protocol::{
         self as protocol, AttachStart, Capability, ControlCode, ControlError, ControlMessage,
@@ -8100,9 +8405,14 @@ mod tests {
             sequence: 8,
         });
 
-        assert!(!identity_sequence_is_fresh(&journal, 7));
-        assert!(!identity_sequence_is_fresh(&journal, 8));
-        assert!(identity_sequence_is_fresh(&journal, 9));
+        let marks = IdentityMarks::default();
+        let released = Reporter {
+            pid: 11,
+            start_identity: 110,
+        };
+        assert!(!identity_sequence_is_fresh(&journal, &marks, released, 7));
+        assert!(!identity_sequence_is_fresh(&journal, &marks, released, 8));
+        assert!(identity_sequence_is_fresh(&journal, &marks, released, 9));
     }
 
     // Needs a descendant that keeps the PTY open after the root exits. Darwin

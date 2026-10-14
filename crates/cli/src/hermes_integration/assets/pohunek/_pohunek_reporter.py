@@ -207,10 +207,10 @@ class Reporter:
         return remaining
 
     def _next_sequence(self) -> int:
-        # The worker orders the identity claims of every reporter in a session
-        # against each other, so claims carry the system-wide monotonic clock
-        # the shipped Claude and Codex hooks also use. The counter keeps two
-        # reports within one clock tick strictly increasing.
+        # The worker orders each process's own identity reports. This reporter
+        # is one long-lived process reporting itself, so `time.monotonic_ns()`
+        # is strictly increasing for it; the counter keeps two reports within
+        # one clock tick strictly increasing too.
         self._sequence = max(self._sequence + 1, time.monotonic_ns())
         return self._sequence
 

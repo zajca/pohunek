@@ -584,9 +584,12 @@ cleared in these cases:
   a `clear` release whose session start never arrived. A release from another
   process changes nothing;
 - an admitted, process-valid identity report comes from a process other than
-  the owner, and the stored sequence is older than the report's
-  (`agent_changed`), whatever its session source. This holds even when the
-  identity rules refuse the report;
+  the owner (`agent_changed`), whatever its session source: when the report is
+  accepted as the active identity, whatever its sequence, because sequences of
+  different processes are never compared, and then the stored sequence is
+  raised to the worker's own `CLOCK_MONOTONIC` reading, so an owner snapshot
+  taken before the report but delivered after it stays stale; when the identity
+  rules refuse it, only if the stored sequence is older than the report's;
 - an admitted, process-valid identity report from the owner with source
   `startup` or `resume`, ordered after the stored sequence (`session_start`);
 - the owner process is not running (`owner_exited`): it has exited and been
@@ -1205,11 +1208,26 @@ launch process and sequence for the worker's active identity), a stale or
 refused one leaves the stored reference alone, and an assigned value never
 replaces a reported one, also across a daemon restart. Sequences are compared per
 transport (worker claim or public report) and per runtime generation, so one
-clock never makes the other stale. Inside the worker, the claims of every
-reporter in a session share one ordering, so the shipped Codex and Claude hooks
-stamp their worker claims from the system-wide monotonic clock in nanoseconds
-(`CLOCK_MONOTONIC`) and a nested agent's claim never makes the launch agent's
-later claim stale. A recovered
+clock never makes the other stale. Inside the worker, identity claims and
+releases are ordered per reported process (pid and kernel start identity): a
+report must be newer than every claim and release accepted for that same
+process, and reports of different processes are never compared, so a nested
+agent's claim, even at `u64::MAX`, never makes the launch agent's later claim
+stale. Across processes the latest accepted claim is the active identity. A
+release answered `ok: false` (its process is not active) still orders that
+process's later claims. The worker keeps every live reporter's sequence, never
+evicting it, so a released process cannot become active again through its own
+older claim delivered late. Marks of exited processes, unreaped ones
+included, are pruned when room is needed; when live reporters other than the
+PTY root and the launch process fill the bound (16), a further process's report
+is refused with reason `identity_reporters_exhausted` until one exits. Before
+the launch identity exists, a launch agent's report with a native reference is
+still verified as a launch claim at the bound and kept only when it
+establishes the launch identity; a deferred verification keeps only its
+pending launch claim, so the retry can still establish it. Each
+hook event runs a fresh interpreter for the same agent process, so the shipped
+Codex and Claude hooks stamp their worker claims from the system-wide
+monotonic clock in nanoseconds (`CLOCK_MONOTONIC`). A recovered
 generation's first claim supersedes the reference it was relaunched with. The worker journals the latest
 reference of the verified launch process apart from the active claim's lease, so
 a switch made while the daemon was down survives the lease, and every
