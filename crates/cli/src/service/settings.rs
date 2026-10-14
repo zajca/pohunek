@@ -21,6 +21,12 @@ pub const WORKER_CONNECT: Duration = Duration::from_secs(10);
 /// systemd template, so both backends expire an uninitialized worker alike.
 pub const WORKER_INITIALIZE: Duration = Duration::from_secs(45);
 
+/// Time the systemd user manager may take to report its environment.
+pub const MANAGER_ENVIRONMENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bytes of the user manager's environment report that are kept.
+pub const MANAGER_ENVIRONMENT_OUTPUT: usize = 1024 * 1024;
+
 /// Deadline of one `/bin/launchctl` command.
 ///
 /// `bootstrap` and `print` finish in milliseconds; ten seconds only guards
@@ -104,14 +110,6 @@ pub const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// A version line is tens of bytes; the cap bounds memory for a binary that
 /// floods stdout.
 pub const VERSION_PROBE_OUTPUT: usize = 4 * 1024;
-
-/// Deadline for one `pohunekd upgrade-preflight` run.
-///
-/// The preflight reads the metadata store, the worker journals and the process
-/// table, which finishes in well under a second on a host with hundreds of
-/// sessions; thirty seconds only guards against a wedged filesystem and keeps
-/// an upgrade from hanging before its first effect.
-pub const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bytes of the preflight report kept from the new daemon.
 ///

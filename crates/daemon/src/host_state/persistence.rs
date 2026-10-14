@@ -147,12 +147,31 @@ impl HostStateDir {
     /// Returns [`HostStateError`] when a component is unsafe, permissions are too
     /// broad, or an operating-system operation fails.
     pub fn open_or_create(state_dir: &Path) -> Result<Self, HostStateError> {
-        let state_path = state_dir.to_path_buf();
         let state = TrustedDir::open_or_create_absolute(state_dir, DIRECTORY_MODE)
             .map_err(platform_error)?;
         let host = state
             .open_or_create_child(pohunek_paths::HOST_STATE_SUBDIR, DIRECTORY_MODE)
             .map_err(platform_error)?;
+        Self::from_trusted(state_dir, host)
+    }
+
+    /// Opens the host-state directory under `state_dir` only if it exists,
+    /// creating nothing, with the same safety checks as [`Self::open_or_create`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostStateError`] when a component is missing or unsafe, or an
+    /// operating-system operation fails.
+    pub fn open_existing(state_dir: &Path) -> Result<Self, HostStateError> {
+        let state = TrustedDir::open_absolute(state_dir, DIRECTORY_MODE).map_err(platform_error)?;
+        let host = state
+            .open_child(pohunek_paths::HOST_STATE_SUBDIR, DIRECTORY_MODE)
+            .map_err(platform_error)?;
+        Self::from_trusted(state_dir, host)
+    }
+
+    fn from_trusted(state_dir: &Path, host: TrustedDir) -> Result<Self, HostStateError> {
+        let state_path = state_dir.to_path_buf();
         Ok(Self {
             state_path: state_path.clone(),
             path: state_path.join(pohunek_paths::HOST_STATE_SUBDIR),

@@ -14,15 +14,26 @@ mod native;
 #[path = "../../daemon/tests/support/official_runtimes.rs"]
 mod official_runtimes;
 
+use std::future::Future;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
-use pohunek_cli::service::preflight::{decide, gate, DaemonPreflight};
+use pohunek_cli::service::manager_env::{user_manager_search_path, UserManager};
+use pohunek_cli::service::preflight::{
+    decide, gate, gate_upgrade, AdoptionPreflight as _, DaemonPreflight, ReleasePlan,
+};
 use pohunek_cli::service::{Context, Error, VERSION};
 use pohunek_daemon::store::{DesiredState, RuntimeRecord, SessionRecord, Store};
 use pohunek_paths::{BasePaths, PathEnv, Platform};
 use pohunek_platform::process::{HostInspector, ProcessInspector as _};
-use pohunek_service_config::preflight::Verdict;
+use pohunek_service_config::preflight::{
+    PreflightReport, SessionVerdict, StoreReport, StoreState, Verdict, RELEASE_PLAN_FLAG,
+    REPORT_VERSION,
+};
+use pohunek_service_config::runtimes::{
+    CatalogStatus, EnsureReport, Refusal, ENSURE_REPORT_VERSION,
+};
 use pohunek_session_worker::{Journal, JournalRecord, WorkerOrigin};
 use protocol::{
     RuntimeGeneration, RuntimeRef, RuntimeState, SessionCapabilities, SessionId, SessionInfo,
@@ -274,9 +285,16 @@ async fn the_real_daemon_reports_a_clean_live_session_adoptable() {
     host.seed_live_session(false);
     let archive = host.archive();
 
-    let gated = gate(&DaemonPreflight, &host.context, &archive, VERSION, false)
-        .await
-        .expect("a clean state passes the gate");
+    let gated = gate(
+        &DaemonPreflight,
+        &host.context,
+        &archive,
+        VERSION,
+        "/usr/bin:/bin",
+        false,
+    )
+    .await
+    .expect("a clean state passes the gate");
 
     assert!(!gated.accepted);
     assert_eq!(gated.report.daemon_version, VERSION);
@@ -295,9 +313,16 @@ async fn the_real_daemon_names_a_session_it_would_not_adopt_and_the_flag_accepts
     host.seed_live_session(true);
     let archive = host.archive();
 
-    let error = gate(&DaemonPreflight, &host.context, &archive, VERSION, false)
-        .await
-        .expect_err("a record that cannot be loaded is refused");
+    let error = gate(
+        &DaemonPreflight,
+        &host.context,
+        &archive,
+        VERSION,
+        "/usr/bin:/bin",
+        false,
+    )
+    .await
+    .expect_err("a record that cannot be loaded is refused");
     let Error::UpgradeAtRisk { sessions } = &error else {
         panic!("{error:?}");
     };
@@ -306,9 +331,16 @@ async fn the_real_daemon_names_a_session_it_would_not_adopt_and_the_flag_accepts
     assert_eq!(sessions[0].verdict, Verdict::WouldNotBeAdopted);
     assert!(error.to_string().contains(SESSION), "{error}");
 
-    let gated = gate(&DaemonPreflight, &host.context, &archive, VERSION, true)
-        .await
-        .expect("the flag accepts the loss");
+    let gated = gate(
+        &DaemonPreflight,
+        &host.context,
+        &archive,
+        VERSION,
+        "/usr/bin:/bin",
+        true,
+    )
+    .await
+    .expect("the flag accepts the loss");
     assert!(gated.accepted);
     assert_eq!(gated.report.at_risk().count(), 1);
     // `decide` is the whole policy: the same report is refused without the flag.
@@ -349,9 +381,16 @@ async fn a_preflight_that_fails_or_prints_garbage_fails_closed() {
         ),
     ] {
         let archive = scripted_daemon(&host.root, body);
-        let error = gate(&DaemonPreflight, &host.context, &archive, VERSION, true)
-            .await
-            .expect_err(name);
+        let error = gate(
+            &DaemonPreflight,
+            &host.context,
+            &archive,
+            VERSION,
+            "/usr/bin:/bin",
+            true,
+        )
+        .await
+        .expect_err(name);
         assert!(
             matches!(error, Error::UpgradePreflightFailed { .. }),
             "{name}: {error:?}"
@@ -361,15 +400,390 @@ async fn a_preflight_that_fails_or_prints_garbage_fails_closed() {
     }
 }
 
+/// A report of the release daemon with `runtimes` and one stopped session.
+fn daemon_report(runtimes: Option<EnsureReport>, stopped: Vec<SessionVerdict>) -> PreflightReport {
+    PreflightReport {
+        report_version: REPORT_VERSION,
+        daemon_version: VERSION.to_owned(),
+        store: StoreReport {
+            path: PathBuf::from("/data/metadata.jsonl"),
+            state: StoreState::UpToDate,
+            schema_from: None,
+            schema_to: 4,
+            records: 1,
+            error_code: None,
+            error: None,
+        },
+        sessions: Vec::new(),
+        stopped_sessions: stopped,
+        unmanaged_workers: Vec::new(),
+        runtimes,
+    }
+}
+
+/// Stages a `pohunekd` that prints `report` as its upgrade preflight.
+fn reporting_daemon(root: &Path, name: &str, report: &PreflightReport) -> PathBuf {
+    let root = root.join(name);
+    std::fs::create_dir_all(&root).expect("report dir");
+    let report_file = root.join("report.json");
+    std::fs::write(&report_file, serde_json::to_vec(report).expect("serialize")).expect("write");
+    scripted_daemon(&root, &format!("cat '{}'", report_file.display()))
+}
+
+#[tokio::test]
+async fn the_daemon_report_fields_reach_the_upgrade_gate_through_the_process_boundary() {
+    let host = Host::new();
+    let refused = daemon_report(
+        Some(EnsureReport {
+            report_version: ENSURE_REPORT_VERSION,
+            daemon_version: VERSION.to_owned(),
+            dry_run: true,
+            catalog: CatalogStatus::Current,
+            packages: Vec::new(),
+            profiles: Vec::new(),
+            integrations: Vec::new(),
+            refusals: vec![Refusal {
+                subject: "claude".to_owned(),
+                code: "package_unavailable_for_platform".to_owned(),
+                detail: "no package for this platform".to_owned(),
+            }],
+        }),
+        Vec::new(),
+    );
+    let daemon = reporting_daemon(&host.root, "refused", &refused);
+    let error = gate_upgrade(
+        &DaemonPreflight,
+        &host.context,
+        &daemon,
+        VERSION,
+        "/usr/bin:/bin",
+        ReleasePlan::Included,
+        true,
+    )
+    .await
+    .expect_err("a refused plan is not overridable");
+    let Error::UpgradeRuntimesRefused { refusals } = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(refusals, &refused.runtimes.expect("plan").refusals);
+
+    let stopped = SessionVerdict {
+        session_id: SESSION.to_owned(),
+        name: None,
+        verdict: Verdict::WouldLoseRecovery,
+        code: "runtime_source_not_served".to_owned(),
+        detail: "the stopped session's runtime source is not served".to_owned(),
+    };
+    let at_risk = daemon_report(None, vec![stopped.clone()]);
+    let daemon = reporting_daemon(&host.root, "at-risk", &at_risk);
+    let error = gate_upgrade(
+        &DaemonPreflight,
+        &host.context,
+        &daemon,
+        VERSION,
+        "/usr/bin:/bin",
+        ReleasePlan::Included,
+        false,
+    )
+    .await
+    .expect_err("a stopped session at risk needs the flag");
+    let Error::UpgradeAtRisk { sessions } = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(sessions, std::slice::from_ref(&stopped));
+
+    let gated = gate_upgrade(
+        &DaemonPreflight,
+        &host.context,
+        &daemon,
+        VERSION,
+        "/usr/bin:/bin",
+        ReleasePlan::Included,
+        true,
+    )
+    .await
+    .expect("the flag accepts the stopped session");
+    assert!(gated.accepted);
+}
+
+#[tokio::test]
+async fn the_daemon_judges_with_the_path_its_job_carries() {
+    let host = Host::new();
+    host.seed_live_session(false);
+    let tools = host.root.join("tools");
+    std::fs::create_dir_all(&tools).expect("tools dir");
+    std::fs::set_permissions(&tools, std::fs::Permissions::from_mode(0o755))
+        .expect("make tools dir readable");
+    let search_path = tools.display().to_string();
+    // The wrapper refuses to run unless it has the job's PATH, then runs the
+    // real daemon, so only the search path decides whether the judgment runs.
+    let real = host.archive().join("pohunekd");
+    let wrapper = scripted_daemon(
+        &host.root.join("wrapper"),
+        &format!(
+            "[ \"$PATH\" = '{}' ] || exit 7\nexec '{}' \"$@\"",
+            search_path,
+            real.display()
+        ),
+    );
+
+    let gated = gate(
+        &DaemonPreflight,
+        &host.context,
+        &wrapper,
+        VERSION,
+        &search_path,
+        false,
+    )
+    .await
+    .expect("the daemon runs with the job's PATH and judges");
+    assert_eq!(gated.report.sessions.len(), 1);
+
+    let error = gate(
+        &DaemonPreflight,
+        &host.context,
+        &wrapper,
+        VERSION,
+        "/usr/bin:/bin",
+        false,
+    )
+    .await
+    .expect_err("without the job's PATH the wrapper refuses to judge");
+    assert!(
+        matches!(error, Error::UpgradePreflightFailed { .. }),
+        "{error:?}"
+    );
+}
+
+/// Stands in for the systemd user manager's `Environment` property.
+#[derive(Debug)]
+struct FakeUserManager(Result<Vec<String>, String>);
+
+impl UserManager for FakeUserManager {
+    fn environment(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + '_>> {
+        let value = self.0.clone();
+        Box::pin(async move { value })
+    }
+}
+
+#[tokio::test]
+async fn the_daemon_judges_with_the_user_managers_path_and_an_unreadable_one_fails_first() {
+    let host = Host::new();
+    host.seed_live_session(false);
+    let tools = host.root.join("manager-tools");
+    std::fs::create_dir_all(&tools).expect("tools dir");
+    std::fs::set_permissions(&tools, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    let manager_path = tools.display().to_string();
+    let marker = host.root.join("wrapper-ran");
+    let real = host.archive().join("pohunekd");
+    // The wrapper runs the real daemon only with the user manager's PATH, and
+    // records that it ran.
+    let wrapper = scripted_daemon(
+        &host.root.join("wrapper"),
+        &format!(
+            "[ \"$PATH\" = '{manager_path}' ] || exit 7\n: > '{}'\nexec '{}' \"$@\"",
+            marker.display(),
+            real.display()
+        ),
+    );
+    let manager = FakeUserManager(Ok(vec![
+        "HOME=/home/u".to_owned(),
+        format!("PATH={manager_path}"),
+    ]));
+
+    let search_path = user_manager_search_path(&manager)
+        .await
+        .expect("the manager reports its PATH");
+    assert_eq!(search_path, manager_path);
+    let gated = gate(
+        &DaemonPreflight,
+        &host.context,
+        &wrapper,
+        VERSION,
+        &search_path,
+        false,
+    )
+    .await
+    .expect("the daemon runs with the user manager's PATH and judges");
+    assert_eq!(gated.report.sessions.len(), 1);
+    assert!(marker.exists(), "the daemon ran with the manager's PATH");
+
+    std::fs::remove_file(&marker).expect("reset marker");
+    let unreadable = FakeUserManager(Err("no session bus".to_owned()));
+    let error = user_manager_search_path(&unreadable)
+        .await
+        .expect_err("an unreadable environment is an error, not an empty PATH");
+    assert_eq!(error.code(), "service_manager_environment_unavailable");
+    assert!(error.to_string().contains("no session bus"), "{error}");
+
+    let no_path = FakeUserManager(Ok(vec!["HOME=/home/u".to_owned()]));
+    let error = user_manager_search_path(&no_path)
+        .await
+        .expect_err("an environment without PATH is an error");
+    assert_eq!(error.code(), "service_manager_environment_unavailable");
+    assert!(!marker.exists(), "no daemon ran without the manager's PATH");
+}
+
+#[tokio::test]
+async fn a_user_manager_path_is_judged_as_the_job_gets_it_even_with_an_open_directory() {
+    let host = Host::new();
+    // A directory any user may write to: the daemon job runs with it anyway, so
+    // the judgment must use the same PATH and not refuse it.
+    let open = host.root.join("open-tools");
+    std::fs::create_dir_all(&open).expect("open dir");
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).expect("mode");
+    let value = format!("{}:/usr/bin", open.display());
+    let manager = FakeUserManager(Ok(vec!["HOME=/home/u".to_owned(), format!("PATH={value}")]));
+
+    let search_path = user_manager_search_path(&manager)
+        .await
+        .expect("the job's PATH is used as it is");
+    assert_eq!(search_path, value);
+
+    // A control character is no problem for a process environment: the value
+    // is carried as it is.
+    let control = FakeUserManager(Ok(vec!["PATH=/usr/bin:\u{7}/bin".to_owned()]));
+    assert_eq!(
+        user_manager_search_path(&control).await.expect("carried"),
+        "/usr/bin:\u{7}/bin"
+    );
+}
+
+#[tokio::test]
+async fn a_user_manager_path_reaches_the_spawned_daemon_byte_for_byte() {
+    let host = Host::new();
+    host.seed_live_session(false);
+    let open = host.root.join("resolving-tools");
+    std::fs::create_dir_all(&open).expect("open dir");
+    let open_text = open.display().to_string();
+    // A relative entry and a repeated directory: the job runs with this exact
+    // value, so the spawned daemon must receive it unchanged.
+    let value = format!("relative/bin:{open_text}:/usr/bin:{open_text}");
+    let manager = FakeUserManager(Ok(vec![format!("PATH={value}")]));
+    let received = host.root.join("received-path");
+    let real = host.archive().join("pohunekd");
+    // The stand-in records the PATH it was started with, then runs the real daemon.
+    let recording = scripted_daemon(
+        &host.root.join("recording"),
+        &format!(
+            "printf '%s' \"$PATH\" > '{}'\nexec '{}' \"$@\"",
+            received.display(),
+            real.display()
+        ),
+    );
+
+    let search_path = user_manager_search_path(&manager)
+        .await
+        .expect("a value a process environment carries is used");
+    assert_eq!(search_path, value);
+    let gated = gate(
+        &DaemonPreflight,
+        &host.context,
+        &recording,
+        VERSION,
+        &search_path,
+        false,
+    )
+    .await
+    .expect("the daemon judges");
+    assert_eq!(gated.report.sessions.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(&received).expect("the daemon's record"),
+        value,
+        "the spawned daemon received the job's PATH unchanged"
+    );
+
+    // Only a NUL byte cannot be carried by a process environment.
+    let nul = FakeUserManager(Ok(vec!["PATH=/usr/bin\u{0}/bin".to_owned()]));
+    assert_eq!(
+        user_manager_search_path(&nul)
+            .await
+            .expect_err("a NUL byte is refused")
+            .code(),
+        "service_manager_environment_unavailable"
+    );
+}
+
+#[tokio::test]
+async fn the_release_plan_flag_reaches_the_daemon_only_for_the_upgrade_judgement() {
+    let host = Host::new();
+    host.seed_live_session(false);
+    let real = host.archive().join("pohunekd");
+    // Each stand-in runs the real daemon only with the argument its caller must
+    // pass: the upgrade's judgement with the release-plan flag, a rollback's
+    // judgement with none.
+    let with_plan = scripted_daemon(
+        &host.root.join("with-plan"),
+        &format!(
+            "[ \"$2\" = '{RELEASE_PLAN_FLAG}' ] || exit 7\nexec '{}' \"$@\"",
+            real.display()
+        ),
+    );
+    let without_plan = scripted_daemon(
+        &host.root.join("without-plan"),
+        &format!("[ -z \"$2\" ] || exit 8\nexec '{}' \"$@\"", real.display()),
+    );
+
+    // The report carries the release plan only when the flag reached the
+    // daemon; this host has no installed configuration, so the plan itself is
+    // reported as unreadable, which is the daemon's own answer.
+    let report = DaemonPreflight
+        .judge(
+            &host.context,
+            &with_plan.join("pohunekd"),
+            "/usr/bin:/bin",
+            ReleasePlan::Included,
+        )
+        .await
+        .expect("the upgrade's judgement passes the release-plan flag");
+    assert!(report.runtimes.is_some(), "the plan was judged");
+
+    gate(
+        &DaemonPreflight,
+        &host.context,
+        &without_plan,
+        VERSION,
+        "/usr/bin:/bin",
+        false,
+    )
+    .await
+    .expect("a rollback's judgement passes no flag");
+
+    let error = gate_upgrade(
+        &DaemonPreflight,
+        &host.context,
+        &without_plan,
+        VERSION,
+        "/usr/bin:/bin",
+        ReleasePlan::Included,
+        false,
+    )
+    .await
+    .expect_err("the upgrade's judgement without the flag is not what the daemon answers");
+    assert!(
+        matches!(error, Error::UpgradePreflightFailed { .. }),
+        "{error:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_missing_daemon_is_a_staged_binary_error() {
     let host = Host::new();
     let empty = host.root.join("empty");
     std::fs::create_dir_all(&empty).expect("empty dir");
 
-    let error = gate(&DaemonPreflight, &host.context, &empty, VERSION, true)
-        .await
-        .expect_err("no daemon to ask");
+    let error = gate(
+        &DaemonPreflight,
+        &host.context,
+        &empty,
+        VERSION,
+        "/usr/bin:/bin",
+        true,
+    )
+    .await
+    .expect_err("no daemon to ask");
 
     assert!(matches!(error, Error::StagedBinary { .. }), "{error:?}");
 }
@@ -381,9 +795,16 @@ async fn a_live_agent_session_that_reported_its_identity_is_adoptable_under_the_
     host.seed_session(false, true);
     let archive = host.archive();
 
-    let gated = gate(&DaemonPreflight, &host.context, &archive, VERSION, false)
-        .await
-        .expect("a reported active identity is the normal case and passes the gate");
+    let gated = gate(
+        &DaemonPreflight,
+        &host.context,
+        &archive,
+        VERSION,
+        "/usr/bin:/bin",
+        false,
+    )
+    .await
+    .expect("a reported active identity is the normal case and passes the gate");
 
     let verdicts: Vec<_> = gated
         .report

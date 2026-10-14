@@ -9,6 +9,8 @@
 
 #[path = "support/official_runtimes.rs"]
 mod official_runtimes;
+#[path = "support/service_file.rs"]
+mod service_file;
 
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -23,8 +25,8 @@ use pohunek_paths::{METADATA_STORE_NAME as STORE_NAME, PLUGINS_SUBDIR};
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, PackageStatus, ProfileStatus, UseReason, CODE_DAEMON_RUNNING,
     CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, CODE_PROFILE_NOT_MIGRATABLE,
-    CODE_RELEASE_CATALOG_UNAVAILABLE, DRY_RUN_FLAG, ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG,
-    RELEASE_RUNTIME_DIR,
+    CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE, DRY_RUN_FLAG,
+    ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
 };
 use pohunek_test_support::bin_exe;
 use pohunek_test_support::env::TestEnv;
@@ -35,6 +37,14 @@ const PROFILES_SUBDIR: &str = "agents";
 
 /// Name of the daemon's directory under each XDG base directory.
 const APP_DIR: &str = "pohunek";
+
+/// The allowlist the test service files record: the daemon's default.
+fn default_allowlist() -> Vec<String> {
+    pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST
+        .iter()
+        .map(|pattern| (*pattern).to_owned())
+        .collect()
+}
 
 /// Name of the daemon's single-instance lock file in its runtime directory.
 const INSTANCE_LOCK_NAME: &str = "daemon.lock";
@@ -60,11 +70,40 @@ impl Host {
             .expect("the binary directory");
         let binary = binary_dir.join("pohunekd");
         fs::copy(bin_exe("pohunekd"), &binary).expect("copy the daemon beside its anchor");
-        Self {
+        let host = Self {
             env,
             catalog: OfficialCatalog::new(),
             binary,
-        }
+        };
+        host.write_service(&default_allowlist());
+        host
+    }
+
+    /// The installed service file the step reads its launch environment from.
+    fn service_path(&self) -> PathBuf {
+        self.env
+            .config_home()
+            .join(APP_DIR)
+            .join(pohunek_service_config::FILE_NAME)
+    }
+
+    /// Writes the installed service file with `allowlist`.
+    fn write_service(&self, allowlist: &[String]) {
+        let config = self.env.config_home().join(APP_DIR);
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&config)
+            .expect("the service directory");
+        let state = self.env.state_home().join(APP_DIR);
+        let runtime = self.env.runtime_dir().join(APP_DIR);
+        service_file::write_service_file(
+            &self.service_path(),
+            self.env.root(),
+            &state,
+            &runtime,
+            allowlist,
+        );
     }
 
     fn binary_dir(&self) -> &Path {
@@ -1015,4 +1054,23 @@ fn an_unpinned_profile_is_refused_before_restore_when_both_roots_are_missing() {
             .exists(),
         "the selected root is not restored"
     );
+}
+
+#[test]
+fn a_missing_service_file_refuses_the_plan_and_changes_nothing() {
+    let host = Host::new();
+    host.publish(&["claude"]);
+    let profile = host.write_claude_profile();
+    fs::remove_file(host.service_path()).expect("remove the service file");
+
+    let plan = host.step(true);
+    let applied = host.step(false);
+
+    for report in [&plan, &applied] {
+        assert_eq!(refusal_codes(report), [CODE_SERVICE_CONFIG_UNREADABLE]);
+        assert!(report.packages.is_empty());
+        assert!(report.profiles.is_empty());
+    }
+    assert_eq!(host.profile_text(), profile);
+    assert!(!host.plugins_dir().exists());
 }

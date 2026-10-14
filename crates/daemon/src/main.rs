@@ -56,15 +56,19 @@ use pohunek_daemon::runtime::lifecycle::{
     DEV_WORKER_INITIALIZE,
 };
 use pohunek_daemon::runtime::{
-    EnvironmentSource, SubprocessWorkerLauncher, SupervisionConfig, WorkerLauncher,
+    EnvironmentSource, LaunchEnvironment, SubprocessWorkerLauncher, SupervisionConfig,
+    WorkerLauncher,
 };
-use pohunek_daemon::session::upgrade_preflight::{self, PreflightInputs};
+use pohunek_daemon::session::upgrade_preflight::{
+    self, PreflightInputs, PreflightOptions, ReleaseInputs,
+};
 use pohunek_daemon::session::{
     ensure_official_runtimes, EnsureInputs, SessionRegistry, SessionRegistryConfig,
     SessionRetentionTask, RETENTION_POLICY_NAME,
 };
 use pohunek_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
 use pohunek_platform::supervisor::{self, Namespace};
+use pohunek_service_config::preflight::{PROBE_BUDGET, RELEASE_PLAN_FLAG};
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, Refusal, CODE_DAEMON_RUNNING, DRY_RUN_FLAG, ENSURE_REPORT_VERSION,
     ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
@@ -164,6 +168,8 @@ const PROFILES_SUBDIR: &str = "agents";
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // The probe deadline of `upgrade-preflight` counts from here.
+    let entry = std::time::Instant::now();
     if std::env::args_os()
         .skip(1)
         .eq([OsString::from(VERSION_FLAG)])
@@ -174,7 +180,13 @@ async fn main() -> ExitCode {
         .skip(1)
         .eq([OsString::from(UPGRADE_PREFLIGHT_ARG)])
     {
-        return print_upgrade_preflight();
+        return print_upgrade_preflight(false, entry);
+    }
+    if std::env::args_os().skip(1).eq([
+        OsString::from(UPGRADE_PREFLIGHT_ARG),
+        OsString::from(RELEASE_PLAN_FLAG),
+    ]) {
+        return print_upgrade_preflight(true, entry);
     }
     if std::env::args_os()
         .skip(1)
@@ -203,7 +215,11 @@ async fn main() -> ExitCode {
 }
 
 /// Prints the preflight report of the installed state as JSON.
-fn print_upgrade_preflight() -> ExitCode {
+///
+/// With `release_plan` the judgement also serves the runtimes the release step
+/// would leave behind; without it the judgement serves the installed packages
+/// only, as a rollback's preflight must.
+fn print_upgrade_preflight(release_plan: bool, entry: std::time::Instant) -> ExitCode {
     let report = Paths::resolve()
         .map_err(|error| error.to_string())
         .and_then(|paths| {
@@ -212,9 +228,21 @@ fn print_upgrade_preflight() -> ExitCode {
                 worker_state_root: paths.state_dir.join(WORKERS_SUBDIR),
                 plugins_dir: paths.plugins_dir(),
             };
+            let release_dir = release_runtime_dir()?;
+            let options = PreflightOptions {
+                release: (release_plan && release_dir.is_dir()).then(move || ReleaseInputs {
+                    release_dir,
+                    catalog_trust: CatalogTrust::load_beside_executable(),
+                }),
+                profiles_dir: Some(paths.config_dir.join(PROFILES_SUBDIR)),
+                host_state_dir: Some(paths.state_dir.clone()),
+                probe_budget: PROBE_BUDGET,
+                entry,
+                launch: launch_environment(&paths),
+            };
             let inspector = pohunek_daemon::procwatch::HostInspector::new();
-            serde_json::to_string_pretty(&upgrade_preflight::run(&inputs, &inspector))
-                .map_err(|error| error.to_string())
+            let report = upgrade_preflight::run_with(&inputs, &options, &inspector);
+            serde_json::to_string_pretty(&report).map_err(|error| error.to_string())
         });
     match report {
         Ok(json) => {
@@ -226,6 +254,24 @@ fn print_upgrade_preflight() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The launch environment the installed daemon's `service.toml` configures,
+/// read as daemon startup reads it, or the reason it cannot be read.
+fn launch_environment(paths: &Paths) -> Result<LaunchEnvironment, String> {
+    LaunchEnvironment::from_service_file(
+        &paths.config_dir.join(pohunek_service_config::FILE_NAME),
+        EnvironmentSource::Process,
+    )
+}
+
+/// The release `runtime/` directory beside the running daemon executable.
+fn release_runtime_dir() -> Result<PathBuf, String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    Ok(executable
+        .parent()
+        .ok_or_else(|| "the daemon executable has no directory".to_owned())?
+        .join(RELEASE_RUNTIME_DIR))
 }
 
 /// Prints the offline runtime step's report as JSON, or its failure on stderr.
@@ -253,11 +299,7 @@ fn print_ensure_runtimes(dry_run: bool) -> ExitCode {
 /// the state and nothing may change.
 fn ensure_runtimes(dry_run: bool) -> Result<EnsureReport, String> {
     let paths = Paths::resolve().map_err(|error| error.to_string())?;
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let release_dir = executable
-        .parent()
-        .ok_or_else(|| "the daemon executable has no directory".to_owned())?
-        .join(RELEASE_RUNTIME_DIR);
+    let release_dir = release_runtime_dir()?;
     let inputs = EnsureInputs {
         store_path: paths.data_dir.join(STORE_NAME),
         plugins_dir: paths.plugins_dir(),
@@ -266,6 +308,7 @@ fn ensure_runtimes(dry_run: bool) -> Result<EnsureReport, String> {
         catalog_trust: CatalogTrust::load_beside_executable(),
         dry_run,
         daemon_version: DAEMON_VERSION.to_owned(),
+        environment: launch_environment(&paths),
     };
     if dry_run {
         return ensure_official_runtimes(&inputs).map_err(|error| error.to_string());

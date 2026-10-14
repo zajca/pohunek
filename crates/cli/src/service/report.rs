@@ -75,6 +75,9 @@ pub struct DroppedPath {
 /// Result of `pohunek service upgrade`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UpgradeReport {
+    /// Conditions of the upgrade's inputs that the operator must be told.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     /// The version active before the upgrade.
     pub from_version: String,
     /// The version active after the upgrade.
@@ -204,6 +207,9 @@ pub struct PendingReport {
     pub preflight: Option<PreflightReport>,
     /// Whether the operator accepted the rollback's at-risk sessions.
     pub accepted_runtime_loss: bool,
+    /// Conditions of the journal that the rollback handles with a fallback.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Result of `pohunek service status`.

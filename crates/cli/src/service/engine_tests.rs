@@ -23,7 +23,7 @@ use pohunek_platform::process::{
     Error as ProcessError, ExitWatch, OwnershipMarkers, ProcessFact, ProcessIdentity, StartIdentity,
 };
 use pohunek_platform::supervisor::{DaemonSupervisor, Operation as Pending, ServiceId, Supervisor};
-use pohunek_service_config::preflight::{SessionVerdict, StoreState, Verdict};
+use pohunek_service_config::preflight::{PreflightReport, SessionVerdict, StoreState, Verdict};
 use pohunek_service_config::runtimes::{
     CatalogStatus, IntegrationAction, PackageAction, PackageStatus, ProfileAction, ProfileStatus,
     Refusal, UseReason, CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM, ENSURE_REPORT_VERSION,
@@ -42,7 +42,10 @@ use crate::service::definition::initial_config;
 use crate::service::inherited::Token;
 use crate::service::layout::tests::{anchor_bytes, stage_dir, write_anchor};
 use crate::service::layout::CLI_NAME;
-use crate::service::preflight::Judging;
+use crate::service::manager_env::UserManager;
+#[cfg(target_os = "macos")]
+use crate::service::manager_env::{ActiveJob, LaunchdJob};
+use crate::service::preflight::{Judging, ReleasePlan};
 use crate::service::runtimes::Running;
 use crate::service::usage::tests::{
     own_identity, spawn_when_exec_free, write_journal, write_live_journal, write_outdated_journal,
@@ -182,7 +185,13 @@ struct InProcessPreflight {
 }
 
 impl AdoptionPreflight for InProcessPreflight {
-    fn judge<'a>(&'a self, context: &'a Context, _daemon: &'a Path) -> Judging<'a> {
+    fn judge<'a>(
+        &'a self,
+        context: &'a Context,
+        _daemon: &'a Path,
+        _search_path: &'a str,
+        _plan: ReleasePlan,
+    ) -> Judging<'a> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let paths = context.paths();
@@ -195,6 +204,42 @@ impl AdoptionPreflight for InProcessPreflight {
                 &inputs,
                 &OwnProcesses::default(),
             ))
+        })
+    }
+}
+
+/// Judges with [`InProcessPreflight`], then reports the runtime plan and the
+/// stopped sessions it was given, the fields a release daemon reports.
+#[derive(Debug, Default)]
+struct ScriptedPreflight {
+    inner: InProcessPreflight,
+    runtimes: Option<EnsureReport>,
+    stopped: Vec<SessionVerdict>,
+    /// The `PATH` of every judgment, in call order.
+    search_paths: Arc<Mutex<Vec<String>>>,
+    /// The release-plan choice of every judgment, in call order.
+    plans: Arc<Mutex<Vec<ReleasePlan>>>,
+}
+
+impl AdoptionPreflight for ScriptedPreflight {
+    fn judge<'a>(
+        &'a self,
+        context: &'a Context,
+        daemon: &'a Path,
+        search_path: &'a str,
+        plan: ReleasePlan,
+    ) -> Judging<'a> {
+        Box::pin(async move {
+            self.search_paths
+                .lock()
+                .expect("search path lock")
+                .push(search_path.to_owned());
+            self.plans.lock().expect("plan lock").push(plan);
+            let mut report: PreflightReport =
+                self.inner.judge(context, daemon, search_path, plan).await?;
+            report.runtimes = self.runtimes.clone();
+            report.stopped_sessions = self.stopped.clone();
+            Ok(report)
         })
     }
 }
@@ -217,6 +262,8 @@ struct RuntimeScript {
     unconfirmed_apply: bool,
     /// Every call in order: `plan`, or `apply registered=<bool>`.
     calls: Vec<String>,
+    /// The `PATH` each call ran with, in call order.
+    search_paths: Vec<String>,
     /// The daemon job removals made before each dry run, in order.
     removals_at_plan: Vec<usize>,
 }
@@ -307,8 +354,15 @@ fn installing_plan() -> EnsureReport {
 }
 
 impl RuntimeStep for RuntimeFake {
-    fn run<'a>(&'a self, context: &'a Context, dir: &'a Path, dry_run: bool) -> Running<'a> {
+    fn run<'a>(
+        &'a self,
+        context: &'a Context,
+        dir: &'a Path,
+        dry_run: bool,
+        search_path: &'a str,
+    ) -> Running<'a> {
         Box::pin(async move {
+            self.script().search_paths.push(search_path.to_owned());
             if dry_run {
                 let removals = self.1.world().uninstalls;
                 let mut script = self.script();
@@ -332,14 +386,8 @@ impl RuntimeStep for RuntimeFake {
             // What a real apply writes: the registry, a new catalog state, and the
             // pin of the profile.
             let plugins = context.paths().plugins_dir();
-            std::fs::create_dir_all(&plugins).expect("plugins dir");
-            pohunek_test_support::fs::write_file(plugins.join("registry.json"), "applied registry")
-                .expect("registry");
-            pohunek_test_support::fs::write_file(
-                plugins.join("catalog-state.json"),
-                "applied state",
-            )
-            .expect("catalog state");
+            write_private(&plugins.join("registry.json"), APPLIED_REGISTRY);
+            write_private(&plugins.join("catalog-state.json"), "applied state");
             let agents = context.paths().config_dir.join("agents");
             if agents.join("work.toml").is_file() {
                 pohunek_test_support::fs::write_file(agents.join("work.toml"), "applied profile")
@@ -789,7 +837,21 @@ impl Harness {
     }
 
     fn build(temp: tempfile::TempDir, root: PathBuf, prefix: PathBuf) -> Self {
-        let context = context(&root);
+        let manager_bin = root.join(USER_MANAGER_BIN);
+        std::fs::create_dir_all(&manager_bin).expect("manager bin dir");
+        let context = context(&root).with_user_manager(Arc::new(FakeUserManager(Ok(vec![
+            "HOME=/home/test".to_owned(),
+            format!("PATH={}", manager_bin.display()),
+        ]))));
+        // A launchd job records the PATH its install discovered; without a login
+        // shell the managed discovery records its fallback directories.
+        #[cfg(target_os = "macos")]
+        let context =
+            context.with_path_discovery(crate::service::context::PathDiscovery::Managed {
+                login_shell: None,
+                shell_defaulted: false,
+                fallback_directories: vec!["/usr/bin".to_owned(), "/bin".to_owned()],
+            });
         let fake = Fake::default();
         let backend = Backend::new(
             Box::new(fake.clone()),
@@ -1958,20 +2020,35 @@ async fn an_upgrade_interrupted_after_every_step_resumes_or_rolls_back() {
     }
 }
 
-/// Writes a state file owner-private, as the daemon writes its own.
+/// The registry record an apply leaves behind: schema 1 with one committed
+/// change and no package, the fields `RegistryState` deserializes.
+const APPLIED_REGISTRY: &str = r#"{"schema":1,"generation":1,"packages":[],"selected":{}}"#;
+
+/// Creates the directories below `dir` that do not exist yet with mode `0700`,
+/// as the daemon creates its state directories.
+fn private_dirs(dir: &Path) {
+    std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+        .recursive(true)
+        .create(dir)
+        .expect("private state dir");
+}
+
+/// Writes a state file owner-private, in a directory the daemon would create.
 fn write_private(path: &Path, bytes: &str) {
-    std::fs::create_dir_all(path.parent().expect("parent")).expect("state dir");
+    private_dirs(path.parent().expect("parent"));
     std::fs::write(path, bytes).expect("state file");
     std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
         .expect("mode");
 }
 
-/// The registry and one profile of an installed host, as a daemon left them.
+/// The state of an installed host with a package store and one profile, as
+/// the daemon leaves it: the plugin root opened by the package store (which
+/// creates its `packages` directory privately) and no registry record yet,
+/// which the store reads as its empty state.
 fn seed_runtime_state(harness: &Harness) {
-    write_private(
-        &harness.context.paths().plugins_dir().join("registry.json"),
-        "before",
-    );
+    let plugins = harness.context.paths().plugins_dir();
+    package::registry::Registry::open_at(&plugins, package::Limits::DEFAULT)
+        .expect("the daemon opens its package store");
     write_private(
         &harness
             .context
@@ -1983,10 +2060,11 @@ fn seed_runtime_state(harness: &Harness) {
     );
 }
 
-fn runtime_state(harness: &Harness) -> (String, String) {
+/// The registry record and the profile text; `None` for a registry the
+/// store has not written.
+fn runtime_state(harness: &Harness) -> (Option<String>, String) {
     let registry =
-        std::fs::read_to_string(harness.context.paths().plugins_dir().join("registry.json"))
-            .expect("registry");
+        std::fs::read_to_string(harness.context.paths().plugins_dir().join("registry.json")).ok();
     let profile = std::fs::read_to_string(
         harness
             .context
@@ -2025,10 +2103,7 @@ async fn an_upgrade_whose_runtime_plan_is_refused_stops_nothing_and_changes_noth
     assert_eq!(error.code(), "service_upgrade_runtimes_refused");
     assert_eq!(harness.runtimes.calls(), ["plan"], "no apply ran");
     assert!(harness.fake.world().running, "the old daemon still runs");
-    assert_eq!(
-        runtime_state(&harness),
-        ("before".to_owned(), "profile before".to_owned())
-    );
+    assert_eq!(runtime_state(&harness), (None, "profile before".to_owned()));
     assert!(!harness
         .context
         .paths()
@@ -2036,6 +2111,577 @@ async fn an_upgrade_whose_runtime_plan_is_refused_stops_nothing_and_changes_noth
         .join(record::RUNTIME_BACKUP_DIR_NAME)
         .exists());
     harness.assert_installed(V1);
+}
+
+/// The directory the fake user manager reports as its `PATH`.
+const USER_MANAGER_BIN: &str = "manager-bin";
+
+/// Stands in for the systemd user manager's `Environment` property.
+#[derive(Debug, Clone)]
+struct FakeUserManager(Result<Vec<String>, String>);
+
+impl UserManager for FakeUserManager {
+    fn environment(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + '_>> {
+        let value = self.0.clone();
+        Box::pin(async move { value })
+    }
+}
+
+/// A launchd user-domain configuration that sets `PATH` to `value`, as
+/// `launchctl config user path` writes it.
+#[cfg(target_os = "macos")]
+fn launchd_domain_xml(value: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>PathEnvironmentVariable</key><string>{value}</string></dict></plist>\n"
+    )
+}
+
+/// Stands in for launchd's active state of the daemon job. The state can change
+/// while a test runs, as a job that is unloaded mid-upgrade does.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct FakeLaunchd(Mutex<Result<ActiveJob, String>>);
+
+#[cfg(target_os = "macos")]
+impl FakeLaunchd {
+    fn new(value: Result<ActiveJob, String>) -> Self {
+        Self(Mutex::new(value))
+    }
+
+    fn set(&self, value: Result<ActiveJob, String>) {
+        *self.0.lock().expect("launchd state") = value;
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl LaunchdJob for FakeLaunchd {
+    fn active_path<'a>(
+        &'a self,
+        _uid: u32,
+        _label: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<ActiveJob, String>> + Send + 'a>> {
+        let value = self.0.lock().expect("launchd state").clone();
+        Box::pin(async move { value })
+    }
+}
+
+/// A loaded job whose `default environment` sets `PATH` to `default`.
+#[cfg(target_os = "macos")]
+fn loaded_job(default: impl Into<String>) -> ActiveJob {
+    ActiveJob {
+        domain: None,
+        loaded_default: Some(default.into()),
+    }
+}
+
+/// A job that is not loaded, in a domain that sets no `PATH`.
+#[cfg(target_os = "macos")]
+fn not_loaded() -> ActiveJob {
+    ActiveJob::default()
+}
+
+/// A domain that sets `domain`, with the job loaded at `default` or not.
+#[cfg(target_os = "macos")]
+fn domain_over(domain: &str, default: Option<&str>) -> ActiveJob {
+    ActiveJob {
+        domain: Some(domain.to_owned()),
+        loaded_default: default.map(str::to_owned),
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_loaded_job_without_a_recorded_path_judges_with_the_path_launchd_reports() {
+    const DEFAULT_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+    let mut harness = Harness::new();
+    harness.context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged)
+        .with_launchd_job(Arc::new(FakeLaunchd::new(Ok(loaded_job(
+            DEFAULT_PATH.to_owned(),
+        )))));
+
+    harness.install(V1).await.expect("install");
+
+    assert!(harness.config().expect("config").search_path().is_empty());
+    let judged = harness.runtimes.script().search_paths.clone();
+    assert!(!judged.is_empty(), "the runtime step ran");
+    assert!(
+        judged.iter().all(|path| path == DEFAULT_PATH),
+        "every spawn gets the PATH launchd reports for the job: {judged:?}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_job_that_is_not_loaded_falls_back_to_the_persisted_domain_configuration() {
+    const DOMAIN_PATH: &str = "/opt/pohunek-test/bin:/usr/bin:/bin";
+    let mut harness = Harness::new();
+    let domain = harness.root.join("user.plist");
+    std::fs::write(&domain, launchd_domain_xml(DOMAIN_PATH)).expect("domain configuration");
+    harness.context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged)
+        .with_launchd_domain_config(&domain)
+        .with_launchd_job(Arc::new(FakeLaunchd::new(Ok(not_loaded()))));
+
+    harness.install(V1).await.expect("install");
+
+    let judged = harness.runtimes.script().search_paths.clone();
+    assert!(!judged.is_empty(), "the runtime step ran");
+    assert!(
+        judged.iter().all(|path| path == DOMAIN_PATH),
+        "a job that is down judges with the best evidence available: {judged:?}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn an_unrecognized_launchd_report_refuses_a_job_without_a_recorded_path() {
+    let mut harness = Harness::new();
+    harness.context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged)
+        .with_launchd_job(Arc::new(FakeLaunchd::new(Err(
+            "unrecognized launchctl print output: `launchctl changed its output`".to_owned(),
+        ))));
+
+    let error = harness
+        .install(V1)
+        .await
+        .expect_err("the job's PATH cannot be read");
+    assert_eq!(error.code(), "service_manager_environment_unavailable");
+    assert!(harness.pending().is_none(), "no transaction was journaled");
+    assert!(harness.config().is_none(), "no configuration was kept");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_upgrade_judges_and_runs_with_the_user_managers_path_when_the_job_records_none() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let manager_bin = harness.root.join(USER_MANAGER_BIN).display().to_string();
+    assert!(harness.config().expect("config").search_path().is_empty());
+    harness.runtimes.script().search_paths.clear();
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.search_paths);
+
+    harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect("upgrade");
+
+    let judged = judged.lock().expect("search path lock").clone();
+    assert_eq!(judged, [manager_bin.clone(), manager_bin.clone()]);
+    let runtime_paths = harness.runtimes.script().search_paths.clone();
+    assert!(!runtime_paths.is_empty(), "the runtime step ran");
+    assert!(
+        runtime_paths.iter().all(|path| *path == manager_bin),
+        "{runtime_paths:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_unreadable_user_manager_path_fails_the_upgrade_before_any_effect() {
+    let mut harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    harness.runtimes.script().calls.clear();
+    let unreadable = FakeUserManager(Err("Failed to connect to bus".to_owned()));
+    harness.context = harness
+        .context
+        .clone()
+        .with_user_manager(Arc::new(unreadable));
+
+    let error = harness
+        .upgrade(V2)
+        .await
+        .expect_err("the daemon's PATH cannot be read");
+    assert_eq!(error.code(), "service_manager_environment_unavailable");
+    assert!(
+        error.to_string().contains("Failed to connect to bus"),
+        "{error}"
+    );
+    assert!(harness.pending().is_none(), "no transaction was journaled");
+    assert_eq!(
+        harness.fake.world().replaces,
+        0,
+        "the daemon was not replaced"
+    );
+    assert!(harness.runtimes.calls().is_empty(), "no runtime step ran");
+    harness.assert_installed(V1);
+
+    let no_path = FakeUserManager(Ok(vec!["HOME=/home/test".to_owned()]));
+    harness.context = harness.context.clone().with_user_manager(Arc::new(no_path));
+    let error = harness
+        .upgrade(V2)
+        .await
+        .expect_err("an environment without PATH is refused");
+    assert_eq!(error.code(), "service_manager_environment_unavailable");
+    assert!(harness.pending().is_none(), "no transaction was journaled");
+    harness.assert_installed(V1);
+}
+
+#[tokio::test]
+async fn a_refused_runtime_plan_stops_the_upgrade_before_any_effect_even_when_accepted() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    harness.runtimes.script().calls.clear();
+    let preflight = ScriptedPreflight {
+        runtimes: Some(runtime_report(
+            true,
+            vec![package(PackageStatus::Install)],
+            Vec::new(),
+            vec![Refusal {
+                subject: "claude".to_owned(),
+                code: CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM.to_owned(),
+                detail: "the release lists no package for this platform".to_owned(),
+            }],
+        )),
+        ..ScriptedPreflight::default()
+    };
+
+    let error = harness
+        .engine()
+        .with_runtime_loss_accepted(true)
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("a refused plan is not overridable");
+
+    assert_eq!(error.code(), "service_upgrade_runtimes_refused");
+    assert!(harness.runtimes.calls().is_empty(), "no runtime step ran");
+    assert!(harness.pending().is_none(), "no transaction was journaled");
+    assert!(
+        !layout::version_exists(&harness.layout(), V2).expect("version probe"),
+        "no version directory was published"
+    );
+    assert_eq!(
+        harness.fake.world().replaces,
+        0,
+        "the daemon was not replaced"
+    );
+    assert!(harness.fake.world().running, "the old daemon still runs");
+    harness.assert_installed(V1);
+}
+
+#[tokio::test]
+async fn a_stopped_session_at_risk_needs_the_flag_like_a_live_one() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let stopped = SessionVerdict {
+        session_id: OTHER_SESSION.to_owned(),
+        name: None,
+        verdict: Verdict::WouldLoseRecovery,
+        code: "native_recovery_unmappable".to_owned(),
+        detail: "the stopped session's recovery cannot be mapped".to_owned(),
+    };
+    let scripted = || ScriptedPreflight {
+        stopped: vec![stopped.clone()],
+        ..ScriptedPreflight::default()
+    };
+
+    let error = harness
+        .engine()
+        .with_adoption_preflight(Box::new(scripted()))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("the stopped session would lose its recovery");
+    let Error::UpgradeAtRisk { sessions } = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(sessions, std::slice::from_ref(&stopped));
+    assert!(harness.pending().is_none(), "no transaction was journaled");
+    harness.assert_installed(V1);
+
+    let report = harness
+        .engine()
+        .with_runtime_loss_accepted(true)
+        .with_adoption_preflight(Box::new(scripted()))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect("the flag accepts the stopped session's loss");
+    assert!(report.accepted_runtime_loss);
+    harness.assert_installed(V2);
+}
+
+/// The `PATH` a job without its own gets from its service manager now: the
+/// systemd user manager's on Linux, launchd's active state on macOS.
+fn set_job_path(harness: &mut Harness, path: &str) {
+    harness.context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged);
+    #[cfg(target_os = "linux")]
+    {
+        harness.context = harness
+            .context
+            .clone()
+            .with_user_manager(Arc::new(FakeUserManager(Ok(vec![format!("PATH={path}")]))));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        harness.context = harness
+            .context
+            .clone()
+            .with_launchd_job(Arc::new(FakeLaunchd::new(Ok(loaded_job(path.to_owned())))));
+    }
+}
+
+const JOURNALED_PATH: &str = "/opt/journaled/bin:/usr/bin";
+const CURRENT_PATH: &str = "/opt/current/bin:/usr/bin";
+
+/// Installs V1, starts an upgrade to V2 that stops after registering the new
+/// daemon, and returns the harness with that journal pending.
+async fn interrupted_upgrade_journal(harness: &mut Harness) {
+    set_job_path(harness, JOURNALED_PATH);
+    harness.install(V1).await.expect("install");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registered);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted after the registration");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_rollback_judges_with_the_manager_path_current_at_rollback() {
+    let mut harness = Harness::new();
+    interrupted_upgrade_journal(&mut harness).await;
+    // The manager's environment changes after the upgrade and before the rollback.
+    set_job_path(&mut harness, CURRENT_PATH);
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.search_paths);
+
+    harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V1), V1)
+        .await
+        .expect("the pending upgrade is rolled back");
+
+    let judged = judged.lock().expect("search path lock").clone();
+    assert!(!judged.is_empty(), "the rollback judged");
+    assert!(
+        judged.iter().all(|path| path == CURRENT_PATH),
+        "the rollback judges with the manager's PATH as the restored job gets it: {judged:?}"
+    );
+    // The restored job records no PATH, so it gets the manager's environment.
+    let registered = harness
+        .fake
+        .world()
+        .registered
+        .clone()
+        .expect("the restored daemon is registered");
+    assert_eq!(registered.environment().get("PATH"), None);
+    harness.assert_installed(V1);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_rollback_judges_with_the_domain_path_over_the_journaled_default() {
+    const DOMAIN_PATH: &str = "/opt/domain/bin:/usr/bin";
+    let mut harness = Harness::new();
+    interrupted_upgrade_journal(&mut harness).await;
+    harness.context = harness
+        .context
+        .clone()
+        .with_launchd_job(Arc::new(FakeLaunchd::new(Ok(domain_over(
+            DOMAIN_PATH,
+            Some(CURRENT_PATH),
+        )))));
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.search_paths);
+
+    harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V1), V1)
+        .await
+        .expect("the pending upgrade is rolled back");
+
+    let judged = judged.lock().expect("search path lock").clone();
+    assert!(
+        !judged.is_empty() && judged.iter().all(|path| path == DOMAIN_PATH),
+        "the domain's PATH is what the job gets now: {judged:?}"
+    );
+    harness.assert_installed(V1);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_job_unloaded_before_the_runtime_step_resolves_the_journaled_default_not_the_plist() {
+    const JOURNALED: &str = "/opt/journaled/bin:/usr/bin";
+    const PERSISTED: &str = "/opt/persisted/bin:/usr/bin";
+    let launchd = Arc::new(FakeLaunchd::new(Ok(loaded_job(JOURNALED))));
+    let mut harness = Harness::new();
+    let domain = harness.root.join("user.plist");
+    std::fs::write(&domain, launchd_domain_xml(PERSISTED)).expect("domain configuration");
+    harness.context = harness
+        .context
+        .clone()
+        .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged)
+        .with_launchd_job(Arc::clone(&launchd) as Arc<dyn LaunchdJob>)
+        .with_launchd_domain_config(&domain);
+    harness.install(V1).await.expect("install");
+    harness.runtimes.script().search_paths.clear();
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.search_paths);
+    let mut engine = harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight));
+    // The early gate reads the loaded default and journals it; the job is unloaded
+    // before the swap, so the late gate and the runtime step are not given a live
+    // default by launchd.
+    let unloaded = Arc::clone(&launchd);
+    engine.before_swap = Some(SwapHook(Box::new(move || {
+        unloaded.set(Ok(not_loaded()));
+    })));
+
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect("upgrade");
+
+    assert_eq!(
+        judged.lock().expect("search path lock").clone(),
+        [JOURNALED.to_owned(), JOURNALED.to_owned()],
+        "the early and the late gate judge with the journaled default"
+    );
+    let runtime = harness.runtimes.script().search_paths.clone();
+    assert!(!runtime.is_empty(), "the runtime step ran");
+    assert!(
+        runtime.iter().all(|path| path == JOURNALED),
+        "the runtime step does not fall back to the plist: {runtime:?}"
+    );
+    harness.assert_installed(V2);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_journal_without_a_launchd_default_takes_the_persisted_plist_and_warns() {
+    const PERSISTED: &str = "/opt/persisted/bin:/usr/bin";
+    let mut harness = Harness::new();
+    interrupted_upgrade_journal(&mut harness).await;
+    // A journal that does not hold the launchd default.
+    let journal = harness.context.paths().state_dir.join(record::FILE_NAME);
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&journal).expect("journal")).expect("journal JSON");
+    document
+        .as_object_mut()
+        .expect("journal object")
+        .remove("launchd_default_path");
+    std::fs::write(
+        &journal,
+        serde_json::to_vec(&document).expect("journal bytes"),
+    )
+    .expect("rewrite journal");
+    let domain = harness.root.join("user.plist");
+    std::fs::write(&domain, launchd_domain_xml(PERSISTED)).expect("domain configuration");
+    harness.context = harness
+        .context
+        .clone()
+        .with_launchd_job(Arc::new(FakeLaunchd::new(Ok(not_loaded()))))
+        .with_launchd_domain_config(&domain);
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.search_paths);
+
+    let report = harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V1), V1)
+        .await
+        .expect("the pending upgrade is rolled back");
+
+    let judged = judged.lock().expect("search path lock").clone();
+    assert!(
+        !judged.is_empty() && judged.iter().all(|path| path == PERSISTED),
+        "the persisted configuration is the last evidence: {judged:?}"
+    );
+    let rolled_back = report.rolled_back.expect("the rollback is reported");
+    assert_eq!(rolled_back.warnings.len(), 1, "{:?}", rolled_back.warnings);
+    assert!(
+        rolled_back.warnings[0].contains("persisted launchd configuration was used"),
+        "{:?}",
+        rolled_back.warnings
+    );
+    harness.assert_installed(V1);
+}
+
+#[tokio::test]
+async fn the_runtime_judgment_and_plan_run_with_the_path_of_the_installed_job() {
+    let mut harness = Harness::new();
+    let dir = harness.root.join("job-tools");
+    harness.context = discovering(&harness.context, &harness.root, "job-shell", &dir);
+    harness.install(V1).await.expect("install");
+    let expected = harness
+        .config()
+        .expect("config")
+        .search_path()
+        .to_env_value();
+    assert_eq!(expected, dir.display().to_string());
+    harness.runtimes.script().search_paths.clear();
+    let preflight = ScriptedPreflight::default();
+    let judged = Arc::clone(&preflight.search_paths);
+
+    harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect("upgrade");
+
+    // The early gate of the upgrade and the late gate before the daemon swap.
+    let judged = judged.lock().expect("search path lock").clone();
+    assert_eq!(
+        judged,
+        [expected.clone(), expected.clone()],
+        "every judgment ran with the job PATH"
+    );
+    let runtime_paths = harness.runtimes.script().search_paths.clone();
+    assert!(!runtime_paths.is_empty(), "the runtime step ran");
+    assert!(
+        runtime_paths.iter().all(|path| *path == expected),
+        "every runtime call ran with the job PATH: {runtime_paths:?}"
+    );
+}
+
+#[tokio::test]
+async fn only_the_upgrades_own_gates_judge_the_release_plan() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    harness.runtimes.script().calls.clear();
+    seed_runtime_state(&harness);
+    harness.runtimes.plan(installing_plan());
+    let preflight = ScriptedPreflight::default();
+    let plans = Arc::clone(&preflight.plans);
+
+    harness
+        .engine()
+        .with_adoption_preflight(Box::new(preflight))
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect("upgrade");
+
+    // The early gate and the late gate before the swap judge the plan; the
+    // post-apply judgement runs after the apply, when the plan is already the
+    // installed state, so it judges the installed packages only.
+    assert_eq!(
+        plans.lock().expect("plan lock").clone(),
+        [
+            ReleasePlan::Included,
+            ReleasePlan::Included,
+            ReleasePlan::Omitted,
+        ]
+    );
 }
 
 #[tokio::test]
@@ -2060,7 +2706,10 @@ async fn an_upgrade_stops_the_daemon_and_backs_up_before_it_applies_the_runtime_
     assert_eq!(runtimes.packages[0].status, PackageStatus::Installed);
     assert_eq!(
         runtime_state(&harness),
-        ("applied registry".to_owned(), "applied profile".to_owned())
+        (
+            Some(APPLIED_REGISTRY.to_owned()),
+            "applied profile".to_owned()
+        )
     );
     assert!(!harness
         .context
@@ -2088,7 +2737,7 @@ async fn a_failed_runtime_apply_restores_the_state_it_changed_and_the_previous_d
     );
     assert_eq!(
         runtime_state(&harness),
-        ("before".to_owned(), "profile before".to_owned()),
+        (None, "profile before".to_owned()),
         "the registry and the profile are restored byte for byte"
     );
     assert!(
@@ -2148,10 +2797,7 @@ async fn a_group_readable_profile_upgrades_and_a_failed_apply_restores_its_mode(
         matches!(error, Error::UpgradeRuntimesFailed { .. }),
         "{error:?}"
     );
-    assert_eq!(
-        runtime_state(&harness),
-        ("before".to_owned(), "profile before".to_owned())
-    );
+    assert_eq!(runtime_state(&harness), (None, "profile before".to_owned()));
     assert_eq!(
         mode_of(&profile_path(&harness)),
         0o644,
@@ -2175,7 +2821,7 @@ async fn a_group_readable_profile_is_applied_by_an_upgrade() {
 }
 
 #[tokio::test]
-async fn a_registry_the_package_store_would_not_read_refuses_the_backup_and_keeps_the_daemon() {
+async fn a_registry_the_package_store_would_not_read_refuses_the_upgrade_before_any_effect() {
     let harness = Harness::new();
     harness.install(V1).await.expect("install");
     harness.runtimes.script().calls.clear();
@@ -2186,15 +2832,26 @@ async fn a_registry_the_package_store_would_not_read_refuses_the_backup_and_keep
     );
     harness.runtimes.plan(installing_plan());
 
+    // The plan is judged against the registry first, so the unreadable record
+    // refuses before the backup, the stop, or any apply.
     let error = harness
         .upgrade(V2)
         .await
-        .expect_err("the backup is refused");
-    let Error::RuntimeBackup { detail, .. } = &error else {
+        .expect_err("the registry is refused");
+    let Error::UpgradeRuntimesRefused { refusals } = &error else {
         panic!("a registry of another mode is refused: {error:?}");
     };
-    assert!(detail.contains("0o600"), "{detail}");
-    assert_eq!(harness.runtimes.calls(), ["plan"], "no apply ran");
+    assert_eq!(refusals[0].code, "runtime_plan_unavailable");
+    assert!(
+        refusals[0].detail.contains("owner-private"),
+        "{}",
+        refusals[0].detail
+    );
+    assert_eq!(
+        harness.runtimes.calls(),
+        Vec::<String>::new(),
+        "no plan ran"
+    );
     harness.assert_installed(V1);
     assert_eq!(
         mode_of(&harness.context.paths().plugins_dir().join("registry.json")),
@@ -2225,13 +2882,21 @@ struct PostApplyPreflight {
 }
 
 impl AdoptionPreflight for PostApplyPreflight {
-    fn judge<'a>(&'a self, context: &'a Context, daemon: &'a Path) -> Judging<'a> {
+    fn judge<'a>(
+        &'a self,
+        context: &'a Context,
+        daemon: &'a Path,
+        search_path: &'a str,
+        plan: ReleasePlan,
+    ) -> Judging<'a> {
         Box::pin(async move {
             // Only the new release's judgment after the apply is scripted; the
             // rollback judges the previous release's daemon as it stands.
             let new_release = daemon.components().any(|part| part.as_os_str() == V2);
             if !self.runtimes.applied() || !new_release || self.post == PostApply::Clean {
-                return InProcessPreflight::default().judge(context, daemon).await;
+                return InProcessPreflight::default()
+                    .judge(context, daemon, search_path, plan)
+                    .await;
             }
             self.judged_after_apply.fetch_add(1, Ordering::SeqCst);
             if self.post == PostApply::CannotRun {
@@ -2240,7 +2905,9 @@ impl AdoptionPreflight for PostApplyPreflight {
                     detail: "the scripted post-apply judgment produced no report".to_owned(),
                 });
             }
-            let mut report = InProcessPreflight::default().judge(context, daemon).await?;
+            let mut report = InProcessPreflight::default()
+                .judge(context, daemon, search_path, plan)
+                .await?;
             report.sessions.push(SessionVerdict {
                 session_id: "s-after-apply".to_owned(),
                 name: None,
@@ -2298,7 +2965,7 @@ async fn a_session_at_risk_after_the_apply_restores_the_backup_and_refuses() {
     );
     assert_eq!(
         runtime_state(&harness),
-        ("before".to_owned(), "profile before".to_owned()),
+        (None, "profile before".to_owned()),
         "the apply is rolled back"
     );
     harness.assert_installed(V1);
@@ -2317,7 +2984,10 @@ async fn a_session_at_risk_after_the_apply_proceeds_with_accepted_runtime_loss()
     assert!(report.accepted_runtime_loss);
     assert_eq!(
         runtime_state(&harness),
-        ("applied registry".to_owned(), "applied profile".to_owned())
+        (
+            Some(APPLIED_REGISTRY.to_owned()),
+            "applied profile".to_owned()
+        )
     );
     harness.assert_installed(V2);
 }
@@ -2337,10 +3007,7 @@ async fn a_post_apply_preflight_that_cannot_run_restores_the_backup_and_fails() 
         "service_upgrade_preflight_failed",
         "{error:?}"
     );
-    assert_eq!(
-        runtime_state(&harness),
-        ("before".to_owned(), "profile before".to_owned())
-    );
+    assert_eq!(runtime_state(&harness), (None, "profile before".to_owned()));
     harness.assert_installed(V1);
 }
 
@@ -2441,8 +3108,8 @@ async fn a_held_data_authority_lock_keeps_a_pending_rollback_and_its_backup() {
         "the backup is kept"
     );
     assert_eq!(
-        runtime_state(&harness).0,
-        "applied registry",
+        runtime_state(&harness).0.as_deref(),
+        Some(APPLIED_REGISTRY),
         "nothing was restored while the lock was held"
     );
     assert_eq!(
@@ -2458,10 +3125,7 @@ async fn a_held_data_authority_lock_keeps_a_pending_rollback_and_its_backup() {
         .await
         .expect("the pending rollback runs");
     assert!(report.unchanged);
-    assert_eq!(
-        runtime_state(&harness),
-        ("before".to_owned(), "profile before".to_owned())
-    );
+    assert_eq!(runtime_state(&harness), (None, "profile before".to_owned()));
     harness.assert_installed(V1);
 }
 
@@ -2488,7 +3152,10 @@ async fn a_catalog_record_is_a_plan_of_its_own_and_is_applied_with_a_stop_and_ba
     );
     assert_eq!(
         runtime_state(&harness),
-        ("applied registry".to_owned(), "applied profile".to_owned()),
+        (
+            Some(APPLIED_REGISTRY.to_owned()),
+            "applied profile".to_owned()
+        ),
         "the apply ran and the apply's state is in place"
     );
     harness.assert_installed(V2);
@@ -2575,10 +3242,7 @@ async fn an_empty_runtime_plan_applies_nothing() {
     assert_eq!(harness.runtimes.calls(), ["plan", "plan"]);
     let (before, after) = harness.runtimes.last_two_removal_counts();
     assert_eq!(before, after, "the daemon is not removed for an empty plan");
-    assert_eq!(
-        runtime_state(&harness),
-        ("before".to_owned(), "profile before".to_owned())
-    );
+    assert_eq!(runtime_state(&harness), (None, "profile before".to_owned()));
     harness.assert_installed(V2);
 }
 
@@ -2607,7 +3271,10 @@ async fn an_upgrade_interrupted_after_its_runtime_apply_resumes_without_applying
     );
     assert_eq!(
         runtime_state(&harness),
-        ("applied registry".to_owned(), "applied profile".to_owned())
+        (
+            Some(APPLIED_REGISTRY.to_owned()),
+            "applied profile".to_owned()
+        )
     );
     harness.assert_installed(V2);
 }
@@ -5409,7 +6076,13 @@ struct FailingFrom {
 }
 
 impl AdoptionPreflight for FailingFrom {
-    fn judge<'a>(&'a self, context: &'a Context, daemon: &'a Path) -> Judging<'a> {
+    fn judge<'a>(
+        &'a self,
+        context: &'a Context,
+        daemon: &'a Path,
+        search_path: &'a str,
+        plan: ReleasePlan,
+    ) -> Judging<'a> {
         let call = self.inner.calls.load(Ordering::SeqCst);
         if call >= self.fail_from {
             return Box::pin(async move {
@@ -5419,7 +6092,7 @@ impl AdoptionPreflight for FailingFrom {
                 })
             });
         }
-        self.inner.judge(context, daemon)
+        self.inner.judge(context, daemon, search_path, plan)
     }
 }
 
@@ -6626,7 +7299,13 @@ async fn legacy_downgrade_refuses_an_incomplete_worker_inventory_before_stopping
 struct CountingFailure(Arc<AtomicUsize>);
 
 impl AdoptionPreflight for CountingFailure {
-    fn judge<'a>(&'a self, _context: &'a Context, daemon: &'a Path) -> Judging<'a> {
+    fn judge<'a>(
+        &'a self,
+        _context: &'a Context,
+        daemon: &'a Path,
+        _search_path: &'a str,
+        _plan: ReleasePlan,
+    ) -> Judging<'a> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             Err(Error::UpgradePreflightFailed {

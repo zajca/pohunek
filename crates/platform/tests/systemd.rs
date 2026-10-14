@@ -24,7 +24,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use pohunek_platform::supervisor::systemd::{
-    render_daemon_unit, render_sessions_slice, SystemdDaemon, SystemdPluginUnits, SystemdSupervisor,
+    render_daemon_unit, render_sessions_slice, user_manager_environment, SystemdDaemon,
+    SystemdPluginUnits, SystemdSupervisor,
 };
 use pohunek_platform::supervisor::{
     Activation, DaemonSupervisor, Error, JobDefinition, JobSpec, Namespace, PluginUnitDefinition,
@@ -1888,4 +1889,18 @@ async fn dollar_signs_reach_a_plugin_unit_verbatim() {
     );
 
     plugin.units.remove(&key).await.expect("remove plugin job");
+}
+
+/// The real user manager reports the `KEY=VALUE` environment its units get,
+/// with a `PATH` entry.
+#[test]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"]
+fn the_real_user_manager_reports_its_environment_with_a_path() {
+    require_e2e();
+    let environment = async_io::block_on(user_manager_environment(CALL_TIMEOUT))
+        .expect("the user manager answers the Environment property");
+    assert!(
+        environment.iter().any(|entry| entry.starts_with("PATH=")),
+        "{environment:?}"
+    );
 }

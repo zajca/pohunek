@@ -120,11 +120,16 @@ while sessions are live unless `--stop-sessions` is given, and keeps durable
 metadata unless `--purge` is given.
 
 `pohunek service upgrade` first runs a read-only preflight with the new
-binaries and refuses while a live session would lose its recovery or would not
-be adopted by the new daemon (`service_upgrade_sessions_at_risk`, listing each
-session with a reason code). Passing `--accept-runtime-loss` proceeds after you
-have reviewed that list; a store the new daemon would refuse to start with is
-never overridable. See the
+binaries. It judges every live session and every stopped session that keeps
+native resume or fork, and refuses while one would lose its recovery or would
+not be adopted by the new daemon (`service_upgrade_sessions_at_risk`, listing
+each session with a reason code). The same preflight carries the release's
+official runtime plan: the packages the upgrade installs and the profiles it
+pins. The upgrade installs and pins them in the same run, so a host on an older
+release needs no manual package migration. `--accept-runtime-loss` proceeds
+after you have reviewed the session list, and it never overrides a plan the
+release cannot apply (`service_upgrade_runtimes_refused`, before anything is
+stopped) or a store the new daemon would refuse to start with. See the
 [update runbook](knowledge/runbooks/update-after-release.md).
 
 The first upgrade from a legacy daemon-owned PTY release refuses live sessions
@@ -312,7 +317,8 @@ answer `runtime_served_by_package`, and its work continues in a new session. A
 fork of a Hermes session answers `agent_fork_unsupported`, because Hermes has no
 native fork. Install the Claude Code and
 Codex packages on the earlier release before upgrading so that live sessions
-stay usable. No earlier release archive carries the Hermes package, so finish or
+stay usable (the upgrade from a release with the official runtime step installs
+and pins them itself, see the [update runbook](knowledge/runbooks/update-after-release.md)). No earlier release archive carries the Hermes package, so finish or
 stop built-in Hermes sessions before upgrading; the upgrade preflight reports a
 live one at risk, and after an upgrade with `--accept-runtime-loss` installing
 the Hermes package from this release's archive lets you finish its work. On
@@ -345,8 +351,9 @@ install the plugin until darwin packages are attested (#929).
 To prepare first, install with `--no-enable` and run
 `pohunek plugin enable <package-id>` when you are ready to switch. `pohunek
 plugin disable` or `pohunek plugin uninstall` leaves `claude`, `codex` or
-`hermes` unserved. A daemon upgrade does not change installed packages; they keep
-serving until you run `pohunek plugin update <package> runtime/packages/<runtime>.tar.zst
+`hermes` unserved. The upgrade installs the release's package only for a runtime
+no installed package serves; an installed package keeps serving until you run
+`pohunek plugin update <package> runtime/packages/<runtime>.tar.zst
 --catalog runtime/runtime-catalog.json` from the new release's archive. A plain
 `install` of another version leaves it installed but unselected.
 The trust model and the package classes are described

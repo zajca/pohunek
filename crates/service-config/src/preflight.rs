@@ -12,10 +12,54 @@
 
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::runtimes::{EnsureReport, Refusal};
+
+/// Argument that adds the release runtime plan to the judgement of
+/// `pohunekd upgrade-preflight`. Without it the judgement serves the installed
+/// packages only and the report carries no plan.
+///
+/// Only the upgrade's own gates pass it. A rollback runs the previous release's
+/// binary without it, because that binary never applies the plan.
+pub const RELEASE_PLAN_FLAG: &str = "--release-plan";
+
+/// Deadline the installer gives one `pohunekd upgrade-preflight` run.
+///
+/// [`PROBE_BUDGET`] is kept below it, so a probe budget that runs out still
+/// leaves the installer time to read a complete report before the deadline.
+pub const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Time one preflight run may spend on version probes, counted from the entry of
+/// the command.
+///
+/// The probe deadline is the entry of `pohunekd upgrade-preflight` plus this
+/// budget, so the journal scan, the release plan and the registry load count
+/// against it too. A session whose probe would start at or after the deadline
+/// is judged `would_lose_recovery` with [`CODE_PROBE_BUDGET_EXHAUSTED`]: the
+/// judgement stays pessimistic instead of running past [`PREFLIGHT_TIMEOUT`].
+pub const PROBE_BUDGET: Duration = Duration::from_secs(20);
+
+/// Time reserved after the probe deadline for the rest of the judgement and for
+/// the report to be printed. A probe that started before the deadline ends by
+/// its own bounded timeout, so the run ends within this margin of the deadline.
+pub const REPORT_MARGIN: Duration = Duration::from_secs(5);
+
+// The probe deadline and the report margin must end before the installer's
+// deadline.
+const _: () =
+    assert!(PROBE_BUDGET.as_secs() + REPORT_MARGIN.as_secs() < PREFLIGHT_TIMEOUT.as_secs());
+
+/// Machine code of a session whose version probe the probe budget did not
+/// reach.
+pub const CODE_PROBE_BUDGET_EXHAUSTED: &str = "probe_budget_exhausted";
+
 /// Version of the report layout; a reader refuses any other value.
+///
+/// Stays at 1 while the layout only gains fields, because the rollback gate
+/// parses reports of older daemons, which ignore fields they do not know.
 pub const REPORT_VERSION: u32 = 1;
 
 /// The session is adopted with its native recovery intact.
@@ -183,19 +227,39 @@ pub struct PreflightReport {
     pub store: StoreReport,
     /// Every live session, ordered by id.
     pub sessions: Vec<SessionVerdict>,
+    /// Sessions whose runtime has ended and that keep native resume or fork,
+    /// ordered by id. Each verdict says whether the session still resumes or
+    /// forks through the runtime source the new daemon serves.
+    #[serde(default)]
+    pub stopped_sessions: Vec<SessionVerdict>,
     /// Sessions whose worker journal is live but which the store has no
     /// record of, ordered by id. The running daemon does not manage them
     /// either, so the upgrade leaves them as they are.
     #[serde(default)]
     pub unmanaged_workers: Vec<String>,
+    /// The release step's plan against this host: the packages and profiles
+    /// it changes, and its refusals. Absent when the release carries no
+    /// `runtime/` directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtimes: Option<EnsureReport>,
 }
 
 impl PreflightReport {
-    /// The sessions whose verdict is not [`Verdict::Adoptable`].
+    /// The live and stopped sessions whose verdict is not
+    /// [`Verdict::Adoptable`].
     pub fn at_risk(&self) -> impl Iterator<Item = &SessionVerdict> {
         self.sessions
             .iter()
+            .chain(&self.stopped_sessions)
             .filter(|session| session.verdict.at_risk())
+    }
+
+    /// The reasons the release step refuses its plan, which the upgrade must
+    /// not override: the plan changes nothing while any remains.
+    pub fn plan_refusals(&self) -> impl Iterator<Item = &Refusal> {
+        self.runtimes
+            .iter()
+            .flat_map(|runtimes| runtimes.refusals.iter())
     }
 
     /// Whether the daemon would refuse to start with the store.

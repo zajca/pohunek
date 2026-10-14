@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use pohunek_paths::{BasePaths, PathEnv, HOME, XDG_RUNTIME_DIR};
 use pohunek_platform::filesystem::TrustedDir;
@@ -15,6 +16,7 @@ use pohunek_platform::shell_env::{
 use pohunek_platform::supervisor::{self, Namespace};
 
 use super::error::{fs_error, io_error, Error};
+use super::manager_env::{LaunchdJob, SystemLaunchd, SystemdUserManager, UserManager};
 use super::report::{DroppedPath, SearchPathReport};
 use super::settings;
 
@@ -81,6 +83,21 @@ pub struct Context {
     supervisor_dir: PathBuf,
     cli_executable: PathBuf,
     path_discovery: DiscoverySource,
+    user_manager: Arc<dyn UserManager>,
+    launchd_domain_config: PathBuf,
+    launchd_job: Arc<dyn LaunchdJob>,
+}
+
+/// The launchd user-domain configuration of this host.
+#[cfg(target_os = "macos")]
+fn default_launchd_domain_config() -> PathBuf {
+    PathBuf::from(pohunek_platform::supervisor::launchd::USER_DOMAIN_CONFIG)
+}
+
+/// Hosts without launchd read no launchd configuration.
+#[cfg(not(target_os = "macos"))]
+fn default_launchd_domain_config() -> PathBuf {
+    PathBuf::new()
 }
 
 impl Context {
@@ -106,7 +123,50 @@ impl Context {
             supervisor_dir,
             cli_executable,
             path_discovery: DiscoverySource::Fixed(PathDiscovery::Unmanaged),
+            user_manager: Arc::new(SystemdUserManager),
+            launchd_domain_config: default_launchd_domain_config(),
+            launchd_job: Arc::new(SystemLaunchd),
         }
+    }
+
+    /// Returns this context reading the systemd user manager through `manager`.
+    #[must_use]
+    pub fn with_user_manager(mut self, manager: Arc<dyn UserManager>) -> Self {
+        self.user_manager = manager;
+        self
+    }
+
+    /// Returns this context reading the launchd user domain from `config`.
+    #[must_use]
+    pub fn with_launchd_domain_config(mut self, config: impl Into<PathBuf>) -> Self {
+        self.launchd_domain_config = config.into();
+        self
+    }
+
+    /// Returns this context reading launchd's active state through `job`.
+    #[must_use]
+    pub fn with_launchd_job(mut self, job: Arc<dyn LaunchdJob>) -> Self {
+        self.launchd_job = job;
+        self
+    }
+
+    /// launchd's active state of the daemon job, for a job without a recorded `PATH`.
+    #[must_use]
+    pub fn launchd_job(&self) -> &dyn LaunchdJob {
+        self.launchd_job.as_ref()
+    }
+
+    /// The launchd user-domain configuration a job without a recorded `PATH`
+    /// inherits its `PATH` from on macOS.
+    #[must_use]
+    pub fn launchd_domain_config(&self) -> &Path {
+        &self.launchd_domain_config
+    }
+
+    /// The systemd user manager the daemon job's inherited `PATH` is read from.
+    #[must_use]
+    pub fn user_manager(&self) -> &dyn UserManager {
+        self.user_manager.as_ref()
     }
 
     /// Returns this context with `path_discovery` choosing the daemon `PATH`.

@@ -1768,6 +1768,10 @@ pub(crate) struct RejectedLine {
     /// Whether the session the line holds may own a live runtime. A line whose
     /// state cannot be read counts as live.
     pub(crate) may_own_runtime: bool,
+    /// Whether the line names a removal intent (`desired_state` `removed`).
+    /// Reconciliation finishes such a removal, so the session keeps no
+    /// recovery an upgrade must preserve.
+    pub(crate) removal_intent: bool,
     /// Why the line was rejected.
     pub(crate) reason: String,
 }
@@ -1796,7 +1800,9 @@ fn partition_lines(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, Vec<Rej
                     serde_json::from_value::<Record>(value).map_err(|e| e.to_string()),
                 )
             }
-            schema::ParsedLine::Corrupt { text, error } => (text, (None, None, false), Err(error)),
+            schema::ParsedLine::Corrupt { text, error } => {
+                (text, (None, None, false, false), Err(error))
+            }
         };
         let reason = match parsed {
             Ok(Record::Session(mut record)) if record_agents_are_persistable(&record) => {
@@ -1825,11 +1831,12 @@ fn partition_lines(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, Vec<Rej
                 error
             }
         };
-        let (kind, session_id, may_own_runtime) = hint;
+        let (kind, session_id, may_own_runtime, removal_intent) = hint;
         rejected.push(RejectedLine {
             kind,
             session_id,
             may_own_runtime,
+            removal_intent,
             reason,
         });
     }
@@ -1845,8 +1852,26 @@ pub(crate) fn may_hold_session(kind: Option<&str>) -> bool {
     kind.is_none_or(|kind| !NON_SESSION_KINDS.contains(&kind))
 }
 
-/// The kind, session id and liveness a rejected line still names.
-fn rejected_hint(value: &serde_json::Value) -> (Option<String>, Option<String>, bool) {
+/// The kind, session id, liveness and removal intent a rejected line still names.
+/// The kind of a line, classified by the same internal `kind` tag [`Record`] is
+/// deserialized with, so a line the loader rejects is classified as the loader
+/// would classify it.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum LineKind {
+    Session(serde::de::IgnoredAny),
+    Resume(serde::de::IgnoredAny),
+    Worktree(serde::de::IgnoredAny),
+    Project(serde::de::IgnoredAny),
+}
+
+/// The kind `value` classifies as, or `None` for a line that names no kind the
+/// loader knows.
+fn line_kind(value: &serde_json::Value) -> Option<LineKind> {
+    LineKind::deserialize(value).ok()
+}
+
+fn rejected_hint(value: &serde_json::Value) -> (Option<String>, Option<String>, bool, bool) {
     let text = |key: &str| {
         value
             .get(key)
@@ -1865,7 +1890,15 @@ fn rejected_hint(value: &serde_json::Value) -> (Option<String>, Option<String>, 
             .get("info")
             .and_then(|info| serde_json::from_value::<SessionInfo>(info.clone()).ok())
             .is_none_or(|info| info.may_own_runtime());
-    (kind, text("session_id"), may_own_runtime)
+    // Reconciliation finishes a removal of a session record only, so the intent
+    // is read from session-kind lines alone, with the loader's own tags and
+    // state spelling.
+    let removal_intent = matches!(line_kind(value), Some(LineKind::Session(_)))
+        && value
+            .get("desired_state")
+            .and_then(|state| DesiredState::deserialize(state).ok())
+            == Some(DesiredState::Removed);
+    (kind, text("session_id"), may_own_runtime, removal_intent)
 }
 
 fn record_agents_are_persistable(record: &SessionRecord) -> bool {

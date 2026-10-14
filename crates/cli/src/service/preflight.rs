@@ -16,16 +16,44 @@ use std::pin::Pin;
 use std::process::Stdio;
 
 use pohunek_paths::DAEMON_EXECUTABLE_NAME;
-use pohunek_service_config::preflight::{PreflightReport, SessionVerdict, REPORT_VERSION};
+use pohunek_platform::supervisor::SEARCH_PATH_VARIABLE;
+use pohunek_service_config::preflight::{
+    PreflightReport, SessionVerdict, PREFLIGHT_TIMEOUT, RELEASE_PLAN_FLAG, REPORT_VERSION,
+};
 use tokio::io::AsyncReadExt as _;
 
 use super::context::Context;
 use super::error::Error;
 use super::layout;
+use super::runtimes;
 use super::settings;
 
 /// Argument that makes the daemon print its preflight report.
 pub const PREFLIGHT_ARGUMENT: &str = "upgrade-preflight";
+
+/// Whether a preflight judgement includes the release's runtime plan.
+///
+/// Only the upgrade's own gates include it: the plan is what the upgrade is
+/// about to apply. The post-apply judgement runs after the apply, so the
+/// installed packages already are the plan's result. A rollback runs the
+/// previous release's binary, which never applies a plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleasePlan {
+    /// The judgement serves the installed packages only.
+    Omitted,
+    /// The judgement adds the release's runtime plan.
+    Included,
+}
+
+impl ReleasePlan {
+    /// The daemon argument this choice passes, if any.
+    fn argument(self) -> Option<&'static str> {
+        match self {
+            Self::Omitted => None,
+            Self::Included => Some(RELEASE_PLAN_FLAG),
+        }
+    }
+}
 
 /// A pending preflight run.
 pub type Judging<'a> = Pin<Box<dyn Future<Output = Result<PreflightReport, Error>> + Send + 'a>>;
@@ -33,8 +61,15 @@ pub type Judging<'a> = Pin<Box<dyn Future<Output = Result<PreflightReport, Error
 /// Judges the adoption of the live sessions of the installed state.
 pub trait AdoptionPreflight: Debug + Send + Sync {
     /// Returns the report of the daemon executable `daemon` for the state
-    /// `context` locates.
-    fn judge<'a>(&'a self, context: &'a Context, daemon: &'a Path) -> Judging<'a>;
+    /// `context` locates, run with the `PATH` `search_path` gives the daemon
+    /// job.
+    fn judge<'a>(
+        &'a self,
+        context: &'a Context,
+        daemon: &'a Path,
+        search_path: &'a str,
+        plan: ReleasePlan,
+    ) -> Judging<'a>;
 }
 
 /// Runs `<daemon> upgrade-preflight` as a child process.
@@ -42,9 +77,23 @@ pub trait AdoptionPreflight: Debug + Send + Sync {
 pub struct DaemonPreflight;
 
 impl AdoptionPreflight for DaemonPreflight {
-    fn judge<'a>(&'a self, context: &'a Context, daemon: &'a Path) -> Judging<'a> {
-        Box::pin(run_daemon(context, daemon))
+    fn judge<'a>(
+        &'a self,
+        context: &'a Context,
+        daemon: &'a Path,
+        search_path: &'a str,
+        plan: ReleasePlan,
+    ) -> Judging<'a> {
+        Box::pin(run_daemon(context, daemon, search_path, plan))
     }
+}
+
+/// Sets the `PATH` of a child that stands in for the daemon job, byte for byte.
+///
+/// The job's `PATH` value is the one the child gets, so the child resolves and
+/// probes exactly as the job does.
+pub(super) fn set_search_path(command: &mut tokio::process::Command, search_path: &str) {
+    command.env(SEARCH_PATH_VARIABLE, search_path);
 }
 
 /// The outcome of a preflight the operator may proceed on.
@@ -54,6 +103,8 @@ pub struct Gated {
     pub report: PreflightReport,
     /// Whether at-risk sessions exist and `--accept-runtime-loss` accepted them.
     pub accepted: bool,
+    /// Conditions of the judgement's inputs that the operator must be told.
+    pub warnings: Vec<String>,
 }
 
 /// Runs the preflight of the staged `daemon` and applies the operator's choice.
@@ -71,12 +122,60 @@ pub async fn gate(
     context: &Context,
     daemon_dir: &Path,
     version: &str,
+    search_path: &str,
     accept_runtime_loss: bool,
 ) -> Result<Gated, Error> {
+    let report = judge_daemon(
+        preflight,
+        context,
+        daemon_dir,
+        version,
+        search_path,
+        ReleasePlan::Omitted,
+    )
+    .await?;
+    decide(report, accept_runtime_loss)
+}
+
+/// Runs [`gate`] for an upgrade, which also refuses a runtime plan that cannot
+/// be applied.
+///
+/// A rollback never runs the runtime step, so only the upgrade path calls this.
+/// The plan refusal is checked before the operator's choice, so
+/// `--accept-runtime-loss` cannot accept it.
+///
+/// # Errors
+///
+/// Returns [`Error::UpgradeRuntimesRefused`] for a refused plan, and the errors
+/// of [`gate`] otherwise.
+pub async fn gate_upgrade(
+    preflight: &dyn AdoptionPreflight,
+    context: &Context,
+    daemon_dir: &Path,
+    version: &str,
+    search_path: &str,
+    plan: ReleasePlan,
+    accept_runtime_loss: bool,
+) -> Result<Gated, Error> {
+    let report = judge_daemon(preflight, context, daemon_dir, version, search_path, plan).await?;
+    if let Some(plan) = &report.runtimes {
+        runtimes::check_plan(plan)?;
+    }
+    decide(report, accept_runtime_loss)
+}
+
+/// Checks the staged `daemon` is of `version` and returns its report.
+async fn judge_daemon(
+    preflight: &dyn AdoptionPreflight,
+    context: &Context,
+    daemon_dir: &Path,
+    version: &str,
+    search_path: &str,
+    plan: ReleasePlan,
+) -> Result<PreflightReport, Error> {
     let daemon = daemon_dir.join(DAEMON_EXECUTABLE_NAME);
     probe_daemon(&daemon, version).await?;
-    let report = preflight.judge(context, &daemon).await?;
-    decide(report, accept_runtime_loss)
+    preflight.judge(context, &daemon, search_path, plan).await
 }
 
 /// Verifies the daemon binary before using it as compatibility evidence.
@@ -117,12 +216,14 @@ pub fn decide(report: PreflightReport, accept_runtime_loss: bool) -> Result<Gate
         return Ok(Gated {
             report,
             accepted: false,
+            warnings: Vec::new(),
         });
     }
     if accept_runtime_loss {
         Ok(Gated {
             report,
             accepted: true,
+            warnings: Vec::new(),
         })
     } else {
         Err(Error::UpgradeAtRisk { sessions: at_risk })
@@ -130,20 +231,29 @@ pub fn decide(report: PreflightReport, accept_runtime_loss: bool) -> Result<Gate
 }
 
 /// Runs the daemon's preflight with the environment the installed daemon gets.
-async fn run_daemon(context: &Context, daemon: &Path) -> Result<PreflightReport, Error> {
+async fn run_daemon(
+    context: &Context,
+    daemon: &Path,
+    search_path: &str,
+    plan: ReleasePlan,
+) -> Result<PreflightReport, Error> {
     let failure = |detail: String| Error::UpgradePreflightFailed {
         binary: daemon.to_path_buf(),
         detail,
     };
     let mut command = tokio::process::Command::new(daemon);
+    command.arg(PREFLIGHT_ARGUMENT);
+    if let Some(flag) = plan.argument() {
+        command.arg(flag);
+    }
     command
-        .arg(PREFLIGHT_ARGUMENT)
         .env_clear()
         .envs(context.bootstrap_environment()?)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    set_search_path(&mut command, search_path);
     let mut child =
         layout::retry_while_exec_busy(settings::EXEC_BUSY_WAIT, settings::EXEC_BUSY_POLL, || {
             command.spawn()
@@ -166,12 +276,12 @@ async fn run_daemon(context: &Context, daemon: &Path) -> Result<PreflightReport,
         let status = child.wait().await;
         (report, diagnostics, status)
     };
-    let (report, diagnostics, status) = tokio::time::timeout(settings::PREFLIGHT_TIMEOUT, run)
+    let (report, diagnostics, status) = tokio::time::timeout(PREFLIGHT_TIMEOUT, run)
         .await
         .map_err(|_elapsed| {
             failure(format!(
                 "it did not finish within {} s",
-                settings::PREFLIGHT_TIMEOUT.as_secs()
+                PREFLIGHT_TIMEOUT.as_secs()
             ))
         })?;
     let status = status.map_err(|error| failure(format!("cannot wait for it: {error}")))?;
@@ -197,7 +307,7 @@ async fn run_daemon(context: &Context, daemon: &Path) -> Result<PreflightReport,
 ///
 /// A report cut at the limit does not parse, which fails the preflight; cut
 /// diagnostics are only context.
-async fn read_bounded(
+pub(super) async fn read_bounded(
     mut reader: impl tokio::io::AsyncRead + Unpin,
     limit: usize,
 ) -> std::io::Result<Vec<u8>> {

@@ -39,6 +39,12 @@ pub const CODE_PACKAGE_ARCHIVE_INVALID: &str = "official_package_archive_invalid
 pub const CODE_PROFILE_NOT_MIGRATABLE: &str = "profile_not_migratable";
 /// A daemon holds the instance lock, so nothing may change offline.
 pub const CODE_DAEMON_RUNNING: &str = "daemon_running";
+/// The release runtime plan cannot be computed at all, so the upgrade refuses
+/// before any change.
+pub const CODE_RUNTIME_PLAN_UNAVAILABLE: &str = "runtime_plan_unavailable";
+/// The installed `service.toml` cannot be read, so the environment a launch
+/// inherits, and therefore the plan and the version probes, are unknown.
+pub const CODE_SERVICE_CONFIG_UNREADABLE: &str = "service_config_unreadable";
 
 /// What the step found, planned and (unless a dry run) did.
 ///

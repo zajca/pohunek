@@ -475,6 +475,15 @@ impl ProfileRegistry {
         self
     }
 
+    /// Reads the revisions of `state_dir`'s key without creating it: a missing
+    /// key is an unavailable revision, so a judgement that only reads keeps the
+    /// host state unchanged.
+    #[must_use]
+    pub(crate) fn with_read_only_revision_state_dir(mut self, state_dir: Option<PathBuf>) -> Self {
+        self.revision_keys = Arc::new(RevisionKeys::read_only(state_dir));
+        self
+    }
+
     /// The revision keys of this host.
     pub(crate) fn revision_keys(&self) -> &RevisionKeys {
         &self.revision_keys

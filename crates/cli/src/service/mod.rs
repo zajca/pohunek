@@ -37,6 +37,7 @@ pub mod error;
 pub mod inherited;
 pub mod layout;
 mod legacy_store;
+pub mod manager_env;
 pub mod preflight;
 pub mod record;
 pub mod report;
@@ -215,7 +216,8 @@ async fn finish_check(
                     version: previous.to_owned(),
                     detail: "previous version has no valid installation directory".to_owned(),
                 })?;
-        let gated = rollback::gate(
+        let job = engine::journal_job_path(context, record).await?;
+        let mut gated = rollback::gate(
             rollback::Inputs {
                 preflight,
                 context,
@@ -226,19 +228,31 @@ async fn finish_check(
             &daemon_dir,
             previous,
             previous,
+            &job.value,
             accept_runtime_loss,
         )
         .await?;
+        gated.warnings = engine::job_warnings(context, &job);
         checked.report.accepted_runtime_loss = gated.accepted;
         checked.report.preflight = Some(gated.report.clone());
         if let Some(pending) = &mut checked.report.pending_transaction {
             pending.accepted_runtime_loss = gated.accepted;
+            pending.warnings.clone_from(&gated.warnings);
             pending.preflight = Some(gated.report);
         }
     }
     if checked.adoption == Adoption::Required {
-        let gated =
-            preflight::gate(preflight, context, daemon_dir, version, accept_runtime_loss).await?;
+        let job = engine::installed_job_path(context).await?;
+        let gated = preflight::gate_upgrade(
+            preflight,
+            context,
+            daemon_dir,
+            version,
+            &job.value,
+            preflight::ReleasePlan::Included,
+            accept_runtime_loss,
+        )
+        .await?;
         checked.report.accepted_runtime_loss |= gated.accepted;
         checked.report.preflight = Some(gated.report);
     }
@@ -877,13 +891,9 @@ async fn status_of(context: &Context) -> Result<report::StatusReport, Error> {
             workers_error: None,
             unreadable_journals: Vec::new(),
             transaction_in_progress: store.in_progress()?,
-            pending_transaction: store.load()?.map(|pending| report::PendingReport {
-                operation: pending.operation.as_str(),
-                version: pending.version,
-                step: pending.step.as_str(),
-                preflight: None,
-                accepted_runtime_loss: false,
-            }),
+            pending_transaction: store
+                .load()?
+                .map(|pending| engine::pending_report(&pending)),
         });
     }
     let config = verified_config(context)?;
@@ -1088,6 +1098,7 @@ mod tests {
             rolling_back: false,
             runtime_stop: false,
             runtime_backup: None,
+            launchd_default_path: None,
         };
         assert_eq!(
             checked_config_migration(&engine::Plan::Resume(record.clone()), &source, "2.0.0"),

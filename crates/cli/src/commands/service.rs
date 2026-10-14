@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Subcommand, ValueHint};
-use pohunek_service_config::preflight::{PreflightReport, StoreState};
+use pohunek_service_config::preflight::{PreflightReport, SessionVerdict, StoreState};
 use pohunek_service_config::runtimes::{CatalogStatus, EnsureReport, PackageStatus};
 
 use crate::commands::render_json;
@@ -284,14 +284,43 @@ fn render_preflight(text: &mut String, preflight: &PreflightReport, accepted_run
     }
     if preflight.sessions.is_empty() {
         let _ = writeln!(text, "sessions   no live sessions");
+    }
+    render_sessions(
+        text,
+        ("sessions", "live"),
+        &preflight.sessions,
+        accepted_runtime_loss,
+    );
+    render_sessions(
+        text,
+        ("stopped", "with native resume or fork"),
+        &preflight.stopped_sessions,
+        accepted_runtime_loss,
+    );
+}
+
+/// Appends the count line of `sessions` and one line per session.
+///
+/// `heading` is the label and the kind of the sessions in the count line.
+/// Nothing is written for an empty list.
+fn render_sessions(
+    text: &mut String,
+    (heading, kind): (&str, &str),
+    sessions: &[SessionVerdict],
+    accepted_runtime_loss: bool,
+) {
+    if sessions.is_empty() {
         return;
     }
-    let at_risk = preflight.at_risk().count();
+    let at_risk = sessions
+        .iter()
+        .filter(|session| session.verdict.at_risk())
+        .count();
     let _ = writeln!(
         text,
-        "sessions   {} live, {} adoptable{}",
-        preflight.sessions.len(),
-        preflight.sessions.len() - at_risk,
+        "{heading:<10} {} {kind}, {} adoptable{}",
+        sessions.len(),
+        sessions.len() - at_risk,
         if at_risk == 0 {
             String::new()
         } else if accepted_runtime_loss {
@@ -300,7 +329,7 @@ fn render_preflight(text: &mut String, preflight: &PreflightReport, accepted_run
             format!(", {at_risk} at risk")
         }
     );
-    for session in &preflight.sessions {
+    for session in sessions {
         let name = session
             .name
             .as_deref()
@@ -314,8 +343,55 @@ fn render_preflight(text: &mut String, preflight: &PreflightReport, accepted_run
     }
 }
 
+/// Appends the release step's plan: the packages it installs with the reasons
+/// the host uses them, the profiles it pins, and the integrations it reinstalls.
+/// A plan with refusals never reaches this, because its error lists them.
+fn render_plan(text: &mut String, plan: &EnsureReport) {
+    render_catalog(text, plan);
+    for package in &plan.packages {
+        let _ = writeln!(
+            text,
+            "plan       runtime {}  {} {}  {} ({})",
+            package.runtime,
+            package.package,
+            package.version,
+            format!("{:?}", package.status).to_lowercase(),
+            package
+                .reasons
+                .iter()
+                .map(|reason| format!("{reason:?}").to_lowercase())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    for profile in &plan.profiles {
+        let _ = writeln!(
+            text,
+            "plan       profile {}  pin to {}  {}",
+            profile.name,
+            profile.base,
+            format!("{:?}", profile.status).to_lowercase()
+        );
+    }
+    for integration in &plan.integrations {
+        let profile = integration
+            .profile
+            .as_deref()
+            .map(|profile| format!(" (profile {profile})"))
+            .unwrap_or_default();
+        let _ = writeln!(
+            text,
+            "plan       integration {}{profile}  reinstall after the upgrade",
+            integration.runtime
+        );
+    }
+}
+
 fn render_upgrade(report: &report::UpgradeReport) -> String {
     let mut text = String::new();
+    for warning in &report.warnings {
+        let _ = writeln!(text, "warning: {warning}");
+    }
     if let Some(pending) = &report.rolled_back {
         let _ = writeln!(text, "{}", render_rolled_back(pending));
     }
@@ -369,14 +445,20 @@ fn render_upgrade(report: &report::UpgradeReport) -> String {
         {
             return text;
         }
+        // The applied packages above already list the plan of an upgrade that ran it.
+        if report.runtimes.is_none() {
+            if let Some(plan) = &preflight.runtimes {
+                render_plan(&mut text, plan);
+            }
+        }
         render_preflight(&mut text, preflight, report.accepted_runtime_loss);
     }
     text
 }
 
-/// Lists the official runtime packages, the catalog trust state and profile
-/// pins of the runtime step.
-fn render_runtimes(text: &mut String, runtimes: &EnsureReport) {
+/// Appends the catalog trust state of the runtime step and why a kept package
+/// is kept.
+fn render_catalog(text: &mut String, runtimes: &EnsureReport) {
     match runtimes.catalog {
         CatalogStatus::Unavailable => {
             let kept: Vec<&str> = runtimes
@@ -402,6 +484,12 @@ fn render_runtimes(text: &mut String, runtimes: &EnsureReport) {
             let _ = writeln!(text, "catalog  {}", format!("{other:?}").to_lowercase());
         }
     }
+}
+
+/// Lists the official runtime packages, the catalog trust state and profile
+/// pins of the runtime step.
+fn render_runtimes(text: &mut String, runtimes: &EnsureReport) {
+    render_catalog(text, runtimes);
     for package in &runtimes.packages {
         let _ = writeln!(
             text,
@@ -458,8 +546,12 @@ fn render_check(report: &report::CheckReport) -> String {
                 "rolled back first"
             }
         );
+        render_pending_warnings(&mut text, pending);
     }
     if let Some(preflight) = &report.preflight {
+        if let Some(plan) = &preflight.runtimes {
+            render_plan(&mut text, plan);
+        }
         render_preflight(&mut text, preflight, report.accepted_runtime_loss);
     }
     text
@@ -592,6 +684,13 @@ fn render_status(report: &report::StatusReport) -> String {
     text
 }
 
+/// Appends one `warning:` line for each journal condition of `pending`.
+fn render_pending_warnings(text: &mut String, pending: &report::PendingReport) {
+    for warning in &pending.warnings {
+        let _ = writeln!(text, "warning: {warning}");
+    }
+}
+
 fn render_transaction(text: &mut String, report: &report::StatusReport) {
     match (&report.pending_transaction, report.transaction_in_progress) {
         (Some(pending), true) => {
@@ -600,6 +699,7 @@ fn render_transaction(text: &mut String, report: &report::StatusReport) {
                 "running    {} {} is at step {} in another `pohunek service` command",
                 pending.operation, pending.version, pending.step
             );
+            render_pending_warnings(text, pending);
         }
         (None, true) => {
             let _ = writeln!(
@@ -613,6 +713,7 @@ fn render_transaction(text: &mut String, report: &report::StatusReport) {
                 "pending    {} {} stopped after step {} (rerun it to resume, or uninstall to roll back)",
                 pending.operation, pending.version, pending.step
             );
+            render_pending_warnings(text, pending);
         }
         (None, false) => {}
     }
@@ -623,6 +724,7 @@ fn render_rolled_back(pending: &report::PendingReport) -> String {
         "rolled back an interrupted {} of {} (stopped after step {})",
         pending.operation, pending.version, pending.step
     );
+    render_pending_warnings(&mut text, pending);
     if let Some(preflight) = &pending.preflight {
         text.push('\n');
         render_preflight(&mut text, preflight, pending.accepted_runtime_loss);
@@ -824,6 +926,7 @@ mod tests {
                 step: "config",
                 preflight: None,
                 accepted_runtime_loss: false,
+                warnings: Vec::new(),
             }),
             pending_action: Some("roll_back"),
             locked: true,
@@ -839,6 +942,128 @@ mod tests {
             text.contains(
                 "pending    upgrade 0.9.0 stopped after step config would be rolled back first"
             ),
+            "{text}"
+        );
+    }
+
+    /// A plan with one live and two stopped sessions; the refusals of a plan go to its error.
+    fn runtime_plan_preflight() -> PreflightReport {
+        use pohunek_service_config::preflight::{StoreReport, Verdict, REPORT_VERSION};
+        use pohunek_service_config::runtimes::{
+            IntegrationAction, PackageAction, ProfileAction, ProfileStatus, UseReason,
+            ENSURE_REPORT_VERSION,
+        };
+
+        let session = |id: &str, verdict: Verdict| SessionVerdict {
+            session_id: id.to_owned(),
+            name: None,
+            verdict,
+            code: "native_recovery_unmappable".to_owned(),
+            detail: "detail".to_owned(),
+        };
+        PreflightReport {
+            report_version: REPORT_VERSION,
+            daemon_version: "1.0.0".to_owned(),
+            store: StoreReport {
+                path: PathBuf::from("/d/metadata.db"),
+                state: StoreState::UpToDate,
+                schema_from: None,
+                schema_to: 4,
+                records: 3,
+                error_code: None,
+                error: None,
+            },
+            sessions: vec![session("s-live", Verdict::Adoptable)],
+            stopped_sessions: vec![
+                session("s-stopped-a", Verdict::WouldLoseRecovery),
+                session("s-stopped-b", Verdict::WouldNotBeAdopted),
+            ],
+            unmanaged_workers: Vec::new(),
+            runtimes: Some(EnsureReport {
+                report_version: ENSURE_REPORT_VERSION,
+                daemon_version: "1.0.0".to_owned(),
+                dry_run: true,
+                catalog: CatalogStatus::Current,
+                packages: vec![PackageAction {
+                    runtime: "claude".to_owned(),
+                    package: "pohunek.runtime.claude".to_owned(),
+                    version: "1.0.0".to_owned(),
+                    digest: "de".repeat(32),
+                    status: PackageStatus::Install,
+                    reasons: vec![UseReason::Profile, UseReason::Session],
+                }],
+                profiles: vec![ProfileAction {
+                    name: "work".to_owned(),
+                    base: "claude".to_owned(),
+                    digest: "de".repeat(32),
+                    status: ProfileStatus::Bind,
+                }],
+                integrations: vec![IntegrationAction {
+                    runtime: "claude".to_owned(),
+                    profile: None,
+                }],
+                refusals: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn check_renders_the_runtime_plan_and_every_stopped_session() {
+        let preflight = runtime_plan_preflight();
+        let text = render_check(&report::CheckReport {
+            operation: "upgrade",
+            version: "1.0.0".to_owned(),
+            prefix: PathBuf::from("/p"),
+            namespace: "ns".to_owned(),
+            config_path: PathBuf::from("/c/pohunek/service.toml"),
+            pending_transaction: None,
+            pending_action: None,
+            locked: false,
+            preflight: Some(preflight),
+            accepted_runtime_loss: false,
+            config_schema_migration: None,
+        });
+
+        assert!(
+            text.contains(
+                "plan       runtime claude  pohunek.runtime.claude 1.0.0  install (profile, session)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("plan       profile work  pin to claude  bind"),
+            "{text}"
+        );
+        assert!(
+            text.contains("plan       integration claude  reinstall after the upgrade"),
+            "{text}"
+        );
+        assert!(text.contains("catalog  current\n"), "{text}");
+        assert!(text.contains("sessions   1 live, 1 adoptable\n"), "{text}");
+        assert!(
+            text.contains("stopped    2 with native resume or fork, 0 adoptable, 2 at risk\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  s-stopped-a: would_lose_recovery"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_rolled_back_journal_without_a_job_path_says_so() {
+        let text = render_rolled_back(&report::PendingReport {
+            operation: "upgrade",
+            version: "2.0.0".to_owned(),
+            step: "registered",
+            preflight: None,
+            accepted_runtime_loss: false,
+            warnings: vec![
+                "the journal /state/service-install.json records no job PATH".to_owned(),
+            ],
+        });
+        assert!(
+            text.contains("warning: the journal /state/service-install.json records no job PATH"),
             "{text}"
         );
     }
@@ -864,6 +1089,7 @@ mod tests {
                 step: "config",
                 preflight: None,
                 accepted_runtime_loss: false,
+                warnings: Vec::new(),
             }),
         });
         assert!(text.contains("pending    install 1.0.0 stopped after step config"));
@@ -906,6 +1132,7 @@ mod tests {
     #[test]
     fn an_unchanged_upgrade_renders_its_version_cleanup() {
         let text = render_upgrade(&report::UpgradeReport {
+            warnings: Vec::new(),
             from_version: "2.0.0".to_owned(),
             to_version: "2.0.0".to_owned(),
             unchanged: true,
@@ -972,6 +1199,7 @@ mod tests {
                 step: "ready",
                 preflight: None,
                 accepted_runtime_loss: false,
+                warnings: Vec::new(),
             }),
         };
         let json = render_json(&status).expect("status JSON");

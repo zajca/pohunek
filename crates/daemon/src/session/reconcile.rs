@@ -6267,17 +6267,22 @@ mod tests {
         validate_worker_identity_process_facts, SessionRegistry,
     };
     use crate::agent::{InputRules, NativeSessionLaunch, SessionRefKind};
+    use crate::catalog_anchor::CatalogTrust;
     use crate::procwatch::readable_host::ReadableHost;
     use crate::procwatch::{
         ExitWatch, HostInspector, OwnershipMarkers, Pid, ProcessFact,
         ProcessIdentity as OsProcessIdentity, ProcessInspector,
     };
     use crate::runtime::lifecycle::DEV_WORKER_CONNECT;
+    use crate::runtime::{EnvironmentSource, LaunchEnvironment};
+    use crate::session::upgrade_preflight::{PreflightOptions, ReleaseInputs};
     use crate::session::SessionRegistryConfig;
+    use crate::session::{ensure_official_runtimes, EnsureInputs};
     use crate::store::{
         DesiredState, NativeIdentityOrdering, ResumeBinding, RuntimeRecord, SessionRecord,
         SessionWriteOutcome, Store, StoredInputRules,
     };
+    use pohunek_service_config::preflight::PROBE_BUDGET;
 
     /// Interactive shell for registries whose sessions run the default shell.
     ///
@@ -18678,6 +18683,7 @@ handler = "codex-hook-v1"
         clippy::struct_excessive_bools,
         reason = "each flag is one independent column of the case table"
     )]
+    #[derive(Clone, Copy)]
     struct Differential {
         name: &'static str,
         /// Whether the worker is initialized; an uninitialized one is still in
@@ -18735,17 +18741,110 @@ handler = "codex-hook-v1"
     }
     fn untouched_journal(_: &mut serde_json::Value) {}
 
+    /// The runtime registry of the official packages installed in `plugins_dir`.
+    fn installed_runtimes(plugins_dir: &Path) -> crate::agent::host::RuntimeHost {
+        crate::agent::host::RuntimeHost::with_packages(
+            crate::agent::host::BuiltinSource::from_host_environment(),
+            crate::agent::host::PackageSource::new(
+                crate::agent::host::PackageStore::open(plugins_dir).expect("the plugin root opens"),
+            ),
+        )
+        .expect("the runtime host builds")
+    }
+
+    /// Writes a release `runtime/` directory for `runtimes`, as the release build
+    /// does: the official archives under `packages/` and a catalog listing them,
+    /// signed by a throwaway key. Returns the anchor trust of that key.
+    fn write_test_release(release: &Path, runtimes: &[&str]) -> CatalogTrust {
+        use package::{build_archive, read_archive, CatalogEntry, Limits};
+        use pohunek_test_support::catalog::{
+            attestations_for, catalog_of, host_platform, root_of, signed, test_key, ANY_CORE,
+            RUNTIME_API, WINDOW_END, WINDOW_START,
+        };
+
+        let key = test_key();
+        let packages = release.join("packages");
+        std::fs::create_dir_all(&packages).expect("create the release packages directory");
+        let entries: Vec<CatalogEntry> = runtimes
+            .iter()
+            .map(|runtime| {
+                let archive_entries =
+                    crate::agent::host::fixture::official_package_entries(runtime);
+                let bytes = build_archive(&archive_entries, &Limits::DEFAULT)
+                    .expect("the official archive builds");
+                let digest = read_archive(&bytes, &Limits::DEFAULT)
+                    .expect("the official archive reads")
+                    .digest()
+                    .clone();
+                std::fs::write(packages.join(format!("{runtime}.tar.zst")), &bytes)
+                    .expect("write the release package archive");
+                let definition =
+                    crate::agent::host::definition_from_archive(&archive_entries, &digest)
+                        .expect("the official package parses");
+                let protocol::BindingProvenance::Package { package, .. } =
+                    definition.binding().provenance.clone()
+                else {
+                    panic!("the {runtime} package has package provenance");
+                };
+                CatalogEntry {
+                    package_id: package.id,
+                    runtime_id: protocol::RuntimeId::parse(runtime).expect("runtime id"),
+                    version: package.version,
+                    digest,
+                    runtime_api: RUNTIME_API,
+                    platforms: vec![host_platform()],
+                    attestations: attestations_for(&[host_platform()]),
+                    core: ANY_CORE.to_owned(),
+                }
+            })
+            .collect();
+        std::fs::write(
+            release.join("runtime-catalog.json"),
+            signed(&key, catalog_of(1, WINDOW_END, entries)),
+        )
+        .expect("write the release catalog");
+        CatalogTrust::Loaded(
+            crate::session::HostTrustAnchor::new(
+                vec![root_of(&key, WINDOW_START, WINDOW_END)],
+                Vec::new(),
+            )
+            .expect("the throwaway trust anchor"),
+        )
+    }
+
+    /// The launch pin of a session launched from the built-in `claude` of a
+    /// v0.34 daemon, bound to the package id the official package declares.
+    fn built_in_claude_pin() -> crate::agent::host::LaunchPin {
+        let package = crate::agent::host::fixture::official_package_identity("claude").0;
+        let binding = serde_json::json!({
+            "runtime_id": "claude",
+            "provenance": {
+                "kind": "builtin",
+                "package": {"id": package, "version": "1.0.0"},
+                "descriptor_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            },
+        });
+        crate::agent::host::LaunchPin::Pinned(Box::new(
+            serde_json::from_value(binding).expect("the built-in launch binding"),
+        ))
+    }
+
     /// The preflight is never more optimistic than reconciliation: it calls a
     /// session adoptable only when startup adopts its worker live. Each case
     /// runs the real reconcile over a real in-process worker, so a rule added
     /// to one side and not the other fails here.
+    ///
+    /// Each case runs twice. The first form judges the installed official
+    /// packages. The second form judges a host with no package installed, where
+    /// the release `runtime/` holds the claude package: the preflight with that
+    /// plan is checked against reconciliation after the real release apply.
     #[tokio::test]
     #[expect(
         clippy::too_many_lines,
         reason = "one table drives every case through the same real worker fixture"
     )]
     async fn the_upgrade_preflight_is_never_more_optimistic_than_reconciliation() {
-        use super::upgrade_preflight::{run, PreflightInputs};
+        use super::upgrade_preflight::{run, run_with, PreflightInputs};
         use pohunek_service_config::preflight::Verdict;
 
         let cases = [
@@ -18998,7 +19097,15 @@ handler = "codex-hook-v1"
             },
         ];
 
-        for case in cases {
+        for (with_plan, case) in cases
+            .into_iter()
+            .flat_map(|case| [(false, case), (true, case)])
+        {
+            let form = if with_plan {
+                "with the release plan"
+            } else {
+                "installed"
+            };
             let root = temp_root();
             let runtime_root = root.join("runtime/workers");
             let session_id = DIFFERENTIAL_SESSION;
@@ -19090,15 +19197,25 @@ handler = "codex-hook-v1"
             // The preflight and reconciliation serve the same runtimes: the
             // built-ins and the official packages of one plugin root.
             let plugins_dir = root.join("state/plugins");
-            crate::agent::host::fixture::install_official_packages(&plugins_dir);
-            let runtimes = crate::agent::host::RuntimeHost::with_packages(
-                crate::agent::host::BuiltinSource::from_host_environment(),
-                crate::agent::host::PackageSource::new(
-                    crate::agent::host::PackageStore::open(&plugins_dir)
-                        .expect("the plugin root opens"),
-                ),
-            )
-            .expect("the runtime host builds");
+            let release = root.join("release/runtime");
+            let agents = root.join("agents");
+            let launch = LaunchEnvironment::new(
+                pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST
+                    .iter()
+                    .map(|pattern| (*pattern).to_owned())
+                    .collect(),
+                EnvironmentSource::fixed([(
+                    std::ffi::OsString::from("HOME"),
+                    root.join("home").into_os_string(),
+                )]),
+            );
+            let release_trust = if with_plan {
+                std::fs::create_dir_all(&agents).expect("the agents directory");
+                Some(write_test_release(&release, &["claude"]))
+            } else {
+                crate::agent::host::fixture::install_official_packages(&plugins_dir);
+                None
+            };
 
             let mut record = identity_record();
             record.session_id = session_id.to_owned();
@@ -19122,15 +19239,21 @@ handler = "codex-hook-v1"
             bind_test_generation(&mut record);
             (case.edit_record)(&mut record);
             if record.info.agent_base == RuntimeRef::claude() {
-                // A Claude session pins the package it was launched from.
-                let claude = runtimes
-                    .resolve_id(&protocol::RuntimeId::claude())
-                    .expect("the official Claude package is served");
+                // A Claude session pins the package it was launched from, or,
+                // before the release step, the built-in it was launched from.
+                let pin = if with_plan {
+                    built_in_claude_pin()
+                } else {
+                    let claude = installed_runtimes(&plugins_dir)
+                        .resolve_id(&protocol::RuntimeId::claude())
+                        .expect("the official Claude package is served");
+                    crate::agent::host::LaunchPin::of(&claude)
+                };
                 record
                     .recovery
                     .as_mut()
                     .expect("recovery binding")
-                    .launch_binding = crate::agent::host::LaunchPin::of(&claude);
+                    .launch_binding = pin;
             }
             let store_path = root.join("data/metadata.jsonl");
             Store::new(store_path.clone())
@@ -19150,14 +19273,30 @@ handler = "codex-hook-v1"
                 std::fs::write(&journal_path, journal.to_string()).expect("write journal");
             }
 
-            let report = run(
-                &PreflightInputs {
-                    store_path: store_path.clone(),
-                    worker_state_root: state_root.clone(),
-                    plugins_dir,
-                },
-                &crate::procwatch::HostInspector::new(),
-            );
+            let inputs = PreflightInputs {
+                store_path: store_path.clone(),
+                worker_state_root: state_root.clone(),
+                plugins_dir: plugins_dir.clone(),
+            };
+            let inspector = crate::procwatch::HostInspector::new();
+            let report = match &release_trust {
+                Some(trust) => run_with(
+                    &inputs,
+                    &PreflightOptions {
+                        probe_budget: PROBE_BUDGET,
+                        entry: std::time::Instant::now(),
+                        release: Some(ReleaseInputs {
+                            release_dir: release.clone(),
+                            catalog_trust: trust.clone(),
+                        }),
+                        profiles_dir: Some(agents.clone()),
+                        host_state_dir: None,
+                        launch: Ok(launch.clone()),
+                    },
+                    &inspector,
+                ),
+                None => run(&inputs, &inspector),
+            };
             let verdict = report
                 .sessions
                 .iter()
@@ -19165,6 +19304,41 @@ handler = "codex-hook-v1"
                 .map(|session| session.verdict);
             // The worker serves one controller at a time.
             drop(controller);
+            if let Some(trust) = &release_trust {
+                // A store the plan cannot read leaves nothing to apply, and
+                // reconciliation then judges that store as it is.
+                if let Ok(applied) = ensure_official_runtimes(&EnsureInputs {
+                    store_path: store_path.clone(),
+                    plugins_dir: plugins_dir.clone(),
+                    profiles_dir: agents.clone(),
+                    release_dir: release.clone(),
+                    catalog_trust: trust.clone(),
+                    dry_run: false,
+                    daemon_version: crate::DAEMON_VERSION.to_owned(),
+                    environment: Ok(launch.clone()),
+                }) {
+                    assert!(
+                        applied.refusals.is_empty(),
+                        "{} ({form}): {:?}",
+                        case.name,
+                        applied.refusals
+                    );
+                }
+            }
+            if with_plan
+                && verdict == Some(Verdict::Adoptable)
+                && record.info.agent_base == RuntimeRef::claude()
+            {
+                // The adoptable verdict claims resume will work, so the runtime
+                // the session's pin names is served once the release step ran.
+                let recovery = record.recovery.as_ref().expect("recovery binding");
+                installed_runtimes(&plugins_dir)
+                    .resolve_pinned(&recovery.agent_base, &recovery.launch_binding)
+                    .unwrap_or_else(|error| {
+                        panic!("{} (with the release plan): {error:?}", case.name)
+                    });
+            }
+            let runtimes = installed_runtimes(&plugins_dir);
             let registry = SessionRegistry::new_with_runtimes(
                 SessionRegistryConfig {
                     shell_command: hermetic_shell(),
@@ -19203,20 +19377,24 @@ handler = "codex-hook-v1"
             task.abort();
 
             let adoptable = verdict == Some(Verdict::Adoptable);
-            assert_eq!(live, case.reconcile_live, "{}: reconcile", case.name);
+            assert_eq!(
+                live, case.reconcile_live,
+                "{} ({form}): reconcile",
+                case.name
+            );
             assert_eq!(
                 adoptable, case.preflight_adoptable,
-                "{}: preflight {:?}",
+                "{} ({form}): preflight {:?}",
                 case.name, report.sessions
             );
             assert!(
                 !adoptable || live,
-                "{}: the preflight must not call adoptable what reconciliation does not adopt",
+                "{} ({form}): the preflight must not call adoptable what reconciliation does not adopt",
                 case.name
             );
             assert!(
                 live || report.at_risk().count() > 0,
-                "{}: a session reconciliation does not adopt must be listed at risk: {:?}",
+                "{} ({form}): a session reconciliation does not adopt must be listed at risk: {:?}",
                 case.name,
                 report
             );

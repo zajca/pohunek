@@ -354,6 +354,7 @@ fn pending_migration(
         rolling_back: false,
         runtime_stop: false,
         runtime_backup: None,
+        launchd_default_path: None,
     };
     store.save(&record).expect("journal interrupted migration");
 }

@@ -14,7 +14,10 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use package::registry::RegistryError as PackageRegistryError;
 use package::PackageDigest;
-use protocol::{BindingProvenance, LaunchBinding, PackageId, ProtocolError, RuntimeId, RuntimeRef};
+use protocol::{
+    BindingProvenance, LaunchBinding, PackageId, PackageIdentity, ProtocolError, RuntimeId,
+    RuntimeRef,
+};
 use tracing::warn;
 
 use super::builtin::BuiltinSource;
@@ -80,7 +83,13 @@ impl PackageReport {
 #[derive(Debug)]
 struct Packages {
     builtin: BuiltinSource,
-    source: PackageSource,
+    /// The installed packages; absent for a read-only overlay over no store.
+    source: Option<PackageSource>,
+    /// Official definitions that serve their runtime id in place of the
+    /// installed selected package of that id. Only the read-only upgrade
+    /// preflight sets them, to judge against the state the release step
+    /// leaves behind before that step runs.
+    planned: Vec<RuntimeDefinition>,
     /// Serializes reloads so a slower rebuild never replaces a newer one.
     reload_gate: Mutex<()>,
 }
@@ -175,9 +184,32 @@ impl RuntimeHost {
         builtin: BuiltinSource,
         source: PackageSource,
     ) -> Result<Self, RegistryError> {
+        Self::with_planned_packages(builtin, Some(source), Vec::new())
+    }
+
+    /// Builds a host serving the built-in runtimes, the packages `source`
+    /// loads (when there is a store) and `planned` in place of the installed
+    /// selected official package of each planned runtime id.
+    ///
+    /// The planned definitions are taken as already verified: they come from
+    /// the release archives the release step verifies before it installs them.
+    /// A planned digest that is not installed is accepted by an adoption of a
+    /// built-in pin, because the registry is what the adoption resolves. Every
+    /// other pin still resolves through the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns the registry error when the built-in runtimes or the planned
+    /// definitions are invalid.
+    pub fn with_planned_packages(
+        builtin: BuiltinSource,
+        source: Option<PackageSource>,
+        planned: Vec<RuntimeDefinition>,
+    ) -> Result<Self, RegistryError> {
         let packages = Packages {
             builtin,
             source,
+            planned,
             reload_gate: Mutex::new(()),
         };
         let state = build_state(&packages)?;
@@ -285,7 +317,8 @@ impl RuntimeHost {
     pub fn package_store(&self) -> Option<&PackageStore> {
         self.packages
             .as_ref()
-            .map(|packages| packages.source.store())
+            .and_then(|packages| packages.source.as_ref())
+            .map(PackageSource::store)
     }
 
     /// Rebuilds the registry from the built-in runtimes and the packages
@@ -391,10 +424,39 @@ impl RuntimeHost {
         if pinned_id != runtime_id {
             return Err(ProtocolError::runtime_not_installed(runtime_id));
         }
+        // The release step installs exactly the planned archive, and the plan
+        // verified it when it was made, so the planned definition of this digest
+        // is what the pin resolves to once the step ran.
+        if let Some(planned) = self.planned_definition(runtime_id, package_digest, package) {
+            return Ok(Arc::new(planned));
+        }
         store
             .load_pinned(runtime_id, package_digest, package)
             .map(Arc::new)
             .map_err(|reason| refuse(runtime_id, &reason))
+    }
+
+    /// The planned definition of exactly `digest` under `identity` for
+    /// `runtime_id`, when the planned overlay holds it.
+    fn planned_definition(
+        &self,
+        runtime_id: &RuntimeId,
+        digest: &PackageDigest,
+        identity: &PackageIdentity,
+    ) -> Option<RuntimeDefinition> {
+        self.packages
+            .as_ref()?
+            .planned
+            .iter()
+            .find_map(|definition| {
+                let matches = definition.runtime_id() == runtime_id
+                    && matches!(
+                        &definition.binding().provenance,
+                        BindingProvenance::Package { package, package_digest }
+                            if package == identity && package_digest == digest
+                    );
+                matches.then(|| definition.clone())
+            })
     }
 
     /// Verifies the package root of a definition that adopts a built-in `pin`.
@@ -417,7 +479,7 @@ impl RuntimeHost {
         else {
             return Ok(definition);
         };
-        if !adopts(pin, &definition) {
+        if !adopts(pin, &definition) || self.is_planned(package_digest) {
             return Ok(definition);
         }
         let runtime_id = definition.runtime_id();
@@ -576,6 +638,18 @@ impl RuntimeHost {
         pohunek_worker_protocol::hook_schema_for_handler(handler.as_str())
     }
 
+    /// Whether `digest` is the archive digest of a planned definition.
+    fn is_planned(&self, digest: &PackageDigest) -> bool {
+        self.packages.as_ref().is_some_and(|packages| {
+            packages.planned.iter().any(|definition| {
+                matches!(
+                    &definition.binding().provenance,
+                    BindingProvenance::Package { package_digest, .. } if package_digest == digest
+                )
+            })
+        })
+    }
+
     /// The refusal of a session launched from the built-in runtime of the
     /// official alias `runtime_id` while nothing serves that alias: this
     /// daemon does not compile the built-in in and no official package is
@@ -618,7 +692,11 @@ fn refuse(runtime_id: &RuntimeId, reason: &super::package::PackageRejection) -> 
 /// Builds one registry snapshot from the built-in runtimes and the packages
 /// installed now.
 fn build_state(packages: &Packages) -> Result<HostState, RegistryError> {
-    let (definitions, official, report) = match packages.source.load_report() {
+    let loaded = match &packages.source {
+        Some(source) => source.load_report(),
+        None => Ok(super::package::PackageLoad::default()),
+    };
+    let (definitions, mut official, report) = match loaded {
         Ok(load) => (
             load.definitions,
             load.official,
@@ -636,6 +714,15 @@ fn build_state(packages: &Packages) -> Result<HostState, RegistryError> {
             },
         ),
     };
+    if !packages.planned.is_empty() {
+        official.retain(|installed| {
+            packages
+                .planned
+                .iter()
+                .all(|planned| planned.runtime_id() != installed.runtime_id())
+        });
+        official.extend(packages.planned.iter().cloned());
+    }
     for rejected in &report.rejected {
         warn!(
             package = %rejected.identity.id,

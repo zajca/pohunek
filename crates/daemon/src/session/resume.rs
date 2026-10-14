@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use crate::agent::host::{ProfileRevision, RuntimeDefinition};
 use crate::agent::{
-    InputRules, LaunchEnv, LaunchView, NativeReferenceProvenance, ReferenceExistence,
-    ResolvedAgent, StoreRoot,
+    InputRules, LaunchEnv, LaunchView, NativeReferenceProvenance, ProfileRegistry,
+    ReferenceExistence, ResolvedAgent, StoreRoot,
 };
 use crate::detect::Manifest;
 use crate::runtime::environment::{base_environment, effective_variable};
@@ -955,115 +955,7 @@ impl SessionRegistry {
         change: ProfileChange,
         fork: bool,
     ) -> Result<RecoveryProfile, ProtocolError> {
-        let frozen = binding.profile_revision.as_ref();
-        let resolved = match self.resolve_recovery_agent(binding) {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                warn!(
-                    session_id = %binding.session_id,
-                    agent = %binding.agent,
-                    error_code = %error.code,
-                    "agent profile no longer resolves"
-                );
-                return Err(profile_missing(binding, &error.code));
-            }
-        };
-        let Some(profile) = resolved.profile else {
-            return match frozen {
-                Some(_) => Err(profile_missing(binding, "profile_removed")),
-                None => Ok(RecoveryProfile::none()),
-            };
-        };
-        let keys = self.inner.profiles.revision_keys();
-        let current = keys.revision(&profile.inputs)?;
-        let unchanged = match frozen {
-            Some(frozen) => {
-                keys.matches(&profile.inputs, frozen)?
-                    || self.adopted_profile_matches(
-                        binding,
-                        &resolved.name,
-                        &resolved.definition,
-                        frozen,
-                        fork,
-                    )?
-            }
-            None => false,
-        };
-        if !unchanged && change == ProfileChange::Refuse {
-            return Err(profile_changed(binding, frozen.is_some()));
-        }
-        if !unchanged {
-            warn!(
-                session_id = %binding.session_id,
-                agent = %binding.agent,
-                "relaunching under a changed agent profile the owner accepted"
-            );
-        }
-        Ok(RecoveryProfile {
-            env: profile.env,
-            manifest: profile.manifest,
-            revision: Some(current),
-        })
-    }
-
-    /// Whether a profile whose revision was frozen over a built-in pin still
-    /// matches that revision once the official package adopts the pin.
-    ///
-    /// The frozen revision digests the built-in binding the session stored, so
-    /// the package that now serves the runtime cannot reproduce it. The match
-    /// is accepted only when the definition is the adoption of the pin
-    /// ([`host::adopts`]) and honors the frozen launch for this operation, and
-    /// the profile's pin keys, if any, name that package.
-    fn adopted_profile_matches(
-        &self,
-        binding: &ResumeBinding,
-        name: &str,
-        definition: &RuntimeDefinition,
-        frozen: &ProfileRevision,
-        fork: bool,
-    ) -> Result<bool, ProtocolError> {
-        if !host::adopts(&binding.launch_binding, definition)
-            || recovery_contract(binding, definition, fork).is_err()
-        {
-            return Ok(false);
-        }
-        let (
-            Some(stored),
-            BindingProvenance::Package {
-                package,
-                package_digest,
-            },
-        ) = (
-            binding.launch_binding.binding(),
-            &definition.binding().provenance,
-        )
-        else {
-            return Ok(false);
-        };
-        if binding.program.is_empty() {
-            return Ok(false);
-        }
-        self.inner.profiles.frozen_builtin_matches(
-            name,
-            stored,
-            (&binding.program, &binding.args),
-            (&package.id, package_digest),
-            frozen,
-        )
-    }
-
-    /// Re-resolves the agent `binding` was launched as.
-    fn resolve_recovery_agent(
-        &self,
-        binding: &ResumeBinding,
-    ) -> Result<ResolvedAgent, ProtocolError> {
-        match self.binding_definition(binding) {
-            Ok(pinned) => self
-                .inner
-                .profiles
-                .resolve_agent_pinned(&binding.agent, &pinned),
-            Err(_unresolved) => self.inner.profiles.resolve_agent(&binding.agent),
-        }
+        recovery_profile_in(&self.inner.profiles, binding, change, fork)
     }
 
     /// The input framing a relaunch of `binding` uses: the rules frozen into
@@ -1512,7 +1404,134 @@ fn clear_refused_capabilities(
     info.capability_refusals = (!refusals.is_empty()).then_some(refusals);
 }
 
-fn binding_program(binding: &ResumeBinding, definition: &RuntimeDefinition) -> String {
+/// Re-resolves the agent `binding` was launched as.
+fn resolve_recovery_agent_in(
+    profiles: &ProfileRegistry,
+    binding: &ResumeBinding,
+) -> Result<ResolvedAgent, ProtocolError> {
+    match recovery_definition(profiles.runtimes(), binding) {
+        Ok(pinned) => profiles.resolve_agent_pinned(&binding.agent, &pinned),
+        Err(_unresolved) => profiles.resolve_agent(&binding.agent),
+    }
+}
+
+/// Whether a profile whose revision was frozen over a built-in pin still
+/// matches that revision once the official package adopts the pin.
+///
+/// The frozen revision digests the built-in binding the session stored, so
+/// the package that now serves the runtime cannot reproduce it. The match
+/// is accepted only when the definition is the adoption of the pin
+/// ([`host::adopts`]) and honors the frozen launch for this operation, and
+/// the profile's pin keys, if any, name that package.
+fn adopted_profile_matches_in(
+    profiles: &ProfileRegistry,
+    binding: &ResumeBinding,
+    name: &str,
+    definition: &RuntimeDefinition,
+    frozen: &ProfileRevision,
+    fork: bool,
+) -> Result<bool, ProtocolError> {
+    if !host::adopts(&binding.launch_binding, definition)
+        || recovery_contract(binding, definition, fork).is_err()
+    {
+        return Ok(false);
+    }
+    let (
+        Some(stored),
+        BindingProvenance::Package {
+            package,
+            package_digest,
+        },
+    ) = (
+        binding.launch_binding.binding(),
+        &definition.binding().provenance,
+    )
+    else {
+        return Ok(false);
+    };
+    if binding.program.is_empty() {
+        return Ok(false);
+    }
+    profiles.frozen_builtin_matches(
+        name,
+        stored,
+        (&binding.program, &binding.args),
+        (&package.id, package_digest),
+        frozen,
+    )
+}
+
+/// Resolves the host profile `binding` was launched from and checks it against
+/// the revision frozen into the binding, as a resume or a fork of `binding`
+/// does. Resume and the upgrade preflight both run this one check.
+///
+/// # Errors
+///
+/// Returns `agent_profile_missing` when a profile the session was launched
+/// from (frozen, or named by a binding that predates freezing) does not
+/// resolve, `agent_profile_changed` when its revision differs from the
+/// frozen one or none was frozen and `change` is [`ProfileChange::Refuse`],
+/// and `agent_profile_revision_unavailable` when the revision key cannot be
+/// read.
+pub(super) fn recovery_profile_in(
+    profiles: &ProfileRegistry,
+    binding: &ResumeBinding,
+    change: ProfileChange,
+    fork: bool,
+) -> Result<RecoveryProfile, ProtocolError> {
+    let frozen = binding.profile_revision.as_ref();
+    let resolved = match resolve_recovery_agent_in(profiles, binding) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            warn!(
+                session_id = %binding.session_id,
+                agent = %binding.agent,
+                error_code = %error.code,
+                "agent profile no longer resolves"
+            );
+            return Err(profile_missing(binding, &error.code));
+        }
+    };
+    let Some(profile) = resolved.profile else {
+        return match frozen {
+            Some(_) => Err(profile_missing(binding, "profile_removed")),
+            None => Ok(RecoveryProfile::none()),
+        };
+    };
+    let keys = profiles.revision_keys();
+    let current = keys.revision(&profile.inputs)?;
+    let unchanged = match frozen {
+        Some(frozen) => {
+            keys.matches(&profile.inputs, frozen)?
+                || adopted_profile_matches_in(
+                    profiles,
+                    binding,
+                    &resolved.name,
+                    &resolved.definition,
+                    frozen,
+                    fork,
+                )?
+        }
+        None => false,
+    };
+    if !unchanged && change == ProfileChange::Refuse {
+        return Err(profile_changed(binding, frozen.is_some()));
+    }
+    if !unchanged {
+        warn!(
+            session_id = %binding.session_id,
+            agent = %binding.agent,
+            "relaunching under a changed agent profile the owner accepted"
+        );
+    }
+    Ok(RecoveryProfile {
+        env: profile.env,
+        manifest: profile.manifest,
+        revision: Some(current),
+    })
+}
+
+pub(super) fn binding_program(binding: &ResumeBinding, definition: &RuntimeDefinition) -> String {
     if binding.program.is_empty() {
         definition.program().as_str().to_owned()
     } else {

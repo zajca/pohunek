@@ -61,6 +61,7 @@ pub(super) async fn gate(
     daemon_dir: &Path,
     previous: &str,
     reported_version: &str,
+    search_path: &str,
     accept_runtime_loss: bool,
 ) -> Result<Gated, Error> {
     let judged = if let Some(reader) = LegacyReader::from_version(previous) {
@@ -79,6 +80,7 @@ pub(super) async fn gate(
             inputs.context,
             daemon_dir,
             reported_version,
+            search_path,
             accept_runtime_loss,
         )
         .await
@@ -118,6 +120,8 @@ async fn legacy_report(
         store,
         sessions,
         unmanaged_workers: Vec::new(),
+        stopped_sessions: Vec::new(),
+        runtimes: None,
     })
 }
 

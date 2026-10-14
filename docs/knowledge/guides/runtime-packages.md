@@ -447,7 +447,11 @@ no native fork. A session whose contract the package cannot honor, and a
 session record that names no package (v0.33.0), answer `runtime_served_by_package`;
 the migration is a new session: `pohunek session new --agent <alias>`, which the
 package serves. No command rebinds a session to another runtime source. Stop and
-remove still work. `pohunekd upgrade-preflight` reports an adoptable built-in
+remove still work. The upgrade's runtime step installs the release's packages
+and pins the profiles to them in the same run, so the manual `plugin install`
+and `plugin profile migrate` steps are the fallback (see the
+[update runbook](../runbooks/update-after-release.md#official-runtime-packages-during-an-upgrade)).
+`pohunekd upgrade-preflight` reports an adoptable built-in
 session as `adoptable`. A session that no package adopts is reported as
 `would_lose_recovery` with code `runtime_source_not_served`, so `pohunek service
 upgrade` refuses until `--accept-runtime-loss` is given. A session whose worker

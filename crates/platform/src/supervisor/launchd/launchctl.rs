@@ -88,6 +88,8 @@ pub(crate) struct Completion {
     exit: ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    /// Whether standard output had more bytes than the runner kept.
+    pub(crate) stdout_truncated: bool,
 }
 
 impl Completion {
@@ -101,8 +103,7 @@ impl Completion {
         }
     }
 
-    /// Returns the captured standard output, bounded by [`OUTPUT_CAP`].
-    #[cfg(test)]
+    /// Returns the captured standard output, bounded by the runner's cap.
     pub(crate) fn stdout(&self) -> &[u8] {
         &self.stdout
     }
@@ -183,20 +184,28 @@ pub(crate) struct Launchctl {
     program: PathBuf,
     leading: Vec<String>,
     deadline: Duration,
+    output_cap: usize,
 }
 
 impl Launchctl {
     /// Creates a runner for [`LAUNCHCTL`] whose commands end after `deadline`.
-    #[cfg_attr(
-        not(target_os = "macos"),
-        expect(dead_code, reason = "only the macOS backend runs the real launchctl")
-    )]
     pub(crate) fn new(deadline: Duration) -> Self {
         Self {
             program: PathBuf::from(LAUNCHCTL),
             leading: Vec::new(),
             deadline,
+            output_cap: OUTPUT_CAP,
         }
+    }
+
+    /// Returns this runner keeping up to `cap` bytes of standard output.
+    ///
+    /// A command whose output is larger reports it with
+    /// [`Completion::stdout_truncated`]; callers that need the whole output
+    /// refuse a truncated one.
+    pub(crate) fn with_output_cap(mut self, cap: usize) -> Self {
+        self.output_cap = cap;
+        self
     }
 
     /// Creates a runner for a fake `program` that receives `leading`
@@ -207,6 +216,7 @@ impl Launchctl {
             program: program.to_path_buf(),
             leading: leading.iter().map(|value| (*value).to_owned()).collect(),
             deadline,
+            output_cap: OUTPUT_CAP,
         }
     }
 
@@ -254,8 +264,13 @@ impl Launchctl {
             .map_err(|source| RunError::Spawn { subcommand, source })?;
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
+        let output_cap = self.output_cap;
         let collected = tokio::time::timeout(deadline, async {
-            tokio::join!(drain(stdout), drain(stderr), child.wait())
+            tokio::join!(
+                drain(stdout, output_cap),
+                drain(stderr, OUTPUT_CAP),
+                child.wait()
+            )
         })
         .await;
         let Ok((stdout, stderr, exit)) = collected else {
@@ -268,29 +283,38 @@ impl Launchctl {
         };
         let io = |source| RunError::Io { subcommand, source };
         let exit = exit.map_err(io)?;
+        let (stdout, stdout_truncated) = stdout.map_err(io)?;
         Ok(Completion {
             status: Status::from_code(exit.code()),
             subcommand,
             exit,
-            stdout: stdout.map_err(io)?,
-            stderr: stderr.map_err(io)?,
+            stdout,
+            stdout_truncated,
+            stderr: stderr.map_err(io)?.0,
         })
     }
 }
 
-/// Reads a pipe to its end, keeping at most [`OUTPUT_CAP`] bytes.
-async fn drain(pipe: Option<impl AsyncRead + Unpin>) -> std::io::Result<Vec<u8>> {
+/// Reads a pipe to its end, keeping at most `cap` bytes.
+///
+/// Returns the kept bytes and whether any were discarded.
+async fn drain(
+    pipe: Option<impl AsyncRead + Unpin>,
+    cap: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
     let mut kept = Vec::new();
+    let mut truncated = false;
     let Some(mut pipe) = pipe else {
-        return Ok(kept);
+        return Ok((kept, truncated));
     };
     let mut chunk = [0_u8; READ_CHUNK];
     loop {
         let read = pipe.read(&mut chunk).await?;
         if read == 0 {
-            return Ok(kept);
+            return Ok((kept, truncated));
         }
-        let room = OUTPUT_CAP - kept.len();
+        let room = cap - kept.len();
+        truncated |= read > room;
         kept.extend_from_slice(&chunk[..read.min(room)]);
     }
 }

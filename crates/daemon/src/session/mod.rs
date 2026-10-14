@@ -97,7 +97,9 @@ mod turn_events;
 mod turn_wait;
 
 pub use attach::{RedeemedAttach, RedeemedRuntime};
-pub use package_lifecycle::ensure::{ensure_official_runtimes, EnsureError, EnsureInputs};
+pub use package_lifecycle::ensure::{
+    ensure_official_runtimes, plan_official_runtimes, EnsureError, EnsureInputs, OfficialPlan,
+};
 pub use package_lifecycle::HostTrustAnchor;
 pub use retention::{SessionRetentionTask, POLICY_FILE_NAME as RETENTION_POLICY_NAME};
 
