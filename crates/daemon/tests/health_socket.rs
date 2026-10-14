@@ -4781,12 +4781,14 @@ async fn a_stopped_session_still_owns_its_worktree_in_project_show() {
 }
 
 /// Script of the temporary-directory scenario: it fills `$TMPDIR` with what
-/// agents leave there (a read-only directory, a hardlink, a FIFO) and then
+/// agents leave there (a read-only and an unreadable directory, a hardlink, a
+/// FIFO) and then
 /// reports the value it saw in `tmpdir.txt` of its working directory.
 const TMPDIR_SCRIPT: &str = concat!(
     "mkdir -p \"$TMPDIR/ro/inner\" && : > \"$TMPDIR/ro/inner/file\" && ",
     ": > \"$TMPDIR/data\" && ln \"$TMPDIR/data\" \"$TMPDIR/hardlink\" && ",
     "mkfifo \"$TMPDIR/fifo\" && chmod 0555 \"$TMPDIR/ro\" && ",
+    "mkdir \"$TMPDIR/locked\" && : > \"$TMPDIR/locked/file\" && chmod 0000 \"$TMPDIR/locked\" && ",
     "printf '%s|' \"$TMPDIR\" > tmpdir.partial && mv tmpdir.partial tmpdir.txt; ",
     "exec sleep 30",
 );
@@ -4917,11 +4919,57 @@ async fn every_session_gets_a_private_tmpdir_that_its_removal_deletes() {
         profile_tmpdir.join("data").exists(),
         "the profile's own TMPDIR is never deleted"
     );
-    std::fs::set_permissions(
-        profile_tmpdir.join("ro"),
-        std::fs::Permissions::from_mode(0o700),
-    )
-    .expect("let the fixture delete the profile's TMPDIR");
+    for dir in ["ro", "locked"] {
+        std::fs::set_permissions(
+            profile_tmpdir.join(dir),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("let the fixture delete the profile's TMPDIR");
+    }
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// A `TMPDIR` root reached through a symlink is refused before any worker
+/// starts, and no session is left behind.
+#[tokio::test]
+async fn a_symlinked_tmpdir_root_refuses_the_launch() {
+    let socket = temp_socket("session-tmpdir-symlink");
+    let elsewhere = socket.dir.join("elsewhere");
+    std::fs::create_dir(&elsewhere).expect("create the symlink target");
+    let tmp_root = socket.dir.join("session-tmp");
+    std::os::unix::fs::symlink(&elsewhere, &tmp_root).expect("plant the symlinked root");
+    let started = socket.dir.join("agent-started");
+    let script = format!("touch '{}'; exec sleep 30", started.display());
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", script.as_str()]),
+        session_tmp_root: Some(tmp_root),
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+
+    let error =
+        err_payload(create_session_with_params(&mut control, session_params(&socket)).await);
+    assert_eq!(error.code, "session_tmpdir_unsafe", "{error}");
+    assert_eq!(error.class, ErrorClass::Runtime);
+    let list = Request::make("tmpdir-symlink-list", method::SESSION_LIST, Value::Null);
+    let sessions: Vec<SessionInfo> =
+        serde_json::from_value(ok_payload(exchange(&mut control, &list).await))
+            .expect("list sessions");
+    assert!(
+        sessions.is_empty(),
+        "the refused session is not listed: {sessions:?}"
+    );
+    assert!(!started.exists(), "the agent never starts");
+    assert_eq!(
+        std::fs::read_dir(&elsewhere)
+            .expect("list the symlink target")
+            .count(),
+        0,
+        "nothing is created through the symlink"
+    );
 
     let _ = shutdown.send(());
     let _ = handle.await;

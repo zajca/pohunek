@@ -181,36 +181,31 @@ fn try_remove(root: &Path, id: &SessionId) -> Result<(), String> {
 
 /// Grants the owner `rwx` on every directory of the daemon's user in the tree
 /// at `top`, without following symlinks and without touching any other entry.
+///
+/// Each directory is made accessible through its parent before it is opened,
+/// so a directory its owner cannot even read (mode 0000) is reached as well.
 fn grant_owner_access(top: &Path) -> std::io::Result<()> {
     let uid = rustix::process::geteuid().as_raw();
-    let open_dir = |parent: Option<&OwnedFd>, name: &Path| -> std::io::Result<OwnedFd> {
-        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        let fd = match parent {
-            Some(parent) => rustix::fs::openat(parent, name, flags, Mode::empty()),
-            None => rustix::fs::open(name, flags, Mode::empty()),
-        };
-        fd.map_err(std::io::Error::from)
-    };
-    let make_accessible = |fd: &OwnedFd| -> std::io::Result<()> {
-        let stat = rustix::fs::fstat(fd)?;
-        if stat.st_uid == uid {
-            let mode = Mode::from_raw_mode(stat.st_mode) | Mode::RWXU;
-            rustix::fs::fchmod(fd, mode)?;
-        }
-        Ok(())
-    };
-    let top_fd = open_dir(None, top)?;
-    make_accessible(&top_fd)?;
-    let mut pending = vec![top_fd];
+    let accessible = |stat: &rustix::fs::Stat| Mode::from_raw_mode(stat.st_mode) | Mode::RWXU;
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let top_stat = rustix::fs::lstat(top)?;
+    if top_stat.st_uid == uid {
+        rustix::fs::chmod(top, accessible(&top_stat))?;
+    }
+    let mut pending = vec![rustix::fs::open(top, flags, Mode::empty())?];
     while let Some(dir) = pending.pop() {
         for name in child_names(&dir)? {
             let stat = rustix::fs::statat(&dir, name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW)?;
             if FileType::from_raw_mode(stat.st_mode) != FileType::Directory || stat.st_uid != uid {
                 continue;
             }
-            let child = open_dir(Some(&dir), Path::new(&name))?;
-            make_accessible(&child)?;
-            pending.push(child);
+            rustix::fs::chmodat(&dir, name.as_os_str(), accessible(&stat), AtFlags::empty())?;
+            pending.push(rustix::fs::openat(
+                &dir,
+                name.as_os_str(),
+                flags,
+                Mode::empty(),
+            )?);
         }
     }
     Ok(())
@@ -232,8 +227,14 @@ fn child_names(dir: &OwnedFd) -> std::io::Result<Vec<OsString>> {
 }
 
 fn tmpdir_error(error: &FsError) -> ProtocolError {
+    // A symlink or a non-directory in the path fails the no-follow directory
+    // open with `ELOOP` or `ENOTDIR`; both are an unsafe entry, not an I/O
+    // failure.
+    let unsafe_entry = [rustix::io::Errno::LOOP, rustix::io::Errno::NOTDIR]
+        .iter()
+        .any(|errno| error.raw_os_error() == Some(errno.raw_os_error()));
     let code = match error {
-        FsError::Io { .. } => "session_tmpdir_failed",
+        FsError::Io { .. } if !unsafe_entry => "session_tmpdir_failed",
         _ => "session_tmpdir_unsafe",
     };
     ProtocolError::new(
