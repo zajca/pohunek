@@ -7,6 +7,16 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 const FIXTURE_SUBJECT: &str = "fixture-subject";
 /// Device code the fixture issuer hands out.
 const FIXTURE_DEVICE_CODE: &str = "fixture-device-code";
+/// Drain budget of a runtime expected to stop cleanly. Its clean stop validates
+/// and releases the lease in a `PostgreSQL` that every relay test shares, which
+/// a loaded runner can delay well past a fraction of a second, before it ends
+/// the witness run; the budget stays below `LEASE_LIFETIME`, as the
+/// configuration requires.
+const CLEAN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// Drain budget of the forced-shutdown scenario. Its stalled handshake never
+/// completes, so the drain always runs out; a short budget only keeps the
+/// scenario quick.
+const FORCED_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(150);
 
 use std::{
     fs,
@@ -250,9 +260,11 @@ impl Running {
 
     async fn shutdown(self) -> Result<(), RuntimeError> {
         self.stop.send(()).expect("runtime still running");
-        timeout(Duration::from_secs(2), self.task)
+        // The runtime bounds its own stop; the guard only turns a hang into a
+        // failure.
+        timeout(pohunek_test_support::wait::HANG_GUARD, self.task)
             .await
-            .expect("bounded runtime stop")
+            .expect("runtime stopped within the hang guard")
             .expect("runtime task")
     }
 }
@@ -528,7 +540,8 @@ async fn successful_browser_callback_holds_shared_capacity_until_session_issue_f
 
 #[tokio::test]
 async fn forced_shutdown_cancels_stalled_tls_and_preserves_dirty_evidence() {
-    let ingress = Ingress::new().await;
+    let mut ingress = Ingress::new().await;
+    ingress.config.limits.shutdown_timeout = FORCED_SHUTDOWN_TIMEOUT;
     let running = ingress.start().await;
     let mut stalled = tokio::net::TcpStream::connect(running.address)
         .await
@@ -823,7 +836,7 @@ fn configuration(
     limits.per_principal = 2;
     limits.requests_per_window = 100;
     limits.request_timeout = Duration::from_secs(2);
-    limits.shutdown_timeout = Duration::from_millis(150);
+    limits.shutdown_timeout = CLEAN_SHUTDOWN_TIMEOUT;
     limits.lease_renew = Duration::from_millis(500);
     Config {
         relay_id: fixture.relay_id.clone(),
