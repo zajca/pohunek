@@ -303,7 +303,8 @@ stage_check() {
 
 network_check() {
     if [ "$(uname -s)" = Darwin ]; then
-        # On macOS, verify the sandbox blocks egress and loopback works.
+        # On macOS, verify the sandbox blocks egress and loopback works, and that
+        # it cannot access unrelated host sockets outside the permitted paths.
         # Test that external egress fails.
         if /usr/bin/nc -z -w 3 1.1.1.1 443 >/dev/null 2>&1; then
             fail "the sandbox does not block TCP egress to external IP"
@@ -321,6 +322,12 @@ network_check() {
         else
             /bin/kill "$listener_pid" 2>/dev/null || true
             fail "loopback is not usable inside the sandbox"
+        fi
+        # Test that unix sockets outside the permitted paths are blocked.
+        [ -n "$host_probe" ] || fail "the host unix-socket probe is missing"
+        [ -S "$host_probe/s" ] || fail "the host unix-socket probe is missing"
+        if printf x | /usr/bin/nc -U -w 2 "$host_probe/s" >/dev/null 2>&1; then
+            fail "the sandbox does not block unrelated host unix sockets"
         fi
     else
         # Linux: check iproute2 state.
@@ -350,7 +357,12 @@ stray_check() {
         # pgrep never lists itself. This shell and its forks (the command
         # substitution) run "<self> __inner sandbox <work> ...": skip them.
         uid=$(/usr/bin/id -u)
-        snapshot=$(/usr/bin/pgrep -lf -U "$uid" . 2>/dev/null || true)
+        snapshot=$(/usr/bin/pgrep -lf -U "$uid" . 2>/dev/null) && rc=0 || rc=$?
+        case $rc in
+            0) ;;
+            1) snapshot= ;;
+            *) fail "cannot list processes (pgrep exit $rc)" ;;
+        esac
         same_user=
         while IFS= read -r line; do
             [ -n "$line" ] || continue
@@ -368,7 +380,13 @@ EOF
             stray_pid=${same_user%% *}
             # Re-verify the identity right before signalling: same pid, still
             # naming the temp root.
-            now=$(/usr/bin/pgrep -lf -U "$uid" . 2>/dev/null | while IFS= read -r l; do if [ "${l%% *}" = "$stray_pid" ]; then printf '%s\n' "$l"; fi; done) || true
+            now_output=$(/usr/bin/pgrep -lf -U "$uid" . 2>/dev/null) && rc=0 || rc=$?
+            case $rc in
+                0) ;;
+                1) now_output= ;;
+                *) fail "cannot re-verify processes (pgrep exit $rc)" ;;
+            esac
+            now=$(printf '%s\n' "$now_output" | while IFS= read -r l; do if [ "${l%% *}" = "$stray_pid" ]; then printf '%s\n' "$l"; fi; done)
             case $now in
                 *"$work"*)
                     /bin/kill -KILL -- "-$stray_pid" 2>/dev/null || true
@@ -402,7 +420,9 @@ inner_main() {
     stage=$4
     consumer=$5
     node_dir=$6
-    shift 6
+    sock_root=$7
+    host_probe=$8
+    shift 8
     if [ "$isolation" = userns ]; then
         ip link set lo up || fail "cannot bring loopback up inside the namespace"
     fi
@@ -435,6 +455,7 @@ inner_main() {
                 POHUNEK_CONSUMER_CATALOG="$root/runtime/runtime-catalog.json" \
                 POHUNEK_CONSUMER_STAGE_BIN="$stage/$rt/bin" \
                 POHUNEK_CONSUMER_REPORT="$run/report.json" \
+                POHUNEK_TEST_TEMP_ROOT="$sock_root" \
                 "$consumer" --exact "$consumer_test" --nocapture || consumer_exit=$?
             stray_pgid=$(cat "$pidfile")
             rm "$pidfile"
@@ -584,13 +605,21 @@ self=$(cd "$(dirname -- "$0")" && pwd -P)/$(basename -- "$0")
 checkout=$(cd "$(dirname -- "$self")/.." && pwd -P)
 
 umask 022
-if [ "$(uname -s)" = Darwin ]; then
+uname_s=$(uname -s)
+if [ "$uname_s" = Darwin ]; then
     work=$(mktemp -d /tmp/pks.XXXXXX)
 else
     work=$(mktemp -d "${TMPDIR:-/tmp}/pks.XXXXXX")
 fi
 chmod 700 "$work"
 work=$(cd "$work" && pwd -P)
+sock_root=
+host_probe=
+host_probe_listener_pid=
+if [ "$uname_s" = Darwin ]; then
+    sock_root=$(mktemp -d /tmp/pk.XXXX) || fail "cannot create socket root directory"
+    sock_root=$(cd "$sock_root" && pwd -P)
+fi
 ns_pid=
 chosen=
 cleanup() {
@@ -621,7 +650,17 @@ cleanup() {
             /bin/kill -KILL -- "-$sid" 2>/dev/null || true
         done
     fi
+    # Kill the host_probe listener if it was started.
+    if [ -n "$host_probe_listener_pid" ]; then
+        /bin/kill "$host_probe_listener_pid" 2>/dev/null || true
+    fi
     rm -rf -- "$work"
+    if [ -n "$sock_root" ]; then
+        rm -rf -- "$sock_root"
+    fi
+    if [ -n "$host_probe" ]; then
+        rm -rf -- "$host_probe"
+    fi
     exit "$status"
 }
 trap cleanup EXIT
@@ -751,11 +790,11 @@ root_path=/usr/sbin:/usr/bin:/sbin:/bin
 
 run_userns() {
     exec /usr/bin/setsid /usr/bin/env -i PATH="$root_path" /usr/bin/unshare --user --map-root-user --net --pid --fork --kill-child --mount-proc \
-        /bin/sh "$self" __inner userns "$work" "$root" "$stage" "$work/consumer" "$node_dir" $runtimes
+        /bin/sh "$self" __inner userns "$work" "$root" "$stage" "$work/consumer" "$node_dir" "" "" $runtimes
 }
 run_sudo() {
     exec /usr/bin/setsid /usr/bin/sudo -n /usr/bin/env -i PATH="$root_path" \
-        /usr/bin/setsid --wait /bin/sh "$self" __sudo_supervisor "$uid" "$gid" "$work/sudo-cancel" "$work" "$root" "$stage" "$work/consumer" "$node_dir" $runtimes 3>&-
+        /usr/bin/setsid --wait /bin/sh "$self" __sudo_supervisor "$uid" "$gid" "$work/sudo-cancel" "$work" "$root" "$stage" "$work/consumer" "$node_dir" "" "" $runtimes 3>&-
 }
 run_sandbox() {
     # Generate the sandbox profile with the canonical temp root path.
@@ -764,6 +803,10 @@ run_sandbox() {
         *'"'*) fail "temp root contains quote: $work" ;;
         *'\\'*) fail "temp root contains backslash: $work" ;;
     esac
+    case $sock_root in
+        *'"'*) fail "socket root contains quote: $sock_root" ;;
+        *'\\'*) fail "socket root contains backslash: $sock_root" ;;
+    esac
     profile=$(printf '%s\n' \
         '(version 1)' \
         '(allow default)' \
@@ -771,16 +814,19 @@ run_sandbox() {
         '(allow network* (remote ip "localhost:*"))' \
         '(allow network-bind (local ip "localhost:*"))' \
         '(allow network-inbound (local ip "localhost:*"))' \
-        '(allow network* (remote unix-socket (regex #"^/private/tmp/(ph-|pohunek-)")))' \
-        '(allow network-bind (local unix-socket (regex #"^/private/tmp/(ph-|pohunek-)")))' \
+        "(allow network* (remote unix-socket (subpath \"$sock_root\")))" \
+        "(allow network-bind (local unix-socket (subpath \"$sock_root\")))" \
         "(allow network* (remote unix-socket (subpath \"$work\")))" \
-        "(allow network-bind (local unix-socket (subpath \"$work\")))")
-    # Unix sockets are local IPC, not egress. The daemon's runtime default
-    # (/private/tmp/pohunek-<uid>) and the test support's temp roots (/private/tmp/ph-*)
-    # hold its sockets. The scope is narrowed so the smoke cannot reach unrelated host
-    # sockets in /tmp. DNS (/private/var/run/mDNSResponder) stays denied.
+        "(allow network-bind (local unix-socket (subpath \"$work\")))" \
+        '(allow process-exec* (literal "/bin/ps") (with no-sandbox))')
+    # Unix sockets are local IPC, not egress. The socket path for the smoke's own
+    # roots (sock_root and work) is narrowed to subpaths only, so the smoke cannot
+    # reach unrelated host sockets. /bin/ps is setuid, so the sandbox cannot exec
+    # it; it runs unsandboxed as a fixed read-only system tool so the test-support
+    # worker-leak check can read the process table; egress stays denied. DNS
+    # (/private/var/run/mDNSResponder) stays denied.
     exec /usr/bin/sandbox-exec -p "$profile" /usr/bin/env -i PATH="$root_path" \
-        /bin/sh "$self" __inner sandbox "$work" "$root" "$stage" "$work/consumer" "$node_dir" $runtimes
+        /bin/sh "$self" __inner sandbox "$work" "$root" "$stage" "$work/consumer" "$node_dir" "$sock_root" "$host_probe" $runtimes
 }
 probe_userns() {
     /usr/bin/env -i PATH="$root_path" /usr/bin/unshare --user --map-root-user --net --pid --fork --kill-child --mount-proc /usr/bin/true >/dev/null 2>&1
@@ -822,6 +868,22 @@ esac
 if [ "$chosen" = sudo ]; then
     /usr/bin/mkfifo "$work/sudo-cancel"
     exec 3<> "$work/sudo-cancel"
+fi
+
+# Darwin sandbox: set up a host unix socket outside the permitted roots to
+# verify the sandbox cannot reach it.
+if [ "$chosen" = sandbox ]; then
+    host_probe=$(mktemp -d /tmp/pkh.XXXX) || fail "cannot create host probe directory"
+    host_probe=$(cd "$host_probe" && pwd -P)
+    /usr/bin/nc -lU "$host_probe/s" >/dev/null 2>&1 &
+    host_probe_listener_pid=$!
+    # Wait for the socket to be created before entering the sandbox.
+    n=0
+    while [ ! -S "$host_probe/s" ] && [ "$n" -lt 50 ]; do
+        sleep 0.01
+        n=$((n + 1))
+    done
+    [ -S "$host_probe/s" ] || fail "failed to create host probe socket: $host_probe/s"
 fi
 
 # The namespace runs in the background so a signal reaches the trap at once.

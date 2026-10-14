@@ -68,7 +68,7 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
-// Rust guideline compliant 2026-10-12
+// Rust guideline compliant 2026-10-14
 
 #[cfg(feature = "catalog")]
 pub mod catalog;
@@ -107,6 +107,16 @@ const BIN_EXE_PREFIX: &str = "CARGO_BIN_EXE_";
 
 /// Environment variable that points tests at an explicit session worker binary.
 const WORKER_OVERRIDE_VAR: &str = "POHUNEK_WORKER_BIN";
+
+/// Environment variable that overrides the fixture base directory.
+///
+/// When set and non-empty, [`temp_root`] uses this value as the raw base on
+/// all platforms instead of the platform default. It is still canonicalized
+/// through `resolve_root` to ensure it exists and contains no symlinks. The
+/// macOS archive smoke sets this to point fixtures at a short root it owns, so
+/// its sandbox can confine unix sockets to that root instead of the global
+/// `/private/tmp/(ph-|pohunek-)` regex.
+const TEMP_ROOT_OVERRIDE_VAR: &str = "POHUNEK_TEST_TEMP_ROOT";
 
 /// File name of the session worker inside the Cargo profile directory.
 const WORKER_FILE_NAME: &str = "pohunek-sessiond";
@@ -158,11 +168,12 @@ fn resolve_root(
 
 /// Returns the base directory test fixtures create their roots under.
 ///
-/// The result is always absolute and free of symlinked components, whatever
-/// `TMPDIR` holds: a relative `TMPDIR` is resolved against the working
-/// directory and a symlinked one is replaced by its target. On macOS the base
-/// is `/private/tmp`, short enough for socket paths nested several levels
-/// below it. Elsewhere it is [`std::env::temp_dir`].
+/// The result is always absolute and free of symlinked components. When
+/// `POHUNEK_TEST_TEMP_ROOT` is set and non-empty, it is used as the raw base
+/// on all platforms. Otherwise, on macOS the base is `/private/tmp`, short
+/// enough for socket paths nested several levels below it. On other platforms
+/// it is [`std::env::temp_dir`]. A relative `TMPDIR` or override is resolved
+/// against the working directory and a symlinked one is replaced by its target.
 ///
 /// # Panics
 ///
@@ -171,16 +182,27 @@ fn resolve_root(
 /// fixture can be created beneath it.
 #[must_use]
 pub fn temp_root() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    let raw = PathBuf::from(MACOS_TEMP_ROOT);
-    #[cfg(not(target_os = "macos"))]
-    let raw = std::env::temp_dir();
+    let raw = std::env::var_os(TEMP_ROOT_OVERRIDE_VAR)
+        .filter(|value| !value.is_empty())
+        .map_or_else(default_temp_root, PathBuf::from);
     resolve_root(&raw, std::env::current_dir).unwrap_or_else(|error| {
         panic!(
             "temporary root {} cannot be resolved to a canonical path: {error}",
             raw.display()
         )
     })
+}
+
+/// Returns the default temporary root path for macOS: `/private/tmp`.
+#[cfg(target_os = "macos")]
+fn default_temp_root() -> PathBuf {
+    PathBuf::from(MACOS_TEMP_ROOT)
+}
+
+/// Returns the default temporary root path for non-macOS platforms: [`std::env::temp_dir`].
+#[cfg(not(target_os = "macos"))]
+fn default_temp_root() -> PathBuf {
+    std::env::temp_dir()
 }
 
 /// Creates a private fixture directory under [`temp_root`].

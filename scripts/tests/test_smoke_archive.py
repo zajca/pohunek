@@ -394,6 +394,7 @@ done
 echo "ENV-PATH=$PATH"; echo "ENV-HOME=$HOME"; echo "ENV-PWD=$(pwd)"
 echo "ENV-POHUNEK=$(set | grep -c '^POHUNEK_' || true)"
 echo "ENV-CATALOG=$POHUNEK_CONSUMER_CATALOG"; echo "ENV-ARGS=$*"
+if [ -n "${POHUNEK_TEST_TEMP_ROOT:-}" ]; then echo "ENV-TEMP-ROOT=$POHUNEK_TEST_TEMP_ROOT"; fi
 """
             + STUB_REPORT
         )
@@ -405,12 +406,25 @@ echo "ENV-CATALOG=$POHUNEK_CONSUMER_CATALOG"; echo "ENV-ARGS=$*"
         self.assertIn(f"ENV-PATH={self.stage}/codex/bin:{node_dir}:/usr/bin:/bin", result.stdout)
         self.assertIn("/runtime/runtime-catalog.json", result.stdout)
         self.assertIn(f"--exact the_release_binaries_serve_the_runtime_out_of_process", result.stdout)
-        # Exactly the six consumer-contract variables reach the consumer.
-        self.assertIn("ENV-POHUNEK=6", result.stdout)
+        # On Darwin, seven POHUNEK variables (six consumer-contract + POHUNEK_TEST_TEMP_ROOT).
+        # On Linux, exactly six consumer-contract variables.
+        expected_pohunek_count = "7" if sys.platform.startswith("darwin") else "6"
+        self.assertIn(f"ENV-POHUNEK={expected_pohunek_count}", result.stdout)
         for line in result.stdout.splitlines():
             if line.startswith(("ENV-HOME=", "ENV-PWD=")):
                 self.assertNotIn(str(ROOT), line)
                 self.assertIn("/run/", line)
+        # On Darwin, the fixture receives POHUNEK_TEST_TEMP_ROOT pointing to the
+        # smoke's socket root, which must not equal the work root.
+        if sys.platform.startswith("darwin"):
+            found_temp_root = False
+            for line in result.stdout.splitlines():
+                if line.startswith("ENV-TEMP-ROOT="):
+                    found_temp_root = True
+                    temp_root = line.split("=", 1)[1]
+                    self.assertTrue(temp_root.startswith("/private/tmp/pk"))
+                    self.assertNotEqual(temp_root, str(ROOT))
+            self.assertTrue(found_temp_root, "POHUNEK_TEST_TEMP_ROOT not found on Darwin")
         self.assert_cleaned_up()
 
     def test_runtime_flag_restricts_the_shipped_set_and_unknown_runtime_fails(self):
@@ -705,8 +719,8 @@ for host in ("192.0.2.1", "8.8.8.8"):
         print("OUTBOUND-REFUSED", host, error.errno)
     else:
         print("OUTBOUND-REACHED", host); sys.exit(1)
-PY
 """
+        probe += "PY\n"
         self.write_consumer(STUB_PREAMBLE + probe + STUB_REPORT)
         result = self.smoke("--runtime", "pi")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
