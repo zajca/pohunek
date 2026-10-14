@@ -1814,10 +1814,7 @@ pub async fn run_cli() -> ExitCode {
         Err(err) => return error::render_clap_error(&err, error::args_request_json(&args)),
     };
     if cli.command.uses_all_hosts() && args_request_host(&args) {
-        let err = clap::Error::raw(
-            clap::error::ErrorKind::ArgumentConflict,
-            "--host cannot be used together with --all-hosts",
-        );
+        let err = usage_conflict("--host cannot be used together with --all-hosts");
         return error::render_clap_error(&err, error::args_request_json(&args));
     }
     if let Some(err) = session_wait_usage_error(&cli) {
@@ -2811,11 +2808,7 @@ fn session_wait_usage_error(cli: &Cli) -> Option<clap::Error> {
         return None;
     };
     if timeout_ms.is_some() && target.len() > 1 {
-        return Some(clap::Error::raw(
-            clap::error::ErrorKind::ArgumentConflict,
-            // A raw clap message is printed verbatim, newline included.
-            format!("{LEGACY_WAIT_SINGLE_TARGET}\n"),
-        ));
+        return Some(usage_conflict(LEGACY_WAIT_SINGLE_TARGET));
     }
     let host_of = |entry: &Target| {
         let host = effective_host(&cli.host, Some(entry));
@@ -2827,13 +2820,21 @@ fn session_wait_usage_error(cli: &Cli) -> Option<clap::Error> {
     };
     let first = target.first().map(host_of)?;
     let other = target.iter().map(host_of).find(|host| *host != first)?;
-    Some(clap::Error::raw(
+    Some(usage_conflict(format!(
+        "`session wait` targets must all be on one host, got `{first}` and `{other}`; \
+         run one wait per host"
+    )))
+}
+
+/// A usage error for arguments that conflict, rendered like clap's own.
+///
+/// A raw clap message is printed verbatim, so the newline that ends clap's own
+/// messages is part of it; the JSON form trims it.
+fn usage_conflict(message: impl std::fmt::Display) -> clap::Error {
+    clap::Error::raw(
         clap::error::ErrorKind::ArgumentConflict,
-        format!(
-            "`session wait` targets must all be on one host, got `{first}` and `{other}`; \
-             run one wait per host\n"
-        ),
-    ))
+        format!("{message}\n"),
+    )
 }
 
 fn effective_notification_host(
