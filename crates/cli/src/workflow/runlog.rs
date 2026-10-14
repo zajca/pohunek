@@ -13,7 +13,7 @@ use std::path::Path;
 use std::io::ErrorKind;
 
 use pohunek_logging::{Files, Legacy, Policy, Writer};
-use pohunek_platform::filesystem::TrustedDir;
+use pohunek_platform::filesystem::{FileLock, FsError, LockKind, TrustedDir};
 use protocol::{PackageDigest, PackageVersion};
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +31,15 @@ const PRIVATE_DIR_MODE: u32 = 0o700;
 
 /// Mode of the run log files.
 const PRIVATE_FILE_MODE: u32 = 0o600;
+
+/// Attempts to take the run log family lock for a read. The writer holds it
+/// exclusively only while it appends or rotates one record, a few
+/// milliseconds, so this many attempts at [`RUN_LOG_LOCK_RETRY`] apart wait
+/// half a second at most before the read reports the log as busy.
+const RUN_LOG_LOCK_ATTEMPTS: u32 = 50;
+
+/// Pause between two attempts to take the run log family lock.
+const RUN_LOG_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// How a run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,14 +206,16 @@ pub(crate) struct ReadRecord {
 ///
 /// The active file and its rotations are read, at most `logs.run_log_files`
 /// of them and each at most `logs.run_log_file_bytes`: the bounds the writer
-/// keeps the family within, so a status read never grows past them. A line
-/// that does not parse is skipped, which includes a line still being
-/// appended. A missing log directory holds no records.
+/// keeps the family within, so a status read never grows past them. The files
+/// are read under a shared hold of the writer's family lock, so a rotation
+/// never moves a file between two reads and no record is read twice or
+/// missed. A line that does not parse is skipped. A missing log directory
+/// holds no records.
 ///
 /// # Errors
 ///
-/// Returns [`Error::RunLog`] when a directory is unsafe, a file is larger than
-/// its bound, or a file cannot be read.
+/// Returns [`Error::RunLog`] when a directory is unsafe, the family lock stays
+/// held by a writer, a file is larger than its bound, or a file cannot be read.
 pub(crate) fn recent(state_dir: &Path, logs: Logs) -> Result<Vec<ReadRecord>, Error> {
     let failed = |detail: String| Error::RunLog { detail };
     let Some(dir) = open_logs_dir(state_dir)? else {
@@ -214,6 +225,7 @@ pub(crate) fn recent(state_dir: &Path, logs: Logs) -> Result<Vec<ReadRecord>, Er
         .map_err(|_too_large| failed("the run log file size is too large".to_owned()))?;
     let files = usize::try_from(logs.run_log_files)
         .map_err(|_too_many| failed("the run log file count is too large".to_owned()))?;
+    let _family = lock_family(&dir)?;
     let mut records = Vec::new();
     for index in 0..files {
         // The writer keeps the newest records in the active file and moves
@@ -236,6 +248,32 @@ pub(crate) fn recent(state_dir: &Path, logs: Logs) -> Result<Vec<ReadRecord>, Er
         );
     }
     Ok(records)
+}
+
+/// Takes a shared hold of the run log family lock the writer serializes on,
+/// retrying while a writer holds it.
+fn lock_family(dir: &TrustedDir) -> Result<FileLock, Error> {
+    let name = format!("{FILE_NAME}.lock");
+    let mut attempt = 1;
+    loop {
+        match dir.lock_file(&name, PRIVATE_FILE_MODE, LockKind::Shared) {
+            Ok(lock) => return Ok(lock),
+            Err(FsError::LockContended { .. }) if attempt < RUN_LOG_LOCK_ATTEMPTS => {
+                attempt += 1;
+                std::thread::sleep(RUN_LOG_LOCK_RETRY);
+            }
+            Err(FsError::LockContended { .. }) => {
+                return Err(Error::RunLog {
+                    detail: "the run log is being written; retry".to_owned(),
+                });
+            }
+            Err(error) => {
+                return Err(Error::RunLog {
+                    detail: error.to_string(),
+                })
+            }
+        }
+    }
 }
 
 /// Opens the `logs` directory below `state_dir`; `None` when either is missing.

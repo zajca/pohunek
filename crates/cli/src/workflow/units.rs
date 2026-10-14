@@ -862,16 +862,18 @@ impl From<Error> for LifecycleError {
 ///
 /// Returns the unit lifecycle lock, held from before the records are read; the
 /// caller keeps it until the uninstall is done, so no enable can record units
-/// in between. `None` when there is no workflow store, which holds no units.
+/// in between. Without a workflow store the lock is taken in creating mode,
+/// so a first enabling install cannot create the store and record units
+/// meanwhile either.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Busy`] while another unit lifecycle command holds the lock,
 /// [`Error::Store`] when a unit record cannot be read, and
 /// [`Error::UnitsInstalled`] naming the plugins with recorded units.
-pub(crate) fn check_no_units(context: &Context) -> Result<Option<FileLock>, Error> {
+pub(crate) fn check_no_units(context: &Context) -> Result<FileLock, Error> {
     let store = store_of(context)?;
-    let lock = store.lock_units()?;
+    let lock = store.lock_units_creating()?;
     let plugins = store.plugins_with_units()?;
     if plugins.is_empty() {
         return Ok(lock);

@@ -478,8 +478,9 @@ actions never touch the service manager.
   any plugin's unit record names a unit. The check runs before the service
   manager is contacted and changes nothing. It takes `units.lock` (a unit
   command running at the same time makes it fail with `workflow_store_busy`)
-  and keeps it until the uninstall ends, so a `workflow enable` or enabling
-  install meanwhile fails with `workflow_store_busy` instead of recording units. Its
+  and keeps it until the uninstall ends (creating the workflow store's lock
+  file when no store exists yet), so a `workflow enable` or enabling install
+  meanwhile fails with `workflow_store_busy` instead of recording units. Its
   message names each such plugin with the `pohunek workflow disable <id>` that
   stops it. A unit record that cannot be read refuses it with
   `workflow_store_failed`. The operator order is: `pohunek workflow disable <id>`
