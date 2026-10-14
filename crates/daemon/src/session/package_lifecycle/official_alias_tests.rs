@@ -1291,6 +1291,27 @@ region = "whole_recent"
 contains = "the process needs you"
 "#;
 
+/// Override manifest of a host profile over `claude`. Its base waits for a
+/// screen idle state, so the override declares one.
+const OVERRIDE_MANIFEST: &str = r#"[process]
+comm = ["^official-hermes$"]
+cmdline = ['(^|/)official-hermes($| )']
+
+[[rules]]
+id = "official_blocked"
+state = "blocked"
+priority = 1
+region = "whole_recent"
+contains = "official needs you"
+
+[[rules]]
+id = "override_idle"
+state = "idle"
+priority = 2
+region = "whole_recent"
+contains = "override is idle"
+"#;
+
 /// Detection manifest of the official package: other process matchers and
 /// other rules than the built-in `hermes`.
 const OFFICIAL_MANIFEST: &str = r#"[process]
@@ -2294,7 +2315,7 @@ async fn an_own_runtime_report_naming_a_profile_keeps_its_manifest_override_thro
     fs::create_dir_all(fixture.agents.join("manifests")).expect("the manifests directory");
     fs::write(
         fixture.agents.join("manifests").join("tuned.toml"),
-        OFFICIAL_MANIFEST,
+        OVERRIDE_MANIFEST,
     )
     .expect("the override manifest");
     fixture.write_profile(
@@ -2577,7 +2598,7 @@ async fn adopt_session_beside_a_profile_named_like_its_runtime(
     fs::create_dir_all(fixture.agents.join("manifests")).expect("the manifests directory");
     fs::write(
         fixture.agents.join("manifests").join("tuned.toml"),
-        OFFICIAL_MANIFEST,
+        OVERRIDE_MANIFEST,
     )
     .expect("the override manifest");
     // A host profile named like the runtime, with its own detection manifest.
@@ -2734,7 +2755,7 @@ async fn an_explicit_report_of_a_differently_named_profile_keeps_its_override_th
     fs::create_dir_all(fixture.agents.join("manifests")).expect("the manifests directory");
     fs::write(
         fixture.agents.join("manifests").join("tuned.toml"),
-        OFFICIAL_MANIFEST,
+        OVERRIDE_MANIFEST,
     )
     .expect("the override manifest");
     fixture.write_profile(
