@@ -222,15 +222,24 @@ pohunek_fold_knowledge_log() {
 }
 
 # Between the fold and the release commit the script edits tracked files of a
-# tree it verified clean. A failing step restores them, so the release can be
-# repeated from the same commit.
+# tree it verified clean: the version in Cargo.toml and Cargo.lock, and the
+# knowledge log and its fragments. A failing step restores exactly those paths
+# and removes the bump's temporary file, so the release can be repeated from
+# the same commit; a path that cannot be restored is named.
 release_edits_pending=false
 pohunek_restore_release_edits() {
   [ "$release_edits_pending" = true ] || return 0
-  for path in Cargo.toml Cargo.lock docs/knowledge; do
-    git -C "$repo_root" restore --source=HEAD --staged --worktree -- "$path" 2>/dev/null || true
+  rm -f "$manifest.tmp"
+  unrestored=""
+  for path in Cargo.toml Cargo.lock docs/knowledge/log.md docs/knowledge/log.d; do
+    git -C "$repo_root" cat-file -e "HEAD:$path" 2>/dev/null || continue
+    git -C "$repo_root" restore --source=HEAD --staged --worktree -- "$path" || unrestored="$unrestored $path"
   done
-  printf 'pohunek: a release step failed; the version bump and the knowledge-log fold were undone\n' >&2
+  if [ -n "$unrestored" ]; then
+    printf 'pohunek: a release step failed and these paths could not be restored:%s\n' "$unrestored" >&2
+  else
+    printf 'pohunek: a release step failed; the version bump and the knowledge-log fold were undone\n' >&2
+  fi
 }
 trap pohunek_restore_release_edits EXIT
 
@@ -281,9 +290,11 @@ else
   ( cd "$repo_root" && cargo update --workspace --offline >/dev/null 2>&1 || cargo update --workspace >/dev/null )
 
   git -C "$repo_root" add Cargo.toml Cargo.lock
-  if [ -d "$knowledge_dir" ]; then
-    git -C "$repo_root" add -A -- docs/knowledge
-  fi
+  for path in docs/knowledge/log.md docs/knowledge/log.d; do
+    if git -C "$repo_root" cat-file -e "HEAD:$path" 2>/dev/null; then
+      git -C "$repo_root" add -A -- "$path"
+    fi
+  done
   git -C "$repo_root" commit -m "Release $tag"
   release_edits_pending=false
 fi

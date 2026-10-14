@@ -71,7 +71,7 @@ pub fn fold(source_dir: &Path, version: &str, dry_run: bool) -> Result<FoldSumma
     if dry_run || fragments.is_empty() {
         return Ok(summary);
     }
-    fs::write(&log_path, folded).map_err(io(&log_path))?;
+    replace_file(&log_path, &folded)?;
     for fragment in &fragments {
         let path = fragment_dir.join(fragment.file_name());
         fs::remove_file(&path).map_err(io(&path))?;
@@ -130,10 +130,11 @@ pub fn migrate(source_dir: &Path, dry_run: bool) -> Result<MigrateSummary, Xtask
             written.push(path.clone());
             std::io::Write::write_all(&mut file, fragment.content.as_bytes()).map_err(io(&path))
         })
-        .and_then(|()| fs::write(&log_path, kept).map_err(io(&log_path)));
+        .and_then(|()| replace_file(&log_path, &kept));
     if let Err(error) = outcome {
-        // The log still holds every section, so the fragments written so far
-        // are removed; a repeated migration then names them the same way.
+        // The log is replaced only as a whole, so it still holds every section
+        // and the fragments written so far are removed; a repeated migration
+        // then names them the same way.
         for path in &written {
             if let Err(cleanup) = fs::remove_file(path) {
                 return Err(XtaskError::Usage(format!(
@@ -145,6 +146,23 @@ pub fn migrate(source_dir: &Path, dry_run: bool) -> Result<MigrateSummary, Xtask
         return Err(error);
     }
     Ok(summary)
+}
+
+/// Replaces `path` with `content` through a sibling temporary file, so a
+/// failed write leaves the previous file whole.
+fn replace_file(path: &Path, content: &str) -> Result<(), XtaskError> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| XtaskError::InvalidPath(path.to_path_buf()))?;
+    let temporary = path.with_file_name(format!(".{}.tmp", file_name.to_string_lossy()));
+    let written = fs::write(&temporary, content)
+        .and_then(|()| fs::rename(&temporary, path))
+        .map_err(io(path));
+    if written.is_err() {
+        // Best effort: the returned error already reports the failed write.
+        let _ = fs::remove_file(&temporary);
+    }
+    written
 }
 
 /// File names already present in the fragment directory.

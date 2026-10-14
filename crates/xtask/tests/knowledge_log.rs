@@ -5,10 +5,14 @@
 // Rust guideline compliant 2026-10-14
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use knowledge::BundleValidationIssue;
 use xtask::{build_docs, fold_log, migrate_log, validate_docs, BuildOptions, XtaskError};
+
+/// Mode of a directory its owner can list but not write to.
+const READ_ONLY_DIR_MODE: u32 = 0o500;
 
 /// Release section the scenarios fold into.
 const RELEASE: &str = "0.35.0";
@@ -343,21 +347,17 @@ fn a_migration_that_fails_part_way_removes_the_fragments_it_wrote() {
         "## Unreleased (2026-10-14, second, #2)\n\n- Second.\n",
     );
     write_bundle(root, log, &[]);
-    // A read-only log makes the last step fail after both fragments exist.
-    let log_path = root.join("log.md");
-    let mut permissions = fs::metadata(&log_path).expect("log metadata").permissions();
-    permissions.set_readonly(true);
-    fs::set_permissions(&log_path, permissions.clone()).expect("make the log read-only");
+    // A read-only bundle root lets the fragments be written into the existing
+    // log.d, then refuses the replacement log.
+    fs::create_dir_all(root.join("log.d")).expect("create log.d");
+    let original = fs::metadata(root).expect("root metadata").permissions();
+    fs::set_permissions(root, fs::Permissions::from_mode(READ_ONLY_DIR_MODE))
+        .expect("make the root read-only");
 
     let outcome = migrate_log(root, false);
 
-    #[expect(
-        clippy::permissions_set_readonly_false,
-        reason = "the test owns the file and restores write access for its cleanup"
-    )]
-    permissions.set_readonly(false);
-    fs::set_permissions(&log_path, permissions).expect("restore write access");
-    outcome.expect_err("the read-only log fails the migration");
+    fs::set_permissions(root, original).expect("restore the root's mode");
+    outcome.expect_err("the replacement log cannot be written");
     assert!(
         !root.join("log.d/1-first.md").exists(),
         "the first fragment is removed again"
@@ -417,4 +417,66 @@ fn an_impossible_date_and_an_indented_unreleased_heading_are_refused() {
         error.to_string().contains("belongs in a fragment"),
         "{error}"
     );
+}
+
+#[test]
+fn a_resumed_fold_counts_only_entries_filed_under_its_own_release() {
+    let dir = temp_dir("fold-resume-scope");
+    let root = dir.path();
+    // The entry sits under 0.34.2, and the 0.35.0 section lacks it.
+    let log = concat!(
+        "# Knowledge Bundle Log\n\n",
+        "## 0.35.0\n\n### 2026-10-01, other, #1\n\n- Other.\n\n",
+        "## 0.34.2\n\n### 2026-10-14, newer change, #200\n\n- Newer body.\n",
+    );
+    write_bundle(root, log, &[NEWER]);
+    let before = snapshot(root);
+
+    let error = fold_log(root, RELEASE, false).expect_err("the entry is not filed under 0.35.0");
+
+    assert!(error.to_string().contains("is not filed in it"), "{error}");
+    assert_eq!(snapshot(root), before, "the fragment is kept");
+}
+
+#[test]
+fn docs_build_assembles_a_crlf_log_like_an_lf_one() {
+    let dir = temp_dir("crlf-build");
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).expect("create source");
+    write_bundle(
+        &source,
+        &COMMITTED_LOG.replace('\n', "\r\n"),
+        &[(NEWER.0, &NEWER.1.replace('\n', "\r\n"))],
+    );
+
+    let summary = build_docs(BuildOptions {
+        source_dir: source,
+        output_root: dir.path().join("out"),
+        pohunek_version: "0.0.0-test".to_owned(),
+    })
+    .expect("build succeeds");
+
+    assert_eq!(
+        read(summary.bundle_dir.join("log.md")),
+        concat!(
+            "# Knowledge Bundle Log\n\nIntroduction.\n\n",
+            "## Unreleased (2026-10-14, newer change, #200)\n\n- Newer body.\n\n",
+            "## 0.34.2\n\n- Earlier release.\n",
+        )
+    );
+}
+
+#[test]
+fn a_fragment_body_with_an_indented_section_heading_is_refused() {
+    let dir = temp_dir("indented-body");
+    let root = dir.path();
+    let indented = (
+        "10-indented-heading.md",
+        "## Unreleased (2026-10-14, indented heading, #10)\n\n- Body.\n\n  ## Stray section\n",
+    );
+    write_bundle(root, COMMITTED_LOG, &[indented]);
+
+    let error = validate_docs(root).expect_err("the indented heading opens a section");
+
+    assert!(error.to_string().contains("`##` heading"), "{error}");
 }

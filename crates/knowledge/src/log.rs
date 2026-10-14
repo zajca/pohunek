@@ -369,11 +369,11 @@ pub fn fold(log: &str, fragments: &[Fragment], version: &str) -> Result<String, 
     let log = unix_lines(log);
     let heading = format!("{SECTION_OPEN}{version}");
     let entries: Vec<String> = fragments.iter().map(Fragment::release_entry).collect();
-    if log.lines().any(|line| line == heading) {
+    if let Some(section) = release_section(&log, &heading) {
         return match fragments
             .iter()
             .zip(&entries)
-            .find(|(_, entry)| !log.contains(entry.as_str()))
+            .find(|(_, entry)| !section.contains(entry.as_str()))
         {
             None => Ok(log.into_owned()),
             Some((fragment, _)) => Err(LogError::new(
@@ -386,6 +386,21 @@ pub fn fold(log: &str, fragments: &[Fragment], version: &str) -> Result<String, 
         };
     }
     insert_sections(&log, &format!("{heading}\n\n{}", entries.join("\n")))
+}
+
+/// The text of the section `heading` opens in `log`, up to the next `## `
+/// section, with a trailing blank line so its last entry reads like the
+/// others; `None` when `log` has no such section.
+fn release_section(log: &str, heading: &str) -> Option<String> {
+    let mut lines = log.lines().skip_while(|line| *line != heading);
+    lines.next()?;
+    let mut section = String::new();
+    for line in lines.take_while(|line| !line.starts_with(SECTION_OPEN)) {
+        section.push_str(line);
+        section.push('\n');
+    }
+    section.push('\n');
+    Some(section)
 }
 
 /// Inserts `sections` before the first section of `log`, after its title and
