@@ -41,8 +41,9 @@ use pohunek_service_config::runtimes::{
     ProfileAction, ProfileStatus, Refusal, RELEASE_RUNTIME_DIR,
 };
 use protocol::{
-    method, DoctorStatus, PackageBindProfileParams, PackageDigest, PackageInstallParams,
-    PackageSelectParams, PackageSetEnabledParams, PackageTrust,
+    method, DoctorStatus, IntegrationInstallState, IntegrationRecovery, IntegrationStatusParams,
+    PackageBindProfileParams, PackageDigest, PackageInstallParams, PackageSelectParams,
+    PackageSetEnabledParams, PackageTrust, RuntimeRef,
 };
 use serde::Serialize;
 
@@ -529,13 +530,14 @@ async fn apply_steps(
     apply_remaining(&mut client, &dir, &remaining, applied).await?;
 
     let env = integration_env(context);
-    let others: Vec<IntegrationAction> = remaining
-        .integrations
-        .iter()
-        .filter(|integration| integration.runtime != HERMES_RUNTIME)
-        .cloned()
-        .collect();
-    let mut hooks = reinstall_after_upgrade(&env, &others, false).await;
+    let mut stale = Vec::new();
+    for integration in &remaining.integrations {
+        if integration.runtime != HERMES_RUNTIME && !hook_is_current(&mut client, integration).await
+        {
+            stale.push(integration.clone());
+        }
+    }
+    let mut hooks = reinstall_after_upgrade(&env, &stale, false).await;
     if !hermes_homes.is_empty() {
         hooks.extend(reinstall_previewed_hermes_homes(&env, hermes_homes));
     }
@@ -554,6 +556,29 @@ async fn apply_steps(
     let catalog_recorded = installs_packages && previewed.catalog == CatalogStatus::Record;
     let verdict = verdict(&paths, previewed, &after, &hooks, catalog_recorded).await?;
     Ok((hooks, config, verdict))
+}
+
+/// Whether the daemon reports the hook of `action` as current in its home, so
+/// that installing it again would change nothing. A report that cannot be
+/// read, or that ignores the profile selector, is not current: the hook is
+/// then installed, and the install reports any failure.
+async fn hook_is_current(client: &mut Client, action: &IntegrationAction) -> bool {
+    let params = IntegrationStatusParams {
+        agent: Some(RuntimeRef::from_wire(&action.runtime)),
+        profile: action.profile.clone(),
+        all_profiles: false,
+    };
+    client
+        .call::<method::IntegrationStatus>(params)
+        .await
+        .is_ok_and(|result| {
+            (action.profile.is_none() || result.home_selectors)
+                && !result.agents.is_empty()
+                && result.agents.iter().all(|status| {
+                    status.state == IntegrationInstallState::Current
+                        && status.recovery == IntegrationRecovery::None
+                })
+        })
 }
 
 /// Installs this release as the service and reads the plan of the installed
