@@ -27,6 +27,7 @@ use super::supervision::{
     WorkerBounds, CREATE_COMPENSATION_PENDING, MAX_ACCEPTED_UNCONFIRMED_PROCESSES, RUNTIME_LOST,
     RUNTIME_LOST_CLEANUP_UNCONFIRMED, UNREADABLE_CANDIDATES_RECOVER, UNSUPERVISED_WORKER,
 };
+use super::tmpdir::TmpdirOwners;
 use super::{
     current_time_millis, event, event_payload, event_runtime, identity_claim_expiry_is_valid, mpsc,
     preserve_durable_worker_metadata, preserve_newer_updated_at, runtime_error, sort_subagents,
@@ -768,11 +769,15 @@ impl SessionRegistry {
     ///
     /// Returns a store error when logical records cannot be loaded. Individual
     /// worker failures are classified per session and do not abort startup.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "startup reconciliation is one ordered pass whose evidence feeds the TMPDIR sweep at its end"
+    )]
     pub async fn reconcile_workers(&self) -> Result<(), ProtocolError> {
         let Some(store) = self.inner.store.clone() else {
             return Ok(());
         };
-        let (manifest, records, resume_bindings) = load_durable_state(store).await?;
+        let (manifest, records, resume_bindings, rejected) = load_durable_state(store).await?;
         let unmigrated = if manifest == LegacyManifest::Missing && records.is_empty() {
             unmigrated_legacy_bindings(&resume_bindings)
         } else {
@@ -785,11 +790,6 @@ impl SessionRegistry {
             .into_iter()
             .map(|binding| (binding.session_id.clone(), binding))
             .collect::<HashMap<_, _>>();
-        let known_sessions = records
-            .iter()
-            .map(|record| record.session_id.clone())
-            .chain(resume_bindings.keys().cloned())
-            .collect::<HashSet<_>>();
 
         let lifecycle = self.lifecycle().ok();
         let (mut discovered, socket_failure) = match self.discover_workers(&records).await {
@@ -806,10 +806,10 @@ impl SessionRegistry {
             }),
             Err(detail) => Err(detail.clone()),
         };
-        inventory.extend(
-            self.retire_stale_jobs(lifecycle.as_ref(), &records, stale_journal)
-                .await,
-        );
+        let (stale_jobs, job_failure) = self
+            .retire_stale_jobs(lifecycle.as_ref(), &records, stale_journal)
+            .await;
+        inventory.extend(stale_jobs);
         for entry in inventory
             .iter()
             .filter(|entry| entry.status != RuntimeInventoryStatus::Managed)
@@ -822,6 +822,18 @@ impl SessionRegistry {
             );
             let _ = self.inner.events.send(event);
         }
+        let tmpdir_owners = tmpdir_owners(
+            &records,
+            &resume_bindings,
+            &rejected,
+            &discovered,
+            &inventory,
+            DiscoveryFailures {
+                sockets: socket_failure.as_deref(),
+                jobs: job_failure.as_deref(),
+            },
+            &journals,
+        );
         *self.inner.runtime_inventory.lock().await = inventory;
 
         // Every record is reconciled inline in this task before the daemon
@@ -867,8 +879,41 @@ impl SessionRegistry {
             }
         }))
         .await;
-        self.delete_orphaned_session_tmpdirs(known_sessions).await;
+        self.sweep_orphaned_session_tmpdirs(tmpdir_owners, lifecycle.as_ref())
+            .await;
         Ok(())
+    }
+
+    /// Deletes the private temporary directories no startup evidence names.
+    ///
+    /// The supervisor's lenient discovery may omit a job whose inspection
+    /// raced, so the owners are completed with a strict discovery first; a
+    /// strict discovery that cannot list every job leaves every directory in
+    /// place.
+    async fn sweep_orphaned_session_tmpdirs(
+        &self,
+        owners: TmpdirOwners,
+        lifecycle: Option<&Lifecycle<'_>>,
+    ) {
+        let owners = match (owners, lifecycle) {
+            (TmpdirOwners::Known(mut known), Some(lifecycle)) => {
+                match lifecycle.supervisor.discover_strict().await {
+                    Ok(jobs) => {
+                        known.extend(jobs.iter().filter_map(|job| {
+                            WorkerKey::from_service_id(&job.id)
+                                .ok()
+                                .map(|key| key.session_id().to_owned())
+                        }));
+                        TmpdirOwners::Known(known)
+                    }
+                    Err(error) => TmpdirOwners::unknown_after_failure(format!(
+                        "the strict worker job discovery failed: {error}"
+                    )),
+                }
+            }
+            (owners, _) => owners,
+        };
+        self.delete_orphaned_session_tmpdirs(owners).await;
     }
 
     /// Classifies the socket evidence startup discovery found for a session,
@@ -5423,9 +5468,84 @@ struct LegacyMigrationManifest {
 ///
 /// Returns the typed migration error of [`import_legacy_manifest`], or
 /// `session_reconcile_failed` when the store cannot be loaded.
+/// Why startup worker discovery could not see every runtime.
+#[derive(Clone, Copy)]
+struct DiscoveryFailures<'a> {
+    /// The worker socket scan failed.
+    sockets: Option<&'a str>,
+    /// The native supervisor's job discovery failed.
+    jobs: Option<&'a str>,
+}
+
+/// The sessions whose private temporary directory startup keeps: every
+/// session any startup evidence names, whether a record, a resume binding, a
+/// store line no loader accepted, a worker runtime slot, a worker's claim, a
+/// supervisor job, or a worker journal. Ownership is unknown when worker or
+/// job discovery or the journal scan failed, or when a rejected store line
+/// names no session.
+fn tmpdir_owners(
+    records: &[SessionRecord],
+    resume_bindings: &HashMap<String, ResumeBinding>,
+    rejected: &[crate::store::RejectedLine],
+    discovered: &WorkerDiscovery,
+    inventory: &[RuntimeInventoryEntry],
+    failures: DiscoveryFailures<'_>,
+    journals: &Result<HashMap<String, WorkerJournalScan>, String>,
+) -> TmpdirOwners {
+    if let Some(detail) = failures.sockets {
+        return TmpdirOwners::unknown_after_failure(format!("worker discovery failed: {detail}"));
+    }
+    if let Some(detail) = failures.jobs {
+        return TmpdirOwners::unknown_after_failure(format!(
+            "worker job discovery failed: {detail}"
+        ));
+    }
+    let journals = match journals {
+        Ok(journals) => journals,
+        Err(detail) => {
+            return TmpdirOwners::unknown_after_failure(format!(
+                "the worker journal scan failed: {detail}"
+            ));
+        }
+    };
+    if rejected.iter().any(|line| line.session_id.is_none()) {
+        return TmpdirOwners::unknown(
+            "the store holds a rejected line that names no session".to_owned(),
+        );
+    }
+    let mut owners = HashSet::new();
+    owners.extend(records.iter().map(|record| record.session_id.clone()));
+    owners.extend(resume_bindings.keys().cloned());
+    owners.extend(rejected.iter().filter_map(|line| line.session_id.clone()));
+    owners.extend(discovered.workers.keys().cloned());
+    owners.extend(discovered.unresponsive.keys().cloned());
+    for entry in inventory {
+        owners.insert(entry.runtime_slot.clone());
+        owners.extend(entry.claimed_session_id.clone());
+        // A supervisor job is inventoried under its service ID, which names
+        // its session and generation.
+        let job = pohunek_platform::supervisor::ServiceId::parse(&entry.runtime_slot)
+            .and_then(|id| WorkerKey::from_service_id(&id));
+        if let Ok(key) = job {
+            owners.insert(key.session_id().to_owned());
+        }
+    }
+    owners.extend(journals.keys().cloned());
+    TmpdirOwners::Known(owners)
+}
+
+/// What startup reads from the store: the legacy manifest outcome, the
+/// logical sessions, the resume bindings, and the lines no loader accepted.
+type DurableState = (
+    LegacyManifest,
+    Vec<SessionRecord>,
+    Vec<ResumeBinding>,
+    Vec<crate::store::RejectedLine>,
+);
+
 async fn load_durable_state(
     store: Arc<crate::store::Store>,
-) -> Result<(LegacyManifest, Vec<SessionRecord>, Vec<ResumeBinding>), ProtocolError> {
+) -> Result<DurableState, ProtocolError> {
     let import_store = Arc::clone(&store);
     let manifest = tokio::task::spawn_blocking(move || import_legacy_manifest(&import_store))
         .await
@@ -5435,8 +5555,12 @@ async fn load_durable_state(
                 "legacy migration import task panicked",
             )
         })??;
-    let (records, resume_bindings) = tokio::task::spawn_blocking(move || {
-        Ok::<_, std::io::Error>((store.load_sessions()?, store.load_resume()?))
+    let (records, resume_bindings, rejected) = tokio::task::spawn_blocking(move || {
+        Ok::<_, std::io::Error>((
+            store.load_sessions()?,
+            store.load_resume()?,
+            store.load_rejected()?,
+        ))
     })
     .await
     .map_err(|_join_error| {
@@ -5451,7 +5575,7 @@ async fn load_durable_state(
             format!("failed to load logical sessions: {error}"),
         )
     })?;
-    Ok((manifest, records, resume_bindings))
+    Ok((manifest, records, resume_bindings, rejected))
 }
 
 /// What startup found at the one-time migration manifest path.
@@ -8608,12 +8732,28 @@ while os.getppid() == parent:
         let runtime_root = root.join("runtime/workers");
         let (socket, server_task) =
             spawn_uninitialized_worker(&root, &runtime_root, "s-201", "s-201", "worker-o").await;
-        let registry = empty_registry(&root, &runtime_root);
+        // The orphan worker's agent keeps using its TMPDIR; a directory no
+        // evidence names is orphaned.
+        let tmp_root = root.join("cache/session-tmp");
+        let orphan_worker_data = session_tmpdir_with_data(&tmp_root, "s-201");
+        let unowned_data = session_tmpdir_with_data(&tmp_root, "s-gone");
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            session_tmp_root: Some(tmp_root.clone()),
+            ..registry_config(&root, &runtime_root, DISCOVERY_CONNECT_DEADLINE)
+        });
         let mut events = registry.subscribe();
 
         Box::pin(registry.reconcile_workers())
             .await
             .expect("discover orphan");
+        assert!(
+            orphan_worker_data.exists(),
+            "the TMPDIR of a worker that survives without a record is kept"
+        );
+        assert!(
+            !unowned_data.exists(),
+            "a TMPDIR no startup evidence names is deleted"
+        );
 
         let event = events.recv().await.expect("orphan discovery event");
         assert_eq!(event.event(), protocol::event::SESSION_RUNTIME_DISCOVERED);
@@ -8627,6 +8767,112 @@ while os.getppid() == parent:
             .await
             .expect("quarantine releases controller lease and leaves worker alive");
         server_task.abort();
+    }
+
+    /// A store line the loaders reject still names its session, whose TMPDIR
+    /// startup keeps; a rejected line that names no session leaves every
+    /// TMPDIR in place, since no one can tell which are orphaned.
+    #[tokio::test]
+    async fn startup_keeps_the_tmpdirs_of_sessions_a_rejected_store_line_may_own() {
+        let root = temp_root();
+        let runtime_root = root.join("runtime/workers");
+        create_private_dir(&root.join("data"));
+        let store_path = root.join("data/metadata.jsonl");
+        let damaged = format!(
+            "{{\"kind\":\"session\",\"schema_version\":{},\"session_id\":\"s-damaged\"}}\n",
+            crate::store::STORE_SCHEMA_VERSION
+        );
+        write_private_store(&store_path, &damaged);
+        let tmp_root = root.join("cache/session-tmp");
+        let damaged_data = session_tmpdir_with_data(&tmp_root, "s-damaged");
+        let unowned_data = session_tmpdir_with_data(&tmp_root, "s-gone");
+        let config = || SessionRegistryConfig {
+            session_tmp_root: Some(tmp_root.clone()),
+            ..registry_config(&root, &runtime_root, DISCOVERY_CONNECT_DEADLINE)
+        };
+
+        Box::pin(SessionRegistry::new(config()).reconcile_workers())
+            .await
+            .expect("reconcile a store with a rejected session line");
+        assert!(
+            damaged_data.exists(),
+            "the TMPDIR of a session whose record was rejected is kept"
+        );
+        assert!(!unowned_data.exists(), "an unowned TMPDIR is deleted");
+
+        write_private_store(&store_path, &format!("{damaged}not a record\n"));
+        let unowned_data = session_tmpdir_with_data(&tmp_root, "s-gone");
+        Box::pin(SessionRegistry::new(config()).reconcile_workers())
+            .await
+            .expect("reconcile a store with a corrupt line");
+        assert!(
+            unowned_data.exists(),
+            "a rejected line that names no session keeps every TMPDIR"
+        );
+        assert!(damaged_data.exists());
+    }
+
+    /// Daemons with different stores that share a cache directory get separate
+    /// TMPDIR roots, and each startup sweep leaves the other's directories in
+    /// place.
+    #[tokio::test]
+    async fn stores_sharing_a_cache_sweep_only_their_own_tmpdir_roots() {
+        let root = temp_root();
+        let cache = root.join("cache/session-tmp");
+        let store_root = |name: &str| {
+            let dir = root.join(name);
+            create_private_dir(&dir.join("data"));
+            dir
+        };
+        let (a, b) = (store_root("a"), store_root("b"));
+        let tmp_root = |dir: &Path| {
+            super::super::store_session_tmp_root(&cache, &dir.join("data/metadata.jsonl"))
+                .expect("the store's TMPDIR root")
+        };
+        let (a_tmp, b_tmp) = (tmp_root(&a), tmp_root(&b));
+        assert_ne!(a_tmp, b_tmp, "each store gets its own TMPDIR root");
+        assert_eq!(a_tmp.parent(), Some(cache.as_path()));
+        assert_eq!(b_tmp.parent(), Some(cache.as_path()));
+        let a_data = session_tmpdir_with_data(&a_tmp, "s-a");
+        let b_data = session_tmpdir_with_data(&b_tmp, "s-b");
+        let reconcile = |dir: &Path, tmp: &Path| {
+            SessionRegistry::new(SessionRegistryConfig {
+                session_tmp_root: Some(tmp.to_path_buf()),
+                ..registry_config(
+                    dir,
+                    &dir.join("runtime/workers"),
+                    DISCOVERY_CONNECT_DEADLINE,
+                )
+            })
+        };
+
+        Box::pin(reconcile(&a, &a_tmp).reconcile_workers())
+            .await
+            .expect("reconcile store a");
+        assert!(!a_data.exists(), "store a deletes its own orphaned TMPDIR");
+        assert!(b_data.exists(), "store a never touches store b's TMPDIRs");
+
+        let a_data = session_tmpdir_with_data(&a_tmp, "s-a");
+        Box::pin(reconcile(&b, &b_tmp).reconcile_workers())
+            .await
+            .expect("reconcile store b");
+        assert!(!b_data.exists(), "store b deletes its own orphaned TMPDIR");
+        assert!(a_data.exists(), "store b never touches store a's TMPDIRs");
+    }
+
+    fn write_private_store(path: &Path, content: &str) {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .expect("open the private store")
+            .write_all(content.as_bytes())
+            .expect("write the store");
     }
 
     #[tokio::test]
@@ -8907,7 +9153,15 @@ while os.getppid() == parent:
         runtime_root: &std::path::Path,
         worker_connect_deadline: Duration,
     ) -> SessionRegistry {
-        SessionRegistry::new(SessionRegistryConfig {
+        SessionRegistry::new(registry_config(root, runtime_root, worker_connect_deadline))
+    }
+
+    fn registry_config(
+        root: &std::path::Path,
+        runtime_root: &std::path::Path,
+        worker_connect_deadline: Duration,
+    ) -> SessionRegistryConfig {
+        SessionRegistryConfig {
             // A fixed shell keeps the sessions independent of the host user's
             // `$SHELL` and its startup files, whose background helpers can
             // hold the PTY open past the stop deadline.
@@ -8917,7 +9171,19 @@ while os.getppid() == parent:
             worker_state_root: Some(root.join("state/workers")),
             worker_connect_deadline,
             ..SessionRegistryConfig::default()
-        })
+        }
+    }
+
+    /// Creates the private temporary directory of session `id` below
+    /// `tmp_root`, holding one file, and returns that file.
+    fn session_tmpdir_with_data(tmp_root: &Path, id: &str) -> PathBuf {
+        let dir = tmp_root.join(id);
+        create_private_dir(&dir);
+        std::fs::set_permissions(tmp_root, std::fs::Permissions::from_mode(0o700))
+            .expect("secure the TMPDIR root");
+        let data = dir.join("data");
+        std::fs::write(&data, b"agent data").expect("write the session's temporary data");
+        data
     }
 
     async fn spawn_uninitialized_worker(
@@ -11631,6 +11897,9 @@ handler = "codex-hook-v1"
 
         /// Sweep grace of the fixtures; short so a `SIGKILL` fallback stays fast.
         const SWEEP_GRACE: Duration = Duration::from_millis(300);
+
+        /// Root of the fixtures' private session TMPDIRs, below the fixture root.
+        const FIXTURE_TMP_ROOT: &str = "cache/session-tmp";
         use super::hermetic_shell;
         use pohunek_test_support::wait::HANG_GUARD;
 
@@ -11728,6 +11997,7 @@ handler = "codex-hook-v1"
                     supervision: Some(supervision),
                     supervision_retry_initial,
                     log_dir: Some(root.join("logs")),
+                    session_tmp_root: Some(root.join(FIXTURE_TMP_ROOT)),
                     ..SessionRegistryConfig::default()
                 },
                 crate::agent::host::fixture::official_host_over(
@@ -12679,11 +12949,21 @@ handler = "codex-hook-v1"
             fixture
                 .supervisor
                 .script_job(live.clone(), present(ServiceState::Running, None));
+            // The live job's agent keeps using its TMPDIR; no evidence names
+            // the other directory.
+            let tmp_root = fixture.root.join(FIXTURE_TMP_ROOT);
+            let live_data = super::session_tmpdir_with_data(&tmp_root, "s-308");
+            let unowned_data = super::session_tmpdir_with_data(&tmp_root, "s-gone");
 
             Box::pin(fixture.registry.reconcile_workers())
                 .await
                 .expect("reconcile");
 
+            assert!(
+                live_data.exists(),
+                "the TMPDIR of a live job without a record is kept"
+            );
+            assert!(!unowned_data.exists(), "an unowned TMPDIR is deleted");
             let retired = fixture.supervisor.retired();
             assert!(retired.contains(&ended), "{retired:?}");
             assert!(
@@ -12698,6 +12978,45 @@ handler = "codex-hook-v1"
                 .expect("live stale job is inventoried");
             assert_eq!(orphan.status, RuntimeInventoryStatus::Orphaned);
             assert_eq!(orphan.reason.as_deref(), Some(STALE_GENERATION));
+        }
+
+        /// When the supervisor cannot list its jobs, the jobs it hides are
+        /// unknown, so startup deletes no TMPDIR.
+        #[tokio::test]
+        async fn a_failed_job_discovery_keeps_every_session_tmpdir() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            fixture.supervisor.fail_discovery();
+            let tmp_root = fixture.root.join(FIXTURE_TMP_ROOT);
+            let unowned_data = super::session_tmpdir_with_data(&tmp_root, "s-hidden");
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            assert!(
+                unowned_data.exists(),
+                "a TMPDIR a hidden job may use is kept"
+            );
+        }
+
+        /// A job whose inspection races is omitted by the lenient discovery,
+        /// so the strict discovery decides, and its failure keeps every
+        /// TMPDIR, including the one that job may use.
+        #[tokio::test]
+        async fn a_job_a_raced_discovery_omits_keeps_every_session_tmpdir() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            fixture.supervisor.script_job(
+                service_id("s-raced", TEST_GENERATION),
+                JobScript::Unavailable,
+            );
+            let tmp_root = fixture.root.join(FIXTURE_TMP_ROOT);
+            let raced_data = super::session_tmpdir_with_data(&tmp_root, "s-raced");
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            assert!(raced_data.exists(), "a TMPDIR a raced job may use is kept");
         }
 
         #[tokio::test]

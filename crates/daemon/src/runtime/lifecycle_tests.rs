@@ -335,6 +335,26 @@ impl Supervisor for ScriptedSupervisor {
         })
     }
 
+    /// Fails as a real backend's destructive discovery does when a job it
+    /// would list cannot be inspected: a job scripted unavailable or panicking
+    /// is a raced job.
+    fn discover_strict(&self) -> Operation<'_, Vec<ServiceObservation>> {
+        Box::pin(async move {
+            let raced = self
+                .jobs
+                .lock()
+                .expect("jobs")
+                .values()
+                .any(|script| matches!(script, JobScript::Unavailable | JobScript::Panic));
+            if raced {
+                return Err(SupervisorError::Race {
+                    operation: "discover",
+                });
+            }
+            self.discover().await
+        })
+    }
+
     fn inspect<'a>(&'a self, id: &'a ServiceId) -> Operation<'a, ServiceObservation> {
         Box::pin(async move {
             self.record(Call::Inspect(id.clone()));
