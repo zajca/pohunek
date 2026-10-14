@@ -1116,6 +1116,7 @@ fn all_enabled_notification_policy() -> NotificationPolicy {
 }
 
 async fn read_file_until(path: &Path, marker: &[u8]) -> Vec<u8> {
+    let _report = ReceivedOnPanic(path);
     wait::guard("file marker arrives before timeout", async {
         loop {
             if let Ok(bytes) = tokio::fs::read(path).await {
@@ -1127,6 +1128,26 @@ async fn read_file_until(path: &Path, marker: &[u8]) -> Vec<u8> {
         }
     })
     .await
+}
+
+/// Prints what the file at its path holds when the wait for a marker panics,
+/// so a missed delivery shows what did arrive.
+struct ReceivedOnPanic<'a>(&'a Path);
+
+impl Drop for ReceivedOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            match std::fs::read(self.0) {
+                Ok(bytes) => eprintln!(
+                    "{} held {} bytes: {:?}",
+                    self.0.display(),
+                    bytes.len(),
+                    String::from_utf8_lossy(&bytes)
+                ),
+                Err(error) => eprintln!("{} is unreadable: {error}", self.0.display()),
+            }
+        }
+    }
 }
 
 async fn open_attach_stream(socket: &std::path::Path, stream_id: &str) -> UnixStream {
@@ -3128,11 +3149,16 @@ fn claude_stub_without_prompt_box(script: &Path, received: &Path) {
         script,
         format!(
             r#"import os
+import termios
 import tty
 
-os.write(1, b"\x1b[?2004h")
-tty.setraw(0)
+# The daemon writes the prompt once bracketed paste is on, or after its startup
+# grace when this script starts slowly. Raw mode is set without flushing
+# (TCSANOW, not tty.setraw's TCSAFLUSH), so a prompt that arrived before it is
+# still read.
+tty.setraw(0, termios.TCSANOW)
 with open({received:?}, "wb") as capture:
+    os.write(1, b"\x1b[?2004h")
     while True:
         chunk = os.read(0, 4096)
         if not chunk:
