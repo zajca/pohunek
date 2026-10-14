@@ -710,10 +710,9 @@ the preflight reports them as `adoptable`:
    install: finish or stop built-in Hermes sessions before the upgrade, or
    accept the loss (`--accept-runtime-loss`) and install the Hermes package
    from the new release's archive afterwards to finish their work in the live
-   session. On a host that keeps no Codex or Claude
-   Code (macOS has no package yet, #929), the hooks pohunek installed into
-   `~/.codex` or `~/.claude` stay removable after the upgrade with
-   `pohunek integration uninstall --agent codex` or
+   session. On a host that keeps no Codex or Claude Code, the hooks pohunek
+   installed into `~/.codex` or `~/.claude` stay removable after the upgrade
+   with `pohunek integration uninstall --agent codex` or
    `pohunek integration uninstall --agent claude`, which need no package.
    After the upgrade, install the hooks again only after the package:
    `pohunek integration install --agent claude` (or `codex`) is refused while

@@ -112,10 +112,14 @@ jobs:
 
   consumer:
     name: Build the release consumer executable
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -127,7 +131,7 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: release-consumer
+          shared-key: release-consumer-${{ runner.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build the consumer executable
@@ -136,7 +140,7 @@ jobs:
       - name: Upload the consumer executable
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: release-consumer
+          name: release-consumer-${{ runner.os }}
           path: ${{ runner.temp }}/consumer/release_consumer
           if-no-files-found: error
 
@@ -161,13 +165,13 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: release-row
+          shared-key: release-row-${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Download the daemon archive of the target
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: build-daemon-${{ matrix.target }}
+          name: ${{ matrix.daemon_artifact }}
           path: ${{ runner.temp }}/daemon
 
       - name: Download the package archives
@@ -179,7 +183,7 @@ jobs:
       - name: Download the consumer executable
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: release-consumer
+          name: release-consumer-${{ runner.os }}
           path: ${{ runner.temp }}/consumer
 
       # The upstream runtimes are Node programs: the version is the highest
@@ -423,6 +427,13 @@ jobs:
           pattern: build-*
           path: ${{ runner.temp }}/dl/build
 
+      - name: Download the macOS archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: macos-signed-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/dl/macos
+
       - name: Download the package archives
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -456,7 +467,7 @@ jobs:
       - name: Collect the inputs
         run: |
           scripts/release-workflow/collect-inputs "$RUNNER_TEMP/inputs" \
-            "$RUNNER_TEMP/dl/build" "$RUNNER_TEMP/dl/packages" \
+            "$RUNNER_TEMP/dl/build" "$RUNNER_TEMP/dl/macos" "$RUNNER_TEMP/dl/packages" \
             "$RUNNER_TEMP/dl/sdk" "$RUNNER_TEMP/dl/attestations"
 
       - name: Assemble the rehearsal bundle

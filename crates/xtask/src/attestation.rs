@@ -46,7 +46,11 @@ const BINARY_SET: [&str; 3] = BINARIES;
 
 /// Targets every official package is attested on; `compat/matrix.json` holds
 /// one row per official package and target.
-const DECLARED_TARGETS: [&str; 2] = ["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"];
+const DECLARED_TARGETS: [&str; 3] = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-apple-darwin",
+];
 
 /// Largest accepted JSON input (report, lock, matrix, attestation): all are
 /// a few hundred bytes, so this only bounds a hostile file.
@@ -863,6 +867,7 @@ mod tests {
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
     const GNU: &str = "x86_64-unknown-linux-gnu";
     const MUSL: &str = "x86_64-unknown-linux-musl";
+    const MAC: &str = "aarch64-apple-darwin";
 
     fn sha(bytes: &[u8]) -> String {
         let mut hasher = Sha256::new();
@@ -907,7 +912,7 @@ mod tests {
             fs::write(fixture.path("lock.json"), lock_json("0.160.0", "0.161.0")).expect("write");
             fs::write(
                 fixture.path("matrix.json"),
-                matrix_json(&[("codex", GNU), ("codex", MUSL)]),
+                matrix_json(&[("codex", GNU), ("codex", MUSL), ("codex", MAC)]),
             )
             .expect("write");
             fixture.write_report(&fixture.report("0.160.0"));

@@ -32,8 +32,7 @@ template stay compiled into core; the descriptor and detection manifest come
 only from the package.
 
 The release catalog lists the package for the Linux x86_64 glibc and musl
-targets only; the Apple Silicon archive carries no package, so a macOS daemon
-has no source of Claude Code until darwin packages are attested (#929).
+targets, and for Apple Silicon (aarch64-apple-darwin).
 
 On a host without the package nothing serves `claude`:
 
@@ -46,8 +45,7 @@ On a host without the package nothing serves `claude`:
 - `pohunek integration status|doctor|uninstall --agent claude` still work: the
   core-owned Claude hook handler keeps the config home of the earlier built-in
   (`CLAUDE_CONFIG_DIR`, else `~/.claude`), so hooks pohunek installed there are
-  reported and removed (only pohunek-owned entries) without the package, also
-  on macOS, where no package exists yet (#929). `--profile <name>` and
+  reported and removed (only pohunek-owned entries) without the package. `--profile <name>` and
   `--all-profiles` reach the homes of host profiles over `claude` too, each
   through the profile's own `[env]` (`CLAUDE_CONFIG_DIR`), although such a
   profile does not resolve without the package. A bare `integration status` or
@@ -184,7 +182,7 @@ held before its first output, a streaming reply, the screen after a turn, a Bash
 tool approval and a multiple-choice question. The binary was the linux-x64
 native executable of 2.1.289 from the distribution package, byte-identical
 (SHA-256 in the lock) to the one the npm package installs; the real-Claude tests
-also ran against the npm install. `crates/cli/tests/claude_package.rs` classifies every
+also ran against the npm install. The darwin-arm64 executable of the same release is pinned by its own SHA-256 and runs in the aarch64-apple-darwin release-evidence row; the screen captures were not repeated on macOS. `crates/cli/tests/claude_package.rs` classifies every
 captured screen through the package manifest.
 
 - The idle, working and blocked states are read from the screen and the title.

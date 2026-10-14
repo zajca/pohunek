@@ -176,7 +176,7 @@ impl Fixture {
             );
             self.write_checksum(&tarball);
         }
-        for target in [GNU, MUSL] {
+        for target in [GNU, MUSL, MAC] {
             for runtime in runtimes() {
                 self.attest(&runtime, target, commit);
             }
@@ -501,7 +501,7 @@ fn a_complete_set_assembles_a_verifiable_reproducible_bundle() {
     }
     for runtime in runtimes() {
         expected.push(format!("pohunek-runtime-{runtime}-{VERSION}.tar.zst"));
-        for target in [GNU, MUSL] {
+        for target in [GNU, MUSL, MAC] {
             expected.push(format!("attestation-{runtime}-{target}.json"));
         }
     }
@@ -569,7 +569,7 @@ fn a_daemon_bundle_holds_exactly_the_packages_its_target_attests() {
     let scratch = fixture.path("unpacked");
     let catalog = fs::read(bundle.join("runtime-catalog.json")).expect("catalog");
 
-    for target in [GNU, MUSL] {
+    for target in [GNU, MUSL, MAC] {
         let top = extract(
             &bundle.join(archive_name("daemon", target)),
             &scratch.join(target),
@@ -600,20 +600,16 @@ fn a_daemon_bundle_holds_exactly_the_packages_its_target_attests() {
                     .expect("top-level package"),
             );
         }
+        // The macOS archive also keeps the producer's signing state and deployment target.
+        if target == MAC {
+            let manifest = fs::read_to_string(top.join("MANIFEST")).expect("manifest");
+            assert!(manifest.contains("\nsigning adhoc\n"), "{manifest}");
+            assert!(manifest.contains(&format!("\nminimum-macos {MINIMUM_MACOS}\n")));
+            assert!(manifest.contains("runtime/runtime-catalog.json"));
+            assert!(manifest.contains("runtime/packages"));
+            assert!(manifest.contains("runtime/attestations"));
+        }
     }
-
-    // The macOS archive carries the signed catalog and no package, and keeps
-    // the producer's signing state and deployment target.
-    let mac = extract(
-        &bundle.join(archive_name("daemon", MAC)),
-        &scratch.join(MAC),
-    );
-    assert_eq!(names_in(&mac.join("runtime")), ["runtime-catalog.json"]);
-    let manifest = fs::read_to_string(mac.join("MANIFEST")).expect("manifest");
-    assert!(manifest.contains("\nsigning adhoc\n"), "{manifest}");
-    assert!(manifest.contains(&format!("\nminimum-macos {MINIMUM_MACOS}\n")));
-    assert!(manifest.contains("runtime/runtime-catalog.json"));
-    assert!(!manifest.contains("runtime/packages"));
 
     // The installer's own archive verifier accepts the Linux tree on a host
     // of its target.

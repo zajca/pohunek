@@ -67,12 +67,6 @@ copy of its payload, and `pohunek integration install|update --agent hermes`
 without an installed package fails with `hermes_package_not_installed`, whose
 recovery hint names the install command above.
 
-macOS has no Hermes package row: the Apple Silicon daemon archive carries the
-signed catalog and no runtime package
-([#929](https://github.com/zajca/pohunek/issues/929)), so a macOS host has
-no source of Hermes: its daemon serves no `hermes` session and the operator
-plugin cannot be installed until darwin packages are attested.
-
 On a host without the package nothing serves `hermes`:
 
 - `pohunek session new --agent hermes` fails with `agent_profile_not_found`,

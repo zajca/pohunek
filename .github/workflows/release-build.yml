@@ -387,3 +387,89 @@ jobs:
           name: sdk-release-assets
           path: sdk-dist
           if-no-files-found: error
+
+  # Rehearsal-only macOS archives for CI (issue #929): native aarch64-apple-darwin
+  # builds with a throwaway trust anchor. This job runs on macos-15 and produces
+  # the macos-signed-<component> archives that the evidence workflow expects from
+  # a rehearsal. In release mode, release.yml's stage-macos and package-macos jobs
+  # build and sign the production archives instead; a rehearsal has no need for
+  # that three-job split since it publishes nothing and runs in a single ephemeral
+  # runner environment.
+  rehearsal-macos:
+    name: Build and sign ${{ matrix.component }} for aarch64-apple-darwin (rehearsal)
+    if: ${{ inputs.mode == 'rehearsal' }}
+    needs: [meta]
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      RUSTFLAGS: -D warnings
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [cli, daemon]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Verify native runner architecture
+        shell: bash
+        run: test "$(uname -m)" = "arm64"
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: release-macos-${{ matrix.component }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build offline documentation
+        run: cargo xtask docs site
+
+      - name: Install the rehearsal trust anchor
+        if: ${{ matrix.component == 'daemon' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked -p xtask
+          XTASK="$PWD/target/debug/xtask" scripts/release-workflow/rehearsal-trust \
+            "$RUNNER_TEMP/rehearsal-trust" "$GITHUB_RUN_ID" "$GITHUB_SHA"
+          cp "$RUNNER_TEMP/rehearsal-trust/anchor.json" packaging/runtime-catalog-anchor.json
+
+      - name: Build release binaries
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          bindir="$(packaging/macos/build-release "${{ matrix.component }}")"
+          echo "bindir=$bindir" >> "$GITHUB_OUTPUT"
+
+      - name: Stage and package the archive
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          set -euo pipefail
+          # Archives are stamped with the commit time, so rebuilding the same
+          # commit yields the same archive bytes.
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          packaging/macos/package --stage-release "$COMPONENT" "$VERSION" \
+            "${{ steps.build.outputs.bindir }}" target/pohunek-docs dist
+          # Ad-hoc sign, verify, and archive; runs no program from the tree.
+          archive="$(packaging/macos/package --adhoc-release "$COMPONENT" "$VERSION" \
+            "dist/pohunek-$COMPONENT-$VERSION-aarch64-apple-darwin")"
+          mkdir -p "$RUNNER_TEMP/signed-upload"
+          cp "$archive" "$archive.sha256" "$RUNNER_TEMP/signed-upload/"
+
+      - name: Upload the signed archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-signed-${{ matrix.component }}
+          path: ${{ runner.temp }}/signed-upload
+          if-no-files-found: error

@@ -3,7 +3,7 @@
 #
 # usage: row-matrix <compat/matrix.json> [target]...
 #
-# Output: one line `{"include":[{"runtime","target","runner"}...]}` with one
+# Output: one line `{"include":[{"runtime","target","runner","daemon_artifact"}...]}` with one
 # entry per row of the matrix file, optionally restricted to the listed
 # targets. Runtime ids and targets are validated as plain words, because the
 # workflow puts them into artifact names. A target without a known runner
@@ -27,12 +27,16 @@ jq -ec --arg targets "$targets" '
     def word: type == "string" and test("^[a-z0-9][a-z0-9_-]*$");
     def runner:
         if test("^x86_64-unknown-linux-(gnu|musl)$") then "ubuntu-latest"
+        elif test("^aarch64-apple-darwin$") then "macos-15"
         else error("no runner for target " + .) end;
+    def daemon_artifact:
+        if test("^aarch64-apple-darwin$") then "macos-signed-daemon"
+        else "build-daemon-" + . end;
     ($targets | split(" ") | map(select(length > 0))) as $wanted
     | [.rows[]
         | select(($wanted | length) == 0 or ((.target) as $t | $wanted | index($t)))
         | if (.runtime | word) and (.target | word) then
-            {runtime, target, runner: (.target | runner)}
+            {runtime, target, runner: (.target | runner), daemon_artifact: (.target | daemon_artifact)}
           else error("invalid row") end]
     | if length == 0 then error("no rows selected") else {include: .} end
 ' "$matrix" || fail "cannot derive the row matrix from $matrix"

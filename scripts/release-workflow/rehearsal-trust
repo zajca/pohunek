@@ -42,7 +42,11 @@ esac
 umask 077
 mkdir -p "$output"
 chmod 700 "$output"
-printf 'rehearsal %s %s' "$run_id" "$commit" | sha256sum | cut -c1-64 > "$output/seed"
+if command -v sha256sum >/dev/null 2>&1; then
+    printf 'rehearsal %s %s' "$run_id" "$commit" | sha256sum | cut -c1-64 > "$output/seed"
+else
+    printf 'rehearsal %s %s' "$run_id" "$commit" | shasum -a 256 | cut -c1-64 > "$output/seed"
+fi
 chmod 600 "$output/seed"
 "$XTASK" catalog public-key --key-file "$output/seed" > "$output/public-key.txt"
 sed -n 's/^key_id: //p' "$output/public-key.txt" > "$output/key-id"

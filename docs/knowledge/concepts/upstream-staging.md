@@ -32,7 +32,7 @@ Besides the supported range, the `upstream` object of an npm-based lock carries:
 | `binary` | The executable name; `bin/<binary>` of the stage. |
 | `version_output` | The `--version` banner with a single `{release}` placeholder (`codex-cli {release}`, `{release} (Claude Code)`, `{release}`). |
 | `scripts` | Optional, default `false`. `true` runs install scripts (Claude Code's postinstall links the native binary); the lockfile must then show the locked package as the only one with an install script. |
-| `sha256` | Optional map from `<os>-<arch>` (`linux-x64`) to the SHA-256 of the native binary `bin/<binary>` resolves to; a host without an entry is refused. |
+| `sha256` | Optional map from `<os>-<arch>` (`linux-x64`, `darwin-arm64`) to the SHA-256 of the native binary `bin/<binary>` resolves to; a host without an entry is refused. |
 
 `compat/<runtime>/npm/package.json` depends on exactly the locked release (no
 ranges, no other dependency kind) and `compat/<runtime>/npm/package-lock.json`
