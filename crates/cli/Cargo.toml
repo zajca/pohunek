@@ -80,6 +80,9 @@ netbird = { workspace = true }
 ed25519-dalek = { workspace = true }
 # `codex_package.rs` compares the package files with the built-in Codex files as data.
 toml = { workspace = true }
+# `release_upgrade.rs` reads the previous release's archive, whose frame the
+# current encoder does not reproduce, without the strict canonical reader.
+ruzstd = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { workspace = true, features = ["async-secret-service", "tokio", "crypto-rust"] }

@@ -233,6 +233,148 @@ fn canonical_bytes_are_pinned() {
 const PINNED_SAMPLE_DIGEST: &str =
     "133fcf87bb30d8c45900acf3d81f2dfa6cd1f0169bab76cabc53fa34f6b7cdbb";
 
+/// Seed of the drift sample's generator; any fixed value works, a change
+/// only changes the pinned digest.
+const DRIFT_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// Bytes of the incompressible block the drift sample repeats. Copies of it
+/// placed farther apart than the encoder's window exercise long-distance
+/// match handling, and copies inside it exercise long matches.
+const DRIFT_BLOCK_BYTES: usize = 256 * 1024;
+
+/// Copies of that block, spaced by [`DRIFT_GAP_BYTES`].
+const DRIFT_BLOCK_COPIES: usize = 6;
+
+/// Fresh random bytes between two copies of the block: more than the
+/// encoder's window, so a copy cannot reach the previous one.
+const DRIFT_GAP_BYTES: usize = 384 * 1024;
+
+/// Words of the generated text, which produce many short and medium matches.
+const DRIFT_WORDS: &[&str] = &[
+    "package", "runtime", "session", "worker", "daemon", "archive", "digest", "catalog", "anchor",
+    "manifest", "hook", "identity", "the", "a", "of", "to", "and", "is",
+];
+
+/// Words of the generated text.
+const DRIFT_TEXT_WORDS: usize = 400_000;
+
+/// One in this many words of the generated text ends a line, so lines vary
+/// in length.
+const DRIFT_LINE_ODDS: u64 = 11;
+
+/// Length of each run of one repeated byte, a match against itself longer
+/// than the 65 538 bytes the shorter zstd match-length codes cover, so the
+/// longest length code is exercised.
+const DRIFT_RUN_BYTES: usize = 96 * 1024;
+
+/// A deterministic xorshift64 stream.
+struct Xorshift(u64);
+
+impl Xorshift {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn bytes(&mut self, len: usize) -> Vec<u8> {
+        (0..len).map(|_| self.next().to_le_bytes()[0]).collect()
+    }
+}
+
+/// A sample far larger than the encoder's window, with incompressible data,
+/// repeated blocks beyond and within the window, generated text and long
+/// runs, so any change to the encoder's match finding or sequence encoding
+/// changes the archive bytes. The small [`sample`] cannot tell encoder
+/// versions apart.
+fn drift_sample() -> Vec<ArchiveEntry> {
+    let mut random = Xorshift(DRIFT_SEED);
+    let block = random.bytes(DRIFT_BLOCK_BYTES);
+    let mut repeats = Vec::new();
+    for copy in 0..DRIFT_BLOCK_COPIES {
+        repeats.extend_from_slice(&random.bytes(DRIFT_GAP_BYTES));
+        repeats.extend_from_slice(&block);
+        // Half a block again, at once, and one byte changed in each copy.
+        repeats.extend_from_slice(&block[..DRIFT_BLOCK_BYTES / 2]);
+        let changed = repeats.len() - DRIFT_BLOCK_BYTES / 4;
+        repeats[changed] ^= u8::try_from(copy + 1).expect("few copies");
+        repeats.extend(std::iter::repeat_n(
+            u8::try_from(copy).expect("few copies"),
+            DRIFT_RUN_BYTES,
+        ));
+    }
+    let mut text = String::new();
+    for _ in 0..DRIFT_TEXT_WORDS {
+        let index = usize::try_from(random.next() % DRIFT_WORDS.len() as u64).expect("small");
+        text.push_str(DRIFT_WORDS[index]);
+        text.push(if random.next().is_multiple_of(DRIFT_LINE_ODDS) {
+            '\n'
+        } else {
+            ' '
+        });
+    }
+    vec![
+        entry("data/random.bin", &random.bytes(DRIFT_BLOCK_BYTES)),
+        entry("data/repeats.bin", &repeats),
+        entry("data/text.txt", text.as_bytes()),
+        entry("runtime.toml", b"schema = 1\n"),
+    ]
+}
+
+/// The official Claude package archive released in v0.34.2, byte for byte as
+/// published (its digest is the release catalog's entry). Its tar stream is a
+/// few kilobytes long and not a power of two, which is the input shape whose
+/// encoding changed between `ruzstd` 0.9.0 and 0.9.1; the large sample, whose
+/// first block is a full power-of-two block, encodes alike under both.
+const RELEASED_CLAUDE_ARCHIVE: &[u8] = include_bytes!("fixtures/claude-0.34.2.tar.zst");
+
+/// Digest of [`RELEASED_CLAUDE_ARCHIVE`], as the v0.34.2 catalog lists it.
+const RELEASED_CLAUDE_DIGEST: &str =
+    "bc3c11cfee1ab3807996e1053e5898438abac5c9561f2beb577aaddf3cabcbab";
+
+#[test]
+fn canonical_bytes_of_the_drift_samples_are_pinned() {
+    // The encoder-drift guard: a change here means the encoder writes other
+    // bytes for the same content, which changes every package digest. Update
+    // the pins only as a deliberate format decision.
+    let bytes = build_archive(&drift_sample(), &Limits::DEFAULT).expect("build");
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    assert_eq!(digest, PINNED_DRIFT_DIGEST, "the large drift sample");
+    read_archive(&bytes, &Limits::DEFAULT).expect("the sample reads back");
+
+    assert_eq!(
+        format!("{:x}", Sha256::digest(RELEASED_CLAUDE_ARCHIVE)),
+        RELEASED_CLAUDE_DIGEST
+    );
+    let rebuilt = compress_to_vec(
+        ruzstd_decode(RELEASED_CLAUDE_ARCHIVE).as_slice(),
+        CompressionLevel::Fastest,
+    );
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&rebuilt)),
+        PINNED_REBUILT_CLAUDE_DIGEST,
+        "the released Claude package's content under this encoder"
+    );
+    read_archive(&rebuilt, &Limits::DEFAULT).expect("the rebuilt archive reads back");
+}
+
+/// An archive published before the format moved to `ruzstd` 0.9.1 is refused:
+/// its frame is not what this encoder writes for its content.
+#[test]
+fn an_archive_of_the_previous_format_is_refused_as_non_canonical() {
+    assert!(matches!(
+        read_archive(RELEASED_CLAUDE_ARCHIVE, &Limits::DEFAULT),
+        Err(ArchiveError::NonCanonicalCompression)
+    ));
+}
+
+const PINNED_DRIFT_DIGEST: &str =
+    "ffd04b96cea75aebf365cab00e42234e311012df32f4cd13b39d4bb986e06003";
+
+const PINNED_REBUILT_CLAUDE_DIGEST: &str =
+    "7cdbce52a237c272b58e1e7ba83439a17135f353ce7bad54234a64cd348b2c5b";
+
 #[test]
 fn canonical_tar_headers_use_fixed_metadata() {
     let tar = ruzstd_decode(&build_archive(&sample(), &Limits::DEFAULT).expect("build"));

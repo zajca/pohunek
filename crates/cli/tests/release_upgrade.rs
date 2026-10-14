@@ -42,6 +42,15 @@
 //! - `POHUNEK_UPGRADE_ARTIFACTS_DIR`: writable directory receiving the
 //!   previous release's store, journals, `service.toml`, and `--json` outputs.
 //!
+//! The previous release's archive may be of an older package format than this
+//! build reads (the 0.35 move to `ruzstd` 0.9.1), so the test takes its digest
+//! from the raw bytes and its descriptor from a plain zstd and tar decode, and
+//! never hands it to the strict canonical reader. Installed packages keep
+//! working across such an upgrade, because the registry keeps verified roots,
+//! never archive bytes. After the upgrade the head links a small package
+//! directory, so its daemon builds and installs an archive of the head's own
+//! format, while the session stays pinned to the previous package.
+//!
 //! Results of both CLIs are read as untyped JSON and only the fields named
 //! below are consulted, so a schema difference between the releases cannot
 //! fail the test before the behavior it exercises does.
@@ -56,7 +65,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use package::{read_archive, Limits};
+use package::archive_digest;
 use pohunek_test_support::wait::poll_until;
 use serde_json::Value;
 
@@ -100,6 +109,53 @@ const VERSION_LINE_PARSER: &str = "semver-line-v1";
 /// Placeholder of the release inside a `semver-line-v1` `line` template.
 const VERSION_PLACEHOLDER: &str = "{version}";
 
+/// Directory under `HOME` the head links as a probe package.
+const PROBE_DIRECTORY: &str = "upgrade-probe";
+
+/// Package id of the probe package.
+const PROBE_PACKAGE_ID: &str = "pohunek.upgrade.probe";
+
+/// Detect manifest path of the probe package.
+const PROBE_DETECT_PATH: &str = "detect.toml";
+
+/// Descriptor of the probe package: an unreserved runtime that is never
+/// launched, only installed.
+const PROBE_DESCRIPTOR: &str = r#"schema = 1
+id = "pohunek.upgrade.probe"
+version = "0.1.0"
+runtime_api = 1
+
+[runtime]
+id = "upgrade-probe"
+name = "Upgrade probe"
+program = "upgrade-probe-agent"
+args = []
+detect_manifest = "detect.toml"
+prompt_arg = false
+
+[input]
+bracketed_paste = false
+submit_delay_ms = 0
+text_policy = "unrestricted"
+
+[resume]
+supported = false
+
+[fork]
+supported = false
+
+[native_reference]
+strategy = "none"
+"#;
+
+/// Detect manifest of the probe package.
+const PROBE_DETECT: &str = r#"[[rules]]
+id = "idle_prompt"
+state = "idle"
+priority = 100
+region = "whole_recent"
+any = [{ contains = "ready" }]
+"#;
 /// Host profile name of the fake agent.
 const PROFILE: &str = "fake-claude";
 
@@ -535,14 +591,10 @@ impl ClaudePackage {
         );
         let bytes = fs::read(&archive)
             .unwrap_or_else(|error| panic!("read {}: {error}", archive.display()));
-        let verified = read_archive(&bytes, &Limits::DEFAULT)
-            .unwrap_or_else(|error| panic!("{} is not a package: {error}", archive.display()));
-        let descriptor = verified
-            .entries()
-            .iter()
-            .find(|entry| entry.path == PACKAGE_DESCRIPTOR)
+        let digest = archive_digest(&bytes).expect("the archive digest");
+        let contents = tar_member(&zstd_decode(&bytes), PACKAGE_DESCRIPTOR)
             .unwrap_or_else(|| panic!("{} has no {PACKAGE_DESCRIPTOR}", archive.display()));
-        let text = std::str::from_utf8(&descriptor.contents).expect("the descriptor is UTF-8");
+        let text = std::str::from_utf8(&contents).expect("the descriptor is UTF-8");
         let descriptor: toml::Table = toml::from_str(text).expect("the descriptor is TOML");
         assert_eq!(
             descriptor.get("id").and_then(toml::Value::as_str),
@@ -575,10 +627,59 @@ impl ClaudePackage {
         Self {
             archive,
             catalog,
-            digest: verified.digest().as_str().to_owned(),
+            digest: digest.as_str().to_owned(),
             version_line: line.replace(VERSION_PLACEHOLDER, field("min")),
         }
     }
+}
+
+/// Decodes one zstd frame, of whichever encoder wrote it.
+fn zstd_decode(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut source = bytes;
+    let mut decoder = ruzstd::decoding::StreamingDecoder::new(&mut source).expect("a zstd frame");
+    let mut tar = Vec::new();
+    decoder
+        .read_to_end(&mut tar)
+        .expect("decode the zstd frame");
+    tar
+}
+
+/// USTAR header block size.
+const TAR_BLOCK: usize = 512;
+
+/// Byte range of a USTAR header's name field.
+const TAR_NAME: std::ops::Range<usize> = 0..100;
+
+/// Byte range of a USTAR header's octal size field.
+const TAR_SIZE: std::ops::Range<usize> = 124..136;
+
+/// The contents of the regular file `name` in the USTAR stream `tar`, if it
+/// has one. The archive's digest is authorized by its signed catalog, which
+/// the previous release checks when it installs it; this only reads one file.
+fn tar_member(tar: &[u8], name: &str) -> Option<Vec<u8>> {
+    let mut offset = 0;
+    while offset + TAR_BLOCK <= tar.len() {
+        let header = &tar[offset..offset + TAR_BLOCK];
+        if header.iter().all(|byte| *byte == 0) {
+            return None;
+        }
+        let field = &header[TAR_NAME];
+        let path = &field[..field
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(field.len())];
+        let size = std::str::from_utf8(&header[TAR_SIZE])
+            .ok()
+            .and_then(|text| usize::from_str_radix(text.trim_matches(['\0', ' ']), 8).ok())?;
+        let start = offset + TAR_BLOCK;
+        let end = start.checked_add(size).filter(|end| *end <= tar.len())?;
+        if path == name.as_bytes() {
+            return Some(tar[start..end].to_vec());
+        }
+        offset = start + size.div_ceil(TAR_BLOCK) * TAR_BLOCK;
+    }
+    None
 }
 
 /// Writes `source` as an owner-only executable script interpreted by
@@ -989,7 +1090,54 @@ fn start_on_previous(run: Run, previous: Cli, head: Cli) -> (Upgrade, Runtime, u
     (upgrade, before, daemon)
 }
 
+/// Removes the probe package directory `dir`, if it exists.
+fn remove_probe(dir: &Path) {
+    match fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("remove {}: {error}", dir.display()),
+    }
+}
+
 impl Upgrade {
+    /// The head links a package directory, so the head daemon builds an
+    /// archive of the head's package format and installs it. Across a format
+    /// change that is the first archive of the new format on this host; it
+    /// installs next to the previous release's package, which the session
+    /// stays pinned to, and both are listed afterwards. The probe serves an
+    /// unreserved runtime, which a linked package may claim.
+    fn assert_head_links_a_package_of_its_format(&self) {
+        let dir = self.run.home.join(PROBE_DIRECTORY);
+        // A run that stopped before its cleanup leaves the directory behind.
+        remove_probe(&dir);
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .unwrap_or_else(|error| panic!("create {}: {error}", dir.display()));
+        fs::write(dir.join(PACKAGE_DESCRIPTOR), PROBE_DESCRIPTOR)
+            .expect("write the probe descriptor");
+        fs::write(dir.join(PROBE_DETECT_PATH), PROBE_DETECT)
+            .expect("write the probe detect manifest");
+        let path = dir.display().to_string();
+        let linked = self
+            .head
+            .json(&["plugin", "link", &path, "--yes", "--json"]);
+        // `plugin link` copied the directory into the package store.
+        remove_probe(&dir);
+        let info = &linked["package"];
+        assert_eq!(info["package"]["id"], PROBE_PACKAGE_ID, "{linked}");
+        let digest = info["digest"].as_str().expect("the linked digest");
+        assert_ne!(digest, self.digest, "{linked}");
+        let listed = self.head.json(&["plugin", "list", "--json"]);
+        let text = listed.to_string();
+        for expected in [digest, self.digest.as_str()] {
+            assert!(
+                text.contains(expected),
+                "{expected} is not installed: {listed}"
+            );
+        }
+    }
+
     /// Stores the previous release's store and protocol goldens, taken before
     /// this build migrates anything in place.
     fn capture_previous_goldens(&self) {
@@ -1230,6 +1378,7 @@ fn previous_release_session_survives_the_upgrade_to_head() {
     upgrade.upgrade();
     let after = upgrade.assert_adopted(&before, daemon_before);
     upgrade.assert_session_works();
+    upgrade.assert_head_links_a_package_of_its_format();
     upgrade.assert_previous_client(&after);
     upgrade.assert_stop_and_resume(&after);
     upgrade.assert_previous_client_creates_with_input();

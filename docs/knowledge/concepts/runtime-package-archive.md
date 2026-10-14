@@ -23,9 +23,12 @@ The same file set always produces the same bytes, whatever the input order, host
 clock, user, or filesystem metadata.
 
 - One zstd frame with a content checksum, written by the pure-Rust `ruzstd`
-  encoder pinned to an exact version. A `ruzstd` upgrade can change the bytes
-  and therefore every package digest, so it is a deliberate format decision (a
-  test pins the sample archive digest).
+  encoder pinned to an exact version (0.9.1). A `ruzstd` upgrade can change the
+  bytes and therefore every package digest, so it is a deliberate format
+  decision. An encoder-drift test in `crates/package/tests/archive.rs` pins the
+  digests of a large generated sample and of the released v0.34.2 Claude
+  package's content rebuilt by the current encoder; the second is the input
+  shape whose encoding changed between `ruzstd` 0.9.0 and 0.9.1.
 - Inside, a POSIX USTAR stream of regular files only, sorted by path in
   ascending byte order. Per file: one header block, the data, zero padding to a
   512-byte block. The stream ends with exactly two zero blocks and nothing
@@ -36,6 +39,25 @@ clock, user, or filesystem metadata.
   every entry and requires the actual header to match byte for byte, so any
   other metadata is rejected.
 - Directories are implied by file paths and never stored.
+
+## Format generations
+
+The reader accepts only frames the pinned encoder writes, so a `ruzstd` change
+that alters the output is a cut-over: archives of one generation are refused by
+the binaries of the other, with `NonCanonicalCompression`. pohunek 0.35 moved
+from `ruzstd` 0.9.0 to 0.9.1 this way.
+
+- Binaries of 0.35 and later refuse archives built before 0.35, including the
+  archives published with 0.34.x; such an archive must be rebuilt with current
+  tooling (`cargo xtask package build`). Third-party archives are affected
+  alike.
+- Binaries of 0.34.x refuse archives built by 0.35 and later, for example after
+  a downgrade or through `--host` against an older daemon.
+- Packages already installed keep working across an upgrade: the registry
+  stores verified extracted roots with a per-file manifest, never the archive
+  bytes, and re-verifies a root against that manifest without re-encoding.
+  Sessions pinned to a package digest, `resume`, and the upgrade preflight do
+  not read archive bytes.
 
 ## Paths
 
@@ -73,11 +95,9 @@ digest, and only then is anything decompressed.
 | zstd window | 8 MiB |
 
 Decompression writes at most `min(64 MiB, compressed size x 100)` bytes of
-output before it stops. The zstd decoder in use does not bound the memory of a
-single decoded block (RUSTSEC-2026-0344, tracked in #969), so the daemon decodes
-only archives whose raw digest is already authorized by `--sha256` or by a
-verified catalog, and `plugin link` decodes only the archive it just built from
-the owner's directory. `build_archive`
+output before it stops. The daemon decodes only archives whose raw digest is
+already authorized by `--sha256` or by a verified catalog, and `plugin link`
+decodes only the archive it just built from the owner's directory. `build_archive`
 re-reads its own output under the same limits, so a built archive is always one
 the reader accepts.
 
