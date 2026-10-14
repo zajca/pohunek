@@ -5886,7 +5886,10 @@ pub(super) fn scan_worker_journals(
             let evidence = session_directory
                 .read_file(&journal_name, 0o600, MAX_WORKER_JOURNAL_BYTES)
                 .map_err(|_unreadable| JournalReject::Unreadable)
-                .and_then(|bytes| journal_evidence(&bytes, &session_id, journal_stem));
+                .and_then(|bytes| {
+                    let path = state_root.join(&session_name).join(&journal_name);
+                    journal_evidence(&bytes, &path, &session_id, journal_stem)
+                });
             match evidence {
                 Ok(evidence) => scan.evidence.push(evidence),
                 Err(reject) => {
@@ -5903,10 +5906,11 @@ pub(super) fn scan_worker_journals(
 /// Decodes one journal file found under `session_id` as `journal_stem`.
 fn journal_evidence(
     bytes: &[u8],
+    journal: &Path,
     session_id: &str,
     journal_stem: &str,
 ) -> Result<JournalEvidence, JournalReject> {
-    if let Err(error) = require_supported_journal_schema(bytes, session_id, journal_stem) {
+    if let Err(error) = require_supported_journal_schema(bytes, journal, session_id, journal_stem) {
         return Err(error
             .get_ref()
             .and_then(|inner| inner.downcast_ref::<UnsupportedJournalSchema>())
@@ -7175,6 +7179,51 @@ while os.getppid() == parent:
             ),
             super::TerminalJournalClassification::Conflict
         ));
+    }
+
+    #[test]
+    fn repeated_journal_scans_warn_once_per_unsupported_journal() {
+        const SESSIONS: usize = 3;
+        const SCANS: usize = 4;
+        let logs = crate::runtime::lifecycle::tests::LogCapture::default();
+        let _subscriber = logs.install();
+        let root = temp_root();
+        let state_root = root.join("workers");
+        std::fs::create_dir_all(&state_root).expect("create the state root");
+        std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o700))
+            .expect("secure the state root");
+        for index in 0..SESSIONS {
+            let session_dir = state_root.join(format!("s-{index}"));
+            std::fs::create_dir(&session_dir).expect("create the journal directory");
+            std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o700))
+                .expect("secure the journal directory");
+            let path = session_dir.join("worker-old.json");
+            std::fs::write(&path, br#"{"schema_version":1}"#).expect("write a schema 1 journal");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("secure the journal");
+        }
+
+        for _ in 0..SCANS {
+            let journals = super::scan_worker_journals(&state_root).expect("scan journals");
+            assert_eq!(journals.len(), SESSIONS);
+            assert!(journals.values().all(|scan| scan.rejected
+                == [(
+                    "worker-old.json".to_owned(),
+                    super::JournalReject::UnsupportedSchema(1)
+                )]));
+        }
+
+        let logged = logs.text();
+        let reports = |level: &str| {
+            logged
+                .lines()
+                .filter(|line| {
+                    line.contains(level) && line.contains("worker journal schema is unsupported")
+                })
+                .count()
+        };
+        assert_eq!(reports("WARN"), SESSIONS, "{logged}");
+        assert_eq!(reports("DEBUG"), SESSIONS * (SCANS - 1), "{logged}");
     }
 
     #[test]

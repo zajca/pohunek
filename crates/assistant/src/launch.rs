@@ -444,7 +444,7 @@ fn materialize_degraded(
     snapshot: &str,
 ) -> Result<DegradedMaterializeResult, AssistantError> {
     let runtime_dir = assistant_runtime_dir(paths)?;
-    std::fs::create_dir_all(&runtime_dir).map_err(|err| {
+    create_private_dir_all(&runtime_dir).map_err(|err| {
         ProtocolError::materialization_failed(&runtime_dir.display().to_string(), &err.to_string())
     })?;
     let snapshot_path = runtime_dir.join(SNAPSHOT_FILE);
@@ -481,7 +481,7 @@ fn materialize_local(
             )
         })?;
     let runtime_dir = assistant_runtime_dir(paths)?;
-    std::fs::create_dir_all(&runtime_dir).map_err(|err| {
+    create_private_dir_all(&runtime_dir).map_err(|err| {
         ProtocolError::materialization_failed(&runtime_dir.display().to_string(), &err.to_string())
     })?;
     let snapshot_path = runtime_dir.join(SNAPSHOT_FILE);
@@ -515,6 +515,27 @@ async fn materialize_remote(
     assert_bundle_matches(&result)?;
     Ok(result)
 }
+
+/// Creates `dir` and every missing ancestor owner-private. The runtime root
+/// is `XDG_RUNTIME_DIR/pohunek`, which the daemon refuses unless it is 0700.
+fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(PRIVATE_DIR_MODE)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+/// Mode of every directory a launch creates above its runtime snapshot.
+#[cfg(unix)]
+const PRIVATE_DIR_MODE: u32 = 0o700;
 
 fn assistant_runtime_dir(paths: &AssistantPaths) -> Result<PathBuf, AssistantError> {
     let version_hash = materialized_version_hash();

@@ -166,6 +166,75 @@ async fn auto_agent_selects_the_pohunek_assistant_runtime_first() {
     assert_eq!(exchange.selected(), "pohunek-assistant");
 }
 
+/// Set in the child process that prepares a launch under the permissive umask.
+const UMASK_CHILD_VAR: &str = "ASSISTANT_RUNTIME_UMASK_CHILD";
+
+#[test]
+fn a_degraded_preparation_creates_the_runtime_directories_owner_private() {
+    // The umask is process-wide, so a child owns it and this multithreaded test
+    // binary keeps its own; under umask 022 a plain `mkdir` is 0755.
+    let output = std::process::Command::new("/bin/sh")
+        .args(["-c", "umask 022; exec \"$0\" \"$@\""])
+        .arg(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "degraded_preparation_under_a_permissive_umask_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(UMASK_CHILD_VAR, "1")
+        .output()
+        .expect("run the child under the permissive umask");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "child failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn degraded_preparation_under_a_permissive_umask_child() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if std::env::var_os(UMASK_CHILD_VAR).is_none() {
+        return;
+    }
+    let fixture = pohunek_test_support::tempdir().expect("create the hermetic fixture root");
+    let socket_path = fixture.path().join("assistant.sock");
+    let listener = UnixListener::bind(&socket_path).expect("bind the fixture host socket");
+    let capability_json =
+        serde_json::to_value(capabilities(caps(vec![("pohunek-assistant", true)])))
+            .expect("serialize the capability snapshot");
+    let task = spawn_responder(listener, capability_json);
+    // `runtime` stands for `XDG_RUNTIME_DIR/pohunek`, which does not exist yet.
+    let paths = assistant_paths(fixture.path());
+
+    let result = prepare_with_options(
+        &local_host(&socket_path),
+        &paths,
+        launch_params(None),
+        no_origin_options(),
+    )
+    .await;
+    pohunek_test_support::wait::guard("capability responder", task)
+        .await
+        .expect("capability responder task completed");
+
+    result.expect("the degraded preparation succeeds");
+    for directory in [
+        paths.runtime_dir.clone(),
+        paths.runtime_dir.join("assistant"),
+    ] {
+        let mode = std::fs::metadata(&directory)
+            .expect("the runtime directory exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "{}", directory.display());
+    }
+}
+
 #[tokio::test]
 async fn auto_agent_uses_hermes_when_codex_and_claude_are_absent() {
     let exchange = prepare_selection(

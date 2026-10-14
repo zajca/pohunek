@@ -163,7 +163,9 @@ pub(crate) fn journal_schema_supported(schema_version: u32) -> bool {
 /// Only the schema number is decoded, so a schema whose other fields differ
 /// is still named instead of surfacing as a missing-field error. An
 /// unsupported schema is logged: its journal is evidence the daemon cannot
-/// use, never an absence of evidence.
+/// use, never an absence of evidence. The warning is logged once per
+/// `journal` file and schema; every later read logs at debug level, because
+/// each scan rereads the journals of every stored session.
 ///
 /// # Errors
 ///
@@ -171,6 +173,7 @@ pub(crate) fn journal_schema_supported(schema_version: u32) -> bool {
 /// unsupported schema, or the decoding error when no schema is declared.
 pub(crate) fn require_supported_journal_schema(
     bytes: &[u8],
+    journal: &Path,
     session_id: &str,
     worker_id: &str,
 ) -> std::io::Result<()> {
@@ -185,15 +188,37 @@ pub(crate) fn require_supported_journal_schema(
     let reason = UnsupportedJournalSchema {
         found: schema_version,
     };
-    tracing::warn!(
-        session_id,
-        worker.id = worker_id,
-        journal.schema_version = schema_version,
-        error = %reason,
-        "worker journal schema is unsupported; it is not used as generation evidence"
-    );
+    let first_report = WARNED_UNSUPPORTED_JOURNALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((journal.to_path_buf(), schema_version));
+    if first_report {
+        tracing::warn!(
+            session_id,
+            worker.id = worker_id,
+            journal.schema_version = schema_version,
+            error = %reason,
+            "worker journal schema is unsupported; it is not used as generation evidence"
+        );
+    } else {
+        tracing::debug!(
+            session_id,
+            worker.id = worker_id,
+            journal.schema_version = schema_version,
+            error = %reason,
+            "worker journal schema is unsupported; it is not used as generation evidence"
+        );
+    }
     Err(std::io::Error::new(std::io::ErrorKind::InvalidData, reason))
 }
+
+/// Journal files and schemas whose unsupported schema was already logged at
+/// warning level. Entries are never removed, so it grows with every distinct
+/// unsupported journal file and schema this process reads, bounded in practice
+/// by the old journals a host keeps.
+static WARNED_UNSUPPORTED_JOURNALS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<(PathBuf, u32)>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// Largest worker journal read as lifecycle evidence.
 ///
@@ -1561,7 +1586,10 @@ fn read_journal(
         .map_err(|error| {
             std::io::Error::new(error.io_kind().unwrap_or(std::io::ErrorKind::Other), error)
         })?;
-    require_supported_journal_schema(&bytes, session_id, worker_id)?;
+    let journal_path = state_root
+        .join(session_id)
+        .join(format!("{worker_id}.json"));
+    require_supported_journal_schema(&bytes, &journal_path, session_id, worker_id)?;
     let journal = serde_json::from_slice::<JournalFacts>(&bytes)?;
     if !journal_schema_supported(journal.schema_version)
         || journal.session_id != session_id

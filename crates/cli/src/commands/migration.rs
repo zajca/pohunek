@@ -5,7 +5,7 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use protocol::{method, ErrorClass, ProtocolError, SessionInfo, SessionState};
@@ -17,6 +17,8 @@ use crate::error::CliError;
 use crate::paths::Paths;
 
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
+/// Mode of the manifest directory and of every ancestor this command creates.
+const PRIVATE_DIR_MODE: u32 = 0o700;
 const OWNER_PRIVATE_FILE_MODE: u32 = 0o600;
 
 /// Sanitized migration authority consumed by the first worker-aware daemon.
@@ -153,8 +155,13 @@ fn write_manifest(path: &Path, manifest: &MigrationManifest) -> Result<(), CliEr
             "migration manifest has no parent directory",
         ))
     })?;
-    fs::create_dir_all(parent)?;
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    // Missing ancestors, the daemon's data directory among them, are created
+    // owner-private as the daemon requires.
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(PRIVATE_DIR_MODE)
+        .create(parent)?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(PRIVATE_DIR_MODE))?;
     let temporary = path.with_extension(format!("json.tmp.{}", std::process::id()));
     let bytes = serde_json::to_vec_pretty(manifest)?;
     let mut file = fs::OpenOptions::new()
@@ -256,10 +263,43 @@ mod tests {
         );
     }
 
+    /// Set in the child process that runs the manifest write under the
+    /// permissive umask.
+    const UMASK_CHILD_VAR: &str = "MIGRATION_MANIFEST_UMASK_CHILD";
+
+    #[test]
+    fn manifest_write_is_owner_private_under_a_permissive_umask() {
+        // The umask is process-wide, so a child owns it and this multithreaded
+        // test binary keeps its own; under umask 022 a plain `mkdir` is 0755.
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", "umask 022; exec \"$0\" \"$@\""])
+            .arg(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "commands::migration::tests::manifest_write_is_owner_private_and_replaces_atomically",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(UMASK_CHILD_VAR, "1")
+            .output()
+            .expect("run the child under the permissive umask");
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn manifest_write_is_owner_private_and_replaces_atomically() {
+        if std::env::var_os(UMASK_CHILD_VAR).is_none() {
+            return;
+        }
         let guard = pohunek_test_support::tempdir().expect("create fixture directory");
-        let root = guard.path().join("manifest");
+        // Neither the data directory nor its `migrations` child exists yet.
+        let data = guard.path().join("pohunek");
+        let root = data.join("migrations");
         let path = root.join("migration.json");
         let manifest = MigrationManifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
@@ -275,6 +315,14 @@ mod tests {
         write_manifest(&path, &manifest).expect("write manifest");
         let permissions = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
         assert_eq!(permissions, OWNER_PRIVATE_FILE_MODE);
+        for directory in [&data, &root] {
+            let mode = fs::metadata(directory)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, PRIVATE_DIR_MODE, "{}", directory.display());
+        }
         assert_eq!(
             serde_json::from_slice::<MigrationManifest>(&fs::read(&path).expect("read manifest"))
                 .expect("parse manifest"),
