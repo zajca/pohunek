@@ -3346,8 +3346,9 @@ knobs `<config>/pohunek/workflow.toml` are specified in
 `docs/knowledge/guides/workflow-plugins.md`, which also holds the manifest and
 trust rules, and the plugin units of jobs and services: each runs the hidden
 `pohunek workflow __exec <id> <digest> job|service <name>`, an entry point
-of the service manager units, not a command to call. Event reactions are not
-yet available.
+of the service manager units, not a command to call. Event reactions run
+through the dispatcher unit's hidden `pohunek workflow __dispatch` (see
+"Events" above and the guide's "Event reactions").
 
 ## Hermes Operator Plugin CLI
 

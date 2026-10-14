@@ -33,12 +33,13 @@ pohunek workflow uninstall acme.work [--purge] [--remove-modified]
 pohunek workflow run [--json] acme.work overview [<args>...]
 ```
 
-Event reactions are not yet available; the manifest refuses the reaction
-table until it ships (#148).
+Jobs, services and event reactions need no command of their own: `enable`
+installs their units, and `disable` and `uninstall` remove them (see
+[Jobs and services](#jobs-and-services) and [Event reactions](#event-reactions)).
 
 With dynamic shell completion (`pohunek setup completions <shell> --dynamic`),
 Tab completes installed plugin ids for `inspect`, `enable`, `disable`,
-`uninstall` and `run` (`run` offers only enabled plugins), and after
+`status`, `uninstall` and `run` (`run` offers only enabled plugins), and after
 `workflow run <id>` the actions of that plugin. A plugin whose installed files
 fail verification offers no actions. Completion only reads the store, within
 its short deadline, and stays silent when the store is missing or unusable.

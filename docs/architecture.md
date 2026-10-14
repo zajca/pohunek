@@ -375,9 +375,10 @@ run record is the only failure record; `ExitTimeOut` bounds a stop, after
 which the backend kills the rest of the job's process group captured before
 the stop. Stopping a unit boots it out but keeps its definition,
 so it runs again at the next login until it is removed. Worker discovery
-never matches these names or labels, so it neither adopts nor sweeps them. No
-command installs plugin units yet; the CLI that drives both backends is
-ordered work in #326.
+never matches these names or labels, so it neither adopts nor sweeps them.
+`pohunek workflow enable` installs a plugin's job and service units through
+this contract, and `disable` and `uninstall` remove them
+(`crates/cli/src/workflow/units.rs`).
 
 The shared contract crate compiles and tests natively on Apple Silicon Darwin
 with a macOS 14 deployment target. Intel Macs are outside the current release
