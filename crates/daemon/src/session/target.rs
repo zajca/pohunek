@@ -1060,6 +1060,11 @@ impl SessionRegistry {
         transaction_id: &str,
         runtime_generation: protocol::RuntimeGeneration,
     ) -> Result<StartedRuntime, LaunchFailure> {
+        // Nothing of the generation exists yet, so a refused directory leaves
+        // nothing to retire.
+        self.prepare_session_tmpdir(id, &command.env)
+            .await
+            .map_err(LaunchFailure::Cleaned)?;
         let worker = lifecycle.launch(generation).await?;
         match self
             .initialize_runtime(

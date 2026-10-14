@@ -4780,6 +4780,153 @@ async fn a_stopped_session_still_owns_its_worktree_in_project_show() {
     let _ = handle.await;
 }
 
+/// Script of the temporary-directory scenario: it fills `$TMPDIR` with what
+/// agents leave there (a read-only directory, a hardlink, a FIFO) and then
+/// reports the value it saw in `tmpdir.txt` of its working directory.
+const TMPDIR_SCRIPT: &str = concat!(
+    "mkdir -p \"$TMPDIR/ro/inner\" && : > \"$TMPDIR/ro/inner/file\" && ",
+    ": > \"$TMPDIR/data\" && ln \"$TMPDIR/data\" \"$TMPDIR/hardlink\" && ",
+    "mkfifo \"$TMPDIR/fifo\" && chmod 0555 \"$TMPDIR/ro\" && ",
+    "printf '%s|' \"$TMPDIR\" > tmpdir.partial && mv tmpdir.partial tmpdir.txt; ",
+    "exec sleep 30",
+);
+
+/// Starts a session of `agent` in `cwd` and returns it with the `TMPDIR` its
+/// child saw.
+async fn session_with_reported_tmpdir(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    agent: &str,
+    cwd: &Path,
+) -> (SessionInfo, PathBuf) {
+    let params = SessionNewParams {
+        agent: agent.to_owned(),
+        ..session_params_in(cwd.to_path_buf())
+    };
+    let session: SessionInfo =
+        serde_json::from_value(ok_payload(create_session_with_params(framed, params).await))
+            .expect("session info");
+    let report = read_file_until(&cwd.join("tmpdir.txt"), b"|").await;
+    let reported = String::from_utf8(report).expect("TMPDIR is UTF-8");
+    (session, PathBuf::from(reported.trim_end_matches('|')))
+}
+
+async fn remove_session(framed: &mut Framed<UnixStream, LinesCodec>, id: &SessionId) {
+    let request = Request::make(
+        "session-remove-tmpdir",
+        method::SESSION_REMOVE,
+        serde_json::to_value(id).expect("serialize id"),
+    );
+    let removed: SessionRemoveResult =
+        serde_json::from_value(ok_payload(exchange(framed, &request).await))
+            .expect("remove result");
+    assert!(removed.removed);
+}
+
+/// Each session gets its own private `TMPDIR`, kept across a stop and deleted
+/// with everything an agent left in it when the session is removed. A profile
+/// that sets `TMPDIR` keeps its own value.
+#[tokio::test]
+async fn every_session_gets_a_private_tmpdir_that_its_removal_deletes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let socket = temp_socket("session-tmpdir");
+    let tmp_root = socket.dir.join("cache").join("session-tmp");
+    let profile_tmpdir = temp_dir("profile-tmpdir");
+    let agents = socket.dir.join("agents");
+    std::fs::create_dir(&agents).expect("create agent profiles");
+    std::fs::write(
+        agents.join("own-tmpdir.toml"),
+        format!(
+            "base = \"shell\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", {script:?}]\n\n[env]\nTMPDIR = {dir:?}\n",
+            script = TMPDIR_SCRIPT,
+            dir = profile_tmpdir.display().to_string(),
+        ),
+    )
+    .expect("write the profile with its own TMPDIR");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", TMPDIR_SCRIPT]),
+        session_tmp_root: Some(tmp_root.clone()),
+        agents_dir: Some(agents),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+
+    let cwds: Vec<_> = ["alpha", "beta", "profile"]
+        .into_iter()
+        .map(|name| {
+            let cwd = socket.dir.join(name);
+            std::fs::create_dir(&cwd).expect("create the session's working directory");
+            cwd
+        })
+        .collect();
+    let (alpha, alpha_tmp) = session_with_reported_tmpdir(&mut control, "shell", &cwds[0]).await;
+    let (beta, beta_tmp) = session_with_reported_tmpdir(&mut control, "shell", &cwds[1]).await;
+    let (own, own_tmp) = session_with_reported_tmpdir(&mut control, "own-tmpdir", &cwds[2]).await;
+
+    assert_eq!(alpha_tmp, tmp_root.join(&alpha.id.0));
+    assert_eq!(beta_tmp, tmp_root.join(&beta.id.0));
+    for dir in [&alpha_tmp, &beta_tmp] {
+        let metadata = std::fs::symlink_metadata(dir).expect("the session's TMPDIR exists");
+        assert!(metadata.is_dir());
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            0o700,
+            "{}",
+            dir.display()
+        );
+    }
+    assert_eq!(
+        own_tmp,
+        profile_tmpdir.to_path_buf(),
+        "the profile's TMPDIR wins"
+    );
+    assert!(
+        !tmp_root.join(&own.id.0).exists(),
+        "a session with the profile's TMPDIR gets no private directory"
+    );
+
+    stop_session(&mut control, &beta.id).await;
+    wait_for_state(&mut control, &beta.id, SessionState::Stopped).await;
+    assert!(
+        beta_tmp.join("data").exists(),
+        "a stop keeps the session's TMPDIR"
+    );
+
+    for session in [&alpha, &beta, &own] {
+        remove_session(&mut control, &session.id).await;
+    }
+    assert!(
+        !alpha_tmp.exists(),
+        "the removal deletes the session's TMPDIR"
+    );
+    assert!(
+        !beta_tmp.exists(),
+        "the removal deletes the stopped session's TMPDIR"
+    );
+    let left: Vec<_> = std::fs::read_dir(&tmp_root)
+        .expect("list the TMPDIR root")
+        .map(|entry| entry.expect("TMPDIR root entry").file_name())
+        .collect();
+    assert!(
+        left.is_empty(),
+        "nothing stays below the TMPDIR root: {left:?}"
+    );
+    assert!(
+        profile_tmpdir.join("data").exists(),
+        "the profile's own TMPDIR is never deleted"
+    );
+    std::fs::set_permissions(
+        profile_tmpdir.join("ro"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("let the fixture delete the profile's TMPDIR");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
 /// Writes a host-global `post-create` hook into `config_dir` and returns the
 /// config directory for [`SessionRegistryConfig::config_dir`].
 fn host_post_create_hook(socket: &TestSocket, body: &str) -> PathBuf {

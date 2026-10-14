@@ -955,6 +955,19 @@ and runtime id. A typed worker-stream failure is surfaced once and is not
 retried. A lost worker cannot be reconstructed by retrying attach; inspect
 `runtime.state` and use explicit native recovery only when supported.
 
+## Temporary directory
+
+Each session's agent runs with `TMPDIR` set to the session's own directory,
+`<cache_dir>/session-tmp/<session id>` below Pohunek's cache directory
+(`$XDG_CACHE_HOME/pohunek` or the platform cache path), so agents running side
+by side never overwrite each other's temporary files. The directory is private
+(mode 0700) and replaces a `TMPDIR` forwarded from the daemon's environment. A
+profile that sets `TMPDIR` in its `[env]` keeps that value instead. Stopping a
+session keeps the directory and resuming it reuses it; removing the session,
+explicitly or through retention, deletes it with its content. A launch whose
+directory is not a private directory of the daemon's user fails with
+`session_tmpdir_unsafe` before the agent starts.
+
 ## Retention
 
 A host that runs agents for weeks accumulates logical records for sessions that
