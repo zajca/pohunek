@@ -2257,10 +2257,11 @@ jobs:
   # is skipped.
   hermes-compatibility-macos:
     name: pinned Hermes compatibility (macOS arm64, model-free)
-    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && (needs.changes.outputs.hermes_macos == 'true' || needs.package-selection.result != 'success' || needs.package-selection.outputs.hermes != 'false'))) }}
-    # `package-selection` runs on pull requests only; `!cancelled()` keeps
-    # its skip on push, schedule and dispatch from skipping this job.
-    needs: [changes, package-selection]
+    # A pull request runs it only for its narrow input filter (issue #1050);
+    # core inputs are covered by the main and nightly tiers. The Linux
+    # `hermes-package` job follows the runtime package selection instead.
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && needs.changes.outputs.hermes_macos == 'true') }}
+    needs: changes
     runs-on: macos-15
     env:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
