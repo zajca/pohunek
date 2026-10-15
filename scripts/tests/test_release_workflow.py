@@ -826,9 +826,12 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
         self.assertIn("ISOLATION: ${{ steps.isolation.outputs.strategy }}", smoke)
         run_smoke_text = (SCRIPTS / "run-smoke").read_text()
         self.assertIn("--isolation", run_smoke_text)
-        # On macOS, run-smoke makes stage readable by other users for the throwaway user
+        # On macOS, run-smoke stages under a root-owned base and hands it to the throwaway user
         self.assertIn('[ "$(uname -s)" = Darwin ]', run_smoke_text)
-        self.assertIn("chmod -R go+rX", run_smoke_text)
+        self.assertIn("/usr/bin/sudo -n /usr/bin/mktemp -d /private/var/pks-stage.XXXXXX", run_smoke_text)
+        self.assertIn("trap 'cleanup_base' EXIT INT TERM", run_smoke_text)
+        self.assertIn("/usr/bin/sudo -n /usr/sbin/chown", run_smoke_text)
+        self.assertNotIn("chmod -R go+rX", run_smoke_text)
         # Smoke is a matrix job with ubuntu-latest and macos-15
         self.assertIn("    strategy:\n      fail-fast: false\n      matrix:\n        include:", smoke)
         self.assertIn("          - os: ubuntu-latest\n            smoke_target: \"\"", smoke)

@@ -475,14 +475,14 @@ if [ -n "${POHUNEK_TEST_TEMP_ROOT:-}" ]; then echo "ENV-TEMP-ROOT=$POHUNEK_TEST_
         self.assertIn("pi ok", result.stdout)
         self.assertIn("codex ok", result.stdout)
         if sys.platform.startswith("darwin"):
-            # On Darwin, stage and node are copied to a temporary-user-owned pki dir
+            # On Darwin, stage is chowned to the throwaway user; node is in a pki dir
             pi_dirs = []
             codex_dirs = []
             for line in result.stdout.splitlines():
-                pi_match = re.match(r"^ENV-PATH=(/private/tmp/pki\.[A-Za-z0-9]+)/stage/pi/bin:\1/node-bin:/usr/bin:/bin$", line)
+                pi_match = re.match(r"^ENV-PATH=" + re.escape(f"{self.stage}/pi/bin") + r":(/private/tmp/pki\.[A-Za-z0-9]+)/node-bin:/usr/bin:/bin$", line)
                 if pi_match:
                     pi_dirs.append(pi_match.group(1))
-                codex_match = re.match(r"^ENV-PATH=(/private/tmp/pki\.[A-Za-z0-9]+)/stage/codex/bin:\1/node-bin:/usr/bin:/bin$", line)
+                codex_match = re.match(r"^ENV-PATH=" + re.escape(f"{self.stage}/codex/bin") + r":(/private/tmp/pki\.[A-Za-z0-9]+)/node-bin:/usr/bin:/bin$", line)
                 if codex_match:
                     codex_dirs.append(codex_match.group(1))
             self.assertTrue(pi_dirs, "pi ENV-PATH not found")

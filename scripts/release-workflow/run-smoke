@@ -21,13 +21,25 @@
 # aside once, and before each archive every runtime is restored from that copy
 # at the same absolute path and checked with `compat verify-stage`. The stage
 # never moves: a provisioned environment names its interpreter by absolute
-# path.
+# path. On macOS the stage lives under a fresh root-owned /private/var/pks-stage.*
+# base that is removed on exit.
 
 set -eu
 
 fail() {
     printf 'run-smoke: %s\n' "$*" >&2
     exit 1
+}
+
+cleanup_base() {
+    if [ -n "${base:-}" ]; then
+        case $base in
+            /private/var/pks-stage.*) ;;
+            *) fail "cleanup_base: base does not match /private/var/pks-stage.*: $base" ;;
+        esac
+        /usr/bin/sudo -n /bin/rm -rf "$base" || true
+        [ ! -e "$base" ] || fail "cleanup_base: base still exists: $base"
+    fi
 }
 
 [ "$#" -eq 1 ] || fail "usage: run-smoke <bundle-dir>"
@@ -54,7 +66,19 @@ consumer_copy=$RUNNER_TEMP/smoke-consumer
 cp -- "$CONSUMER" "$consumer_copy"
 chmod 0755 "$consumer_copy"
 
-stage=$RUNNER_TEMP/smoke-stage
+if [ "$(uname -s)" = Darwin ]; then
+    /usr/bin/sudo -n true || fail "the macOS smoke needs passwordless sudo (CI runner only)"
+    base=$(/usr/bin/sudo -n /usr/bin/mktemp -d /private/var/pks-stage.XXXXXX) || fail "cannot create temporary base directory"
+    case $base in
+        /private/var/pks-stage.*) ;;
+        *) fail "base does not match /private/var/pks-stage.*: $base" ;;
+    esac
+    /usr/bin/sudo -n /bin/chmod 0755 "$base" || fail "cannot chmod base directory"
+    trap 'cleanup_base' EXIT INT TERM
+    stage=$base/stage
+else
+    stage=$RUNNER_TEMP/smoke-stage
+fi
 pristine=$RUNNER_TEMP/smoke-stage-pristine
 [ ! -e "$stage" ] || fail "stage exists: $stage"
 [ ! -e "$pristine" ] || fail "pristine stage copy exists: $pristine"
@@ -66,7 +90,12 @@ for runtime in $runtimes; do
         *[!a-z0-9_-]*) fail "invalid runtime id: $runtime" ;;
     esac
 done
-mkdir -p "$stage"
+if [ "$(uname -s)" = Darwin ]; then
+    /usr/bin/sudo -n /bin/mkdir -m 0755 "$stage" || fail "cannot create stage directory"
+    /usr/bin/sudo -n /usr/sbin/chown "$(id -u):$(id -g)" "$stage" || fail "cannot chown stage directory"
+else
+    mkdir -p "$stage"
+fi
 for runtime in $runtimes; do
     "$XTASK" compat stage-upstream --runtime "$runtime" --out "$stage"
 done
@@ -78,12 +107,6 @@ for archive in "$bundle"/pohunek-daemon-"$VERSION"-$smoke_target.tar.gz; do
     for runtime in $runtimes; do
         rm -rf -- "${stage:?}/$runtime"
         cp -a -- "$pristine/$runtime" "$stage/$runtime"
-        # macOS runs the consumer as a throwaway local user: the smoke's own
-        # temp copy of the stage must be readable by other users. The
-        # provisioner creates its install root 0700.
-        if [ "$(uname -s)" = Darwin ]; then
-            chmod -R go+rX "$stage/$runtime"
-        fi
         "$XTASK" compat verify-stage --runtime "$runtime" --dir "$stage"
     done
     packaging/smoke-archive --archive "$archive" --stage "$stage" --consumer "$consumer_copy" --isolation "$ISOLATION"

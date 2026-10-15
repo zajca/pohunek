@@ -452,13 +452,9 @@ inner_main() {
     network_check
     if [ "$isolation" = sandbox ]; then
         umask 022
-        # Copy every input the consumer executes into $inputs. We are $tuser here,
-        # so the copies are owned by $tuser, satisfying the product's ownership checks.
-        mkdir -p "$inputs/stage"
-        for rt in "$@"; do
-            /usr/bin/ditto "$stage/$rt" "$inputs/stage/$rt" || fail "cannot copy stage $rt to inputs"
-        done
-        stage=$inputs/stage
+        # Copy the root, consumer and node to $inputs. The stage is used in place,
+        # chowned to the throwaway user before entering the sandbox, because a
+        # provisioned venv names its interpreter by absolute path.
         /usr/bin/ditto "$root" "$inputs/root" || fail "cannot copy root to inputs"
         root=$inputs/root
         /bin/cp "$consumer" "$inputs/consumer" || fail "cannot copy consumer to inputs"
@@ -477,6 +473,15 @@ inner_main() {
         bad=$(/usr/bin/find "$inputs" ! -type l ! -user "$(id -u)" -print | head -n 1)
         [ -z "$bad" ] || fail "a copied input is not owned by the current user: $bad"
     fi
+    # The stage is used in place on macOS, chowned to the throwaway user
+    for rt in "$@"; do
+        # Fail closed if anything in the stage is group- or other-writable
+        bad=$(/usr/bin/find "$stage/$rt" \( -perm -020 -o -perm -002 \) ! -type l -print | head -n 1)
+        [ -z "$bad" ] || fail "a file in the stage is writable by others: $bad"
+        # Fail closed if anything in the stage (excluding symlinks) is not owned by the current user
+        bad=$(/usr/bin/find "$stage/$rt" ! -type l ! -user "$(id -u)" -print | head -n 1)
+        [ -z "$bad" ] || fail "a file in the stage is not owned by the current user: $bad"
+    done
     for rt in "$@"; do
         stage_check "$stage/$rt"
     done
@@ -720,6 +725,7 @@ chosen=
 tuser=
 tuid=
 tuser_created=
+stage_chowned=
 codex_dir=
 cleanup() {
     status=$?
@@ -767,6 +773,9 @@ cleanup() {
         if /usr/bin/pgrep -U "$tuid" >/dev/null 2>&1; then
             printf 'smoke-archive: processes of %s survived cleanup\n' "$tuser" >&2
             status=1
+        fi
+        if [ -n "$stage_chowned" ]; then
+            /usr/bin/sudo -n /usr/sbin/chown -R "$(id -u):$(id -g)" "$stage" || status=1
         fi
         case $tuid in
             '' | *[!0-9]*) ;;
@@ -1045,6 +1054,14 @@ if [ "$chosen" = sandbox ]; then
     if [ "$uname_s" = Darwin ]; then
         probe_darwin_sudo || fail "the macOS smoke runs the consumer as a throwaway local user and needs passwordless sudo (sudo -n) to create it; refusing to run as the invoking user"
         create_throwaway_user
+        if [ -n "$tuser" ]; then
+            /usr/bin/sudo -n /usr/sbin/chown "$tuser:20" "$stage" || fail "cannot chown stage to throwaway user"
+            for rt in $runtimes; do
+                /usr/bin/sudo -n /usr/sbin/chown -R "$tuser:20" "$stage/$rt" || fail "cannot chown $stage/$rt to throwaway user"
+                /usr/bin/sudo -n /bin/chmod -R go-w "$stage/$rt" || fail "cannot drop group/other write from $stage/$rt"
+            done
+            stage_chowned=1
+        fi
     fi
 fi
 if [ "$chosen" = sudo ]; then
