@@ -1159,9 +1159,13 @@ check = "none"
             &impostor,
         )
         .expect("copy the shell as the impostor");
+        // Its environment names no path of the scope, as a child's reads while
+        // `execve` sets it up, so only its executable and working directory
+        // tie it to the scope.
         let child = host
             .env
             .command(&impostor)
+            .env_clear()
             .args(["-c", "read line"])
             .stdin(Stdio::piped())
             .spawn()
