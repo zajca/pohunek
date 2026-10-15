@@ -40,6 +40,9 @@ const LIBEXEC: &str = "libexec/pohunek";
 /// version is known.
 const STAGE: &str = ".stage";
 
+/// Prefix of the name of every pohunek binary.
+const POHUNEK_NAME_PREFIX: &str = "pohunek";
+
 /// Size of the read buffer used while hashing.
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -293,6 +296,38 @@ impl Layout {
         &self.file(name).digest
     }
 
+    /// Whether a process runs a pohunek binary, judged by what it executes
+    /// rather than by the name it reports.
+    ///
+    /// A process qualifies when its command name or its executable's file name
+    /// starts with `pohunek`, or when its executable is byte-identical to a
+    /// binary of this layout under any name. `image` hashes the executable
+    /// only when the names do not already decide; it yields `None` only for a
+    /// process that has exited, and fails for a live one whose bytes cannot be
+    /// read, so an unreadable copy never passes as a foreign binary.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of `image`.
+    fn runs_a_pohunek_binary(
+        &self,
+        command: &str,
+        executable: &Path,
+        image: impl FnOnce() -> Result<Option<String>, LayoutError>,
+    ) -> Result<bool, LayoutError> {
+        let named = |name: &str| name.starts_with(POHUNEK_NAME_PREFIX);
+        if named(command)
+            || executable
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(named)
+        {
+            return Ok(true);
+        }
+        Ok(image()?
+            .is_some_and(|digest| BINARIES.iter().any(|name| self.file(name).digest == digest)))
+    }
+
     /// Re-hashes every installed file and its source.
     ///
     /// # Errors
@@ -432,8 +467,9 @@ impl Layout {
     ///
     /// # Errors
     ///
-    /// Fails for a process named `pohunek*` that does not execute a
-    /// byte-identical binary of this layout.
+    /// Fails for a process that runs a pohunek binary (see
+    /// [`Self::runs_a_pohunek_binary`]) and does not execute a byte-identical
+    /// binary of this layout at its installed path.
     #[cfg(target_os = "linux")]
     pub(crate) fn pohunek_processes(
         &self,
@@ -456,13 +492,31 @@ impl Layout {
                 continue;
             }
             let command = fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
-            if !command.trim().starts_with("pohunek") {
+            let executable = match fs::read_link(entry.path().join("exe")) {
+                Ok(executable) => executable,
+                Err(_) if process_ended(&entry.path()) => continue,
+                Err(source) => {
+                    return Err(LayoutError::Io {
+                        what: format!("read the executable of live process {pid}"),
+                        source,
+                    });
+                }
+            };
+            // The running image is hashed through /proc/<pid>/exe, the inode
+            // that was executed, whatever its path now holds. It stays readable
+            // after an unlink, so a failure is an exit only once the process
+            // has ended.
+            let image = || match sha256_file(&entry.path().join("exe")) {
+                Ok(digest) => Ok(Some(digest)),
+                Err(_) if process_ended(&entry.path()) => Ok(None),
+                Err(source) => Err(LayoutError::Io {
+                    what: format!("hash the image of live process {pid}"),
+                    source,
+                }),
+            };
+            if !self.runs_a_pohunek_binary(command.trim(), &executable, image)? {
                 continue;
             }
-            let Ok(executable) = fs::read_link(entry.path().join("exe")) else {
-                // Exited between the scan and the read.
-                continue;
-            };
             let Some(name) = BINARIES.iter().find(|name| self.path(name) == executable) else {
                 return Err(if executable.starts_with(&self.dir) {
                     LayoutError::ImageMismatch {
@@ -495,8 +549,9 @@ impl Layout {
     ///
     /// # Errors
     ///
-    /// Fails for a process named `pohunek*` that belongs to the scope and does not
-    /// execute a byte-identical binary of this layout. Fails closed on error.
+    /// Fails for a process that belongs to the scope, runs a pohunek binary (see
+    /// [`Self::runs_a_pohunek_binary`]), and does not execute a byte-identical
+    /// binary of this layout. Fails closed on error.
     #[cfg(target_os = "macos")]
     pub(crate) fn pohunek_processes(
         &self,
@@ -534,18 +589,11 @@ impl Layout {
         };
 
         for fact in processes {
-            // Skip own process and non-pohunek processes.
-            if fact.pid == own || !fact.comm.starts_with("pohunek") {
+            if fact.pid == own {
                 continue;
             }
 
-            // Read the executable; Ok(None) means process exited.
-            let Some(executable) = inspect(
-                format!("read executable of process {}", fact.pid),
-                inspector.executable(fact.pid),
-            )?
-            else {
-                // Process exited during the scan.
+            let Some(executable) = darwin_executable(inspector, &fact, below_root)? else {
                 continue;
             };
 
@@ -558,32 +606,42 @@ impl Layout {
             if !belongs {
                 continue;
             }
+            // Darwin offers no handle to the executed image, so the bytes are
+            // those the executable path holds at observation time. A path that
+            // cannot be hashed is an exit only once the process is gone.
+            let image = || match sha256_file(&executable) {
+                Ok(digest) => Ok(Some(digest)),
+                Err(source) => {
+                    if still_running(inspector, &fact)? {
+                        Err(LayoutError::Io {
+                            what: format!("hash the executable of live process {}", fact.pid),
+                            source,
+                        })
+                    } else {
+                        Ok(None)
+                    }
+                }
+            };
+            if !self.runs_a_pohunek_binary(&fact.comm, &executable, image)? {
+                continue;
+            }
 
             // Only for members: canonicalize and check the executable.
             let canonical_exe = match fs::canonicalize(&executable) {
                 Ok(path) => path,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // Process executable is no longer available. Check if the process is still running.
-                    match inspect(
-                        format!("check if process {pid} is running", pid = fact.pid),
-                        inspector.is_running(fact.identity()),
-                    ) {
-                        Ok(false) => {
-                            // Process has exited; skip it.
-                            continue;
-                        }
-                        Ok(true) => {
-                            // Process is alive but its executable path no longer resolves.
-                            return Err(LayoutError::Io {
-                                what: format!(
-                                    "the executable of live process {} no longer resolves",
-                                    fact.pid
-                                ),
-                                source: e,
-                            });
-                        }
-                        Err(err) => return Err(err),
+                    // A process that exited is skipped; a live one whose
+                    // executable path no longer resolves fails the scan.
+                    if !still_running(inspector, &fact)? {
+                        continue;
                     }
+                    return Err(LayoutError::Io {
+                        what: format!(
+                            "the executable of live process {} no longer resolves",
+                            fact.pid
+                        ),
+                        source: e,
+                    });
                 }
                 Err(source) => {
                     return Err(LayoutError::Io {
@@ -618,6 +676,74 @@ impl Layout {
 
         Ok(found)
     }
+}
+
+/// Whether the process of `fact` still runs.
+#[cfg(target_os = "macos")]
+fn still_running(
+    inspector: pohunek_platform::process::HostInspector,
+    fact: &pohunek_platform::process::ProcessFact,
+) -> Result<bool, LayoutError> {
+    use pohunek_platform::process::ProcessInspector as _;
+
+    inspect(
+        format!("check if process {} is running", fact.pid),
+        inspector.is_running(fact.identity()),
+    )
+}
+
+/// The executable of `fact`, or `None` for a process the scan skips: one that
+/// exited, or one whose executable cannot be read and that neither reports a
+/// pohunek name nor works in a directory `in_scope` accepts.
+///
+/// # Errors
+///
+/// Fails for a live process with a pohunek name or an in-scope working
+/// directory whose executable cannot be read.
+#[cfg(target_os = "macos")]
+fn darwin_executable(
+    inspector: pohunek_platform::process::HostInspector,
+    fact: &pohunek_platform::process::ProcessFact,
+    in_scope: impl Fn(&Path) -> bool,
+) -> Result<Option<PathBuf>, LayoutError> {
+    use pohunek_platform::process::ProcessInspector as _;
+
+    match inspector.executable(fact.pid) {
+        Ok(Some(executable)) => Ok(Some(executable)),
+        Err(error)
+            if fact.comm.starts_with(POHUNEK_NAME_PREFIX)
+                || inspector.cwd(fact.pid).is_ok_and(|cwd| in_scope(&cwd)) =>
+        {
+            // A process that ended after the failed read is skipped like any
+            // other exit.
+            if !still_running(inspector, fact)? {
+                return Ok(None);
+            }
+            Err(LayoutError::Io {
+                what: format!("read executable of process {}", fact.pid),
+                source: std::io::Error::other(error),
+            })
+        }
+        // `Ok(None)` is an exit during the scan; any other process whose
+        // executable cannot be read is unrelated whatever it executes.
+        Ok(None) | Err(_) => Ok(None),
+    }
+}
+
+/// Whether the process of `directory` (a `/proc/<pid>` entry) has ended: its
+/// entry is gone, or it is a zombie or dead task whose image can no longer be
+/// read although the entry remains until its parent reaps it. A `stat` that
+/// cannot be read while the entry exists proves no exit.
+#[cfg(target_os = "linux")]
+fn process_ended(directory: &Path) -> bool {
+    let Ok(stat) = fs::read_to_string(directory.join("stat")) else {
+        return !directory.exists();
+    };
+    // The state follows the parenthesised command name, which may itself hold
+    // spaces or parentheses.
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .is_some_and(|state| matches!(state, "Z" | "X" | "x"))
 }
 
 /// Whether a value of the process environment of `directory` (a `/proc/<pid>`

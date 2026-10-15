@@ -195,6 +195,15 @@ mod guards {
     /// 120 s hang guard of `pohunek_test_support::wait`.
     const CHILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
+    /// The shell copied as the impostor. It must keep executing its own image:
+    /// macOS `/bin/sh` re-executes the selected shell (`/private/var/select/sh`)
+    /// within milliseconds, after which the process no longer runs the copy.
+    #[cfg(target_os = "macos")]
+    const IMPOSTOR_SHELL: &str = "/bin/bash";
+    /// The shell copied as the impostor; Linux `/bin/sh` runs its own image.
+    #[cfg(not(target_os = "macos"))]
+    const IMPOSTOR_SHELL: &str = "/bin/sh";
+
     /// Runs `command` bounded and requires success, printing its output on
     /// failure.
     fn assert_child_succeeds(command: std::process::Command, label: &str) {
@@ -1146,7 +1155,7 @@ check = "none"
         fs::create_dir_all(&outside).expect("outside dir");
         let impostor = outside.join("pohunekd");
         pohunek_test_support::fs::copy_shell_image(
-            fs::canonicalize("/bin/sh").expect("resolve the shell"),
+            fs::canonicalize(IMPOSTOR_SHELL).expect("resolve the shell"),
             &impostor,
         )
         .expect("copy the shell as the impostor");
@@ -1171,6 +1180,48 @@ check = "none"
             .unwrap_err();
         assert!(
             matches!(error, LayoutError::OutsideLayout { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_renamed_copy_of_a_layout_binary_running_outside_the_layout_is_refused() {
+        let guarded = guarded();
+        let host = &guarded.host;
+        let scope = host.env.root().to_path_buf();
+
+        // The bytes of the layout's CLI under a name that is not a pohunek
+        // name: the scan must judge it by what it executes.
+        let outside = scope.join("elsewhere");
+        fs::create_dir_all(&outside).expect("outside dir");
+        let renamed = outside.join("watcher");
+        // The bytes carry the binary's embedded ad-hoc signature on macOS, so
+        // the copy runs as it is. They are written through a child process,
+        // so no sibling test thread's fork inherits a writable descriptor of
+        // the copy and makes its exec fail with ETXTBSY.
+        let image = fs::read(host.layout.path("pohunek")).expect("read the layout CLI");
+        pohunek_test_support::fs::write_executable(&renamed, image)
+            .expect("copy the layout CLI under another name");
+        assert_eq!(
+            sha256_file(&renamed).expect("hash the copy"),
+            host.layout.digest("pohunek"),
+            "the copy is byte-identical to the layout CLI"
+        );
+        // A watch stays connected to the daemon until it is stopped.
+        let child = host
+            .env
+            .command(&renamed)
+            .args(["notifications", "watch", "--json"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the renamed copy");
+        let child = ChildGuard::new(child);
+
+        let error = host.layout.pohunek_processes(&scope).unwrap_err();
+        assert!(
+            matches!(&error, LayoutError::OutsideLayout { pid, .. } if *pid == child.id()),
             "{error}"
         );
     }
