@@ -381,6 +381,11 @@ stray_check() {
                 *" __inner sandbox $work "*) continue ;;
                 *"$work"*) same_user="$pid $cmd"; break ;;
             esac
+            if [ -n "$inputs" ]; then
+                case $cmd in
+                    *"$inputs"*) same_user="$pid $cmd"; break ;;
+                esac
+            fi
         done <<EOF
 $snapshot
 EOF
@@ -430,7 +435,8 @@ inner_main() {
     node_dir=$6
     sock_root=$7
     host_probe=$8
-    shift 8
+    inputs=$9
+    shift 9
     case "$isolation" in
         sandbox)
             check_dir=$work/t/check
@@ -444,6 +450,31 @@ inner_main() {
         ip link set lo up || fail "cannot bring loopback up inside the namespace"
     fi
     network_check
+    if [ "$isolation" = sandbox ]; then
+        umask 022
+        # Copy every input the consumer executes into $inputs. We are $tuser here,
+        # so the copies are owned by $tuser, satisfying the product's ownership checks.
+        mkdir -p "$inputs/stage"
+        for rt in "$@"; do
+            /usr/bin/ditto "$stage/$rt" "$inputs/stage/$rt" || fail "cannot copy stage $rt to inputs"
+        done
+        stage=$inputs/stage
+        /usr/bin/ditto "$root" "$inputs/root" || fail "cannot copy root to inputs"
+        root=$inputs/root
+        /bin/cp "$consumer" "$inputs/consumer" || fail "cannot copy consumer to inputs"
+        /bin/chmod 0755 "$inputs/consumer" || fail "cannot chmod consumer in inputs"
+        consumer=$inputs/consumer
+        mkdir "$inputs/node-bin" || fail "cannot create node-bin in inputs"
+        /bin/cp "$node_dir/node" "$inputs/node-bin/node" || fail "cannot copy node to inputs"
+        /bin/chmod 0755 "$inputs/node-bin/node" || fail "cannot chmod node in inputs"
+        node_dir=$inputs/node-bin
+        # Fail closed if anything under $inputs is group- or other-writable
+        bad=$(/usr/bin/find "$inputs" \( -perm -020 -o -perm -002 \) ! -type l -print | head -n 1)
+        [ -z "$bad" ] || fail "a copied input is writable by others: $bad"
+        # Fail closed if anything under $inputs (excluding symlinks) is not owned by the current user
+        bad=$(/usr/bin/find "$inputs" ! -type l ! -user "$(id -u)" -print | head -n 1)
+        [ -z "$bad" ] || fail "a copied input is not owned by the current user: $bad"
+    fi
     for rt in "$@"; do
         stage_check "$stage/$rt"
     done
@@ -584,6 +615,11 @@ create_throwaway_user() {
         fail "throwaway user $tuser uid is not $tuid after polling"
     fi
     codex_dir=/private/tmp/codex-daemon-$tuid
+    inputs=$(/usr/bin/sudo -n -u "$tuser" /usr/bin/mktemp -d /private/tmp/pki.XXXXXX) || fail "cannot create the throwaway user's input directory"
+    case $inputs in
+        /private/tmp/pki.*) ;;
+        *) fail "inputs directory is not in /private/tmp/pki.*: $inputs" ;;
+    esac
 }
 
 if [ "${1:-}" = __inner ]; then
@@ -672,6 +708,7 @@ sock_root=
 host_probe=
 host_probe_listener_pid=
 host_probe_w_listener_pid=
+inputs=
 if [ "$uname_s" = Darwin ]; then
     sock_root=$(mktemp -d /tmp/pk.XXXX) || fail "cannot create socket root directory"
     sock_root=$(cd "$sock_root" && pwd -P)
@@ -737,6 +774,12 @@ cleanup() {
                 [ -e "/private/tmp/pohunek-$tuid" ] && { printf 'smoke-archive: /private/tmp/pohunek-%s still exists\n' "$tuid" >&2; status=1; }
                 ;;
         esac
+        case $inputs in
+            /private/tmp/pki.*) /usr/bin/sudo -n /bin/rm -rf -- "$inputs" || true ;;
+            '') ;;
+            *) printf 'smoke-archive: refusing to remove %s\n' "$inputs" >&2; status=1 ;;
+        esac
+        [ -e "$inputs" ] && { printf 'smoke-archive: inputs directory %s still exists\n' "$inputs" >&2; status=1; }
         /usr/bin/sudo -n /usr/bin/dscl . -delete "/Users/$tuser" 2>/dev/null || true
         if /usr/bin/dscl . -read "/Users/$tuser" >/dev/null 2>&1; then
             printf 'smoke-archive: throwaway user %s still exists\n' "$tuser" >&2
@@ -900,18 +943,25 @@ fi
 
 run_userns() {
     exec /usr/bin/setsid /usr/bin/env -i PATH="$root_path" /usr/bin/unshare --user --map-root-user --net --pid --fork --kill-child --mount-proc \
-        /bin/sh "$self" __inner userns "$work" "$root" "$stage" "$work/consumer" "$node_dir" "" "" $runtimes
+        /bin/sh "$self" __inner userns "$work" "$root" "$stage" "$work/consumer" "$node_dir" "" "" "" $runtimes
 }
 run_sudo() {
     exec /usr/bin/setsid /usr/bin/sudo -n /usr/bin/env -i PATH="$root_path" \
-        /usr/bin/setsid --wait /bin/sh "$self" __sudo_supervisor "$uid" "$gid" "$work/sudo-cancel" "$work" "$root" "$stage" "$work/consumer" "$node_dir" "" "" $runtimes 3>&-
+        /usr/bin/setsid --wait /bin/sh "$self" __sudo_supervisor "$uid" "$gid" "$work/sudo-cancel" "$work" "$root" "$stage" "$work/consumer" "$node_dir" "" "" "" $runtimes 3>&-
 }
 run_sandbox() {
     # Generate the sandbox profile with the canonical temp root path.
+    # The consumer's executables are copied into a throwaway-owned /private/tmp/pki.*
+    # root because the product only executes files owned by the effective user,
+    # in owner-controlled directories.
     # Refuse work paths containing " or \ which could break the profile.
     case $work in
         *'"'*) fail "temp root contains quote: $work" ;;
         *'\\'*) fail "temp root contains backslash: $work" ;;
+    esac
+    case $inputs in
+        *'"'*) fail "inputs root contains quote: $inputs" ;;
+        *'\\'*) fail "inputs root contains backslash: $inputs" ;;
     esac
     case $sock_root in
         *'"'*) fail "socket root contains quote: $sock_root" ;;
@@ -947,7 +997,7 @@ run_sandbox() {
     # stays denied. DNS (/private/var/run/mDNSResponder) stays denied.
     cd /
     [ -n "$tuser" ] || fail "no throwaway user; refusing to run the macOS smoke as the invoking user"
-    exec /usr/bin/sudo -n -u "$tuser" /usr/bin/sandbox-exec -p "$profile" /usr/bin/env -i PATH="$root_path" /bin/sh "$work/smoke-archive" __inner sandbox "$work" "$root" "$stage" "$work/consumer" "$node_dir" "$sock_root" "$host_probe" $runtimes
+    exec /usr/bin/sudo -n -u "$tuser" /usr/bin/sandbox-exec -p "$profile" /usr/bin/env -i PATH="$root_path" /bin/sh "$work/smoke-archive" __inner sandbox "$work" "$root" "$stage" "$work/consumer" "$node_dir" "$sock_root" "$host_probe" "$inputs" $runtimes
 }
 probe_userns() {
     /usr/bin/env -i PATH="$root_path" /usr/bin/unshare --user --map-root-user --net --pid --fork --kill-child --mount-proc /usr/bin/true >/dev/null 2>&1

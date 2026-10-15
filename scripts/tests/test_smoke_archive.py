@@ -861,6 +861,22 @@ for host in ("192.0.2.1", "8.8.8.8"):
         self.assert_cleaned_up()
 
     @needs_isolated_run
+    @unittest.skipUnless(sys.platform.startswith("darwin"), "ownership check is meaningful on Darwin with throwaway user")
+    def test_every_executable_the_consumer_gets_is_owned_by_the_running_user(self):
+        consumer_check = STUB_PREAMBLE + """
+me=$(id -u)
+owner() { if [ "$(uname -s)" = Darwin ]; then stat -f %u "$1"; else stat -c %u "$1"; fi; }
+for f in "$0" "$POHUNEK_CONSUMER_BIN_DIR/pohunek" "$POHUNEK_CONSUMER_BIN_DIR/pohunekd" "$POHUNEK_CONSUMER_BIN_DIR/pohunek-sessiond" "$POHUNEK_CONSUMER_STAGE_BIN/$POHUNEK_CONSUMER_RUNTIME" "$(command -v node)"; do
+  [ "$(owner "$f")" = "$me" ] || { echo "FOREIGN-OWNER $f $(owner "$f") != $me" >&2; exit 1; }
+done
+""" + STUB_REPORT
+        self.write_consumer(consumer_check)
+        result = self.smoke("--runtime", "pi")
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertNotIn("FOREIGN-OWNER", result.stderr, f"executable owned by wrong user: {result.stderr}")
+        self.assert_cleaned_up()
+
+    @needs_isolated_run
     @unittest.skipUnless(sys.platform.startswith("darwin"), "the throwaway-user preflight is macOS-only")
     def test_an_unreadable_stage_fails_the_preflight_clearly(self):
         stage_dir = self.stage / "pi"
