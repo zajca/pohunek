@@ -3375,6 +3375,12 @@ impl SessionRegistry {
             if let Err(refusal) = attest_report_caller(peer, &params) {
                 return Err(unattested(&session_id, refusal));
             }
+            // The admission may have waited for the worker to reconnect, so
+            // the report's validity is checked again before it changes the entry.
+            if !identity_claim_expiry_is_valid(params.expires_at()) {
+                debug!(session_id = %session_id.0, "native-id report expired before it was recorded; ignoring");
+                return not_recorded;
+            }
             let Some(entry) = sessions.get_mut(&session_id) else {
                 return not_recorded;
             };

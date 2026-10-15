@@ -1343,6 +1343,70 @@ async fn a_native_id_report_while_an_unpinned_sessions_worker_reconnects_is_reco
     );
 }
 
+/// Validity of a native-id report that expires while its admission waits:
+/// long enough for the admission to start waiting on a loaded runner, and
+/// well inside the admission's `worker_connect_deadline`.
+const SHORT_CLAIM_TTL: time::Duration = time::Duration::seconds(5);
+
+#[tokio::test]
+async fn a_native_id_report_that_expires_while_the_worker_reconnects_is_not_recorded() {
+    let released = ReleasedWorker::built_in(RuntimeId::CLAUDE, "alias-native-expired").await;
+    let expires_at = time::OffsetDateTime::now_utc() + SHORT_CLAIM_TTL;
+    let identity = &released.native_report;
+    let report = protocol::SessionReportNativeIdParams::new(
+        released.id.clone(),
+        identity.worker_instance_id().to_owned(),
+        RuntimeId::CLAUDE.to_owned(),
+        identity.pid(),
+        identity.pid_start_identity(),
+        identity.sequence(),
+        expires_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("format the expiry"),
+        "claude-conversation-expired".to_owned(),
+        None,
+    )
+    .expect("a valid native-id report");
+    let logs = crate::runtime::lifecycle::tests::LogCapture::default();
+    let _subscriber = logs.install();
+    let registry = released.restarted.registry.clone();
+    let recorded = tokio::spawn(async move { registry.report_as_root(report).await.recorded });
+    wait_until("the native-id report waits for the worker", || async {
+        logs.text()
+            .contains("the worker cannot report its journaled hook schema")
+            .then_some(())
+    })
+    .await;
+    wait_until("the native-id report expires", || async {
+        (time::OffsetDateTime::now_utc() > expires_at).then_some(())
+    })
+    .await;
+
+    released.reconnect().await;
+    assert!(
+        !recorded.await.expect("the report task joins"),
+        "a report that expired while it waited is not recorded"
+    );
+    // The report was admitted by the reconnected worker's schema and refused
+    // only for its expiry, not for the admission bound.
+    let logs = logs.text();
+    assert!(
+        logs.contains("native-id report expired before it was recorded")
+            && !logs.contains("the worker's hook schema was unavailable after the bound"),
+        "{logs}"
+    );
+    let info = released
+        .restarted
+        .registry
+        .inspect(&released.id)
+        .await
+        .expect("the session");
+    assert_ne!(
+        info.native_session_id.as_deref(),
+        Some("claude-conversation-expired")
+    );
+}
+
 /// Asserts that the adopted session `id` of `fixture` is observed with the
 /// generic manifest and its launch-time input framing, never through the
 /// package that serves `hermes` now.
