@@ -19879,9 +19879,11 @@ async fn wait_for_adapters(done: &std::path::Path) {
         done.exists().then_some(())
     })
     .await;
-    // Each adapter answers only after the worker or daemon handled its report,
-    // so state is settled once the script is done. A rejection test proves
-    // nothing if the adapters could not run, so the interpreter must exist.
+    // An adapter gives up on an answer after its 0.5 s socket timeout, and the
+    // daemon still finishes a report it received. On a loaded host the script
+    // can therefore finish before the state it reported is recorded, so a
+    // positive check waits for that state. A rejection test proves nothing if
+    // the adapters could not run, so the interpreter must exist.
     let python = fs::read_to_string(format!("{}.python", done.display())).unwrap_or_default();
     assert!(
         !python.trim().is_empty(),
@@ -19894,12 +19896,21 @@ async fn wait_for_adapters(done: &std::path::Path) {
 ///
 /// The daemon's own `active_agent` projection is not observed: procwatch
 /// releases a claim that no foreground process backs within a tick, so it is
-/// transient. The worker journal is written before the adapter is answered,
-/// and applying the snapshot returns once the daemon has committed it.
+/// transient. The worker journals a report before it answers, but an adapter
+/// that timed out has moved on, so the journal is awaited. Applying the
+/// snapshot returns once the daemon has committed it.
 #[cfg(unix)]
 async fn assert_worker_state_imported(registry: &SessionRegistry, id: &SessionId) {
     let (worker, _identity) = live_worker_and_identity(registry, id).await;
-    let snapshot = worker.inspect().await.expect("inspect worker");
+    let snapshot = wait_until("the worker to journal the adapters' reports", || async {
+        let snapshot = worker.inspect().await.expect("inspect worker");
+        let claude = snapshot
+            .active_identity
+            .as_ref()
+            .is_some_and(|identity| identity.provider == "claude");
+        (claude && !snapshot.subagents.is_empty()).then_some(snapshot)
+    })
+    .await;
     // The Claude state adapter reports last through the worker socket, so a
     // Claude adapter that does not report as `claude` leaves another identity.
     assert_eq!(
@@ -20061,6 +20072,19 @@ async fn the_public_socket_alone_accepts_adapter_reports_of_a_runtime_with_a_hoo
         crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
     );
     let rig = HookRig::start(&dir, Some(host), hermetic_shell()).await;
+    // Every report is parked until the adapters have given up on their
+    // answers, the order a loaded host produces: the daemon still records a
+    // report whose client stopped waiting.
+    let hold = crate::runtime::lifecycle::tests::StartGate {
+        session_id: None,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    *rig.registry
+        .inner
+        .report_hold
+        .lock()
+        .expect("report hold is never poisoned") = Some(hold.clone());
     let created = rig
         .registry
         .create(SessionNewParams {
@@ -20071,18 +20095,37 @@ async fn the_public_socket_alone_accepts_adapter_reports_of_a_runtime_with_a_hoo
         .await
         .expect("create session");
     wait_for_adapters(&done).await;
+    guard("a report to reach the hold", hold.entered.notified()).await;
+    let recorded_source = || async {
+        rig.registry
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(&created.id)
+            .and_then(|entry| entry.last_agent_report.as_ref().map(|r| r.source.clone()))
+    };
+    assert_eq!(
+        recorded_source().await,
+        None,
+        "the adapters finished while their reports were parked"
+    );
 
-    let source = rig
-        .registry
+    // Disarmed first: a report that reaches the hold afterwards passes it, and
+    // every parked one is released.
+    *rig.registry
         .inner
-        .sessions
+        .report_hold
         .lock()
-        .await
-        .get(&created.id)
-        .and_then(|entry| entry.last_agent_report.as_ref().map(|r| r.source.clone()));
+        .expect("report hold is never poisoned") = None;
+    hold.release.notify_waiters();
+    let source = wait_until("the public socket to record an adapter report", || async {
+        recorded_source().await
+    })
+    .await;
     assert!(
-        source.is_some_and(|source| source.starts_with("pohunek:")),
-        "the public socket recorded an adapter report"
+        source.starts_with("pohunek:"),
+        "the public socket recorded an adapter report: {source}"
     );
     let (worker, _identity) = live_worker_and_identity(&rig.registry, &created.id).await;
     let snapshot = worker.inspect().await.expect("inspect worker");
