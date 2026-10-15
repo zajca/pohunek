@@ -481,6 +481,21 @@ impl NotificationService {
         self.inner.store.path()
     }
 
+    /// The source ids of `provider`'s stored records that start with
+    /// `prefix`, with the prefix removed, each with its record's creation
+    /// timestamp.
+    #[must_use]
+    pub(crate) fn source_id_suffixes(&self, provider: &str, prefix: &str) -> Vec<(String, String)> {
+        self.inner.store.source_id_suffixes(provider, prefix)
+    }
+
+    /// Whether an unread `agent_blocked` or `approval_required` record carries
+    /// `dedupe_key`.
+    #[must_use]
+    pub(crate) fn has_unread_attention(&self, dedupe_key: &str) -> bool {
+        self.inner.store.has_unread_attention(dedupe_key)
+    }
+
     /// Subscribe to notification lifecycle events.
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {

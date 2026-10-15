@@ -2,15 +2,16 @@
 
 // Rust guideline compliant 2026-10-12
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use protocol::{
     event, AgentActivity, Event, NotificationCreateParams, NotificationKind, NotificationSeverity,
-    NotificationSource, RuntimeRef, SessionId, SessionInfo, SessionState,
+    NotificationSource, RuntimeGeneration, RuntimeRef, SessionId, SessionInfo, SessionState,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use time::OffsetDateTime;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -19,8 +20,8 @@ use tracing::warn;
 use crate::session::SessionRegistry;
 
 use super::{
-    is_debounced_create, policy_enables_kind, AttentionCoordinator, DeferredNotification,
-    NotificationService, ATTENTION_DEDUPE_KEY_PREFIX, TURN_DEDUPE_KEY_PREFIX,
+    is_debounced_create, parse_timestamp, policy_enables_kind, AttentionCoordinator,
+    DeferredNotification, NotificationService, ATTENTION_DEDUPE_KEY_PREFIX, TURN_DEDUPE_KEY_PREFIX,
 };
 
 /// Provider namespace used for daemon-derived notification records.
@@ -184,22 +185,113 @@ fn resolve_session_notifications(attention: &AttentionCoordinator, session_id: &
     attention.resolve(turn_dedupe_key(session_id));
 }
 
+/// What tells apart the projected transitions of one session and kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransitionKey {
+    /// Increments each time the session enters a projected state for the
+    /// kind. It continues from the highest epoch the store holds for the
+    /// session and kind, so a restarted daemon never reuses the key of a
+    /// record from before the restart, which the store would merge the new
+    /// transition into.
+    Epoch(u64),
+    /// The runtime generation a terminal state ends. A generation ends once,
+    /// so a terminal state the daemon replays after a restart keeps the key
+    /// of the record it already projected.
+    Generation(RuntimeGeneration),
+}
+
+/// Marks a [`TransitionKey::Generation`] in a source id.
+const GENERATION_KEY_PREFIX: char = 'g';
+
 /// Return a deterministic projector source id.
 ///
-/// Scheme: `projector:<session_id>:<kind>:<transition_epoch>`. The transition
-/// epoch is local to one daemon projector instance and increments only when the
-/// session enters a projected state for that notification kind.
+/// Scheme: `projector:<session_id>:<kind>:<epoch>` or
+/// `projector:<session_id>:<kind>:g<runtime_generation>`.
 #[must_use]
 fn projector_source_id(
     session_id: &SessionId,
     kind: NotificationKind,
-    transition_epoch: u64,
+    transition: TransitionKey,
 ) -> String {
-    format!(
-        "{PROJECTOR_SOURCE_ID_PREFIX}:{}:{}:{transition_epoch}",
-        session_id.0,
-        kind.as_str()
+    let prefix = projector_source_id_prefix(session_id, kind);
+    match transition {
+        TransitionKey::Epoch(epoch) => format!("{prefix}{epoch}"),
+        TransitionKey::Generation(generation) => {
+            format!("{prefix}{GENERATION_KEY_PREFIX}{generation}")
+        }
+    }
+}
+
+/// The transition key a stored projector source id suffix names.
+fn parse_transition_key(key: &str) -> Option<TransitionKey> {
+    match key.strip_prefix(GENERATION_KEY_PREFIX) {
+        Some(generation) => RuntimeGeneration::parse(generation)
+            .ok()
+            .map(TransitionKey::Generation),
+        None => key.parse().ok().map(TransitionKey::Epoch),
+    }
+}
+
+/// The part of a projector source id before its transition epoch.
+fn projector_source_id_prefix(session_id: &SessionId, kind: NotificationKind) -> String {
+    format!("{}{}:", projector_session_prefix(session_id), kind.as_str())
+}
+
+/// The part of a projector source id before its notification kind.
+fn projector_session_prefix(session_id: &SessionId) -> String {
+    format!("{PROJECTOR_SOURCE_ID_PREFIX}:{}:", session_id.0)
+}
+
+/// The notification kind a projector source id names, if the projector
+/// derives that kind.
+fn projected_kind(name: &str) -> Option<NotificationKind> {
+    [
+        NotificationKind::AgentBlocked,
+        NotificationKind::ApprovalRequired,
+        NotificationKind::TurnCompleted,
+        NotificationKind::SessionFinished,
+        NotificationKind::Error,
+    ]
+    .into_iter()
+    .find(|kind| kind.as_str() == name)
+}
+
+/// Whether the projector derives `kind` from a session's terminal state.
+fn is_terminal_kind(kind: NotificationKind) -> bool {
+    matches!(
+        kind,
+        NotificationKind::Error | NotificationKind::SessionFinished
     )
+}
+
+/// The session an event the projector derives notifications from names, with
+/// the agent activity the projector reads from it.
+fn event_subject(event: &Event) -> Option<(SessionId, Option<AgentActivity>)> {
+    match event.event() {
+        event::AGENT_STATE => parse_projector_payload::<AgentStatePayload>(event)
+            .map(|payload| (payload.session_id, Some(payload.activity))),
+        event::SESSION_UPDATED => parse_projector_payload::<SessionPayload>(event)
+            .map(|payload| (payload.session.id, None)),
+        _ => None,
+    }
+}
+
+/// Whether a stored terminal record keyed by transition epoch reports the
+/// runtime generation `session` ends. Such a record names no generation, so it
+/// counts only when it was created after the generation started. A generation
+/// whose start is unknown, such as one a resume prepared before its worker
+/// connected, is not covered: its terminal state may be newer than the record.
+/// A session without runtime information keys its terminal records by epoch
+/// and is never bridged.
+fn epoch_keyed_record_reports_runtime(created_at: OffsetDateTime, session: &SessionInfo) -> bool {
+    let Some(runtime) = session.runtime.as_ref() else {
+        return false;
+    };
+    runtime
+        .started_at
+        .as_deref()
+        .and_then(|started_at| parse_timestamp(started_at).ok())
+        .is_some_and(|started_at| created_at >= started_at)
 }
 
 #[derive(Debug, Default)]
@@ -207,6 +299,18 @@ struct ProjectorState {
     activity_by_session: HashMap<SessionId, AgentActivity>,
     lifecycle_by_session: HashMap<SessionId, SessionState>,
     transition_epochs: HashMap<(SessionId, NotificationKind), u64>,
+    /// Terminal states the store or this process holds a record key for.
+    projected_generations: HashSet<(SessionId, NotificationKind, RuntimeGeneration)>,
+    /// Sessions whose transition epochs continue from the store's records.
+    seeded_sessions: HashSet<SessionId>,
+    /// Seeded sessions with an unread attention record and no blocked,
+    /// working or terminal observation in this process yet. Their first
+    /// blocked observation replays the condition that record surfaces.
+    blocked_replay_candidates: HashSet<SessionId>,
+    /// The latest creation time of each terminal kind's stored records that
+    /// are keyed by transition epoch, by session, until the session's first
+    /// lifecycle observation in this process.
+    epoch_keyed_terminal_records: HashMap<SessionId, HashMap<NotificationKind, OffsetDateTime>>,
 }
 
 impl ProjectorState {
@@ -216,6 +320,16 @@ impl ProjectorState {
         attention: &AttentionCoordinator,
         event: &Event,
     ) {
+        if let Some((session_id, activity)) = event_subject(event) {
+            if !self
+                .seed_transition_epochs(notifications, &session_id)
+                .await
+            {
+                return;
+            }
+            self.confirm_blocked_replay(notifications, &session_id, activity)
+                .await;
+        }
         for pending in self.pending_event(notifications, attention, event) {
             create_pending_notification_blocking(notifications.clone(), attention, pending).await;
         }
@@ -227,6 +341,14 @@ impl ProjectorState {
         attention: &AttentionCoordinator,
         session: &SessionInfo,
     ) {
+        if !self
+            .seed_transition_epochs(notifications, &session.id)
+            .await
+        {
+            return;
+        }
+        self.confirm_blocked_replay(notifications, &session.id, session.activity)
+            .await;
         for pending in self.pending_session_snapshot(notifications, attention, session) {
             create_pending_notification_blocking(notifications.clone(), attention, pending).await;
         }
@@ -306,10 +428,18 @@ impl ProjectorState {
         // terminal lifecycle paths below resolve stale attention separately.
         // Do not gate on a previous blocked observation because provider hooks
         // can create attention without the detector seeing that edge first.
-        if activity == AgentActivity::Working && previous != Some(AgentActivity::Working) {
-            resolve_session_notifications(attention, session_id);
+        if activity == AgentActivity::Working {
+            self.blocked_replay_candidates.remove(session_id);
+            if previous != Some(AgentActivity::Working) {
+                resolve_session_notifications(attention, session_id);
+            }
         }
         if activity != AgentActivity::Blocked || previous == Some(AgentActivity::Blocked) {
+            return None;
+        }
+        // A daemon process replays the blocked state of a session that was
+        // blocked before it started; an unread record already surfaces it.
+        if self.blocked_replay_candidates.remove(session_id) {
             return None;
         }
         self.prepare_derived(
@@ -325,6 +455,7 @@ impl ProjectorState {
                 agent_kind: None,
                 project_id: None,
                 dedupe_key: Some(attention_dedupe_key(session_id)),
+                runtime_generation: None,
             },
         )
     }
@@ -338,15 +469,33 @@ impl ProjectorState {
         let previous = self
             .lifecycle_by_session
             .insert(session.id.clone(), session.state);
+        let epoch_keyed_records = self
+            .epoch_keyed_terminal_records
+            .remove(&session.id)
+            .filter(|_| previous.is_none())
+            .unwrap_or_default();
+        let reported_before = |kind| {
+            epoch_keyed_records
+                .get(&kind)
+                .is_some_and(|created_at| epoch_keyed_record_reports_runtime(*created_at, session))
+        };
         match session.state {
             SessionState::Failed if previous != Some(SessionState::Failed) => {
                 resolve_session_notifications(attention, &session.id);
                 self.activity_by_session.remove(&session.id);
+                self.blocked_replay_candidates.remove(&session.id);
+                if reported_before(NotificationKind::Error) {
+                    return None;
+                }
                 self.pending_failed_notification(notifications, session)
             }
             SessionState::Done if previous != Some(SessionState::Done) => {
                 resolve_session_notifications(attention, &session.id);
                 self.activity_by_session.remove(&session.id);
+                self.blocked_replay_candidates.remove(&session.id);
+                if reported_before(NotificationKind::SessionFinished) {
+                    return None;
+                }
                 self.pending_finished_notification(notifications, session)
             }
             SessionState::Stopped => {
@@ -365,6 +514,7 @@ impl ProjectorState {
         self.lifecycle_by_session
             .insert(session.id.clone(), SessionState::Stopped);
         self.activity_by_session.remove(&session.id);
+        self.blocked_replay_candidates.remove(&session.id);
     }
 
     fn pending_failed_notification(
@@ -399,6 +549,7 @@ impl ProjectorState {
                 agent_kind: Some(session_agent_kind(session)),
                 project_id: session.project_id.clone(),
                 dedupe_key: None,
+                runtime_generation: session_runtime_generation(session),
             },
         )
     }
@@ -421,6 +572,7 @@ impl ProjectorState {
                 agent_kind: Some(session_agent_kind(session)),
                 project_id: session.project_id.clone(),
                 dedupe_key: None,
+                runtime_generation: session_runtime_generation(session),
             },
         )
     }
@@ -437,8 +589,27 @@ impl ProjectorState {
         {
             return None;
         }
-        let transition_epoch = self.next_transition_epoch(&derived.session_id, derived.kind);
-        let source_id = projector_source_id(&derived.session_id, derived.kind, transition_epoch);
+        let transition = if let Some(generation) = derived.runtime_generation {
+            if !self.projected_generations.insert((
+                derived.session_id.clone(),
+                derived.kind,
+                generation,
+            )) {
+                return None;
+            }
+            TransitionKey::Generation(generation)
+        } else {
+            let Some(epoch) = self.next_transition_epoch(&derived.session_id, derived.kind) else {
+                warn!(
+                    session_id = %derived.session_id.0,
+                    kind = derived.kind.as_str(),
+                    "projector transition epoch is exhausted; the notification is not created"
+                );
+                return None;
+            };
+            TransitionKey::Epoch(epoch)
+        };
+        let source_id = projector_source_id(&derived.session_id, derived.kind, transition);
         let params = NotificationCreateParams {
             source: NotificationSource {
                 provider: PROJECTOR_PROVIDER.to_owned(),
@@ -463,13 +634,133 @@ impl ProjectorState {
         })
     }
 
-    fn next_transition_epoch(&mut self, session_id: &SessionId, kind: NotificationKind) -> u64 {
+    /// Seeds the transition state of `session_id` from the store's records,
+    /// once per session and daemon process:
+    /// - the epochs continue from the highest ones the store holds;
+    /// - a terminal state with a generation-keyed record is not projected
+    ///   again, and an epoch-keyed terminal record can report the generation
+    ///   the session's first lifecycle observation ends;
+    /// - an unread attention record makes the session a blocked replay
+    ///   candidate.
+    ///
+    /// The store is read off the async runtime.
+    ///
+    /// Returns whether the session is seeded. An unseeded session's event is
+    /// not projected, because its transition could reuse a stored key; the
+    /// next event of the session tries again.
+    async fn seed_transition_epochs(
+        &mut self,
+        notifications: &NotificationService,
+        session_id: &SessionId,
+    ) -> bool {
+        if self.seeded_sessions.contains(session_id) {
+            return true;
+        }
+        let service = notifications.clone();
+        let prefix = projector_session_prefix(session_id);
+        let attention_key = attention_dedupe_key(session_id);
+        let (suffixes, unread_attention) = match run_projector_blocking(move || {
+            (
+                service.source_id_suffixes(PROJECTOR_PROVIDER, &prefix),
+                service.has_unread_attention(&attention_key),
+            )
+        })
+        .await
+        {
+            Ok(seed) => seed,
+            Err(error) => {
+                warn!(
+                    session_id = %session_id.0,
+                    %error,
+                    "projector epoch seeding task failed; the session's event is not projected"
+                );
+                return false;
+            }
+        };
+        for (suffix, created_at) in suffixes {
+            let Some((kind, key)) = suffix.rsplit_once(':') else {
+                continue;
+            };
+            let (Some(kind), Some(key)) = (projected_kind(kind), parse_transition_key(key)) else {
+                continue;
+            };
+            match key {
+                TransitionKey::Epoch(epoch) => {
+                    let current = self
+                        .transition_epochs
+                        .entry((session_id.clone(), kind))
+                        .or_insert(0);
+                    *current = (*current).max(epoch);
+                    if let (true, Ok(created_at)) =
+                        (is_terminal_kind(kind), parse_timestamp(&created_at))
+                    {
+                        let latest = self
+                            .epoch_keyed_terminal_records
+                            .entry(session_id.clone())
+                            .or_default()
+                            .entry(kind)
+                            .or_insert(created_at);
+                        *latest = (*latest).max(created_at);
+                    }
+                }
+                TransitionKey::Generation(generation) => {
+                    self.projected_generations
+                        .insert((session_id.clone(), kind, generation));
+                }
+            }
+        }
+        if unread_attention {
+            self.blocked_replay_candidates.insert(session_id.clone());
+        }
+        self.seeded_sessions.insert(session_id.clone());
+        true
+    }
+
+    /// Keeps a blocked replay candidate only while the store still holds an
+    /// unread attention record for it, checked when its blocked state arrives.
+    /// If the store cannot be read, the session stays a candidate and its
+    /// replayed blocked state is not projected.
+    async fn confirm_blocked_replay(
+        &mut self,
+        notifications: &NotificationService,
+        session_id: &SessionId,
+        activity: Option<AgentActivity>,
+    ) {
+        if activity != Some(AgentActivity::Blocked)
+            || !self.blocked_replay_candidates.contains(session_id)
+        {
+            return;
+        }
+        let service = notifications.clone();
+        let attention_key = attention_dedupe_key(session_id);
+        match run_projector_blocking(move || service.has_unread_attention(&attention_key)).await {
+            Ok(true) => {}
+            Ok(false) => {
+                self.blocked_replay_candidates.remove(session_id);
+            }
+            Err(error) => {
+                warn!(
+                    session_id = %session_id.0,
+                    %error,
+                    "projector attention check failed; the session's replayed blocked state is not projected"
+                );
+            }
+        }
+    }
+
+    /// The next transition epoch of `session_id` and `kind`, or `None` once
+    /// the counter is exhausted.
+    fn next_transition_epoch(
+        &mut self,
+        session_id: &SessionId,
+        kind: NotificationKind,
+    ) -> Option<u64> {
         let epoch = self
             .transition_epochs
             .entry((session_id.clone(), kind))
             .or_insert(0);
-        *epoch += 1;
-        *epoch
+        *epoch = epoch.checked_add(1)?;
+        Some(*epoch)
     }
 }
 
@@ -565,6 +856,9 @@ struct DerivedNotification {
     agent_kind: Option<RuntimeRef>,
     project_id: Option<String>,
     dedupe_key: Option<String>,
+    /// The runtime generation a terminal state ends, when the session has a
+    /// runtime; it keys the record instead of the transition epoch.
+    runtime_generation: Option<RuntimeGeneration>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -595,6 +889,13 @@ where
     }
 }
 
+fn session_runtime_generation(session: &SessionInfo) -> Option<RuntimeGeneration> {
+    session
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.runtime_generation)
+}
+
 fn session_agent_kind(session: &SessionInfo) -> RuntimeRef {
     session
         .active_agent_base
@@ -607,15 +908,17 @@ mod tests {
     use std::collections::BTreeMap;
 
     use protocol::{
-        event, AgentActivity, Event, NotificationCreateParams, NotificationKind,
-        NotificationKindPolicy, NotificationListParams, NotificationSeverity, NotificationSource,
-        NotificationStatus, RuntimeRef, SessionId, SessionInfo, SessionState, StateSource,
+        event, AgentActivity, Event, NotificationCreateParams, NotificationDeleteParams,
+        NotificationKind, NotificationKindPolicy, NotificationListParams, NotificationSeverity,
+        NotificationSource, NotificationStatus, NotificationUpdateParams, RuntimeGeneration,
+        RuntimeRef, RuntimeState, SessionId, SessionInfo, SessionRuntime, SessionState,
+        StateSource,
     };
     use serde_json::json;
 
     use super::{
         attention_dedupe_key, projector_source_id, run_projector_blocking, AttentionCoordinator,
-        ProjectorState,
+        ProjectorState, TransitionKey,
     };
     use crate::notifications::{
         default_policy, NotificationService, DEFAULT_ATTENTION_DEBOUNCE_SECS,
@@ -1161,8 +1464,548 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(source_ids, vec!["projector:s-1:agent_blocked:1".to_owned()]);
         assert_eq!(
-            projector_source_id(&SessionId("s-2".to_owned()), NotificationKind::Error, 3),
+            projector_source_id(
+                &SessionId("s-2".to_owned()),
+                NotificationKind::Error,
+                TransitionKey::Epoch(3)
+            ),
             "projector:s-2:error:3"
+        );
+    }
+
+    /// One blocked transition of session `s-1`, flushed past the debounce.
+    async fn block_and_resume(
+        projector: &mut ProjectorState,
+        service: &NotificationService,
+        attention: &AttentionCoordinator,
+    ) {
+        projector
+            .handle_event_blocking(
+                service,
+                attention,
+                &agent_state_event("s-1", AgentActivity::Blocked),
+            )
+            .await;
+        settle().await;
+        advance_past_debounce().await;
+        settle().await;
+        projector
+            .handle_event_blocking(
+                service,
+                attention,
+                &agent_state_event("s-1", AgentActivity::Working),
+            )
+            .await;
+        settle().await;
+    }
+
+    fn agent_blocked_records(service: &NotificationService) -> usize {
+        list(service)
+            .iter()
+            .filter(|record| record.kind == NotificationKind::AgentBlocked)
+            .count()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_transition_after_a_daemon_restart_surfaces_beside_the_records_before_it() {
+        let dir = temp_data_dir("restart");
+        let before_restart = {
+            let service = NotificationService::open(&dir).expect("open notification service");
+            let (attention, _task) = spawn_coordinator(&service);
+            let mut projector = ProjectorState::default();
+            for _ in 0..2 {
+                block_and_resume(&mut projector, &service, &attention).await;
+            }
+            agent_blocked_records(&service)
+        };
+        assert_eq!(before_restart, 2);
+
+        // A restarted daemon opens the same store with a fresh projector.
+        let service = NotificationService::open(&dir).expect("reopen notification service");
+        let (attention, _task) = spawn_coordinator(&service);
+        let mut projector = ProjectorState::default();
+        block_and_resume(&mut projector, &service, &attention).await;
+        assert_eq!(
+            agent_blocked_records(&service),
+            3,
+            "the first transition after the restart is a new record: {:#?}",
+            list(&service)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_projector_key_at_the_epoch_limit_drops_the_next_transition_without_panicking()
+    {
+        let service = service("epoch-limit");
+        service
+            .create(NotificationCreateParams {
+                source: NotificationSource {
+                    provider: super::PROJECTOR_PROVIDER.to_owned(),
+                    provider_event: event::SESSION_UPDATED.to_owned(),
+                    host_local_source_id: "stored".to_owned(),
+                },
+                kind: NotificationKind::Error,
+                severity: NotificationSeverity::Error,
+                title: "Session failed".to_owned(),
+                body: "Session s-1 failed.".to_owned(),
+                metadata: BTreeMap::new(),
+                session_id: Some(SessionId("s-1".to_owned())),
+                agent_kind: None,
+                source_id: Some(projector_source_id(
+                    &SessionId("s-1".to_owned()),
+                    NotificationKind::Error,
+                    TransitionKey::Epoch(u64::MAX),
+                )),
+                dedupe_key: None,
+                project_id: None,
+            })
+            .expect("store a record at the epoch limit");
+        let attention = AttentionCoordinator::disconnected();
+        let mut projector = ProjectorState::default();
+
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &session_event(
+                    event::SESSION_UPDATED,
+                    &session_info("s-1", SessionState::Failed, Some(1)),
+                ),
+            )
+            .await;
+
+        assert_eq!(
+            list(&service).len(),
+            1,
+            "an exhausted epoch creates nothing rather than reuse a key"
+        );
+    }
+
+    /// `session_info` of a session whose worker runtime is in `generation`.
+    fn session_in_generation(
+        session_id: &str,
+        state: SessionState,
+        exit_code: Option<i32>,
+        generation: u64,
+    ) -> SessionInfo {
+        session_started_in_generation(session_id, state, exit_code, generation, None)
+    }
+
+    /// `session_in_generation` whose generation started at `started_at`.
+    fn session_started_in_generation(
+        session_id: &str,
+        state: SessionState,
+        exit_code: Option<i32>,
+        generation: u64,
+        started_at: Option<&str>,
+    ) -> SessionInfo {
+        SessionInfo {
+            runtime: Some(SessionRuntime {
+                state: RuntimeState::Terminal,
+                runtime_generation: RuntimeGeneration::new(generation),
+                worker_id: None,
+                worker_instance_id: None,
+                started_at: started_at.map(str::to_owned),
+                last_connected_at: None,
+                loss_reason: None,
+            }),
+            ..session_info(session_id, state, exit_code)
+        }
+    }
+
+    async fn project_session_update(
+        projector: &mut ProjectorState,
+        service: &NotificationService,
+        session: &SessionInfo,
+    ) {
+        projector
+            .handle_event_blocking(
+                service,
+                &AttentionCoordinator::disconnected(),
+                &session_event(event::SESSION_UPDATED, session),
+            )
+            .await;
+    }
+
+    fn records_of(service: &NotificationService, kind: NotificationKind) -> usize {
+        list(service)
+            .iter()
+            .filter(|record| record.kind == kind)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_terminal_state_replayed_after_a_restart_is_not_reported_again() {
+        let dir = temp_data_dir("terminal-replay");
+        let failed = session_in_generation("s-1", SessionState::Failed, Some(1), 1);
+        let done = session_in_generation("s-2", SessionState::Done, Some(0), 1);
+        let service = NotificationService::open(&dir).expect("open notification service");
+        enable_session_finished(&service);
+        let mut projector = ProjectorState::default();
+        project_session_update(&mut projector, &service, &failed).await;
+        project_session_update(&mut projector, &service, &done).await;
+        drop(service);
+
+        // A restarted daemon reconciles the sessions and publishes their
+        // terminal states again.
+        let service = NotificationService::open(&dir).expect("reopen notification service");
+        let mut projector = ProjectorState::default();
+        project_session_update(&mut projector, &service, &failed).await;
+        project_session_update(&mut projector, &service, &done).await;
+        assert_eq!(
+            (
+                records_of(&service, NotificationKind::Error),
+                records_of(&service, NotificationKind::SessionFinished)
+            ),
+            (1, 1),
+            "a replayed terminal state keeps its record: {:#?}",
+            list(&service)
+        );
+
+        // The session is relaunched into its next runtime generation and fails.
+        project_session_update(
+            &mut projector,
+            &service,
+            &session_in_generation("s-1", SessionState::Running, None, 2),
+        )
+        .await;
+        project_session_update(
+            &mut projector,
+            &service,
+            &session_in_generation("s-1", SessionState::Failed, Some(1), 2),
+        )
+        .await;
+        assert_eq!(records_of(&service, NotificationKind::Error), 2);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_record_the_owner_deleted_stays_deleted_after_a_restart() {
+        let dir = temp_data_dir("terminal-deleted");
+        let failed = session_in_generation("s-1", SessionState::Failed, Some(1), 1);
+        let service = NotificationService::open(&dir).expect("open notification service");
+        let mut projector = ProjectorState::default();
+        project_session_update(&mut projector, &service, &failed).await;
+        let record = list(&service).pop().expect("the failure is reported");
+        service
+            .delete(NotificationDeleteParams { id: record.id })
+            .expect("delete the failure record");
+        drop(service);
+
+        let service = NotificationService::open(&dir).expect("reopen notification service");
+        let mut projector = ProjectorState::default();
+        project_session_update(&mut projector, &service, &failed).await;
+        assert!(
+            list(&service).is_empty(),
+            "a replayed terminal state does not bring back a deleted record: {:#?}",
+            list(&service)
+        );
+    }
+
+    /// Stores the projector's `agent_blocked` record of session `s-1` from a
+    /// block reported long before the restart, outside the attention dedupe
+    /// window.
+    fn store_earlier_blocked_record(service: &NotificationService) -> protocol::NotificationId {
+        let session_id = SessionId("s-1".to_owned());
+        let source_id = projector_source_id(
+            &session_id,
+            NotificationKind::AgentBlocked,
+            TransitionKey::Epoch(1),
+        );
+        service
+            .create_at(
+                NotificationCreateParams {
+                    source: NotificationSource {
+                        provider: super::PROJECTOR_PROVIDER.to_owned(),
+                        provider_event: event::AGENT_STATE.to_owned(),
+                        host_local_source_id: source_id.clone(),
+                    },
+                    kind: NotificationKind::AgentBlocked,
+                    severity: NotificationSeverity::ActionRequired,
+                    title: "Agent needs attention".to_owned(),
+                    body: "Session s-1 is waiting for owner attention.".to_owned(),
+                    metadata: BTreeMap::new(),
+                    session_id: Some(session_id.clone()),
+                    agent_kind: None,
+                    source_id: Some(source_id),
+                    dedupe_key: Some(attention_dedupe_key(&session_id)),
+                    project_id: None,
+                },
+                "2026-07-03T10:00:00Z",
+            )
+            .expect("store the earlier blocked record")
+            .record
+            .id
+    }
+
+    /// The blocked state of session `s-1` a restarted daemon publishes,
+    /// flushed past the debounce.
+    async fn replay_blocked_after_restart(service: &NotificationService) {
+        let (attention, _task) = spawn_coordinator(service);
+        let mut projector = ProjectorState::default();
+        projector
+            .handle_event_blocking(
+                service,
+                &attention,
+                &agent_state_event("s-1", AgentActivity::Blocked),
+            )
+            .await;
+        settle().await;
+        advance_past_debounce().await;
+        settle().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_blocked_session_replayed_after_a_restart_keeps_its_unread_record() {
+        let dir = temp_data_dir("blocked-replay-unread");
+        store_earlier_blocked_record(
+            &NotificationService::open(&dir).expect("open notification service"),
+        );
+
+        let service = NotificationService::open(&dir).expect("reopen notification service");
+        replay_blocked_after_restart(&service).await;
+        assert_eq!(
+            agent_blocked_records(&service),
+            1,
+            "the unread record already surfaces the blocked state: {:#?}",
+            list(&service)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_blocked_session_whose_record_was_acknowledged_is_raised_again_after_a_restart() {
+        let dir = temp_data_dir("blocked-replay-acknowledged");
+        let service = NotificationService::open(&dir).expect("open notification service");
+        let id = store_earlier_blocked_record(&service);
+        service
+            .update(NotificationUpdateParams {
+                id,
+                status: NotificationStatus::Acknowledged,
+            })
+            .expect("acknowledge the blocked record");
+        drop(service);
+
+        let service = NotificationService::open(&dir).expect("reopen notification service");
+        replay_blocked_after_restart(&service).await;
+        assert_eq!(
+            agent_blocked_records(&service),
+            2,
+            "a session still blocked after its record was acknowledged is raised again: {:#?}",
+            list(&service)
+        );
+    }
+
+    /// Stores the `error` record of session `s-1` that a daemon keying
+    /// terminal records by transition epoch created at `created_at`.
+    fn store_epoch_keyed_error_record(service: &NotificationService, created_at: &str) {
+        let session_id = SessionId("s-1".to_owned());
+        let source_id = projector_source_id(
+            &session_id,
+            NotificationKind::Error,
+            TransitionKey::Epoch(1),
+        );
+        service
+            .create_at(
+                NotificationCreateParams {
+                    source: NotificationSource {
+                        provider: super::PROJECTOR_PROVIDER.to_owned(),
+                        provider_event: event::SESSION_UPDATED.to_owned(),
+                        host_local_source_id: source_id.clone(),
+                    },
+                    kind: NotificationKind::Error,
+                    severity: NotificationSeverity::Error,
+                    title: "Session failed".to_owned(),
+                    body: "Session s-1 failed with exit code 1.".to_owned(),
+                    metadata: BTreeMap::new(),
+                    session_id: Some(session_id),
+                    agent_kind: None,
+                    source_id: Some(source_id),
+                    dedupe_key: None,
+                    project_id: None,
+                },
+                created_at,
+            )
+            .expect("store the epoch-keyed error record");
+    }
+
+    #[tokio::test]
+    async fn a_failure_an_epoch_keyed_record_reports_is_not_reported_again_after_an_upgrade() {
+        let dir = temp_data_dir("epoch-keyed-same-generation");
+        store_epoch_keyed_error_record(
+            &NotificationService::open(&dir).expect("open notification service"),
+            "2026-07-03T10:05:00Z",
+        );
+
+        let service = NotificationService::open(&dir).expect("reopen notification service");
+        let mut projector = ProjectorState::default();
+        project_session_update(
+            &mut projector,
+            &service,
+            &session_started_in_generation(
+                "s-1",
+                SessionState::Failed,
+                Some(1),
+                1,
+                Some("2026-07-03T10:00:00Z"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            records_of(&service, NotificationKind::Error),
+            1,
+            "the record from before the upgrade reports this failure: {:#?}",
+            list(&service)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_in_a_generation_started_after_an_epoch_keyed_record_is_reported() {
+        let dir = temp_data_dir("epoch-keyed-next-generation");
+        store_epoch_keyed_error_record(
+            &NotificationService::open(&dir).expect("open notification service"),
+            "2026-07-03T10:05:00Z",
+        );
+
+        // The session was relaunched and failed again while the daemon was
+        // down; its worker outlives the daemon.
+        let service = NotificationService::open(&dir).expect("reopen notification service");
+        let mut projector = ProjectorState::default();
+        project_session_update(
+            &mut projector,
+            &service,
+            &session_started_in_generation(
+                "s-1",
+                SessionState::Failed,
+                Some(1),
+                2,
+                Some("2026-07-03T11:00:00Z"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            records_of(&service, NotificationKind::Error),
+            2,
+            "the earlier record reports an earlier generation: {:#?}",
+            list(&service)
+        );
+    }
+
+    async fn observe_activity(
+        projector: &mut ProjectorState,
+        service: &NotificationService,
+        attention: &AttentionCoordinator,
+        activity: AgentActivity,
+    ) {
+        projector
+            .handle_event_blocking(service, attention, &agent_state_event("s-1", activity))
+            .await;
+        settle().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_blocked_session_first_seen_idle_after_a_restart_keeps_its_unread_record() {
+        let dir = temp_data_dir("blocked-replay-idle-first");
+        store_earlier_blocked_record(
+            &NotificationService::open(&dir).expect("open notification service"),
+        );
+
+        let service = NotificationService::open(&dir).expect("reopen notification service");
+        let (attention, _task) = spawn_coordinator(&service);
+        let mut projector = ProjectorState::default();
+        observe_activity(&mut projector, &service, &attention, AgentActivity::Idle).await;
+        observe_activity(&mut projector, &service, &attention, AgentActivity::Blocked).await;
+        advance_past_debounce().await;
+        settle().await;
+        assert_eq!(
+            agent_blocked_records(&service),
+            1,
+            "an idle observation does not end the unread blocked state: {:#?}",
+            list(&service)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_blocked_record_acknowledged_after_the_restart_lets_the_replay_surface() {
+        let dir = temp_data_dir("blocked-replay-acknowledged-later");
+        let id = store_earlier_blocked_record(
+            &NotificationService::open(&dir).expect("open notification service"),
+        );
+
+        let service = NotificationService::open(&dir).expect("reopen notification service");
+        let (attention, _task) = spawn_coordinator(&service);
+        let mut projector = ProjectorState::default();
+        observe_activity(&mut projector, &service, &attention, AgentActivity::Idle).await;
+        service
+            .update(NotificationUpdateParams {
+                id,
+                status: NotificationStatus::Acknowledged,
+            })
+            .expect("acknowledge the blocked record");
+        observe_activity(&mut projector, &service, &attention, AgentActivity::Blocked).await;
+        advance_past_debounce().await;
+        settle().await;
+        assert_eq!(
+            agent_blocked_records(&service),
+            2,
+            "the blocked state is raised again once its record is acknowledged: {:#?}",
+            list(&service)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_of_a_generation_that_ended_during_a_restart_is_reported() {
+        let dir = temp_data_dir("terminal-next-generation");
+        let service = NotificationService::open(&dir).expect("open notification service");
+        let mut projector = ProjectorState::default();
+        project_session_update(
+            &mut projector,
+            &service,
+            &session_in_generation("s-1", SessionState::Failed, Some(1), 1),
+        )
+        .await;
+        drop(service);
+
+        // The session was relaunched and failed again while the daemon was
+        // down; the start of its generation is not known.
+        let service = NotificationService::open(&dir).expect("reopen notification service");
+        let mut projector = ProjectorState::default();
+        project_session_update(
+            &mut projector,
+            &service,
+            &session_in_generation("s-1", SessionState::Failed, Some(1), 2),
+        )
+        .await;
+        assert_eq!(
+            records_of(&service, NotificationKind::Error),
+            2,
+            "each generation's failure is reported: {:#?}",
+            list(&service)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_of_a_generation_with_an_unknown_start_is_reported_beside_an_epoch_keyed_record(
+    ) {
+        let dir = temp_data_dir("epoch-keyed-unknown-start");
+        store_epoch_keyed_error_record(
+            &NotificationService::open(&dir).expect("open notification service"),
+            "2026-07-03T10:05:00Z",
+        );
+
+        // A resume prepared the next generation, and its worker failed before
+        // the daemon recorded when the generation started.
+        let service = NotificationService::open(&dir).expect("reopen notification service");
+        let mut projector = ProjectorState::default();
+        project_session_update(
+            &mut projector,
+            &service,
+            &session_in_generation("s-1", SessionState::Failed, Some(1), 2),
+        )
+        .await;
+        assert_eq!(
+            records_of(&service, NotificationKind::Error),
+            2,
+            "a record cannot be shown to report a generation of unknown start: {:#?}",
+            list(&service)
         );
     }
 }

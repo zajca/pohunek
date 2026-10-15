@@ -146,6 +146,38 @@ impl NotificationStore {
         &self.path
     }
 
+    /// The source ids of `provider`'s records that start with `prefix`, with
+    /// the prefix removed, each with its record's creation timestamp.
+    pub(crate) fn source_id_suffixes(&self, provider: &str, prefix: &str) -> Vec<(String, String)> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .records
+            .values()
+            .filter(|record| record.source.provider == provider)
+            .filter_map(|record| {
+                let suffix = record.source_id.as_deref()?.strip_prefix(prefix)?;
+                Some((suffix.to_owned(), record.created_at.clone()))
+            })
+            .collect()
+    }
+
+    /// Whether an unread attention record (`agent_blocked` or
+    /// `approval_required`) carries `dedupe_key`.
+    pub(crate) fn has_unread_attention(&self, dedupe_key: &str) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.records.values().any(|record| {
+            record.status == NotificationStatus::Unread
+                && is_attention_kind(record.kind)
+                && record.dedupe_key.as_deref() == Some(dedupe_key)
+        })
+    }
+
     /// Return all reconstructed notification records.
     pub(crate) fn all(&self) -> Vec<NotificationRecord> {
         let state = self
