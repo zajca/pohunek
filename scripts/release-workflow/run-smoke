@@ -82,7 +82,7 @@ for archive in "$bundle"/pohunek-daemon-"$VERSION"-$smoke_target.tar.gz; do
         # temp copy of the stage must be readable by other users. The
         # provisioner creates its install root 0700.
         if [ "$(uname -s)" = Darwin ]; then
-            chmod -R go+rX -- "$stage/$runtime"
+            chmod -R go+rX "$stage/$runtime"
         fi
         "$XTASK" compat verify-stage --runtime "$runtime" --dir "$stage"
     done
