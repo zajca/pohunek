@@ -120,6 +120,42 @@ impl Host {
         String::from_utf8_lossy(&bytes[start..]).into_owned()
     }
 
+    /// Best-effort failure diagnostics: never panics, ignores every error.
+    fn dump_failure_diagnostics(&self) {
+        self.dump_session_screens();
+        dump_runtime_logs(self.env.root());
+    }
+
+    /// Prints the visible screen of up to five sessions.
+    fn dump_session_screens(&self) {
+        let Some(listed) = self.try_json(&["session", "list"]) else {
+            return;
+        };
+        let Some(sessions) = listed["ok"].as_array() else {
+            return;
+        };
+        for id in sessions.iter().filter_map(|s| s["id"].as_str()).take(5) {
+            let Some(screen) = self.try_json(&["session", "screen", id]) else {
+                continue;
+            };
+            let Some(lines) = screen["ok"]["visible_lines"].as_array() else {
+                continue;
+            };
+            eprintln!("screen of {id} at the failure:");
+            for line in lines.iter().filter_map(Value::as_str) {
+                eprintln!("{}", line.trim_end());
+            }
+        }
+    }
+
+    /// Runs `pohunek <arguments> --json` without panicking.
+    fn try_json(&self, arguments: &[&str]) -> Option<Value> {
+        let mut command = self.env.command(self.layout.path("pohunek"));
+        command.args(arguments).arg("--json");
+        let output = run_bounded(command, &format!("pohunek {arguments:?}"), CLI_TIMEOUT).ok()?;
+        serde_json::from_slice(&output.stdout).ok()
+    }
+
     /// Runs the layout's `pohunek` with `arguments` in the hermetic environment.
     pub(crate) fn run(&self, arguments: &[&str]) -> Output {
         let mut command = self.env.command(self.layout.path("pohunek"));
@@ -262,12 +298,66 @@ impl Drop for Host {
     fn drop(&mut self) {
         if std::thread::panicking() {
             eprintln!("daemon output before the failure:\n{}", self.daemon_log());
+            self.dump_failure_diagnostics();
         }
         if let Some(mut child) = self.daemon.take() {
             // The daemon may have exited already; the process is not needed
             // past this point either way.
             let _ = child.kill();
             let _ = child.wait();
+        }
+    }
+}
+
+/// Prints the last `LOG_TAIL_BYTES` of runtime log files found in the directory tree.
+fn dump_runtime_logs(root: &Path) {
+    let mut logs = Vec::new();
+    collect_logs(root, 0, &mut logs);
+    for path in logs {
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        let start = bytes.len().saturating_sub(LOG_TAIL_BYTES);
+        let tail = &bytes[start..];
+        eprintln!("--- {}", path.display());
+        eprintln!("{}", String::from_utf8_lossy(tail));
+    }
+}
+
+/// Recursively collects up to 20 log file paths, depth ≤ 8, skipping symlinks.
+fn collect_logs(dir: &Path, depth: usize, logs: &mut Vec<std::path::PathBuf>) {
+    if depth > 8 || logs.len() >= 20 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.file_type().is_file() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let is_log = path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("log"));
+            if (is_log || name.contains("stderr")) && name != "daemon.out" {
+                logs.push(path);
+                if logs.len() >= 20 {
+                    return;
+                }
+            }
+        } else if metadata.file_type().is_dir() {
+            collect_logs(&path, depth + 1, logs);
         }
     }
 }

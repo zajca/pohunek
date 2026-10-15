@@ -764,14 +764,17 @@ cleanup() {
     fi
     # Darwin throwaway user cleanup
     if [ -n "$tuser_created" ]; then
-        /usr/bin/sudo -n /usr/bin/pkill -KILL -U "$tuid" 2>/dev/null || true
         poll=0
-        while /usr/bin/pgrep -U "$tuid" >/dev/null 2>&1 && [ "$poll" -lt 50 ]; do
+        while [ "$poll" -lt 100 ] && /usr/bin/pgrep -U "$tuid" >/dev/null 2>&1; do
+            /usr/bin/sudo -n /usr/bin/pkill -KILL -U "$tuid" 2>/dev/null || true
             sleep 0.1
             poll=$((poll + 1))
         done
         if /usr/bin/pgrep -U "$tuid" >/dev/null 2>&1; then
             printf 'smoke-archive: processes of %s survived cleanup\n' "$tuser" >&2
+            /bin/ps -U "$tuid" -o pid,ppid,stat,command | while read -r line; do
+                printf 'smoke-archive:   %s\n' "$line" >&2
+            done
             status=1
         fi
         if [ -n "$stage_chowned" ]; then
