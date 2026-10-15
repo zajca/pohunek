@@ -30,8 +30,8 @@ use pohunek_daemon::store::{DesiredState, RuntimeRecord, SessionRecord, Store};
 use pohunek_paths::{BasePaths, PathEnv, Platform};
 use pohunek_platform::process::{HostInspector, ProcessInspector as _};
 use pohunek_service_config::preflight::{
-    PreflightReport, SessionVerdict, StoreReport, StoreState, Verdict, RELEASE_PLAN_FLAG,
-    REPORT_VERSION,
+    PreflightReport, ProfileWarning, SessionVerdict, StoreReport, StoreState, Verdict,
+    CODE_PROFILE_WITHOUT_SCREEN_READINESS, RELEASE_PLAN_FLAG, REPORT_VERSION,
 };
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, Refusal, ENSURE_REPORT_VERSION,
@@ -454,6 +454,7 @@ fn daemon_report(runtimes: Option<EnsureReport>, stopped: Vec<SessionVerdict>) -
         sessions: Vec::new(),
         stopped_sessions: stopped,
         unmanaged_workers: Vec::new(),
+        profile_warnings: Vec::new(),
         runtimes,
     }
 }
@@ -545,6 +546,62 @@ async fn the_daemon_report_fields_reach_the_upgrade_gate_through_the_process_bou
     .await
     .expect("the flag accepts the stopped session");
     assert!(gated.accepted);
+}
+
+#[tokio::test]
+async fn a_profile_warning_reaches_the_gate_and_leaves_its_decision_unchanged() {
+    let host = Host::new();
+    let clean = daemon_report(None, Vec::new());
+    let mut warned = clean.clone();
+    warned.profile_warnings = vec![ProfileWarning {
+        profile: "claude-norule".to_owned(),
+        code: CODE_PROFILE_WITHOUT_SCREEN_READINESS.to_owned(),
+        detail: "profile claude-norule with manifest norule: the fix".to_owned(),
+    }];
+
+    // A clean report omits the field, as a daemon without profile warnings
+    // reports it, and it still parses with no warnings.
+    let legacy = serde_json::to_value(&clean).expect("serialize the clean report");
+    assert!(legacy.get("profile_warnings").is_none(), "{legacy}");
+    let parsed: PreflightReport =
+        serde_json::from_value(legacy).expect("a report without the field parses");
+    assert!(parsed.profile_warnings.is_empty());
+    let json = serde_json::to_value(&warned).expect("serialize the warned report");
+    assert_eq!(
+        json["profile_warnings"][0]["code"],
+        CODE_PROFILE_WITHOUT_SCREEN_READINESS
+    );
+
+    let daemon = reporting_daemon(&host.root, "warned", &warned);
+    let gated = gate_upgrade(
+        &DaemonPreflight,
+        &host.context,
+        &daemon,
+        VERSION,
+        "/usr/bin:/bin",
+        &std::collections::BTreeMap::new(),
+        ReleasePlan::Included,
+        false,
+    )
+    .await
+    .expect("a profile warning does not refuse the upgrade");
+    assert_eq!(gated.report.profile_warnings, warned.profile_warnings);
+
+    let daemon = reporting_daemon(&host.root, "clean", &clean);
+    let clean_gate = gate_upgrade(
+        &DaemonPreflight,
+        &host.context,
+        &daemon,
+        VERSION,
+        "/usr/bin:/bin",
+        &std::collections::BTreeMap::new(),
+        ReleasePlan::Included,
+        false,
+    )
+    .await
+    .expect("the clean report passes the gate");
+    assert_eq!(gated.accepted, clean_gate.accepted);
+    assert!(!gated.accepted, "no --accept-runtime-loss is needed");
 }
 
 #[tokio::test]

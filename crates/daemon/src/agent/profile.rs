@@ -188,6 +188,8 @@ pub(crate) struct ResolvedProfile {
     pub native: Option<NativeSessionLaunch>,
     /// Parsed detection-manifest override; `None` ⇒ inherit the base kind's manifest.
     pub manifest: Option<Manifest>,
+    /// File stem of the detection-manifest override, as the profile names it.
+    pub manifest_name: Option<String>,
     /// Digest of the profile's launch inputs; the source of its revision.
     pub inputs: ProfileInputs,
 }
@@ -267,6 +269,13 @@ impl ResolvedAgent {
     pub(crate) fn override_lacks_screen_readiness(&self) -> bool {
         self.definition.input_readiness() == InputReadiness::ScreenIdle
             && self.input_readiness() != InputReadiness::ScreenIdle
+    }
+
+    /// The name of the profile's detection-manifest override, when it has one.
+    pub(crate) fn override_manifest_name(&self) -> Option<&str> {
+        self.profile
+            .as_ref()
+            .and_then(|profile| profile.manifest_name.as_deref())
     }
 
     fn override_manifest(&self) -> Option<&Manifest> {
@@ -682,11 +691,24 @@ impl ProfileRegistry {
         content: &str,
         definition: &Arc<RuntimeDefinition>,
     ) -> Result<(), ProtocolError> {
+        self.resolve_candidate(name, content, definition)
+            .map(|_agent| ())
+    }
+
+    /// Resolves the profile `name` with file text `content` over `definition`,
+    /// the way [`Self::validate_candidate`] does, and returns the agent a launch
+    /// of that text would use.
+    pub(crate) fn resolve_candidate(
+        &self,
+        name: &str,
+        content: &str,
+        definition: &Arc<RuntimeDefinition>,
+    ) -> Result<ResolvedAgent, ProtocolError> {
         let dir = self
             .dir
             .as_deref()
             .ok_or_else(|| invalid_profile(name, "the agents directory is not available"))?;
-        resolve_profile_text(name, content, dir, &self.runtimes, Some(definition)).map(|_agent| ())
+        resolve_profile_text(name, content, dir, &self.runtimes, Some(definition))
     }
 
     /// Every `*.toml` of the agents directory with its text, read through the
@@ -1224,6 +1246,7 @@ fn resolve_profile_text(
             input_rules,
             native,
             manifest: manifest_source.map(|source| source.manifest),
+            manifest_name: raw.manifest,
             inputs,
         }),
     })

@@ -48,7 +48,9 @@ use pohunek_service_config::preflight::{
 use tracing::warn;
 
 use pohunek_service_config::preflight::{
-    CODE_PROBE_BUDGET_EXHAUSTED, CODE_REFERENCE_UNVERIFIED, MAX_PROBE_BUDGET_SECS, PROBE_BUDGET,
+    ProfileWarning, CODE_PROBE_BUDGET_EXHAUSTED, CODE_PROFILE_WITHOUT_SCREEN_READINESS,
+    CODE_REFERENCE_UNVERIFIED, MAX_PROBE_BUDGET_SECS, PROBE_BUDGET,
+    PROFILE_WITHOUT_SCREEN_READINESS_DETAIL,
 };
 use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, Refusal, CODE_RUNTIME_PLAN_UNAVAILABLE,
@@ -69,8 +71,8 @@ use crate::agent::host::{
     Spawn,
 };
 use crate::agent::{
-    NativeReferenceProvenance, ProfileRegistry, ReferenceCheckFailure, ReferenceExistence,
-    RefusalPhase, ValidatedLaunchProgram,
+    parse_head, NativeReferenceProvenance, Pin, ProfileRegistry, ReferenceCheckFailure,
+    ReferenceExistence, RefusalPhase, ResolvedAgent, ValidatedLaunchProgram,
 };
 use crate::capabilities::LaunchValidationFailure;
 use crate::catalog_anchor::CatalogTrust;
@@ -84,7 +86,7 @@ use crate::session::resume::{
     recovery_definition, reference_existence, session_ref_from_binding,
 };
 use crate::session::resume::{recovery_profile_in, ProfileChange};
-use crate::session::{plan_official_runtimes, EnsureInputs, OfficialPlan};
+use crate::session::{plan_official_runtimes, EnsureInputs, OfficialPlan, PlannedProfile};
 use crate::session::{runtime_hook_schema, HookSchemaLookup};
 use crate::session::{DesiredState, Generation, SessionRecord};
 use crate::store::{
@@ -189,13 +191,15 @@ pub fn run_with(
 ) -> PreflightReport {
     let journals = scan_worker_journals(&inputs.worker_state_root)
         .map_err(|error| format!("the worker journal root cannot be read: {error}"));
-    let (runtimes_report, planned) = match &options.launch {
+    let (runtimes_report, planned, planned_profiles) = match &options.launch {
         Ok(_) => release_plan(inputs, options),
         Err(detail) => (
             Some(refused_plan(CODE_SERVICE_CONFIG_UNREADABLE, detail)),
             Vec::new(),
+            Vec::new(),
         ),
     };
+    let judged_definitions = planned.clone();
     let (runtimes, runtimes_report) = match read_only_runtimes(&inputs.plugins_dir, planned) {
         Ok(runtimes) => (runtimes, runtimes_report),
         Err(detail) => {
@@ -240,6 +244,8 @@ pub fn run_with(
         probes: &probes,
         store_from,
     };
+    let profile_warnings =
+        judge_profile_warnings(&profiles, &planned_profiles, &judged_definitions);
     let (store, sessions, unmanaged_workers, stopped_sessions) = match dry {
         Ok(dry) => {
             let (sessions, unmanaged) =
@@ -278,7 +284,112 @@ pub fn run_with(
         stopped_sessions,
         unmanaged_workers,
         runtimes: runtimes_report,
+        profile_warnings,
     }
+}
+
+/// The host profiles that load with a reduced guarantee on the runtimes the
+/// new daemon serves: an override manifest without the screen readiness rule
+/// its base declares. Profiles that do not resolve are left to the session
+/// verdicts and to doctor, and nothing here refuses the upgrade.
+fn judge_profile_warnings(
+    profiles: &ProfileRegistry,
+    planned_profiles: &[PlannedProfile],
+    planned: &[RuntimeDefinition],
+) -> Vec<ProfileWarning> {
+    let mut warnings = Vec::new();
+    for profile in planned_profiles {
+        // A profile the plan rewrites is judged as the apply writes it, over the
+        // planned definition of its base. The planner validated that text, so a
+        // failure here is left to the session verdicts and doctor.
+        let Some(definition) = planned
+            .iter()
+            .find(|definition| definition.runtime_id() == &profile.base)
+        else {
+            continue;
+        };
+        if let Ok(agent) =
+            profiles.resolve_candidate(&profile.name, &profile.text, &Arc::new(definition.clone()))
+        {
+            warnings.extend(profile_warning(&agent));
+        }
+    }
+    // A profile the plan does not rewrite is judged as it is on disk, which is
+    // the case after the apply, when its profiles are already pinned.
+    let enumerated = profiles.enumerate();
+    let resolved: HashSet<String> = enumerated.iter().map(|agent| agent.name.clone()).collect();
+    for agent in enumerated {
+        if planned_profiles
+            .iter()
+            .any(|profile| profile.name == agent.name)
+        {
+            continue;
+        }
+        warnings.extend(profile_warning(&agent));
+    }
+    // Enumeration skips a profile pinned to a digest the store does not hold
+    // yet, although the plan installs that digest. Such a profile is judged over
+    // the planned definition of its pin; a pin that is neither installed nor
+    // planned resolves nowhere and stays skipped.
+    let texts = match profiles.scanned_texts() {
+        Ok(texts) => texts,
+        Err(error) => {
+            warn!(error = %error, "the agent profiles cannot be listed for the profile warnings");
+            Vec::new()
+        }
+    };
+    for (name, text) in texts {
+        if resolved.contains(&name) || planned_profiles.iter().any(|profile| profile.name == name) {
+            continue;
+        }
+        let Ok(text) = text else { continue };
+        let Ok(head) = parse_head(&text) else {
+            continue;
+        };
+        let Some(pin) = head.pin() else { continue };
+        let Some(definition) = planned_for_pin(planned, &head.base, &pin) else {
+            continue;
+        };
+        if let Ok(agent) = profiles.resolve_candidate(&name, &text, &Arc::new(definition.clone())) {
+            warnings.extend(profile_warning(&agent));
+        }
+    }
+    warnings.sort_by(|left, right| left.profile.cmp(&right.profile));
+    warnings
+}
+
+/// The planned definition of `base` at exactly the package and digest `pin`
+/// names, as the apply installs it.
+fn planned_for_pin<'a>(
+    planned: &'a [RuntimeDefinition],
+    base: &RuntimeId,
+    pin: &Pin,
+) -> Option<&'a RuntimeDefinition> {
+    planned.iter().find(|definition| {
+        definition.runtime_id() == base
+            && matches!(
+                &definition.binding().provenance,
+                BindingProvenance::Package { package, package_digest }
+                    if package.id == pin.package && package_digest == &pin.digest
+            )
+    })
+}
+
+/// The warning of a resolved profile whose override manifest lacks the screen
+/// readiness its base declares.
+fn profile_warning(agent: &ResolvedAgent) -> Option<ProfileWarning> {
+    if !agent.override_lacks_screen_readiness() {
+        return None;
+    }
+    let manifest = agent.override_manifest_name()?;
+    Some(ProfileWarning {
+        detail: format!(
+            "profile {} with manifest {manifest}: {PROFILE_WITHOUT_SCREEN_READINESS_DETAIL}",
+            agent.name
+        ),
+        profile: agent.name.clone(),
+        code: CODE_PROFILE_WITHOUT_SCREEN_READINESS.to_owned(),
+    })
 }
 
 /// The release step's plan and the definitions of the packages it would
@@ -286,12 +397,16 @@ pub fn run_with(
 fn release_plan(
     inputs: &PreflightInputs,
     options: &PreflightOptions,
-) -> (Option<EnsureReport>, Vec<RuntimeDefinition>) {
+) -> (
+    Option<EnsureReport>,
+    Vec<RuntimeDefinition>,
+    Vec<PlannedProfile>,
+) {
     let Some(release) = options.release.as_ref() else {
-        return (None, Vec::new());
+        return (None, Vec::new(), Vec::new());
     };
     if !release.release_dir.is_dir() {
-        return (None, Vec::new());
+        return (None, Vec::new(), Vec::new());
     }
     // The plan scans the host profiles, so without their directory it cannot
     // say what the release step would do, and the upgrade must not proceed.
@@ -301,6 +416,7 @@ fn release_plan(
                 CODE_RUNTIME_PLAN_UNAVAILABLE,
                 "the release runtime plan cannot be computed: the host profiles directory is not known",
             )),
+            Vec::new(),
             Vec::new(),
         );
     };
@@ -318,12 +434,14 @@ fn release_plan(
         Ok(OfficialPlan {
             report,
             definitions,
-        }) => (Some(report), definitions),
+            profiles,
+        }) => (Some(report), definitions, profiles),
         Err(error) => (
             Some(refused_plan(
                 CODE_RUNTIME_PLAN_UNAVAILABLE,
                 &format!("the release runtime plan cannot be computed: {error}"),
             )),
+            Vec::new(),
             Vec::new(),
         ),
     }

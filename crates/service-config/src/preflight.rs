@@ -83,6 +83,15 @@ pub const CODE_PROBE_BUDGET_EXHAUSTED: &str = "probe_budget_exhausted";
 /// never reported as already not resumable.
 pub const CODE_REFERENCE_UNVERIFIED: &str = "reference_unverified_within_budget";
 
+/// Machine code of a host profile whose override manifest has no idle rule on
+/// a screen region, over a base that declares `input.ready = "screen_idle"`.
+/// The profile still loads, with bracketed-paste readiness.
+pub const CODE_PROFILE_WITHOUT_SCREEN_READINESS: &str = "profile_without_screen_readiness";
+
+/// Human text of [`CODE_PROFILE_WITHOUT_SCREEN_READINESS`], shared by the
+/// doctor check and the preflight warning so both name the same fix.
+pub const PROFILE_WITHOUT_SCREEN_READINESS_DETAIL: &str = "The override manifest has no idle rule on a screen region, so the sessions write the initial prompt once bracketed paste is on instead of waiting for the prompt to render, and the agent may drop it; add an idle rule on a screen region to the override, such as the package's live_prompt_box rule on prompt_box_body.";
+
 /// Version of the report layout; a reader refuses any other value.
 ///
 /// Stays at 1 while the layout only gains fields, because the rollback gate
@@ -154,6 +163,18 @@ pub const CODE_STORE_UNUSABLE: &str = "store_unusable";
 /// The separately stored resume record of the session is skipped when the
 /// store loads.
 pub const CODE_RESUME_RECORD_UNREADABLE: &str = "resume_record_unreadable";
+
+/// A host profile the new daemon would load with a reduced guarantee. It never
+/// refuses the upgrade and is not part of the session verdicts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileWarning {
+    /// Name of the host profile.
+    pub profile: String,
+    /// Stable machine reason.
+    pub code: String,
+    /// Human explanation naming the profile, its manifest and the fix.
+    pub detail: String,
+}
 
 /// What the new daemon would do with one live session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -274,6 +295,10 @@ pub struct PreflightReport {
     /// `runtime/` directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtimes: Option<EnsureReport>,
+    /// Host profiles the new daemon loads with a reduced guarantee, ordered by
+    /// name. They never refuse the upgrade and do not change any verdict.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profile_warnings: Vec<ProfileWarning>,
 }
 
 impl PreflightReport {

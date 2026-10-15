@@ -2233,7 +2233,12 @@ but that keep native resume or fork; at risk under the same flag), `runtimes` (a
 `runtime/` tree; otherwise the `EnsureReport` of the release's official runtime
 plan with `packages`, `profiles`, `integrations` and `refusals`), and
 `unmanaged_workers` (ids of live worker journals the store has no record of; the
-running daemon does not manage them either, so they never refuse the upgrade). A session that is neither `adoptable` nor `already_not_resumable` fails the command with the CLI error
+running daemon does not manage them either, so they never refuse the upgrade),
+and `profile_warnings` (host profiles that load with a reduced guarantee, ordered
+by `profile`, each with a `code` and a `detail` naming the profile and its
+manifest; the code `profile_without_screen_readiness` marks an override manifest
+without the idle rule on a screen region that its `screen_idle` base needs). The
+field is omitted when empty and never refuses the upgrade or changes a verdict. A session that is neither `adoptable` nor `already_not_resumable` fails the command with the CLI error
 code `service_upgrade_sessions_at_risk` unless `--accept-runtime-loss` is given;
 a `refused` store fails it with `service_upgrade_store_unusable` and a preflight
 that cannot run or be parsed with `service_upgrade_preflight_failed`, neither of

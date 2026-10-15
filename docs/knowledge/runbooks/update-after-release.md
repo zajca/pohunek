@@ -878,9 +878,13 @@ such as `rules = []` or only working and blocked rules, keeps loading when
 upgrading from 0.34.2, and its sessions keep the bracketed-paste readiness of
 that release: the initial input is written once bracketed paste is on, and
 Claude may drop it. `pohunek doctor` lists each such profile as a warning
-(`agent_profile_<name>`). To get prompt-box readiness, add an idle rule on the
-`prompt_box_body` region to the override, copying the package's
-`live_prompt_box` rule.
+(`agent_profile_<name>`). `pohunek service check` and the upgrade's preflight
+list it too, under `profile_warnings` with the code
+`profile_without_screen_readiness`, judged as the new release loads it: the
+planned profile text when the release plan pins the profile, else the profile on
+disk, over the planned package when its pin names a digest the release installs. That warning never blocks the upgrade and needs no `--accept-runtime-loss`.
+To get prompt-box readiness, add an idle rule on the `prompt_box_body` region to
+the override, copying the package's `live_prompt_box` rule.
 
 ## Configuration migration from schemas 2, 3, 4 and 5
 
