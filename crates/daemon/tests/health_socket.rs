@@ -2640,12 +2640,25 @@ const SILENT_AGENT_STALL_TIMEOUT: Duration = Duration::from_millis(300);
 /// wait for the stalled write, so this guard fails the test rather than hang.
 const STALL_SCENARIO_SHUTDOWN_GUARD: Duration = Duration::from_secs(30);
 
-/// Lines in the oversized input. Their total size exceeds the canonical input
-/// queue of the PTY on both Linux (4096 bytes) and macOS.
-const OVERSIZED_INPUT_LINES: usize = 200;
+/// Lines in the oversized input, about 134 KB in all. A PTY whose program
+/// does not read takes more than its 4 KiB line-discipline queue: Linux also
+/// buffers up to 64 KiB in the tty layer, and an input that fits is accepted
+/// at once. The input is larger than both, so the write always stalls.
+const OVERSIZED_INPUT_LINES: usize = 1_700;
 
 /// Bytes per oversized input line.
 const OVERSIZED_INPUT_LINE_BYTES: usize = 78;
+
+/// Bytes a Linux PTY can hold for a program that does not read: the tty
+/// layer's buffer limit plus the line-discipline queue.
+const PTY_UNREAD_INPUT_CAPACITY: usize = 64 * 1024 + 4 * 1024;
+
+const _: () = assert!(
+    OVERSIZED_INPUT_LINES * (OVERSIZED_INPUT_LINE_BYTES + 1) > PTY_UNREAD_INPUT_CAPACITY
+        && OVERSIZED_INPUT_LINES * (OVERSIZED_INPUT_LINE_BYTES + 1)
+            <= protocol::MAX_SESSION_INPUT_BYTES,
+    "the oversized input must exceed what a PTY holds and fit one session input"
+);
 
 /// A child that runs `sleep` and never reads its terminal.
 fn silent_agent_config() -> SessionRegistryConfig {
