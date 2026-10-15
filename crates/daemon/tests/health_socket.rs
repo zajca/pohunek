@@ -2456,6 +2456,123 @@ async fn session_input_writes_text_to_shell_pty() {
     let _ = handle.await;
 }
 
+/// Bytes pasted into the attach stream: far more than the terminal's input
+/// queue and the socket buffers between the client and the worker hold.
+const LARGE_PASTE_BYTES: usize = 1024 * 1024;
+
+/// Bytes per pasted line, newline included, so a canonical-mode reader
+/// receives the paste line by line.
+const PASTE_LINE_BYTES: usize = 64;
+
+/// Bytes the child prints while the paste is pending: more than the socket
+/// buffers between the worker and the client hold.
+const PENDING_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Line the child prints after its output, while the paste is still pending.
+const PENDING_OUTPUT_MARKER: &[u8] = b"pending-output-done";
+
+/// Line the child prints once it has read the whole paste.
+const PASTE_DRAINED_MARKER: &[u8] = b"paste-drained";
+
+/// Reads `stream` until `marker` has arrived, keeping only the bytes a
+/// marker split across reads needs.
+async fn read_past_marker<R>(stream: &mut R, marker: &[u8], what: &str)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    wait::guard(what, async {
+        let mut tail = Vec::new();
+        let mut buf = vec![0_u8; 64 * 1024];
+        loop {
+            let n = stream.read(&mut buf).await.expect("read raw stream");
+            assert_ne!(n, 0, "raw stream closed before {what}");
+            tail.extend_from_slice(&buf[..n]);
+            if tail.windows(marker.len()).any(|window| window == marker) {
+                return;
+            }
+            let keep = tail.len().min(marker.len() - 1);
+            tail.drain(..tail.len() - keep);
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_attached_client_keeps_receiving_output_while_its_large_paste_waits_for_the_child() {
+    let socket = temp_socket("attach-large-paste");
+    let gates = temp_dir("attach-large-paste-gates");
+    let output_gate = gates.join("output");
+    let drain_gate = gates.join("drain");
+    let script = format!(
+        "while [ ! -e '{output_gate}' ]; do sleep 0.05; done; \
+         head -c {PENDING_OUTPUT_BYTES} /dev/zero | tr '\\0' y; \
+         printf '\\n%s\\n' '{pending}'; \
+         while [ ! -e '{drain_gate}' ]; do sleep 0.05; done; \
+         head -c {LARGE_PASTE_BYTES} >/dev/null; \
+         printf '%s\\n' '{drained}'; sleep 30",
+        output_gate = output_gate.display(),
+        drain_gate = drain_gate.display(),
+        pending = std::str::from_utf8(PENDING_OUTPUT_MARKER).expect("ASCII marker"),
+        drained = std::str::from_utf8(PASTE_DRAINED_MARKER).expect("ASCII marker"),
+    );
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", script.as_str()]),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut client = connect(&socket).await;
+    let created = create_session(&mut client, &socket).await;
+    let attach = attach_session(&mut client, &created.id).await;
+    let raw = open_attach_stream(&socket, &attach.stream_id).await;
+    let (mut raw_read, mut raw_write) = tokio::io::split(raw);
+
+    // The paste is written from its own task, as a terminal sends it while it
+    // keeps drawing; it completes only once the child reads it.
+    let mut line = vec![b'x'; PASTE_LINE_BYTES - 1];
+    line.push(b'\n');
+    let paste = line.repeat(LARGE_PASTE_BYTES / PASTE_LINE_BYTES);
+    let pasting = tokio::spawn(async move {
+        raw_write.write_all(&paste).await.expect("write the paste");
+        raw_write
+    });
+
+    // The child does not read yet, so the paste stays pending in the worker
+    // while the child prints more than every buffer on the way holds.
+    std::fs::File::create(&output_gate).expect("open the output gate");
+    read_past_marker(
+        &mut raw_read,
+        PENDING_OUTPUT_MARKER,
+        "the child's output arrives while the paste is pending",
+    )
+    .await;
+    assert!(!pasting.is_finished(), "the paste is still pending");
+
+    std::fs::File::create(&drain_gate).expect("open the drain gate");
+    read_past_marker(
+        &mut raw_read,
+        PASTE_DRAINED_MARKER,
+        "the child reads the whole paste",
+    )
+    .await;
+    let _raw_write = wait::guard("the paste completes", pasting)
+        .await
+        .expect("paste task");
+
+    let _ = detach_stream(&mut client, &attach.stream_id).await;
+    let stop_req = Request::make(
+        "attach-large-paste-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut client, &stop_req).await))
+            .expect("stop result");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
 #[tokio::test]
 async fn session_new_with_input_writes_text_to_shell_pty() {
     let socket = temp_socket("session-new-input-shell");

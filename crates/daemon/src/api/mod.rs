@@ -29,6 +29,7 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -839,6 +840,12 @@ struct WorkerFrameIdentity {
 /// One worker read stays pending across every `select!` iteration (see
 /// [`read_owned_frame`]), so public input arriving while a worker frame is
 /// only partly received never discards the bytes already consumed.
+///
+/// A send of public input to the worker stays pending across iterations as
+/// well. The worker reads the next input frame only once the PTY accepted the
+/// previous one, so a paste into a program that does not read fills the
+/// socket; worker output keeps being forwarded meanwhile, and public input is
+/// read again only once the send completed.
 async fn bridge_worker_frames<S, W>(
     stream: &mut S,
     worker: &mut W,
@@ -852,14 +859,17 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     W: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let (worker_read, mut worker_write) = tokio::io::split(worker);
+    let (worker_read, worker_write) = tokio::io::split(worker);
+    let mut worker_write = Some(worker_write);
     let mut write_sequence = 1_u64;
     if !initial_input.is_empty() {
-        send_worker_attach_input(&mut worker_write, identity, write_sequence, initial_input)
+        let writer = worker_write.as_mut().expect("the worker writer is idle");
+        send_worker_attach_input(writer, identity, write_sequence, initial_input)
             .await
             .map_err(AttachBridgeError::worker_stream)?;
         write_sequence = next_attach_sequence(write_sequence)?;
     }
+    let mut pending_send: Option<PendingWorkerSend<'_, W>> = None;
     let mut input = [0_u8; 8 * 1024];
     let mut snapshot_started = false;
     let next_frame = read_owned_frame(worker_read);
@@ -922,20 +932,26 @@ where
                     }
                 }
             }
-            read = stream.read(&mut input) => {
+            (writer, sent) = async {
+                pending_send.as_mut().expect("guarded pending worker send").await
+            }, if pending_send.is_some() => {
+                pending_send = None;
+                worker_write = Some(writer);
+                sent.map_err(AttachBridgeError::worker_stream)?;
+                write_sequence = next_attach_sequence(write_sequence)?;
+            }
+            read = stream.read(&mut input), if pending_send.is_none() => {
                 let count = read.map_err(AttachBridgeError::client_io)?;
                 if count == 0 {
                     break;
                 }
-                send_worker_attach_input(
-                    &mut worker_write,
+                let writer = worker_write.take().expect("the worker writer is idle");
+                pending_send = Some(Box::pin(send_owned_attach_input(
+                    writer,
                     identity,
                     write_sequence,
                     input[..count].to_vec(),
-                )
-                .await
-                .map_err(AttachBridgeError::worker_stream)?;
-                write_sequence = next_attach_sequence(write_sequence)?;
+                )));
             }
             () = cancel.cancelled() => break,
         }
@@ -1031,6 +1047,27 @@ impl AttachBridgeError {
     fn into_io(self) -> io::Error {
         self.source
     }
+}
+
+/// A send of public input to the worker that has not completed; it hands the
+/// worker writer back with its result.
+type PendingWorkerSend<'a, W> = Pin<
+    Box<dyn Future<Output = (tokio::io::WriteHalf<&'a mut W>, Result<(), io::Error>)> + Send + 'a>,
+>;
+
+/// [`send_worker_attach_input`] over an owned writer, which it returns with
+/// the result so the send can stay pending across `select!` iterations.
+async fn send_owned_attach_input<'a, W>(
+    mut writer: tokio::io::WriteHalf<&'a mut W>,
+    identity: &'a WorkerFrameIdentity,
+    sequence: u64,
+    bytes: Vec<u8>,
+) -> (tokio::io::WriteHalf<&'a mut W>, Result<(), io::Error>)
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    let sent = send_worker_attach_input(&mut writer, identity, sequence, bytes).await;
+    (writer, sent)
 }
 
 async fn send_worker_attach_input<W>(

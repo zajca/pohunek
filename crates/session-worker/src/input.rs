@@ -319,11 +319,19 @@ impl WriteCoordinator {
     /// ordered and never replayed by the daemon, so lifetime deduplication would
     /// add ambiguity without adding retry safety.
     ///
+    /// The write runs in a task of its own, so dropping the returned future
+    /// leaves it running: the task holds the execution lock until the PTY
+    /// accepted every byte, and a control plan waiting behind it keeps its
+    /// stall bound.
+    ///
     /// # Errors
     ///
     /// Returns [`InputError`] when the PTY writer fails.
     pub async fn execute_stream(&self, fragments: Vec<InputFragment>) -> Result<(), InputError> {
-        self.execute_once(&fragments, None).await
+        let coordinator = self.clone();
+        tokio::spawn(async move { coordinator.execute_once(&fragments, None).await })
+            .await
+            .map_err(|_join_error| InputError::WriterTask)?
     }
 
     /// Writes the fragments in order while holding the execution lock.

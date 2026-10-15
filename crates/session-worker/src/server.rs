@@ -2889,6 +2889,11 @@ async fn serve_data(
 /// One input read stays pending across every `select!` iteration (see
 /// [`read_owned_frame`]), so output that becomes ready while an input frame
 /// is only partly received never discards the bytes already consumed.
+///
+/// An accepted input frame's write stays pending across iterations as well,
+/// so output keeps flowing while the PTY waits for the program to read that
+/// input, as on a real terminal. The next input frame is read only once the
+/// write is acknowledged, which keeps the stream's writes in order.
 #[expect(
     clippy::too_many_arguments,
     reason = "stream framing keeps authenticated stream identity and lease explicit"
@@ -2921,6 +2926,7 @@ where
     let mut pending_output_exit = None;
     let next_input = read_owned_frame(reader);
     tokio::pin!(next_input);
+    let mut pending_write: Option<PendingAttachWrite<'_>> = None;
 
     loop {
         tokio::select! {
@@ -2980,7 +2986,51 @@ where
                     pty.output_forced_closed(),
                 ).await?;
             }
-            (reader, input) = &mut next_input => {
+            written = async {
+                let pending = pending_write.as_mut().expect("guarded pending attach write");
+                (&mut pending.write).await
+            }, if pending_write.is_some() => {
+                let PendingAttachWrite { write_id, bytes_written, .. } = pending_write
+                    .take()
+                    .expect("guarded pending attach write");
+                if let Err(error) = written {
+                    return write_data_error(
+                        writer,
+                        version,
+                        stream_id,
+                        worker_instance_id,
+                        input_control_error(error, version),
+                    ).await;
+                }
+                write_data_frame(
+                    writer,
+                    version,
+                    stream_id,
+                    worker_instance_id,
+                    FrameKind::InputAck {
+                        write_id,
+                        bytes_written,
+                    },
+                    Vec::new(),
+                ).await?;
+                next_input_sequence = match next_input_sequence.checked_add(1) {
+                    Some(sequence) => sequence,
+                    None => {
+                        return write_data_error(
+                            writer,
+                            version,
+                            stream_id,
+                            worker_instance_id,
+                            control_error_message(
+                                ControlCode::InvalidRequest,
+                                "attach input sequence was exhausted",
+                                false,
+                            ),
+                        ).await;
+                    }
+                };
+            }
+            (reader, input) = &mut next_input, if pending_write.is_none() => {
                 next_input.set(read_owned_frame(reader));
                 let input = match input {
                     Ok(Some(input)) => input,
@@ -3043,49 +3093,25 @@ where
                         error,
                     ).await;
                 }
-                let byte_count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                if let Err(error) = pty.input().execute_stream(vec![InputFragment {
+                let bytes_written = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                pending_write = Some(PendingAttachWrite {
+                    write_id,
+                    bytes_written,
+                    write: Box::pin(pty.input().execute_stream(vec![InputFragment {
                         bytes,
                         delay_after: Duration::ZERO,
-                    }]).await {
-                    return write_data_error(
-                        writer,
-                        version,
-                        stream_id,
-                        worker_instance_id,
-                        input_control_error(error, version),
-                    ).await;
-                }
-                write_data_frame(
-                    writer,
-                    version,
-                    stream_id,
-                    worker_instance_id,
-                    FrameKind::InputAck {
-                        write_id,
-                        bytes_written: byte_count,
-                    },
-                    Vec::new(),
-                ).await?;
-                next_input_sequence = match next_input_sequence.checked_add(1) {
-                    Some(sequence) => sequence,
-                    None => {
-                        return write_data_error(
-                            writer,
-                            version,
-                            stream_id,
-                            worker_instance_id,
-                            control_error_message(
-                                ControlCode::InvalidRequest,
-                                "attach input sequence was exhausted",
-                                false,
-                            ),
-                        ).await;
-                    }
-                };
+                    }])),
+                });
             }
         }
     }
+}
+
+/// An attach stream's input write that the PTY has not accepted completely.
+struct PendingAttachWrite<'a> {
+    write_id: WriteId,
+    bytes_written: u64,
+    write: Pin<Box<dyn std::future::Future<Output = Result<(), crate::InputError>> + Send + 'a>>,
 }
 
 /// Reads one client frame and hands the reader back with the result.
