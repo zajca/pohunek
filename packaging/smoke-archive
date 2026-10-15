@@ -131,20 +131,20 @@ stage_check() {
         [ "$(LC_ALL=C tr -cd '[:cntrl:]\\' < "$stage_dir/$manifest" | LC_ALL=C tr -d "$allowed_controls" | wc -c)" -eq 0 ] \
             || fail "staged upstream has a control character or backslash in $manifest: $stage_dir"
         if [ "$manifest" = STAGE.links ]; then
-            LC_ALL=C tr -d '\011' < "$stage_dir/$manifest" > "$work/stage-text-check.txt"
+            LC_ALL=C tr -d '\011' < "$stage_dir/$manifest" > "$check_dir/stage-text-check.txt"
         else
-            cp -- "$stage_dir/$manifest" "$work/stage-text-check.txt"
+            cp -- "$stage_dir/$manifest" "$check_dir/stage-text-check.txt"
         fi
-        if LC_ALL=C.UTF-8 grep -q '[[:cntrl:]]' "$work/stage-text-check.txt"; then
+        if LC_ALL=C.UTF-8 grep -q '[[:cntrl:]]' "$check_dir/stage-text-check.txt"; then
             fail "staged upstream has a Unicode control character in $manifest: $stage_dir"
         else
             control_status=$?
             [ "$control_status" -eq 1 ] || fail "cannot check Unicode controls in $manifest: $stage_dir"
         fi
     done
-    : > "$work/stage-files.txt"
-    : > "$work/stage-links.txt"
-    : > "$work/stage-execs.txt"
+    : > "$check_dir/stage-files.txt"
+    : > "$check_dir/stage-links.txt"
+    : > "$check_dir/stage-execs.txt"
     while :; do
         line=
         if IFS= read -r line; then
@@ -161,7 +161,7 @@ stage_check() {
             *[!0-9a-f]*) fail "staged upstream has an invalid STAGE.sha256 digest: $stage_dir" ;;
         esac
         safe_stage_path "$path" || fail "staged upstream has an unsafe STAGE.sha256 path: $stage_dir"
-        printf '%s\n' "$path" >> "$work/stage-files.txt"
+        printf '%s\n' "$path" >> "$check_dir/stage-files.txt"
     done < "$stage_dir/STAGE.sha256"
     tab=$(printf '\t')
     while :; do
@@ -180,7 +180,7 @@ stage_check() {
                 esac
                 safe_stage_path "$path" \
                     || fail "staged upstream has an invalid STAGE.links exec path: $stage_dir/$path"
-                printf '%s\n' "$path" >> "$work/stage-execs.txt"
+                printf '%s\n' "$path" >> "$check_dir/stage-execs.txt"
                 ;;
             "link$tab"*)
                 rest=${line#"link$tab"}
@@ -203,14 +203,14 @@ stage_check() {
                 done
                 safe_stage_path "$path" && safe_stage_target "$target" "$link_depth" \
                     || fail "staged upstream has an invalid STAGE.links link path or target: $stage_dir/$path"
-                printf '%s\n' "$path" >> "$work/stage-links.txt"
+                printf '%s\n' "$path" >> "$check_dir/stage-links.txt"
                 ;;
             *) fail "staged upstream has an invalid STAGE.links entry: $stage_dir" ;;
         esac
     done < "$stage_dir/STAGE.links"
     for kind in files links execs; do
-        LC_ALL=C sort "$work/stage-$kind.txt" > "$work/stage-$kind-sorted.txt"
-        duplicate=$(LC_ALL=C uniq -d "$work/stage-$kind-sorted.txt" | head -n 1)
+        LC_ALL=C sort "$check_dir/stage-$kind.txt" > "$check_dir/stage-$kind-sorted.txt"
+        duplicate=$(LC_ALL=C uniq -d "$check_dir/stage-$kind-sorted.txt" | head -n 1)
         case $kind in
             files) kind_name=STAGE.sha256 ;;
             links) kind_name='STAGE.links link' ;;
@@ -218,9 +218,9 @@ stage_check() {
         esac
         [ -z "$duplicate" ] || fail "staged upstream has a duplicate $kind_name path: $stage_dir/$duplicate"
     done
-    unknown_exec=$(LC_ALL=C comm -23 "$work/stage-execs-sorted.txt" "$work/stage-files-sorted.txt" | head -n 1)
+    unknown_exec=$(LC_ALL=C comm -23 "$check_dir/stage-execs-sorted.txt" "$check_dir/stage-files-sorted.txt" | head -n 1)
     [ -z "$unknown_exec" ] || fail "staged upstream has an invalid STAGE.links exec path: $stage_dir/$unknown_exec"
-    conflicting_link=$(LC_ALL=C comm -12 "$work/stage-links-sorted.txt" "$work/stage-files-sorted.txt" | head -n 1)
+    conflicting_link=$(LC_ALL=C comm -12 "$check_dir/stage-links-sorted.txt" "$check_dir/stage-files-sorted.txt" | head -n 1)
     [ -z "$conflicting_link" ] || fail "staged upstream has a duplicate STAGE.links link path: $stage_dir/$conflicting_link"
     if [ "$(uname -s)" = Darwin ]; then
         stage_real=$(/usr/bin/perl -MCwd=realpath -e 'my $p = realpath($ARGV[0]); defined $p or exit 1; print $p' -- "$stage_dir") \
@@ -231,25 +231,25 @@ stage_check() {
     # Empty directories are absent from both manifests, but their names must
     # still obey the stage tree's name contract. NUL-delimited paths preserve
     # newlines and other hostile bytes while scanning the tree in one pass.
-    (cd "$stage_dir" && find . -type d -print0) > "$work/stage-dirs.txt" \
+    (cd "$stage_dir" && find . -type d -print0) > "$check_dir/stage-dirs.txt" \
         || fail "cannot enumerate staged upstream directories: $stage_dir"
-    iconv -f UTF-8 -t UTF-8 "$work/stage-dirs.txt" >/dev/null \
+    iconv -f UTF-8 -t UTF-8 "$check_dir/stage-dirs.txt" >/dev/null \
         || fail "staged upstream has an invalid UTF-8 directory name: $stage_dir"
-    [ "$(LC_ALL=C tr -cd '[:cntrl:]\\' < "$work/stage-dirs.txt" | LC_ALL=C tr -d '\000' | wc -c)" -eq 0 ] \
+    [ "$(LC_ALL=C tr -cd '[:cntrl:]\\' < "$check_dir/stage-dirs.txt" | LC_ALL=C tr -d '\000' | wc -c)" -eq 0 ] \
         || fail "staged upstream has an unsafe directory name: $stage_dir"
-    if LC_ALL=C.UTF-8 grep -azq '[[:cntrl:]]' "$work/stage-dirs.txt"; then
+    if LC_ALL=C.UTF-8 grep -azq '[[:cntrl:]]' "$check_dir/stage-dirs.txt"; then
         fail "staged upstream has a Unicode control in a directory name: $stage_dir"
     else
         control_status=$?
         [ "$control_status" -eq 1 ] || fail "cannot check staged upstream directory names: $stage_dir"
     fi
-    files=$(cat "$work/stage-files-sorted.txt")
-    links=$(cat "$work/stage-links-sorted.txt")
+    files=$(cat "$check_dir/stage-files-sorted.txt")
+    links=$(cat "$check_dir/stage-links-sorted.txt")
     listed=$({ printf '%s\n' "$files"; printf '%s\n' "$links"; } | sed '/^$/d' | LC_ALL=C sort)
     present=$(cd "$stage_dir" && find . -path ./STAGE.sha256 -prune -o -path ./STAGE.links -prune -o ! -type d -print | sed 's|^\./||' | LC_ALL=C sort)
-    printf '%s\n' "$listed" > "$work/listed.txt"
-    printf '%s\n' "$present" > "$work/present.txt"
-    unlisted=$(LC_ALL=C comm -13 "$work/listed.txt" "$work/present.txt")
+    printf '%s\n' "$listed" > "$check_dir/listed.txt"
+    printf '%s\n' "$present" > "$check_dir/present.txt"
+    unlisted=$(LC_ALL=C comm -13 "$check_dir/listed.txt" "$check_dir/present.txt")
     [ -z "$unlisted" ] || fail "staged upstream holds entries its manifests do not list: $(printf '%s' "$unlisted" | head -n 1)"
     [ "$listed" = "$present" ] || fail "staged upstream differs from its STAGE manifests: $stage_dir"
     actual_files=$(cd "$stage_dir" && find . -path ./STAGE.sha256 -prune -o -path ./STAGE.links -prune -o -type f -print | sed 's|^\./||' | LC_ALL=C sort)
@@ -257,7 +257,7 @@ stage_check() {
     actual_links=$(cd "$stage_dir" && find . -type l -print | sed 's|^\./||' | LC_ALL=C sort)
     [ "$links" = "$actual_links" ] || fail "staged upstream link types differ from STAGE.links: $stage_dir"
     actual_execs=$(cd "$stage_dir" && find . -path ./STAGE.sha256 -prune -o -path ./STAGE.links -prune -o -type f -perm -100 -print | sed 's|^\./||' | LC_ALL=C sort)
-    [ "$(cat "$work/stage-execs-sorted.txt")" = "$actual_execs" ] \
+    [ "$(cat "$check_dir/stage-execs-sorted.txt")" = "$actual_execs" ] \
         || fail "staged upstream executable bits differ from STAGE.links: $stage_dir"
     while IFS="$tab" read -r kind path target; do
         case $kind in
@@ -427,6 +427,15 @@ inner_main() {
     sock_root=$7
     host_probe=$8
     shift 8
+    case "$isolation" in
+        sandbox)
+            check_dir=$work/t/check
+            mkdir -p "$check_dir"
+            ;;
+        *)
+            check_dir=$work
+            ;;
+    esac
     if [ "$isolation" = userns ]; then
         ip link set lo up || fail "cannot bring loopback up inside the namespace"
     fi
@@ -654,6 +663,7 @@ else
 fi
 chmod 700 "$work"
 work=$(cd "$work" && pwd -P)
+check_dir=$work
 sock_root=
 host_probe=
 host_probe_listener_pid=
@@ -873,6 +883,13 @@ mkdir "$work/run"
 # caller's PATH, which may include writable directories populated by npm.
 root_path=/usr/sbin:/usr/bin:/sbin:/bin
 
+# macOS: validate every staged upstream before the throwaway user is created,
+# so validation needs no sudo and fails exactly as inside the isolated run.
+# The isolated run validates again before it executes anything.
+if [ "$uname_s" = Darwin ]; then
+    ( PATH=$root_path; for rt in $runtimes; do stage_check "$stage/$rt"; done ) || exit 1
+fi
+
 run_userns() {
     exec /usr/bin/setsid /usr/bin/env -i PATH="$root_path" /usr/bin/unshare --user --map-root-user --net --pid --fork --kill-child --mount-proc \
         /bin/sh "$self" __inner userns "$work" "$root" "$stage" "$work/consumer" "$node_dir" "" "" $runtimes
@@ -921,12 +938,8 @@ run_sandbox() {
     # test-support worker-leak check can read the process table; egress
     # stays denied. DNS (/private/var/run/mDNSResponder) stays denied.
     cd /
-    if [ "$uname_s" = Darwin ]; then
-        [ -n "$tuser" ] || fail "no throwaway user; refusing to run the macOS smoke as the invoking user"
-        exec /usr/bin/sudo -n -u "$tuser" /usr/bin/sandbox-exec -p "$profile" /usr/bin/env -i PATH="$root_path" /bin/sh "$work/smoke-archive" __inner sandbox "$work" "$root" "$stage" "$work/consumer" "$node_dir" "$sock_root" "$host_probe" $runtimes
-    else
-        exec /usr/bin/sandbox-exec -p "$profile" /usr/bin/env -i PATH="$root_path" /bin/sh "$self" __inner sandbox "$work" "$root" "$stage" "$work/consumer" "$node_dir" "$sock_root" "$host_probe" $runtimes
-    fi
+    [ -n "$tuser" ] || fail "no throwaway user; refusing to run the macOS smoke as the invoking user"
+    exec /usr/bin/sudo -n -u "$tuser" /usr/bin/sandbox-exec -p "$profile" /usr/bin/env -i PATH="$root_path" /bin/sh "$work/smoke-archive" __inner sandbox "$work" "$root" "$stage" "$work/consumer" "$node_dir" "$sock_root" "$host_probe" $runtimes
 }
 probe_userns() {
     /usr/bin/env -i PATH="$root_path" /usr/bin/unshare --user --map-root-user --net --pid --fork --kill-child --mount-proc /usr/bin/true >/dev/null 2>&1

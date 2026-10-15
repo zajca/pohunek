@@ -8,6 +8,7 @@ itself, its extraction, its namespace entry and its report checks are real.
 Run: python3 -m unittest scripts.tests.test_smoke_archive
 """
 
+import glob
 import hashlib
 import io
 import json
@@ -74,6 +75,23 @@ def sudo_available():
     return probe.returncode == 0
 
 
+def darwin_sudo_available():
+    """On Darwin, check if passwordless sudo is available for the isolated run."""
+    if not sys.platform.startswith("darwin"):
+        return False
+    try:
+        probe = subprocess.run(
+            ["/usr/bin/sudo", "-n", "/usr/bin/true"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        return probe.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
 def can_run_smoke_archive_tests():
     """Check if the platform can run smoke-archive tests."""
     if sys.platform.startswith("linux"):
@@ -88,6 +106,13 @@ def can_run_smoke_archive_tests():
         has_codesign = bool(shutil.which("codesign") or Path("/usr/bin/codesign").exists())
         return has_sandbox and has_jq and has_codesign
     return False
+
+
+# Decorator for tests that reach the isolated run on macOS (needs passwordless sudo)
+needs_isolated_run = unittest.skipIf(
+    sys.platform.startswith("darwin") and not darwin_sudo_available(),
+    "the macOS isolated run needs passwordless sudo for the throwaway user",
+)
 
 
 def processes_with_marker():
@@ -380,6 +405,7 @@ class _SmokeArchiveFixture:
 class SmokeArchiveTest(_SmokeArchiveFixture, unittest.TestCase):
     # -- scenarios ----------------------------------------------------------
 
+    @needs_isolated_run
     def test_success_runs_every_shipped_runtime_in_a_hermetic_environment(self):
         node_dir = self.base / "node-bin"
         node_dir.mkdir()
@@ -427,6 +453,7 @@ if [ -n "${POHUNEK_TEST_TEMP_ROOT:-}" ]; then echo "ENV-TEMP-ROOT=$POHUNEK_TEST_
             self.assertTrue(found_temp_root, "POHUNEK_TEST_TEMP_ROOT not found on Darwin")
         self.assert_cleaned_up()
 
+    @needs_isolated_run
     def test_runtime_flag_restricts_the_shipped_set_and_unknown_runtime_fails(self):
         result = self.smoke("--runtime", "pi")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -495,6 +522,7 @@ if [ -n "${POHUNEK_TEST_TEMP_ROOT:-}" ]; then echo "ENV-TEMP-ROOT=$POHUNEK_TEST_
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid STAGE.links link path or target", result.stderr)
 
+    @needs_isolated_run
     def test_a_retargeted_link_is_refused(self):
         stage = self.stage / "pi"
         (stage / "bin" / "alias").symlink_to("pi")
@@ -536,6 +564,7 @@ if [ -n "${POHUNEK_TEST_TEMP_ROOT:-}" ]; then echo "ENV-TEMP-ROOT=$POHUNEK_TEST_
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid STAGE.links link path or target", result.stderr)
 
+    @needs_isolated_run
     def test_a_link_target_can_use_parent_inside_stage(self):
         stage = self.stage / "pi"
         (stage / "bin" / "alias").symlink_to("../bin/pi")
@@ -544,6 +573,7 @@ if [ -n "${POHUNEK_TEST_TEMP_ROOT:-}" ]; then echo "ENV-TEMP-ROOT=$POHUNEK_TEST_
         result = self.smoke("--runtime", "pi")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    @needs_isolated_run
     def test_a_link_chain_inside_stage_is_accepted(self):
         stage = self.stage / "pi"
         (stage / "alias").symlink_to(".")
@@ -687,6 +717,7 @@ if [ -n "${POHUNEK_TEST_TEMP_ROOT:-}" ]; then echo "ENV-TEMP-ROOT=$POHUNEK_TEST_
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("does not match its catalog digest", result.stderr)
 
+    @needs_isolated_run
     def test_a_report_with_a_foreign_executable_or_package_digest_is_refused(self):
         self.write_consumer(STUB_PREAMBLE + STUB_REPORT.replace('"$(h pohunekd)"', '"' + "1" * 64 + '"'))
         result = self.smoke("--runtime", "pi")
@@ -698,6 +729,7 @@ if [ -n "${POHUNEK_TEST_TEMP_ROOT:-}" ]; then echo "ENV-TEMP-ROOT=$POHUNEK_TEST_
         self.assertIn("does not match the archive's catalog digest and binaries", result.stderr)
         self.assert_cleaned_up()
 
+    @needs_isolated_run
     def test_the_namespace_has_loopback_but_no_route_out(self):
         probe = f"""
 {sys.executable} - <<'PY'
@@ -732,6 +764,7 @@ for host in ("192.0.2.1", "8.8.8.8"):
         self.assertIn("OUTBOUND-REFUSED 8.8.8.8", result.stdout)
         self.assertNotIn("OUTBOUND-REACHED", result.stdout)
 
+    @needs_isolated_run
     def test_a_failing_consumer_leaves_no_process_and_no_temp_directory(self):
         self.write_consumer(STUB_PREAMBLE + f"sleep {MARKER_SLEEP} &\nexit 3\n")
         result = self.smoke()
@@ -739,6 +772,7 @@ for host in ("192.0.2.1", "8.8.8.8"):
         self.assertIn("consumer run failed for runtime", result.stderr)
         self.assert_cleaned_up()
 
+    @needs_isolated_run
     def test_a_process_outliving_a_successful_consumer_fails_the_run(self):
         self.write_consumer(STUB_PREAMBLE + f"sleep {MARKER_SLEEP} &\n" + STUB_REPORT)
         result = self.smoke("--runtime", "pi")
@@ -746,6 +780,7 @@ for host in ("192.0.2.1", "8.8.8.8"):
         self.assertIn("outlived the consumer run", result.stderr)
         self.assert_cleaned_up()
 
+    @needs_isolated_run
     def test_a_helper_in_its_own_session_is_killed_and_fails_the_run(self):
         # Start a helper in its OWN session that names the work temp root in its argv,
         # so stray_check's snapshot-based identity-kill branch (not pgrep -g) catches it.
@@ -811,6 +846,29 @@ for host in ("192.0.2.1", "8.8.8.8"):
         result = self.smoke("--isolation=sudo", "--runtime", "pi")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(f"UID={os.getuid()}", result.stdout)
+
+    @unittest.skipUnless(
+        sys.platform.startswith("darwin") and not darwin_sudo_available(),
+        "needs macOS without passwordless sudo",
+    )
+    def test_macos_without_passwordless_sudo_fails_closed(self):
+        before_pks = set(glob.glob("/private/tmp/pks.*"))
+        before_pk = set(glob.glob("/private/tmp/pk.*"))
+        before_pkh = set(glob.glob("/private/tmp/pkh.*"))
+
+        result = self.smoke("--runtime", "pi")
+
+        after_pks = set(glob.glob("/private/tmp/pks.*"))
+        after_pk = set(glob.glob("/private/tmp/pk.*"))
+        after_pkh = set(glob.glob("/private/tmp/pkh.*"))
+
+        self.assertNotEqual(result.returncode, 0, "smoke should fail without passwordless sudo")
+        self.assertIn("needs passwordless sudo (sudo -n)", result.stderr)
+        self.assert_cleaned_up()
+        # Verify no temp directories were created by the smoke
+        self.assertEqual(before_pks, after_pks, "leftover /private/tmp/pks.* directory")
+        self.assertEqual(before_pk, after_pk, "leftover /private/tmp/pk.* directory")
+        self.assertEqual(before_pkh, after_pkh, "leftover /private/tmp/pkh.* directory")
 
 
 @unittest.skipUnless(

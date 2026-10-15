@@ -4,9 +4,13 @@
   with two runners: `ubuntu-latest` (every Linux daemon archive in a network
   namespace via unprivileged user namespaces or `sudo -n unshare`) and `macos-15`
   (the aarch64-apple-darwin daemon archive under `sandbox-exec` after
-  `packaging/macos/verify-signed --adhoc`). The macOS smoke validates that the
-  Apple Silicon daemon archive and every official runtime package it carries
-  (`claude`, `codex`, `hermes`, `pi`) can be installed offline and serve agents
-  on the target platform. Leftover processes are checked with a weaker detection
-  on macOS (#1010).
+  `packaging/macos/verify-signed --adhoc`). On macOS, the consumer runs under
+  `sandbox-exec` as a throwaway local user created per run and deleted afterwards.
+  That requires passwordless `sudo -n`; without it, the smoke fails closed after
+  archive and stage validation. Unix sockets are allowed only under the run's own
+  roots and the throwaway user's Codex socket directory. The macOS smoke validates
+  that the Apple Silicon daemon archive and every official runtime package it
+  carries (`claude`, `codex`, `hermes`, `pi`) can be installed offline and serve
+  agents on the target platform. Leftover processes are checked with a weaker
+  detection on macOS (#1010).
 - Documented in `guides/hermes-operator`, `runbooks/install-on-macos`.
