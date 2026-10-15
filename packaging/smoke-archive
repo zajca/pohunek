@@ -949,6 +949,10 @@ root_path=/usr/sbin:/usr/bin:/sbin:/bin
 # so validation needs no sudo and fails exactly as inside the isolated run.
 # The isolated run validates again before it executes anything.
 if [ "$uname_s" = Darwin ]; then
+    for rt in $runtimes; do
+        unreadable=$(cd "$stage/$rt" 2>/dev/null && /usr/bin/find . ! -type l \( ! -perm -u+r -o \( -type d ! -perm -u+x \) \) -print 2>&1 | head -n 1) || unreadable="$stage/$rt"
+        [ -z "$unreadable" ] || fail "the staged upstream is not readable by the invoking user: $stage/$rt (${unreadable#./})"
+    done
     ( PATH=$root_path; for rt in $runtimes; do stage_check "$stage/$rt"; done ) || exit 1
 fi
 
@@ -1110,7 +1114,7 @@ if [ "$chosen" = sandbox ]; then
                 /usr/bin/find "$1" -print >/dev/null 2>&1 || { printf "find failed in stage: %s\n" "$1"; exit 1; }
             ' sh "$stage/$rt" "$stage/$rt/STAGE.sha256" "$stage/$rt/STAGE.links" 2>&1) && stage_status=0 || stage_status=$?
             if [ "$stage_status" -ne 0 ]; then
-                fail "the throwaway user cannot read the staged upstream $stage/$rt: $(printf '%s\n' "$output" | head -n 1); the caller must make the stage readable by other users (scripts/release-workflow/run-smoke does chmod -R go+rX on macOS)"
+                fail "the throwaway user cannot read the staged upstream $stage/$rt after it was handed over: $(printf '%s\n' "$output" | head -n 1)"
             fi
         done
         [ -S "$host_probe/s" ] || fail "host probe socket is missing"
