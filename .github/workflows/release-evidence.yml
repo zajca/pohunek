@@ -598,6 +598,7 @@ jobs:
       # which only the macOS runner has; on Linux they run in ci.yml.
       - name: Run the archive smoke scenarios on macOS
         if: runner.os == 'macOS'
+        timeout-minutes: 20
         shell: bash
         env:
           POHUNEK_SMOKE_TESTS_REQUIRE_ISOLATED_RUN: "1"

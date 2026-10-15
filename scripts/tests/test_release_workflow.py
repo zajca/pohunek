@@ -840,6 +840,11 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
             smoke.index("python3 -m unittest -v scripts.tests.test_smoke_archive"),
             smoke.index("scripts/release-workflow/run-smoke"),
         )
+        # Verify timeout-minutes: 20 is set for the macOS smoke step
+        smoke_step_start = smoke.index("Run the archive smoke scenarios on macOS")
+        smoke_step_end = smoke.index("python3 -m unittest -v scripts.tests.test_smoke_archive")
+        smoke_step = smoke[smoke_step_start:smoke_step_end]
+        self.assertIn("timeout-minutes: 20", smoke_step)
 
     def test_the_consumer_test_name_matches_the_smoke(self):
         pattern = r"consumer_test=(\S+)"

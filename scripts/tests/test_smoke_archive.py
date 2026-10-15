@@ -35,6 +35,8 @@ EPOCH = "1700000000"
 BINARIES = ("pohunek", "pohunekd", "pohunek-sessiond")
 # A marker sleep duration no other process uses, so a leftover is recognizable.
 MARKER_SLEEP = "2987"
+# Wall-clock timeout for smoke() calls, applied as Python's subprocess timeout.
+SMOKE_TIMEOUT_SECONDS = 600
 
 STUB_PREAMBLE = """#!/bin/sh
 set -eu
@@ -278,13 +280,20 @@ class _SmokeArchiveFixture:
         ]
         if timeout is not None:
             command = ["timeout", "--signal=TERM", "--kill-after=2s", f"{timeout}s", *command]
-        return subprocess.run(
-            command,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        try:
+            return subprocess.run(
+                command,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=SMOKE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise AssertionError(
+                f"smoke-archive did not finish within {SMOKE_TIMEOUT_SECONDS}s: "
+                f"stdout={error.stdout!r} stderr={error.stderr!r}"
+            ) from error
 
     def assert_cleaned_up(self):
         self.assertEqual(list(self.tmpdir.iterdir()), [], "the temp directory was left behind")
@@ -797,15 +806,19 @@ for host in ("192.0.2.1", "8.8.8.8"):
         # Start a helper in its OWN session that names the work temp root in its argv,
         # so stray_check's snapshot-based identity-kill branch (not pgrep -g) catches it.
         # Write the pid to a file OUTSIDE work so we can verify it's dead afterward.
-        pidfile = self.base / "helper.pid"
+        handoff = self.base / "handoff"
+        handoff.mkdir()
+        os.chmod(handoff, 0o777)
+        pidfile = handoff / "helper.pid"
         self.write_consumer(
             STUB_PREAMBLE
             + f'/usr/bin/perl -MPOSIX -e \'POSIX::setsid(); open(my $f, ">", $ARGV[0]) or die; print $f "$$\\n"; close $f; sleep 60\' {pidfile} "$TMPDIR/marker" </dev/null >/dev/null 2>&1 &\n'
-            + f'while [ ! -s {pidfile} ]; do sleep 0.1; done\n'
+            + f'n=0; while [ ! -s {pidfile} ]; do n=$((n+1)); [ "$n" -le 100 ] || {{ echo "HELPER-NOT-READY: helper did not write {pidfile}" >&2; exit 1; }}; sleep 0.1; done\n'
             + STUB_REPORT
         )
         result = self.smoke("--runtime", "pi")
         self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("HELPER-NOT-READY", result.stderr, result.stderr)
         self.assertIn("outlived the consumer run", result.stderr)
         # Verify pidfile was written before consumer exited
         self.assertTrue(pidfile.exists())
