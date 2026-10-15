@@ -540,6 +540,16 @@ impl WorktreeManager {
             .map(StoreMutation::into_value)
             .map_err(|err| store_error("persist worktree binding", &err))?;
         let added = Self::create_worktree(&repository, &path, &req.branch, &start_point);
+        if let Ok(true) = added {
+            Self::warn_ignored_base_branch(
+                &repository,
+                &path,
+                req,
+                &base_branch,
+                &start_point,
+                &mut warnings,
+            );
+        }
         // The new branch holds the commit from here on.
         drop(fetched);
         if let Err(add_error) = added {
@@ -1107,6 +1117,65 @@ impl WorktreeManager {
         Ok(default)
     }
 
+    /// Warns when the worktree at `path` checked out an existing `req.branch`
+    /// at another commit than the explicitly requested base.
+    ///
+    /// An existing branch is checked out as it is, so the worktree holds that
+    /// branch's commit, not the base's. The worktree's own `HEAD` is compared,
+    /// so a pre-create hook that moved the branch is reported as checked out.
+    /// The warning reaches the `session.new` result; a caller that must not let
+    /// the agent act on another commit starts the session without initial
+    /// input and checks it first. A commit that cannot be resolved counts as
+    /// different.
+    fn warn_ignored_base_branch(
+        repository: &Path,
+        path: &Path,
+        req: &WorktreeRequest,
+        base_branch: &str,
+        start_point: &str,
+        warnings: &mut Vec<SessionWarning>,
+    ) {
+        let explicit_base = req
+            .base_branch
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|base| !base.is_empty());
+        if !explicit_base {
+            return;
+        }
+        let branch_commit = git_capture(path, &["rev-parse", "--verify", "HEAD^{commit}"]);
+        // A start point other than the base's name is the fetched commit; the
+        // local base is named by its full ref, so a same-named tag cannot win.
+        let base_rev = if start_point == base_branch {
+            format!("refs/heads/{base_branch}^{{commit}}")
+        } else {
+            format!("{start_point}^{{commit}}")
+        };
+        let base_commit = git_capture(repository, &["rev-parse", "--verify", &base_rev]);
+        if let (Ok(branch_commit), Ok(base_commit)) = (&branch_commit, &base_commit) {
+            if branch_commit == base_commit {
+                return;
+            }
+        }
+        let describe = |resolved: &Result<String, String>| match resolved {
+            Ok(commit) => commit.clone(),
+            Err(message) => format!("unresolved ({message})"),
+        };
+        warnings.push(SessionWarning {
+            kind: SessionWarningKind::BaseBranchFallback,
+            message: format!(
+                "Branch {:?} already exists, so the worktree checks it out as it is and base branch {base_branch:?} was ignored.",
+                req.branch
+            ),
+            detail: Some(format!(
+                "{} is checked out at {}; base branch {base_branch:?} is at {}",
+                req.branch,
+                describe(&branch_commit),
+                describe(&base_commit)
+            )),
+        });
+    }
+
     /// Determine the start-point for a **new** branch: the freshly fetched base
     /// when a fetch from `origin` succeeds, else the local `base_branch` (with a
     /// non-fatal `fetch` warning on failure). A fetch is only attempted when an
@@ -1142,13 +1211,13 @@ impl WorktreeManager {
     }
 
     /// Run `git worktree add`, checking out an existing branch or creating a new
-    /// one from the base ref.
+    /// one from the base ref. Returns whether it checked out an existing branch.
     fn create_worktree(
         repository: &Path,
         path: &Path,
         branch: &str,
         start_point: &str,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<bool, ProtocolError> {
         let exists = matches!(branch_exists(repository, branch), Ok(true));
         let result = if exists {
             // The branch already exists (e.g. a recreate after the dir was lost):
@@ -1157,7 +1226,7 @@ impl WorktreeManager {
         } else {
             worktree_add_new(repository, path, branch, start_point)
         };
-        result.map_err(|message| {
+        result.map(|()| exists).map_err(|message| {
             // Git allows only one worktree per branch: a concurrent or prior
             // session already holding this branch fails with "already checked
             // out"/"already used by worktree". Surface that as a clear typed

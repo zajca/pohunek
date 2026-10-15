@@ -16,6 +16,21 @@ configured default, then the repository default. When an explicit base branch
 is not present locally, Pohunek fetches that branch from `origin` before it
 considers falling back to the repository default.
 
+The base branch only applies to a branch the worktree creates. A `--branch`
+that already exists locally is checked out as it is. When `--base-branch` was
+given explicitly and that existing branch is at another commit than the base,
+for example a local pull-request branch behind its `origin` copy, the
+`session.new` result carries a `base_branch_fallback` warning whose `detail`
+names both commits. The warning arrives with the created session, so a caller
+that must not let the agent act on another commit starts the session without
+`--input`, checks `warnings`, and only then sends the prompt with
+`session input`.
+
+A branch the worktree creates from a base has no upstream. The base is fetched
+into a temporary ref, not a remote-tracking branch, and an upstream set to a
+base with another name would make a plain `git push` target the base branch.
+Set one when the branch is first pushed, with `git push -u origin <branch>`.
+
 Worktrees are useful when an agent should make branch-scoped edits without
 touching the main checkout. They also make remote project sessions practical:
 the daemon resolves the project on the target host and creates the worktree in

@@ -1484,8 +1484,12 @@ Important fields:
   written by a newer daemon drops such a warning too and keeps the session;
   when it later rewrites that session's record, the dropped warning is not
   kept, so a later upgrade does not show it again. `kind` is
-  `fetch`, `base_branch_fallback`, `setup_script` or `hook` for worktree setup,
-  and `native_recovery` for a session whose stored native recovery record could
+  `fetch`, `base_branch_fallback`, `setup_script` or `hook` for worktree setup.
+  `base_branch_fallback` marks a requested base branch that was not used:
+  either it did not exist and the repository's default branch was used, or the
+  session's `branch` already existed locally at another commit and was checked
+  out as it is, with `detail` naming both commits. `kind` is
+  `native_recovery` for a session whose stored native recovery record could
   not be completed after an upgrade: it cannot resume or fork, `message` says to
   start a new session and resume the native conversation, and `detail` carries
   the stored native reference. `hook` also marks a launch (new, resume or fork)

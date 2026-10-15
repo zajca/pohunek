@@ -1058,6 +1058,186 @@ fn base_branch_fallback_keeps_the_worktree_with_a_warning() {
     assert!(warning.message.contains("main"));
 }
 
+/// A repository whose `feat/x` branch is one commit behind `main`, and the
+/// two commits.
+fn repo_with_a_branch_behind_main(tag: &str) -> (PathBuf, String, String) {
+    let repo = init_repo(tag);
+    git_in(&repo, &["branch", "feat/x"]);
+    git_in(
+        &repo,
+        &["commit", "-q", "--allow-empty", "-m", "main moves on"],
+    );
+    let branch = git_stdout(&repo, &["rev-parse", "refs/heads/feat/x"]);
+    let main = git_stdout(&repo, &["rev-parse", "refs/heads/main"]);
+    assert_ne!(branch, main);
+    (repo, branch, main)
+}
+
+#[test]
+fn an_explicit_base_ignored_for_an_existing_branch_at_another_commit_is_reported() {
+    let mgr = manager("base-ignored");
+    let (repo, branch_commit, main_commit) = repo_with_a_branch_behind_main("base-ignored-repo");
+    let mut req = request("s-1", &repo, "feat/x");
+    req.base_branch = Some("main".to_owned());
+
+    let bound = mgr.bind(&req).expect("bind checks the existing branch out");
+
+    assert_eq!(
+        git_stdout(&bound.path, &["rev-parse", "HEAD"]),
+        branch_commit,
+        "the existing branch is checked out as it is"
+    );
+    let warning = bound
+        .warnings
+        .iter()
+        .find(|w| w.kind == SessionWarningKind::BaseBranchFallback)
+        .expect("base-branch warning present");
+    assert!(warning.message.contains("feat/x"), "{}", warning.message);
+    assert!(warning.message.contains("main"), "{}", warning.message);
+    let detail = warning.detail.as_deref().expect("warning detail");
+    assert!(detail.contains(&branch_commit), "{detail}");
+    assert!(detail.contains(&main_commit), "{detail}");
+}
+
+#[test]
+fn a_local_branch_behind_its_origin_named_as_its_own_base_is_reported() {
+    // Adopting a pull request's head branch: `--branch H --base-branch H`,
+    // where the local `H` is behind `origin/H`.
+    let upstream = init_repo("adopt-upstream");
+    git_in(&upstream, &["checkout", "-q", "-b", "pr/head"]);
+    git_in(
+        &upstream,
+        &["commit", "-q", "--allow-empty", "-m", "first head commit"],
+    );
+    git_in(&upstream, &["checkout", "-q", "main"]);
+    let downstream = unique_dir("adopt-downstream-parent").join("clone");
+    let clone = pohunek_test_support::process_env::command("git")
+        .args(["clone", "-q"])
+        .arg(&upstream)
+        .arg(&downstream)
+        .output()
+        .expect("git clone");
+    assert!(
+        clone.status.success(),
+        "git clone failed: {}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    git_in(&downstream, &["branch", "pr/head", "origin/pr/head"]);
+    let local_commit = git_stdout(&downstream, &["rev-parse", "refs/heads/pr/head"]);
+    git_in(&upstream, &["checkout", "-q", "pr/head"]);
+    git_in(
+        &upstream,
+        &["commit", "-q", "--allow-empty", "-m", "second head commit"],
+    );
+    let origin_commit = git_stdout(&upstream, &["rev-parse", "HEAD"]);
+    git_in(&upstream, &["checkout", "-q", "main"]);
+
+    let mut req = request("s-1", &downstream, "pr/head");
+    req.base_branch = Some("pr/head".to_owned());
+    let bound = manager("adopt")
+        .bind(&req)
+        .expect("bind the local head branch");
+
+    assert_eq!(
+        git_stdout(&bound.path, &["rev-parse", "HEAD"]),
+        local_commit,
+        "the local branch is checked out as it is"
+    );
+    let warning = bound
+        .warnings
+        .iter()
+        .find(|w| w.kind == SessionWarningKind::BaseBranchFallback)
+        .expect("base-branch warning present");
+    let detail = warning.detail.as_deref().expect("warning detail");
+    assert!(detail.contains(&local_commit), "{detail}");
+    assert!(detail.contains(&origin_commit), "{detail}");
+}
+
+#[test]
+fn a_branch_a_pre_create_hook_moves_off_the_base_is_reported_as_checked_out() {
+    let repo = init_repo("base-moved-repo");
+    commit_hook(
+        &repo,
+        "pre-create",
+        "#!/bin/sh\ngit update-ref refs/heads/feat/y \"$(git rev-parse main~1)\"\n",
+    );
+    git_in(&repo, &["branch", "feat/y", "main"]);
+    let moved_to = git_stdout(&repo, &["rev-parse", "main~1"]);
+    let mut req = request("s-1", &repo, "feat/y");
+    req.base_branch = Some("main".to_owned());
+
+    let bound = manager("base-moved")
+        .bind(&req)
+        .expect("bind the moved branch");
+
+    assert_eq!(git_stdout(&bound.path, &["rev-parse", "HEAD"]), moved_to);
+    let warning = bound
+        .warnings
+        .iter()
+        .find(|w| w.kind == SessionWarningKind::BaseBranchFallback)
+        .expect("base-branch warning present");
+    let detail = warning.detail.as_deref().expect("warning detail");
+    assert!(detail.contains(&moved_to), "{detail}");
+}
+
+#[test]
+fn a_tag_named_like_the_local_base_does_not_decide_the_base_commit() {
+    let (repo, branch_commit, _main_commit) = repo_with_a_branch_behind_main("base-tag-repo");
+    // The existing branch sits on the base branch's commit, and a tag with the
+    // base's name points elsewhere.
+    git_in(&repo, &["branch", "-f", "feat/x", "main"]);
+    git_in(&repo, &["tag", "main", &branch_commit]);
+    let mut req = request("s-1", &repo, "feat/x");
+    req.base_branch = Some("main".to_owned());
+
+    let bound = manager("base-tag")
+        .bind(&req)
+        .expect("bind at the base commit");
+
+    assert!(
+        bound
+            .warnings
+            .iter()
+            .all(|w| w.kind != SessionWarningKind::BaseBranchFallback),
+        "{:?}",
+        bound.warnings
+    );
+}
+
+#[test]
+fn an_existing_branch_without_an_explicit_base_or_at_the_base_commit_is_not_reported() {
+    let (repo, _branch_commit, _main_commit) = repo_with_a_branch_behind_main("base-kept-repo");
+
+    // No explicit base: an existing branch is the ordinary resume case.
+    let bound = manager("base-default")
+        .bind(&request("s-1", &repo, "feat/x"))
+        .expect("bind without an explicit base");
+    assert!(
+        bound
+            .warnings
+            .iter()
+            .all(|w| w.kind != SessionWarningKind::BaseBranchFallback),
+        "{:?}",
+        bound.warnings
+    );
+
+    // An explicit base at the branch's own commit changes nothing.
+    git_in(&repo, &["branch", "feat/y", "main"]);
+    let mut req = request("s-2", &repo, "feat/y");
+    req.base_branch = Some("main".to_owned());
+    let bound = manager("base-same")
+        .bind(&req)
+        .expect("bind at the base commit");
+    assert!(
+        bound
+            .warnings
+            .iter()
+            .all(|w| w.kind != SessionWarningKind::BaseBranchFallback),
+        "{:?}",
+        bound.warnings
+    );
+}
+
 #[test]
 fn fetch_failure_keeps_the_worktree_with_a_warning() {
     let mgr = manager("fetch-warn");
