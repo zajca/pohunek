@@ -197,9 +197,11 @@ const DEFAULT_HOOK_STDERR_TAIL_BYTES: u32 = pohunek_service_config::DEFAULT_HOOK
 ///
 /// A hook's short-lived trailing children (a `git` helper, a backgrounded
 /// cleanup) close its stderr within moments of the hook's exit; a process that
-/// still holds it after two seconds is a long-lived background process, which
-/// gets `SIGPIPE` after a daemon restart. Raising it delays that warning;
-/// lowering it may report a child that was about to exit.
+/// still holds it after two seconds is a long-lived background process, whose
+/// stderr the daemon then hands to a drain process so it survives a daemon
+/// restart. Raising it widens the window in which a restart still gives that
+/// process `SIGPIPE`; lowering it may start a drain for a child that was about
+/// to exit.
 const DEFAULT_HOOK_STDERR_RELEASE_GRACE: Duration = Duration::from_secs(2);
 
 /// Default upper bound for a freshly spawned agent to expose an input-ready
@@ -440,7 +442,8 @@ pub struct SessionRegistryConfig {
     /// Defaults to [`DEFAULT_HOOK_STDERR_TAIL_BYTES`].
     pub hook_stderr_tail_bytes: u32,
     /// How long a background process may keep a captured hook's stderr open
-    /// after the hook ended before the daemon logs a warning naming the hook.
+    /// after the hook ended before the daemon hands the stderr to a drain
+    /// process.
     /// Defaults to [`DEFAULT_HOOK_STDERR_RELEASE_GRACE`].
     pub hook_stderr_release_grace: Duration,
     /// Directory for the append-only event log (`<data_dir>/events`). `None`

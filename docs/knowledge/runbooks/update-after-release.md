@@ -811,17 +811,20 @@ the `session.new` warning, so the hook's stderr is a pipe the daemon drains
 instead of `/dev/null` (`hooks.stderr_tail_bytes`, default 4096). A process a
 hook leaves running in the background with its stderr inherited (`npm run dev &`,
 also `nohup cmd &`, since `nohup` redirects only a terminal) keeps running while
-the daemon does, but after a later daemon restart on macOS or without a service
-manager its next stderr write raises `SIGPIPE`. The daemon log names each such
-hook two seconds after it ended:
+the daemon does. Two seconds after the hook ended, the daemon hands that stderr
+to a drain process (`/bin/cat` into `/dev/null`), so the process keeps running
+across a later daemon restart on macOS or without a service manager. Only a
+restart within those two seconds still gives it `SIGPIPE` on its next stderr
+write. If the drain cannot start, the daemon log names the hook:
 
 ```text
-WARN ... a background process still holds the hook's stderr; redirect its stderr or set hooks.stderr_tail_bytes = 0, or it gets SIGPIPE after a daemon restart event=post-create script=...
+WARN ... a background process still holds the hook's stderr and no drain process could take it; redirect its stderr or set hooks.stderr_tail_bytes = 0, or it gets SIGPIPE after a daemon restart event=post-create script=...
 ```
 
-Redirect that process's stderr in the hook (`>/dev/null 2>&1` or a log file), or
-set `hooks.stderr_tail_bytes = 0` in `service.toml` to keep every hook's stderr
-on `/dev/null`. Under systemd the daemon restart already ends such processes.
+Then redirect that process's stderr in the hook (`>/dev/null 2>&1` or a log
+file), or set `hooks.stderr_tail_bytes = 0` in `service.toml` to keep every
+hook's stderr on `/dev/null`. Under systemd the daemon restart already ends
+such processes.
 
 ## Claude profiles with a detection manifest override
 

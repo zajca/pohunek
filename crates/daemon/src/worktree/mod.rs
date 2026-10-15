@@ -50,6 +50,7 @@ use tracing::{debug, info, warn};
 use crate::store::{Store, StoreMutation, WorktreeBinding, WorktreeStatus};
 use crate::time::now_rfc3339;
 
+mod stderr_drain;
 mod stderr_tail;
 
 use stderr_tail::{CaptureSettings, HookOrigin, StderrCapture};

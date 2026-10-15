@@ -1761,25 +1761,121 @@ fn host_global_and_in_repo_post_create_run_host_global_first() {
     );
 }
 
-/// Release grace of the held-stderr scenario: short, so the warning follows the
+/// Release grace of the held-stderr scenario: short, so the hand-off follows the
 /// hook within moments.
 const HELD_STDERR_RELEASE_GRACE: Duration = Duration::from_millis(200);
 
+/// The `drain_pid` field of the hand-off line.
+fn drain_pid(line: &str) -> rustix::process::Pid {
+    line.split_whitespace()
+        .find_map(|field| field.strip_prefix("drain_pid="))
+        .and_then(|pid| pid.parse::<i32>().ok())
+        .and_then(rustix::process::Pid::from_raw)
+        .unwrap_or_else(|| panic!("the hand-off names the drain: {line}"))
+}
+
+/// The pipe a process holds as descriptor `fd`, as `/proc` names it.
+#[cfg(target_os = "linux")]
+fn pipe_of(pid: rustix::process::Pid, fd: u32) -> String {
+    fs::read_link(format!("/proc/{}/fd/{fd}", pid.as_raw_nonzero()))
+        .expect("read the descriptor link")
+        .display()
+        .to_string()
+}
+
+/// Asserts that `drain` reads the pipe `holder` writes as stderr, has
+/// `/dev/null` as stdout and stderr, inherited no descriptor this process
+/// holds, and that this process no longer holds the pipe's read end.
+#[cfg(target_os = "linux")]
+fn assert_drain_descriptors(holder: rustix::process::Pid, drain: rustix::process::Pid) {
+    // The drain holds the writer's pipe as stdin and `/dev/null` as stdout
+    // and stderr. Any higher descriptor is the drain's own (GNU cat opens a
+    // splice pipe), never one this process holds.
+    let pipe = pipe_of(holder, 2);
+    assert_eq!(pipe_of(drain, 0), pipe, "the drain reads the writer's pipe");
+    for fd in [1, 2] {
+        assert_eq!(pipe_of(drain, fd), "/dev/null");
+    }
+    let own: Vec<String> = fs::read_dir("/proc/self/fd")
+        .expect("list own descriptors")
+        .filter_map(Result::ok)
+        .filter_map(|entry| fs::read_link(entry.path()).ok())
+        .map(|target| target.display().to_string())
+        .collect();
+    for entry in fs::read_dir(format!("/proc/{}/fd", drain.as_raw_nonzero()))
+        .expect("list the drain's descriptors")
+        .filter_map(Result::ok)
+    {
+        let fd: u32 = entry
+            .file_name()
+            .to_string_lossy()
+            .parse()
+            .expect("numeric descriptor");
+        if fd > 2 {
+            let target = pipe_of(drain, fd);
+            assert!(
+                !own.contains(&target),
+                "the drain inherited descriptor {fd} ({target}) from the daemon"
+            );
+        }
+    }
+    pohunek_test_support::wait::poll_until("the reader closes its read end", || {
+        let held = fs::read_dir("/proc/self/fd")
+            .expect("list own descriptors")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                fs::read_link(entry.path()).is_ok_and(|target| target.display().to_string() == pipe)
+            });
+        (!held).then_some(())
+    });
+}
+
+/// The numbered descriptors `pid` holds, as `lsof` lists them.
+#[cfg(target_os = "macos")]
+fn lsof_descriptors(pid: rustix::process::Pid) -> Vec<u32> {
+    let output = std::process::Command::new("/usr/sbin/lsof")
+        .args([
+            "-a",
+            "-p",
+            &pid.as_raw_nonzero().to_string(),
+            "-d",
+            "0-65535",
+            "-F",
+            "f",
+        ])
+        .output()
+        .expect("run lsof");
+    let mut descriptors: Vec<u32> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix('f'))
+        .filter_map(|fd| fd.parse().ok())
+        .collect();
+    descriptors.sort_unstable();
+    descriptors
+}
+
 #[test]
-fn a_background_process_holding_a_create_hook_stderr_is_reported_by_hook() {
-    // A hook that leaves a process running with its stderr inherited gets a
-    // warning naming the event and script, since that process would get SIGPIPE
-    // after a daemon restart; the warning never carries the hook's output.
+fn a_background_process_holding_a_create_hook_stderr_gets_a_drain_process() {
+    // A hook that leaves a process running with its stderr inherited: after the
+    // release grace the daemon hands the pipe's read end to a drain process and
+    // closes its own, so the process keeps a readable stderr when the daemon
+    // exits. The log names the event and script, never the hook's output.
     let logs = crate::runtime::lifecycle::tests::LogCapture::default();
     let _subscriber = logs.install();
     let config_dir = unique_dir("hook-held-config");
     fs::create_dir_all(config_dir.join("hooks")).expect("host hooks dir");
     let holder_pid = config_dir.join("holder.pid");
+    let holder_writes = config_dir.join("holder-writes");
     fs::write(
         config_dir.join("hooks/post-create"),
         format!(
-            "#!/bin/sh\necho 'hook output stays private' >&2\nsleep 30 &\necho $! > '{}'\n",
-            holder_pid.display()
+            "#!/bin/sh
+echo 'hook output stays private' >&2
+             (echo $$ > /dev/null; while :; do echo tick >&2 || exit 1; echo w >> '{writes}'; sleep 0.1; done) &
+             echo $! > '{holder}'
+",
+            writes = holder_writes.display(),
+            holder = holder_pid.display()
         ),
     )
     .expect("write host hook");
@@ -1796,6 +1892,11 @@ fn a_background_process_holding_a_create_hook_stderr_is_reported_by_hook() {
         Some(config_dir.clone()),
     );
     let repo = init_repo("hook-held-repo");
+    // A descriptor without close-on-exec, as a library could leave one: the
+    // drain must not inherit it.
+    let inheritable = fs::File::open(&config_dir).expect("open a descriptor");
+    rustix::io::fcntl_setfd(&inheritable, rustix::io::FdFlags::empty())
+        .expect("clear close-on-exec");
 
     let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
     assert!(
@@ -1803,26 +1904,47 @@ fn a_background_process_holding_a_create_hook_stderr_is_reported_by_hook() {
         "a successful hook leaves no warning and no tail: {:?}",
         bound.warnings
     );
-    let line = pohunek_test_support::wait::poll_until("the held-stderr warning", || {
+    let line = pohunek_test_support::wait::poll_until("the drain hand-off", || {
         logs.text()
             .lines()
-            .find(|line| line.contains("still holds the hook's stderr"))
+            .find(|line| line.contains("a drain process reads it from now on"))
             .map(str::to_owned)
     });
+    assert!(line.contains("DEBUG"), "{line}");
     assert!(line.contains("post-create"), "{line}");
     assert!(
         line.contains(&config_dir.join("hooks/post-create").display().to_string()),
         "{line}"
     );
     assert!(!logs.text().contains("hook output stays private"));
-
-    if let Some(pid) = fs::read_to_string(&holder_pid)
+    let drain = drain_pid(&line);
+    let holder = fs::read_to_string(&holder_pid)
         .ok()
         .and_then(|pid| pid.trim().parse::<i32>().ok())
         .and_then(rustix::process::Pid::from_raw)
-    {
-        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-    }
+        .expect("the hook recorded its background writer");
+
+    #[cfg(target_os = "linux")]
+    assert_drain_descriptors(holder, drain);
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        lsof_descriptors(drain),
+        [0, 1, 2],
+        "the drain inherits only its stdio"
+    );
+
+    let writes = || fs::read_to_string(&holder_writes).map_or(0, |text| text.lines().count());
+    let before = writes();
+    pohunek_test_support::wait::poll_until("the writer keeps writing to stderr", || {
+        (writes() > before + 3).then_some(())
+    });
+
+    let _ = rustix::process::kill_process(holder, rustix::process::Signal::KILL);
+    pohunek_test_support::wait::poll_until("the drain ends and is reaped", || {
+        rustix::process::test_kill_process(drain)
+            .is_err()
+            .then_some(())
+    });
 }
 
 // --- retention safety probe -----------------------------------------------

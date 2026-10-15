@@ -515,17 +515,23 @@ default 4096, `0..=32768`, `0` disables the capture) while the hook runs:
 - **Never waits for the hook's descendants.** One reader thread drains the pipe
   while the hook runs, so a chatty hook never blocks on a full pipe. When the hook
   ends, the reader takes only what is buffered at that moment, then keeps reading
-  and discarding until EOF without anyone waiting for it. While the daemon runs,
-  a process the hook left running in the background keeps a stderr that neither
-  fills up nor raises `SIGPIPE`; it holds that reader thread until it closes
-  stderr. The read end lives in the daemon, so after a daemon restart such a
-  process gets `SIGPIPE` on its next stderr write (under systemd the restart
-  already ends it with the daemon's cgroup). **A hook that starts long-lived
-  processes redirects their stderr** (`>/dev/null 2>&1` or a log file);
-  `hooks.stderr_tail_bytes = 0` keeps every hook's stderr on `/dev/null`. When
-  the pipe is still open two seconds after the hook ended, the daemon logs a
-  WARN naming the event and script: "a background process still holds the hook's stderr; redirect its stderr or set hooks.stderr_tail_bytes = 0, or it gets SIGPIPE after a daemon restart". The tracked
-  alternative, a detached sink that outlives the daemon, is #1046.
+  and discarding until EOF without anyone waiting for it, so a process the hook
+  left running in the background keeps a stderr that neither fills up nor
+  raises `SIGPIPE`. When the pipe is still open two seconds after the hook
+  ended, the daemon hands the read end to a detached drain: `/bin/cat`, run by
+  absolute path, with the pipe as stdin, `/dev/null` as stdout and stderr, a
+  cleared environment, its own process group, and no other inherited
+  descriptor. The daemon closes its own read end, waits for the drain on the
+  reader thread, and logs the hand-off at DEBUG with the event, script and
+  drain PID. The drain outlives a daemon restart (a launchd job, or a daemon no
+  manager supervises; under systemd the restart ends the hook's descendants
+  with the daemon's cgroup anyway), so the process's stderr writes keep
+  succeeding, and it ends at EOF. Until the hand-off the read end is the
+  daemon's: a restart while the hook runs or within those two seconds still
+  gives such a process `SIGPIPE` on its next stderr write. A drain that cannot
+  start leaves the discard in the daemon, with a WARN naming the event and
+  script. `hooks.stderr_tail_bytes = 0` keeps every hook's stderr on
+  `/dev/null` (#1046).
 - **Exposure.** The tail reaches the client that created the session, which can
   already read the worktree and the hook script. The hook runs with the cleared
   environment of B.3.1, so the tail holds only what the hook itself printed, but
