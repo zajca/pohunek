@@ -1715,15 +1715,50 @@ generated_history! {
     generated_history_eight_keeps_the_latest_conversation: 0xBF58_476D_1CE4_E5B9,
 }
 
-#[tokio::test]
-async fn generated_histories_over_many_seeds_keep_the_latest_conversation() {
-    // Seeds are derived from a fixed one, so a failure names its seed and steps.
-    let mut seeds = Generator(0x00C0_FFEE_D15E_A5E5);
-    for _ in 0..24 {
+/// The fixed seed the sweep's seeds are derived from, so a failure names its
+/// seed and steps.
+const SWEEP_SEED: u64 = 0x00C0_FFEE_D15E_A5E5;
+
+/// Seeds one sweep test runs. The 24 derived seeds are split over four tests
+/// that run in parallel, so no single test runs long enough to reach the slow
+/// timeout on a loaded runner.
+const SWEEP_BATCH: usize = 6;
+
+/// Steps of each sweep history.
+const SWEEP_HISTORY_LENGTH: usize = 10;
+
+/// Runs the histories of sweep batch `batch`: derived seeds
+/// `batch * SWEEP_BATCH` up to the next batch.
+async fn run_sweep_batch(batch: usize) {
+    let mut seeds = Generator(SWEEP_SEED);
+    for _ in 0..batch * SWEEP_BATCH {
+        seeds.next();
+    }
+    for _ in 0..SWEEP_BATCH {
         let seed = seeds.next();
-        let history = Generator(seed).history(10);
+        let history = Generator(seed).history(SWEEP_HISTORY_LENGTH);
         run_history(seed, &history).await;
     }
+}
+
+#[tokio::test]
+async fn generated_histories_of_sweep_batch_one_keep_the_latest_conversation() {
+    run_sweep_batch(0).await;
+}
+
+#[tokio::test]
+async fn generated_histories_of_sweep_batch_two_keep_the_latest_conversation() {
+    run_sweep_batch(1).await;
+}
+
+#[tokio::test]
+async fn generated_histories_of_sweep_batch_three_keep_the_latest_conversation() {
+    run_sweep_batch(2).await;
+}
+
+#[tokio::test]
+async fn generated_histories_of_sweep_batch_four_keep_the_latest_conversation() {
+    run_sweep_batch(3).await;
 }
 
 #[tokio::test]

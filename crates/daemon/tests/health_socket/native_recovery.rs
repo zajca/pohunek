@@ -195,7 +195,13 @@ impl ClaudeRig {
 
     /// Has the fixture agent of session `id` send the real `SessionStart` hook
     /// for conversation `reference` with `source`, and waits until
-    /// `session.inspect` shows it.
+    /// `session.inspect` shows it as both the active conversation and the
+    /// recovery target.
+    ///
+    /// The hook reports the active identity and the native reference in
+    /// separate fire-and-forget requests with a 0.5 s socket timeout, so on a
+    /// loaded host the daemon can record the reference after the hook has
+    /// acknowledged and after the active identity shows.
     async fn report_for(&mut self, id: &SessionId, source: &str, reference: &str) {
         let submitted = input_session(
             &mut self.control,
@@ -209,7 +215,9 @@ impl ClaudeRig {
         wait_until("Claude hook report to reach session.inspect", || async {
             let mut control = control.lock().await;
             let session = inspect_session(&mut control, id).await;
-            (session.active_agent_session_id.as_deref() == Some(reference)).then_some(())
+            (session.active_agent_session_id.as_deref() == Some(reference)
+                && session.native_session_id.as_deref() == Some(reference))
+            .then_some(())
         })
         .await;
     }
