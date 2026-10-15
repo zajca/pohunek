@@ -148,6 +148,9 @@ fn installer_lock_rejects_a_second_installer_without_touching_the_tree() {
 
 #[test]
 fn concurrent_installers_neither_lose_user_hooks_nor_duplicate_registrations() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let dir = scoped_dir("lock-race");
     write_json(&dir.join("settings.json"), &user_claude_settings());
     let barrier = Arc::new(Barrier::new(CONCURRENT_INSTALLERS));
@@ -405,6 +408,9 @@ fn a_displaced_managed_symlink_is_restored_when_a_later_step_fails() {
 
 #[test]
 fn reinstall_and_upgrade_are_idempotent_for_each_agent() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         let dir = scoped_dir("idempotent");
         prepare_existing(&agent, &dir);
@@ -467,6 +473,9 @@ fn installed_assets_match_the_embedded_scripts_with_owner_only_write_modes() {
 
 #[test]
 fn profiles_are_isolated_by_directory_and_exact_command_ownership() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let profile_a = scoped_dir("profile-a");
     let profile_b = scoped_dir("profile-b");
     let hook_a = profile_a.join("hooks").join(STATE_HOOK_INSTALL_NAME);
@@ -516,6 +525,9 @@ fn profiles_are_isolated_by_directory_and_exact_command_ownership() {
 
 #[test]
 fn explicit_agent_home_selects_exactly_the_targeted_directory() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let claude = scoped_dir("target-claude");
     let codex = scoped_dir("target-codex");
     let codex_before = tree_snapshot(&codex);
@@ -554,6 +566,9 @@ fn explicit_agent_home_selects_exactly_the_targeted_directory() {
 
 #[test]
 fn a_symlinked_config_root_is_rejected_and_its_canonical_path_installs() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let root = pohunek_test_support::tempdir().expect("fixture root");
     let real = root.path().join("real");
     fs::create_dir(&real).expect("create real dir");
@@ -579,6 +594,9 @@ fn a_symlinked_config_root_is_rejected_and_its_canonical_path_installs() {
 
 #[test]
 fn a_missing_optional_agent_is_informational_and_a_broken_config_root_is_a_failure() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let root = scoped_dir("optional-agent");
     let absent = root.join("absent");
     let not_a_directory = root.join("file");
@@ -600,6 +618,9 @@ fn a_missing_optional_agent_is_informational_and_a_broken_config_root_is_a_failu
 
 #[test]
 fn an_unresolvable_config_root_is_a_failure_not_an_absent_agent() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let report = with_config_dirs(
         Path::new("relative/claude"),
         Path::new("/nonexistent"),
@@ -808,6 +829,9 @@ fn error_text(error: &ProtocolError) -> String {
 
 #[test]
 fn provider_secrets_never_reach_install_status_or_error_output() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let claude = scoped_dir("secret-claude");
     let codex = scoped_dir("secret-codex");
     write_json(
@@ -1055,6 +1079,9 @@ fn a_later_failure_restores_an_oversized_managed_script_exactly() {
 
 #[test]
 fn installing_over_an_oversized_managed_script_replaces_it_without_residue() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         let dir = scoped_dir("oversized-replace");
         install_gated(&agent, &dir, &mut |_index, _name| Ok(())).expect("seed install");

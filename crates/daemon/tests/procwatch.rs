@@ -345,6 +345,9 @@ fn worker_backed_registry_with_launcher(
 
 #[tokio::test]
 async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     if !native_exit_watch_is_available() {
         return;
     }
@@ -500,16 +503,25 @@ async fn assert_foreground_agent_unattributed_without_the_official_package(agent
 
 #[tokio::test]
 async fn procwatch_leaves_a_foreground_codex_unattributed_without_the_official_package() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     assert_foreground_agent_unattributed_without_the_official_package("codex").await;
 }
 
 #[tokio::test]
 async fn procwatch_leaves_a_foreground_claude_unattributed_without_the_official_package() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     assert_foreground_agent_unattributed_without_the_official_package("claude").await;
 }
 
 #[tokio::test]
 async fn procwatch_keeps_worker_agent_after_daemon_restart() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let env = TestEnv::new().expect("create the test environment");
     let dir = env.cwd();
     let fake_codex = dir.join("codex");
@@ -666,6 +678,9 @@ impl Drop for ReapOnDrop {
 
 #[tokio::test]
 async fn procwatch_skips_nested_worker_agent_with_same_session_marker() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let env = TestEnv::new().expect("create the test environment");
     let dir = env.cwd();
     let fake_codex = dir.join("codex");
@@ -816,6 +831,9 @@ async fn procwatch_updates_cwd_after_shell_cd() {
     reason = "the end-to-end external-session contract is clearer in one lifecycle test"
 )]
 async fn external_observer_reports_fake_agent_and_pidfd_removes_it() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     if !native_exit_watch_is_available() {
         return;
     }

@@ -1813,6 +1813,10 @@ mod supervision_tests {
         // The variable name and the spellings are the documented contract in
         // `docs/public-api.md` ("Daemon Runtime Configuration").
         const DOCUMENTED_NAME: &str = "POHUNEK_OBSERVE_EXTERNAL_AGENTS";
+
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let mut env = ProcessEnv::lock();
 
         env.remove(DOCUMENTED_NAME);

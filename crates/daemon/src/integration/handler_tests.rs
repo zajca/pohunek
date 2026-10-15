@@ -276,6 +276,9 @@ fn staging_changes_nothing_and_holds_the_installer_lock() {
 
 #[test]
 fn a_schema_that_does_not_admit_the_asset_set_keeps_the_old_set_active() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let foreign = hook_schema("identity-v1").expect("registered");
     let narrowed = pohunek_worker_protocol::HookSchema {
         handlers: &[CODEX_ID, CLAUDE_ID],
@@ -516,6 +519,9 @@ fn a_retained_schema_that_does_not_admit_the_asset_set_keeps_the_old_set_active(
 
 #[test]
 fn an_undetermined_retained_version_refuses_every_handler_update() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let package = protocol::PackageId::parse("acme.runtime.other").expect("package id");
     let mut undetermined = RetainedSchemas::default();
     undetermined.push_unresolvable(package);
@@ -553,6 +559,9 @@ fn an_undetermined_retained_version_refuses_every_handler_update() {
 
 #[test]
 fn an_active_set_newer_than_the_update_is_replaced_by_it() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     for agent in agents() {
         let dir = scoped_dir("compat-newer-active");
         write_user_config(&agent, &dir);
@@ -621,6 +630,9 @@ fn a_failing_activation_restores_the_exact_prior_tree() {
 
 #[test]
 fn a_script_body_that_differs_at_the_current_version_is_outdated_and_the_doctor_fails() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     for agent in agents() {
         let dir = scoped_dir("same-version-drift");
         write_user_config(&agent, &dir);
@@ -673,6 +685,9 @@ fn a_script_body_that_differs_at_the_current_version_is_outdated_and_the_doctor_
 
 #[test]
 fn updating_from_the_previous_asset_set_activates_atomically() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     for agent in agents() {
         let dir = scoped_dir("update-previous");
         write_user_config(&agent, &dir);
@@ -739,6 +754,9 @@ fn updating_from_the_previous_asset_set_activates_atomically() {
 
 #[test]
 fn install_dispatches_through_the_package_runtime_definition() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let claude = scoped_dir("dispatch-claude");
     let codex = scoped_dir("dispatch-codex");
     let host = pi_shaped_integration_host(Path::new("/bin/sh"), CLAUDE_ID, "identity-subagent-v1");
@@ -791,6 +809,9 @@ fn install_dispatches_through_the_package_runtime_definition() {
 /// runtime reaches is acted on once.
 #[test]
 fn a_home_several_runtimes_reach_through_one_handler_is_attributed_to_none() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let claude = scoped_dir("dispatch-shared-claude");
     let codex = scoped_dir("dispatch-shared-codex");
     let host = pi_shaped_integration_host(Path::new("/bin/sh"), CLAUDE_ID, "identity-subagent-v1");
@@ -827,6 +848,9 @@ fn a_home_several_runtimes_reach_through_one_handler_is_attributed_to_none() {
 
 #[test]
 fn a_package_runtime_naming_the_cli_run_handler_is_not_installable() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let dir = scoped_dir("dispatch-cli-run");
     let host = pi_shaped_integration_host(Path::new("/bin/sh"), "hermes-hook-v1", "identity-v1");
     let pi = RuntimeRef::from_wire("pi");
@@ -854,6 +878,9 @@ fn a_package_runtime_naming_the_cli_run_handler_is_not_installable() {
 
 #[test]
 fn a_package_runtime_is_named_in_every_recovery_command_of_status_and_doctor() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let dir = scoped_dir("recovery-command");
     let codex = scoped_dir("recovery-command-codex");
     let host = pi_shaped_integration_host(Path::new("/bin/sh"), CLAUDE_ID, "identity-subagent-v1");
@@ -1017,6 +1044,9 @@ fn break_claude_state(dir: &Path, state: usize) {
 
 #[test]
 fn a_runtime_id_never_changes_how_the_doctor_classifies_a_warning() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let other = scoped_dir("classify-other");
     for state in 0..BROKEN_STATES {
         let dir = scoped_dir("classify");
@@ -1044,6 +1074,9 @@ fn a_runtime_id_never_changes_how_the_doctor_classifies_a_warning() {
 
 #[test]
 fn a_runtime_id_never_changes_the_not_installed_filter() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let other = scoped_dir("not-installed-other");
     let dir = scoped_dir("not-installed");
     let expected = doctor_findings(&official_host(), &RuntimeRef::claude(), &dir, &other);
@@ -1085,6 +1118,10 @@ fn the_codex_scripts_are_the_templates_rendered_from_the_descriptor_values() {
 #[test]
 fn installed_codex_scripts_are_the_rendered_bytes_and_an_unrendered_template_is_drift() {
     use super::{CODEX_HOOK_ASSET, CODEX_HOOK_TEMPLATE};
+
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let dir = scoped_dir("rendered-asset-drift");
     let state_hook = install_current(&RuntimeRef::codex(), &dir);
     assert_eq!(

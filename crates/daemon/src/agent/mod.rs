@@ -530,44 +530,25 @@ mod tests {
         crate::test_support::scoped_dir(&format!("pohunek-agent-test-{tag}-"))
     }
 
-    /// Set in the child process that [`in_own_process`] runs a test in.
-    const OWN_PROCESS_CHILD_VAR: &str = "POHUNEK_AGENT_TEST_OWN_PROCESS_CHILD";
-
-    /// Runs the calling test's `body` in a child process of this test binary
-    /// that runs only that test.
+    /// Runs the calling test's `body` only in a process of its own
+    /// ([`pohunek_test_support::process_env::in_own_process`]).
     ///
     /// The working directory and the environment are process-wide: a test that
-    /// changed either here would reach every concurrently running test of this
-    /// binary and the children they spawn, including the `PATH` that registry
-    /// fixtures snapshot for their agents. The child owns them instead.
+    /// changed either in a shared process would reach every concurrently
+    /// running test of this binary and the children they spawn, including the
+    /// `PATH` that registry fixtures snapshot for their agents.
     fn in_own_process(body: impl FnOnce()) {
-        if std::env::var_os(OWN_PROCESS_CHILD_VAR).is_some() {
+        if pohunek_test_support::process_env::in_own_process() {
             body();
-            return;
         }
-        let name = std::thread::current()
-            .name()
-            .expect("the test harness names each test's thread after the test")
-            .to_owned();
-        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
-            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
-            .env(OWN_PROCESS_CHILD_VAR, "1")
-            .output()
-            .expect("run the test in its own process");
-        assert!(
-            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
-            "{name} failed in its own process: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
     }
 
     /// Panics unless the calling test runs [`in_own_process`], the only place
-    /// a test may change the process environment or working directory.
+    /// a test may change the working directory.
     fn assert_own_process() {
         assert!(
-            std::env::var_os(OWN_PROCESS_CHILD_VAR).is_some(),
-            "a test changes the process environment or working directory only in_own_process"
+            pohunek_test_support::process_env::runs_in_own_process(),
+            "a test changes the working directory only in_own_process"
         );
     }
 
@@ -588,14 +569,12 @@ mod tests {
     }
 
     fn with_path<T>(path: &Path, run: impl FnOnce() -> T) -> T {
-        assert_own_process();
         let mut env = ProcessEnv::lock();
         env.set("PATH", path);
         run()
     }
 
     fn with_path_and_shell<T>(path: &Path, shell: &str, run: impl FnOnce() -> T) -> T {
-        assert_own_process();
         let mut env = ProcessEnv::lock();
         env.set("PATH", path).set("SHELL", shell);
         run()

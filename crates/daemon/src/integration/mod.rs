@@ -4799,6 +4799,9 @@ mod tests {
 
     #[test]
     fn status_reports_missing_config_without_mutation() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let root = scoped_dir("status-missing");
         fs::create_dir_all(&root).expect("create temp root");
         let claude = root.join(".claude");
@@ -4873,6 +4876,9 @@ mod tests {
 
     #[test]
     fn status_reports_complete_installs_current_without_mutation() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let root = scoped_dir("status-current");
         let claude = root.join("claude");
         let codex = root.join("codex");
@@ -4907,6 +4913,9 @@ mod tests {
     fn registration_files_require_owner_safe_permissions() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         for (name, agent, relative_path) in [
             (
                 "Claude settings.json",
@@ -4963,6 +4972,9 @@ mod tests {
     fn registration_files_are_opened_without_following_symlinks() {
         use std::os::unix::fs::symlink;
 
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         for (name, agent, relative_path) in [
             (
                 "Claude settings.json",
@@ -5167,6 +5179,9 @@ mod tests {
 
     #[test]
     fn missing_claude_hooks_directory_is_reinstallable_not_installed() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let claude = scoped_dir("status-missing-claude-hooks-parent");
 
         let report = explicit_status(&claude, RuntimeRef::claude());
@@ -5184,6 +5199,9 @@ mod tests {
 
     #[test]
     fn relative_provider_config_roots_are_rejected_before_cwd_can_diverge() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let home = scoped_dir("relative-provider-root-home");
         let relative = Path::new("relative-agent-config");
 
@@ -5246,6 +5264,9 @@ mod tests {
     fn writable_managed_asset_parents_require_manual_repair() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         for (name, agent, mode) in [
             ("codex config root", RuntimeRef::codex(), 0o775),
             ("claude hooks directory", RuntimeRef::claude(), 0o757),
@@ -5296,6 +5317,9 @@ mod tests {
 
     #[test]
     fn status_detects_each_modified_or_missing_managed_asset() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         for (name, relative_path, mutation) in [
             (
                 "state modified",
@@ -5346,6 +5370,9 @@ mod tests {
 
     #[test]
     fn installed_version_is_unknown_when_one_readable_asset_has_no_valid_marker() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let codex = scoped_dir("status-invalid-version-marker");
         install_codex(&codex).expect("install Codex fixture");
         let notify_path = codex.join(NOTIFY_HOOK_INSTALL_NAME);
@@ -5365,6 +5392,9 @@ mod tests {
 
     #[test]
     fn status_classifies_oversized_asset_as_reinstallable_outdated() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let codex = scoped_dir("status-oversized-asset");
         install_codex(&codex).expect("install Codex fixture");
         fs::write(
@@ -5385,6 +5415,9 @@ mod tests {
 
     #[test]
     fn status_classifies_oversized_provider_config_as_manual_repair() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let codex = scoped_dir("status-oversized-config");
         install_codex(&codex).expect("install Codex fixture");
         fs::write(
@@ -5447,6 +5480,9 @@ mod tests {
     fn managed_asset_symlink_requires_repair_and_reinstall_preserves_target() {
         use std::os::unix::fs::symlink;
 
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let codex = scoped_dir("status-asset-symlink");
         install_codex(&codex).expect("install Codex fixture");
         let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
@@ -5487,6 +5523,9 @@ mod tests {
     fn managed_asset_parent_symlink_requires_manual_repair() {
         use std::os::unix::fs::symlink;
 
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let claude = scoped_dir("status-asset-parent-symlink");
         install_claude(&claude).expect("install Claude fixture");
         let hooks_path = claude.join("hooks");
@@ -5510,6 +5549,9 @@ mod tests {
 
     #[test]
     fn managed_asset_metadata_error_requires_manual_repair() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let claude = scoped_dir("status-asset-metadata-error");
         fs::write(claude.join("hooks"), "not a directory\n")
             .expect("replace managed asset parent with a file");
@@ -5532,6 +5574,9 @@ mod tests {
     fn status_rejects_unsafe_managed_hook_permissions_with_repair_hint() {
         use std::os::unix::fs::PermissionsExt;
 
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let codex = scoped_dir("status-unsafe-hook-permissions");
         install_codex(&codex).expect("install Codex fixture");
         let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
@@ -5565,6 +5610,9 @@ mod tests {
     fn status_detects_special_managed_hook_mode_bits() {
         use std::os::unix::fs::PermissionsExt;
 
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let codex = scoped_dir("status-special-hook-mode");
         install_codex(&codex).expect("install Codex fixture");
         let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
@@ -5612,6 +5660,9 @@ mod tests {
 
     #[test]
     fn status_detects_broken_claude_registration() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let claude = scoped_dir("status-claude-registration");
         install_claude(&claude).expect("install Claude fixture");
         let settings_path = claude.join("settings.json");
@@ -5634,6 +5685,9 @@ mod tests {
 
     #[test]
     fn status_rejects_managed_registration_under_an_extra_event() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let codex = scoped_dir("status-extra-registration-event");
         install_codex(&codex).expect("install Codex fixture");
         let hooks_path = codex.join("hooks.json");
@@ -5663,6 +5717,9 @@ mod tests {
 
     #[test]
     fn codex_managed_hook_group_with_sibling_handler_is_not_current() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let codex = scoped_dir("status-codex-sibling-handler");
         install_codex(&codex).expect("install Codex fixture");
         let hooks_path = codex.join("hooks.json");
@@ -5708,6 +5765,9 @@ mod tests {
 
     #[test]
     fn stale_codex_managed_trust_keys_are_reinstalled_to_the_exact_set() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let codex = scoped_dir("status-codex-stale-trust-key");
         install_codex(&codex).expect("install Codex fixture");
         let hooks_path = codex.join("hooks.json");
@@ -5748,6 +5808,9 @@ mod tests {
 
     #[test]
     fn invalid_hook_event_structure_requires_manual_repair_before_install() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let codex = scoped_dir("status-invalid-hook-event");
         install_codex(&codex).expect("install Codex fixture");
         let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
@@ -5779,6 +5842,9 @@ mod tests {
 
     #[test]
     fn non_object_registration_root_requires_manual_repair_for_each_provider() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
             let config_dir = scoped_dir(&format!("status-non-object-root-{}", agent.as_wire()));
             let registration_path = match agent.as_wire() {
@@ -5814,6 +5880,9 @@ mod tests {
 
     #[test]
     fn missing_hooks_object_is_reinstallable_for_each_provider() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
             let config_dir = scoped_dir(&format!("status-missing-hooks-{}", agent.as_wire()));
             let registration_path = match agent.as_wire() {
@@ -5848,6 +5917,9 @@ mod tests {
 
     #[test]
     fn reinstall_replaces_owned_command_with_missing_type_for_each_provider() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
             let config_dir = scoped_dir(&format!("status-owned-command-{}", agent.as_wire()));
             let registration_path = match agent.as_wire() {
@@ -5889,6 +5961,9 @@ mod tests {
 
     #[test]
     fn invalid_codex_config_structure_requires_manual_repair_before_install() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let codex = scoped_dir("status-invalid-config-structure");
         install_codex(&codex).expect("install Codex fixture");
         let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
@@ -5914,6 +5989,9 @@ mod tests {
 
     #[test]
     fn scalar_managed_trust_key_requires_manual_repair_before_install() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let codex = scoped_dir("status-scalar-trust-key");
         install_codex(&codex).expect("install Codex fixture");
         let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
@@ -5951,6 +6029,9 @@ mod tests {
 
     #[test]
     fn scalar_future_trust_key_with_hook_drift_requires_manual_repair() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let codex = scoped_dir("status-scalar-future-trust-key");
         install_codex(&codex).expect("install Codex fixture");
         let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
@@ -6003,6 +6084,9 @@ mod tests {
 
     #[test]
     fn status_detects_broken_codex_registration_trust_and_read_errors() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         for failure in ["registration", "trust", "read", "malformed-config"] {
             let codex = scoped_dir(&format!("status-codex-{failure}"));
             install_codex(&codex).expect("install Codex fixture");
@@ -6057,6 +6141,9 @@ mod tests {
 
     #[test]
     fn aggregate_status_degrades_one_resolution_failure_without_aborting() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let codex = scoped_dir("status-aggregate-resolve");
         install_codex(&codex).expect("install Codex fixture");
 
@@ -6088,6 +6175,9 @@ mod tests {
 
     #[test]
     fn explicit_status_degrades_resolution_failure_to_warning() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let report = with_status_env(None, None, None, || {
             super::status(protocol::IntegrationStatusParams {
                 agent: Some(RuntimeRef::claude()),
@@ -6392,6 +6482,9 @@ mod tests {
 
     #[test]
     fn install_codex_fails_closed_on_inline_feature_table() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let codex_dir = scoped_dir("codex-inline");
         fs::write(
             codex_dir.join("config.toml"),

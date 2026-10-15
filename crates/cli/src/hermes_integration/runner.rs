@@ -1467,6 +1467,9 @@ mod tests {
 
     #[test]
     fn target_environment_and_arguments_are_fixed_for_default_named_and_custom_targets() {
+        if !pohunek_test_support::process_env::in_own_process() {
+            return;
+        }
         let mut environment = ProcessEnv::lock();
         environment.set("POHUNEK_HERMES_RUNNER_TEST_LEAK", "secret");
         let root = fixture("targets");

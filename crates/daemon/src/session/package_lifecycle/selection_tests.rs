@@ -765,6 +765,9 @@ async fn a_restart_with_a_live_old_version_worker_keeps_the_newer_incompatible_v
 
 #[tokio::test]
 async fn a_restart_after_an_integration_activation_still_sees_the_schema_of_the_live_worker() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let v = versions("selection-activation-restart", Some(SUBAGENT)).await;
     let created = v
         .fixture

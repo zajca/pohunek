@@ -43,6 +43,9 @@ fn process_start_time(pid: u32) -> Option<String> {
 
 #[tokio::test(flavor = "current_thread")]
 async fn cancelling_discovery_kills_the_active_netbird_status_process() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let root = pohunek_test_support::tempdir_with_prefix("pohunek-netbird-discovery-")
         .expect("private test root");
     let bin = root.path().join("bin");
@@ -84,6 +87,9 @@ async fn cancelling_discovery_kills_the_active_netbird_status_process() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn concurrent_discovery_calls_complete_through_one_netbird_provider() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let root = pohunek_test_support::tempdir_with_prefix("pohunek-netbird-concurrent-")
         .expect("private test root");
     let bin = root.path().join("bin");

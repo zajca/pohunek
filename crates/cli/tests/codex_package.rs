@@ -2094,6 +2094,9 @@ fn recovery_hint(refused: &Value) -> &str {
 /// integration.
 #[tokio::test]
 async fn codex_launches_only_from_the_installed_official_package() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let host = CleanHost::start().await;
 
     let (code, refused) = host.launch("codex").await;
@@ -2156,6 +2159,9 @@ async fn codex_launches_only_from_the_installed_official_package() {
 /// migrated profile launches from the package.
 #[tokio::test]
 async fn an_unpinned_codex_profile_names_the_install_and_the_migration() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let host = CleanHost::start().await;
     host.harness.profile("my-codex", "base = \"codex\"\n");
 
@@ -2198,6 +2204,9 @@ async fn an_unpinned_codex_profile_names_the_install_and_the_migration() {
 /// install still needs the package.
 #[tokio::test]
 async fn codex_hooks_stay_removable_without_the_official_package() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let host = CleanHost::start().await;
     let codex_home = host.harness.env.home().join(".codex");
     fs::create_dir_all(&codex_home).expect("create the Codex home");
@@ -2293,6 +2302,9 @@ fn assert_hooks(homes: &[&Path], present: bool, context: &Value) {
 /// home through its own environment, so no profile home is left behind.
 #[tokio::test]
 async fn codex_profile_hooks_stay_removable_without_the_official_package() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let host = CleanHost::start().await;
     let root = host.harness.env.root().to_path_buf();
     let own_home = host.harness.env.home().join(".codex");
@@ -2402,6 +2414,9 @@ async fn codex_profile_hooks_stay_removable_without_the_official_package() {
 /// runtime's own home.
 #[tokio::test]
 async fn a_malformed_codex_profile_is_refused_without_the_official_package() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let host = CleanHost::start().await;
     let own_home = host.harness.env.home().join(".codex");
     let profile_home = host.harness.env.root().join("work-codex");

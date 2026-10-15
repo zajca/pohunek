@@ -270,6 +270,9 @@ async fn spawn_server(
 
 #[tokio::test]
 async fn integration_status_accepts_null_at_daemon_boundary() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let ambient = temp_dir("integration-status-ambient-provider-overrides");
     let ambient_claude = ambient.join("claude");
     let ambient_codex = ambient.join("codex");
@@ -362,7 +365,14 @@ async fn integration_status_rejects_unknown_params_at_daemon_boundary() {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "The RPC scenario drives uninstall and doctor at the daemon boundary in one flow."
+)]
 async fn integration_uninstall_and_doctor_run_at_daemon_boundary() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let mut xdg = XdgGuard::set_all("integration-uninstall-doctor-rpc");
     let claude = xdg.home().join(".claude");
     let codex = xdg.home().join(".codex");
@@ -1428,6 +1438,9 @@ fn daemon_startup_rejects_missing_config_home_and_home() {
 async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home() {
     use std::os::unix::fs::PermissionsExt;
 
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let mut xdg = XdgGuard::set_all("daemon-startup-private-state");
     // The real worker nests its control socket below the XDG runtime root, and
     // `sockaddr_un` imposes a small platform path bound. Keep this fixture short
@@ -1647,6 +1660,9 @@ async fn health_returns_versions() {
 
 #[tokio::test]
 async fn public_bind_serves_host_discover_with_supplied_registry() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let mut origin_env = ProcessEnv::lock();
     origin_env.remove(ENV_DAEMON_ID).remove(ENV_SESSION_ID);
     let socket = temp_socket("host-discover-public-bind");
@@ -2970,6 +2986,9 @@ while True:
 
 #[tokio::test]
 async fn codex_stub_session_publishes_blocked_and_receives_bracketed_input() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let bin_dir = temp_dir("codex-stub-bin");
     let cwd = temp_dir("codex-stub-cwd");
     let input_log_dir = temp_dir("codex-stub-input");
@@ -3044,6 +3063,9 @@ async fn codex_stub_session_publishes_blocked_and_receives_bracketed_input() {
 
 #[tokio::test]
 async fn claude_stub_session_publishes_screen_blocked_and_receives_plain_input() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let bin_dir = temp_dir("claude-stub-bin");
     let cwd = temp_dir("claude-stub-cwd");
     let input_log_dir = temp_dir("claude-stub-input");
@@ -3532,6 +3554,9 @@ while True:
 
 #[tokio::test]
 async fn host_zero_submit_delay_passes_wait_framing_for_opted_in_claude() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let (response, captured) =
         waited_input_with_host_submit_delay(RuntimeRef::claude(), Duration::ZERO, None, true).await;
     let error = response
@@ -3543,6 +3568,9 @@ async fn host_zero_submit_delay_passes_wait_framing_for_opted_in_claude() {
 
 #[tokio::test]
 async fn host_zero_submit_delay_does_not_override_non_opted_in_codex() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let (response, captured) =
         waited_input_with_host_submit_delay(RuntimeRef::codex(), Duration::ZERO, None, false).await;
     let error = response
@@ -3554,6 +3582,9 @@ async fn host_zero_submit_delay_does_not_override_non_opted_in_codex() {
 
 #[tokio::test]
 async fn per_runtime_submit_delay_override_wins_over_host_zero() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let (response, captured) = waited_input_with_host_submit_delay(
         RuntimeRef::claude(),
         Duration::ZERO,
@@ -5775,6 +5806,9 @@ async fn event_log_records_notification_control_events() {
 /// metadata in the same atomic store.
 #[tokio::test]
 async fn worktree_session_persists_recovery_and_worktree_metadata() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let agent = RuntimeRef::claude();
     let bin_name = "claude";
     let native_id = "native-claude-wt-1";

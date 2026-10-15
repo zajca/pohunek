@@ -16,17 +16,21 @@
 //! integration-test file linked into that binary contends on the same lock,
 //! whatever it is named locally. A lock per module cannot give that guarantee.
 //!
-//! The runner decides how much the lock matters. `cargo nextest` runs each test
-//! in its own process, where no sibling can interfere; `cargo test` runs the
-//! tests of a binary as threads of one process, and doctests of a crate run as
-//! separate processes but a doctest that mutates the environment still shares
-//! it with its own threads. Tests must be correct under the threaded runner too.
+//! The lock alone cannot keep a change from code that reads the environment
+//! without taking it, such as a fixture whose children inherit the process
+//! environment. `cargo nextest` runs each test in its own process, where no
+//! sibling can see a change; `cargo test` runs the tests of a binary as threads
+//! of one process. A change therefore happens only in a process that runs one
+//! test: [`ProcessEnv::set`] and [`ProcessEnv::remove`] panic anywhere else,
+//! and [`in_own_process`] gives a test such a process under either runner.
 //!
 //! # Rules for tests
 //!
 //! - **Prefer injection.** When the code under test can take the value as an
 //!   argument, pass it and leave the process environment alone. Reach for this
 //!   module only when reading the environment is the behavior being tested.
+//! - **Writers run in their own process.** A test that changes the
+//!   environment starts with `if !in_own_process() { return; }`.
 //! - **Readers hold the guard too.** A test that does not change anything but
 //!   whose code reads environment-derived values calls [`ProcessEnv::lock`] and
 //!   keeps the returned value alive for the whole test, so no writer can run
@@ -58,9 +62,13 @@
 //!
 //! # Examples
 //!
-//! ```
-//! use pohunek_test_support::process_env::ProcessEnv;
+//! ```no_run
+//! use pohunek_test_support::process_env::{in_own_process, ProcessEnv};
 //!
+//! # fn a_test() {
+//! if !in_own_process() {
+//!     return;
+//! }
 //! let mut env = ProcessEnv::lock();
 //! env.set("TEST_SUPPORT_PROCESS_ENV_DOC_EXAMPLE", "value");
 //! assert_eq!(
@@ -69,9 +77,10 @@
 //! );
 //! drop(env);
 //! assert!(std::env::var_os("TEST_SUPPORT_PROCESS_ENV_DOC_EXAMPLE").is_none());
+//! # }
 //! ```
 
-// Rust guideline compliant 2026-10-13
+// Rust guideline compliant 2026-10-14
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::PermissionsExt as _;
@@ -81,6 +90,101 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// The one lock of this test binary's process environment.
 static PROCESS_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Set in the child process that [`in_own_process`] runs a test in.
+const OWN_PROCESS_CHILD_VAR: &str = "POHUNEK_TEST_OWN_PROCESS_CHILD";
+
+/// Set by `cargo nextest` to how it runs tests.
+const NEXTEST_EXECUTION_MODE_VAR: &str = "NEXTEST_EXECUTION_MODE";
+
+/// The [`NEXTEST_EXECUTION_MODE_VAR`] value of a run with one process per test.
+const NEXTEST_PROCESS_PER_TEST: &str = "process-per-test";
+
+/// Whether this process runs only the current test: the child of
+/// [`in_own_process`], or a `cargo nextest` process per test.
+#[must_use]
+pub fn runs_in_own_process() -> bool {
+    std::env::var_os(OWN_PROCESS_CHILD_VAR).is_some()
+        || std::env::var_os(NEXTEST_EXECUTION_MODE_VAR)
+            .is_some_and(|mode| mode == NEXTEST_PROCESS_PER_TEST)
+}
+
+/// Gives the calling test a process of its own, for a test that changes the
+/// process environment or working directory.
+///
+/// Returns `true` where the test body runs: in a process that runs only this
+/// test ([`runs_in_own_process`]). Anywhere else it runs the calling test in a
+/// child process of this test binary with `--exact` (and `--include-ignored`,
+/// so an ignored test selected with `--ignored` runs too), fails when the child
+/// fails or does not run exactly that test, and returns `false`; the caller
+/// then returns without running its body. Call it first:
+///
+/// ```no_run
+/// # use pohunek_test_support::process_env::{in_own_process, ProcessEnv};
+/// # fn a_test() {
+/// if !in_own_process() {
+///     return;
+/// }
+/// let mut env = ProcessEnv::lock();
+/// env.set("PATH", "/fixture/bin");
+/// # }
+/// ```
+///
+/// # Panics
+///
+/// Panics when the calling thread has no name (the test harness names each
+/// test's thread after the test), when the child cannot be run, or when it
+/// does not pass.
+#[must_use]
+pub fn in_own_process() -> bool {
+    if runs_in_own_process() {
+        return true;
+    }
+    let name = std::thread::current()
+        .name()
+        .expect("the test harness names each test's thread after the test")
+        .to_owned();
+    // The child writes to files, not pipes: a process the test leaves behind
+    // keeps an inherited pipe open, and the verdict waits only for the child
+    // itself. The files are read through descriptors of their own, so such a
+    // process can neither move the read position nor be moved by it.
+    let output_dir = crate::tempdir().expect("child output directory");
+    let stdout_path = output_dir.path().join("stdout");
+    let stderr_path = output_dir.path().join("stderr");
+    let create = |path: &std::path::Path| std::fs::File::create(path).expect("child output file");
+    let status = Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            &name,
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(OWN_PROCESS_CHILD_VAR, "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(create(&stdout_path))
+        .stderr(create(&stderr_path))
+        .status()
+        .expect("run the test in its own process");
+    let read = |path: &std::path::Path| {
+        String::from_utf8_lossy(&std::fs::read(path).expect("read the child output")).into_owned()
+    };
+    let (stdout, stderr) = (read(&stdout_path), read(&stderr_path));
+    assert!(
+        status.success() && stdout.contains("1 passed"),
+        "{name} failed in its own process: {stdout}{stderr}"
+    );
+    false
+}
+
+/// Panics unless the calling test runs in its own process.
+fn assert_own_process() {
+    assert!(
+        runs_in_own_process(),
+        "a test changes the process environment only in its own process: start it with \
+         `if !pohunek_test_support::process_env::in_own_process() {{ return; }}`"
+    );
+}
 
 /// Exclusive hold on the process environment with restore-on-drop overrides.
 ///
@@ -118,9 +222,11 @@ impl ProcessEnv {
     ///
     /// # Panics
     ///
-    /// Panics when `key` is empty or contains `=` or NUL, or when `value`
-    /// contains NUL, as [`std::env::set_var`] does.
+    /// Panics outside a test's own process ([`in_own_process`]), when `key` is
+    /// empty or contains `=` or NUL, or when `value` contains NUL, as
+    /// [`std::env::set_var`] does.
     pub fn set(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> &mut Self {
+        assert_own_process();
         self.snapshot(key.as_ref());
         std::env::set_var(key, value);
         self
@@ -130,9 +236,10 @@ impl ProcessEnv {
     ///
     /// # Panics
     ///
-    /// Panics when `key` is empty or contains `=` or NUL, as
-    /// [`std::env::remove_var`] does.
+    /// Panics outside a test's own process ([`in_own_process`]), or when `key`
+    /// is empty or contains `=` or NUL, as [`std::env::remove_var`] does.
     pub fn remove(&mut self, key: impl AsRef<OsStr>) -> &mut Self {
+        assert_own_process();
         self.snapshot(key.as_ref());
         std::env::remove_var(key);
         self
@@ -222,13 +329,77 @@ mod tests {
     const KEY_SET: &str = "TEST_SUPPORT_PROCESS_ENV_SET";
     const KEY_PANIC: &str = "TEST_SUPPORT_PROCESS_ENV_PANIC";
     const KEY_CONTEND: &str = "TEST_SUPPORT_PROCESS_ENV_CONTEND";
+    const KEY_GUARD: &str = "TEST_SUPPORT_PROCESS_ENV_GUARD";
+
+    /// The test path of [`write_probe`] in this crate's test binary.
+    const WRITE_PROBE: &str = "process_env::tests::write_probe";
+
+    /// Set only by [`a_write_runs_only_in_a_tests_own_process`] for the probe
+    /// it runs, so a run of the ignored tests leaves the probe idle.
+    const WRITE_PROBE_VAR: &str = "TEST_SUPPORT_PROCESS_ENV_WRITE_PROBE";
 
     fn var(key: &str) -> Option<String> {
         std::env::var(key).ok()
     }
 
+    /// Changes the environment wherever [`a_write_runs_only_in_a_tests_own_process`]
+    /// runs it, in a process shared with other tests; anywhere else it does
+    /// nothing.
+    #[test]
+    #[ignore = "run by a_write_runs_only_in_a_tests_own_process"]
+    fn write_probe() {
+        if std::env::var_os(WRITE_PROBE_VAR).is_none() {
+            return;
+        }
+        let mut env = ProcessEnv::lock();
+        env.set(KEY_GUARD, "probe");
+    }
+
+    #[test]
+    fn a_write_runs_only_in_a_tests_own_process() {
+        // Without the own-process marker or nextest's process per test, the
+        // probe stands for a test that shares its process with others.
+        let shared = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                WRITE_PROBE,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(WRITE_PROBE_VAR, "1")
+            .env_remove(super::OWN_PROCESS_CHILD_VAR)
+            .env_remove(super::NEXTEST_EXECUTION_MODE_VAR)
+            .output()
+            .expect("run the write probe");
+        let shared_output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&shared.stdout),
+            String::from_utf8_lossy(&shared.stderr)
+        );
+        assert!(
+            !shared.status.success()
+                && shared_output
+                    .contains("changes the process environment only in its own process"),
+            "a write in a shared process must panic: {shared_output}"
+        );
+
+        if !super::in_own_process() {
+            return;
+        }
+        let mut env = ProcessEnv::lock();
+        env.set(KEY_GUARD, "own process");
+        assert_eq!(var(KEY_GUARD).as_deref(), Some("own process"));
+        drop(env);
+        let _env = ProcessEnv::lock();
+        assert_eq!(var(KEY_GUARD), None);
+    }
+
     #[test]
     fn variable_unset_before_is_unset_after() {
+        if !super::in_own_process() {
+            return;
+        }
         let mut env = ProcessEnv::lock();
         env.remove(KEY_UNSET);
         env.set(KEY_UNSET, "temporary");
@@ -240,6 +411,9 @@ mod tests {
 
     #[test]
     fn variable_set_before_keeps_its_value_after_set_and_remove() {
+        if !super::in_own_process() {
+            return;
+        }
         let mut env = ProcessEnv::lock();
         std::env::set_var(KEY_SET, "preexisting");
         env.set(KEY_SET, "changed");
@@ -253,6 +427,9 @@ mod tests {
 
     #[test]
     fn panic_restores_the_environment_and_does_not_poison_the_lock() {
+        if !super::in_own_process() {
+            return;
+        }
         let result = catch_unwind(AssertUnwindSafe(|| {
             let mut env = ProcessEnv::lock();
             env.set(KEY_PANIC, "leaked");
@@ -266,6 +443,9 @@ mod tests {
 
     #[test]
     fn a_second_thread_blocks_until_the_first_drops_and_sees_the_restored_value() {
+        if !super::in_own_process() {
+            return;
+        }
         let mut env = ProcessEnv::lock();
         env.set(KEY_CONTEND, "held");
         let released = Arc::new(AtomicBool::new(false));
@@ -337,6 +517,9 @@ mod tests {
 
     #[test]
     fn command_keeps_the_captured_path_when_another_test_changes_it_before_the_spawn() {
+        if !super::in_own_process() {
+            return;
+        }
         let captured = {
             let _env = ProcessEnv::lock();
             // Readers hold the lock so a concurrent writer's override is never captured.
@@ -355,6 +538,9 @@ mod tests {
 
     #[test]
     fn a_command_built_from_an_unset_path_keeps_it_unset_when_another_test_sets_it() {
+        if !super::in_own_process() {
+            return;
+        }
         let mut command = super::command_with_path("/bin/sh", None);
         assert!(
             command
