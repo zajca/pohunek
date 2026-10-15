@@ -40,7 +40,7 @@ carries no copy of them. The generic hook reporter is exclusively core-owned:
 the CLI compiles it in and installs it beside the package's operator payload.
 
 `integration install` and `update` therefore need the official
-`pohunek.runtime.hermes` package. Install it from an extracted Linux release
+`pohunek.runtime.hermes` package. Install it from an extracted release
 archive with
 `pohunek plugin install runtime/packages/hermes.tar.zst --catalog runtime/runtime-catalog.json`.
 Without a usable package, `integration install` and `update` refuse with a

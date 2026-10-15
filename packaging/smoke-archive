@@ -3,7 +3,7 @@
 #
 # usage: smoke-archive --archive <pohunek-daemon-...tar.gz> --stage <dir>
 #                      --consumer <release-consumer-test-executable>
-#                      [--runtime <id>]... [--isolation auto|userns|sudo]
+#                      [--runtime <id>]... [--isolation auto|userns|sudo|sandbox]
 #
 # Proves that the archive alone - its binaries, its signed catalog and trust
 # anchor, its runtime packages - installs and serves every official runtime
@@ -11,14 +11,15 @@
 #
 #   1. extracts the archive into a fresh private temp directory after refusing
 #      absolute, `..`, link and special members, and runs the archive's own
-#      `packaging/verify-archive` on the unpacked tree;
+#      `packaging/verify-archive` on the unpacked tree; on macOS, also verifies
+#      ad-hoc signatures with `packaging/macos/verify-signed --adhoc`;
 #   2. derives the runtimes from `runtime/packages/*.tar.zst` (the set is data;
 #      `--runtime` only restricts it) and requires a staged upstream
 #      `<stage>/<runtime>/` for every one of them (a missing stage fails);
-#   3. enters a fresh network namespace (plus a PID namespace, so no process can
-#      outlive the run), brings loopback up, asserts that loopback is the only
-#      interface and that no default route exists, and re-verifies every stage
-#      against STAGE.sha256 and STAGE.links using POSIX tools only;
+#   3. enters a fresh isolated environment (network namespace on Linux,
+#      sandbox-exec on macOS), brings loopback up, asserts that loopback is
+#      the only interface and that no default route exists, and re-verifies
+#      every stage against STAGE.sha256 and STAGE.links using POSIX tools only;
 #   4. runs the prebuilt consumer test executable once per runtime with
 #      PATH = `<stage>/<runtime>/bin` + the system node and tool directories,
 #      a hermetic HOME/XDG tree, a temp working directory and only the
@@ -30,19 +31,26 @@
 #      `executables` equal the SHA-256 of the archive's binaries.
 #
 # Isolation strategies (`--isolation`, default auto picks the first that works):
-#   userns  `unshare --user --map-root-user --net --pid`: needs unprivileged
-#           user namespaces (Ubuntu 24.04 blocks them through AppArmor unless
-#           `kernel.apparmor_restrict_unprivileged_userns=0`).
-#   sudo    `sudo -n unshare --net --pid`, loopback brought up as root, then
-#           the invoking uid/gid is restored with `setpriv` before anything else
-#           runs, with all capabilities dropped.
-# When neither works the script fails; there is no un-isolated fallback.
+#   userns  `unshare --user --map-root-user --net --pid` (Linux only): needs
+#           unprivileged user namespaces (Ubuntu 24.04 blocks them through
+#           AppArmor unless `kernel.apparmor_restrict_unprivileged_userns=0`).
+#   sudo    `sudo -n unshare --net --pid` (Linux only), loopback brought up as
+#           root, then the invoking uid/gid is restored with `setpriv` before
+#           anything else runs, with all capabilities dropped.
+#   sandbox `/usr/bin/sandbox-exec` with a profile denying egress (macOS only).
+#           On macOS, the smoke runs the consumer as a throwaway local user
+#           created with passwordless sudo; it fails closed without sudo. Codex's
+#           socket directory is unique to that user; the user and its leftovers
+#           are removed and verified on exit.
+# When no suitable strategy is available the script fails; there is no
+# un-isolated fallback.
 #
-# This script comes from the checkout and runs outside the namespace up to
-# step 3. "No source-tree path" is about everything the daemon, worker, CLI and
-# upstream see: the archive, stage and temp paths are refused when they lie
+# This script comes from the checkout and runs outside the namespace/sandbox up
+# to step 3. "No source-tree path" is about everything the daemon, worker, CLI
+# and upstream see: the archive, stage and temp paths are refused when they lie
 # inside the checkout, and the consumer executable is copied to the temp
-# directory and run from there. Linux only (util-linux unshare, iproute2, jq).
+# directory and run from there. Linux and macOS (util-linux unshare/iproute2 on
+# Linux, sandbox-exec on macOS, jq on both).
 
 set -eu
 
@@ -58,8 +66,17 @@ fail() {
 }
 
 usage() {
-    echo "usage: smoke-archive --archive <daemon.tar.gz> --stage <dir> --consumer <executable> [--runtime <id>]... [--isolation auto|userns|sudo]" >&2
+    echo "usage: smoke-archive --archive <daemon.tar.gz> --stage <dir> --consumer <executable> [--runtime <id>]... [--isolation auto|userns|sudo|sandbox]" >&2
     exit 2
+}
+
+# Helper to compute SHA-256. Uses sha256sum when available, else shasum -a 256.
+sha256_digest() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -- "$1" | cut -d' ' -f1
+    else
+        shasum -a 256 -- "$1" | cut -d' ' -f1
+    fi
 }
 
 safe_id() {
@@ -114,20 +131,20 @@ stage_check() {
         [ "$(LC_ALL=C tr -cd '[:cntrl:]\\' < "$stage_dir/$manifest" | LC_ALL=C tr -d "$allowed_controls" | wc -c)" -eq 0 ] \
             || fail "staged upstream has a control character or backslash in $manifest: $stage_dir"
         if [ "$manifest" = STAGE.links ]; then
-            LC_ALL=C tr -d '\011' < "$stage_dir/$manifest" > "$work/stage-text-check.txt"
+            LC_ALL=C tr -d '\011' < "$stage_dir/$manifest" > "$check_dir/stage-text-check.txt"
         else
-            cp -- "$stage_dir/$manifest" "$work/stage-text-check.txt"
+            cp -- "$stage_dir/$manifest" "$check_dir/stage-text-check.txt"
         fi
-        if LC_ALL=C.UTF-8 grep -q '[[:cntrl:]]' "$work/stage-text-check.txt"; then
+        if LC_ALL=C.UTF-8 grep -q '[[:cntrl:]]' "$check_dir/stage-text-check.txt"; then
             fail "staged upstream has a Unicode control character in $manifest: $stage_dir"
         else
             control_status=$?
             [ "$control_status" -eq 1 ] || fail "cannot check Unicode controls in $manifest: $stage_dir"
         fi
     done
-    : > "$work/stage-files.txt"
-    : > "$work/stage-links.txt"
-    : > "$work/stage-execs.txt"
+    : > "$check_dir/stage-files.txt"
+    : > "$check_dir/stage-links.txt"
+    : > "$check_dir/stage-execs.txt"
     while :; do
         line=
         if IFS= read -r line; then
@@ -144,7 +161,7 @@ stage_check() {
             *[!0-9a-f]*) fail "staged upstream has an invalid STAGE.sha256 digest: $stage_dir" ;;
         esac
         safe_stage_path "$path" || fail "staged upstream has an unsafe STAGE.sha256 path: $stage_dir"
-        printf '%s\n' "$path" >> "$work/stage-files.txt"
+        printf '%s\n' "$path" >> "$check_dir/stage-files.txt"
     done < "$stage_dir/STAGE.sha256"
     tab=$(printf '\t')
     while :; do
@@ -163,7 +180,7 @@ stage_check() {
                 esac
                 safe_stage_path "$path" \
                     || fail "staged upstream has an invalid STAGE.links exec path: $stage_dir/$path"
-                printf '%s\n' "$path" >> "$work/stage-execs.txt"
+                printf '%s\n' "$path" >> "$check_dir/stage-execs.txt"
                 ;;
             "link$tab"*)
                 rest=${line#"link$tab"}
@@ -186,14 +203,14 @@ stage_check() {
                 done
                 safe_stage_path "$path" && safe_stage_target "$target" "$link_depth" \
                     || fail "staged upstream has an invalid STAGE.links link path or target: $stage_dir/$path"
-                printf '%s\n' "$path" >> "$work/stage-links.txt"
+                printf '%s\n' "$path" >> "$check_dir/stage-links.txt"
                 ;;
             *) fail "staged upstream has an invalid STAGE.links entry: $stage_dir" ;;
         esac
     done < "$stage_dir/STAGE.links"
     for kind in files links execs; do
-        LC_ALL=C sort "$work/stage-$kind.txt" > "$work/stage-$kind-sorted.txt"
-        duplicate=$(LC_ALL=C uniq -d "$work/stage-$kind-sorted.txt" | head -n 1)
+        LC_ALL=C sort "$check_dir/stage-$kind.txt" > "$check_dir/stage-$kind-sorted.txt"
+        duplicate=$(LC_ALL=C uniq -d "$check_dir/stage-$kind-sorted.txt" | head -n 1)
         case $kind in
             files) kind_name=STAGE.sha256 ;;
             links) kind_name='STAGE.links link' ;;
@@ -201,33 +218,38 @@ stage_check() {
         esac
         [ -z "$duplicate" ] || fail "staged upstream has a duplicate $kind_name path: $stage_dir/$duplicate"
     done
-    unknown_exec=$(LC_ALL=C comm -23 "$work/stage-execs-sorted.txt" "$work/stage-files-sorted.txt" | head -n 1)
+    unknown_exec=$(LC_ALL=C comm -23 "$check_dir/stage-execs-sorted.txt" "$check_dir/stage-files-sorted.txt" | head -n 1)
     [ -z "$unknown_exec" ] || fail "staged upstream has an invalid STAGE.links exec path: $stage_dir/$unknown_exec"
-    conflicting_link=$(LC_ALL=C comm -12 "$work/stage-links-sorted.txt" "$work/stage-files-sorted.txt" | head -n 1)
+    conflicting_link=$(LC_ALL=C comm -12 "$check_dir/stage-links-sorted.txt" "$check_dir/stage-files-sorted.txt" | head -n 1)
     [ -z "$conflicting_link" ] || fail "staged upstream has a duplicate STAGE.links link path: $stage_dir/$conflicting_link"
-    stage_real=$(cd "$stage_dir" && pwd -P)
+    if [ "$(uname -s)" = Darwin ]; then
+        stage_real=$(/usr/bin/perl -MCwd=realpath -e 'my $p = realpath($ARGV[0]); defined $p or exit 1; print $p' -- "$stage_dir") \
+            || fail "cannot resolve staged upstream to a canonical path: $stage_dir"
+    else
+        stage_real=$(cd "$stage_dir" && pwd -P)
+    fi
     # Empty directories are absent from both manifests, but their names must
     # still obey the stage tree's name contract. NUL-delimited paths preserve
     # newlines and other hostile bytes while scanning the tree in one pass.
-    (cd "$stage_dir" && find . -type d -print0) > "$work/stage-dirs.txt" \
+    (cd "$stage_dir" && find . -type d -print0) > "$check_dir/stage-dirs.txt" \
         || fail "cannot enumerate staged upstream directories: $stage_dir"
-    iconv -f UTF-8 -t UTF-8 "$work/stage-dirs.txt" >/dev/null \
+    iconv -f UTF-8 -t UTF-8 "$check_dir/stage-dirs.txt" >/dev/null \
         || fail "staged upstream has an invalid UTF-8 directory name: $stage_dir"
-    [ "$(LC_ALL=C tr -cd '[:cntrl:]\\' < "$work/stage-dirs.txt" | LC_ALL=C tr -d '\000' | wc -c)" -eq 0 ] \
+    [ "$(LC_ALL=C tr -cd '[:cntrl:]\\' < "$check_dir/stage-dirs.txt" | LC_ALL=C tr -d '\000' | wc -c)" -eq 0 ] \
         || fail "staged upstream has an unsafe directory name: $stage_dir"
-    if LC_ALL=C.UTF-8 grep -azq '[[:cntrl:]]' "$work/stage-dirs.txt"; then
+    if LC_ALL=C.UTF-8 grep -azq '[[:cntrl:]]' "$check_dir/stage-dirs.txt"; then
         fail "staged upstream has a Unicode control in a directory name: $stage_dir"
     else
         control_status=$?
         [ "$control_status" -eq 1 ] || fail "cannot check staged upstream directory names: $stage_dir"
     fi
-    files=$(cat "$work/stage-files-sorted.txt")
-    links=$(cat "$work/stage-links-sorted.txt")
+    files=$(cat "$check_dir/stage-files-sorted.txt")
+    links=$(cat "$check_dir/stage-links-sorted.txt")
     listed=$({ printf '%s\n' "$files"; printf '%s\n' "$links"; } | sed '/^$/d' | LC_ALL=C sort)
     present=$(cd "$stage_dir" && find . -path ./STAGE.sha256 -prune -o -path ./STAGE.links -prune -o ! -type d -print | sed 's|^\./||' | LC_ALL=C sort)
-    printf '%s\n' "$listed" > "$work/listed.txt"
-    printf '%s\n' "$present" > "$work/present.txt"
-    unlisted=$(LC_ALL=C comm -13 "$work/listed.txt" "$work/present.txt")
+    printf '%s\n' "$listed" > "$check_dir/listed.txt"
+    printf '%s\n' "$present" > "$check_dir/present.txt"
+    unlisted=$(LC_ALL=C comm -13 "$check_dir/listed.txt" "$check_dir/present.txt")
     [ -z "$unlisted" ] || fail "staged upstream holds entries its manifests do not list: $(printf '%s' "$unlisted" | head -n 1)"
     [ "$listed" = "$present" ] || fail "staged upstream differs from its STAGE manifests: $stage_dir"
     actual_files=$(cd "$stage_dir" && find . -path ./STAGE.sha256 -prune -o -path ./STAGE.links -prune -o -type f -print | sed 's|^\./||' | LC_ALL=C sort)
@@ -235,7 +257,7 @@ stage_check() {
     actual_links=$(cd "$stage_dir" && find . -type l -print | sed 's|^\./||' | LC_ALL=C sort)
     [ "$links" = "$actual_links" ] || fail "staged upstream link types differ from STAGE.links: $stage_dir"
     actual_execs=$(cd "$stage_dir" && find . -path ./STAGE.sha256 -prune -o -path ./STAGE.links -prune -o -type f -perm -100 -print | sed 's|^\./||' | LC_ALL=C sort)
-    [ "$(cat "$work/stage-execs-sorted.txt")" = "$actual_execs" ] \
+    [ "$(cat "$check_dir/stage-execs-sorted.txt")" = "$actual_execs" ] \
         || fail "staged upstream executable bits differ from STAGE.links: $stage_dir"
     while IFS="$tab" read -r kind path target; do
         case $kind in
@@ -254,8 +276,14 @@ stage_check() {
                 while :; do
                     link_component=${link_rest%%/*}
                     link_prefix=$link_prefix/$link_component
-                    resolved=$(readlink -e -- "$link_prefix") \
-                        || fail "unresolvable link in staged upstream: $stage_dir/$path"
+                    if [ "$(uname -s)" = Linux ]; then
+                        resolved=$(readlink -e -- "$link_prefix") \
+                            || fail "unresolvable link in staged upstream: $stage_dir/$path"
+                    else
+                        # macOS: resolve each prefix with perl, requiring existence and refusing cycles
+                        resolved=$(/usr/bin/perl -MCwd=realpath -e 'my $p = realpath($ARGV[0]); defined $p && -e $p or exit 1; print $p' -- "$link_prefix") \
+                            || fail "unresolvable link in staged upstream: $stage_dir/$path"
+                    fi
                     case $resolved in
                         "$stage_real" | "$stage_real"/*) ;;
                         *) fail "link leaves the staged upstream: $stage_dir/$path" ;;
@@ -273,29 +301,129 @@ stage_check() {
     done < "$stage_dir/STAGE.links"
     # Only read listed payloads after every path has been checked as a regular
     # file. `sha256sum -c` would otherwise block forever on a listed FIFO.
-    (cd "$stage_dir" && sha256sum -c STAGE.sha256 >/dev/null 2>&1) \
+    (cd "$stage_dir" && if command -v sha256sum >/dev/null 2>&1; then sha256sum -c STAGE.sha256 >/dev/null 2>&1; else shasum -a 256 -c STAGE.sha256 >/dev/null 2>&1; fi) \
         || fail "staged upstream does not match STAGE.sha256: $stage_dir"
 }
 
 network_check() {
-    link=$(ip -o link show lo 2>/dev/null) || fail "cannot read the loopback state (iproute2 'ip' is required)"
-    case $link in
-        *[\<,]UP[\>,]*) ;;
-        *) fail "loopback is not up inside the namespace" ;;
-    esac
-    ifaces=$(sed -n '3,$p' /proc/net/dev | sed 's/:.*//; s/^ *//')
-    [ "$ifaces" = lo ] || fail "the namespace is not isolated, interfaces: $(printf '%s' "$ifaces" | tr '\n' ' ')"
-    default_routes=$(awk 'NR > 1 && $2 == "00000000"' /proc/net/route)
-    [ -z "$default_routes" ] || fail "the namespace has a default route"
+    if [ "$(uname -s)" = Darwin ]; then
+        # On macOS, verify the sandbox blocks egress and loopback works, and that
+        # it cannot access unrelated host sockets outside the permitted paths.
+        # Test that external egress fails.
+        if /usr/bin/nc -z -w 3 1.1.1.1 443 >/dev/null 2>&1; then
+            fail "the sandbox does not block TCP egress to external IP"
+        fi
+        if /usr/bin/curl -s -o /dev/null --max-time 5 https://registry.npmjs.org >/dev/null 2>&1; then
+            fail "the sandbox does not block HTTPS egress"
+        fi
+        # Test that loopback works: start a listener and connect to it.
+        listen_port=$((20000 + $$ % 20000))
+        /usr/bin/nc -l 127.0.0.1 "$listen_port" >/dev/null 2>&1 &
+        listener_pid=$!
+        sleep 0.5
+        if /usr/bin/nc -z -w 3 127.0.0.1 "$listen_port" >/dev/null 2>&1; then
+            /bin/kill "$listener_pid" 2>/dev/null || true
+        else
+            /bin/kill "$listener_pid" 2>/dev/null || true
+            fail "loopback is not usable inside the sandbox"
+        fi
+        # Test that unix sockets outside the permitted paths are blocked.
+        [ -n "$host_probe" ] || fail "the host unix-socket probe is missing"
+        [ -S "$host_probe/s" ] || fail "the host unix-socket probe is missing"
+        [ -S "$host_probe/w" ] || fail "the host unix-socket probe is missing"
+        if printf x | /usr/bin/nc -U -w 2 "$host_probe/s" >/dev/null 2>&1; then
+            fail "the sandbox does not block unrelated host unix sockets: $host_probe/s"
+        fi
+        if printf x | /usr/bin/nc -U -w 2 "$host_probe/w" >/dev/null 2>&1; then
+            fail "the sandbox does not block unrelated host unix sockets: $host_probe/w"
+        fi
+    else
+        # Linux: check iproute2 state.
+        link=$(ip -o link show lo 2>/dev/null) || fail "cannot read the loopback state (iproute2 'ip' is required)"
+        case $link in
+            *[\<,]UP[\>,]*) ;;
+            *) fail "loopback is not up inside the namespace" ;;
+        esac
+        ifaces=$(sed -n '3,$p' /proc/net/dev | sed 's/:.*//; s/^ *//')
+        [ "$ifaces" = lo ] || fail "the namespace is not isolated, interfaces: $(printf '%s' "$ifaces" | tr '\n' ' ')"
+        default_routes=$(awk 'NR > 1 && $2 == "00000000"' /proc/net/route)
+        [ -z "$default_routes" ] || fail "the namespace has a default route"
+    fi
 }
 
 stray_check() {
-    for proc_dir in /proc/[0-9]*; do
-        pid=${proc_dir#/proc/}
-        if [ "$pid" != "$$" ]; then
-            fail "a process outlived the consumer run (pid $pid)"
+    if [ "$(uname -s)" = Darwin ]; then
+        # On macOS, check the process group (session). Note: this weaker check does
+        # not detect a detached helper whose executable and cwd are outside the temp
+        # root (see #1010).
+        if /usr/bin/pgrep -g "$stray_pgid" >/dev/null 2>&1; then
+            # Found stray processes, kill the group before failing
+            /bin/kill -KILL -- -"$stray_pgid" 2>/dev/null || true
+            fail "a process outlived the consumer run (process group $stray_pgid)"
         fi
-    done
+        # /bin/ps is denied inside the sandbox; `pgrep -lf` prints "<pid> <argv>".
+        # pgrep never lists itself. This shell and its forks (the command
+        # substitution) run "<self> __inner sandbox <work> ...": skip them.
+        uid=$(/usr/bin/id -u)
+        snapshot=$(/usr/bin/pgrep -lf -U "$uid" . 2>/dev/null) && rc=0 || rc=$?
+        case $rc in
+            0) ;;
+            1) snapshot= ;;
+            *) fail "cannot list processes (pgrep exit $rc)" ;;
+        esac
+        same_user=
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            pid=${line%% *}
+            cmd=${line#* }
+            [ "$pid" = "$$" ] && continue
+            case $cmd in
+                *" __inner sandbox $work "*) continue ;;
+                *"$work"*) same_user="$pid $cmd"; break ;;
+            esac
+            if [ -n "$inputs" ]; then
+                case $cmd in
+                    *"$inputs"*) same_user="$pid $cmd"; break ;;
+                esac
+            fi
+        done <<EOF
+$snapshot
+EOF
+        if [ -n "$same_user" ]; then
+            stray_pid=${same_user%% *}
+            # Re-verify the identity right before signalling: same pid, still
+            # naming the temp root.
+            now_output=$(/usr/bin/pgrep -lf -U "$uid" . 2>/dev/null) && rc=0 || rc=$?
+            case $rc in
+                0) ;;
+                1) now_output= ;;
+                *) fail "cannot re-verify processes (pgrep exit $rc)" ;;
+            esac
+            now=$(printf '%s\n' "$now_output" | while IFS= read -r l; do if [ "${l%% *}" = "$stray_pid" ]; then printf '%s\n' "$l"; fi; done)
+            case $now in
+                *"$work"*)
+                    /bin/kill -KILL -- "-$stray_pid" 2>/dev/null || true
+                    /bin/kill -KILL "$stray_pid" 2>/dev/null || true
+                    ;;
+            esac
+            n=0
+            while /bin/kill -0 "$stray_pid" 2>/dev/null && [ "$n" -lt 50 ]; do
+                sleep 0.1
+                n=$((n + 1))
+            done
+            if /bin/kill -0 "$stray_pid" 2>/dev/null; then
+                fail "a process outlived the consumer run and survived SIGKILL: $same_user"
+            fi
+            fail "a process outlived the consumer run: $same_user"
+        fi
+    else
+        for proc_dir in /proc/[0-9]*; do
+            pid=${proc_dir#/proc/}
+            if [ "$pid" != "$$" ]; then
+                fail "a process outlived the consumer run (pid $pid)"
+            fi
+        done
+    fi
 }
 
 inner_main() {
@@ -305,20 +433,69 @@ inner_main() {
     stage=$4
     consumer=$5
     node_dir=$6
-    shift 6
+    sock_root=$7
+    host_probe=$8
+    inputs=$9
+    shift 9
+    case "$isolation" in
+        sandbox)
+            check_dir=$work/t/check
+            mkdir -p "$check_dir"
+            ;;
+        *)
+            check_dir=$work
+            ;;
+    esac
     if [ "$isolation" = userns ]; then
         ip link set lo up || fail "cannot bring loopback up inside the namespace"
     fi
     network_check
+    if [ "$isolation" = sandbox ]; then
+        umask 022
+        # Copy the root, consumer and node to $inputs. The stage is used in place,
+        # chowned to the throwaway user before entering the sandbox, because a
+        # provisioned venv names its interpreter by absolute path.
+        /usr/bin/ditto "$root" "$inputs/root" || fail "cannot copy root to inputs"
+        root=$inputs/root
+        /bin/cp "$consumer" "$inputs/consumer" || fail "cannot copy consumer to inputs"
+        /bin/chmod 0755 "$inputs/consumer" || fail "cannot chmod consumer in inputs"
+        consumer=$inputs/consumer
+        mkdir "$inputs/node-bin" || fail "cannot create node-bin in inputs"
+        /bin/cp "$node_dir/node" "$inputs/node-bin/node" || fail "cannot copy node to inputs"
+        /bin/chmod 0755 "$inputs/node-bin/node" || fail "cannot chmod node in inputs"
+        node_dir=$inputs/node-bin
+        # The copies are the temporary user's own; upstream trees such as uv's venv .lock can be group- or world-writable, which the product's executable trust check rejects
+        /bin/chmod -R go-w "$inputs" || fail "cannot drop group/other write from the copied inputs"
+        # Fail closed if anything under $inputs is group- or other-writable
+        bad=$(/usr/bin/find "$inputs" \( -perm -020 -o -perm -002 \) ! -type l -print | head -n 1)
+        [ -z "$bad" ] || fail "a copied input is writable by others: $bad"
+        # Fail closed if anything under $inputs (excluding symlinks) is not owned by the current user
+        bad=$(/usr/bin/find "$inputs" ! -type l ! -user "$(id -u)" -print | head -n 1)
+        [ -z "$bad" ] || fail "a copied input is not owned by the current user: $bad"
+    fi
+    # The stage is used in place on macOS, chowned to the throwaway user
+    for rt in "$@"; do
+        # Fail closed if anything in the stage is group- or other-writable
+        bad=$(/usr/bin/find "$stage/$rt" \( -perm -020 -o -perm -002 \) ! -type l -print | head -n 1)
+        [ -z "$bad" ] || fail "a file in the stage is writable by others: $bad"
+        # Fail closed if anything in the stage (excluding symlinks) is not owned by the current user
+        bad=$(/usr/bin/find "$stage/$rt" ! -type l ! -user "$(id -u)" -print | head -n 1)
+        [ -z "$bad" ] || fail "a file in the stage is not owned by the current user: $bad"
+    done
     for rt in "$@"; do
         stage_check "$stage/$rt"
     done
     for rt in "$@"; do
         run=$work/run/$rt
         mkdir -p "$work/t" "$run/home" "$run/cwd" "$run/config" "$run/data" "$run/state" "$run/cache"
-        (
-            cd "$run/cwd"
-            exec env -i \
+
+        if [ "$isolation" = sandbox ]; then
+            # On macOS, run the consumer in a new session to detect stray processes.
+            pidfile="$work/run/.stray_$rt.pid"
+            consumer_exit=0
+            /usr/bin/perl -MPOSIX -e 'my ($pidfile, $dir) = splice(@ARGV, 0, 2); POSIX::setsid() > 0 or die "setsid: $!"; open(my $fh, ">", $pidfile) or die "$pidfile: $!"; print $fh "$$\n"; close($fh); chdir($dir) or die "$dir: $!"; exec { $ARGV[0] } @ARGV or die "exec: $!"' \
+                "$pidfile" "$run/cwd" \
+                env -i \
                 PATH="$stage/$rt/bin:$node_dir:/usr/bin:/bin" \
                 HOME="$run/home" \
                 XDG_CONFIG_HOME="$run/config" \
@@ -333,8 +510,35 @@ inner_main() {
                 POHUNEK_CONSUMER_CATALOG="$root/runtime/runtime-catalog.json" \
                 POHUNEK_CONSUMER_STAGE_BIN="$stage/$rt/bin" \
                 POHUNEK_CONSUMER_REPORT="$run/report.json" \
-                "$consumer" --exact "$consumer_test" --nocapture
-        ) || fail "the consumer run failed for runtime $rt"
+                POHUNEK_TEST_TEMP_ROOT="$sock_root" \
+                "$consumer" --exact "$consumer_test" --nocapture || consumer_exit=$?
+            stray_pgid=$(cat "$pidfile")
+            rm "$pidfile"
+            if [ "$consumer_exit" -ne 0 ]; then
+                /bin/kill -KILL -- -"$stray_pgid" 2>/dev/null || true
+                fail "the consumer run failed for runtime $rt"
+            fi
+        else
+            (
+                cd "$run/cwd"
+                exec env -i \
+                    PATH="$stage/$rt/bin:$node_dir:/usr/bin:/bin" \
+                    HOME="$run/home" \
+                    XDG_CONFIG_HOME="$run/config" \
+                    XDG_DATA_HOME="$run/data" \
+                    XDG_STATE_HOME="$run/state" \
+                    XDG_CACHE_HOME="$run/cache" \
+                    TMPDIR="$work/t" \
+                    LANG=C.UTF-8 \
+                    POHUNEK_CONSUMER_BIN_DIR="$root" \
+                    POHUNEK_CONSUMER_RUNTIME="$rt" \
+                    POHUNEK_CONSUMER_PACKAGE="$root/runtime/packages/$rt.tar.zst" \
+                    POHUNEK_CONSUMER_CATALOG="$root/runtime/runtime-catalog.json" \
+                    POHUNEK_CONSUMER_STAGE_BIN="$stage/$rt/bin" \
+                    POHUNEK_CONSUMER_REPORT="$run/report.json" \
+                    "$consumer" --exact "$consumer_test" --nocapture
+            ) || fail "the consumer run failed for runtime $rt"
+        fi
         stray_check
         [ -f "$run/report.json" ] || fail "the consumer wrote no report for runtime $rt"
     done
@@ -368,11 +572,11 @@ sudo_supervisor() {
         IFS= read -r _ <&3 || :
         # The supervisor is the group leader until this signal arrives, so
         # the group ID cannot have been reused for an unrelated process.
-        /usr/bin/kill -KILL 0 2>/dev/null || true
+        /bin/kill -KILL 0 2>/dev/null || true
     ) &
     sudo_watchdog=$!
     sudo_stop() {
-        /usr/bin/kill -KILL 0 2>/dev/null || true
+        /bin/kill -KILL 0 2>/dev/null || true
     }
     trap sudo_stop HUP INT TERM
     sudo_status=0
@@ -381,6 +585,53 @@ sudo_supervisor() {
     wait "$sudo_watchdog" 2>/dev/null || true
     trap - HUP INT TERM
     return "$sudo_status"
+}
+
+create_throwaway_user() {
+    retry=0
+    while [ "$retry" -lt 20 ]; do
+        tuid=$(( 40000 + $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 20000 ))
+        [ -n "$(/usr/bin/dscl . -search /Users UniqueID "$tuid" 2>/dev/null)" ] && { retry=$((retry + 1)); continue; }
+        [ -e "/private/tmp/codex-daemon-$tuid" ] && { retry=$((retry + 1)); continue; }
+        [ -e "/private/tmp/pohunek-$tuid" ] && { retry=$((retry + 1)); continue; }
+        tuser=pksmoke$tuid
+        /usr/bin/dscl . -read "/Users/$tuser" >/dev/null 2>&1 && { retry=$((retry + 1)); continue; }
+        break
+    done
+    if [ "$retry" -ge 20 ]; then
+        fail "cannot find a unique throwaway uid after 20 retries"
+    fi
+    tuser_created=1
+    /usr/bin/sudo -n /usr/bin/dscl . -create "/Users/$tuser" || fail "cannot create the throwaway user $tuser"
+    /usr/bin/sudo -n /usr/bin/dscl . -create "/Users/$tuser" UniqueID "$tuid" || fail "cannot create the throwaway user $tuser"
+    /usr/bin/sudo -n /usr/bin/dscl . -create "/Users/$tuser" PrimaryGroupID 20 || fail "cannot create the throwaway user $tuser"
+    /usr/bin/sudo -n /usr/bin/dscl . -create "/Users/$tuser" UserShell /usr/bin/false || fail "cannot create the throwaway user $tuser"
+    thome=$(/usr/bin/sudo -n /usr/bin/mktemp -d /private/var/pks-home.XXXXXX) || fail "cannot create the throwaway user's home"
+    case $thome in /private/var/pks-home.*) ;; *) fail "throwaway home is not /private/var/pks-home.*: $thome" ;; esac
+    /usr/bin/sudo -n /usr/bin/dscl . -create "/Users/$tuser" NFSHomeDirectory "$thome" || fail "cannot create the throwaway user $tuser"
+    /usr/bin/sudo -n /usr/bin/dscl . -create "/Users/$tuser" RealName "pohunek archive smoke" || fail "cannot create the throwaway user $tuser"
+    /usr/bin/sudo -n /usr/bin/dscl . -create "/Users/$tuser" IsHidden 1 || fail "cannot create the throwaway user $tuser"
+    poll=0
+    while [ "$poll" -lt 50 ]; do
+        current_uid=$(/usr/bin/id -u "$tuser" 2>/dev/null)
+        if [ "$current_uid" = "$tuid" ]; then
+            break
+        fi
+        sleep 0.1
+        poll=$((poll + 1))
+    done
+    if [ "$poll" -ge 50 ]; then
+        fail "throwaway user $tuser uid is not $tuid after polling"
+    fi
+    codex_dir=/private/tmp/codex-daemon-$tuid
+    inputs=$(/usr/bin/sudo -n -u "$tuser" /usr/bin/mktemp -d /private/tmp/pki.XXXXXX) || fail "cannot create the throwaway user's input directory"
+    case $inputs in
+        /private/tmp/pki.*) ;;
+        *) fail "inputs directory is not in /private/tmp/pki.*: $inputs" ;;
+    esac
+    /usr/bin/sudo -n /usr/sbin/chown "$tuser:20" "$thome" || fail "cannot hand the home to $tuser"
+    /usr/bin/sudo -n /bin/chmod 0700 "$thome" || fail "cannot chmod the throwaway home"
+    /usr/bin/sudo -n -u "$tuser" /bin/mkdir -p "$thome/Library/Preferences" || fail "cannot create the throwaway user's Library/Preferences"
 }
 
 if [ "${1:-}" = __inner ]; then
@@ -421,13 +672,31 @@ while [ "$#" -gt 0 ]; do
 done
 [ -n "$archive" ] && [ -n "$stage" ] && [ -n "$consumer" ] || usage
 case $isolation in
-    auto | userns | sudo) ;;
-    *) fail "--isolation must be auto, userns or sudo" ;;
+    auto | userns | sudo | sandbox) ;;
+    *) fail "--isolation must be auto, userns, sudo or sandbox" ;;
 esac
-[ "$(uname -s)" = Linux ] || fail "the archive smoke needs Linux network namespaces"
-for tool in tar sha256sum jq unshare setsid mkfifo ps ip awk sed find readlink comm sort uniq tr wc cat head iconv mktemp; do
+uname_s=$(uname -s)
+case $uname_s in
+    Linux) ;;
+    Darwin) ;;
+    *) fail "unsupported OS: $uname_s (Linux and macOS are supported)" ;;
+esac
+
+# OS-specific tool checking
+common_tools="tar jq awk sed find readlink comm sort uniq tr wc cat head iconv mktemp ps"
+if [ "$uname_s" = Linux ]; then
+    required_tools="$common_tools sha256sum unshare setsid mkfifo ip"
+else
+    # macOS
+    required_tools="$common_tools shasum perl sandbox-exec"
+fi
+for tool in $required_tools; do
     command -v "$tool" >/dev/null 2>&1 || fail "required tool is missing: $tool"
 done
+# On either OS, prefer sha256sum if available, else shasum
+if ! command -v sha256sum >/dev/null 2>&1; then
+    command -v shasum >/dev/null 2>&1 || fail "neither sha256sum nor shasum is available"
+fi
 [ -f "$archive" ] && [ ! -L "$archive" ] || fail "archive is not a regular file: $archive"
 [ -d "$stage" ] && [ ! -L "$stage" ] || fail "stage is not a directory: $stage"
 [ -f "$consumer" ] && [ -x "$consumer" ] || fail "consumer is not an executable file: $consumer"
@@ -438,10 +707,43 @@ self=$(cd "$(dirname -- "$0")" && pwd -P)/$(basename -- "$0")
 checkout=$(cd "$(dirname -- "$self")/.." && pwd -P)
 
 umask 022
-work=$(mktemp -d "${TMPDIR:-/tmp}/pks.XXXXXX")
+uname_s=$(uname -s)
+if [ "$uname_s" = Darwin ]; then
+    work=$(mktemp -d /tmp/pks.XXXXXX)
+else
+    work=$(mktemp -d "${TMPDIR:-/tmp}/pks.XXXXXX")
+fi
 chmod 700 "$work"
 work=$(cd "$work" && pwd -P)
+check_dir=$work
+sock_root=
+host_probe=
+host_probe_listener_pid=
+host_probe_w_listener_pid=
+inputs=
+thome=
+if [ "$uname_s" = Darwin ]; then
+    sock_root=$(mktemp -d /tmp/pk.XXXX) || fail "cannot create socket root directory"
+    sock_root=$(cd "$sock_root" && pwd -P)
+fi
 ns_pid=
+chosen=
+tuser=
+tuid=
+tuser_created=
+stage_chowned=
+codex_dir=
+
+# Kill every process of the throwaway user, polling up to 10 s.
+kill_throwaway_user_processes() {
+    poll=0
+    while [ "$poll" -lt 100 ] && /usr/bin/pgrep -U "$tuid" >/dev/null 2>&1; do
+        /usr/bin/sudo -n /usr/bin/pkill -KILL -U "$tuid" 2>/dev/null || true
+        sleep 0.1
+        poll=$((poll + 1))
+    done
+}
+
 cleanup() {
     status=$?
     trap '' EXIT
@@ -452,14 +754,100 @@ cleanup() {
     fi
     exec 3>&-
     if [ -n "$ns_pid" ]; then
-        if [ "$chosen" != sudo ]; then
+        if [ "$chosen" = sandbox ] && [ -n "$tuser_created" ]; then
+            # The sandbox runs as the throwaway user under a root-owned sudo,
+            # which the invoking user cannot signal; kill the user's processes
+            # so sudo exits before it is reaped.
+            kill_throwaway_user_processes
+            # Also stop sudo itself, in case the signal arrived before it forked.
+            /usr/bin/sudo -n /bin/kill -KILL "$ns_pid" 2>/dev/null || true
+        elif [ "$chosen" != sudo ]; then
             # Signal the private group before reaping its leader, so its ID
             # cannot be reused for an unrelated process group.
-            /usr/bin/kill -KILL -- "-$ns_pid" 2>/dev/null || kill -KILL "$ns_pid" 2>/dev/null || true
+            /bin/kill -KILL -- "-$ns_pid" 2>/dev/null || kill -KILL "$ns_pid" 2>/dev/null || true
         fi
         wait "$ns_pid" 2>/dev/null || true
     fi
-    rm -rf -- "$work"
+    # macOS: the consumer runs in its own session (setsid) inside the sandbox,
+    # so killing the sandbox shell does not reach it; kill each live session
+    # recorded by the inner shell before the temp tree goes away.
+    # With a throwaway user, pkill -U covers these sessions and the pidfile is not trusted at all.
+    if [ "$chosen" = sandbox ] && [ -z "$tuser_created" ]; then
+        for pidfile in "$work"/run/.stray_*.pid; do
+            [ -f "$pidfile" ] || continue
+            sid=$(cat -- "$pidfile" 2>/dev/null) || continue
+            case $sid in '' | *[!0-9]* | 0* | 1) continue ;; esac
+            # The pidfile is consumer-writable: never sudo, and never group 0 or 1.
+            /bin/kill -KILL -- "-$sid" 2>/dev/null || true
+        done
+    fi
+    # Kill the host_probe listeners if they were started.
+    if [ -n "$host_probe_listener_pid" ]; then
+        /bin/kill "$host_probe_listener_pid" 2>/dev/null || true
+    fi
+    if [ -n "$host_probe_w_listener_pid" ]; then
+        /bin/kill "$host_probe_w_listener_pid" 2>/dev/null || true
+    fi
+    # Darwin throwaway user cleanup
+    if [ -n "$tuser_created" ]; then
+        kill_throwaway_user_processes
+        if /usr/bin/pgrep -U "$tuid" >/dev/null 2>&1; then
+            printf 'smoke-archive: processes of %s survived cleanup\n' "$tuser" >&2
+            /bin/ps -U "$tuid" -o pid,ppid,stat,command | while read -r line; do
+                printf 'smoke-archive:   %s\n' "$line" >&2
+            done
+            status=1
+        fi
+        if [ -n "$stage_chowned" ]; then
+            /usr/bin/sudo -n /usr/sbin/chown -R "$(id -u):$(id -g)" "$stage" || status=1
+        fi
+        case $tuid in
+            '' | *[!0-9]*) ;;
+            *)
+                /usr/bin/sudo -n /bin/rm -rf -- "/private/tmp/codex-daemon-$tuid" "/private/tmp/pohunek-$tuid" || true
+                [ -e "/private/tmp/codex-daemon-$tuid" ] && { printf 'smoke-archive: /private/tmp/codex-daemon-%s still exists\n' "$tuid" >&2; status=1; }
+                [ -e "/private/tmp/pohunek-$tuid" ] && { printf 'smoke-archive: /private/tmp/pohunek-%s still exists\n' "$tuid" >&2; status=1; }
+                ;;
+        esac
+        case $inputs in
+            /private/tmp/pki.*) /usr/bin/sudo -n /bin/rm -rf -- "$inputs" || true ;;
+            '') ;;
+            *) printf 'smoke-archive: refusing to remove %s\n' "$inputs" >&2; status=1 ;;
+        esac
+        [ -e "$inputs" ] && { printf 'smoke-archive: inputs directory %s still exists\n' "$inputs" >&2; status=1; }
+        case $thome in
+            /private/var/pks-home.*) /usr/bin/sudo -n /bin/rm -rf -- "$thome" || true ;;
+            '') ;;
+            *) printf 'smoke-archive: refusing to remove %s\n' "$thome" >&2; status=1 ;;
+        esac
+        [ -n "$thome" ] && [ -e "$thome" ] && { printf 'smoke-archive: throwaway home %s still exists\n' "$thome" >&2; status=1; }
+        /usr/bin/sudo -n /usr/bin/dscl . -delete "/Users/$tuser" 2>/dev/null || true
+        if /usr/bin/dscl . -read "/Users/$tuser" >/dev/null 2>&1; then
+            printf 'smoke-archive: throwaway user %s still exists\n' "$tuser" >&2
+            status=1
+        fi
+    fi
+    if [ -n "$tuser_created" ]; then
+        case $work in
+            /private/tmp/pks.*) /usr/bin/sudo -n /bin/rm -rf -- "$work" || true ;;
+            *) printf 'smoke-archive: refusing to remove %s\n' "$work" >&2; status=1 ;;
+        esac
+    else
+        rm -rf -- "$work"
+    fi
+    if [ -n "$sock_root" ]; then
+        if [ -n "$tuser_created" ]; then
+            case $sock_root in
+                /private/tmp/pk.*) /usr/bin/sudo -n /bin/rm -rf -- "$sock_root" || true ;;
+                *) printf 'smoke-archive: refusing to remove %s\n' "$sock_root" >&2; status=1 ;;
+            esac
+        else
+            rm -rf -- "$sock_root"
+        fi
+    fi
+    if [ -n "$host_probe" ]; then
+        rm -rf -- "$host_probe"
+    fi
     exit "$status"
 }
 trap cleanup EXIT
@@ -510,6 +898,11 @@ for member in MANIFEST packaging/verify-archive runtime-catalog-anchor.json runt
 done
 "$root/packaging/verify-archive" "$root" daemon $binaries >/dev/null \
     || fail "the archive's own verify-archive refused the archive"
+if [ "$uname_s" = Darwin ]; then
+    script_dir=$(cd "$(dirname -- "$self")" && pwd -P)
+    "$script_dir/macos/verify-signed" --adhoc "$root" >/dev/null \
+        || fail "the archive's ad-hoc signatures could not be verified"
+fi
 manifest_covers() {
     grep -q "^sha256 [0-9a-f]\{64\} $1\$" "$root/MANIFEST" || fail "MANIFEST does not cover $1"
 }
@@ -550,11 +943,11 @@ for rt in $runtimes; do
         sha256:????????????????????????????????????????????????????????????????) ;;
         *) fail "the catalog has no single entry with a digest for runtime $rt" ;;
     esac
-    [ "$digest" = "sha256:$(sha256sum -- "$root/runtime/packages/$rt.tar.zst" | cut -d' ' -f1)" ] \
+    [ "$digest" = "sha256:$(sha256_digest "$root/runtime/packages/$rt.tar.zst")" ] \
         || fail "the shipped package of $rt does not match its catalog digest"
 done
 expected_binary_sha() {
-    sha256sum -- "$root/$1" | cut -d' ' -f1
+    sha256_digest "$root/$1"
 }
 
 # --- namespace ---------------------------------------------------------------
@@ -562,8 +955,13 @@ cp -- "$consumer" "$work/consumer"
 chmod 755 "$work/consumer"
 node_bin=$(command -v node) || fail "node is required on PATH (the upstreams are node programs)"
 node_dir=$(cd "$(dirname -- "$node_bin")" && pwd -P)
-node_real=$(readlink -f -- "$node_bin") || fail "cannot resolve node on PATH: $node_bin"
-[ -f "$node_real" ] && [ -x "$node_real" ] || fail "node on PATH is not an executable file: $node_bin"
+if [ "$(uname -s)" = Linux ]; then
+    node_real=$(readlink -f -- "$node_bin") || fail "cannot resolve node on PATH: $node_bin"
+    [ -f "$node_real" ] && [ -x "$node_real" ] || fail "node on PATH is not an executable file: $node_bin"
+else
+    # macOS: node is pinned in compat/matrix.json and installed via actions/setup-node
+    node_real="$node_bin"
+fi
 for path in "$node_dir" "$node_real"; do
     case $path in
         "$checkout" | "$checkout"/*) fail "node on PATH resolves inside the checkout $checkout: $path" ;;
@@ -577,13 +975,75 @@ mkdir "$work/run"
 # caller's PATH, which may include writable directories populated by npm.
 root_path=/usr/sbin:/usr/bin:/sbin:/bin
 
+# macOS: validate every staged upstream before the throwaway user is created,
+# so validation needs no sudo and fails exactly as inside the isolated run.
+# The isolated run validates again before it executes anything.
+if [ "$uname_s" = Darwin ]; then
+    for rt in $runtimes; do
+        unreadable=$(cd "$stage/$rt" 2>/dev/null && /usr/bin/find . ! -type l \( ! -perm -u+r -o \( -type d ! -perm -u+x \) \) -print 2>&1 | head -n 1) || unreadable="$stage/$rt"
+        [ -z "$unreadable" ] || fail "the staged upstream is not readable by the invoking user: $stage/$rt (${unreadable#./})"
+    done
+    ( PATH=$root_path; for rt in $runtimes; do stage_check "$stage/$rt"; done ) || exit 1
+fi
+
 run_userns() {
     exec /usr/bin/setsid /usr/bin/env -i PATH="$root_path" /usr/bin/unshare --user --map-root-user --net --pid --fork --kill-child --mount-proc \
-        /bin/sh "$self" __inner userns "$work" "$root" "$stage" "$work/consumer" "$node_dir" $runtimes
+        /bin/sh "$self" __inner userns "$work" "$root" "$stage" "$work/consumer" "$node_dir" "" "" "" $runtimes
 }
 run_sudo() {
     exec /usr/bin/setsid /usr/bin/sudo -n /usr/bin/env -i PATH="$root_path" \
-        /usr/bin/setsid --wait /bin/sh "$self" __sudo_supervisor "$uid" "$gid" "$work/sudo-cancel" "$work" "$root" "$stage" "$work/consumer" "$node_dir" $runtimes 3>&-
+        /usr/bin/setsid --wait /bin/sh "$self" __sudo_supervisor "$uid" "$gid" "$work/sudo-cancel" "$work" "$root" "$stage" "$work/consumer" "$node_dir" "" "" "" $runtimes 3>&-
+}
+run_sandbox() {
+    # Generate the sandbox profile with the canonical temp root path.
+    # The consumer's executables are copied into a throwaway-owned /private/tmp/pki.*
+    # root because the product only executes files owned by the effective user,
+    # in owner-controlled directories.
+    # Refuse work paths containing " or \ which could break the profile.
+    case $work in
+        *'"'*) fail "temp root contains quote: $work" ;;
+        *'\\'*) fail "temp root contains backslash: $work" ;;
+    esac
+    case $inputs in
+        *'"'*) fail "inputs root contains quote: $inputs" ;;
+        *'\\'*) fail "inputs root contains backslash: $inputs" ;;
+    esac
+    case $sock_root in
+        *'"'*) fail "socket root contains quote: $sock_root" ;;
+        *'\\'*) fail "socket root contains backslash: $sock_root" ;;
+    esac
+    case $codex_dir in
+        *'"'*) fail "codex directory contains quote: $codex_dir" ;;
+        *'\\'*) fail "codex directory contains backslash: $codex_dir" ;;
+    esac
+    profile=$(printf '%s\n' \
+        '(version 1)' \
+        '(allow default)' \
+        '(deny network*)' \
+        '(allow network* (remote ip "localhost:*"))' \
+        '(allow network-bind (local ip "localhost:*"))' \
+        '(allow network-inbound (local ip "localhost:*"))' \
+        "(allow network* (remote unix-socket (subpath \"$sock_root\")))" \
+        "(allow network-bind (local unix-socket (subpath \"$sock_root\")))" \
+        "(allow network* (remote unix-socket (subpath \"$work\")))" \
+        "(allow network-bind (local unix-socket (subpath \"$work\")))" \
+        "(allow network* (remote unix-socket (subpath \"$codex_dir\")))" \
+        "(allow network-bind (local unix-socket (subpath \"$codex_dir\")))" \
+        '(allow process-exec* (literal "/bin/ps") (with no-sandbox))')
+    # Unix sockets are local IPC, not egress. The socket paths for smoke's own
+    # roots (sock_root and work) and the throwaway user's codex directory
+    # (codex_dir) are narrowed to subpaths only, so the smoke cannot reach
+    # unrelated host sockets. Codex binds its app-server socket under
+    # /private/tmp/codex-daemon-<uid>, and that directory is unique to the
+    # throwaway uid. The real user's sockets are unreachable by permissions
+    # as well as by the profile. /bin/ps is setuid, so the sandbox cannot
+    # exec it; it runs unsandboxed as a fixed read-only system tool so the
+    # test-support worker-leak check can read the process table; egress
+    # stays denied. DNS (/private/var/run/mDNSResponder) stays denied.
+    cd /
+    [ -n "$tuser" ] || fail "no throwaway user; refusing to run the macOS smoke as the invoking user"
+    # codex 0.157+ reads preferences from the dscl home, which must exist and be owned by the user (openai/codex#50072); see create_throwaway_user
+    exec /usr/bin/sudo -n -u "$tuser" /usr/bin/sandbox-exec -p "$profile" /usr/bin/env -i PATH="$root_path" /bin/sh "$work/smoke-archive" __inner sandbox "$work" "$root" "$stage" "$work/consumer" "$node_dir" "$sock_root" "$host_probe" "$inputs" $runtimes
 }
 probe_userns() {
     /usr/bin/env -i PATH="$root_path" /usr/bin/unshare --user --map-root-user --net --pid --fork --kill-child --mount-proc /usr/bin/true >/dev/null 2>&1
@@ -593,25 +1053,115 @@ probe_sudo() {
         && /usr/bin/sudo -n /usr/bin/env -i PATH="$root_path" /usr/bin/unshare \
             --net --pid --fork --kill-child --mount-proc true >/dev/null 2>&1
 }
+probe_sandbox() {
+    /usr/bin/sandbox-exec -p '(version 1)(allow default)(deny network*)' /usr/bin/true >/dev/null 2>&1
+}
+probe_darwin_sudo() {
+    [ -x /usr/bin/sudo ] && [ -x /usr/bin/dscl ] && /usr/bin/sudo -n /usr/bin/true >/dev/null 2>&1
+}
 
 chosen=$isolation
 if [ "$chosen" = auto ]; then
-    if probe_userns; then
-        chosen=userns
-    elif probe_sudo; then
-        chosen=sudo
+    if [ "$uname_s" = Darwin ]; then
+        if probe_sandbox; then
+            chosen=sandbox
+        else
+            fail "sandbox-exec isolation is not available on this macOS system"
+        fi
     else
-        fail "no network isolation is available: unprivileged user namespaces are denied and 'sudo -n unshare' does not work; refusing to run un-isolated"
+        if probe_userns; then
+            chosen=userns
+        elif probe_sudo; then
+            chosen=sudo
+        else
+            fail "no network isolation is available: unprivileged user namespaces are denied and 'sudo -n unshare' does not work; refusing to run un-isolated"
+        fi
     fi
 fi
 echo "smoke-archive: isolation $chosen, runtimes:$runtimes"
 case $chosen in
     userns) probe_userns || fail "isolation userns is not available on this host" ;;
     sudo) probe_sudo || fail "isolation sudo is not available on this host" ;;
+    sandbox) probe_sandbox || fail "isolation sandbox is not available on this host" ;;
+    *) fail "unknown isolation strategy: $chosen" ;;
 esac
+if [ "$chosen" = sandbox ]; then
+    if [ "$uname_s" = Darwin ]; then
+        probe_darwin_sudo || fail "the macOS smoke runs the consumer as a throwaway local user and needs passwordless sudo (sudo -n) to create it; refusing to run as the invoking user"
+        create_throwaway_user
+        if [ -n "$tuser" ]; then
+            # Set before the first chown so cleanup reverts a partial handover.
+            stage_chowned=1
+            /usr/bin/sudo -n /usr/sbin/chown "$tuser:20" "$stage" || fail "cannot chown stage to throwaway user"
+            for rt in $runtimes; do
+                /usr/bin/sudo -n /usr/sbin/chown -R "$tuser:20" "$stage/$rt" || fail "cannot chown $stage/$rt to throwaway user"
+                /usr/bin/sudo -n /bin/chmod -R go-w "$stage/$rt" || fail "cannot drop group/other write from $stage/$rt"
+            done
+        fi
+    fi
+fi
 if [ "$chosen" = sudo ]; then
     /usr/bin/mkfifo "$work/sudo-cancel"
     exec 3<> "$work/sudo-cancel"
+fi
+
+# Darwin sandbox: set up two host unix sockets outside the permitted roots to
+# verify the sandbox cannot reach them. Socket s (mode 0755) proves that file
+# permissions isolate the invoking user's sockets. Socket w (mode 0777) proves
+# that the sandbox profile itself denies unix sockets, independently of permissions.
+if [ "$chosen" = sandbox ]; then
+    host_probe=$(mktemp -d /tmp/pkh.XXXX) || fail "cannot create host probe directory"
+    host_probe=$(cd "$host_probe" && pwd -P)
+    chmod 711 "$host_probe" || fail "cannot chmod host probe directory"
+    /usr/bin/nc -lkU "$host_probe/s" >/dev/null 2>&1 &
+    host_probe_listener_pid=$!
+    /usr/bin/nc -lkU "$host_probe/w" >/dev/null 2>&1 &
+    host_probe_w_listener_pid=$!
+    # Wait for both sockets to be created before entering the sandbox.
+    n=0
+    while ([ ! -S "$host_probe/s" ] || [ ! -S "$host_probe/w" ]) && [ "$n" -lt 50 ]; do
+        sleep 0.01
+        n=$((n + 1))
+    done
+    [ -S "$host_probe/s" ] || fail "failed to create host probe socket: $host_probe/s"
+    [ -S "$host_probe/w" ] || fail "failed to create host probe socket: $host_probe/w"
+    chmod 755 "$host_probe/s" || fail "cannot chmod host probe socket s"
+    chmod 777 "$host_probe/w" || fail "cannot chmod host probe socket w"
+    if [ "$uname_s" = Darwin ] && [ -n "$tuser" ]; then
+        chmod 711 "$work"
+        cp -- "$self" "$work/smoke-archive"
+        chmod 755 "$work/smoke-archive"
+        mkdir -p "$work/t"
+        /usr/bin/sudo -n /usr/sbin/chown -R "$tuser" "$work/run" "$work/t" "$sock_root" || fail "cannot set permissions for the throwaway user"
+        output=$(/usr/bin/sudo -n -u "$tuser" /bin/sh -c 'for p do [ -r "$p" ] && [ -x "$p" ] || { printf "%s\n" "$p"; exit 1; }; done' sh "$root" "$stage" "$node_dir" "$node_bin" "$work/consumer" "$work/smoke-archive" 2>&1) && preflight_status=0 || preflight_status=$?
+        if [ "$preflight_status" -ne 0 ]; then
+            fail "the throwaway user cannot read and enter: $(printf '%s\n' "$output" | head -n 1)"
+        fi
+        # Verify the throwaway user can traverse the entire stage tree for each runtime
+        for rt in $runtimes; do
+            output=$(/usr/bin/sudo -n -u "$tuser" /bin/sh -c '
+                [ -r "$1" ] && [ -x "$1" ] || { printf "stage dir not readable/executable: %s\n" "$1"; exit 1; }
+                [ -r "$2" ] && [ -f "$2" ] || { printf "STAGE.sha256 not readable: %s\n" "$2"; exit 1; }
+                [ -r "$3" ] && [ -f "$3" ] || { printf "STAGE.links not readable: %s\n" "$3"; exit 1; }
+                /usr/bin/find "$1" -print >/dev/null 2>&1 || { printf "find failed in stage: %s\n" "$1"; exit 1; }
+            ' sh "$stage/$rt" "$stage/$rt/STAGE.sha256" "$stage/$rt/STAGE.links" 2>&1) && stage_status=0 || stage_status=$?
+            if [ "$stage_status" -ne 0 ]; then
+                fail "the throwaway user cannot read the staged upstream $stage/$rt after it was handed over: $(printf '%s\n' "$output" | head -n 1)"
+            fi
+        done
+        [ -S "$host_probe/s" ] || fail "host probe socket is missing"
+        [ -S "$host_probe/w" ] || fail "host probe socket is missing"
+        if /usr/bin/sudo -n -u "$tuser" /usr/bin/nc -U -w 2 "$host_probe/s" </dev/null >/dev/null 2>&1; then
+            fail "the throwaway user reaches a socket of the invoking user"
+        fi
+        if ! printf x | /usr/bin/sudo -n -u "$tuser" /usr/bin/nc -U -w 2 "$host_probe/w" >/dev/null 2>&1; then
+            fail "the throwaway user cannot reach the world-connectable probe socket outside the sandbox; the sandbox probe would prove nothing"
+        fi
+        [ -S "$host_probe/s" ] || fail "the host probe listener exited"
+        [ -S "$host_probe/w" ] || fail "the host probe listener exited"
+        /bin/kill -0 "$host_probe_listener_pid" 2>/dev/null || fail "the host probe listener exited"
+        /bin/kill -0 "$host_probe_w_listener_pid" 2>/dev/null || fail "the host probe listener exited"
+    fi
 fi
 
 # The namespace runs in the background so a signal reaches the trap at once.

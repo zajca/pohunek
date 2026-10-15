@@ -1,18 +1,19 @@
 #!/bin/sh
-# Stage the pinned upstreams and run the network-isolated smoke on every Linux
-# daemon archive of a release bundle.
+# Stage the pinned upstreams and run the network-isolated smoke on daemon
+# archives of a release bundle.
 #
 # usage: run-smoke <bundle-dir>                   (run from the repository root)
 # env:   VERSION    release version
 #        CONSUMER   the prebuilt release_consumer executable
-#        ISOLATION  userns or sudo (from probe-isolation)
+#        ISOLATION  isolation strategy (from probe-isolation)
 #        XTASK      path of the built xtask binary
 #        RUNNER_TEMP
+#        SMOKE_TARGET (optional) archive target selector (default: *-linux-*)
 #
 # Every runtime of the compatibility matrix is staged once (network), then
-# packaging/smoke-archive runs each Linux daemon archive of the bundle in a
-# network namespace. The stage, the temp tree and the consumer copy lie outside
-# the checkout, as smoke-archive requires.
+# packaging/smoke-archive runs each daemon archive matching SMOKE_TARGET of
+# the bundle in a network-isolated environment. The stage, the temp tree and
+# the consumer copy lie outside the checkout, as smoke-archive requires.
 #
 # A consumer may write into the stage it ran from (a provisioned Python
 # upstream writes bytecode and state files), and smoke-archive refuses a stage
@@ -20,7 +21,8 @@
 # aside once, and before each archive every runtime is restored from that copy
 # at the same absolute path and checked with `compat verify-stage`. The stage
 # never moves: a provisioned environment names its interpreter by absolute
-# path.
+# path. On macOS the stage lives under a fresh root-owned /private/var/pks-stage.*
+# base that is removed on exit.
 
 set -eu
 
@@ -29,13 +31,34 @@ fail() {
     exit 1
 }
 
+cleanup_base() {
+    if [ -n "${base:-}" ]; then
+        case $base in
+            /private/var/pks-stage.*) ;;
+            *) fail "cleanup_base: base does not match /private/var/pks-stage.*: $base" ;;
+        esac
+        /usr/bin/sudo -n /bin/rm -rf "$base" || true
+        [ ! -e "$base" ] || fail "cleanup_base: base still exists: $base"
+    fi
+}
+
 [ "$#" -eq 1 ] || fail "usage: run-smoke <bundle-dir>"
 bundle=$1
 for name in VERSION CONSUMER ISOLATION XTASK RUNNER_TEMP; do
     eval "value=\${$name:-}"
     [ -n "$value" ] || fail "$name is required"
 done
-case $ISOLATION in userns | sudo) ;; *) fail "ISOLATION must be userns or sudo" ;; esac
+case $ISOLATION in userns | sudo | sandbox) ;; *) fail "ISOLATION must be userns, sudo or sandbox" ;; esac
+
+# SMOKE_TARGET: if empty, use the default Linux glob; if set, validate and use exactly
+if [ -z "${SMOKE_TARGET:-}" ]; then
+    smoke_target="*-linux-*"
+else
+    smoke_target="$SMOKE_TARGET"
+    case $smoke_target in
+        *[!a-zA-Z0-9._-]*) fail "SMOKE_TARGET contains unsafe characters: $smoke_target" ;;
+    esac
+fi
 [ -d "$bundle" ] || fail "not a directory: $bundle"
 
 # Artifact upload drops the executable bit; the copy gets it back.
@@ -43,7 +66,19 @@ consumer_copy=$RUNNER_TEMP/smoke-consumer
 cp -- "$CONSUMER" "$consumer_copy"
 chmod 0755 "$consumer_copy"
 
-stage=$RUNNER_TEMP/smoke-stage
+if [ "$(uname -s)" = Darwin ]; then
+    /usr/bin/sudo -n true || fail "the macOS smoke needs passwordless sudo (CI runner only)"
+    base=$(/usr/bin/sudo -n /usr/bin/mktemp -d /private/var/pks-stage.XXXXXX) || fail "cannot create temporary base directory"
+    case $base in
+        /private/var/pks-stage.*) ;;
+        *) fail "base does not match /private/var/pks-stage.*: $base" ;;
+    esac
+    /usr/bin/sudo -n /bin/chmod 0755 "$base" || fail "cannot chmod base directory"
+    trap 'cleanup_base' EXIT INT TERM
+    stage=$base/stage
+else
+    stage=$RUNNER_TEMP/smoke-stage
+fi
 pristine=$RUNNER_TEMP/smoke-stage-pristine
 [ ! -e "$stage" ] || fail "stage exists: $stage"
 [ ! -e "$pristine" ] || fail "pristine stage copy exists: $pristine"
@@ -55,14 +90,19 @@ for runtime in $runtimes; do
         *[!a-z0-9_-]*) fail "invalid runtime id: $runtime" ;;
     esac
 done
-mkdir -p "$stage"
+if [ "$(uname -s)" = Darwin ]; then
+    /usr/bin/sudo -n /bin/mkdir -m 0755 "$stage" || fail "cannot create stage directory"
+    /usr/bin/sudo -n /usr/sbin/chown "$(id -u):$(id -g)" "$stage" || fail "cannot chown stage directory"
+else
+    mkdir -p "$stage"
+fi
 for runtime in $runtimes; do
     "$XTASK" compat stage-upstream --runtime "$runtime" --out "$stage"
 done
 cp -a -- "$stage" "$pristine"
 
 found=0
-for archive in "$bundle"/pohunek-daemon-"$VERSION"-*-linux-*.tar.gz; do
+for archive in "$bundle"/pohunek-daemon-"$VERSION"-$smoke_target.tar.gz; do
     [ -f "$archive" ] || continue
     for runtime in $runtimes; do
         rm -rf -- "${stage:?}/$runtime"
@@ -72,4 +112,4 @@ for archive in "$bundle"/pohunek-daemon-"$VERSION"-*-linux-*.tar.gz; do
     packaging/smoke-archive --archive "$archive" --stage "$stage" --consumer "$consumer_copy" --isolation "$ISOLATION"
     found=$((found + 1))
 done
-[ "$found" -gt 0 ] || fail "the bundle holds no Linux daemon archive"
+[ "$found" -gt 0 ] || fail "the bundle holds no daemon archive matching selector: $smoke_target"

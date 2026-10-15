@@ -404,7 +404,7 @@ packaging/smoke-archive \
   --archive <bundle>/pohunek-daemon-<v>-<target>.tar.gz \
   --stage <stage-dir> \
   --consumer <release_consumer-executable> \
-  [--runtime <id>]... [--isolation auto|userns|sudo]
+  [--runtime <id>]... [--isolation auto|userns|sudo|sandbox]
 ```
 
 `<stage-dir>/<runtime>/` is the staged upstream of each runtime: an npm prefix
@@ -441,18 +441,31 @@ with `setpriv` and all capabilities dropped). If neither works the script
 fails; there is no un-isolated fallback. It needs Linux, util-linux `unshare`,
 iproute2 `ip`, `jq` and `node` on `PATH`.
 
+On macOS, the `aarch64-apple-darwin` daemon archive runs the consumer under
+`sandbox-exec` as a throwaway local user, created per run with a random uid
+40000-59999 via `dscl` and deleted afterwards. Passwordless `sudo -n` is
+required; without it the smoke fails closed after archive and stage validation,
+with no same-user fallback. The sandbox profile denies network
+egress except loopback IP and unix sockets under the run's own work root, socket
+root and the throwaway user's Codex socket directory. A positive probe proves
+TCP/HTTPS egress fails, loopback works, and both a permission-protected and a
+world-connectable host socket are unreachable. The leftover-process check is
+weaker than a PID namespace (#1010).
+
 What it proves: the released bytes, catalog and anchor, the staged upstream
 and the packages work together offline, and the consumer saw no path of the
 checkout (stage and temp paths inside the checkout are refused, the consumer
 executable is copied out of `target/`). The script itself comes from the
-checkout and runs outside the namespace until step 2. It does not prove other
-platforms: macOS has no network namespaces, so a macOS row is not covered. The
-consumer's temp root is kept short (`/tmp/pks.XXXXXX/t`) because the suite
-refuses a `TMPDIR` that makes its socket paths too long.
+checkout and runs outside the namespace until step 2. Linux archives run in a
+namespace, the Apple Silicon archive in the sandbox above, and other targets
+are not covered. The consumer's temp root is kept short (`/tmp/pks.XXXXXX/t`)
+because the suite refuses a `TMPDIR` that makes its socket paths too long.
 
 Scenarios: `python3 -m unittest scripts.tests.test_smoke_archive` (synthetic
 archive and stub consumers; the `sudo` scenario is skipped where `sudo -n` is
-unavailable).
+unavailable; on macOS the scenarios that need the isolated run are skipped
+without passwordless sudo, and the macos-15 `smoke` job runs them with
+`POHUNEK_SMOKE_TESTS_REQUIRE_ISOLATED_RUN=1`, so they cannot skip there).
 
 ## Conventions that matter here
 
@@ -507,7 +520,8 @@ assembles and publishes the release in one fixed flow:
    attestation verify`, then `cargo xtask release assemble` signs the catalog
    with the CI root key and writes the bundle; `attest-bundle` attests the
    bundle; `smoke` runs `packaging/smoke-archive` on every Linux daemon archive
-   in a network namespace; `verdict` requires all of them.
+   in a network namespace and on the Apple Silicon archive under `sandbox-exec`
+   on macos-15; `verdict` requires all of them.
 3. **Publish**: the single job with `contents: write`. It checks out nothing and
    runs no repository or downloaded code. It downloads the `release-bundle`
    artifact, checks it against `release-inventory.sha256` (the only list of

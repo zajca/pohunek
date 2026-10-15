@@ -91,6 +91,30 @@ pohunek doctor
 `pohunek doctor` lists anything the host still lacks (login shell, Terminal,
 notifications, keychain, Privacy & Security access to project folders).
 
+## Install runtime packages from the release archive
+
+The daemon archive carries the official runtime packages of its release and the
+signed catalog that authorizes them. Install the official Pi, Claude Code, Codex, and
+Hermes packages from the extracted archive:
+
+```bash
+cd pohunek-daemon-<version>-aarch64-apple-darwin
+pohunek plugin install runtime/packages/pi.tar.zst --catalog runtime/runtime-catalog.json --yes
+pohunek plugin install runtime/packages/claude.tar.zst --catalog runtime/runtime-catalog.json --yes
+pohunek plugin install runtime/packages/codex.tar.zst --catalog runtime/runtime-catalog.json --yes
+pohunek plugin install runtime/packages/hermes.tar.zst --catalog runtime/runtime-catalog.json --yes
+```
+
+Verify the installation:
+
+```bash
+pohunek plugin list
+pohunek host inspect local --json
+```
+
+See `docs/install.md` for details on package verification,
+profiles, and environment setup.
+
 ## Start, status, stop
 
 launchd starts the agent at every login and restarts it after a failure. It never

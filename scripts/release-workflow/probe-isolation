@@ -3,19 +3,32 @@
 #
 # usage: probe-isolation
 #
-# Prints `userns` when unprivileged user namespaces work and `sudo` when only
-# `sudo -n unshare` does, the two strategies of packaging/smoke-archive. Fails
-# when neither works: the archive smoke never runs un-isolated. The probe runs
-# the same unshare flags as the smoke and executes nothing else.
+# Prints the isolation strategy available: `userns` or `sudo` on Linux,
+# `sandbox` on macOS. Fails when no strategy works: the archive smoke never
+# runs un-isolated. The probe runs the same flags as the smoke and executes
+# nothing else.
 
 set -eu
 
-if unshare --user --map-root-user --net --pid --fork --kill-child --mount-proc true >/dev/null 2>&1; then
-    echo userns
-elif command -v sudo >/dev/null 2>&1 && command -v setpriv >/dev/null 2>&1 \
-    && sudo -n unshare --net --pid --fork --kill-child --mount-proc true >/dev/null 2>&1; then
-    echo sudo
+uname_s=$(uname -s)
+
+if [ "$uname_s" = Darwin ]; then
+    # On macOS, probe sandbox-exec.
+    if /usr/bin/sandbox-exec -p '(version 1)(allow default)(deny network*)' /usr/bin/true >/dev/null 2>&1; then
+        echo sandbox
+    else
+        echo "probe-isolation: sandbox-exec is not available on this macOS system" >&2
+        exit 1
+    fi
 else
-    echo "probe-isolation: neither unprivileged user namespaces nor 'sudo -n unshare' work on this runner" >&2
-    exit 1
+    # On Linux, probe unprivileged user namespaces first, then sudo.
+    if unshare --user --map-root-user --net --pid --fork --kill-child --mount-proc true >/dev/null 2>&1; then
+        echo userns
+    elif command -v sudo >/dev/null 2>&1 && command -v setpriv >/dev/null 2>&1 \
+        && sudo -n unshare --net --pid --fork --kill-child --mount-proc true >/dev/null 2>&1; then
+        echo sudo
+    else
+        echo "probe-isolation: neither unprivileged user namespaces nor 'sudo -n unshare' work on this runner" >&2
+        exit 1
+    fi
 fi

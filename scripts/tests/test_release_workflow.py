@@ -824,7 +824,34 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
             smoke.index("scripts/release-workflow/run-smoke"),
         )
         self.assertIn("ISOLATION: ${{ steps.isolation.outputs.strategy }}", smoke)
-        self.assertIn("--isolation", (SCRIPTS / "run-smoke").read_text())
+        run_smoke_text = (SCRIPTS / "run-smoke").read_text()
+        self.assertIn("--isolation", run_smoke_text)
+        # On macOS, run-smoke stages under a root-owned base and hands it to the throwaway user
+        self.assertIn('[ "$(uname -s)" = Darwin ]', run_smoke_text)
+        self.assertIn("/usr/bin/sudo -n /usr/bin/mktemp -d /private/var/pks-stage.XXXXXX", run_smoke_text)
+        self.assertIn("trap 'cleanup_base' EXIT INT TERM", run_smoke_text)
+        self.assertIn("/usr/bin/sudo -n /usr/sbin/chown", run_smoke_text)
+        self.assertNotIn("chmod -R go+rX", run_smoke_text)
+        # Smoke is a matrix job with ubuntu-latest and macos-15
+        self.assertIn("    strategy:\n      fail-fast: false\n      matrix:\n        include:", smoke)
+        self.assertIn("          - os: ubuntu-latest\n            smoke_target: \"\"", smoke)
+        self.assertIn("          - os: macos-15\n            smoke_target: aarch64-apple-darwin", smoke)
+        self.assertIn("SMOKE_TARGET: ${{ matrix.smoke_target }}", smoke)
+
+    def test_smoke_runs_archive_scenarios_on_macos(self):
+        smoke = self.evidence_jobs["smoke"]
+        self.assertIn("python3 -m unittest -v scripts.tests.test_smoke_archive", smoke)
+        self.assertIn("if: runner.os == 'macOS'", smoke)
+        self.assertIn("POHUNEK_SMOKE_TESTS_REQUIRE_ISOLATED_RUN: \"1\"", smoke)
+        self.assertLess(
+            smoke.index("python3 -m unittest -v scripts.tests.test_smoke_archive"),
+            smoke.index("scripts/release-workflow/run-smoke"),
+        )
+        # Verify timeout-minutes: 20 is set for the macOS smoke step
+        smoke_step_start = smoke.index("Run the archive smoke scenarios on macOS")
+        smoke_step_end = smoke.index("python3 -m unittest -v scripts.tests.test_smoke_archive")
+        smoke_step = smoke[smoke_step_start:smoke_step_end]
+        self.assertIn("timeout-minutes: 20", smoke_step)
 
     def test_the_consumer_test_name_matches_the_smoke(self):
         pattern = r"consumer_test=(\S+)"
@@ -927,10 +954,10 @@ class AssetNameTests(ReleaseWorkflowFiles):
                 self.assertIn(name, consumed)
         # `release-bundle` must stay outside every `release-*` download pattern.
         self.assertNotRegex(self.release + self.evidence + self.build, r"pattern: release-")
-        # Consumer artifacts must include the OS suffix; smoke runs on ubuntu and must
-        # download release-consumer-Linux specifically, not a bare release-consumer.
+        # Consumer artifacts must include the OS suffix; smoke runs on ubuntu and
+        # macos and must download release-consumer-${{ runner.os }} specifically.
         smoke = self.evidence_jobs["smoke"]
-        self.assertIn("name: release-consumer-Linux", smoke)
+        self.assertIn("name: release-consumer-${{ runner.os }}", smoke)
 
     def test_the_package_evidence_is_uploaded_and_never_consumed(self):
         # Builder evidence is in-house JSON outside the release policy: it is

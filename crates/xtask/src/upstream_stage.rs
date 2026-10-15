@@ -22,7 +22,7 @@
 //! The command is data driven: it knows no runtime by name. A lock of another
 //! `schema` or `upstream.kind` is refused instead of guessed at.
 
-// Rust guideline compliant 2026-10-12
+// Rust guideline compliant 2026-10-15
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -398,6 +398,8 @@ pub enum Fault {
     /// The entrypoint does not, or at this path would not, start the stage's
     /// venv interpreter through a direct `#!<path>` line.
     IndirectShebang,
+    /// The entry is writable by group or others.
+    SharedWrite,
 }
 
 impl fmt::Display for Fault {
@@ -423,6 +425,7 @@ impl fmt::Display for Fault {
                  `#!<path>` line (a `/bin/sh` trampoline, another interpreter, a path \
                  too long or with a space, or a stage moved after staging)"
             }
+            Self::SharedWrite => "is writable by group or others",
         })
     }
 }
@@ -514,6 +517,85 @@ fn refuse(subject: impl Into<String>, fault: Fault) -> XtaskError {
 fn io_error(path: &Path) -> impl FnOnce(io::Error) -> XtaskError {
     let path = path.to_path_buf();
     move |source| XtaskError::Io { path, source }
+}
+
+/// Clears group and other write bits from a file or directory.
+fn clear_shared_write(path: &Path, metadata: &fs::Metadata) -> Result<(), XtaskError> {
+    let mode = metadata.permissions().mode();
+    if mode & 0o022 != 0 {
+        let new_perms = fs::Permissions::from_mode(mode & !0o022);
+        fs::set_permissions(path, new_perms).map_err(io_error(path))?;
+    }
+    Ok(())
+}
+
+/// Removes group and other write permissions from all entries under `root`.
+///
+/// uv and npm can leave shared-write entries such as `venv/.lock`, and the
+/// smoke's trust check, like the product's executable lookup, refuses them.
+fn drop_shared_write(root: &Path) -> Result<(), XtaskError> {
+    let metadata = fs::symlink_metadata(root).map_err(io_error(root))?;
+    clear_shared_write(root, &metadata)?;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let entries = fs::read_dir(&dir).map_err(io_error(&dir))?;
+        for entry in entries {
+            let entry = entry.map_err(io_error(&dir))?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(io_error(&path))?;
+            // Skip symlinks, following them would escape the stage.
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            clear_shared_write(&path, &metadata)?;
+            if metadata.file_type().is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuses the first entry under `root` that is writable by group or others.
+fn refuse_shared_write(root: &Path) -> Result<(), XtaskError> {
+    let metadata = fs::symlink_metadata(root).map_err(io_error(root))?;
+    let mode = metadata.permissions().mode();
+    if mode & 0o022 != 0 {
+        return Err(refuse(".", Fault::SharedWrite));
+    }
+    let mut pending = vec![(root.to_path_buf(), String::new())];
+    while let Some((dir, prefix)) = pending.pop() {
+        let entries = fs::read_dir(&dir).map_err(io_error(&dir))?;
+        for entry in entries {
+            let entry = entry.map_err(io_error(&dir))?;
+            let path = entry.path();
+            let name = entry
+                .file_name()
+                .into_string()
+                .ok()
+                .filter(|name| safe_component(name))
+                .ok_or_else(|| refuse(escaped(&path), Fault::UnsafeName))?;
+            let relative = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let metadata = fs::symlink_metadata(&path).map_err(io_error(&path))?;
+            let kind = metadata.file_type();
+            // Skip symlinks.
+            if kind.is_symlink() {
+                continue;
+            }
+            let mode = metadata.permissions().mode();
+            if mode & 0o022 != 0 {
+                return Err(refuse(relative, Fault::SharedWrite));
+            }
+            if kind.is_dir() {
+                pending.push((path, relative));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `compat` actions that stage and verify upstream releases.
@@ -2099,6 +2181,7 @@ fn stage_npm(
 
     install(&stage, &scratch.0, lock, ci)?;
     check_pins(&stage, lock, ci.pins, ci.project)?;
+    drop_shared_write(&stage)?;
     let tree = scan_tree(&stage)?;
     let (sha256, links) = render_manifests(&tree);
     write_manifest(&stage.join(SHA256_MANIFEST), &sha256)?;
@@ -2112,6 +2195,7 @@ fn stage_npm(
         BannerMatch::Whole,
     )?;
     check_manifests(&stage)?;
+    refuse_shared_write(&stage)?;
 
     if destination.is_dir() {
         fs::remove_dir(destination).map_err(io_error(destination))?;
@@ -2258,6 +2342,7 @@ fn stage_provisioned(
     write_manifest(&inputs.join(LOCK_COPY), &provisioner.lock_bytes)?;
     write_manifest(&inputs.join(&provisioner.name), &provisioner.script_bytes)?;
 
+    drop_shared_write(destination)?;
     check_provisioned(destination, lock, provisioner)?;
     let tree = scan_tree(destination)?;
     let (sha256, links) = render_manifests(&tree);
@@ -2272,6 +2357,7 @@ fn stage_provisioned(
         BannerMatch::FirstLine,
     )?;
     check_manifests(destination)?;
+    refuse_shared_write(destination)?;
     partial.complete = true;
     Ok(summarize(lock, &tree, destination))
 }

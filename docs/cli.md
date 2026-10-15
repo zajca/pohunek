@@ -499,9 +499,8 @@ and creation outcome" in [public-api.md](public-api.md).
 
 Pohunek manages the local interactive Hermes terminal as `--agent hermes`. The
 daemon compiles no Hermes in: only the official `pohunek.runtime.hermes`
-package serves `hermes`, so install it from the extracted Linux daemon archive
-first (the macOS archive carries no runtime package yet, #929). Without it
-`session new --agent hermes` fails with `agent_profile_not_found`, whose hint
+package serves `hermes`, so install it from the extracted daemon archive first.
+Without it `session new --agent hermes` fails with `agent_profile_not_found`, whose hint
 names the install. Before launching, inspect the target host: the `hermes`
 runtime must be `available` and report `version=0.20.0` with `supported=true`.
 

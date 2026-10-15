@@ -634,5 +634,7 @@ class AssembleRefusalTests(unittest.TestCase):
         self.assertFalse((self.directory / "trust").exists())
 
 
+
+
 if __name__ == "__main__":
     unittest.main()

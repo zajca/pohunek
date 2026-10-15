@@ -8,15 +8,18 @@ itself, its extraction, its namespace entry and its report checks are real.
 Run: python3 -m unittest scripts.tests.test_smoke_archive
 """
 
+import glob
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import re
 import select
 import selectors
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -26,18 +29,28 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 PACKAGING = ROOT / "packaging"
 SCRIPT = PACKAGING / "smoke-archive"
-TARGET = "x86_64-unknown-linux-gnu"
+# On macOS, use aarch64-apple-darwin for arm64; on Linux, use x86_64-unknown-linux-gnu
+TARGET = "aarch64-apple-darwin" if sys.platform.startswith("darwin") else "x86_64-unknown-linux-gnu"
 VERSION = "1.2.3"
 NAME = f"pohunek-daemon-{VERSION}-{TARGET}"
 EPOCH = "1700000000"
 BINARIES = ("pohunek", "pohunekd", "pohunek-sessiond")
 # A marker sleep duration no other process uses, so a leftover is recognizable.
 MARKER_SLEEP = "2987"
+# Wall-clock timeout for smoke() calls, applied as Python's subprocess timeout.
+SMOKE_TIMEOUT_SECONDS = 600
+# Grace period after SIGTERM before SIGKILL; cleanup (deleting a user) may take time
+SMOKE_KILL_GRACE_SECONDS = 60
 
 STUB_PREAMBLE = """#!/bin/sh
 set -eu
-pkg="sha256:$(sha256sum "$POHUNEK_CONSUMER_PACKAGE" | cut -d' ' -f1)"
-h() { sha256sum "$POHUNEK_CONSUMER_BIN_DIR/$1" | cut -d' ' -f1; }
+if command -v sha256sum >/dev/null 2>&1; then
+  sum_cmd="sha256sum"
+else
+  sum_cmd="shasum -a 256"
+fi
+pkg="sha256:$($sum_cmd "$POHUNEK_CONSUMER_PACKAGE" | cut -d' ' -f1)"
+h() { $sum_cmd "$POHUNEK_CONSUMER_BIN_DIR/$1" | cut -d' ' -f1; }
 """
 
 STUB_REPORT = """
@@ -68,17 +81,81 @@ def sudo_available():
     return probe.returncode == 0
 
 
+def darwin_sudo_available():
+    """On Darwin, check if passwordless sudo is available for the isolated run."""
+    if not sys.platform.startswith("darwin"):
+        return False
+    try:
+        probe = subprocess.run(
+            ["/usr/bin/sudo", "-n", "/usr/bin/true"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        return probe.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def can_run_smoke_archive_tests():
+    """Check if the platform can run smoke-archive tests."""
+    if sys.platform.startswith("linux"):
+        return bool(shutil.which("unshare") and shutil.which("jq") and userns_available())
+    elif sys.platform.startswith("darwin"):
+        # On macOS, check for sandbox-exec, jq, and codesign
+        import platform
+        if platform.machine() != "arm64":
+            return False
+        has_sandbox = bool(shutil.which("sandbox-exec") or Path("/usr/bin/sandbox-exec").exists())
+        has_jq = bool(shutil.which("jq"))
+        has_codesign = bool(shutil.which("codesign") or Path("/usr/bin/codesign").exists())
+        return has_sandbox and has_jq and has_codesign
+    return False
+
+
+# Decorator for tests that reach the isolated run on macOS (needs passwordless sudo)
+needs_isolated_run = unittest.skipIf(
+    sys.platform.startswith("darwin") and not darwin_sudo_available(),
+    "the macOS isolated run needs passwordless sudo for the throwaway user",
+)
+
+# If the environment requires isolated run scenarios, fail if they're not available.
+if os.environ.get("POHUNEK_SMOKE_TESTS_REQUIRE_ISOLATED_RUN") == "1":
+    if not can_run_smoke_archive_tests():
+        raise RuntimeError("POHUNEK_SMOKE_TESTS_REQUIRE_ISOLATED_RUN=1 requires the smoke archive tests to be runnable on this platform")
+    if sys.platform.startswith("darwin") and not darwin_sudo_available():
+        raise RuntimeError("POHUNEK_SMOKE_TESTS_REQUIRE_ISOLATED_RUN=1 requires passwordless sudo on macOS for the throwaway user")
+
+
 def processes_with_marker():
     found = []
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
+    if sys.platform.startswith("darwin"):
+        # On macOS, use ps to find processes with the marker sleep duration
         try:
-            cmdline = (entry / "cmdline").read_bytes().split(b"\0")
-        except OSError:
-            continue
-        if cmdline[:2] == [b"sleep", MARKER_SLEEP.encode()]:
-            found.append(entry.name)
+            result = subprocess.run(
+                ["ps", "aux"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            for line in result.stdout.splitlines()[1:]:  # Skip header
+                parts = line.split()
+                if len(parts) >= 11 and parts[10] == f"sleep" and len(parts) > 11 and parts[11] == MARKER_SLEEP:
+                    found.append(parts[1])  # PID is second column
+        except Exception:
+            pass
+    else:
+        # On Linux, use /proc
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                cmdline = (entry / "cmdline").read_bytes().split(b"\0")
+            except OSError:
+                continue
+            if cmdline[:2] == [b"sleep", MARKER_SLEEP.encode()]:
+                found.append(entry.name)
     return found
 
 
@@ -119,9 +196,22 @@ def process_snapshot(pids):
     return "; ".join(snapshot)
 
 
+def darwin_leftovers():
+    """Paths and throwaway users the macOS smoke creates outside TMPDIR."""
+    paths = set(glob.glob("/private/tmp/pk*.*")) | set(glob.glob("/private/var/pks-home.*"))
+    users = subprocess.run(["dscl", ".", "-list", "/Users"], stdout=subprocess.PIPE, text=True, check=True).stdout.split()
+    return paths | {f"user:{user}" for user in users if user.startswith("pksmoke")}
+
+
 class _SmokeArchiveFixture:
     def setUp(self):
-        self.base = Path(tempfile.mkdtemp(prefix="pohunek-smoke-test-"))
+        # On Darwin, create base in /private/tmp and chmod it so the throwaway user can read it
+        if sys.platform.startswith("darwin"):
+            self.darwin_before = darwin_leftovers()
+            self.base = Path(tempfile.mkdtemp(prefix="pohunek-smoke-test-", dir="/private/tmp")).resolve()
+            os.chmod(self.base, 0o755)
+        else:
+            self.base = Path(tempfile.mkdtemp(prefix="pohunek-smoke-test-")).resolve()
         self.addCleanup(shutil.rmtree, self.base, ignore_errors=True)
         self.tmpdir = self.base / "tmp"
         self.tmpdir.mkdir()
@@ -153,7 +243,18 @@ class _SmokeArchiveFixture:
             digest = catalog_digest_override or f"sha256:{sha256_hex(package)}"
             entries.append({"runtime_id": runtime, "package_id": f"pohunek.runtime.{runtime}", "digest": digest})
         (tree / "runtime" / "runtime-catalog.json").write_text(json.dumps({"catalog": {"entries": entries}}))
-        run_checked([PACKAGING / "write-manifest", tree, "daemon", VERSION, TARGET, "none"])
+
+        # On Darwin, add one real ad-hoc-signed Mach-O for verify-signed to check
+        if sys.platform.startswith("darwin"):
+            mach_o = tree / "test-mach-o"
+            shutil.copy("/usr/bin/true", mach_o)
+            subprocess.run(["codesign", "-s", "-", "-f", str(mach_o)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # write-manifest requires a minimum-macos version for apple-darwin targets
+            manifest_args = [PACKAGING / "write-manifest", tree, "daemon", VERSION, TARGET, "none", "11.0"]
+        else:
+            manifest_args = [PACKAGING / "write-manifest", tree, "daemon", VERSION, TARGET, "none"]
+
+        run_checked(manifest_args)
         out = self.base / "dist"
         shutil.rmtree(out, ignore_errors=True)
         run_checked([PACKAGING / "archive", self.base / "tree", NAME, out], env={"SOURCE_DATE_EPOCH": EPOCH})
@@ -191,18 +292,47 @@ class _SmokeArchiveFixture:
         ]
         if timeout is not None:
             command = ["timeout", "--signal=TERM", "--kill-after=2s", f"{timeout}s", *command]
-        return subprocess.run(
+        process = subprocess.Popen(
             command,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            start_new_session=True,
         )
+        try:
+            stdout, stderr = process.communicate(timeout=SMOKE_TIMEOUT_SECONDS)
+            return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+        except subprocess.TimeoutExpired:
+            # First try SIGTERM so the smoke's cleanup trap runs
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                stdout, stderr = process.communicate(timeout=SMOKE_KILL_GRACE_SECONDS)
+                raise AssertionError(
+                    f"smoke-archive did not finish within {SMOKE_TIMEOUT_SECONDS}s; "
+                    f"it exited {process.returncode} after SIGTERM: stdout={stdout!r} stderr={stderr!r}"
+                ) from None
+            except subprocess.TimeoutExpired:
+                # SIGTERM grace period expired, send SIGKILL
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                stdout, stderr = process.communicate()
+                raise AssertionError(
+                    f"smoke-archive did not finish within {SMOKE_TIMEOUT_SECONDS}s "
+                    f"and did not exit {SMOKE_KILL_GRACE_SECONDS}s after SIGTERM; "
+                    f"sent SIGKILL: stdout={stdout!r} stderr={stderr!r}"
+                ) from None
 
     def assert_cleaned_up(self):
         self.assertEqual(list(self.tmpdir.iterdir()), [], "the temp directory was left behind")
         self.assertEqual(processes_with_marker(), [], "a process was left behind")
-
+        if sys.platform.startswith("darwin"):
+            self.assertEqual(darwin_leftovers(), self.darwin_before, "the macOS smoke left a temp directory, home or throwaway user behind")
 
     def assert_termination_kills_namespace(self, isolation):
         fifo_probe = (
@@ -324,12 +454,13 @@ class _SmokeArchiveFixture:
                 process.wait(timeout=10)
 
 @unittest.skipUnless(
-    sys.platform.startswith("linux") and shutil.which("unshare") and shutil.which("jq") and userns_available(),
-    "needs Linux with unprivileged user namespaces, unshare and jq",
+    can_run_smoke_archive_tests(),
+    "needs (Linux with unshare, jq and unprivileged userns) or (Darwin arm64 with sandbox-exec, jq and codesign)",
 )
 class SmokeArchiveTest(_SmokeArchiveFixture, unittest.TestCase):
     # -- scenarios ----------------------------------------------------------
 
+    @needs_isolated_run
     def test_success_runs_every_shipped_runtime_in_a_hermetic_environment(self):
         node_dir = self.base / "node-bin"
         node_dir.mkdir()
@@ -344,6 +475,7 @@ done
 echo "ENV-PATH=$PATH"; echo "ENV-HOME=$HOME"; echo "ENV-PWD=$(pwd)"
 echo "ENV-POHUNEK=$(set | grep -c '^POHUNEK_' || true)"
 echo "ENV-CATALOG=$POHUNEK_CONSUMER_CATALOG"; echo "ENV-ARGS=$*"
+if [ -n "${POHUNEK_TEST_TEMP_ROOT:-}" ]; then echo "ENV-TEMP-ROOT=$POHUNEK_TEST_TEMP_ROOT"; fi
 """
             + STUB_REPORT
         )
@@ -351,18 +483,51 @@ echo "ENV-CATALOG=$POHUNEK_CONSUMER_CATALOG"; echo "ENV-ARGS=$*"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("pi ok", result.stdout)
         self.assertIn("codex ok", result.stdout)
-        self.assertIn(f"ENV-PATH={self.stage}/pi/bin:{node_dir}:/usr/bin:/bin", result.stdout)
-        self.assertIn(f"ENV-PATH={self.stage}/codex/bin:{node_dir}:/usr/bin:/bin", result.stdout)
+        if sys.platform.startswith("darwin"):
+            # On Darwin, stage is chowned to the throwaway user; node is in a pki dir
+            pi_dirs = []
+            codex_dirs = []
+            for line in result.stdout.splitlines():
+                pi_match = re.match(r"^ENV-PATH=" + re.escape(f"{self.stage}/pi/bin") + r":(/private/tmp/pki\.[A-Za-z0-9]+)/node-bin:/usr/bin:/bin$", line)
+                if pi_match:
+                    pi_dirs.append(pi_match.group(1))
+                codex_match = re.match(r"^ENV-PATH=" + re.escape(f"{self.stage}/codex/bin") + r":(/private/tmp/pki\.[A-Za-z0-9]+)/node-bin:/usr/bin:/bin$", line)
+                if codex_match:
+                    codex_dirs.append(codex_match.group(1))
+            self.assertTrue(pi_dirs, "pi ENV-PATH not found")
+            self.assertTrue(codex_dirs, "codex ENV-PATH not found")
+            pki_dirs_union = set(pi_dirs) | set(codex_dirs)
+            self.assertEqual(len(pki_dirs_union), 1, f"Expected one pki dir, found {pki_dirs_union}")
+            pki_dir = pki_dirs_union.pop()
+            # Verify pki dir is cleaned up
+            self.assertFalse(Path(pki_dir).exists(), f"pki dir {pki_dir} still exists after cleanup")
+        else:
+            self.assertIn(f"ENV-PATH={self.stage}/pi/bin:{node_dir}:/usr/bin:/bin", result.stdout)
+            self.assertIn(f"ENV-PATH={self.stage}/codex/bin:{node_dir}:/usr/bin:/bin", result.stdout)
         self.assertIn("/runtime/runtime-catalog.json", result.stdout)
         self.assertIn(f"--exact the_release_binaries_serve_the_runtime_out_of_process", result.stdout)
-        # Exactly the six consumer-contract variables reach the consumer.
-        self.assertIn("ENV-POHUNEK=6", result.stdout)
+        # On Darwin, seven POHUNEK variables (six consumer-contract + POHUNEK_TEST_TEMP_ROOT).
+        # On Linux, exactly six consumer-contract variables.
+        expected_pohunek_count = "7" if sys.platform.startswith("darwin") else "6"
+        self.assertIn(f"ENV-POHUNEK={expected_pohunek_count}", result.stdout)
         for line in result.stdout.splitlines():
             if line.startswith(("ENV-HOME=", "ENV-PWD=")):
                 self.assertNotIn(str(ROOT), line)
                 self.assertIn("/run/", line)
+        # On Darwin, the fixture receives POHUNEK_TEST_TEMP_ROOT pointing to the
+        # smoke's socket root, which must not equal the work root.
+        if sys.platform.startswith("darwin"):
+            found_temp_root = False
+            for line in result.stdout.splitlines():
+                if line.startswith("ENV-TEMP-ROOT="):
+                    found_temp_root = True
+                    temp_root = line.split("=", 1)[1]
+                    self.assertTrue(temp_root.startswith("/private/tmp/pk"))
+                    self.assertNotEqual(temp_root, str(ROOT))
+            self.assertTrue(found_temp_root, "POHUNEK_TEST_TEMP_ROOT not found on Darwin")
         self.assert_cleaned_up()
 
+    @needs_isolated_run
     def test_runtime_flag_restricts_the_shipped_set_and_unknown_runtime_fails(self):
         result = self.smoke("--runtime", "pi")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -431,6 +596,7 @@ echo "ENV-CATALOG=$POHUNEK_CONSUMER_CATALOG"; echo "ENV-ARGS=$*"
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid STAGE.links link path or target", result.stderr)
 
+    @needs_isolated_run
     def test_a_retargeted_link_is_refused(self):
         stage = self.stage / "pi"
         (stage / "bin" / "alias").symlink_to("pi")
@@ -472,6 +638,7 @@ echo "ENV-CATALOG=$POHUNEK_CONSUMER_CATALOG"; echo "ENV-ARGS=$*"
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid STAGE.links link path or target", result.stderr)
 
+    @needs_isolated_run
     def test_a_link_target_can_use_parent_inside_stage(self):
         stage = self.stage / "pi"
         (stage / "bin" / "alias").symlink_to("../bin/pi")
@@ -480,6 +647,7 @@ echo "ENV-CATALOG=$POHUNEK_CONSUMER_CATALOG"; echo "ENV-ARGS=$*"
         result = self.smoke("--runtime", "pi")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    @needs_isolated_run
     def test_a_link_chain_inside_stage_is_accepted(self):
         stage = self.stage / "pi"
         (stage / "alias").symlink_to(".")
@@ -623,6 +791,7 @@ echo "ENV-CATALOG=$POHUNEK_CONSUMER_CATALOG"; echo "ENV-ARGS=$*"
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("does not match its catalog digest", result.stderr)
 
+    @needs_isolated_run
     def test_a_report_with_a_foreign_executable_or_package_digest_is_refused(self):
         self.write_consumer(STUB_PREAMBLE + STUB_REPORT.replace('"$(h pohunekd)"', '"' + "1" * 64 + '"'))
         result = self.smoke("--runtime", "pi")
@@ -634,6 +803,7 @@ echo "ENV-CATALOG=$POHUNEK_CONSUMER_CATALOG"; echo "ENV-ARGS=$*"
         self.assertIn("does not match the archive's catalog digest and binaries", result.stderr)
         self.assert_cleaned_up()
 
+    @needs_isolated_run
     def test_the_namespace_has_loopback_but_no_route_out(self):
         probe = f"""
 {sys.executable} - <<'PY'
@@ -645,20 +815,30 @@ for host in ("192.0.2.1", "8.8.8.8"):
     try:
         socket.create_connection((host, 53), timeout=3).close()
     except OSError as error:
-        if error.errno != errno.ENETUNREACH:
+        # On Linux, denied connections fail with ENETUNREACH.
+        # On macOS under sandbox, they fail with EPERM or EACCES.
+        allowed_errors = (errno.ENETUNREACH,)
+        if sys.platform.startswith('darwin'):
+            allowed_errors = (errno.EPERM, errno.EACCES)
+        if error.errno not in allowed_errors:
             print("OUTBOUND-WRONG-ERROR", host, error); sys.exit(1)
         print("OUTBOUND-REFUSED", host, error.errno)
     else:
         print("OUTBOUND-REACHED", host); sys.exit(1)
-PY
 """
+        probe += "PY\n"
         self.write_consumer(STUB_PREAMBLE + probe + STUB_REPORT)
         result = self.smoke("--runtime", "pi")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("OUTBOUND-REFUSED 192.0.2.1 101", result.stdout)
+        # On Linux errno is 101 (ENETUNREACH), on macOS it's 1 (EPERM)
+        if sys.platform.startswith("linux"):
+            self.assertIn("OUTBOUND-REFUSED 192.0.2.1 101", result.stdout)
+        else:
+            self.assertIn("OUTBOUND-REFUSED 192.0.2.1 1", result.stdout)
         self.assertIn("OUTBOUND-REFUSED 8.8.8.8", result.stdout)
         self.assertNotIn("OUTBOUND-REACHED", result.stdout)
 
+    @needs_isolated_run
     def test_a_failing_consumer_leaves_no_process_and_no_temp_directory(self):
         self.write_consumer(STUB_PREAMBLE + f"sleep {MARKER_SLEEP} &\nexit 3\n")
         result = self.smoke()
@@ -666,6 +846,7 @@ PY
         self.assertIn("consumer run failed for runtime", result.stderr)
         self.assert_cleaned_up()
 
+    @needs_isolated_run
     def test_a_process_outliving_a_successful_consumer_fails_the_run(self):
         self.write_consumer(STUB_PREAMBLE + f"sleep {MARKER_SLEEP} &\n" + STUB_REPORT)
         result = self.smoke("--runtime", "pi")
@@ -673,14 +854,160 @@ PY
         self.assertIn("outlived the consumer run", result.stderr)
         self.assert_cleaned_up()
 
+    @needs_isolated_run
+    def test_a_helper_in_its_own_session_is_killed_and_fails_the_run(self):
+        # Start a helper in its OWN session that names the work temp root in its argv,
+        # so stray_check's snapshot-based identity-kill branch (not pgrep -g) catches it.
+        # Write the pid to a file OUTSIDE work so we can verify it's dead afterward.
+        handoff = self.base / "handoff"
+        handoff.mkdir()
+        os.chmod(handoff, 0o777)
+        pidfile = handoff / "helper.pid"
+        self.write_consumer(
+            STUB_PREAMBLE
+            + f'/usr/bin/perl -MPOSIX -e \'POSIX::setsid(); open(my $f, ">", $ARGV[0]) or die; print $f "$$\\n"; close $f; sleep 60\' {pidfile} "$TMPDIR/marker" </dev/null >/dev/null 2>&1 &\n'
+            + f'n=0; while [ ! -s {pidfile} ]; do n=$((n+1)); [ "$n" -le 100 ] || {{ echo "HELPER-NOT-READY: helper did not write {pidfile}" >&2; exit 1; }}; sleep 0.1; done\n'
+            + STUB_REPORT
+        )
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("HELPER-NOT-READY", result.stderr, result.stderr)
+        self.assertIn("outlived the consumer run", result.stderr)
+        # Verify pidfile was written before consumer exited
+        self.assertTrue(pidfile.exists())
+
+        # On Darwin, verify it was the snapshot-based identity-kill branch (not pgrep -g)
+        # and verify the helper is actually dead (killed by stray_check)
+        if sys.platform.startswith("darwin"):
+            pid = int(pidfile.read_text().strip())
+            self.assertNotIn("process group", result.stderr)
+            # Verify the helper is actually dead (killed by stray_check)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+        # On Linux the written pid is namespace-local; the namespace teardown that
+        # kills the helper is covered by the termination scenarios.
+
+        self.assert_cleaned_up()
+
+    @needs_isolated_run
+    @unittest.skipUnless(sys.platform.startswith("darwin"), "ownership check is meaningful on Darwin with throwaway user")
+    def test_every_executable_the_consumer_gets_is_owned_by_the_running_user(self):
+        consumer_check = STUB_PREAMBLE + """
+me=$(id -u)
+owner() { if [ "$(uname -s)" = Darwin ]; then stat -f %u "$1"; else stat -c %u "$1"; fi; }
+for f in "$0" "$POHUNEK_CONSUMER_BIN_DIR/pohunek" "$POHUNEK_CONSUMER_BIN_DIR/pohunekd" "$POHUNEK_CONSUMER_BIN_DIR/pohunek-sessiond" "$POHUNEK_CONSUMER_STAGE_BIN/$POHUNEK_CONSUMER_RUNTIME" "$(command -v node)"; do
+  [ "$(owner "$f")" = "$me" ] || { echo "FOREIGN-OWNER $f $(owner "$f") != $me" >&2; exit 1; }
+done
+""" + STUB_REPORT
+        self.write_consumer(consumer_check)
+        result = self.smoke("--runtime", "pi")
+        self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+        self.assertNotIn("FOREIGN-OWNER", result.stderr, f"executable owned by wrong user: {result.stderr}")
+        self.assert_cleaned_up()
+
+    @unittest.skipUnless(sys.platform.startswith("darwin"), "the throwaway-user preflight is macOS-only")
+    def test_an_unreadable_stage_fails_the_preflight_clearly(self):
+        stage_dir = self.stage / "pi"
+        target = next(p for p in sorted((self.stage / "pi").rglob("*")) if p.is_file() and not p.is_symlink() and p.name not in ("STAGE.sha256", "STAGE.links"))
+        mode = stat.S_IMODE(os.stat(target).st_mode)
+        self.addCleanup(os.chmod, target, mode)
+        os.chmod(target, 0)
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the staged upstream is not readable by the invoking user", result.stderr)
+        self.assert_cleaned_up()
+
+    @needs_isolated_run
+    @unittest.skipUnless(sys.platform.startswith("darwin"), "the throwaway-user preflight is macOS-only")
+    def test_a_stage_private_to_the_invoking_user_runs(self):
+        stage_dir = self.stage / "pi"
+        private_dir = stage_dir / "private"
+        private_dir.mkdir()
+        private_file = private_dir / "data.txt"
+        payload = b"private data\n"
+        private_file.write_bytes(payload)
+        private_file.chmod(0o600)  # no x bits initially
+        os.chmod(private_dir, 0o700)
+
+        # Make the stage private to the invoking user; the handover to the throwaway user makes it readable
+        original_stage_mode = stat.S_IMODE(os.stat(stage_dir).st_mode)
+        self.addCleanup(os.chmod, stage_dir, original_stage_mode)
+        os.chmod(stage_dir, 0o700)
+
+        # Update stage manifests to include the new file
+        digest = sha256_hex(payload)
+        with (stage_dir / "STAGE.sha256").open("a") as manifest:
+            manifest.write(f"{digest}  private/data.txt\n")
+
+        # Run should succeed
+        result = self.smoke("--runtime", "pi")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_cleaned_up()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "userns isolation is Linux-only")
     def test_termination_kills_the_userns_namespace_and_its_workload(self):
         self.assert_termination_kills_namespace("userns")
 
+    @needs_isolated_run
+    @unittest.skipUnless(sys.platform.startswith("darwin"), "the throwaway-user sandbox is macOS-only")
+    def test_termination_kills_the_sandbox_run_and_removes_the_throwaway_user(self):
+        self.write_consumer(
+            STUB_PREAMBLE
+            + f"sleep {MARKER_SLEEP} &\n"
+            + "echo SMOKE-CONSUMER-READY\nwait\n"
+        )
+        env = dict(os.environ)
+        env["TMPDIR"] = str(self.tmpdir)
+        command = [
+            str(SCRIPT), "--archive", str(self.archive), "--stage", str(self.stage),
+            "--consumer", str(self.consumer), "--runtime", "pi",
+        ]
+        process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        workload_uid = None
+        try:
+            output = b""
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while b"SMOKE-CONSUMER-READY\n" not in output:
+                    self.assertTrue(selector.select(timeout=120), "consumer did not become ready")
+                    chunk = os.read(process.stdout.fileno(), 4096)
+                    self.assertTrue(chunk, "consumer exited before becoming ready")
+                    output += chunk
+            markers = processes_with_marker()
+            self.assertEqual(len(markers), 1, "consumer workload did not start")
+            workload_uid = int(subprocess.run(["ps", "-o", "uid=", "-p", markers[0]], stdout=subprocess.PIPE, text=True, check=True).stdout.strip())
+            self.assertNotEqual(workload_uid, os.getuid(), "the workload does not run as the throwaway user")
+            os.kill(process.pid, signal.SIGTERM)
+            try:
+                _, stderr = process.communicate(timeout=60)
+            except subprocess.TimeoutExpired as error:
+                raise AssertionError("cancellation did not finish within 60s") from error
+            self.assertEqual(process.returncode, 143, stderr.decode(errors="replace"))
+            self.assertEqual(processes_with_marker(), [], "the workload survived cancellation")
+            survivors = subprocess.run(["pgrep", "-U", str(workload_uid)], stdout=subprocess.PIPE, text=True).stdout.split()
+            self.assertEqual(survivors, [], "a process of the throwaway user survived cancellation")
+            self.assert_cleaned_up()
+        finally:
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if workload_uid is not None and 40000 <= workload_uid <= 59999:
+                subprocess.run(["sudo", "-n", "pkill", "-KILL", "-U", str(workload_uid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "userns isolation is Linux-only")
     def test_the_userns_strategy_can_be_forced(self):
         result = self.smoke("--isolation=userns", "--runtime", "pi")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("isolation userns", result.stdout)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "userns isolation is Linux-only")
     def test_userns_strategy_does_not_run_shadow_tools_from_caller_path(self):
         shadow = self.base / "shadow"
         shadow.mkdir()
@@ -697,14 +1024,25 @@ PY
         self.assert_cleaned_up()
 
     @unittest.skipUnless(
-        shutil.which("sudo") and shutil.which("setpriv") and sudo_available(),
-        "skipped: `sudo -n unshare` is unavailable here, so the sudo strategy is not exercised locally",
+        sys.platform.startswith("linux") and shutil.which("sudo") and shutil.which("setpriv") and sudo_available(),
+        "sudo isolation is Linux-only, or `sudo -n unshare` is unavailable",
     )
     def test_the_sudo_strategy_isolates_and_drops_to_the_invoking_user(self):
         self.write_consumer(STUB_PREAMBLE + 'echo "UID=$(id -u)"\n' + STUB_REPORT)
         result = self.smoke("--isolation=sudo", "--runtime", "pi")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(f"UID={os.getuid()}", result.stdout)
+
+    @unittest.skipUnless(
+        sys.platform.startswith("darwin") and not darwin_sudo_available(),
+        "needs macOS without passwordless sudo",
+    )
+    def test_macos_without_passwordless_sudo_fails_closed(self):
+        result = self.smoke("--runtime", "pi")
+
+        self.assertNotEqual(result.returncode, 0, "smoke should fail without passwordless sudo")
+        self.assertIn("needs passwordless sudo (sudo -n)", result.stderr)
+        self.assert_cleaned_up()
 
 
 @unittest.skipUnless(
