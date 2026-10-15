@@ -3282,24 +3282,16 @@ uses the Rust SDK's dedicated creation budget described below, which covers
 the daemon's bounded worker startup and create hooks. `session new` sends one
 `session.new` request and never resends it. Only its own refusals before that
 request (`cli_usage`, `confirmation_required`, `confirmation_declined`) prove
-that nothing was created. Any other failure may come after the daemon created
-the session:
-- `request_timeout`, which also carries a recovery hint saying so, because the
-  daemon still finishes or rolls back the create;
-- a reply lost after the request was sent (`framing` locally,
-  `remote_daemon_unavailable` for a remote host);
-- a typed daemon error returned after the session was recorded, such as
-  `session_runtime_reconnecting`.
-
-A session is listed only once its target, the `pre-create` and `post-create`
-hooks included, and its launch are done, and a listed session can still be
-rolled back while its initial input is delivered (`session_input_not_ready`,
-`session_input_stalled`). A caller that must know gives each create a unique
-key such as `--meta launch=<id>` and looks it up with
-`pohunek session list --meta-eq launch=<id> --json` before retrying. An empty
-list does not prove that nothing was created, and `session.new` has no
-idempotency key: a retry can create a second session, which the same key
-shows, so the caller can stop the extra one.
+that nothing was created. Any other failure leaves the outcome unknown:
+`request_timeout`, whose recovery hint says so; a transport error such as
+`framing` locally or `remote_daemon_unavailable` for a remote host, which may
+be a reply lost after the request was sent; or a typed daemon error returned
+after the session was recorded, such as `session_runtime_reconnecting`. A
+create in progress is listed only once its target, the `pre-create` and
+`post-create` hooks included, and its launch are done. To find the session,
+pass a caller key such as `--meta launch=<id>` and look it up as described in
+[Creation outcome](#creation-outcome): the lookup, how to read its result, and
+why a retry can create a second session apply to `session new` as well.
 
 Initial input waits for an editable prompt or bracketed-paste enable signal,
 up to the bounded startup grace for a silent agent; the body and submit key
