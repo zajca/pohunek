@@ -409,11 +409,7 @@ impl Supervisor for ScriptedSupervisor {
                 .remove(id);
             if let Some(pid) = ends_then_fails {
                 self.jobs.lock().expect("jobs").remove(id);
-                let ended = pohunek_test_support::process_env::command("kill")
-                    .args(["-KILL", &pid.to_string()])
-                    .status()
-                    .expect("end the process of the failing retirement");
-                assert!(ended.success(), "the retired job's process was running");
+                end_process(pid, "the process of the failing retirement");
                 return Err(unavailable("retire"));
             }
             let scripted = self.jobs.lock().expect("jobs").remove(id);
@@ -423,11 +419,7 @@ impl Supervisor for ScriptedSupervisor {
                         if let Some(pid) =
                             self.retire_ends.lock().expect("retire script").remove(id)
                         {
-                            let ended = pohunek_test_support::process_env::command("kill")
-                                .args(["-KILL", &pid.to_string()])
-                                .status()
-                                .expect("end the retired job's process");
-                            assert!(ended.success(), "the retired job's process was running");
+                            end_process(pid, "the retired job's process");
                         }
                         Ok(())
                     }
@@ -473,6 +465,27 @@ fn unavailable(operation: &'static str) -> SupervisorError {
         operation,
         source: Box::new(std::io::Error::other("scripted manager outage")),
     }
+}
+
+/// Ends the running process `pid` the way a supervisor's retirement does: it
+/// returns once the process no longer runs, not once the signal is sent. A
+/// killed child of this test process stays an unreaped zombie, which counts as
+/// not running. An inspection error while the process is torn down is sampled
+/// again; one that persists fails the wait at its hang guard.
+fn end_process(pid: u32, what: &str) {
+    let inspector = HostInspector::new();
+    let identity = inspector
+        .identity(pid)
+        .expect("inspect the process to end")
+        .unwrap_or_else(|| panic!("{what} was running"));
+    let ended = pohunek_test_support::process_env::command("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap_or_else(|error| panic!("end {what}: {error}"));
+    assert!(ended.success(), "{what} was running");
+    wait::poll_until(&format!("{what} to end"), || {
+        matches!(inspector.is_running(identity), Ok(false)).then_some(())
+    });
 }
 
 fn own_process() -> ProcessIdentity {
