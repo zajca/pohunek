@@ -155,15 +155,14 @@ packaging/smoke-hermes-plugin-release /abs/pohunek-daemon-X.Y.Z-TARGET \
   /abs/runtime-catalog-anchor.json /abs/pinned/hermes
 ```
 
-A Linux release daemon archive carries all three inputs:
+A Linux or Apple Silicon release daemon archive carries all three inputs:
 `runtime/packages/hermes.tar.zst`, `runtime/runtime-catalog.json`, and the
 `runtime-catalog-anchor.json` that trusts the catalog's signer. CI and the
 release workflows run this plugin smoke only on archives without the signed
-release catalog, so that combination is not exercised there. For the macOS
-archive, which carries no runtime package, or for a development archive,
-build the package from a checkout with `scripts/build-hermes-package` and write
-a catalog and anchor for it with
-`cargo xtask hermes throwaway-catalog --package <archive> --output-dir <dir>`.
+release catalog, so that combination is not exercised there. For a development
+archive, build the package from a checkout with `scripts/build-hermes-package`
+and write a catalog and anchor for it with `cargo xtask hermes throwaway-catalog
+--package <archive> --output-dir <dir>`.
 The script copies the binaries into a private prefix with the anchor beside the
 daemon, starts that daemon with its own temporary home/profile/state, installs
 the package with `pohunek plugin install --catalog`, and fails hard if an
