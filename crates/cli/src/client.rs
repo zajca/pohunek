@@ -50,6 +50,12 @@ impl Client {
         paths: &Paths,
         options: pohunek_client::ClientOptions,
     ) -> Result<Self, CliError> {
+        // This machine's own overlay name dials the local socket, like `local`.
+        let host = if crate::target::is_local_host(host) {
+            crate::target::LOCAL_HOST
+        } else {
+            host
+        };
         let inner = pohunek_client::Client::connect_with_options(host, &paths.socket, options)
             .await
             .map_err(map_connect_error)?;
@@ -133,7 +139,7 @@ fn map_connect_error(err: pohunek_client::ClientError) -> CliError {
     }
 }
 
-fn map_client_error(err: pohunek_client::ClientError) -> CliError {
+pub(crate) fn map_client_error(err: pohunek_client::ClientError) -> CliError {
     match err {
         pohunek_client::ClientError::Protocol(source) => CliError::Protocol(source),
         other => CliError::Client(other),

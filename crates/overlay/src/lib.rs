@@ -322,6 +322,35 @@ pub struct ResolvedPeer {
     pub address: IpAddr,
 }
 
+/// What a host selector names on one overlay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedSelector {
+    /// This machine itself, by its own overlay identity.
+    LocalHost,
+    /// One exact, policy-approved peer.
+    Peer(ResolvedPeer),
+}
+
+/// This machine's own identity on one overlay, as its provider reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalIdentity {
+    /// Stable overlay identifier.
+    pub overlay: OverlayId,
+    /// Provider-qualified DNS name, when reported.
+    pub fqdn: Option<String>,
+    /// Overlay address, when reported.
+    pub address: Option<IpAddr>,
+}
+
+/// Where a host selector leads across all configured overlays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostTarget {
+    /// The selector names this machine; the local daemon serves it.
+    Local,
+    /// The selector names one remote peer.
+    Remote(OverlayRoute),
+}
+
 /// A discovered peer with its configured overlay route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutedPeer {
@@ -396,6 +425,21 @@ pub trait OverlayTransport: Send + Sync + fmt::Debug {
 
     /// Enumerate visible remote peers while preserving address-less candidates.
     fn discover_peers(&self) -> OverlayFuture<'_, Vec<DiscoveredPeer>>;
+
+    /// Resolve a user selector to this machine or to one exact peer.
+    ///
+    /// A provider that knows its own identity matches it at the same steps as a
+    /// peer's, so a name both carry is a [`OverlayError::PeerCollision`]. A
+    /// provider without that knowledge resolves only peers.
+    fn resolve_selector<'a>(&'a self, host: &'a str) -> OverlayFuture<'a, ResolvedSelector> {
+        Box::pin(async move { self.resolve_peer(host).await.map(ResolvedSelector::Peer) })
+    }
+
+    /// Return this machine's own identity on the overlay, when the provider
+    /// reports one.
+    fn local_identity(&self) -> OverlayFuture<'_, Option<LocalIdentity>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// One transport paired with its configured daemon port.
@@ -624,6 +668,137 @@ impl OverlayRegistry {
                 failures: vec![OverlayFailure { overlay, error }],
             }),
         }
+    }
+
+    /// Resolve one unqualified or provider-qualified host to this machine or to
+    /// one remote peer.
+    ///
+    /// Providers match their own identity next to their peers. A selector that
+    /// names this machine on one overlay and a peer on another is ambiguous; one
+    /// that names only this machine, on any number of overlays, is local. A
+    /// typed identity selector (`<overlay>:peer_id:…`, `<overlay>:fqdn:…`)
+    /// resolves peers only, as in [`Self::resolve_host`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed unknown, ambiguous, or aggregated provider failures of
+    /// [`Self::resolve_host`].
+    pub async fn resolve_target(&self, host: &str) -> Result<HostTarget, RegistryError> {
+        if host.parse::<IpAddr>().is_err() && host.contains(':') {
+            return self.resolve_qualified_target(host).await;
+        }
+
+        let mut local_overlays = Vec::new();
+        let mut routes = Vec::new();
+        let mut failures = Vec::new();
+        let mut collision_overlays = Vec::new();
+        let results = join_all(self.entries().iter().map(|entry| async move {
+            (
+                entry.id().clone(),
+                entry.port(),
+                entry.transport.resolve_selector(host).await,
+            )
+        }))
+        .await;
+        for (overlay, port, result) in results {
+            match result {
+                Ok(ResolvedSelector::LocalHost) => local_overlays.push(overlay),
+                Ok(ResolvedSelector::Peer(peer)) => routes.push(OverlayRoute {
+                    overlay,
+                    peer_id: peer.peer_id,
+                    display_name: peer.display_name,
+                    fqdn: peer.fqdn,
+                    addr: SocketAddr::new(peer.address, port),
+                }),
+                Err(OverlayError::HostUnknown { .. }) => {}
+                Err(error @ OverlayError::PeerCollision { .. }) => {
+                    collision_overlays.push(overlay.clone());
+                    failures.push(OverlayFailure { overlay, error });
+                }
+                Err(error) => failures.push(OverlayFailure { overlay, error }),
+            }
+        }
+        if !collision_overlays.is_empty() || (!local_overlays.is_empty() && !routes.is_empty()) {
+            collision_overlays.extend(local_overlays);
+            collision_overlays.extend(routes.into_iter().map(|route| route.overlay));
+            collision_overlays.sort();
+            collision_overlays.dedup();
+            return Err(RegistryError::AmbiguousHost {
+                host: host.to_owned(),
+                overlays: collision_overlays,
+            });
+        }
+        if !local_overlays.is_empty() {
+            return Ok(HostTarget::Local);
+        }
+        match routes.len() {
+            1 => Ok(HostTarget::Remote(routes.remove(0))),
+            count if count > 1 => Err(RegistryError::AmbiguousHost {
+                host: host.to_owned(),
+                overlays: routes.into_iter().map(|route| route.overlay).collect(),
+            }),
+            _ if failures.is_empty() => Err(RegistryError::HostUnknown(host.to_owned())),
+            _ => Err(RegistryError::HostUnavailable {
+                host: host.to_owned(),
+                failures,
+            }),
+        }
+    }
+
+    async fn resolve_qualified_target(&self, host: &str) -> Result<HostTarget, RegistryError> {
+        let (overlay, selector) = host
+            .split_once(':')
+            .filter(|(overlay, selector)| !overlay.is_empty() && !selector.is_empty())
+            .ok_or_else(|| RegistryError::InvalidQualifiedHost(host.to_owned()))?;
+        let overlay = OverlayId::new(overlay)
+            .map_err(|_invalid_id| RegistryError::InvalidQualifiedHost(host.to_owned()))?;
+        if ExternalIdentity::parse_selector(selector)?.is_some() {
+            return self
+                .resolve_qualified_host(host)
+                .await
+                .map(HostTarget::Remote);
+        }
+        let entry = self
+            .entries()
+            .iter()
+            .find(|entry| entry.id() == &overlay)
+            .ok_or_else(|| RegistryError::OverlayNotConfigured(overlay.clone()))?;
+        match entry.transport.resolve_selector(selector).await {
+            Ok(ResolvedSelector::LocalHost) => Ok(HostTarget::Local),
+            Ok(ResolvedSelector::Peer(peer)) => Ok(HostTarget::Remote(OverlayRoute {
+                overlay,
+                peer_id: peer.peer_id,
+                display_name: peer.display_name,
+                fqdn: peer.fqdn,
+                addr: SocketAddr::new(peer.address, entry.port()),
+            })),
+            Err(OverlayError::HostUnknown { .. }) => {
+                Err(RegistryError::HostUnknown(host.to_owned()))
+            }
+            Err(error @ OverlayError::PeerCollision { .. }) => Err(RegistryError::AmbiguousHost {
+                host: host.to_owned(),
+                overlays: vec![error.overlay().clone()],
+            }),
+            Err(error) => Err(RegistryError::HostUnavailable {
+                host: host.to_owned(),
+                failures: vec![OverlayFailure { overlay, error }],
+            }),
+        }
+    }
+
+    /// This machine's identity on every configured overlay that reports one.
+    ///
+    /// An overlay whose provider fails or reports nothing is left out.
+    pub async fn local_identities(&self) -> Vec<LocalIdentity> {
+        join_all(
+            self.entries()
+                .iter()
+                .map(|entry| async move { entry.transport.local_identity().await }),
+        )
+        .await
+        .into_iter()
+        .filter_map(|result| result.ok().flatten())
+        .collect()
     }
 
     /// Collect one typed diagnostic per configured overlay.

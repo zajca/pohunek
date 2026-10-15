@@ -245,9 +245,9 @@ struct CompletionContext {
     /// Plugin id already typed on the `pohunek workflow run` line being
     /// completed, when the cursor is on the action name.
     workflow_plugin: Option<String>,
-    /// The last `--host` value names a host other than this machine, by the
-    /// rule `pohunek workflow` refuses with `workflow_local_only`.
-    remote_host: bool,
+    /// The raw last `--host` value; [`names_remote_host`] decides whether it
+    /// names a host other than this machine.
+    last_host: Option<String>,
 }
 
 /// Completes the `<PACKAGE>` argument of `pohunek plugin` with installed ids.
@@ -331,16 +331,19 @@ impl ValueCompleter for ProfileNameCompleter {
 /// Reads only the store's registry record, through the same lock-free read
 /// `workflow list` uses; it creates, locks and writes nothing. A line with a
 /// remote `--host` offers nothing, since the command refuses it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct WorkflowPluginCompleter {
     /// Offer only enabled plugins: `workflow run` refuses a disabled one.
     enabled_only: bool,
-    remote_host: bool,
+    last_host: Option<String>,
 }
 
 impl ValueCompleter for WorkflowPluginCompleter {
     fn complete(&self, current: &OsStr) -> Vec<CompletionCandidate> {
-        let Some(current) = current.to_str().filter(|_| !self.remote_host) else {
+        let Some(current) = current
+            .to_str()
+            .filter(|_| !names_remote_host(self.last_host.as_deref()))
+        else {
             return Vec::new();
         };
         let current = current.to_owned();
@@ -364,12 +367,12 @@ impl ValueCompleter for WorkflowPluginCompleter {
 #[derive(Clone, Debug)]
 struct WorkflowActionCompleter {
     plugin: Option<String>,
-    remote_host: bool,
+    last_host: Option<String>,
 }
 
 impl ValueCompleter for WorkflowActionCompleter {
     fn complete(&self, current: &OsStr) -> Vec<CompletionCandidate> {
-        if self.remote_host {
+        if names_remote_host(self.last_host.as_deref()) {
             return Vec::new();
         }
         let (Some(current), Some(plugin)) = (current.to_str(), self.plugin.as_deref()) else {
@@ -464,9 +467,28 @@ impl CompletionContext {
             explicit_host,
             plugin_package: plugin_package_from_words(words),
             workflow_plugin: workflow_plugin_from_words(words),
-            remote_host: last_host.is_some_and(|host| !is_local_host(&host)),
+            last_host,
         }
     }
+}
+
+/// Whether the last `--host` value names a host other than this machine, by
+/// the rule `pohunek workflow` refuses with `workflow_local_only`.
+///
+/// Whether a name is this machine's own overlay name is resolved within the
+/// completion deadline; a name that does not resolve in time, or that this
+/// machine shares with a peer, counts as remote.
+fn names_remote_host(last_host: Option<&str>) -> bool {
+    let Some(host) = last_host.filter(|host| !is_local_host(host)) else {
+        return false;
+    };
+    let host = host.to_owned();
+    !run_bounded(async move {
+        pohunek_client::names_this_machine(&host, COMPLETION_DEADLINE)
+            .await
+            .ok()
+    })
+    .unwrap_or(false)
 }
 
 /// The plugin id of a `pohunek workflow run <plugin>` line whose cursor is
@@ -601,11 +623,11 @@ fn with_workflow_completers(command: Command, context: &CompletionContext) -> Co
     command.mut_args(|arg| match arg.get_id().as_str() {
         WORKFLOW_PLUGIN_ARG => arg.add(ArgValueCompleter::new(WorkflowPluginCompleter {
             enabled_only,
-            remote_host: context.remote_host,
+            last_host: context.last_host.clone(),
         })),
         WORKFLOW_CALL_ARG => arg.add(ArgValueCompleter::new(WorkflowActionCompleter {
             plugin: context.workflow_plugin.clone(),
-            remote_host: context.remote_host,
+            last_host: context.last_host.clone(),
         })),
         _ => arg,
     })
@@ -721,7 +743,11 @@ async fn query_sessions(host: &str) -> Option<Vec<SessionInfo>> {
         .with_origin_source(paths.origin_source)
         .with_connect_timeout(COMPLETION_DEADLINE)
         .with_request_timeout(COMPLETION_DEADLINE);
-    let mut client = if host == LOCAL_HOST {
+    let names_this_machine = host == LOCAL_HOST
+        || pohunek_client::names_this_machine(host, COMPLETION_DEADLINE)
+            .await
+            .unwrap_or(false);
+    let mut client = if names_this_machine {
         Client::connect_local_with_options(&paths.socket, options)
             .await
             .ok()?
@@ -1000,7 +1026,7 @@ mod tests {
             CompletionContext::from_words(&words),
             CompletionContext {
                 explicit_host: Some("host-b".to_owned()),
-                remote_host: true,
+                last_host: Some("host-b".to_owned()),
                 ..CompletionContext::default()
             }
         );
@@ -1012,7 +1038,7 @@ mod tests {
         assert_eq!(
             CompletionContext::from_words(&words),
             CompletionContext {
-                remote_host: true,
+                last_host: Some("../peer".to_owned()),
                 ..CompletionContext::default()
             }
         );

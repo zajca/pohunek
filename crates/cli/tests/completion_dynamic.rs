@@ -28,15 +28,22 @@ const PUBLIC_COMPLETION_MODE: u32 = 0o644;
 /// Runs one bash completion request for `words` (the command line, cursor on
 /// the last word) and returns its output.
 fn complete_bash(env: &TestEnv, words: &[&str]) -> std::process::Output {
+    complete_bash_command(env, words)
+        .output()
+        .expect("spawn pohunek")
+}
+
+/// The bash completion request for `words`, cursor on the last word.
+fn complete_bash_command(env: &TestEnv, words: &[&str]) -> std::process::Command {
     let index = words.len() - 1;
-    env.command(pohunek_test_support::bin_exe("pohunek"))
+    let mut command = env.command(pohunek_test_support::bin_exe("pohunek"));
+    command
         .env("POHUNEK_COMPLETE", "bash")
         .env("_CLAP_COMPLETE_INDEX", index.to_string())
         .env("_CLAP_IFS", "\n")
         .arg("--")
-        .args(words)
-        .output()
-        .expect("spawn pohunek")
+        .args(words);
+    command
 }
 
 /// Entry names directly under `dir`, sorted.
@@ -473,14 +480,19 @@ fn install_workflow(env: &TestEnv, id: &str, actions: &[&str], extra: &[&str]) -
 /// Flags clap offers beside the values for an empty word are dropped: no
 /// plugin id or action name starts with `-`.
 fn candidates(env: &TestEnv, words: &[&str]) -> Vec<String> {
-    let output = complete_bash(env, words);
+    value_candidates(words, &complete_bash(env, words))
+}
+
+/// The value candidates of a completion request for `words` that must
+/// succeed silently on stderr.
+fn value_candidates(words: &[&str], output: &std::process::Output) -> Vec<String> {
     assert!(output.status.success(), "{words:?}: {output:?}");
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
         "",
         "{words:?} printed an error"
     );
-    String::from_utf8(output.stdout)
+    String::from_utf8(output.stdout.clone())
         .expect("UTF-8 candidates")
         .lines()
         .filter(|line| !line.starts_with('-'))
@@ -574,6 +586,67 @@ fn workflow_plugin_ids_complete_from_the_installed_store() {
         store,
         "completion changed the store"
     );
+}
+
+/// This machine's own overlay name in `--host` is the local host, so workflow
+/// lines naming it complete the local store, as the command runs locally; a
+/// peer name still offers nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn workflow_completion_treats_the_machines_own_overlay_name_as_local() {
+    let env = TestEnv::new().expect("private completion environment");
+    install_workflow(&env, "other.tool", &["build"], &[]);
+    let bin = env.root().join("self-netbird-bin");
+    fs::create_dir_all(&bin).expect("create fixture bin");
+    let netbird = bin.join("netbird");
+    pohunek_test_support::fs::write_file(
+        &netbird,
+        "#!/bin/sh\nprintf '%s\\n' '{\"fqdn\":\"fixture-self.netbird.test\",\"netbirdIp\":\"100.64.0.7\",\"peers\":{\"details\":[{\"fqdn\":\"fixture-remote.netbird.test\",\"netbirdIp\":\"100.64.0.42\",\"publicKey\":\"remote-key\",\"status\":\"Connected\"}]}}'\n",
+    )
+    .expect("write fake netbird");
+    fs::set_permissions(&netbird, fs::Permissions::from_mode(0o700))
+        .expect("make fake netbird executable");
+    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+    let path =
+        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&inherited_path)))
+            .expect("join PATH");
+    let complete = |words: &[&str]| {
+        let output = complete_bash_command(&env, words)
+            .env("PATH", &path)
+            .output()
+            .expect("spawn pohunek");
+        value_candidates(words, &output)
+    };
+
+    for host in ["fixture-self.netbird.test", "100.64.0.7"] {
+        assert_eq!(
+            complete(&["pohunek", "--host", host, "workflow", "run", "o"]),
+            ["other.tool"],
+            "{host}"
+        );
+        assert_eq!(
+            complete(&[
+                "pohunek",
+                "--host",
+                host,
+                "workflow",
+                "run",
+                "other.tool",
+                "b"
+            ]),
+            ["build"],
+            "{host}"
+        );
+    }
+    assert!(complete(&[
+        "pohunek",
+        "--host",
+        "fixture-remote",
+        "workflow",
+        "run",
+        "o"
+    ])
+    .is_empty());
 }
 
 /// `workflow run <plugin> <action>` completes the actions the typed plugin's

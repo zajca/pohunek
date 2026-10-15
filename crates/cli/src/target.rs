@@ -3,9 +3,9 @@
 //! Sessions are addressed as `<host>/<session-id>` (or a bare `<session-id>` for
 //! the implicit local host). The parser only extracts the two parts; the
 //! *effective host* (which selects the transport) is decided by `main::
-//! effective_host`, and whether a host string is local is decided by the
-//! transport (`client::Client::connect`). Keeping `Target` a pure parse holder
-//! avoids two competing notions of "is this local".
+//! effective_host`, and whether a host string is local is decided by
+//! [`is_local_host`]: `local`, an empty name, or this machine's own overlay name
+//! as [`prime_local_aliases`] resolved it for the current command line.
 //!
 //! Grammar:
 //! - `s-42`            → local session `s-42` (host `None`, falls back to the
@@ -13,9 +13,77 @@
 //! - `local/s-42`      → explicit local host, session `s-42`
 //! - `host-b/s-42`     → remote host `host-b`, session `s-42`
 
+use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::{PoisonError, RwLock};
 
-pub(crate) use pohunek_client::{is_local_host, LOCAL_HOST};
+pub(crate) use pohunek_client::LOCAL_HOST;
+
+use crate::error::CliError;
+
+/// This machine's own overlay names among the hosts of the current command
+/// line, as the latest [`prime_local_aliases`] resolved them. The set is fixed
+/// for the command it was primed for, reconnects included.
+static LOCAL_ALIASES: RwLock<BTreeSet<String>> = RwLock::new(BTreeSet::new());
+
+/// Return whether `host` selects the local daemon: `local`, an empty name, or
+/// this machine's own overlay name given on this command line.
+pub(crate) fn is_local_host(host: &str) -> bool {
+    pohunek_client::is_local_host(host)
+        || LOCAL_ALIASES
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(host)
+}
+
+/// Resolve which of `hosts` name this machine by its own overlay identity, so
+/// [`is_local_host`] treats them as `local`. Each call replaces the aliases a
+/// previous call resolved.
+///
+/// Literal `local` never consults an overlay; when every host is local nothing
+/// runs. Resolution follows [`pohunek_client::names_this_machine_in`]: a name
+/// this machine shares with a peer is the typed ambiguous-host error, and an
+/// unknown name stays remote, so its connection reports what it reports today.
+///
+/// # Errors
+///
+/// Returns [`CliError`] for an ambiguous or invalid host.
+pub(crate) async fn prime_local_aliases<'a>(
+    hosts: impl IntoIterator<Item = &'a str>,
+) -> Result<(), CliError> {
+    let aliases = own_overlay_names(hosts).await?;
+    *LOCAL_ALIASES
+        .write()
+        .unwrap_or_else(PoisonError::into_inner) = aliases;
+    Ok(())
+}
+
+/// The members of `hosts` that name this machine on a configured overlay.
+async fn own_overlay_names<'a>(
+    hosts: impl IntoIterator<Item = &'a str>,
+) -> Result<BTreeSet<String>, CliError> {
+    let candidates = hosts
+        .into_iter()
+        .filter(|host| !pohunek_client::is_local_host(host))
+        .collect::<BTreeSet<_>>();
+    let mut aliases = BTreeSet::new();
+    if candidates.is_empty() {
+        return Ok(aliases);
+    }
+    let Ok(registry) = pohunek_client::default_overlay_registry() else {
+        return Ok(aliases);
+    };
+    let connect_timeout = pohunek_client::ClientOptions::default().connect_timeout;
+    for host in candidates {
+        if pohunek_client::names_this_machine_in(host, connect_timeout, &registry)
+            .await
+            .map_err(crate::client::map_client_error)?
+        {
+            aliases.insert(host.to_owned());
+        }
+    }
+    Ok(aliases)
+}
 
 /// A parsed session target.
 #[derive(Debug, Clone, PartialEq, Eq)]

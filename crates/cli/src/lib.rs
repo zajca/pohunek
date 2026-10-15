@@ -51,9 +51,10 @@ use crate::target::{Target, LOCAL_HOST};
 #[derive(Debug, Parser)]
 #[command(name = "pohunek", version, about, long_about = None)]
 struct Cli {
-    /// Target host for the command. `local` (the default) uses this machine; any
-    /// other name is resolved to a `NetBird` peer and dialed over the mesh. A
-    /// `<host>/<session-id>` target's host overrides this flag for that command.
+    /// Target host for the command. `local` (the default) and this machine's own
+    /// overlay name use this machine; any other name is resolved to a `NetBird`
+    /// peer and dialed over the mesh. A `<host>/<session-id>` target's host
+    /// overrides this flag for that command.
     #[arg(long, global = true, default_value = LOCAL_HOST)]
     host: String,
 
@@ -1835,15 +1836,21 @@ pub async fn run_cli() -> ExitCode {
         let err = usage_conflict("--host cannot be used together with --all-hosts");
         return error::render_clap_error(&err, error::args_request_json(&args));
     }
-    if let Some(err) = session_wait_usage_error(&cli) {
-        return error::render_clap_error(&err, error::args_request_json(&args));
-    }
     if let Some(err) = setup_dry_run_usage_error(&cli) {
         return error::render_clap_error(&err, error::args_request_json(&args));
     }
     // Capture whether the active command requested `--json` before `run` consumes
     // `cli`, so a failure is rendered in the same mode a success would have been.
     let json = cli.command.wants_json();
+    // Resolved before any host check, so this machine's own overlay name is
+    // `local` everywhere the command looks.
+    if let Err(err) = crate::target::prime_local_aliases(command_line_hosts(&cli)).await {
+        error::render(&err, json);
+        return ExitCode::FAILURE;
+    }
+    if let Some(err) = session_wait_usage_error(&cli) {
+        return error::render_clap_error(&err, error::args_request_json(&args));
+    }
     // Box the large dispatch future so this entrypoint future stays small.
     match Box::pin(run(cli)).await {
         Ok(code) => code,
@@ -2810,6 +2817,98 @@ fn effective_host(global: &str, target: Option<&Target>) -> String {
         Some(host) => host.to_owned(),
         None => global.to_owned(),
     }
+}
+
+/// Every host the parsed command will select: the effective host of each
+/// target, a positional host, or the global `--host` flag where the command
+/// reads it. A flag that the command ignores, or that each explicit target
+/// host overrides, contributes nothing.
+fn command_line_hosts(cli: &Cli) -> Vec<&str> {
+    let global = cli.host.as_str();
+    match &cli.command {
+        Commands::Relay { .. }
+        | Commands::Completions { .. }
+        | Commands::AgentSkill { .. }
+        | Commands::Doctor { .. }
+        | Commands::Daemon { .. }
+        | Commands::Service { .. }
+        | Commands::Setup { .. }
+        | Commands::Prompt { .. }
+        | Commands::Integration {
+            action:
+                IntegrationAction::Install { .. }
+                | IntegrationAction::Update { .. }
+                | IntegrationAction::Uninstall { .. }
+                | IntegrationAction::Status {
+                    agent: Some(commands::integration::HookAgentArg::Hermes),
+                    ..
+                }
+                | IntegrationAction::Doctor {
+                    agent: Some(commands::integration::HookAgentArg::Hermes),
+                    ..
+                },
+        }
+        | Commands::Host {
+            action: HostAction::Discover { .. } | HostAction::List { .. },
+        } => Vec::new(),
+        Commands::Host {
+            action:
+                HostAction::Inspect { host, .. }
+                | HostAction::Governance {
+                    action: HostGovernanceAction::Inspect { host, .. },
+                },
+        } => vec![host.as_str()],
+        Commands::Attach { target } => vec![target_host(target, global)],
+        Commands::Session { action } => session_action_hosts(action, global),
+        Commands::Notifications {
+            action:
+                NotificationsAction::Read { target, .. }
+                | NotificationsAction::Ack { target, .. }
+                | NotificationsAction::Archive { target, .. }
+                | NotificationsAction::Delete { target, .. },
+        } => vec![target.host.as_deref().unwrap_or(global)],
+        Commands::Plugin { .. }
+        | Commands::Workflow { .. }
+        | Commands::Health { .. }
+        | Commands::Status { .. }
+        | Commands::Subscribe { .. }
+        | Commands::Integration { .. }
+        | Commands::Migration { .. }
+        | Commands::Notifications { .. }
+        | Commands::Project { .. }
+        | Commands::Assistant { .. } => vec![global],
+    }
+}
+
+/// The hosts one `session` subcommand selects: each target's effective host,
+/// or the global `--host` for a subcommand without targets.
+fn session_action_hosts<'a>(action: &'a SessionAction, global: &'a str) -> Vec<&'a str> {
+    match action {
+        SessionAction::Inspect { target, .. }
+        | SessionAction::Stop { target, .. }
+        | SessionAction::Fork { target, .. }
+        | SessionAction::Rm { target, .. }
+        | SessionAction::Input { target, .. }
+        | SessionAction::Screen { target, .. }
+        | SessionAction::Detection { target, .. }
+        | SessionAction::Read { target, .. }
+        | SessionAction::Output { target, .. }
+        | SessionAction::Resume { target, .. }
+        | SessionAction::Resize { target, .. }
+        | SessionAction::Metadata { target, .. }
+        | SessionAction::Rename { target, .. }
+        | SessionAction::Diff { target, .. } => vec![target_host(target, global)],
+        SessionAction::Wait { target, .. } if !target.is_empty() => target
+            .iter()
+            .map(|target| target_host(target, global))
+            .collect(),
+        _ => vec![global],
+    }
+}
+
+/// The host `target` selects: its own host, or the global `--host`.
+fn target_host<'a>(target: &'a Target, global: &'a str) -> &'a str {
+    target.host.as_deref().unwrap_or(global)
 }
 
 /// Usage message for a legacy `session wait` with several targets.

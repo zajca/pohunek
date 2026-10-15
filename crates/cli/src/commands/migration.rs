@@ -54,7 +54,7 @@ pub(crate) async fn run_preflight(
     accept_runtime_loss: bool,
     json: bool,
 ) -> Result<(), CliError> {
-    if host != crate::target::LOCAL_HOST {
+    if !crate::target::is_local_host(host) {
         return Err(CliError::Protocol(ProtocolError::new(
             ErrorClass::Configuration,
             "migration_local_only",

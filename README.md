@@ -94,7 +94,9 @@ handles it once, for every agent CLI:
   sessions. The CLI and SDKs talk directly to each host's daemon: an owner-only
   Unix socket locally, a NetBird/WireGuard overlay remotely, bound only to the
   overlay address. No central server, no SaaS, no state sync. `--host buildbox`
-  or a `buildbox/<session-id>` target is all it takes.
+  or a `buildbox/<session-id>` target is all it takes, and a machine's own
+  overlay name selects its local daemon, so one host name works everywhere
+  ([resolution order](docs/cli.md#commands)).
 - **Driven by agents, not only by people.** Every automation command returns
   one versioned JSON envelope with typed errors. `pohunek agent-skill` prints
   the complete operating skill an agent needs, and `pohunek assistant` starts

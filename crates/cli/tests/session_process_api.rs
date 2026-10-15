@@ -1905,6 +1905,253 @@ fn fake_netbird_resolution_reaches_tcp_fixture_with_origin_pair() {
     );
 }
 
+/// This machine's own `NetBird` name in the self-name scenarios' fake status.
+#[cfg(target_os = "linux")]
+const SELF_FQDN: &str = "fixture-self.netbird.test";
+/// This machine's own `NetBird` IP in the self-name scenarios' fake status.
+#[cfg(target_os = "linux")]
+const SELF_NETBIRD_IP: &str = "100.64.0.7";
+
+/// A fake `netbird` whose status names this machine at the root, with one
+/// peer that shares its short name on another domain, so the bare short name
+/// is ambiguous. Every run appends a line to the call log.
+#[cfg(target_os = "linux")]
+struct SelfNetbird {
+    path: std::ffi::OsString,
+    program: PathBuf,
+    calls: PathBuf,
+}
+
+/// How long a stalled fake `netbird` runs: far beyond the client's 5 s connect
+/// timeout, so only a lookup bounded by that timeout finishes before it.
+#[cfg(target_os = "linux")]
+const STALLED_NETBIRD: Duration = Duration::from_secs(300);
+
+#[cfg(target_os = "linux")]
+impl SelfNetbird {
+    fn install(root: &Path) -> Self {
+        let bin = root.join("self-netbird-bin");
+        fs::create_dir_all(&bin).expect("create fixture bin");
+        let netbird = bin.join("netbird");
+        let calls = root.join("netbird-calls");
+        pohunek_test_support::fs::write_file(
+            &netbird,
+            format!(
+                "#!/bin/sh\necho call >> '{calls}'\nprintf '%s\\n' '{{\"fqdn\":\"{SELF_FQDN}\",\"netbirdIp\":\"{SELF_NETBIRD_IP}\",\"peers\":{{\"details\":[{{\"fqdn\":\"fixture-remote.netbird.test\",\"netbirdIp\":\"100.64.0.42\",\"publicKey\":\"remote-key\",\"status\":\"Connected\"}},{{\"fqdn\":\"fixture-self.lan.test\",\"netbirdIp\":\"100.64.0.43\",\"publicKey\":\"twin-key\",\"status\":\"Connected\"}}]}}}}'\n",
+                calls = calls.display(),
+            ),
+        )
+        .expect("write fake netbird");
+        fs::set_permissions(&netbird, fs::Permissions::from_mode(0o700))
+            .expect("make fake netbird executable");
+        let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![bin];
+        paths.extend(std::env::split_paths(&inherited_path));
+        let path = std::env::join_paths(paths).expect("join PATH");
+        Self {
+            path,
+            program: netbird,
+            calls,
+        }
+    }
+
+    /// Makes every later `netbird` run hang for [`STALLED_NETBIRD`].
+    fn stall(&self) {
+        pohunek_test_support::fs::write_file(
+            &self.program,
+            format!("#!/bin/sh\nexec sleep {}\n", STALLED_NETBIRD.as_secs()),
+        )
+        .expect("write stalled netbird");
+        fs::set_permissions(&self.program, fs::Permissions::from_mode(0o700))
+            .expect("make stalled netbird executable");
+    }
+
+    fn call_count(&self) -> usize {
+        fs::read_to_string(&self.calls).map_or(0, |calls| calls.lines().count())
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn the_machines_own_overlay_name_selects_the_local_daemon() {
+    let home = TestHome::new();
+    let local_fixture = FixtureDaemon::start(&home.socket(), Scenario::Success);
+    let tcp_fixture = TcpFixtureDaemon::start(Ipv4Addr::LOCALHOST, Scenario::Success);
+    let remote_port = tcp_fixture.address.port();
+    let (connect_redirect, connect_capture) = connect_redirect::build(&home.root);
+    let netbird = SelfNetbird::install(&home.root);
+    let run = |args: &[&str]| {
+        home.command()
+            .env("PATH", &netbird.path)
+            .env("LD_PRELOAD", &connect_redirect)
+            .env("POHUNEK_TEST_CONNECT_CAPTURE", &connect_capture)
+            .env("POHUNEK_REMOTE_PORT", remote_port.to_string())
+            .args(args)
+            .output()
+            .expect("run pohunek")
+    };
+    let screen =
+        |host: &str, target: &str| run(&["--host", host, "session", "screen", target, "--json"]);
+
+    // Literal `local` never consults the overlay.
+    let ok = assert_json_success(&screen("local", SESSION_ID));
+    assert_eq!(ok["session_id"], SESSION_ID);
+    assert_eq!(netbird.call_count(), 0, "`local` must not run netbird");
+
+    // The own fqdn, its upper-case spelling, the own IP and a target host all
+    // reach the local daemon.
+    let self_target = format!("{SELF_FQDN}/{SESSION_ID}");
+    for output in [
+        screen(SELF_FQDN, SESSION_ID),
+        screen("FIXTURE-SELF.NETBIRD.TEST", SESSION_ID),
+        screen(SELF_NETBIRD_IP, SESSION_ID),
+        run(&["session", "screen", &self_target, "--json"]),
+    ] {
+        let ok = assert_json_success(&output);
+        assert_eq!(ok["session_id"], SESSION_ID);
+    }
+
+    // A short name this machine shares with a peer is ambiguous, never a
+    // silent choice; an unknown name keeps its typed error.
+    assert_json_error(
+        &screen("fixture-self", SESSION_ID),
+        "overlay_host_ambiguous",
+    );
+    assert_json_error(&screen("fixture-nobody", SESSION_ID), "host_unknown");
+    // An explicit target host overrides that `--host`, so it is never resolved.
+    let ok = assert_json_success(&screen("fixture-self", &format!("local/{SESSION_ID}")));
+    assert_eq!(ok["session_id"], SESSION_ID);
+
+    // A peer is still dialed over the overlay.
+    let ok = assert_json_success(&screen("fixture-remote", SESSION_ID));
+    assert_eq!(ok["session_id"], SESSION_ID);
+
+    let local_screens = local_fixture
+        .finish()
+        .iter()
+        .filter(|request| request.method() == protocol::method::SESSION_SCREEN)
+        .count();
+    assert_eq!(
+        local_screens, 6,
+        "`local`, every own-name selector and the overriding target use the local socket"
+    );
+    let remote_screens = tcp_fixture
+        .finish()
+        .iter()
+        .filter(|request| request.method() == protocol::method::SESSION_SCREEN)
+        .count();
+    assert_eq!(
+        remote_screens, 1,
+        "only the peer selector dials the overlay"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn host_commands_treat_the_machines_own_overlay_name_as_local() {
+    let home = TestHome::new();
+    let local_fixture = FixtureDaemon::start(&home.socket(), Scenario::GovernanceInspectSuccess);
+    let tcp_fixture = TcpFixtureDaemon::start(Ipv4Addr::LOCALHOST, Scenario::Success);
+    let remote_port = tcp_fixture.address.port();
+    let (connect_redirect, connect_capture) = connect_redirect::build(&home.root);
+    let netbird = SelfNetbird::install(&home.root);
+    let run = |args: &[&str]| {
+        home.command()
+            .env("PATH", &netbird.path)
+            .env("LD_PRELOAD", &connect_redirect)
+            .env("POHUNEK_TEST_CONNECT_CAPTURE", &connect_capture)
+            .env("POHUNEK_REMOTE_PORT", remote_port.to_string())
+            .args(args)
+            .output()
+            .expect("run pohunek")
+    };
+
+    // A positional host that names this machine inspects the local daemon.
+    assert_json_success(&run(&[
+        "host",
+        "governance",
+        "inspect",
+        SELF_FQDN,
+        "--json",
+    ]));
+
+    // A command that ignores `--host` never resolves it.
+    let calls = netbird.call_count();
+    let hermes = run(&[
+        "--host",
+        "fixture-self",
+        "integration",
+        "status",
+        "--agent",
+        "hermes",
+        "--json",
+    ]);
+    assert!(
+        !utf8(&hermes.stdout).contains("overlay_host_ambiguous"),
+        "{}",
+        utf8(&hermes.stdout)
+    );
+    assert_eq!(
+        netbird.call_count(),
+        calls,
+        "the ignored `--host` ran netbird"
+    );
+
+    // `host list` ignores `--host`, so an ambiguous one does not stop it. It
+    // shows this machine first, named by its own overlay name and routed as
+    // `local`.
+    let listed = run(&["--host", "fixture-self", "host", "list", "--refresh"]);
+    assert!(
+        listed.status.success(),
+        "host list: {}",
+        utf8(&listed.stderr)
+    );
+    let table = utf8(&listed.stdout);
+    let first_row = table.lines().nth(1).expect("a row below the header");
+    assert_eq!(
+        first_row.split_whitespace().take(3).collect::<Vec<_>>(),
+        ["fixture-self", "local", "local"],
+        "{table}"
+    );
+
+    // With a stuck overlay CLI, the cached records still print without this
+    // machine's row once the lookup's deadline passes.
+    netbird.stall();
+    let started = std::time::Instant::now();
+    let listed = run(&["host", "list"]);
+    assert!(
+        started.elapsed() < STALLED_NETBIRD,
+        "host list waited for the stalled netbird"
+    );
+    assert!(
+        listed.status.success(),
+        "host list: {}",
+        utf8(&listed.stderr)
+    );
+    let table = utf8(&listed.stdout);
+    assert!(
+        table
+            .lines()
+            .all(|row| row.split_whitespace().nth(1) != Some("local")),
+        "{table}"
+    );
+    assert!(
+        table.lines().any(|row| row.starts_with("fixture-remote")),
+        "{table}"
+    );
+
+    let local_inspections = local_fixture
+        .finish()
+        .iter()
+        .filter(|request| request.method() == protocol::method::HOST_GOVERNANCE_INSPECT)
+        .count();
+    assert_eq!(
+        local_inspections, 1,
+        "the own name inspects the local daemon"
+    );
+    drop(tcp_fixture.finish());
+}
+
 #[test]
 #[cfg(target_os = "linux")]
 fn stable_netbird_peer_identity_follows_its_new_address_but_not_a_reassigned_one() {
