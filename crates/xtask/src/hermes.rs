@@ -4333,6 +4333,12 @@ mod tests {
     const CONTROLLED_PACKAGE_DIGEST: &str =
         "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
+    /// Pause between typing a prompt and submitting it, in the controlled
+    /// fixtures. The fake front end echoes everything one read returns before
+    /// it forwards a line, so it needs no settle time; the pause only keeps the
+    /// two writes apart, as the harness does against the real Hermes.
+    const FIXTURE_INPUT_SETTLE_WAIT: Duration = Duration::from_millis(50);
+
     /// Limits for the controlled fixtures.
     ///
     /// Waits return as soon as their evidence appears, so the production
@@ -4348,7 +4354,7 @@ mod tests {
             startup_wait: STARTUP_WAIT,
             turn_wait: TURN_WAIT,
             working_wait: TURN_WAIT,
-            input_settle_wait: Duration::from_secs(1),
+            input_settle_wait: FIXTURE_INPUT_SETTLE_WAIT,
             interrupt_wait: INTERRUPT_WAIT,
             exit_grace: EXIT_GRACE,
         }
@@ -5935,25 +5941,6 @@ PY
 
     #[test]
     #[cfg(unix)]
-    fn cli_and_fixture_plugin_accept_pinned_model_free_shape() {
-        let repo = fixture_repo();
-        let binary = fake_hermes(repo.path(), "0.20.0");
-        refresh_with(repo.path(), &binary, fast_limits()).expect("controlled refresh succeeds");
-
-        let lock = check_cli(repo.path(), &binary, fast_limits())
-            .expect("pinned CLI and fixture plugin checks succeed");
-        let manifest = load_golden_manifest(repo.path()).expect("load refreshed manifest");
-        validate_golden_manifest(repo.path(), &lock, &manifest, 64 * 1024, false)
-            .expect("refreshed model-free evidence succeeds");
-        let summary = compatibility_summary(lock, &manifest);
-        assert_eq!(summary.release, "0.20.0");
-        assert_eq!(summary.cli_checks, 8);
-        assert_eq!(summary.plugin_checks, 17);
-        assert_eq!(summary.golden_records, 10);
-    }
-
-    #[test]
-    #[cfg(unix)]
     fn compatibility_rejects_missing_sibling_python_runtime() {
         let repo = fixture_repo();
         let binary = fake_hermes(repo.path(), "0.20.0");
@@ -6559,9 +6546,13 @@ PY
         assert_process_exited(process_id);
     }
 
+    /// One healthy refresh carries the checks that every healthy refresh
+    /// supports: its goldens are sanitized and hashed, the pinned CLI and
+    /// fixture plugin accept them, and the PTY cleanup kills a descendant that
+    /// still holds the terminal after each scenario.
     #[test]
     #[cfg(unix)]
-    fn pty_cleanup_kills_descendant_holding_terminal() {
+    fn a_healthy_refresh_writes_sanitized_goldens_the_compatibility_check_accepts() {
         let repo = fixture_repo();
         let binary = fake_hermes(repo.path(), "0.20.0");
         let pid_file = repo.path().join("held-pty-child.pid");
@@ -6571,77 +6562,20 @@ PY
         );
         rewrite_script(&binary, "  chat)\n    copilot_probe\n", &replacement);
 
-        refresh_with(repo.path(), &binary, fast_limits())
-            .expect("PTY refresh cleans up descendants after every scenario");
+        let summary =
+            refresh_with(repo.path(), &binary, fast_limits()).expect("controlled refresh succeeds");
+
         let process_id: i32 = fs::read_to_string(pid_file)
             .expect("read PTY descendant pid")
             .trim()
             .parse()
             .expect("parse PTY descendant pid");
-
         assert_process_exited(process_id);
-    }
 
-    #[test]
-    #[cfg(unix)]
-    fn tui_unsupported_requires_recognized_local_diagnostic() {
-        let repo = fixture_repo();
-        let unavailable = fake_hermes(repo.path(), "0.20.0");
-        let tui_arm = front_invocation("tui");
-        rewrite_script(
-            &unavailable,
-            &tui_arm,
-            "    echo 'node not found \u{2014} install Node.js to use the TUI.'\n    exit 1",
-        );
-        let summary = refresh_with(repo.path(), &unavailable, fast_limits())
-            .expect("recognized local TUI unavailability is recorded");
-        assert_eq!(summary.unsupported, 1);
-
-        let crash_repo = fixture_repo();
-        let crash = fake_hermes(crash_repo.path(), "0.20.0");
-        rewrite_script(
-            &crash,
-            &tui_arm,
-            "    echo 'authentication failed'\n    exit 1",
-        );
-        let error = refresh_with(crash_repo.path(), &crash, fast_limits())
-            .expect_err("auth failure cannot be recorded as unsupported");
-        assert!(
-            error
-                .to_string()
-                .contains("neither alternate-screen evidence"),
-            "an auth failure must be rejected for the TUI diagnosis, not an earlier scenario: {error}"
-        );
-
-        let alt_crash_repo = fixture_repo();
-        let alt_crash = fake_hermes(alt_crash_repo.path(), "0.20.0");
-        rewrite_script(
-            &alt_crash_repo.path().join(FAKE_FRONT_NAME),
-            "TUI_INTERRUPT_STATUS = 0\n",
-            "TUI_INTERRUPT_STATUS = 2\n",
-        );
-        let error = refresh_with(alt_crash_repo.path(), &alt_crash, fast_limits())
-            .expect_err("alternate-screen entry does not hide a subsequent crash");
-        assert_eq!(
-            error.to_string(),
-            "Hermes alternate-screen TUI crashed after entering alternate-screen mode",
-            "the TUI must exit by itself; a killed child bypasses the crash check"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn refresh_writes_sanitized_hashed_inventory() {
-        let repo = fixture_repo();
-        let binary = fake_hermes(repo.path(), "0.20.0");
-
-        let summary =
-            refresh_with(repo.path(), &binary, fast_limits()).expect("controlled refresh succeeds");
         let manifest: GoldenManifest = serde_json::from_slice(
             &fs::read(summary.manifest_path).expect("read refreshed manifest"),
         )
         .expect("parse refreshed manifest");
-
         assert_eq!(manifest.records.len(), 10);
         assert!(manifest
             .records
@@ -6658,6 +6592,77 @@ PY
             assert!(!text.contains('\u{1b}'));
             assert!(record.sha256.is_some());
         }
+
+        let lock = check_cli(repo.path(), &binary, fast_limits())
+            .expect("pinned CLI and fixture plugin checks succeed");
+        let manifest = load_golden_manifest(repo.path()).expect("load refreshed manifest");
+        validate_golden_manifest(repo.path(), &lock, &manifest, 64 * 1024, false)
+            .expect("refreshed model-free evidence succeeds");
+        let summary = compatibility_summary(lock, &manifest);
+        assert_eq!(summary.release, "0.20.0");
+        assert_eq!(summary.cli_checks, 8);
+        assert_eq!(summary.plugin_checks, 17);
+        assert_eq!(summary.golden_records, 10);
+    }
+
+    /// A TUI that cannot start for a recognized local reason is recorded as
+    /// unsupported.
+    #[test]
+    #[cfg(unix)]
+    fn tui_unsupported_requires_recognized_local_diagnostic() {
+        let repo = fixture_repo();
+        let unavailable = fake_hermes(repo.path(), "0.20.0");
+        rewrite_script(
+            &unavailable,
+            &front_invocation("tui"),
+            "    echo 'node not found \u{2014} install Node.js to use the TUI.'\n    exit 1",
+        );
+        let summary = refresh_with(repo.path(), &unavailable, fast_limits())
+            .expect("recognized local TUI unavailability is recorded");
+        assert_eq!(summary.unsupported, 1);
+    }
+
+    /// A TUI that fails for any other reason is rejected at the TUI step,
+    /// not recorded as unsupported.
+    #[test]
+    #[cfg(unix)]
+    fn tui_failure_without_a_recognized_diagnostic_is_rejected() {
+        let repo = fixture_repo();
+        let crash = fake_hermes(repo.path(), "0.20.0");
+        rewrite_script(
+            &crash,
+            &front_invocation("tui"),
+            "    echo 'authentication failed'\n    exit 1",
+        );
+        let error = refresh_with(repo.path(), &crash, fast_limits())
+            .expect_err("auth failure cannot be recorded as unsupported");
+        assert!(
+            error
+                .to_string()
+                .contains("neither alternate-screen evidence"),
+            "an auth failure must be rejected for the TUI diagnosis, not an earlier scenario: {error}"
+        );
+    }
+
+    /// A TUI that enters the alternate screen and then exits unsuccessfully
+    /// is a crash.
+    #[test]
+    #[cfg(unix)]
+    fn tui_crash_after_entering_the_alternate_screen_is_rejected() {
+        let repo = fixture_repo();
+        let alt_crash = fake_hermes(repo.path(), "0.20.0");
+        rewrite_script(
+            &repo.path().join(FAKE_FRONT_NAME),
+            "TUI_INTERRUPT_STATUS = 0\n",
+            "TUI_INTERRUPT_STATUS = 2\n",
+        );
+        let error = refresh_with(repo.path(), &alt_crash, fast_limits())
+            .expect_err("alternate-screen entry does not hide a subsequent crash");
+        assert_eq!(
+            error.to_string(),
+            "Hermes alternate-screen TUI crashed after entering alternate-screen mode",
+            "the TUI must exit by itself; a killed child bypasses the crash check"
+        );
     }
 
     #[test]
@@ -6836,6 +6841,15 @@ PY
     #[cfg(unix)]
     const FIXTURE_STALL: &str = "1.5";
 
+    /// How long a race-window fixture holds back the rest of its output:
+    /// fifteen harness polls (`PROCESS_POLL_INTERVAL`), so an early reader acts
+    /// on the incomplete output well before it is completed. The detection is
+    /// probabilistic, as with any hold: a harness thread descheduled for the
+    /// whole hold sees only the completed output and the test passes without
+    /// exercising the window.
+    #[cfg(unix)]
+    const RACE_WINDOW_HOLD: &str = "0.3";
+
     /// Which fixture steps stall.
     #[cfg(unix)]
     #[derive(Clone, Copy)]
@@ -6942,7 +6956,7 @@ PY
     }
 
     /// Rewrites the fake Hermes so that each terminal command line reaches the
-    /// PTY in two writes: the text first, its terminator `FIXTURE_STALL` later.
+    /// PTY in two writes: the text first, its terminator `RACE_WINDOW_HOLD` later.
     ///
     /// The harness cannot signal the fixture once it waits for a terminated
     /// line, so no handshake can release the terminator; the hold only widens
@@ -6962,7 +6976,7 @@ PY
                 &binary,
                 &format!("echo 'Running {command}'"),
                 &format!(
-                    "printf 'Running {command}'\n          sleep {FIXTURE_STALL}\n          echo"
+                    "printf 'Running {command}'\n          sleep {RACE_WINDOW_HOLD}\n          echo"
                 ),
             );
         }
@@ -6988,7 +7002,7 @@ PY
         rewrite_script(
             &binary,
             &format!("printf '%s\\n' '{bottom}'"),
-            &format!("printf '%s' '{bottom}'\n  sleep {FIXTURE_STALL}\n  printf '\\n'"),
+            &format!("printf '%s' '{bottom}'\n  sleep {RACE_WINDOW_HOLD}\n  printf '\\n'"),
         );
 
         refresh_with(repo.path(), &binary, fast_limits())
@@ -6996,7 +7010,7 @@ PY
     }
 
     /// Rewrites the fake Hermes so that it acknowledges Ctrl-C and then stays
-    /// busy for `FIXTURE_STALL`, discarding any input typed meanwhile, before
+    /// busy for `RACE_WINDOW_HOLD`, discarding any input typed meanwhile, before
     /// it prints its idle prompt.
     ///
     /// Like the real Hermes, input typed before the idle prompt never reaches
@@ -7010,7 +7024,7 @@ PY
             &root.join(FAKE_FRONT_NAME),
             "    # busy-window\n",
             &format!(
-                "    time.sleep({FIXTURE_STALL})\n    termios.tcflush(IN, termios.TCIFLUSH)\n"
+                "    time.sleep({RACE_WINDOW_HOLD})\n    termios.tcflush(IN, termios.TCIFLUSH)\n"
             ),
         );
         binary
