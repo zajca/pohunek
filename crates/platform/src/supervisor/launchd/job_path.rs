@@ -125,7 +125,26 @@ pub async fn domain_environment_of(
     deadline: Duration,
 ) -> Result<Vec<(String, String)>, Error> {
     let launchctl = Launchctl::new(deadline).with_output_cap(PRINT_OUTPUT_CAP);
-    domain_environment(&launchctl, &format!("gui/{uid}")).await
+    redacted_domain_environment(&launchctl, &format!("gui/{uid}")).await
+}
+
+/// The variables of `domain`, with a parse failure reported without the line
+/// it could not read.
+async fn redacted_domain_environment(
+    launchctl: &Launchctl,
+    domain: &str,
+) -> Result<Vec<(String, String)>, Error> {
+    domain_environment(launchctl, domain)
+        .await
+        .map_err(|error| match error {
+            // The parser quotes the line it could not read, and a line of the
+            // domain's environment carries a value, so only the condition is kept.
+            Error::InvalidData { operation, .. } => Error::InvalidData {
+                operation,
+                detail: "unrecognized launchctl print output in the domain environment".to_owned(),
+            },
+            other => other,
+        })
 }
 
 /// [`job_path_sources`] through the given runner, so tests can answer for launchd.
@@ -562,6 +581,25 @@ mod tests {
             let debug = format!("{sources:?}");
             assert!(debug.contains("SECRET_STORE"), "the name is shown: {debug}");
             assert!(!debug.contains("/sentinel/secret-value"), "no value: {debug}");
+        });
+    }
+
+    /// A domain line the parser cannot read is reported by the domain-only read
+    /// without the line, which may carry a variable's value.
+    #[test]
+    fn an_unreadable_domain_line_is_reported_without_its_text() {
+        runtime().block_on(async {
+            let dir = pohunek_test_support::tempdir().expect("scratch directory");
+            let domain = "gui/501 = {\n\tenvironment = {\n\t\tSECRET_STORE=/sentinel/secret-value\n\t}\n\tservices = {\n\t}\n}\n";
+            let launchctl = fake(dir.path(), Reply::Output(domain), Reply::Status(113), None);
+
+            let error = redacted_domain_environment(&launchctl, "gui/501")
+                .await
+                .expect_err("the line has no separator");
+            assert!(matches!(error, Error::InvalidData { .. }), "{error}");
+            let text = format!("{error} {error:?}");
+            assert!(!text.contains("/sentinel/secret-value"), "{text}");
+            assert!(!text.contains("SECRET_STORE"), "{text}");
         });
     }
 
