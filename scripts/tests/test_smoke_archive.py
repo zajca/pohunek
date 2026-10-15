@@ -860,6 +860,61 @@ for host in ("192.0.2.1", "8.8.8.8"):
 
         self.assert_cleaned_up()
 
+    @needs_isolated_run
+    @unittest.skipUnless(sys.platform.startswith("darwin"), "the throwaway-user preflight is macOS-only")
+    def test_an_unreadable_stage_fails_the_preflight_clearly(self):
+        stage_dir = self.stage / "pi"
+        original_mode = stat.S_IMODE(os.stat(stage_dir).st_mode)
+        self.addCleanup(os.chmod, stage_dir, original_mode)
+        os.chmod(stage_dir, 0o700)
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the throwaway user cannot read the staged upstream", result.stderr)
+        self.assert_cleaned_up()
+
+    @needs_isolated_run
+    @unittest.skipUnless(sys.platform.startswith("darwin"), "the throwaway-user preflight is macOS-only")
+    def test_a_stage_with_a_private_subdirectory_made_readable_runs(self):
+        stage_dir = self.stage / "pi"
+        private_dir = stage_dir / "private"
+        private_dir.mkdir()
+        private_file = private_dir / "data.txt"
+        payload = b"private data\n"
+        private_file.write_bytes(payload)
+        private_file.chmod(0o600)  # no x bits initially
+        os.chmod(private_dir, 0o700)
+
+        # Apply go+rX: walk the whole runtime directory and chmod everything
+        # Mirrors chmod -R go+rX $stage/$runtime
+        for root, dirs, files in os.walk(stage_dir):
+            # chmod the root directory itself
+            root_mode = stat.S_IMODE(os.stat(root).st_mode)
+            os.chmod(root, root_mode | 0o055)
+            # chmod all subdirectories
+            for d in dirs:
+                dir_path = Path(root) / d
+                current_mode = stat.S_IMODE(os.stat(dir_path).st_mode)
+                os.chmod(dir_path, current_mode | 0o055)
+            # chmod all files
+            for f in files:
+                file_path = Path(root) / f
+                current_mode = stat.S_IMODE(os.stat(file_path).st_mode)
+                # Add 0o044, plus 0o011 if file has owner x
+                if current_mode & 0o100:
+                    os.chmod(file_path, current_mode | 0o055)
+                else:
+                    os.chmod(file_path, current_mode | 0o044)
+
+        # Also update stage manifests to include the new file
+        digest = sha256_hex(payload)
+        with (stage_dir / "STAGE.sha256").open("a") as manifest:
+            manifest.write(f"{digest}  private/data.txt\n")
+
+        # Run should succeed
+        result = self.smoke("--runtime", "pi")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_cleaned_up()
+
     @unittest.skipUnless(sys.platform.startswith("linux"), "userns isolation is Linux-only")
     def test_termination_kills_the_userns_namespace_and_its_workload(self):
         self.assert_termination_kills_namespace("userns")
@@ -978,61 +1033,6 @@ class SmokeArchivePreflightTest(_SmokeArchiveFixture, unittest.TestCase):
         result = self.smoke("--runtime", "pi", node_dir=node_dir)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("node on PATH resolves inside the checkout", result.stderr)
-        self.assert_cleaned_up()
-
-    @needs_isolated_run
-    @unittest.skipUnless(sys.platform.startswith("darwin"), "the throwaway-user preflight is macOS-only")
-    def test_an_unreadable_stage_fails_the_preflight_clearly(self):
-        stage_dir = self.stage / "pi"
-        original_mode = stat.S_IMODE(os.stat(stage_dir).st_mode)
-        self.addCleanup(os.chmod, stage_dir, original_mode)
-        os.chmod(stage_dir, 0o700)
-        result = self.smoke("--runtime", "pi")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("the throwaway user cannot read the staged upstream", result.stderr)
-        self.assert_cleaned_up()
-
-    @needs_isolated_run
-    @unittest.skipUnless(sys.platform.startswith("darwin"), "the throwaway-user preflight is macOS-only")
-    def test_a_stage_with_a_private_subdirectory_made_readable_runs(self):
-        stage_dir = self.stage / "pi"
-        private_dir = stage_dir / "private"
-        private_dir.mkdir()
-        private_file = private_dir / "data.txt"
-        payload = b"private data\n"
-        private_file.write_bytes(payload)
-        private_file.chmod(0o600)  # no x bits initially
-        os.chmod(private_dir, 0o700)
-
-        # Apply go+rX: walk the whole runtime directory and chmod everything
-        # Mirrors chmod -R go+rX $stage/$runtime
-        for root, dirs, files in os.walk(stage_dir):
-            # chmod the root directory itself
-            root_mode = stat.S_IMODE(os.stat(root).st_mode)
-            os.chmod(root, root_mode | 0o055)
-            # chmod all subdirectories
-            for d in dirs:
-                dir_path = Path(root) / d
-                current_mode = stat.S_IMODE(os.stat(dir_path).st_mode)
-                os.chmod(dir_path, current_mode | 0o055)
-            # chmod all files
-            for f in files:
-                file_path = Path(root) / f
-                current_mode = stat.S_IMODE(os.stat(file_path).st_mode)
-                # Add 0o044, plus 0o011 if file has owner x
-                if current_mode & 0o100:
-                    os.chmod(file_path, current_mode | 0o055)
-                else:
-                    os.chmod(file_path, current_mode | 0o044)
-
-        # Also update stage manifests to include the new file
-        digest = sha256_hex(payload)
-        with (stage_dir / "STAGE.sha256").open("a") as manifest:
-            manifest.write(f"{digest}  private/data.txt\n")
-
-        # Run should succeed
-        result = self.smoke("--runtime", "pi")
-        self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_cleaned_up()
 
 
