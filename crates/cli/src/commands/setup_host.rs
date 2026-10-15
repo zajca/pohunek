@@ -73,6 +73,23 @@ const RELEASE_CATALOG_FILE: &str = "runtime-catalog.json";
 /// Matches `PACKAGES_DIR` of the release daemon's `ensure-official-runtimes`.
 const RELEASE_PACKAGES_DIR: &str = "packages";
 
+/// Manifest at the root of a sealed release archive (`packaging/write-manifest`).
+const ARCHIVE_MANIFEST: &str = "MANIFEST";
+
+/// The archive's own verifier, which its installer `packaging/install-daemon.sh`
+/// runs before anything from the archive.
+const ARCHIVE_VERIFIER: &str = "packaging/verify-archive";
+
+/// Component and binaries the daemon archive must carry, as
+/// `packaging/install-daemon.sh` passes them to the verifier.
+const DAEMON_ARCHIVE_COMPONENT: &str = "daemon";
+const DAEMON_ARCHIVE_BINARIES: [&str; 3] = ["pohunek", "pohunekd", "pohunek-sessiond"];
+
+/// The search path the verifier runs with: the system's own tools, so a
+/// directory of the caller's `PATH` cannot stand in for `uname`, `find` or the
+/// digest tool it relies on.
+const VERIFIER_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
 /// Suffix of a release package archive, named after the runtime id.
 ///
 /// Matches `ARCHIVE_SUFFIX` of the release daemon's `ensure-official-runtimes`.
@@ -401,6 +418,9 @@ async fn plan_in(
             }
         }
     } else {
+        // The plan runs the release's daemon, so a sealed archive is verified
+        // before anything from it runs.
+        verify_sealed_archive(staged).await?;
         // The search path a fresh install records, so the plan judges the
         // packages against the PATH the daemon job will get.
         let (search, _report) = context.install_search_path()?;
@@ -1106,6 +1126,62 @@ fn hook_lines(hooks: &[IntegrationReinstall], status: &str) -> Vec<String> {
             None => hook.integration.clone(),
         })
         .collect()
+}
+
+/// Verifies the release in `staged` with the archive's own
+/// `packaging/verify-archive`, with the arguments `packaging/install-daemon.sh`
+/// gives it, before anything from the release runs.
+///
+/// A release that carries a `MANIFEST` or the verifier is an extracted
+/// archive, so both must be present and the verifier must accept it: a
+/// removed manifest or verifier fails like a modified member. A directory with
+/// neither is a development build or a package manager's layout, which ships
+/// no manifest.
+///
+/// # Errors
+///
+/// Returns [`CliError::SetupBlocked`] with the verifier's reason when the
+/// archive is refused or the verifier cannot run.
+async fn verify_sealed_archive(staged: &Path) -> Result<(), CliError> {
+    let blocked = |detail: String| CliError::SetupBlocked { detail };
+    let manifest = staged.join(ARCHIVE_MANIFEST);
+    let verifier = staged.join(ARCHIVE_VERIFIER);
+    let mut sealed = false;
+    for path in [&manifest, &verifier] {
+        match fs::symlink_metadata(path) {
+            Ok(_) => sealed = true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(blocked(format!(
+                    "cannot inspect {} of the release archive: {error}",
+                    path.display()
+                )))
+            }
+        }
+    }
+    if !sealed {
+        return Ok(());
+    }
+    let output = tokio::process::Command::new("/bin/sh")
+        .arg(&verifier)
+        .arg(staged)
+        .arg(DAEMON_ARCHIVE_COMPONENT)
+        .args(DAEMON_ARCHIVE_BINARIES)
+        .env_clear()
+        .env("PATH", VERIFIER_PATH)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|error| blocked(format!("cannot run {}: {error}", verifier.display())))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let reason = String::from_utf8_lossy(&output.stderr);
+    Err(blocked(format!(
+        "the release archive {} failed its verification ({ARCHIVE_VERIFIER}): {}",
+        staged.display(),
+        reason.trim()
+    )))
 }
 
 /// The version directory of the installed release.

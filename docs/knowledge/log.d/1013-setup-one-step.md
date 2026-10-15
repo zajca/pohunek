@@ -33,6 +33,10 @@
   fails the verdict. A config write that fails part way names the files it
   created. A catalog to be recorded on an installed host with no official
   package to install is a note, not an effect.
+- Setup run from an extracted release archive verifies it first with the
+  archive's own `packaging/verify-archive`, as `packaging/install-daemon.sh`
+  does, and stops before any change on a modified member or a removed
+  manifest.
 - Setup installs only the hooks the daemon does not report as current, so a
   run on a ready host applies nothing and a modified hook is still repaired.
 - The install quick start, the setup guide and the Homebrew path in the macOS

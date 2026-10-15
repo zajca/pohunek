@@ -21,6 +21,8 @@
 
 #[path = "support/native.rs"]
 mod native;
+#[path = "support/sealed_archive.rs"]
+mod sealed_archive;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -914,12 +916,15 @@ fn write_release_runtime(runtime: &Path, key: &SigningKey) {
     fs::write(runtime.join(CATALOG_FILE), signed(key, catalog)).expect("write the catalog");
 }
 
-/// Stages the release the scenario installs from: this build's binaries, the
-/// throwaway trust anchor beside the daemon, and the signed `runtime/`.
+/// Stages the release the scenario installs from as an extracted daemon
+/// archive: this build's binaries, the throwaway trust anchor beside the
+/// daemon and the signed `runtime/`, sealed with the archive's verifier and
+/// `MANIFEST`, so setup verifies it before it runs anything from it.
 fn stage_release(installation: &Installation, key: &SigningKey) -> PathBuf {
     let release = installation.stage();
     fs::write(release.join(ANCHOR_FILE_NAME), anchor_for(key)).expect("write the trust anchor");
     write_release_runtime(&release.join(RUNTIME_DIR), key);
+    sealed_archive::seal(&release);
     release
 }
 

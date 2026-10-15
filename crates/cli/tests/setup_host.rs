@@ -19,6 +19,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 
 use pohunek_test_support::env::TestEnv;
+
+#[path = "support/sealed_archive.rs"]
+mod sealed_archive;
 use serde_json::Value;
 
 /// Mode of the fixture daemon: owner and group and other may execute it.
@@ -290,4 +293,102 @@ fn a_pending_install_stops_setup_before_any_change() {
         without_locks(before),
         "a pending install writes no configuration, package or hook"
     );
+}
+
+/// File the fixture daemon of a tampered archive creates when it runs.
+const RAN_MARKER: &str = "fixture-daemon-ran";
+
+/// Turns the fixture release into an extracted daemon archive: a fixture
+/// session worker beside the daemon, then the archive's verifier and a sealed
+/// `MANIFEST` (see `support/sealed_archive.rs`).
+fn seal_release(release: &Path) {
+    let worker = release.join("pohunek-sessiond");
+    fs::write(&worker, "#!/bin/sh\nexit 0\n").expect("write the fixture worker");
+    fs::set_permissions(&worker, fs::Permissions::from_mode(FIXTURE_EXECUTABLE_MODE))
+        .expect("make the fixture worker executable");
+    sealed_archive::seal(release);
+}
+
+/// A sealed archive whose member changed after sealing is refused before its
+/// daemon runs: the fixture daemon, which the change makes leave a marker,
+/// never runs, the reason names the digest mismatch, and nothing is written.
+#[test]
+fn a_tampered_sealed_archive_stops_setup_before_its_daemon_runs() {
+    let env = TestEnv::new().expect("private environment");
+    let binary = release_with_fixture(&env, REFUSED_REPORT);
+    let release = binary.parent().expect("release directory").to_path_buf();
+    seal_release(&release);
+    let daemon = release.join(pohunek_paths::DAEMON_EXECUTABLE_NAME);
+    let mut script = fs::read_to_string(&daemon).expect("read the fixture daemon");
+    script.insert_str(
+        script.find('\n').expect("a shebang line") + 1,
+        &format!(": > \"${{0%/*}}/{RAN_MARKER}\"\n"),
+    );
+    fs::write(&daemon, script).expect("tamper with the sealed daemon");
+    let before = tree(env.root());
+
+    let output = run_setup(&env, &binary, &["setup", "--yes"]);
+
+    assert!(
+        !output.status.success(),
+        "a tampered archive exits non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("setup stopped before any change")
+            && stderr.contains("failed its verification")
+            && stderr.contains("digest mismatch"),
+        "stderr names the verification failure: {stderr}"
+    );
+    assert!(
+        !release.join(RAN_MARKER).exists(),
+        "the tampered daemon never runs"
+    );
+    assert_eq!(tree(env.root()), before, "a refused archive writes nothing");
+}
+
+/// A sealed archive whose manifest was removed is refused like a modified
+/// one: the verifier it still carries marks it as an archive.
+#[test]
+fn a_sealed_archive_without_its_manifest_stops_setup() {
+    let env = TestEnv::new().expect("private environment");
+    let binary = release_with_fixture(&env, REFUSED_REPORT);
+    let release = binary.parent().expect("release directory").to_path_buf();
+    seal_release(&release);
+    fs::remove_file(release.join("MANIFEST")).expect("remove the manifest");
+    let before = tree(env.root());
+
+    let output = run_setup(&env, &binary, &["setup", "--yes"]);
+
+    assert!(
+        !output.status.success(),
+        "an unsealed archive exits non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed its verification") && stderr.contains("has no MANIFEST"),
+        "stderr names the missing manifest: {stderr}"
+    );
+    assert_eq!(tree(env.root()), before, "a refused archive writes nothing");
+}
+
+/// An intact sealed archive passes the verification, so setup goes on to run
+/// its daemon's plan, which this fixture refuses.
+#[test]
+fn an_intact_sealed_archive_passes_verification_and_is_planned() {
+    let env = TestEnv::new().expect("private environment");
+    let binary = release_with_fixture(&env, REFUSED_REPORT);
+    seal_release(binary.parent().expect("release directory"));
+    let before = tree(env.root());
+
+    let output = run_setup(&env, &binary, &["setup", "--yes"]);
+
+    assert!(!output.status.success(), "the fixture plan is refused");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("failed its verification")
+            && stderr.contains("fixture refusal: archive missing"),
+        "the archive verifies and its daemon plans: {stderr}"
+    );
+    assert_eq!(tree(env.root()), before, "a refused plan writes nothing");
 }
